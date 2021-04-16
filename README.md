@@ -1,6 +1,6 @@
 ## BEHAV3D pipeline
 ### Overview
-BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study tumor death dynamics; immune cell behavior and behavior-guided transcriptomics.
+BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study tumor death dynamics; immune cell behavior and behavior-guided transcriptomics. 
 
 #### What type of data does BEHAV3D work with?
 - Any type of multispectral time-lapse 3D (or 2D) imaging data, where objects such as cells or organoids are in co-culture or single culture. 
@@ -16,7 +16,12 @@ The current version of the pipeline works with objects (cells or organoids) time
 BEHAV3D runs on R studio (version 4.0.2). See package requirements for each module. 
 #### Dataset example
 In this repository we provide an example dataset consisting of a multispectral time-lapse 3D imaging dataset originated from a co-culture of engeneered T cells and Tumor derived organoids. Multispectral imaging allows to identify: Live/dead T cells; Live/Dead organoids. For downstream analysis of organoids: either individual tumor derived organoids are tracked overtime or the total organoid volume per well is tracked. For each generated object we acquire information on the dead cell dye intensity and position and volume of individual organoids. For downstream analysis of T cell: T cells are tracked overtime. For each Tracked T cell object we aquire, position per timepoint, speed, square displacement, distance to an organoid, dead dye intensity, major and minor axis length (used in some downstream analysis).
-### Organoids death dynamics
-#### Full well organoid dynamics
+## Repository
+This repository contains a collection of scripts enabling the following dowstream analysis. Follow the strucutre in the script folder.
+### (1) Organoids death dynamics 
+#### Full well organoid dynamics. 
+-Script to import data
+-Script to process data
 #### Individual organoid dynamics
-
+-Script to import data
+-Script to process data
