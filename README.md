@@ -21,7 +21,9 @@ This repository contains a collection of scripts enabling the following dowstrea
 ### (1) Organoids death dynamics 
 #### Full well organoid dynamics. 
 -Script to import data
+
 -Script to process data
 #### Individual organoid dynamics
 -Script to import data
+
 -Script to process data
