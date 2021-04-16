@@ -17,10 +17,12 @@ BEHAV3D runs on R studio (version 4.0.2). See package requirements for each modu
 #### Dataset example
 In this repository we provide an example dataset consisting of a multispectral time-lapse 3D imaging dataset originated from a co-culture of engeneered T cells and Tumor derived organoids. Multispectral imaging allows to identify: Live/dead T cells; Live/Dead organoids. For downstream analysis of organoids: either individual tumor derived organoids are tracked overtime or the total organoid volume per well is tracked. For each generated object we acquire information on the dead cell dye intensity and position and volume of individual organoids. For downstream analysis of T cell: T cells are tracked overtime. For each Tracked T cell object we aquire, position per timepoint, speed, square displacement, distance to an organoid, dead dye intensity, major and minor axis length (used in some downstream analysis).
 ## Repository
-This repository contains a collection of scripts enabling the following dowstream analysis. Follow the strucutre in the script folder.
+This repository contains a collection of scripts and example datasets enabling the following dowstream analysis. Follow the structre in the script folder.
 ### (1) Organoids death dynamics 
 -Script to batch import data
 
 -Script for death dynamics per well
 
 -Script for individual organoid death dynamics
+### (2) T cell behavior classification
+-Script to import data
