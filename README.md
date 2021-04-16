@@ -19,11 +19,8 @@ In this repository we provide an example dataset consisting of a multispectral t
 ## Repository
 This repository contains a collection of scripts enabling the following dowstream analysis. Follow the strucutre in the script folder.
 ### (1) Organoids death dynamics 
-#### Full well organoid dynamics. 
--Script to import data
+-Script to batch import data
 
--Script to process data
-#### Individual organoid dynamics
--Script to import data
+-Script for death dynamics per well
 
--Script to process data
+-Script for individual organoid death dynamics
