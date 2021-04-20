@@ -25,4 +25,8 @@ This repository contains a collection of scripts and example datasets enabling t
 
 -Script for individual organoid death dynamics
 ### (2) T cell behavior classification
--Script to import data
+-Script to import T cell data
+
+-Script to Behavioral reference map generation (Dynamic time warping)
+
+-Script for T cell behavior classification based on the Behavioral reference map
