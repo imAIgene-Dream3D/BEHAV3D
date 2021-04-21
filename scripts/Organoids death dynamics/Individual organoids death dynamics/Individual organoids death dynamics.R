@@ -1,7 +1,7 @@
 library(ggplot2)
 library(gridExtra)
 library(dplyr)
-live_deadROI6_combi<-readRDS(file = "D:/R/scripts/T_cell paper/FINAL SCRIPTS_20210408/Fig1/example_data_set_organoids/live_deadROI6_example_data")  ### save here a dataframe with all the organoids values
+live_deadROI6_combi<-readRDS(file = "Individual_orgs_death_dynamics")  ### set here the direction of your df with processed individual organoids death dynamics
 
 live_deadROI6_combi$dead<-ifelse(live_deadROI6_combi$red<7,0,1)
 library(tidyr)
