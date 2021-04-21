@@ -69,5 +69,11 @@ Output files: [Full_well_death_dynamics.rds](https://github.com/alievakrash/BEHA
 -For each well of interest [adapt here](https://github.com/alievakrash/BEHAV3D/blob/c516cafc900cb71e8d33ba6d125b457923915bdb/scripts/T%20cell%20dynamics%20classification/Create_Behavioral_Reference_map.R#L127-L131) with the corresponding "ranks" and output direction.
 - Predict T cell behavior classification for new datasets, based on the [Behavioral reference map](https://github.com/alievakrash/BEHAV3D/blob/57c67317eea1af74d9aa82b33a9fab795d0a2dcc/scripts/T%20cell%20dynamics%20classification/Behavioral%20reference%20map/Behavioral_Referance_map_git) :
 
+-Import your new dataset as indicate [above]
+
+-Run script 
+
+-Insert [here](https://github.com/alievakrash/BEHAV3D/blob/7734d41e0032d1aee872a1b99d5d391db41ec566/scripts/T%20cell%20dynamics%20classification/Random_forest_classifier.R#L9) the direction of the [Behavioral_Referance_map](https://github.com/alievakrash/BEHAV3D/blob/7734d41e0032d1aee872a1b99d5d391db41ec566/scripts/T%20cell%20dynamics%20classification/Behavioral%20reference%20map/Behavioral_Referance_map_git) on your PC.
+
 ### (3) Behavior-guided transcriptomics module
 - Script to create a behavioral probability map for scRNA seq data
