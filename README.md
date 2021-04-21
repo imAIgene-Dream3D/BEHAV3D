@@ -30,9 +30,13 @@ This repository contains a collection of scripts and example datasets enabling t
 
 Output files: [Full_well_death_dynamics.rds](https://github.com/alievakrash/BEHAV3D/blob/553db58a0116559817b9f2109333cf4f7e58f4da/scripts/Organoids%20death%20dynamics/Test%20dataset/Full_well_death_dynamics) and [Individual_orgs_death_dynamics.rds](https://github.com/alievakrash/BEHAV3D/blob/553db58a0116559817b9f2109333cf4f7e58f4da/scripts/Organoids%20death%20dynamics/Test%20dataset/Individual_organoids_death_dynamics)
 
-- Script for death dynamics per well
+- Compute death dynamics per well:
+-Run script [Calculate_mean_dead_dye_perwell.R](https://github.com/alievakrash/BEHAV3D/blob/5a2aed55ede54f2f14a987d7ab37480b8d15e038/scripts/Organoids%20death%20dynamics/Death%20dynamics%20per%20well/Calculate_mean_dead_dye_perwell.R)
+-Insert [here](https://github.com/alievakrash/BEHAV3D/blob/fa49556265fc14c2da2355ef99561884ce65c807/scripts/Organoids%20death%20dynamics/Death%20dynamics%20per%20well/Calculate_mean_dead_dye_perwell.R#L5) the direction on your PC of the processed dataframe [Full_well_death_dynamics.rds](https://github.com/alievakrash/BEHAV3D/blob/553db58a0116559817b9f2109333cf4f7e58f4da/scripts/Organoids%20death%20dynamics/Test%20dataset/Full_well_death_dynamics) 
 
-- Script for individual organoid death dynamics
+
+- Computer individual organoid death dynamics:
+-Run script [Individual organoids death dynamics.R](https://github.com/alievakrash/BEHAV3D/blob/5a2aed55ede54f2f14a987d7ab37480b8d15e038/scripts/Organoids%20death%20dynamics/Individual%20organoids%20death%20dynamics/Individual%20organoids%20death%20dynamics.R)
 ### (2) T cell behavior classification module
 - Script to import T cell data
 
