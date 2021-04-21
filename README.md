@@ -32,4 +32,4 @@ This repository contains a collection of scripts and example datasets enabling t
 -Script for T cell behavior classification based on the Behavioral reference map (Random Forest classifier)
 
 ### (3) Behavior-guided transcriptomics module
-- Script to create a behavioral probability map for scRNA seq data
+-Script to create a behavioral probability map for scRNA seq data
