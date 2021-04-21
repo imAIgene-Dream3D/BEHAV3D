@@ -28,6 +28,8 @@ This repository contains a collection of scripts and example datasets enabling t
 
 -Insert the direction of the example dataset on your PC [here](https://github.com/alievakrash/BEHAV3D/blob/c0a285b105d6ee237dfc7f9b7bf912caa6f3e1cb/scripts/Organoids%20death%20dynamics/Batch%20import%20organoids%20data/batch_import_organoids_data_for_each_n.R#L9)
 
+> Output files: Full_well_death_dynamics.rds and Individual_orgs_death_dynamics.rds
+
 - Script for death dynamics per well
 
 - Script for individual organoid death dynamics
