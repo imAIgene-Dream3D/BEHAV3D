@@ -134,7 +134,7 @@ live_deadROI7$red<-live_deadROI7$red/live_deadROI7$Volume
 ### set an experiment ID if processing several experimental replicates
 live_deadROI7$exp<-"1"
 ### SAVE dataframe for processing in a different script
-saveRDS(live_deadROI7, file = "live_deadROI7_example_data")
+saveRDS(live_deadROI7, file = "Full_well_death_dynamics")
 
 
 
@@ -165,4 +165,4 @@ ggtitle("Individual org increase in dead dye intensity TEG")
 
 Plot
  ### SAVE Dataframe for later processing
-saveRDS(live_deadROI6, file = "live_deadROI6_example_data")  ### save here a dataframe with all the organoids values
+saveRDS(live_deadROI6, file = "Individual_orgs_death_dynamics")  ### save here a dataframe with all the organoids values
