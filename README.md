@@ -22,7 +22,7 @@ The current version of the pipeline works with objects (cells or organoids) time
 #### Dataset example
 In this repository we provide an example dataset consisting of a multispectral time-lapse 3D imaging dataset originated from a co-culture of engeneered T cells and Tumor derived organoids. Multispectral imaging allows to identify: Live/dead T cells; Live/Dead organoids. For downstream analysis of organoids: either individual tumor derived organoids are tracked overtime or the total organoid volume per well is tracked. For each generated object we acquire information on the dead cell dye intensity and position and volume of individual organoids. For downstream analysis of T cell: T cells are tracked overtime. For each Tracked T cell object we aquire, position per timepoint, speed, square displacement, distance to an organoid, dead dye intensity, major and minor axis length (used in some downstream analysis).
 ## Repository
-This repository contains a collection of scripts and example datasets enabling the following dowstream analysis. Follow the structure in the script folder for each module and each analysis:
+This repository contains a collection of scripts and example datasets enabling the following dowstream analysis. Follow the structure in the script folder for each module and each analysis type. Introduce the corresponding folder/ file direction on your own computer where required (note that to specify directory paths in R (/) forward slash is recommended):
 ### (1) Organoids death dynamics module
 - Batch import tracked organoids data: 
 
@@ -64,8 +64,9 @@ Output files: [Full_well_death_dynamics.rds](https://github.com/alievakrash/BEHA
 
 -Run script [Create_Behavioral_Reference_map.R](https://github.com/alievakrash/BEHAV3D/blob/57c67317eea1af74d9aa82b33a9fab795d0a2dcc/scripts/T%20cell%20dynamics%20classification/Create_Behavioral_Reference_map.R)
 
--Insert [here](https://github.com/alievakrash/BEHAV3D/blob/c516cafc900cb71e8d33ba6d125b457923915bdb/scripts/T%20cell%20dynamics%20classification/Create_Behavioral_Reference_map.R#L118) the direction of [master_example_data](https://github.com/alievakrash/BEHAV3D/blob/18f9332a54adf0b0d8e00d688802edc980aabdc9/scripts/T%20cell%20dynamics%20classification/example_dataset_T_cell_tracking/master_example_data) that is used to reconvert the unique TrackIDs that are created back to the original TrackIDs that will be used for backprojection.
+-Insert [here](https://github.com/alievakrash/BEHAV3D/blob/c516cafc900cb71e8d33ba6d125b457923915bdb/scripts/T%20cell%20dynamics%20classification/Create_Behavioral_Reference_map.R#L118) the direction of [master_example_data](https://github.com/alievakrash/BEHAV3D/blob/18f9332a54adf0b0d8e00d688802edc980aabdc9/scripts/T%20cell%20dynamics%20classification/example_dataset_T_cell_tracking/master_example_data) that is used to reconvert the unique TrackIDs that are created for processing back into the original TrackIDs, that will be used for backprojection.
 
+-For each well of interest [adapt here](https://github.com/alievakrash/BEHAV3D/blob/c516cafc900cb71e8d33ba6d125b457923915bdb/scripts/T%20cell%20dynamics%20classification/Create_Behavioral_Reference_map.R#L127-L131) with the corresponding "ranks" and output direction.
 - Predict T cell behavior classification for new datasets, based on the [Behavioral reference map](https://github.com/alievakrash/BEHAV3D/blob/57c67317eea1af74d9aa82b33a9fab795d0a2dcc/scripts/T%20cell%20dynamics%20classification/Behavioral%20reference%20map/Behavioral_Referance_map_git) :
 
 ### (3) Behavior-guided transcriptomics module
