@@ -6,7 +6,7 @@ read_plus <- function(flnm) {
   read_csv(flnm, skip=3) %>% 
     mutate(filename = flnm)
 }
-setwd("DIRECTORY_THAT_CONTAINS_example_data_set_organoids")
+setwd("DIRECTORY_THAT_CONTAINS_example_data_set_organoids")  ## set here your working directory that contains the example dataset
 working_directory <- "example_data_set_organoids"
 
 # import volumes
