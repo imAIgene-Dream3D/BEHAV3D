@@ -2,7 +2,7 @@ library(dplyr)
 library(scales)
 library(MESS)
 ##Import dataframe live_deadROI7 for each experiment. Combine several if necessary
-Combi<-readRDS("Full_well_organoids_dynamics")
+Combi<-readRDS("Full_well_death_dynamics")
 
 
 ## Rescale the mean dead cell dye per experiment
