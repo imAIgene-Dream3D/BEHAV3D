@@ -104,7 +104,7 @@ p2
 
 ###################################################################################################################################################################
 #### Import new dataset to predict behavior (e.g. import dataset called "master_corrected3_example")
-master_test<-readRDS("D:/R/scripts/T_cell paper/FINAL SCRIPTS_20210408/Fig2/b/github/example_t cell_data/master_corrected3_example")
+master_test<-readRDS("master_corrected3_example")
 ### Normalize the data
 master_test2<-master_test%>% ungroup()%>%
   group_by(exp) %>% 
