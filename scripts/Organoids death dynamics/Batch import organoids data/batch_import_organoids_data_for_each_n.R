@@ -6,8 +6,8 @@ read_plus <- function(flnm) {
   read_csv(flnm, skip=3) %>% 
     mutate(filename = flnm)
 }
-
-working_directory <- "D:/R/scripts/T_cell paper/FINAL SCRIPTS_20210408/Fig1/example_data_set_organoids"
+setwd("DIRECTORY_THAT_CONTAINS_example_data_set_organoids")
+working_directory <- "example_data_set_organoids"
 
 # import volumes
 pat = "*Volume"
@@ -134,7 +134,7 @@ live_deadROI7$red<-live_deadROI7$red/live_deadROI7$Volume
 ### set an experiment ID if processing several experimental replicates
 live_deadROI7$exp<-"1"
 ### SAVE dataframe for processing in a different script
-saveRDS(live_deadROI7, file = "D:/R/scripts/T_cell paper/FINAL SCRIPTS_20210408/Fig1/example_data_set_organoids/live_deadROI7_example_data")
+saveRDS(live_deadROI7, file = "live_deadROI7_example_data")
 
 
 
@@ -165,4 +165,4 @@ ggtitle("Individual org increase in dead dye intensity TEG")
 
 Plot
  ### SAVE Dataframe for later processing
-saveRDS(live_deadROI6, file = "D:/R/scripts/T_cell paper/FINAL SCRIPTS_20210408/Fig1/example_data_set_organoids/live_deadROI6_example_data")  ### save here a dataframe with all the organoids values
+saveRDS(live_deadROI6, file = "live_deadROI6_example_data")  ### save here a dataframe with all the organoids values
