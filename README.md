@@ -25,6 +25,7 @@ This repository contains a collection of scripts and example datasets enabling t
 - Batch import tracked organoids data: 
 
 -Run script [batch_import_organoids_data_for_each_n](https://github.com/alievakrash/BEHAV3D/blob/main/scripts/Organoids%20death%20dynamics/Batch%20import%20organoids%20data/batch_import_organoids_data_for_each_n.R)
+-Insert the direction of the example dataset on your PC [here](https://github.com/alievakrash/BEHAV3D/blob/c0a285b105d6ee237dfc7f9b7bf912caa6f3e1cb/scripts/Organoids%20death%20dynamics/Batch%20import%20organoids%20data/batch_import_organoids_data_for_each_n.R#L9)
 
 - Script for death dynamics per well
 
