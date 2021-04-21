@@ -42,6 +42,7 @@ Output files: [Full_well_death_dynamics.rds](https://github.com/alievakrash/BEHA
 - Computer individual organoid death dynamics:
 
 -Run script [Individual organoids death dynamics.R](https://github.com/alievakrash/BEHAV3D/blob/5a2aed55ede54f2f14a987d7ab37480b8d15e038/scripts/Organoids%20death%20dynamics/Individual%20organoids%20death%20dynamics/Individual%20organoids%20death%20dynamics.R)
+
 -Insert [here](https://github.com/alievakrash/BEHAV3D/blob/81ab7207a48fb60f8467737e5aa2e85f643f054d/scripts/Organoids%20death%20dynamics/Individual%20organoids%20death%20dynamics/Individual%20organoids%20death%20dynamics.R#L4) the direction of the processed dataframe [Individual_orgs_death_dynamics.rds](https://github.com/alievakrash/BEHAV3D/blob/553db58a0116559817b9f2109333cf4f7e58f4da/scripts/Organoids%20death%20dynamics/Test%20dataset/Individual_organoids_death_dynamics)
 
 ### (2) T cell behavior classification module
