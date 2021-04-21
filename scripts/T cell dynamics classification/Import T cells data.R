@@ -16,7 +16,7 @@ read_plus <- function(flnm) {
     mutate(filename = flnm)
 }
 ## directory where the files are located
-working_directory <- "D:/R/scripts/T_cell paper/FINAL SCRIPTS_20210408/Fig2/b/github/example_t cell_data"
+working_directory <- "example_dataset_T_cell_tracking"  ## Insert here the direction to the example dataset directory
 setwd(working_directory)
 # import Displacement^2
 pat = "*Displacement"
