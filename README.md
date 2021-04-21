@@ -54,9 +54,19 @@ Output files: [Full_well_death_dynamics.rds](https://github.com/alievakrash/BEHA
 
 -Insert [here](https://github.com/alievakrash/BEHAV3D/blob/42e1379bbd34aecbb764793bbd74d163519e3c00/scripts/T%20cell%20dynamics%20classification/Import%20T%20cells%20data.R#L83) and [here](https://github.com/alievakrash/BEHAV3D/blob/42e1379bbd34aecbb764793bbd74d163519e3c00/scripts/T%20cell%20dynamics%20classification/Import%20T%20cells%20data.R#L251) where to store the output [master_example_data](https://github.com/alievakrash/BEHAV3D/blob/18f9332a54adf0b0d8e00d688802edc980aabdc9/scripts/T%20cell%20dynamics%20classification/example_dataset_T_cell_tracking/master_example_data) and [master_corrected3_example](https://github.com/alievakrash/BEHAV3D/blob/18f9332a54adf0b0d8e00d688802edc980aabdc9/scripts/T%20cell%20dynamics%20classification/example_dataset_T_cell_tracking/master_corrected3_example) dataframes, respectively.
 
-- Script to Behavioral reference map generation (Dynamic time warping)
+- Compute the Behavioral reference map generation (by Dynamic time warping):
 
--Script for T cell behavior classification based on the Behavioral reference map (Random Forest classifier)
+-Run script [Create_Behavioral_Reference_map.R](https://github.com/alievakrash/BEHAV3D/blob/57c67317eea1af74d9aa82b33a9fab795d0a2dcc/scripts/T%20cell%20dynamics%20classification/Create_Behavioral_Reference_map.R)
+
+-Insert [here](https://github.com/alievakrash/BEHAV3D/blob/57c67317eea1af74d9aa82b33a9fab795d0a2dcc/scripts/T%20cell%20dynamics%20classification/Create_Behavioral_Reference_map.R#L2) the direction of your dataset used for reference map. In this case we use the example dataset, consisting of only two different wells. For the creation of a new reference map use a compilation of datasets with different cell types of interest (likely to have different behavioral signatures). If you are creating a new reference map, insert [here](https://github.com/alievakrash/BEHAV3D/blob/c516cafc900cb71e8d33ba6d125b457923915bdb/scripts/T%20cell%20dynamics%20classification/Create_Behavioral_Reference_map.R#L92) the direction for your output dataframe.
+
+- Backproject behavioral signatures in the imaging dataset:
+
+-Run script [Create_Behavioral_Reference_map.R](https://github.com/alievakrash/BEHAV3D/blob/57c67317eea1af74d9aa82b33a9fab795d0a2dcc/scripts/T%20cell%20dynamics%20classification/Create_Behavioral_Reference_map.R)
+
+-Insert [here](https://github.com/alievakrash/BEHAV3D/blob/c516cafc900cb71e8d33ba6d125b457923915bdb/scripts/T%20cell%20dynamics%20classification/Create_Behavioral_Reference_map.R#L118) the direction of [master_example_data](https://github.com/alievakrash/BEHAV3D/blob/18f9332a54adf0b0d8e00d688802edc980aabdc9/scripts/T%20cell%20dynamics%20classification/example_dataset_T_cell_tracking/master_example_data) that is used to reconvert the unique TrackIDs that are created back to the original TrackIDs that will be used for backprojection.
+
+- Predict T cell behavior classification for new datasets, based on the [Behavioral reference map](https://github.com/alievakrash/BEHAV3D/blob/57c67317eea1af74d9aa82b33a9fab795d0a2dcc/scripts/T%20cell%20dynamics%20classification/Behavioral%20reference%20map/Behavioral_Referance_map_git) :
 
 ### (3) Behavior-guided transcriptomics module
 - Script to create a behavioral probability map for scRNA seq data
