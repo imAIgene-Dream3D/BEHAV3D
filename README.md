@@ -12,9 +12,11 @@ BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study 
 - Predicted behavior states infered to transcriptomic data
 
 #### Software and Hardware requirements
-BEHAV3D runs on R studio (version 4.0.2) and was tested on Windows 10. See package requirements for each module. 
+BEHAV3D runs on R studio (version 4.0.2) and was tested on Windows 10. 
 #### Installation
 Download the repository to your PC via direct dowload or git clone https://github.com/alievakrash/BEHAV3D.git in Git Bash.
+
+See in each module and script the required libraries or install in R Studio libraries for all modules: devtools, dplyr, dtwclust, eulerr, ggplot2, ggpubr, ggrepel, gridExtra, hypergeo, kmodR, lme4, lmerTest, MESS, nlme, openxlsx, parallel, patternplot, pheatmap, plotly, plyr, png, purr, RColorBrewer, readxl, reshape2, rgeos, scales, Seurat, sp, spatstat, stats, tidyr, tidyverse, umap, VennDiagram, viridis, xlsx, zoo.
 #### Input data
 The current version of the pipeline works with objects (cells or organoids) time-lapse statistics that are aquired by tracking these objects in a commercially available software (Imaris, Oxford Instruments). However any type of time-lapse data can be processed with the pipeline, including measruements extract from MTrackJ (Fiji) or others. Main feature that is needed are coordinates for the objects and a common ID for the same object that is tracked over time. Aditional statistics describing the cell behavior such as speed, displacement are calculated by Imaris, however they can also be calculate by pre-processing algorithms from the cell coordinates. Statistics related to the expression of markers of interest (e.g live-dead cell dye) should be included to study the dynamic expression of these overtime.
 #### Dataset example
