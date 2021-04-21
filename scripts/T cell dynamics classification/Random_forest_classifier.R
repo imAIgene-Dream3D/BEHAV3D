@@ -6,7 +6,7 @@ library(randomForest)
 library(ggplot2)
 ## Import reference map that will be used as the ground truth dataset to train and test a random forest classifier
 
-train_dataset<-readRDS("D:/R/scripts/T_cell paper/FINAL SCRIPTS_20210408/Fig2/d/github/Behavioral_Referance_map_git")
+train_dataset<-readRDS("Behavioral_Referance_map_git")
 set.seed(123)
 train_dataset$cluster2<-as.numeric(train_dataset$cluster2)
 train_dataset_grouped <- train_dataset %>% 
