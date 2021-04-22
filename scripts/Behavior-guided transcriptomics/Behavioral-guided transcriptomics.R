@@ -1,11 +1,12 @@
 library(scales)
 library(ggplot2)
-library(reshape2)
+library(dplyr)
 library(viridis)
-library(plotly)
 library(Seurat)
-
-setwd("D:/R/scripts/T_cell paper/FINAL SCRIPTS_20210408/Fig3/github")
+library(reshape2)
+library(pheatmap)
+library(gplots)
+setwd("WORKING_DIRECTORY") 
 ## Import dataframe with T cell tracks
 scRNA_seq_dataset<-readRDS("scRNA_seq_dataset.rds")
 
@@ -95,7 +96,7 @@ for (r in seq_along(1:7)){
 ###Calculate the average probability map per cell based on probability obtained with difference clustering resolution##################################
 
 ## Import all the probability maps obtained with different cluster resolutions
-setwd("D:/R/scripts/T_cell paper/FINAL SCRIPTS_20210408/Fig3/github/Probability_map")
+setwd("DIRECTORY/Probability_map")
 temp = list.files(pattern="*.csv")
 named.list <- lapply(temp, read.csv) 
 library(abind)
@@ -119,8 +120,6 @@ mean_prob$X9<-mean_prob$X9*mean_prob$Pseudotime
 mean_prob$X8<-mean_prob$X8*mean_prob$Pseudotime
 mean_prob$X7<-mean_prob$X7*mean_prob$Pseudotime
 ### Add the probability information to the seurat object, creating new metadata for each behavioral signature
-library(scales)
-library(viridis)
 ### First normalize the probability
 mean_prob2<-as.data.frame(scale(mean_prob[c(1:9)]))
 
@@ -176,12 +175,10 @@ scRNA_seq_dataset_meta$Tickler<-rescale(scRNA_seq_dataset_meta$Tickler, to=c(0,1
 
 
 ###heatmap per individual behavior and with pheatmap
-library(pheatmap)
+
 ### Include rescaled pseudotime in the heatmap in order to organize the cells by pseudotime
 mat_exp = as.data.frame(cbind(rescale(scRNA_seq_dataset_meta$Pseudotime, to=c(0,1)),scRNA_seq_dataset_meta$Medium_exposed,rowMeans(as.matrix(scRNA_seq_dataset_meta[c("Static","Lazy","Slow_scanner","Medium_scanner","Super_scanner")])),scRNA_seq_dataset_meta$Tickler,scRNA_seq_dataset_meta$Engager, scRNA_seq_dataset_meta$Super_Engager))
 mat_exp2 =mat_exp[order(mat_exp$V1),]
-library(gplots)
-
 mat<-cbind(mat_exp2$V1,mat_exp2$V2, mat_exp2$V3,mat_exp2$V4,mat_exp2$V5,mat_exp2$V6)
 ### Plot heatmap
 heatmap.2(t(mat),scale = c("none"), trace="n", col=viridis,Colv = NA, 
@@ -214,7 +211,7 @@ p16
 
 
 ### Save the heatmap and pseudotime line that goes on top
-pdf("CD8_probability_map20210402.pdf")
+pdf("CD8_probability.pdf")
 heatmap.2(t(mat),scale = c("none"), trace="n", col=viridis,Colv = NA, 
           dendrogram = "none", labCol = "", labRow = c("Pseudotime","No target control","Static to Scanner","Tickler","Engager","Super-engager"),Rowv=FALSE, cexRow = 0.5)
 p16
@@ -237,4 +234,4 @@ levels(x = scRNA_seq_dataset) <- c( "TEGs_alone" ,"tumor_exposed","engagement", 
 
 ### Save the processed Seurat object
 setwd("DIRECTORY WHERE TO SAVE THE PSEUDOTIME")
-saveRDS(scRNA_seq_dataset,"D:/R/scripts/T_cell paper/FINAL SCRIPTS_20210408/Fig3/github/scRNA_seq_dataset_processed.rds")
+saveRDS(scRNA_seq_dataset,"scRNA_seq_dataset_processed.rds")
