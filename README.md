@@ -81,3 +81,5 @@ Output files: [Full_well_death_dynamics.rds](https://github.com/alievakrash/BEHA
 - Compute behavioral probability map for scRNA seq data:
 
 -Run script [Behavioral-guided transcriptomics](https://github.com/alievakrash/BEHAV3D/blob/60a653b51d1417b0374225f720f5655c59f980ca/scripts/Behavior-guided%20transcriptomics/Behavioral-guided%20transcriptomics.R)
+
+-Insert [here](https://github.com/alievakrash/BEHAV3D/blob/d3857d0ddebd6d1c3d88fe45c5a4aef8f648faf9/scripts/Behavior-guided%20transcriptomics/Behavioral-guided%20transcriptomics.R#L9) the directory containing the [scRNA seq dataset](https://github.com/alievakrash/BEHAV3D/blob/d3857d0ddebd6d1c3d88fe45c5a4aef8f648faf9/scripts/Behavior-guided%20transcriptomics/example%20dataset/scRNA_seq_dataset.rds) containing pseudotime trajectory.
