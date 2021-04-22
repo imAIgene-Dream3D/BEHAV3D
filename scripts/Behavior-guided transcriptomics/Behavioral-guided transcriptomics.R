@@ -7,14 +7,14 @@ library(reshape2)
 library(pheatmap)
 library(gplots)
 setwd("WORKING_DIRECTORY") 
-## Import dataframe with T cell tracks
+## Import scRNA seq dataset
 scRNA_seq_dataset<-readRDS("scRNA_seq_dataset.rds")
 
 p1<-DimPlot(scRNA_seq_dataset, reduction = "umap", pt.size=1, label.size = 8)+theme(aspect.ratio = 1)
 p1
 
 
-###Import the proportion of behavioral signatures [er exp condition calculated in silico based on imaging data:
+###Import the proportion of behavioral signatures per exp condition calculated in silico based on imaging data:
 CD8_behav<-read.csv("CD8_behav_sig_per_exp_condition.csv")
 
 ###### For behavioral inference we will build a probability map for cells are similar to each other. For this we cluster the scRNA seq data with different resolutions (creating a range of bigger to smaller clusters)
