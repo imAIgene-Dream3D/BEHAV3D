@@ -78,4 +78,6 @@ Output files: [Full_well_death_dynamics.rds](https://github.com/alievakrash/BEHA
 -Insert [here](https://github.com/alievakrash/BEHAV3D/blob/a4c9ea882c8a9109bb952ceb10ece68f082fcd9d/scripts/T%20cell%20dynamics%20classification/Random_forest_classifier.R#L107) the direction of your imported new dataset. For testing use the provided example dataset: [master_corrected3_example](https://github.com/alievakrash/BEHAV3D/blob/18f9332a54adf0b0d8e00d688802edc980aabdc9/scripts/T%20cell%20dynamics%20classification/example_dataset_T_cell_tracking/master_corrected3_example)
 
 ### (3) Behavior-guided transcriptomics module
-- Script to create a behavioral probability map for scRNA seq data 
+- Compute behavioral probability map for scRNA seq data:
+
+-Run script [Behavioral-guided transcriptomics] (https://github.com/alievakrash/BEHAV3D/blob/60a653b51d1417b0374225f720f5655c59f980ca/scripts/Behavior-guided%20transcriptomics/Behavioral-guided%20transcriptomics.R)
