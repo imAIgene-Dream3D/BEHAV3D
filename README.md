@@ -80,4 +80,4 @@ Output files: [Full_well_death_dynamics.rds](https://github.com/alievakrash/BEHA
 ### (3) Behavior-guided transcriptomics module
 - Compute behavioral probability map for scRNA seq data:
 
--Run script [Behavioral-guided transcriptomics] (https://github.com/alievakrash/BEHAV3D/blob/60a653b51d1417b0374225f720f5655c59f980ca/scripts/Behavior-guided%20transcriptomics/Behavioral-guided%20transcriptomics.R)
+-Run script [Behavioral-guided transcriptomics](https://github.com/alievakrash/BEHAV3D/blob/60a653b51d1417b0374225f720f5655c59f980ca/scripts/Behavior-guided%20transcriptomics/Behavioral-guided%20transcriptomics.R)
