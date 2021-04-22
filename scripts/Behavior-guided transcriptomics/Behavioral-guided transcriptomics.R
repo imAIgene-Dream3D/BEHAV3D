@@ -1,11 +1,5 @@
-library(parallel)
-library(dplyr)
-library(dtwclust)
-library(stats)
 library(scales)
 library(ggplot2)
-library(umap)
-library(kmodR)
 library(reshape2)
 library(viridis)
 library(plotly)
@@ -187,7 +181,6 @@ library(pheatmap)
 mat_exp = as.data.frame(cbind(rescale(scRNA_seq_dataset_meta$Pseudotime, to=c(0,1)),scRNA_seq_dataset_meta$Medium_exposed,rowMeans(as.matrix(scRNA_seq_dataset_meta[c("Static","Lazy","Slow_scanner","Medium_scanner","Super_scanner")])),scRNA_seq_dataset_meta$Tickler,scRNA_seq_dataset_meta$Engager, scRNA_seq_dataset_meta$Super_Engager))
 mat_exp2 =mat_exp[order(mat_exp$V1),]
 library(gplots)
-library(viridis)
 
 mat<-cbind(mat_exp2$V1,mat_exp2$V2, mat_exp2$V3,mat_exp2$V4,mat_exp2$V5,mat_exp2$V6)
 ### Plot heatmap
