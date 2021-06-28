@@ -134,7 +134,7 @@ live_deadROI7$red<-live_deadROI7$red/live_deadROI7$Volume
 ### set an experiment ID if processing several experimental replicates
 live_deadROI7$exp<-"1"
 ### SAVE dataframe for processing in a different script
-saveRDS(live_deadROI7, file = "Full_well_death_dynamics")
+saveRDS(live_deadROI7, file = "Full_well_death_dynamics")   ### save here a dataframe with all the well values
 
 
 
