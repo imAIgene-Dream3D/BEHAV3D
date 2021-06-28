@@ -21,4 +21,4 @@ delta <-Combi%>%group_by(Org, type, exp)%>%arrange(Time2)%>%summarize(delta= las
 AUC_delta<-left_join(Area_under_Curve,delta,by=c("Org","type", "exp"))
 library(xlsx)
 ## export calculation for plot 
-write.xlsx(AUC_delta, file = "AUC_delta")
+write.xlsx(AUC_delta, file = "AUC_delta.xsx")
