@@ -41,23 +41,23 @@ pos <- ldply(files, read_plus)
 
 ### join all
 master <- cbind(displacement[,c(1,4,5,6)], speed[,c(1)], dist_org[,c(1)], red_lym[,c(1)], pos[,c(1,2,3,11)])
-
 ### remove unnecesary signs from filename:
 master$filename<- gsub("/", "", master$filename)
 master$filename <- gsub("\\(", "", master$filename)
 master$filename <- gsub("\\)", "", master$filename)
+unique(master$filename)  ### check here the unique filenames (each filename corresponds to a well) and use unique patterns to adjust the metadata of your experiment
 ## rename well // date // cell type according to filename
 master$well<-master$filename  ### well name
-master$well <- gsub(".*4_13T_CD4teg_CD8TEG.*", "well4_13T_exp1", master$well, perl=TRUE)
+master$well <- gsub(".*4_13T_CD4teg_CD8TEG.*", "well4_13T_exp1", master$well, perl=TRUE) ###duplicate and adjust if necessary
 master$well <- gsub(".*20201027_610T.*", "well6_10T_exp2", master$well, perl=TRUE)
 
-master$exp<-master$filename  ### well name
-master$exp <- gsub(".*2020-07-28.*", "20200728", master$exp, perl=TRUE)
+master$exp<-master$filename  ### exp name
+master$exp <- gsub(".*2020-07-28.*", "20200728", master$exp, perl=TRUE) ###duplicate and adjust if necessary
 master$exp <- gsub(".*20201027.*", "20201027", master$exp, perl=TRUE)
 
 
-master$cell_type<-master$filename  ### well name
-master$cell_type <- gsub(".*610T_g_.*", "CD4_TEG_10T", master$cell_type, perl=TRUE)
+master$cell_type<-master$filename  ### TEG and organoid name
+master$cell_type <- gsub(".*610T_g_.*", "CD4_TEG_10T", master$cell_type, perl=TRUE) ###duplicate and adjust if necessary
 master$cell_type <- gsub(".*610T_b_.*", "CD8_TEG_10T", master$cell_type, perl=TRUE)
 master$cell_type <- gsub(".*13T_CD4teg_CD8TEG_green.*", "CD4_TEG_13T", master$cell_type, perl=TRUE)
 master$cell_type <- gsub(".*13T_CD4teg_CD8TEG_blue.*", "CD8_TEG_13T", master$cell_type, perl=TRUE)
