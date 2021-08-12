@@ -100,16 +100,16 @@ List2 = list() ## create list for each experiment
 ## For loop to look for the distance to the nearest neighbor at each timepoint and each experiment
 for ( m in unique(master$well)){
   distance_1<-master[which(master$well==m),]
-  distanceDF<-as.data.frame(distance_1[,c(2,8,9,10)])
   List = list()
-  for (i in unique(distanceDF$Time)){
-    distanceDFi <- distanceDF[distanceDF$Time==i,]
-    coordin<-ppx(distanceDFi, coord.type=c("t","s","s", "s")) ## create a multidimensional space-time pattern
+  for (i in unique(distance_1$Time)){
+    distanceDFi <- distance_1[distance_1$Time==i,]
+    distanceDF2<-as.data.frame(distanceDFi[,c(2,8,9,10)])
+    coordin<-ppx(distanceDF2, coord.type=c("t","s","s", "s")) ## create a multidimensional space-time pattern
     dist<- nndist(coordin)
-    List[[length(List)+1]] <-dist   ## store to list object
+    distanceDFi_dist<-cbind(distanceDFi, dist)
+    List[[length(List)+1]] <-distanceDFi_dist   ## store to list object
   }
-  nearest_n <- data.frame(matrix(unlist(List))) ## convert List to dataframe
-  master_distance <- data.frame(distance_1,nearest_n)
+  master_distance <- data.frame(do.call(rbind, List)) ## convert List to dataframe
   List2[[length(List2)+1]] <-master_distance 
 }
 
