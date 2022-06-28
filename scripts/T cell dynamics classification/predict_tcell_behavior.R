@@ -566,28 +566,15 @@ if (model_path != ""){
   umap_2 <- left_join(Track2_umap ,temp_df)
   
   ## Perform clustering. Select clusterig type that suits more your dataset
-  #library(mclust)
   library(ggplot2)
-  #mc.norm <- Mclust(umap_dist$`layout`, 9, start =123) ## slower but better clustering
-  #umap_3 <- cbind(mc.norm$classification, umap_2)
-  
-  # Try dbscan
-  library(dbscan)
-  cl <- dbscan(umap_dist$`layout`, eps= 0.8, minPts = 10)  ## minPts is the min amount of values per cluster
-  umap_3 <- cbind(cl$cluster, umap_2)
-  
-  # Try kmeans
-  #km.norm <- kmeans(umap_dist$`layout`,10, nstart = 100)
-  #umap_3 <- cbind(km.norm$cluster, umap_2)
-  #outliers<- rownames(km.mod[["L"]]) ##find outliers
-  #umap_3 <-umap_3%>%filter(!TrackID %in% outliers) ##remove outliers
+
+  km.norm <- kmeans(umap_dist$`layout`,pars$nr_of_clusters, nstart = 100)
+  umap_3 <- cbind(km.norm$cluster, umap_2)
   colnames(umap_3)[1]<- "cluster2"
   ## remove the outlier cluster if necessary
   umap_3<-subset(umap_3, cluster2!=0)
   
-  ##plot
-  # umap_3$cluster2 = factor(umap_3$cluster2, levels=c("4","7","5","8","3", "2","9","6","1"))
-  # levels(umap_3$cluster2) <- c("1","2","3","4","5","6", "7","8","9")  ##reorder clusters
+ 
   ggplot(umap_3, aes(x=V1, y=V2, color=as.factor(cluster2))) +  
     geom_point(size=2, alpha=0.6) + labs(color="cluster")+
     xlab("") + ylab("")+
