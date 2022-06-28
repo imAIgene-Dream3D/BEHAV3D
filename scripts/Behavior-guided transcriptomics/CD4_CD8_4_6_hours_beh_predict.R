@@ -1,10 +1,22 @@
 ## Impor the processed tracks with a length that is coinciding the the length of the experiment in Fig 4a.
 setwd()
+
+library(yaml)
+
+### Checks if being run in GUI (e.g. Rstudio) or command line
+if (interactive()) {
+  ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
+  pars = yaml.load_file("D:/R/scripts/BEHAV3D_v2_SAM/BEHAV3D/configs/config_template.yml")
+} else {
+  args <- commandArgs(trailingOnly = TRUE)
+  pars <- yaml.load_file(args[1])
+}
 library(dplyr)
 master_CD3<-readRDS("master_CD3_scRNA_seq_inference_4")
 ## Import the training dataset
 library(stats)
 library(tidyr)
+
 train_dataset<-readRDS("master_clust_Live7_REF_1")
 set.seed(123)
 train_dataset$cluster2<-as.numeric(train_dataset$cluster2)
@@ -158,8 +170,8 @@ Per
 ######### Reproduce in silico the experiment performed in Fig 4a. Separate cells at each washing step and compute the behavirs of the cells that were in contact with an organoid vs the ones that weren't
 #################################################################################################################################################
 #### Define the timepoints where the washing steps occured. Instead of selecting just one timepoint, that gives a very small amount of tracks, we define the time as a time-range around 3 hours or 5 hours of imaging. these correspond to 4 and 6 hours of culture respectively
-around_5h<-c(145:154)
-around_3h<-c(86:95)
+around_5h<-c(pars$second_1:pars$second_2)
+around_3h<-c(pars$first_1:pars$first_2)
 
 ### calculate the frequency of behaviors per conditions for CD8 only:
 
@@ -240,8 +252,8 @@ master_clust_Live4_h_EN_CD8<-master_clust_Live4_h_EN_CD8%>%group_by(TrackID)%>%f
 master_clust_Live4_h_NEN_CD4<-subset(master_clust_Live6, Time%in%around_3h & cell_type=="CD4"&contact==0)
 master_clust_Live4_h_NEN_CD4<-master_clust_Live4_h_NEN_CD4%>%group_by(TrackID)%>%filter(Time==min(Time))
 ###Simulate the separation at 5 hours of T cells in contact with organoid or not
-master_clust_Live6_h_SEN_CD4<-subset(master_clust_Live6_h, contact==1 &TrackID%in%master_clust_Live4_h_EN_CD4$TrackID)
-master_clust_Live6_h_NEN_CD4<-subset(master_clust_Live6_h, contact==0 &TrackID%in%master_clust_Live4_h_NEN_CD4$TrackID)
+master_clust_Live6_h_SEN_CD4<-subset(master_clust_Live6, contact==1 &TrackID%in%master_clust_Live4_h_EN_CD4$TrackID)
+master_clust_Live6_h_NEN_CD4<-subset(master_clust_Live6, contact==0 &TrackID%in%master_clust_Live4_h_NEN_CD4$TrackID)
 master_clust_Live6_h_NEN_SEN_CD4<-rbind(master_clust_Live6_h_NEN_CD4,master_clust_Live6_h_SEN_CD4)
 master_clust_Live6_h_NEN_SEN_CD4<-subset(master_clust_Live6_h_NEN_SEN_CD4, !cluster=="1")
 

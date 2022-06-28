@@ -33,3 +33,14 @@ umap_minimal_distance: 0.1
 umap_n_neighbors: 5
 
 nr_of_clusters: 6
+
+
+###################################################################################
+### Optional parameters for in silico simulation of T cell populations separation by slow spin ###
+###################################################################################
+# Range of timepoints for first spin (we do here a combination of timepoints to enrich the data)
+first_1: 86
+first_2: 95
+# Range of timepoints for second spin (we do here a combination of timepoints to enrich the data)
+second_1: 145
+second_2: 154
