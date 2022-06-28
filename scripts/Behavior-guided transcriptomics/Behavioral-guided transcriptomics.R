@@ -169,7 +169,7 @@ scRNA_seq_dataset_meta$Super_Engager<-rescale(scRNA_seq_dataset_meta$Super_Engag
 ### ticklers have several outlier values above: 2.4. So they are converted to the maximal value before rescaling
 hist(scRNA_seq_dataset_meta$Tickler)
 sort(boxplot.stats(scRNA_seq_dataset_meta$Tickler)$out)
-scRNA_seq_dataset_meta$Tickler<-ifelse(scRNA_seq_dataset_meta$Tickler>2.4, 2.4, scRNA_seq_dataset_meta$Tickler)
+scRNA_seq_dataset_meta$Tickler<-ifelse(scRNA_seq_dataset_meta$Tickler>quantile(scRNA_seq_dataset_meta$Tickler,0.98), quantile(scRNA_seq_dataset_meta$Tickler,0.98), scRNA_seq_dataset_meta$Tickler)
 scRNA_seq_dataset_meta$Tickler<-rescale(scRNA_seq_dataset_meta$Tickler, to=c(0,1))
 
 
