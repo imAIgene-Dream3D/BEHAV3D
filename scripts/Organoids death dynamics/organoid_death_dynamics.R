@@ -7,6 +7,7 @@ library(yaml)
 
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
+  ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
   pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/tcell_paper/20220330_fixes/10_per_cells/BEHAV3D_configOrg.yml")
 } else {
   args <- commandArgs(trailingOnly = TRUE)
@@ -17,33 +18,29 @@ if (interactive()) {
 # working_directory <- pars$data_dir
 output_dir=paste0(pars$output_dir,"/")
 
-## function to import organoid data from csv files extracted by Imaris
-read_imaris_csv <- function(flnm) {
-  read_csv(flnm, skip = 3, col_types = cols()) %>% 
-    mutate(filename = flnm)
-}
-
 # Import file-specific metadata for all images used in this analysis.
 pat = pars$metadata_csv
 metadata=read.csv(pars$metadata_csv, sep="\t")
 
-if ( any(is.na(metadata$stat_folder)) ){
-  metadata$stat_folder=apply(metadata, 1, function(x) paste0(pars$data_dir, x["basename"], "_Statistics"))
+if ( any(is.na(metadata$organoid_stats_folder)) ){
+  metadata$organoid_stats_folder=apply(metadata, 1, function(x) paste0(pars$data_dir, x["basename"], "_Statistics"))
 }
 
 # Function to import organoid data specifically from Imaris generated csv files
 read_ims_csv <- function(stat_folder, pattern) {
-  read_plus <- function(flnm) {
-    read_csv(flnm, skip = 3, col_types = cols()) %>% 
-      mutate(filename = flnm)
+  read_plus <- function(flnm, stat_folder) {
+    read_csv(flnm, skip = 3, col_types = cols(TrackID= col_character())) %>% 
+      mutate(filename = flnm, stat_folder=stat_folder) 
   }
   pattern_file <- list.files(path = stat_folder, pattern = pattern, full.names=TRUE)
-  print(pattern_file)
-  ims_csv <- read_plus(pattern_file)
+  if (identical(pattern_file, character(0))){
+    print(paste("No file with pattern '", pattern, "' found for", stat_folder))
+  } 
+  ims_csv <- read_plus(pattern_file, stat_folder)
   return(ims_csv)
 }
 
-stat_folders <- metadata$stat_folder
+stat_folders <- metadata$organoid_stats_folder
 pat = "*Volume"
 volume_csv <- ldply(stat_folders, read_ims_csv, pattern=pat)
 # import sum_red
@@ -56,17 +53,12 @@ area_csv <- ldply(stat_folders, read_ims_csv, pattern=pat)
 pat = "*Position"
 pos_csv <- ldply(stat_folders, read_ims_csv, pattern=pat)
 
-
 live_deadROI <- cbind(volume_csv[,c("Volume","Time", "TrackID", "ID")], 
                       sum_red_csv[,c("Intensity Mean")], 
                       area_csv[,c("Area")],
-                      pos_csv[,c("Position X","Position Y","Position Z","filename")])
-colnames(live_deadROI) <- c("Volume","Time","TrackID","ID","red_sum","area", "pos_x","pos_y","pos_z", "filename")
+                      pos_csv[,c("Position X","Position Y","Position Z","filename", "stat_folder")])
+colnames(live_deadROI) <- c("Volume","Time","TrackID","ID","red_sum","area", "pos_x","pos_y","pos_z", "filename", "organoid_stats_folder")
 
-
-### Convert the filename to the same format in both datasets (master and metadata)
-live_deadROI$basename <- gsub("_org_Position.csv", "",live_deadROI$filename, perl=TRUE)
-live_deadROI$basename=basename(live_deadROI$basename)
 ##Join the information of metadata to master:
 live_deadROI<-left_join(live_deadROI, metadata)
 
@@ -76,17 +68,20 @@ ranks <- rank(-table(category), ties.method="first")
 ranks <- as.data.frame(ranks)
 ranks$basename <- row.names(ranks)
 live_deadROI <- left_join(live_deadROI, ranks)  ## plot with all the tracks together 
+live_deadROI$TrackID2 <- factor(paste(live_deadROI$ranks, live_deadROI$TrackID, sep="_"))
 
-live_deadROI$Track2 <- with(live_deadROI, interaction(TrackID, ranks))
-live_deadROI$Track2 <- gsub(".", '', live_deadROI$Track2, fixed = T)
-live_deadROI$Track2 <- as.numeric(as.character(live_deadROI$Track2))
-
+# live_deadROI$Track2 <- with(live_deadROI, interaction(TrackID, ranks))
+# live_deadROI$Track2 <- gsub(".", '', live_deadROI$Track2, fixed = T)
+# live_deadROI$Track2 <- as.numeric(as.character(live_deadROI$Track2))
+live_deadROI$Original_TrackID <- live_deadROI$TrackID
+live_deadROI$TrackID<-live_deadROI$TrackID2
+live_deadROI$TrackID2<-NULL
 
 detach(package:plyr)
 library(dplyr)
 live_deadROI$red_sum <- live_deadROI$red_sum*live_deadROI$Volume
 live_deadROI1 <-live_deadROI %>% 
-  group_by(Track2, Time, organoid_line, tcell_line,exp_nr, well, date) %>% 
+  group_by(TrackID, Time, organoid_line, tcell_line,exp_nr, well, date) %>% 
   summarise(Volume = sum(Volume), sum_red= sum(red_sum), area=sum(area), pos_x=mean(pos_x), pos_y=mean(pos_y), pos_z=mean(pos_z))
 
 live_deadROI3 <- live_deadROI1 ## plot with all the tracks together 
@@ -98,7 +93,7 @@ live_deadROI3$Time2<-(live_deadROI3$Time-1)/2
 
 ### Quantify the dead cell dye intensity per well
 live_deadROI32<-live_deadROI3%>% 
-  group_by(Track2) %>%arrange(Track2)%>% filter(n() > 40) ## filter cells with at least 40 timepoints
+  group_by(TrackID) %>%arrange(TrackID)%>% filter(n() > 40) ## filter cells with at least 40 timepoints
 ### pulled all the dead cell dye signal from the well
 live_deadROI7 <-live_deadROI32 %>% 
   group_by(Time2, organoid_line, tcell_line,exp_nr, well, date) %>% 
@@ -115,23 +110,23 @@ library(scales)
 live_deadROI3<-live_deadROI3%>% ungroup()%>%
   mutate(red_rs=rescale(red, to=c(0,100)))
 live_deadROI3<-live_deadROI3%>% 
-  group_by(Track2) %>%arrange(Track2)%>% filter(n() > 40)
-temp1 <- aggregate(red_rs ~ Track2+organoid_line+tcell_line+exp_nr+well+date, data = live_deadROI3, max)  ##calculate the max red of each track
+  group_by(TrackID) %>%arrange(TrackID)%>% filter(n() > 40)
+temp1 <- aggregate(red_rs ~ TrackID+organoid_line+tcell_line+exp_nr+well+date, data = live_deadROI3, max)  ##calculate the max red of each track
 colnames(temp1) [length(names(temp1))] <- "max_red"
 live_deadROI4 <- merge(temp1, live_deadROI3)
 live_deadROI6 <- subset(live_deadROI4 , Volume>1000)
-live_deadROI6deadT0 <-live_deadROI6%>%group_by(Track2)%>%filter(Time==min(Time) & red_rs<10 )
-live_deadROI6 <-live_deadROI6%>%filter(Track2 %in% live_deadROI6deadT0$Track2)
+live_deadROI6deadT0 <-live_deadROI6%>%group_by(TrackID)%>%filter(Time==min(Time) & red_rs<10 )
+live_deadROI6 <-live_deadROI6%>%filter(TrackID %in% live_deadROI6deadT0$TrackID)
 ## Filter For the organoids that increase in red dead cell dye, subsitute by the max:
 library(tibble)  # for `rownames_to_column` and `column_to_rownames`
-temp1 <- live_deadROI6%>%rownames_to_column('row') %>%arrange(Time) %>% group_by(Track2) %>% filter(row_number() <= which.max(red))%>%column_to_rownames('row')
+temp1 <- live_deadROI6%>%rownames_to_column('row') %>%arrange(Time) %>% group_by(TrackID) %>% filter(row_number() <= which.max(red))%>%column_to_rownames('row')
 # Filter the rows that are missing (after reaching the max):
 temp2<-subset(live_deadROI6, !row.names(live_deadROI6)%in%row.names(temp1))
 temp2$red_rs<-temp2$max_red
 live_deadROI6<-rbind(temp1, temp2)
 ### plot to check outcome
 library(ggplot2)
-Plot <- ggplot(live_deadROI6, aes(Time2,red_rs, color = Track2, group = Track2)) + 
+Plot <- ggplot(live_deadROI6, aes(Time2,red_rs, color = TrackID, group = TrackID)) + 
   geom_smooth(method="loess", size = 1, se=F, span=1) +
   theme_bw() + 
   ylab("dead dye intensity") + 
