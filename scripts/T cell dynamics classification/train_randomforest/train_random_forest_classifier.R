@@ -1,3 +1,4 @@
+set.seed(123)
 library(dplyr)
 library(stats)
 library(tidyr)
@@ -5,19 +6,36 @@ library(scales)
 library(randomForest)
 library(ggplot2)
 library(yaml)
+
 ## Import reference map that will be used as the ground truth dataset to train and test a random forest classifier
+### Checks if being run in GUI (e.g. Rstudio) or command line
+if (interactive()) {
+  ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
+  reference_map <- readRDS(file = opt$input)
+  model_path <- opt$output
+} else {
+  option_list = list(
+    make_option(c("-i", "--input"), type="character", default=NULL, 
+                help="Path to behavioral_reference_map", metavar="character"),
+    make_option(c("-o", "--output"), type="character", default=NULL, 
+                help="Output path for the RandomForest model", metavar="character")
+  )
+  opt_parser = OptionParser(option_list=option_list)
+  opt = parse_args(opt_parser)
+  if (is.null(opt$input)){
+    print_help(opt_parser)
+    stop("-i|--input, must be supplied", call.=FALSE)
+  }
+  if (is.null(opt$output)){
+    print_help(opt_parser)
+    stop("-o|--output, must be supplied", call.=FALSE)
+  }
+  reference_map <- readRDS(file = opt$input)
+  model_path <- opt$output
+}
 
-pars = yaml.load_file("/Users/samdeblank/surfdrive/Shared/T cell paper/Revision_nature_biotech/Sam_analysis/WT1_pooled/BEHAV3D_config.yml")
-
-reference_map <- pars$reference_map
-model_path <- pars$randomforest_path
-
-# reference_map <- "/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D/scripts/T cell dynamics classification/Behavioral reference map/"
-# output_dir="/Users/samdeblank/Documents/tcell_paper/unprocessed/2021-06-10_WT1_n1/1.split_data/2021-06-10_WT1_n1(2)_36T_[ims1_2021-09-09T14-14-13.594]_dt_Statistics/0.Analysis/"
-
-  
 train_dataset<-readRDS(reference_map)
-set.seed(123)
+
 train_dataset$cluster2<-as.numeric(train_dataset$cluster2)
 train_dataset_grouped <- train_dataset %>% 
   group_by(TrackID) %>% 

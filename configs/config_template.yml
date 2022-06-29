@@ -15,7 +15,6 @@ metadata_csv_path: "/Users/samdeblank/surfdrive/Shared/T cell paper/Revision_nat
 #####################################################
 
 randomforest_path: "/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-forked/references/TrainedRandomForest.Rdata"
-reference_map_path: "/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-forked/references/Behavioral_Referance_map_git"
 
 ### Maximum length of experiment (all timepoints after will be cut)
 exp_duration: 300

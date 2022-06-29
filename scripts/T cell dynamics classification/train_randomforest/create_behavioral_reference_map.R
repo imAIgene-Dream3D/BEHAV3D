@@ -1,14 +1,43 @@
 set.seed(123)
-master_corrected3<-readRDS(file = "master_corrected3_example")
+
 ##import T cell data:
 library(dplyr)
 library(dtwclust)
 library(stats)
 library(scales)
 
+if (interactive()) {
+  ### !!!!!! Change the path to the BEHAV3D config processed T cell tracks RDS here !!!!!!
+  pars = yaml.load_file("/Users/samdeblank/surfdrive/Shared/Dream3DLab (Groupfolder)/1.Projects/AIM_ALLImmune/3.Analysis/BEHAV3D_analysis/AIM_MB2_Exp21_Tcellstats/BEHAV3D_config_combined.yml")
+  # Change master_corrected3 if the file is not located in the specified output folder in the BEHAV3D config
+  master_corrected3<-readRDS(file = paste0(output_dir,"processed_tcell_track_data.rds"))
+  
+} else {
+  option_list = list(
+    make_option(c("-c", "--config"), type="character", default=NULL, 
+                help="Path to the BEHAV3D config file", metavar="character"),
+    make_option(c("-t", "--tracks_rds"), type="character", default=NULL, 
+                help="(Optional) Path to RDS file containing processed T cell track data", metavar="character")
+  )
+  opt_parser = OptionParser(option_list=option_list)
+  opt = parse_args(opt_parser)
+  if (is.null(opt$config)){
+    print_help(opt_parser)
+    stop("Config file -c|--config, must be supplied", call.=FALSE)
+  }
+  pars = yaml.load_file(opt$config)
+  tracks_provided = paste0(output_dir,"processed_tcell_track_data.rds")
+  if (! is.null(opt$tracks_rds)){
+    tracks_provided=opt$tracks_rds
+  }
+  master_corrected3<-readRDS(file = tracks_provided)
+}
+
+output_dir=paste0(pars$output_dir,"/tcell_behavior/train_randomforest/")
+dir.create(output_dir, recursive=TRUE)
+
 ### Normalize per experiment
 ## Normalize and rescale all variables for multivariate clustering. For continuos values such as speed, displacement and mean dead dye intensity. Only values of the upper quantile are taken. This ensures a clearer separation of static and dead cells.
-
 master_processed<-master_corrected3%>% 
   group_by(exp) %>% 
   mutate(z.disp = (displacement-mean(displacement))/sd(displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (red_lym-mean(red_lym))/sd(red_lym))%>%
@@ -18,6 +47,9 @@ master_processed<-master_corrected3%>%
 
 ### Arrange data by time:
 master_processed<-master_processed%>%group_by(TrackID)%>%arrange(Time)
+
+saveRDS(master_processed, file = paste0(output_dir,"tcell_track_features.rds"))
+
 ###Split the data in a list of TrackIDs with multivariate data for each Track overtime
 list_multivariate <- split(master_processed[,c("q.disp", "q.speed", "q.red","s.contact", "s.contact_lym")],master_processed$TrackID) 
 
@@ -89,7 +121,7 @@ ggplot(umap_3, aes(x=V1, y=V2, color=as.factor(cluster2))) +
 #### To the original dataset add information on cluster type
 master_clustered <- merge(master_processed ,umap_3[c("TrackID","cluster2")], by.x = "TrackID", by.y = "TrackID")
 ### Save Reference UMAP for training of random forest classifier
-saveRDS(master_clustered, file = "New_Behavioral_Referance_map") ### store here your reference map that can be used to predict behaviors in new experiments
+saveRDS(master_clustered, file = paste0(output_dir,"behavioral_reference_map.rds")) ### store here your reference map that can be used to predict behaviors in new experiments
 
 ## Plot a heatmap to show the relative values of each behavior parameter
 ## Create a dataframe the summarizes the mean values for each parameter
