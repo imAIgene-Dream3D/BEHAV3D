@@ -4,19 +4,30 @@ library(plyr)
 library(readr)
 library(dplyr)
 library(yaml)
+library(optparse)
 
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
   pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/tcell_paper/20220330_fixes/10_per_cells/BEHAV3D_configOrg.yml")
 } else {
-  args <- commandArgs(trailingOnly = TRUE)
-  pars <- yaml.load_file(args[1])
+  option_list = list(
+    make_option(c("-c", "--config"), type="character", default=NULL, 
+                help="Path to the BEHAV3D config file", metavar="character")
+  )
+  opt_parser = OptionParser(option_list=option_list)
+  opt = parse_args(opt_parser)
+  if (is.null(opt$config)){
+    print_help(opt_parser)
+    stop("Config file -c|--config, must be supplied", call.=FALSE)
+  }
+  pars = yaml.load_file(opt$config)
 }
 
 ## directory where the files are located
-# working_directory <- pars$data_dir
-output_dir=paste0(pars$output_dir,"/")
+pars$data_dir = paste0(pars$data_dir,"/")
+output_dir=paste0(pars$output_dir,"/organoid_dynamics/results/")
+dir.create(output_dir, recursive=TRUE)
 
 # Import file-specific metadata for all images used in this analysis.
 pat = pars$metadata_csv
@@ -126,24 +137,33 @@ temp2$red_rs<-temp2$max_red
 live_deadROI6<-rbind(temp1, temp2)
 ### plot to check outcome
 library(ggplot2)
-Plot <- ggplot(live_deadROI6, aes(Time2,red_rs, color = TrackID, group = TrackID)) + 
+ggplot(live_deadROI6, aes(Time2,red_rs, color = TrackID, group = TrackID)) + 
   geom_smooth(method="loess", size = 1, se=F, span=1) +
   theme_bw() + 
   ylab("dead dye intensity") + 
   xlab("Time (hours)") +
   theme(axis.text.x = element_text(size=20), axis.text.y = element_text(size=20), axis.title.y = element_text(size = 20), axis.title.x = element_text(size = 20), legend.text=element_text(size= 10))+
   labs(color = "Organoid")+
-  facet_grid(organoid_line~well, scales = "free")
-ggtitle("Individual org increase in dead dye intensity TEG")
+  facet_grid(organoid_line~well, scales = "free")+
+  ggtitle("Individual org increase in dead dye intensity TEG")
 
-Plot
+ggplot(live_deadROI6, aes(Time2,red_rs, color = TrackID, group = TrackID)) + 
+  geom_line(method="loess", size = 1, se=F, span=1) +
+  theme_bw() + 
+  ylab("dead dye intensity") + 
+  xlab("Time (hours)") +
+  theme(axis.text.x = element_text(size=20), axis.text.y = element_text(size=20), axis.title.y = element_text(size = 20), axis.title.x = element_text(size = 20), legend.text=element_text(size= 10))+
+  labs(color = "Organoid")+
+  facet_grid(organoid_line~well, scales = "free")+
+  ggtitle("Individual org increase in dead dye intensity TEG")
+# Plot
 saveRDS(live_deadROI6, file = paste0(output_dir,"Individual_orgs_death_dynamics"))  ### save here a dataframe with all the organoids values
 ggsave(paste0(output_dir,"Individual_orgs_death_dynamics.png"), device="png")
-
 
 library(dplyr)
 library(scales)
 library(MESS)
+
 ##Import dataframe live_deadROI7 for each experiment. Combine several if necessary
 Combi<-live_deadROI7
 

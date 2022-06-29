@@ -11,6 +11,10 @@ library(stats)
 library(yaml)
 library(optparse)
 
+### Set to TRUE if you want to run import and processing even if file already exists
+force_redo=TRUE
+tracks_provided=NULL
+
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
@@ -20,7 +24,9 @@ if (interactive()) {
     make_option(c("-c", "--config"), type="character", default=NULL, 
                 help="Path to the BEHAV3D config file", metavar="character"),
     make_option(c("-f", "--force_redo"), action="store_true", default=FALSE, 
-                help="Force the pipeline to re-import data even if files exists")
+                help="Force the pipeline to re-import data even if files exists"),
+    make_option(c("-t", "--tracks_rds"), type="character", default=NULL, 
+                help="(Optional) Path to RDS file containing processed T cell track data", metavar="character")
   )
   opt_parser = OptionParser(option_list=option_list)
   opt = parse_args(opt_parser)
@@ -30,13 +36,17 @@ if (interactive()) {
   }
   pars = yaml.load_file(opt$config)
   force_redo=opt$force_redo
+  tracks_provided=opt$tracks_rds
 }
 
 pars$data_dir = paste0(pars$data_dir,"/")
-output_dir=paste0(pars$output_dir,"/")
+qc_output_dir = paste0(pars$output_dir,"/tcell_behavior/quality_control/")
+output_dir=paste0(pars$output_dir,"/tcell_behavior/results/")
+dir.create(qc_output_dir, recursive=TRUE)
+dir.create(output_dir, recursive=TRUE)
 model_path <- pars$randomforest
 
-if ( (! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | force_redo==TRUE ){
+if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | force_redo==TRUE ) & is.null(tracks_provided) ){
   print("#################################################")
   print("###############  Importing data  ################")
   print("#################################################")
@@ -291,7 +301,7 @@ if ( (! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | forc
     geom_histogram(fill="white", alpha=0.5, position="identity")+facet_grid(organoid_line~well, scales = "free")
   
   ggsave(
-    paste0(output_dir,"TouchingvsNontouching_distribution.png"), 
+    paste0(qc_output_dir,"TouchingvsNontouching_distribution.png"), 
     device="png", height=210, width=297, units="mm"
   )
   
@@ -328,7 +338,7 @@ if ( (! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | forc
     theme_bw()
   
   ggsave(
-    paste0(output_dir,"RedLym_distribution.png"), 
+    paste0(qc_output_dir,"RedLym_distribution.png"), 
     device="png", height=210, width=297, units="mm"
   )
   
@@ -354,7 +364,7 @@ if ( (! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | forc
   ### Save processed data on the tcells for possible further analysis
   saveRDS(master_corrected3, file = paste0(output_dir,"processed_tcell_track_data.rds"))
   
-  write.table(track_counts, file=paste0(output_dir, "nr_of_tracks_after_filtering.tsv"), sep="\t", row.names=FALSE)
+  write.table(track_counts, file=paste0(qc_output_dir, "NrCellTracks_filtering.tsv"), sep="\t", row.names=FALSE)
   
   library(reshape2)
   melted_track_counts = melt(track_counts)
@@ -368,7 +378,7 @@ if ( (! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | forc
     xlab("Experiment")
   
   ggsave(
-    paste0(output_dir,"NrCellTracks_filtering_perExp.png"), 
+    paste0(qc_output_dir,"NrCellTracks_filtering_perExp.png"), 
     device="png", height=210, width=297, units="mm"
   )
   
@@ -378,12 +388,12 @@ if ( (! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | forc
     theme_bw() + 
     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
   
-  ggsave(paste0(output_dir,"NrCellTracks_filtering_perFilt.png"), device="png", height=210, width=297, units="mm")
+  ggsave(paste0(qc_output_dir,"NrCellTracks_filtering_perFilt.png"), device="png", height=210, width=297, units="mm")
 } else{
   master_corrected3 = readRDS(paste0(output_dir,"processed_tcell_track_data.rds"))
 
   print("#################################################")
-  print("#### processed_tcell_track_data.rds already exists in output folder")
+  print("#### processed_tcell_track_data.rds already exists in output folder or is supplied with -t|--track_rds")
   print("#### Run with --force-redo (or set force_redo to TRUE in RStudio) to force re-importing of data")
   print("#################################################")
 }
@@ -553,6 +563,8 @@ if (model_path != ""){
   master_processed$TrackID = as.character(master_processed$TrackID)
   # master_processed_ref<-master_processed_ref%>%group_by(TrackID)%>%arrange(Time)
   
+  saveRDS(master_processed, file = paste0(output_dir,"tcell_track_features.rds"))
+  
   ###Split the data in a list of TrackIDs with multivariate data for each Track overtime
   list_multivariate <- split(master_processed[,c("q.disp", "q.speed", "q.red","s.contact", "s.contact_lym")],master_processed$TrackID) 
   # list_multivariate_ref <- split(master_processed_ref[,c("q.disp", "q.speed", "q.red","s.contact", "s.contact_lym")],master_processed_ref$TrackID) 
@@ -720,3 +732,4 @@ if (model_path != ""){
     device="pdf", height=210, width=297, units="mm"
   )
 }
+
