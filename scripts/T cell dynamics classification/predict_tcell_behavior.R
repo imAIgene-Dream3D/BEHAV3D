@@ -9,19 +9,37 @@ library(spatstat)
 library(sp)
 library(stats)
 library(yaml)
+library(optparse)
 
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
   pars = yaml.load_file("/Users/samdeblank/surfdrive/Shared/Dream3DLab (Groupfolder)/1.Projects/AIM_ALLImmune/3.Analysis/BEHAV3D_analysis/AIM_MB2_Exp21_Tcellstats/BEHAV3D_config_combined.yml")
 } else {
-  args <- commandArgs(trailingOnly = TRUE)
-  pars <- yaml.load_file(args[1])
+  option_list = list(
+    make_option(c("-c", "--config"), type="character", default=NULL, 
+                help="Path to the BEHAV3D config file", metavar="character"),
+    make_option(c("-f", "--force_redo"), action="store_true", default=FALSE, 
+                help="Force the pipeline to re-import data even if files exists")
+  )
+  opt_parser = OptionParser(option_list=option_list)
+  opt = parse_args(opt_parser)
+  if (is.null(opt$config)){
+    print_help(opt_parser)
+    stop("Config file -c|--config, must be supplied", call.=FALSE)
+  }
+  pars = yaml.load_file(opt$config)
+  force_redo=opt$force_redo
 }
 
-force_redo=FALSE
+pars$data_dir = paste0(pars$data_dir,"/")
+output_dir=paste0(pars$output_dir,"/")
+model_path <- pars$randomforest
 
 if ( (! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | force_redo==TRUE ){
+  print("#################################################")
+  print("###############  Importing data  ################")
+  print("#################################################")
   ### Function to count the number of tracks in the dataset
   count_tracks = function (track_table){
     nr_tracks_unfilt=track_table
@@ -34,9 +52,6 @@ if ( (! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | forc
       ungroup()
   }
   
-  pars$data_dir = paste0(pars$data_dir,"/")
-  output_dir=paste0(pars$output_dir,"/")
-  model_path <- pars$randomforest
   
   ###############################
   ######### Data import #########
@@ -287,7 +302,7 @@ if ( (! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | forc
   ### For that we select cell track that have at least 100 timepoints. 
   ### Detach package  'plyr' as it can interfere with 'dplyr'
   detach("package:reshape2", unload=TRUE)
-  detach("package:plyr", unload=TRUE)
+  # detach("package:plyr", unload=TRUE)
   
   master_corrected2<-master_corrected1 %>% 
     group_by(TrackID) %>% arrange(TrackID)%>% filter(Time>00&Time<pars$exp_duration)%>% filter(n() >= pars$min_track_length)
@@ -364,12 +379,22 @@ if ( (! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | forc
     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
   
   ggsave(paste0(output_dir,"NrCellTracks_filtering_perFilt.png"), device="png", height=210, width=297, units="mm")
+} else{
+  master_corrected3 = readRDS(paste0(output_dir,"processed_tcell_track_data.rds"))
+
+  print("#################################################")
+  print("#### processed_tcell_track_data.rds already exists in output folder")
+  print("#### Run with --force-redo (or set force_redo to TRUE in RStudio) to force re-importing of data")
+  print("#################################################")
 }
+
 
 ####### IF MODEL_PATH IS DEFINED PERFORM CLASSIFICATION BASED ON EXISTING DATA
 ####### OTHERWISE, PERFORM UNSUPERVISED UMAP CLUSTERING
 if (model_path != ""){
+  print("#################################################")
   print("#### Model_path defined, performing random forest classification...")
+  print("#################################################")
   ###############################
   ##### Behavior prediction #####
   ###############################
@@ -503,7 +528,10 @@ if (model_path != ""){
   ggsave(paste0(output_dir,"RF_ClassProp_WellvsCelltype.png"), device="png")
   ggsave(paste0(output_dir,"RF_ClassProp_WellvsCelltype.pdf"), device="pdf")
 } else {
+  print("#################################################")
   print("#### Model_path NOT defined, performing UMAP clustering...")
+  print("#################################################")
+  
   #######################################################
   ###########     UNSUPERVISED CLUSTERING     ###########
   #######################################################
