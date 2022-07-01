@@ -11,8 +11,8 @@ library(yaml)
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
-  reference_map <- readRDS(file = opt$input)
-  model_path <- opt$output
+  reference_map <- "/Users/samdeblank/surfdrive/Shared/Dream3DLab (Groupfolder)/1.Projects/AIM_ALLImmune/3.Analysis/BEHAV3D_analysis/AIM_MB2_Exp21_Tcellstats/results/tcell_behavior/results/behavioral_reference_map.rds"
+  model_output_path <- "/Users/samdeblank/surfdrive/Shared/Dream3DLab (Groupfolder)/1.Projects/AIM_ALLImmune/3.Analysis/BEHAV3D_analysis/AIM_MB2_Exp21_Tcellstats/results/train_randomforest/TrainedRandomForest.Rdata"
 } else {
   option_list = list(
     make_option(c("-i", "--input"), type="character", default=NULL, 
@@ -31,9 +31,10 @@ if (interactive()) {
     stop("-o|--output, must be supplied", call.=FALSE)
   }
   reference_map <- readRDS(file = opt$input)
-  model_path <- opt$output
+  model_output_path <- opt$output
 }
 
+output_dir = paste0(dirname(model_output_path), "/")
 train_dataset<-readRDS(reference_map)
 
 train_dataset$cluster2<-as.numeric(train_dataset$cluster2)
@@ -49,7 +50,6 @@ train_dataset_1<-as.data.frame(train_dataset_1)%>%
 
 train_dataset_2 <-train_dataset_grouped%>%filter(!TrackID%in% train_dataset_1$TrackID)
 
-set.seed(321)
 rsq <- function(x, y) summary(lm(y~x))$r.squared
 
 train_dataset1 <- train_dataset_1%>% group_by(TrackID)%>%
@@ -69,8 +69,9 @@ validation_dataset <- train_dataset_2%>% group_by(TrackID)%>%
 
 train_dataset1<-as.data.frame(train_dataset1)  ### training dataset
 ##set names of columns to the same:
-y <-as.factor(train_dataset1[,16]) ##strack ID
-x <- as.matrix(train_dataset1[,2:15]) ##data for training
+
+y <-as.factor(train_dataset1[,"cluster"]) ##strack ID
+x <- as.matrix(train_dataset1[,-which(names(train_dataset1) == "TrackID" | names(train_dataset1) == "cluster")]) ##data for training
 
 model <- randomForest(y=y,x=x,ntree=100, importance=TRUE)
 predictors_importance<-importance(model)
@@ -85,21 +86,13 @@ test_error2 <- randomForest(y=y,x=x,ntree=100, importance=TRUE,
 
 ###Test for error per cluster using the validation dataset
 ## predict the cluster types in the validation dataset using the trained classifier
-model_predict_train<-predict(model,validation_dataset[,2:15],type="response")
+model_predict_train<-predict(model,validation_dataset[,-which(names(train_dataset1) == "TrackID" | names(train_dataset1) == "cluster")],type="response")
 ## Merge predicted and ground truth values
 ground_truth<-validation_dataset[!duplicated(validation_dataset$TrackID),]
 ground_truth_classified<-cbind(ground_truth,model_predict_train)
 ## Plot the ground truth vs predicted values
 p2 <-ggplot(ground_truth_classified, aes(x=as.factor(model_predict_train),y=as.factor(cluster), color = as.factor(cluster))) + 
-  geom_jitter(width = 0.2, height = 0.2)+ scale_colour_manual(values = c("gold3",
-                                                                         "darkolivegreen3",
-                                                                         "seagreen3",
-                                                                         "blue3",
-                                                                         "dodgerblue",
-                                                                         "cyan1",
-                                                                         "indianred",
-                                                                         "firebrick",
-                                                                         "brown1"))+
+  geom_jitter(width = 0.2, height = 0.2)+ 
   theme_bw() + theme(aspect.ratio = 1)+
   xlab("model predicted") +ylab("ground_truth") 
 
@@ -112,21 +105,13 @@ model_df<-as.data.frame(model_df)
 model_df$tree<-rownames(model_df)
 model_df$tree<-as.numeric(model_df$tree)
 model_df <- data.frame(tree= model_df$tree,stack(model_df,select=-tree))
-model_df$ind = factor(model_df$ind, levels=c("OOB","1","2","3","4","5","6","7","8","9"))
+model_df$ind = as.factor(model_df$ind)
 p2 <-ggplot(model_df , aes(x=tree,y=values, group = ind, color = as.factor(ind))) + 
-  geom_line(size=1)+ scale_colour_manual(values = c("grey","gold3",
-                                              "darkolivegreen3",
-                                              "seagreen3",
-                                              "blue3",
-                                              "dodgerblue",
-                                              "cyan1",
-                                              "indianred",
-                                              "firebrick",
-                                              "brown1"))+
+  geom_line(size=1)+ 
   theme_classic() + theme(aspect.ratio = 0.5)+
   xlab("tree") +ylab("error") 
 
 p2
 ggsave(paste0(output_dir,"RF_TreeErrorEvolution.png"), device="png")
 
-save(model, file = model_path)
+save(model, file = model_output_path)

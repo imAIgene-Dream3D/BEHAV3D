@@ -623,16 +623,6 @@ if (model_path != ""){
   ggplot(umap_3, aes(x=V1, y=V2, color=as.factor(cluster2))) +  
     geom_point(size=2, alpha=0.6) + labs(color="cluster")+
     xlab("") + ylab("")+
-    
-    # +scale_color_manual(values = c("gold3",
-    #                                                      "darkolivegreen3",
-    #                                                      "seagreen3",
-    #                                                      "blue3",
-    #                                                      "dodgerblue",
-    #                                                      "cyan1",
-    #                                                      "indianred",
-    #                                                      "firebrick",
-    #                                                      "brown1" ))+
     ggtitle("umap Cluster ") +
     theme_light(base_size=20) +theme_bw()+
     theme(axis.text.x=element_blank(),
@@ -643,12 +633,11 @@ if (model_path != ""){
     device="pdf", height=210, width=297, units="mm"
   )
   
-  
   #### To the original dataset add information on cluster type
   master_clustered <- merge(master_processed ,umap_3[c("TrackID","cluster2")], by.x = "TrackID", by.y = "TrackID")
   # master_clustered$cluster = master_clustered$cluster2
   ### Save Reference UMAP for training of random forest classifier
-  # saveRDS(master_clustered, file = "New_Behavioral_Referance_map") ### store here your reference map that can be used to predict behaviors in new experiments
+  saveRDS(master_clustered, file = paste0(output_dir,"behavioral_reference_map.rds")) ### store here your reference map that can be used to predict behaviors in new experiments
   
   ## Plot a heatmap to show the relative values of each behavior parameter
   ## Create a dataframe the summarizes the mean values for each parameter
