@@ -1,6 +1,4 @@
 set.seed(123)
-
-##import T cell data:
 library(dplyr)
 library(dtwclust)
 library(stats)
@@ -8,33 +6,28 @@ library(scales)
 
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D config processed T cell tracks RDS here !!!!!!
-  pars = yaml.load_file("/Users/samdeblank/surfdrive/Shared/Dream3DLab (Groupfolder)/1.Projects/AIM_ALLImmune/3.Analysis/BEHAV3D_analysis/AIM_MB2_Exp21_Tcellstats/BEHAV3D_config_combined.yml")
   # Change master_corrected3 if the file is not located in the specified output folder in the BEHAV3D config
-  master_corrected3<-readRDS(file = paste0(output_dir,"processed_tcell_track_data.rds"))
-  
+  tracks_provided = ""
+  output_path = ""
 } else {
   option_list = list(
-    make_option(c("-c", "--config"), type="character", default=NULL, 
-                help="Path to the BEHAV3D config file", metavar="character"),
-    make_option(c("-t", "--tracks_rds"), type="character", default=NULL, 
-                help="(Optional) Path to RDS file containing processed T cell track data", metavar="character")
+    make_option(c("-i", "--input"), type="character", default=NULL, 
+                help="Path to RDS file containing processed T cell track data; default name: processed_tcell_track_data.rds", metavar="character"),
+    make_option(c("-o", "--output"), type="character", default="./", 
+                help="Output path for the behavior_reference_map", metavar="character")
   )
   opt_parser = OptionParser(option_list=option_list)
   opt = parse_args(opt_parser)
-  if (is.null(opt$config)){
+  if (is.null(opt$input)){
     print_help(opt_parser)
-    stop("Config file -c|--config, must be supplied", call.=FALSE)
+    stop("Config file -i|--input, must be supplied", call.=FALSE)
   }
-  pars = yaml.load_file(opt$config)
-  tracks_provided = paste0(output_dir,"processed_tcell_track_data.rds")
-  if (! is.null(opt$tracks_rds)){
-    tracks_provided=opt$tracks_rds
-  }
-  master_corrected3<-readRDS(file = tracks_provided)
+  tracks_provided = opt$input
+  output_path = opt$output
 }
 
-output_dir=paste0(pars$output_dir,"/tcell_behavior/train_randomforest/")
-dir.create(output_dir, recursive=TRUE)
+master_corrected3 <- readRDS(file = opt$input)
+output_dir=dirname(output_path)
 
 ### Normalize per experiment
 ## Normalize and rescale all variables for multivariate clustering. For continuos values such as speed, displacement and mean dead dye intensity. Only values of the upper quantile are taken. This ensures a clearer separation of static and dead cells.
@@ -73,7 +66,7 @@ matrix_distmat<-as.matrix(distmat)
 ## Store TrackID names
 TrackID<-as.numeric(names(list_multivariate))
 library(umap)
-set.seed(123)
+
 ## Project cross-distance matrix in a UMAP
 umap_dist<- umap(matrix_distmat,n_components=2,input="dist",init = "random", 
                  n_neighbors=3, min_dist=0.1, spread=1)  ### adjust parameters
@@ -98,25 +91,15 @@ outliers<- rownames(km.mod[["L"]]) ##find outliers
 umap_3 <-umap_3%>%filter(!TrackID %in% outliers) ##remove outliers
 colnames(umap_3)[2]<- "cluster2"
 ##plot
-umap_3$cluster2 = factor(umap_3$cluster2, levels=c("4","7","5","8","3", "2","9","6","1"))
-levels(umap_3$cluster2) <- c("1","2","3","4","5","6", "7","8","9")  ##reorder clusters
+umap_3$cluster2 = as.factor(umap_3$cluster2)
+
 ggplot(umap_3, aes(x=V1, y=V2, color=as.factor(cluster2))) +  
   geom_point(size=2, alpha=0.6) + labs(color="cluster")+
-  xlab("") + ylab("") +scale_color_manual(values = c("gold3",
-                                                     "darkolivegreen3",
-                                                     "seagreen3",
-                                                     "blue3",
-                                                     "dodgerblue",
-                                                     "cyan1",
-                                                     "indianred",
-                                                     "firebrick",
-                                                     "brown1" ))+
+  xlab("") + ylab("") +
   ggtitle("umap Cluster ") +
   theme_light(base_size=20) +theme_bw()+
   theme(axis.text.x=element_blank(),
         axis.text.y=element_blank(), aspect.ratio=1)+coord_fixed()
-
-
 
 #### To the original dataset add information on cluster type
 master_clustered <- merge(master_processed ,umap_3[c("TrackID","cluster2")], by.x = "TrackID", by.y = "TrackID")
@@ -142,9 +125,6 @@ gg <- gg + scale_fill_viridis(option="C", name="AU")
 gg <- gg + labs(x=NULL, y="Cluster", title="cluster represention")+theme(aspect.ratio=1.7,axis.text.x = element_text(angle = 45, hjust = 1))+ylim(rev(levels(sum_all$cluster2)))
 gg
 
-
-
-
 ### Backproject the clustered data to the imaging dataset. Each TrackID (was coded to be made unique) has to be converted back to its original TrackID
 ## read master dataset that contains both TrackID and TrackID2
 master<-readRDS("master_example_data")
@@ -160,5 +140,5 @@ Ranks_2<-subset(master3,ranks==2)
 Ranks_2<-Ranks_2[!duplicated(Ranks_2$TrackID),c("TrackID","cluster2")] 
 Ranks_2_list<-split(Ranks_2,Ranks_2$cluster2)
 ### Save this list that allows to identify in the imaging dataset to which cluster does each cell belong to.
-write(paste(as.character(Ranks_2_list), sep="' '", collapse=", "), "Backproject.txt")
+write(paste(as.character(Ranks_2_list), sep="' '", collapse=", "), paste0(output_dir, "Backproject.txt"))
 
