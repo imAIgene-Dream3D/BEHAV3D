@@ -39,6 +39,7 @@ if (interactive()) {
   tracks_provided=opt$tracks_rds
 }
 
+### Setting data directory (if specified) and creating output directories
 pars$data_dir = paste0(pars$data_dir,"/")
 qc_output_dir = paste0(pars$output_dir,"/tcell_behavior/quality_control/")
 output_dir=paste0(pars$output_dir,"/tcell_behavior/results/")
@@ -305,7 +306,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     device="png", height=210, width=297, units="mm"
   )
   
-  ### Remove contact threshold variable
+  ### Remove organoid contact threshold variable
   master_corrected1$organoid_contact_threshold<-NULL
   
   ### For clustering it is necessary to compare T cell tracks that have a similar length. 
@@ -398,9 +399,11 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   print("#################################################")
 }
 
-
+##############################################################################################################################
 ####### IF MODEL_PATH IS DEFINED PERFORM CLASSIFICATION BASED ON EXISTING DATA
 ####### OTHERWISE, PERFORM UNSUPERVISED UMAP CLUSTERING
+##############################################################################################################################
+
 if (model_path != ""){
   print("#################################################")
   print("#### Model_path defined, performing random forest classification...")
@@ -450,7 +453,7 @@ if (model_path != ""){
               contact=mean(s.contact),mean_contact2=mean(contact2),contact2=max(contact2))
   
   ### create a  matrix from the predictors
-  test1<-as.matrix(test_dataset[,2:15]) 
+  test1 = as.matrix(test_dataset[,-which(names(test_dataset) == "TrackID")]) 
   model_predict_test<-predict(model,test1,type="response")
   test_dataset_predicted<-cbind(model_predict_test,test_dataset)
   test_dataset_predicted$cluster<-test_dataset_predicted$model_predict
