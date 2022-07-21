@@ -10,6 +10,7 @@ library(sp)
 library(stats)
 library(yaml)
 library(optparse)
+library(ggplot2)
 
 ### Set to TRUE if you want to run import and processing even if file already exists
 force_redo=TRUE
@@ -18,7 +19,9 @@ tracks_provided=NULL
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
-  pars = yaml.load_file("/Users/samdeblank/surfdrive/Shared/Dream3DLab (Groupfolder)/1.Projects/AIM_ALLImmune/3.Analysis/BEHAV3D_analysis/AIM_MB2_Exp21_Tcellstats/BEHAV3D_config_combined.yml")
+  # pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/tcell_paper/20220721_BEHAV3D2.0_testing/WT1_pooled/BEHAV3D_config.yml")
+  pars = yaml.load_file("/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/combined_demo_data/BEHAV3D_config.yml")
+  
 } else {
   option_list = list(
     make_option(c("-c", "--config"), type="character", default=NULL, 
@@ -54,9 +57,9 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   ### Function to count the number of tracks in the dataset
   count_tracks = function (track_table){
     nr_tracks_unfilt=track_table
-    nr_tracks_unfilt$name = paste(nr_tracks_unfilt$organoid_line, nr_tracks_unfilt$exp_nr, nr_tracks_unfilt$well)
+    nr_tracks_unfilt$name = paste(nr_tracks_unfilt$organoid_line, nr_tracks_unfilt$tcell_line, nr_tracks_unfilt$exp_nr, nr_tracks_unfilt$well)
     nr_tracks_unfilt = nr_tracks_unfilt %>% 
-      group_by(name, organoid_line) %>% 
+      group_by(name, organoid_line, tcell_line, exp_nr, well) %>% 
       dplyr::summarize(
         nr_tracks=length(unique(TrackID))
       ) %>% 
@@ -73,7 +76,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   metadata=read.csv(pars$metadata_csv, sep="\t", check.names=FALSE)
   
   track_counts=metadata
-  track_counts$name = paste(metadata$organoid_line, metadata$exp_nr, metadata$well)
+  track_counts$name = paste(metadata$organoid_line, metadata$tcell_line, metadata$exp_nr, metadata$well)
   track_counts=track_counts[,c("name", "organoid_line")]
   
   ### Check if folder with statistics is named in the metadata table, if not, try default naming of data basename + "_Statistics"
@@ -95,10 +98,10 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     return(ims_csv)
   }
   
-  stat_folders <- metadata$tcell_stats_folder
+  stat_folders <- as.character(metadata$tcell_stats_folder)
   
   # import Displacement^2
-  pat = "*Displacement\\^2"
+  pat = "*Displacement(\\^2)"
   displacement=ldply(stat_folders, read_ims_csv, pattern=pat)
   
   # import Speed
@@ -176,9 +179,9 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   detach("package:reshape2", unload=TRUE)
   detach("package:plyr", unload=TRUE)
-  pars$exp_duration
+  pars$tcell_exp_duration
   
-  master <- master[which(master$Time<=pars$exp_duration), ] ##Make sure that all the time-series have the same length, in this case 10hours
+  master <- master[which(master$Time<=pars$tcell_exp_duration), ] ##Make sure that all the time-series have the same length, in this case 10hours
   
   track_counts=left_join(track_counts, count_tracks(master))
   colnames(track_counts)[colnames(track_counts)=="nr_tracks"]="filt_exp_duration"
@@ -297,13 +300,12 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   master_corrected1$contact <- ifelse(master_corrected1$dist_org>master_corrected1$organoid_contact_threshold, 0,1)
   
   ### Plot the number of touching vs. non-touching T cells
-  library(ggplot2)
   ggplot(master_corrected1, aes(x=contact, color=as.factor(exp_nr))) +
     geom_histogram(fill="white", alpha=0.5, position="identity")+facet_grid(organoid_line~well, scales = "free")
   
   ggsave(
-    paste0(qc_output_dir,"TouchingvsNontouching_distribution.png"), 
-    device="png", height=210, width=297, units="mm"
+    paste0(qc_output_dir,"TouchingvsNontouching_distribution.pdf"), 
+    device="pdf", height=210, width=297, units="mm"
   )
   
   ### Remove organoid contact threshold variable
@@ -316,7 +318,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   # detach("package:plyr", unload=TRUE)
   
   master_corrected2<-master_corrected1 %>% 
-    group_by(TrackID) %>% arrange(TrackID)%>% filter(Time>00&Time<pars$exp_duration)%>% filter(n() >= pars$min_track_length)
+    group_by(TrackID) %>% arrange(TrackID)%>% filter(Time>00&Time<pars$tcell_exp_duration)%>% filter(n() >= pars$tcell_min_track_length)
   
   track_counts=left_join(track_counts, count_tracks(master_corrected2))
   colnames(track_counts)[colnames(track_counts)=="nr_tracks"]="filt_minLength"
@@ -326,7 +328,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     group_by(TrackID) %>%arrange(Time)%>%mutate(Time2 = Time - first(Time))
   ### For the Tracks that have more then 100 timepoints filter only the first 100.
   master_corrected2<-master_corrected2 %>% 
-    group_by(TrackID) %>%arrange(TrackID)%>% filter(Time2<pars$max_track_length)
+    group_by(TrackID) %>%arrange(TrackID)%>% filter(Time2<pars$tcell_max_track_length)
   
   ### To exclude noise due to dead cells remove the dead t cells from the beginning
   # master_corrected3 <- master_corrected2
@@ -339,12 +341,12 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     theme_bw()
   
   ggsave(
-    paste0(qc_output_dir,"RedLym_distribution.png"), 
-    device="png", height=210, width=297, units="mm"
+    paste0(qc_output_dir,"RedLym_distribution.pdf"), 
+    device="pdf", height=210, width=297, units="mm"
   )
   
   ### Filter out T cells that are dead at the start of the experiment
-  master_corrected3deadT0 <-master_corrected2%>%group_by(TrackID)%>%filter((Time2==0) & red_lym<dead_dye_threshold )
+  master_corrected3deadT0 <-master_corrected2%>%group_by(TrackID)%>%filter((Time2==0) & red_lym<tcell_dead_dye_threshold )
   
   master_corrected3 <-master_corrected2%>%filter(TrackID %in% master_corrected3deadT0$TrackID )
   
@@ -352,7 +354,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   colnames(track_counts)[colnames(track_counts)=="nr_tracks"]="filt_DeadCellStart"
   
   ### Create a binary variable for live or dead cells:
-  master_corrected3$death<- ifelse(master_corrected3$red_lym<master_corrected3$dead_dye_threshold,0,1)
+  master_corrected3$death<- ifelse(master_corrected3$red_lym<master_corrected3$tcell_dead_dye_threshold,0,1)
   
   ### Create a variable for cumulative interaction with organoids
   master_corrected3<-master_corrected3 %>% 
@@ -368,7 +370,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   write.table(track_counts, file=paste0(qc_output_dir, "NrCellTracks_filtering.tsv"), sep="\t", row.names=FALSE)
   
   library(reshape2)
-  melted_track_counts = melt(track_counts)
+  melted_track_counts = melt(track_counts,id.vars=c("name","organoid_line", "tcell_line", "exp_nr", "well"))
   detach("package:reshape2", unload=TRUE)
   ggplot(melted_track_counts, aes(x=name, y=value, fill=variable)) + 
     geom_col(width=0.75, position="dodge") + 
@@ -379,8 +381,8 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     xlab("Experiment")
   
   ggsave(
-    paste0(qc_output_dir,"NrCellTracks_filtering_perExp.png"), 
-    device="png", height=210, width=297, units="mm"
+    paste0(qc_output_dir,"NrCellTracks_filtering_perExp.pdf"), 
+    device="pdf", height=210, width=297, units="mm"
   )
   
   ggplot(melted_track_counts, aes(x=name, y=value, fill=organoid_line)) + 
@@ -389,10 +391,13 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     theme_bw() + 
     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
   
-  ggsave(paste0(qc_output_dir,"NrCellTracks_filtering_perFilt.png"), device="png", height=210, width=297, units="mm")
-} else{
-  master_corrected3 = readRDS(paste0(output_dir,"processed_tcell_track_data.rds"))
-
+  ggsave(paste0(qc_output_dir,"NrCellTracks_filtering_perFilt.pdf"), device="pdf", height=210, width=297, units="mm")
+} else {
+  if (is.null(tracks_provided)){
+    master_corrected3 = readRDS(paste0(output_dir,"processed_tcell_track_data.rds"))
+  } else {
+    master_corrected3 = readRDS(tracks_provided)
+  }
   print("#################################################")
   print("#### processed_tcell_track_data.rds already exists in output folder or is supplied with -t|--track_rds")
   print("#### Run with --force-redo (or set force_redo to TRUE in RStudio) to force re-importing of data")
@@ -463,14 +468,14 @@ if (model_path != ""){
   classification<-test_dataset_predicted[,c(2,17)]
   master_classified<-left_join(master_test,classification, by="TrackID")
   cell_ID<-master_classified[!duplicated(master_classified$TrackID),c("TrackID","organoid_line","tcell_line","exp_nr", "well")] 
-  
+  saveRDS(master_classified, file = paste0(output_dir,"classified_tcell_track_data.rds"))
   
   classified_tracks<-test_dataset_predicted
   classified_tracks$cluster2<-classified_tracks$cluster
   classified_tracks<-left_join(classified_tracks,cell_ID)
   classified_tracks<-classified_tracks%>%arrange(cluster2)
   
-  saveRDS(classified_tracks, file = paste0(output_dir,"classified_tcell_track_data.rds"))
+  saveRDS(classified_tracks, file = paste0(output_dir,"classified_tcell_track_data_summary.rds"))
   
   ### Quantify the number of cells per well
   Number_cell_exp<-classified_tracks%>%group_by(well, exp_nr, tcell_line, organoid_line)%>%
@@ -533,7 +538,7 @@ if (model_path != ""){
                                                      "cyan1",
                                                      "indianred",
                                                      "firebrick",
-                                                     "brown1"))+
+                                                     "brown1"),drop = FALSE)+
     theme(aspect.ratio = 0.2,strip.text.x = element_text(angle = 90))
   
   Per
@@ -614,7 +619,6 @@ if (model_path != ""){
   umap_2 <- left_join(Track2_umap ,temp_df)
   
   ## Perform clustering. Select clusterig type that suits more your dataset
-  library(ggplot2)
 
   km.norm <- kmeans(umap_dist$`layout`,pars$nr_of_clusters, nstart = 100)
   umap_3 <- cbind(km.norm$cluster, umap_2)
