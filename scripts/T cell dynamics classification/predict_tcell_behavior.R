@@ -20,7 +20,7 @@ tracks_provided=NULL
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
   # pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/tcell_paper/20220721_BEHAV3D2.0_testing/WT1_pooled/BEHAV3D_config.yml")
-  pars = yaml.load_file("/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/combined_demo_data/BEHAV3D_config.yml")
+  pars = yaml.load_file("/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/behavioral_transcriptomics_demo/BEHAV3D_config.yml")
   
 } else {
   option_list = list(
@@ -56,10 +56,10 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   print("#################################################")
   ### Function to count the number of tracks in the dataset
   count_tracks = function (track_table){
-    nr_tracks_unfilt=track_table
-    nr_tracks_unfilt$name = paste(nr_tracks_unfilt$organoid_line, nr_tracks_unfilt$tcell_line, nr_tracks_unfilt$exp_nr, nr_tracks_unfilt$well)
-    nr_tracks_unfilt = nr_tracks_unfilt %>% 
-      group_by(name, organoid_line, tcell_line, exp_nr, well) %>% 
+    # nr_tracks_unfilt=track_table
+    # nr_tracks_unfilt$name = paste(nr_tracks_unfilt$organoid_line, nr_tracks_unfilt$tcell_line, nr_tracks_unfilt$exp_nr, nr_tracks_unfilt$well)
+    nr_tracks_unfilt = track_table %>% 
+      group_by(basename, organoid_line, tcell_line, exp_nr, well) %>% 
       dplyr::summarize(
         nr_tracks=length(unique(TrackID))
       ) %>% 
@@ -77,43 +77,45 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   track_counts=metadata
   track_counts$name = paste(metadata$organoid_line, metadata$tcell_line, metadata$exp_nr, metadata$well)
-  track_counts=track_counts[,c("name", "organoid_line")]
+  track_counts=track_counts[,c("basename", "name", "organoid_line")]
   
   ### Check if folder with statistics is named in the metadata table, if not, try default naming of data basename + "_Statistics"
   if ( any(is.na(metadata$tcell_stats_folder)) ){
     metadata$tcell_stats_folder=apply(metadata, 1, function(x) paste0(pars$data_dir, x["basename"], "_Statistics"))
   }
   
-  ### Function to import tcell data specifically from Imaris generated csv files
-  read_ims_csv <- function(stat_folder, pattern) {
+  read_ims_csv <- function(metadata_row, pattern) {
     read_plus <- function(flnm, stat_folder) {
       read_csv(flnm, skip = 3, col_types = cols(TrackID= col_character())) %>% 
-        mutate(filename = flnm, stat_folder=stat_folder) 
+        mutate(filename = flnm, stat_folder=stat_folder, basename=basename) 
     }
-    pattern_file <- list.files(path = stat_folder, pattern = pattern, full.names=TRUE)
+    basename=gsub("([.|()\\^{}+$*?]|\\[|\\])", "\\\\\\1", metadata_row[['basename']])
+    pattern <- paste0(basename,".*", pattern, ".*")
+    pattern_file <- list.files(path = metadata_row[['stats_folder']], pattern = pattern, full.names=TRUE)
     if (identical(pattern_file, character(0))){
-      print(paste("No file with pattern '", pattern, "' found for", stat_folder))
+      print(paste("No file with pattern '", pattern, "' found for", metadata_row['stats_folder']))
     } 
-    ims_csv <- read_plus(pattern_file, stat_folder)
+    print(pattern_file)
+    ims_csv <- read_plus(pattern_file, metadata_row['stats_folder'])
     return(ims_csv)
   }
   
-  stat_folders <- as.character(metadata$tcell_stats_folder)
-  
+  stat_folders <- metadata[c("basename", "tcell_stats_folder")]
+  colnames(stat_folders) <- c("basename", "stats_folder")
+
   # import Displacement^2
-  pat = "*Displacement(\\^2)"
-  displacement=ldply(stat_folders, read_ims_csv, pattern=pat)
+  pat = "Displacement\\^2"
+  displacement=do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   # import Speed
-  pat = "*Speed"
-  speed <- ldply(stat_folders, read_ims_csv, pattern=pat)
+  pat = "Speed"
+  speed <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   # import mean dead dye intensity values
   datalist = list()
-  for (i in 1:length(stat_folders)){
-    pat=paste0("*Intensity_Mean_Ch=", metadata$dead_dye_channel[i], "_Img=1")
-    print(pat)
-    img_csv = read_ims_csv(stat_folders[i], pat)
+  for (i in 1:length(stat_folders$stats_folder)){
+    pat=paste0("Intensity_Mean_Ch=", metadata$dead_dye_channel[i], "_Img=1")
+    img_csv = read_ims_csv(stat_folders[i,], pattern=pat)
     if (!identical(img_csv, character(0))){
       datalist[[i]]=img_csv
     }
@@ -122,16 +124,18 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   # import Minimal distance to organoids
   datalist = list()
-  for (i in 1:length(stat_folders)){
-    pat=paste0("*Intensity_Min_Ch=", metadata$organoid_distance_channel[i], "_Img=1")
-    # print(pat)
-    datalist[[i]]=read_ims_csv(stat_folders[i], pat)
+  for (i in 1:length(stat_folders$stats_folder)){
+    pat=paste0("Intensity_Min_Ch=", metadata$organoid_distance_channel[i], "_Img=1")
+    img_csv = read_ims_csv(stat_folders[i,], pattern=pat)
+    if (!identical(img_csv, character(0))){
+      datalist[[i]]=img_csv
+    }
   }
   dist_org=do.call(rbind, datalist)
   
   # import Position
-  pat = "*Position.csv"
-  pos <- ldply(stat_folders, read_ims_csv, pattern=pat)
+  pat = "Position"
+  pos <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   ### Join all Imaris information
   master <- cbind(
@@ -139,13 +143,13 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     speed[,c("Speed" )], 
     dist_org[,c("Intensity Min")], 
     red_lym[,c("Intensity Mean")], 
-    pos[,c("Position X" ,"Position Y" ,"Position Z","filename", "stat_folder")]
+    pos[,c("Position X" ,"Position Y" ,"Position Z","filename", "stat_folder", "basename")]
   )
   
   ### Get the basename from the filename for combination with metadata
   # master$basename <- gsub("_Position.csv", "", master$filename, perl=TRUE)
   # master$basename=basename(master$basename)
-  colnames(master) <- c("displacement","Time","TrackID","ID","speed","dist_org","red_lym","X-pos","Y-pos","Z-pos", "filename", "tcell_stats_folder")
+  colnames(master) <- c("displacement","Time","TrackID","ID","speed","dist_org","red_lym","X-pos","Y-pos","Z-pos", "filename", "tcell_stats_folder", "basename")
   
   ### Join the information of metadata to master:
   master<-left_join(metadata,master)
@@ -370,7 +374,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   write.table(track_counts, file=paste0(qc_output_dir, "NrCellTracks_filtering.tsv"), sep="\t", row.names=FALSE)
   
   library(reshape2)
-  melted_track_counts = melt(track_counts,id.vars=c("name","organoid_line", "tcell_line", "exp_nr", "well"))
+  melted_track_counts = melt(track_counts,id.vars=c("basename","name","organoid_line", "tcell_line", "exp_nr", "well"))
   detach("package:reshape2", unload=TRUE)
   ggplot(melted_track_counts, aes(x=name, y=value, fill=variable)) + 
     geom_col(width=0.75, position="dodge") + 

@@ -12,7 +12,7 @@ tracks_provided=NULL
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
-  pars = yaml.load_file("/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/combined_demo_data/BEHAV3D_config.yml")
+  pars = yaml.load_file("/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/behavioral_transcriptomics_demo/BEHAV3D_config.yml")
 } else {
   option_list = list(
     make_option(c("-c", "--config"), type="character", default=NULL, 
@@ -79,7 +79,8 @@ Plot_Eng_CD8<-ggplot(master_clust_Live6_h_CD8, aes(x=factor(contact), fill=as.fa
   theme_void()+
   theme(aspect.ratio = 0.2, axis.text.y = element_text())+  
   coord_flip() +
-  facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line)
+  # facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line) #For plotting all wells separately
+  facet_grid(organoid_line  ~ tcell_line)
 Plot_Eng_CD8
 
 ### Now plot the super engagers and the never engagers. These cells under go two washing and separation steps:
@@ -122,7 +123,8 @@ Plot_SEng_CD8<-ggplot(master_clust_Live6_h_NEN_SEN_CD8, aes(fill=as.factor(clust
   theme_void()+
   theme(aspect.ratio = 0.2, axis.text.y = element_text())+  
   coord_flip() +
-  facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line)
+  # facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line) #For plotting all wells separately
+  facet_grid(organoid_line  ~ tcell_line)
 Plot_SEng_CD8
 
 #### Repeat the same for the CD4 cells
@@ -153,7 +155,8 @@ Plot_Eng_CD4<-ggplot(master_clust_Live6_h_CD4, aes(fill=as.factor(cluster), x=as
   theme_void()+
   theme(aspect.ratio = 0.2, axis.text.y = element_text())+  
   coord_flip() +
-  facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line)
+  # facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line) #For plotting all wells separately
+  facet_grid(organoid_line  ~ tcell_line)
 Plot_Eng_CD4
 
 ### Never engagers> T cells that were not in contact with organoids at 3 hours and also not at 5 hours.
@@ -190,7 +193,8 @@ Plot_SEng_CD4<-ggplot(master_clust_Live6_h_NEN_SEN_CD4, aes(fill=as.factor(clust
   theme_void()+
   theme(aspect.ratio = 0.2, axis.text.y = element_text())+  
   coord_flip() +
-  facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line)
+  # facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line) #For plotting all wells separately
+  facet_grid(organoid_line  ~ tcell_line)
 Plot_SEng_CD4
 
 ########################### CD8 ########################################################
@@ -227,7 +231,8 @@ Plot_x<-ggplot(CD8_engagement, aes(fill=as.factor(cluster), x=engagement)) +
   theme_void()+
   theme(aspect.ratio = 0.2, axis.text.y = element_text())+  
   coord_flip() +
-  facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line)
+  # facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line) #For plotting all wells separately
+  facet_grid(organoid_line  ~ tcell_line)
 Plot_x
 ### save data to csv same folder where the pseudotime clustering from Farid
 write.csv(CD8_behav,paste0(output_dir, "CD8_engagement_behavior_freq.csv"))
@@ -285,7 +290,7 @@ engagement_n<-CD4_engagement %>% group_by(engagement) %>%summarize(total_n = n()
 CD4_behav<-left_join(CD4_behav,engagement_n)
 CD4_behav$cluster_prop<-100*CD4_behav$frec/CD4_behav$total_n
 
-
+CD4_engagement$engagement <- factor(CD4_engagement$engagement, levels = c("never-engaged", "non-engaged", "engaged", "super-engaged"))
 Plot_y<-ggplot(CD4_engagement, aes(fill=as.factor(cluster), x=engagement)) + 
   geom_bar( position="fill")+ 
   ylab("Percentage")+
@@ -306,7 +311,8 @@ Plot_y<-ggplot(CD4_engagement, aes(fill=as.factor(cluster), x=engagement)) +
   theme_void()+
   theme(aspect.ratio = 0.2, axis.text.y = element_text())+  
   coord_flip() +
-  facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line)
+  # facet_grid(interaction(exp_nr, well, organoid_line)  ~ tcell_line) #For plotting all wells separately
+  facet_grid(organoid_line  ~ tcell_line)
 Plot_y
 
 ### save data to csv same folder where the pseudotime clustering from Farid

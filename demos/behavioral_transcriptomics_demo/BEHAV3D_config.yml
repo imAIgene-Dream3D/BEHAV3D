@@ -1,0 +1,53 @@
+#####################################################
+############## General data parameters ##############
+#####################################################
+
+#Data dir will be overwritten by the stat_folder column in the sample metadata.csv if provided
+data_dir: ""
+
+output_dir: "/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/behavioral_transcriptomics_demo/example_output"
+metadata_csv_path: "/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/behavioral_transcriptomics_demo/BEHAV3D_metadata.tsv"
+
+#####################################################
+### Parameters for T-cell dynamics classification ###
+#####################################################
+
+randomforest_path: "/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/references/TrainedRandomForest.Rdata"
+
+# Maximum length of experiment (all timepoints after will be cut)
+tcell_exp_duration: 155
+# Minimum track length to take into analysis. Filters out shorter tracks
+tcell_min_track_length: 60
+# Maximum track length to take into analysis. Cut longer tracks to the length defined below
+tcell_max_track_length: 60
+
+#####################################################
+### Parameters for Organoid dynamics classification ###
+#####################################################
+
+### Minimum volume for organoids to be taken along
+organoid_min_volume: 1000
+### Minimum track length to take into analysis. Filters out shorter tracks
+organoid_min_track_length: 40
+### Number of timepoints to take along from start of experiments
+organoid_exp_duration: 48
+
+###################################################################################
+### Optional parameters for behavioural clustering if no random forest provided ###
+###################################################################################
+# Decrease for more resolution
+umap_minimal_distance: 0.1
+# Increase if you have a larger number of cells
+umap_n_neighbors: 5
+# Increase for more clusters
+nr_of_clusters: 6
+
+###################################################################################
+### Optional parameters for in silico simulation of T cell populations separation by slow spin ###
+###################################################################################
+# Range of timepoints for first in silico spin (we do here a combination of timepoints to enrich the data)
+first_1: 86
+first_2: 95
+# Range of timepoints for second in silico spin (we do here a combination of timepoints to enrich the data)
+second_1: 145
+second_2: 154

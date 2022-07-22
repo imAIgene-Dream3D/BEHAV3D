@@ -39,31 +39,44 @@ if ( any(is.na(metadata$organoid_stats_folder)) ){
 }
 
 ### Function to import organoid data specifically from Imaris generated csv files
-read_ims_csv <- function(stat_folder, pattern) {
+read_ims_csv <- function(metadata_row, pattern) {
   read_plus <- function(flnm, stat_folder) {
     read_csv(flnm, skip = 3, col_types = cols(TrackID= col_character())) %>% 
       mutate(filename = flnm, stat_folder=stat_folder) 
   }
-  pattern_file <- list.files(path = stat_folder, pattern = pattern, full.names=TRUE)
+  basename=gsub("([.|()\\^{}+$*?]|\\[|\\])", "\\\\\\1", metadata_row[['basename']])
+  pattern <- paste0(basename,".*", pattern, ".*")
+  print(pattern)
+  pattern_file <- list.files(path = metadata_row[['stats_folder']], pattern = pattern, full.names=TRUE)
   if (identical(pattern_file, character(0))){
-    print(paste("No file with pattern '", pattern, "' found for", stat_folder))
+    print(paste("No file with pattern '", pattern, "' found for", metadata_row['stats_folder']))
   } 
-  ims_csv <- read_plus(pattern_file, stat_folder)
+  ims_csv <- read_plus(pattern_file, metadata_row['stats_folder'])
   return(ims_csv)
 }
 
-stat_folders <- metadata$organoid_stats_folder
-pat = "*Volume"
-volume_csv <- ldply(stat_folders, read_ims_csv, pattern=pat)
+stat_folders <- metadata[c("basename", "organoid_stats_folder")]
+colnames(stat_folders) <- c("basename", "stats_folder")
+
+pat = "Volume"
+volume_csv <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
 # import sum_red
-pat = paste0("*Intensity_Mean_Ch=", pars$dead_dye_channel, "_Img=1")
-sum_red_csv <- ldply(stat_folders, read_ims_csv, pattern=pat)
+datalist = list()
+for (i in 1:length(stat_folders$stats_folder)){
+  pat=paste0("Intensity_Mean_Ch=", metadata$dead_dye_channel[i], "_Img=1")
+  img_csv = read_ims_csv(stat_folders[i,], pattern=pat)
+  if (!identical(img_csv, character(0))){
+    datalist[[i]]=img_csv
+  }
+}
+sum_red_csv=do.call(rbind, datalist)
+
 # import area
-pat = "*Area"
-area_csv <- ldply(stat_folders, read_ims_csv, pattern=pat)
+pat = "Area"
+area_csv <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
 # import position
-pat = "*Position"
-pos_csv <- ldply(stat_folders, read_ims_csv, pattern=pat)
+pat = "Position"
+pos_csv <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
 
 live_deadROI <- cbind(volume_csv[,c("Volume","Time", "TrackID", "ID")], 
                       sum_red_csv[,c("Intensity Mean")], 
