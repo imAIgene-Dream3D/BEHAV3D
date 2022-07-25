@@ -7,6 +7,9 @@ library(reshape2)
 library(pheatmap)
 library(gplots)
 library(yaml)
+
+tracks_provided=NULL
+
 ## Import scRNA seq dataset
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
