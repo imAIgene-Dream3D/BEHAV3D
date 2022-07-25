@@ -51,3 +51,9 @@ first_2: 95
 # Range of timepoints for second in silico spin (we do here a combination of timepoints to enrich the data)
 second_1: 145
 second_2: 154
+
+###################################################################################
+### Parameters for behavioral-guidded transcriptomics ###
+###################################################################################
+
+scRNAseq_dataset: "/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/behavioral_transcriptomics_demo/data/scRNA_seq_dataset.rds"
