@@ -19,8 +19,12 @@ tracks_provided=NULL
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
-  # pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/tcell_paper/20220721_BEHAV3D2.0_testing/WT1_pooled/BEHAV3D_config.yml")
-  pars = yaml.load_file("/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/behavioral_transcriptomics_demo/BEHAV3D_config.yml")
+  ### Demo path
+  BEHAV3D_dir = paste0(dirname(dirname(dirname(rstudioapi::getSourceEditorContext()$path))),"/")
+  pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/tcell_demo/BEHAV3D_config.yml"))
+  
+  ### For your own file, uncomment following line and add own path to the BEHAV3D_config.yml
+  # pars = yaml.load_file("")
   
 } else {
   option_list = list(
@@ -183,8 +187,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   detach("package:reshape2", unload=TRUE)
   detach("package:plyr", unload=TRUE)
-  pars$tcell_exp_duration
-  
+
   master <- master[which(master$Time<=pars$tcell_exp_duration), ] ##Make sure that all the time-series have the same length, in this case 10hours
   
   track_counts=left_join(track_counts, count_tracks(master))
@@ -345,7 +348,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     theme_bw()
   
   ggsave(
-    paste0(qc_output_dir,"RedLym_distribution.pdf"), 
+    paste0(qc_output_dir,"DeadDye_distribution.pdf"), 
     device="pdf", height=210, width=297, units="mm"
   )
   

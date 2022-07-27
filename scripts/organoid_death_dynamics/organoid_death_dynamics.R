@@ -10,7 +10,13 @@ library(ggplot2)
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
-  pars = yaml.load_file("/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/combined_demo_data/BEHAV3D_config.yml")
+  ### Demo path
+  BEHAV3D_dir = paste0(dirname(dirname(dirname(rstudioapi::getSourceEditorContext()$path))),"/")
+  pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/organoid_demo/BEHAV3D_config.yml"))
+  
+  ### For your own file
+  pars = yaml.load_file("")
+
 } else {
   option_list = list(
     make_option(c("-c", "--config"), type="character", default=NULL, 
@@ -60,6 +66,7 @@ colnames(stat_folders) <- c("basename", "stats_folder")
 
 pat = "Volume"
 volume_csv <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
+
 # import sum_red
 datalist = list()
 for (i in 1:length(stat_folders$stats_folder)){
@@ -152,7 +159,7 @@ ggplot(live_deadROI7, aes(Time,dead_dye_mean)) +
 
 ggsave(paste0(output_dir,"Full_well_death_dynamics.pdf"), device="pdf")
 ### SAVE dataframe with all the well values for processing in a different script
-saveRDS(live_deadROI7, file = paste0(output_dir,"Full_well_death_dynamics"))
+saveRDS(live_deadROI7, file = paste0(output_dir,"Full_well_death_dynamics.rds"))
 
 live_deadROI7_exp_dur = live_deadROI7[live_deadROI7$Time <= pars$organoid_exp_duration,]
 ggplot(live_deadROI7_exp_dur, aes(Time,dead_dye_mean)) + 
@@ -166,7 +173,7 @@ ggplot(live_deadROI7_exp_dur, aes(Time,dead_dye_mean)) +
   facet_grid(organoid_line~well, scales = "free")+
   ggtitle("Mean of dead dye intensity in organoids per well")
 
-saveRDS(live_deadROI7_exp_dur, file = paste0(output_dir,"Exp_well_death_dynamics"))
+saveRDS(live_deadROI7_exp_dur, file = paste0(output_dir,"Exp_well_death_dynamics.rds"))
 ggsave(paste0(output_dir,"Exp_well_death_dynamics.pdf"), device="pdf")
 
 ### Process the death dynamics per individual organoid
@@ -201,13 +208,13 @@ ggplot(live_deadROI6, aes(Time,dead_dye_mean_rescaled, color = TrackID, group = 
   geom_smooth(method="loess", size = 1, se=F, span=1) +
   theme_bw() + 
   ylab("dead dye intensity") + 
-  xlab("Time (hours)") +
+  xlab("Time") +
   theme(axis.text.x = element_text(size=20), axis.text.y = element_text(size=20), axis.title.y = element_text(size = 20), axis.title.x = element_text(size = 20), legend.text=element_text(size= 10))+
   labs(color = "Organoid")+
   facet_grid(interaction(exp_nr,well,organoid_line)  ~ tcell_line, scales = "free")+
   ggtitle("Individual org increase in dead dye intensity TEG")
 
-saveRDS(live_deadROI6, file = paste0(output_dir,"Full_individual_orgs_death_dynamics"))  ### save here a dataframe with all the organoids values
+saveRDS(live_deadROI6, file = paste0(output_dir,"Full_individual_orgs_death_dynamics.rds"))  ### save here a dataframe with all the organoids values
 ggsave(paste0(output_dir,"Full_individual_orgs_death_dynamics.pdf"), device="pdf")
 
 live_deadROI6_exp_dur = live_deadROI6[live_deadROI6$Time<=pars$organoid_exp_duration,]
@@ -216,13 +223,13 @@ ggplot(live_deadROI6_exp_dur, aes(Time,dead_dye_mean_rescaled, color = TrackID, 
   geom_smooth(method="loess", size = 1, se=F, span=1) +
   theme_bw() + 
   ylab("dead dye intensity") + 
-  xlab("Time (hours)") +
+  xlab("Time") +
   theme(axis.text.x = element_text(size=20), axis.text.y = element_text(size=20), axis.title.y = element_text(size = 20), axis.title.x = element_text(size = 20), legend.text=element_text(size= 10))+
   labs(color = "Organoid")+
   facet_grid(interaction(exp_nr,well,organoid_line)  ~ tcell_line, scales = "free")+
   ggtitle("Individual org increase in dead dye intensity TEG")
 
-saveRDS(live_deadROI6_exp_dur, file = paste0(output_dir,"Exp_individual_orgs_death_dynamics"))  ### save here a dataframe with all the organoids values
+saveRDS(live_deadROI6_exp_dur, file = paste0(output_dir,"Exp_individual_orgs_death_dynamics.rds"))  ### save here a dataframe with all the organoids values
 ggsave(paste0(output_dir,"Exp_individual_orgs_death_dynamics.pdf"), device="pdf")
 
 library(dplyr)

@@ -1,5 +1,0 @@
-"name"	"organoid_line"	"tcell_line"	"exp_nr"	"well"	"unfiltered"	"filt_exp_duration"	"filt_minLength"	"filt_DeadCellStart"
-"10T CD4_TEG 1 well1"	"10T"	"CD4_TEG"	1	"well1"	681	393	88	86
-"10T CD8_TEG 1 well1"	"10T"	"CD8_TEG"	1	"well1"	919	539	106	86
-"10T CD4_TEG 2 well1"	"10T"	"CD4_TEG"	2	"well1"	1115	632	129	129
-"10T CD8_TEG 2 well1"	"10T"	"CD8_TEG"	2	"well1"	1485	848	188	147

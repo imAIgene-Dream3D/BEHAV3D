@@ -1,8 +1,0 @@
-basename	organoid_line	tcell_line	exp_nr	well	date	dead_dye_channel	organoid_distance_channel	tcell_contact_threshold	tcell_dead_dye_threshold	tcell_stats_folder	organoid_contact_threshold	organoid_dead_dye_threshold	organoid_stats_folder
-Demodataset1_CD4	13T	CD4_TEG	1	well4	28/07/2020	3	9	0.0012	10		0.0012	10	
-Demodataset1_CD8	13T	CD8_TEG	1	well4	28/07/2020	3	9	0.0012	10		0.0012	10	
-Demodataset2_CD4	10T	CD4_TEG	2	well6	27/10/2020	3	8	0.0001	10		0.0001	10	
-Demodataset2_CD8	10T	CD8_TEG	2	well6	28/10/2020	3	8	0.0001	10		0.0001	10	
-													
-													
-													

@@ -5,18 +5,27 @@ library(dplyr)
 library(stats)
 library(tidyr)
 library(ggplot2)
+library(optparse)
 
-
+force_redo=TRUE
 tracks_provided=NULL
 
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
   ### !!!!!! Change the path to the BEHAV3D_config file here if running the code in RStudio !!!!!!
-  pars = yaml.load_file("/Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0/demos/behavioral_transcriptomics_demo/BEHAV3D_config.yml")
-} else {
+  ### Demo path
+  BEHAV3D_dir = paste0(dirname(dirname(dirname(rstudioapi::getSourceEditorContext()$path))),"/")
+  pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/behavioral_transcriptomics_demo/BEHAV3D_config.yml"))
+  
+  ### For your own file
+  pars = yaml.load_file("")
+  
+    } else {
   option_list = list(
     make_option(c("-c", "--config"), type="character", default=NULL, 
                 help="Path to the BEHAV3D config file", metavar="character"),
+    make_option(c("-f", "--force_redo"), action="store_true", default=FALSE, 
+                help="Force the pipeline to re-import data even if files exists"),
     make_option(c("-t", "--tracks_rds"), type="character", default=NULL, 
                 help="(Optional) Path to RDS file containing clustered T cell track data", metavar="character")
   )
@@ -28,17 +37,29 @@ if (interactive()) {
   }
   pars = yaml.load_file(opt$config)
   tracks_provided=opt$tracks_rds
+  force_redo=opt$force_redo
+  BEHAV3D_dir = paste0(dirname(dirname(dirname(normalizePath(sub("--file=", "", commandArgs(trailingOnly = FALSE)[grep("--file=", commandArgs(trailingOnly = FALSE))]))))), "/")
 }
-
-if (is.null(tracks_provided)){
-  master_clust_Live6 = readRDS(file=paste0(pars$output_dir,"/tcell_behavior/results/","classified_tcell_track_data.rds"))
-} else {
-  master_clust_Live6 = readRDS(file=opt$tracks_rds)
-}
-
+  
 main_output_dir=pars$output_dir
 output_dir=paste0(main_output_dir,"/transcriptomics/results/")
 dir.create(output_dir, recursive=TRUE)
+
+pars$tcell_exp_duration=pars$second_2
+  pars$output_dir=output_dir
+write_yaml(pars, file=paste0(output_dir,"in_silico_BEHAV3D_config.yml"))
+
+if (is.null(tracks_provided)){
+  tcelL_class_script=paste0(BEHAV3D_dir, "/scripts/tcell_dynamics_classification/predict_tcell_behavior.R")
+  if (force_redo==TRUE){
+    system(paste0("Rscript '", tcelL_class_script, "' -c ", paste0("'",output_dir,"in_silico_BEHAV3D_config.yml' -f")))
+  } else{
+    system(paste0("Rscript '", tcelL_class_script, "' -c ", paste0("'",output_dir,"in_silico_BEHAV3D_config.yml'")))
+  }
+  master_clust_Live6 = readRDS(file=paste0(output_dir,"/tcell_behavior/results/","classified_tcell_track_data.rds"))
+} else {
+  master_clust_Live6 = readRDS(file=opt$tracks_rds)
+}
 
 #######################################################################################################################################################
 ######### Reproduce in silico the experiment performed in Fig 4a. Separate cells at each washing step and compute the behaviors of the cells that were in contact with an organoid vs the ones that weren't
@@ -200,7 +221,7 @@ Plot_SEng_CD4
 ########################### CD8 ########################################################
 ### calculare the proportions for combination with scRNA seq:
 ### create a condition for each experimental condition
-master_clust_Live6_h_CD8$engagement<-ifelse(master_clust_Live6_h_CD8$contact==1, "engaged","non-engaged")
+master_clust_Live6_h_CD8$engagement<-ifelse(master_clust_Live6_h_CD8$contact==1, "engager","nonengager")
 master_clust_Live6_h_NEN_SEN_CD8$engagement<-ifelse(master_clust_Live6_h_NEN_SEN_CD8$contact==1,"super-engaged","never-engaged")
 ## join both datasets:
 CD8_engagement<-rbind(master_clust_Live6_h_CD8,master_clust_Live6_h_NEN_SEN_CD8)
@@ -208,10 +229,10 @@ library(dplyr)
 CD8_behav<-CD8_engagement %>% group_by(cluster,engagement) %>%summarize(frec = n())
 engagement_n<-CD8_engagement %>% group_by(engagement) %>%summarize(total_n = n())
 CD8_behav<-left_join(CD8_behav,engagement_n)
-CD8_behav$cluster_prop<-100*CD8_behav$frec/CD8_behav$total_n
-colnames(CD8_behav)=c("behavioral_cluster", "exp_condition", "count", "total_n", "cluster_percentage")
+CD8_behav$cluster_prop<-CD8_behav$frec/CD8_behav$total_n
+colnames(CD8_behav)=c("behavioral_cluster", "exp_condition", "count", "total_n", "cluster_proportion")
 
-CD8_engagement$engagement <- factor(CD8_engagement$engagement, levels = c("never-engaged", "non-engaged", "engaged", "super-engaged"))
+CD8_engagement$engagement <- factor(CD8_engagement$engagement, levels = c("never-engaged", "nonengager", "engager", "super-engaged"))
 Plot_x<-ggplot(CD8_engagement, aes(fill=as.factor(cluster), x=engagement)) + 
   geom_bar( position="fill")+ 
   ylab("Percentage")+
@@ -280,7 +301,7 @@ saveRDS(mean_cont, paste0(output_dir,"min_contact_per_hour_13T_per_exp"))
 ########################### CD4 ########################################################
 ### calculare the proportions for combination with scRNA seq:
 ### create a condition for each experimental condition
-master_clust_Live6_h_CD4$engagement<-ifelse(master_clust_Live6_h_CD4$contact==1, "engaged","non-engaged")
+master_clust_Live6_h_CD4$engagement<-ifelse(master_clust_Live6_h_CD4$contact==1, "engager","nonengager")
 master_clust_Live6_h_NEN_SEN_CD4$engagement<-ifelse(master_clust_Live6_h_NEN_SEN_CD4$contact==1,"super-engaged","never-engaged")
 ## join both datasets:
 CD4_engagement<-rbind(master_clust_Live6_h_CD4,master_clust_Live6_h_NEN_SEN_CD4)
@@ -288,10 +309,10 @@ library(dplyr)
 CD4_behav<-CD4_engagement %>% group_by(cluster,engagement) %>%summarize(frec = n())
 engagement_n<-CD4_engagement %>% group_by(engagement) %>%summarize(total_n = n())
 CD4_behav<-left_join(CD4_behav,engagement_n)
-CD4_behav$cluster_prop<-100*CD4_behav$frec/CD4_behav$total_n
-colnames(CD4_behav)=c("behavioral_signature", "exp_condition", "count", "total_n", "cluster_percentage")
+CD4_behav$cluster_prop<-CD4_behav$frec/CD4_behav$total_n
+colnames(CD4_behav)=c("behavioral_signature", "exp_condition", "count", "total_n", "cluster_proportion")
 
-CD4_engagement$engagement <- factor(CD4_engagement$engagement, levels = c("never-engaged", "non-engaged", "engaged", "super-engaged"))
+CD4_engagement$engagement <- factor(CD4_engagement$engagement, levels = c("never-engaged", "nonengager", "engager", "super-engaged"))
 Plot_y<-ggplot(CD4_engagement, aes(fill=as.factor(cluster), x=engagement)) + 
   geom_bar( position="fill")+ 
   ylab("Percentage")+
@@ -324,3 +345,4 @@ pdf(paste0(output_dir,"Engager_Super_ENG_proportions_CD4_CD8.pdf"))
 Plot_x
 Plot_y
 dev.off()
+

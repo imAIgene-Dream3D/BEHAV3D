@@ -17,9 +17,7 @@ BEHAV3D runs in R studio or from command line and was tested on MacOS Big Sur wi
 ## Installation
 Download the repository to your PC via direct dowload or git clone https://github.com/alievakrash/BEHAV3D.git in Git Bash.
 
-For the required libraries, it is possible to run the "install_required_packages.R" script in the main BEHAV3D folder.
-
-BEHAV3D uses the following libraries:
+BEHAV3D uses the following R libraries:
 - abind
 - dplyr
 - dtwclust
@@ -63,7 +61,7 @@ BEHAV3D uses 2 specific fiels to set up analysis:\
 ### **BEHAV3D config**
 Contains all experiment-specific settings and paths to data for all modules in BEHAV3D\
 An example version can be found in [...BEHAV3D/configs/config_template.yml](https://github.com/RiosGroup/BEHAV3D/blob/main/configs/config_template.yml)\
-Explanation for the different variables are explained in that template
+Explanation on what each variable changes is commented in that template
 
 ### **Experimental metadata template**
 To correctly import data for BEHAV3D, it is required to fill in a .tsv that contains information per experiment performed, requiring information on:
@@ -73,8 +71,8 @@ To correctly import data for BEHAV3D, it is required to fill in a .tsv that cont
 - exp_nr
 - well
 - date
-- dead_dye_channel (Channel that contains the channel with the dead dye)
-- organoid_distance_channel (Channel that contains the distance to organoids)
+- dead_dye_channel (Channel # that contains the dead dye intensities)
+- organoid_distance_channel (Channel # that contains the distance to organoids)
 - tcell_contact_threshold (threshold of distance to other tcells to be considered touching))
 - tcell_dead_dye_threshold (threshold to consider an tcell "dead")
 - tcell_stats_folder (path to folder with tcell track statistics)
@@ -82,6 +80,18 @@ To correctly import data for BEHAV3D, it is required to fill in a .tsv that cont
 - organoid_dead_dye_threshold (threshold to consider an organoid "dead")
 - organoid_stats_folder (path to folder with organoid track statistics)
 
+For an example see: [...BEHAV3D/configs/metadata_template.tsv](https://github.com/RiosGroup/BEHAV3D/blob/main/configs/metadata_template.tsv)\
+
+## Demo
+
+You can run BEHAV3D on demo data to see examples of the results.\
+\
+There are 2 demos:
+- tcell_demo    (For 'tcell_dynamics_classification' and 'behavior_guided_transcriptomics')
+- organoid_demo (For 'organoid_death_dynamics')
+
+To set the configs up for running the demo, run [BEHAV3D/demos/set_up_demos.R](https://github.com/RiosGroup/BEHAV3D/blob/main/demos/set_up_demos.R)\
+This sets up the paths in the config for the demo, then look below on how to run the different modules on the demo
 
 ## Modules
 ### (1) Organoids death dynamics module
@@ -133,9 +143,34 @@ Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/predict_tcell_behavior.
 ```
 
 ***To run from Rstudio***\
-Change the config path on [line 23](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/T%20cell%20dynamics%20classification/predict_tcell_behavior.R#L23)\
+Change the config path on [line 27](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/T%20cell%20dynamics%20classification/predict_tcell_behavior.R#L23)\
 (Optional) Change the force_redo parameter on [line 16](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/T%20cell%20dynamics%20classification/predict_tcell_behavior.R#L16)\
 (Optional) Change the for parameter on [line 17](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/T%20cell%20dynamics%20classification/predict_tcell_behavior.R#L17)
+
+***Output_files***
+
+output rds:
+- raw_tcell_track_data.rds (Combined raw track data for all experiments)
+- processed_tcell_track_data.rds (Combined processed track data for all experiments; Added contact, death etc.)
+- behavioral_reference_map.rds   (Output of the t_cell behavior that can be used to train your own randomForest)
+- classified_tcell_track_data.rds (Combined classified track data - Either randomForest or clustering - for all experiments)
+- classified_tcell_track_data_summary.rds (Summary of classified track data - Either randomForest or clustering- for all experiments)
+- cluster_perc_tcell_track_data.rds (Cluster percentages for the track data - used for creation of RF_ClassProp_WellvsCelltype.pdf)
+- (If no randomForest) tcell_track_features.rds (Track features used to create Cluster_heatmap.pdf)
+
+output pdf:
+- (If randomForest supplied) RF_ClassProp_WellvsCelltype.pdf (Proportion of each randomForest predetermined cluster for all experiments)
+- (If no randomForest) Umap_unclustered.pdf
+- (If no randomForest) Umap_clustered.pdf 
+- (If no randomForest) Cluster_heatmap.pdf (Heatmap of track features for created clusters)
+- (If no randomForest) umap_cluster_percentage_bars_separate.pdf (Proportion of each cluster for each separate experiment)
+- (If no randomForest) umap_cluster_percentage_bars_combined.pdf (Proportion of each cluster for combiend experiments - based on organoid_lines and tcell_lines)
+
+quality control:
+- NrCellTracks_filtering_perExp.pdf (Shows the number of tracks remaining after each filtering step, shown per experiment)
+- NrCellTracks_filtering_perFilt.pdf    (Shows the number of tracks remaining after each filtering step, shown per filtering step)
+- TouchingvsNontouching_distribution.pdf    (Shows the number of Touching vs. Non-Touching T cells based on the defined "tcell_contact_threshold")
+- DeadDye_distribution.pdf (Shows the distribution of mean dead dye intensity in Tcells per experiment, can be used to set correct "tcell_dead_dye_threshold" for dead cells)
 
 ### ***(Optional) You can (re)train the randomforest with the following steps***
 - Run ...BEHAV3D/scripts/tcell_dynamics_classification/predict_tcell_behavior.R 
@@ -153,13 +188,23 @@ Predict in silico the proportions of cells with different behavioral signatures 
 
 ***To run from command line:***\
 ```
-Rscript ...BEHAV3D/scripts/behavior_guided_transcriptomics/1.in_silico_engager-superengager_selection.R -c </Path/to/BEHAV3D/config> [-t </Path/to/trackRDS>]
+Rscript ...BEHAV3D/scripts/behavior_guided_transcriptomics/1.in_silico_engager-superengager_selection.R -c </Path/to/BEHAV3D/config> [-t </Path/to/trackRDS>] [-f]
 Rscript ...BEHAV3D/scripts/behavior_guided_transcriptomics/2.behavioral-guided_transcriptomics.R -c </Path/to/BEHAV3D/config> [-t </Path/to/trackRDS>]
 ```
 
 ***To run from Rstudio:***\
 
-Change the config path in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/1.in_silico_engager-superengager_selection.R#L15) and [2.behavioral-guided_transcriptomics.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/2.behavioral-guided_transcriptomics.R#L16)
+Change the config path in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/1.in_silico_engager-superengager_selection.R#L21) and [2.behavioral-guided_transcriptomics.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/2.behavioral-guided_transcriptomics.R#L22)
 
-(Optional) Supply a tracks_rds in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/1.in_silico_engager-superengager_selection.R#L10) and [2.behavioral-guided_transcriptomics.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/2.behavioral-guided_transcriptomics.R#L11)
+(Optional) Supply a tracks_rds in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/1.in_silico_engager-superengager_selection.R#L11) and [2.behavioral-guided_transcriptomics.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/2.behavioral-guided_transcriptomics.R#L12)
 
+(Optional) Set force_redo=TRUE in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/1.in_silico_engager-superengager_selection.R#L10) to force re-importing and processing of tracking data (if you for example change values in the config)
+
+***Output_files***
+- raw_tcell_track_data.rds (Combined raw track data for all experiments)
+- processed_tcell_track_data.rds (Combined processed track data for all experiments; Added contact, death etc.)
+- behavioral_reference_map.rds   (Output of the t_cell behavior that can be used to train your own randomForest)
+- classified_tcell_track_data.rds (Combined classified track data - Either randomForest or clustering - for all experiments)
+- classified_tcell_track_data_summary.rds (Summary of classified track data - Either randomForest or clustering- for all experiments)
+- cluster_perc_tcell_track_data.rds (Cluster percentages for the track data - used for creation of RF_ClassProp_WellvsCelltype.pdf)
+- (If no randomForest) tcell_track_features.rds (Track features used to create Cluster_heatmap.pdf)
