@@ -1,9 +1,9 @@
 # BEHAV3D pipeline
 ## Overview
-BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study tumor death dynamics; immune cell behavior and behavior-guided transcriptomics. 
+BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study tumor death dynamics; immune cell behavior and behavior-guided transcriptomics.
 
 ## What type of data does BEHAV3D work with?
-- Any type of multispectral time-lapse 3D (or 2D) imaging data, where objects such as cells or organoids are in co-culture or single culture. 
+- Any type of multispectral time-lapse 3D (or 2D) imaging data, where objects such as cells or organoids are in co-culture or single culture.
 ## What output can BEHAV3D provide?
 - Any type of change of cell state that can be detected by a change in fluorescent intensity e.g. cell death, reporter, Ca2+ signalling
 - Classification of different types of cell dynamics
@@ -12,7 +12,7 @@ BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study 
 - Predicted behavior states infered to transcriptomic data
 
 ## Software and Hardware requirements
-BEHAV3D runs in R studio or from command line and was tested on MacOS Big Sur with R version 4.1.1. 
+BEHAV3D runs in R studio or from command line and was tested on MacOS Big Sur with R version 4.1.1.
 
 ## Installation
 Download the repository to your PC via direct dowload or git clone https://github.com/alievakrash/BEHAV3D.git in Git Bash.
@@ -45,7 +45,7 @@ BEHAV3D uses the following R libraries:
 - zoo
 
 ## Input data
-The current version of the pipeline works with objects (cells or organoids) time-lapse statistics that are aquired by tracking these objects in a commercially available software (Imaris, Oxford Instruments). 
+The current version of the pipeline works with objects (cells or organoids) time-lapse statistics that are aquired by tracking these objects in a commercially available software (Imaris, Oxford Instruments).
 However any type of time-lapse data can be processed with the pipeline, including measruements extract from MTrackJ (Fiji) or others. Main feature that is needed are coordinates for the objects and a common ID for the same object that is tracked over time. Aditional statistics describing the cell behavior such as speed, displacement are calculated by Imaris, however they can also be calculate by pre-processing algorithms from the cell coordinates. Statistics related to the expression of markers of interest (e.g live-dead cell dye) should be included to study the dynamic expression of these overtime. For statistics related to distance to organoids, use the *min_intensity in ch X* (corresponding to the channel number created by the Distance transformation Xtension. Rename it to be called *dist_org*.
 
 ## Dataset example
@@ -90,7 +90,7 @@ There are 2 demos:
 - tcell_demo    (For 'tcell_dynamics_classification' and 'behavior_guided_transcriptomics')
 - organoid_demo (For 'organoid_death_dynamics')
 
-To set the configs up for running the demo, run [BEHAV3D/demos/set_up_demos.R](https://github.com/RiosGroup/BEHAV3D/blob/main/demos/set_up_demos.R)\
+To set the configs up for running the demo, run [BEHAV3D/demos/set_up_demos.R](https://github.com/RiosGroup/BEHAV3D/blob/main/demos/set_up_demo.R)\
 This sets up the paths in the config for the demo, then look below on how to run the different modules on the demo
 
 ## Modules
@@ -161,7 +161,7 @@ output rds:
 output pdf:
 - (If randomForest supplied) RF_ClassProp_WellvsCelltype.pdf (Proportion of each randomForest predetermined cluster for all experiments)
 - (If no randomForest) Umap_unclustered.pdf
-- (If no randomForest) Umap_clustered.pdf 
+- (If no randomForest) Umap_clustered.pdf
 - (If no randomForest) Cluster_heatmap.pdf (Heatmap of track features for created clusters)
 - (If no randomForest) umap_cluster_percentage_bars_separate.pdf (Proportion of each cluster for each separate experiment)
 - (If no randomForest) umap_cluster_percentage_bars_combined.pdf (Proportion of each cluster for combiend experiments - based on organoid_lines and tcell_lines)
@@ -173,7 +173,7 @@ quality control:
 - DeadDye_distribution.pdf (Shows the distribution of mean dead dye intensity in Tcells per experiment, can be used to set correct "tcell_dead_dye_threshold" for dead cells)
 
 ### ***(Optional) You can (re)train the randomforest with the following steps***
-- Run ...BEHAV3D/scripts/tcell_dynamics_classification/predict_tcell_behavior.R 
+- Run ...BEHAV3D/scripts/tcell_dynamics_classification/predict_tcell_behavior.R
 - Run ...BEHAV3D/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R from command line
 ```
 Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R -i </Path/to/behavioral/reference/map> -o </Path/to/output/randomForest>
