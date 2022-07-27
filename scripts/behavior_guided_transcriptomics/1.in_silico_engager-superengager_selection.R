@@ -18,7 +18,7 @@ if (interactive()) {
   pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/behavioral_transcriptomics_demo/BEHAV3D_config.yml"))
   
   ### For your own file
-  pars = yaml.load_file("")
+  # pars = yaml.load_file("")
   
     } else {
   option_list = list(

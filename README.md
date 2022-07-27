@@ -15,7 +15,7 @@ BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study 
 BEHAV3D runs in R studio or from command line and was tested on MacOS Big Sur with R version 4.1.1.
 
 ## Installation
-Download the repository to your PC via direct dowload or git clone https://github.com/alievakrash/BEHAV3D.git in Git Bash.
+Download the repository to your PC via direct dowload or git clone https://github.com/RiosGroup/BEHAV3D in Git Bash.
 
 BEHAV3D uses the following R libraries:
 - abind
@@ -90,7 +90,7 @@ There are 2 demos:
 - tcell_demo    (For 'tcell_dynamics_classification' and 'behavior_guided_transcriptomics')
 - organoid_demo (For 'organoid_death_dynamics')
 
-To set the configs up for running the demo, run [BEHAV3D/demos/set_up_demos.R](https://github.com/RiosGroup/BEHAV3D/blob/main/demos/set_up_demo.R)\
+To set the configs up for running the demo, run [BEHAV3D/demos/set_up_demo.R](https://github.com/RiosGroup/BEHAV3D/blob/main/demos/set_up_demo.R)\
 This sets up the paths in the config for the demo, then look below on how to run the different modules on the demo
 
 ## Modules
@@ -105,7 +105,7 @@ Rscript ...BEHAV3D/scripts/organoid_death_dynamics/organoid_death_dynamics.R -c 
 
 ***To run from Rstudio:***
 
-Change the config path on [line 18](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Organoids%20death%20dynamics/organoid_death_dynamics.R#L13)
+Change the config path on [line 18](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/organoid_death_dynamics/organoid_death_dynamics.R#L18)
 
 ***Output_files***
 
@@ -143,9 +143,9 @@ Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/predict_tcell_behavior.
 ```
 
 ***To run from Rstudio***\
-Change the config path on [line 27](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/T%20cell%20dynamics%20classification/predict_tcell_behavior.R#L23)\
-(Optional) Change the force_redo parameter on [line 16](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/T%20cell%20dynamics%20classification/predict_tcell_behavior.R#L16)\
-(Optional) Change the for parameter on [line 17](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/T%20cell%20dynamics%20classification/predict_tcell_behavior.R#L17)
+Change the config path on [line 27](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L27)\
+(Optional) Change the force_redo parameter on [line 16](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L16)\
+(Optional) Change the for parameter on [line 17](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L17)
 
 ***Output_files***
 
@@ -178,7 +178,7 @@ quality control:
 ```
 Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R -i </Path/to/behavioral/reference/map> -o </Path/to/output/randomForest>
 ```
-- or change the [input parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/T%20cell%20dynamics%20classification/train_randomforest/train_random_forest_classifier.R#L14) and [output parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/T%20cell%20dynamics%20classification/train_randomforest/train_random_forest_classifier.R#L15)
+- or change the [input parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L14) and [output parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L15)
 
 
 ## (3) Behavior-guided transcriptomics module
@@ -194,11 +194,11 @@ Rscript ...BEHAV3D/scripts/behavior_guided_transcriptomics/2.behavioral-guided_t
 
 ***To run from Rstudio:***\
 
-Change the config path in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/1.in_silico_engager-superengager_selection.R#L21) and [2.behavioral-guided_transcriptomics.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/2.behavioral-guided_transcriptomics.R#L22)
+Change the config path in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/behavior_guided_transcriptomics/1.in_silico_engager-superengager_selection.R#L21) and [2.behavioral-guided_transcriptomics.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/behavior_guided_transcriptomics/2.behavioral-guided_transcriptomics.R#L22)
 
-(Optional) Supply a tracks_rds in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/1.in_silico_engager-superengager_selection.R#L11) and [2.behavioral-guided_transcriptomics.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/2.behavioral-guided_transcriptomics.R#L12)
+(Optional) Supply a tracks_rds in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/behavior_guided_transcriptomics/1.in_silico_engager-superengager_selection.R#L11) and [2.behavioral-guided_transcriptomics.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/behavior_guided_transcriptomics/2.behavioral-guided_transcriptomics.R#L12)
 
-(Optional) Set force_redo=TRUE in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/Behavior-guided%20transcriptomics/1.in_silico_engager-superengager_selection.R#L10) to force re-importing and processing of tracking data (if you for example change values in the config)
+(Optional) Set force_redo=TRUE in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/behavior_guided_transcriptomics/1.in_silico_engager-superengager_selection.R#L10) to force re-importing and processing of tracking data (if you for example change values in the config)
 
 ***Output_files***
 - raw_tcell_track_data.rds (Combined raw track data for all experiments)
