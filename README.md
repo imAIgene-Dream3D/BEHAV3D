@@ -73,11 +73,11 @@ To correctly import data for BEHAV3D, it is required to fill in a .tsv that cont
 - date
 - dead_dye_channel (Channel # that contains the dead dye intensities)
 - organoid_distance_channel (Channel # that contains the distance to organoids)
-- tcell_contact_threshold (threshold of distance to other tcells to be considered touching))
-- tcell_dead_dye_threshold (threshold to consider an tcell "dead")
+- tcell_contact_threshold (threshold of distance to other tcells to be considered touching, usually set to average cell diameter (10um), change if cells are of different size )
+- tcell_dead_dye_threshold (threshold to consider an tcell "dead", can be visually estimates from the Imaris file based on mean intentisity of ch "dead cells")
 - tcell_stats_folder (path to folder with tcell track statistics)
-- organoid_contact_threshold (threshold of distance to organoid to be considered touching)
-- organoid_dead_dye_threshold (threshold to consider an organoid "dead")
+- organoid_contact_threshold (threshold of distance to organoid to be considered touching,estimate from the Imaris file based on min distance to ch "distance transformation" in T cell touching the organoid. Note that while this value is usually fixed in the same experiment, it might change if image resolution is different or between Imaris versions)
+- organoid_dead_dye_threshold (threshold to consider an organoid "dead", same as for tcell_dead_dye_threshold)
 - organoid_stats_folder (path to folder with organoid track statistics)
 
 For an example see: [...BEHAV3D/configs/metadata_template.tsv](https://github.com/RiosGroup/BEHAV3D/blob/main/configs/metadata_template.tsv)\
