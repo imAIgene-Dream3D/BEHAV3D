@@ -3,13 +3,13 @@
 BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study tumor death dynamics; immune cell behavior and behavior-guided transcriptomics.
 
 ## What type of data does BEHAV3D work with?
-- Any type of multispectral time-lapse 3D (or 2D) imaging data, where objects such as cells or organoids are in co-culture or single culture.
+- Any type of multispectral time-lapse 3D (or 2D) imaging data, where objects such as tumor cells or tumor organoids are in co-culture with immune cells of interest.
 ## What output can BEHAV3D provide?
 - Any type of change of cell state that can be detected by a change in fluorescent intensity e.g. cell death, reporter, Ca2+ signalling
 - Classification of different types of cell dynamics
-- Correlation between dynamics of different cell types
-- Interaction between cell types
-- Predicted behavior states infered to transcriptomic data
+- Tumor death dynamics quantification
+- Backprojection of behavioral phenotype in Imaris 3D image visualization software 
+- Correlation between tumor death dynamics and behavioral phenotypes
 
 ## Software and Hardware requirements
 BEHAV3D runs in R studio or from command line and was tested on MacOS Big Sur with R version 4.1.1.
@@ -49,7 +49,7 @@ The current version of the pipeline works with objects (cells or organoids) time
 However any type of time-lapse data can be processed with the pipeline, including measruements extract from MTrackJ (Fiji) or others. Main feature that is needed are coordinates for the objects and a common ID for the same object that is tracked over time. Aditional statistics describing the cell behavior such as speed, displacement are calculated by Imaris, however they can also be calculate by pre-processing algorithms from the cell coordinates. Statistics related to the expression of markers of interest (e.g live-dead cell dye) should be included to study the dynamic expression of these overtime. For statistics related to distance to organoids, use the *min_intensity in ch X* (corresponding to the channel number created by the Distance transformation Xtension. Rename it to be called *dist_org*.
 
 ## Dataset example
-In this repository we provide example datasets consisting of a multispectral time-lapse 3D imaging dataset originated from a co-culture of engeneered T cells and Tumor derived organoids. Multispectral imaging allows to identify: Live/dead T cells; Live/Dead organoids. For downstream analysis of organoids: Either individual tumor derived organoids are tracked overtime or the total organoid volume per well is tracked. For each generated object we acquire information on the dead cell dye intensity and position and volume of individual organoids. For downstream analysis of T cell: T cells are tracked overtime. For each Tracked T cell object we aquire, position per timepoint, speed, square displacement, distance to an organoid, dead dye intensity, major and minor axis length (used in some downstream analysis).
+In this repository we provide example datasets consisting of a multispectral time-lapse 3D imaging dataset originated from a co-culture of engeneered T cells and Tumor derived organoids from the BEHAV3D [original paper](https://www.nature.com/articles/s41587-022-01397-w). Multispectral imaging allows to identify: Live/dead T cells; Live/Dead organoids. For downstream analysis of organoids: Either individual tumor derived organoids are tracked overtime or the total organoid volume per well is tracked. For each generated object we acquire information on the dead cell dye intensity and position and volume of individual organoids. For downstream analysis of T cell: T cells are tracked overtime. For each Tracked T cell object we aquire, position per timepoint, speed, square displacement, distance to an organoid, dead dye intensity, major and minor axis length (used in some downstream analysis).
 
 ## Repository
 This repository contains a collection of scripts and example datasets enabling the following dowstream analysis. Follow the structure in the script folder for each module and each analysis type. Introduce the corresponding folder/ file direction on your own computer where required (note that to specify directory paths in R (/) forward slash is recommended):
@@ -87,11 +87,11 @@ For an example see: [...BEHAV3D/configs/metadata_template.tsv](https://github.co
 You can run BEHAV3D on demo data to see examples of the results.\
 \
 There are 2 demos:
-- tcell_demo    (For 'tcell_dynamics_classification' and 'behavior_guided_transcriptomics')
+- tcell_demo    (For 'tcell_dynamics_classification' )
 - organoid_demo (For 'organoid_death_dynamics')
 
-To set the configs up for running the demo, run [BEHAV3D/demos/set_up_demo.R](https://github.com/RiosGroup/BEHAV3D/blob/main/demos/set_up_demo.R)\
-This sets up the paths in the config for the demo, then look below on how to run the different modules on the demo
+To set up the the demo, run [BEHAV3D/demos/set_up_demo.R](https://github.com/RiosGroup/BEHAV3D/blob/main/demos/set_up_demo.R)\
+This sets up the paths in the BEHAV3D config file for the demo, then run the different modules on the demo (look below).
 
 ## Modules
 ### (1) Organoids death dynamics module
@@ -181,30 +181,3 @@ Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/train_randomforest/trai
 - or change the [input parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L14) and [output parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L15)
 
 
-## (3) Behavior-guided transcriptomics module
-This module integrates information from single cell sequencing and behavioral profiling, by predicting in a behavioral phenotype of single cells in scRNA seq data. For more information see Figure 4 in https://www.biorxiv.org/content/10.1101/2021.05.05.442764v2
-
-Predict in silico the proportions of cells with different behavioral signatures in different experimental groups [non-engaged, non-engaged enriched, engaged, super-engaged]
-
-***To run from command line:***\
-```
-Rscript ...BEHAV3D/scripts/behavior_guided_transcriptomics/1.in_silico_engager-superengager_selection.R -c </Path/to/BEHAV3D/config> [-t </Path/to/trackRDS>] [-f]
-Rscript ...BEHAV3D/scripts/behavior_guided_transcriptomics/2.behavioral-guided_transcriptomics.R -c </Path/to/BEHAV3D/config> [-t </Path/to/trackRDS>]
-```
-
-***To run from Rstudio:***\
-
-Change the config path in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/behavior_guided_transcriptomics/1.in_silico_engager-superengager_selection.R#L21) and [2.behavioral-guided_transcriptomics.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/behavior_guided_transcriptomics/2.behavioral-guided_transcriptomics.R#L22)
-
-(Optional) Supply a tracks_rds in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/behavior_guided_transcriptomics/1.in_silico_engager-superengager_selection.R#L11) and [2.behavioral-guided_transcriptomics.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/behavior_guided_transcriptomics/2.behavioral-guided_transcriptomics.R#L12)
-
-(Optional) Set force_redo=TRUE in [1.in_silico_engager-superengager_selection.R](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/behavior_guided_transcriptomics/1.in_silico_engager-superengager_selection.R#L10) to force re-importing and processing of tracking data (if you for example change values in the config)
-
-***Output_files***
-- raw_tcell_track_data.rds (Combined raw track data for all experiments)
-- processed_tcell_track_data.rds (Combined processed track data for all experiments; Added contact, death etc.)
-- behavioral_reference_map.rds   (Output of the t_cell behavior that can be used to train your own randomForest)
-- classified_tcell_track_data.rds (Combined classified track data - Either randomForest or clustering - for all experiments)
-- classified_tcell_track_data_summary.rds (Summary of classified track data - Either randomForest or clustering- for all experiments)
-- cluster_perc_tcell_track_data.rds (Cluster percentages for the track data - used for creation of RF_ClassProp_WellvsCelltype.pdf)
-- (If no randomForest) tcell_track_features.rds (Track features used to create Cluster_heatmap.pdf)
