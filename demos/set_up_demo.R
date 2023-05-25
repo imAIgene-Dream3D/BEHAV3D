@@ -13,7 +13,6 @@ tcell_demo_config$data_dir = paste0(BEHAV3D_dir, "/demos/tcell_demo/data")
 tcell_demo_config$output_dir = paste0(BEHAV3D_dir, "/demos/tcell_demo/example_output")
 tcell_demo_config$metadata_csv_path = paste0(BEHAV3D_dir, "/demos/tcell_demo/BEHAV3D_metadata.tsv")
 tcell_demo_config$randomforest_path = paste0(BEHAV3D_dir, "/references/TrainedRandomForest.Rdata")
-tcell_demo_config$scRNAseq_dataset = paste0(BEHAV3D_dir, "/demos/tcell_demo/data/scRNA_seq_dataset.rds")
 
 write_yaml(tcell_demo_config, file=tcell_demo_config_path)
 
@@ -25,6 +24,5 @@ organoid_demo_config$data_dir = paste0(BEHAV3D_dir, "/demos/organoid_demo/data")
 organoid_demo_config$output_dir = paste0(BEHAV3D_dir, "/demos/organoid_demo/example_output")
 organoid_demo_config$metadata_csv_path = paste0(BEHAV3D_dir, "/demos/organoid_demo/BEHAV3D_metadata.tsv")
 organoid_demo_config$randomforest_path = paste0(BEHAV3D_dir, "/references/TrainedRandomForest.Rdata")
-organoid_demo_config$scRNAseq_dataset = paste0(BEHAV3D_dir, "/demos/organoid_demo/data/scRNA_seq_dataset.rds")
 
 write_yaml(organoid_demo_config, file=organoid_demo_config_path)
