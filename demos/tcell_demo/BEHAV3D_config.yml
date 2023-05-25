@@ -11,8 +11,3 @@ organoid_exp_duration: 300
 umap_minimal_distance: 0.1
 umap_n_neighbors: 5
 nr_of_clusters: 6
-first_1: 86
-first_2: 95
-second_1: 145
-second_2: 154
-scRNAseq_dataset: /Users/samdeblank/OneDrive - Prinses Maxima Centrum/github/BEHAV3D-2.0//demos/tcell_demo/data/scRNA_seq_dataset.rds
