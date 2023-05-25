@@ -45,6 +45,7 @@ BEHAV3D uses the following R libraries:
 - yaml
 - zoo
 
+Java installation is required for the functioning of some packages: https://www.java.com/en/download/manual.jsp
 ## Input data
 The current version of the pipeline works with objects (cells or organoids) time-lapse statistics that are aquired by tracking these objects in a commercially available software (Imaris, Oxford Instruments).
 However any type of time-lapse data can be processed with the pipeline, including measruements extract from MTrackJ (Fiji) or others. Main feature that is needed are coordinates for the objects and a common ID for the same object that is tracked over time. Aditional statistics describing the cell behavior such as speed, displacement are calculated by Imaris, however they can also be calculate by pre-processing algorithms from the cell coordinates. Statistics related to the expression of markers of interest (e.g live-dead cell dye) should be included to study the dynamic expression of these overtime. For statistics related to distance to organoids, use the *min_intensity in ch X* (corresponding to the channel number created by the Distance transformation Xtension. Rename it to be called *dist_org*.
@@ -57,7 +58,7 @@ This repository contains a collection of scripts and example datasets enabling t
 
 ## Set-up
 
-BEHAV3D uses 2 specific fiels to set up analysis:\
+BEHAV3D uses 2 specific fiels to customize the analysis:\
 
 ### **BEHAV3D config**
 Contains all experiment-specific settings and paths to data for all modules in BEHAV3D\
@@ -91,7 +92,7 @@ There are 2 demos:
 - tcell_demo    (For 'tcell_dynamics_classification' )
 - organoid_demo (For 'organoid_death_dynamics')
 
-To set up the the demo, run [BEHAV3D/demos/set_up_demo.R](https://github.com/RiosGroup/BEHAV3D/blob/main/demos/set_up_demo.R)\
+**>Step 1** To set up the demo on you local PC, run [BEHAV3D/demos/set_up_demo.R](https://github.com/RiosGroup/BEHAV3D/blob/main/demos/set_up_demo.R)\
 This sets up the paths in the BEHAV3D config file for the demo, then run the different modules on the demo (look below).
 
 ## Modules
@@ -106,7 +107,8 @@ Rscript ...BEHAV3D/scripts/organoid_death_dynamics/organoid_death_dynamics.R -c 
 
 ***To run from Rstudio:***
 
-Change the config path on [line 18](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/organoid_death_dynamics/organoid_death_dynamics.R#L18)
+**>Step 2** For demo mode run [organoid_death_dynamics script](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/organoid_death_dynamics/organoid_death_dynamics.R)
+If you have your own new data in a different folder, change the path to the **BEHAV3D config** file on [line 18](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/organoid_death_dynamics/organoid_death_dynamics.R#L18)
 
 ***Output_files***
 
@@ -144,7 +146,8 @@ Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/predict_tcell_behavior.
 ```
 
 ***To run from Rstudio***\
-Change the config path on [line 27](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L27)\
+**>Step 3** For demo run  [predict_tcell_behavior](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R)
+If you want to run new data in a different folder, change the path to the corresponding **BEHAV3D config** file on [line 27](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L27)\
 (Optional) Change the force_redo parameter on [line 16](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L16)\
 (Optional) Change the for parameter on [line 17](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L17)
 
@@ -180,5 +183,11 @@ quality control:
 Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R -i </Path/to/behavioral/reference/map> -o </Path/to/output/randomForest>
 ```
 - or change the [input parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L14) and [output parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L15)
+### (3) T cell behavior backprojection module
+
+This module allows you to export the classified T cell tracks to visualize them in Imaris.
+
+***To run from Rstudio***\
+**>Step 4** For demo run  the [backprojection_tcell_classification](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/backprojection_tcell_classification.R) script to save the behaviral classification for each processed T cell. This can then be uploaded in Imaris via the tracks search module.
 
 
