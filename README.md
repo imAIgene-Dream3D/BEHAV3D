@@ -183,7 +183,7 @@ quality control:
 Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R -i </Path/to/behavioral/reference/map> -o </Path/to/output/randomForest>
 ```
 - or change the [input parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L14) and [output parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L15)
-### (3) T cell behavior backprojection module
+### (3) T cell behavioral classification backprojection module
 
 This module allows you to export the classified T cell tracks to visualize them in Imaris.
 
