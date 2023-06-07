@@ -101,7 +101,7 @@ For an example see: [...BEHAV3D/configs/metadata_template.tsv](https://github.co
 
 ## Demo
 
-You can run BEHAV3D on demo data to see examples of the results.\
+You can run BEHAV3D on demo data to see examples of the results. This will take <15 minutes\
 \
 There are 2 demos:
 - tcell_demo    (For 'tcell_dynamics_classification' )
