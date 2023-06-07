@@ -18,32 +18,35 @@ BEHAV3D runs in R studio or from command line and was tested on MacOS Big Sur wi
 ## Installation
 Download the repository to your PC via direct dowload or git clone https://github.com/RiosGroup/BEHAV3D in Git Bash.
 
-BEHAV3D uses the following R libraries:
-- abind
-- dplyr
-- dtwclust
-- ggplot2
-- gplots
-- MESS
-- optparse
-- parallel
-- pheatmap
-- plyr
-- randomForest
-- readr
-- reshape2
-- scales
-- Seurat
-- spatstat
-- sp
-- stats
-- tibble
-- tidyr
-- umap
-- viridis
-- xlsx
-- yaml
-- zoo
+BEHAV3D uses the following R libraries (version used with R 4.3.0) :
+| Package  | Version |
+| ------------- | ------------- |
+| abind  | 1.4-5  |
+| dplyr  | 1.1.2  |
+| dtwclust  | 5.5.12  |
+| ggplot2  | 1.1.2  |
+| gplots  | 1.4-5  |
+| MESS  | 0.5.9  |
+| optparse  | 1.7.3  |
+| parallel  | 4.3.0  |
+| pheatmap  | 1.0.12  |
+| plyr  | 1.8.8  |
+| randomForest  | 4.7-1.1  |
+| readr  | 2.1.4  |
+| reshape2  | 1.4.4  |
+| scales  | 1.2.1  |
+| Seurat  | 4.3.0  |
+| spatstat  | 3.0-6  |
+| sp  | 1.6-1  |
+| stats  | 4.3.0  |
+| tibble  | 3.2.1  |
+| tidyr  | 1.3.0  |
+| umap  | 0.2.10.0  |
+| viridis  | 0.6.3  |
+| xlsx  | 0.6.5  |
+| yaml  | 2.3.7  |
+| zoo  | 1.8-12  |
+
 
 Java installation is required for the functioning of some packages: https://www.java.com/en/download/manual.jsp
 ## Input data
