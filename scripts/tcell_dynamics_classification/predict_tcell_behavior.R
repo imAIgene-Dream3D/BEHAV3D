@@ -428,7 +428,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
 ####### OTHERWISE, PERFORM UNSUPERVISED UMAP CLUSTERING
 ##############################################################################################################################
 
-if (model_path != ""){
+if (!is.null(model_path) && model_path != "") {
   print("#################################################")
   print("#### Model_path defined, performing random forest classification...")
   print("#################################################")
