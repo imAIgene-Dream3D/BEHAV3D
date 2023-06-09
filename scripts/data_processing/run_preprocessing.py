@@ -45,34 +45,36 @@ def run_bash(script, path_bash="bash", stdin=None):
     return(stdout.decode("utf-8") , stderr.decode("utf-8") , proc.returncode)
 
 ## Perform pixel classification
-pix_out_path = Path(output_dir, f"{Path(data_path).stem}_pixclass.tiff")
+pix_out_path = Path(output_dir, f"{Path(data_path).stem}_probabilities.tiff")
 command = (
     f"{ilastik_path} --headless "
     f"--project='{ilastik_pix_clas_model}' "
     f"--output_format='multipage tiff' "
     f"--output_filename_format={pix_out_path} "
     f"--output_axis_order=ctzyx "
-    f"--export_source='Simple Segmentation' "
+    f"--export_source='Probabilities' "
     f"{data_path}"
 )
 out, error, returncode = run_bash(command)
+
 ## Perform object classification
 preobj_out_path = Path(output_dir, f"{Path(data_path).stem}_preobjects.tiff")
 command = (
     f"{ilastik_path} --headless "
-    f"--project='{ilastik_pix_clas_model}' "
+    f"--project='{ilastik_obj_clas_model}' "
     f"--output_format='multipage tiff' "
     f"--output_filename_format={preobj_out_path} "
-    f"--output_axis_order=zyx "
-    f"--export_source='object identities' "
+    # f"--output_axis_order=zyx "
+    f"--export_source='simple segmentation' "
     f"{pix_out_path}"
 )
+out, error, returncode = run_bash(command)
 
 ## Perform pixel classification
 finobj_out_path = Path(output_dir, f"{Path(data_path).stem}_finalobjects.tiff")
 command = (
     f"{ilastik_path} --headless "
-    f"--project='{ilastik_pix_clas_model}' "
+    f"--project='{ilastik_postproc_model}' "
     f"--output_format='multipage tiff' "
     f"--output_filename_format={finobj_out_path} "
     f"--output_axis_order=zyx "

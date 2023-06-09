@@ -2,4 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
+*.ilp
+*.tiff
+test/
 **/.DS_Store
