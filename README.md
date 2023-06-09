@@ -8,7 +8,7 @@ BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study 
 - Any type of change of cell state that can be detected by a change in fluorescent intensity e.g. cell death, reporter, Ca2+ signalling
 - Classification of different types of cell dynamics
 - Tumor death dynamics quantification
-- Backprojection of behavioral phenotype in Imaris 3D image visualization software 
+- Backprojection of behavioral phenotype in Imaris 3D image visualization software
 - Correlation between tumor death dynamics and behavioral phenotypes
 ## How to cite this pipeline
 Dekkers JF*, Alieva M*, Cleven A, Keramati F, Wezenaar AKL, van Vliet EJ, Puschhof J, Brazda P, Johanna I, Meringa AD, Rebel HG, Buchholz MB, Barrera Román M, Zeeman AL, de Blank S, Fasci D, Geurts MH, Cornel AM, Driehuis E, Millen R, Straetemans T, Nicolasen MJT, Aarts-Riemens T, Ariese HCR, Johnson HR, van Ineveld RL, Karaiskaki F, Kopper O, Bar-Ephraim YE, Kretzschmar K, Eggermont AMM, Nierkens S, Wehrens EJ, Stunnenberg HG, Clevers H, Kuball J, Sebestyen Z, Rios AC. **Uncovering the mode of action of engineered T cells in patient cancer organoids**. * *equal contibution* Nat Biotechnol. 2023 Jan https://doi.org/10.1038/s41587-022-01397-w
@@ -82,20 +82,22 @@ Explanation on what each variable changes is commented in that template
 
 ### **Experimental metadata template**
 To correctly import data for BEHAV3D, it is required to fill in a .tsv that contains information per experiment performed, requiring information on:
-- Experiment basename
-- organoid_line
-- tcell_line
+- Experiment basename (same name as your folder where the surfaces exported statistics are stored without "_Statistics", that is created by default)
+- organoid_line (tumor or organoid line used in that particular well)
+- tcell_line (name of the T cell concept and subpopulation if different populations were labelled)
 - exp_nr
 - well
 - date
 - dead_dye_channel (Channel # that contains the dead dye intensities)
-- organoid_distance_channel (Channel # that contains the distance to organoids)
+- organoid_distance_channel (Channel # that contains the distance transformation, if distance transformation step was not used, write any channel number that you have)
 - tcell_contact_threshold (threshold of distance to other tcells to be considered touching, usually set to average cell diameter (10um), change if cells are of different size )
 - tcell_dead_dye_threshold (threshold to consider an tcell "dead", can be visually estimates from the Imaris file based on mean intentisity of ch "dead cells")
-- tcell_stats_folder (path to folder with tcell track statistics)
+- (optional)tcell_stats_folder (path to folder with tcell track statistics)
 - organoid_contact_threshold (threshold of distance to organoid to be considered touching,estimate from the Imaris file based on min distance to ch "distance transformation" in T cell touching the organoid. Note that while this value is usually fixed in the same experiment, it might change if image resolution is different or between Imaris versions)
 - organoid_dead_dye_threshold (threshold to consider an organoid "dead", same as for tcell_dead_dye_threshold)
-- organoid_stats_folder (path to folder with organoid track statistics)
+- (optional)organoid_stats_folder (path to folder with organoid track statistics)
+- tumor_name (name of the tumor/organoids surfaces that were created with imaris, only required if you Object-Object statistics to import the distance to tumor data)
+- Object_distance (TRUE if Object-Object statistics were used to import the data related to T cell distance to tumor cells/ FALSE if distance transformation was for this step )
 
 For an example see: [...BEHAV3D/configs/metadata_template.tsv](https://github.com/RiosGroup/BEHAV3D/blob/main/configs/metadata_template.tsv)\
 
@@ -203,6 +205,4 @@ Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/train_randomforest/trai
 This module allows you to export the classified T cell tracks to visualize them in Imaris.
 
 ***To run from Rstudio***\
-**>Step 4** For demo run  the [backprojection_tcell_classification](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/backprojection_tcell_classification.R) script to save the behaviral classification for each processed T cell. This can then be uploaded in Imaris via the tracks search module.
-
-
+**>Step 4** For demo run  the [backprojection_tcell_classification](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/backprojection_tcell_classification.R) script to save the behavioral classification for each processed T cell. This can then be uploaded in Imaris via the tracks search module.

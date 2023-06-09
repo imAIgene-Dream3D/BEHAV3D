@@ -126,16 +126,28 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   }
   red_lym=do.call(rbind, datalist)
   
-  # import Minimal distance to organoids
-  datalist = list()
-  for (i in 1:length(stat_folders$stats_folder)){
-    pat=paste0("Intensity_Min_Ch=", metadata$organoid_distance_channel[i], "_Img=1")
-    img_csv = read_ims_csv(stat_folders[i,], pattern=pat)
-    if (!identical(img_csv, character(0))){
-      datalist[[i]]=img_csv
+  # import distance to organoids (if calculated with distance transformation or with object distance)
+  
+  datalist2 = list()
+  
+  for (i in 1:length(stat_folders$stats_folder)) {
+      if (metadata$Object_distance[i] == TRUE) {
+      # import Object distance to organoids
+      pat <- paste0("Shortest_Distance_to_Surfaces_Surfaces=", metadata$tumor_name[i])
+      img_csv <- read_ims_csv(stat_folders[i,], pattern = pat)
+      if (!identical(img_csv, character(0))) {
+        datalist2[[i]] <- img_csv
+      }
+    } else {
+      # import Minimal distance to organoids (distance transformation channel)
+      pat <- paste0("Intensity_Min_Ch=", metadata$organoid_distance_channel[i], "_Img=1")
+      img_csv <- read_ims_csv(stat_folders[i,], pattern = pat)
+      if (!identical(img_csv, character(0))) {
+        datalist2[[i]] <- img_csv
+      }
     }
   }
-  dist_org=do.call(rbind, datalist)
+  dist_org = do.call(rbind, datalist2)
   
   # import Position
   pat = "Position"
@@ -145,7 +157,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   master <- cbind(
     displacement[,c("Displacement^2","Time","TrackID" ,"ID")], 
     speed[,c("Speed" )], 
-    dist_org[,c("Intensity Min")], 
+    dist_org[,c(1)], 
     red_lym[,c("Intensity Mean")], 
     pos[,c("Position X" ,"Position Y" ,"Position Z","filename", "stat_folder", "basename")]
   )
