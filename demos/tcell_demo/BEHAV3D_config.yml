@@ -1,7 +1,7 @@
-data_dir: E:/SURF_2/Scripts/R/scripts/BEHAV3D//demos/tcell_demo/data
-output_dir: E:/SURF_2/Scripts/R/scripts/BEHAV3D//demos/tcell_demo/example_output
-metadata_csv_path: E:/SURF_2/Scripts/R/scripts/BEHAV3D//demos/tcell_demo/BEHAV3D_metadata.tsv
-randomforest_path: E:/SURF_2/Scripts/R/scripts/BEHAV3D//references/TrainedRandomForest.Rdata
+data_dir: /Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-dev//demos/tcell_demo/data
+output_dir: /Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-dev//demos/tcell_demo/example_output
+metadata_csv_path: /Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-dev//demos/tcell_demo/BEHAV3D_metadata.tsv
+randomforest_path: /Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-dev//references/TrainedRandomForest.Rdata
 tcell_exp_duration: 400
 tcell_min_track_length: 60
 tcell_max_track_length: 60
