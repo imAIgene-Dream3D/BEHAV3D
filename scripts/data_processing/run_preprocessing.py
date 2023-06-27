@@ -4,6 +4,8 @@ import argparse
 import subprocess
 import yaml
 from pathlib import Path
+from tifffile import imread, imwrite
+from trackmate import run_trackmate
 
 parser = argparse.ArgumentParser()
 parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
@@ -13,7 +15,7 @@ args = parser.parse_args()
 with open(args.config, "r") as parameters:
     config=yaml.load(parameters, Loader=yaml.SafeLoader)
 
-with open("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D/scripts/data_processing/config.yml", "r") as parameters:
+with open("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/scripts/data_processing/config.yml", "r") as parameters:
     config=yaml.load(parameters, Loader=yaml.SafeLoader)
     
 data_path = config['data_path']
@@ -45,12 +47,15 @@ def run_bash(script, path_bash="bash", stdin=None):
     return(stdout.decode("utf-8") , stderr.decode("utf-8") , proc.returncode)
 
 ## Perform pixel classification
-pix_out_path = Path(output_dir, f"{Path(data_path).stem}_probabilities.tiff")
+pix_prob_path = Path(output_dir, f"{Path(data_path).stem}_probabilities.h5")
 command = (
     f"{ilastik_path} --headless "
     f"--project='{ilastik_pix_clas_model}' "
-    f"--output_format='multipage tiff' "
-    f"--output_filename_format={pix_out_path} "
+    # f"--output_format='multipage tiff' "
+    # f"--output_filename_format={pix_prob_path} "
+    f"--output_format='hdf5' "
+    f"--output_internal_path /probabilities "
+    f"--output_filename_format={pix_prob_path} "
     f"--output_axis_order=ctzyx "
     f"--export_source='Probabilities' "
     f"{data_path}"
@@ -58,35 +63,54 @@ command = (
 out, error, returncode = run_bash(command)
 
 ## Perform object classification
-preobj_out_path = Path(output_dir, f"{Path(data_path).stem}_preobjects.tiff")
+preobj_out_path = Path(output_dir, f"{Path(data_path).stem}_preobjects.h5")
+preobj_feature_csv_path = Path(output_dir, f"{Path(data_path).stem}_preobject_features.h5")
 command = (
     f"{ilastik_path} --headless "
     f"--project='{ilastik_obj_clas_model}' "
-    f"--output_format='multipage tiff' "
+    # f"--output_format='multipage tiff' "
+    # f"--output_filename_format={preobj_out_path} "
+    f"--output_format='hdf5' "
+    f"--output_internal_path /pre_objects "
     f"--output_filename_format={preobj_out_path} "
-    # f"--output_axis_order=zyx "
-    f"--export_source='simple segmentation' "
-    f"{pix_out_path}"
+    f"--table_filename={preobj_feature_csv_path} "
+    f"--raw_data {data_path} " 
+    f"--prediction_maps {pix_prob_path}/probabilities "
+
+    f"--export_source='object identities' "
 )
 out, error, returncode = run_bash(command)
 
 ## Perform pixel classification
+# finobj_out_path = Path(output_dir, f"{Path(data_path).stem}_finalobjects.h5")
 finobj_out_path = Path(output_dir, f"{Path(data_path).stem}_finalobjects.tiff")
 command = (
     f"{ilastik_path} --headless "
     f"--project='{ilastik_postproc_model}' "
     f"--output_format='multipage tiff' "
+    #  f"--output_format='hdf5' "
     f"--output_filename_format={finobj_out_path} "
-    f"--output_axis_order=zyx "
-    f"--export_source='object identities' "
-    f"{preobj_out_path}"
+    # f"--output_internal_path /segments "
+    # f"--output_axis_order=zyx "
+    f"--raw_data {data_path} " 
+    f"--segmentation_image {preobj_out_path}/pre_objects "
+    f"--export_source='Object-Identities' "
+)
+out, error, returncode = run_bash(command)
+
+im = imread(finobj_out_path)
+imwrite(
+   finobj_out_path,
+    im.astype('uint16'),
+    imagej=True,
+    metadata={'axes':'TZYX'}
 )
 
-
-print(command)
-out, error, returncode = run_bash(command)
 ### Track the data using TrackMate
-
+ # https://imagej.net/plugins/trackmate/scripting/scripting
+ # https://forum.image.sc/t/trackmate-scripting-command-to-generate-full-track-statistics-table-from-analysis/10166/2
+tracks=run_trackmate(str(finobj_out_path))
+ 
 ### Process and extract features from the tracks
 
 ### Combine into single table with all features per track
