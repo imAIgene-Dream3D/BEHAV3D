@@ -2,8 +2,8 @@ data_path: "/Users/samdeblank/surfdrive/Documents/1.projects/BHVD_BEHAV3D/BEHAV3
 output_dir: "/Users/samdeblank/surfdrive/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test"
 
 ilastik_path: "/Applications/ilastik-1.4.0b27-OSX.app/Contents/ilastik-release/run_ilastik.sh"
-ilastik_pixel_classifier_model: "/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/scripts/data_processing/ilastik/AIM_MB2_pix_clas_v5.ilp"
-ilastik_object_classifier_model: "/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/scripts/data_processing/ilastik/AIM_MB2_obj_clas_v4.ilp"
-ilastik_object_postprocessing_model: "/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/scripts/data_processing/ilastik/AIM_MB2_faketrack_obj_split_v4.ilp"
+ilastik_pixel_classifier_model: "/Users/samdeblank/surfdrive/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_pix_clas_v5.ilp"
+ilastik_object_classifier_model: "/Users/samdeblank/surfdrive/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_obj_clas_v4.ilp"
+ilastik_object_postprocessing_model: "/Users/samdeblank/surfdrive/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_faketrack_obj_split_v4.ilp"
 
 trackmate_path: ""

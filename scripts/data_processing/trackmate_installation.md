@@ -8,4 +8,8 @@ https://forum.image.sc/t/running-trackmate-using-pyimagej-headless-on-mac/69129/
 conda install -c conda-forge pyimagej
 conda install java
 
+
+
+
+
 conda install -c ome omero-py
