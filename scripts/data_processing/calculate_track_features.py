@@ -1,11 +1,13 @@
 import numpy as np
 import pandas as pd
+from scipy.ndimage.morphology import distance_transform_edt
+from skimage.measure import regionprops_table, regionprops
 
-def calculate_track_features(df_tracks, element_size_x, element_size_y, element_size_z):
+
+def calculate_movement_features(df_tracks, element_size_x, element_size_y, element_size_z):
     # element_size_x=3.54
     # element_size_y=3.54
     # element_size_z=1.2
-
 
     df_tracks["real_x"]=df_tracks["position_x"]*element_size_x
     df_tracks["real_y"]=df_tracks["position_y"]*element_size_y
@@ -52,6 +54,17 @@ def calculate_track_features(df_tracks, element_size_x, element_size_y, element_
     df_tracks_processed = pd.concat(df_tracks_processed)
     return(df_tracks_processed)
 
-def calculate_organoid_distance(df_tracks, organoid_segments, element_size_x, element_size_y, element_size_z):
+def calculate_organoid_distance(tcell_segments, organoid_segments, element_size_x, element_size_y, element_size_z):
+    df_dist_organoid = []
+    for t, tcell_stack in enumerate(tcell_segments):
+        org_stack = organoid_segments[t,:,:,:]
+        mask_org= np.ma.masked_where(org_stack==0, org_stack)
+        dist_org=distance_transform_edt(mask_org.mask)
+        properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=dist_org, properties=['label', 'intensity_min']))
+        properties["position_t"]=t
+        df_dist_organoid.append(properties)
+    df_dist_organoid = pd.concat(df_dist_organoid)
+    df_dist_organoid=df_dist_organoid.rename(columns={"label":"track_id"})
+    return(df_dist_organoid)
+
     
-    mask_org= np.ma.masked_where(data!=0, data)
