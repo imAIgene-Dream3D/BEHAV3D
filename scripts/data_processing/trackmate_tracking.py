@@ -4,8 +4,66 @@ import imagej
 import scyjava as sj
 import pandas as pd
 import numpy as np
+import psutil
+from pathlib import Path
+import yaml
+from tifffile import imread, imwrite
 
-def run_trackmate(image_path):
+parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
+parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
+args = parser.parse_args()
+
+def main(config):
+    with open("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/scripts/data_processing/config.yml", "r") as parameters:
+        config=yaml.load(parameters, Loader=yaml.SafeLoader)
+    
+    sample_name = config['sample_name']
+    output_dir = config['output_dir']
+
+    element_size_x=config['element_size_x']
+    element_size_y=config['element_size_y'] 
+    element_size_z=config['element_size_z']
+    element_size_unit=config['element_size_unit']
+    
+    ### Track the data using TrackMate
+    tcell_segments_path = Path(output_dir, f"{sample_name}_tcell_segments.tiff")   
+    df_tracks=run_trackmate(
+        image_path=str(tcell_segments_path),
+        element_size_x=element_size_x,
+        element_size_y=element_size_y,
+        element_size_z=element_size_z,
+        element_size_unit=element_size_unit
+        )
+    # Add 1 to every track_id so 0 is not a track in the image (should be background)
+    df_tracks["track_id"]=df_tracks["track_id"]+1
+    tracks_out_path = Path(output_dir, f"{sample_name}_tracks.csv")
+    df_tracks.to_csv(tracks_out_path, sep=",", index=False)
+    ### Assign the tracks to existing segments
+    # Loop through spots, link to segments in the image and replace label with track_id
+    tcell_segments = imread(tcell_segments_path)
+    tcell_tracked_out_path= Path(output_dir, f"{sample_name}_tcells_tracked.tiff")
+    tcells_tracked = np.zeros_like(tcell_segments)
+    for _, row in df_tracks.iterrows():
+        t,z,y,x = row["position_t"],row["position_z"], row["position_y"], row["position_x"]
+        t,z,y,x = round(t), round(z), round(y), round(x)
+        corr_seg = tcell_segments[t,z,y,x]
+        tcells_tracked[t,:,:,:][tcell_segments[t,:,:,:]==corr_seg]=row["track_id"]
+        # im_track = im_track[im==corr_seg]=row["track_id"]
+    imwrite(
+        tcell_tracked_out_path,
+        tcells_tracked
+    ) 
+
+def run_trackmate(
+    image_path,
+    element_size_x, 
+    element_size_y, 
+    element_size_z,
+    element_size_unit
+    ):
+    available_75perc_memory=int(psutil.virtual_memory().available*0.75/(1024**3))
+    sj.config.add_options(f'-Xmx{available_75perc_memory}g')
     ij = imagej.init('sc.fiji:fiji', mode='headless')
     IJ = ij.IJ
     WindowManager=ij.WindowManager
@@ -21,10 +79,10 @@ def run_trackmate(image_path):
     FeatureFilter = sj.jimport('fiji.plugin.trackmate.features.FeatureFilter')
     Logger = sj.jimport('fiji.plugin.trackmate.Logger')
 
-    # image_path="/Users/samdeblank/surfdrive/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/testdata_medium_finalobjects.tiff"
     print(image_path)
     imp = IJ.openImage(image_path)
-    imp.show()
+    IJ.run(imp, "Properties...", f"unit={element_size_unit} pixel_width={element_size_x} pixel_height={element_size_y} voxel_depth={element_size_z}")
+    # imp.show()
     
     #----------------------------
     # Create the model object now
@@ -47,17 +105,10 @@ def run_trackmate(image_path):
     # Configure detector - We use the Strings for the keys
     settings.detectorFactory = LabelImageDetectorFactory()
     settings.detectorSettings = settings.detectorFactory.getDefaultSettings()
-    # settings.detectorSettings = {
-    #     # 'DO_SUBPIXEL_LOCALIZATION' : True,
-    #     # 'RADIUS' : 2.5,
-    #     'TARGET_CHANNEL' : 1,
-    #     'SIMPLIFY_CONTOURS' : False,
-    #     # 'DO_MEDIAN_FILTERING' : False,
-    # }  
     
-    # Configure spot filters - Classical filter on quality
-    filter1 = FeatureFilter('QUALITY', 30, True)
-    settings.addSpotFilter(filter1)
+    # # Configure spot filters - Classical filter on quality
+    # filter1 = FeatureFilter('QUALITY', 30, True)
+    # settings.addSpotFilter(filter1)
     
     # Configure tracker - We want to allow merges and fusions
     settings.trackerFactory = SparseLAPTrackerFactory()
@@ -125,3 +176,8 @@ def run_trackmate(image_path):
             df_spots = pd.concat([df_spots, new_row], ignore_index=True)
             
     return(df_spots)
+
+if __name__ == "__main__":
+    with open(args.config, "r") as parameters:
+        config=yaml.load(parameters, Loader=yaml.SafeLoader)
+    main(config)
