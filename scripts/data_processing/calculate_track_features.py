@@ -4,6 +4,7 @@ from scipy.ndimage.morphology import distance_transform_edt
 from skimage.measure import regionprops_table
 import argparse
 import yaml
+from tifffile import imread, imwrite
 
 parser = argparse.ArgumentParser()
 parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')

@@ -8,6 +8,7 @@ import psutil
 from pathlib import Path
 import yaml
 from tifffile import imread, imwrite
+from skimage.measure import regionprops_table
 
 parser = argparse.ArgumentParser()
 parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
@@ -37,17 +38,35 @@ def main(config):
         )
     # Add 1 to every track_id so 0 is not a track in the image (should be background)
     df_tracks["track_id"]=df_tracks["track_id"]+1
+    df_tracks = df_tracks.sort_values(by=["track_id","position_t"])
+
     tracks_out_path = Path(output_dir, f"{sample_name}_tracks.csv")
     df_tracks.to_csv(tracks_out_path, sep=",", index=False)
     ### Assign the tracks to existing segments
     # Loop through spots, link to segments in the image and replace label with track_id
     tcell_segments = imread(tcell_segments_path)
+    
+    df_centroids = []
+    for t, tcell_stack in enumerate(tcell_segments):
+        properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, properties=['label', f'centroid']))
+        properties["position_t"]=t
+        df_centroids.append(properties)
+    df_centroids = pd.concat(df_centroids)
+    df_centroids["position_z"]=df_centroids["centroid-0"]*element_size_z
+    df_centroids["position_y"]=df_centroids["centroid-1"]*element_size_y
+    df_centroids["position_x"]=df_centroids["centroid-2"]*element_size_x
+    
     tcell_tracked_out_path= Path(output_dir, f"{sample_name}_tcells_tracked.tiff")
     tcells_tracked = np.zeros_like(tcell_segments)
     for _, row in df_tracks.iterrows():
-        t,z,y,x = row["position_t"],row["position_z"], row["position_y"], row["position_x"]
-        t,z,y,x = round(t), round(z), round(y), round(x)
-        corr_seg = tcell_segments[t,z,y,x]
+        t,z,y,x = int(row["position_t"]),row["position_z"], row["position_y"], row["position_x"]
+        corr_seg = df_centroids[
+            (df_centroids["position_x"]==x) &
+            (df_centroids["position_y"]==y) &
+            (df_centroids["position_z"]==z) &
+            (df_centroids["position_t"]==t) 
+        ]["label"].iloc[0]
+        assert corr_seg!=0, f"Position of center segment corresponds to background (0), which is an error"
         tcells_tracked[t,:,:,:][tcell_segments[t,:,:,:]==corr_seg]=row["track_id"]
         # im_track = im_track[im==corr_seg]=row["track_id"]
     imwrite(
@@ -93,22 +112,13 @@ def run_trackmate(
     # empty model now.
     
     model = Model()
-    # Send all messages to ImageJ log window.
     model.setLogger(Logger.IJ_LOGGER)
-    
-    #------------------------
-    # Prepare settings object
-    #------------------------
     
     settings = Settings(imp)
     
     # Configure detector - We use the Strings for the keys
     settings.detectorFactory = LabelImageDetectorFactory()
     settings.detectorSettings = settings.detectorFactory.getDefaultSettings()
-    
-    # # Configure spot filters - Classical filter on quality
-    # filter1 = FeatureFilter('QUALITY', 30, True)
-    # settings.addSpotFilter(filter1)
     
     # Configure tracker - We want to allow merges and fusions
     settings.trackerFactory = SparseLAPTrackerFactory()
@@ -126,17 +136,7 @@ def run_trackmate(
     # filter2 = FeatureFilter('TRACK_DISPLACEMENT', 10, True)
     # settings.addTrackFilter(filter2)
     
-    
-    #-------------------
-    # Instantiate plugin
-    #-------------------
-    
     trackmate = TrackMate(model, settings)
-    
-    #--------
-    # Process
-    #--------
-    
     ok = trackmate.checkInput()
     if not ok:
         sys.exit(str(trackmate.getErrorMessage()))
@@ -144,8 +144,7 @@ def run_trackmate(
     ok = trackmate.process()
     if not ok:
         sys.exit(str(trackmate.getErrorMessage()))
-    
-    
+
     # The feature model, that stores edge and track features.
     fm = model.getFeatureModel()
 
