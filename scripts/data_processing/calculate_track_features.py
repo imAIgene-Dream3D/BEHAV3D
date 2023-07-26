@@ -33,6 +33,7 @@ def main(config):
         element_size_x=sample['pixel_distance_xy']
         element_size_y=sample['pixel_distance_xy'] 
         element_size_z=sample['pixel_distance_z']
+        distance_unit=sample['distance_unit']
         
         contact_threshold = sample["contact_threshold"]
         
@@ -44,14 +45,16 @@ def main(config):
         print("- Calculating movement features...")
         df_tracks=calculate_movement_features(df_tracks)
 
-        print("- Calculating distance to organoids...")
+        print("- Calculating contact with organoids and other T cells...")
+        print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
         # Get minimal distance of each segment to an organoid
         organoid_segments_path=Path(output_dir, f"{sample_name}_organoid_segments.tiff")
         organoid_segments=imread(organoid_segments_path)
         
         tcell_segments_path=Path(output_dir, f"{sample_name}_tcells_tracked.tiff")
         tcell_segments=imread(tcell_segments_path)
-        df_dist_org=calculate_organoid_distance(
+        
+        df_contacts=calculate_organoid_and_tcell_contact(
             tcell_segments=tcell_segments,
             organoid_segments=organoid_segments,
             element_size_x=element_size_x,
@@ -59,18 +62,8 @@ def main(config):
             element_size_z=element_size_z,
             contact_threshold=contact_threshold
         )
-        df_tracks = pd.merge(df_tracks, df_dist_org)
+        df_tracks = pd.merge(df_tracks, df_contacts)
         
-        # print("- Calculating distance to nearest T cell...")
-        # # Get minimal distance of each segment to an organoid
-        # df_dist_org=calculate_tcell_distance(
-        #     tcell_segments=tcell_segments,
-        #     element_size_x=element_size_x,
-        #     element_size_y=element_size_y,
-        #     element_size_z=element_size_z
-        # )
-        # df_tracks = pd.merge(df_tracks, df_dist_org)
-
         print("- Calculating death dye intensities...")
         
         # Split the path into file path and dataset path
@@ -176,7 +169,22 @@ def calculate_tcell_contact(
     element_size_z,
     contact_threshold
     ):
-
+    """
+    Calculates contact with other tcells by looping through
+    the segments and cutting out a small area around it.
+    It then calculates the euclidian distance of every pixel
+    outside the segment and sees if any other segments are in this
+    area.
+    
+    tcell_contact: 
+    Based on the provided 'contact_threshold' value. Any other segment
+    in this distance is seen as contacting
+    
+    tcell_contact_pixel:
+    Based on direct pixel contact of one t cell and another, not influenced
+    by the element_sizes
+    """
+    df_contact_tcell = []
     for t, tcell_stack in enumerate(tcell_segments):
         segment_ids = np.unique(tcell_stack)
   
@@ -198,32 +206,125 @@ def calculate_tcell_contact(
                 max(0, min_x-x_ext):min(stack_max_x, max_x+x_ext+1),
                 ]
             
-            real_dist_org=distance_transform_edt(
+            real_dist_tcell=distance_transform_edt(
                 segment_cutout!=segment_id,
                 sampling=[element_size_z, element_size_y, element_size_x]
                 )
-            other_cells = [x for x in np.unique(segment_cutout[real_dist_org<=contact_threshold]) if x not in [0, segment_id]]
-            if len(other_cells)>0:
-                real_tcell_contact = 1
-            pix_dist_org=distance_transform_edt(
+            tcell_contacts = [str(x) for x in np.unique(segment_cutout[real_dist_tcell<=contact_threshold]) if x not in [0, segment_id]]
+            real_tcell_contact = len(tcell_contacts)>0
+            
+            pix_dist_tcell=distance_transform_edt(
                 segment_cutout!=segment_id
                 )
-            other_cells = [x for x in np.unique(segment_cutout[pix_dist_org<= 1.73]) if x not in [0, segment_id]]
-            if len(other_cells)>0:
-                pix_tcell_contact = 1
+            pix_tcell_contacts = [str(x) for x in np.unique(segment_cutout[pix_dist_tcell<= 1.73]) if x not in [0, segment_id]]
+            pix_tcell_contact = len(pix_tcell_contacts)>0
             
-            df_tcell_contact = pd.DataFrame({
-            'TrackID': segment_id, 
-            'position_t': t,
-            'tcell_contact': real_tcell_contact, 
-            'tcell_contact_pixel': pix_tcell_contact
-            })
-    # TODO Calculation with EDT will take way too long
-    # Option is that you expand each segment per timepoint by x pixels 
-    # based on the supplied distance for t cell contact
-    # then regionprops on the segment image and find if any segment 
-    # other than itself is in the segment
-    return
+            if real_tcell_contact:
+                touching_tcells = ",".join(tcell_contacts.tolist())
+                
+            df_contact_tcell.append(pd.DataFrame([{
+                'TrackID': segment_id, 
+                'position_t': t,
+                'tcell_contact': real_tcell_contact, 
+                'tcell_contact_pixel': pix_tcell_contact,
+                'touching_tcells': touching_tcells
+            }]))
+    
+    df_contact_tcell=pd.concat(df_contact_tcell)
+    return(df_contact_tcell)
+
+def calculate_organoid_and_tcell_contact(
+    tcell_segments,
+    organoid_segments,
+    element_size_x, 
+    element_size_y, 
+    element_size_z,
+    contact_threshold
+    ):
+    """
+    Calculates contact with organoids by looping through
+    the segments and cutting out a small area around it.
+    It then calculates the euclidian distance of every pixel
+    outside the segment and sees if any other segments are in this
+    area.
+    
+    organoid_contact: 
+    Based on the provided 'contact_threshold' value. Any other segment
+    in this distance is seen as contacting
+    
+    organoid_contact_pixel:
+    Based on direct pixel contact of one t cell and another, not influenced
+    by the element_sizes
+    """
+    df_contacts= []
+    for t, tcell_stack in enumerate(tcell_segments):
+        segment_ids = np.unique(tcell_stack)
+        org_stack = organoid_segments[t,:,:,:]
+        for segment_id in segment_ids:
+            if segment_id==0:
+                continue
+            
+            stack_max_z, stack_max_y, stack_max_x = tcell_stack.shape
+            seg_locs = np.argwhere(tcell_stack==segment_id)
+            min_z, min_y, min_x = seg_locs.min(axis=0)
+            max_z, max_y, max_x = seg_locs.max(axis=0)
+            
+            z_ext = 2*math.ceil(contact_threshold / element_size_z)
+            y_ext = 2*math.ceil(contact_threshold / element_size_y)
+            x_ext = 2*math.ceil(contact_threshold / element_size_x)
+            segment_cutout = tcell_stack[
+                max(0, min_z-z_ext):min(stack_max_z, max_z+z_ext+1),
+                max(0, min_y-y_ext):min(stack_max_y, max_y+y_ext+1),
+                max(0, min_x-x_ext):min(stack_max_x, max_x+x_ext+1),
+                ]
+            org_cutout = org_stack[
+                max(0, min_z-z_ext):min(stack_max_z, max_z+z_ext+1),
+                max(0, min_y-y_ext):min(stack_max_y, max_y+y_ext+1),
+                max(0, min_x-x_ext):min(stack_max_x, max_x+x_ext+1),
+                ]
+            
+            real_distances=distance_transform_edt(
+                segment_cutout!=segment_id,
+                sampling=[element_size_z, element_size_y, element_size_x]
+                )
+            pix_distances=distance_transform_edt(
+                segment_cutout!=segment_id
+                )
+             
+            organoid_contacts = [str(x) for x in np.unique(org_cutout[real_distances<=contact_threshold]) if x!=0]
+            real_organoid_contact = len(organoid_contacts)>0
+            
+            pix_organoid_contacts = [str(x) for x in np.unique(org_cutout[pix_distances<= 1.73]) if x!=0]
+            pix_organoid_contact = len(pix_organoid_contacts)>0
+            
+            tcell_contacts = [str(x) for x in np.unique(segment_cutout[real_distances<=contact_threshold]) if x not in [0, segment_id]]
+            real_tcell_contact = len(tcell_contacts)>0
+
+            pix_tcell_contacts = [str(x) for x in np.unique(segment_cutout[pix_distances<= 1.73]) if x not in [0, segment_id]]
+            pix_tcell_contact = len(pix_tcell_contacts)>0
+            
+            if real_tcell_contact:
+                touching_tcells = ",".join(tcell_contacts)
+            else:
+                touching_tcells=None
+            if real_organoid_contact:
+                touching_organoids = ",".join(organoid_contacts)
+            else:
+                touching_organoids = None
+                
+            df_contacts.append(pd.DataFrame([{
+                'TrackID': segment_id, 
+                'position_t': t,
+                'organoid_contact': real_organoid_contact, 
+                'organoid_contact_pixels': pix_organoid_contact,
+                'touching_organoids':touching_organoids,
+                'tcell_contact': real_tcell_contact, 
+                'tcell_contact_pixels': pix_tcell_contact,
+                'touching_tcells': touching_tcells
+            }]))
+    
+    df_contacts=pd.concat(df_contacts)
+    return(df_contacts)
 
 def calculate_segment_intensity(tcell_segments, intensity_image, calculation="mean"):
     assert calculation in ["min", "max", "mean", "median"]

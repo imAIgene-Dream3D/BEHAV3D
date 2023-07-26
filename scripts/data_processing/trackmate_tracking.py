@@ -20,10 +20,6 @@ args = parser.parse_args()
 
 def main(config, metadata, verbose):
     
-    available_75perc_memory=int(psutil.virtual_memory().available*0.75/(1024**3))
-    sj.config.add_options(f'-Xmx{available_75perc_memory}g')
-    imagej = ij.init('sc.fiji:fiji', mode='headless')
-    
     print("### Running T cell tracking")
     
     with open("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/scripts/data_processing/config.yml", "r") as parameters:
@@ -51,7 +47,6 @@ def main(config, metadata, verbose):
             element_size_y=element_size_y,
             element_size_z=element_size_z,
             element_size_unit=element_size_unit,
-            imagej=imagej,
             verbose=verbose
             )
         # Add 1 to every TrackID so 0 is not a track in the image (should be background)
@@ -102,12 +97,13 @@ def run_trackmate(
     element_size_y, 
     element_size_z,
     element_size_unit,
-    verbose=False,
-    imagej=None
+    verbose=False
     ):
-    if imagej == None:
-        imagej = ij.init('sc.fiji:fiji', mode='headless')
-        
+
+    available_75perc_memory=int(psutil.virtual_memory().available*0.75/(1024**3))
+    sj.config.add_options(f'-Xmx{available_75perc_memory}g')
+    imagej = ij.init('sc.fiji:fiji', mode='headless')
+    
     IJ = imagej.IJ
     WindowManager=imagej.WindowManager
     Model = sj.jimport('fiji.plugin.trackmate.Model')
@@ -200,6 +196,8 @@ def run_trackmate(
             df_spots = pd.concat([df_spots, new_row], ignore_index=True)
     
     imp.close()       
+    imagej.window().clear()
+    imagej.getContext().dispose()
     return(df_spots)
 
 if __name__ == "__main__":
