@@ -1,115 +1,153 @@
 import numpy as np
 import pandas as pd
-from scipy.ndimage.morphology import distance_transform_edt
+from scipy.ndimage import distance_transform_edt
 from skimage.measure import regionprops_table
 import argparse
 import yaml
-from tifffile import imread, imwrite
+from tifffile import imread
+from pathlib import Path
+import h5py
+import math
 
 parser = argparse.ArgumentParser()
 parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
 parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
 args = parser.parse_args()
 
-with open(args.config, "r") as parameters:
-    config=yaml.load(parameters, Loader=yaml.SafeLoader)
-
-with open("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/scripts/data_processing/config.yml", "r") as parameters:
-    config=yaml.load(parameters, Loader=yaml.SafeLoader)
-    
-sample_name = config['sample_name']
-data_path = config['data_path']
-output_dir = config['output_dir']
-
-red_lym_channel=config['red_lym_channel']
-
-element_size_x=config['element_size_x']
-element_size_y=config['element_size_y'] 
-element_size_z=config['element_size_z']
-
 def main(config):
-### Process and extract features from the tracks
-# Get movement features (displacement, speed, etc.)
-    df_tracks=calculate_movement_features(
-        df_tracks, 
-        element_size_x=3.54, 
-        element_size_y=3.54, 
-        element_size_z=1.2
+    ### Process and extract features from the tracks
+    # Get movement features (displacement, speed, etc.)
+    print("### Running track feature calculation")
+    with open("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/scripts/data_processing/config.yml", "r") as parameters:
+        config=yaml.load(parameters, Loader=yaml.SafeLoader)
+    metadata=pd.read_csv("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/configs/metadata_template_ilastik.csv")
+    
+    output_dir = config['output_dir']
+
+    for _, sample in metadata.iterrows():
+        sample_name = sample['sample_name']
+        image_path = sample['image_path']
+        image_internal_path = sample["image_internal_path"]
+        red_lym_channel=sample['dead_dye_channel']
+
+        element_size_x=sample['pixel_distance_xy']
+        element_size_y=sample['pixel_distance_xy'] 
+        element_size_z=sample['pixel_distance_z']
+        
+        contact_threshold = sample["contact_threshold"]
+        
+        print(f"### Processing: {sample_name}")
+        print("- Loading in tracks csv...")
+        df_tracks_path = Path(output_dir, f"{sample_name}_tracks.csv")
+        df_tracks=pd.read_csv(df_tracks_path, sep=",")
+        
+        print("- Calculating movement features...")
+        df_tracks=calculate_movement_features(df_tracks)
+
+        print("- Calculating distance to organoids...")
+        # Get minimal distance of each segment to an organoid
+        organoid_segments_path=Path(output_dir, f"{sample_name}_organoid_segments.tiff")
+        organoid_segments=imread(organoid_segments_path)
+        
+        tcell_segments_path=Path(output_dir, f"{sample_name}_tcells_tracked.tiff")
+        tcell_segments=imread(tcell_segments_path)
+        df_dist_org=calculate_organoid_distance(
+            tcell_segments=tcell_segments,
+            organoid_segments=organoid_segments,
+            element_size_x=element_size_x,
+            element_size_y=element_size_y,
+            element_size_z=element_size_z,
+            contact_threshold=contact_threshold
         )
+        df_tracks = pd.merge(df_tracks, df_dist_org)
+        
+        # print("- Calculating distance to nearest T cell...")
+        # # Get minimal distance of each segment to an organoid
+        # df_dist_org=calculate_tcell_distance(
+        #     tcell_segments=tcell_segments,
+        #     element_size_x=element_size_x,
+        #     element_size_y=element_size_y,
+        #     element_size_z=element_size_z
+        # )
+        # df_tracks = pd.merge(df_tracks, df_dist_org)
 
-    # Get minimal distance of each segment to an organoid
-    organoid_segments=imread(seg_org_out_path)
-    df_dist_org=calculate_organoid_distance(
-        tcell_segments=im_track,
-        organoid_segments=organoid_segments,
-        element_size_x=3.54, 
-        element_size_y=3.54, 
-        element_size_z=1.2
-    )
-    df_tracks = pd.merge(df_tracks, df_dist_org)
+        print("- Calculating death dye intensities...")
+        
+        # Split the path into file path and dataset path
+        intensity_image = h5py.File(name=image_path, mode="r")[image_internal_path][:][red_lym_channel,:,:,:,:]
+        df_red_lym_intensity=calculate_segment_intensity(
+            tcell_segments=tcell_segments,
+            intensity_image=intensity_image
+        )
+        df_tracks = pd.merge(df_tracks, df_red_lym_intensity)
+        df_tracks=df_tracks.rename(columns={"intensity_mean":"dead_dye_mean"})
 
-    intensity_image=imread(data_path)[red_lym_channel,:,:,:,:]
-    df_red_lym_intensity=calculate_segment_intensity(
-        tcell_segments=im_track,
-        intensity_image=intensity_image
-    )
-    df_tracks = pd.merge(df_tracks, df_red_lym_intensity)
-    df_tracks=df_tracks.rename(columns={"intensity_mean":"dead_dye_mean"})
-
-    df_tracks = df_tracks.sort_values(['track_id', 'position_t'])
-
-def calculate_movement_features(df_tracks, element_size_x, element_size_y, element_size_z):
-    # element_size_x=3.54
-    # element_size_y=3.54
-    # element_size_z=1.2
-
-    df_tracks["real_x"]=df_tracks["position_x"]*element_size_x
-    df_tracks["real_y"]=df_tracks["position_y"]*element_size_y
-    df_tracks["real_z"]=df_tracks["position_z"]*element_size_z
-
+        df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
+        
+        tracks_out_path = Path(output_dir, f"{sample_name}_tracks_features.csv")
+        print(f"- Writing output to {tracks_out_path}")
+        df_tracks.to_csv(tracks_out_path, sep=",", index=False)
+        
+        print("### Done\n")
+        
+def calculate_movement_features(df_tracks):
     ## Convert the coordinates to time series
-    def calculate_speed(a):
-        """calculate the speed"""
-        return (np.linalg.norm(a - [0,0,0]))
-    def calculate_displacement(a):
+    
+    #TODO Angleness/directionality: How much does it move in a single direction
+    # Calculate by calcualting standard deviation of angle changes ?
+    
+    def calculate_displacement(track_coordinates):
+        """calculate the displacement per timepoint compared to previous timepoint"""
+        track_relative_pos = np.diff(track_coordinates,axis=0,prepend=track_coordinates[[0]])
+        displacement=np.apply_along_axis(np.linalg.norm, 1, track_relative_pos)
+        return (displacement)
+    def calculate_displacement_from_origin(track_coordinates):
         """calculate the displacement to the first timepoint"""
-        return (np.linalg.norm(a - a[[0]]))
-    def compute_MSD(path):
-        totalsize=len(path)
-        msd=[]
-        for i in range(totalsize-1):
-            j=i+1
-            msd.append(np.sum((path[0:-j]-path[j::])**2)/float(totalsize-j))
-
-        msd=np.array(msd)
-        msd= np.insert(msd, 0, 0, axis=0)
-        return msd
+        displacement_from_origin=np.apply_along_axis(np.linalg.norm, 1, track_coordinates)
+        return (displacement_from_origin)
+    def compute_MSD(track_coordinates):
+        nr_rows=len(track_coordinates)
+        msd_values=np.zeros(nr_rows)
+        for i in range(nr_rows):
+            squared_displacements = np.sum((track_coordinates[:i+1] - track_coordinates[i])**2, axis=1)
+            msd_values[i] = np.mean(squared_displacements)
+        return msd_values
 
     ## split by unique trackID2 and process
     df_tracks_processed = []
-    for track in df_tracks['track_id'].unique():
-        df_track = df_tracks[df_tracks['track_id'] == track ].sort_values(by="position_t")
-        df_track = df_track[['real_x', 'real_y', 'real_z']] ## select the data of interest
+    for track in df_tracks['TrackID'].unique():
+        df_track = df_tracks[df_tracks['TrackID'] == track ].sort_values(by="position_t").reset_index(drop=True)
+        df_track_pos = df_track[['position_x', 'position_y', 'position_z']] ## select the data of interest
         
         # convert to array
-        track_array = df_track.to_numpy()
-        track_array_diff= np.diff(track_array,axis=0,prepend=track_array[[0]]) #normalized to previous raw coordinates
-        arr_norm= track_array - track_array[[0]] #normalized to first raw coordinates
-        # Compute per timepoint time stats
-        array_track_dist=np.apply_along_axis(calculate_speed, 1, track_array_diff)
-        array_cum_dist = np.cumsum(array_track_dist, axis = 0) 
-        array_start_dist=np.apply_along_axis(calculate_displacement, 1, arr_norm)
-        array_msd=compute_MSD(track_array)
+        track_array = df_track_pos.to_numpy()
+        track_array_rel = track_array - track_array[0]
+        displacement = calculate_displacement(track_array_rel)
+        displacement_from_origin = calculate_displacement_from_origin(track_array_rel)
+        cumulative_displacement = np.cumsum(displacement, axis = 0)
+        mean_square_displacement=compute_MSD(track_array_rel)
         # combine
-        d = {'speed': array_track_dist, 'cumulative_distance': array_cum_dist, 'displacement_from_start': array_start_dist,'mean_square_displacement':array_msd}
-        df_computed = pd.DataFrame(data=d)
-        df_result= pd.concat([df_track.reset_index(drop=True),df_computed.reset_index(drop=True)], axis=1)
+        df_computed = pd.DataFrame({
+            'displacement': displacement, 
+            'cumulative_displacement': cumulative_displacement, 
+            'displacement_from_origin': displacement_from_origin, 
+            'mean_square_displacement':mean_square_displacement
+            })
+        df_result= pd.concat([df_track_pos,df_computed], axis=1)
+        df_result = pd.concat([df_result, df_track[["position_t", "SegmentID"]]], axis=1)
         df_tracks_processed.append(df_result)
     df_tracks_processed = pd.concat(df_tracks_processed)
     df_tracks_processed=pd.merge(df_tracks, df_tracks_processed)
     return(df_tracks_processed)
 
-def calculate_organoid_distance(tcell_segments, organoid_segments, element_size_x, element_size_y, element_size_z):
+def calculate_organoid_distance(
+    tcell_segments, 
+    organoid_segments, 
+    element_size_x, 
+    element_size_y, 
+    element_size_z,
+    contact_threshold
+    ):
     df_dist_organoid = []
     for t, tcell_stack in enumerate(tcell_segments):
         org_stack = organoid_segments[t,:,:,:]
@@ -117,7 +155,7 @@ def calculate_organoid_distance(tcell_segments, organoid_segments, element_size_
         dist_org=distance_transform_edt(mask_org.mask)
         real_dist_org=distance_transform_edt(
             mask_org.mask,
-            sampling=[element_size_z, element_size_y, element_size_z]
+            sampling=[element_size_z, element_size_y, element_size_x]
             )
         properties_pix=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=dist_org, properties=['label', 'intensity_min']))
         properties_pix=properties_pix.rename(columns={"intensity_min":"pix_distance_organoids"})
@@ -127,9 +165,65 @@ def calculate_organoid_distance(tcell_segments, organoid_segments, element_size_
         properties["position_t"]=t
         df_dist_organoid.append(properties)
     df_dist_organoid = pd.concat(df_dist_organoid)
-    df_dist_organoid=df_dist_organoid.rename(columns={"label":"track_id"})
+    df_dist_organoid=df_dist_organoid.rename(columns={"label":"TrackID"})
     df_dist_organoid["pix_organoid_contact"] =  df_dist_organoid["pix_distance_organoids"] <= 1.73
     return(df_dist_organoid)
+
+def calculate_tcell_contact(
+    tcell_segments, 
+    element_size_x, 
+    element_size_y, 
+    element_size_z,
+    contact_threshold
+    ):
+
+    for t, tcell_stack in enumerate(tcell_segments):
+        segment_ids = np.unique(tcell_stack)
+  
+        for segment_id in segment_ids:
+            if segment_id==0:
+                continue
+            
+            stack_max_z, stack_max_y, stack_max_x = tcell_stack.shape
+            seg_locs = np.argwhere(tcell_stack==segment_id)
+            min_z, min_y, min_x = seg_locs.min(axis=0)
+            max_z, max_y, max_x = seg_locs.max(axis=0)
+            
+            z_ext = 2*math.ceil(contact_threshold / element_size_z)
+            y_ext = 2*math.ceil(contact_threshold / element_size_y)
+            x_ext = 2*math.ceil(contact_threshold / element_size_x)
+            segment_cutout = tcell_stack[
+                max(0, min_z-z_ext):min(stack_max_z, max_z+z_ext+1),
+                max(0, min_y-y_ext):min(stack_max_y, max_y+y_ext+1),
+                max(0, min_x-x_ext):min(stack_max_x, max_x+x_ext+1),
+                ]
+            
+            real_dist_org=distance_transform_edt(
+                segment_cutout!=segment_id,
+                sampling=[element_size_z, element_size_y, element_size_x]
+                )
+            other_cells = [x for x in np.unique(segment_cutout[real_dist_org<=contact_threshold]) if x not in [0, segment_id]]
+            if len(other_cells)>0:
+                real_tcell_contact = 1
+            pix_dist_org=distance_transform_edt(
+                segment_cutout!=segment_id
+                )
+            other_cells = [x for x in np.unique(segment_cutout[pix_dist_org<= 1.73]) if x not in [0, segment_id]]
+            if len(other_cells)>0:
+                pix_tcell_contact = 1
+            
+            df_tcell_contact = pd.DataFrame({
+            'TrackID': segment_id, 
+            'position_t': t,
+            'tcell_contact': real_tcell_contact, 
+            'tcell_contact_pixel': pix_tcell_contact
+            })
+    # TODO Calculation with EDT will take way too long
+    # Option is that you expand each segment per timepoint by x pixels 
+    # based on the supplied distance for t cell contact
+    # then regionprops on the segment image and find if any segment 
+    # other than itself is in the segment
+    return
 
 def calculate_segment_intensity(tcell_segments, intensity_image, calculation="mean"):
     assert calculation in ["min", "max", "mean", "median"]
@@ -141,7 +235,7 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
         properties["position_t"]=t
         df_intensities.append(properties)
     df_intensities = pd.concat(df_intensities)
-    df_intensities=df_intensities.rename(columns={"label":"track_id"})
+    df_intensities=df_intensities.rename(columns={"label":"TrackID"})
     return(df_intensities)
 
 if __name__ == "__main__":

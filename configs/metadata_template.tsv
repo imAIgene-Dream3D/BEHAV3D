@@ -1,8 +1,0 @@
-basename	organoid_line	tcell_line	exp_nr	well	date	dead_dye_channel	organoid_distance_channel	tcell_contact_threshold	tcell_dead_dye_threshold	tcell_stats_folder	organoid_contact_threshold	organoid_dead_dye_threshold	organoid_stats_folder
-2021-06-10_WT1_n1(1)_10T_[ims1_2021-09-09T14-14-13.594]	10T	CART_WT1	1	well0	10/06/2021	4	8	3.6	3000		3.6	3000	
-2021-06-10_WT1_n1(2)_36T_[ims1_2021-09-09T14-14-13.594]	36T	CART_WT1	1	well1	10/06/2021	4	8	3.6	3000		3.6	3000	
-2021-06-10_WT1_n1(3)_36T_[ims1_2021-09-09T14-14-13.594]	36T	CART_WT1	1	well2	10/06/2021	4	8	3.6	3000		3.6	3000	
-2021-06-10_WT1_n1(4)_62T_[ims1_2021-09-09T14-14-13.594]	62T	CART_WT1	1	well3	10/06/2021	4	8	3.6	3000		3.6	3000	
-2021-06-10_WT1_n1(5)_62T_[ims1_2021-09-09T14-14-13.594]	62T	CART_WT1	1	well4	10/06/2021	4	8	3.6	3000		3.6	3000	
-2021-06-10_WT1_n1(6)_209M_[ims1_2021-09-09T14-14-13.594]	209M	CART_WT1	1	well5	10/06/2021	4	8	3.6	3000		3.6	3000	
-2021-06-10_WT1_n1(7)_209M_[ims1_2021-09-09T14-14-13.594]	209M	CART_WT1	1	well6	10/06/2021	4	8	3.6	3000		3.6	3000	

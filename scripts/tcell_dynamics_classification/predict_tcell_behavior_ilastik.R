@@ -24,7 +24,7 @@ if (interactive()) {
   pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/tcell_demo/BEHAV3D_config.yml"))
   
   ### For your own file, uncomment following line and add own path to the BEHAV3D_config.yml
-  pars = yaml.load_file("/Users/samdeblank/surfdrive/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/BEHAV3D_run/config.yml")
+  pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/BEHAV3D_run/config.yml")
   
 } else {
   option_list = list(
@@ -76,15 +76,15 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   ###############################
   
   ### Import file-specific metadata for all images used in this analysis.
-  metadata=read.csv(pars$metadata_csv, sep="\t", check.names=FALSE)
+  metadata=readr::read_csv(pars$metadata_csv)
   
   track_counts=metadata
   track_counts$name = paste(metadata$organoid_line, metadata$tcell_line, metadata$exp_nr, metadata$well)
   track_counts=track_counts[,c("basename", "name", "organoid_line")]
  
   df_tracks = data.frame()
-  for (track_file in metadata$basename){
-    loaded_tracks=read.csv(paste0("/Users/samdeblank/surfdrive/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/", {track_file},"_tracks.csv"), sep=",", check.names=FALSE)
+  for (tcell_track_csv in metadata$tcell_track_csv){
+    loaded_tracks=readr::read_csv(tcell_track_csv)
     loaded_tracks=cbind(loaded_tracks, metadata)
     df_tracks = rbind(df_tracks, loaded_tracks)
   }
@@ -92,21 +92,21 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   ### Get the basename from the filename for combination with metadata
   # df_tracks$basename <- gsub("_Position.csv", "", df_tracks$filename, perl=TRUE)
   # df_tracks$basename=basename(df_tracks$basename)
-  # colnames(df_tracks) <- c("displacement","position_t","track_id","ID","speed","real_distance_organoids","tcell_dead_dye_threshold","position_x","position_y","position_z", "filename", "tcell_stats_folder", "basename")
+  # colnames(df_tracks) <- c("displacement","position_t","track_id","ID","speed","real_distance_organoids","dead_dye_mean","position_x","position_y","position_z", "filename", "tcell_stats_folder", "basename")
 
   ### Create a unique track_id. 
   ### Each file processes with Imaris has separate TRACKIDs and these must be made unique before merging
-  category <- as.factor(df_tracks$basename)
+  category <- as.factor(df_tracks$tcell_track_csv)
   ranks <- rank(-table(category), ties.method="first")
   ranks <- as.data.frame(ranks)
-  ranks$basename <- row.names(ranks)
-  df_tracks <- left_join(df_tracks, ranks) 
+  ranks$tcell_track_csv <- row.names(ranks)
+  df_tracks <- dplyr::left_join(df_tracks, ranks) 
   df_tracks$track_id <- factor(paste(df_tracks$ranks, df_tracks$track_id, sep="_"))
   
   ### save RDS for later use (e.g. Backprojection of classified TrackIDs)
   saveRDS(df_tracks, paste0(output_dir,"raw_tcell_track_data.rds"))
   
-  track_counts=left_join(track_counts, count_tracks(df_tracks))
+  track_counts=dplyr::left_join(track_counts, count_tracks(df_tracks))
   colnames(track_counts)[colnames(track_counts)=="nr_tracks"]="unfiltered"
   
   ###############################
@@ -118,14 +118,14 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
 
   df_tracks <- df_tracks[which(df_tracks$position_t<=pars$tcell_exp_duration), ] ##Make sure that all the position_t-series have the same length, in this case 10hours
   
-  track_counts=left_join(track_counts, count_tracks(df_tracks))
+  track_counts=dplyr::left_join(track_counts, count_tracks(df_tracks))
   colnames(track_counts)[colnames(track_counts)=="nr_tracks"]="filt_exp_duration"
   
   ### Perform check for duplicates, should be empty
-  data_dup <- df_tracks%>%group_by(position_t)%>%
+  data_dup <- df_tracks%>%dplyr::group_by(position_t)%>%
     dplyr::count(track_id) %>% 
-    filter(n > 1) %>% 
-    select(-n)
+    dplyr::filter(n > 1) %>% 
+    dplyr::select(-n)
   
   if (dim(data_dup)[1]!=0){
     stop("There are duplicates in the data, which should not be the case. Stopping execution...")
@@ -166,7 +166,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   ### Select the variables for which we need to interpolate NAs (numeric)
   column_names<-names(master_dist)
-  column_names <- c("mean_square_displacement", "real_distance_organoids", "tcell_dead_dye_threshold", "tcell_contact")
+  column_names <- c("mean_square_displacement", "real_distance_organoids", "dead_dye_mean", "tcell_contact")
   
   ### Create a first dataset with refilled values for speed:
   time_series<-acast(master_dist, position_t ~ track_id, value.var='speed',fun.aggregate = mean)
@@ -276,7 +276,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   # master_corrected3 <- master_corrected2
   red_lym_over_time=master_corrected2
   red_lym_over_time$name=paste(master_corrected2$organoid_line, master_corrected2$exp_nr, master_corrected2$well)
-  ggplot(red_lym_over_time[red_lym_over_time$position_t==1,], aes(x=position_t, y=tcell_dead_dye_threshold))+
+  ggplot(red_lym_over_time[red_lym_over_time$position_t==1,], aes(x=position_t, y=dead_dye_mean))+
     geom_violin(aes(fill=name))+
     geom_jitter()+
     facet_grid(~name)+
@@ -288,7 +288,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   )
   
   ### Filter out T cells that are dead at the start of the experiment
-  master_corrected3deadT0 <-master_corrected2%>%group_by(track_id)%>%filter((Time2==0) & tcell_dead_dye_threshold<tcell_dead_dye_threshold )
+  master_corrected3deadT0 <-master_corrected2%>%group_by(track_id)%>%filter((Time2==0) & dead_dye_mean<tcell_dead_dye_threshold )
   
   master_corrected3 <-master_corrected2%>%filter(track_id %in% master_corrected3deadT0$track_id )
   
@@ -296,7 +296,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   colnames(track_counts)[colnames(track_counts)=="nr_tracks"]="filt_DeadCellStart"
   
   ### Create a binary variable for live or dead cells:
-  master_corrected3$death<- ifelse(master_corrected3$tcell_dead_dye_threshold<master_corrected3$tcell_dead_dye_threshold,0,1)
+  master_corrected3$death<- ifelse(master_corrected3$dead_dye_mean<master_corrected3$tcell_dead_dye_threshold,0,1)
   
   ### Create a variable for cumulative interaction with organoids
   master_corrected3<-master_corrected3 %>% 
@@ -385,7 +385,7 @@ if (model_path != ""){
   master_test2<-master_test%>% ungroup()%>%
     # group_by(tcell_line, organoid_line, exp_nr, well) %>%
     group_by(exp_nr) %>%
-    mutate(z.disp = (displacement-mean(displacement))/sd(displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (tcell_dead_dye_threshold-mean(tcell_dead_dye_threshold))/sd(tcell_dead_dye_threshold))%>%
+    mutate(z.disp = (displacement-mean(displacement))/sd(displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (dead_dye_mean-mean(dead_dye_mean))/sd(dead_dye_mean))%>%
     mutate(q.disp=ifelse(z.disp>(quantile(z.disp, p=0.75)),z.disp,min(z.disp)), q.speed=ifelse(z.speed>(quantile(z.speed, p=0.75)),z.speed,min(z.speed)),q.red=ifelse(z.red>(quantile(z.red, p=0.75)),z.red,min(z.red)))%>%
     mutate(q.disp=scales::rescale(q.disp, to=c(0,100)),q.speed=scales::rescale(q.speed, to=c(0,100)),q.red=scales::rescale(q.red, to=c(0,100)),s.contact=scales::rescale(contact, to=c(0,1)),s.tcell_contact=scales::rescale(tcell_contact, to=c(0,1)))%>%
     mutate(q.disp=q.disp/mean(quantile(q.disp, p=0.9999)),q.speed=q.speed/mean(quantile(q.speed, p=0.9999)),q.red=q.red/mean(quantile(q.red, p=0.9999)))%>%
@@ -503,7 +503,7 @@ if (model_path != ""){
   
   master_processed<-master_corrected3%>% 
     group_by(exp_nr) %>% 
-    mutate(z.disp = (displacement-mean(displacement))/sd(displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (tcell_dead_dye_threshold-mean(tcell_dead_dye_threshold))/sd(tcell_dead_dye_threshold))%>%
+    mutate(z.disp = (displacement-mean(displacement))/sd(displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (dead_dye_mean-mean(dead_dye_mean))/sd(dead_dye_mean))%>%
     mutate(q.disp=ifelse(z.disp>(quantile(z.disp, p=0.75)),z.disp,min(z.disp)), q.speed=ifelse(z.speed>(quantile(z.speed, p=0.75)),z.speed,min(z.speed)),q.red=ifelse(z.red>(quantile(z.red, p=0.75)),z.red,min(z.red)))%>%
     mutate(q.disp=scales::rescale(q.disp, to=c(0,1)),q.speed=scales::rescale(q.speed, to=c(0,1)),q.red=scales::rescale(q.red, to=c(0,1)),s.contact=scales::rescale(contact, to=c(0,1)),s.tcell_contact=scales::rescale(tcell_contact, to=c(0,1))) %>%
     mutate(q.disp=q.disp/mean(quantile(q.disp, p=0.9999999)),q.speed=q.speed/mean(quantile(q.speed, p=0.9999999)),q.red=q.red/mean(quantile(q.red, p=0.9999999)))%>%ungroup()
@@ -590,8 +590,8 @@ if (model_path != ""){
   
   ## Plot a heatmap to show the relative values of each behavior parameter
   ## Create a dataframe the summarizes the mean values for each parameter
-  sum_all <- master_clustered%>% select( speed, displacement, tcell_dead_dye_threshold, contact2, tcell_contact, cluster2, contact)%>% group_by(cluster2)%>%
-    summarise(contact_len=mean(contact2),n_contact_org= mean(contact),displacement2 = median(displacement), speed = median(speed), interaction_T_cells= mean(tcell_contact),death = median(tcell_dead_dye_threshold))
+  sum_all <- master_clustered%>% select( speed, displacement, dead_dye_mean, contact2, tcell_contact, cluster2, contact)%>% group_by(cluster2)%>%
+    summarise(contact_len=mean(contact2),n_contact_org= mean(contact),displacement2 = median(displacement), speed = median(speed), interaction_T_cells= mean(tcell_contact),death = median(dead_dye_mean))
   ## scales::rescale the values from each parameter
   sum_all <- sum_all%>%mutate(contact_len= scales::rescale(contact_len, to=c(0,100)) ,n_contact_org= scales::rescale(n_contact_org, to=c(0,100)),displacement2 = scales::rescale(displacement2, to=c(0,100)), speed = scales::rescale(speed, to=c(0,100)),interaction_T_cells= scales::rescale(interaction_T_cells, to=c(0,100)), death =scales::rescale(death, to=c(0,100)))
   
