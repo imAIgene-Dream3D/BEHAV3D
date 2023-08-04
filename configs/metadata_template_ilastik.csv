@@ -1,3 +1,2 @@
-﻿sample_name,organoid_line,tcell_line,exp_nr,well,dead_dye_channel,dead_dye_threshold,contact_threshold,pixel_distance_xy,pixel_distance_z,distance_unit,image_path,image_internal_path
-testdata_small,10T,CART_WT1,1,well0,3,3000,3.6,3.54,1.2,μm,/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/testdata_small.h5,/image
-AIM_MB2_Exp58_Img003_donor899,10T,CART_WT1,1,well0,3,3000,3.6,3.54,1.2,μm,/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/AIM_MB2_Exp58_Img003_donor899.h5,/image
+﻿sample_name,organoid_line,tcell_line,exp_nr,well,dead_dye_channel,dead_dye_threshold,contact_threshold,pixel_distance_xy,pixel_distance_z,distance_unit,time_interval,time_unit,image_path,image_internal_path,tcell_track_csv
+AIM_MB2_Exp58_Img003_donor899,10T,CART_WT1,1,well0,3,3000,3.6,3.54,1.2,µm,2,m,/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/BEHAV3D_run/AIM_MB2_Exp58_Img003_donor899.h5,/image,/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/BEHAV3D_run/output/AIM_MB2_Exp58_Img003_donor899_tracks_features.csv

@@ -39,12 +39,6 @@ with open(args.config, "r") as parameters:
     config=yaml.load(parameters, Loader=yaml.SafeLoader)
 
 def main(config, metadata, keep_all=False):
-    with open("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/configs/config_template.yml", "r") as parameters:
-        config=yaml.load(parameters, Loader=yaml.SafeLoader)
-    metadata=pd.read_csv("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/configs/metadata_template_ilastik.csv")
-    keep_all=False
-    verbose=False
- 
     ilastik_path = config['ilastik_path']
     ilastik_pix_clas_model = config['ilastik_pixel_classifier_model']
     ilastik_org_seg_model = config['ilastik_organoid_segmentation_model']

@@ -21,12 +21,6 @@ args = parser.parse_args()
 def main(config, metadata, verbose):
     
     print("### Running T cell tracking")
-    
-    with open("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/scripts/data_processing/config.yml", "r") as parameters:
-        config=yaml.load(parameters, Loader=yaml.SafeLoader)
-    metadata=pd.read_csv("/Users/samdeblank/Library/CloudStorage/OneDrive-PrinsesMaximaCentrum/github/BEHAV3D-ilastik/configs/metadata_template_ilastik.csv")
-    verbose=False
-    
     output_dir = config['output_dir']
 
     for _, sample in metadata.iterrows():
@@ -36,6 +30,9 @@ def main(config, metadata, verbose):
         element_size_y=sample['pixel_distance_xy'] 
         element_size_z=sample['pixel_distance_z']
         element_size_unit=sample['distance_unit']
+        
+        time_interval = sample['time_interval']
+        time_unit = sample['time_unit']
         
         print(f"### Processing: {sample_name}")
         print("- Running TrackMate...")
@@ -52,7 +49,7 @@ def main(config, metadata, verbose):
         # Add 1 to every TrackID so 0 is not a track in the image (should be background)
         df_tracks["TrackID"]=df_tracks["TrackID"]+1
         df_tracks = df_tracks.sort_values(by=["TrackID","position_t"])
-
+        
         tracks_out_path = Path(output_dir, f"{sample_name}_tracks.csv")
         df_tracks.to_csv(tracks_out_path, sep=",", index=False)
         
@@ -101,6 +98,7 @@ def run_trackmate(
     ):
 
     available_75perc_memory=int(psutil.virtual_memory().available*0.75/(1024**3))
+    print(f"Setting {available_75perc_memory} Gb of memory based on available memory")
     sj.config.add_options(f'-Xmx{available_75perc_memory}g')
     imagej = ij.init('sc.fiji:fiji', mode='headless')
     

@@ -63,9 +63,9 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     # nr_tracks_unfilt=track_table
     # nr_tracks_unfilt$name = paste(nr_tracks_unfilt$organoid_line, nr_tracks_unfilt$tcell_line, nr_tracks_unfilt$exp_nr, nr_tracks_unfilt$well)
     nr_tracks_unfilt = track_table %>% 
-      group_by(basename, organoid_line, tcell_line, exp_nr, well) %>% 
+      group_by(sample_name, organoid_line, tcell_line, exp_nr, well) %>% 
       dplyr::summarize(
-        nr_tracks=length(unique(track_id))
+        nr_tracks=length(unique(TrackID))
       ) %>% 
       ungroup()
   }
@@ -80,7 +80,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   track_counts=metadata
   track_counts$name = paste(metadata$organoid_line, metadata$tcell_line, metadata$exp_nr, metadata$well)
-  track_counts=track_counts[,c("basename", "name", "organoid_line")]
+  track_counts=track_counts[,c("sample_name", "name", "organoid_line")]
  
   df_tracks = data.frame()
   for (tcell_track_csv in metadata$tcell_track_csv){
@@ -89,19 +89,14 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     df_tracks = rbind(df_tracks, loaded_tracks)
   }
   
-  ### Get the basename from the filename for combination with metadata
-  # df_tracks$basename <- gsub("_Position.csv", "", df_tracks$filename, perl=TRUE)
-  # df_tracks$basename=basename(df_tracks$basename)
-  # colnames(df_tracks) <- c("displacement","position_t","track_id","ID","speed","real_distance_organoids","dead_dye_mean","position_x","position_y","position_z", "filename", "tcell_stats_folder", "basename")
-
-  ### Create a unique track_id. 
+  ### Create a unique TrackID. 
   ### Each file processes with Imaris has separate TRACKIDs and these must be made unique before merging
   category <- as.factor(df_tracks$tcell_track_csv)
   ranks <- rank(-table(category), ties.method="first")
   ranks <- as.data.frame(ranks)
   ranks$tcell_track_csv <- row.names(ranks)
   df_tracks <- dplyr::left_join(df_tracks, ranks) 
-  df_tracks$track_id <- factor(paste(df_tracks$ranks, df_tracks$track_id, sep="_"))
+  df_tracks$TrackID <- factor(paste(df_tracks$ranks, df_tracks$TrackID, sep="_"))
   
   ### save RDS for later use (e.g. Backprojection of classified TrackIDs)
   saveRDS(df_tracks, paste0(output_dir,"raw_tcell_track_data.rds"))
@@ -123,40 +118,13 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   ### Perform check for duplicates, should be empty
   data_dup <- df_tracks%>%dplyr::group_by(position_t)%>%
-    dplyr::count(track_id) %>% 
+    dplyr::count(TrackID) %>% 
     dplyr::filter(n > 1) %>% 
     dplyr::select(-n)
   
   if (dim(data_dup)[1]!=0){
     stop("There are duplicates in the data, which should not be the case. Stopping execution...")
   }
-  
-  ### For each well separately:
-  ### Estimate if a T cells interacts with another T cell 
-  ### This is done by calculating the minimal distance to the nearest neighboring T cell. 
-  
-  List = list() ## create list for each timepoint
-  List2 = list() ## create list for each experiment
-  
-  ### For loop to look for the distance to the nearest neighbor at each timepoint and each experiment
-  for ( m in unique(df_tracks$well)){
-    distance_1<-df_tracks[which(df_tracks$well==m),]
-    List = list()
-    for (i in unique(distance_1$position_t)){
-      distanceDFi <- distance_1[distance_1$position_t==i,]
-      distanceDF2<-as.data.frame(distanceDFi[,c("position_t","position_x","position_y","position_z")])
-      coordin<-ppx(distanceDF2, coord.type=c("t","s","s", "s")) ## create a multidimensional space-position_t pattern
-      dist<- nndist(coordin)
-      distanceDFi_dist<-cbind(distanceDFi, dist)
-      List[[length(List)+1]] <-distanceDFi_dist   ## store to list object
-    }
-    master_distance <- data.frame(do.call(rbind, List)) ## convert List to dataframe
-    List2[[length(List2)+1]] <-master_distance 
-  }
-  
-  master_dist<-do.call(rbind, List2)
-  colnames(master_dist)[which(names(master_dist) == "dist")] <- "nearest_Tcell"
-  master_dist$tcell_contact <- ifelse(master_dist$nearest_Tcell<master_dist$tcell_contact_thr,1,0)
   
   library(reshape2)
   library(zoo)
@@ -165,14 +133,14 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   ### Interpolate missing values and fill the NA (for each variable)
   
   ### Select the variables for which we need to interpolate NAs (numeric)
-  column_names<-names(master_dist)
-  column_names <- c("mean_square_displacement", "real_distance_organoids", "dead_dye_mean", "tcell_contact")
+  column_names<-names(df_tracks)
+  column_names <- c("mean_square_displacement", "dead_dye_mean", "tcell_contact")
   
-  ### Create a first dataset with refilled values for speed:
-  time_series<-acast(master_dist, position_t ~ track_id, value.var='speed',fun.aggregate = mean)
+  ### Create a first dataset with refilled values for mean_square_displacement:
+  time_series<-acast(df_tracks, position_t ~ TrackID, value.var='mean_square_displacement',fun.aggregate = mean)
   
   ### rownames timepoints:
-  row.names(time_series)<-unique(master_dist$position_t)
+  row.names(time_series)<-unique(df_tracks$position_t)
   
   ### Get rid of NA by interpolation
   time_series_zoo<-zoo(time_series, row.names(time_series))
@@ -180,14 +148,14 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   time_series<-as.matrix(time_series_zoo)
   time_series2<-melt(time_series)
   data<-time_series2[complete.cases(time_series2), ] 
-  colnames(data)<-c("position_t", "track_id", "speed")
+  colnames(data)<-c("position_t", "TrackID", "mean_square_displacement")
   
   ### Store this data for calculating lagged speed later:
   time_series2_speed<-data
   
   for (i in column_names){
-    time_series<-acast(master_dist, position_t ~ track_id, value.var=i,fun.aggregate = mean)
-    row.names(time_series)<-unique(master_dist$position_t)
+    time_series<-acast(df_tracks, position_t ~ TrackID, value.var=i,fun.aggregate = mean)
+    row.names(time_series)<-unique(df_tracks$position_t)
     ### get rid of NA
     time_series_zoo<-zoo(time_series,row.names(time_series))
     time_series_zoo<-na.approx(time_series_zoo) ## replace by last value
@@ -203,55 +171,22 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   ### When two cells interact it is often the one cell moves and interacts with another one that is static
   ### In this case one might consider that only the motile cell is actively interacting and the static cell is just passively interacting
   ### To determine when a cell is actively interacting we measure for each cell what was its mean speed over the last 10 timepoints (20 mins)
-  time_series2_meanspeed <- time_series2_speed %>% 
-    group_by(track_id) %>%
-    mutate(meanspeed=zoo::rollapply(
-      speed,
-      width=10,
-      mean,
-      align='right',
-      fill=NA)
-      )
   
-  ### Refill all missing values with the last value
-  time_series<-acast(time_series2_meanspeed, position_t ~ track_id, value.var='meanspeed',fun.aggregate = mean)
-  time_series_zoo<-zoo(time_series)
-  time_series_zoo<-na.locf(time_series_zoo, fromLast=T) ## replace by last value
-  time_series<-as.matrix(time_series_zoo)
-  time_series2_meanspeed<-melt(time_series)
-  colnames(time_series2_meanspeed)<-c("position_t", "track_id", "meanspeed")
-  
-  ### Remove last NAs
-  time_series2_meanspeed<-na.omit(time_series2_meanspeed)
-  
-  ### Create a dataframe with all the variables with corrected missing values
-  master_corrected <- data
-  
-  ### Join the information on the cell line, experiment number and well number
-  master_temp<- df_tracks[c("track_id", colnames(metadata))]
-  #master_temp<- df_tracks[c("TrackID2", colnames(metadata)[-1])]
-  master_temp<-master_temp[!duplicated(master_temp$track_id),]
-  master_corrected<- left_join(master_corrected, master_temp, by=c("track_id"))
-  
-  ### Merge the information for the mean speed over the last 20 mins
-  master_corrected1<- merge(master_corrected, time_series2_meanspeed, by = c("position_t","track_id"))
-  
-  ### Update the binary variable for contact with organoids
+  ### Update the binary variable for organoid_contact with organoids
   ### It can vary between experiments depending on the intensity of the T cells or organoids. 
-  ### Check the threshold of contact in the imaging data and update in the metadata csv
-  master_corrected1$contact <- ifelse(master_corrected1$real_distance_organoids>master_corrected1$organoid_contact_threshold, 0,1)
-  
+  ### Check the threshold of organoid_contact in the imaging data and update in the metadata csv
+
   ### Plot the number of touching vs. non-touching T cells
-  ggplot(master_corrected1, aes(x=contact, color=as.factor(exp_nr))) +
-    geom_histogram(fill="white", alpha=0.5, position="identity")+facet_grid(organoid_line~well, scales = "free")
+  ggplot(df_tracks, aes(x=organoid_contact, fill=as.factor(exp_nr))) +
+    geom_bar(position="identity")+facet_grid(organoid_line~well, scales = "free")
   
   ggsave(
     paste0(qc_output_dir,"TouchingvsNontouching_distribution.pdf"), 
     device="pdf", height=210, width=297, units="mm"
   )
   
-  ### Remove organoid contact threshold variable
-  master_corrected1$organoid_contact_threshold<-NULL
+  ### Remove organoid organoid_contact threshold variable
+  # master_corrected1$organoid_contact_threshold<-NULL
   
   ### For clustering it is necessary to compare T cell tracks that have a similar length. 
   ### For that we select cell track that have at least 100 timepoints. 
@@ -259,18 +194,18 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   detach("package:reshape2", unload=TRUE)
   # detach("package:plyr", unload=TRUE)
   
-  master_corrected2<-master_corrected1 %>% 
-    group_by(track_id) %>% arrange(track_id)%>% filter(position_t>00&position_t<pars$tcell_exp_duration)%>% filter(n() >= pars$tcell_min_track_length)
+  master_corrected2<-df_tracks %>% 
+    group_by(TrackID) %>% arrange(TrackID)%>% filter(position_t>00&position_t<pars$tcell_exp_duration)%>% filter(n() >= pars$tcell_min_track_length)
   
   track_counts=left_join(track_counts, count_tracks(master_corrected2))
   colnames(track_counts)[colnames(track_counts)=="nr_tracks"]="filt_minLength"
   
   ### Create a variable for the relative position_t
   master_corrected2<-master_corrected2 %>% 
-    group_by(track_id) %>%arrange(position_t)%>%mutate(Time2 = position_t - first(position_t))
+    group_by(TrackID) %>%arrange(position_t)%>%mutate(Time2 = position_t - first(position_t))
   ### For the Tracks that have more then 100 timepoints filter only the first 100.
   master_corrected2<-master_corrected2 %>% 
-    group_by(track_id) %>%arrange(track_id)%>% filter(Time2<pars$tcell_max_track_length)
+    group_by(TrackID) %>%arrange(TrackID)%>% filter(Time2<pars$tcell_max_track_length)
   
   ### To exclude noise due to dead cells remove the dead t cells from the beginning
   # master_corrected3 <- master_corrected2
@@ -288,23 +223,23 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   )
   
   ### Filter out T cells that are dead at the start of the experiment
-  master_corrected3deadT0 <-master_corrected2%>%group_by(track_id)%>%filter((Time2==0) & dead_dye_mean<tcell_dead_dye_threshold )
+  master_corrected3deadT0 <-master_corrected2%>%group_by(TrackID)%>%filter((Time2==0) & dead_dye_mean<dead_dye_threshold )
   
-  master_corrected3 <-master_corrected2%>%filter(track_id %in% master_corrected3deadT0$track_id )
+  master_corrected3 <-master_corrected2%>%filter(TrackID %in% master_corrected3deadT0$TrackID )
   
   track_counts=left_join(track_counts, count_tracks(master_corrected3))
   colnames(track_counts)[colnames(track_counts)=="nr_tracks"]="filt_DeadCellStart"
   
   ### Create a binary variable for live or dead cells:
-  master_corrected3$death<- ifelse(master_corrected3$dead_dye_mean<master_corrected3$tcell_dead_dye_threshold,0,1)
+  master_corrected3$death<- ifelse(master_corrected3$dead_dye_mean<master_corrected3$dead_dye_threshold,0,1)
   
   ### Create a variable for cumulative interaction with organoids
   master_corrected3<-master_corrected3 %>% 
-    group_by(track_id) %>%mutate(contact2=(ave(contact, cumsum(!contact), FUN = cumsum)))
+    group_by(TrackID) %>%mutate(cum_contact=(ave(organoid_contact, cumsum(!organoid_contact), FUN = cumsum)))
   ### Create a variable for T cells interact with other T cells while in the environment
-  master_corrected3$tcell_contact<- ifelse(master_corrected3$contact==1,0,master_corrected3$tcell_contact)
+  # master_corrected3$tcell_contact<- ifelse(master_corrected3$organoid_contact==1,0,master_corrected3$tcell_contact)
   ### For T cells inteacting in the environment keep as "interacting" only cells that had a mean speed in the last 20 minutes that is in the upper quantile.
-  master_corrected3<-master_corrected3%>%group_by(exp_nr)%>%mutate(tcell_contact=ifelse(meanspeed<quantile(meanspeed,p=0.75),0,tcell_contact))
+  master_corrected3<-master_corrected3%>%group_by(exp_nr)%>%mutate(active_tcell_contact=ifelse(meanspeed<quantile(meanspeed,p=0.75),0,tcell_contact))
   
   ### Save processed data on the tcells for possible further analysis
   saveRDS(master_corrected3, file = paste0(output_dir,"processed_tcell_track_data.rds"))
@@ -312,7 +247,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   write.table(track_counts, file=paste0(qc_output_dir, "NrCellTracks_filtering.tsv"), sep="\t", row.names=FALSE)
   
   library(reshape2)
-  melted_track_counts = melt(track_counts,id.vars=c("basename","name","organoid_line", "tcell_line", "exp_nr", "well"))
+  melted_track_counts = melt(track_counts,id.vars=c("sample_name","name","organoid_line", "tcell_line", "exp_nr", "well"))
   detach("package:reshape2", unload=TRUE)
   ggplot(melted_track_counts, aes(x=name, y=value, fill=variable)) + 
     geom_col(width=0.75, position="dodge") + 
@@ -385,22 +320,22 @@ if (model_path != ""){
   master_test2<-master_test%>% ungroup()%>%
     # group_by(tcell_line, organoid_line, exp_nr, well) %>%
     group_by(exp_nr) %>%
-    mutate(z.disp = (displacement-mean(displacement))/sd(displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (dead_dye_mean-mean(dead_dye_mean))/sd(dead_dye_mean))%>%
+    mutate(z.disp = (mean_square_displacement-mean(mean_square_displacement))/sd(mean_square_displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (dead_dye_mean-mean(dead_dye_mean))/sd(dead_dye_mean))%>%
     mutate(q.disp=ifelse(z.disp>(quantile(z.disp, p=0.75)),z.disp,min(z.disp)), q.speed=ifelse(z.speed>(quantile(z.speed, p=0.75)),z.speed,min(z.speed)),q.red=ifelse(z.red>(quantile(z.red, p=0.75)),z.red,min(z.red)))%>%
-    mutate(q.disp=scales::rescale(q.disp, to=c(0,100)),q.speed=scales::rescale(q.speed, to=c(0,100)),q.red=scales::rescale(q.red, to=c(0,100)),s.contact=scales::rescale(contact, to=c(0,1)),s.tcell_contact=scales::rescale(tcell_contact, to=c(0,1)))%>%
+    mutate(q.disp=scales::rescale(q.disp, to=c(0,100)),q.speed=scales::rescale(q.speed, to=c(0,100)),q.red=scales::rescale(q.red, to=c(0,100)),s.organoid_contact=scales::rescale(organoid_contact, to=c(0,1)),s.tcell_contact=scales::rescale(tcell_contact, to=c(0,1)))%>%
     mutate(q.disp=q.disp/mean(quantile(q.disp, p=0.9999)),q.speed=q.speed/mean(quantile(q.speed, p=0.9999)),q.red=q.red/mean(quantile(q.red, p=0.9999)))%>%
     ungroup()
   
   ### Calculate position_t-series descriptive statistics
-  test_dataset <- master_test2%>%group_by(track_id)%>% arrange(position_t)%>%
+  test_dataset <- master_test2%>%group_by(TrackID)%>% arrange(position_t)%>%
     summarise(mean_speed= mean(q.speed),median_speed= median(q.speed),speed_sd= sd(q.speed),q3_speed= quantile(q.speed,0.90),
               mean_displacement = mean(q.disp),median_displacement = median(q.disp),
               displacement_sd=sd(q.disp),q3_disp= quantile(q.disp,0.90),
               mean_red_lym = mean(q.red),red_lym_sd=sd(q.red),q3_red= quantile(q.red,0.90),
-              contact=mean(s.contact),mean_contact2=mean(contact2),contact2=max(contact2))
+              organoid_contact=mean(s.organoid_contact),mean_cum_contact=mean(cum_contact),cum_contact=max(cum_contact))
   
   ### create a  matrix from the predictors
-  test1 = as.matrix(test_dataset[,-which(names(test_dataset) == "track_id")]) 
+  test1 = as.matrix(test_dataset[,-which(names(test_dataset) == "TrackID")]) 
   model_predict_test<-predict(model,test1,type="response")
   test_dataset_predicted<-cbind(model_predict_test,test_dataset)
   test_dataset_predicted$cluster<-test_dataset_predicted$model_predict
@@ -408,8 +343,8 @@ if (model_path != ""){
   ### Plot the proportion of cells for each behavioral signature
   ## Join information of cell ID
   classification<-test_dataset_predicted[,c(2,17)]
-  master_classified<-left_join(master_test,classification, by="track_id")
-  cell_ID<-master_classified[!duplicated(master_classified$track_id),c("track_id","organoid_line","tcell_line","exp_nr", "well")] 
+  master_classified<-left_join(master_test,classification, by="TrackID")
+  cell_ID<-master_classified[!duplicated(master_classified$TrackID),c("TrackID","organoid_line","tcell_line","exp_nr", "well")] 
   saveRDS(master_classified, file = paste0(output_dir,"classified_tcell_track_data.rds"))
   
   classified_tracks<-test_dataset_predicted
@@ -503,21 +438,21 @@ if (model_path != ""){
   
   master_processed<-master_corrected3%>% 
     group_by(exp_nr) %>% 
-    mutate(z.disp = (displacement-mean(displacement))/sd(displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (dead_dye_mean-mean(dead_dye_mean))/sd(dead_dye_mean))%>%
+    mutate(z.disp = (mean_square_displacement-mean(mean_square_displacement))/sd(mean_square_displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (dead_dye_mean-mean(dead_dye_mean))/sd(dead_dye_mean))%>%
     mutate(q.disp=ifelse(z.disp>(quantile(z.disp, p=0.75)),z.disp,min(z.disp)), q.speed=ifelse(z.speed>(quantile(z.speed, p=0.75)),z.speed,min(z.speed)),q.red=ifelse(z.red>(quantile(z.red, p=0.75)),z.red,min(z.red)))%>%
-    mutate(q.disp=scales::rescale(q.disp, to=c(0,1)),q.speed=scales::rescale(q.speed, to=c(0,1)),q.red=scales::rescale(q.red, to=c(0,1)),s.contact=scales::rescale(contact, to=c(0,1)),s.tcell_contact=scales::rescale(tcell_contact, to=c(0,1))) %>%
+    mutate(q.disp=scales::rescale(q.disp, to=c(0,1)),q.speed=scales::rescale(q.speed, to=c(0,1)),q.red=scales::rescale(q.red, to=c(0,1)),s.organoid_contact=scales::rescale(organoid_contact, to=c(0,1)),s.tcell_contact=scales::rescale(tcell_contact, to=c(0,1))) %>%
     mutate(q.disp=q.disp/mean(quantile(q.disp, p=0.9999999)),q.speed=q.speed/mean(quantile(q.speed, p=0.9999999)),q.red=q.red/mean(quantile(q.red, p=0.9999999)))%>%ungroup()
   
   ### Arrange data by position_t:
-  master_processed<-master_processed%>%group_by(track_id)%>%arrange(position_t)
-  master_processed$track_id = as.character(master_processed$track_id)
-  # master_processed_ref<-master_processed_ref%>%group_by(track_id)%>%arrange(position_t)
+  master_processed<-master_processed%>%group_by(TrackID)%>%arrange(position_t)
+  master_processed$TrackID = as.character(master_processed$TrackID)
+  # master_processed_ref<-master_processed_ref%>%group_by(TrackID)%>%arrange(position_t)
   
   saveRDS(master_processed, file = paste0(output_dir,"tcell_track_features.rds"))
   
   ###Split the data in a list of TrackIDs with multivariate data for each Track overtime
-  list_multivariate <- split(master_processed[,c("q.disp", "q.speed", "q.red","s.contact", "s.tcell_contact")],master_processed$track_id) 
-  # list_multivariate_ref <- split(master_processed_ref[,c("q.disp", "q.speed", "q.red","s.contact", "s.tcell_contact")],master_processed_ref$track_id) 
+  list_multivariate <- split(master_processed[,c("q.disp", "q.speed", "q.red","s.organoid_contact", "s.tcell_contact")],master_processed$TrackID) 
+  # list_multivariate_ref <- split(master_processed_ref[,c("q.disp", "q.speed", "q.red","s.organoid_contact", "s.tcell_contact")],master_processed_ref$TrackID) 
   
   ##Set up parallel working for big datasets
   # load parallel
@@ -536,8 +471,8 @@ if (model_path != ""){
   ###MULTIVARIATE cross-distance matrix calculate for different tracks
   distmat <- proxy::dist(list_multivariate, method = "dtw")
   matrix_distmat<-as.matrix(distmat)
-  ## Store track_id names
-  track_id<-as.character(names(list_multivariate))
+  ## Store TrackID names
+  TrackID<-as.character(names(list_multivariate))
   
   library(umap)
   ## Project cross-distance matrix in a UMAP
@@ -555,9 +490,9 @@ if (model_path != ""){
   
   umap_1 <- as.data.frame(umap_dist$`layout`) 
   
-  Track2_umap<-cbind(track_id,umap_1)
-  temp_df<-master_corrected3[,c("track_id", "well","exp_nr","organoid_line")]
-  temp_df<- temp_df[!duplicated(temp_df$track_id),]
+  Track2_umap<-cbind(TrackID,umap_1)
+  temp_df<-master_corrected3[,c("TrackID", "well","exp_nr","organoid_line")]
+  temp_df<- temp_df[!duplicated(temp_df$TrackID),]
   umap_2 <- left_join(Track2_umap ,temp_df)
   
   ## Perform clustering. Select clusterig type that suits more your dataset
@@ -583,15 +518,15 @@ if (model_path != ""){
   )
   
   #### To the original dataset add information on cluster type
-  master_clustered <- merge(master_processed ,umap_3[c("track_id","cluster2")], by.x = "track_id", by.y = "track_id")
+  master_clustered <- merge(master_processed ,umap_3[c("TrackID","cluster2")], by.x = "TrackID", by.y = "TrackID")
   # master_clustered$cluster = master_clustered$cluster2
   ### Save Reference UMAP for training of random forest classifier
   saveRDS(master_clustered, file = paste0(output_dir,"behavioral_reference_map.rds")) ### store here your reference map that can be used to predict behaviors in new experiments
   
   ## Plot a heatmap to show the relative values of each behavior parameter
   ## Create a dataframe the summarizes the mean values for each parameter
-  sum_all <- master_clustered%>% select( speed, displacement, dead_dye_mean, contact2, tcell_contact, cluster2, contact)%>% group_by(cluster2)%>%
-    summarise(contact_len=mean(contact2),n_contact_org= mean(contact),displacement2 = median(displacement), speed = median(speed), interaction_T_cells= mean(tcell_contact),death = median(dead_dye_mean))
+  sum_all <- master_clustered%>% select( speed, mean_square_displacement, dead_dye_mean, cum_contact, tcell_contact, cluster2, organoid_contact)%>% group_by(cluster2)%>%
+    summarise(contact_len=mean(cum_contact),n_contact_org= mean(organoid_contact),displacement2 = median(mean_square_displacement), speed = median(speed), interaction_T_cells= mean(tcell_contact),death = median(dead_dye_mean))
   ## scales::rescale the values from each parameter
   sum_all <- sum_all%>%mutate(contact_len= scales::rescale(contact_len, to=c(0,100)) ,n_contact_org= scales::rescale(n_contact_org, to=c(0,100)),displacement2 = scales::rescale(displacement2, to=c(0,100)), speed = scales::rescale(speed, to=c(0,100)),interaction_T_cells= scales::rescale(interaction_T_cells, to=c(0,100)), death =scales::rescale(death, to=c(0,100)))
   
@@ -612,14 +547,14 @@ if (model_path != ""){
     device="pdf", height=210, width=297, units="mm"
   )
   
-  master_clustered_info<-master_clustered[!duplicated(master_clustered$track_id),c("track_id","organoid_line","tcell_line","exp_nr", "well", "cluster2")] 
+  master_clustered_info<-master_clustered[!duplicated(master_clustered$TrackID),c("TrackID","organoid_line","tcell_line","exp_nr", "well", "cluster2")] 
   
-  master_clustered2 =master_clustered%>%group_by(track_id)%>% arrange(position_t)%>%
+  master_clustered2 =master_clustered%>%group_by(TrackID)%>% arrange(position_t)%>%
                       summarise(mean_speed= mean(q.speed),median_speed= median(q.speed),speed_sd= sd(q.speed),q3_speed= quantile(q.speed,0.90),
                                 mean_displacement = mean(q.disp),median_displacement = median(q.disp),
                                 displacement_sd=sd(q.disp),q3_disp= quantile(q.disp,0.90),
                                 mean_red_lym = mean(q.red),red_lym_sd=sd(q.red),q3_red= quantile(q.red,0.90),
-                                contact=mean(s.contact),mean_contact2=mean(contact2),contact2=max(contact2))
+                                organoid_contact=mean(s.organoid_contact),mean_cum_contact=mean(cum_contact),cum_contact=max(cum_contact))
   
   master_clustered2<-left_join(master_clustered2,master_clustered_info)
   

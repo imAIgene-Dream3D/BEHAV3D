@@ -10,6 +10,7 @@
 output_dir: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test"
 ### Path to the metadata csv that contains experiment specific information
 metadata_csv_path: "....BEVAV3D/config/metadata_template.tsv"
+imaris_position_csv: "/Users/samdeblank/surfdrive/Documents/1.projects/tcell_paper/processed/2021-06-10_WT1_n1/1.data/2021-06-10_WT1_n1(1)_10T_[ims1_2021-09-09T14-14-13.594]_dt_Statistics/2021-06-10_WT1_n1(1)_10T_[ims1_2021-09-09T14-14-13.594]_dt_Position.csv"
 
 #####################################################
 ############## Preprocessing paths and parameters ##############
