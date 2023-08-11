@@ -10,7 +10,7 @@
 output_dir: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test"
 ### Path to the metadata csv that contains experiment specific information
 metadata_csv_path: "....BEVAV3D/config/metadata_template.tsv"
-imaris_position_csv: "/Users/samdeblank/surfdrive/Documents/1.projects/tcell_paper/processed/2021-06-10_WT1_n1/1.data/2021-06-10_WT1_n1(1)_10T_[ims1_2021-09-09T14-14-13.594]_dt_Statistics/2021-06-10_WT1_n1(1)_10T_[ims1_2021-09-09T14-14-13.594]_dt_Position.csv"
+imaris: True
 
 #####################################################
 ############## Preprocessing paths and parameters ##############
@@ -18,8 +18,9 @@ imaris_position_csv: "/Users/samdeblank/surfdrive/Documents/1.projects/tcell_pap
 ilastik_path: "/Applications/ilastik-1.4.0b27-OSX.app/Contents/ilastik-release/run_ilastik.sh"
 ilastik_pixel_classifier_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_pix_clas_v5.ilp"
 ilastik_organoid_segmentation_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_obj_clas_v4.ilp"
+ilastik_organoid_postprocessing_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_faketrack_obj_split_v4.ilp"
 ilastik_tcell_segmentation_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_obj_clas_TCELL.ilp"
-ilastik_object_postprocessing_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_faketrack_obj_split_v4.ilp"
+ilastik_tcell_postprocessing_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_faketrack_obj_split_v4.ilp"
 
 #####################################################
 ### Parameters for T-cell dynamics classification ###
