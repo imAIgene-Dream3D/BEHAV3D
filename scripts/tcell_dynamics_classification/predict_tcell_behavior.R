@@ -24,7 +24,7 @@ if (interactive()) {
   pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/tcell_demo/BEHAV3D_config.yml"))
   
   ### For your own file, uncomment following line and add own path to the BEHAV3D_config.yml
-  # pars = yaml.load_file("")
+  pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/imaris_run/old_behav3d/config.yml")
   
 } else {
   option_list = list(
@@ -138,7 +138,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   dist_org=do.call(rbind, datalist)
   
   # import Position
-  pat = "Position"
+  pat = "Position.csv"
   pos <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   ### Join all Imaris information
@@ -353,7 +353,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   )
   
   ### Filter out T cells that are dead at the start of the experiment
-  master_corrected3deadT0 <-master_corrected2%>%group_by(TrackID)%>%filter((Time2==0) & red_lym<tcell_dead_dye_threshold )
+  master_corrected3deadT0 <-master_corrected2%>%group_by(TrackID)%>%filter((Time2==0) & red_lym<dead_dye_threshold )
   
   master_corrected3 <-master_corrected2%>%filter(TrackID %in% master_corrected3deadT0$TrackID )
   
@@ -361,7 +361,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   colnames(track_counts)[colnames(track_counts)=="nr_tracks"]="filt_DeadCellStart"
   
   ### Create a binary variable for live or dead cells:
-  master_corrected3$death<- ifelse(master_corrected3$red_lym<master_corrected3$tcell_dead_dye_threshold,0,1)
+  master_corrected3$death<- ifelse(master_corrected3$red_lym<master_corrected3$dead_dye_threshold,0,1)
   
   ### Create a variable for cumulative interaction with organoids
   master_corrected3<-master_corrected3 %>% 

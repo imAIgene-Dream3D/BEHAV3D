@@ -43,7 +43,8 @@ def main(config, metadata, keep_all=False):
     ilastik_pix_clas_model = config['ilastik_pixel_classifier_model']
     ilastik_org_seg_model = config['ilastik_organoid_segmentation_model']
     ilastik_tcell_seg_model = config['ilastik_tcell_segmentation_model']
-    ilastik_postproc_model = config['ilastik_object_postprocessing_model']
+    ilastik_org_postproc_model = config['ilastik_organoid_postprocessing_model']
+    ilastik_tcell_postproc_model = config['ilastik_tcell_postprocessing_model']
     
     for _, sample in metadata.iterrows():
         sample_name = sample['sample_name']
@@ -82,7 +83,7 @@ def main(config, metadata, keep_all=False):
         seg_org_h5_path=run_ilastik_object_splitter(
             raw_data=full_image_path,
             segments=preseg_org_h5_path,
-            model=ilastik_postproc_model,
+            model=ilastik_org_postproc_model,
             out_path=seg_org_h5_path,
             ilastik_path=ilastik_path,
             verbose=verbose
@@ -114,7 +115,7 @@ def main(config, metadata, keep_all=False):
         seg_tcell_h5_path=run_ilastik_object_splitter(
             raw_data=full_image_path,
             segments=preseg_tcell_h5_path,
-            model=ilastik_postproc_model,
+            model=ilastik_tcell_postproc_model,
             out_path=seg_tcell_h5_path,
             ilastik_path=ilastik_path
         )

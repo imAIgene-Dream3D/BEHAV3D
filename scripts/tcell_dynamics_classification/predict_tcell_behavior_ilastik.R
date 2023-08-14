@@ -13,8 +13,6 @@ library(optparse)
 library(ggplot2)
 
 ### Set to TRUE if you want to run import and processing even if file already exists
-force_redo=TRUE
-tracks_provided=NULL
 
 ### Checks if being run in GUI (e.g. Rstudio) or command line
 if (interactive()) {
@@ -24,7 +22,7 @@ if (interactive()) {
   pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/tcell_demo/BEHAV3D_config.yml"))
   
   ### For your own file, uncomment following line and add own path to the BEHAV3D_config.yml
-  pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/BEHAV3D_run/config.yml")
+  pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/imaris_run/ilastik_behav3d/config.yml")
   
 } else {
   option_list = list(
@@ -54,7 +52,7 @@ dir.create(qc_output_dir, recursive=TRUE)
 dir.create(output_dir, recursive=TRUE)
 model_path <- pars$randomforest
 
-if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | force_redo==TRUE ) & is.null(tracks_provided) ){
+if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))))){
   print("#################################################")
   print("###############  Importing data  ################")
   print("#################################################")
@@ -77,6 +75,9 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   ### Import file-specific metadata for all images used in this analysis.
   metadata=readr::read_csv(pars$metadata_csv)
+  metadata$time_unit = NULL
+  metadata$distance_unit = NULL
+  metadata$time_interval = NULL
   
   track_counts=metadata
   track_counts$name = paste(metadata$organoid_line, metadata$tcell_line, metadata$exp_nr, metadata$well)
@@ -128,44 +129,6 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   library(reshape2)
   library(zoo)
-  
-  ### Since not all the tracks are tracked at all timepoints,
-  ### Interpolate missing values and fill the NA (for each variable)
-  
-  ### Select the variables for which we need to interpolate NAs (numeric)
-  column_names<-names(df_tracks)
-  column_names <- c("mean_square_displacement", "dead_dye_mean", "tcell_contact")
-  
-  ### Create a first dataset with refilled values for mean_square_displacement:
-  time_series<-acast(df_tracks, position_t ~ TrackID, value.var='mean_square_displacement',fun.aggregate = mean)
-  
-  ### rownames timepoints:
-  row.names(time_series)<-unique(df_tracks$position_t)
-  
-  ### Get rid of NA by interpolation
-  time_series_zoo<-zoo(time_series, row.names(time_series))
-  time_series_zoo<-na.approx(time_series_zoo) ## replace by interpolated value
-  time_series<-as.matrix(time_series_zoo)
-  time_series2<-melt(time_series)
-  data<-time_series2[complete.cases(time_series2), ] 
-  colnames(data)<-c("position_t", "TrackID", "mean_square_displacement")
-  
-  ### Store this data for calculating lagged speed later:
-  time_series2_speed<-data
-  
-  for (i in column_names){
-    time_series<-acast(df_tracks, position_t ~ TrackID, value.var=i,fun.aggregate = mean)
-    row.names(time_series)<-unique(df_tracks$position_t)
-    ### get rid of NA
-    time_series_zoo<-zoo(time_series,row.names(time_series))
-    time_series_zoo<-na.approx(time_series_zoo) ## replace by last value
-    time_series<-as.matrix(time_series_zoo)
-    time_series2<-melt(time_series)
-    new<-time_series2[complete.cases(time_series2), ] 
-    data[ , ncol(data) + 1] <- new[3]                  # Append new column
-    colnames(data)[ncol(data)] <- paste0(i)
-  }
-  
   library(dplyr)
   ### For cell interaction we need to consider the following:
   ### When two cells interact it is often the one cell moves and interacts with another one that is static
@@ -239,7 +202,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   ### Create a variable for T cells interact with other T cells while in the environment
   # master_corrected3$tcell_contact<- ifelse(master_corrected3$organoid_contact==1,0,master_corrected3$tcell_contact)
   ### For T cells inteacting in the environment keep as "interacting" only cells that had a mean speed in the last 20 minutes that is in the upper quantile.
-  master_corrected3<-master_corrected3%>%group_by(exp_nr)%>%mutate(active_tcell_contact=ifelse(meanspeed<quantile(meanspeed,p=0.75),0,tcell_contact))
+  master_corrected3<-master_corrected3%>%group_by(exp_nr)%>%mutate(active_tcell_contact=ifelse(mean_speed<quantile(mean_speed,p=0.75),0,tcell_contact))
   
   ### Save processed data on the tcells for possible further analysis
   saveRDS(master_corrected3, file = paste0(output_dir,"processed_tcell_track_data.rds"))

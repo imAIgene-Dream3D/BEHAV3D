@@ -59,6 +59,8 @@ def main(config, metadata, verbose):
         tcell_segments = imread(tcell_segments_path)
         
         df_centroids = []
+        # TODO 
+        # Check if trackmate removes objects and still keep them in image
         for t, tcell_stack in enumerate(tcell_segments):
             properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, properties=['label', f'centroid']))
             properties["position_t"]=t
