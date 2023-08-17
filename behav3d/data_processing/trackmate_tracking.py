@@ -14,11 +14,10 @@ import argparse
 parser = argparse.ArgumentParser()
 parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
 parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
-parser.add_argument('-m', '--metadata', type=str, help='path to a metadata.csv file that stores metadata per image', required=False)
 parser.add_argument('-v', '--verbose', action='store_true', help='Verbose', required=False)
 args = parser.parse_args()
 
-def main(config, metadata, verbose):
+def run_trackmate(config, metadata, verbose):
     
     print("### Running T cell tracking")
     output_dir = config['output_dir']
@@ -38,7 +37,7 @@ def main(config, metadata, verbose):
         print("- Running TrackMate...")
         ### Track the data using TrackMate
         tcell_segments_path = Path(output_dir, f"{sample_name}_tcell_segments.tiff")   
-        df_tracks=run_trackmate(
+        df_tracks=trackmate_tracking(
             image_path=str(tcell_segments_path),
             element_size_x=element_size_x,
             element_size_y=element_size_y,
@@ -90,7 +89,7 @@ def main(config, metadata, verbose):
         ) 
         print("### Done\n")
         
-def run_trackmate(
+def trackmate_tracking(
     image_path,
     element_size_x, 
     element_size_y, 
@@ -203,6 +202,6 @@ def run_trackmate(
 if __name__ == "__main__":
     with open(args.config, "r") as parameters:
         config=yaml.load(parameters, Loader=yaml.SafeLoader)
-    metadata = pd.read_csv(args.metadata)
+    metadata = pd.read_csv(config["metadata_csv_path"])
     verbose=args.verbose
-    main(config, metadata, verbose)
+    run_trackmate(config, metadata, verbose)

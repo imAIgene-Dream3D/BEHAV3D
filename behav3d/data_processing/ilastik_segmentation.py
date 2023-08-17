@@ -29,16 +29,12 @@ import pandas as pd
 parser = argparse.ArgumentParser()
 parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
 parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
-parser.add_argument('-m', '--metadata', type=str, help='path to a metadata.csv file that stores metadata per image', required=False)
 parser.add_argument('-k', '--keep_all', action='store_true', help='Keep original files after checks if compression has been succesful', required=False)
 parser.add_argument('-v', '--verbose', action='store_true', help='Verbose', required=False)
 
 args = parser.parse_args()
 
-with open(args.config, "r") as parameters:
-    config=yaml.load(parameters, Loader=yaml.SafeLoader)
-
-def main(config, metadata, keep_all=False):
+def run_ilastik_segmentation(config, metadata, keep_all=False):
     ilastik_path = config['ilastik_path']
     ilastik_pix_clas_model = config['ilastik_pixel_classifier_model']
     ilastik_org_seg_model = config['ilastik_organoid_segmentation_model']
@@ -273,6 +269,6 @@ if __name__ == "__main__":
     with open(args.config, "r") as parameters:
         config=yaml.load(parameters, Loader=yaml.SafeLoader)
     keep_all=args.keep_all
-    metadata = pd.read_csv(args.metadata)
+    metadata = pd.read_csv(config['metadata_csv_path'])
     verbose=args.verbose
-    main(config, metadata, keep_all, verbose)
+    run_ilastik_segmentation(config, metadata, keep_all, verbose)
