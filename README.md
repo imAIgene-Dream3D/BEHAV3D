@@ -168,6 +168,8 @@ If you want to run new data in a different folder, change the path to the corres
 (Optional) Change the force_redo parameter on [line 16](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L16)\
 (Optional) Change the for parameter on [line 17](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L17)
 
+*Note, that when generating a new Behavioral Map, Uniform Manifold Approximation and Projection (UMAP) projection of the dissimilarity matrix of T cells might require adjusting parameters. See notes in the code and following link for more information of UMAP performance: https://pair-code.github.io/understanding-umap/*
+
 ***Output_files***
 
 output rds:
