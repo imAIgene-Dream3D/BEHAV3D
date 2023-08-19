@@ -619,7 +619,10 @@ if (!is.null(model_path) && model_path != "") {
   library(umap)
   ## Project cross-distance matrix in a UMAP
   umap_dist<- umap(matrix_distmat,n_components=2,input="dist",init = "random", 
-                   n_neighbors=pars$umap_n_neighbors, min_dist=pars$umap_minimal_distance, spread=1)  ### adjust parameters
+                   n_neighbors=pars$umap_n_neighbors, min_dist=pars$umap_minimal_distance, spread=1)  ### If you are generating a new behavioral map, we advise to adjust the n_neighbors and the min_dist parameters.
+  ###The "min_dist" parameter controls how tightly the UMAP algorithm packs points in the low-dimensional space. Smaller values of "min_dist" cause points to be spread out more, but can also cause too many clusters
+  ###"n_neighbors" parameter should be chosen considering the size of your dataset and your goals for preserving local versus global structure. Roughly n_neighbours parameter values should increase for larger datasets, as they often contain more intricate local structures that require a higher number of neighbors to be adequately captured
+
   #Visualize plot
   pdf(file=paste0(output_dir,"Umap_unclustered.pdf"))
   
