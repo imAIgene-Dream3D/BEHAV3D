@@ -26,15 +26,7 @@ from tifffile import imread, imwrite
 import numpy as np
 import pandas as pd
 
-parser = argparse.ArgumentParser()
-parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
-parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
-parser.add_argument('-k', '--keep_all', action='store_true', help='Keep original files after checks if compression has been succesful', required=False)
-parser.add_argument('-v', '--verbose', action='store_true', help='Verbose', required=False)
-
-args = parser.parse_args()
-
-def run_ilastik_segmentation(config, metadata, keep_all=False):
+def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
     ilastik_path = config['ilastik_path']
     ilastik_pix_clas_model = config['ilastik_pixel_classifier_model']
     ilastik_org_seg_model = config['ilastik_organoid_segmentation_model']
@@ -266,6 +258,13 @@ def run_ilastik_object_splitter(
     return(out_path)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
+    parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
+    parser.add_argument('-k', '--keep_all', action='store_true', help='Keep original files after checks if compression has been succesful', required=False)
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose', required=False)
+
+    args = parser.parse_args()
     with open(args.config, "r") as parameters:
         config=yaml.load(parameters, Loader=yaml.SafeLoader)
     keep_all=args.keep_all

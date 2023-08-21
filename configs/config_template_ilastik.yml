@@ -14,7 +14,8 @@ ilastik_path: "/Applications/ilastik-1.4.0b27-OSX.app/Contents/ilastik-release/r
 ilastik_pixel_classifier_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_pix_clas_v5.ilp"
 ilastik_organoid_segmentation_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_obj_clas_v4.ilp"
 ilastik_tcell_segmentation_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_obj_clas_TCELL.ilp"
-ilastik_object_postprocessing_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_faketrack_obj_split_v4.ilp"
+ilastik_organoid_postprocessing_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_faketrack_obj_split_v4.ilp"
+ilastik_tcell_postprocessing_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_faketrack_obj_split_v4.ilp"
 
 #####################################################
 ### Parameters for T-cell dynamics classification ###

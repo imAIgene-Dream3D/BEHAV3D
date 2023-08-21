@@ -11,13 +11,7 @@ from tifffile import imread, imwrite
 from skimage.measure import regionprops_table
 import argparse
 
-parser = argparse.ArgumentParser()
-parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
-parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
-parser.add_argument('-v', '--verbose', action='store_true', help='Verbose', required=False)
-args = parser.parse_args()
-
-def run_trackmate(config, metadata, verbose):
+def run_trackmate(config, metadata, verbose=False):
     
     print("### Running T cell tracking")
     output_dir = config['output_dir']
@@ -200,6 +194,11 @@ def trackmate_tracking(
     return(df_spots)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
+    parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose', required=False)
+    args = parser.parse_args()
     with open(args.config, "r") as parameters:
         config=yaml.load(parameters, Loader=yaml.SafeLoader)
     metadata = pd.read_csv(config["metadata_csv_path"])
