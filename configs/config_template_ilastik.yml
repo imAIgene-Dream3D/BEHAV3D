@@ -11,11 +11,11 @@ metadata_csv_path: "....BEVAV3D/config/metadata_template.tsv"
 ############## Preprocessing paths and parameters ##############
 #####################################################
 ilastik_path: "/Applications/ilastik-1.4.0b27-OSX.app/Contents/ilastik-release/run_ilastik.sh"
-ilastik_pixel_classifier_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_pix_clas_v5.ilp"
-ilastik_organoid_segmentation_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_obj_clas_v4.ilp"
-ilastik_tcell_segmentation_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_obj_clas_TCELL.ilp"
-ilastik_organoid_postprocessing_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_faketrack_obj_split_v4.ilp"
-ilastik_tcell_postprocessing_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_faketrack_obj_split_v4.ilp"
+ilastik_pixel_classifier_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_pixel_class.ilp"
+ilastik_organoid_segmentation_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_organoid_class.ilp"
+ilastik_tcell_segmentation_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_tcell_class.ilp"
+ilastik_organoid_postprocessing_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_object_splitter.ilp"
+ilastik_tcell_postprocessing_model: "/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/ilastik_pipelines/AIM_MB2_object_splitter.ilp"
 
 #####################################################
 ### Parameters for T-cell dynamics classification ###
