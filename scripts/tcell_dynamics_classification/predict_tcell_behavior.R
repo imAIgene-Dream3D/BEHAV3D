@@ -584,7 +584,15 @@ if (!is.null(model_path) && model_path != "") {
     mutate(q.disp=ifelse(z.disp>(quantile(z.disp, p=0.75)),z.disp,min(z.disp)), q.speed=ifelse(z.speed>(quantile(z.speed, p=0.75)),z.speed,min(z.speed)),q.red=ifelse(z.red>(quantile(z.red, p=0.75)),z.red,min(z.red)))%>%
     mutate(q.disp=scales::rescale(q.disp, to=c(0,1)),q.speed=scales::rescale(q.speed, to=c(0,1)),q.red=scales::rescale(q.red, to=c(0,1)),s.contact=scales::rescale(contact, to=c(0,1)),s.contact_lym=scales::rescale(contact_lym, to=c(0,1))) %>%
     mutate(q.disp=q.disp/mean(quantile(q.disp, p=0.9999999)),q.speed=q.speed/mean(quantile(q.speed, p=0.9999999)),q.red=q.red/mean(quantile(q.red, p=0.9999999)))%>%ungroup()
-  
+  # master_processed might need adjustement if small sample size is used (quantile p value should decrease) or if T cell death parameter is more representative as a continuous variable (dead dye values) instead of a binary variable ("dead" vs"alive")
+  #see below an alternative for this code used to processes a small set of CART with liquid tumors
+  # master_processed<-master_corrected3%>% 
+  #  group_by(exp_nr) %>% 
+  #  mutate(z.disp = (displacement-mean(displacement))/sd(displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (red_lym-mean(red_lym))/sd(red_lym))%>%
+  #  mutate(q.disp=ifelse(z.disp>(quantile(z.disp, p=0.75)),z.disp ,min(z.disp)), q.speed=ifelse(z.speed>(quantile(z.speed, p=0.75)),z.speed,min(z.speed)),q.red=ifelse(z.red>(quantile(z.red, p=0.75)),z.red,min(z.red)))%>%  ## new step to update
+  #  mutate(q.disp=scales::rescale(q.disp, to=c(0,1)),q.speed=scales::rescale(q.speed, to=c(0,1)),q.red=scales::rescale(q.red, to=c(0,1))) %>%
+  #  mutate(q.disp=q.disp/mean(quantile(q.disp, p=0.95)),q.speed=q.speed/mean(quantile(q.speed, p=0.95)),q.red=q.red/mean(quantile(q.red, p=0.95)))%>%ungroup()%>%mutate(s.contact=contact,s.contact_lym=contact_lym)
+
   ### Arrange data by time:
   master_processed<-master_processed%>%group_by(TrackID)%>%arrange(Time)
   master_processed$TrackID = as.character(master_processed$TrackID)
