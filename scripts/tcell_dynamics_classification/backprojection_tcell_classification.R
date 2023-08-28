@@ -50,9 +50,11 @@ master3 <- left_join(master2 ,clustertype, by=c("TrackID"))
 for(to_backproject in unique(master3$basename)){
   To_export<-subset(master3,basename==to_backproject)
   To_export<-To_export[!duplicated(To_export$Original_TrackID),c("Original_TrackID","cluster2")]
+  To_export$Original_TrackID=as.numeric(To_export$Original_TrackID)
   To_export_list<-split(To_export,To_export$cluster2)
   ### Save this list that allows to identify in the imaging dataset to which cluster does each cell belong to.
   backproject_dir=paste0(output_dir,"backprojection/",to_backproject)
   dir.create(backproject_dir, recursive=TRUE)
-  write(paste(as.character(To_export_list), sep="' '", collapse=", "), paste0(backproject_dir,"/Backproject.txt"))
+  write(gsub(" ", "", paste(as.character(To_export_list), sep="' '", collapse=",")), paste0(backproject_dir,"/Backproject.txt"))
 }
+
