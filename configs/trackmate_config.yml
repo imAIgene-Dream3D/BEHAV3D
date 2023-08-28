@@ -1,0 +1,18 @@
+allow_track_splitting: False
+splitting_max_distance: 15.0
+# splitting_feature_penalties:
+
+alllow_track_merging: False
+merging_max_distance: 15.0
+# merging_feature_penalties:
+
+allow_gap_closing: True
+max_frame_gap: 5
+gap_closing_max_distance: 60.0
+gap_closing_feature_penalties:
+  visibility: 3.0
+  quality: 0.75
+
+linking_max_distance: 45.0
+linking_feature_penalties:
+  radius: 2.0

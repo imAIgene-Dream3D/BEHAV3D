@@ -160,6 +160,7 @@ from plotnine import (
 import h5py
 import math
 import time
+from behav3d import format_time
 
 def run_behav3d_feature_extraction(config, metadata):
    
@@ -170,8 +171,8 @@ def run_behav3d_feature_extraction(config, metadata):
     
     # Calculate features for each timepoint in a track
     df_summarized_tracks=summarize_track_features(df_all_tracks_filt, config, metadata) 
-           
-def calculate_track_features(config, metadata):
+         
+def calculate_track_features(config, metadata, cell_type="tcells"):
     """
     This code calculates the various features for each timepoint in a track for each 
     separateexperiment
@@ -191,7 +192,7 @@ def calculate_track_features(config, metadata):
     df_all_tracks=pd.DataFrame()
     
     for _, sample_metadata in metadata.iterrows():
-        print(f"--------------- Processing: {sample_metadata['sample_name']} ---------------")
+        print(f"--------------- Processing {cell_type}: {sample_metadata['sample_name']} ---------------")
         start_time = time.time()
         sample_name = sample_metadata['sample_name']
         element_size_x=sample_metadata['pixel_distance_xy']
@@ -200,9 +201,12 @@ def calculate_track_features(config, metadata):
         distance_unit=sample_metadata['distance_unit']
         dead_dye_threshold=sample_metadata['dead_dye_threshold']
         # Sometimes excel saves the encoding for µm differently, the following lines converts
-        # other variants of µm to ones comparable in this code 
+        # other variants of µm to ones comparable in this code
+        # The two written "μm" have different formatting
         if distance_unit=='_m':
-            distance_unit = 'µm'
+            distance_unit ='μm'
+        if distance_unit=='µm':
+            distance_unit="μm"
         time_interval = sample_metadata['time_interval']
         time_unit = sample_metadata['time_unit']
 
@@ -227,13 +231,13 @@ def calculate_track_features(config, metadata):
         print("- Loading in tracks csv...")
         ### Load in the specified track csv
         if sample_metadata["tcell_track_csv"]=="" or sample_metadata["tcell_track_csv"]==None:
-            df_tracks_path = Path(output_dir, f"{sample_name}_tracks.csv")
+            df_tracks_path = Path(output_dir, f"{sample_name}_{cell_type}_tcell_tracks.csv")
         else:
             df_tracks_path = sample_metadata["tcell_track_csv"]
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
         
         ### Calculate organoid distance, t cell distance and dead dye mean form Imaris or BEHAV3D processing
-        if imaris:
+        if imaris and cell_type=="tcells":
             print("- Calculating contact with organoids and other T cells... (From Imaris)")
             # Threshold the distance to organoid based on the supplied "organoid_contact_threshold"
             # This distance is calculated before in Imaris and supplied as a separate channel and
@@ -275,7 +279,7 @@ def calculate_track_features(config, metadata):
             print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
             
             # Load in the images containing the organoid segments and T cell segments
-            organoid_segments_path=Path(output_dir, f"{sample_name}_organoid_segments.tiff")
+            organoid_segments_path=Path(output_dir, f"{sample_name}_organoids_tracked.tiff")
             organoid_segments=imread(organoid_segments_path)
             
             tcell_segments_path=Path(output_dir, f"{sample_name}_tcells_tracked.tiff")
@@ -289,7 +293,8 @@ def calculate_track_features(config, metadata):
                 element_size_x=element_size_x,
                 element_size_y=element_size_y,
                 element_size_z=element_size_z,
-                contact_threshold=contact_threshold
+                contact_threshold=contact_threshold,
+                calculate_from=cell_type
             )
             df_tracks = pd.merge(df_tracks, df_contacts, how="left")
             
@@ -331,7 +336,7 @@ def calculate_track_features(config, metadata):
         def convert_distance(distance, distance_unit):
             distance_conversions={
                 "nm":1000,
-                "µm":1
+                "μm":1
             }
             assert distance_unit in list(distance_conversions.keys()), f"time unit needs to be one of: {list(distance_conversions.keys())}, is {distance_unit}"
             distance = distance/distance_conversions[distance_unit]
@@ -371,7 +376,7 @@ def calculate_track_features(config, metadata):
         element_size_x = convert_distance(element_size_x, distance_unit)
         element_size_y = convert_distance(element_size_y, distance_unit)
         element_size_z = convert_distance(element_size_z, distance_unit)
-        df_tracks["distance_unit"] = "µm"
+        df_tracks["distance_unit"] = "μm"
         df_tracks["time_unit"] = "h"
 
         # Calculate various movement features such as speed and mean square displacement of the tracks  
@@ -383,21 +388,22 @@ def calculate_track_features(config, metadata):
             )
         df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
         
-        print("- Determining active contact of T cells")
-        # Determining if a T cell is actively interacting with another T cell based on speed
-        # More explanation at the top of this code
-        df_tracks['list_touching_tcells'] = df_tracks['touching_tcells'].apply(lambda x: [] if pd.isna(x) else list(map(int, x.split(','))))
-        active_interaction = []
-        for _, row in df_tracks.iterrows():
-            if row['tcell_contact']:
-                max_mean_speed = max(row['mean_speed'], df_tracks.loc[df_tracks['SegmentID'].isin(row['list_touching_tcells']), 'mean_speed'].max())
-                active_interaction.append(row['mean_speed'] == max_mean_speed)
-            else:
-                active_interaction.append(False)
-        df_tracks=df_tracks.drop('list_touching_tcells', axis=1)      
-        df_tracks['active_tcell_contact'] = active_interaction
+        if cell_type=="tcells":
+            print("- Determining active contact of T cells")
+            # Determining if a T cell is actively interacting with another T cell based on speed
+            # More explanation at the top of this code
+            df_tracks['list_touching_tcells'] = df_tracks['touching_tcells'].apply(lambda x: [] if pd.isna(x) else list(map(int, x.split(','))))
+            active_interaction = []
+            for _, row in df_tracks.iterrows():
+                if row['tcell_contact']:
+                    max_mean_speed = max(row['mean_speed'], df_tracks.loc[df_tracks['SegmentID'].isin(row['list_touching_tcells']), 'mean_speed'].max())
+                    active_interaction.append(row['mean_speed'] == max_mean_speed)
+                else:
+                    active_interaction.append(False)
+            df_tracks=df_tracks.drop('list_touching_tcells', axis=1)      
+            df_tracks['active_tcell_contact'] = active_interaction
         
-        tracks_out_path = Path(output_dir, f"{sample_name}_track_features.csv")
+        tracks_out_path = Path(output_dir, f"{sample_name}_{cell_type}_track_features.csv")
         print(f"- Writing output to {tracks_out_path}")
         df_tracks.to_csv(tracks_out_path, sep=",", index=False)
         
@@ -772,7 +778,8 @@ def calculate_organoid_and_tcell_contact(
     element_size_x, 
     element_size_y, 
     element_size_z,
-    contact_threshold
+    contact_threshold,
+    calculate_from="tcells"
     ):
     """
     Calculates contact with organoids by looping through
@@ -789,23 +796,30 @@ def calculate_organoid_and_tcell_contact(
     Based on direct pixel contact of one t cell and another, not influenced
     by the element_sizes
     """
-    df_contacts= []
+    df_contacts= []    
     for t, tcell_stack in enumerate(tcell_segments):
-        segment_ids = np.unique(tcell_stack)
         org_stack = organoid_segments[t,:,:,:]
+        if calculate_from=="tcells":
+            segments_stack=tcell_stack
+        elif calculate_from=="organoids":
+            segments_stack=org_stack
+        else:
+            print(f"calculate_from has to be either 'tcells' or 'organoids', is {calculate_from}")
+            return
+        segment_ids=np.unique(segments_stack)
         for segment_id in segment_ids:
             if segment_id==0:
                 continue
             
-            stack_max_z, stack_max_y, stack_max_x = tcell_stack.shape
-            seg_locs = np.argwhere(tcell_stack==segment_id)
+            stack_max_z, stack_max_y, stack_max_x = segments_stack.shape
+            seg_locs = np.argwhere(segments_stack==segment_id)
             min_z, min_y, min_x = seg_locs.min(axis=0)
             max_z, max_y, max_x = seg_locs.max(axis=0)
             
             z_ext = 2*math.ceil(contact_threshold / element_size_z)
             y_ext = 2*math.ceil(contact_threshold / element_size_y)
             x_ext = 2*math.ceil(contact_threshold / element_size_x)
-            segment_cutout = tcell_stack[
+            tcell_cutout = tcell_stack[
                 max(0, min_z-z_ext):min(stack_max_z, max_z+z_ext+1),
                 max(0, min_y-y_ext):min(stack_max_y, max_y+y_ext+1),
                 max(0, min_x-x_ext):min(stack_max_x, max_x+x_ext+1),
@@ -815,13 +829,18 @@ def calculate_organoid_and_tcell_contact(
                 max(0, min_y-y_ext):min(stack_max_y, max_y+y_ext+1),
                 max(0, min_x-x_ext):min(stack_max_x, max_x+x_ext+1),
                 ]
+            seg_cutout = segments_stack[
+                max(0, min_z-z_ext):min(stack_max_z, max_z+z_ext+1),
+                max(0, min_y-y_ext):min(stack_max_y, max_y+y_ext+1),
+                max(0, min_x-x_ext):min(stack_max_x, max_x+x_ext+1),
+                ]
             
             real_distances=distance_transform_edt(
-                segment_cutout!=segment_id,
+                seg_cutout!=segment_id,
                 sampling=[element_size_z, element_size_y, element_size_x]
                 )
             pix_distances=distance_transform_edt(
-                segment_cutout!=segment_id
+                seg_cutout!=segment_id
                 )
              
             organoid_contacts = [str(x) for x in np.unique(org_cutout[real_distances<=contact_threshold]) if x!=0]
@@ -829,10 +848,9 @@ def calculate_organoid_and_tcell_contact(
             pix_organoid_contacts = [str(x) for x in np.unique(org_cutout[pix_distances<= 1.73]) if x!=0]
             pix_organoid_contact = len(pix_organoid_contacts)>0
             
-            tcell_contacts = [str(x) for x in np.unique(segment_cutout[real_distances<=contact_threshold]) if x not in [0, segment_id]]
+            tcell_contacts = [str(x) for x in np.unique(tcell_cutout[real_distances<=contact_threshold]) if x not in [0, segment_id]]
             real_tcell_contact = len(tcell_contacts)>0
-
-            pix_tcell_contacts = [str(x) for x in np.unique(segment_cutout[pix_distances<= 1.73]) if x not in [0, segment_id]]
+            pix_tcell_contacts = [str(x) for x in np.unique(tcell_cutout[pix_distances<= 1.73]) if x not in [0, segment_id]]
             pix_tcell_contact = len(pix_tcell_contacts)>0
             
             if real_tcell_contact:
@@ -874,16 +892,6 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
     df_intensities = pd.concat(df_intensities)
     df_intensities=df_intensities.rename(columns={"label":"TrackID"})
     return(df_intensities)
-
-def format_time(
-    start_time,
-    end_time
-):
-    elapsed_time = end_time - start_time
-    hours = int(elapsed_time // 3600)
-    minutes = int((elapsed_time % 3600) // 60)
-    seconds = int(elapsed_time % 60)
-    return(hours, minutes, seconds)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

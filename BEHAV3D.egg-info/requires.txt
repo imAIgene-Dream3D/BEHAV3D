@@ -1,0 +1,11 @@
+numpy
+pandas
+scyjava
+imagej
+tifffile
+scikit-image
+scipy
+matplotlib
+seaborn
+plotnine
+h5py

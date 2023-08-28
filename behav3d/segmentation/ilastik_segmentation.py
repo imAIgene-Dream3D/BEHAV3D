@@ -25,6 +25,8 @@ from tifffile import imread, imwrite
 
 import numpy as np
 import pandas as pd
+import time
+from behav3d import format_time
 
 def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
     ilastik_path = config['ilastik_path']
@@ -35,14 +37,14 @@ def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
     ilastik_tcell_postproc_model = config['ilastik_tcell_postprocessing_model']
     
     for _, sample in metadata.iterrows():
+        start_time = time.time()
         sample_name = sample['sample_name']
         image_path = sample['image_path']
         image_internal_path = sample["image_internal_path"]
         full_image_path = f"{image_path}/{image_internal_path}"
         output_dir = config['output_dir']
 
-        print(f"### Processing: {sample_name}")
-         
+        print(f"--------------- Segmenting: {sample_name} ---------------")       
         ### General pixel classifier
         print("- Running the ilastik pixel classifier...")
         pix_prob_path = Path(output_dir, f"{sample_name}_probabilities.h5")
@@ -126,7 +128,10 @@ def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
             os.remove(seg_org_h5_path)
             os.remove(preseg_tcell_h5_path)
             os.remove(seg_tcell_h5_path)
-        print("### Done\n")
+        
+        end_time = time.time()
+        h,m,s = format_time(start_time, end_time)
+        print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
         
 ### Segment the data using Ilastik
 def run_bash(script, path_bash="bash", stdin=None):
