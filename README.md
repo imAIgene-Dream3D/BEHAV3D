@@ -27,7 +27,7 @@ For image analysis we made use of a workstation with the following specs:
 
 
 ## Installation
-Download the repository to your PC via direct dowload or git clone https://github.com/RiosGroup/BEHAV3D in Git Bash.\
+Download the repository to your PC via direct dowload or git clone https://github.com/AlievaRios/BEHAV3D.git in Git Bash.\
 Installation should take <15 minutes
 
 BEHAV3D uses the following R libraries (version used with R 4.3.0) :
@@ -77,7 +77,7 @@ BEHAV3D uses 2 specific fiels to customize the analysis:\
 
 ### **BEHAV3D config**
 Contains all experiment-specific settings and paths to data for all modules in BEHAV3D\
-An example version can be found in [...BEHAV3D/configs/config_template.yml](https://github.com/RiosGroup/BEHAV3D/blob/main/configs/config_template.yml)\
+An example version can be found in [...BEHAV3D/configs/config_template.yml](/configs/config_template.yml)\
 Explanation on what each variable changes is commented in that template
 
 ### **Experimental metadata template**
@@ -99,7 +99,7 @@ To correctly import data for BEHAV3D, it is required to fill in a .tsv that cont
 - tumor_name (name of the tumor/organoids surfaces that were created with imaris, only required if you Object-Object statistics to import the distance to tumor data)
 - Object_distance (TRUE if Object-Object statistics were used to import the data related to T cell distance to tumor cells/ FALSE if distance transformation was for this step )
 
-For an example see: [...BEHAV3D/configs/metadata_template.tsv](https://github.com/RiosGroup/BEHAV3D/blob/main/configs/metadata_template.tsv)\
+For an example see: [...BEHAV3D/configs/metadata_template.tsv](/configs/metadata_template.tsv)\
 
 ## Demo
 
@@ -109,7 +109,7 @@ There are 2 demos:
 - tcell_demo    (For 'tcell_dynamics_classification' )
 - organoid_demo (For 'organoid_death_dynamics')
 
-**>Step 1** To set up the demo on you local PC, run [BEHAV3D/demos/set_up_demo.R](https://github.com/RiosGroup/BEHAV3D/blob/main/demos/set_up_demo.R)\
+**>Step 1** To set up the demo on you local PC, run [...BEHAV3D/demos/set_up_demo.R](/demos/set_up_demo.R)\
 This sets up the paths in the BEHAV3D config file for the demo, then run the different modules on the demo (look below).
 
 ## Modules
@@ -124,8 +124,8 @@ Rscript ...BEHAV3D/scripts/organoid_death_dynamics/organoid_death_dynamics.R -c 
 
 ***To run from Rstudio:***
 
-**>Step 2** For demo mode run [organoid_death_dynamics script](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/organoid_death_dynamics/organoid_death_dynamics.R)
-If you have your own new data in a different folder, change the path to the **BEHAV3D config** file on [line 18](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/organoid_death_dynamics/organoid_death_dynamics.R#L18)
+**>Step 2** For demo mode run [organoid_death_dynamics script](/scripts/organoid_death_dynamics/organoid_death_dynamics.R)
+If you have your own new data in a different folder, change the path to the **BEHAV3D config** file on [line 18](/scripts/organoid_death_dynamics/organoid_death_dynamics.R#L18)
 
 ***Output_files***
 
@@ -163,12 +163,12 @@ Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/predict_tcell_behavior.
 ```
 
 ***To run from Rstudio***\
-**>Step 3** For demo run  [predict_tcell_behavior](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R)
-If you want to run new data in a different folder, change the path to the corresponding **BEHAV3D config** file on [line 27](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L27)\
-(Optional) Change the force_redo parameter on [line 16](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L16)\
-(Optional) Change the for parameter on [line 17](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L17)
+**>Step 3** For demo run  [predict_tcell_behavior](/scripts/tcell_dynamics_classification/predict_tcell_behavior.R)
+If you want to run new data in a different folder, change the path to the corresponding **BEHAV3D config** file on [line 27](/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L27)\
+(Optional) Change the force_redo parameter on [line 16](/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L16)\
+(Optional) Change the for parameter on [line 17](/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L17)
 
-*Note, that when generating a new Behavioral Map, Uniform Manifold Approximation and Projection (UMAP) projection of the dissimilarity matrix of T cells might require adjusting parameters. See notes in the [code](https://github.com/RiosGroup/BEHAV3D/blob/1b17776adeb1602e9f502ec7f5060c2139e037d7/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L621C3-L624C2) and following link for more information of UMAP performance: https://pair-code.github.io/understanding-umap/ . Moreover depending on the datatype and sample size data normalization methods might require adjusting. See notes in the code for [example parameters adjustment](https://github.com/RiosGroup/BEHAV3D/blob/1c68557b192e8e663d848d28bf0b6e4e6d945280/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L587C2-L595C1) for liquid tumors implementation*. 
+*Note, that when generating a new Behavioral Map, Uniform Manifold Approximation and Projection (UMAP) projection of the dissimilarity matrix of T cells might require adjusting parameters. See notes in the [code](/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L621C3-L624C2) and following link for more information of UMAP performance: https://pair-code.github.io/understanding-umap/ . Moreover depending on the datatype and sample size data normalization methods might require adjusting. See notes in the code for [example parameters adjustment](/scripts/tcell_dynamics_classification/predict_tcell_behavior.R#L587C2-L595C1) for liquid tumors implementation*. 
 
 ***Output_files***
 
@@ -201,10 +201,10 @@ quality control:
 ```
 Rscript ...BEHAV3D/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R -i </Path/to/behavioral/reference/map> -o </Path/to/output/randomForest>
 ```
-- or change the [input parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L14) and [output parameter](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L15)
+- or change the [input parameter](/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L14) and [output parameter](/scripts/tcell_dynamics_classification/train_randomforest/train_random_forest_classifier.R#L15)
 ### (3) T cell behavioral classification backprojection module
 
 This module allows you to export the classified T cell tracks to visualize them in Imaris.
 
 ***To run from Rstudio***\
-**>Step 4** For demo run  the [backprojection_tcell_classification](https://github.com/RiosGroup/BEHAV3D/blob/main/scripts/tcell_dynamics_classification/backprojection_tcell_classification.R) script to save the behavioral classification for each processed T cell. This can then be uploaded in Imaris via the tracks search module.
+**>Step 4** For demo run  the [backprojection_tcell_classification](/scripts/tcell_dynamics_classification/backprojection_tcell_classification.R) script to save the behavioral classification for each processed T cell. This can then be uploaded in Imaris via the tracks search module.
