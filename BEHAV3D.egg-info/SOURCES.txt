@@ -1,9 +1,0 @@
-LICENSE
-README.md
-setup.py
-BEHAV3D.egg-info/PKG-INFO
-BEHAV3D.egg-info/SOURCES.txt
-BEHAV3D.egg-info/dependency_links.txt
-BEHAV3D.egg-info/requires.txt
-BEHAV3D.egg-info/top_level.txt
-behav3d/__init__.py
