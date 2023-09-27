@@ -13,7 +13,7 @@ setup(
     license='Apache License 2.0',
     packages=setuptools.find_packages(),
     install_requires=[
-          'pyyaml'
+          'pyyaml',
           'numpy',
           'pandas',
           'scyjava',
@@ -24,6 +24,8 @@ setup(
           'matplotlib',
           'seaborn',
           'plotnine',
-          'h5py'
+          'patchworklib',
+          'h5py',
+          'ipykernel'
       ]
 )

@@ -403,6 +403,8 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
             df_tracks=df_tracks.drop('list_touching_tcells', axis=1)      
             df_tracks['active_tcell_contact'] = active_interaction
         
+        df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
+        
         tracks_out_path = Path(output_dir, f"{sample_name}_{cell_type}_track_features.csv")
         print(f"- Writing output to {tracks_out_path}")
         df_tracks.to_csv(tracks_out_path, sep=",", index=False)
@@ -564,6 +566,8 @@ def summarize_track_features(
             return 0
     df_summarized_tracks['active_tcell_contact'] = grouped_df_tracks.apply(calculate_active_contact_when_contact).reset_index(drop=True)
 
+    df_trackinfo = df_tracks[['TrackID', 'sample_name','well', 'exp_nr', 'organoid_line', 'tcell_line']].drop_duplicates()
+    df_summarized_tracks = pd.merge(df_trackinfo, df_summarized_tracks, how="left")
     # Write the summarized features to a .csv
     summ_tracks_out_path = Path(output_dir, f"BEHAV3D_combined_track_features_summarized.csv")
     print(f"- Writing summarized tracks to {summ_tracks_out_path}")
@@ -572,7 +576,7 @@ def summarize_track_features(
     end_time = time.time()
     h,m,s = format_time(start_time, end_time)
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
-    return()
+    return(df_summarized_tracks)
 
 def plot_dead_dye_distribution(
     df_tracks

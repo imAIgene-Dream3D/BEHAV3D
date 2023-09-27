@@ -7,3 +7,5 @@
 *.tiff
 test/
 **/.DS_Store
+**/.egg-info
+*.egg-info
