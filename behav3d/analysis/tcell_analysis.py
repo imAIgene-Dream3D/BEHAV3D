@@ -1,4 +1,4 @@
-import argprase
+import argparse
 from dtaidistance import dtw, dtw_ndim
 import pandas as pd
 import numpy as np
@@ -17,7 +17,7 @@ import yaml
 def run_tcell_analysis(
     config,
     df_tracks_path=None,
-    df_tracks_summarized_path =None 
+    df_tracks_summarized_path=None 
     ):
     
     output_dir = config["output_dir"]
@@ -41,10 +41,15 @@ def run_tcell_analysis(
     )
     
     df_clusters = cluster_umap(
-        umap_embedding,
-        
+        umap_embedding=umap_embedding,
+        config=config,
+        df_tracks=df_tracks,
+        df_tracks_summarized=df_tracks_summarized,
+        random_state=None
     )
     
+    return(df_clusters)
+
 def calculate_dtw(
     df_tracks, 
     features=[
@@ -97,8 +102,7 @@ def cluster_umap(
     umap_embedding,
     config,
     df_tracks=None,
-    df_track_summarized=None,
-    nr_clusters=6,
+    df_tracks_summarized=None,
     random_state=None
     ):
     
@@ -114,7 +118,7 @@ def cluster_umap(
     TrackIDs = df_tracks[["sample_name", "TrackID"]].drop_duplicates().reset_index(drop=True)
     df_umap = pd.concat([TrackIDs, umap_embedding], axis=1)
     # df_trackinfo = df_tracks[['TrackID', 'sample_name','well', 'exp_nr', 'organoid_line', 'tcell_line']].drop_duplicates()
-    df_umap = pd.merge(df_track_summarized, df_umap, how="left")
+    df_umap = pd.merge(df_tracks_summarized, df_umap, how="left")
     
     # Perform clustering
     scaler = StandardScaler()
@@ -125,7 +129,7 @@ def cluster_umap(
     df_umap["cluster"]=df_umap["cluster"].astype('category')
     
     df_umap_out_path = Path(output_dir, f"BEHAV3D_UMAP_clusters.csv")
-    print(f"- Writing summarized tracks to {df_umap_out_path}")
+    print(f"- Writing clustered tracks to {df_umap_out_path}")
     df_umap.to_csv(df_umap_out_path, sep=",", index=False)
 
     umap_plots = []
@@ -141,9 +145,7 @@ def cluster_umap(
             theme_light(base_size=20) +
             theme_bw() +
             theme(axis_text_x=element_blank(), axis_text_y=element_blank(), aspect_ratio=1) +
-            # scale_color_discrete() +
             coord_fixed()
-            # facet_grid('organoid_line ~ sample_name')
         )
     
     for colorcol in info_cols:
@@ -156,25 +158,19 @@ def cluster_umap(
             theme_light(base_size=20) +
             theme_bw() +
             theme(axis_text_x=element_blank(), axis_text_y=element_blank(), aspect_ratio=1) +
-            # scale_color_discrete() +
             coord_fixed()
-            # facet_grid('organoid_line ~ sample_name')
         )
-        umap_plots.append(pw.load_ggplot(plot, figsize=[4,4]))
+        umap_plots.append(plot)
     
-    nr_cols = 2
-    comb_plot=(pw.load_ggplot(cluster_plot, figsize=[4,4]))
-    for idr in range(0, len(info_cols), nr_cols):
-        rowplots = umap_plots[idr]
-        for idc in range(1,nr_cols):
-            if idc+idr+1 <= len(info_cols):
-                rowplots |= umap_plots[idc+idr]
-            else:
-                rowplots |= pw.load_ggplot((ggplot()+geom_blank()+theme_void()), figsize=[4,4])
-            comb_plot /= (rowplots)
+    combined_umaps = structure_plotnine(
+        umap_plots, 
+        figsize=(4,4), 
+        nr_cols=2, 
+        append_to=pw.load_ggplot(cluster_plot, figsize=[4,4])
+        ) 
     
     cluster_UMAP_path = Path(output_dir, f"BEHAV3D_UMAP_clusters.pdf")
-    comb_plot.savefig(cluster_UMAP_path)
+    combined_umaps.savefig(cluster_UMAP_path)
     
     cluster_means = df_umap.drop(
         columns=[
@@ -188,23 +184,33 @@ def cluster_umap(
             "TrackID"
             ]).groupby('cluster').mean().reset_index()
     df_heatmap = cluster_means.melt(id_vars='cluster', var_name='var', value_name='value')
-    heatmap_plot = (
-        ggplot(df_heatmap, aes(x='cluster', y='var', fill='value')) +
-        geom_tile() +
-        scale_fill_gradient(low="blue", high="yellow") +  # Adjust the color scale as needed
-        labs(x='Cluster', y='Mean Columns', fill='Value') +
-        theme_minimal()
-    )
+    
+    columns = df_heatmap["var"].unique()
+    heatmaps = []
+    
+    for col in columns:
+        col_heatmap = df_heatmap[df_heatmap["var"]==col]
+        heatmap_plot = (
+            ggplot(col_heatmap, aes(x='cluster', y='var', fill='value')) +
+            geom_tile() +
+            labs(x='Cluster', y='', fill='Value', title="") +
+            scale_fill_cmap(limits=(0, None))+
+            theme_minimal() +
+            theme(plot_margin = 0, legend_key_height=10, legend_key_width=10,legend_title=element_blank())
+        )
+        heatmaps.append(heatmap_plot)
+    
+    combined_heatmaps = structure_plotnine(heatmaps, figsize=(3,0.5), nr_cols=2) 
     cluster_features_heatmap_path = Path(output_dir, f"BEHAV3D_UMAP_cluster_feature_heatmap.pdf")
-    heatmap_plot.save(cluster_features_heatmap_path, width=8, height=8)
+    combined_heatmaps.savefig(cluster_features_heatmap_path)
     
     df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "cluster"]).size().reset_index(name='count')
     total_counts = df_clust_perc.groupby(['organoid_line', 'tcell_line'])['count'].sum().reset_index(name='total_count')
-    total_counts["total_count"] = '# Cells: ' + total_counts["total_count"].astype("string")
     cluster_counts = pd.merge(df_clust_perc, total_counts)
     df_clust_perc["percentage"] = (df_clust_perc['count'] / df_clust_perc['count'].sum())
 
     total_counts_facet = cluster_counts.groupby(['organoid_line', 'tcell_line'])['total_count'].mean().reset_index()
+    total_counts["total_count"] = '# Cells: ' + total_counts["total_count"].astype("string")
     
     plot = (
         ggplot(df_clust_perc) + 
@@ -229,6 +235,28 @@ def cluster_umap(
     
     return()
 
+def structure_plotnine(
+        plotlist,
+        figsize=[3,0.5],
+        nr_cols=2,
+        append_to=None
+        ):
+        comb_plot=append_to
+        plotlist = [pw.load_ggplot(plot, figsize=figsize) for plot in plotlist]
+        for idr in range(0, len(plotlist), nr_cols):
+            rowplots = plotlist[idr]
+            for idc in range(1,nr_cols):
+                if idc+idr+1 <= len(plotlist):
+                    rowplots |= plotlist[idc+idr]
+                else:
+                    rowplots |= pw.load_ggplot((ggplot()+geom_blank()+theme_void()), figsize=[4,4])
+
+                if comb_plot is None:
+                    comb_plot= rowplots
+                else:
+                    comb_plot /= (rowplots)
+        return(comb_plot)
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
