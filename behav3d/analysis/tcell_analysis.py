@@ -53,9 +53,9 @@ def run_tcell_analysis(
 def calculate_dtw(
     df_tracks, 
     features=[
-        "mean_square_displacement", 
-        "speed", 
-        "dead_dye_mean", 
+        "z_mean_square_displacement", 
+        "z_speed", 
+        "z_dead_dye_mean", 
         "tcell_contact", 
         "organoid_contact"
         ]
@@ -68,6 +68,8 @@ def calculate_dtw(
 
     dtw_input_tracks = np.empty((nr_tracks, nr_timepoints, nr_features),dtype=np.double)
     for i, feature in enumerate(features):
+        df_tracks[feature] = df_tracks[feature].astype(np.double)
+        df_tracks[feature] = (df_tracks[feature] - df_tracks[feature].min()) / (df_tracks[feature].max() - df_tracks[feature].min())
         pivot_df = df_tracks.pivot(
             index=['sample_name', 'TrackID'], 
             columns='relative_time', 
@@ -77,7 +79,7 @@ def calculate_dtw(
         dtw_input_tracks[:, :, i] = numpy_array
     dtw_input_tracks=dtw_input_tracks.astype(np.double)
 
-    dtw_distance_matrix = dtw_ndim.distance_matrix_fast(dtw_input_tracks)
+    dtw_distance_matrix3 = dtw_ndim.distance_matrix_fast(dtw_input_tracks)
     return(dtw_distance_matrix)
 
 def fit_umap(

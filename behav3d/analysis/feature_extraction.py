@@ -403,11 +403,23 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
             df_tracks=df_tracks.drop('list_touching_tcells', axis=1)      
             df_tracks['active_tcell_contact'] = active_interaction
         
+        print("- Perform z-normalization on selected feature columns")
+        df_tracks=normalize_track_features(
+            df_tracks, 
+            columns=[
+                "mean_square_displacement",
+                "speed",
+                "dead_dye_mean"
+            ]
+        )
+        
         df_tracks=df_tracks.sort_values(by=["TrackID", "relative_time"])
         
         tracks_out_path = Path(output_dir, f"{sample_name}_{cell_type}_track_features.csv")
         print(f"- Writing output to {tracks_out_path}")
         df_tracks.to_csv(tracks_out_path, sep=",", index=False)
+        
+        
         
         # Adding a sample name for later combination of multiple track experiments
         df_tracks['sample_name']=sample_name
@@ -512,13 +524,17 @@ def filter_tracks(
     return(df_all_tracks_filt)
 
 def normalize_track_features(
-    df_tracks
+    df_tracks,
+    columns = [
+        "mean_square_displacement",
+        "speed",
+        "dead_dye_mean"
+    ]
     ):
-    # calculate z scores for some of the movement features
-    df_tracks.loc[:, 'z_MSD'] = df_tracks['mean_square_displacement'].transform(lambda x: (x - x.mean()) / x.std())
-    df_tracks.loc[:, 'z_speed'] = df_tracks['speed'].transform(lambda x: (x - x.mean()) / x.std())
-    df_tracks.loc[:, 'z_dead_dye_mean'] = df_tracks['dead_dye_mean'].transform(lambda x: (x - x.mean()) / x.std())
-    return
+    
+    for column_name in columns:
+        df_tracks.loc[:, f'z_{column_name}'] = df_tracks[column_name].transform(lambda x: (x - x.mean()) / x.std())
+    return (df_tracks)
 
 def summarize_track_features(
     df_tracks,
@@ -537,11 +553,6 @@ def summarize_track_features(
     print(f"--------------- Summarizing track features ---------------")
     
     output_dir = config['output_dir']
-    
-    # calculate z scores for some of the movement features
-    df_tracks.loc[:, 'z_MSD'] = df_tracks['mean_square_displacement'].transform(lambda x: (x - x.mean()) / x.std())
-    df_tracks.loc[:, 'z_speed'] = df_tracks['speed'].transform(lambda x: (x - x.mean()) / x.std())
-    df_tracks.loc[:, 'z_dead_dye_mean'] = df_tracks['dead_dye_mean'].transform(lambda x: (x - x.mean()) / x.std())
     
     # Calculate mean values of track features over the whole track
     grouped_df_tracks=df_tracks.groupby(['sample_name','TrackID'])
