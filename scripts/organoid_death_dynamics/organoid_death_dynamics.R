@@ -16,7 +16,7 @@ if (interactive()) {
   
   ### For your own file
   # pars = yaml.load_file("")
-
+  
 } else {
   option_list = list(
     make_option(c("-c", "--config"), type="character", default=NULL, 
@@ -109,6 +109,7 @@ live_deadROI$TrackID2<-NULL
 detach(package:plyr)
 library(dplyr)
 
+
 ### Some organoids fall apart into separated segments, combine them and calculate total dead dye signal
 live_deadROI$dead_dye_sum <- live_deadROI$dead_dye_mean*live_deadROI$Volume
 live_deadROI1 <-live_deadROI %>% 
@@ -117,6 +118,7 @@ live_deadROI1 <-live_deadROI %>%
 
 live_deadROI3 <- live_deadROI1 ## plot with all the tracks together 
 live_deadROI3$dead_dye_mean <- live_deadROI3$dead_dye_sum/live_deadROI3$Volume
+# Returns a logical vector indicating which cases have no missing values
 live_deadROI3 <- live_deadROI3[complete.cases(live_deadROI3), ]
 
 ### Set time in hours
@@ -157,6 +159,7 @@ ggplot(live_deadROI7, aes(Time,dead_dye_mean)) +
   facet_grid(organoid_line~well, scales = "free")+
   ggtitle("Mean of dead dye intensity in organoids per well")
 
+# Saves the last plot in a PDF
 ggsave(paste0(output_dir,"Full_well_death_dynamics.pdf"), device="pdf")
 ### SAVE dataframe with all the well values for processing in a different script
 saveRDS(live_deadROI7, file = paste0(output_dir,"Full_well_death_dynamics.rds"))
@@ -190,6 +193,7 @@ colnames(temp2) [length(names(temp1))] <- "max_dead_dye_mean"
 temp_merge <-merge(temp1, temp2)
 ### Filter out organoids that have dead dye signal above 'organoid_dead_dye_threshold' (e.g. dead) and are bigger than 'organoid_min_volume'
 live_deadROI4 <- merge(temp_merge, live_deadROI3)
+
 
 live_deadROI6 <- left_join(live_deadROI4, metadata)
 live_deadROI6aliveT0 <-live_deadROI6%>%group_by(TrackID)%>%filter(Time==min(Time) & dead_dye_mean<organoid_dead_dye_threshold & Volume>pars$organoid_min_volume)
@@ -265,22 +269,47 @@ live_deadROI6<-live_deadROI6 %>%group_by(organoid_line, tcell_line,exp_nr, well,
 live_deadROI6<-live_deadROI6 %>%group_by(organoid_line, tcell_line,exp_nr, well, date)%>%arrange(Time, .by_group = TRUE)%>%fill(names(live_deadROI6))  
 ## select the dead cells
 live_deadROI4_dead <-live_deadROI6%>%group_by(organoid_line, tcell_line,exp_nr, well, date, TrackID)%>%filter(max_dead_dye_mean>organoid_dead_dye_threshold )
-# live_deadROI4_dead$track_exp <- with(live_deadROI4_dead , interaction(TrackID,Time))
+live_deadROI4_dead$track_exp <- with(live_deadROI4_dead , interaction(TrackID,Time))
 live_deadROI4_live <-live_deadROI6%>%group_by(TrackID, organoid_line, tcell_line,exp_nr, well, date)%>%filter(max_dead_dye_mean<=organoid_dead_dye_threshold ) ## select the live cells
-temp2 <-live_deadROI4_dead%>%group_by(TrackID, organoid_line, tcell_line,exp_nr, well, date)## group by track ID
-temp2 <- temp2%>%arrange(Time, .by_group = TRUE) 
-### After timepoint of dying set further timepoints to dead=1 as well
-live_deadROI5_dead <- temp2 %>% group_by(TrackID, organoid_line, tcell_line,exp_nr, well, date) %>% filter(row_number() >= which.max(dead)) ## stop at max dead
-live_deadROI6 <- temp2 %>% group_by(TrackID, organoid_line, tcell_line,exp_nr, well, date) %>% mutate(dead=replace(dead, row_number() > which.max(dead), 1))
-live_deadROI6 <- live_deadROI6 %>% group_by(TrackID, organoid_line, tcell_line,exp_nr, well, date) %>% arrange(Time, .by_group = TRUE) %>% mutate(dead=replace(dead, row_number() > which.max(dead), 1))
 
+# # Commented for testing
+# temp2 <-live_deadROI4_dead%>%group_by(TrackID, organoid_line, tcell_line,exp_nr, well, date)## group by track ID
+# temp2 <- temp2%>%arrange(Time, .by_group = TRUE) 
+
+## TEST
+
+# Graph all organoids (not only dead ones)
+temp2 <-live_deadROI6%>%group_by(TrackID, organoid_line, tcell_line,exp_nr, well, date)## group by track ID
+temp2 <- temp2%>%arrange(Time, .by_group = TRUE) 
+
+### After timepoint of dying set further timepoints to dead=1 as well
+# live_deadROI5_dead <- temp2 %>% group_by(TrackID, organoid_line, tcell_line,exp_nr, well, date) %>% filter(row_number() >= which.max(dead)) ## stop at max dead
+live_deadROI6 <- temp2 %>%
+  group_by(TrackID, organoid_line, tcell_line, exp_nr, well, date) %>%
+  mutate(
+    dead = if (any(dead != 0)) {
+      replace(dead, row_number() > which.max(dead), 1)
+    } else {
+      dead  # Keep it as is if there are no non-zero values in the group
+    }
+  )
+live_deadROI6 <- live_deadROI6 %>% group_by(TrackID, organoid_line, tcell_line,exp_nr, well, date) %>% arrange(Time, .by_group = TRUE) %>%   
+  mutate(
+    dead = if (any(dead != 0)) {
+      replace(dead, row_number() > which.max(dead), 1)
+    } else {
+      dead  # Keep it as is if there are no non-zero values in the group
+    }
+  )
 # test1 <- live_deadROI4_dead%>%filter(!track_exp%in% live_deadROI5_dead$track_exp)  ###find all the rows that are beyond max red
 # test1$dead<-1 ## set as dead beyond max red
 # live_deadROI6_2<-rbind(live_deadROI4_live,live_deadROI5_dead[,c(-16)],test1[,c(-16)])  ## bind dataframe again
-## calculate the number of organoids at T0 to calculate the percentage
+
+# calculate the number of organoids at T0 to calculate the percentage (inlcuding alive ones)
 live_deadROI6_n_t0<-live_deadROI6%>%filter(Time==1)%>%group_by(organoid_line, tcell_line,exp_nr, well, date)%>%summarise(starting_nr_organoids= n())
 live_deadROI6_2<-left_join(live_deadROI6,live_deadROI6_n_t0)
 live_deadROI6_2$starting_nr_organoids<-as.numeric(live_deadROI6_2$starting_nr_organoids)
+
 # for each dead calculate the percentage of dead cells, if no, then 0 
 live_deadROI6_per<-live_deadROI6_2%>%group_by(Time, organoid_line, tcell_line,exp_nr, well, date, .drop=FALSE)%>%summarize(n=sum(dead==1), starting_nr_organoids=mean(starting_nr_organoids))%>%mutate(perc = n*100 / starting_nr_organoids)
 
@@ -338,3 +367,4 @@ p1
 
 saveRDS(perc_dead_exp_dur, file = paste0(output_dir,"Exp_percentage_dead_org_over_time.rds"))  ### save here a dataframe with all the organoids values
 ggsave(paste0(output_dir,"Exp_percentage_dead_org_over_time.pdf"), device="pdf")
+
