@@ -26,6 +26,8 @@ setup(
           'plotnine',
           'patchworklib',
           'h5py',
-          'ipykernel'
+          'ipykernel',
+          'napari',
+          'pyqt5'
       ]
 )

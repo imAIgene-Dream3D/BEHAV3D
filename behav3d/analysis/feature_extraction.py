@@ -556,7 +556,8 @@ def summarize_track_features(
     
     # Calculate mean values of track features over the whole track
     grouped_df_tracks=df_tracks.groupby(['sample_name','TrackID'])
-    df_summarized_tracks = grouped_df_tracks['dead_dye_mean'].mean().reset_index()
+    df_summarized_tracks = grouped_df_tracks.size().reset_index(name="track_length")
+    df_summarized_tracks['mean_dead_dye'] = grouped_df_tracks['dead_dye_mean'].mean().reset_index()["dead_dye_mean"]
     df_summarized_tracks['mean_MSD'] =  grouped_df_tracks['mean_square_displacement'].mean().reset_index()['mean_square_displacement']
     df_summarized_tracks['mean_speed'] =  grouped_df_tracks['speed'].mean().reset_index()['speed']
     df_summarized_tracks['mean_organoid_contact'] =  grouped_df_tracks['organoid_contact'].mean().reset_index()['organoid_contact']

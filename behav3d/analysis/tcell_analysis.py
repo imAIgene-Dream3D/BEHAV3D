@@ -30,6 +30,10 @@ def run_tcell_analysis(
     df_tracks_summarized = pd.read_csv(df_tracks_summarized_path)
     df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
     
+    if df_tracks_summarized["track_length"].nunique() != 1:
+        print("Warning: The track lengths are not cut to similar length, this might influence dynamic time warping")
+        print("Set 'tcell_min_track_length' and 'tcell_max_track_length' to the same value to create equal tracks")
+
     dtw_distance_matrix = calculate_dtw(
         df_tracks
         )
@@ -60,6 +64,8 @@ def calculate_dtw(
         "organoid_contact"
         ]
     ):
+    
+    print("- Calculating the dynamic time warping distance matrix")
     df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
     
     nr_tracks=len(df_tracks[["sample_name", "TrackID"]].drop_duplicates())
@@ -67,19 +73,25 @@ def calculate_dtw(
     nr_features=len(features)
 
     dtw_input_tracks = np.empty((nr_tracks, nr_timepoints, nr_features),dtype=np.double)
-    for i, feature in enumerate(features):
-        df_tracks[feature] = df_tracks[feature].astype(np.double)
-        df_tracks[feature] = (df_tracks[feature] - df_tracks[feature].min()) / (df_tracks[feature].max() - df_tracks[feature].min())
-        pivot_df = df_tracks.pivot(
-            index=['sample_name', 'TrackID'], 
-            columns='relative_time', 
-            values=feature
-            )
-        numpy_array = pivot_df.values.astype(np.double)
-        dtw_input_tracks[:, :, i] = numpy_array
-    dtw_input_tracks=dtw_input_tracks.astype(np.double)
-
-    dtw_distance_matrix3 = dtw_ndim.distance_matrix_fast(dtw_input_tracks)
+    
+    dtw_input_tracks=[]
+    for TrackID in df_tracks["TrackID"].unique():
+        track_features = df_tracks[df_tracks["TrackID"]==TrackID][features].to_numpy().astype(np.double)
+        dtw_input_tracks.append(track_features)
+    # for i, feature in enumerate(features):
+    #     df_tracks[feature] = df_tracks[feature].astype(np.double)
+    #     df_tracks[feature] = (df_tracks[feature] - df_tracks[feature].min()) / (df_tracks[feature].max() - df_tracks[feature].min())
+    #     pivot_df = df_tracks.pivot(
+    #         index=['sample_name', 'TrackID'], 
+    #         columns='relative_time', 
+    #         values=feature
+    #         )
+    #     pivot_np_array = pivot_df.values.astype(np.double)
+        
+    #     dtw_input_tracks[:, :, i] = pivot_np_array
+    # dtw_input_tracks=dtw_input_tracks.astype(np.double)
+    
+    dtw_distance_matrix = dtw_ndim.distance_matrix_fast(dtw_input_tracks)
     return(dtw_distance_matrix)
 
 def fit_umap(
@@ -88,6 +100,7 @@ def fit_umap(
     random_state=None
     ):
     
+    print("- Fitting the dynamic time warping to a UMAP")
     umap_model = umap.UMAP(
         n_components=2, 
         n_neighbors=config["umap_n_neighbors"], 
@@ -108,6 +121,7 @@ def cluster_umap(
     random_state=None
     ):
     
+    print("- Performing clustering on the UMAP data")
     output_dir = config['output_dir']
     if df_tracks is None:
         df_tracks_path = Path(output_dir, f"BEHAV3D_combined_track_features_filtered.csv")
@@ -128,19 +142,23 @@ def cluster_umap(
     kmeans = KMeans(n_clusters=config["nr_of_clusters"], n_init=100, random_state=random_state)
     df_umap["cluster"] = kmeans.fit_predict(umap_embedding)
     # df_umap["cluster2"] = kmeans.fit_predict(umap_embedding)
+    
+    # Set cluster index to start from 1 for backprojection purposes
+    df_umap["cluster"]=df_umap["cluster"]+1
     df_umap["cluster"]=df_umap["cluster"].astype('category')
     
     df_umap_out_path = Path(output_dir, f"BEHAV3D_UMAP_clusters.csv")
     print(f"- Writing clustered tracks to {df_umap_out_path}")
     df_umap.to_csv(df_umap_out_path, sep=",", index=False)
 
+    print("- Producing clustered UMAP plots with displayed Track features")
     umap_plots = []
     
     info_cols = df_umap.drop(columns=["TrackID", "well", "exp_nr", "UMAP1", "UMAP2", "cluster"]).columns
     
     cluster_plot = (
             ggplot(df_umap, aes(x='UMAP1', y='UMAP2', color="cluster")) +
-            geom_point(size=2, alpha=0.6) +
+            geom_point(size=4, alpha=0.8) +
             labs(color="cluster") +
             labs(title="cluster") +
             labs(x="", y="") +
@@ -149,7 +167,7 @@ def cluster_umap(
             theme(axis_text_x=element_blank(), axis_text_y=element_blank(), aspect_ratio=1) +
             coord_fixed()
         )
-    
+        
     for colorcol in info_cols:
         plot = (
             ggplot(df_umap, aes(x='UMAP1', y='UMAP2', color=colorcol)) +
@@ -174,6 +192,7 @@ def cluster_umap(
     cluster_UMAP_path = Path(output_dir, f"BEHAV3D_UMAP_clusters.pdf")
     combined_umaps.savefig(cluster_UMAP_path)
     
+    print("- Producing heatmaps with summarized cluster features")
     cluster_means = df_umap.drop(
         columns=[
             "sample_name", 
@@ -206,6 +225,7 @@ def cluster_umap(
     cluster_features_heatmap_path = Path(output_dir, f"BEHAV3D_UMAP_cluster_feature_heatmap.pdf")
     combined_heatmaps.savefig(cluster_features_heatmap_path)
     
+    print("- Producing percentage plots of each cluster per combination of T-cell and organoid line")
     df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "cluster"]).size().reset_index(name='count')
     total_counts = df_clust_perc.groupby(['organoid_line', 'tcell_line'])['count'].sum().reset_index(name='total_count')
     cluster_counts = pd.merge(df_clust_perc, total_counts)
