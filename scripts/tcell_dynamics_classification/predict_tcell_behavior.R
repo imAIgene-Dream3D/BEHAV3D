@@ -126,16 +126,28 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   }
   red_lym=do.call(rbind, datalist)
   
-  # import Minimal distance to organoids
-  datalist = list()
-  for (i in 1:length(stat_folders$stats_folder)){
-    pat=paste0("Intensity_Min_Ch=", metadata$organoid_distance_channel[i], "_Img=1")
-    img_csv = read_ims_csv(stat_folders[i,], pattern=pat)
-    if (!identical(img_csv, character(0))){
-      datalist[[i]]=img_csv
+  # import distance to organoids (if calculated with distance transformation or with object distance)
+  
+  datalist2 = list()
+  
+  for (i in 1:length(stat_folders$stats_folder)) {
+      if (metadata$Object_distance[i] == TRUE) {
+      # import Object distance to organoids
+      pat <- paste0("Shortest_Distance_to_Surfaces_Surfaces=", metadata$tumor_name[i])
+      img_csv <- read_ims_csv(stat_folders[i,], pattern = pat)
+      if (!identical(img_csv, character(0))) {
+        datalist2[[i]] <- img_csv
+      }
+    } else {
+      # import Minimal distance to organoids (distance transformation channel)
+      pat <- paste0("Intensity_Min_Ch=", metadata$organoid_distance_channel[i], "_Img=1")
+      img_csv <- read_ims_csv(stat_folders[i,], pattern = pat)
+      if (!identical(img_csv, character(0))) {
+        datalist2[[i]] <- img_csv
+      }
     }
   }
-  dist_org=do.call(rbind, datalist)
+  dist_org = do.call(rbind, datalist2)
   
   # import Position
   pat = "Position"
@@ -145,7 +157,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   master <- cbind(
     displacement[,c("Displacement^2","Time","TrackID" ,"ID")], 
     speed[,c("Speed" )], 
-    dist_org[,c("Intensity Min")], 
+    dist_org[,c(1)], 
     red_lym[,c("Intensity Mean")], 
     pos[,c("Position X" ,"Position Y" ,"Position Z","filename", "stat_folder", "basename")]
   )
@@ -416,7 +428,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
 ####### OTHERWISE, PERFORM UNSUPERVISED UMAP CLUSTERING
 ##############################################################################################################################
 
-if (model_path != ""){
+if (!is.null(model_path) && model_path != "") {
   print("#################################################")
   print("#### Model_path defined, performing random forest classification...")
   print("#################################################")
@@ -572,7 +584,15 @@ if (model_path != ""){
     mutate(q.disp=ifelse(z.disp>(quantile(z.disp, p=0.75)),z.disp,min(z.disp)), q.speed=ifelse(z.speed>(quantile(z.speed, p=0.75)),z.speed,min(z.speed)),q.red=ifelse(z.red>(quantile(z.red, p=0.75)),z.red,min(z.red)))%>%
     mutate(q.disp=scales::rescale(q.disp, to=c(0,1)),q.speed=scales::rescale(q.speed, to=c(0,1)),q.red=scales::rescale(q.red, to=c(0,1)),s.contact=scales::rescale(contact, to=c(0,1)),s.contact_lym=scales::rescale(contact_lym, to=c(0,1))) %>%
     mutate(q.disp=q.disp/mean(quantile(q.disp, p=0.9999999)),q.speed=q.speed/mean(quantile(q.speed, p=0.9999999)),q.red=q.red/mean(quantile(q.red, p=0.9999999)))%>%ungroup()
-  
+  # master_processed might need adjustement if small sample size is used (quantile p value should decrease) or if T cell death parameter is more representative as a continuous variable (dead dye values) instead of a binary variable ("dead" vs"alive")
+  #see below an alternative for this code used to processes a small set of CART with liquid tumors
+  # master_processed<-master_corrected3%>% 
+  #  group_by(exp_nr) %>% 
+  #  mutate(z.disp = (displacement-mean(displacement))/sd(displacement),z.speed = (speed-mean(speed))/sd(speed), z.red = (red_lym-mean(red_lym))/sd(red_lym))%>%
+  #  mutate(q.disp=ifelse(z.disp>(quantile(z.disp, p=0.75)),z.disp ,min(z.disp)), q.speed=ifelse(z.speed>(quantile(z.speed, p=0.75)),z.speed,min(z.speed)),q.red=ifelse(z.red>(quantile(z.red, p=0.75)),z.red,min(z.red)))%>%  ## new step to update
+  #  mutate(q.disp=scales::rescale(q.disp, to=c(0,1)),q.speed=scales::rescale(q.speed, to=c(0,1)),q.red=scales::rescale(q.red, to=c(0,1))) %>%
+  #  mutate(q.disp=q.disp/mean(quantile(q.disp, p=0.95)),q.speed=q.speed/mean(quantile(q.speed, p=0.95)),q.red=q.red/mean(quantile(q.red, p=0.95)))%>%ungroup()%>%mutate(s.contact=contact,s.contact_lym=contact_lym)
+
   ### Arrange data by time:
   master_processed<-master_processed%>%group_by(TrackID)%>%arrange(Time)
   master_processed$TrackID = as.character(master_processed$TrackID)
@@ -607,7 +627,10 @@ if (model_path != ""){
   library(umap)
   ## Project cross-distance matrix in a UMAP
   umap_dist<- umap(matrix_distmat,n_components=2,input="dist",init = "random", 
-                   n_neighbors=pars$umap_n_neighbors, min_dist=pars$umap_minimal_distance, spread=1)  ### adjust parameters
+                   n_neighbors=pars$umap_n_neighbors, min_dist=pars$umap_minimal_distance, spread=1)  ### If you are generating a new behavioral map, we advise to adjust the n_neighbors and the min_dist parameters.
+  ###The "min_dist" parameter controls how tightly the UMAP algorithm packs points in the low-dimensional space. Smaller values of "min_dist" cause points to be spread out more, but can also cause too many clusters
+  ###"n_neighbors" parameter should be chosen considering the size of your dataset and your goals for preserving local versus global structure. Roughly n_neighbours parameter values should increase for larger datasets, as they often contain more intricate local structures that require a higher number of neighbors to be adequately captured
+
   #Visualize plot
   pdf(file=paste0(output_dir,"Umap_unclustered.pdf"))
   
