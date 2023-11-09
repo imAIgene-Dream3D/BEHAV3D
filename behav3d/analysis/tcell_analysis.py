@@ -140,12 +140,12 @@ def cluster_umap(
     scaler = StandardScaler()
     # umap_scaled = scaler.fit_transform(umap_embedding)  # Standardize UMAP coordinates
     kmeans = KMeans(n_clusters=config["nr_of_clusters"], n_init=100, random_state=random_state)
-    df_umap["cluster"] = kmeans.fit_predict(umap_embedding)
+    df_umap["ClusterID"] = kmeans.fit_predict(umap_embedding)
     # df_umap["cluster2"] = kmeans.fit_predict(umap_embedding)
     
     # Set cluster index to start from 1 for backprojection purposes
-    df_umap["cluster"]=df_umap["cluster"]+1
-    df_umap["cluster"]=df_umap["cluster"].astype('category')
+    df_umap["ClusterID"]=df_umap["ClusterID"]+1
+    df_umap["ClusterID"]=df_umap["ClusterID"].astype('category')
     
     df_umap_out_path = Path(output_dir, f"BEHAV3D_UMAP_clusters.csv")
     print(f"- Writing clustered tracks to {df_umap_out_path}")
@@ -154,13 +154,13 @@ def cluster_umap(
     print("- Producing clustered UMAP plots with displayed Track features")
     umap_plots = []
     
-    info_cols = df_umap.drop(columns=["TrackID", "well", "exp_nr", "UMAP1", "UMAP2", "cluster"]).columns
+    info_cols = df_umap.drop(columns=["TrackID", "well", "exp_nr", "UMAP1", "UMAP2", "ClusterID"]).columns
     
     cluster_plot = (
-            ggplot(df_umap, aes(x='UMAP1', y='UMAP2', color="cluster")) +
+            ggplot(df_umap, aes(x='UMAP1', y='UMAP2', color="ClusterID")) +
             geom_point(size=4, alpha=0.8) +
-            labs(color="cluster") +
-            labs(title="cluster") +
+            labs(color="ClusterID") +
+            labs(title="ClusterID") +
             labs(x="", y="") +
             theme_light(base_size=20) +
             theme_bw() +
@@ -203,8 +203,8 @@ def cluster_umap(
             "UMAP1",
             "UMAP2",
             "TrackID"
-            ]).groupby('cluster').mean().reset_index()
-    df_heatmap = cluster_means.melt(id_vars='cluster', var_name='var', value_name='value')
+            ]).groupby('ClusterID').mean().reset_index()
+    df_heatmap = cluster_means.melt(id_vars='ClusterID', var_name='var', value_name='value')
     
     columns = df_heatmap["var"].unique()
     heatmaps = []
@@ -212,9 +212,9 @@ def cluster_umap(
     for col in columns:
         col_heatmap = df_heatmap[df_heatmap["var"]==col]
         heatmap_plot = (
-            ggplot(col_heatmap, aes(x='cluster', y='var', fill='value')) +
+            ggplot(col_heatmap, aes(x='ClusterID', y='var', fill='value')) +
             geom_tile() +
-            labs(x='Cluster', y='', fill='Value', title="") +
+            labs(x='ClusterID', y='', fill='Value', title="") +
             scale_fill_cmap(limits=(0, None))+
             theme_minimal() +
             theme(plot_margin = 0, legend_key_height=10, legend_key_width=10,legend_title=element_blank())
@@ -226,7 +226,7 @@ def cluster_umap(
     combined_heatmaps.savefig(cluster_features_heatmap_path)
     
     print("- Producing percentage plots of each cluster per combination of T-cell and organoid line")
-    df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "cluster"]).size().reset_index(name='count')
+    df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "ClusterID"]).size().reset_index(name='count')
     total_counts = df_clust_perc.groupby(['organoid_line', 'tcell_line'])['count'].sum().reset_index(name='total_count')
     cluster_counts = pd.merge(df_clust_perc, total_counts)
     df_clust_perc["percentage"] = (df_clust_perc['count'] / df_clust_perc['count'].sum())
@@ -236,11 +236,11 @@ def cluster_umap(
     
     plot = (
         ggplot(df_clust_perc) + 
-        geom_col(aes(x=0, y='percentage', fill='cluster')) + 
+        geom_col(aes(x=0, y='percentage', fill='ClusterID')) + 
         # geom_text(aes(x=0, y=1,label='sum(count)'), va='bottom', size=8, position='identity') +
         theme_void() + 
         facet_grid('tcell_line ~ organoid_line', scales='free_y') +
-        labs(x='', y='Cluster', title='Horizontal Stacked Bar Chart') +
+        labs(x='', y='ClusterID', title='Horizontal Stacked Bar Chart') +
         coord_flip() +
         theme(aspect_ratio = 0.2) +
         # geom_text(data=total_counts, aes(x=0, y=1,label='sum(count)'), va='bottom', size=8, position='identity') 
@@ -271,7 +271,7 @@ def structure_plotnine(
                 if idc+idr+1 <= len(plotlist):
                     rowplots |= plotlist[idc+idr]
                 else:
-                    rowplots |= pw.load_ggplot((ggplot()+geom_blank()+theme_void()), figsize=[4,4])
+                    rowplots |= pw.load_ggplot((ggplot()+geom_blank()+theme_void()), figsize=figsize)
 
                 if comb_plot is None:
                     comb_plot= rowplots

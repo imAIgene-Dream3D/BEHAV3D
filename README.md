@@ -2,6 +2,7 @@
 
 ## Important
 ***This code is currently under development***
+
 _____
 
 ## Overview
@@ -37,7 +38,6 @@ _____
 git clone https://github.com/RiosGroup/BEHAV3D
 cd ./BEHAV3D
 
-install ilastik ()
 conda create -n BEHAV3D python=3
 conda activate BEHAV3D
 pip install .

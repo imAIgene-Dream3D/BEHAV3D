@@ -4,27 +4,35 @@ from pathlib import Path
 
 def run_imaris_preprocessing(
     df_positions_path, 
-    df_organoid_distances_path, 
+    df_organoid_distances_path,
+    df_tcell_distances_path,
     df_dead_dye_means_path, 
     output_path
     ):
     df_pos_imaris = pd.read_csv(df_positions_path, skiprows=3)
     df_pos_imaris=df_pos_imaris[["TrackID", "ID", "Time", "Position X", "Position Y", "Position Z"]]
+    df_pos_imaris=df_pos_imaris.rename(columns={
+            "Position X": "position_x",
+            "Position Y": "position_y",
+            "Position Z": "position_z",
+            }
+        )
     df_orgdist_imaris = pd.read_csv(df_organoid_distances_path, skiprows=3)
-    df_orgdist_imaris=df_orgdist_imaris[["TrackID", "ID", "Time", "Intensity Min"]]
+    df_orgdist_imaris=df_orgdist_imaris[["TrackID", "ID", "Time", "Shortest Distance to Surfaces"]]
+    df_orgdist_imaris=df_orgdist_imaris.rename(columns={"Shortest Distance to Surfaces": "organoid_distance"})
+    df_tcelldist_imaris = pd.read_csv(df_tcell_distances_path, skiprows=3)
+    df_tcelldist_imaris=df_tcelldist_imaris[["TrackID", "ID", "Time", "Shortest Distance to Surfaces"]]
+    df_tcelldist_imaris=df_tcelldist_imaris.rename(columns={"Shortest Distance to Surfaces": "tcell_distance"})
     df_dye_imaris = pd.read_csv(df_dead_dye_means_path, skiprows=3)
     df_dye_imaris=df_dye_imaris[["TrackID", "ID", "Time", "Intensity Mean"]]
-
+    df_dye_imaris=df_dye_imaris.rename(columns={"Intensity Mean": "dead_dye_mean"})
+    
     df_imaris = pd.merge(df_pos_imaris, df_orgdist_imaris)
+    df_imaris = pd.merge(df_imaris, df_tcelldist_imaris)
     df_imaris = pd.merge(df_imaris, df_dye_imaris)
 
     df_imaris=df_imaris.rename(
         columns={
-            "Position X": "position_x",
-            "Position Y": "position_y",
-            "Position Z": "position_z",
-            "Intensity Min": "organoid_distance",
-            "Intensity Mean": "dead_dye_mean",
             "Time": 'position_t',
             "ID": "SegmentID"    
             }

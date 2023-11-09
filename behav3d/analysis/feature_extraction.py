@@ -200,6 +200,7 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
         element_size_z=sample_metadata['pixel_distance_z']
         distance_unit=sample_metadata['distance_unit']
         dead_dye_threshold=sample_metadata['dead_dye_threshold']
+        contact_threshold = sample_metadata["contact_threshold"]
         # Sometimes excel saves the encoding for µm differently, the following lines converts
         # other variants of µm to ones comparable in this code
         # The two written "μm" have different formatting
@@ -218,15 +219,15 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
         if imaris:
             print("Performing feature calculation from Imaris processing..")
         
-        ### Set specific parameters based on Imaris or BEHAV3D processing
-        if imaris:
-            tcell_contact_threshold = sample_metadata["tcell_contact_threshold"]
-            organoid_contact_threshold = sample_metadata["organoid_contact_threshold"]
-        else:
-            image_path = sample_metadata['image_path']
-            image_internal_path = sample_metadata["image_internal_path"]
-            red_lym_channel=sample_metadata['dead_dye_channel']
-            contact_threshold = sample_metadata["contact_threshold"]
+        # ### Set specific parameters based on Imaris or BEHAV3D processing
+        # if imaris:
+        #     tcell_contact_threshold = sample_metadata["tcell_contact_threshold"]
+        #     organoid_contact_threshold = sample_metadata["organoid_contact_threshold"]
+        # else:
+        image_path = sample_metadata['image_path']
+        image_internal_path = sample_metadata["image_internal_path"]
+        red_lym_channel=sample_metadata['dead_dye_channel']
+        contact_threshold = sample_metadata["contact_threshold"]
 
         print("- Loading in tracks csv...")
         ### Load in the specified track csv
@@ -242,38 +243,8 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
             # Threshold the distance to organoid based on the supplied "organoid_contact_threshold"
             # This distance is calculated before in Imaris and supplied as a separate channel and
             # Extracted as a statistic (...Intensity_Min_Ch<#>_img=<#>.csv)
-            df_tracks["organoid_contact"]=df_tracks["organoid_distance"]<=organoid_contact_threshold
-            # Calculate the nearest Tcell based on the distance between the centroids of other T cells
-            # Caution: This distance, unlike the BEHAV3D processing, is between centroids of cells, not borders
-            # Thus the provided "tcell_contact_threshold" needs to reflect this
-            grouped = df_tracks.groupby('position_t')
-            new_dfs = []
-            
-            touching_tcells_dict = {}
-            # Calculate distances between a segment and all other segments with cdist
-            for group_name, group_df in grouped:
-                positions = group_df[['position_x', 'position_y', 'position_z']].values
-                distances = cdist(positions, positions)
-                np.fill_diagonal(distances, np.inf)
-                distances_mask = distances <= tcell_contact_threshold
-                
-                tcell_contacts_list = []
-                for i, row in enumerate(distances_mask):
-                    tcell_contacts = np.where(row)[0].tolist()
-                    tcell_contacts=[group_df.reset_index().loc[idx]["TrackID"] for idx in tcell_contacts]
-                    tcell_contacts_list.append(tcell_contacts)                 
-                group_df['touching_tcells'] = tcell_contacts_list
-                
-                for track_id, tcell_contacts in zip(group_df['TrackID'], tcell_contacts_list):
-                    touching_tcells_dict[track_id] = tcell_contacts
- 
-                group_df['tcell_contact'] = group_df['touching_tcells'].apply(lambda x: len(x) > 0)
-                group_df['touching_tcells'] = group_df['touching_tcells'].apply(lambda x: ",".join(map(str, x)) if isinstance(x, list) and len(x) > 0 else None)
-                
-                new_dfs.append(group_df)
-            df_tracks = pd.concat(new_dfs, ignore_index=True)
-            # Threshold the distance to t cells based on the supplied "tcell_contact_threshold"
-            # df_tracks["tcell_contact"]=df_tracks["touching_tcells"]<=tcell_contact_threshold
+            df_tracks["organoid_contact"]=df_tracks["organoid_distance"]<=contact_threshold
+            df_tracks["tcell_contact"]=df_tracks["tcell_distance"]<=contact_threshold
         else:
             print("- Calculating contact with organoids and other T cells...")
             print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
@@ -367,11 +338,7 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
         df_tracks["time"]=df_tracks["position_t"]*time_interval
         df_tracks["time"]=df_tracks["time"].apply(convert_time, args=(time_unit))
         time_interval=convert_time(time_interval, time_unit)
-        if imaris:
-            organoid_contact_threshold = convert_distance(organoid_contact_threshold, distance_unit)
-            tcell_contact_threshold = convert_distance(tcell_contact_threshold, distance_unit)
-        else:
-            contact_threshold = convert_distance(contact_threshold, distance_unit)
+        contact_threshold = convert_distance(contact_threshold, distance_unit)
 
         element_size_x = convert_distance(element_size_x, distance_unit)
         element_size_y = convert_distance(element_size_y, distance_unit)
@@ -388,7 +355,7 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
             )
         df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
         
-        if cell_type=="tcells":
+        if cell_type=="tcells" and not imaris:
             print("- Determining active contact of T cells")
             # Determining if a T cell is actively interacting with another T cell based on speed
             # More explanation at the top of this code
@@ -550,6 +517,11 @@ def summarize_track_features(
     
     start_time = time.time()
     
+    if "imaris" in config.keys():
+        imaris = config["imaris"]
+    else:
+        imaris = False
+            
     print(f"--------------- Summarizing track features ---------------")
     
     output_dir = config['output_dir']
@@ -569,15 +541,16 @@ def summarize_track_features(
     df_summarized_tracks['displacement_from_origin'] =  grouped_df_tracks['displacement_from_origin'].last().reset_index()['displacement_from_origin']
     df_summarized_tracks['cumulative_displacement'] =  grouped_df_tracks['cumulative_displacement'].last().reset_index()['cumulative_displacement']
     
-    # Calculate for the contact that occurs, what percentage has been active contact
-    # As it only takes points of contact, this can mean the mean contact is 1% (0.01)
-    # while the active contact can then still be 100% (1.0)
-    def calculate_active_contact_when_contact(group):
-        if group['tcell_contact'].any():
-            return group[group['tcell_contact']]['active_tcell_contact'].mean()
-        else:
-            return 0
-    df_summarized_tracks['active_tcell_contact'] = grouped_df_tracks.apply(calculate_active_contact_when_contact).reset_index(drop=True)
+    if not imaris:
+        # Calculate for the contact that occurs, what percentage has been active contact
+        # As it only takes points of contact, this can mean the mean contact is 1% (0.01)
+        # while the active contact can then still be 100% (1.0)
+        def calculate_active_contact_when_contact(group):
+            if group['tcell_contact'].any():
+                return group[group['tcell_contact']]['active_tcell_contact'].mean()
+            else:
+                return 0
+        df_summarized_tracks['active_tcell_contact'] = grouped_df_tracks.apply(calculate_active_contact_when_contact).reset_index(drop=True)
 
     df_trackinfo = df_tracks[['TrackID', 'sample_name','well', 'exp_nr', 'organoid_line', 'tcell_line']].drop_duplicates()
     df_summarized_tracks = pd.merge(df_trackinfo, df_summarized_tracks, how="left")
@@ -608,7 +581,6 @@ def plot_dead_dye_distribution(
         scale_x_continuous(breaks=[]) +
         theme_bw()
     )   
-    print(figure)
     return(figure)
 
 def plot_touching_nontouching_distribution(
