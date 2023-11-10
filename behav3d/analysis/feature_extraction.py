@@ -872,11 +872,15 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
     """
     assert calculation in ["min", "max", "mean", "median"]
     
+    intensity_image=np.transpose(intensity_image, [1,2,3,4,0])
     df_intensities = []
     for t, tcell_stack in enumerate(tcell_segments):
-        intensity_stack=intensity_image[t,:,:,:]
+        print(t)
+        intensity_stack=intensity_image[:,t,:,:,:]
+        print("a")
         properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=intensity_stack, properties=['label', f'intensity_{calculation}']))
         properties["position_t"]=t
+        print("b")
         df_intensities.append(properties)
     df_intensities = pd.concat(df_intensities)
     df_intensities=df_intensities.rename(columns={"label":"TrackID"})
