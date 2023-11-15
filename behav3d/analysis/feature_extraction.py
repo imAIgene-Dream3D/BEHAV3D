@@ -37,7 +37,7 @@ This script calculates the features of tracks for BEHAV3D analysis.
 - tcell_contact_pixels
 - touching_tcells
 - active_tcell_interaction
-- dead_dye_mean
+- mean_dead_dye
 - displacement
 - cumulative_displacement
 - displacement_from_origin
@@ -85,7 +85,7 @@ cell what was its mean_speed over the last "rolling_meanspeed_window" timepoints
 T cells that are touching on mean_speed and only the one with the highest speed is labeled as an 
 active tcellinteraction.
 
-### dead_dye_mean
+### mean_dead_dye
 - Float
 The mean intensity of the dead dye inside of each segment per timepoint. Calculated based on the 
 channel of the dead dye. Supplied as an index of the channel image supplied as "dead_dye_channel" 
@@ -161,7 +161,7 @@ import h5py
 import math
 import time
 from behav3d import format_time
-
+ 
 def run_behav3d_feature_extraction(config, metadata):
    
     df_all_tracks=calculate_track_features(config, metadata)
@@ -270,13 +270,13 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
             df_tracks = pd.merge(df_tracks, df_contacts, how="left")
             
             print("- Calculating death dye intensities...")
-            intensity_image = h5py.File(name=image_path, mode="r")[image_internal_path][red_lym_channel,:,:,:,:]
-            df_red_lym_intensity=calculate_segment_intensity(
+            intensity_image = h5py.File(name=image_path, mode="r")[image_internal_path]
+            df_intensity=calculate_segment_intensity(
                 tcell_segments=tcell_segments,
                 intensity_image=intensity_image
             )
-            df_tracks = pd.merge(df_tracks, df_red_lym_intensity, how="left")
-            df_tracks=df_tracks.rename(columns={"intensity_mean":"dead_dye_mean"})
+            df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{red_lym_channel}":"mean_dead_dye"})
+            df_tracks = pd.merge(df_tracks, df_intensity, how="left")
         
         # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
         # Values are interpolated linearly, forward filled or left blank based on the column
@@ -294,7 +294,7 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
         for track_id in df_tracks["TrackID"].unique():
             track_df = df_tracks[df_tracks["TrackID"] == track_id]
             track_df_reset = track_df.reset_index(drop=True)
-            threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset["dead_dye_mean"] >= dead_dye_threshold].index
+            threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset["mean_dead_dye"] >= dead_dye_threshold].index
             
             if not threshold_indices.empty:
                 first_threshold_index = threshold_indices.min()
@@ -376,7 +376,7 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
             columns=[
                 "mean_square_displacement",
                 "speed",
-                "dead_dye_mean"
+                "mean_dead_dye"
             ]
         )
         
@@ -495,7 +495,7 @@ def normalize_track_features(
     columns = [
         "mean_square_displacement",
         "speed",
-        "dead_dye_mean"
+        "mean_dead_dye"
     ]
     ):
     
@@ -529,7 +529,7 @@ def summarize_track_features(
     # Calculate mean values of track features over the whole track
     grouped_df_tracks=df_tracks.groupby(['sample_name','TrackID'])
     df_summarized_tracks = grouped_df_tracks.size().reset_index(name="track_length")
-    df_summarized_tracks['mean_dead_dye'] = grouped_df_tracks['dead_dye_mean'].mean().reset_index()["dead_dye_mean"]
+    df_summarized_tracks['mean_dead_dye'] = grouped_df_tracks['mean_dead_dye'].mean().reset_index()["mean_dead_dye"]
     df_summarized_tracks['mean_MSD'] =  grouped_df_tracks['mean_square_displacement'].mean().reset_index()['mean_square_displacement']
     df_summarized_tracks['mean_speed'] =  grouped_df_tracks['speed'].mean().reset_index()['speed']
     df_summarized_tracks['mean_organoid_contact'] =  grouped_df_tracks['organoid_contact'].mean().reset_index()['organoid_contact']
@@ -574,7 +574,7 @@ def plot_dead_dye_distribution(
     """
     df_time1 = df_tracks[df_tracks["relative_time"]==1]
     figure = (
-        ggplot(df_time1, aes(x='time', y='dead_dye_mean')) +
+        ggplot(df_time1, aes(x='time', y='mean_dead_dye')) +
         geom_jitter() +
         geom_violin(aes(fill='sample_name')) +
         facet_grid('~sample_name') +
@@ -621,7 +621,7 @@ def interpolate_missing_positions(
         "position_z", 
         "position_y", 
         "position_x",
-        "dead_dye_mean"
+        "mean_dead_dye"
         ]
     ):
     """
@@ -872,19 +872,24 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
     """
     assert calculation in ["min", "max", "mean", "median"]
     
-    intensity_image=np.transpose(intensity_image, [1,2,3,4,0])
-    df_intensities = []
-    for t, tcell_stack in enumerate(tcell_segments):
-        print(t)
-        intensity_stack=intensity_image[:,t,:,:,:]
-        print("a")
+    intensity_image=np.transpose(intensity_image, axes=[1,2,3,4,0])
+    intensity_image = np.swapaxes(intensity_image, 0, -1)
+    df_intensity = []
+    for t, (tcell_stack, intensity_stack) in enumerate(zip(tcell_segments, intensity_image)):
         properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=intensity_stack, properties=['label', f'intensity_{calculation}']))
         properties["position_t"]=t
-        print("b")
-        df_intensities.append(properties)
-    df_intensities = pd.concat(df_intensities)
-    df_intensities=df_intensities.rename(columns={"label":"TrackID"})
-    return(df_intensities)
+        df_intensity.append(properties)
+    df_intensity = pd.concat(df_intensity)
+    
+    # Define a dictionary mapping old column names to new column names using regex
+    column_mapping = {}
+    for i in range(df_intensity.shape[1]):
+        old_col_name = f'intensity_mean-{i}'
+        new_col_name = f'mean_intensity_ch{i}'
+        column_mapping[old_col_name] = new_col_name
+    column_mapping["label"]="TrackID"
+    df_intensity=df_intensity.rename(columns=column_mapping)
+    return(df_intensity)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
