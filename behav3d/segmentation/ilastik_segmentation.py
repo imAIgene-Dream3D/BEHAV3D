@@ -35,19 +35,25 @@ def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
     ilastik_tcell_seg_model = config['ilastik_tcell_segmentation_model']
     ilastik_org_postproc_model = config['ilastik_organoid_postprocessing_model']
     ilastik_tcell_postproc_model = config['ilastik_tcell_postprocessing_model']
-    
+    output_dir = config['output_dir']
+    img_outdir = Path(output_dir, "images")
+   
     for _, sample in metadata.iterrows():
         start_time = time.time()
         sample_name = sample['sample_name']
         image_path = sample['image_path']
         image_internal_path = sample["image_internal_path"]
         full_image_path = f"{image_path}/{image_internal_path}"
-        output_dir = config['output_dir']
+        img_outdir = Path(output_dir, "images", sample_name)
+        if not img_outdir.exists():
+            img_outdir.mkdir(parents=True)
 
+        
+        
         print(f"--------------- Segmenting: {sample_name} ---------------")       
         ### General pixel classifier
         print("- Running the ilastik pixel classifier...")
-        pix_prob_path = Path(output_dir, f"{sample_name}_probabilities.h5")
+        pix_prob_path = Path(img_outdir, f"{sample_name}_probabilities.h5")
         pix_prob_path=run_ilastik_pixel_classifier(
             raw_data=full_image_path,
             model=ilastik_pix_clas_model,
@@ -58,7 +64,7 @@ def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
 
         ### Organoid segmentation
         print("- Performing initial organoid segmentation...")
-        preseg_org_h5_path = Path(output_dir, f"{sample_name}_organoid_presegments.h5")
+        preseg_org_h5_path = Path(img_outdir, f"{sample_name}_organoid_presegments.h5")
         preseg_org_h5_path=run_ilastik_object_segmentation(
             raw_data=full_image_path,
             pixel_probabilities=pix_prob_path,
@@ -69,7 +75,7 @@ def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
         )
 
         print("- Performing organoid segment postprocessing (splitting)...")
-        seg_org_h5_path = Path(output_dir, f"{sample_name}_organoid_segments.h5")
+        seg_org_h5_path = Path(img_outdir, f"{sample_name}_organoid_segments.h5")
         seg_org_h5_path=run_ilastik_object_splitter(
             raw_data=full_image_path,
             segments=preseg_org_h5_path,
@@ -81,7 +87,7 @@ def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
 
         im = h5py.File(name=seg_org_h5_path, mode="r")["segments"][:].squeeze()
         # im = imread(seg_tcell_out_path)
-        seg_org_tiff_path = Path(output_dir, f"{sample_name}_organoid_segments.tiff")
+        seg_org_tiff_path = Path(img_outdir, f"{sample_name}_organoid_segments.tiff")
         imwrite(
             seg_org_tiff_path,
             im.astype('uint16'),
@@ -91,7 +97,7 @@ def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
 
         ### Tcell segmentation
         print("- Performing initial T cell segmentation...")
-        preseg_tcell_h5_path = Path(output_dir, f"{sample_name}_tcell_presegments.h5")
+        preseg_tcell_h5_path = Path(img_outdir, f"{sample_name}_tcell_presegments.h5")
         preseg_tcell_h5_path=run_ilastik_object_segmentation(
             raw_data=full_image_path,
             pixel_probabilities=pix_prob_path,
@@ -101,7 +107,7 @@ def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
         )
 
         print("- Performing T cell segment postprocessing (splitting)...")
-        seg_tcell_h5_path = Path(output_dir, f"{sample_name}_tcell_segments.h5")
+        seg_tcell_h5_path = Path(img_outdir, f"{sample_name}_tcell_segments.h5")
         seg_tcell_h5_path=run_ilastik_object_splitter(
             raw_data=full_image_path,
             segments=preseg_tcell_h5_path,
@@ -111,7 +117,7 @@ def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
         )
 
         ### Add metadata to the image so TrackMate correctly reads the dimensions
-        seg_tcell_tiff_path = Path(output_dir, f"{sample_name}_tcell_segments.tiff")
+        seg_tcell_tiff_path = Path(img_outdir, f"{sample_name}_tcell_segments.tiff")
         im = h5py.File(name=seg_tcell_h5_path, mode="r")["segments"][:].squeeze()
         # im = imread(seg_tcell_out_path)
         imwrite(

@@ -21,10 +21,13 @@ def run_tcell_analysis(
     ):
     
     output_dir = config["output_dir"]
+    analysis_outdir = Path(output_dir, "analysis", "tcells")
+    feature_outdir = Path(analysis_outdir, "track_features")
+    
     if df_tracks_path is None:
-        df_tracks_path = Path(output_dir, f"BEHAV3D_combined_track_features_filtered.csv")
+        df_tracks_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_filtered.csv")
     if df_tracks_summarized_path is None:
-        df_tracks_summarized_path = Path(output_dir, f"BEHAV3D_combined_track_features_summarized.csv")
+        df_tracks_summarized_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_summarized.csv")
     
     df_tracks = pd.read_csv(df_tracks_path)
     df_tracks_summarized = pd.read_csv(df_tracks_summarized_path)
@@ -49,7 +52,8 @@ def run_tcell_analysis(
         config=config,
         df_tracks=df_tracks,
         df_tracks_summarized=df_tracks_summarized,
-        random_state=None
+        random_state=None,
+        output_dir = analysis_outdir
     )
     
     return(df_clusters)
@@ -59,7 +63,7 @@ def calculate_dtw(
     features=[
         "z_mean_square_displacement", 
         "z_speed", 
-        "z_dead_dye_mean", 
+        "z_mean_dead_dye", 
         "tcell_contact", 
         "organoid_contact"
         ]
@@ -78,18 +82,6 @@ def calculate_dtw(
     for TrackID in df_tracks["TrackID"].unique():
         track_features = df_tracks[df_tracks["TrackID"]==TrackID][features].to_numpy().astype(np.double)
         dtw_input_tracks.append(track_features)
-    # for i, feature in enumerate(features):
-    #     df_tracks[feature] = df_tracks[feature].astype(np.double)
-    #     df_tracks[feature] = (df_tracks[feature] - df_tracks[feature].min()) / (df_tracks[feature].max() - df_tracks[feature].min())
-    #     pivot_df = df_tracks.pivot(
-    #         index=['sample_name', 'TrackID'], 
-    #         columns='relative_time', 
-    #         values=feature
-    #         )
-    #     pivot_np_array = pivot_df.values.astype(np.double)
-        
-    #     dtw_input_tracks[:, :, i] = pivot_np_array
-    # dtw_input_tracks=dtw_input_tracks.astype(np.double)
     
     dtw_distance_matrix = dtw_ndim.distance_matrix_fast(dtw_input_tracks)
     return(dtw_distance_matrix)
@@ -118,16 +110,23 @@ def cluster_umap(
     config,
     df_tracks=None,
     df_tracks_summarized=None,
-    random_state=None
+    random_state=None,
+    output_dir = None
     ):
     
     print("- Performing clustering on the UMAP data")
-    output_dir = config['output_dir']
+    if output_dir is None:
+        output_dir = Path(config['output_dir'], "analysis", "tcells")
+    feature_outdir = Path(output_dir, "track_features")
+    results_outdir = Path(output_dir, "results")
+    if not results_outdir.exists():
+        results_outdir.mkdir(parents=True)
+        
     if df_tracks is None:
-        df_tracks_path = Path(output_dir, f"BEHAV3D_combined_track_features_filtered.csv")
+        df_tracks_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_filtered.csv")
         df_tracks = pd.read_csv(df_tracks_path)
     if df_tracks_summarized is None:
-        df_tracks_summarized_path = Path(output_dir, f"BEHAV3D_combined_track_features_summarized.csv")
+        df_tracks_summarized_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_summarized.csv")
         df_tracks_summarized = pd.read_csv(df_tracks_summarized_path)
       
     df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
@@ -147,7 +146,7 @@ def cluster_umap(
     df_umap["ClusterID"]=df_umap["ClusterID"]+1
     df_umap["ClusterID"]=df_umap["ClusterID"].astype('category')
     
-    df_umap_out_path = Path(output_dir, f"BEHAV3D_UMAP_clusters.csv")
+    df_umap_out_path = Path(results_outdir, f"BEHAV3D_UMAP_clusters.csv")
     print(f"- Writing clustered tracks to {df_umap_out_path}")
     df_umap.to_csv(df_umap_out_path, sep=",", index=False)
 
@@ -189,7 +188,7 @@ def cluster_umap(
         append_to=pw.load_ggplot(cluster_plot, figsize=[4,4])
         ) 
     
-    cluster_UMAP_path = Path(output_dir, f"BEHAV3D_UMAP_clusters.pdf")
+    cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_UMAP_clusters.pdf")
     combined_umaps.savefig(cluster_UMAP_path)
     
     print("- Producing heatmaps with summarized cluster features")
@@ -222,7 +221,7 @@ def cluster_umap(
         heatmaps.append(heatmap_plot)
     
     combined_heatmaps = structure_plotnine(heatmaps, figsize=(3,0.5), nr_cols=2) 
-    cluster_features_heatmap_path = Path(output_dir, f"BEHAV3D_UMAP_cluster_feature_heatmap.pdf")
+    cluster_features_heatmap_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_feature_heatmap.pdf")
     combined_heatmaps.savefig(cluster_features_heatmap_path)
     
     print("- Producing percentage plots of each cluster per combination of T-cell and organoid line")
@@ -247,11 +246,11 @@ def cluster_umap(
         geom_text(aes(label="total_count", x=-1.0, y=0.5), data=total_counts, va='bottom', size=8, position='identity')
         # annotate('text', x=0.5, y=105, label=lambda d: f"Total Count: {d['total_count'].iloc[0]}", size=12)
     )
-    cluster_percentage_plot_path = Path(output_dir, f"BEHAV3D_UMAP_cluster_percentages.pdf")
+    cluster_percentage_plot_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_percentages.pdf")
     plot.save(cluster_percentage_plot_path, width=8, height=8)
 
     df_clust_perc = df_clust_perc.reset_index(drop=True)
-    df_clust_perc_out_path = Path(output_dir, f"BEHAV3D_UMAP_cluster_percentages.csv")
+    df_clust_perc_out_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_percentages.csv")
     print(f"- Writing summarized tracks to {df_clust_perc_out_path}")
     df_clust_perc.to_csv(df_clust_perc_out_path, sep=",", index=False)
     

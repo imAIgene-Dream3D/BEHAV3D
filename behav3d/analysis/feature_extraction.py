@@ -162,9 +162,9 @@ import math
 import time
 from behav3d import format_time
  
-def run_behav3d_feature_extraction(config, metadata):
+def run_behav3d_feature_extraction(config, metadata, cell_type="tcells"):
    
-    df_all_tracks=calculate_track_features(config, metadata)
+    df_all_tracks=calculate_track_features(config, metadata, cell_type=cell_type)
     
     # Calculate features for each timepoint in a track
     df_all_tracks_filt = filter_tracks(df_all_tracks, config, metadata)
@@ -187,6 +187,12 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
     """
 
     output_dir = config['output_dir']
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
+    feature_outdir = Path(analysis_outdir, "track_features")
+    
+    if not feature_outdir.exists():
+        feature_outdir.mkdir(parents=True)
+        
     rolling_meanspeed_window=10
     
     df_all_tracks=pd.DataFrame()
@@ -201,6 +207,10 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
         distance_unit=sample_metadata['distance_unit']
         dead_dye_threshold=sample_metadata['dead_dye_threshold']
         contact_threshold = sample_metadata["contact_threshold"]
+        
+        img_outdir = Path(output_dir, "images", sample_name)
+        track_outdir = Path(output_dir, "trackdata", sample_name)
+        analysis_outdir = Path(output_dir, "analysis", cell_type)
         # Sometimes excel saves the encoding for µm differently, the following lines converts
         # other variants of µm to ones comparable in this code
         # The two written "μm" have different formatting
@@ -231,8 +241,8 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
 
         print("- Loading in tracks csv...")
         ### Load in the specified track csv
-        if sample_metadata["tcell_track_csv"]=="" or sample_metadata["tcell_track_csv"]==None:
-            df_tracks_path = Path(output_dir, f"{sample_name}_{cell_type}_tcell_tracks.csv")
+        if sample_metadata["tcell_track_csv"]=="" or sample_metadata["tcell_track_csv"]==None or math.isnan(sample_metadata["tcell_track_csv"]):
+            df_tracks_path = Path(track_outdir, f"{sample_name}_{cell_type}_tracks.csv")
         else:
             df_tracks_path = sample_metadata["tcell_track_csv"]
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
@@ -250,10 +260,10 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
             print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
             
             # Load in the images containing the organoid segments and T cell segments
-            organoid_segments_path=Path(output_dir, f"{sample_name}_organoids_tracked.tiff")
+            organoid_segments_path=Path(img_outdir, f"{sample_name}_organoids_tracked.tiff")
             organoid_segments=imread(organoid_segments_path)
             
-            tcell_segments_path=Path(output_dir, f"{sample_name}_tcells_tracked.tiff")
+            tcell_segments_path=Path(img_outdir, f"{sample_name}_tcells_tracked.tiff")
             tcell_segments=imread(tcell_segments_path)
             
             # Calculate the contact od each T cell with an organoid or a T cell
@@ -269,7 +279,7 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
             )
             df_tracks = pd.merge(df_tracks, df_contacts, how="left")
             
-            print("- Calculating death dye intensities...")
+            print("- Calculating channel and especially death dye intensities...")
             intensity_image = h5py.File(name=image_path, mode="r")[image_internal_path]
             df_intensity=calculate_segment_intensity(
                 tcell_segments=tcell_segments,
@@ -382,11 +392,9 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
         
         df_tracks=df_tracks.sort_values(by=["TrackID", "relative_time"])
         
-        tracks_out_path = Path(output_dir, f"{sample_name}_{cell_type}_track_features.csv")
+        tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
         print(f"- Writing output to {tracks_out_path}")
         df_tracks.to_csv(tracks_out_path, sep=",", index=False)
-        
-        
         
         # Adding a sample name for later combination of multiple track experiments
         df_tracks['sample_name']=sample_name
@@ -397,14 +405,15 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
         h,m,s = format_time(start_time, end_time)
         print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
     
-    all_tracks_out_path = Path(output_dir, f"BEHAV3D_combined_track_features.csv")
+    all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features.csv")
     df_all_tracks.to_csv(all_tracks_out_path, index=False) 
     return(df_all_tracks)
 
 def filter_tracks(
     df_all_tracks,
     config,
-    metadata
+    metadata,
+    cell_type="tcells"
     ):
     """
     This code filters tracks based on supplied parameters in the config.yml
@@ -426,6 +435,15 @@ def filter_tracks(
     print(f"--------------- Filtering tracks ---------------")
     
     output_dir = config['output_dir']
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
+    feature_outdir = Path(analysis_outdir, "track_features")
+    qc_outdir = Path(analysis_outdir, "quality_control")
+    
+    if not feature_outdir.exists():
+        feature_outdir.mkdir(parents=True)
+    if not qc_outdir.exists():
+        qc_outdir.mkdir(parents=True)
+    
     tcell_exp_duration = config['tcell_exp_duration']
     tcell_min_track_length = config['tcell_min_track_length']
     tcell_max_track_length = config['tcell_max_track_length']
@@ -481,8 +499,10 @@ def filter_tracks(
     df_all_tracks_filt=df_all_tracks_filt[~df_all_tracks_filt.set_index(['TrackID', 'sample_name']).index.isin(dead_t0.set_index(['TrackID', 'sample_name']).index)]   
     df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_dead_t1", df_track_counts=df_track_counts)
 
+    # TODO create filter plot to see how much is filtered
+    
     # Write the filtered tracks to a .csv
-    filt_tracks_out_path = Path(output_dir, f"BEHAV3D_combined_track_features_filtered.csv")
+    filt_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_filtered.csv")
     print(f"- Writing filtered tracks to {filt_tracks_out_path}")
     df_all_tracks_filt.to_csv(filt_tracks_out_path, sep=",", index=False)
     end_time = time.time()
@@ -505,7 +525,8 @@ def normalize_track_features(
 
 def summarize_track_features(
     df_tracks,
-    config
+    config,
+    cell_type="tcells"
     ):
     """
     This code calculates summarized features (e.g. mean speed of the whole track) 
@@ -525,7 +546,13 @@ def summarize_track_features(
     print(f"--------------- Summarizing track features ---------------")
     
     output_dir = config['output_dir']
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
+    feature_outdir = Path(analysis_outdir, "track_features")
+    qc_outdir = Path(analysis_outdir, "quality_control")
     
+    if not feature_outdir.exists():
+        feature_outdir.mkdir(parents=True)
+
     # Calculate mean values of track features over the whole track
     grouped_df_tracks=df_tracks.groupby(['sample_name','TrackID'])
     df_summarized_tracks = grouped_df_tracks.size().reset_index(name="track_length")
@@ -555,7 +582,7 @@ def summarize_track_features(
     df_trackinfo = df_tracks[['TrackID', 'sample_name','well', 'exp_nr', 'organoid_line', 'tcell_line']].drop_duplicates()
     df_summarized_tracks = pd.merge(df_trackinfo, df_summarized_tracks, how="left")
     # Write the summarized features to a .csv
-    summ_tracks_out_path = Path(output_dir, f"BEHAV3D_combined_track_features_summarized.csv")
+    summ_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_summarized.csv")
     print(f"- Writing summarized tracks to {summ_tracks_out_path}")
     df_summarized_tracks.to_csv(summ_tracks_out_path, sep=",", index=False)
     
@@ -873,7 +900,6 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
     assert calculation in ["min", "max", "mean", "median"]
     
     intensity_image=np.transpose(intensity_image, axes=[1,2,3,4,0])
-    intensity_image = np.swapaxes(intensity_image, 0, -1)
     df_intensity = []
     for t, (tcell_stack, intensity_stack) in enumerate(zip(tcell_segments, intensity_image)):
         properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=intensity_stack, properties=['label', f'intensity_{calculation}']))

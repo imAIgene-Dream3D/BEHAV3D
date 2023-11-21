@@ -22,10 +22,20 @@ def run_trackmate_organoids(config, metadata, verbose=False):
       
 def run_trackmate(config, metadata, cell_type="tcells", verbose=False):
     output_dir = config['output_dir']
+    
+   
+    
     for _, sample in metadata.iterrows():
         start_time = time.time()
         sample_name = sample['sample_name']
-
+        img_outdir = Path(output_dir, "images", sample_name)
+        track_outdir = Path(output_dir, "trackdata", sample_name)
+        
+        if not img_outdir.exists():
+            img_outdir.mkdir(parents=True)
+        if not track_outdir.exists():
+            track_outdir.mkdir(parents=True)
+            
         element_size_x=sample['pixel_distance_xy']
         element_size_y=sample['pixel_distance_xy'] 
         element_size_z=sample['pixel_distance_z']
@@ -36,7 +46,7 @@ def run_trackmate(config, metadata, cell_type="tcells", verbose=False):
         print(f"--------------- Tracking ({cell_type}) : {sample_name} ---------------")
         print("- Running TrackMate...")
         ### Track the data using TrackMate
-        segments_path = Path(output_dir, f"{sample_name}_{cell_type}_segments.tiff")   
+        segments_path = Path(img_outdir, f"{sample_name}_{cell_type}_segments.tiff")   
         df_tracks=trackmate_tracking(
             image_path=str(segments_path),
             element_size_x=element_size_x,
@@ -49,7 +59,7 @@ def run_trackmate(config, metadata, cell_type="tcells", verbose=False):
         df_tracks["TrackID"]=df_tracks["TrackID"]+1
         df_tracks = df_tracks.sort_values(by=["TrackID","position_t"])
         
-        tracks_out_path = Path(output_dir, f"{sample_name}_{cell_type}_tracks.csv")
+        tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_tracks.csv")
         df_tracks.to_csv(tracks_out_path, sep=",", index=False)
         
         ### Assign the tracks to existing segments
@@ -84,7 +94,7 @@ def run_trackmate(config, metadata, cell_type="tcells", verbose=False):
             tcells_tracked[t,:,:,:][tcell_segments[t,:,:,:]==corr_seg]=row["TrackID"]
             # im_track = im_track[im==corr_seg]=row["TrackID"]
             
-        tcell_tracked_out_path= Path(output_dir, f"{sample_name}_{cell_type}_tracked.tiff")
+        tcell_tracked_out_path= Path(img_outdir, f"{sample_name}_{cell_type}_tracked.tiff")
         imwrite(
             tcell_tracked_out_path,
             tcells_tracked

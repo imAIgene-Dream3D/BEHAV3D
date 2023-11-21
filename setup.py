@@ -28,6 +28,9 @@ setup(
           'h5py',
           'ipykernel',
           'napari',
-          'pyqt5'
+          'pyqt5',
+        #   'dtaidistance',
+          "umap-learn",
+          'scikit-learn'
       ]
 )

@@ -18,12 +18,19 @@ def backproject_data(
     sample_name="AIM_MB2_Exp58_Img003_donor899"
     
     output_dir = config['output_dir']
+    img_dir = Path(output_dir, "images", sample_name)
+    analysis_outdir = Path(output_dir, "analysis", "tcells")
+    results_outdir = Path(analysis_outdir, "results")
+    backproj_outdir = Path(analysis_outdir, "backprojection")
     
+    if not backproj_outdir.exists():
+        backproj_outdir.mkdir(parents=True)
+        
     metadata = pd.read_csv(config["metadata_csv_path"])
     df_sample = metadata[metadata["sample_name"]==sample_name]
     assert(sample_name in df_sample["sample_name"].values), f"Supplied sample name {sample_name} not in metadata"
  
-    track_img_path = Path(output_dir, f"{sample_name}_{cell_type}_tracked.tiff")
+    track_img_path = Path(img_dir, f"{sample_name}_{cell_type}_tracked.tiff")
     elsize = [
         df_sample["pixel_distance_z"].values[0],
         df_sample["pixel_distance_xy"].values[0],
@@ -37,7 +44,7 @@ def backproject_data(
         
     # raw_data = np.array(h5py.File(name=raw_h5_path, mode="r")[raw_internal_path])
     
-    df_tracks_clustered=pd.read_csv(Path(output_dir, "BEHAV3D_UMAP_clusters.csv"))
+    df_tracks_clustered=pd.read_csv(Path(results_outdir, "BEHAV3D_UMAP_clusters.csv"))
     track_img = np.where(np.isin(track_img, df_tracks_clustered["TrackID"].unique()), track_img, 0)
 
     trackid_data = {
@@ -64,7 +71,7 @@ def backproject_data(
     
     if save:
         # Output to .h5 format
-        backproj_out_path = track_img_path.with_name(f"{track_img_path.stem}_backprojected.h5")
+        backproj_out_path = Path(backproj_outdir, f"{track_img_path.stem}_backprojected.h5")
         out_h5 = h5py.File(name=backproj_out_path, mode="w")
         
 

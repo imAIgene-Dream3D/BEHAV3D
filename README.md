@@ -38,9 +38,14 @@ _____
 git clone https://github.com/RiosGroup/BEHAV3D
 cd ./BEHAV3D
 
-conda create -n BEHAV3D python=3
+conda create -n BEHAV3D python=3.10
 conda activate BEHAV3D
-pip install .
+pip install -e .
+conda install -c conda-forge dtaidistance
+
+# Installing dtaidistance through pip might lead to the error:
+# Exception: The compiled dtaidistance C library is not available.
+
 ```
 
 for open-source processing:
