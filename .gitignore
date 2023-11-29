@@ -6,6 +6,7 @@
 *.ilp
 *.tiff
 test/
+build/
 **/.DS_Store
 **/.egg-info
 *.egg-info

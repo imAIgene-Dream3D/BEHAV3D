@@ -20,10 +20,17 @@ def run_trackmate_tcells(config, metadata, verbose=False):
 def run_trackmate_organoids(config, metadata, verbose=False):
     run_trackmate(config, metadata, cell_type="organoids", verbose=verbose)
       
-def run_trackmate(config, metadata, cell_type="tcells", verbose=False):
-    output_dir = config['output_dir']
+def run_trackmate(
+    metadata,
+    output_dir=None,
+    config=None, 
+    cell_type="tcells", 
+    verbose=False):
     
-   
+    assert config is not None or output_dir is not None, "Either 'config' or 'output_dir' must be supplied"
+
+    if output_dir is None:
+        output_dir = config['output_dir']
     
     for _, sample in metadata.iterrows():
         start_time = time.time()

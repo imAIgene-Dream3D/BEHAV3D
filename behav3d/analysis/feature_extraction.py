@@ -157,7 +157,6 @@ from plotnine import (
     theme_bw,
     scale_x_continuous
 )
-import h5py
 import math
 import time
 from behav3d import format_time
@@ -172,7 +171,13 @@ def run_behav3d_feature_extraction(config, metadata, cell_type="tcells"):
     # Calculate features for each timepoint in a track
     df_summarized_tracks=summarize_track_features(df_all_tracks_filt, config, metadata) 
          
-def calculate_track_features(config, metadata, cell_type="tcells"):
+def calculate_track_features(
+    metadata, 
+    config=None,
+    output_dir=None,
+    cell_type="tcells",
+    imaris=False,
+    ):
     """
     This code calculates the various features for each timepoint in a track for each 
     separateexperiment
@@ -186,7 +191,15 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
       features
     """
 
-    output_dir = config['output_dir']
+    assert config is not None or output_dir is not None, "Either 'config' or 'output_dir' must be supplied"
+    
+    if output_dir is None:
+        output_dir = config['output_dir']
+        if "imaris" in config.keys():
+            imaris = config["imaris"]
+        else:
+            imaris = False
+            
     analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     
@@ -222,10 +235,7 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
         time_unit = sample_metadata['time_unit']
 
         print("###### Running track feature calculation")
-        if "imaris" in config.keys():
-            imaris = config["imaris"]
-        else:
-            imaris = False
+        
         if imaris:
             print("Performing feature calculation from Imaris processing..")
         
@@ -234,17 +244,19 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
         #     tcell_contact_threshold = sample_metadata["tcell_contact_threshold"]
         #     organoid_contact_threshold = sample_metadata["organoid_contact_threshold"]
         # else:
-        image_path = sample_metadata['image_path']
-        image_internal_path = sample_metadata["image_internal_path"]
+        raw_image_path = sample_metadata['raw_image_path']
+        organoid_segments_path = sample_metadata['organoid_segments_path']
+        tcell_segments_path = sample_metadata['tcell_segments_path']
+        
         red_lym_channel=sample_metadata['dead_dye_channel']
         contact_threshold = sample_metadata["contact_threshold"]
 
         print("- Loading in tracks csv...")
         ### Load in the specified track csv
-        if sample_metadata["tcell_track_csv"]=="" or sample_metadata["tcell_track_csv"]==None or math.isnan(sample_metadata["tcell_track_csv"]):
-            df_tracks_path = Path(track_outdir, f"{sample_name}_{cell_type}_tracks.csv")
-        else:
-            df_tracks_path = sample_metadata["tcell_track_csv"]
+        # if sample_metadata["tcell_track_csv"]=="" or sample_metadata["tcell_track_csv"]==None or math.isnan(sample_metadata["tcell_track_csv"]):
+        #     df_tracks_path = Path(track_outdir, f"{sample_name}_{cell_type}_tracks.csv")
+        # else:
+        df_tracks_path = sample_metadata["tcell_track_csv"]
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
         
         ### Calculate organoid distance, t cell distance and dead dye mean form Imaris or BEHAV3D processing
@@ -260,10 +272,10 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
             print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
             
             # Load in the images containing the organoid segments and T cell segments
-            organoid_segments_path=Path(img_outdir, f"{sample_name}_organoids_tracked.tiff")
+            # organoid_segments_path=Path(img_outdir, f"{sample_name}_organoids_tracked.tiff")
             organoid_segments=imread(organoid_segments_path)
             
-            tcell_segments_path=Path(img_outdir, f"{sample_name}_tcells_tracked.tiff")
+            # tcell_segments_path=Path(img_outdir, f"{sample_name}_tcells_tracked.tiff")
             tcell_segments=imread(tcell_segments_path)
             
             # Calculate the contact od each T cell with an organoid or a T cell
@@ -280,7 +292,7 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
             df_tracks = pd.merge(df_tracks, df_contacts, how="left")
             
             print("- Calculating channel and especially death dye intensities...")
-            intensity_image = h5py.File(name=image_path, mode="r")[image_internal_path]
+            intensity_image = imread(raw_image_path)
             df_intensity=calculate_segment_intensity(
                 tcell_segments=tcell_segments,
                 intensity_image=intensity_image
@@ -411,8 +423,12 @@ def calculate_track_features(config, metadata, cell_type="tcells"):
 
 def filter_tracks(
     df_all_tracks,
-    config,
     metadata,
+    config=None,
+    output_dir=None,
+    tcell_exp_duration=None,
+    tcell_min_track_length=None,
+    tcell_max_track_length=None,
     cell_type="tcells"
     ):
     """
@@ -430,11 +446,20 @@ def filter_tracks(
     - A .csv file containing filtered tracks from all experiments
     """
     
+    assert config is not None or all(
+        [output_dir, tcell_exp_duration, tcell_min_track_length, tcell_max_track_length]
+    ), "Either 'config' or 'output_dir, tcell_exp_duration, tcell_min_track_length and tcell_max_track_length' parameters must be supplied"
+    
     start_time = time.time()
     
     print(f"--------------- Filtering tracks ---------------")
     
-    output_dir = config['output_dir']
+    if not all([output_dir, tcell_exp_duration, tcell_min_track_length, tcell_max_track_length]):
+        output_dir = config['output_dir']
+        tcell_exp_duration = config['tcell_exp_duration']
+        tcell_min_track_length = config['tcell_min_track_length']
+        tcell_max_track_length = config['tcell_max_track_length']
+    
     analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     qc_outdir = Path(analysis_outdir, "quality_control")
@@ -443,11 +468,7 @@ def filter_tracks(
         feature_outdir.mkdir(parents=True)
     if not qc_outdir.exists():
         qc_outdir.mkdir(parents=True)
-    
-    tcell_exp_duration = config['tcell_exp_duration']
-    tcell_min_track_length = config['tcell_min_track_length']
-    tcell_max_track_length = config['tcell_max_track_length']
-    
+     
     group_cols = ['TrackID', 'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
     df_all_tracks_filt = pd.merge(df_all_tracks, metadata, how="left", on="sample_name")
 
@@ -525,7 +546,9 @@ def normalize_track_features(
 
 def summarize_track_features(
     df_tracks,
-    config,
+    config=None,
+    output_dir=None,
+    imaris=False,
     cell_type="tcells"
     ):
     """
@@ -536,16 +559,18 @@ def summarize_track_features(
     - A .csv file containing all tracks from all experiments with their track-summarized features
     """
     
-    start_time = time.time()
+    assert config is not None or output_dir is not None, "Either 'config' or 'output_dir' must be supplied"
     
-    if "imaris" in config.keys():
-        imaris = config["imaris"]
-    else:
-        imaris = False
+    start_time = time.time()
             
     print(f"--------------- Summarizing track features ---------------")
     
-    output_dir = config['output_dir']
+    if output_dir is None:
+        output_dir = config['output_dir']
+        if "imaris" in config.keys():
+            imaris = config["imaris"]
+        else:
+            imaris = False
     analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     qc_outdir = Path(analysis_outdir, "quality_control")

@@ -1,3 +1,28 @@
+"""
+This script performs Dynamic Time Warpign to calculate distance between tracks.
+It then fits this to a UMAP and perform K means clustering.
+It then overlays the features back over the UMAP and creates
+a heatmap with summarized feature values per cluster
+
+-------------------------------------
+--------------- INPUT ---------------
+-------------------------------------
+
+- BEHAV3D track features .csv
+- umap_minimal_distance
+- umap_n_neighbors
+- nr_of_clusters
+
+-------------------------------------
+--------------- OUTPUT --------------
+-------------------------------------
+
+# Features of a track at each timepoint per sample in the metadata csv (.csv)
+- See "FEATURES TRACKS"
+
+# Combined summarized features for each track for all samples in metadata csv (.csv)
+- 
+"""
 import argparse
 from dtaidistance import dtw, dtw_ndim
 import pandas as pd
@@ -11,16 +36,35 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from plotnine import *
 from pathlib import Path
+from behav3d import format_time
 import yaml
+import time
 # df_tracks=df_tracks[df_tracks["relative_time"]<=30]
 
 def run_tcell_analysis(
-    config,
+    config=None,
+    output_dir=None,
     df_tracks_path=None,
-    df_tracks_summarized_path=None 
+    df_tracks_summarized_path=None,
+    dtw_features=[
+        "z_mean_square_displacement", 
+        "z_speed", 
+        "z_mean_dead_dye", 
+        "tcell_contact", 
+        "organoid_contact"
+        ],
+    umap_minimal_distance=None,
+    umap_n_neighbors=None,
+    nr_of_clusters=None
     ):
-    
-    output_dir = config["output_dir"]
+    print(f"--------------- Performing T-cell behavioral analysis ---------------")
+    start_time = time.time()
+    assert config is not None or all(
+        [output_dir, umap_minimal_distance, umap_n_neighbors, nr_of_clusters]
+    ), "Either 'config' or 'output_dir, umap_minimal_distance, umap_n_neighbors, nr_of_clusters' parameters must be supplied"
+        
+    if output_dir is None:
+        output_dir = config['output_dir']
     analysis_outdir = Path(output_dir, "analysis", "tcells")
     feature_outdir = Path(analysis_outdir, "track_features")
     
@@ -38,24 +82,28 @@ def run_tcell_analysis(
         print("Set 'tcell_min_track_length' and 'tcell_max_track_length' to the same value to create equal tracks")
 
     dtw_distance_matrix = calculate_dtw(
-        df_tracks
+        df_tracks, 
+        features=dtw_features
         )
     
     umap_embedding = fit_umap(
         dtw_distance_matrix=dtw_distance_matrix,
-        config=config,
+        umap_n_neighbors=umap_n_neighbors,
+        umap_minimal_distance=umap_minimal_distance,
         random_state=None
     )
     
     df_clusters = cluster_umap(
         umap_embedding=umap_embedding,
-        config=config,
+        output_dir = analysis_outdir,
+        nr_of_clusters=nr_of_clusters,
         df_tracks=df_tracks,
         df_tracks_summarized=df_tracks_summarized,
-        random_state=None,
-        output_dir = analysis_outdir
+        random_state=None
     )
-    
+    end_time = time.time()
+    h,m,s = format_time(start_time, end_time)
+    print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
     return(df_clusters)
 
 def calculate_dtw(
@@ -88,15 +136,25 @@ def calculate_dtw(
 
 def fit_umap(
     dtw_distance_matrix,
-    config,
+    config=None,
+    umap_n_neighbors=None,
+    umap_minimal_distance=None,
     random_state=None
     ):
     
     print("- Fitting the dynamic time warping to a UMAP")
+    assert config is not None or all(
+            [umap_n_neighbors, umap_minimal_distance]
+        ), "Either 'config' or 'umap_n_neighbors and umap_minimal_distance' must be supplied"
+            
+    if all([umap_n_neighbors, umap_minimal_distance]) is None:
+        umap_n_neighbors = config['umap_n_neighbors']
+        umap_minimal_distance = config["umap_minimal_distance"]
+        
     umap_model = umap.UMAP(
         n_components=2, 
-        n_neighbors=config["umap_n_neighbors"], 
-        min_dist=config["umap_minimal_distance"], 
+        n_neighbors=umap_n_neighbors, 
+        min_dist=umap_minimal_distance, 
         init="random", 
         random_state=random_state,
         metric="precomputed", 
@@ -107,16 +165,22 @@ def fit_umap(
 
 def cluster_umap(
     umap_embedding,
-    config,
+    config=None,
+    nr_of_clusters=None,
     df_tracks=None,
     df_tracks_summarized=None,
     random_state=None,
     output_dir = None
     ):
     
+    assert config is not None or all(
+        [output_dir, nr_of_clusters]
+    ), "Either 'config' or 'output_dir, nr_of_clusters' parameters must be supplied"
+      
     print("- Performing clustering on the UMAP data")
-    if output_dir is None:
+    if all([output_dir, nr_of_clusters]) is None:
         output_dir = Path(config['output_dir'], "analysis", "tcells")
+        nr_of_clusters=config["nr_of_clusters"]
     feature_outdir = Path(output_dir, "track_features")
     results_outdir = Path(output_dir, "results")
     if not results_outdir.exists():
@@ -138,7 +202,7 @@ def cluster_umap(
     # Perform clustering
     scaler = StandardScaler()
     # umap_scaled = scaler.fit_transform(umap_embedding)  # Standardize UMAP coordinates
-    kmeans = KMeans(n_clusters=config["nr_of_clusters"], n_init=100, random_state=random_state)
+    kmeans = KMeans(n_clusters=nr_of_clusters, n_init=100, random_state=random_state)
     df_umap["ClusterID"] = kmeans.fit_predict(umap_embedding)
     # df_umap["cluster2"] = kmeans.fit_predict(umap_embedding)
     
@@ -155,6 +219,7 @@ def cluster_umap(
     
     info_cols = df_umap.drop(columns=["TrackID", "well", "exp_nr", "UMAP1", "UMAP2", "ClusterID"]).columns
     
+    ### Plotting the main UMAP with clusters at the top with 2 columns of UMAP with overlayed features
     cluster_plot = (
             ggplot(df_umap, aes(x='UMAP1', y='UMAP2', color="ClusterID")) +
             geom_point(size=4, alpha=0.8) +
@@ -190,6 +255,10 @@ def cluster_umap(
     
     cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_UMAP_clusters.pdf")
     combined_umaps.savefig(cluster_UMAP_path)
+    print(combined_umaps)
+    
+    ### Producing a heatmap of the summarized features again summarized over all tracks
+    ### Belonging to that cluster
     
     print("- Producing heatmaps with summarized cluster features")
     cluster_means = df_umap.drop(
@@ -205,6 +274,7 @@ def cluster_umap(
             ]).groupby('ClusterID').mean().reset_index()
     df_heatmap = cluster_means.melt(id_vars='ClusterID', var_name='var', value_name='value')
     
+    ### Plot the heatmap separated per feature, but scale in original values
     columns = df_heatmap["var"].unique()
     heatmaps = []
     
@@ -223,6 +293,11 @@ def cluster_umap(
     combined_heatmaps = structure_plotnine(heatmaps, figsize=(3,0.5), nr_cols=2) 
     cluster_features_heatmap_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_feature_heatmap.pdf")
     combined_heatmaps.savefig(cluster_features_heatmap_path)
+    print(combiend_heatmaps)
+    
+    ### Plot an overall heatmap where every feature is scaled from 0 to 1
+    cluster_means
+    
     
     print("- Producing percentage plots of each cluster per combination of T-cell and organoid line")
     df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "ClusterID"]).size().reset_index(name='count')

@@ -28,34 +28,82 @@ import pandas as pd
 import time
 from behav3d import format_time
 
-def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
-    ilastik_path = config['ilastik_path']
-    ilastik_pix_clas_model = config['ilastik_pixel_classifier_model']
-    ilastik_org_seg_model = config['ilastik_organoid_segmentation_model']
-    ilastik_tcell_seg_model = config['ilastik_tcell_segmentation_model']
-    ilastik_org_postproc_model = config['ilastik_organoid_postprocessing_model']
-    ilastik_tcell_postproc_model = config['ilastik_tcell_postprocessing_model']
-    output_dir = config['output_dir']
+def run_ilastik_segmentation(
+    metadata, 
+    output_dir = None,
+    ilastik_path = None,
+    ilastik_pix_clas_model = None,
+    ilastik_org_seg_model = None,
+    ilastik_tcell_seg_model = None,
+    ilastik_org_postproc_model = None,
+    ilastik_tcell_postproc_model = None,
+    config=None, 
+    keep_all=False, 
+    verbose=False
+    ):
+    
+    assert config is not None or all(
+        [output_dir,
+         ilastik_path, 
+         ilastik_pix_clas_model, 
+         ilastik_org_seg_model, 
+         ilastik_tcell_seg_model,
+         ilastik_org_postproc_model,
+         ilastik_tcell_postproc_model
+         is not None]
+    ), "Either 'config' or 'output_dir, ilastik_path, ilastik_pix_clas_model, ilastik_org_seg_model, ilastik_tcell_seg_model, ilastik_org_postproc_model and ilastik_tcell_postproc_model' parameters must be supplied"
+    
+    if not all([
+        output_dir,
+        ilastik_path, 
+        ilastik_pix_clas_model, 
+        ilastik_org_seg_model, 
+        ilastik_tcell_seg_model,
+        ilastik_org_postproc_model,
+        ilastik_tcell_postproc_model
+        is not None]
+        ):
+        output_dir = config['output_dir']
+        metadata = pd.read_csv(config["metadata_csv_path"])
+        ilastik_path = config['ilastik_path']
+        ilastik_pix_clas_model = config['ilastik_pixel_classifier_model']
+        ilastik_org_seg_model = config['ilastik_organoid_segmentation_model']
+        ilastik_tcell_seg_model = config['ilastik_tcell_segmentation_model']
+        ilastik_org_postproc_model = config['ilastik_organoid_postprocessing_model']
+        ilastik_tcell_postproc_model = config['ilastik_tcell_postprocessing_model']
+    
     img_outdir = Path(output_dir, "images")
    
     for _, sample in metadata.iterrows():
         start_time = time.time()
         sample_name = sample['sample_name']
-        image_path = sample['image_path']
-        image_internal_path = sample["image_internal_path"]
-        full_image_path = f"{image_path}/{image_internal_path}"
+        raw_image_path = sample['raw_image_path']
         img_outdir = Path(output_dir, "images", sample_name)
         if not img_outdir.exists():
             img_outdir.mkdir(parents=True)
 
-        
+
+        raw_image_path = Path(sample['raw_image_path'])
+        raw_h5_path = Path(img_outdir, raw_image_path.stem + "_ilastik_input.h5")
+
+        if raw_h5_path.exists():
+            print(f"--------------- Using existing raw_img .h5: {sample_name} ---------------")
+            print(raw_h5_path)
+        else:
+            print(f"--------------- Converting .tiff to .h5: {sample_name} ---------------")
+            print(f"(Due to Ilastik not supporting these 5D .tiff files yet)")
+            raw_img = imread(raw_image_path)
+            
+            raw_h5 = h5py.File(name=raw_h5_path, mode="w")
+            raw_h5.create_dataset(name="/image", data=raw_img)
+            raw_h5.close()
         
         print(f"--------------- Segmenting: {sample_name} ---------------")       
         ### General pixel classifier
         print("- Running the ilastik pixel classifier...")
         pix_prob_path = Path(img_outdir, f"{sample_name}_probabilities.h5")
         pix_prob_path=run_ilastik_pixel_classifier(
-            raw_data=full_image_path,
+            raw_data=str(raw_h5_path)+"/image",
             model=ilastik_pix_clas_model,
             out_path=pix_prob_path,
             ilastik_path=ilastik_path,
@@ -134,6 +182,7 @@ def run_ilastik_segmentation(config, metadata, keep_all=False, verbose=False):
             os.remove(seg_org_h5_path)
             os.remove(preseg_tcell_h5_path)
             os.remove(seg_tcell_h5_path)
+            os.remove(raw_h5_path)
         
         end_time = time.time()
         h,m,s = format_time(start_time, end_time)
