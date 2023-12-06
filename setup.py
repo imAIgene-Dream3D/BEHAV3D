@@ -1,9 +1,6 @@
 import setuptools
 from setuptools import setup
 
-# https://betterscientificsoftware.github.io/python-for-hpc/tutorials/python-pypi-packaging/
-# Use 'pip install -e .' in this folder to install all modules
-# https://python-packaging.readthedocs.io/en/latest/dependencies.html
 setup(
     name='BEHAV3D',
     version='3.0',
@@ -21,15 +18,14 @@ setup(
           'tifffile==2023.9.26',
           'scikit-image==0.22.0',
           'scipy==1.11.3',
-          'matplotlib==3.5.0',
+          'matplotlib==3.6.0',
           'seaborn==0.13.0',
           'plotnine==0.12.4',
           'patchworklib==0.6.3',
           'h5py==3.10.0',
           'ipykernel==6.26.0',
           'napari==0.4.18',
-          'pyqt5==5.15.1',
-        #   'dtaidistance',
+          'pyqt5',
           "umap-learn==0.5.5",
           'scikit-learn==1.3.2'
       ]
