@@ -35,7 +35,6 @@ def convert_segments_to_tracks(
     tcells_tracked = np.zeros_like(tcell_segments)
     for _, row in df_tracks.iterrows():
         t,z,y,x = int(row["position_t"]),row["position_z"], row["position_y"], row["position_x"]
-        print(t,z,y,x)
         corr_seg=None
         # There seems to be an issue where the tracking output gives 
         # e.g. 25.99355 and regionprops * elemen_size gives 25.99354999999999 (Floating point arithmetics issue)
