@@ -43,6 +43,47 @@ def run_imaris_preprocessing(
         output_path = df_positions_path.replace("_Position", "_tracks")
 
     df_imaris.to_csv(output_path, index=False)
+    
+def batch_imaris_preprocessing(
+    folder,
+    dead_dye_channel=5,
+    tcell_surfaces_name="CD8",
+    organoid_surfaces_name="Leukemia"
+    ):
+    folder="/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/imaris_batch_preprocessing"
+    folder=Path(folder)
+    assert folder.is_dir(), f"Given path is not a directory: {folder}"
+    ims_samples = [d.resolve() for d in folder.iterdir() if d.is_dir()]
+    
+    def get_imaris_path(pattern, folder):
+        folder = Path(folder)
+        file_matches = list(folder.glob(pattern))
+        assert len(file_matches)!=0, f"No {pattern} found for {folder.name}"
+        assert len(file_matches)==1, f"Multiple {pattern} csv's found for {folder.name}"
+        match = file_matches[0]
+        return(match)
+    
+    for ims_sample in ims_samples:
+        pos_patt = "*_Position.csv"
+        pos_path = get_imaris_path(pos_patt, ims_sample)
+        
+        pos_patt = f"*_Intensity_Mean_Ch={dead_dye_channel}_Img=1.csv"
+        deaddye_path = get_imaris_path(pos_patt, ims_sample)
+        
+        pos_patt = f"*_Shortest_Distance_to_Surfaces_Surfaces={tcell_surfaces_name}.csv"
+        tcell_dist_path = get_imaris_path(pos_patt, ims_sample)
+        
+        pos_patt = f"*_Shortest_Distance_to_Surfaces_Surfaces={organoid_surfaces_name}.csv"
+        organoid_dist_path = get_imaris_path(pos_patt, ims_sample)
+        
+        outpath = f"{ims_sample}_behav3d_preprocessed.csv"
+        run_imaris_preprocessing(
+            df_positions_path=pos_path, 
+            df_organoid_distances_path=organoid_dist_path,
+            df_tcell_distances_path=tcell_dist_path,
+            df_dead_dye_means_path=deaddye_path, 
+            output_path=outpath
+        )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
