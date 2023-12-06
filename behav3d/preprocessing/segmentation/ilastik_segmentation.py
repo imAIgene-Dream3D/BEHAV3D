@@ -95,85 +95,124 @@ def run_ilastik_segmentation(
             raw_img = imread(raw_image_path)
             
             raw_h5 = h5py.File(name=raw_h5_path, mode="w")
-            raw_h5.create_dataset(name="/image", data=raw_img)
+            raw_h5.create_dataset(name="/image", data=raw_img, chunks=True)
             raw_h5.close()
+            
+        full_raw_image_path=str(raw_h5_path)+"/image"
         
         print(f"--------------- Segmenting: {sample_name} ---------------")       
         ### General pixel classifier
-        print("- Running the ilastik pixel classifier...")
+        
         pix_prob_path = Path(img_outdir, f"{sample_name}_probabilities.h5")
-        pix_prob_path=run_ilastik_pixel_classifier(
-            raw_data=str(raw_h5_path)+"/image",
-            model=ilastik_pix_clas_model,
-            out_path=pix_prob_path,
-            ilastik_path=ilastik_path,
-            verbose=verbose
-        )
+        if pix_prob_path.exists():
+            print(f"- Already found pixel classifier results")
+            print(f"If wanting to redo, delete the *_probabilities.h5")
+            print(f"Using {pix_prob_path}")
+        else:
+            print("- Running the ilastik pixel classifier...")
+            pix_prob_path=run_ilastik_pixel_classifier(
+                raw_data=full_raw_image_path,
+                model=ilastik_pix_clas_model,
+                out_path=pix_prob_path,
+                ilastik_path=ilastik_path,
+                verbose=verbose
+            )
 
         ### Organoid segmentation
-        print("- Performing initial organoid segmentation...")
         preseg_org_h5_path = Path(img_outdir, f"{sample_name}_organoid_presegments.h5")
-        preseg_org_h5_path=run_ilastik_object_segmentation(
-            raw_data=full_image_path,
-            pixel_probabilities=pix_prob_path,
-            model=ilastik_org_seg_model,
-            out_path=preseg_org_h5_path,
-            ilastik_path=ilastik_path,
-            verbose=verbose
-        )
+        if preseg_org_h5_path.exists():
+            print(f"- Already found initial organoid segmentation results")
+            print(f"If wanting to redo, delete the *_organoids_presegments.h5")
+            print(f"Using {preseg_org_h5_path}")
+        else:
+            print("- Performing initial organoid segmentation...")
+            preseg_org_h5_path=run_ilastik_object_segmentation(
+                raw_data=full_raw_image_path,
+                pixel_probabilities=pix_prob_path,
+                model=ilastik_org_seg_model,
+                out_path=preseg_org_h5_path,
+                ilastik_path=ilastik_path,
+                verbose=verbose
+            )
 
-        print("- Performing organoid segment postprocessing (splitting)...")
         seg_org_h5_path = Path(img_outdir, f"{sample_name}_organoid_segments.h5")
-        seg_org_h5_path=run_ilastik_object_splitter(
-            raw_data=full_image_path,
-            segments=preseg_org_h5_path,
-            model=ilastik_org_postproc_model,
-            out_path=seg_org_h5_path,
-            ilastik_path=ilastik_path,
-            verbose=verbose
-        )
-
-        im = h5py.File(name=seg_org_h5_path, mode="r")["segments"][:].squeeze()
-        # im = imread(seg_tcell_out_path)
+        if seg_org_h5_path.exists():
+            print(f"- Already found postprocessed (splitting) organoid segmentation results")
+            print(f"If wanting to redo, delete the *_organoids_segments.h5")
+            print(f"Using {seg_org_h5_path}")
+        else:
+            print("- Performing organoid segment postprocessing (splitting)...")
+            seg_org_h5_path=run_ilastik_object_splitter(
+                raw_data=full_raw_image_path,
+                segments=preseg_org_h5_path,
+                model=ilastik_org_postproc_model,
+                out_path=seg_org_h5_path,
+                ilastik_path=ilastik_path,
+                verbose=verbose
+            )
+            
         seg_org_tiff_path = Path(img_outdir, f"{sample_name}_organoid_segments.tiff")
-        imwrite(
-            seg_org_tiff_path,
-            im.astype('uint16'),
-            imagej=True,
-            metadata={'axes':'TZYX'}
-        )
+        if seg_org_tiff_path.exists():
+            print(f"- Already found organoid segmentation .tiff file")
+            print(f"If wanting to redo, delete the *_organoids_segments.tiff")
+            print(f"Using {seg_org_tiff_path}")
+        else:
+            im = h5py.File(name=seg_org_h5_path, mode="r")["segments"][:].squeeze()
+            # im = imread(seg_tcell_out_path)
+            
+            imwrite(
+                seg_org_tiff_path,
+                im.astype('uint16'),
+                imagej=True,
+                metadata={'axes':'TZYX'}
+            )
 
         ### Tcell segmentation
-        print("- Performing initial T cell segmentation...")
         preseg_tcell_h5_path = Path(img_outdir, f"{sample_name}_tcell_presegments.h5")
-        preseg_tcell_h5_path=run_ilastik_object_segmentation(
-            raw_data=full_image_path,
-            pixel_probabilities=pix_prob_path,
-            model=ilastik_tcell_seg_model,
-            out_path=preseg_tcell_h5_path,
-            ilastik_path=ilastik_path
-        )
+        if preseg_tcell_h5_path.exists():
+            print(f"- Already found initial T cell segmentation")
+            print(f"If wanting to redo, delete the *_tcell_presegments.h5")
+            print(f"Using {preseg_tcell_h5_path}")
+        else:
+            print("- Performing initial T cell segmentation...")
+            preseg_tcell_h5_path=run_ilastik_object_segmentation(
+                raw_data=full_raw_image_path,
+                pixel_probabilities=pix_prob_path,
+                model=ilastik_tcell_seg_model,
+                out_path=preseg_tcell_h5_path,
+                ilastik_path=ilastik_path
+            )
 
-        print("- Performing T cell segment postprocessing (splitting)...")
         seg_tcell_h5_path = Path(img_outdir, f"{sample_name}_tcell_segments.h5")
-        seg_tcell_h5_path=run_ilastik_object_splitter(
-            raw_data=full_image_path,
-            segments=preseg_tcell_h5_path,
-            model=ilastik_tcell_postproc_model,
-            out_path=seg_tcell_h5_path,
-            ilastik_path=ilastik_path
-        )
+        if seg_tcell_h5_path.exists():
+            print(f"- Already found postprocessed (splitting) T cell segmentation results")
+            print(f"If wanting to redo, delete the *_tcell_segments.h5")
+            print(f"Using {seg_tcell_h5_path}")
+        else:
+            print("- Performing T cell segment postprocessing (splitting)...")
+            seg_tcell_h5_path=run_ilastik_object_splitter(
+                raw_data=full_raw_image_path,
+                segments=preseg_tcell_h5_path,
+                model=ilastik_tcell_postproc_model,
+                out_path=seg_tcell_h5_path,
+                ilastik_path=ilastik_path
+            )
 
         ### Add metadata to the image so TrackMate correctly reads the dimensions
         seg_tcell_tiff_path = Path(img_outdir, f"{sample_name}_tcell_segments.tiff")
-        im = h5py.File(name=seg_tcell_h5_path, mode="r")["segments"][:].squeeze()
-        # im = imread(seg_tcell_out_path)
-        imwrite(
-            seg_tcell_tiff_path,
-            im.astype('uint16'),
-            imagej=True,
-            metadata={'axes':'TZYX'}
-        )
+        if seg_tcell_tiff_path.exists():
+            print(f"- Already found T cell segmentation .tiff file")
+            print(f"If wanting to redo, delete the *_tcell_segments.tiff")
+            print(f"Using {seg_tcell_tiff_path}")
+        else:
+            im = h5py.File(name=seg_tcell_h5_path, mode="r")["segments"][:].squeeze()
+            # im = imread(seg_tcell_out_path)
+            imwrite(
+                seg_tcell_tiff_path,
+                im.astype('uint16'),
+                imagej=True,
+                metadata={'axes':'TZYX'}
+            )
         
         if not keep_all:
             print("- Removing all intermediate files and keeping only final segment tiffs as '--keep_all' is not supplied...")

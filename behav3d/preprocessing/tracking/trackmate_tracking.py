@@ -13,6 +13,7 @@ from skimage.measure import regionprops_table
 import argparse
 import time
 from behav3d import format_time
+from behav3d.preprocessing import convert_segments_to_tracks
 
 def run_trackmate_tcells(config, metadata, verbose=False):
     run_trackmate(config,metadata, cell_type="tcells", verbose=verbose)
@@ -71,41 +72,16 @@ def run_trackmate(
         
         ### Assign the tracks to existing segments
         # Loop through spots, link to segments in the image and replace label with TrackID
-        print("- Assigning track ID to segmented image to create tracked image...")
-        tcell_segments = imread(segments_path)
-        
-        df_centroids = []
-        # TODO 
-        # Check if trackmate removes objects and still keep them in image
-        for t, tcell_stack in enumerate(tcell_segments):
-            properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, properties=['label', f'centroid']))
-            properties["position_t"]=t
-            df_centroids.append(properties)
-        df_centroids = pd.concat(df_centroids)
-        df_centroids["position_z"]=df_centroids["centroid-0"]*element_size_z
-        df_centroids["position_y"]=df_centroids["centroid-1"]*element_size_y
-        df_centroids["position_x"]=df_centroids["centroid-2"]*element_size_x
-        
-        tcells_tracked = np.zeros_like(tcell_segments)
-        for _, row in df_tracks.iterrows():
-            t,z,y,x = int(row["position_t"]),row["position_z"], row["position_y"], row["position_x"]
-            corr_seg=None
-            corr_seg = df_centroids[
-                (df_centroids["position_x"]==x) &
-                (df_centroids["position_y"]==y) &
-                (df_centroids["position_z"]==z) &
-                (df_centroids["position_t"]==t) 
-            ]["label"].iloc[0]
-            assert corr_seg!=None, f"Position of center segment corresponds to no tracked center, which is an error"
-            assert corr_seg!=0, f"Position of center segment corresponds to background (0), which is an error"
-            tcells_tracked[t,:,:,:][tcell_segments[t,:,:,:]==corr_seg]=row["TrackID"]
-            # im_track = im_track[im==corr_seg]=row["TrackID"]
-            
         tcell_tracked_out_path= Path(img_outdir, f"{sample_name}_{cell_type}_tracked.tiff")
-        imwrite(
-            tcell_tracked_out_path,
-            tcells_tracked
-        ) 
+        convert_segments_to_tracks(
+            tracks_out_path,
+            segments_path,
+            outpath=tcell_tracked_out_path,
+            element_size_z=element_size_z,
+            element_size_y=element_size_y,
+            element_size_x=element_size_x
+        )
+        
         end_time = time.time()
         h,m,s = format_time(start_time, end_time)
         print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
@@ -203,8 +179,8 @@ def trackmate_tracking(
     fm = model.getFeatureModel()
 
     keys_df_spots = [
-        "SegmentID",
         "TrackID",
+        "SegmentID",
         "position_t",
         "position_z",
         "position_y",
@@ -218,8 +194,8 @@ def trackmate_tracking(
             sid = spot.ID()
             # q=spot.getFeature('QUALITY')
             spot_info = {
-                "SegmentID":spot.ID(),
                 "TrackID":trackid,
+                "SegmentID":spot.ID(),
                 "position_t":spot.getFeature("POSITION_T"),
                 "position_z":spot.getFeature("POSITION_Z"),
                 "position_y":spot.getFeature("POSITION_Y"),

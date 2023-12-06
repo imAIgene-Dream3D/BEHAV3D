@@ -2,7 +2,6 @@
 
 ## Important
 ***This code is currently under development***
-
 _____
 
 ## Overview
@@ -13,9 +12,9 @@ _____
 _____
 ## What output can BEHAV3D provide?
 - Behavioral clustering/classification of different types of cell dynamics
+- Backprojection of behavioral phenotype over tracked cells
 - Any type of change of cell state that can be detected by a change in fluorescent intensity e.g. cell death, reporter, Ca2+ signalling (In Progress)
 - Tumor death dynamics quantification (In Progress)
-- Backprojection of behavioral phenotype in Imaris 3D image visualization software (In Progress)
 - Correlation between tumor death dynamics and behavioral phenotypes (In Progress)
 _____
 ## How to cite this pipeline
@@ -25,12 +24,12 @@ _____
 BEHAV3D runs can be run from both command line or through the jupyter notebook and was tested on MacOS Big Sur with R version 4.1.1 and on WIndows 10 with R version 4.3.0 .
 
 For segmentation, a computer with decent hardware is required dependent on the sizes of images that need to be processed:
-- Ilastik segmentation of a timeseries with dimensions [4, 390, 36, 512, 512] (ctzyx) can be segmented in X minutes on a xxx workstation
+- Ilastik segmentation of a timeseries with dimensions [4, 390, 36, 512, 512] (ctzyx) can take a total of 12 hours on a normal workstation
 
 For tracking, a computer with lower specs is often sufficiant:
 - Tracking with TrackMate using Linear Assignment Problem tracking on a timeseries with dimensions [4, 390, 36, 512, 512] (ctzyx) and assigning TrackIDs back to the segmented image takes approx. 15 minutes
 
-BEHAV3D runs in R studio, jupyter notebook or from command line and was tested on MacOS Big Sur with R version 4.1.1 and on Windows 10 with R version 4.3.0 .
+BEHAV3D runs in python, jupyter notebook or from command line and was tested on MacOS Big Sur with R version 4.1.1 and on Windows 10 with R version 4.3.0 .
 _____
 ## Installation
 
@@ -68,12 +67,7 @@ _____
 ## Set-up
 BEHAV3D contains several pipelines for the processing of time-lapse imaging. <br>
 
-For all steps, BEHAV3D requires 2 files:<br>
-
-### **config.yml** <br>
-A yaml file that contains general (non-experimentally bound) parameters for BEHAV3D and paths to the used software.
-An example version can be found in [...BEHAV3D/configs/config_template.yml](https://github.com/RiosGroup/BEHAV3D/blob/main/configs/config_template.yml) <br>
-Explanation on what each variable changes is commented in that template
+For all steps, BEHAV3D requires :<br>
 
 ### **metadata.csv** <br>
 To correctly import experimental data for analysis with BEHAV3D, it is required to fill in a .csv that contains information per experiment performed, requiring information on:<br>
@@ -106,12 +100,22 @@ The unit of the distance parameters (e.g. µm) which will be used to noramlize e
 The real-life time inbetween each timepoint in the experiment  <br>
 - **time_unit** <br>
 The unit of the time parameters (e.g. m for minutes) which will be used to noramlize each experiment to the same time unit <br>
-- **image_path** <br>
-The path to the image containing the T cells, organoids and dead dyes, saved as a channel in .h5 format<br>
-- **image_internal_path** <br>
-The internal path of the .h5 file containing the image (e.g. "./image") <br>
+- **raw_image_path** <br>
+The path to the raw image containing the T cells, organoids and dead dyes, saved as a channel in .tiff format<br>
+- **tcell_segments_path** <br>
+The path to the segmented T cells in .tiff format <br>
+- **organoid_segments_path** <br>
+The path to the segmented organoids in .tiff format <br>
 - **tcell_track_csv** <br>
 The path to the .csv containing the positions of each T cell track <br>
+
+*Optional:*
+
+### **config.yml** <br>
+BEHAV3D can run with a config file if preferred, although mostly parameters can be set in the jupyter notebooks.
+The config is a yaml file that contains general (non-experimentally bound) parameters for BEHAV3D and paths to the used software.
+An example version can be found in [...BEHAV3D/configs/config_template.yml](https://github.com/RiosGroup/BEHAV3D/blob/main/configs/config_template.yml) <br>
+Explanation on what each variable changes is commented in that template
 
 ---
 ## Running
@@ -119,10 +123,11 @@ The path to the .csv containing the positions of each T cell track <br>
 
 To run BEHAV3D, the following notebooks can be followed:
 - **run_behav3d.ipynb** (Link to ipynb)<br>
-    Run the full pipeline of BEHAV3D (including segmentation, tracking and feature extraction). Each block can be ran separetly to run the various parts of the BEHAV3D pipeline. It requires you to only change the config.yml path to the config you supply
+    Run the full pipeline of BEHAV3D (including segmentation, tracking and feature extraction). Each block can be ran separetly to run the various parts of the BEHAV3D pipeline. It requires a metadata.csv that includes the paths to the track .csv, a .tiff with tracked T cells and a .tiff to segmented organoids.
 - **run_behav3d_imaris.ipynb** (Link to ipynb)<br>
-    Run the imaris pipeline of BEHAV3D (using preprocessed imaris statistics files (.csv) and converting it to track input that can be used for BEHAV3D feature extraction.
-    It requires the multiple .csv files.
+    Run the imaris pipeline of BEHAV3D (preprocess imaris statistics files (.csv) and converting it to track input that can be used for BEHAV3D feature extraction.
+    It requires the multiple .csv files and a metadata.csv.
+
 ### Segmentation and tracking of input data
 BEHAV3D provides an open-source approach to the segmentaion and tracking of time-lapse data.<br>
 This step is ***optional***, as you can also process the data using other software (e.g. Imaris, Fiji)

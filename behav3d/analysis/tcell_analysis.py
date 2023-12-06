@@ -33,7 +33,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 import patchworklib as pw
 import random
 from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from plotnine import *
 from pathlib import Path
 from behav3d import format_time
@@ -179,10 +179,12 @@ def cluster_umap(
       
     print("- Performing clustering on the UMAP data")
     if all([output_dir, nr_of_clusters]) is None:
-        output_dir = Path(config['output_dir'], "analysis", "tcells")
+        output_dir = Path(config['output_dir'])
         nr_of_clusters=config["nr_of_clusters"]
-    feature_outdir = Path(output_dir, "track_features")
-    results_outdir = Path(output_dir, "results")
+    
+    tcell_outdir = Path(output_dir, "analysis", "tcells")
+    feature_outdir = Path(tcell_outdir, "track_features")
+    results_outdir = Path(tcell_outdir, "results")
     if not results_outdir.exists():
         results_outdir.mkdir(parents=True)
         
@@ -255,8 +257,8 @@ def cluster_umap(
     
     cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_UMAP_clusters.pdf")
     combined_umaps.savefig(cluster_UMAP_path)
-    print(combined_umaps)
     
+    display(combined_umaps)
     ### Producing a heatmap of the summarized features again summarized over all tracks
     ### Belonging to that cluster
     
@@ -286,18 +288,55 @@ def cluster_umap(
             labs(x='ClusterID', y='', fill='Value', title="") +
             scale_fill_cmap(limits=(0, None))+
             theme_minimal() +
-            theme(plot_margin = 0, legend_key_height=10, legend_key_width=10,legend_title=element_blank())
+            theme(plot_margin = 0, 
+                  legend_key_height=10, 
+                  legend_key_width=10,
+                  legend_title=element_blank(),
+                  axis_text_x=element_text(size=12), 
+                  axis_text_y=element_text(size=12)
+                  )
         )
         heatmaps.append(heatmap_plot)
     
-    combined_heatmaps = structure_plotnine(heatmaps, figsize=(3,0.5), nr_cols=2) 
+    ### Plot an overall heatmap where every feature is scaled from 0 to 1
+    cluster_means_scaled=cluster_means
+    scale_columns = cluster_means_scaled.columns[cluster_means.columns!="ClusterID"]
+    cluster_means_scaled[scale_columns] = MinMaxScaler().fit_transform(cluster_means_scaled[scale_columns])
+    df_heatmap_scaled = cluster_means.melt(id_vars='ClusterID', var_name='var', value_name='AU')
+    
+    scaled_heatmap_plot = (
+        ggplot(df_heatmap_scaled, aes(x='ClusterID', y='var', fill='AU')) +
+        geom_tile() +
+        labs(x='ClusterID', y='', fill='AU', title="Min-Max scaled heatmap") +
+        scale_fill_cmap(limits=(0, None))+
+        theme_minimal() +
+        theme(plot_margin = 0, 
+              legend_key_height=40, 
+              legend_key_width=20,
+            #   legend_title=element_blank(),
+              plot_title=element_text(size=25),
+              legend_text=element_text(size=14),
+              axis_text_x=element_text(size=16), 
+              axis_text_y=element_text(size=16)
+              )
+        )
+    
+    combined_heatmaps = structure_plotnine(
+        heatmaps, 
+        figsize=(4,1), 
+        nr_cols=2, 
+        append_to=pw.load_ggplot(scaled_heatmap_plot, figsize=[4,4])
+        ) 
+    
+    # combined_heatmaps = structure_plotnine(heatmaps, figsize=(3,0.5), nr_cols=2) 
     cluster_features_heatmap_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_feature_heatmap.pdf")
     combined_heatmaps.savefig(cluster_features_heatmap_path)
-    print(combiend_heatmaps)
+    display(combined_heatmaps)
+
+    # START HERE
     
-    ### Plot an overall heatmap where every feature is scaled from 0 to 1
-    cluster_means
     
+    # cluster_means
     
     print("- Producing percentage plots of each cluster per combination of T-cell and organoid line")
     df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "ClusterID"]).size().reset_index(name='count')
@@ -324,6 +363,8 @@ def cluster_umap(
     cluster_percentage_plot_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_percentages.pdf")
     plot.save(cluster_percentage_plot_path, width=8, height=8)
 
+    display(plot)
+    
     df_clust_perc = df_clust_perc.reset_index(drop=True)
     df_clust_perc_out_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_percentages.csv")
     print(f"- Writing summarized tracks to {df_clust_perc_out_path}")

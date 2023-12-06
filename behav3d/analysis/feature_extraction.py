@@ -253,10 +253,10 @@ def calculate_track_features(
 
         print("- Loading in tracks csv...")
         ### Load in the specified track csv
-        # if sample_metadata["tcell_track_csv"]=="" or sample_metadata["tcell_track_csv"]==None or math.isnan(sample_metadata["tcell_track_csv"]):
+        # if sample_metadata["tcell_tracks_csv"]=="" or sample_metadata["tcell_tracks_csv"]==None or math.isnan(sample_metadata["tcell_tracks_csv"]):
         #     df_tracks_path = Path(track_outdir, f"{sample_name}_{cell_type}_tracks.csv")
         # else:
-        df_tracks_path = sample_metadata["tcell_track_csv"]
+        df_tracks_path = sample_metadata["tcell_tracks_csv"]
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
         
         ### Calculate organoid distance, t cell distance and dead dye mean form Imaris or BEHAV3D processing
@@ -297,7 +297,8 @@ def calculate_track_features(
                 tcell_segments=tcell_segments,
                 intensity_image=intensity_image
             )
-            df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{red_lym_channel}":"mean_dead_dye"})
+            if red_lym_channel is not None:
+                df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{red_lym_channel}":"mean_dead_dye"})
             df_tracks = pd.merge(df_tracks, df_intensity, how="left")
         
         # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
