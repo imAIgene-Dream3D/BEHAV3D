@@ -50,7 +50,6 @@ def batch_imaris_preprocessing(
     tcell_surfaces_name="CD8",
     organoid_surfaces_name="Leukemia"
     ):
-    folder="/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/BEHAV3D-ilastik/test/imaris_batch_preprocessing"
     folder=Path(folder)
     assert folder.is_dir(), f"Given path is not a directory: {folder}"
     ims_samples = [d.resolve() for d in folder.iterdir() if d.is_dir()]
