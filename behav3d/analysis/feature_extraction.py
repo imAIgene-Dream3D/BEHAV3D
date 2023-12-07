@@ -224,6 +224,13 @@ def calculate_track_features(
         img_outdir = Path(output_dir, "images", sample_name)
         track_outdir = Path(output_dir, "trackdata", sample_name)
         analysis_outdir = Path(output_dir, "analysis", cell_type)
+        
+        if not img_outdir.exists():
+            img_outdir.mkdir(parents=True)
+        if not track_outdir.exists():
+            track_outdir.mkdir(parents=True)
+        if not analysis_outdir.exists():
+            analysis_outdir.mkdir(parents=True)
         # Sometimes excel saves the encoding for µm differently, the following lines converts
         # other variants of µm to ones comparable in this code
         # The two written "μm" have different formatting
@@ -471,6 +478,8 @@ def filter_tracks(
     feature_outdir = Path(analysis_outdir, "track_features")
     qc_outdir = Path(analysis_outdir, "quality_control")
     
+    if not analysis_outdir.exists():
+        analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
         feature_outdir.mkdir(parents=True)
     if not qc_outdir.exists():
@@ -582,8 +591,12 @@ def summarize_track_features(
     feature_outdir = Path(analysis_outdir, "track_features")
     qc_outdir = Path(analysis_outdir, "quality_control")
     
+    if not analysis_outdir.exists():
+        analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
         feature_outdir.mkdir(parents=True)
+    if not qc_outdir.exists():
+        qc_outdir.mkdir(parents=True)
 
     # Calculate mean values of track features over the whole track
     grouped_df_tracks=df_tracks.groupby(['sample_name','TrackID'])

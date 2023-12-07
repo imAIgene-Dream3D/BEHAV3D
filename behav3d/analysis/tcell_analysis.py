@@ -68,6 +68,11 @@ def run_tcell_analysis(
     analysis_outdir = Path(output_dir, "analysis", "tcells")
     feature_outdir = Path(analysis_outdir, "track_features")
     
+    if not analysis_outdir.exists():
+        analysis_outdir.mkdir(parents=True)
+    if not feature_outdir.exists():
+        feature_outdir.mkdir(parents=True)    
+    
     if df_tracks_path is None:
         df_tracks_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_filtered.csv")
     if df_tracks_summarized_path is None:
@@ -185,9 +190,13 @@ def cluster_umap(
     tcell_outdir = Path(output_dir, "analysis", "tcells")
     feature_outdir = Path(tcell_outdir, "track_features")
     results_outdir = Path(tcell_outdir, "results")
+    if not tcell_outdir.exists():
+        tcell_outdir.mkdir(parents=True)
+    if not feature_outdir.exists():
+        feature_outdir.mkdir(parents=True)
     if not results_outdir.exists():
         results_outdir.mkdir(parents=True)
-        
+    
     if df_tracks is None:
         df_tracks_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_filtered.csv")
         df_tracks = pd.read_csv(df_tracks_path)
