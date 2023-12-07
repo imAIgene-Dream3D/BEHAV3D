@@ -112,7 +112,7 @@ or some outside force is directing its movement.
 
 ### speed
 - Float
-The speed is the same as "displacement", but now normalized to µm/h
+The speed is the same as "displacement", but now normalized to um/h
 
 ### mean_speed
 - Float
@@ -323,16 +323,18 @@ def calculate_track_features(
                 first_threshold_index = threshold_indices.min()
                 df_tracks.loc[track_df.index[first_threshold_index:], "dead"] = True
         
-        print("- Converting distance and time unit to default µm and hours...")
+        print("- Converting distance and time unit to default um and hours...")
         
         # Converting the time and distance values to a default unit to allow comparison 
         # with differently provided units (defaults to µm and hours)
         def convert_distance(distance, distance_unit):
             distance_conversions={
                 "nm":1000,
-                "μm":1
+                "μm":1,
+                "um":1,
+                "mm":0.001
             }
-            assert distance_unit in list(distance_conversions.keys()), f"time unit needs to be one of: {list(distance_conversions.keys())}, is {distance_unit}"
+            assert distance_unit in list(distance_conversions.keys()), f"distance unit needs to be one of: {list(distance_conversions.keys())}, is {distance_unit}"
             distance = distance/distance_conversions[distance_unit]
             return(distance)
         
@@ -366,7 +368,11 @@ def calculate_track_features(
         element_size_x = convert_distance(element_size_x, distance_unit)
         element_size_y = convert_distance(element_size_y, distance_unit)
         element_size_z = convert_distance(element_size_z, distance_unit)
-        df_tracks["distance_unit"] = "μm"
+        
+        # Make default distance unit um over μm, as encoding of μm between python 
+        # and e.g Excel can lead to formatting errors
+        
+        df_tracks["distance_unit"] = "um"
         df_tracks["time_unit"] = "h"
 
         # Calculate various movement features such as speed and mean square displacement of the tracks  
@@ -777,7 +783,7 @@ def calculate_movement_features(
         df_result = pd.concat([df_result, df_track[["position_t", "SegmentID", "TrackID"]]], axis=1)
 
         df_result['speed'] = df_result["displacement"]/time_interval
-        # Calculate the mean speed (default µm/h) over the last {rolling_meanspeed_window} timepoints
+        # Calculate the mean speed (default um/h) over the last {rolling_meanspeed_window} timepoints
         df_result['mean_speed'] = df_result.groupby('TrackID')['speed'].apply(lambda x: x.iloc[1:].rolling(window=rolling_meanspeed_window, min_periods=1).mean()).reset_index(0, drop=True)
         df_result['mean_speed'] = df_result['mean_speed'].fillna(0)
    

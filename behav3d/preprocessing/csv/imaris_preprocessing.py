@@ -25,7 +25,7 @@ def run_imaris_preprocessing(
     df_tcelldist_imaris=df_tcelldist_imaris.rename(columns={"Shortest Distance to Surfaces": "tcell_distance"})
     df_dye_imaris = pd.read_csv(df_dead_dye_means_path, skiprows=3)
     df_dye_imaris=df_dye_imaris[["TrackID", "ID", "Time", "Intensity Mean"]]
-    df_dye_imaris=df_dye_imaris.rename(columns={"Intensity Mean": "dead_dye_mean"})
+    df_dye_imaris=df_dye_imaris.rename(columns={"Intensity Mean": "mean_dead_dye"})
     
     df_imaris = pd.merge(df_pos_imaris, df_orgdist_imaris)
     df_imaris = pd.merge(df_imaris, df_tcelldist_imaris)
