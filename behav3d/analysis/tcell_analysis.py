@@ -129,15 +129,40 @@ def calculate_dtw(
     nr_timepoints=len(df_tracks["relative_time"].unique())
     nr_features=len(features)
 
-    dtw_input_tracks = np.empty((nr_tracks, nr_timepoints, nr_features),dtype=np.double)
+    # dtw_input_tracks = np.empty((nr_tracks, nr_timepoints, nr_features),dtype=np.double)
     
     dtw_input_tracks=[]
-    for TrackID in df_tracks["TrackID"].unique():
-        track_features = df_tracks[df_tracks["TrackID"]==TrackID][features].to_numpy().astype(np.double)
+    dtw_rownames=[]
+    unique_tracks = df_tracks.groupby(['TrackID', 'sample_name'])
+    for (TrackID, sample_name), group in unique_tracks:
+        track_features = group[features].to_numpy().astype(np.double)
+        dtw_rownames.append(f"{TrackID}--{sample_name}")
+        # dtw_track = {
+        #     "TrackID": TrackID,
+        #     "sample_name": sample_name,
+        #     "dtw_input": track_features
+        # }
+        # dtw_track = pd.DataFrame(dtw_track)
         dtw_input_tracks.append(track_features)
     
     dtw_distance_matrix = dtw_ndim.distance_matrix_fast(dtw_input_tracks)
+    dtw_distance_matrix = pd.DataFrame(dtw_distance_matrix, index=dtw_rownames, columns=dtw_rownames)
     return(dtw_distance_matrix)
+
+#  # dtw_input_tracks = np.empty((nr_tracks, nr_timepoints, nr_features),dtype=np.double)
+#     colnames=['TrackID', 'sample_name']+features
+#     dtw_input_tracks=pd.DataFrame(columns=colnames)
+#     unique_tracks = df_tracks.groupby(['TrackID', 'sample_name'])
+#     for (TrackID, sample_name), group in unique_tracks:
+#         track_features = group[features].to_numpy().astype(np.double)
+#         # dtw_input_tracks=pd.concat([dtw_input_tracks, group[colnames]])
+#         # track_features = group[['TrackID', 'sample_name']+features]
+#         # track_features = group[features].to_numpy().astype(np.double)
+#         # dtw_input_tracks.append(track_features)
+#     dtw_input = dtw_input_tracks.drop(columns=['TrackID', 'sample_name']).to_numpy().astype(np.double)
+#     dtw_distance_matrix = dtw_ndim.distance_matrix_fast(dtw_input)
+#     dtw_distance_matrix = pd.concat([pd.DataFrame(dtw_distance_matrix)
+#     return(dtw_distance_matrix)
 
 def fit_umap(
     dtw_distance_matrix,
@@ -164,8 +189,12 @@ def fit_umap(
         random_state=random_state,
         metric="precomputed", 
         )
-    umap_embedding = umap_model.fit_transform(dtw_distance_matrix)
-    umap_embedding = pd.DataFrame(umap_embedding, columns=['UMAP1', 'UMAP2'])  
+    umap_embedding = umap_model.fit_transform(dtw_distance_matrix.values)
+    umap_embedding = pd.DataFrame(umap_embedding, columns=['UMAP1', 'UMAP2'])
+    umap_embedding[['TrackID', 'sample_name']] = pd.DataFrame(
+        [string.split('--') for string in dtw_distance_matrix.index]
+        )
+    umap_embedding["TrackID"] = umap_embedding["TrackID"].astype(np.int64)
     return(umap_embedding)
 
 def cluster_umap(
@@ -204,17 +233,17 @@ def cluster_umap(
         df_tracks_summarized_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_summarized.csv")
         df_tracks_summarized = pd.read_csv(df_tracks_summarized_path)
       
-    df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
-    TrackIDs = df_tracks[["sample_name", "TrackID"]].drop_duplicates().reset_index(drop=True)
-    df_umap = pd.concat([TrackIDs, umap_embedding], axis=1)
+    # df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
+    # TrackIDs = df_tracks[["sample_name", "TrackID"]].drop_duplicates().reset_index(drop=True)
+    # df_umap = pd.concat([TrackIDs, umap_embedding], axis=1)
     # df_trackinfo = df_tracks[['TrackID', 'sample_name','well', 'exp_nr', 'organoid_line', 'tcell_line']].drop_duplicates()
-    df_umap = pd.merge(df_tracks_summarized, df_umap, how="left")
+    df_umap = pd.merge(df_tracks_summarized, umap_embedding, how="left")
     
     # Perform clustering
     scaler = StandardScaler()
     # umap_scaled = scaler.fit_transform(umap_embedding)  # Standardize UMAP coordinates
     kmeans = KMeans(n_clusters=nr_of_clusters, n_init=100, random_state=random_state)
-    df_umap["ClusterID"] = kmeans.fit_predict(umap_embedding)
+    df_umap["ClusterID"] = kmeans.fit_predict(umap_embedding.drop(columns=["TrackID","sample_name"]))
     # df_umap["cluster2"] = kmeans.fit_predict(umap_embedding)
     
     # Set cluster index to start from 1 for backprojection purposes
@@ -228,7 +257,7 @@ def cluster_umap(
     print("- Producing clustered UMAP plots with displayed Track features")
     umap_plots = []
     
-    info_cols = df_umap.drop(columns=["TrackID", "well", "exp_nr", "UMAP1", "UMAP2", "ClusterID"]).columns
+    info_cols = df_umap.drop(columns=["TrackID", "sample_name", "well", "exp_nr", "UMAP1", "UMAP2", "ClusterID"]).columns
     
     ### Plotting the main UMAP with clusters at the top with 2 columns of UMAP with overlayed features
     cluster_plot = (
@@ -350,10 +379,10 @@ def cluster_umap(
     print("- Producing percentage plots of each cluster per combination of T-cell and organoid line")
     df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "ClusterID"]).size().reset_index(name='count')
     total_counts = df_clust_perc.groupby(['organoid_line', 'tcell_line'])['count'].sum().reset_index(name='total_count')
-    cluster_counts = pd.merge(df_clust_perc, total_counts)
-    df_clust_perc["percentage"] = (df_clust_perc['count'] / df_clust_perc['count'].sum())
+    df_clust_perc = pd.merge(df_clust_perc, total_counts)
+    df_clust_perc["percentage"] = (df_clust_perc['count'] / df_clust_perc['total_count'])
 
-    total_counts_facet = cluster_counts.groupby(['organoid_line', 'tcell_line'])['total_count'].mean().reset_index()
+    total_counts_facet = df_clust_perc.groupby(['organoid_line', 'tcell_line'])['total_count'].mean().reset_index()
     total_counts["total_count"] = '# Cells: ' + total_counts["total_count"].astype("string")
     
     plot = (

@@ -203,6 +203,8 @@ def calculate_track_features(
     analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     
+    if not analysis_outdir.exists():
+        analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
         feature_outdir.mkdir(parents=True)
         

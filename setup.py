@@ -18,7 +18,6 @@ setup(
           'tifffile==2023.9.26',
           'scikit-image==0.22.0',
           'scipy==1.11.3',
-          'matplotlib==3.6.0',
           'seaborn==0.13.0',
           'plotnine==0.12.4',
           'patchworklib==0.6.3',
