@@ -76,8 +76,8 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   ###############################
   
   ### Import file-specific metadata for all images used in this analysis.
-  pat = pars$metadata_csv
-  metadata=read.csv(pars$metadata_csv, sep="\t", check.names=FALSE)
+  pat = pars$metadata_csv_path
+  metadata=read.csv(pars$metadata_csv_path, sep="\t", check.names=FALSE)
   
   track_counts=metadata
   track_counts$name = paste(metadata$organoid_line, metadata$tcell_line, metadata$exp_nr, metadata$well)
@@ -100,6 +100,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
       print(paste("No file with pattern '", pattern, "' found for", metadata_row['stats_folder']))
     } 
     print(pattern_file)
+    basename=metadata_row[['basename']]
     ims_csv <- read_plus(pattern_file, metadata_row['stats_folder'])
     return(ims_csv)
   }
@@ -131,7 +132,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   datalist2 = list()
   
   for (i in 1:length(stat_folders$stats_folder)) {
-      if (metadata$Object_distance[i] == TRUE) {
+      if (metadata$object_distance[i] == TRUE) {
       # import Object distance to organoids
       pat <- paste0("Shortest_Distance_to_Surfaces_Surfaces=", metadata$tumor_name[i])
       img_csv <- read_ims_csv(stat_folders[i,], pattern = pat)
