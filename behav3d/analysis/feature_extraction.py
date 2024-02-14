@@ -180,7 +180,7 @@ def calculate_track_features(
     ):
     """
     This code calculates the various features for each timepoint in a track for each 
-    separateexperiment
+    separate experiment
     
     This codes works with either:
     - The generated segments and tracks from the BEHAV3D preprocessing modules
@@ -221,7 +221,7 @@ def calculate_track_features(
         element_size_z=sample_metadata['pixel_distance_z']
         distance_unit=sample_metadata['distance_unit']
         dead_dye_threshold=sample_metadata['dead_dye_threshold']
-        contact_threshold = sample_metadata["contact_threshold"]
+        
         
         img_outdir = Path(output_dir, "images", sample_name)
         track_outdir = Path(output_dir, "trackdata", sample_name)
@@ -248,17 +248,19 @@ def calculate_track_features(
         if imaris:
             print("Performing feature calculation from Imaris processing..")
         
-        # ### Set specific parameters based on Imaris or BEHAV3D processing
-        # if imaris:
-        #     tcell_contact_threshold = sample_metadata["tcell_contact_threshold"]
-        #     organoid_contact_threshold = sample_metadata["organoid_contact_threshold"]
-        # else:
+        ### Set specific parameters based on Imaris or BEHAV3D processing
+        if imaris:
+            tcell_contact_threshold = sample_metadata["tcell_contact_threshold"]
+            organoid_contact_threshold = sample_metadata["organoid_contact_threshold"]
+        else:
+            contact_threshold = sample_metadata["contact_threshold"]
+            
         raw_image_path = sample_metadata['raw_image_path']
         organoid_segments_path = sample_metadata['organoid_segments_path']
         tcell_segments_path = sample_metadata['tcell_segments_path']
         
         red_lym_channel=sample_metadata['dead_dye_channel']
-        contact_threshold = sample_metadata["contact_threshold"]
+        # contact_threshold = sample_metadata["contact_threshold"]
 
         print("- Loading in tracks csv...")
         ### Load in the specified track csv
@@ -270,12 +272,46 @@ def calculate_track_features(
         
         ### Calculate organoid distance, t cell distance and dead dye mean form Imaris or BEHAV3D processing
         if imaris and cell_type=="tcells":
-            print("- Calculating contact with organoids and other T cells... (From Imaris)")
+            print("- Calculating contact with organoids... (From Imaris)")
             # Threshold the distance to organoid based on the supplied "organoid_contact_threshold"
             # This distance is calculated before in Imaris and supplied as a separate channel and
             # Extracted as a statistic (...Intensity_Min_Ch<#>_img=<#>.csv)
-            df_tracks["organoid_contact"]=df_tracks["organoid_distance"]<=contact_threshold
-            df_tracks["tcell_contact"]=df_tracks["tcell_distance"]<=contact_threshold
+            df_tracks["organoid_contact"]=df_tracks["organoid_distance"]<=organoid_contact_threshold
+            
+            # Calculate the nearest Tcell based on the distance between the centroids of other T cells
+            # Caution: This distance, unlike the BEHAV3D processing, is between centroids of cells, not borders
+            # Thus the provided "tcell_contact_threshold" needs to reflect this
+            print("- Calculating contact with other T cells... (From Imaris)")
+            print(f"Using a contact threshold of {tcell_contact_threshold}{distance_unit}")
+            grouped = df_tracks.groupby('position_t')
+            new_dfs = []
+
+            touching_tcells_dict = {}
+            # Calculate distances between a segment and all other segments with cdist
+            for group_name, group_df in grouped:
+                positions = group_df[['position_x', 'position_y', 'position_z']].values
+                distances = cdist(positions, positions)
+                np.fill_diagonal(distances, np.inf)
+                distances_mask = distances <= tcell_contact_threshold
+
+                tcell_contacts_list = []
+                for i, row in enumerate(distances_mask):
+                    tcell_contacts = np.where(row)[0].tolist()
+                    tcell_contacts=[group_df.reset_index().loc[idx]["TrackID"] for idx in tcell_contacts]
+                    tcell_contacts_list.append(tcell_contacts)                 
+                group_df['touching_tcells'] = tcell_contacts_list
+
+                for track_id, tcell_contacts in zip(group_df['TrackID'], tcell_contacts_list):
+                    touching_tcells_dict[track_id] = tcell_contacts
+
+                group_df['tcell_contact'] = group_df['touching_tcells'].apply(lambda x: len(x) > 0)
+                group_df['touching_tcells'] = group_df['touching_tcells'].apply(lambda x: ",".join(map(str, x)) if isinstance(x, list) and len(x) > 0 else None)
+
+                new_dfs.append(group_df)
+            df_tracks = pd.concat(new_dfs, ignore_index=True)
+            
+            # df_tracks["organoid_contact"]=df_tracks["organoid_distance"]<=organoid_contact_threshold
+            # df_tracks["tcell_contact"]=df_tracks["tcell_distance"]<=contact_threshold
         else:
             print("- Calculating contact with organoids and other T cells...")
             print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
@@ -372,7 +408,12 @@ def calculate_track_features(
         df_tracks["time"]=df_tracks["position_t"]*time_interval
         df_tracks["time"]=df_tracks["time"].apply(convert_time, args=(time_unit))
         time_interval=convert_time(time_interval, time_unit)
-        contact_threshold = convert_distance(contact_threshold, distance_unit)
+        
+        if imaris:
+            tcell_contact_threshold = convert_distance(tcell_contact_threshold, distance_unit)
+            organoid_contact_threshold = convert_distance(organoid_contact_threshold, distance_unit)
+        else:
+            contact_threshold = convert_distance(contact_threshold, distance_unit)
 
         element_size_x = convert_distance(element_size_x, distance_unit)
         element_size_y = convert_distance(element_size_y, distance_unit)

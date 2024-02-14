@@ -5,3 +5,5 @@
 # Add a docker object to ease the installation of BEHAV3D
 
 # Allow customization of the feature calculation
+
+# Add a feature that checks if after contact the dead dye increasews within the organoid to label actual killing. Get trendline of 5 timepoints before and after contact for example
