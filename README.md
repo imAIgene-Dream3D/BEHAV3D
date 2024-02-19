@@ -25,6 +25,7 @@ For image analysis we made use of a workstation with the following specs:
 | RAM |	1.00 TB |
 |System | type	64-bit operating system, x64-based processor |
 
+### BEHAV3D also runs on Google Colab, check it out [here](https://github.com/imaigene/BEHAV3D_Colab?)
 
 ## Installation
 Download the repository to your PC via direct dowload or git clone https://github.com/AlievaRios/BEHAV3D.git in Git Bash.\
