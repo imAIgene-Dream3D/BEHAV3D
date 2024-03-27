@@ -12,6 +12,9 @@ BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study 
 - Correlation between tumor death dynamics and behavioral phenotypes
 ## How to cite this pipeline
 Dekkers JF*, Alieva M*, Cleven A, Keramati F, Wezenaar AKL, van Vliet EJ, Puschhof J, Brazda P, Johanna I, Meringa AD, Rebel HG, Buchholz MB, Barrera Román M, Zeeman AL, de Blank S, Fasci D, Geurts MH, Cornel AM, Driehuis E, Millen R, Straetemans T, Nicolasen MJT, Aarts-Riemens T, Ariese HCR, Johnson HR, van Ineveld RL, Karaiskaki F, Kopper O, Bar-Ephraim YE, Kretzschmar K, Eggermont AMM, Nierkens S, Wehrens EJ, Stunnenberg HG, Clevers H, Kuball J, Sebestyen Z, Rios AC. **Uncovering the mode of action of engineered T cells in patient cancer organoids**. * *equal contibution* Nat Biotechnol. 2023 Jan https://doi.org/10.1038/s41587-022-01397-w
+
+Alieva, M., Barrera Román, M., de Blank, S. et al. **BEHAV3D: a 3D live imaging platform for comprehensive analysis of engineered T cell behavior and tumor response**. Nat Protoc (2024). https://doi.org/10.1038/s41596-024-00972-6
+
 ## Software and Hardware requirements
 BEHAV3D runs in R studio or from command line and was tested on MacOS Big Sur with R version 4.1.1 and on Windows 10 with R version 4.3.0.
 
