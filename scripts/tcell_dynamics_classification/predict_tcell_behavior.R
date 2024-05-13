@@ -24,7 +24,7 @@ if (interactive()) {
   pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/tcell_demo/BEHAV3D_config.yml"))
   
   ### For your own file, uncomment following line and add own path to the BEHAV3D_config.yml
-  # pars = yaml.load_file("")
+  pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/Bugfixes/batch_imaris_import/config_template.yml")
   
 } else {
   option_list = list(
@@ -91,30 +91,40 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   read_ims_csv <- function(metadata_row, pattern) {
     read_plus <- function(flnm, stat_folder) {
       read_csv(flnm, skip = 3, col_types = cols(TrackID= col_character())) %>% 
-        mutate(filename = flnm, stat_folder=stat_folder, basename=basename) 
+        mutate(filename = flnm, stat_folder=stat_folder)
     }
-    basename=gsub("([.|()\\^{}+$*?]|\\[|\\])", "\\\\\\1", metadata_row[['basename']])
-    pattern <- paste0(basename,".*", pattern, ".*")
+    pattern <- paste0(pattern, ".*")
     pattern_file <- list.files(path = metadata_row[['stats_folder']], pattern = pattern, full.names=TRUE)
     if (identical(pattern_file, character(0))){
       print(paste("No file with pattern '", pattern, "' found for", metadata_row['stats_folder']))
     } 
     print(pattern_file)
-    basename=metadata_row[['basename']]
+    exp_basename=metadata_row[['basename']]
     ims_csv <- read_plus(pattern_file, metadata_row[['stats_folder']])
+    if ('Original Image Name' %in% names(ims_csv)){
+      time_file <- list.files(path = metadata_row[['stats_folder']], pattern = "_Time_Index.csv", full.names=TRUE)
+      time_csv <- read_plus(time_file, metadata_row[['stats_folder']]) %>% rename(Time=`Time Index`, basename = `Original Image Name`)
+      ims_csv <- ims_csv %>% 
+        rename(basename = `Original Image Name`) %>% 
+        filter(basename == exp_basename)
+      ims_csv2 = left_join(ims_csv,time_csv2, by=c("basename", "Birth [s]", "Death [s]", "ID", "TrackID"))
+      
+    } else {
+      ims_csv$basename = exp_basename
+    }
     return(ims_csv)
   }
   
   stat_folders <- metadata[c("basename", "tcell_stats_folder")]
   colnames(stat_folders) <- c("basename", "stats_folder")
-
+  
   # import Displacement^2
   pat = "Displacement\\^2"
-  displacement=do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
+  displacement=do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   # import Speed
   pat = "Speed"
-  speed <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
+  speed <- do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   # import mean dead dye intensity values
   datalist = list()
@@ -125,7 +135,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
       datalist[[i]]=img_csv
     }
   }
-  red_lym=do.call(rbind, datalist)
+  red_lym=do.call(rbind.fill, datalist)
   
   
   # import distance to organoids (if calculated with distance transformation or with object distance)
@@ -149,11 +159,11 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
       }
     }
   }
-  dist_org = do.call(rbind, datalist2)
+  dist_org = do.call(rbind.fill, datalist2)
   
   # import Position
   pat = "Position"
-  pos <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
+  pos <- do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   ### Join all Imaris information
   info_cols <- c("stat_folder", "basename","Time","TrackID" ,"ID")
