@@ -231,7 +231,7 @@ live_deadROI6<-rbind(temp1, temp2)
 
 ### plot to check outcome
 ggplot(live_deadROI6, aes(Time,dead_dye_mean_rescaled, color = TrackID, group = TrackID)) + 
-  geom_smooth(method="loess", size = 1, se=F, span=1) +
+  geom_smooth(method="loess", size = 1, se=F, span=1, show.legend=FALSE) +
   theme_bw() + 
   ylab("dead dye intensity") + 
   xlab("Time") +
