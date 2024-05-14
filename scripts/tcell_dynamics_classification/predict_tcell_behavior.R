@@ -24,7 +24,7 @@ if (interactive()) {
   pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/tcell_demo/BEHAV3D_config.yml"))
   
   ### For your own file, uncomment following line and add own path to the BEHAV3D_config.yml
-  pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/Bugfixes/batch_imaris_import/config_template.yml")
+  pars = yaml.load_file("")
   
 } else {
   option_list = list(
@@ -183,18 +183,19 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   ### Create a unique TRACKID. 
   ### Each file processes with Imaris has separate TRACKIDs and these must be made unique before merging
-  category <- as.factor(master$basename)
-  ranks <- rank(-table(category), ties.method="first")
-  ranks <- as.data.frame(ranks)
-  ranks$basename <- row.names(ranks)
-  master <- left_join(master, ranks) 
+  master$combination <- paste(master$basename, master$tcell_stats_folder)
+  unique_combinations <- unique(master$combination)
+  combination_ranks <- rank(unique_combinations)
+  master$ranks <- combination_ranks[match(master$combination, unique_combinations)]
+  master$ranks <- as.factor(master$rank)
   master$TrackID2 <- factor(paste(master$ranks, master$TrackID, sep="_"))
   
   ### Remove the variable TrackID and only use unique TrackID2 (unique identifier instead)
   master$Original_TrackID <- master$TrackID
   master$TrackID<-master$TrackID2
   master$TrackID2<-NULL
-  
+  master$combination<-NULL
+  master$ranks<-NULL
   ### save RDS for later use (e.g. Backprojection of classified TrackIDs)
   saveRDS(master, paste0(output_dir,"raw_tcell_track_data.rds"))
   
