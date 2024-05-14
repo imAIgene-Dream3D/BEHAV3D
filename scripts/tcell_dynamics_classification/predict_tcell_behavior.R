@@ -24,7 +24,7 @@ if (interactive()) {
   pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/tcell_demo/BEHAV3D_config.yml"))
   
   ### For your own file, uncomment following line and add own path to the BEHAV3D_config.yml
-  pars = yaml.load_file("")
+  # pars = yaml.load_file("")
   
 } else {
   option_list = list(
@@ -77,11 +77,11 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   
   ### Import file-specific metadata for all images used in this analysis.
   pat = pars$metadata_csv_path
-  metadata=read.csv(pars$metadata_csv_path, sep="\t", check.names=FALSE)
+  metadata=read.csv(pars$metadata_csv_path, sep=",", check.names=FALSE)
   
   track_counts=metadata
   track_counts$name = paste(metadata$organoid_line, metadata$tcell_line, metadata$exp_nr, metadata$well)
-  track_counts=track_counts[,c("basename", "name", "organoid_line")]
+  track_counts=track_counts[,c("basename", "name", "organoid_line", "tcell_line", "exp_nr", "well")]
   
   ### Check if folder with statistics is named in the metadata table, if not, try default naming of data basename + "_Statistics"
   if ( any(is.na(metadata$tcell_stats_folder)) ){
@@ -187,7 +187,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   unique_combinations <- unique(master$combination)
   combination_ranks <- rank(unique_combinations)
   master$ranks <- combination_ranks[match(master$combination, unique_combinations)]
-  master$ranks <- as.factor(master$rank)
+  master$ranks <- as.factor(master$ranks)
   master$TrackID2 <- factor(paste(master$ranks, master$TrackID, sep="_"))
   
   ### Remove the variable TrackID and only use unique TrackID2 (unique identifier instead)
@@ -196,6 +196,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   master$TrackID2<-NULL
   master$combination<-NULL
   master$ranks<-NULL
+  
   ### save RDS for later use (e.g. Backprojection of classified TrackIDs)
   saveRDS(master, paste0(output_dir,"raw_tcell_track_data.rds"))
   
