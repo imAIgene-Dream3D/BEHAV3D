@@ -103,11 +103,11 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     ims_csv <- read_plus(pattern_file, metadata_row[['stats_folder']])
     if ('Original Image Name' %in% names(ims_csv)){
       time_file <- list.files(path = metadata_row[['stats_folder']], pattern = "_Time_Index.csv", full.names=TRUE)
-      time_csv <- read_plus(time_file, metadata_row[['stats_folder']]) %>% rename(Time=`Time Index`, basename = `Original Image Name`)
+      time_csv <- read_plus(time_file, metadata_row[['stats_folder']]) %>% dplyr::rename(Time=`Time Index`, basename =`Original Image Name`)
       ims_csv <- ims_csv %>% 
-        rename(basename = `Original Image Name`) %>% 
-        filter(basename == exp_basename)
-      ims_csv2 = left_join(ims_csv,time_csv2, by=c("basename", "Birth [s]", "Death [s]", "ID", "TrackID"))
+        dplyr::rename(basename = `Original Image Name`) %>% 
+        dplyr::filter(basename == exp_basename)
+      ims_csv = left_join(ims_csv,time_csv, by=c("basename", "Birth [s]", "Death [s]", "ID", "TrackID", "stat_folder"))
       
     } else {
       ims_csv$basename = exp_basename
@@ -153,7 +153,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     } else {
       # import Minimal distance to organoids (distance transformation channel)
       pat <- paste0("Intensity_Min_Ch=", metadata$organoid_distance_channel[i], "_Img=1")
-      img_csv <- read_ims_csv(stat_folders[i,], pattern = pat)
+      img_csv <- read_ims_csv(stat_folders[i,], pattern = pat) %>% dplyr::rename(`Shortest Distance to Surfaces`=`Intensity Min`)
       if (!identical(img_csv, character(0))) {
         datalist2[[i]] <- img_csv
       }
@@ -169,7 +169,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   info_cols <- c("stat_folder", "basename","Time","TrackID" ,"ID")
   master <- displacement[,c("Displacement^2",info_cols)] %>%
     inner_join(speed[,c("Speed", info_cols)]) %>%
-    inner_join(dist_org[,c('Intensity Min', info_cols)]) %>%
+    inner_join(dist_org[,c('Shortest Distance to Surfaces', info_cols)]) %>%
     inner_join(red_lym[,c("Intensity Mean",info_cols)]) %>%
     inner_join(pos[,c("Position X" ,"Position Y" ,"Position Z",info_cols)])
   
