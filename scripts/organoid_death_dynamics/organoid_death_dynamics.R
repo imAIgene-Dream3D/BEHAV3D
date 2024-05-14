@@ -246,7 +246,7 @@ ggsave(paste0(output_dir,"Full_individual_orgs_death_dynamics.pdf"), device="pdf
 live_deadROI6_exp_dur = live_deadROI6[live_deadROI6$Time<=pars$organoid_exp_duration,]
 ### plot to check outcome
 ggplot(live_deadROI6_exp_dur, aes(Time,dead_dye_mean_rescaled, color = TrackID, group = TrackID)) + 
-  geom_smooth(method="loess", size = 1, se=F, span=1) +
+  geom_smooth(method="loess", size = 1, se=F, span=1, show.legend=FALSE) +
   theme_bw() + 
   ylab("dead dye intensity") + 
   xlab("Time") +
