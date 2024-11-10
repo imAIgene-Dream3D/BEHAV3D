@@ -1,6 +1,6 @@
 # BEHAV3D pipeline
 ## Overview
-BEHAV3D is dynamic immuno-organoid 3D imaging-transcriptomics platform to study tumor death dynamics and immune cell behavior.
+BEHAV3D is dynamic immuno-organoid 3D imaging platform to study tumor death dynamics and immune cell behavior.
 
 ## What type of data does BEHAV3D work with?
 - Any type of multispectral time-lapse 3D (or 2D) imaging data, where objects such as tumor cells or tumor organoids are in co-culture with immune cells of interest.
