@@ -76,44 +76,55 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   ###############################
   
   ### Import file-specific metadata for all images used in this analysis.
-  pat = pars$metadata_csv
-  metadata=read.csv(pars$metadata_csv, sep="\t", check.names=FALSE)
+  pat = pars$metadata_csv_path
+  metadata=read.csv(pars$metadata_csv_path, sep=",", check.names=FALSE)
   
   track_counts=metadata
   track_counts$name = paste(metadata$organoid_line, metadata$tcell_line, metadata$exp_nr, metadata$well)
-  track_counts=track_counts[,c("basename", "name", "organoid_line")]
+  track_counts=track_counts[,c("basename", "name", "organoid_line", "tcell_line", "exp_nr", "well")]
   
   ### Check if folder with statistics is named in the metadata table, if not, try default naming of data basename + "_Statistics"
   if ( any(is.na(metadata$tcell_stats_folder)) ){
-    metadata$tcell_stats_folder=apply(metadata, 1, function(x) paste0(pars$data_dir, x["basename"], "_Statistics"))
+    metadata$tcell_stats_folder=apply(metadata, 1, function(x) paste0(pars$data_dir, "/", x["basename"], "_Statistics"))
   }
   
   read_ims_csv <- function(metadata_row, pattern) {
     read_plus <- function(flnm, stat_folder) {
       read_csv(flnm, skip = 3, col_types = cols(TrackID= col_character())) %>% 
-        mutate(filename = flnm, stat_folder=stat_folder, basename=basename) 
+        mutate(filename = flnm, stat_folder=stat_folder)
     }
-    basename=gsub("([.|()\\^{}+$*?]|\\[|\\])", "\\\\\\1", metadata_row[['basename']])
-    pattern <- paste0(basename,".*", pattern, ".*")
+    pattern <- paste0(pattern, ".*")
     pattern_file <- list.files(path = metadata_row[['stats_folder']], pattern = pattern, full.names=TRUE)
     if (identical(pattern_file, character(0))){
       print(paste("No file with pattern '", pattern, "' found for", metadata_row['stats_folder']))
     } 
     print(pattern_file)
-    ims_csv <- read_plus(pattern_file, metadata_row['stats_folder'])
+    exp_basename=metadata_row[['basename']]
+    ims_csv <- read_plus(pattern_file, metadata_row[['stats_folder']])
+    if ('Original Image Name' %in% names(ims_csv)){
+      time_file <- list.files(path = metadata_row[['stats_folder']], pattern = "_Time_Index.csv", full.names=TRUE)
+      time_csv <- read_plus(time_file, metadata_row[['stats_folder']]) %>% dplyr::rename(Time=`Time Index`, basename =`Original Image Name`)
+      ims_csv <- ims_csv %>% 
+        dplyr::rename(basename = `Original Image Name`) %>% 
+        dplyr::filter(basename == exp_basename)
+      ims_csv = left_join(ims_csv,time_csv, by=c("basename", "Birth [s]", "Death [s]", "ID", "TrackID", "stat_folder"))
+      
+    } else {
+      ims_csv$basename = exp_basename
+    }
     return(ims_csv)
   }
   
   stat_folders <- metadata[c("basename", "tcell_stats_folder")]
   colnames(stat_folders) <- c("basename", "stats_folder")
-
+  
   # import Displacement^2
   pat = "Displacement\\^2"
-  displacement=do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
+  displacement=do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   # import Speed
   pat = "Speed"
-  speed <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
+  speed <- do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   # import mean dead dye intensity values
   datalist = list()
@@ -124,14 +135,15 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
       datalist[[i]]=img_csv
     }
   }
-  red_lym=do.call(rbind, datalist)
+  red_lym=do.call(rbind.fill, datalist)
+  
   
   # import distance to organoids (if calculated with distance transformation or with object distance)
   
   datalist2 = list()
   
   for (i in 1:length(stat_folders$stats_folder)) {
-      if (metadata$Object_distance[i] == TRUE) {
+      if (metadata$imaris_object_distance[i] == TRUE) {
       # import Object distance to organoids
       pat <- paste0("Shortest_Distance_to_Surfaces_Surfaces=", metadata$tumor_name[i])
       img_csv <- read_ims_csv(stat_folders[i,], pattern = pat)
@@ -141,51 +153,49 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
     } else {
       # import Minimal distance to organoids (distance transformation channel)
       pat <- paste0("Intensity_Min_Ch=", metadata$organoid_distance_channel[i], "_Img=1")
-      img_csv <- read_ims_csv(stat_folders[i,], pattern = pat)
+      img_csv <- read_ims_csv(stat_folders[i,], pattern = pat) %>% dplyr::rename(`Shortest Distance to Surfaces`=`Intensity Min`)
       if (!identical(img_csv, character(0))) {
         datalist2[[i]] <- img_csv
       }
     }
   }
-  dist_org = do.call(rbind, datalist2)
+  dist_org = do.call(rbind.fill, datalist2)
   
   # import Position
-  pat = "Position"
-  pos <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
+  pat = "Position.csv"
+  pos <- do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   ### Join all Imaris information
-  master <- cbind(
-    displacement[,c("Displacement^2","Time","TrackID" ,"ID")], 
-    speed[,c("Speed" )], 
-    dist_org[,c(1)], 
-    red_lym[,c("Intensity Mean")], 
-    pos[,c("Position X" ,"Position Y" ,"Position Z","filename", "stat_folder", "basename")]
-  )
+  info_cols <- c("stat_folder", "basename","Time","TrackID" ,"ID")
+  master <- displacement[,c("Displacement^2",info_cols)] %>%
+    inner_join(speed[,c("Speed", info_cols)]) %>%
+    inner_join(dist_org[,c('Shortest Distance to Surfaces', info_cols)]) %>%
+    inner_join(red_lym[,c("Intensity Mean",info_cols)]) %>%
+    inner_join(pos[,c("Position X" ,"Position Y" ,"Position Z",info_cols)])
   
   ### Get the basename from the filename for combination with metadata
   # master$basename <- gsub("_Position.csv", "", master$filename, perl=TRUE)
   # master$basename=basename(master$basename)
-  colnames(master) <- c("displacement","Time","TrackID","ID","speed","dist_org","red_lym","X-pos","Y-pos","Z-pos", "filename", "tcell_stats_folder", "basename")
+  colnames(master) <- c("displacement","tcell_stats_folder", "basename", "Time","TrackID","ID","speed","dist_org","red_lym","X-pos","Y-pos","Z-pos")
   
   ### Join the information of metadata to master:
   master<-left_join(metadata,master)
   
   ### Create a unique TRACKID. 
   ### Each file processes with Imaris has separate TRACKIDs and these must be made unique before merging
-  category <- as.factor(master$filename)
-  ranks <- rank(-table(category), ties.method="first")
-  ranks <- as.data.frame(ranks)
-  ranks$filename <- row.names(ranks)
-  master <- left_join(master, ranks) 
+  master$combination <- paste(master$basename, master$tcell_stats_folder)
+  unique_combinations <- unique(master$combination)
+  combination_ranks <- rank(unique_combinations)
+  master$ranks <- combination_ranks[match(master$combination, unique_combinations)]
+  master$ranks <- as.factor(master$ranks)
   master$TrackID2 <- factor(paste(master$ranks, master$TrackID, sep="_"))
   
   ### Remove the variable TrackID and only use unique TrackID2 (unique identifier instead)
   master$Original_TrackID <- master$TrackID
   master$TrackID<-master$TrackID2
   master$TrackID2<-NULL
-  
-  ### Remove filename
-  master$filename<-NULL
+  master$combination<-NULL
+  master$ranks<-NULL
   
   ### save RDS for later use (e.g. Backprojection of classified TrackIDs)
   saveRDS(master, paste0(output_dir,"raw_tcell_track_data.rds"))

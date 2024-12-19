@@ -15,7 +15,7 @@ if (interactive()) {
   pars = yaml.load_file(paste0(BEHAV3D_dir, "/demos/organoid_demo/BEHAV3D_config.yml"))
   
   ### For your own file
-  # pars = yaml.load_file("")
+  pars = yaml.load_file("/Users/samdeblank/Documents/1.projects/BHVD_BEHAV3D/Bugfixes/batch_imaris_import/config_template.yml")
   
 } else {
   option_list = list(
@@ -38,7 +38,7 @@ dir.create(output_dir, recursive=TRUE)
 
 ### Import file-specific metadata for all images used in this analysis.
 pat = pars$metadata_csv
-metadata=read.csv(pars$metadata_csv, sep="\t")
+metadata=read.csv(pars$metadata_csv, sep=",")
 
 if ( any(is.na(metadata$organoid_stats_folder)) ){
   metadata$organoid_stats_folder=apply(metadata, 1, function(x) paste0(pars$data_dir, x["basename"], "_Statistics"))
@@ -48,24 +48,39 @@ if ( any(is.na(metadata$organoid_stats_folder)) ){
 read_ims_csv <- function(metadata_row, pattern) {
   read_plus <- function(flnm, stat_folder) {
     read_csv(flnm, skip = 3, col_types = cols(TrackID= col_character())) %>% 
-      mutate(filename = flnm, stat_folder=stat_folder) 
+      mutate(filename = flnm, stat_folder=stat_folder)
   }
-  basename=gsub("([.|()\\^{}+$*?]|\\[|\\])", "\\\\\\1", metadata_row[['basename']])
-  pattern <- paste0(basename,".*", pattern, ".*")
-  print(pattern)
+  pattern <- paste0(pattern, ".*")
   pattern_file <- list.files(path = metadata_row[['stats_folder']], pattern = pattern, full.names=TRUE)
   if (identical(pattern_file, character(0))){
     print(paste("No file with pattern '", pattern, "' found for", metadata_row['stats_folder']))
   } 
-  ims_csv <- read_plus(pattern_file, metadata_row['stats_folder'])
+  print(pattern_file)
+  exp_basename=metadata_row[['basename']]
+  ims_csv <- read_plus(pattern_file, metadata_row[['stats_folder']])
+  if ('Original Image Name' %in% names(ims_csv)){
+    time_file <- list.files(path = metadata_row[['stats_folder']], pattern = "_Time_Index.csv", full.names=TRUE)
+    time_csv <- read_plus(time_file, metadata_row[['stats_folder']]) %>% dplyr::rename(Time=`Time Index`, basename =`Original Image Name`)
+    ims_csv <- ims_csv %>% 
+      dplyr::rename(basename = `Original Image Name`) %>% 
+      dplyr::filter(basename == exp_basename)
+    ims_csv = left_join(ims_csv,time_csv, by=c("basename", "Birth [s]", "Death [s]", "ID", "TrackID", "stat_folder"))
+    
+  } else {
+    ims_csv$basename = exp_basename
+  }
   return(ims_csv)
 }
 
 stat_folders <- metadata[c("basename", "organoid_stats_folder")]
 colnames(stat_folders) <- c("basename", "stats_folder")
 
+# Filter out unique basename rows as there is only 1 organoid line per experiment, while in metadata there can be multiple rows of T cells types (e.g. CD4 and CD8)
+stat_folders <- stat_folders[!duplicated(stat_folders$basename), ]
+metadata <- metadata[!duplicated(metadata$basename), ]
+
 pat = "Volume"
-volume_csv <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
+volume_csv <- do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
 
 # import sum_red
 datalist = list()
@@ -76,35 +91,42 @@ for (i in 1:length(stat_folders$stats_folder)){
     datalist[[i]]=img_csv
   }
 }
-sum_red_csv=do.call(rbind, datalist)
+sum_red_csv=do.call(rbind.fill, datalist)
 
 # import area
 pat = "Area"
-area_csv <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
+area_csv <- do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
 # import position
-pat = "Position"
-pos_csv <- do.call("rbind", apply(stat_folders, 1, read_ims_csv, pattern=pat))
+pat = "Position.csv"
+pos_csv <- do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
 
-live_deadROI <- cbind(volume_csv[,c("Volume","Time", "TrackID", "ID")], 
-                      sum_red_csv[,c("Intensity Mean")], 
-                      area_csv[,c("Area")],
-                      pos_csv[,c("Position X","Position Y","Position Z","filename", "stat_folder")])
-colnames(live_deadROI) <- c("Volume","Time","TrackID","ID","dead_dye_mean","area", "pos_x","pos_y","pos_z", "filename", "organoid_stats_folder")
+### Join all Imaris information
+info_cols <- c("stat_folder", "basename","Time","TrackID" ,"ID")
+live_deadROI <- volume_csv[,c("Volume",info_cols)] %>%
+  inner_join(sum_red_csv[,c("Intensity Mean", info_cols)]) %>%
+  inner_join(area_csv[,c('Area', info_cols)]) %>%
+  inner_join(pos_csv[,c("Position X" ,"Position Y" ,"Position Z",info_cols)])
+
+colnames(live_deadROI) <- c("Volume", "organoid_stats_folder", "basename", "Time","TrackID","ID","dead_dye_mean","area", "pos_x","pos_y","pos_z")
 
 ### Join the information of metadata to master:
 live_deadROI<-left_join(live_deadROI, metadata)
 
-### Make TrackID unique for each file:
-category <- as.factor(live_deadROI$basename)
-ranks <- rank(-table(category), ties.method="first")
-ranks <- as.data.frame(ranks)
-ranks$basename <- row.names(ranks)
-live_deadROI <- left_join(live_deadROI, ranks)  ## plot with all the tracks together 
+### Create a unique TRACKID. 
+### Each file processes with Imaris has separate TRACKIDs and these must be made unique before merging
+live_deadROI$combination <- paste(live_deadROI$basename, live_deadROI$organoid_stats_folder)
+unique_combinations <- unique(live_deadROI$combination)
+combination_ranks <- rank(unique_combinations)
+live_deadROI$ranks <- combination_ranks[match(live_deadROI$combination, unique_combinations)]
+live_deadROI$ranks <- as.factor(live_deadROI$ranks)
 live_deadROI$TrackID2 <- factor(paste(live_deadROI$ranks, live_deadROI$TrackID, sep="_"))
 
+### Remove the variable TrackID and only use unique TrackID2 (unique identifier instead)
 live_deadROI$Original_TrackID <- live_deadROI$TrackID
 live_deadROI$TrackID<-live_deadROI$TrackID2
 live_deadROI$TrackID2<-NULL
+live_deadROI$combination<-NULL
+live_deadROI$ranks<-NULL
 
 detach(package:plyr)
 library(dplyr)
@@ -209,7 +231,7 @@ live_deadROI6<-rbind(temp1, temp2)
 
 ### plot to check outcome
 ggplot(live_deadROI6, aes(Time,dead_dye_mean_rescaled, color = TrackID, group = TrackID)) + 
-  geom_smooth(method="loess", size = 1, se=F, span=1) +
+  geom_smooth(method="loess", size = 1, se=F, span=1, show.legend=FALSE) +
   theme_bw() + 
   ylab("dead dye intensity") + 
   xlab("Time") +
@@ -224,7 +246,7 @@ ggsave(paste0(output_dir,"Full_individual_orgs_death_dynamics.pdf"), device="pdf
 live_deadROI6_exp_dur = live_deadROI6[live_deadROI6$Time<=pars$organoid_exp_duration,]
 ### plot to check outcome
 ggplot(live_deadROI6_exp_dur, aes(Time,dead_dye_mean_rescaled, color = TrackID, group = TrackID)) + 
-  geom_smooth(method="loess", size = 1, se=F, span=1) +
+  geom_smooth(method="loess", size = 1, se=F, span=1, show.legend=FALSE) +
   theme_bw() + 
   ylab("dead dye intensity") + 
   xlab("Time") +
