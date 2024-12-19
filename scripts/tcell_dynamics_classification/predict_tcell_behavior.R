@@ -162,7 +162,7 @@ if ( ((! file.exists(paste0(output_dir,"processed_tcell_track_data.rds"))) | for
   dist_org = do.call(rbind.fill, datalist2)
   
   # import Position
-  pat = "Position"
+  pat = "Position.csv"
   pos <- do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
   
   ### Join all Imaris information
