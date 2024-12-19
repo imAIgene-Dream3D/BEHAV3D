@@ -97,7 +97,7 @@ sum_red_csv=do.call(rbind.fill, datalist)
 pat = "Area"
 area_csv <- do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
 # import position
-pat = "Position"
+pat = "Position.csv"
 pos_csv <- do.call("rbind.fill", apply(stat_folders, 1, read_ims_csv, pattern=pat))
 
 ### Join all Imaris information
