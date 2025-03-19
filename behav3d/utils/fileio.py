@@ -1,0 +1,277 @@
+
+# from PyImarisWriter import PyImarisWriter as PW
+import numpy as np
+from datetime import datetime, timedelta
+import os
+from pathlib import Path
+from tifffile import imwrite, imread
+from aicspylibczi import CziFile
+import h5py
+import zarr
+import dask.array as da
+import shutil
+from time import sleep
+
+def load_image(path, axis_order="TCZYX"):
+    path = Path(path)
+    default_axis_order = "TCZYX"
+    if path.suffix==".czi":
+        img = load_czi(path)
+    elif path.suffix==".h5":
+        img = load_h5(path, substruct="Data")
+    elif path.suffix==".ims":
+        img = load_ims(path)
+    elif path.suffix==".zarr" or str(path).endswith(".zarr.zip"):
+        img = load_zarr(path)
+    elif path.suffix==".tif" or path.suffix==".tiff":
+        img = load_tiff(path)
+    else:
+        raise ValueError(f"Unsupported file format: {path.suffix}")
+    
+    img = convert_axis_order(
+        img, 
+        default_axis_order=default_axis_order, 
+        user_axis_order = axis_order
+        )
+    return(img)
+
+def convert_axis_order(img, default_axis_order, user_axis_order):
+    """
+    Convert axis order of image
+    """
+    if user_axis_order==default_axis_order:
+        return img
+    else:
+        user_axes = list(user_axis_order)
+        default_axes = list(default_axis_order)
+        axis_map = {user_axes[i]: default_axes[i] for i in range(len(user_axes))}
+        new_order = [axis_map[axis] for axis in default_axes]
+        return np.transpose(img, axes=new_order)
+
+def load_tiff(path):
+    """
+    Loading .tif/.tiff images
+    """
+    img = imread(path)
+    return(img)
+
+def save_as_tiff(img, path):
+    path = Path(path)
+    assert path.parent.exists(), f"Parent folder of supplied .tiff path does not exist:\n{path}"
+    imwrite(path, img)
+
+def load_czi(path, t=None, z=None, c=None):
+    """
+    Loading .czi images
+    """
+    czifile=CziFile(path)
+    # Load specific timepoints, z-slice, etc.
+    img, _ = czifile.read_image()
+    # img, _ = czifile.read_image(T=t, Z=z, C=c)
+
+    # The shape of img contain a lot of singular dimensions
+    # img.shape = (1, 1, 1, 1, 1, 1, 350, 3, 36, 200, 200)
+    # np.squeeze removes preceding or trailing "empty" dimensions
+    img = np.squeeze(img) # img.shape = (350, 3, 36, 200, 200)
+    return(img)
+
+def load_h5(path, substruct):
+    """
+    Loading .h5 images
+    """
+    h5file = h5py.File(name=path, mode="r")
+    img = h5file[substruct][:]
+    return(img)
+
+def load_ims(path):
+    """
+    Loading .ims images
+    """
+    imsfile = h5py.File(name=path, mode="r")
+
+    nr_timepoints = len([x for x in imsfile['/DataSet/ResolutionLevel 0/']])
+    nr_channels = len([x for x in imsfile['/DataSet/ResolutionLevel 0/Timepoint 0']])
+
+    image_channels = []
+    for channel in range(nr_channels):
+        # print("Loading Channel {}".format(channel))
+        if nr_timepoints>1:
+            image_timepoints = []
+            for timepoint in range(nr_timepoints):
+                # Loads in single timepoint and single channel
+                # print("Loading TimePoint {}".format(timepoint))
+                time_img=imsfile[f'/DataSet/ResolutionLevel 0/Timepoint {timepoint}/Channel {channel}/Data'][:]
+                image_timepoints.append(time_img)
+                
+            #Stack all timepoints to create single channel image over all timepoints
+            image_timepoints = np.stack(image_timepoints, axis=0)
+        else:
+            image_timepoints = imsfile[f'/DataSet/ResolutionLevel 0/Timepoint 0/Channel {channel}/Data'][:]
+            
+        image_channels.append(image_timepoints)
+    
+    #Stack all channels to create full image
+    img=np.stack(image_channels, axis=0)
+    return(img)
+
+def load_zarr(path):
+    """
+    Loading .zarr images
+    """
+    dask_img = da.from_zarr(zarr.open(path))
+    # img = np.asarray(dask_img)
+    return(dask_img)
+
+
+def save_as_zarr(img, path, chunks=None):
+    path=Path(path)
+    zipping=False
+    if path.suffix == ".zip":
+        zipping=True
+        path = Path(path.parent, path.stem)
+        
+    if path.suffix==".zarr":
+        if chunks is None:
+            chunks = (1,) + img.shape[1:]
+        if not isinstance(img, da.Array):
+            img = da.from_array(img, chunks=chunks)
+ 
+        zarr_store = zarr.DirectoryStore(path)
+        da.to_zarr(img, zarr_store, overwrite=True)
+    img=None
+    if zipping:
+        shutil.make_archive(path, "zip", path)
+        shutil.rmtree(path)
+    
+
+
+def save_as_imaris(
+    img,
+    outpath,
+    voxel_size_x,
+    voxel_size_y,
+    voxel_size_z,
+    time_interval_seconds,
+    ImarisFileConverter_dll_path="C:/Program Files/Bitplane/ImarisFileConverter 10.0.0/bpImarisWriter100.dll",
+    number_of_threads=1
+    ):
+    ImarisFileConverter_dll_path=str(ImarisFileConverter_dll_path)
+    class ImageConverter(PW.ImageConverter):
+        def __init__(
+            self,
+            datatype : str,
+            image_size : PW.ImageSize,
+            sample_size : PW.ImageSize,
+            dimension_sequence : PW.DimensionSequence,
+            block_size: PW.ImageSize,
+            output_filename : str,
+            options : PW.Options,
+            application_name : str,
+            application_version : str,
+            progress_callback_class: PW.CallbackClass,
+            ImarisFileConverter_dll_path = "/Applications/ImarisFileConverter 9.7.2.app/Contents/Frameworks/libbpImarisWriter.9.7.dylib",
+            ):
+
+            self.ImarisFileConverter_dll_path = ImarisFileConverter_dll_path
+            super().__init__(
+                output_filename = output_filename, 
+                image_size = image_size,
+                sample_size = sample_size,
+                dimension_sequence = dimension_sequence,
+                block_size = block_size,
+                application_name = application_name,
+                application_version=application_version,
+                options=options,
+                datatype=datatype,
+                progress_callback_class = progress_callback_class
+                )
+        
+
+        def _get_dll_filename(self):
+            return(self.ImarisFileConverter_dll_path)
+                
+    # Define the input and output file paths
+    # input_czi_path = "D:/Sharing/personal/Sam/FUNC/FUNC_BV1_Exp020/FUNC_BV1_Exp020_Img1.czi"
+    # input_czi_path = Path(input_czi_path)
+
+    outdir = outpath.parent
+    os.chdir(outdir)
+    outname = outpath.name
+    
+    # Step 1: Read the CZI file
+    # czi = CziFile(input_czi_path)
+    # image_data, _ = czi.read_image() 
+    # metadata = element_to_dict(czi.meta)
+    # Extract img data as a NumPy array
+    img = np.ascontiguousarray(img).copy()
+    # image_data = np.squeeze(image_data)
+
+    # czi.get_dims_shape()
+    image_shape = img.shape
+    image_size = PW.ImageSize(
+        x=image_shape[-1], 
+        y=image_shape[-2], 
+        z=image_shape[-3], 
+        c=image_shape[-4], 
+        t=image_shape[-5]
+        )
+
+
+    dimension_sequence = PW.DimensionSequence('x', 'y', 'z', 'c', 't')
+    block_size = image_size
+    sample_size = PW.ImageSize(x=1, y=1, z=1, c=1, t=1)
+        
+    application_name = 'PyImarisWriter'
+    application_version = '1.0.0'
+    callback_class = PW.CallbackClass()
+
+    options = PW.Options()
+    options.mNumberOfThreads = number_of_threads
+    # options.mCompressionAlgorithmType = PW.eCompressionAlgorithmGzipLevel2
+    # options.mEnableLogProgress = True
+            
+    # Step 3: Create an IMS file with ImarisWriter
+    converter = ImageConverter(
+        ImarisFileConverter_dll_path = ImarisFileConverter_dll_path,
+        output_filename = outname, 
+        image_size = image_size,
+        sample_size = sample_size,
+        dimension_sequence = dimension_sequence,
+        block_size = block_size,
+        application_name = application_name,
+        application_version=application_version,
+        options=options,
+        datatype='uint16',
+        progress_callback_class = callback_class
+        )  # Adjust data type as needed
+
+    # voxel_size_x = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]['AcquisitionBlock']['AcquisitionModeSetup']['ScalingX']["ScalingX"])*(10**6)
+    # voxel_size_y = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]['AcquisitionBlock']['AcquisitionModeSetup']['ScalingY']["ScalingY"])*(10**6)
+    # voxel_size_z = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]['AcquisitionBlock']['AcquisitionModeSetup']['ScalingZ']["ScalingZ"])*(10**6)
+
+    num_blocks = image_size / block_size
+    block_index = PW.ImageSize()
+    for c in range(num_blocks.c):
+        block_index.c = c
+        for t in range(num_blocks.t):
+            block_index.t = t
+            for z in range(num_blocks.z):
+                block_index.z = z
+                for y in range(num_blocks.y):
+                    block_index.y = y
+                    for x in range(num_blocks.x):
+                        block_index.x = x
+                        if converter.NeedCopyBlock(block_index):
+                            converter.CopyBlock(img, block_index)
+                            
+    adjust_color_range = True
+    extent_x = image_size.x * voxel_size_x
+    extent_y = image_size.y * voxel_size_y
+    extent_z = image_size.z * voxel_size_z
+    image_extents = PW.ImageExtents(0, 0, 0, extent_x, extent_y, extent_z)
+    parameters = PW.Parameters()
+    now = datetime.today()
+    time_infos = [now + timedelta(seconds=t*time_interval_seconds) for t in range(img.shape[0])]
+    color_infos = [PW.ColorInfo() for _ in range(image_size.c)]
+    converter.Finish(image_extents, parameters, time_infos, color_infos, adjust_color_range)
+    converter.Destroy()

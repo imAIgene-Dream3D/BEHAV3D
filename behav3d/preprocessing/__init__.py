@@ -4,6 +4,69 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import math
+from behav3d.utils.fileio import load_image,save_as_zarr
+
+def convert_input_files_to_zarr(
+    tcell_segments_path,
+    organoid_segments_path,
+    raw_image_path,
+    outfolder = None,
+    chunks=None
+    ):
+    
+    tcell_segments_path = Path(tcell_segments_path)
+    organoid_segments_path = Path(organoid_segments_path)
+    raw_image_path = Path(raw_image_path)
+    
+    if outfolder is None:
+        tcell_zarr_out_path = tcell_segments_path.with_suffix(".zarr.zip")
+        organoid_zarr_out_path = organoid_segments_path.with_suffix(".zarr.zip")
+        raw_image_zarr_out_path = raw_image_path.with_suffix(".zarr.zip")
+    else:   
+        tcell_zarr_out_path = Path(outfolder, tcell_segments_path.stem + ".zarr.zip")
+        organoid_zarr_out_path = Path(outfolder, organoid_segments_path.stem + ".zarr.zip")
+        raw_image_zarr_out_path = Path(outfolder, raw_image_path.stem + ".zarr.zip")
+    
+    if tcell_zarr_out_path.exists():
+        print("Skipping conversion of tcell segments to zarr, as file already exists")
+    else:
+        tcell_segments = load_image(tcell_segments_path)
+        chunksize = (1,) + tcell_segments.shape[1:]
+        save_as_zarr(
+            img=tcell_segments, 
+            path=tcell_zarr_out_path, 
+            chunks=chunks
+            )
+    
+    if organoid_zarr_out_path.exists():
+       print("Skipping conversion of organoid segments to zarr, as file already exists")
+    else:
+        organoid_segments = load_image(organoid_segments_path)
+        chunksize = (1,) + organoid_segments.shape[1:]
+        save_as_zarr(
+            img=organoid_segments, 
+            path=organoid_zarr_out_path, 
+            chunks=chunks
+            )
+
+    if raw_image_zarr_out_path.exists():
+       print("Skipping conversion of raw_image to zarr, as file already exists")
+    else:
+        img = load_image(raw_image_path)
+        chunksize = (1,) + img.shape[1:]
+        save_as_zarr(
+            img=img, 
+            path=raw_image_zarr_out_path, 
+            chunks=chunks
+            )
+    
+    return(
+        tcell_zarr_out_path,
+        organoid_zarr_out_path,
+        raw_image_zarr_out_path
+    )
+
+
 
 def convert_segments_to_tracks(
         tracks_csv_path,

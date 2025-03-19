@@ -139,7 +139,6 @@ from scipy.spatial.distance import cdist
 from skimage.measure import regionprops_table
 import argparse
 import yaml
-from tifffile import imread
 from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -160,7 +159,10 @@ from plotnine import (
 import math
 import time
 from behav3d import format_time
- 
+from behav3d.utils.fileio import load_image
+from behav3d.preprocessing import convert_input_files_to_zarr
+
+
 def run_behav3d_feature_extraction(config, metadata, cell_type="tcells"):
    
     df_all_tracks=calculate_track_features(config, metadata, cell_type=cell_type)
@@ -221,7 +223,6 @@ def calculate_track_features(
         element_size_z=sample_metadata['pixel_distance_z']
         distance_unit=sample_metadata['distance_unit']
         dead_dye_threshold=sample_metadata['dead_dye_threshold']
-        
         
         img_outdir = Path(output_dir, "images", sample_name)
         track_outdir = Path(output_dir, "trackdata", sample_name)
@@ -322,21 +323,36 @@ def calculate_track_features(
             
             # df_tracks["organoid_contact"]=df_tracks["organoid_distance"]<=organoid_contact_threshold
             # df_tracks["tcell_contact"]=df_tracks["tcell_distance"]<=contact_threshold
-        else:
-            print("- Calculating contact with organoids and other T cells...")
-            print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
-            
+        else:           
             #TODO Add possibility to add multiple T cell types
             #TODO So both CD4 and CD8 segments, label the type for each track
             #TODO Then get distance and contact between all of them
             
+            print("- Converting all input files to .zarr for memory efficiency...")
+            tcell_segments_path, organoid_segments_path, raw_image_path = convert_input_files_to_zarr(
+                tcell_segments_path=tcell_segments_path,
+                organoid_segments_path=organoid_segments_path,
+                raw_image_path=raw_image_path,
+                outfolder=img_outdir
+            )
             # Load in the images containing the organoid segments and T cell segments
             # organoid_segments_path=Path(img_outdir, f"{sample_name}_organoids_tracked.tiff")
-            organoid_segments=imread(organoid_segments_path)
-            
+            organoid_segments=load_image(organoid_segments_path)
             # tcell_segments_path=Path(img_outdir, f"{sample_name}_tcells_tracked.tiff")
-            tcell_segments=imread(tcell_segments_path)
+            tcell_segments=load_image(tcell_segments_path)
+            intensity_image = load_image(raw_image_path)
             
+            print("- Calculating channel and especially death dye intensities...")
+            df_intensity=calculate_segment_intensity(
+                tcell_segments=tcell_segments,
+                intensity_image=intensity_image
+            )
+            if red_lym_channel is not None:
+                df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{red_lym_channel}":"mean_dead_dye"})
+            df_tracks = pd.merge(df_tracks, df_intensity, how="left")
+            
+            print("- Calculating contact with organoids and other T cells...")
+            print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
             # Calculate the contact od each T cell with an organoid or a T cell
             # Explanation on how in the function itself
             df_contacts=calculate_organoid_and_tcell_contact(
@@ -349,16 +365,6 @@ def calculate_track_features(
                 calculate_from=cell_type
             )
             df_tracks = pd.merge(df_tracks, df_contacts, how="left")
-            
-            print("- Calculating channel and especially death dye intensities...")
-            intensity_image = imread(raw_image_path)
-            df_intensity=calculate_segment_intensity(
-                tcell_segments=tcell_segments,
-                intensity_image=intensity_image
-            )
-            if red_lym_channel is not None:
-                df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{red_lym_channel}":"mean_dead_dye"})
-            df_tracks = pd.merge(df_tracks, df_intensity, how="left")
         
         # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
         # Values are interpolated linearly, forward filled or left blank based on the column
@@ -918,7 +924,8 @@ def calculate_organoid_and_tcell_contact(
     """
     df_contacts= []    
     for t, tcell_stack in enumerate(tcell_segments):
-        org_stack = organoid_segments[t,:,:,:]
+        tcell_stack = np.asarray(tcell_stack)
+        org_stack = np.asarray(organoid_segments[t,:,:,:])
         if calculate_from=="tcells":
             segments_stack=tcell_stack
         elif calculate_from=="organoids":
@@ -1006,6 +1013,8 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
     intensity_image=np.transpose(intensity_image, axes=[1,2,3,4,0])
     df_intensity = []
     for t, (tcell_stack, intensity_stack) in enumerate(zip(tcell_segments, intensity_image)):
+        tcell_stack = np.asarray(tcell_stack)
+        intensity_stack = np.asarray(intensity_stack)
         properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=intensity_stack, properties=['label', f'intensity_{calculation}']))
         properties["position_t"]=t
         df_intensity.append(properties)
