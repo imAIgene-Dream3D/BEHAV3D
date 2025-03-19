@@ -286,6 +286,8 @@ def calculate_track_features(
             grouped = df_tracks.groupby('position_t')
             new_dfs = []
 
+            ### The following code calculates the distances between all tracks of the same
+            ### type (So between for example CD4 and other CD4 cells)
             touching_tcells_dict = {}
             # Calculate distances between a segment and all other segments with cdist
             for group_name, group_df in grouped:
@@ -305,8 +307,16 @@ def calculate_track_features(
                     touching_tcells_dict[track_id] = tcell_contacts
 
                 group_df['tcell_contact'] = group_df['touching_tcells'].apply(lambda x: len(x) > 0)
-                group_df['touching_tcells'] = group_df['touching_tcells'].apply(lambda x: ",".join(map(str, x)) if isinstance(x, list) and len(x) > 0 else None)
 
+                ### As Imaris does not give interacting IDs, we can only add contact 
+                ### but leave the actual interacting ID as unknown
+                
+                if "complementary_tcell_distance" in df_tracks.columns:
+                    # !! ADJUST THIS THRESHOLD OR MOVE TO AFTER ADDING ALL TRACKS
+                    group_df['tcell_contact'] = group_df['complementary_tcell_distance']<=tcell_contact_threshold
+                    group_df['touching_tcells'].append("unknown")
+                group_df['touching_tcells'] = group_df['touching_tcells'].apply(lambda x: ",".join(map(str, x)) if isinstance(x, list) and len(x) > 0 else None)
+                
                 new_dfs.append(group_df)
             df_tracks = pd.concat(new_dfs, ignore_index=True)
             
@@ -315,6 +325,10 @@ def calculate_track_features(
         else:
             print("- Calculating contact with organoids and other T cells...")
             print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
+            
+            #TODO Add possibility to add multiple T cell types
+            #TODO So both CD4 and CD8 segments, label the type for each track
+            #TODO Then get distance and contact between all of them
             
             # Load in the images containing the organoid segments and T cell segments
             # organoid_segments_path=Path(img_outdir, f"{sample_name}_organoids_tracked.tiff")
@@ -470,6 +484,8 @@ def calculate_track_features(
         df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
         df_all_tracks = pd.concat([df_all_tracks, df_tracks])
         
+        ### TODO Add T cell contact calculation for all T cell types from centroid
+        ### 
         end_time = time.time()
         h,m,s = format_time(start_time, end_time)
         print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")

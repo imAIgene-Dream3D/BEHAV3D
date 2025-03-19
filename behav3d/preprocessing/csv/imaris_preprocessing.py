@@ -25,7 +25,7 @@ def run_imaris_preprocessing(
     if df_tcell_distances_path:
         df_tcelldist_imaris = pd.read_csv(df_tcell_distances_path, skiprows=3)
         df_tcelldist_imaris=df_tcelldist_imaris[["TrackID", "ID", "Time", "Shortest Distance to Surfaces"]]
-        df_tcelldist_imaris=df_tcelldist_imaris.rename(columns={"Shortest Distance to Surfaces": "tcell_distance"})
+        df_tcelldist_imaris=df_tcelldist_imaris.rename(columns={"Shortest Distance to Surfaces": "complementary_tcell_distance"})
         df_imaris = pd.merge(df_imaris, df_tcelldist_imaris)
         
     df_dye_imaris = pd.read_csv(df_dead_dye_means_path, skiprows=3)

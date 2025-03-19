@@ -1,3 +1,5 @@
+# For T cell analysis, Add the separate CD8 to CD4 distance calculation (Right now it only does distances between itself, so CD4 to CD4)
+
 # Create behavioral clustering based on features, as projecting new samples on DTW clustered data is not possible (To dispaly together,e verything has to be recalculated)
 
 # Add correction for drift in the images, some test images seems to ahve some flow due to imaging, not cells, leading to incorrect features
