@@ -11,6 +11,7 @@ import zarr
 import dask.array as da
 import shutil
 from time import sleep
+from behav3d.utils import element_to_dict
 
 def load_image(path, axis_order="TCZYX"):
     path = Path(path)
@@ -34,6 +35,22 @@ def load_image(path, axis_order="TCZYX"):
         user_axis_order = axis_order
         )
     return(img)
+
+def load_image_metadata(path):
+    path = Path(path)
+    if path.suffix==".czi":
+        metadata = load_czi_metadata(path)
+    elif path.suffix==".h5":
+        pass
+    elif path.suffix==".ims":
+        pass
+    elif path.suffix==".zarr" or str(path).endswith(".zarr.zip"):
+        pass
+    elif path.suffix==".tif" or path.suffix==".tiff":
+        pass
+    else:
+        raise ValueError(f"Unsupported file format: {path.suffix}")
+    return(metadata)
 
 def convert_axis_order(img, default_axis_order, user_axis_order):
     """
@@ -74,6 +91,46 @@ def load_czi(path, t=None, z=None, c=None):
     # np.squeeze removes preceding or trailing "empty" dimensions
     img = np.squeeze(img) # img.shape = (350, 3, 36, 200, 200)
     return(img)
+
+
+def load_czi_metadata(path):
+    """
+    Loading .czi metadata
+    """
+    czifile=CziFile(path)
+    metadata = element_to_dict(czifile.meta)
+        
+    try:
+        elsize_x = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]['AcquisitionBlock']['AcquisitionModeSetup']['ScalingX']["ScalingX"])*(10**6)
+        elsize_y = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]['AcquisitionBlock']['AcquisitionModeSetup']['ScalingY']["ScalingY"])*(10**6)
+        elsize_z = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]['AcquisitionBlock']['AcquisitionModeSetup']['ScalingZ']["ScalingZ"])*(10**6)
+    except:
+        elsize_x = float(metadata["Metadata"]["Scaling"]["Items"]["Distance"][0]["Value"]["Value"])*(10**6)
+        elsize_y = float(metadata["Metadata"]["Scaling"]["Items"]["Distance"][1]["Value"]["Value"])*(10**6)
+        elsize_z = float(metadata["Metadata"]["Scaling"]["Items"]["Distance"][2]["Value"]["Value"])*(10**6)
+    
+    #LSM880
+    try:
+        time_interval = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["TimeSeriesSetup"]["Switches"]["Switch"]["SwitchAction"]["SetIntervalAction"]["Interval"]["TimeSpan"]["Value"]["Value"])
+        interval_unit = metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["TimeSeriesSetup"]["Switches"]["Switch"]["SwitchAction"]["SetIntervalAction"]["Interval"]["TimeSpan"]["DefaultUnitFormat"]["DefaultUnitFormat"]
+        if interval_unit == "ms":
+            time_interval = time_interval / 1000
+    except:
+        time_interval = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["SubDimensionSetups"]["TimeSeriesSetup"]["Interval"]["TimeSpan"]["Value"]["Value"])
+        interval_unit = metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["SubDimensionSetups"]["TimeSeriesSetup"]["Interval"]["TimeSpan"]["DefaultUnitFormat"]["DefaultUnitFormat"]
+    
+    if interval_unit == "ms":
+        time_interval = time_interval / 1000
+    elif interval_unit == "min":
+        time_interval = time_interval * 60
+        
+    metadata = {
+        "elsize_x": elsize_x,
+        "elsize_y": elsize_y,
+        "elsize_z": elsize_z,
+        "time_interval": time_interval,
+    }
+    return(metadata)
 
 def load_h5(path, substruct):
     """

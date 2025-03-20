@@ -161,6 +161,7 @@ import time
 from behav3d import format_time
 from behav3d.utils.fileio import load_image
 from behav3d.preprocessing import convert_input_files_to_zarr
+from tqdm import tqdm
 
 
 def run_behav3d_feature_extraction(config, metadata, cell_type="tcells"):
@@ -179,6 +180,7 @@ def calculate_track_features(
     output_dir=None,
     cell_type="tcells",
     imaris=False,
+    overwrite=False
     ):
     """
     This code calculates the various features for each timepoint in a track for each 
@@ -327,7 +329,10 @@ def calculate_track_features(
             #TODO Add possibility to add multiple T cell types
             #TODO So both CD4 and CD8 segments, label the type for each track
             #TODO Then get distance and contact between all of them
-            
+            track_intermediate_outdir= Path(track_outdir, "intermediate_results")
+            if not track_intermediate_outdir.exists():
+                track_intermediate_outdir.mkdir()
+                
             print("- Converting all input files to .zarr for memory efficiency...")
             tcell_segments_path, organoid_segments_path, raw_image_path = convert_input_files_to_zarr(
                 tcell_segments_path=tcell_segments_path,
@@ -343,27 +348,42 @@ def calculate_track_features(
             intensity_image = load_image(raw_image_path)
             
             print("- Calculating channel and especially death dye intensities...")
-            df_intensity=calculate_segment_intensity(
-                tcell_segments=tcell_segments,
-                intensity_image=intensity_image
-            )
-            if red_lym_channel is not None:
-                df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{red_lym_channel}":"mean_dead_dye"})
+            df_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_intensity.csv")
+            if df_intensity_outpath.exists() and not overwrite:
+                print("Intensity calculation .csv already exists. Loading in intensity information...")
+                df_intensity = pd.read_csv(df_intensity_outpath)
+            else:
+                df_intensity=calculate_segment_intensity(
+                    tcell_segments=tcell_segments,
+                    intensity_image=intensity_image
+                )
+                if red_lym_channel is not None:
+                    df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{red_lym_channel}":"mean_dead_dye"})
+                df_intensity.to_csv(df_intensity_outpath, sep=",", index=False)
+            
             df_tracks = pd.merge(df_tracks, df_intensity, how="left")
             
             print("- Calculating contact with organoids and other T cells...")
             print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
             # Calculate the contact od each T cell with an organoid or a T cell
             # Explanation on how in the function itself
-            df_contacts=calculate_organoid_and_tcell_contact(
-                tcell_segments=tcell_segments,
-                organoid_segments=organoid_segments,
-                element_size_x=element_size_x,
-                element_size_y=element_size_y,
-                element_size_z=element_size_z,
-                contact_threshold=contact_threshold,
-                calculate_from=cell_type
-            )
+            df_contacts_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_contact.csv")
+            if df_contacts_outpath.exists() and not overwrite:
+                print("Contact .csv already exists. Loading in contact information...")
+                df_contacts = pd.read_csv(df_contacts_outpath)
+            else:
+                df_contacts=calculate_organoid_and_tcell_contact(
+                    tcell_segments=tcell_segments,
+                    organoid_segments=organoid_segments,
+                    element_size_x=element_size_x,
+                    element_size_y=element_size_y,
+                    element_size_z=element_size_z,
+                    contact_threshold=contact_threshold,
+                    calculate_from=cell_type
+                )
+                   
+            df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
+            
             df_tracks = pd.merge(df_tracks, df_contacts, how="left")
         
         # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
@@ -878,7 +898,7 @@ def calculate_organoid_distance(
     element_size_z
     ):
     df_dist_organoid = []
-    for t, tcell_stack in enumerate(tcell_segments):
+    for t, tcell_stack in tqdm(enumerate(tcell_segments), total=len(tcell_segments)):
         org_stack = organoid_segments[t,:,:,:]
         mask_org= np.ma.masked_where(org_stack==0, org_stack)
         dist_org=distance_transform_edt(mask_org.mask)
@@ -923,7 +943,7 @@ def calculate_organoid_and_tcell_contact(
     by the element_sizes
     """
     df_contacts= []    
-    for t, tcell_stack in enumerate(tcell_segments):
+    for t, tcell_stack in tqdm(enumerate(tcell_segments), total=len(tcell_segments)):
         tcell_stack = np.asarray(tcell_stack)
         org_stack = np.asarray(organoid_segments[t,:,:,:])
         if calculate_from=="tcells":
@@ -1009,10 +1029,10 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
     The calculation can be the minimum, maximum, mean or median
     """
     assert calculation in ["min", "max", "mean", "median"]
-    
-    intensity_image=np.transpose(intensity_image, axes=[1,2,3,4,0])
+    intensity_image=np.transpose(intensity_image, axes=[0,2,3,4,1])
     df_intensity = []
-    for t, (tcell_stack, intensity_stack) in enumerate(zip(tcell_segments, intensity_image)):
+    # for t, (tcell_stack, intensity_stack) in enumerate(zip(tcell_segments, intensity_image)):      
+    for t, (tcell_stack, intensity_stack) in tqdm(enumerate(zip(tcell_segments, intensity_image)),total=len(tcell_segments)):      
         tcell_stack = np.asarray(tcell_stack)
         intensity_stack = np.asarray(intensity_stack)
         properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=intensity_stack, properties=['label', f'intensity_{calculation}']))
