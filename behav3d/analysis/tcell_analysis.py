@@ -102,7 +102,7 @@ def run_tcell_analysis(
     
     df_clusters = cluster_umap(
         umap_embedding=umap_embedding,
-        output_dir = analysis_outdir,
+        output_dir = output_dir,
         nr_of_clusters=nr_of_clusters,
         df_tracks=df_tracks,
         df_tracks_summarized=df_tracks_summarized,
@@ -257,23 +257,147 @@ def cluster_umap(
     df_umap.to_csv(df_umap_out_path, sep=",", index=False)
 
     print("- Producing clustered UMAP plots with displayed Track features")
-    umap_plots = []
-    
     sample_cols = ["organoid_line", "tcell_line"]
     info_cols = df_umap.drop(columns=["TrackID", "sample_name", "well", "exp_nr", "UMAP1", "UMAP2", "ClusterID"]).columns
     
-    rows_per_page = 4
-    nr_cols = 2
-    rows_first_img = 2
-    figsize = (8.27, 11.69)  # A4 portrait
+    cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_UMAP_clusters.pdf")
+    create_umap_plot(
+        df_umap=df_umap,
+        info_cols=info_cols,
+        sample_cols=sample_cols,
+        outpath=cluster_UMAP_path,
+        rows_per_page = 4,
+        nr_cols = 2,
+        rows_first_img = 2,
+        figsize = (8.27, 11.69)
+    )
+    
+    ### Producing a heatmap of the summarized features again summarized over all tracks
+    ### Belonging to that cluster
+    print("- Producing heatmaps with summarized cluster features")
+    cluster_features_heatmap_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_feature_heatmap.pdf")
+    create_heatmap_plot(
+        df_umap,
+        info_cols,
+        sample_cols,
+        cluster_features_heatmap_path,
+        rows_per_page = 7,
+        nr_cols = 2,
+        rows_first_img = 4,
+        figsize = (8.27, 11.69)
+    )
 
+    print("- Producing percentage plots of each cluster per combination of T-cell and organoid line")
+    df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "ClusterID"]).size().reset_index(name='count')
+    total_counts = df_clust_perc.groupby(['organoid_line', 'tcell_line'])['count'].sum().reset_index(name='total_count')
+    
+    df_clust_perc = pd.merge(df_clust_perc, total_counts)
+    df_clust_perc["percentage"] = (df_clust_perc['count'] / df_clust_perc['total_count'])
+    
+    cluster_percentage_plot_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_percentages.pdf")
+    create_percentage_plot(
+        df_clust_perc,
+        cluster_percentage_plot_path
+    )
+        
+    df_clust_perc = df_clust_perc.reset_index(drop=True)
+    df_clust_perc_out_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_percentages.csv")
+    print(f"- Writing summarized tracks to {df_clust_perc_out_path}")
+    df_clust_perc.to_csv(df_clust_perc_out_path, sep=",", index=False)
+    
+    return()
+
+def create_percentage_plot(
+    df_clust_perc,
+    outpath
+    ):
+    with PdfPages(outpath) as pdf:
+        tcell_lines = df_clust_perc['tcell_line'].unique()
+        organoid_lines = df_clust_perc['organoid_line'].unique()
+        
+        fig, axes = plt.subplots(
+            len(tcell_lines), 
+            len(organoid_lines), 
+            figsize=(20, 10), sharex=True, sharey=True)
+
+        axes = np.atleast_2d(axes)
+        # Plot horizontal stacked bar charts
+        for i, tcell_line in enumerate(tcell_lines):
+            for j, organoid_line in enumerate(organoid_lines):
+                ax = axes[i, j]
+                subset = df_clust_perc[(df_clust_perc['tcell_line'] == tcell_line) & (df_clust_perc['organoid_line'] == organoid_line)]
+                if i == 0:
+                    ax.set_title(f'{organoid_line}', fontsize=30)
+                if j == 0:
+                    ax.set_ylabel(f'{tcell_line}', fontsize=30) 
+                if subset.empty:
+                    ax.spines['top'].set_visible(False)
+                    ax.spines['right'].set_visible(False)
+                    ax.spines['left'].set_visible(False)
+                    ax.spines['bottom'].set_visible(False)
+                    continue
+                subset_pivot = subset.pivot(index='tcell_line', columns='ClusterID', values='percentage').fillna(0)
+                subset_pivot.plot(kind='barh', stacked=True, ax=ax, legend=False)
+                if i == 0:
+                    ax.set_title(f'{organoid_line}', fontsize=30)
+                if j == 0:
+                    print(tcell_line)
+                    ax.set_ylabel(f'{tcell_line}', fontsize=30) 
+    
+                num_cells = subset['count'].sum()
+                ax.text(
+                    0.5, 
+                    0.1, 
+                    f'# Cells: {num_cells}', 
+                    ha='center', 
+                    va='center', 
+                    transform=ax.transAxes, 
+                    fontsize=20
+                    )
+                
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_xticklabels([])
+                ax.set_yticklabels([])
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.spines['left'].set_visible(False)
+                ax.spines['bottom'].set_visible(False)
+                
+                # ax.set_xlabel('Percentage')
+
+         # Add legend
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(
+            handles, 
+            labels, 
+            fontsize=30,
+            title='ClusterID', 
+            title_fontsize=30,
+            bbox_to_anchor=(0.9, 0.5), 
+            loc='center left')
+        fig.tight_layout(rect=[0, 0, 0.85, 1])
+        plt.show()
+        pdf.savefig(fig, bbox_inches='tight', dpi=600)
+        plt.close(fig)
+            
+def create_umap_plot(
+    df_umap,
+    info_cols,
+    sample_cols,
+    outpath,
+    rows_per_page = 4,
+    nr_cols = 2,
+    rows_first_img = 2,
+    figsize = (8.27, 11.69)
+    ):
     n_plots = len(info_cols)
     n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0) + rows_first_img
     nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
 
     # Create PDF file
-    cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_UMAP_clusters.pdf")
-    with PdfPages(cluster_UMAP_path) as pdf:
+    
+    with PdfPages(outpath) as pdf:
         plot_idx = 0  # Track which plot we are adding
 
         for page in range(nr_pages):
@@ -376,143 +500,101 @@ def cluster_umap(
             plt.show()
             pdf.savefig(fig, dpi=600)
             plt.close(fig)
-    ### Producing a heatmap of the summarized features again summarized over all tracks
-    ### Belonging to that cluster
-    
-    print("- Producing heatmaps with summarized cluster features")
-    cluster_means = df_umap.drop(
-        columns=[
-            "sample_name", 
-            "organoid_line", 
-            "tcell_line",
-            "well",
-            "exp_nr",
-            "UMAP1",
-            "UMAP2",
-            "TrackID"
-            ]).groupby('ClusterID').mean().reset_index()
+
+def create_heatmap_plot(
+    df_umap,
+    info_cols,
+    sample_cols,
+    outpath,
+    rows_per_page = 7,
+    nr_cols = 2,
+    rows_first_img = 4,
+    figsize = (8.27, 11.69)
+    ):
+
+    # Producing heatmaps with summarized cluster features
+    cluster_means = df_umap[list(info_cols)+["ClusterID"]].drop(columns=sample_cols).groupby('ClusterID').mean().reset_index()
     df_heatmap = cluster_means.melt(id_vars='ClusterID', var_name='var', value_name='value')
-    
-    ### Plot the heatmap separated per feature, but scale in original values
-    columns = df_heatmap["var"].unique()
-    heatmaps = []
-    
-    for col in columns:
-        col_heatmap = df_heatmap[df_heatmap["var"]==col]
-        heatmap_plot = (
-            ggplot(col_heatmap, aes(x='ClusterID', y='var', fill='value')) +
-            geom_tile() +
-            labs(x='ClusterID', y='', fill='Value', title="") +
-            scale_fill_cmap(limits=(0, None))+
-            theme_minimal() +
-            theme(plot_margin = 0, 
-                  legend_key_height=10, 
-                  legend_key_width=10,
-                  legend_title=element_blank(),
-                  axis_text_x=element_text(size=12), 
-                  axis_text_y=element_text(size=12)
-                  )
-        )
-        heatmaps.append(heatmap_plot)
-    
-    ### Plot an overall heatmap where every feature is scaled from 0 to 1
-    cluster_means_scaled=cluster_means
-    scale_columns = cluster_means_scaled.columns[cluster_means.columns!="ClusterID"]
+
+    # Plot an overall heatmap where every feature is scaled from 0 to 1
+    cluster_means_scaled = cluster_means.copy()
+    scale_columns = cluster_means_scaled.columns[cluster_means.columns != "ClusterID"]
     cluster_means_scaled[scale_columns] = MinMaxScaler().fit_transform(cluster_means_scaled[scale_columns])
-    df_heatmap_scaled = cluster_means.melt(id_vars='ClusterID', var_name='var', value_name='AU')
-    
-    scaled_heatmap_plot = (
-        ggplot(df_heatmap_scaled, aes(x='ClusterID', y='var', fill='AU')) +
-        geom_tile() +
-        labs(x='ClusterID', y='', fill='AU', title="Min-Max scaled heatmap") +
-        scale_fill_cmap(limits=(0, None))+
-        theme_minimal() +
-        theme(plot_margin = 0, 
-              legend_key_height=40, 
-              legend_key_width=20,
-            #   legend_title=element_blank(),
-              plot_title=element_text(size=25),
-              legend_text=element_text(size=14),
-              axis_text_x=element_text(size=16), 
-              axis_text_y=element_text(size=16)
-              )
-        )
-    
-    combined_heatmaps = structure_plotnine(
-        heatmaps, 
-        figsize=(4,1), 
-        nr_cols=2, 
-        append_to=pw.load_ggplot(scaled_heatmap_plot, figsize=[4,4])
-        ) 
-    
-    # combined_heatmaps = structure_plotnine(heatmaps, figsize=(3,0.5), nr_cols=2) 
-    cluster_features_heatmap_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_feature_heatmap.pdf")
-    combined_heatmaps.savefig(cluster_features_heatmap_path)
-    display(combined_heatmaps)
+    df_heatmap_scaled = cluster_means_scaled.melt(id_vars='ClusterID', var_name='var', value_name='AU')
 
-    # START HERE
+    overall_heatmap_data = df_heatmap_scaled.pivot(index="var", columns="ClusterID", values="AU")
     
+    # Plot the heatmap separated per feature, but scale in original values
+    columns = df_heatmap["var"].unique()
     
-    # cluster_means
-    
-    print("- Producing percentage plots of each cluster per combination of T-cell and organoid line")
-    df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "ClusterID"]).size().reset_index(name='count')
-    total_counts = df_clust_perc.groupby(['organoid_line', 'tcell_line'])['count'].sum().reset_index(name='total_count')
-    df_clust_perc = pd.merge(df_clust_perc, total_counts)
-    df_clust_perc["percentage"] = (df_clust_perc['count'] / df_clust_perc['total_count'])
+    n_plots = len(columns)
+    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0) + rows_first_img
+    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
+    with PdfPages(outpath) as pdf:
+        plot_idx = 0  # Track which plot we are adding
 
-    total_counts_facet = df_clust_perc.groupby(['organoid_line', 'tcell_line'])['total_count'].mean().reset_index()
-    total_counts["total_count"] = '# Cells: ' + total_counts["total_count"].astype("string")
-    
-    plot = (
-        ggplot(df_clust_perc) + 
-        geom_col(aes(x=0, y='percentage', fill='ClusterID')) + 
-        # geom_text(aes(x=0, y=1,label='sum(count)'), va='bottom', size=8, position='identity') +
-        theme_void() + 
-        facet_grid('tcell_line ~ organoid_line', scales='free_y') +
-        labs(x='', y='ClusterID', title='Horizontal Stacked Bar Chart') +
-        coord_flip() +
-        theme(aspect_ratio = 0.2) +
-        # geom_text(data=total_counts, aes(x=0, y=1,label='sum(count)'), va='bottom', size=8, position='identity') 
-        geom_text(aes(label="total_count", x=-1.0, y=0.5), data=total_counts, va='bottom', size=8, position='identity')
-        # annotate('text', x=0.5, y=105, label=lambda d: f"Total Count: {d['total_count'].iloc[0]}", size=12)
-    )
-    cluster_percentage_plot_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_percentages.pdf")
-    plot.save(cluster_percentage_plot_path, width=8, height=8)
+        for page in range(nr_pages):
+            fig = plt.figure(figsize=figsize)
+            gs = GridSpec(rows_per_page, nr_cols, figure=fig, hspace=1.5, wspace=0.3)
 
-    display(plot)
-    
-    df_clust_perc = df_clust_perc.reset_index(drop=True)
-    df_clust_perc_out_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_percentages.csv")
-    print(f"- Writing summarized tracks to {df_clust_perc_out_path}")
-    df_clust_perc.to_csv(df_clust_perc_out_path, sep=",", index=False)
-    
-    return()
+            # First image on the first page
+            if page == 0:
+                ax = fig.add_subplot(gs[:rows_first_img, :])
+                heatmap = sns.heatmap(overall_heatmap_data, ax=ax, cmap="viridis", cbar=True)
+                ax.set_title("Min-Max scaled heatmap", fontsize=16)
+                ax.set_xlabel("ClusterID")
+                ax.set_ylabel("")
+                ax.tick_params(axis='y', labelsize=8)
+                cbar = heatmap.collections[0].colorbar
+                cbar.ax.tick_params(labelsize=12)
+            # Remaining plots
+            remaining_axes = [
+                fig.add_subplot(gs[i, j])
+                for i in range(rows_first_img if page == 0 else 0, rows_per_page)
+                for j in range(nr_cols)
+            ]
 
+            for ax in remaining_axes:
+                if plot_idx >= len(columns):
+                    ax.remove()  # Remove empty axes
+                    continue
+                col = columns[plot_idx]
+                col_heatmap = df_heatmap[df_heatmap["var"] == col].pivot(index="var", columns="ClusterID", values="value")
+                vmin=0
+                vmax = round_legend_ticks(df_heatmap[df_heatmap["var"] == col]["value"].max())
+                
+                heatmap = sns.heatmap(col_heatmap, ax=ax, cmap="viridis", cbar=True, vmin=0, vmax=vmax)
+                ax.set_title(col)
+                ax.set_xlabel("ClusterID")
+                ax.set_ylabel("")
+                # ax.set_xticks([])
+                ax.set_yticks([])
+                # ax.set_xticklabels([])
+                ax.set_yticklabels([])
+                cbar = heatmap.collections[0].colorbar
+                cbar.ax.tick_params(labelsize=8)  # Adjust font size of colorbar ticks
+                cbar.set_ticks([vmin, vmax/2, vmax])
+                plot_idx += 1  # Move to the next plot
 
-    
-# def structure_plotnine(
-#         plotlist,
-#         figsize=[3,0.5],
-#         nr_cols=2,
-#         append_to=None
-#         ):
-#         comb_plot=append_to
-#         plotlist = [pw.load_ggplot(plot, figsize=figsize) for plot in plotlist]
-#         for idr in range(0, len(plotlist), nr_cols):
-#             rowplots = plotlist[idr]
-#             for idc in range(1,nr_cols):
-#                 if idc+idr+1 <= len(plotlist):
-#                     rowplots |= plotlist[idc+idr]
-#                 else:
-#                     rowplots |= pw.load_ggplot((ggplot()+geom_blank()+theme_void()), figsize=figsize)
+            # Save and close the figure for this page
+            # fig.tight_layout()
+            fig.subplots_adjust(left=0.2, right=0.95, top=0.95, bottom=0.05)
+            # fig.tight_layout(pad=2.0)
+            # fig.set_constrained_layout(True)
+            plt.show()
+            pdf.savefig(fig, dpi=600)
+            plt.close(fig)
 
-#                 if comb_plot is None:
-#                     comb_plot= rowplots
-#                 else:
-#                     comb_plot /= (rowplots)
-#         return(comb_plot)
-    
+def round_legend_ticks(value):
+    if value <= 1.0:
+        # return np.ceil(value * 10) / 10
+        return 1.0
+    elif value <= 100:
+        return np.ceil(value / 10) * 10
+    elif value <= 10000:
+        return np.ceil(value / 500) * 500
+    return value
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
