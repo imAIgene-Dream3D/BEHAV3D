@@ -30,6 +30,7 @@ import numpy as np
 import umap
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.gridspec import GridSpec
 import patchworklib as pw
 import random
 from sklearn.cluster import KMeans
@@ -39,6 +40,7 @@ from pathlib import Path
 from behav3d import format_time
 import yaml
 import time
+import seaborn as sns
 # df_tracks=df_tracks[df_tracks["relative_time"]<=30]
 
 def run_tcell_analysis(
@@ -257,46 +259,123 @@ def cluster_umap(
     print("- Producing clustered UMAP plots with displayed Track features")
     umap_plots = []
     
+    sample_cols = ["organoid_line", "tcell_line"]
     info_cols = df_umap.drop(columns=["TrackID", "sample_name", "well", "exp_nr", "UMAP1", "UMAP2", "ClusterID"]).columns
     
-    ### Plotting the main UMAP with clusters at the top with 2 columns of UMAP with overlayed features
-    cluster_plot = (
-            ggplot(df_umap, aes(x='UMAP1', y='UMAP2', color="ClusterID")) +
-            geom_point(size=4, alpha=0.8) +
-            labs(color="ClusterID") +
-            labs(title="ClusterID") +
-            labs(x="", y="") +
-            theme_light(base_size=20) +
-            theme_bw() +
-            theme(axis_text_x=element_blank(), axis_text_y=element_blank(), aspect_ratio=1) +
-            coord_fixed()
-        )
-        
-    for colorcol in info_cols:
-        plot = (
-            ggplot(df_umap, aes(x='UMAP1', y='UMAP2', color=colorcol)) +
-            geom_point(size=2, alpha=0.6) + #show_legend=False
-            labs(color=colorcol) +
-            labs(title=colorcol) +
-            labs(x="", y="") +
-            theme_light(base_size=20) +
-            theme_bw() +
-            theme(axis_text_x=element_blank(), axis_text_y=element_blank(), aspect_ratio=1) +
-            coord_fixed()
-        )
-        umap_plots.append(plot)
-    
-    combined_umaps = structure_plotnine(
-        umap_plots, 
-        figsize=(4,4), 
-        nr_cols=2, 
-        append_to=pw.load_ggplot(cluster_plot, figsize=[4,4])
-        ) 
-    
+    rows_per_page = 4
+    nr_cols = 2
+    rows_first_img = 2
+    figsize = (8.27, 11.69)  # A4 portrait
+
+    n_plots = len(info_cols)
+    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0) + rows_first_img
+    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
+
+    # Create PDF file
     cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_UMAP_clusters.pdf")
-    combined_umaps.savefig(cluster_UMAP_path)
-    
-    display(combined_umaps)
+    with PdfPages(cluster_UMAP_path) as pdf:
+        plot_idx = 0  # Track which plot we are adding
+
+        for page in range(nr_pages):
+            fig = plt.figure(figsize=figsize)
+            gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.3)
+
+            # First image on the first page
+            if page == 0:
+                ax = fig.add_subplot(gs[:rows_first_img, :])
+                sns.scatterplot(
+                    data=df_umap,
+                    x="UMAP1",
+                    y="UMAP2",
+                    hue="ClusterID",
+                    s=40,
+                    alpha=0.95,
+                    palette="Set1",
+                    ax=ax,
+                )
+                ax.legend(
+                    loc="upper left", 
+                    prop={'size': 8}, 
+                    bbox_to_anchor=(1, 1), 
+                    borderpad=0.3, 
+                    labelspacing=0.4,
+                    columnspacing=0.1,
+                    frameon=False
+                    )
+                # legend.set_title("ClusterID", prop={'size': 9})
+                ax.set_title("ClusterID", fontsize=10, loc='center')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_xticklabels([])
+                ax.set_yticklabels([])
+                ax.set_xlabel("")
+                ax.set_ylabel("")
+                # plot_idx += 1  # Increment for the next plots
+
+            # Remaining plots
+            remaining_axes = [
+                fig.add_subplot(gs[i, j])
+                for i in range(rows_first_img if page == 0 else 0, rows_per_page)
+                for j in range(nr_cols)
+            ]
+
+            for ax in remaining_axes:
+                if plot_idx >= len(info_cols):
+                    ax.remove()  # Remove empty axes
+                    continue
+                colorcol = info_cols[plot_idx]
+                if colorcol in sample_cols or df_umap.dtypes[colorcol]==bool:
+                    sns.scatterplot(
+                        data=df_umap,
+                        x="UMAP1",
+                        y="UMAP2",
+                        s=40,
+                        hue=colorcol,
+                        alpha=0.8,
+                        palette="Set2",
+                        ax=ax
+                    )
+                else:
+                    sns.scatterplot(
+                        data=df_umap,
+                        x="UMAP1",
+                        y="UMAP2",
+                        s=40,
+                        hue=colorcol,
+                        palette="viridis",
+                        alpha=0.6,
+                        ax=ax
+                    )
+
+                # Reduce legend size & move outside plot
+                ax.legend(
+                    loc="upper left", 
+                    prop={'size': 8}, 
+                    bbox_to_anchor=(1, 1), 
+                    borderpad=0.3, 
+                    labelspacing=0.4,
+                    columnspacing=0.1,
+                    frameon=False
+                    )
+                # legend.set_title(colorcol, prop={'size': 9})
+                ax.set_title(colorcol, fontsize=10, loc='center')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_xticklabels([])
+                ax.set_yticklabels([])
+                ax.set_xlabel("")
+                ax.set_ylabel("")
+
+                plot_idx += 1  # Move to the next plot
+
+            # Save and close the figure for this page
+            # fig.tight_layout()
+            fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
+            # fig.tight_layout(pad=2.0)
+            # fig.set_constrained_layout(True)
+            plt.show()
+            pdf.savefig(fig, dpi=600)
+            plt.close(fig)
     ### Producing a heatmap of the summarized features again summarized over all tracks
     ### Belonging to that cluster
     
@@ -410,27 +489,29 @@ def cluster_umap(
     
     return()
 
-def structure_plotnine(
-        plotlist,
-        figsize=[3,0.5],
-        nr_cols=2,
-        append_to=None
-        ):
-        comb_plot=append_to
-        plotlist = [pw.load_ggplot(plot, figsize=figsize) for plot in plotlist]
-        for idr in range(0, len(plotlist), nr_cols):
-            rowplots = plotlist[idr]
-            for idc in range(1,nr_cols):
-                if idc+idr+1 <= len(plotlist):
-                    rowplots |= plotlist[idc+idr]
-                else:
-                    rowplots |= pw.load_ggplot((ggplot()+geom_blank()+theme_void()), figsize=figsize)
 
-                if comb_plot is None:
-                    comb_plot= rowplots
-                else:
-                    comb_plot /= (rowplots)
-        return(comb_plot)
+    
+# def structure_plotnine(
+#         plotlist,
+#         figsize=[3,0.5],
+#         nr_cols=2,
+#         append_to=None
+#         ):
+#         comb_plot=append_to
+#         plotlist = [pw.load_ggplot(plot, figsize=figsize) for plot in plotlist]
+#         for idr in range(0, len(plotlist), nr_cols):
+#             rowplots = plotlist[idr]
+#             for idc in range(1,nr_cols):
+#                 if idc+idr+1 <= len(plotlist):
+#                     rowplots |= plotlist[idc+idr]
+#                 else:
+#                     rowplots |= pw.load_ggplot((ggplot()+geom_blank()+theme_void()), figsize=figsize)
+
+#                 if comb_plot is None:
+#                     comb_plot= rowplots
+#                 else:
+#                     comb_plot /= (rowplots)
+#         return(comb_plot)
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

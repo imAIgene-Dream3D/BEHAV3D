@@ -329,6 +329,7 @@ def calculate_track_features(
             #TODO Add possibility to add multiple T cell types
             #TODO So both CD4 and CD8 segments, label the type for each track
             #TODO Then get distance and contact between all of them
+            #TODO Perhaps allow for input of the track df that already has T cell type in there
             track_intermediate_outdir= Path(track_outdir, "intermediate_results")
             if not track_intermediate_outdir.exists():
                 track_intermediate_outdir.mkdir()
@@ -338,7 +339,8 @@ def calculate_track_features(
                 tcell_segments_path=tcell_segments_path,
                 organoid_segments_path=organoid_segments_path,
                 raw_image_path=raw_image_path,
-                outfolder=img_outdir
+                outfolder=img_outdir,
+                overwrite=overwrite
             )
             # Load in the images containing the organoid segments and T cell segments
             # organoid_segments_path=Path(img_outdir, f"{sample_name}_organoids_tracked.tiff")
@@ -380,9 +382,8 @@ def calculate_track_features(
                     element_size_z=element_size_z,
                     contact_threshold=contact_threshold,
                     calculate_from=cell_type
-                )
-                   
-            df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
+                ) 
+                df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
             
             df_tracks = pd.merge(df_tracks, df_contacts, how="left")
         
@@ -1044,7 +1045,7 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
     column_mapping = {}
     for i in range(df_intensity.shape[1]):
         old_col_name = f'intensity_mean-{i}'
-        new_col_name = f'mean_intensity_ch{i}'
+        new_col_name = f'mean_intensity_ch{i+1}'
         column_mapping[old_col_name] = new_col_name
     column_mapping["label"]="TrackID"
     df_intensity=df_intensity.rename(columns=column_mapping)

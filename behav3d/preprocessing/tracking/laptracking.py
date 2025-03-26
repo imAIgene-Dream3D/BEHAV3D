@@ -14,6 +14,7 @@ import time
 import math
 import time
 from laptrack import LapTrack
+from tqdm import tqdm
 
 def run_lap_tracking(
     segments,
@@ -59,21 +60,24 @@ def run_lap_tracking(
             columns={
                     'track_id': 'TrackID',
                     'label': 'SegmentID',
+                    'centroid-0': "pixel_position_z",
+                    'centroid-1': "pixel_position_y",
+                    'centroid-2': "pixel_position_x",
                 }, 
             inplace=True
         )
     
+    df_tracks["TrackID"]+=1
     # select only the columns we need
-    df_tracks = df_tracks[["position_t", "position_x", "position_y", "position_z", "TrackID", "SegmentID"]]
+    df_tracks = df_tracks[["TrackID", "SegmentID", "position_t", "position_x", "position_y", "position_z", "pixel_position_x", "pixel_position_y", "pixel_position_z"]]
     
     if return_trackimg:
         tracked_img = np.zeros_like(segments)
         
-        for t, t_seg in enumerate(segments):
-            print(t)
+        for t, t_seg in tqdm(enumerate(segments), total=len(segments)):
             t_df_tracks = df_tracks[df_tracks["position_t"]==t]
             for _, row in t_df_tracks.iterrows():
-                # print(row["label"], row["track_id"], (tracked_img[t]==row["label"]).any())
+                # print(row["SegmentID"], row["TrackID"], (tracked_img[t]==row["SegmentID"]).any())
                 tracked_img[t][t_seg==row["SegmentID"]] = row["TrackID"]
         
         return df_tracks, tracked_img

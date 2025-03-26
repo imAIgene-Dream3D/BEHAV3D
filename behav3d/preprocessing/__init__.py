@@ -11,7 +11,8 @@ def convert_input_files_to_zarr(
     organoid_segments_path,
     raw_image_path,
     outfolder = None,
-    chunks=None
+    chunks=None,
+    overwrite=False
     ):
     
     tcell_segments_path = Path(tcell_segments_path)
@@ -27,7 +28,7 @@ def convert_input_files_to_zarr(
         organoid_zarr_out_path = Path(outfolder, organoid_segments_path.stem + ".zarr.zip")
         raw_image_zarr_out_path = Path(outfolder, raw_image_path.stem + ".zarr.zip")
     
-    if tcell_zarr_out_path.exists():
+    if tcell_zarr_out_path.exists() and not overwrite:
         print("Skipping conversion of tcell segments to zarr, as file already exists")
     else:
         tcell_segments = load_image(tcell_segments_path)
@@ -38,7 +39,7 @@ def convert_input_files_to_zarr(
             chunks=chunks
             )
     
-    if organoid_zarr_out_path.exists():
+    if organoid_zarr_out_path.exists() and not overwrite:
        print("Skipping conversion of organoid segments to zarr, as file already exists")
     else:
         organoid_segments = load_image(organoid_segments_path)
@@ -49,7 +50,7 @@ def convert_input_files_to_zarr(
             chunks=chunks
             )
 
-    if raw_image_zarr_out_path.exists():
+    if raw_image_zarr_out_path.exists() and not overwrite:
        print("Skipping conversion of raw_image to zarr, as file already exists")
     else:
         img = load_image(raw_image_path)
