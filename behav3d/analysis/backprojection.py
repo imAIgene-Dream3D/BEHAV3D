@@ -1,13 +1,14 @@
 import napari
 import numpy as np
 import pandas as pd
-from tifffile import imread, imwrite
 from pathlib import Path
 import h5py
 import yaml
 import time
 import argparse
 from behav3d import format_time
+from behav3d.utils.fileio import load_image
+
 # df_tracks=df_tracks[df_tracks["relative_time"]<=30]
 
 def backproject_behav3d(
@@ -51,7 +52,7 @@ def backproject_behav3d(
         ]
     
     backproj_out_path = Path(backproj_outdir, f"{track_img_path.stem}_backprojected.h5")
-    raw_img = imread(raw_img_path)
+    raw_img = load_image(raw_img_path)
     
     raw_img_data = {
             "raw_data":{
@@ -61,7 +62,7 @@ def backproject_behav3d(
             }
     
     print("- Loading in tracked segments")
-    track_img = imread(track_img_path)
+    track_img = load_image(track_img_path)
     
     df_tracks_clustered=pd.read_csv(Path(results_outdir, "BEHAV3D_UMAP_clusters.csv"))
     track_img = np.where(np.isin(track_img, df_tracks_clustered["TrackID"].unique()), track_img, 0)

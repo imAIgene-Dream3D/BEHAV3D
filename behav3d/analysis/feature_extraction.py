@@ -140,22 +140,13 @@ from skimage.measure import regionprops_table
 import argparse
 import yaml
 from pathlib import Path
+
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.gridspec import GridSpec
+
 import seaborn as sns
-from plotnine import (
-    ggplot, 
-    aes, 
-    geom_bar, 
-    geom_violin, 
-    geom_jitter, 
-    facet_grid, 
-    labs, 
-    theme, 
-    element_text, 
-    theme_minimal,
-    theme_bw,
-    scale_x_continuous
-)
+
 import math
 import time
 from behav3d import format_time
@@ -600,19 +591,47 @@ def filter_tracks(
 
     # Plot the number of cells having contact with another T cell and Organoid for analysis
     # of the set contact_threshold
-    plot_tcell_touching = plot_touching_nontouching_distribution(
+    plot_tcell_touching_outpath = Path(qc_outdir, f"BEHAV3D_tcell_touching_distribution.pdf")
+    print(f"- Plotting tcell touching distribution to {plot_tcell_touching_outpath}")
+    plot_touching_nontouching_distribution(
         df_all_tracks_filt, 
-        contact_column="tcell_contact"
+        outpath=plot_tcell_touching_outpath,
+        contact_column="tcell_contact",
+        nr_cols=3,
+        rows_per_page = 3,
         )
-    plot_org_touching = plot_touching_nontouching_distribution(
+    
+    plot_organoid_touching_outpath = Path(qc_outdir, f"BEHAV3D_organoid_touching_distribution.pdf")
+    print(f"- Plotting organoid touching distribution to {plot_organoid_touching_outpath}")
+    plot_touching_nontouching_distribution(
         df_all_tracks_filt, 
-        contact_column="organoid_contact"
+        outpath=plot_organoid_touching_outpath,
+        contact_column="organoid_contact",
+        nr_cols=3,
+        rows_per_page=3,
         )
+    
+    
     
     # Plot the distribution of dead dye intensity of all timepoints and at timepoint 1
     # Can be used to aid in the choice of dead_dye_threshold
-    dead_dye_distr=plot_dead_dye_distribution(df_all_tracks_filt)
-    dead_dye_distr_t0=plot_dead_dye_distribution(df_all_tracks_filt[df_all_tracks_filt["relative_time"]==1])
+    plot_dead_dye_distr_outpath = Path(qc_outdir, f"BEHAV3D_dead_dye_distribution.pdf")
+    print(f"- Plotting dead dye distribution at all timepoints to {plot_dead_dye_distr_outpath}")
+    plot_dead_dye_distribution(
+        df_all_tracks_filt,
+        outpath=plot_dead_dye_distr_outpath,
+        nr_cols=2,
+        rows_per_page=2
+        )
+    
+    plot_dead_dye_distr_t0_outpath = Path(qc_outdir, f"BEHAV3D_dead_dye_distribution_t0.pdf")
+    print(f"- Plotting dead dye distribution at timepoint 1 to {plot_dead_dye_distr_outpath}")
+    plot_dead_dye_distribution(
+        df_all_tracks_filt[df_all_tracks_filt["relative_time"]==1],
+        outpath=plot_dead_dye_distr_t0_outpath,
+        nr_cols=2,
+        rows_per_page=2
+        )
     
     # Filter out all T cells that are dead based on the threshold at the first timepoint of a track
     dead_t0 = df_all_tracks_filt[
@@ -622,7 +641,15 @@ def filter_tracks(
     df_all_tracks_filt=df_all_tracks_filt[~df_all_tracks_filt.set_index(['TrackID', 'sample_name']).index.isin(dead_t0.set_index(['TrackID', 'sample_name']).index)]   
     df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_dead_t1", df_track_counts=df_track_counts)
 
-    # TODO create filter plot to see how much is filtered
+    plot_filter_count_outpath = Path(qc_outdir, f"BEHAV3D_filter_counts.pdf")
+    print(f"- Plotting track counts after filtering steps to {plot_filter_count_outpath}")
+    plot_filter_count(
+        df_track_counts,
+        outpath=plot_filter_count_outpath,
+        nr_cols=3,
+        rows_per_page = 3,
+        filter_cols=["nr_tracks_before_filtering", "nr_tracks_exp_duration", "nr_tracks_min_track_length", "nr_tracks_dead_t1"]
+    )
     
     # Write the filtered tracks to a .csv
     filt_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_filtered.csv")
@@ -722,47 +749,192 @@ def summarize_track_features(
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
     return(df_summarized_tracks)
 
+def plot_filter_count(
+    df_track_counts,
+    outpath,
+    nr_cols=3,
+    rows_per_page = 3,
+    figsize=(8.27, 11.69),
+    filter_cols=["nr_tracks_before_filtering", "nr_tracks_exp_duration", "nr_tracks_min_track_length", "nr_tracks_dead_t1"]
+    ):
+    
+    sample_names = df_track_counts["sample_name"].unique()
+    n_plots = len(sample_names)
+    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
+    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
+    
+    with PdfPages(outpath) as pdf:
+        plot_idx = 0
+        for page in range(nr_pages):
+            fig = plt.figure(figsize=figsize)
+            gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.5, hspace=0.3)
+            remaining_axes = [
+                fig.add_subplot(gs[i, j])
+                for i in range(rows_per_page)
+                for j in range(nr_cols)
+            ]
+            
+            for ax in remaining_axes:
+                if plot_idx >= n_plots:
+                    ax.remove()
+                    continue
+                
+                sample = sample_names[plot_idx]
+                df_subset = df_track_counts[df_track_counts["sample_name"] == sample]
+                
+                sns.barplot(
+                    x=filter_cols, 
+                    y=df_subset[filter_cols].values.flatten(),
+                    ax=ax
+                )
+                
+                ax.set_title(sample, fontsize=10, loc='center')
+                ax.set_xlabel("")
+                ax.set_ylabel("Count")
+                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+                
+                plot_idx += 1
+            
+            fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
+            plt.show()
+            pdf.savefig(fig, bbox_inches='tight', dpi=600)
+            plt.close(fig)
+
+
 def plot_dead_dye_distribution(
-    df_tracks
+    df_tracks,
+    outpath,
+    nr_cols=3,
+    rows_per_page = 3,
+    figsize=(8.27, 11.69)
     ):
     """
     Create a violin plot with an underlying scatterplot that provides an
     overview of the mean dead dye intensity per segment at the first timepoint
     in each experiment
     """
-    df_time1 = df_tracks[df_tracks["relative_time"]==1]
-    figure = (
-        ggplot(df_time1, aes(x='time', y='mean_dead_dye')) +
-        geom_jitter() +
-        geom_violin(aes(fill='sample_name')) +
-        facet_grid('~sample_name') +
-        scale_x_continuous(breaks=[]) +
-        theme_bw()
-    )   
-    return(figure)
+    sample_names = df_tracks["sample_name"].unique()
+    n_plots = len(sample_names)
+    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
+    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
+    
+    with PdfPages(outpath) as pdf:
+        # df_time1 = df_tracks[df_tracks["relative_time"]==1]
+        plot_idx = 0  # Track which plot we are adding
+        for page in range(nr_pages):
+            fig = plt.figure(figsize=figsize)
+            gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.3, hspace=0.1)
+            remaining_axes = [
+                fig.add_subplot(gs[i, j]) 
+                for i in range(rows_per_page)
+                for j in range(nr_cols)
+                ]
 
+            for ax in remaining_axes:
+                if plot_idx >= n_plots:
+                    ax.remove()  # Remove empty axes
+                    continue
+                
+                sample = sample_names[plot_idx]
+                df_subset = df_tracks[(df_tracks["sample_name"] == sample)]
+
+                # Violin plot
+                sns.violinplot(
+                    data=df_subset, 
+                    # x='sample_name', 
+                    y='mean_dead_dye', 
+                    dodge=False, 
+                    inner=None,
+                    ax=ax
+                    )
+
+                # Jitter plot (scatter over the violin)
+                sns.stripplot(
+                    data=df_subset, 
+                    # x='sample_name', 
+                    y='mean_dead_dye', 
+                    color='black', 
+                    alpha=0.5, 
+                    jitter=True,
+                    ax=ax
+                    )
+                ax.set_title(sample, fontsize=10, loc='center')
+                ax.set_xticks([])
+                ax.set_xticklabels([])
+                ax.set_xlabel("")
+                ax.set_ylabel("Mean Dead Dye")
+                ax.grid(True, linestyle="--", alpha=0.7)
+                sns.despine()
+                plot_idx += 1
+                
+            # plt.show(fig)
+            fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
+            pdf.savefig(fig, bbox_inches='tight', dpi=600)
+            plt.close(fig)
+        
 def plot_touching_nontouching_distribution(
     df_tracks,
+    outpath,
     contact_column='organoid_contact',
+    nr_cols=3,
+    rows_per_page = 3,
+    figsize=(8.27, 11.69)
     ):
     """
     Create a barplot that provides an overview of how many cells make contact with
     other organoids/cells
     """
-    figure = (
-        ggplot(df_tracks, aes(x=contact_column, fill='tcell_line')) +
-        geom_bar(position='dodge') +
-        labs(x='Contact', y='Count', title='Touching vs. Non_touching organoids', fill='T cell line') +
-        facet_grid('sample_name ~ organoid_line', scales='free') +
-        theme_minimal() +
-        theme(
-            strip_text_x=element_text(angle=0, ha='center'),
-            strip_text_y=element_text(angle=0, va='center')# Rotate row facet titles horizontally
-        )   
-    )
-    # Display the combined plot
-    # print(figure)
-    return(figure)
+    
+    sample_names = df_tracks["sample_name"].unique()
+    n_plots = len(sample_names)
+    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
+    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
+        
+    with PdfPages(outpath) as pdf:
+        # organoid_lines = df_tracks["organoid_line"].unique()
+        plot_idx = 0  # Track which plot we are adding
+        for page in range(nr_pages):
+            fig = plt.figure(figsize=figsize)
+            gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.5, hspace=0.3)
+
+            remaining_axes = [
+                fig.add_subplot(gs[i, j]) 
+                for i in range(rows_per_page)
+                for j in range(nr_cols)
+                ]
+
+            for ax in remaining_axes:
+                if plot_idx >= n_plots:
+                    ax.remove()  # Remove empty axes
+                    continue
+                
+                sample = sample_names[plot_idx]
+                df_subset = df_tracks[(df_tracks["sample_name"] == sample)]
+
+                sns.histplot(
+                    df_subset, 
+                    x=contact_column, 
+                    multiple="dodge", 
+                    shrink=0.8, 
+                    discrete=True, 
+                    ax=ax
+                    )
+                ax.set_title(f"{sample}", fontsize=10)
+                plot_idx += 1
+            # Add a global title
+            if contact_column == "organoid_contact":
+                fig.suptitle("Touching vs. Non-touching Organoids", fontsize=14, fontweight="bold")
+            elif contact_column == "tcell_contact":
+                fig.suptitle("Touching vs. Non-touching T cells", fontsize=14, fontweight="bold")
+
+            # Adjust layout and save
+            # plt.tight_layout(rect=[0, 0, 1, 0.96])
+            fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
+            # plt.show(fig)
+            pdf.savefig(fig, bbox_inches='tight', dpi=600)
+            plt.close(fig)
+            # plt.savefig("output.pdf", bbox_inches='tight', dpi=600)
+            
     
 def interpolate_missing_positions(
     df_tracks,

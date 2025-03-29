@@ -31,11 +31,10 @@ import umap
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.gridspec import GridSpec
-import patchworklib as pw
 import random
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from plotnine import *
+
 from pathlib import Path
 from behav3d import format_time
 import yaml

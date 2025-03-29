@@ -39,7 +39,7 @@ def convert_input_files_to_zarr(
             chunks=chunks
             )
     
-    if organoid_zarr_out_path.exists() and not overwrite:
+    if organoid_zarr_out_path.exists():
        print("Skipping conversion of organoid segments to zarr, as file already exists")
     else:
         organoid_segments = load_image(organoid_segments_path)
@@ -50,7 +50,7 @@ def convert_input_files_to_zarr(
             chunks=chunks
             )
 
-    if raw_image_zarr_out_path.exists() and not overwrite:
+    if raw_image_zarr_out_path.exists():
        print("Skipping conversion of raw_image to zarr, as file already exists")
     else:
         img = load_image(raw_image_path)
@@ -66,8 +66,6 @@ def convert_input_files_to_zarr(
         organoid_zarr_out_path,
         raw_image_zarr_out_path
     )
-
-
 
 def convert_segments_to_tracks(
         tracks_csv_path,

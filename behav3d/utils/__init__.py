@@ -34,3 +34,11 @@ def element_to_dict(element):
     
     result = clean_dict(result)
     return result
+
+def rel_elsize(elsize):
+    """
+    Calculate the relative element sizes for an array, smallest is set to 1
+    """
+    min_size=min(elsize)
+    elsize_scaled= [round(x/min_size, 2) for x in elsize]
+    return(elsize_scaled)
