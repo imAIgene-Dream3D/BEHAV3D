@@ -149,7 +149,7 @@ import seaborn as sns
 
 import math
 import time
-from behav3d import format_time
+from behav3d.utils import format_time
 from behav3d.utils.fileio import load_image
 from behav3d.preprocessing import convert_input_files_to_zarr
 from tqdm import tqdm

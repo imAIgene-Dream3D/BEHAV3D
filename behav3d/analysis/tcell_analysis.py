@@ -36,7 +36,7 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 from pathlib import Path
-from behav3d import format_time
+from behav3d.utils import format_time
 import yaml
 import time
 import seaborn as sns

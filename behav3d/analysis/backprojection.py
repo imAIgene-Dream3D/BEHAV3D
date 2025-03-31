@@ -6,7 +6,7 @@ import h5py
 import yaml
 import time
 import argparse
-from behav3d import format_time
+from behav3d.utils import format_time
 from behav3d.utils.fileio import load_image
 
 # df_tracks=df_tracks[df_tracks["relative_time"]<=30]

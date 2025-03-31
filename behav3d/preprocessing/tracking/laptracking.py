@@ -1,23 +1,18 @@
-# https://imagej.net/plugins/trackmate/scripting/trackmate-detectors-trackers-keys
-# TODO https://github.com/yfukai/laptrack
-import sys
-import os
+import shutil
 import pandas as pd
 import numpy as np
-import psutil
 from pathlib import Path
-import yaml
-from tifffile import imread, imwrite
 from skimage.measure import regionprops_table
-import argparse
-import time
-import math
-import time
 from laptrack import LapTrack
 from tqdm import tqdm
+from behav3d.utils.fileio import load_image, append_to_zarr, get_filepath_stem
 
-def run_lap_tracking(
-    segments,
+def laptrack_image(
+    segments=None,
+    segments_path=None,
+    trackimg_outdir=None,
+    trackcsv_outdir=None,
+    basename=None,
     element_size_x=1,
     element_size_y=1,
     element_size_z=1,
@@ -29,9 +24,21 @@ def run_lap_tracking(
     return_trackimg=True
     ):
     
+    assert segments is not None or segments_path is not None, "Either segments or segments_path must be provided"
+    if segments is None:
+        segments = load_image(segments_path)
     
+    if trackimg_outdir is None:
+        trackimg_outdir = Path(segments_path).parent
+    if trackcsv_outdir is None:
+        trackcsv_outdir = Path(segments_path).parent
+    
+    if basename is None and segments_path is not None:
+        basename = get_filepath_stem(segments_path)
+          
     df_centroids = []
     for t, tcell_stack in enumerate(segments):
+        tcell_stack = np.asarray(tcell_stack)
         properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, properties=['label', f'centroid']))
         properties["position_t"]=t
         df_centroids.append(properties)
@@ -66,107 +73,90 @@ def run_lap_tracking(
                 }, 
             inplace=True
         )
-    
     df_tracks["TrackID"]+=1
     # select only the columns we need
     df_tracks = df_tracks[["TrackID", "SegmentID", "position_t", "position_x", "position_y", "position_z", "pixel_position_x", "pixel_position_y", "pixel_position_z"]]
     
+    df_tracks_outpath = Path(trackcsv_outdir, f"{basename}_tracks.csv")
+    df_tracks.to_csv(df_tracks_outpath, sep=",", index=False)
+    
     if return_trackimg:
-        tracked_img = np.zeros_like(segments)
-        
+        print("Overwriting the original segments IDs with the tracked IDs")
+        # tracked_img = np.zeros_like(segments)
+        tracked_img_outpath = Path(trackimg_outdir, f"{basename}_tracked.zarr")
+        if tracked_img_outpath.exists():
+            # Remove the file if it already exists
+            tracked_img_outpath.unlink()
         for t, t_seg in tqdm(enumerate(segments), total=len(segments)):
+            t_seg = np.asarray(t_seg)
+            tracked_img = np.zeros_like(t_seg)
             t_df_tracks = df_tracks[df_tracks["position_t"]==t]
             for _, row in t_df_tracks.iterrows():
                 # print(row["SegmentID"], row["TrackID"], (tracked_img[t]==row["SegmentID"]).any())
-                tracked_img[t][t_seg==row["SegmentID"]] = row["TrackID"]
-        
-        return df_tracks, tracked_img
+                tracked_img[t_seg==row["SegmentID"]] = row["TrackID"]
+
+            tracked_img = np.expand_dims(tracked_img, axis=0)
+            append_to_zarr(
+                img=tracked_img, 
+                outpath=tracked_img_outpath
+                )
+        shutil.make_archive(tracked_img_outpath, "zip", tracked_img_outpath)
+        shutil.rmtree(tracked_img_outpath)
+        tracked_img_outpath = Path(f"{tracked_img_outpath}.zip")
+                
+        return df_tracks_outpath, tracked_img_outpath
     else:
-        return df_tracks
-
-def track_file(path):
-    start_time = time.time() 
-    
-    path = Path(path)
-    filename = Path(path).stem
-    
-    print(f"--------------- Tracking {filename} ---------------")
-    segments = imread(path)
-    df_tracks, tracked_img = run_lap_tracking(
-        segments=segments,
+        return df_tracks_outpath
         
-    )
-    
-    tcell_tracked_csv_out_path= Path(path.parent, f"{filename}_tracked.csv")
-    tcell_tracked_img_out_path= Path(path.parent, f"{filename}_tracked.tiff")
-    
-    # df_tracks.to_csv(tcell_tracked_csv_out_path)
-    # imwrite(tcell_tracked_img_out_path, tracked_img)
-    
-    df_tracks = pd.read_csv(tcell_tracked_csv_out_path)
-    df_tracks.rename(
-            columns={
-                    'position_t': 'Time',
-                    'position_x': 'Position X',
-                    'position_y': 'Position Y',
-                    'position_z': 'Position Z',
-                    'track_id': 'TrackID',
-                }, 
-            inplace=True
+        # return df_tracks, tracked_img
+    # else:
+        # return df_tracks
+   
+def run_tcell_laptracking(
+    metadata,
+    output_dir,
+    track_cost_cutoff=45**2, 
+    gap_closing_cost_cutoff=60**2,
+    gap_closing_max_frame_count=3,
+    merging_cost_cutoff=False,
+    splitting_cost_cutoff=False,
+    return_trackimg=True,
+    overwrite=False,
+    **kwargs
+    ):
+     for idx, sample in metadata.iterrows():
+        sample_name=sample['sample_name']
+        print(f"Tracking sample: {sample_name}")
+        
+        tracked_img_outpath = Path(output_dir, "images", sample_name)
+        tracked_csv_outpath = Path(output_dir, "trackdata", sample_name)
+        if not tracked_img_outpath.exists():
+            tracked_img_outpath.mkdir(parents=True)
+        if not tracked_csv_outpath.exists():
+            tracked_csv_outpath.mkdir(parents=True)
+        
+        element_size_x = sample["pixel_distance_xy"]
+        element_size_y = sample["pixel_distance_xy"]
+        element_size_z = sample["pixel_distance_z"]
+        
+        basename = f"{sample_name}_tcell"
+        df_tracks_outpath, tracked_img_outpath = laptrack_image(
+            segments_path=sample["tcell_segments_path"],
+            basename=basename,
+            trackimg_outdir=tracked_img_outpath,
+            trackcsv_outdir=tracked_csv_outpath,
+            element_size_x=element_size_x,
+            element_size_y=element_size_y,
+            element_size_z=element_size_z,
+            track_cost_cutoff=track_cost_cutoff, 
+            gap_closing_cost_cutoff=gap_closing_cost_cutoff,
+            gap_closing_max_frame_count=gap_closing_max_frame_count,
+            merging_cost_cutoff=merging_cost_cutoff,
+            splitting_cost_cutoff=splitting_cost_cutoff,
+            return_trackimg=return_trackimg
         )
-    df_tracks["Length X"]=10
-    df_tracks["Length Y"]=10
-    df_tracks["Length Z"]=10
-    df_tracks["parentID"]=0
-    df_tracks = df_tracks[["Time", "Position X", "Position Y", "Position Z", "TrackID", "Length X", "Length Y", "Length Z", "parentID"]]
-    
-    df_path = Path("/Volumes/T7_Sam/SMI_SmartMicroscopy/TrackingTimeIntervalTest/lap_tracking", tcell_tracked_csv_out_path.name)
-    df_tracks.to_csv(df_path, index=False)
-    
-    print(f"Tracking took {time.time() - start_time:.2f} s")
-
-def main():
-    path = "/Volumes/T7_Sam/SMI_SmartMicroscopy/BEHAV3Dsetup/segmentation/unet_predictions/FUNC_EV1_Exp080_Img001_13T-ctrl_upscaled_T0.tiff"
-    track_file(path)
-    segments_path = Path("/Volumes/T7_Sam/SMI_SmartMicroscopy/TrackingTimeIntervalTest/segmentation/downsampling")
-    segmented_files = [x.resolve() for x in segments_path.glob(f'*.tif')]
-
-    for interval_img_path in segmented_files:
-        start_time = time.time() 
         
-        filename = Path(interval_img_path).stem
-        print(f"--------------- Tracking {filename} ---------------")
-        # segments = imread(interval_img_path)
-        # df_tracks, tracked_img = run_lap_tracking(
-        #     segments=segments,
-            
-        # )
+        metadata.at[idx, "tcell_segments_path"] = str(tracked_img_outpath)
+        metadata.at[idx, "tcell_tracks_csv"] = str(tracked_img_outpath)
         
-        tcell_tracked_csv_out_path= Path(interval_img_path.parent, f"{filename}_tracked.csv")
-        tcell_tracked_img_out_path= Path(interval_img_path.parent, f"{filename}_tracked.tiff")
-        
-        # df_tracks.to_csv(tcell_tracked_csv_out_path)
-        # imwrite(tcell_tracked_img_out_path, tracked_img)
-        
-        df_tracks = pd.read_csv(tcell_tracked_csv_out_path)
-        df_tracks.rename(
-                columns={
-                        'position_t': 'Time',
-                        'position_x': 'Position X',
-                        'position_y': 'Position Y',
-                        'position_z': 'Position Z',
-                        'track_id': 'TrackID',
-                    }, 
-                inplace=True
-            )
-        df_tracks["Length X"]=10
-        df_tracks["Length Y"]=10
-        df_tracks["Length Z"]=10
-        df_tracks["parentID"]=0
-        df_tracks = df_tracks[["Time", "Position X", "Position Y", "Position Z", "TrackID", "Length X", "Length Y", "Length Z", "parentID"]]
-        
-        df_path = Path("/Volumes/T7_Sam/SMI_SmartMicroscopy/TrackingTimeIntervalTest/lap_tracking", tcell_tracked_csv_out_path.name)
-        df_tracks.to_csv(df_path, index=False)
-        
-        print(f"Tracking took {time.time() - start_time:.2f} s")
-
+        return metadata

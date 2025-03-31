@@ -11,7 +11,7 @@ from behav3d.utils.segmentation import segment_size_filter, get_border_segments,
 from behav3d.utils.preprocessing import filter_median, sauvola_thresholding, dilate_mask, open_mask 
 from pathlib import Path
 import torch
-from behav3d.utils.fileio import load_image, save_as_zarr, load_zarr
+from behav3d.utils.fileio import load_image, save_as_zarr, load_zarr, get_filepath_stem
 import shutil
 import zarr
 import dask.array as da
@@ -52,11 +52,12 @@ class BEHAV3D_Unet_Segmenter():
         tcell_segment_size_min=50,
         
         #Segment filtering
-        remove_border_segments=True,
+        remove_border_segments=False,
         organoid_segment_size_min=1000,
         
         logger=None,
         verbose=True,
+        overwrite=False,
         **kwargs
         ):
         self.img = img
@@ -71,7 +72,7 @@ class BEHAV3D_Unet_Segmenter():
             self.output_dir = Path.cwd()
         else:
             self.output_dir = Path(output_dir)
-        
+    
         if self.img_path is not None and self.img is None:
             self.img = load_image(img_path)
             
@@ -86,6 +87,8 @@ class BEHAV3D_Unet_Segmenter():
         self.verbose = verbose
         if self.logger is None:
             self.logger = self.setup_logging(verbose=self.verbose)
+        
+        self.overwrite = overwrite
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")    
         self.model_path = model_path
@@ -350,7 +353,7 @@ class BEHAV3D_Unet_Segmenter():
             self.tcell_segments, self.organoid_segments, self.mask_dead = self.run_single_timepoint(self.img)
         elif self.img.ndim == 5:
             self.logger.info(f"Segmenting multiple timepoint BEHAV3D image: {self.img.shape[0]} timepoints")
-            image_zarr_outpath = Path(self.output_dir, f"{Path(self.img_path).stem}.zarr")
+            image_zarr_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}.zarr")
             if not Path(f"{image_zarr_outpath}.zip").exists():
                 self.logger.info(f"Convert image to .zarr for dask processing")
                 self.logger.info(f"Saving to {image_zarr_outpath}")
@@ -365,40 +368,55 @@ class BEHAV3D_Unet_Segmenter():
             self.img = load_zarr(Path(f"{image_zarr_outpath}.zip"))
             self.first_timepoint = True
             
-            for t, t_img in tqdm(enumerate(self.img), total=self.img.shape[0]):
-            # for t, t_img in enumerate(self.img):
-                t_img = np.asarray(t_img)
-                tcell_segments, organoid_segments, mask_dead = self.run_single_timepoint(t_img)
-                
-                tcell_segments = np.expand_dims(tcell_segments, axis=0)
-                organoid_segments = np.expand_dims(organoid_segments, axis=0)
-                mask_dead = np.expand_dims(mask_dead, axis=0)
-
-                self.logger.info(organoid_segments.shape)
-                tcell_segments_outpath = Path(self.output_dir, f"{Path(self.img_path).stem}_tcell_segments.zarr")
-                self._append_to_zarr(tcell_segments, tcell_segments_outpath)
-                
-                organoid_segments_outpath = Path(self.output_dir, f"{Path(self.img_path).stem}_organoids_tracked.zarr")
-                self._append_to_zarr(organoid_segments, organoid_segments_outpath)
-                
-                mask_dead_outpath = Path(self.output_dir, f"{Path(self.img_path).stem}_mask_dead.zarr")
-                self._append_to_zarr(mask_dead, mask_dead_outpath)
-                self.first_timepoint = False
-                
-            shutil.make_archive(tcell_segments_outpath, "zip", tcell_segments_outpath)
-            shutil.rmtree(tcell_segments_outpath)
-            tcell_segments_outpath = Path(f"{tcell_segments_outpath}.zip")
-            self.tcell_segments = load_zarr(tcell_segments_outpath)
+            tcell_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_tcell_segments.zarr")
+            organoid_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_organoids_tracked.zarr")
+            mask_dead_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_mask_dead.zarr")
             
-            shutil.make_archive(organoid_segments_outpath, "zip", organoid_segments_outpath)
-            shutil.rmtree(organoid_segments_outpath)
-            organoid_segments_outpath = Path(f"{organoid_segments_outpath}.zip")
-            self.organoid_segments = load_zarr(organoid_segments_outpath)
-            
-            shutil.make_archive(mask_dead_outpath, "zip", mask_dead_outpath)
-            shutil.rmtree(mask_dead_outpath)
-            mask_dead_outpath = Path(f"{mask_dead_outpath}.zip")
-            self.mask_dead = load_zarr(mask_dead_outpath)
+            if (Path(f"{tcell_segments_outpath}.zip").exists() and 
+                Path(f"{organoid_segments_outpath}.zip").exists() and 
+                Path(f"{mask_dead_outpath}.zip").exists() and 
+                self.overwrite==False
+                ):
+                self.logger.info("Segmentation already exists... Provide overwrite=True to overwrite")
+                
+                self.tcell_segments_outpath = Path(f"{tcell_segments_outpath}.zip")
+                self.tcell_segments = load_zarr(Path(self.tcell_segments_outpath))
+                
+                self.organoid_segments_outpath = Path(f"{organoid_segments_outpath}.zip")
+                self.organoid_segments = load_zarr(Path(self.organoid_segments_outpath))
+                
+                self.mask_dead_outpath = Path(f"{mask_dead_outpath}.zip")
+                self.mask_dead = load_zarr(Path(f"{mask_dead_outpath}.zip"))
+                # return(self.tcell_segments, self.organoid_segments, self.mask_dead)
+            else:
+                for t, t_img in tqdm(enumerate(self.img), total=self.img.shape[0]):
+                # for t, t_img in enumerate(self.img):
+                    t_img = np.asarray(t_img)
+                    tcell_segments, organoid_segments, mask_dead = self.run_single_timepoint(t_img)
+                    
+                    tcell_segments = np.expand_dims(tcell_segments, axis=0)
+                    organoid_segments = np.expand_dims(organoid_segments, axis=0)
+                    mask_dead = np.expand_dims(mask_dead, axis=0)
+                    
+                    self._append_to_zarr(tcell_segments, tcell_segments_outpath)
+                    self._append_to_zarr(organoid_segments, organoid_segments_outpath)
+                    self._append_to_zarr(mask_dead, mask_dead_outpath)
+                    self.first_timepoint = False
+                    
+                shutil.make_archive(tcell_segments_outpath, "zip", tcell_segments_outpath)
+                shutil.rmtree(tcell_segments_outpath)
+                self.tcell_segments_outpath = Path(f"{tcell_segments_outpath}.zip")
+                self.tcell_segments = load_zarr(self.tcell_segments_outpath)
+                
+                shutil.make_archive(organoid_segments_outpath, "zip", organoid_segments_outpath)
+                shutil.rmtree(organoid_segments_outpath)
+                self.organoid_segments_outpath = Path(f"{organoid_segments_outpath}.zip")
+                self.organoid_segments = load_zarr(self.organoid_segments_outpath)
+                
+                shutil.make_archive(mask_dead_outpath, "zip", mask_dead_outpath)
+                shutil.rmtree(mask_dead_outpath)
+                self.mask_dead_outpath = Path(f"{mask_dead_outpath}.zip")
+                self.mask_dead = load_zarr(self.mask_dead_outpath)
         
             
     def _append_to_zarr(self, img, outpath):
@@ -467,7 +485,7 @@ def run_behav3d_unet_segmentation(
     logger=None,
     **kwargs
     ):
-    for _, sample in metadata.iterrows():
+    for idx, sample in metadata.iterrows():
         print(f"Processing sample: {sample['sample_name']}")
         start_time = time.time()
         sample_name = sample['sample_name']
@@ -480,10 +498,11 @@ def run_behav3d_unet_segmentation(
         # img = load_image(raw_image_path)
         segmenter = BEHAV3D_Unet_Segmenter(
             img_path=raw_image_path,
+            output_dir=img_outdir,
             model_path=model_path,
-            tcell_ch=tcell_ch, 
-            live_ch=live_ch, 
-            dead_ch=dead_ch,
+            tcell_ch=sample['tcell_channel'], 
+            live_ch=sample['live_channel'], 
+            dead_ch=sample['dead_channel'],
             use_dims=use_dims,
             unet_prob_thr=unet_prob_thr,
             logger=logger,
@@ -491,7 +510,10 @@ def run_behav3d_unet_segmentation(
             )
         segmenter.run()
         
-        organoid_segments = segmenter.organoid_segments
-        tcell_segments = segmenter.tcell_segments
-        dead_mask = segmenter.mask_dead
-        return(organoid_segments, tcell_segments, dead_mask)
+        metadata.at[idx, "tcell_tracks_image_path"] = str(segmenter.tcell_segments_outpath)
+        metadata.at[idx, "organoid_tracks_image_path"] = str(segmenter.organoid_segments_outpath)
+    return(metadata)
+        # organoid_segments = segmenter.organoid_segments
+        # tcell_segments = segmenter.tcell_segments
+        # dead_mask = segmenter.mask_dead
+        # return(organoid_segments, tcell_segments, dead_mask)

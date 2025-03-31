@@ -13,6 +13,12 @@ import shutil
 from time import sleep
 from behav3d.utils import element_to_dict
 
+def get_filepath_stem(path):
+    path=Path(path)
+    if path.suffix == ".zip" or path.suffix ==".bz2":
+        path = Path(path.stem)
+    return(path.stem)
+
 def load_image(path, axis_order="TCZYX"):
     path = Path(path)
     default_axis_order = "TCZYX"
@@ -171,6 +177,24 @@ def load_ims(path):
     img=np.stack(image_channels, axis=0)
     return(img)
 
+def append_to_zarr(img, outpath):
+        """
+        Append a timepoint to an existing .zarr array
+        If non-existent, create the .zarr array
+        """
+        outpath = Path(outpath)
+        if not outpath.exists():
+            zarr_file = zarr.open(
+                outpath, 
+                mode='w', 
+                shape=(0,) + img.shape[1:], 
+                chunks=(1,) + img.shape[1:], 
+                dtype=img.dtype
+                )
+        else:
+            zarr_file = zarr.open(outpath, mode='a')
+        zarr_file.append(img)
+        
 def load_zarr(path, mode="r"):
     """
     Loading .zarr images
@@ -190,7 +214,7 @@ def save_as_zarr(img, path, chunks=None):
     zipping=False
     if path.suffix == ".zip":
         zipping=True
-        path = Path(path.parent, path.stem)
+        path = Path(path.parent, path.Sstem)
         
     if path.suffix==".zarr":
         if chunks is None:
@@ -206,8 +230,6 @@ def save_as_zarr(img, path, chunks=None):
         shutil.make_archive(path, "zip", path)
         shutil.rmtree(path)
     
-
-
 def save_as_imaris(
     img,
     outpath,

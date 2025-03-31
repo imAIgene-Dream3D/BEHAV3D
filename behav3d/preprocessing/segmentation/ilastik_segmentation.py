@@ -26,7 +26,7 @@ from tifffile import imread, imwrite
 import numpy as np
 import pandas as pd
 import time
-from behav3d import format_time
+from behav3d.utils import format_time
 
 def run_ilastik_segmentation(
     metadata, 

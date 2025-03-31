@@ -31,6 +31,7 @@ def convert_input_files_to_zarr(
     if tcell_zarr_out_path.exists() and not overwrite:
         print("Skipping conversion of tcell segments to zarr, as file already exists")
     else:
+        # assert(tcell_zarr_out_path.exists()), f" {tcell_segments_path} does not exist"
         tcell_segments = load_image(tcell_segments_path)
         chunksize = (1,) + tcell_segments.shape[1:]
         save_as_zarr(
