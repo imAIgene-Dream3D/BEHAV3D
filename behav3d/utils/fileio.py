@@ -19,17 +19,17 @@ def get_filepath_stem(path):
         path = Path(path.stem)
     return(path.stem)
 
-def load_image(path, axis_order="TCZYX"):
+def load_image(path, axis_order="TCZYX", group=None):
     path = Path(path)
     default_axis_order = "TCZYX"
     if path.suffix==".czi":
         img = load_czi(path)
     elif path.suffix==".h5":
-        img = load_h5(path, substruct="Data")
+        img = load_h5(path, substruct=group)
     elif path.suffix==".ims":
         img = load_ims(path)
     elif path.suffix==".zarr" or str(path).endswith(".zarr.zip"):
-        img = load_zarr(path)
+        img = load_zarr(path, group=group)
     elif path.suffix==".tif" or path.suffix==".tiff":
         img = load_tiff(path)
     else:
@@ -195,7 +195,7 @@ def append_to_zarr(img, outpath):
             zarr_file = zarr.open(outpath, mode='a')
         zarr_file.append(img)
         
-def load_zarr(path, mode="r"):
+def load_zarr(path, group=None, mode="r"):
     """
     Loading .zarr images
     """
@@ -204,17 +204,26 @@ def load_zarr(path, mode="r"):
         zarr_store = zarr.storage.ZipStore(path)
     else:
         zarr_store = zarr.storage.LocalStore(path)
-    dask_img = da.from_zarr(zarr.open(zarr_store, mode=mode))
-    # img = np.asarray(dask_img)
+    
+    if group:
+        zarr_obj = zarr.open(zarr_store, mode=mode)[group]
+    else:
+        zarr_obj = zarr.open(zarr_store, mode=mode)
+    dask_img = da.from_zarr(zarr_obj)
     return(dask_img)
 
 
-def save_as_zarr(img, path, chunks=None):
+def save_as_zarr(
+    img, 
+    path, 
+    chunks=None, 
+    group=None
+    ):
     path=Path(path)
     zipping=False
     if path.suffix == ".zip":
         zipping=True
-        path = Path(path.parent, path.Sstem)
+        path = Path(path.parent, path.stem)
         
     if path.suffix==".zarr":
         if chunks is None:
@@ -223,12 +232,24 @@ def save_as_zarr(img, path, chunks=None):
             img = da.from_array(img, chunks=chunks)
  
         zarr_store = zarr.storage.LocalStore(path)
-        # zarr.save(path, img)
-        da.to_zarr(img, zarr_store, overwrite=True)
+        # If group is specified, create or open that group
+        if group:
+            da.to_zarr(img, zarr_store, component=group, overwrite=True)
+        else:
+            da.to_zarr(img, zarr_store, overwrite=True)
+        
     img=None
     if zipping:
         shutil.make_archive(path, "zip", path)
         shutil.rmtree(path)
+
+def zip_zarr(path):
+    outpath = Path(f"{path}.zip")
+    if outpath.exists():
+        outpath.unlink()
+    shutil.make_archive(path, "zip", path)
+    shutil.rmtree(path)
+    return(outpath)
     
 def save_as_imaris(
     img,
@@ -365,7 +386,7 @@ def convert_input_files_to_zarr(
     tcell_segments_path,
     organoid_segments_path,
     raw_image_path,
-    outfolder = None,
+    output_dir = None,
     chunks=None,
     overwrite=False
     ):
@@ -374,14 +395,14 @@ def convert_input_files_to_zarr(
     organoid_segments_path = Path(organoid_segments_path)
     raw_image_path = Path(raw_image_path)
     
-    if outfolder is None:
-        tcell_zarr_out_path = tcell_segments_path.with_suffix(".zarr.zip")
-        organoid_zarr_out_path = organoid_segments_path.with_suffix(".zarr.zip")
-        raw_image_zarr_out_path = raw_image_path.with_suffix(".zarr.zip")
+    if output_dir is None:
+        tcell_zarr_out_path = Path(tcell_segments_path, f"{get_filepath_stem(tcell_segments_path)}.zarr.zip")
+        organoid_zarr_out_path = Path(organoid_segments_path, f"{get_filepath_stem(organoid_segments_path)}.zarr.zip")
+        raw_image_zarr_out_path = Path(raw_image_path, f"{get_filepath_stem(raw_image_path)}.zarr.zip")
     else:   
-        tcell_zarr_out_path = Path(outfolder, tcell_segments_path.stem + ".zarr.zip")
-        organoid_zarr_out_path = Path(outfolder, organoid_segments_path.stem + ".zarr.zip")
-        raw_image_zarr_out_path = Path(outfolder, raw_image_path.stem + ".zarr.zip")
+        tcell_zarr_out_path = Path(output_dir, f"{get_filepath_stem(tcell_segments_path)}.zarr.zip")
+        organoid_zarr_out_path = Path(output_dir, f"{get_filepath_stem(organoid_segments_path)}.zarr.zip")
+        raw_image_zarr_out_path = Path(output_dir, f"{get_filepath_stem(raw_image_path)}.zarr.zip")
     
     if tcell_zarr_out_path.exists() and not overwrite:
         print("Skipping conversion of tcell segments to zarr, as file already exists")

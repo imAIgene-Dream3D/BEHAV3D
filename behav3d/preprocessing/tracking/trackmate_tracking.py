@@ -13,7 +13,7 @@ from skimage.measure import regionprops_table
 import argparse
 import time
 from behav3d.utils import format_time
-from behav3d.preprocessing import convert_segments_to_tracks
+from behav3d.utils.tracking import convert_segments_to_tracks
 
 def run_trackmate_tcells(config, metadata, verbose=False):
     run_trackmate(config,metadata, cell_type="tcells", verbose=verbose)

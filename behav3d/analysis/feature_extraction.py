@@ -1,6 +1,7 @@
 ### TODO Perhaps set a "static" speed based on quantiles of mean_speed to define static and actively interacting cells
 ### However this excludes a lot of cells to actively interact, now we take the fastest of the contacting T cells as actively interacting
 
+### TODO WHy is tcell_cntact TRUE everywhere?
 """
 This script calculates the features of tracks for BEHAV3D analysis.
 
@@ -88,7 +89,7 @@ active tcellinteraction.
 ### mean_dead_dye
 - Float
 The mean intensity of the dead dye inside of each segment per timepoint. Calculated based on the 
-channel of the dead dye. Supplied as an index of the channel image supplied as "dead_dye_channel" 
+channel of the dead dye. Supplied as an index of the channel image supplied as "dead_channel" 
 
 ### displacement
 - Float
@@ -150,8 +151,7 @@ import seaborn as sns
 import math
 import time
 from behav3d.utils import format_time
-from behav3d.utils.fileio import load_image
-from behav3d.preprocessing import convert_input_files_to_zarr
+from behav3d.utils.fileio import load_image, convert_input_files_to_zarr
 from tqdm import tqdm
 
 
@@ -250,10 +250,10 @@ def calculate_track_features(
             contact_threshold = sample_metadata["contact_threshold"]
             
         raw_image_path = sample_metadata['raw_image_path']
-        organoid_segments_path = sample_metadata['organoid_segments_path']
-        tcell_segments_path = sample_metadata['tcell_segments_path']
+        organoid_segments_path = sample_metadata['organoid_tracks_image_path']
+        tcell_segments_path = sample_metadata['tcell_tracks_image_path']
         
-        red_lym_channel=sample_metadata['dead_dye_channel']
+        red_lym_channel=sample_metadata['dead_channel']
         # contact_threshold = sample_metadata["contact_threshold"]
 
         print("- Loading in tracks csv...")
@@ -261,7 +261,7 @@ def calculate_track_features(
         # if sample_metadata["tcell_tracks_csv"]=="" or sample_metadata["tcell_tracks_csv"]==None or math.isnan(sample_metadata["tcell_tracks_csv"]):
         #     df_tracks_path = Path(track_outdir, f"{sample_name}_{cell_type}_tracks.csv")
         # else:
-        df_tracks_path = sample_metadata["tcell_tracks_csv"]
+        df_tracks_path = sample_metadata["tcell_tracks_csv_path"]
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
         
         ### Calculate organoid distance, t cell distance and dead dye mean form Imaris or BEHAV3D processing
@@ -330,7 +330,7 @@ def calculate_track_features(
                 tcell_segments_path=tcell_segments_path,
                 organoid_segments_path=organoid_segments_path,
                 raw_image_path=raw_image_path,
-                outfolder=img_outdir,
+                output_dir=img_outdir,
                 overwrite=overwrite
             )
             # Load in the images containing the organoid segments and T cell segments
@@ -387,18 +387,19 @@ def calculate_track_features(
         )
         
         print(f"- Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
-        df_tracks["dead"] = False
+        df_tracks = calculate_death(df_tracks, threshold=dead_dye_threshold, threshold_column="mean_dead_dye")
+        # df_tracks["dead"] = False
         
-        # For any cell crossing the dead_dye_threshold, set the cell to dead. Any timepoint after this timepoint are
-        # Also set to dead, even if the mean dead dye intensity goes under the threshold again
-        for track_id in df_tracks["TrackID"].unique():
-            track_df = df_tracks[df_tracks["TrackID"] == track_id]
-            track_df_reset = track_df.reset_index(drop=True)
-            threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset["mean_dead_dye"] >= dead_dye_threshold].index
+        # # For any cell crossing the dead_dye_threshold, set the cell to dead. Any timepoint after this timepoint are
+        # # Also set to dead, even if the mean dead dye intensity goes under the threshold again
+        # for track_id in df_tracks["TrackID"].unique():
+        #     track_df = df_tracks[df_tracks["TrackID"] == track_id]
+        #     track_df_reset = track_df.reset_index(drop=True)
+        #     threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset["mean_dead_dye"] >= dead_dye_threshold].index
             
-            if not threshold_indices.empty:
-                first_threshold_index = threshold_indices.min()
-                df_tracks.loc[track_df.index[first_threshold_index:], "dead"] = True
+        #     if not threshold_indices.empty:
+        #         first_threshold_index = threshold_indices.min()
+        #         df_tracks.loc[track_df.index[first_threshold_index:], "dead"] = True
         
         print("- Converting distance and time unit to default um and hours...")
         
@@ -512,6 +513,26 @@ def calculate_track_features(
     df_all_tracks.to_csv(all_tracks_out_path, index=False) 
     return(df_all_tracks)
 
+def calculate_death(
+    df_tracks,
+    threshold,
+    threshold_column="mean_dead_dye"
+    ):
+    # print(f"- Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
+    df_tracks["dead"] = False
+    
+    # For any cell crossing the dead_dye_threshold, set the cell to dead. Any timepoint after this timepoint are
+    # Also set to dead, even if the mean dead dye intensity goes under the threshold again
+    for track_id in df_tracks["TrackID"].unique():
+        track_df = df_tracks[df_tracks["TrackID"] == track_id]
+        track_df_reset = track_df.reset_index(drop=True)
+        threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset[threshold_column] >= threshold].index
+        
+        if not threshold_indices.empty:
+            first_threshold_index = threshold_indices.min()
+            df_tracks.loc[track_df.index[first_threshold_index:], "dead"] = True
+    return df_tracks
+    
 def filter_tracks(
     df_all_tracks,
     metadata,
@@ -993,7 +1014,7 @@ def interpolate_missing_positions(
                 if previous_idx >= 0:
                     df_interpolated.loc[idx, col] = df_interpolated.loc[previous_idx, col]
         
-        df_interpolated["interpolated"] = df_interpolated["interpolated"].fillna(True) 
+        df_interpolated["interpolated"] = df_interpolated["interpolated"].astype("boolean").fillna(True)
         assert(len(all_times)==len(df_interpolated)), f"Length of expected nr of timepoints ({len(all_times)}) is not the same as resulting timepoints ({df_interpolated})"
         return df_interpolated
     df_interpolated = pd.concat([interpolate_group(group, cols_to_interpolate, cols_to_copy) for _, group in grouped_df])

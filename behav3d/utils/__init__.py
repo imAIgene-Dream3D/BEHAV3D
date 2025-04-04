@@ -21,6 +21,7 @@ def load_behav3d_metadata(
         "time_interval": float,  # Assuming it could be a float
         "time_unit": str,
         "raw_image_path": str,  # Keeping as str for easy handling
+        "tcell_segments_image_path": str,
         "tcell_tracks_image_path": str,
         "organoid_tracks_image_path": str,
         "tcell_tracks_csv_path": str
@@ -32,26 +33,37 @@ def check_behav3d_metadata(
     metadata
     ):
     assert not any(metadata.drop(columns=["tcell_tracks_image_path", "organoid_tracks_image_path", "tcell_tracks_csv_path"]).isna().any()), "Some column values have not been supplied. Make sure you correctly supply values for all columns in the metadata .csv"
+    ok = True
     for rowidx, sample_metadata in metadata.iterrows():
         sample_name = sample_metadata['sample_name']
         
         assert Path(sample_metadata["raw_image_path"]).exists(), f"The image_path supplied for 'row {rowidx+1}: {sample_name}' does not exist"
         
+        if not pd.isna(sample_metadata["tcell_segments_image_path"]):
+            assert Path(sample_metadata["tcell_segments_image_path"]).exists(), f"The tcell_segments_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+        elif not pd.isna(sample_metadata["tcell_tracks_image_path"]):
+            print(f"!!! No segmented or tracked tcell image is supplied for 'row {rowidx+1}: {sample_name}'. Please run segmentation and tracking below.")
+            ok=False
         if not pd.isna(sample_metadata["tcell_tracks_image_path"]):
             assert Path(sample_metadata["tcell_tracks_image_path"]).exists(), f"The tcell_tracks_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
         else:
-            print(f"!!! No tcell segments are supplied for 'row {rowidx+1}: {sample_name}'. Please run segmentation below.")
-        
+            print(f"!!! No tracked tcell image is supplied for 'row {rowidx+1}: {sample_name}'. Please run tracking below.")
+            ok=False
+            
         if not pd.isna(sample_metadata["organoid_tracks_image_path"]):
             assert Path(sample_metadata["organoid_tracks_image_path"]).exists(), f"The organoid_tracks_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
         else:
-            print(f"!!! No organoid segments are supplied for 'row {rowidx+1}: {sample_name}'. Please run segmentation below.")
-        
+            print(f"!!! No tracked organoid image is supplied for 'row {rowidx+1}: {sample_name}'. Please run tracking below.")
+            ok=False
+            
         if not pd.isna(sample_metadata["tcell_tracks_csv_path"]):
             assert Path(sample_metadata["tcell_tracks_csv_path"]).exists(), f"The tcell_tracks_csv_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
         else:
-            print(f"!!! No tcell tracks are supplied for 'row {rowidx+1}: {sample_name}'. Please run tracking (and segmentation) below.")
-   
+            print(f"!!! No .csv of tcell tracks is supplied for 'row {rowidx+1}: {sample_name}'. Please run tracking below.")
+            ok=False
+    if ok:
+        print("Metadata file is complete and correct")
+    
 def format_time(
     start_time,
     end_time
