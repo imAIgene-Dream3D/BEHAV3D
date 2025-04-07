@@ -74,6 +74,27 @@ def format_time(
     seconds = int(elapsed_time % 60)
     return(hours, minutes, seconds)
 
+def convert_time(time_interval, time_unit):
+        time_conversions={
+            "s": 3600,
+            "m": 60,
+            "h": 1
+        }
+        assert time_unit in time_conversions.keys(), f"time unit needs to be one of: {time_conversions.keys()}, is {time_unit}"
+        time_interval = time_interval/time_conversions[time_unit]
+        return(time_interval)
+
+def convert_distance(distance, distance_unit):
+        distance_conversions={
+            "nm":1000,
+            "μm":1,
+            "um":1,
+            "mm":0.001
+        }
+        assert distance_unit in list(distance_conversions.keys()), f"distance unit needs to be one of: {list(distance_conversions.keys())}, is {distance_unit}"
+        distance = distance/distance_conversions[distance_unit]
+        return(distance)
+      
 def element_to_dict(element):
     """
     Convert an ElementTree Element object to a dictionary.

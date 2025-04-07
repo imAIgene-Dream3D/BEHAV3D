@@ -150,7 +150,7 @@ import seaborn as sns
 
 import math
 import time
-from behav3d.utils import format_time
+from behav3d.utils import format_time, convert_time, convert_distance
 from behav3d.utils.fileio import load_image, convert_input_files_to_zarr
 from tqdm import tqdm
 
@@ -164,14 +164,204 @@ def run_behav3d_feature_extraction(config, metadata, cell_type="tcells"):
     
     # Calculate features for each timepoint in a track
     df_summarized_tracks=summarize_track_features(df_all_tracks_filt, config, metadata) 
-         
-def calculate_track_features(
+
+def run_feature_extraction(
     metadata, 
     config=None,
     output_dir=None,
     cell_type="tcells",
     imaris=False,
+    rolling_meanspeed_window=10,
     overwrite=False
+    ):
+    assert config is not None or output_dir is not None, "Either 'config' or 'output_dir' must be supplied"
+    
+    if output_dir is None:
+        output_dir = config['output_dir']
+
+    df_all_tracks=pd.DataFrame()
+    
+    for _, sample_metadata in metadata.iterrows():
+        print(f"--------------- Processing {cell_type}: {sample_metadata['sample_name']} ---------------")
+        start_time = time.time()
+
+        sample_name = sample_metadata['sample_name']
+        
+        distance_unit=sample_metadata['distance_unit']
+        dead_dye_threshold=sample_metadata['dead_dye_threshold']
+        
+        # Sometimes excel saves the encoding for µm differently, the following lines converts
+        # other variants of µm to ones comparable in this code
+        # The two written "μm" have different formatting
+        if distance_unit=='_m':
+            distance_unit ='μm'
+        if distance_unit=='µm':
+            distance_unit="μm"
+        
+        element_size_x=sample_metadata['pixel_distance_xy']
+        element_size_y=sample_metadata['pixel_distance_xy'] 
+        element_size_z=sample_metadata['pixel_distance_z']
+        
+        #Convert elekment size to um and hours, default settings for behav3d
+        element_size_x = convert_distance(element_size_x, distance_unit)
+        element_size_y = convert_distance(element_size_y, distance_unit)
+        element_size_z = convert_distance(element_size_z, distance_unit)
+        
+        time_interval = sample_metadata['time_interval']
+        time_unit = sample_metadata['time_unit']
+        
+        if imaris:
+            tcell_contact_threshold = sample_metadata["tcell_contact_threshold"]
+            organoid_contact_threshold = sample_metadata["organoid_contact_threshold"]
+        else:
+            contact_threshold = sample_metadata["contact_threshold"]
+        dead_channel=sample_metadata['dead_channel']
+        
+        print("###### Running track feature calculation")
+        
+        raw_image_path = sample_metadata['raw_image_path']
+        organoid_segments_path = sample_metadata['organoid_tracks_image_path']
+        tcell_segments_path = sample_metadata['tcell_tracks_image_path']
+        
+        img_outdir = Path(output_dir, "images", sample_name)
+        if not img_outdir.exists():
+            img_outdir.mkdir(parents=True)
+            
+        print("- Converting all input files to .zarr for memory efficiency...")
+        tcell_segments_path, organoid_segments_path, raw_image_path = convert_input_files_to_zarr(
+            tcell_segments_path=tcell_segments_path,
+            organoid_segments_path=organoid_segments_path,
+            raw_image_path=raw_image_path,
+            output_dir=img_outdir,
+            overwrite=overwrite
+        )
+
+        track_outdir = Path(output_dir, "trackdata", sample_name)
+        track_intermediate_outdir= Path(track_outdir, "intermediate_results")
+        analysis_outdir = Path(output_dir, "analysis", cell_type)
+        feature_outdir = Path(analysis_outdir, "track_features")
+        
+        if not track_outdir.exists():
+            track_outdir.mkdir(parents=True)
+        if not track_intermediate_outdir.exists():
+            track_intermediate_outdir.mkdir()
+        if not feature_outdir.exists():
+            feature_outdir.mkdir(parents=True)
+        if not analysis_outdir.exists():
+            analysis_outdir.mkdir(parents=True)
+            
+        print("- Loading in tracks csv...")
+        df_tracks_path = sample_metadata["tcell_tracks_csv_path"]
+        df_tracks=pd.read_csv(df_tracks_path, sep=",")
+        
+        print("### Generalizing the units of position and time to um and hours")
+        df_tracks = generalize_units_of_track_features(
+            df_tracks=df_tracks,
+            distance_unit=distance_unit,
+            time_interval=time_interval,
+            time_unit=time_unit
+            )
+        time_interval=convert_time(time_interval, time_unit)
+        time_unit = "h"
+        
+        ### Calculate image based features (per timepoint)
+        print("### Calculating single-timepoint image-based features...")
+        df_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_intensity.csv")
+        df_contacts_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_contact.csv")
+        if imaris:
+            df_tracks=calculate_imaris_track_features(
+                df_tracks=df_tracks,
+                organoid_contact_threshold=organoid_contact_threshold,
+                tcell_contact_threshold=tcell_contact_threshold,
+                distance_unit=distance_unit,
+            )
+        else:
+            df_tracks=calculate_image_based_track_features(
+                df_tracks=df_tracks,
+                cell_type=cell_type,
+                df_intensity_outpath=df_intensity_outpath,
+                df_contacts_outpath=df_contacts_outpath,
+                dead_channel=dead_channel,
+                contact_threshold=contact_threshold,
+                element_size_x=element_size_x,
+                element_size_y=element_size_y,
+                element_size_z=element_size_z,
+                raw_image_path=raw_image_path,
+                organoid_segments_path=organoid_segments_path,
+                tcell_segments_path=tcell_segments_path,
+                overwrite=overwrite
+            )
+        
+        
+        print("### Interpolating missing timepoints based on time interval")
+        # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
+        # Values are interpolated linearly, forward filled or left blank based on the column
+        # More explanation within the function
+        df_tracks= interpolate_missing_positions(df_tracks)
+
+        print("### Calculating movement features...")
+        df_tracks=calculate_movement_features(
+            df_tracks,
+            time_interval = time_interval,
+            rolling_meanspeed_window=rolling_meanspeed_window
+            )
+        df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
+        
+        if cell_type=="tcells":
+            print("### Calculating T-cell specific features...")
+            df_tracks = calculate_tcell_specific_track_features(
+                df_tracks,
+                dead_dye_threshold=dead_dye_threshold,
+                )
+            
+        elif cell_type=="organoids":
+            print("### Calculating organoid specific features...")
+            #TODO Add organoid specific features
+        else:
+            print("### No cell type specified, skipping cell type specific features...")
+        
+        print("- Perform z-normalization on selected feature columns")
+        df_tracks=normalize_track_features(
+            df_tracks, 
+            columns=[
+                "mean_square_displacement",
+                "speed",
+                "mean_dead_dye"
+            ]
+        )
+            
+        tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
+        print(f"- Writing output to {tracks_out_path}")
+        df_tracks.to_csv(tracks_out_path, sep=",", index=False)
+        
+        # Adding a sample name for later combination of multiple track experiments
+        df_tracks['sample_name']=sample_name
+        df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
+        df_all_tracks = pd.concat([df_all_tracks, df_tracks])
+        
+        end_time = time.time()
+        h,m,s = format_time(start_time, end_time)
+        print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
+        
+    all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features.csv")
+    df_all_tracks.to_csv(all_tracks_out_path, index=False) 
+             
+def calculate_image_based_track_features(
+    df_tracks,
+    cell_type,
+    dead_channel,
+    contact_threshold,
+    element_size_x,
+    element_size_y,
+    element_size_z,
+    #Paths
+    raw_image_path,
+    organoid_segments_path,
+    tcell_segments_path,
+    df_intensity_outpath,
+    df_contacts_outpath,
+    # Overwrite/redo df_intensity_outpath and df_contacts_outpath
+    overwrite=False,
     ):
     """
     This code calculates the various features for each timepoint in a track for each 
@@ -186,332 +376,190 @@ def calculate_track_features(
       features
     """
 
-    assert config is not None or output_dir is not None, "Either 'config' or 'output_dir' must be supplied"
+    #TODO Add possibility to add multiple T cell types
+    #TODO So both CD4 and CD8 segments, label the type for each track
+    #TODO Then get distance and contact between all of them
+    #TODO Perhaps allow for input of the track df that already has T cell type in there
+
+    # Load in the images containing the organoid segments and T cell segments
+    organoid_segments=load_image(organoid_segments_path)
+    tcell_segments=load_image(tcell_segments_path)
+    intensity_image = load_image(raw_image_path)
     
-    if output_dir is None:
-        output_dir = config['output_dir']
-        if "imaris" in config.keys():
-            imaris = config["imaris"]
-        else:
-            imaris = False
-            
-    analysis_outdir = Path(output_dir, "analysis", cell_type)
-    feature_outdir = Path(analysis_outdir, "track_features")
-    
-    if not analysis_outdir.exists():
-        analysis_outdir.mkdir(parents=True)
-    if not feature_outdir.exists():
-        feature_outdir.mkdir(parents=True)
-        
-    rolling_meanspeed_window=10
-    
-    df_all_tracks=pd.DataFrame()
-    
-    for _, sample_metadata in metadata.iterrows():
-        print(f"--------------- Processing {cell_type}: {sample_metadata['sample_name']} ---------------")
-        start_time = time.time()
-        sample_name = sample_metadata['sample_name']
-        element_size_x=sample_metadata['pixel_distance_xy']
-        element_size_y=sample_metadata['pixel_distance_xy'] 
-        element_size_z=sample_metadata['pixel_distance_z']
-        distance_unit=sample_metadata['distance_unit']
-        dead_dye_threshold=sample_metadata['dead_dye_threshold']
-        
-        img_outdir = Path(output_dir, "images", sample_name)
-        track_outdir = Path(output_dir, "trackdata", sample_name)
-        analysis_outdir = Path(output_dir, "analysis", cell_type)
-        
-        if not img_outdir.exists():
-            img_outdir.mkdir(parents=True)
-        if not track_outdir.exists():
-            track_outdir.mkdir(parents=True)
-        if not analysis_outdir.exists():
-            analysis_outdir.mkdir(parents=True)
-        # Sometimes excel saves the encoding for µm differently, the following lines converts
-        # other variants of µm to ones comparable in this code
-        # The two written "μm" have different formatting
-        if distance_unit=='_m':
-            distance_unit ='μm'
-        if distance_unit=='µm':
-            distance_unit="μm"
-        time_interval = sample_metadata['time_interval']
-        time_unit = sample_metadata['time_unit']
-
-        print("###### Running track feature calculation")
-        
-        if imaris:
-            print("Performing feature calculation from Imaris processing..")
-        
-        ### Set specific parameters based on Imaris or BEHAV3D processing
-        if imaris:
-            tcell_contact_threshold = sample_metadata["tcell_contact_threshold"]
-            organoid_contact_threshold = sample_metadata["organoid_contact_threshold"]
-        else:
-            contact_threshold = sample_metadata["contact_threshold"]
-            
-        raw_image_path = sample_metadata['raw_image_path']
-        organoid_segments_path = sample_metadata['organoid_tracks_image_path']
-        tcell_segments_path = sample_metadata['tcell_tracks_image_path']
-        
-        red_lym_channel=sample_metadata['dead_channel']
-        # contact_threshold = sample_metadata["contact_threshold"]
-
-        print("- Loading in tracks csv...")
-        ### Load in the specified track csv
-        # if sample_metadata["tcell_tracks_csv"]=="" or sample_metadata["tcell_tracks_csv"]==None or math.isnan(sample_metadata["tcell_tracks_csv"]):
-        #     df_tracks_path = Path(track_outdir, f"{sample_name}_{cell_type}_tracks.csv")
-        # else:
-        df_tracks_path = sample_metadata["tcell_tracks_csv_path"]
-        df_tracks=pd.read_csv(df_tracks_path, sep=",")
-        
-        ### Calculate organoid distance, t cell distance and dead dye mean form Imaris or BEHAV3D processing
-        if imaris and cell_type=="tcells":
-            print("- Calculating contact with organoids... (From Imaris)")
-            # Threshold the distance to organoid based on the supplied "organoid_contact_threshold"
-            # This distance is calculated before in Imaris and supplied as a separate channel and
-            # Extracted as a statistic (...Intensity_Min_Ch<#>_img=<#>.csv)
-            df_tracks["organoid_contact"]=df_tracks["organoid_distance"]<=organoid_contact_threshold
-            
-            # Calculate the nearest Tcell based on the distance between the centroids of other T cells
-            # Caution: This distance, unlike the BEHAV3D processing, is between centroids of cells, not borders
-            # Thus the provided "tcell_contact_threshold" needs to reflect this
-            print("- Calculating contact with other T cells... (From Imaris)")
-            print(f"Using a contact threshold of {tcell_contact_threshold}{distance_unit}")
-            grouped = df_tracks.groupby('position_t')
-            new_dfs = []
-
-            ### The following code calculates the distances between all tracks of the same
-            ### type (So between for example CD4 and other CD4 cells)
-            touching_tcells_dict = {}
-            # Calculate distances between a segment and all other segments with cdist
-            for group_name, group_df in grouped:
-                positions = group_df[['position_x', 'position_y', 'position_z']].values
-                distances = cdist(positions, positions)
-                np.fill_diagonal(distances, np.inf)
-                distances_mask = distances <= tcell_contact_threshold
-
-                tcell_contacts_list = []
-                for i, row in enumerate(distances_mask):
-                    tcell_contacts = np.where(row)[0].tolist()
-                    tcell_contacts=[group_df.reset_index().loc[idx]["TrackID"] for idx in tcell_contacts]
-                    tcell_contacts_list.append(tcell_contacts)                 
-                group_df['touching_tcells'] = tcell_contacts_list
-
-                for track_id, tcell_contacts in zip(group_df['TrackID'], tcell_contacts_list):
-                    touching_tcells_dict[track_id] = tcell_contacts
-
-                group_df['tcell_contact'] = group_df['touching_tcells'].apply(lambda x: len(x) > 0)
-
-                ### As Imaris does not give interacting IDs, we can only add contact 
-                ### but leave the actual interacting ID as unknown
-                
-                if "complementary_tcell_distance" in df_tracks.columns:
-                    # !! ADJUST THIS THRESHOLD OR MOVE TO AFTER ADDING ALL TRACKS
-                    group_df['tcell_contact'] = group_df['complementary_tcell_distance']<=tcell_contact_threshold
-                    group_df['touching_tcells'].append("unknown")
-                group_df['touching_tcells'] = group_df['touching_tcells'].apply(lambda x: ",".join(map(str, x)) if isinstance(x, list) and len(x) > 0 else None)
-                
-                new_dfs.append(group_df)
-            df_tracks = pd.concat(new_dfs, ignore_index=True)
-            
-            # df_tracks["organoid_contact"]=df_tracks["organoid_distance"]<=organoid_contact_threshold
-            # df_tracks["tcell_contact"]=df_tracks["tcell_distance"]<=contact_threshold
-        else:           
-            #TODO Add possibility to add multiple T cell types
-            #TODO So both CD4 and CD8 segments, label the type for each track
-            #TODO Then get distance and contact between all of them
-            #TODO Perhaps allow for input of the track df that already has T cell type in there
-            track_intermediate_outdir= Path(track_outdir, "intermediate_results")
-            if not track_intermediate_outdir.exists():
-                track_intermediate_outdir.mkdir()
-                
-            print("- Converting all input files to .zarr for memory efficiency...")
-            tcell_segments_path, organoid_segments_path, raw_image_path = convert_input_files_to_zarr(
-                tcell_segments_path=tcell_segments_path,
-                organoid_segments_path=organoid_segments_path,
-                raw_image_path=raw_image_path,
-                output_dir=img_outdir,
-                overwrite=overwrite
-            )
-            # Load in the images containing the organoid segments and T cell segments
-            # organoid_segments_path=Path(img_outdir, f"{sample_name}_organoids_tracked.tiff")
-            organoid_segments=load_image(organoid_segments_path)
-            # tcell_segments_path=Path(img_outdir, f"{sample_name}_tcells_tracked.tiff")
-            tcell_segments=load_image(tcell_segments_path)
-            intensity_image = load_image(raw_image_path)
-            
-            print("- Calculating channel and especially death dye intensities...")
-            df_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_intensity.csv")
-            if df_intensity_outpath.exists() and not overwrite:
-                print("Intensity calculation .csv already exists. Loading in intensity information...")
-                df_intensity = pd.read_csv(df_intensity_outpath)
-            else:
-                df_intensity=calculate_segment_intensity(
-                    tcell_segments=tcell_segments,
-                    intensity_image=intensity_image
-                )
-                if red_lym_channel is not None:
-                    df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{red_lym_channel}":"mean_dead_dye"})
-                df_intensity.to_csv(df_intensity_outpath, sep=",", index=False)
-            
-            df_tracks = pd.merge(df_tracks, df_intensity, how="left")
-            
-            print("- Calculating contact with organoids and other T cells...")
-            print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
-            # Calculate the contact od each T cell with an organoid or a T cell
-            # Explanation on how in the function itself
-            df_contacts_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_contact.csv")
-            if df_contacts_outpath.exists() and not overwrite:
-                print("Contact .csv already exists. Loading in contact information...")
-                df_contacts = pd.read_csv(df_contacts_outpath)
-            else:
-                df_contacts=calculate_organoid_and_tcell_contact(
-                    tcell_segments=tcell_segments,
-                    organoid_segments=organoid_segments,
-                    element_size_x=element_size_x,
-                    element_size_y=element_size_y,
-                    element_size_z=element_size_z,
-                    contact_threshold=contact_threshold,
-                    calculate_from=cell_type
-                ) 
-                df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
-            
-            df_tracks = pd.merge(df_tracks, df_contacts, how="left")
-        
-        # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
-        # Values are interpolated linearly, forward filled or left blank based on the column
-        # More explanation within the function
-        print("- Interpolating missing timepoints based on time interval")
-        df_tracks= interpolate_missing_positions(
-            df_tracks
+    print("- Calculating channel and especially death dye intensities...")
+    if df_intensity_outpath.exists() and not overwrite:
+        print("Intensity calculation .csv already exists. Loading in intensity information...")
+        df_intensity = pd.read_csv(df_intensity_outpath)
+    else:
+        df_intensity=calculate_segment_intensity(
+            tcell_segments=tcell_segments,
+            intensity_image=intensity_image
         )
-        
-        print(f"- Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
-        df_tracks = calculate_death(df_tracks, threshold=dead_dye_threshold, threshold_column="mean_dead_dye")
-        # df_tracks["dead"] = False
-        
-        # # For any cell crossing the dead_dye_threshold, set the cell to dead. Any timepoint after this timepoint are
-        # # Also set to dead, even if the mean dead dye intensity goes under the threshold again
-        # for track_id in df_tracks["TrackID"].unique():
-        #     track_df = df_tracks[df_tracks["TrackID"] == track_id]
-        #     track_df_reset = track_df.reset_index(drop=True)
-        #     threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset["mean_dead_dye"] >= dead_dye_threshold].index
-            
-        #     if not threshold_indices.empty:
-        #         first_threshold_index = threshold_indices.min()
-        #         df_tracks.loc[track_df.index[first_threshold_index:], "dead"] = True
-        
-        print("- Converting distance and time unit to default um and hours...")
-        
-        # Converting the time and distance values to a default unit to allow comparison 
-        # with differently provided units (defaults to µm and hours)
-        def convert_distance(distance, distance_unit):
-            distance_conversions={
-                "nm":1000,
-                "μm":1,
-                "um":1,
-                "mm":0.001
-            }
-            assert distance_unit in list(distance_conversions.keys()), f"distance unit needs to be one of: {list(distance_conversions.keys())}, is {distance_unit}"
-            distance = distance/distance_conversions[distance_unit]
-            return(distance)
-        
-        def convert_time(time_interval, time_unit):
-            time_conversions={
-                "s": 3600,
-                "m": 60,
-                "h": 1
-            }
-            assert time_unit in time_conversions.keys(), f"time unit needs to be one of: {time_conversions.keys()}, is {time_unit}"
-            time_interval = time_interval/time_conversions[time_unit]
-            return(time_interval)
-        
-        df_tracks["position_z"]=df_tracks["position_z"].apply(convert_distance, args=(distance_unit,))
-        df_tracks["position_y"]=df_tracks["position_y"].apply(convert_distance, args=(distance_unit,))
-        df_tracks["position_x"]=df_tracks["position_x"].apply(convert_distance, args=(distance_unit,))
-        
-        # Calculate relative time, where each track begins at timepoint 1
-        def calculate_relative_time(group):
-            min_position = group['position_t'].min()
-            group['relative_time'] = group['position_t'].sub(min_position).add(1)
-            return group
-
-        df_tracks = df_tracks.groupby('TrackID').apply(calculate_relative_time).reset_index(drop=True)
-
-        df_tracks["time"]=df_tracks["position_t"]*time_interval
-        df_tracks["time"]=df_tracks["time"].apply(convert_time, args=(time_unit))
-        time_interval=convert_time(time_interval, time_unit)
-        
-        if imaris:
-            tcell_contact_threshold = convert_distance(tcell_contact_threshold, distance_unit)
-            organoid_contact_threshold = convert_distance(organoid_contact_threshold, distance_unit)
-        else:
-            contact_threshold = convert_distance(contact_threshold, distance_unit)
-
-        element_size_x = convert_distance(element_size_x, distance_unit)
-        element_size_y = convert_distance(element_size_y, distance_unit)
-        element_size_z = convert_distance(element_size_z, distance_unit)
-        
-        # Make default distance unit um over μm, as encoding of μm between python 
-        # and e.g Excel can lead to formatting errors
-        
-        df_tracks["distance_unit"] = "um"
-        df_tracks["time_unit"] = "h"
-
-        # Calculate various movement features such as speed and mean square displacement of the tracks  
-        print("- Calculating movement features...")
-        df_tracks=calculate_movement_features(
-            df_tracks,
-            time_interval = time_interval,
-            rolling_meanspeed_window=rolling_meanspeed_window
-            )
-        df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
-        
-        if cell_type=="tcells" and not imaris:
-            print("- Determining active contact of T cells")
-            # Determining if a T cell is actively interacting with another T cell based on speed
-            # More explanation at the top of this code
-            df_tracks['list_touching_tcells'] = df_tracks['touching_tcells'].apply(lambda x: [] if pd.isna(x) else list(map(int, x.split(','))))
-            active_interaction = []
-            for _, row in df_tracks.iterrows():
-                if row['tcell_contact']:
-                    max_mean_speed = max(row['mean_speed'], df_tracks.loc[df_tracks['SegmentID'].isin(row['list_touching_tcells']), 'mean_speed'].max())
-                    active_interaction.append(row['mean_speed'] == max_mean_speed)
-                else:
-                    active_interaction.append(False)
-            df_tracks=df_tracks.drop('list_touching_tcells', axis=1)      
-            df_tracks['active_tcell_contact'] = active_interaction
-        
-        print("- Perform z-normalization on selected feature columns")
-        df_tracks=normalize_track_features(
-            df_tracks, 
-            columns=[
-                "mean_square_displacement",
-                "speed",
-                "mean_dead_dye"
-            ]
-        )
-        
-        df_tracks=df_tracks.sort_values(by=["TrackID", "relative_time"])
-        
-        tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
-        print(f"- Writing output to {tracks_out_path}")
-        df_tracks.to_csv(tracks_out_path, sep=",", index=False)
-        
-        # Adding a sample name for later combination of multiple track experiments
-        df_tracks['sample_name']=sample_name
-        df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
-        df_all_tracks = pd.concat([df_all_tracks, df_tracks])
-        
-        ### TODO Add T cell contact calculation for all T cell types from centroid
-        ### 
-        end_time = time.time()
-        h,m,s = format_time(start_time, end_time)
-        print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
+        if dead_channel is not None:
+            df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{dead_channel}":"mean_dead_dye"})
+        df_intensity.to_csv(df_intensity_outpath, sep=",", index=False)
     
-    all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features.csv")
-    df_all_tracks.to_csv(all_tracks_out_path, index=False) 
-    return(df_all_tracks)
+    df_tracks = pd.merge(df_tracks, df_intensity, how="left")
+    
+    print("- Calculating contact with organoids and other T cells...")
+    print(f"Using a contact threshold of {contact_threshold} um")
+    # Calculate the contact od each T cell with an organoid or a T cell
+    # Explanation on how in the function itself
+    
+    if df_contacts_outpath.exists() and not overwrite:
+        print("Contact .csv already exists. Loading in contact information...")
+        df_contacts = pd.read_csv(
+            df_contacts_outpath,
+            dtype={
+                'TrackID': int,
+                'position_t': float,
+                'organoid_contact': bool,
+                'organoid_contact_pixels': bool,
+                'touching_organoids': str,
+                'tcell_contact': bool,
+                'tcell_contact_pixels': bool,
+                'touching_tcells': str
+                }
+            )
+
+    else:
+        df_contacts=calculate_organoid_and_tcell_contact(
+            tcell_segments=tcell_segments,
+            organoid_segments=organoid_segments,
+            element_size_x=element_size_x,
+            element_size_y=element_size_y,
+            element_size_z=element_size_z,
+            contact_threshold=contact_threshold,
+            calculate_from=cell_type
+        ) 
+        df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
+    
+    df_tracks = pd.merge(df_tracks, df_contacts, how="left")
+    return(df_tracks)
+
+def generalize_units_of_track_features(
+    df_tracks,
+    distance_unit,
+    time_interval,
+    time_unit
+    ):
+    # Converting the time and distance values to a default unit to allow comparison 
+    # with differently provided units (defaults to µm and hours)
+    print("- Converting distance and time unit to default um and hours...")   
+    df_tracks["position_z"]=df_tracks["position_z"].apply(convert_distance, args=(distance_unit,))
+    df_tracks["position_y"]=df_tracks["position_y"].apply(convert_distance, args=(distance_unit,))
+    df_tracks["position_x"]=df_tracks["position_x"].apply(convert_distance, args=(distance_unit,))
+    
+    # Calculate relative time, where each track begins at timepoint 1
+    def calculate_relative_time(group):
+        min_position = group['position_t'].min()
+        group['relative_time'] = group['position_t'].sub(min_position).add(1)
+        return group
+
+    df_tracks = df_tracks.groupby('TrackID').apply(calculate_relative_time).reset_index(drop=True)
+
+    df_tracks["time"]=df_tracks["position_t"]*time_interval
+    df_tracks["time"]=df_tracks["time"].apply(convert_time, args=(time_unit))
+    
+    # Make default distance unit um over μm, as encoding of μm between python 
+    # and e.g Excel can lead to formatting errors
+    df_tracks["distance_unit"] = "um"
+    df_tracks["time_unit"] = "h"
+    return(df_tracks)
+    
+def calculate_tcell_specific_track_features(
+    df_tracks,
+    dead_dye_threshold,
+    ):
+
+    print(f"- Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
+    df_tracks = calculate_death(df_tracks, threshold=dead_dye_threshold, threshold_column="mean_dead_dye")
+    # Calculate various movement features such as speed and mean square displacement of the tracks  
+    
+    print("- Determining active contact of T cells")
+    # Determining if a T cell is actively interacting with another T cell based on speed
+    # More explanation at the top of this code
+    df_tracks['list_touching_tcells'] = df_tracks['touching_tcells'].apply(lambda x: [] if pd.isna(x) else list(map(int, x.split(','))))
+    active_interaction = []
+    for _, row in df_tracks.iterrows():
+        if row['tcell_contact']:
+            max_mean_speed = max(row['mean_speed'], df_tracks.loc[df_tracks['SegmentID'].isin(row['list_touching_tcells']), 'mean_speed'].max())
+            active_interaction.append(row['mean_speed'] == max_mean_speed)
+        else:
+            active_interaction.append(False)
+    df_tracks=df_tracks.drop('list_touching_tcells', axis=1)      
+    df_tracks['active_tcell_contact'] = active_interaction
+    return(df_tracks)
+
+def calculate_imaris_track_features(
+    df_tracks,
+    organoid_contact_threshold,
+    tcell_contact_threshold,
+    distance_unit,
+    ):
+    """
+    This code calculates the various features for each timepoint in a track for each 
+    separate experiment
+    
+    This codes works with either:
+    - The generated segments and tracks from the BEHAV3D preprocessing modules
+    - Imaris extracted statistics
+    
+    Output:
+    - A .csv file containing all timepoints of all TrackIDs and their time-related 
+      features
+    """
+    
+    print("Performing feature calculation from Imaris processing..")
+    
+    print("- Calculating contact with organoids... (From Imaris)")
+    # Threshold the distance to organoid based on the supplied "organoid_contact_threshold"
+    # This distance is calculated before in Imaris and supplied as a separate channel and
+    # Extracted as a statistic (...Intensity_Min_Ch<#>_img=<#>.csv)
+    df_tracks["organoid_contact"]=df_tracks["organoid_distance"]<=organoid_contact_threshold
+    
+    # Calculate the nearest Tcell based on the distance between the centroids of other T cells
+    # Caution: This distance, unlike the BEHAV3D processing, is between centroids of cells, not borders
+    # Thus the provided "tcell_contact_threshold" needs to reflect this
+    print("- Calculating contact with T cells... (From Imaris)")
+    print(f"Using a contact threshold of {tcell_contact_threshold}{distance_unit}")
+    grouped = df_tracks.groupby('position_t')
+    new_dfs = []
+
+    ### The following code calculates the distances between all tracks of the same
+    ### type (So between for example CD4 and other CD4 cells)
+    touching_tcells_dict = {}
+    # Calculate distances between a segment and all other segments with cdist
+    for group_name, group_df in grouped:
+        positions = group_df[['position_x', 'position_y', 'position_z']].values
+        distances = cdist(positions, positions)
+        np.fill_diagonal(distances, np.inf)
+        distances_mask = distances <= tcell_contact_threshold
+
+        tcell_contacts_list = []
+        for i, row in enumerate(distances_mask):
+            tcell_contacts = np.where(row)[0].tolist()
+            tcell_contacts=[group_df.reset_index().loc[idx]["TrackID"] for idx in tcell_contacts]
+            tcell_contacts_list.append(tcell_contacts)                 
+        group_df['touching_tcells'] = tcell_contacts_list
+
+        for track_id, tcell_contacts in zip(group_df['TrackID'], tcell_contacts_list):
+            touching_tcells_dict[track_id] = tcell_contacts
+
+        group_df['tcell_contact'] = group_df['touching_tcells'].apply(lambda x: len(x) > 0)
+
+        ### As Imaris does not give interacting IDs, we can only add contact 
+        ### but leave the actual interacting ID as unknown
+        
+        if "complementary_tcell_distance" in df_tracks.columns:
+            # !! ADJUST THIS THRESHOLD OR MOVE TO AFTER ADDING ALL TRACKS
+            group_df['tcell_contact'] = group_df['complementary_tcell_distance']<=tcell_contact_threshold
+            group_df['touching_tcells'].append("unknown")
+        group_df['touching_tcells'] = group_df['touching_tcells'].apply(lambda x: ",".join(map(str, x)) if isinstance(x, list) and len(x) > 0 else None)
+        
+        new_dfs.append(group_df)
+    df_tracks = pd.concat(new_dfs, ignore_index=True)
+    return(df_tracks)
 
 def calculate_death(
     df_tracks,
@@ -821,7 +869,6 @@ def plot_filter_count(
             pdf.savefig(fig, bbox_inches='tight', dpi=600)
             plt.close(fig)
 
-
 def plot_dead_dye_distribution(
     df_tracks,
     outpath,
@@ -956,7 +1003,6 @@ def plot_touching_nontouching_distribution(
             plt.close(fig)
             # plt.savefig("output.pdf", bbox_inches='tight', dpi=600)
             
-    
 def interpolate_missing_positions(
     df_tracks,
     cols_to_copy=[
@@ -1202,7 +1248,8 @@ def calculate_organoid_and_tcell_contact(
                 touching_organoids = ",".join(organoid_contacts)
             else:
                 touching_organoids = None
-                
+            
+            
             df_contacts.append(pd.DataFrame([{
                 'TrackID': segment_id, 
                 'position_t': t,
@@ -1215,6 +1262,17 @@ def calculate_organoid_and_tcell_contact(
             }]))
     
     df_contacts=pd.concat(df_contacts)
+    df_contacts = df_contacts.astype({
+        'TrackID': int,
+        'position_t': float,
+        'organoid_contact': bool,
+        'organoid_contact_pixels': bool,
+        'touching_organoids': str,
+        'tcell_contact': bool,
+        'tcell_contact_pixels': bool,
+        'touching_tcells': str
+    })
+        
     return(df_contacts)
 
 def calculate_segment_intensity(tcell_segments, intensity_image, calculation="mean"):
