@@ -16,11 +16,16 @@ def convert_segments_to_tracks(
     # tracked_img = np.zeros_like(segments)
     outpath = Path(outpath)
     if outpath.exists():
+        if outpath.is_dir():
+            # Remove the directory if it already exists
+            shutil.rmtree(outpath)
+        else:
+            # Remove the file if it already exists
+            outpath.unlink()
         # Remove the file if it already exists
-        shutil.rmtree(outpath)
         
     if outpath.suffix == ".zip":
-        outpath = Path(outpath.stem)
+        outpath = Path(outpath.parent, outpath.stem)
     
     assert outpath.suffix == ".zarr", "Supplied outpath is not .zarr or .zarr.zip"
     
@@ -38,7 +43,90 @@ def convert_segments_to_tracks(
             outpath=outpath
             )
     zip_zarr(outpath)
-    
+
+def convert_all_tracked_images_to_csv(
+    metadata,
+    output_dir,
+    cell_type="organoid",
+    overwrite=False,
+    **kwargs
+    ):
+    for idx, sample in metadata.iterrows():
+        sample_name=sample['sample_name']
+        print(f"Tracking sample: {sample_name}")
+        
+        tracked_img_outdir = Path(output_dir, "images", sample_name)
+        tracked_csv_outdir = Path(output_dir, "trackdata", sample_name)
+        
+        # segmented_img_path = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_segments.zarr.zip")
+        tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr.zip")
+        segmented_img_path = tracked_img_outpath
+        tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_{cell_type}_tracks.csv")
+        
+        if not tracked_img_outdir.exists():
+            tracked_img_outdir.mkdir(parents=True)
+        if not tracked_csv_outdir.exists():
+            tracked_csv_outdir.mkdir(parents=True)
+        
+        if (
+            (
+                not tracked_csv_outpath.exists() or 
+                not tracked_img_outpath.exists()
+            ) or overwrite
+            ):
+            element_size_x = sample["pixel_distance_xy"]
+            element_size_y = sample["pixel_distance_xy"]
+            element_size_z = sample["pixel_distance_z"]
+            
+            df_tracks = convert_tracked_image_to_csv(
+                img_path=segmented_img_path,
+                outpath=tracked_csv_outpath,
+                element_size_x=element_size_x,
+                element_size_y=element_size_y,
+                element_size_z=element_size_z
+            )
+        else:
+            print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
+            
+        metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
+        metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
+    return(metadata)
+
+def convert_tracked_image_to_csv(
+    img_path,
+    outpath=None,
+    element_size_z=1,
+    element_size_y=1,
+    element_size_x=1
+    ):
+    segments = load_image(img_path)
+    df_tracks = []
+    for t, t_seg in tqdm(enumerate(segments), total=len(segments)):
+        t_seg = np.asarray(t_seg)
+        properties=pd.DataFrame(regionprops_table(label_image=t_seg, properties=['label', f'centroid']))
+        properties["position_t"]=t
+        df_tracks.append(properties)
+    df_tracks = pd.concat(df_tracks)
+    df_tracks.rename(
+            columns={
+                    'label': 'SegmentID',
+                    'centroid-0': "pixel_position_z",
+                    'centroid-1': "pixel_position_y",
+                    'centroid-2': "pixel_position_x",
+                }, 
+            inplace=True
+        )
+    df_tracks["TrackID"]=df_tracks["SegmentID"]
+    df_tracks["position_z"]=df_tracks["pixel_position_z"]*element_size_z
+    df_tracks["position_y"]=df_tracks["pixel_position_y"]*element_size_y
+    df_tracks["position_x"]=df_tracks["pixel_position_x"]*element_size_x
+    df_tracks = df_tracks[["TrackID", "SegmentID", "position_t", "position_x", "position_y", "position_z", "pixel_position_x", "pixel_position_y", "pixel_position_z"]]
+    if outpath is not None:
+        outpath = Path(outpath)
+        df_tracks.to_csv(outpath, sep=",", index=False)
+        
+    return(df_tracks)
+        
 # def convert_segments_to_tracks(
 #         tracks_csv_path,
 #         segments_path,

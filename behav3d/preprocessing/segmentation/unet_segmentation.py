@@ -367,7 +367,7 @@ class BEHAV3D_Unet_Segmenter():
             self.first_timepoint = True
             
             tcell_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_tcell_segments.zarr")
-            organoid_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_organoids_tracked.zarr")
+            organoid_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_organoid_tracked.zarr")
             mask_dead_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_mask_dead.zarr")
             
             if (Path(f"{tcell_segments_outpath}.zip").exists() and 

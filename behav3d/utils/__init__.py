@@ -1,5 +1,6 @@
 import pandas as pd
 from pathlib import Path
+from datetime import datetime
 
 def load_behav3d_metadata(
     metadata_path
@@ -23,8 +24,11 @@ def load_behav3d_metadata(
         "raw_image_path": str,  # Keeping as str for easy handling
         "tcell_segments_image_path": str,
         "tcell_tracks_image_path": str,
+        "tcell_tracks_csv_path": str,
+        "organoid_segments_image_path": str,
         "organoid_tracks_image_path": str,
-        "tcell_tracks_csv_path": str
+        "organoid_tracks_csv_path": str,
+        
     }
     metadata = pd.read_csv(metadata_path, dtype=dtype_dict)
     return metadata 
@@ -32,15 +36,29 @@ def load_behav3d_metadata(
 def check_behav3d_metadata(
     metadata
     ):
-    assert not any(metadata.drop(columns=["tcell_tracks_image_path", "organoid_tracks_image_path", "tcell_tracks_csv_path"]).isna().any()), "Some column values have not been supplied. Make sure you correctly supply values for all columns in the metadata .csv"
+    assert not any(metadata.drop(columns=[
+        "tcell_segments_image_path", 
+        "tcell_tracks_image_path", 
+        "tcell_tracks_csv_path", 
+        "organoid_segments_image_path",
+        "organoid_tracks_image_path", 
+        "organoid_tracks_csv_path"]).isna().any()), "Some column values have not been supplied. Make sure you correctly supply values for all columns in the metadata .csv"
+    
     ok = True
     for rowidx, sample_metadata in metadata.iterrows():
         sample_name = sample_metadata['sample_name']
-        
+    
         assert Path(sample_metadata["raw_image_path"]).exists(), f"The image_path supplied for 'row {rowidx+1}: {sample_name}' does not exist"
         
+        # elsizes = load_elsizes(sample_metadata["raw_image_path"])
+        # assert sample_metadata["pixel_distance_xy"] == elsizes["x"], f"Pixel distance xy supplied for 'row {rowidx+1}: {sample_name}' does not match the x pixel distance {elsizes['x']} retrieved from the raw image metadata"
+        # assert sample_metadata["pixel_distance_xy"] == elsizes["x"], f"Pixel distance xy supplied for 'row {rowidx+1}: {sample_name}' does not match the y pixel distance {elsizes['y']} retrieved from the raw image metadata"
+        # assert sample_metadata["pixel_distance_z"] == elsizes["z"], f"Pixel distance z supplied for 'row {rowidx+1}: {sample_name}' does not match the z pixel distance {elsizes['z']} in the image"
+        
+        ### T cell paths
         if not pd.isna(sample_metadata["tcell_segments_image_path"]):
             assert Path(sample_metadata["tcell_segments_image_path"]).exists(), f"The tcell_segments_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+        
         elif not pd.isna(sample_metadata["tcell_tracks_image_path"]):
             print(f"!!! No segmented or tracked tcell image is supplied for 'row {rowidx+1}: {sample_name}'. Please run segmentation and tracking below.")
             ok=False
@@ -49,17 +67,27 @@ def check_behav3d_metadata(
         else:
             print(f"!!! No tracked tcell image is supplied for 'row {rowidx+1}: {sample_name}'. Please run tracking below.")
             ok=False
+        if not pd.isna(sample_metadata["tcell_tracks_csv_path"]):
+            assert Path(sample_metadata["tcell_tracks_csv_path"]).exists(), f"The tcell_tracks_csv_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+        else:
+            print(f"!!! No tracked tcell .csv is supplied for 'row {rowidx+1}: {sample_name}'. Please run tracking below.")
+            ok=False
             
+        ### Organoids paths
+        if not pd.isna(sample_metadata["organoid_segments_image_path"]):
+            assert Path(sample_metadata["organoid_segments_image_path"]).exists(), f"The organoid_segments_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+        elif not pd.isna(sample_metadata["organoid_tracks_image_path"]):
+            print(f"!!! No segmented or tracked organoid image is supplied for 'row {rowidx+1}: {sample_name}'. Please run segmentation and tracking below.")
+            ok=False
         if not pd.isna(sample_metadata["organoid_tracks_image_path"]):
             assert Path(sample_metadata["organoid_tracks_image_path"]).exists(), f"The organoid_tracks_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
         else:
             print(f"!!! No tracked organoid image is supplied for 'row {rowidx+1}: {sample_name}'. Please run tracking below.")
             ok=False
-            
-        if not pd.isna(sample_metadata["tcell_tracks_csv_path"]):
-            assert Path(sample_metadata["tcell_tracks_csv_path"]).exists(), f"The tcell_tracks_csv_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+        if not pd.isna(sample_metadata["organoid_tracks_csv_path"]):
+            assert Path(sample_metadata["organoid_tracks_csv_path"]).exists(), f"The organoid_tracks_csv_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
         else:
-            print(f"!!! No .csv of tcell tracks is supplied for 'row {rowidx+1}: {sample_name}'. Please run tracking below.")
+            print(f"!!! No tracked organoid .csv is supplied for 'row {rowidx+1}: {sample_name}'. Please run tracking below.")
             ok=False
     if ok:
         print("Metadata file is complete and correct")
@@ -83,6 +111,9 @@ def convert_time(time_interval, time_unit):
         assert time_unit in time_conversions.keys(), f"time unit needs to be one of: {time_conversions.keys()}, is {time_unit}"
         time_interval = time_interval/time_conversions[time_unit]
         return(time_interval)
+
+def get_current_time():
+    return(datetime.now().strftime("%H:%M:%S"))
 
 def convert_distance(distance, distance_unit):
         distance_conversions={

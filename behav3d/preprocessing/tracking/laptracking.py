@@ -7,8 +7,6 @@ from tqdm import tqdm
 from behav3d.utils.fileio import load_image, append_to_zarr, zip_zarr, get_filepath_stem
 from behav3d.utils.tracking import convert_segments_to_tracks
 
-import shutil
-
 def laptrack_image(
     segments=None,
     segments_path=None,
@@ -99,19 +97,21 @@ def run_tcell_laptracking(
     merging_cost_cutoff=False,
     splitting_cost_cutoff=False,
     return_trackimg=True,
+    cell_type="tcell",
     overwrite=False,
     **kwargs
     ):
-     for idx, sample in metadata.iterrows():
+    for idx, sample in metadata.iterrows():
         sample_name=sample['sample_name']
         print(f"Tracking sample: {sample_name}")
         
         tracked_img_outdir = Path(output_dir, "images", sample_name)
         tracked_csv_outdir = Path(output_dir, "trackdata", sample_name)
         
-        tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_tcell_tracked.zarr.zip")
-        tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_tcell_tracks.csv")
-        
+        segments_path = sample[f"{cell_type}_segments_image_path"]
+        tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr.zip")
+        tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_{cell_type}_tracks.csv")
+    
         if not tracked_img_outdir.exists():
             tracked_img_outdir.mkdir(parents=True)
         if not tracked_csv_outdir.exists():
@@ -128,7 +128,7 @@ def run_tcell_laptracking(
             ) or overwrite
             ):
             laptrack_image(
-                segments_path=sample["tcell_segments_image_path"],
+                segments_path=segments_path,
                 tracked_img_outpath=tracked_img_outpath,
                 tracked_csv_outpath=tracked_csv_outpath,
                 element_size_x=element_size_x,
@@ -144,7 +144,7 @@ def run_tcell_laptracking(
         else:
             print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
         
-        metadata.at[idx, "tcell_tracks_image_path"] = str(tracked_img_outpath)
-        metadata.at[idx, "tcell_tracks_csv_path"] = str(tracked_csv_outpath)
+        metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
+        metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
         
         return metadata

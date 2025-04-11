@@ -442,3 +442,52 @@ def convert_input_files_to_zarr(
         organoid_zarr_out_path,
         raw_image_zarr_out_path
     )
+    
+def load_elsizes(path):
+    path = Path(path)
+    if path.suffix==".czi":
+        elsizes = load_elsizes_czi(path)
+    elif path.suffix==".h5":
+        pass
+    elif path.suffix==".ims":
+        pass
+    elif path.suffix==".zarr" or str(path).endswith(".zarr.zip"):
+        pass
+    elif path.suffix==".tif" or path.suffix==".tiff":
+       pass
+    else:
+        raise ValueError(f"Unsupported file format: {path.suffix}")
+    
+    return(elsizes)
+
+def load_elsizes_czi(path):
+    czi = CziFile(path)
+    metadata = element_to_dict(czi.meta)
+    try:
+        elsize_x = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]['AcquisitionBlock']['AcquisitionModeSetup']['ScalingX']["ScalingX"])*(10**6)
+        elsize_y = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]['AcquisitionBlock']['AcquisitionModeSetup']['ScalingY']["ScalingY"])*(10**6)
+        elsize_z = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]['AcquisitionBlock']['AcquisitionModeSetup']['ScalingZ']["ScalingZ"])*(10**6)
+    except:
+        elsize_x = float(metadata["Metadata"]["Scaling"]["Items"]["Distance"][0]["Value"]["Value"])*(10**6)
+        elsize_y = float(metadata["Metadata"]["Scaling"]["Items"]["Distance"][1]["Value"]["Value"])*(10**6)
+        elsize_z = float(metadata["Metadata"]["Scaling"]["Items"]["Distance"][2]["Value"]["Value"])*(10**6)
+    
+    ### Interval unit does not make sense as it seems to be in seconds but "defaultunit is minutes"
+    try:
+        time_interval = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["TimeSeriesSetup"]["Switches"]["Switch"]["SwitchAction"]["SetIntervalAction"]["Interval"]["TimeSpan"]["Value"]["Value"])
+        interval_unit = metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["TimeSeriesSetup"]["Switches"]["Switch"]["SwitchAction"]["SetIntervalAction"]["Interval"]["TimeSpan"]["DefaultUnitFormat"]["DefaultUnitFormat"]
+    except:
+        time_interval = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["SubDimensionSetups"]["TimeSeriesSetup"]["Interval"]["TimeSpan"]["Value"]["Value"])
+        interval_unit = metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["SubDimensionSetups"]["TimeSeriesSetup"]["Interval"]["TimeSpan"]["DefaultUnitFormat"]["DefaultUnitFormat"]
+    
+    elsizes = {
+        "x": elsize_x,
+        "y": elsize_y,
+        "z": elsize_z,
+        "elsize_unit": "µm",
+        "t": time_interval,
+        # For some reason there doesnt seem 
+        "time_interval_unit": "s"   
+    }
+
+    

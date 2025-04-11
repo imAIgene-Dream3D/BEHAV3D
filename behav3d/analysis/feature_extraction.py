@@ -150,26 +150,16 @@ import seaborn as sns
 
 import math
 import time
-from behav3d.utils import format_time, convert_time, convert_distance
+from behav3d.utils import get_current_time, format_time, convert_time, convert_distance
 from behav3d.utils.fileio import load_image, convert_input_files_to_zarr
 from tqdm import tqdm
-
-
-def run_behav3d_feature_extraction(config, metadata, cell_type="tcells"):
-   
-    df_all_tracks=calculate_track_features(config, metadata, cell_type=cell_type)
-    
-    # Calculate features for each timepoint in a track
-    df_all_tracks_filt = filter_tracks(df_all_tracks, config, metadata)
-    
-    # Calculate features for each timepoint in a track
-    df_summarized_tracks=summarize_track_features(df_all_tracks_filt, config, metadata) 
+from datetime import datetime
 
 def run_feature_extraction(
     metadata, 
     config=None,
     output_dir=None,
-    cell_type="tcells",
+    cell_type="tcell",
     imaris=False,
     rolling_meanspeed_window=10,
     overwrite=False
@@ -226,8 +216,8 @@ def run_feature_extraction(
         img_outdir = Path(output_dir, "images", sample_name)
         if not img_outdir.exists():
             img_outdir.mkdir(parents=True)
-            
-        print("- Converting all input files to .zarr for memory efficiency...")
+
+        print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
         tcell_segments_path, organoid_segments_path, raw_image_path = convert_input_files_to_zarr(
             tcell_segments_path=tcell_segments_path,
             organoid_segments_path=organoid_segments_path,
@@ -249,12 +239,18 @@ def run_feature_extraction(
             feature_outdir.mkdir(parents=True)
         if not analysis_outdir.exists():
             analysis_outdir.mkdir(parents=True)
-            
-        print("- Loading in tracks csv...")
-        df_tracks_path = sample_metadata["tcell_tracks_csv_path"]
+        
+        print(f"{get_current_time()} - Loading in tracks csv...")
+        if cell_type=="tcell":
+            df_tracks_path = sample_metadata["tcell_tracks_csv_path"]
+        elif cell_type=="organoid":
+            df_tracks_path = sample_metadata["organoid_tracks_csv_path"]
+        else:
+            raise ValueError(f"Unknown cell type: {cell_type}. Expected 'tcell' or 'organoid'.")
+        
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
         
-        print("### Generalizing the units of position and time to um and hours")
+        print(f"{get_current_time()} - Generalizing the units of position and time to um and hours")
         df_tracks = generalize_units_of_track_features(
             df_tracks=df_tracks,
             distance_unit=distance_unit,
@@ -265,7 +261,7 @@ def run_feature_extraction(
         time_unit = "h"
         
         ### Calculate image based features (per timepoint)
-        print("### Calculating single-timepoint image-based features...")
+        print(f"{get_current_time()} - Calculating single-timepoint image-based features...")
         df_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_intensity.csv")
         df_contacts_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_contact.csv")
         if imaris:
@@ -293,13 +289,13 @@ def run_feature_extraction(
             )
         
         
-        print("### Interpolating missing timepoints based on time interval")
+        print(f"{get_current_time()} - Interpolating missing timepoints based on time interval")
         # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
         # Values are interpolated linearly, forward filled or left blank based on the column
         # More explanation within the function
         df_tracks= interpolate_missing_positions(df_tracks)
 
-        print("### Calculating movement features...")
+        print(f"{get_current_time()} - Calculating movement features...")
         df_tracks=calculate_movement_features(
             df_tracks,
             time_interval = time_interval,
@@ -307,20 +303,20 @@ def run_feature_extraction(
             )
         df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
         
-        if cell_type=="tcells":
-            print("### Calculating T-cell specific features...")
+        if cell_type=="tcell":
+            print(f"{get_current_time()} - Calculating T-cell specific features...")
             df_tracks = calculate_tcell_specific_track_features(
                 df_tracks,
                 dead_dye_threshold=dead_dye_threshold,
                 )
             
-        elif cell_type=="organoids":
-            print("### Calculating organoid specific features...")
+        elif cell_type=="organoid":
+            print(f"{get_current_time()} - Calculating organoid specific features...")
             #TODO Add organoid specific features
         else:
-            print("### No cell type specified, skipping cell type specific features...")
+            print(f"{get_current_time()} - No cell type specified, skipping cell type specific features...")
         
-        print("- Perform z-normalization on selected feature columns")
+        print(f"{get_current_time()} - Perform z-normalization on selected feature columns")
         df_tracks=normalize_track_features(
             df_tracks, 
             columns=[
@@ -331,7 +327,7 @@ def run_feature_extraction(
         )
             
         tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
-        print(f"- Writing output to {tracks_out_path}")
+        print(f"{get_current_time()} - Writing output to {tracks_out_path}")
         df_tracks.to_csv(tracks_out_path, sep=",", index=False)
         
         # Adding a sample name for later combination of multiple track experiments
@@ -341,11 +337,12 @@ def run_feature_extraction(
         
         end_time = time.time()
         h,m,s = format_time(start_time, end_time)
-        print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
+        print(f"###### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
         
     all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features.csv")
     df_all_tracks.to_csv(all_tracks_out_path, index=False) 
-             
+    return(df_all_tracks)       
+
 def calculate_image_based_track_features(
     df_tracks,
     cell_type,
@@ -386,7 +383,7 @@ def calculate_image_based_track_features(
     tcell_segments=load_image(tcell_segments_path)
     intensity_image = load_image(raw_image_path)
     
-    print("- Calculating channel and especially death dye intensities...")
+    print(f"{get_current_time()} - Calculating channel and especially death dye intensities...")
     if df_intensity_outpath.exists() and not overwrite:
         print("Intensity calculation .csv already exists. Loading in intensity information...")
         df_intensity = pd.read_csv(df_intensity_outpath)
@@ -401,7 +398,7 @@ def calculate_image_based_track_features(
     
     df_tracks = pd.merge(df_tracks, df_intensity, how="left")
     
-    print("- Calculating contact with organoids and other T cells...")
+    print(f"{get_current_time()} - Calculating contact with organoids and other T cells...")
     print(f"Using a contact threshold of {contact_threshold} um")
     # Calculate the contact od each T cell with an organoid or a T cell
     # Explanation on how in the function itself
@@ -445,7 +442,7 @@ def generalize_units_of_track_features(
     ):
     # Converting the time and distance values to a default unit to allow comparison 
     # with differently provided units (defaults to µm and hours)
-    print("- Converting distance and time unit to default um and hours...")   
+    print(f"{get_current_time()} - Converting distance and time unit to default um and hours...")   
     df_tracks["position_z"]=df_tracks["position_z"].apply(convert_distance, args=(distance_unit,))
     df_tracks["position_y"]=df_tracks["position_y"].apply(convert_distance, args=(distance_unit,))
     df_tracks["position_x"]=df_tracks["position_x"].apply(convert_distance, args=(distance_unit,))
@@ -472,14 +469,17 @@ def calculate_tcell_specific_track_features(
     dead_dye_threshold,
     ):
 
-    print(f"- Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
+    print(f"{get_current_time()} - Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
     df_tracks = calculate_death(df_tracks, threshold=dead_dye_threshold, threshold_column="mean_dead_dye")
     # Calculate various movement features such as speed and mean square displacement of the tracks  
     
-    print("- Determining active contact of T cells")
+    print(f"{get_current_time()} - Determining active contact of T cells")
     # Determining if a T cell is actively interacting with another T cell based on speed
     # More explanation at the top of this code
-    df_tracks['list_touching_tcells'] = df_tracks['touching_tcells'].apply(lambda x: [] if pd.isna(x) else list(map(int, x.split(','))))
+    df_tracks['list_touching_tcells'] = df_tracks['touching_tcells'].apply(
+        lambda x: [] if pd.isna(x) or x=="" else list(map(int, x.split(',')))
+        )
+    
     active_interaction = []
     for _, row in df_tracks.iterrows():
         if row['tcell_contact']:
@@ -512,7 +512,7 @@ def calculate_imaris_track_features(
     
     print("Performing feature calculation from Imaris processing..")
     
-    print("- Calculating contact with organoids... (From Imaris)")
+    print(f"{get_current_time()} - Calculating contact with organoids... (From Imaris)")
     # Threshold the distance to organoid based on the supplied "organoid_contact_threshold"
     # This distance is calculated before in Imaris and supplied as a separate channel and
     # Extracted as a statistic (...Intensity_Min_Ch<#>_img=<#>.csv)
@@ -521,7 +521,7 @@ def calculate_imaris_track_features(
     # Calculate the nearest Tcell based on the distance between the centroids of other T cells
     # Caution: This distance, unlike the BEHAV3D processing, is between centroids of cells, not borders
     # Thus the provided "tcell_contact_threshold" needs to reflect this
-    print("- Calculating contact with T cells... (From Imaris)")
+    print(f"{get_current_time()} - Calculating contact with T cells... (From Imaris)")
     print(f"Using a contact threshold of {tcell_contact_threshold}{distance_unit}")
     grouped = df_tracks.groupby('position_t')
     new_dfs = []
@@ -580,154 +580,6 @@ def calculate_death(
             first_threshold_index = threshold_indices.min()
             df_tracks.loc[track_df.index[first_threshold_index:], "dead"] = True
     return df_tracks
-    
-def filter_tracks(
-    df_all_tracks,
-    metadata,
-    config=None,
-    output_dir=None,
-    tcell_exp_duration=None,
-    tcell_min_track_length=None,
-    tcell_max_track_length=None,
-    cell_type="tcells"
-    ):
-    """
-    This code filters tracks based on supplied parameters in the config.yml
-    
-    Filtering is based on:
-    - Maximum experiment length (tcell_exp_duration)    
-    - Minimum track length (tcell_min_track_length)
-    - Tracks starting at timepoint 1 with a dead dye mean over the dead_dye_threshold (dead_dye_threshold)
-    
-    Additonally, all tracks are cut down to:
-    - Maximum track length (tcell_max_track_length)
-    
-    Output:
-    - A .csv file containing filtered tracks from all experiments
-    """
-    
-    assert config is not None or all(
-        [output_dir, tcell_exp_duration, tcell_min_track_length, tcell_max_track_length]
-    ), "Either 'config' or 'output_dir, tcell_exp_duration, tcell_min_track_length and tcell_max_track_length' parameters must be supplied"
-    
-    start_time = time.time()
-    
-    print(f"--------------- Filtering tracks ---------------")
-    
-    if not all([output_dir, tcell_exp_duration, tcell_min_track_length, tcell_max_track_length]):
-        output_dir = config['output_dir']
-        tcell_exp_duration = config['tcell_exp_duration']
-        tcell_min_track_length = config['tcell_min_track_length']
-        tcell_max_track_length = config['tcell_max_track_length']
-    
-    analysis_outdir = Path(output_dir, "analysis", cell_type)
-    feature_outdir = Path(analysis_outdir, "track_features")
-    qc_outdir = Path(analysis_outdir, "quality_control")
-    
-    if not analysis_outdir.exists():
-        analysis_outdir.mkdir(parents=True)
-    if not feature_outdir.exists():
-        feature_outdir.mkdir(parents=True)
-    if not qc_outdir.exists():
-        qc_outdir.mkdir(parents=True)
-     
-    group_cols = ['TrackID', 'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
-    df_all_tracks_filt = pd.merge(df_all_tracks, metadata, how="left", on="sample_name")
-
-    # Function to count the number of unique tracks in the DataFrame
-    def count_tracks(df_all_tracks, col_name="nr_tracks", df_track_counts=None):
-        nr_tracks=df_all_tracks.groupby([
-            'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
-            ).agg(nr_tracks=pd.NamedAgg(column='TrackID', aggfunc='nunique')).reset_index()
-        nr_tracks=nr_tracks.rename(columns={"nr_tracks":col_name})
-        if df_track_counts is None:
-            return(nr_tracks)
-        else:
-            return(pd.merge(df_track_counts, nr_tracks, how="left"))
-    
-    # Counting the nr of tracks before filtering
-    df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_before_filtering")
-    
-    # Filtering the tracks based on the total experimental duration
-    # Any timepoint after this will be filtered out 
-    df_all_tracks_filt=df_all_tracks_filt.drop(df_all_tracks_filt[df_all_tracks_filt["position_t"]>tcell_exp_duration].index)
-    df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_exp_duration", df_track_counts=df_track_counts)
-
-    # Filtering out tracks under specific track length and cutting them down to specified max track length
-    df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).filter(lambda group: len(group) >= tcell_min_track_length).reset_index(drop=True)
-    df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).apply(lambda group: group.iloc[:tcell_max_track_length]).reset_index(drop=True)
-    df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_min_track_length", df_track_counts=df_track_counts)
-
-    # Plot the number of cells having contact with another T cell and Organoid for analysis
-    # of the set contact_threshold
-    plot_tcell_touching_outpath = Path(qc_outdir, f"BEHAV3D_tcell_touching_distribution.pdf")
-    print(f"- Plotting tcell touching distribution to {plot_tcell_touching_outpath}")
-    plot_touching_nontouching_distribution(
-        df_all_tracks_filt, 
-        outpath=plot_tcell_touching_outpath,
-        contact_column="tcell_contact",
-        nr_cols=3,
-        rows_per_page = 3,
-        )
-    
-    plot_organoid_touching_outpath = Path(qc_outdir, f"BEHAV3D_organoid_touching_distribution.pdf")
-    print(f"- Plotting organoid touching distribution to {plot_organoid_touching_outpath}")
-    plot_touching_nontouching_distribution(
-        df_all_tracks_filt, 
-        outpath=plot_organoid_touching_outpath,
-        contact_column="organoid_contact",
-        nr_cols=3,
-        rows_per_page=3,
-        )
-    
-    
-    
-    # Plot the distribution of dead dye intensity of all timepoints and at timepoint 1
-    # Can be used to aid in the choice of dead_dye_threshold
-    plot_dead_dye_distr_outpath = Path(qc_outdir, f"BEHAV3D_dead_dye_distribution.pdf")
-    print(f"- Plotting dead dye distribution at all timepoints to {plot_dead_dye_distr_outpath}")
-    plot_dead_dye_distribution(
-        df_all_tracks_filt,
-        outpath=plot_dead_dye_distr_outpath,
-        nr_cols=2,
-        rows_per_page=2
-        )
-    
-    plot_dead_dye_distr_t0_outpath = Path(qc_outdir, f"BEHAV3D_dead_dye_distribution_t0.pdf")
-    print(f"- Plotting dead dye distribution at timepoint 1 to {plot_dead_dye_distr_outpath}")
-    plot_dead_dye_distribution(
-        df_all_tracks_filt[df_all_tracks_filt["relative_time"]==1],
-        outpath=plot_dead_dye_distr_t0_outpath,
-        nr_cols=2,
-        rows_per_page=2
-        )
-    
-    # Filter out all T cells that are dead based on the threshold at the first timepoint of a track
-    dead_t0 = df_all_tracks_filt[
-        (df_all_tracks_filt["relative_time"]==1) & 
-        (df_all_tracks_filt["dead"])
-        ][["TrackID","sample_name"]]
-    df_all_tracks_filt=df_all_tracks_filt[~df_all_tracks_filt.set_index(['TrackID', 'sample_name']).index.isin(dead_t0.set_index(['TrackID', 'sample_name']).index)]   
-    df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_dead_t1", df_track_counts=df_track_counts)
-
-    plot_filter_count_outpath = Path(qc_outdir, f"BEHAV3D_filter_counts.pdf")
-    print(f"- Plotting track counts after filtering steps to {plot_filter_count_outpath}")
-    plot_filter_count(
-        df_track_counts,
-        outpath=plot_filter_count_outpath,
-        nr_cols=3,
-        rows_per_page = 3,
-        filter_cols=["nr_tracks_before_filtering", "nr_tracks_exp_duration", "nr_tracks_min_track_length", "nr_tracks_dead_t1"]
-    )
-    
-    # Write the filtered tracks to a .csv
-    filt_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_filtered.csv")
-    print(f"- Writing filtered tracks to {filt_tracks_out_path}")
-    df_all_tracks_filt.to_csv(filt_tracks_out_path, sep=",", index=False)
-    end_time = time.time()
-    h,m,s = format_time(start_time, end_time)
-    print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
-    return(df_all_tracks_filt)
 
 def normalize_track_features(
     df_tracks,
@@ -741,268 +593,7 @@ def normalize_track_features(
     for column_name in columns:
         df_tracks.loc[:, f'z_{column_name}'] = df_tracks[column_name].transform(lambda x: (x - x.mean()) / x.std())
     return (df_tracks)
-
-def summarize_track_features(
-    df_tracks,
-    config=None,
-    output_dir=None,
-    imaris=False,
-    cell_type="tcells"
-    ):
-    """
-    This code calculates summarized features (e.g. mean speed of the whole track) 
-    for each TrackID for every experiment specified in the provided metadata.csv
-    
-    Output:
-    - A .csv file containing all tracks from all experiments with their track-summarized features
-    """
-    
-    assert config is not None or output_dir is not None, "Either 'config' or 'output_dir' must be supplied"
-    
-    start_time = time.time()
-            
-    print(f"--------------- Summarizing track features ---------------")
-    
-    if output_dir is None:
-        output_dir = config['output_dir']
-        if "imaris" in config.keys():
-            imaris = config["imaris"]
-        else:
-            imaris = False
-    analysis_outdir = Path(output_dir, "analysis", cell_type)
-    feature_outdir = Path(analysis_outdir, "track_features")
-    qc_outdir = Path(analysis_outdir, "quality_control")
-    
-    if not analysis_outdir.exists():
-        analysis_outdir.mkdir(parents=True)
-    if not feature_outdir.exists():
-        feature_outdir.mkdir(parents=True)
-    if not qc_outdir.exists():
-        qc_outdir.mkdir(parents=True)
-
-    # Calculate mean values of track features over the whole track
-    grouped_df_tracks=df_tracks.groupby(['sample_name','TrackID'])
-    df_summarized_tracks = grouped_df_tracks.size().reset_index(name="track_length")
-    df_summarized_tracks['mean_dead_dye'] = grouped_df_tracks['mean_dead_dye'].mean().reset_index()["mean_dead_dye"]
-    df_summarized_tracks['mean_MSD'] =  grouped_df_tracks['mean_square_displacement'].mean().reset_index()['mean_square_displacement']
-    df_summarized_tracks['mean_speed'] =  grouped_df_tracks['speed'].mean().reset_index()['speed']
-    df_summarized_tracks['mean_organoid_contact'] =  grouped_df_tracks['organoid_contact'].mean().reset_index()['organoid_contact']
-    df_summarized_tracks['mean_tcell_contact'] =  grouped_df_tracks['tcell_contact'].mean().reset_index()['tcell_contact']
-    df_summarized_tracks['mean_displacement'] =  grouped_df_tracks['displacement'].mean().reset_index()['displacement']
-    df_summarized_tracks['dies'] =  grouped_df_tracks['dead'].any().reset_index()["dead"]
-    
-    # For some values, take the maximum of the track such as "displacement_from_origin"
-    df_summarized_tracks['displacement_from_origin'] =  grouped_df_tracks['displacement_from_origin'].last().reset_index()['displacement_from_origin']
-    df_summarized_tracks['cumulative_displacement'] =  grouped_df_tracks['cumulative_displacement'].last().reset_index()['cumulative_displacement']
-    
-    if not imaris:
-        # Calculate for the contact that occurs, what percentage has been active contact
-        # As it only takes points of contact, this can mean the mean contact is 1% (0.01)
-        # while the active contact can then still be 100% (1.0)
-        def calculate_active_contact_when_contact(group):
-            if group['tcell_contact'].any():
-                return group[group['tcell_contact']]['active_tcell_contact'].mean()
-            else:
-                return 0
-        df_summarized_tracks['active_tcell_contact'] = grouped_df_tracks.apply(calculate_active_contact_when_contact).reset_index(drop=True)
-
-    df_trackinfo = df_tracks[['TrackID', 'sample_name','well', 'exp_nr', 'organoid_line', 'tcell_line']].drop_duplicates()
-    df_summarized_tracks = pd.merge(df_trackinfo, df_summarized_tracks, how="left")
-    # Write the summarized features to a .csv
-    summ_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_summarized.csv")
-    print(f"- Writing summarized tracks to {summ_tracks_out_path}")
-    df_summarized_tracks.to_csv(summ_tracks_out_path, sep=",", index=False)
-    
-    end_time = time.time()
-    h,m,s = format_time(start_time, end_time)
-    print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
-    return(df_summarized_tracks)
-
-def plot_filter_count(
-    df_track_counts,
-    outpath,
-    nr_cols=3,
-    rows_per_page = 3,
-    figsize=(8.27, 11.69),
-    filter_cols=["nr_tracks_before_filtering", "nr_tracks_exp_duration", "nr_tracks_min_track_length", "nr_tracks_dead_t1"]
-    ):
-    
-    sample_names = df_track_counts["sample_name"].unique()
-    n_plots = len(sample_names)
-    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
-    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
-    
-    with PdfPages(outpath) as pdf:
-        plot_idx = 0
-        for page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
-            gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.5, hspace=0.3)
-            remaining_axes = [
-                fig.add_subplot(gs[i, j])
-                for i in range(rows_per_page)
-                for j in range(nr_cols)
-            ]
-            
-            for ax in remaining_axes:
-                if plot_idx >= n_plots:
-                    ax.remove()
-                    continue
-                
-                sample = sample_names[plot_idx]
-                df_subset = df_track_counts[df_track_counts["sample_name"] == sample]
-                
-                sns.barplot(
-                    x=filter_cols, 
-                    y=df_subset[filter_cols].values.flatten(),
-                    ax=ax
-                )
-                
-                ax.set_title(sample, fontsize=10, loc='center')
-                ax.set_xlabel("")
-                ax.set_ylabel("Count")
-                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-                
-                plot_idx += 1
-            
-            fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
-            plt.show()
-            pdf.savefig(fig, bbox_inches='tight', dpi=600)
-            plt.close(fig)
-
-def plot_dead_dye_distribution(
-    df_tracks,
-    outpath,
-    nr_cols=3,
-    rows_per_page = 3,
-    figsize=(8.27, 11.69)
-    ):
-    """
-    Create a violin plot with an underlying scatterplot that provides an
-    overview of the mean dead dye intensity per segment at the first timepoint
-    in each experiment
-    """
-    sample_names = df_tracks["sample_name"].unique()
-    n_plots = len(sample_names)
-    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
-    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
-    
-    with PdfPages(outpath) as pdf:
-        # df_time1 = df_tracks[df_tracks["relative_time"]==1]
-        plot_idx = 0  # Track which plot we are adding
-        for page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
-            gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.3, hspace=0.1)
-            remaining_axes = [
-                fig.add_subplot(gs[i, j]) 
-                for i in range(rows_per_page)
-                for j in range(nr_cols)
-                ]
-
-            for ax in remaining_axes:
-                if plot_idx >= n_plots:
-                    ax.remove()  # Remove empty axes
-                    continue
-                
-                sample = sample_names[plot_idx]
-                df_subset = df_tracks[(df_tracks["sample_name"] == sample)]
-
-                # Violin plot
-                sns.violinplot(
-                    data=df_subset, 
-                    # x='sample_name', 
-                    y='mean_dead_dye', 
-                    dodge=False, 
-                    inner=None,
-                    ax=ax
-                    )
-
-                # Jitter plot (scatter over the violin)
-                sns.stripplot(
-                    data=df_subset, 
-                    # x='sample_name', 
-                    y='mean_dead_dye', 
-                    color='black', 
-                    alpha=0.5, 
-                    jitter=True,
-                    ax=ax
-                    )
-                ax.set_title(sample, fontsize=10, loc='center')
-                ax.set_xticks([])
-                ax.set_xticklabels([])
-                ax.set_xlabel("")
-                ax.set_ylabel("Mean Dead Dye")
-                ax.grid(True, linestyle="--", alpha=0.7)
-                sns.despine()
-                plot_idx += 1
-                
-            # plt.show(fig)
-            fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
-            pdf.savefig(fig, bbox_inches='tight', dpi=600)
-            plt.close(fig)
-        
-def plot_touching_nontouching_distribution(
-    df_tracks,
-    outpath,
-    contact_column='organoid_contact',
-    nr_cols=3,
-    rows_per_page = 3,
-    figsize=(8.27, 11.69)
-    ):
-    """
-    Create a barplot that provides an overview of how many cells make contact with
-    other organoids/cells
-    """
-    
-    sample_names = df_tracks["sample_name"].unique()
-    n_plots = len(sample_names)
-    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
-    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
-        
-    with PdfPages(outpath) as pdf:
-        # organoid_lines = df_tracks["organoid_line"].unique()
-        plot_idx = 0  # Track which plot we are adding
-        for page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
-            gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.5, hspace=0.3)
-
-            remaining_axes = [
-                fig.add_subplot(gs[i, j]) 
-                for i in range(rows_per_page)
-                for j in range(nr_cols)
-                ]
-
-            for ax in remaining_axes:
-                if plot_idx >= n_plots:
-                    ax.remove()  # Remove empty axes
-                    continue
-                
-                sample = sample_names[plot_idx]
-                df_subset = df_tracks[(df_tracks["sample_name"] == sample)]
-
-                sns.histplot(
-                    df_subset, 
-                    x=contact_column, 
-                    multiple="dodge", 
-                    shrink=0.8, 
-                    discrete=True, 
-                    ax=ax
-                    )
-                ax.set_title(f"{sample}", fontsize=10)
-                plot_idx += 1
-            # Add a global title
-            if contact_column == "organoid_contact":
-                fig.suptitle("Touching vs. Non-touching Organoids", fontsize=14, fontweight="bold")
-            elif contact_column == "tcell_contact":
-                fig.suptitle("Touching vs. Non-touching T cells", fontsize=14, fontweight="bold")
-
-            # Adjust layout and save
-            # plt.tight_layout(rect=[0, 0, 1, 0.96])
-            fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
-            # plt.show(fig)
-            pdf.savefig(fig, bbox_inches='tight', dpi=600)
-            plt.close(fig)
-            # plt.savefig("output.pdf", bbox_inches='tight', dpi=600)
-            
+           
 def interpolate_missing_positions(
     df_tracks,
     cols_to_copy=[
@@ -1165,7 +756,7 @@ def calculate_organoid_and_tcell_contact(
     element_size_y, 
     element_size_z,
     contact_threshold,
-    calculate_from="tcells"
+    calculate_from="tcell"
     ):
     """
     Calculates contact with organoids by looping through
@@ -1186,12 +777,12 @@ def calculate_organoid_and_tcell_contact(
     for t, tcell_stack in tqdm(enumerate(tcell_segments), total=len(tcell_segments)):
         tcell_stack = np.asarray(tcell_stack)
         org_stack = np.asarray(organoid_segments[t,:,:,:])
-        if calculate_from=="tcells":
+        if calculate_from=="tcell":
             segments_stack=tcell_stack
-        elif calculate_from=="organoids":
+        elif calculate_from=="organoid":
             segments_stack=org_stack
         else:
-            print(f"calculate_from has to be either 'tcells' or 'organoids', is {calculate_from}")
+            print(f"calculate_from has to be either 'tcell' or 'organoid', is {calculate_from}")
             return
         segment_ids=np.unique(segments_stack)
         for segment_id in segment_ids:
@@ -1231,11 +822,15 @@ def calculate_organoid_and_tcell_contact(
                 )
              
             organoid_contacts = [str(x) for x in np.unique(org_cutout[real_distances<=contact_threshold]) if x!=0]
+            if calculate_from=="organoid":
+                organoid_contacts = [x for x in organoid_contacts if x != str(segment_id)]
             real_organoid_contact = len(organoid_contacts)>0
             pix_organoid_contacts = [str(x) for x in np.unique(org_cutout[pix_distances<= 1.73]) if x!=0]
             pix_organoid_contact = len(pix_organoid_contacts)>0
             
-            tcell_contacts = [str(x) for x in np.unique(tcell_cutout[real_distances<=contact_threshold]) if x not in [0, segment_id]]
+            tcell_contacts = [str(x) for x in np.unique(tcell_cutout[real_distances<=contact_threshold]) if x!=0]
+            if calculate_from=="tcell":
+                tcell_contacts = [x for x in tcell_contacts if x != str(segment_id)]
             real_tcell_contact = len(tcell_contacts)>0
             pix_tcell_contacts = [str(x) for x in np.unique(tcell_cutout[pix_distances<= 1.73]) if x not in [0, segment_id]]
             pix_tcell_contact = len(pix_tcell_contacts)>0
@@ -1243,11 +838,11 @@ def calculate_organoid_and_tcell_contact(
             if real_tcell_contact:
                 touching_tcells = ",".join(tcell_contacts)
             else:
-                touching_tcells=None
+                touching_tcells=""
             if real_organoid_contact:
                 touching_organoids = ",".join(organoid_contacts)
             else:
-                touching_organoids = None
+                touching_organoids = ""
             
             
             df_contacts.append(pd.DataFrame([{
