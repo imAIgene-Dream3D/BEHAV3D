@@ -75,9 +75,9 @@ def run_tcell_analysis(
         feature_outdir.mkdir(parents=True)    
     
     if df_tracks_path is None:
-        df_tracks_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_filtered.csv")
+        df_tracks_path = Path(feature_outdir, f"BEHAV3D_tcell_combined_track_features_filtered.csv")
     if df_tracks_summarized_path is None:
-        df_tracks_summarized_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_summarized.csv")
+        df_tracks_summarized_path = Path(feature_outdir, f"BEHAV3D_tcell_combined_track_features_summarized.csv")
     
     df_tracks = pd.read_csv(df_tracks_path)
     df_tracks_summarized = pd.read_csv(df_tracks_summarized_path)
@@ -113,7 +113,6 @@ def run_tcell_analysis(
     return(df_clusters)
 
 def filter_tracks(
-    df_all_tracks,
     metadata,
     config=None,
     output_dir=None,
@@ -161,7 +160,10 @@ def filter_tracks(
         feature_outdir.mkdir(parents=True)
     if not qc_outdir.exists():
         qc_outdir.mkdir(parents=True)
-     
+    
+    df_all_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+    df_all_tracks = pd.read_csv(df_all_tracks_path)
+    
     group_cols = ['TrackID', 'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
     df_all_tracks_filt = pd.merge(df_all_tracks, metadata, how="left", on="sample_name")
 
@@ -251,7 +253,7 @@ def filter_tracks(
     )
     
     # Write the filtered tracks to a .csv
-    filt_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_filtered.csv")
+    filt_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
     print(f"- Writing filtered tracks to {filt_tracks_out_path}")
     df_all_tracks_filt.to_csv(filt_tracks_out_path, sep=",", index=False)
     end_time = time.time()
@@ -260,7 +262,6 @@ def filter_tracks(
     return(df_all_tracks_filt)
 
 def summarize_track_features(
-    df_tracks,
     config=None,
     output_dir=None,
     imaris=False,
@@ -297,6 +298,8 @@ def summarize_track_features(
     if not qc_outdir.exists():
         qc_outdir.mkdir(parents=True)
 
+    df_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
+    df_tracks = pd.read_csv(df_tracks_path)
     # Calculate mean values of track features over the whole track
     grouped_df_tracks=df_tracks.groupby(['sample_name','TrackID'])
     df_summarized_tracks = grouped_df_tracks.size().reset_index(name="track_length")
@@ -326,7 +329,7 @@ def summarize_track_features(
     df_trackinfo = df_tracks[['TrackID', 'sample_name','well', 'exp_nr', 'organoid_line', 'tcell_line']].drop_duplicates()
     df_summarized_tracks = pd.merge(df_trackinfo, df_summarized_tracks, how="left")
     # Write the summarized features to a .csv
-    summ_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features_summarized.csv")
+    summ_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_summarized.csv")
     print(f"- Writing summarized tracks to {summ_tracks_out_path}")
     df_summarized_tracks.to_csv(summ_tracks_out_path, sep=",", index=False)
     

@@ -7,7 +7,7 @@ import yaml
 import time
 import argparse
 from behav3d.utils import format_time
-from behav3d.utils.fileio import get_filepath_stem, load_image, load_zarr, save_as_zarr, zip_zarr
+from behav3d.utils.fileio import get_filepath_stem, load_image, load_zarr, save_as_zarr
 from tqdm import tqdm
 import dask.array as da
 # df_tracks=df_tracks[df_tracks["relative_time"]<=30]
@@ -37,6 +37,7 @@ def backproject_behav3d(
     results_outdir = Path(analysis_outdir, "results")
     backproj_outdir = Path(analysis_outdir, "backprojection")
     feature_outdir = Path(analysis_outdir, "track_features")
+    img_outdir = Path(output_dir, "images", sample_name)
     
     if not backproj_outdir.exists():
         backproj_outdir.mkdir(parents=True)
@@ -83,6 +84,11 @@ def backproject_behav3d(
     org_track_img = np.expand_dims(org_track_img, axis=1)
     org_track_img = da.tile(org_track_img, (1,raw_img.shape[-4],1,1,1))
     
+    dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+    dead_mask = load_zarr(dead_mask_path)
+    dead_mask = np.expand_dims(dead_mask, axis=1)
+    dead_mask = da.tile(dead_mask, (1,raw_img.shape[-4],1,1,1))
+    
     df_tracks_clustered=pd.read_csv(Path(results_outdir, "BEHAV3D_UMAP_clusters.csv"))
     filt_track_img = np.where(np.isin(track_img, df_tracks_clustered["TrackID"].unique()), track_img, 0)
     
@@ -99,6 +105,10 @@ def backproject_behav3d(
             },
         "Organoid_TrackID":{
             "img":org_track_img, 
+            "type":"label"
+            },
+        "Dead_Mask":{  
+            "img":dead_mask, 
             "type":"label"
             }
         }
@@ -195,7 +205,6 @@ def backproject_columns(
                     chunks=(1,) + mapped_img.shape[1:],
                     group=col
                     )
-            zip_zarr(zarr_outpath)
         return(mapped_imgs)
         
 def view_napari(

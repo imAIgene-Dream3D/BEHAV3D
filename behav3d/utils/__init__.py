@@ -58,8 +58,7 @@ def check_behav3d_metadata(
         ### T cell paths
         if not pd.isna(sample_metadata["tcell_segments_image_path"]):
             assert Path(sample_metadata["tcell_segments_image_path"]).exists(), f"The tcell_segments_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
-        
-        elif not pd.isna(sample_metadata["tcell_tracks_image_path"]):
+        elif pd.isna(sample_metadata["tcell_tracks_image_path"]):
             print(f"!!! No segmented or tracked tcell image is supplied for 'row {rowidx+1}: {sample_name}'. Please run segmentation and tracking below.")
             ok=False
         if not pd.isna(sample_metadata["tcell_tracks_image_path"]):
@@ -76,7 +75,7 @@ def check_behav3d_metadata(
         ### Organoids paths
         if not pd.isna(sample_metadata["organoid_segments_image_path"]):
             assert Path(sample_metadata["organoid_segments_image_path"]).exists(), f"The organoid_segments_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
-        elif not pd.isna(sample_metadata["organoid_tracks_image_path"]):
+        elif pd.isna(sample_metadata["organoid_tracks_image_path"]):
             print(f"!!! No segmented or tracked organoid image is supplied for 'row {rowidx+1}: {sample_name}'. Please run segmentation and tracking below.")
             ok=False
         if not pd.isna(sample_metadata["organoid_tracks_image_path"]):

@@ -19,7 +19,7 @@ def get_filepath_stem(path):
         path = Path(path.stem)
     return(path.stem)
 
-def load_image(path, axis_order="TCZYX", group=None):
+def load_image(path, axis_order="TCZYX", group=None, mode="r"):
     path = Path(path)
     default_axis_order = "TCZYX"
     if path.suffix==".czi":
@@ -29,7 +29,7 @@ def load_image(path, axis_order="TCZYX", group=None):
     elif path.suffix==".ims":
         img = load_ims(path)
     elif path.suffix==".zarr" or str(path).endswith(".zarr.zip"):
-        img = load_zarr(path, group=group)
+        img = load_zarr(path, group=group, mode=mode)
     elif path.suffix==".tif" or path.suffix==".tiff":
         img = load_tiff(path)
     else:
@@ -200,6 +200,7 @@ def load_zarr(path, group=None, mode="r"):
     Loading .zarr images
     """
     path = Path(path)
+    assert path.exists(), f"Path to zarr file does not exist:\n{path}"
     if path.suffix==".zip":
         zarr_store = zarr.storage.ZipStore(path)
     else:
@@ -396,13 +397,13 @@ def convert_input_files_to_zarr(
     raw_image_path = Path(raw_image_path)
     
     if output_dir is None:
-        tcell_zarr_out_path = Path(tcell_segments_path, f"{get_filepath_stem(tcell_segments_path)}.zarr.zip")
-        organoid_zarr_out_path = Path(organoid_segments_path, f"{get_filepath_stem(organoid_segments_path)}.zarr.zip")
-        raw_image_zarr_out_path = Path(raw_image_path, f"{get_filepath_stem(raw_image_path)}.zarr.zip")
+        tcell_zarr_out_path = Path(tcell_segments_path, f"{get_filepath_stem(tcell_segments_path)}.zarr.")
+        organoid_zarr_out_path = Path(organoid_segments_path, f"{get_filepath_stem(organoid_segments_path)}.zarr.")
+        raw_image_zarr_out_path = Path(raw_image_path, f"{get_filepath_stem(raw_image_path)}.zarr")
     else:   
-        tcell_zarr_out_path = Path(output_dir, f"{get_filepath_stem(tcell_segments_path)}.zarr.zip")
-        organoid_zarr_out_path = Path(output_dir, f"{get_filepath_stem(organoid_segments_path)}.zarr.zip")
-        raw_image_zarr_out_path = Path(output_dir, f"{get_filepath_stem(raw_image_path)}.zarr.zip")
+        tcell_zarr_out_path = Path(output_dir, f"{get_filepath_stem(tcell_segments_path)}.zarr")
+        organoid_zarr_out_path = Path(output_dir, f"{get_filepath_stem(organoid_segments_path)}.zarr")
+        raw_image_zarr_out_path = Path(output_dir, f"{get_filepath_stem(raw_image_path)}.zarr")
     
     if tcell_zarr_out_path.exists() and not overwrite:
         print("Skipping conversion of tcell segments to zarr, as file already exists")

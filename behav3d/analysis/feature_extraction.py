@@ -135,9 +135,14 @@ This indicates if a timepoint is actually found in the data or interpolated by t
 
 import numpy as np
 import pandas as pd
+
+import warnings
+
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial.distance import cdist
-from skimage.measure import regionprops_table
+from scipy.spatial import ConvexHull
+
+from skimage.measure import regionprops_table, marching_cubes, mesh_surface_area
 import argparse
 import yaml
 from pathlib import Path
@@ -155,6 +160,8 @@ from behav3d.utils.fileio import load_image, convert_input_files_to_zarr
 from tqdm import tqdm
 from datetime import datetime
 
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
 def run_feature_extraction(
     metadata, 
     config=None,
@@ -162,7 +169,8 @@ def run_feature_extraction(
     cell_type="tcell",
     imaris=False,
     rolling_meanspeed_window=10,
-    overwrite=False
+    overwrite=False,
+    n_workers=1
     ):
     assert config is not None or output_dir is not None, "Either 'config' or 'output_dir' must be supplied"
     
@@ -208,15 +216,20 @@ def run_feature_extraction(
         dead_channel=sample_metadata['dead_channel']
         
         print("###### Running track feature calculation")
-        
-        raw_image_path = sample_metadata['raw_image_path']
-        organoid_segments_path = sample_metadata['organoid_tracks_image_path']
-        tcell_segments_path = sample_metadata['tcell_tracks_image_path']
-        
         img_outdir = Path(output_dir, "images", sample_name)
         if not img_outdir.exists():
             img_outdir.mkdir(parents=True)
 
+        track_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
+        track_intermediate_outdir= Path(track_outdir, "intermediate_results")
+        analysis_outdir = Path(output_dir, "analysis", cell_type)
+        feature_outdir = Path(analysis_outdir, "track_features")
+        
+        raw_image_path = sample_metadata['raw_image_path']
+        organoid_segments_path = sample_metadata['organoid_tracks_image_path']
+        tcell_segments_path = sample_metadata['tcell_tracks_image_path']
+        dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+        
         print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
         tcell_segments_path, organoid_segments_path, raw_image_path = convert_input_files_to_zarr(
             tcell_segments_path=tcell_segments_path,
@@ -226,19 +239,14 @@ def run_feature_extraction(
             overwrite=overwrite
         )
 
-        track_outdir = Path(output_dir, "trackdata", sample_name)
-        track_intermediate_outdir= Path(track_outdir, "intermediate_results")
-        analysis_outdir = Path(output_dir, "analysis", cell_type)
-        feature_outdir = Path(analysis_outdir, "track_features")
-        
         if not track_outdir.exists():
             track_outdir.mkdir(parents=True)
         if not track_intermediate_outdir.exists():
             track_intermediate_outdir.mkdir()
-        if not feature_outdir.exists():
-            feature_outdir.mkdir(parents=True)
         if not analysis_outdir.exists():
             analysis_outdir.mkdir(parents=True)
+        if not feature_outdir.exists():
+            feature_outdir.mkdir(parents=True)
         
         print(f"{get_current_time()} - Loading in tracks csv...")
         if cell_type=="tcell":
@@ -264,6 +272,9 @@ def run_feature_extraction(
         print(f"{get_current_time()} - Calculating single-timepoint image-based features...")
         df_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_intensity.csv")
         df_contacts_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_contact.csv")
+        df_dead_mask_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_dead_mask.csv")
+        df_morphology_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_morphology.csv")
+        
         if imaris:
             df_tracks=calculate_imaris_track_features(
                 df_tracks=df_tracks,
@@ -275,6 +286,8 @@ def run_feature_extraction(
             df_tracks=calculate_image_based_track_features(
                 df_tracks=df_tracks,
                 cell_type=cell_type,
+                df_dead_mask_outpath=df_dead_mask_outpath,
+                df_morphology_outpath=df_morphology_outpath,
                 df_intensity_outpath=df_intensity_outpath,
                 df_contacts_outpath=df_contacts_outpath,
                 dead_channel=dead_channel,
@@ -283,9 +296,11 @@ def run_feature_extraction(
                 element_size_y=element_size_y,
                 element_size_z=element_size_z,
                 raw_image_path=raw_image_path,
+                dead_mask_path=dead_mask_path,
                 organoid_segments_path=organoid_segments_path,
                 tcell_segments_path=tcell_segments_path,
-                overwrite=overwrite
+                overwrite=overwrite,
+                n_workers=n_workers
             )
         
         
@@ -312,6 +327,10 @@ def run_feature_extraction(
             
         elif cell_type=="organoid":
             print(f"{get_current_time()} - Calculating organoid specific features...")
+            df_tracks = calculate_organoid_specific_track_features(
+                df_tracks,
+                dead_dye_threshold=dead_dye_threshold,
+                )
             #TODO Add organoid specific features
         else:
             print(f"{get_current_time()} - No cell type specified, skipping cell type specific features...")
@@ -339,7 +358,7 @@ def run_feature_extraction(
         h,m,s = format_time(start_time, end_time)
         print(f"###### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
         
-    all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_combined_track_features.csv")
+    all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
     df_all_tracks.to_csv(all_tracks_out_path, index=False) 
     return(df_all_tracks)       
 
@@ -353,11 +372,15 @@ def calculate_image_based_track_features(
     element_size_z,
     #Paths
     raw_image_path,
+    dead_mask_path,
     organoid_segments_path,
     tcell_segments_path,
+    df_dead_mask_outpath,
+    df_morphology_outpath,
     df_intensity_outpath,
     df_contacts_outpath,
     # Overwrite/redo df_intensity_outpath and df_contacts_outpath
+    n_workers=1,
     overwrite=False,
     ):
     """
@@ -382,6 +405,20 @@ def calculate_image_based_track_features(
     organoid_segments=load_image(organoid_segments_path)
     tcell_segments=load_image(tcell_segments_path)
     intensity_image = load_image(raw_image_path)
+    dead_mask = load_image(dead_mask_path)
+    
+    
+    print(f"{get_current_time()} - Calculating morphology features...")
+    if df_morphology_outpath.exists() and not overwrite:
+        print("Morphology calculation .csv already exists. Loading in intensity information...")
+        df_morphology = pd.read_csv(df_morphology_outpath)
+    else:
+        df_morphology=calculate_morphology_features(
+            tcell_segments_path=tcell_segments_path,
+            n_workers=n_workers
+        )
+        df_morphology.to_csv(df_morphology_outpath, sep=",", index=False)
+    df_tracks = pd.merge(df_tracks, df_morphology, how="left")
     
     print(f"{get_current_time()} - Calculating channel and especially death dye intensities...")
     if df_intensity_outpath.exists() and not overwrite:
@@ -395,8 +432,19 @@ def calculate_image_based_track_features(
         if dead_channel is not None:
             df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{dead_channel}":"mean_dead_dye"})
         df_intensity.to_csv(df_intensity_outpath, sep=",", index=False)
-    
     df_tracks = pd.merge(df_tracks, df_intensity, how="left")
+    
+    print(f"{get_current_time()} - Calculating number of dead mask pixels...")
+    if df_dead_mask_outpath.exists() and not overwrite:
+        print("Dead mask calculation .csv already exists. Loading in intensity information...")
+        df_dead_mask = pd.read_csv(df_dead_mask_outpath)
+    else:
+        df_dead_mask=calculate_dead_mask(
+            tcell_segments=tcell_segments,
+            dead_mask=dead_mask
+        )
+        df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
+    df_tracks = pd.merge(df_tracks, df_dead_mask, how="left")
     
     print(f"{get_current_time()} - Calculating contact with organoids and other T cells...")
     print(f"Using a contact threshold of {contact_threshold} um")
@@ -421,13 +469,14 @@ def calculate_image_based_track_features(
 
     else:
         df_contacts=calculate_organoid_and_tcell_contact(
-            tcell_segments=tcell_segments,
-            organoid_segments=organoid_segments,
+            tcell_segments_path=tcell_segments_path,
+            organoid_segments_path=organoid_segments_path,
             element_size_x=element_size_x,
             element_size_y=element_size_y,
             element_size_z=element_size_z,
             contact_threshold=contact_threshold,
-            calculate_from=cell_type
+            calculate_from=cell_type,
+            n_workers=n_workers
         ) 
         df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
     
@@ -490,6 +539,18 @@ def calculate_tcell_specific_track_features(
     df_tracks=df_tracks.drop('list_touching_tcells', axis=1)      
     df_tracks['active_tcell_contact'] = active_interaction
     return(df_tracks)
+
+def calculate_organoid_specific_track_features(
+    df_tracks,
+    dead_dye_threshold,
+    ):
+
+    print(f"{get_current_time()} - Calculating cell death based on nr dead pixels {dead_dye_threshold}")
+    df_tracks = calculate_death(df_tracks, threshold=dead_dye_threshold, threshold_column="mean_dead_dye")
+    # Calculate various movement features such as speed and mean square displacement of the tracks  
+    
+    return(df_tracks)
+
 
 def calculate_imaris_track_features(
     df_tracks,
@@ -749,126 +810,138 @@ def calculate_organoid_distance(
     df_dist_organoid["pix_organoid_contact"] =  df_dist_organoid["pix_distance_organoids"] <= 1.73
     return(df_dist_organoid)
 
+
+def _calculate_organoid_and_tcell_contact_single_timepoint(args):
+    (
+        t,
+        tcell_segments_path,
+        organoid_segments_path,
+        element_size_x,
+        element_size_y,
+        element_size_z,
+        contact_threshold,
+        calculate_from
+    ) = args
+    
+    tcell_segments = np.asarray(load_image(tcell_segments_path)[t])
+    organoid_segments = np.asarray(load_image(organoid_segments_path)[t])
+    
+    if calculate_from == "tcell":
+        segments_stack = tcell_segments
+    elif calculate_from == "organoid":
+        segments_stack = organoid_segments
+    else:
+        raise ValueError(f"calculate_from has to be either 'tcell' or 'organoid', got {calculate_from}")
+    
+    df_contacts = []
+    segment_ids = np.unique(segments_stack)
+    
+    for segment_id in segment_ids:
+        if segment_id == 0:
+            continue
+        
+        stack_max_z, stack_max_y, stack_max_x = segments_stack.shape
+        seg_locs = np.argwhere(segments_stack == segment_id)
+        min_z, min_y, min_x = seg_locs.min(axis=0)
+        max_z, max_y, max_x = seg_locs.max(axis=0)
+        
+        z_ext = 2 * math.ceil(contact_threshold / element_size_z)
+        y_ext = 2 * math.ceil(contact_threshold / element_size_y)
+        x_ext = 2 * math.ceil(contact_threshold / element_size_x)
+        
+        slicer = (
+            slice(max(0, min_z - z_ext), min(stack_max_z, max_z + z_ext + 1)),
+            slice(max(0, min_y - y_ext), min(stack_max_y, max_y + y_ext + 1)),
+            slice(max(0, min_x - x_ext), min(stack_max_x, max_x + x_ext + 1))
+        )
+        
+        tcell_cutout = tcell_segments[slicer]
+        org_cutout = organoid_segments[slicer]
+        seg_cutout = segments_stack[slicer]
+        
+        real_distances = distance_transform_edt(
+            seg_cutout != segment_id,
+            sampling=[element_size_z, element_size_y, element_size_x]
+        )
+        pix_distances = distance_transform_edt(seg_cutout != segment_id)
+
+        organoid_contacts = [
+            str(x) for x in np.unique(org_cutout[real_distances <= contact_threshold]) if x != 0
+        ]
+        if calculate_from == "organoid":
+            organoid_contacts = [x for x in organoid_contacts if x != str(segment_id)]
+        real_organoid_contact = len(organoid_contacts) > 0
+
+        pix_organoid_contacts = [
+            str(x) for x in np.unique(org_cutout[pix_distances <= 1.73]) if x != 0
+        ]
+        pix_organoid_contact = len(pix_organoid_contacts) > 0
+
+        tcell_contacts = [
+            str(x) for x in np.unique(tcell_cutout[real_distances <= contact_threshold]) if x != 0
+        ]
+        if calculate_from == "tcell":
+            tcell_contacts = [x for x in tcell_contacts if x != str(segment_id)]
+        real_tcell_contact = len(tcell_contacts) > 0
+
+        pix_tcell_contacts = [
+            str(x) for x in np.unique(tcell_cutout[pix_distances <= 1.73]) if x not in [0, segment_id]
+        ]
+        pix_tcell_contact = len(pix_tcell_contacts) > 0
+
+        df_contacts.append(pd.DataFrame([{
+            'TrackID': segment_id,
+            'position_t': t,
+            'organoid_contact': real_organoid_contact,
+            'organoid_contact_pixels': pix_organoid_contact,
+            'touching_organoids': ",".join(organoid_contacts) if real_organoid_contact else "",
+            'tcell_contact': real_tcell_contact,
+            'tcell_contact_pixels': pix_tcell_contact,
+            'touching_tcells': ",".join(tcell_contacts) if real_tcell_contact else ""
+        }]))
+
+    return pd.concat(df_contacts)
+
 def calculate_organoid_and_tcell_contact(
-    tcell_segments,
-    organoid_segments,
-    element_size_x, 
-    element_size_y, 
-    element_size_z,
+    tcell_segments_path,
+    organoid_segments_path,
     contact_threshold,
-    calculate_from="tcell"
+    element_size_x,
+    element_size_y,
+    element_size_z,
+    calculate_from="tcell",
+    n_workers=1
     ):
     """
-    Calculates contact with organoids by looping through
-    the segments and cutting out a small area around it.
-    It then calculates the euclidian distance of every pixel
-    outside the segment and sees if any other segments are in this
-    area.
+    Wrapper function to parallelize contact analysis.
     
-    organoid_contact: 
-    Based on the provided 'contact_threshold' value. Any other segment
-    in this distance is seen as contacting
-    
-    organoid_contact_pixel:
-    Based on direct pixel contact of one t cell and another, not influenced
-    by the element_sizes
+    Returns:
+        DataFrame of contact annotations.
     """
-    df_contacts= []    
-    for t, tcell_stack in tqdm(enumerate(tcell_segments), total=len(tcell_segments)):
-        tcell_stack = np.asarray(tcell_stack)
-        org_stack = np.asarray(organoid_segments[t,:,:,:])
-        if calculate_from=="tcell":
-            segments_stack=tcell_stack
-        elif calculate_from=="organoid":
-            segments_stack=org_stack
-        else:
-            print(f"calculate_from has to be either 'tcell' or 'organoid', is {calculate_from}")
-            return
-        segment_ids=np.unique(segments_stack)
-        for segment_id in segment_ids:
-            if segment_id==0:
-                continue
-            
-            stack_max_z, stack_max_y, stack_max_x = segments_stack.shape
-            seg_locs = np.argwhere(segments_stack==segment_id)
-            min_z, min_y, min_x = seg_locs.min(axis=0)
-            max_z, max_y, max_x = seg_locs.max(axis=0)
-            
-            z_ext = 2*math.ceil(contact_threshold / element_size_z)
-            y_ext = 2*math.ceil(contact_threshold / element_size_y)
-            x_ext = 2*math.ceil(contact_threshold / element_size_x)
-            tcell_cutout = tcell_stack[
-                max(0, min_z-z_ext):min(stack_max_z, max_z+z_ext+1),
-                max(0, min_y-y_ext):min(stack_max_y, max_y+y_ext+1),
-                max(0, min_x-x_ext):min(stack_max_x, max_x+x_ext+1),
-                ]
-            org_cutout = org_stack[
-                max(0, min_z-z_ext):min(stack_max_z, max_z+z_ext+1),
-                max(0, min_y-y_ext):min(stack_max_y, max_y+y_ext+1),
-                max(0, min_x-x_ext):min(stack_max_x, max_x+x_ext+1),
-                ]
-            seg_cutout = segments_stack[
-                max(0, min_z-z_ext):min(stack_max_z, max_z+z_ext+1),
-                max(0, min_y-y_ext):min(stack_max_y, max_y+y_ext+1),
-                max(0, min_x-x_ext):min(stack_max_x, max_x+x_ext+1),
-                ]
-            
-            real_distances=distance_transform_edt(
-                seg_cutout!=segment_id,
-                sampling=[element_size_z, element_size_y, element_size_x]
-                )
-            pix_distances=distance_transform_edt(
-                seg_cutout!=segment_id
-                )
-             
-            organoid_contacts = [str(x) for x in np.unique(org_cutout[real_distances<=contact_threshold]) if x!=0]
-            if calculate_from=="organoid":
-                organoid_contacts = [x for x in organoid_contacts if x != str(segment_id)]
-            real_organoid_contact = len(organoid_contacts)>0
-            pix_organoid_contacts = [str(x) for x in np.unique(org_cutout[pix_distances<= 1.73]) if x!=0]
-            pix_organoid_contact = len(pix_organoid_contacts)>0
-            
-            tcell_contacts = [str(x) for x in np.unique(tcell_cutout[real_distances<=contact_threshold]) if x!=0]
-            if calculate_from=="tcell":
-                tcell_contacts = [x for x in tcell_contacts if x != str(segment_id)]
-            real_tcell_contact = len(tcell_contacts)>0
-            pix_tcell_contacts = [str(x) for x in np.unique(tcell_cutout[pix_distances<= 1.73]) if x not in [0, segment_id]]
-            pix_tcell_contact = len(pix_tcell_contacts)>0
-            
-            if real_tcell_contact:
-                touching_tcells = ",".join(tcell_contacts)
-            else:
-                touching_tcells=""
-            if real_organoid_contact:
-                touching_organoids = ",".join(organoid_contacts)
-            else:
-                touching_organoids = ""
-            
-            
-            df_contacts.append(pd.DataFrame([{
-                'TrackID': segment_id, 
-                'position_t': t,
-                'organoid_contact': real_organoid_contact, 
-                'organoid_contact_pixels': pix_organoid_contact,
-                'touching_organoids':touching_organoids,
-                'tcell_contact': real_tcell_contact, 
-                'tcell_contact_pixels': pix_tcell_contact,
-                'touching_tcells': touching_tcells
-            }]))
-    
-    df_contacts=pd.concat(df_contacts)
-    df_contacts = df_contacts.astype({
-        'TrackID': int,
-        'position_t': float,
-        'organoid_contact': bool,
-        'organoid_contact_pixels': bool,
-        'touching_organoids': str,
-        'tcell_contact': bool,
-        'tcell_contact_pixels': bool,
-        'touching_tcells': str
-    })
-        
-    return(df_contacts)
+    tcell_segments = load_image(tcell_segments_path)
+    timepoints = tcell_segments.shape[0]
+
+    args_list = [
+        (
+            t,
+            tcell_segments_path,
+            organoid_segments_path,
+            element_size_x,
+            element_size_y,
+            element_size_z,
+            contact_threshold,
+            calculate_from
+        )
+        for t in range(timepoints)
+    ]
+
+    if n_workers > 1:
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            results = list(tqdm(executor.map(_calculate_organoid_and_tcell_contact_single_timepoint, args_list), total=len(args_list)))
+    else:
+        results = [_calculate_organoid_and_tcell_contact_single_timepoint(args) for args in tqdm(args_list)]
+
+    return pd.concat(results, ignore_index=True)
 
 def calculate_segment_intensity(tcell_segments, intensity_image, calculation="mean"):
     """
@@ -896,6 +969,147 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
     column_mapping["label"]="TrackID"
     df_intensity=df_intensity.rename(columns=column_mapping)
     return(df_intensity)
+
+def calculate_dead_mask(tcell_segments, dead_mask):
+    """
+    Calculates the intensity of a specific marker features for each segment.
+    The calculation can be the minimum, maximum, mean or median
+    """
+    df_intensity = []
+    # for t, (tcell_stack, intensity_stack) in enumerate(zip(tcell_segments, intensity_image)):      
+    for t, (tcell_stack, dead_mask_stack) in tqdm(enumerate(zip(tcell_segments, dead_mask)),total=len(tcell_segments)):      
+        tcell_stack = np.asarray(tcell_stack)
+        dead_mask_stack = np.asarray(dead_mask_stack)
+        properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=dead_mask_stack, properties=['label', 'num_pixels', f'intensity_mean']))
+        properties["position_t"]=t
+        properties["nr_dead_mask_pixels"] = properties["num_pixels"] * properties["intensity_mean"]
+        properties=properties.rename(columns={"label":"TrackID"})
+        properties = properties[["TrackID", "position_t", "nr_dead_mask_pixels"]]
+        df_intensity.append(properties)
+    df_intensity = pd.concat(df_intensity)
+    return(df_intensity)
+
+def _calculate_morphology_single_timepoint(args):
+    """Helper function to compute morphology features for a single timepoint."""
+    t, tcell_segments_path, voxel_spacing = args
+    tcell_segments = load_image(tcell_segments_path)
+    tcell_stack = tcell_segments[t]
+    tcell_stack = np.asarray(tcell_stack)
+    properties = pd.DataFrame(
+        regionprops_table(
+            label_image=tcell_stack,
+            properties=[
+                "label", "area", "bbox_area", 
+                "extent", "solidity", "equivalent_diameter",
+                "major_axis_length", "minor_axis_length", "inertia_tensor", 
+                "inertia_tensor_eigvals", "moments_central"
+            ]
+        )
+    )
+    properties.rename(columns={
+        "label": "TrackID",
+        "area": "volume",
+        "bbox_area": "bbox_volume"
+    }, inplace=True)
+    properties["elongation"] = properties["major_axis_length"] / properties["minor_axis_length"]
+    properties["position_t"] = t
+
+    # Suppress known/harmless warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="divide by zero encountered in scalar divide")
+        warnings.filterwarnings("ignore", message=".*convex hull image.*")
+        
+
+        surface_areas = []
+        sphericities = []
+        convex_volumes = []
+        orientations = []
+
+        for region_label in properties["TrackID"]:
+            mask = (tcell_stack == region_label)
+            coords = np.argwhere(mask)
+            volume = properties.loc[properties["TrackID"] == region_label, "volume"].values[0]
+
+            # Surface area + sphericity via marching cubes
+            if np.count_nonzero(mask) >= 4:  # sanity check for marching_cubes
+                try:
+                    verts, faces, _, _ = marching_cubes(mask.astype(float), spacing=voxel_spacing)
+                    surface_area = mesh_surface_area(verts, faces)
+                    sphericity = (np.pi ** (1/3)) * ((6 * volume) ** (2/3)) / surface_area
+                except Exception:
+                    surface_area = np.nan
+                    sphericity = np.nan
+            else:
+                surface_area = np.nan
+                sphericity = np.nan
+                
+            surface_areas.append(surface_area)
+            sphericities.append(sphericity)
+
+            if coords.shape[0] >= 4:
+                try:
+                    scaled_coords = coords * np.array(voxel_spacing)
+                    hull = ConvexHull(scaled_coords)
+                    convex_volume = hull.volume
+                except Exception:
+                    convex_volume = np.nan
+            else:
+                convex_volume = np.nan
+            convex_volumes.append(convex_volume)
+
+            # Extract all the inertia tensor components from the DataFrame
+            tensor_columns = [f"inertia_tensor-{i}-{j}" for i in range(3) for j in range(3)]
+
+            orientations = []
+            for idx, row in properties.iterrows():
+                try:
+                    tensor_values = np.array([row[col] for col in tensor_columns])
+                    inertia_tensor = tensor_values.reshape((3, 3))
+                    eigvals, eigvecs = np.linalg.eigh(inertia_tensor)
+                    major_axis_vector = eigvecs[:, np.argmax(eigvals)]
+                    orientations.append(major_axis_vector.tolist())
+                except Exception:
+                    orientations.append([np.nan, np.nan, np.nan])
+
+        properties["surface_area"] = surface_areas
+        properties["sphericity"] = sphericities
+        properties["convex_volume"] = convex_volumes
+        # Guard against divide-by-zero in solidity calculation
+        with np.errstate(divide='ignore', invalid='ignore'):
+            # Lower solidity = more protrusions or invaginations
+            properties["solidity"] = properties["volume"] / properties["convex_volume"]
+            
+        # properties["solidity"] = properties["volume"] / properties["convex_volume"]
+        properties["orientation_vector"] = orientations
+
+    columns_to_drop = [col for col in properties.columns 
+                   if col.startswith("inertia_tensor") 
+                   or col.startswith("inertia_tensor_eigvals") 
+                   or col.startswith("moments_central")]
+    properties = properties.drop(columns=columns_to_drop)
+    return properties
+
+def calculate_morphology_features(tcell_segments_path, voxel_spacing=(1.0, 1.0, 1.0), n_workers=8):
+    """
+    Calculates morphological features (volume, shape, sphericity, etc.) for 3D segments.
+    
+    Parameters:
+        tcell_segments: List of 3D label images (e.g., time-series of segmented volumes)
+        voxel_spacing: Tuple of (z, y, x) spacing in physical units (e.g., µm). Default is isotropic.
+    
+    Returns:
+        pd.DataFrame with one row per object per time point.
+    """
+    tcell_segments=load_image(tcell_segments_path)
+    timepoints = tcell_segments.shape[0]
+    args_list = [(t, tcell_segments_path, voxel_spacing) for t in range(timepoints)]
+    if n_workers > 1:
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            results = list(tqdm(executor.map(_calculate_morphology_single_timepoint, args_list), total=len(args_list)))
+    else:
+        results = [_calculate_morphology_single_timepoint(args) for args in tqdm(args_list) ]
+
+    return pd.concat(results, ignore_index=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import math
-from behav3d.utils.fileio import load_image,save_as_zarr, zip_zarr, append_to_zarr
+from behav3d.utils.fileio import load_image,save_as_zarr, append_to_zarr
 import shutil
 from tqdm import tqdm
 
@@ -42,7 +42,6 @@ def convert_segments_to_tracks(
             img=tracked_img, 
             outpath=outpath
             )
-    zip_zarr(outpath)
 
 def convert_all_tracked_images_to_csv(
     metadata,
@@ -56,10 +55,10 @@ def convert_all_tracked_images_to_csv(
         print(f"Tracking sample: {sample_name}")
         
         tracked_img_outdir = Path(output_dir, "images", sample_name)
-        tracked_csv_outdir = Path(output_dir, "trackdata", sample_name)
+        tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         
-        # segmented_img_path = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_segments.zarr.zip")
-        tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr.zip")
+        # segmented_img_path = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_segments.zarr")
+        tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr")
         segmented_img_path = tracked_img_outpath
         tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_{cell_type}_tracks.csv")
         

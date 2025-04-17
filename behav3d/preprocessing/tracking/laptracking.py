@@ -4,7 +4,7 @@ from pathlib import Path
 from skimage.measure import regionprops_table
 from laptrack import LapTrack
 from tqdm import tqdm
-from behav3d.utils.fileio import load_image, append_to_zarr, zip_zarr, get_filepath_stem
+from behav3d.utils.fileio import load_image, append_to_zarr, get_filepath_stem
 from behav3d.utils.tracking import convert_segments_to_tracks
 
 def laptrack_image(
@@ -106,10 +106,10 @@ def run_tcell_laptracking(
         print(f"Tracking sample: {sample_name}")
         
         tracked_img_outdir = Path(output_dir, "images", sample_name)
-        tracked_csv_outdir = Path(output_dir, "trackdata", sample_name)
+        tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         
         segments_path = sample[f"{cell_type}_segments_image_path"]
-        tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr.zip")
+        tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr")
         tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_{cell_type}_tracks.csv")
     
         if not tracked_img_outdir.exists():
