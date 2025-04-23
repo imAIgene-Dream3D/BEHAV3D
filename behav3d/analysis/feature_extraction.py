@@ -439,7 +439,8 @@ def calculate_image_based_track_features(
     else:
         df_morphology=calculate_morphology_features(
             segments_path=segments_path,
-            n_workers=n_workers
+            n_workers=n_workers,
+            voxel_spacing=(element_size_z, element_size_y, element_size_x)
         )
         df_morphology = df_morphology.astype(morph_dtypes)
         df_morphology.to_csv(df_morphology_outpath, sep=",", index=False)  
@@ -1015,9 +1016,10 @@ def calculate_dead_mask(segments, dead_mask):
         dead_mask_stack = np.asarray(dead_mask_stack)
         properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=dead_mask_stack, properties=['label', 'num_pixels', f'intensity_mean']))
         properties["position_t"]=t
-        properties["nr_dead_mask_pixels"] = properties["num_pixels"] * properties["intensity_mean"]
+        properties.rename(columns={"intensity_mean":"percentage_dead_mask"}, inplace=True)
+        properties["nr_dead_mask_pixels"] = properties["num_pixels"] * properties["percentage_dead_mask"]
         properties=properties.rename(columns={"label":"TrackID"})
-        properties = properties[["TrackID", "position_t", "nr_dead_mask_pixels"]]
+        properties = properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]]
         df_intensity.append(properties)
     df_intensity = pd.concat(df_intensity)
     return(df_intensity)
@@ -1032,17 +1034,19 @@ def _calculate_morphology_single_timepoint(args):
         regionprops_table(
             label_image=stack,
             properties=[
-                "label", "area", "bbox_area", 
+                "label", "num_pixels", "area", "bbox_area", 
                 "extent", "solidity", "equivalent_diameter",
                 "major_axis_length", "minor_axis_length", "inertia_tensor", 
                 "inertia_tensor_eigvals", "moments_central"
-            ]
+            ],
+            spacing=voxel_spacing
         )
     )
     properties.rename(columns={
         "label": "TrackID",
         "area": "volume",
-        "bbox_area": "bbox_volume"
+        "bbox_area": "bbox_volume",
+        "num_pixels": "nr_pixels",
     }, inplace=True)
     properties["elongation"] = properties["major_axis_length"] / properties["minor_axis_length"]
     properties["position_t"] = t

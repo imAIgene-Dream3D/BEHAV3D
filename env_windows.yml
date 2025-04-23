@@ -1,0 +1,39 @@
+name: behav3d
+channels:
+  - conda-forge
+  - defaults
+  - pytorch
+dependencies:
+  - python=3.12
+  - napari=0.5.6
+  - dask-core
+  - numpy
+  - pandas
+  - scikit-image
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - tifffile
+  - imageio
+  - h5py
+  - zarr
+  - pyqt
+  - ipykernel
+  - ipython
+  - magicgui
+  - vispy
+  - superqt
+  - umap-learn
+  - numba
+  - psutil
+  - pydantic
+  - typer
+  - laptrack
+  - dtaidistance
+  - pytorch=2.4.1
+  - torchaudio=2.4.1
+  - torchvision=0.19.1
+  - aicspylibczi
+  - pip
+  - pip:
+      - torchsummary==1.5.1

@@ -10,8 +10,8 @@ from napari.viewer import Viewer
 import matplotlib.pyplot as plt
 
 # --- File paths ---
-seg_path = '/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/test/images/SMI_JM1_Exp004_Img14/SMI_JM1_Exp004_Img14_organoid_tracked.zarr'
-csv_path = '/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/test/analysis/organoid/track_features/BEHAV3D_organoid_combined_track_features.csv'
+seg_path = 'D:/BHVD_BEHAV3D/BEHAV3D_python/test/images/SMI_JM1_Exp004_Img14/SMI_JM1_Exp004_Img14_organoid_tracked.zarr'
+csv_path = 'D:/BHVD_BEHAV3D/BEHAV3D_python/test/analysis/organoid/track_features/BEHAV3D_organoid_combined_track_features.csv'
 
 # --- Load segmentation from Zarr (T, C, Z, Y, X) ---
 seg_zarr = zarr.open(seg_path, mode='r')
@@ -130,7 +130,7 @@ layer = viewer.add_labels(
     # color={col: 'viridis' for col in features_df.columns},  # allows dropdown
 )
 
-Create a ComboBox for feature selection
+# Create a ComboBox for feature selection
 feature_combo = QComboBox()
 feature_combo.addItems(features_df.columns.tolist())  # Add feature columns to the combo box
 
