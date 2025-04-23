@@ -52,11 +52,11 @@ def backproject_behav3d(
     org_track_img_path = Path(df_sample["organoid_tracks_image_path"].values[0])
     df_tracks_path = Path(df_sample["tcell_tracks_csv_path"].values[0])
     
-    df_tracks_full_clustered_path = Path(results_outdir, f"BEHAV3D_combined_track_features_clustered.csv")
+    df_tracks_full_clustered_path = Path(results_outdir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv")
     df_tracks_full_clustered = pd.read_csv(df_tracks_full_clustered_path)
     df_tracks_full_clustered = df_tracks_full_clustered[df_tracks_full_clustered["sample_name"]==sample_name]
     
-    df_tracks_all_path = Path(feature_outdir, f"BEHAV3D_combined_track_features.csv")
+    df_tracks_all_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
     df_tracks_all = pd.read_csv(df_tracks_all_path)
     df_tracks_all = df_tracks_all[df_tracks_all["sample_name"]==sample_name]
     
@@ -89,7 +89,7 @@ def backproject_behav3d(
     dead_mask = np.expand_dims(dead_mask, axis=1)
     dead_mask = da.tile(dead_mask, (1,raw_img.shape[-4],1,1,1))
     
-    df_tracks_clustered=pd.read_csv(Path(results_outdir, "BEHAV3D_UMAP_clusters.csv"))
+    df_tracks_clustered=pd.read_csv(Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_clusters.csv"))
     filt_track_img = np.where(np.isin(track_img, df_tracks_clustered["TrackID"].unique()), track_img, 0)
     
     track_img = da.tile(track_img, (1,raw_img.shape[-4],1,1,1))

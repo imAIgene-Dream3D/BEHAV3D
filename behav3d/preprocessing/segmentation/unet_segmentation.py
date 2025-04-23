@@ -51,7 +51,8 @@ class BEHAV3D_Unet_Segmenter():
         
         #Segment filtering
         remove_border_segments=False,
-        organoid_segment_size_min=1000,
+        organoid_start_segment_size_min=1000,
+        organoid_segment_size_min=100,
         
         logger=None,
         verbose=True,
@@ -111,6 +112,7 @@ class BEHAV3D_Unet_Segmenter():
         self.tcell_segment_splitting_edt    = tcell_segment_splitting_edt
         
         #Segment filtering
+        self.organoid_start_segment_size_min      = organoid_start_segment_size_min
         self.organoid_segment_size_min      = organoid_segment_size_min
         self.tcell_segment_size_min         = tcell_segment_size_min
         self.remove_border_segments         = remove_border_segments
@@ -253,7 +255,7 @@ class BEHAV3D_Unet_Segmenter():
             # For the first timepoint, segments are determined more details (see function description)
             segments = self.segment_mask(
                 mask=mask_organoid,
-                segment_size_min=self.organoid_segment_size_min,
+                segment_size_min=self.organoid_start_segment_size_min,
                 segment_splitting_edt=self.organoid_segment_splitting_edt,
                 use_dims=self.use_dims
             )
@@ -275,7 +277,8 @@ class BEHAV3D_Unet_Segmenter():
             mask_org_dilated = dilate_mask(combined_mask, nr_pixels=self.organoid_dilation_nr_pixels)
             unfiltered_organoid_segments = watershed(mask_org_dilated, markers = unfiltered_organoid_segments, mask=mask_org_dilated)
             unfiltered_organoid_segments[combined_mask==0]=0
-           
+            unfiltered_organoid_segments = segment_size_filter(unfiltered_organoid_segments, size_min=self.organoid_segment_size_min)
+        
         if self.remove_border_segments:
             organoid_segments = remove_boundary_segments(
                 unfiltered_organoid_segments,
@@ -399,9 +402,9 @@ class BEHAV3D_Unet_Segmenter():
                     self._append_to_zarr(mask_dead, mask_dead_outpath)
                     self.first_timepoint = False
                 
-                self.tcell_segments = load_zarr(self.tcell_segments_outpath)
-                self.organoid_segments = load_zarr(self.organoid_segments_outpath)
-                self.mask_dead = load_zarr(self.mask_dead_outpath)
+                self.tcell_segments = load_zarr(tcell_segments_outpath)
+                self.organoid_segments = load_zarr(organoid_segments_outpath)
+                self.mask_dead = load_zarr(mask_dead_outpath)
         
             
     def _append_to_zarr(self, img, outpath):

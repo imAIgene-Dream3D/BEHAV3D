@@ -480,7 +480,7 @@ def cluster_umap(
     df_umap["ClusterID"]=df_umap["ClusterID"]+1
     df_umap["ClusterID"]=df_umap["ClusterID"].astype('category')
     
-    df_umap_out_path = Path(results_outdir, f"BEHAV3D_UMAP_clusters.csv")
+    df_umap_out_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_clusters.csv")
     print(f"- Writing clustered tracks to {df_umap_out_path}")
     df_umap.to_csv(df_umap_out_path, sep=",", index=False)
 
@@ -488,7 +488,7 @@ def cluster_umap(
     sample_cols = ["organoid_line", "tcell_line"]
     info_cols = df_umap.drop(columns=["TrackID", "sample_name", "well", "exp_nr", "UMAP1", "UMAP2", "ClusterID"]).columns
     
-    cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_UMAP_clusters.pdf")
+    cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_clusters.pdf")
     plot_feature_umap(
         df_umap=df_umap,
         info_cols=info_cols,
@@ -503,7 +503,7 @@ def cluster_umap(
     ### Producing a heatmap of the summarized features again summarized over all tracks
     ### Belonging to that cluster
     print("- Producing heatmaps with summarized cluster features")
-    cluster_features_heatmap_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_feature_heatmap.pdf")
+    cluster_features_heatmap_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_cluster_feature_heatmap.pdf")
     plot_clustering_feature_heatmap(
         df_umap,
         info_cols,
@@ -522,18 +522,18 @@ def cluster_umap(
     df_clust_perc = pd.merge(df_clust_perc, total_counts)
     df_clust_perc["percentage"] = (df_clust_perc['count'] / df_clust_perc['total_count'])
     
-    cluster_percentage_plot_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_percentages.pdf")
+    cluster_percentage_plot_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_cluster_percentages.pdf")
     plot_cluster_percentage_bars(
         df_clust_perc,
         cluster_percentage_plot_path
     )
         
     df_clust_perc = df_clust_perc.reset_index(drop=True)
-    df_clust_perc_out_path = Path(results_outdir, f"BEHAV3D_UMAP_cluster_percentages.csv")
+    df_clust_perc_out_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_cluster_percentages.csv")
     print(f"- Writing summarized tracks to {df_clust_perc_out_path}")
     df_clust_perc.to_csv(df_clust_perc_out_path, sep=",", index=False)
     
-    df_clust_tracks_out_path = Path(results_outdir, f"BEHAV3D_combined_track_features_clustered.csv")
+    df_clust_tracks_out_path = Path(results_outdir, f"BEHAV3D_tcell_combined_track_features_clustered.csv")
     print(f"- Writing summarized tracks to {df_clust_perc_out_path}")
     df_tracks = pd.merge(df_tracks, df_umap[["TrackID", "ClusterID"]], on='TrackID', how='left')
     

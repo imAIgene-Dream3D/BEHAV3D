@@ -153,6 +153,7 @@ from matplotlib.gridspec import GridSpec
 
 import seaborn as sns
 
+import ast
 import math
 import time
 from behav3d.utils import get_current_time, format_time, convert_time, convert_distance
@@ -407,17 +408,41 @@ def calculate_image_based_track_features(
     intensity_image = load_image(raw_image_path)
     dead_mask = load_image(dead_mask_path)
     
-    
+    if cell_type=="tcell":
+        segments= tcell_segments
+        segments_path = tcell_segments_path
+    elif cell_type=="organoid":
+        segments= organoid_segments
+        segments_path = organoid_segments_path
+        
     print(f"{get_current_time()} - Calculating morphology features...")
+    morph_dtypes = {
+        "TrackID": int,
+        "position_t": int,
+        "volume": float,
+        "bbox_volume": float,
+        "elongation": float,
+        "extent": float,
+        "equivalent_diameter": float,
+        "major_axis_length": float,
+        "minor_axis_length": float,
+        "surface_area": float,
+        "sphericity": float,
+        "convex_volume": float,
+        "orientation_vector": object,
+    }
+    
     if df_morphology_outpath.exists() and not overwrite:
         print("Morphology calculation .csv already exists. Loading in intensity information...")
-        df_morphology = pd.read_csv(df_morphology_outpath)
+        df_morphology = pd.read_csv(df_morphology_outpath, dtype=morph_dtypes)
+        df_morphology["orientation_vector"] = df_morphology["orientation_vector"].apply(ast.literal_eval)
     else:
         df_morphology=calculate_morphology_features(
-            tcell_segments_path=tcell_segments_path,
+            segments_path=segments_path,
             n_workers=n_workers
         )
-        df_morphology.to_csv(df_morphology_outpath, sep=",", index=False)
+        df_morphology = df_morphology.astype(morph_dtypes)
+        df_morphology.to_csv(df_morphology_outpath, sep=",", index=False)  
     df_tracks = pd.merge(df_tracks, df_morphology, how="left")
     
     print(f"{get_current_time()} - Calculating channel and especially death dye intensities...")
@@ -426,7 +451,7 @@ def calculate_image_based_track_features(
         df_intensity = pd.read_csv(df_intensity_outpath)
     else:
         df_intensity=calculate_segment_intensity(
-            tcell_segments=tcell_segments,
+            segments=segments,
             intensity_image=intensity_image
         )
         if dead_channel is not None:
@@ -440,7 +465,7 @@ def calculate_image_based_track_features(
         df_dead_mask = pd.read_csv(df_dead_mask_outpath)
     else:
         df_dead_mask=calculate_dead_mask(
-            tcell_segments=tcell_segments,
+            segments=segments,
             dead_mask=dead_mask
         )
         df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
@@ -450,12 +475,7 @@ def calculate_image_based_track_features(
     print(f"Using a contact threshold of {contact_threshold} um")
     # Calculate the contact od each T cell with an organoid or a T cell
     # Explanation on how in the function itself
-    
-    if df_contacts_outpath.exists() and not overwrite:
-        print("Contact .csv already exists. Loading in contact information...")
-        df_contacts = pd.read_csv(
-            df_contacts_outpath,
-            dtype={
+    contact_dtypes = {
                 'TrackID': int,
                 'position_t': float,
                 'organoid_contact': bool,
@@ -465,6 +485,11 @@ def calculate_image_based_track_features(
                 'tcell_contact_pixels': bool,
                 'touching_tcells': str
                 }
+    if df_contacts_outpath.exists() and not overwrite:
+        print("Contact .csv already exists. Loading in contact information...")
+        df_contacts = pd.read_csv(
+            df_contacts_outpath,
+            dtype=contact_dtypes
             )
 
     else:
@@ -478,6 +503,7 @@ def calculate_image_based_track_features(
             calculate_from=cell_type,
             n_workers=n_workers
         ) 
+        df_contacts = df_contacts.astype(contact_dtypes)
         df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
     
     df_tracks = pd.merge(df_tracks, df_contacts, how="left")
@@ -658,19 +684,23 @@ def normalize_track_features(
 def interpolate_missing_positions(
     df_tracks,
     cols_to_copy=[
+        "TrackID",
         "organoid_contact",
         "organoid_contact_pixels",
         "touching_organoids",
         "tcell_contact",
         "tcell_contact_pixels",
-        "touching_tcells"
+        "touching_tcells",
+        "distance_unit",
+        "time_unit",
+        "orientation_vector"
         ],
     cols_to_interpolate=[
-        "position_t", 
-        "position_z", 
-        "position_y", 
-        "position_x",
-        "mean_dead_dye"
+        # "position_t", 
+        # "position_z", 
+        # "position_y", 
+        # "position_x",
+        # "mean_dead_dye"
         ]
     ):
     """
@@ -685,6 +715,10 @@ def interpolate_missing_positions(
     -   Puts None in any column not specified, such as SegmentID, as no actual segment exists
     """
      # Interpolate missing timepoints so each calculation takes the same intervals
+    if  cols_to_interpolate is None or cols_to_interpolate == []:
+        # Select all columns that are not in cols_to_copy
+        cols_to_interpolate = df_tracks.columns.difference(cols_to_copy).tolist()
+     
     grouped_df = df_tracks.groupby('TrackID')
     def interpolate_group(group, cols_to_interpolate, cols_to_copy):
         # group=group.set_index('time', drop=False)
@@ -710,8 +744,7 @@ def interpolate_missing_positions(
                 while previous_idx >= 0 and df_interpolated.loc[previous_idx, 'interpolated']:
                     previous_idx -= 1
                 if previous_idx >= 0:
-                    df_interpolated.loc[idx, col] = df_interpolated.loc[previous_idx, col]
-        
+                    df_interpolated.at[idx, col] = df_interpolated.at[previous_idx, col]
         df_interpolated["interpolated"] = df_interpolated["interpolated"].astype("boolean").fillna(True)
         assert(len(all_times)==len(df_interpolated)), f"Length of expected nr of timepoints ({len(all_times)}) is not the same as resulting timepoints ({df_interpolated})"
         return df_interpolated
@@ -943,7 +976,7 @@ def calculate_organoid_and_tcell_contact(
 
     return pd.concat(results, ignore_index=True)
 
-def calculate_segment_intensity(tcell_segments, intensity_image, calculation="mean"):
+def calculate_segment_intensity(segments, intensity_image, calculation="mean"):
     """
     Calculates the intensity of a specific marker features for each segment.
     The calculation can be the minimum, maximum, mean or median
@@ -951,8 +984,8 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
     assert calculation in ["min", "max", "mean", "median"]
     intensity_image=np.transpose(intensity_image, axes=[0,2,3,4,1])
     df_intensity = []
-    # for t, (tcell_stack, intensity_stack) in enumerate(zip(tcell_segments, intensity_image)):      
-    for t, (tcell_stack, intensity_stack) in tqdm(enumerate(zip(tcell_segments, intensity_image)),total=len(tcell_segments)):      
+    # for t, (tcell_stack, intensity_stack) in enumerate(zip(segments, intensity_image)):      
+    for t, (tcell_stack, intensity_stack) in tqdm(enumerate(zip(segments, intensity_image)),total=len(segments)):      
         tcell_stack = np.asarray(tcell_stack)
         intensity_stack = np.asarray(intensity_stack)
         properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=intensity_stack, properties=['label', f'intensity_{calculation}']))
@@ -970,14 +1003,14 @@ def calculate_segment_intensity(tcell_segments, intensity_image, calculation="me
     df_intensity=df_intensity.rename(columns=column_mapping)
     return(df_intensity)
 
-def calculate_dead_mask(tcell_segments, dead_mask):
+def calculate_dead_mask(segments, dead_mask):
     """
     Calculates the intensity of a specific marker features for each segment.
     The calculation can be the minimum, maximum, mean or median
     """
     df_intensity = []
-    # for t, (tcell_stack, intensity_stack) in enumerate(zip(tcell_segments, intensity_image)):      
-    for t, (tcell_stack, dead_mask_stack) in tqdm(enumerate(zip(tcell_segments, dead_mask)),total=len(tcell_segments)):      
+    # for t, (tcell_stack, intensity_stack) in enumerate(zip(segments, intensity_image)):      
+    for t, (tcell_stack, dead_mask_stack) in tqdm(enumerate(zip(segments, dead_mask)),total=len(segments)):      
         tcell_stack = np.asarray(tcell_stack)
         dead_mask_stack = np.asarray(dead_mask_stack)
         properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=dead_mask_stack, properties=['label', 'num_pixels', f'intensity_mean']))
@@ -991,13 +1024,13 @@ def calculate_dead_mask(tcell_segments, dead_mask):
 
 def _calculate_morphology_single_timepoint(args):
     """Helper function to compute morphology features for a single timepoint."""
-    t, tcell_segments_path, voxel_spacing = args
-    tcell_segments = load_image(tcell_segments_path)
-    tcell_stack = tcell_segments[t]
-    tcell_stack = np.asarray(tcell_stack)
+    t, segments_path, voxel_spacing = args
+    segments = load_image(segments_path)
+    stack = segments[t]
+    stack = np.asarray(stack)
     properties = pd.DataFrame(
         regionprops_table(
-            label_image=tcell_stack,
+            label_image=stack,
             properties=[
                 "label", "area", "bbox_area", 
                 "extent", "solidity", "equivalent_diameter",
@@ -1026,7 +1059,7 @@ def _calculate_morphology_single_timepoint(args):
         orientations = []
 
         for region_label in properties["TrackID"]:
-            mask = (tcell_stack == region_label)
+            mask = (stack == region_label)
             coords = np.argwhere(mask)
             volume = properties.loc[properties["TrackID"] == region_label, "volume"].values[0]
 
@@ -1089,20 +1122,20 @@ def _calculate_morphology_single_timepoint(args):
     properties = properties.drop(columns=columns_to_drop)
     return properties
 
-def calculate_morphology_features(tcell_segments_path, voxel_spacing=(1.0, 1.0, 1.0), n_workers=8):
+def calculate_morphology_features(segments_path, voxel_spacing=(1.0, 1.0, 1.0), n_workers=8):
     """
     Calculates morphological features (volume, shape, sphericity, etc.) for 3D segments.
     
     Parameters:
-        tcell_segments: List of 3D label images (e.g., time-series of segmented volumes)
+        segments_path: path to segments .zarr
         voxel_spacing: Tuple of (z, y, x) spacing in physical units (e.g., µm). Default is isotropic.
     
     Returns:
         pd.DataFrame with one row per object per time point.
     """
-    tcell_segments=load_image(tcell_segments_path)
-    timepoints = tcell_segments.shape[0]
-    args_list = [(t, tcell_segments_path, voxel_spacing) for t in range(timepoints)]
+    segments=load_image(segments_path)
+    timepoints = segments.shape[0]
+    args_list = [(t, segments_path, voxel_spacing) for t in range(timepoints)]
     if n_workers > 1:
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
             results = list(tqdm(executor.map(_calculate_morphology_single_timepoint, args_list), total=len(args_list)))
