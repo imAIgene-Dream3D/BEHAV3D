@@ -5,7 +5,7 @@
 **/__pycache__
 *.ilp
 *.tiff
-test/
+test.py
 build/
 **/.DS_Store
 **/.egg-info
