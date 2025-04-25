@@ -37,6 +37,8 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 from pathlib import Path
 from behav3d.utils import format_time
+from behav3d.utils.analysis import plot_filter_count
+
 import yaml
 import time
 import seaborn as sns
@@ -60,15 +62,22 @@ def run_tcell_analysis(
     ):
     print(f"--------------- Performing T-cell behavioral analysis ---------------")
     start_time = time.time()
-    assert config is not None or all(
-        [output_dir, umap_minimal_distance, umap_n_neighbors, nr_of_clusters]
-    ), "Either 'config' or 'output_dir, umap_minimal_distance, umap_n_neighbors, nr_of_clusters' parameters must be supplied"
+    # assert config is not None or all(
+    #     [output_dir, umap_minimal_distance, umap_n_neighbors, nr_of_clusters]
+    # ), "Either 'config' or 'output_dir, umap_minimal_distance, umap_n_neighbors, nr_of_clusters' parameters must be supplied"
         
     if output_dir is None:
         output_dir = config['output_dir']
-    analysis_outdir = Path(output_dir, "analysis", "tcell")
+        
+    sample_outdir = Path(output_dir, "analysis", "per_sample")
+    combined_outdir = Path(output_dir, "analysis", "combined")
+    analysis_outdir = Path(combined_outdir, "tcell")
     feature_outdir = Path(analysis_outdir, "track_features")
     
+    if not sample_outdir.exists():
+        sample_outdir.mkdir(parents=True)
+    if not combined_outdir.exists():
+        combined_outdir.mkdir(parents=True)
     if not analysis_outdir.exists():
         analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
@@ -112,13 +121,14 @@ def run_tcell_analysis(
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
     return(df_clusters)
 
-def filter_tracks(
+def filter_tcell_tracks(
     metadata,
     config=None,
     output_dir=None,
-    tcell_exp_duration=None,
-    tcell_min_track_length=None,
-    tcell_max_track_length=None,
+    exp_duration=None,
+    min_track_length=None,
+    max_track_length=None,
+    filter_t0_dead=True,
     cell_type="tcell"
     ):
     """
@@ -136,24 +146,27 @@ def filter_tracks(
     - A .csv file containing filtered tracks from all experiments
     """
     
-    assert config is not None or all(
-        [output_dir, tcell_exp_duration, tcell_min_track_length, tcell_max_track_length]
-    ), "Either 'config' or 'output_dir, tcell_exp_duration, tcell_min_track_length and tcell_max_track_length' parameters must be supplied"
+    # assert config is not None or all(
+    #     [output_dir, exp_duration, min_track_length, max_track_length]
+    # ), "Either 'config' or 'output_dir, tcell_exp_duration, tcell_min_track_length and tcell_max_track_length' parameters must be supplied"
     
     start_time = time.time()
     
     print(f"--------------- Filtering tracks ---------------")
     
-    if not all([output_dir, tcell_exp_duration, tcell_min_track_length, tcell_max_track_length]):
-        output_dir = config['output_dir']
-        tcell_exp_duration = config['tcell_exp_duration']
-        tcell_min_track_length = config['tcell_min_track_length']
-        tcell_max_track_length = config['tcell_max_track_length']
+    # if not all([output_dir, exp_duration, min_track_length, max_track_length]):
+    #     output_dir = config['output_dir']
+    #     exp_duration = config[f'{cell_type}_exp_duration']
+    #     min_track_length = config[f'{cell_type}_min_track_length']
+    #     max_track_length = config[f'{cell_type}_max_track_length']
     
-    analysis_outdir = Path(output_dir, "analysis", cell_type)
+    combined_outdir = Path(output_dir, "analysis", "combined")
+    analysis_outdir = Path(combined_outdir, cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     qc_outdir = Path(analysis_outdir, "quality_control")
     
+    if not combined_outdir.exists():
+        combined_outdir.mkdir(parents=True)
     if not analysis_outdir.exists():
         analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
@@ -183,12 +196,15 @@ def filter_tracks(
     
     # Filtering the tracks based on the total experimental duration
     # Any timepoint after this will be filtered out 
-    df_all_tracks_filt=df_all_tracks_filt.drop(df_all_tracks_filt[df_all_tracks_filt["position_t"]>tcell_exp_duration].index)
+    if exp_duration is not None:
+       df_all_tracks_filt=df_all_tracks_filt.drop(df_all_tracks_filt[df_all_tracks_filt["position_t"]>exp_duration].index)
     df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_exp_duration", df_track_counts=df_track_counts)
 
     # Filtering out tracks under specific track length and cutting them down to specified max track length
-    df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).filter(lambda group: len(group) >= tcell_min_track_length).reset_index(drop=True)
-    df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).apply(lambda group: group.iloc[:tcell_max_track_length]).reset_index(drop=True)
+    if min_track_length is not None:
+        df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).filter(lambda group: len(group) >= min_track_length).reset_index(drop=True)
+    if max_track_length is not None:
+        df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).apply(lambda group: group.iloc[:max_track_length]).reset_index(drop=True)
     df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_min_track_length", df_track_counts=df_track_counts)
 
     # Plot the number of cells having contact with another T cell and Organoid for analysis
@@ -235,11 +251,12 @@ def filter_tracks(
         )
     
     # Filter out all T cells that are dead based on the threshold at the first timepoint of a track
-    dead_t0 = df_all_tracks_filt[
-        (df_all_tracks_filt["relative_time"]==1) & 
-        (df_all_tracks_filt["dead"])
-        ][["TrackID","sample_name"]]
-    df_all_tracks_filt=df_all_tracks_filt[~df_all_tracks_filt.set_index(['TrackID', 'sample_name']).index.isin(dead_t0.set_index(['TrackID', 'sample_name']).index)]   
+    if filter_t0_dead:
+        dead_t0 = df_all_tracks_filt[
+            (df_all_tracks_filt["relative_time"]==1) & 
+            (df_all_tracks_filt["dead"])
+            ][["TrackID","sample_name"]]
+        df_all_tracks_filt=df_all_tracks_filt[~df_all_tracks_filt.set_index(['TrackID', 'sample_name']).index.isin(dead_t0.set_index(['TrackID', 'sample_name']).index)]   
     df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_dead_t1", df_track_counts=df_track_counts)
 
     plot_filter_count_outpath = Path(qc_outdir, f"BEHAV3D_filter_counts.pdf")
@@ -287,10 +304,14 @@ def summarize_track_features(
             imaris = config["imaris"]
         else:
             imaris = False
-    analysis_outdir = Path(output_dir, "analysis", cell_type)
+            
+    combined_outdir = Path(output_dir, "analysis", "combined")
+    analysis_outdir = Path(combined_outdir, cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     qc_outdir = Path(analysis_outdir, "quality_control")
     
+    if not combined_outdir.exists():
+        combined_outdir.mkdir(parents=True)
     if not analysis_outdir.exists():
         analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
@@ -443,7 +464,7 @@ def cluster_umap(
         output_dir = Path(config['output_dir'])
         nr_of_clusters=config["nr_of_clusters"]
     
-    tcell_outdir = Path(output_dir, "analysis", "tcell")
+    tcell_outdir = Path(output_dir, "analysis/combined/tcell")
     feature_outdir = Path(tcell_outdir, "track_features")
     results_outdir = Path(tcell_outdir, "results")
     if not tcell_outdir.exists():
@@ -484,11 +505,11 @@ def cluster_umap(
     print(f"- Writing clustered tracks to {df_umap_out_path}")
     df_umap.to_csv(df_umap_out_path, sep=",", index=False)
 
-    print("- Producing clustered UMAP plots with displayed Track features")
     sample_cols = ["organoid_line", "tcell_line"]
     info_cols = df_umap.drop(columns=["TrackID", "sample_name", "well", "exp_nr", "UMAP1", "UMAP2", "ClusterID"]).columns
     
     cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_clusters.pdf")
+    print(f"- Plotting clustered UMAP plots with displayed Track features to {cluster_UMAP_path}")
     plot_feature_umap(
         df_umap=df_umap,
         info_cols=info_cols,
@@ -502,8 +523,8 @@ def cluster_umap(
     
     ### Producing a heatmap of the summarized features again summarized over all tracks
     ### Belonging to that cluster
-    print("- Producing heatmaps with summarized cluster features")
     cluster_features_heatmap_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_cluster_feature_heatmap.pdf")
+    print(f"- Plotting heatmaps with summarized cluster features to {cluster_features_heatmap_path}")
     plot_clustering_feature_heatmap(
         df_umap,
         info_cols,
@@ -515,7 +536,6 @@ def cluster_umap(
         figsize = (8.27, 11.69)
     )
 
-    print("- Producing percentage plots of each cluster per combination of T-cell and organoid line")
     df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "ClusterID"]).size().reset_index(name='count')
     total_counts = df_clust_perc.groupby(['organoid_line', 'tcell_line'])['count'].sum().reset_index(name='total_count')
     
@@ -523,6 +543,7 @@ def cluster_umap(
     df_clust_perc["percentage"] = (df_clust_perc['count'] / df_clust_perc['total_count'])
     
     cluster_percentage_plot_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_cluster_percentages.pdf")
+    print(f"- Plotting percentage plots of each cluster per combination of T-cell and organoid line to {cluster_percentage_plot_path}")
     plot_cluster_percentage_bars(
         df_clust_perc,
         cluster_percentage_plot_path
@@ -610,7 +631,7 @@ def plot_cluster_percentage_bars(
             bbox_to_anchor=(0.9, 0.5), 
             loc='center left')
         fig.tight_layout(rect=[0, 0, 0.85, 1])
-        plt.show()
+        # plt.show()
         pdf.savefig(fig, bbox_inches='tight', dpi=600)
         plt.close(fig)
             
@@ -730,7 +751,7 @@ def plot_feature_umap(
             fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
             # fig.tight_layout(pad=2.0)
             # fig.set_constrained_layout(True)
-            plt.show()
+            # plt.show()
             pdf.savefig(fig, dpi=600)
             plt.close(fig)
 
@@ -814,59 +835,8 @@ def plot_clustering_feature_heatmap(
             fig.subplots_adjust(left=0.2, right=0.95, top=0.95, bottom=0.05)
             # fig.tight_layout(pad=2.0)
             # fig.set_constrained_layout(True)
-            plt.show()
-            pdf.savefig(fig, dpi=600)
-            plt.close(fig)
-
-def plot_filter_count(
-    df_track_counts,
-    outpath,
-    nr_cols=3,
-    rows_per_page = 3,
-    figsize=(8.27, 11.69),
-    filter_cols=["nr_tracks_before_filtering", "nr_tracks_exp_duration", "nr_tracks_min_track_length", "nr_tracks_dead_t1"]
-    ):
-    
-    sample_names = df_track_counts["sample_name"].unique()
-    n_plots = len(sample_names)
-    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
-    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
-    
-    with PdfPages(outpath) as pdf:
-        plot_idx = 0
-        for page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
-            gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.5, hspace=0.3)
-            remaining_axes = [
-                fig.add_subplot(gs[i, j])
-                for i in range(rows_per_page)
-                for j in range(nr_cols)
-            ]
-            
-            for ax in remaining_axes:
-                if plot_idx >= n_plots:
-                    ax.remove()
-                    continue
-                
-                sample = sample_names[plot_idx]
-                df_subset = df_track_counts[df_track_counts["sample_name"] == sample]
-                
-                sns.barplot(
-                    x=filter_cols, 
-                    y=df_subset[filter_cols].values.flatten(),
-                    ax=ax
-                )
-                
-                ax.set_title(sample, fontsize=10, loc='center')
-                ax.set_xlabel("")
-                ax.set_ylabel("Count")
-                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-                
-                plot_idx += 1
-            
-            fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
             # plt.show()
-            pdf.savefig(fig, bbox_inches='tight', dpi=600)
+            pdf.savefig(fig, dpi=600)
             plt.close(fig)
 
 def plot_dead_dye_distribution(

@@ -3,7 +3,7 @@ import pandas as pd
 from behav3d.utils.fileio import load_image
 import napari
 
-cell_type = 'tcell'
+cell_type = 'organoid'
 raw_path = '/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/test_windows/images/SMI_JM1_Exp004_Img14/SMI_JM1_Exp004_Img14.zarr'
 seg_path = f'/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/test_windows/images/SMI_JM1_Exp004_Img14/SMI_JM1_Exp004_Img14_{cell_type}_tracked.zarr'
 mask_dead_path = '/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/test_windows/images/SMI_JM1_Exp004_Img14/SMI_JM1_Exp004_Img14_mask_dead.zarr'

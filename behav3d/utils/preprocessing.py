@@ -7,6 +7,7 @@ from skimage.draw import ellipsoid
 from skimage.morphology import disk
 
 from behav3d.utils import rel_elsize
+import warnings
 
 def trim_zeros(arr):
     """
@@ -14,6 +15,30 @@ def trim_zeros(arr):
     """
     slices = tuple(slice(idx.min(), idx.max()+1) for idx in np.nonzero(arr))
     return(arr[slices])
+
+
+def calc_z_projection(im, z_axis=-3, projection='max'):
+    """
+    Calculate the z projection of a 3D czi_utils
+
+    Args:
+        im (array-like): 3D czi_utils, dimension order is ZYX by default
+        z_axis (int): The index of Z-plane
+        projection (string, or tuple of strings): The method to compute z-projection. by default ('max', 'mean', 'std')
+
+    Returns:
+        results (list of tuples): [(method, value), ...], the projection method and the total intensity of the composite czi_utils after z-projection
+    """
+
+    if projection == 'max':
+        return np.max(im, axis=z_axis).astype(im.dtype)
+    elif projection == 'mean':
+        return np.mean(im, axis=z_axis).astype(im.dtype)
+    elif projection == 'std':
+        return np.std(im, axis=z_axis).astype(im.dtype)
+    else:
+        warnings.warn(f'Projection {projection} is not defined')
+    return -1
 
 def draw_ellipsoid(shape=[], radius=1, elsize=[1,1,1], remove_border_zeros=True):
     """
