@@ -367,25 +367,20 @@ class BEHAV3D_Unet_Segmenter():
             self.logger.info(f"Segmenting multiple timepoint BEHAV3D image: {self.img.shape[0]} timepoints")
             self.first_timepoint = True
             
-            tcell_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_tcell_segments.zarr")
-            organoid_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_organoid_tracked.zarr")
-            mask_dead_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_mask_dead.zarr")
+            self.tcell_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_tcell_segments.zarr")
+            self.organoid_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_organoid_tracked.zarr")
+            self.mask_dead_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_mask_dead.zarr")
             
-            if (Path(f"{tcell_segments_outpath}").exists() and 
-                Path(f"{organoid_segments_outpath}").exists() and 
-                Path(f"{mask_dead_outpath}").exists() and 
+            if (Path(f"{self.tcell_segments_outpath}").exists() and 
+                Path(f"{self.organoid_segments_outpath}").exists() and 
+                Path(f"{self.mask_dead_outpath}").exists() and 
                 self.overwrite==False
                 ):
                 self.logger.info("Segmentation already exists... Provide overwrite=True to overwrite")
                 
-                self.tcell_segments_outpath = Path(f"{tcell_segments_outpath}")
                 self.tcell_segments = load_zarr(Path(self.tcell_segments_outpath))
-                
-                self.organoid_segments_outpath = Path(f"{organoid_segments_outpath}")
                 self.organoid_segments = load_zarr(Path(self.organoid_segments_outpath))
-                
-                self.mask_dead_outpath = Path(f"{mask_dead_outpath}")
-                self.mask_dead = load_zarr(Path(f"{mask_dead_outpath}"))
+                self.mask_dead = load_zarr(Path(f"{self.mask_dead_outpath}"))
                 # return(self.tcell_segments, self.organoid_segments, self.mask_dead)
             else:
                 for t, t_img in tqdm(enumerate(self.img), total=self.img.shape[0]):
@@ -397,14 +392,14 @@ class BEHAV3D_Unet_Segmenter():
                     organoid_segments = np.expand_dims(organoid_segments, axis=0)
                     mask_dead = np.expand_dims(mask_dead, axis=0)
                     
-                    self._append_to_zarr(tcell_segments, tcell_segments_outpath)
-                    self._append_to_zarr(organoid_segments, organoid_segments_outpath)
-                    self._append_to_zarr(mask_dead, mask_dead_outpath)
+                    self._append_to_zarr(tcell_segments, self.tcell_segments_outpath)
+                    self._append_to_zarr(organoid_segments, self.organoid_segments_outpath)
+                    self._append_to_zarr(mask_dead, self.mask_dead_outpath)
                     self.first_timepoint = False
                 
-                self.tcell_segments = load_zarr(tcell_segments_outpath)
-                self.organoid_segments = load_zarr(organoid_segments_outpath)
-                self.mask_dead = load_zarr(mask_dead_outpath)
+                self.tcell_segments = load_zarr(self.tcell_segments_outpath)
+                self.organoid_segments = load_zarr(self.organoid_segments_outpath)
+                self.mask_dead = load_zarr(self.mask_dead_outpath)
         
             
     def _append_to_zarr(self, img, outpath):

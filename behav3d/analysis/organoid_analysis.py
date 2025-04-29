@@ -19,10 +19,10 @@ from matplotlib import colormaps
 
 
 def run_organoid_analysis(
+    dead_perc_threshold,
     config=None,
     output_dir=None,
     df_tracks_path=None,
-    dead_perc_threshold=None,
     # df_tracks_summarized_path=None,
     ):
     print(f"--------------- Performing T-cell behavioral analysis ---------------")
@@ -84,18 +84,7 @@ def run_organoid_analysis(
     
     df_tracks["dead"]=df_tracks["smoothed_percentage_dead_mask"] > dead_perc_threshold
     df_tracks["dead"] = df_tracks.groupby("TrackID")["dead"].transform(lambda x: x.cummax())
-    
-    
-    for sample_name in df_tracks["sample_name"].unique():
-        """
-        Create a analysis pdf for each sample separately
-        """
-        analysis_sample_outdir = Path(sample_outdir, sample_name, "organoid")
-        if not analysis_sample_outdir.exists():
-            analysis_sample_outdir.mkdir(parents=True)
-            
-        df_tracks_sample = df_tracks[df_tracks["sample_name"] == sample_name]
-        df_tracks_sample = df_tracks_sample[[
+    df_tracks = df_tracks[[
             "TrackID",
             "sample_name",
             "organoid_line",
@@ -114,6 +103,31 @@ def run_organoid_analysis(
             "volume",
             "dead"]
             ]
+    
+    df_general = df_tracks.groupby(["sample_name", "position_t"]).agg(
+        nr_organoids_t0=("TrackID", lambda x: x.nunique()),
+        nr_dead=("TrackID", lambda x: x[df_tracks.loc[x.index, "dead"]].nunique()),
+    ).reset_index()
+    df_general["nr_alive"]=df_general["nr_organoids_t0"] - df_general["nr_dead"]
+    df_general["percentage_dead"]=df_general["nr_dead"] / df_general["nr_organoids_t0"]
+    df_general["percentage_alive"]= 1.0 - df_general["percentage_dead"]
+    
+    plot_general_organoid_analysis(
+            df_general=df_general,
+            outpath=pdf_outpath,
+            figsize=(8.27, 11.69)
+            )
+    
+    
+    for sample_name in df_tracks["sample_name"].unique():
+        """
+        Create a analysis pdf for each sample separately
+        """
+        analysis_sample_outdir = Path(sample_outdir, sample_name, "organoid")
+        if not analysis_sample_outdir.exists():
+            analysis_sample_outdir.mkdir(parents=True)
+            
+        df_tracks_sample = df_tracks[df_tracks["sample_name"] == sample_name]
         
         img_outdir = Path(output_dir, "images", sample_name)
         
@@ -452,3 +466,59 @@ def plot_feature_lineplot(
         title=hue  # Optional: keep or remove the title
     ).set_title(hue, prop={'size': 6})
     return ax
+
+def plot_general_organoid_analysis(
+    df_general,
+    outpath,
+    figsize=(8.27, 11.69)
+    ):
+    
+    with PdfPages(outpath) as pdf:
+        fig = plt.figure(figsize=figsize)
+        gs = GridSpec(4, 1, figure=fig, wspace=0.1, hspace=0.3)
+        
+        ### Plot the percentage organoid death of all samples
+        ax = fig.add_subplot(gs[:2, :])
+        sns.lineplot(
+            data = df_general,
+            x = 'position_t', 
+            y = 'percentage_alive', 
+            hue = 'sample_name',
+            ax = ax,
+            )
+        ax.grid(True, linestyle=':', linewidth=1, alpha=0.5)
+        ax.set_ylim(0, 1.1)
+        ax.set_xlim(0)
+        ax.set_xlabel('Timepoint')
+        ax.set_ylabel('')
+        ax.set_title(f'Percentage Alive Organoids')
+        
+        ### Plot the barplot organoid death of all samples
+        ax = fig.add_subplot(gs[2, 0])
+        df_end = df_general[df_general["position_t"] == df_general["position_t"].max()]
+        df_end = df_end[["sample_name", "percentage_dead", "percentage_alive"]]
+        df_end.set_index("sample_name").plot(
+            kind='bar', 
+            stacked=True, 
+            ax=ax, 
+            color=["#CC6666", "#6699CC"], 
+            alpha=1.0,
+            width=0.25,
+            zorder=2
+            )
+        ax.grid(True, linestyle=':', linewidth=1, alpha=0.5, zorder=1)
+        ax.set_ylim(0, 1.1)
+        ax.set_xlabel('')
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', size=6)
+        ax.set_ylabel('')
+        ax.set_title(f'Percentage Alive Organoids at end of experiment')
+        handles, labels = ax.get_legend_handles_labels()
+        new_order = [1, 0]  # Dead first (red, index 0), then Alive (blue, index 1)
+        ax.legend([handles[idx] for idx in new_order], [labels[idx] for idx in new_order], loc='upper right')
+        
+        fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
+        
+        plt.show()
+        pdf.savefig(fig)
+        plt.close(fig)
+    
