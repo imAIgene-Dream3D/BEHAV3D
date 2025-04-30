@@ -169,6 +169,7 @@ def run_feature_extraction(
     output_dir=None,
     cell_type="tcell",
     imaris=False,
+    dead_mask_percentage_threshold=None,
     rolling_meanspeed_window=10,
     overwrite=False,
     n_workers=1
@@ -187,7 +188,7 @@ def run_feature_extraction(
         sample_name = sample_metadata['sample_name']
         
         distance_unit=sample_metadata['distance_unit']
-        dead_dye_threshold=sample_metadata['dead_dye_threshold']
+        # dead_dye_threshold=sample_metadata['dead_dye_threshold']
         
         # Sometimes excel saves the encoding for µm differently, the following lines converts
         # other variants of µm to ones comparable in this code
@@ -234,6 +235,7 @@ def run_feature_extraction(
         
         print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
         tcell_segments_path, organoid_segments_path, raw_image_path = convert_input_files_to_zarr(
+            sample_name=sample_name,
             tcell_segments_path=tcell_segments_path,
             organoid_segments_path=organoid_segments_path,
             raw_image_path=raw_image_path,
@@ -326,14 +328,16 @@ def run_feature_extraction(
             print(f"{get_current_time()} - Calculating T-cell specific features...")
             df_tracks = calculate_tcell_specific_track_features(
                 df_tracks,
-                dead_dye_threshold=dead_dye_threshold,
+                dead_mask_percentage_threshold=dead_mask_percentage_threshold
+                # dead_dye_threshold=dead_dye_threshold,
                 )
             
         elif cell_type=="organoid":
             print(f"{get_current_time()} - Calculating organoid specific features...")
             df_tracks = calculate_organoid_specific_track_features(
                 df_tracks,
-                dead_dye_threshold=dead_dye_threshold,
+                dead_mask_percentage_threshold=dead_mask_percentage_threshold
+                # dead_dye_threshold=dead_dye_threshold,
                 )
             #TODO Add organoid specific features
         else:
@@ -370,6 +374,7 @@ def calculate_image_based_track_features(
     df_tracks,
     cell_type,
     dead_channel,
+    
     contact_threshold,
     element_size_x,
     element_size_y,
@@ -384,6 +389,7 @@ def calculate_image_based_track_features(
     df_intensity_outpath,
     df_contacts_outpath,
     # Overwrite/redo df_intensity_outpath and df_contacts_outpath
+    dead_mask_percentage_threshold=None,
     n_workers=1,
     overwrite=False,
     ):
@@ -546,11 +552,13 @@ def generalize_units_of_track_features(
     
 def calculate_tcell_specific_track_features(
     df_tracks,
-    dead_dye_threshold,
+    dead_mask_percentage_threshold=None,
     ):
 
-    print(f"{get_current_time()} - Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
-    df_tracks = calculate_death(df_tracks, threshold=dead_dye_threshold, threshold_column="mean_dead_dye")
+    if dead_mask_percentage_threshold is not None:
+        print(f"{get_current_time()} - Calculating cell death based on defined dead_dye_threshold {dead_mask_percentage_threshold}")
+        df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
+        
     # Calculate various movement features such as speed and mean square displacement of the tracks  
     
     print(f"{get_current_time()} - Determining active contact of T cells")
@@ -573,12 +581,12 @@ def calculate_tcell_specific_track_features(
 
 def calculate_organoid_specific_track_features(
     df_tracks,
-    dead_dye_threshold,
+    dead_mask_percentage_threshold=None,
     ):
 
-    print(f"{get_current_time()} - Calculating cell death based on nr dead pixels {dead_dye_threshold}")
-    df_tracks = calculate_death(df_tracks, threshold=dead_dye_threshold, threshold_column="mean_dead_dye")
-    # Calculate various movement features such as speed and mean square displacement of the tracks  
+    if dead_mask_percentage_threshold is not None:
+        print(f"{get_current_time()} - Calculating cell death based on nr dead pixels {dead_mask_percentage_threshold}")
+        df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
     
     return(df_tracks)
 

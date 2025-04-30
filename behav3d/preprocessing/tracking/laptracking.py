@@ -147,4 +147,4 @@ def run_tcell_laptracking(
         metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
         metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
         
-        return metadata
+    return metadata

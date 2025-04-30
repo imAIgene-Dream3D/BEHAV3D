@@ -27,13 +27,17 @@ import argparse
 from dtaidistance import dtw, dtw_ndim
 import pandas as pd
 import numpy as np
+
 import umap
+
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.gridspec import GridSpec
 import random
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+
+from sklearn.cluster import KMeans, HDBSCAN
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.decomposition import PCA
 
 from pathlib import Path
 from behav3d.utils import format_time
@@ -252,6 +256,7 @@ def filter_tcell_tracks(
     
     # Filter out all T cells that are dead based on the threshold at the first timepoint of a track
     if filter_t0_dead:
+        assert 'dead' in df_all_tracks_filt.columns, "The column 'dead' is not present in the DataFrame, but filter_t0_dead is supplied"
         dead_t0 = df_all_tracks_filt[
             (df_all_tracks_filt["relative_time"]==1) & 
             (df_all_tracks_filt["dead"])
@@ -397,21 +402,115 @@ def calculate_dtw(
     dtw_distance_matrix = pd.DataFrame(dtw_distance_matrix, index=dtw_rownames, columns=dtw_rownames)
     return(dtw_distance_matrix)
 
-#  # dtw_input_tracks = np.empty((nr_tracks, nr_timepoints, nr_features),dtype=np.double)
-#     colnames=['TrackID', 'sample_name']+features
-#     dtw_input_tracks=pd.DataFrame(columns=colnames)
-#     unique_tracks = df_tracks.groupby(['TrackID', 'sample_name'])
-#     for (TrackID, sample_name), group in unique_tracks:
-#         track_features = group[features].to_numpy().astype(np.double)
-#         # dtw_input_tracks=pd.concat([dtw_input_tracks, group[colnames]])
-#         # track_features = group[['TrackID', 'sample_name']+features]
-#         # track_features = group[features].to_numpy().astype(np.double)
-#         # dtw_input_tracks.append(track_features)
-#     dtw_input = dtw_input_tracks.drop(columns=['TrackID', 'sample_name']).to_numpy().astype(np.double)
-#     dtw_distance_matrix = dtw_ndim.distance_matrix_fast(dtw_input)
-#     dtw_distance_matrix = pd.concat([pd.DataFrame(dtw_distance_matrix)
-#     return(dtw_distance_matrix)
+def rolling_classification(
+    df_tracks,
+    window_size=20,
+    features=[
+        "elongation",
+        "sphericity",
+        "percentage_dead_mask",
+        "nr_dead_mask_pixels",
+        "organoid_contact",
+        "tcell_contact",
+        "displacement",
+        "mean_square_displacement",
+        "speed",
+        # "dead",
+        "active_tcell_contact",
+        # "position_t"
+    ]
+    ):
+    
+    df_rolling = df_tracks[features].rolling(window=window_size, min_periods=window_size).mean()
+    df_rolling = df_rolling.dropna()
+    
+    # scaler = StandardScaler()
+    scaler = RobustScaler()
+    df_rolling = pd.DataFrame(scaler.fit_transform(df_rolling), columns=df_rolling.columns)
 
+    n_components=2
+    n_neighbors=15
+    min_dist=0.1
+    
+    pca = PCA(n_components=min(10, len(features)))
+    X_pca = pca.fit_transform(df_rolling[features])
+    umap_result = umap_model.fit_transform(X_pca)
+    umap_model = umap.UMAP(
+        n_components=n_components, 
+        n_neighbors=n_neighbors, 
+        min_dist=min_dist, 
+        # init="random", 
+        # random_state=123,
+        metric="euclidean", 
+        )
+    umap_result = umap_model.fit_transform(df_rolling)
+    
+    fig = plt.figure()
+    if n_components == 1:
+        ax = fig.add_subplot(111)
+        ax.scatter(umap_result[:,0], range(len(umap_result)), c=np.arange(len(umap_result)))
+    if n_components == 2:
+        ax = fig.add_subplot(111)
+        ax.scatter(umap_result[:,0], umap_result[:,1], c=np.arange(len(umap_result)), s=1, alpha=0.5)
+    if n_components == 3:
+        ax = fig.add_subplot(111, projection='3d')
+        ax.scatter(umap_result[:,0], umap_result[:,1], umap_result[:,2], c=np.arange(len(umap_result)), s=1, alpha=0.5)
+
+    clusterer = HDBSCAN(
+        min_cluster_size=500,         # Minimum size of a cluster
+        min_samples=20,               # Controls outlier sensitivity (higher = stricter)
+        cluster_selection_epsilon=0.0,# Optional: smooths cluster boundaries
+        cluster_selection_method='eom',  # Default is good; use 'leaf' if you want more granularity
+        )
+    cluster_labels = clusterer.fit_predict(umap_result)
+
+    ### TODO Do the clustering based straight on the DTW distances
+    ### Miguel suggested clusters are more meaningful before the umap embedding
+    df_rolling['cluster'] = cluster_labels
+
+    # Plot UMAP colored by HDBSCAN clusters
+    plt.figure(figsize=(10, 8))
+    unique_labels = np.unique(cluster_labels)
+
+    # Assign a color for each cluster (noise will be colored gray)
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_labels)))
+    for i, label in enumerate(unique_labels):
+        mask = cluster_labels == label
+        plt.scatter(
+            umap_result[mask, 0],
+            umap_result[mask, 1],
+            s=5,
+            color='gray' if label == -1 else colors[i],
+            label=f'Noise' if label == -1 else f'Cluster {label}',
+            alpha=0.8
+        )
+
+    plt.title('UMAP Projection with HDBSCAN Clusters')
+    plt.xlabel('UMAP 1')
+    plt.ylabel('UMAP 2')
+    plt.legend(markerscale=4, bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.show()
+    
+    # Plot UMAP colored by each selected feature
+    for feature in df_rolling.columns:
+        plt.figure(figsize=(8, 6))
+        plt.scatter(
+            umap_result[:, 0], 
+            umap_result[:, 1], 
+            c=df_rolling[feature], 
+            # cmap='viridis', 
+            s=5, 
+            alpha=0.8
+        )
+        plt.colorbar(label=feature)
+        plt.title(f'UMAP colored by {feature}')
+        plt.xlabel('UMAP 1')
+        plt.ylabel('UMAP 2')
+        plt.tight_layout()
+        plt.show()
+    
+    
 def fit_umap(
     dtw_distance_matrix,
     config=None,

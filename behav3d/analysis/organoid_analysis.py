@@ -83,7 +83,7 @@ def run_organoid_analysis(
         )
     
     df_tracks["dead"]=df_tracks["smoothed_percentage_dead_mask"] > dead_perc_threshold
-    df_tracks["dead"] = df_tracks.groupby("TrackID")["dead"].transform(lambda x: x.cummax())
+    df_tracks["dead"] = df_tracks.groupby(["sample_name", "TrackID"])["dead"].transform(lambda x: x.cummax())
     df_tracks = df_tracks[[
             "TrackID",
             "sample_name",
@@ -112,9 +112,18 @@ def run_organoid_analysis(
     df_general["percentage_dead"]=df_general["nr_dead"] / df_general["nr_organoids_t0"]
     df_general["percentage_alive"]= 1.0 - df_general["percentage_dead"]
     
+    df_general_outpath = Path(analysis_outdir, f"combined_general_organoid_dynamics_analysis.csv")
+    df_general.to_csv(
+        df_general_outpath,
+        sep=",",
+        index=False
+    )
+        
+    general_pdf_outpath = Path(analysis_outdir, f"combined_general_organoid_dynamics_analysis.pdf")
+    
     plot_general_organoid_analysis(
             df_general=df_general,
-            outpath=pdf_outpath,
+            outpath=general_pdf_outpath,
             figsize=(8.27, 11.69)
             )
     
@@ -153,18 +162,18 @@ def run_organoid_analysis(
             index=False
         )
         
-        pdf_outpath = Path(analysis_sample_outdir, f"{sample_name}_organoid_analysis.pdf")
+        sample_pdf_outpath = Path(analysis_sample_outdir, f"{sample_name}_organoid_analysis.pdf")
     
         raw_img_path = Path(img_outdir, f"{sample_name}.zarr")
         organoid_seg_path = Path(img_outdir, f"{sample_name}_organoid_tracked.zarr")
         dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
 
         ### Plot analysis results per sample
-        print(f"- Writing analysis pdf to {pdf_outpath}")
+        print(f"- Writing analysis pdf to {sample_pdf_outpath}")
         plot_sample_organoid_analysis(
             df_experiment_sample=df_experiment_sample,
             df_sample_tracks=df_tracks_sample,
-            outpath=pdf_outpath,
+            outpath=sample_pdf_outpath,
             raw_img_path=raw_img_path,
             organoid_seg_path=organoid_seg_path,
             dead_mask_path=dead_mask_path,

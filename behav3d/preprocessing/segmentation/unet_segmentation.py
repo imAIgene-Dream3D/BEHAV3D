@@ -21,6 +21,7 @@ class BEHAV3D_Unet_Segmenter():
         img=None, 
         img_path=None,
         output_dir=None,
+        sample_name=None,
         
         model=None,
         model_path=None,
@@ -35,9 +36,9 @@ class BEHAV3D_Unet_Segmenter():
         
         dead_opening_nr_pixels = 1,
         dead_sauvola_window_size=4,
-        dead_smooth_radius=1,
-        dead_SNR=30,
-        dead_peaks_SNR=6,
+        dead_smooth_radius=0,
+        dead_SNR=8,
+        dead_peaks_SNR=3,
         
         #Segmentation
         organoids_segments_prev_tp = None,
@@ -61,6 +62,12 @@ class BEHAV3D_Unet_Segmenter():
         ):
         self.img = img
         self.img_path = img_path
+        if sample_name is None:
+            if img_path is not None:
+                sample_name = get_filepath_stem(img_path)
+            else:
+                raise ValueError("No sample name provided and no image path provided to extract sample name from")
+        self.sample_name = sample_name
         
         if self.img_path is not None:
             self.img_path = Path(self.img_path)
@@ -116,7 +123,7 @@ class BEHAV3D_Unet_Segmenter():
         self.organoid_segment_size_min      = organoid_segment_size_min
         self.tcell_segment_size_min         = tcell_segment_size_min
         self.remove_border_segments         = remove_border_segments
-    
+        
     def log_if_verbose(self, message, level="info"):
         if self.verbose:
             log_func = getattr(self.logger, level, self.logger.info)
@@ -169,30 +176,35 @@ class BEHAV3D_Unet_Segmenter():
         use_dims,
         SNR_percentage,
         ):
-        smooth_img = filter_median(img, radius=smooth_radius, use_dimensions=use_dims)
+        if smooth_radius>0:
+            smooth_img = filter_median(img, radius=smooth_radius, use_dimensions=use_dims)
+        else:
+            smooth_img = img
+            
         SNR_thr_absmin = float(np.percentile(smooth_img, SNR_percentage)*SNR_threshold)
-        fg_mask = sauvola_thresholding(
-            smooth_img, 
-            use_dimensions=use_dims, 
-            window_size=sauvola_window_size, 
-            absmin=SNR_thr_absmin
-            )
+        # fg_mask = sauvola_thresholding(
+        #     smooth_img, 
+        #     use_dimensions=use_dims, 
+        #     window_size=sauvola_window_size, 
+        #     absmin=SNR_thr_absmin
+        #     )
+        fg_mask = smooth_img >= SNR_thr_absmin
         return(fg_mask)
     
-    def mask_dead_fg(self, img,):
+    def mask_dead_fg(self, img):
          # Masking the dead channel of the image
         mask_dead = self.segment_foreground(
                 img=img[self.dead_ch],
                 smooth_radius=self.dead_smooth_radius,
                 SNR_threshold=self.dead_SNR,
                 sauvola_window_size=self.dead_sauvola_window_size,
-                use_dims=2,
+                use_dims=self.use_dims,
                 SNR_percentage=90
             )
         
         # Remove single separeted pixel values of dead mask to reduce noise, real signal is often several pixels
-        if self.dead_opening_nr_pixels!=0:
-            mask_dead_opened = open_mask(mask_dead, use_dimensions=self.use_dims, nr_pixels=self.dead_opening_nr_pixels)
+        if self.dead_opening_nr_pixels!=0 and self.dead_opening_nr_pixels is not None:
+            mask_dead_opened = open_mask(mask_dead, use_dimensions=2, nr_pixels=self.dead_opening_nr_pixels)
             # Refill more pixel-precise original dead mask with opened dead mask to reconnect dead pixels belonging to real signal
             mask_dead = watershed(mask_dead, markers = mask_dead_opened, mask=mask_dead)
 
@@ -234,7 +246,7 @@ class BEHAV3D_Unet_Segmenter():
     def postprocess_mask(mask, fill_holes=True, opening_nr_pixels=1):
         if fill_holes:
             mask = binary_fill_holes(mask)
-        if opening_nr_pixels>0:
+        if opening_nr_pixels>0 and opening_nr_pixels is not None:
             mask = open_mask(mask)
         return(mask)
         # if closing_nr_pixels>0:
@@ -321,9 +333,9 @@ class BEHAV3D_Unet_Segmenter():
         mask_dead = self.mask_dead_fg(img)
         
         # self.logger.info("- Postprocessing all the created masks")  
-        mask_tcell = self.postprocess_mask(mask_tcell, self.tcell_opening_nr_pixels)
-        mask_organoid = self.postprocess_mask(mask_organoid, self.organoid_opening_nr_pixels)
-        mask_dead = self.postprocess_mask(mask_dead, self.dead_opening_nr_pixels)
+        mask_tcell = self.postprocess_mask(mask_tcell, opening_nr_pixels=self.tcell_opening_nr_pixels)
+        mask_organoid = self.postprocess_mask(mask_organoid, opening_nr_pixels=self.organoid_opening_nr_pixels)
+        mask_dead = self.postprocess_mask(mask_dead, opening_nr_pixels=0)
         
         # self.logger.info("- Segmenting the organoids (with dead cells)")
         organoid_segments, unfiltered_organoid_segments = self.segment_organoids(
@@ -338,15 +350,16 @@ class BEHAV3D_Unet_Segmenter():
         return(tcell_segments, organoid_segments, mask_dead)
         
     def run(self, img=None):
+        
         if img is not None:
             self.img = img
-        elif self.img_path is not None:
             
-            image_zarr_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}.zarr")
+        elif self.img_path is not None:
+            image_zarr_outpath = Path(self.output_dir, f"{self.sample_name}.zarr")
             if not Path(image_zarr_outpath).exists():
-                self.img = load_image(self.img_path)
                 self.logger.info(f"Convert image to .zarr for dask processing")
                 self.logger.info(f"Saving to {image_zarr_outpath}")
+                self.img = load_image(self.img_path)                
                 chunks = (1,) + self.img.shape[1:]
                 save_as_zarr(
                     img=self.img, 
@@ -357,7 +370,6 @@ class BEHAV3D_Unet_Segmenter():
         else:
             self.logger.error("- No image provided... Nothing to run processing on")
             
-            
         if self.img.ndim < 4:
             self.logger.info("Provided images does not have enough dimensions for a BEHAV3D experiment and segmentation... Exiting")
         elif self.img.ndim == 4:
@@ -367,9 +379,9 @@ class BEHAV3D_Unet_Segmenter():
             self.logger.info(f"Segmenting multiple timepoint BEHAV3D image: {self.img.shape[0]} timepoints")
             self.first_timepoint = True
             
-            self.tcell_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_tcell_segments.zarr")
-            self.organoid_segments_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_organoid_tracked.zarr")
-            self.mask_dead_outpath = Path(self.output_dir, f"{get_filepath_stem(self.img_path)}_mask_dead.zarr")
+            self.tcell_segments_outpath = Path(self.output_dir, f"{self.sample_name}_tcell_segments.zarr")
+            self.organoid_segments_outpath = Path(self.output_dir, f"{self.sample_name}_organoid_tracked.zarr")
+            self.mask_dead_outpath = Path(self.output_dir, f"{self.sample_name}_mask_dead.zarr")
             
             if (Path(f"{self.tcell_segments_outpath}").exists() and 
                 Path(f"{self.organoid_segments_outpath}").exists() and 
@@ -480,6 +492,7 @@ def run_behav3d_unet_segmentation(
 
         # img = load_image(raw_image_path)
         segmenter = BEHAV3D_Unet_Segmenter(
+            sample_name=sample_name,
             img_path=raw_image_path,
             output_dir=img_outdir,
             model_path=model_path,
@@ -496,7 +509,45 @@ def run_behav3d_unet_segmentation(
         metadata.at[idx, "tcell_segments_image_path"] = str(segmenter.tcell_segments_outpath)
         metadata.at[idx, "organoid_tracks_image_path"] = str(segmenter.organoid_segments_outpath)
     return(metadata)
-        # organoid_segments = segmenter.organoid_segments
-        # tcell_segments = segmenter.tcell_segments
-        # dead_mask = segmenter.mask_dead
-        # return(organoid_segments, tcell_segments, dead_mask)
+
+def run_only_death_segmentation():
+    sample_name = "ROCHE_IC1_Exp033_Img08"
+    output_dir = f"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/images/{sample_name}"
+    raw_image_path = Path(output_dir, f"{sample_name}.zarr")
+    unet_model_path = "/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/Unet_3D_model.pth"
+
+    # mask_test = load_image(mask_dead_outpath)
+    img = load_image(raw_image_path)
+    img.shape
+
+    segmenter = BEHAV3D_Unet_Segmenter(
+            sample_name=sample_name,
+            img_path=raw_image_path,
+            output_dir=output_dir,
+            model_path=unet_model_path,
+            tcell_ch=0, 
+            live_ch=1, 
+            dead_ch=2,
+            use_dims=3,
+            unet_prob_thr=0.5,
+            logger=None,
+            )
+    segmenter.img = img
+
+    segmenter.mask_dead_outpath = Path(segmenter.output_dir, f"{segmenter.sample_name}_mask_dead.zarr")
+    segmenter.dead_ch
+
+    segmenter.first_timepoint = True
+
+
+    for t, t_img in tqdm(enumerate(segmenter.img), total=segmenter.img.shape[0]):
+        t_img = np.asarray(t_img)
+        mask_dead = segmenter.mask_dead_fg(t_img)
+        mask_dead = segmenter.postprocess_mask(mask_dead, segmenter.dead_opening_nr_pixels)
+        mask_dead = np.expand_dims(mask_dead, axis=0)
+        segmenter._append_to_zarr(mask_dead, segmenter.mask_dead_outpath)
+        segmenter.first_timepoint = False
+            # organoid_segments = segmenter.organoid_segments
+            # tcell_segments = segmenter.tcell_segments
+            # dead_mask = segmenter.mask_dead
+            # return(organoid_segments, tcell_segments, dead_mask)

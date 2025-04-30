@@ -384,6 +384,7 @@ def save_as_imaris(
     converter.Destroy()
 
 def convert_input_files_to_zarr(
+    sample_name,
     tcell_segments_path,
     organoid_segments_path,
     raw_image_path,
@@ -397,17 +398,22 @@ def convert_input_files_to_zarr(
     raw_image_path = Path(raw_image_path)
     
     if output_dir is None:
-        tcell_zarr_out_path = Path(tcell_segments_path, f"{get_filepath_stem(tcell_segments_path)}.zarr.")
-        organoid_zarr_out_path = Path(organoid_segments_path, f"{get_filepath_stem(organoid_segments_path)}.zarr.")
-        raw_image_zarr_out_path = Path(raw_image_path, f"{get_filepath_stem(raw_image_path)}.zarr")
+        tcell_zarr_out_path = Path(tcell_segments_path, f"{sample_name}_tcell_tracked.zarr")
+        organoid_zarr_out_path = Path(organoid_segments_path, f"{sample_name}_organoid_tracked.zarr")
+        raw_image_zarr_out_path = Path(raw_image_path, f"{sample_name}.zarr")
     else:   
-        tcell_zarr_out_path = Path(output_dir, f"{get_filepath_stem(tcell_segments_path)}.zarr")
-        organoid_zarr_out_path = Path(output_dir, f"{get_filepath_stem(organoid_segments_path)}.zarr")
-        raw_image_zarr_out_path = Path(output_dir, f"{get_filepath_stem(raw_image_path)}.zarr")
+        tcell_zarr_out_path = Path(output_dir, f"{sample_name}_tcell_tracked.zarr")
+        organoid_zarr_out_path = Path(output_dir, f"{sample_name}_organoid_tracked.zarr")
+        raw_image_zarr_out_path = Path(output_dir, f"{sample_name}.zarr")
     
-    if tcell_zarr_out_path.exists() and not overwrite:
+    if  (
+        (tcell_segments_path.suffix == ".zarr" and tcell_segments_path.exists()) or 
+        tcell_zarr_out_path.exists() and 
+        not overwrite
+        ):
         print("Skipping conversion of tcell segments to zarr, as file already exists")
     else:
+        print(f"Converting tcell segments to zarr: {tcell_zarr_out_path}")
         tcell_segments = load_image(tcell_segments_path)
         chunksize = (1,) + tcell_segments.shape[1:]
         save_as_zarr(
@@ -416,9 +422,14 @@ def convert_input_files_to_zarr(
             chunks=chunks
             )
     
-    if organoid_zarr_out_path.exists():
-       print("Skipping conversion of organoid segments to zarr, as file already exists")
+    if  (
+            (organoid_segments_path.suffix == ".zarr" and  organoid_segments_path.exists()) or
+            organoid_zarr_out_path.exists() and 
+            not overwrite
+        ):
+        print("Skipping conversion of organoid segments to zarr, as file already exists")
     else:
+        print(f"Converting organoid segments to zarr: {organoid_zarr_out_path}")
         organoid_segments = load_image(organoid_segments_path)
         chunksize = (1,) + organoid_segments.shape[1:]
         save_as_zarr(
@@ -427,9 +438,14 @@ def convert_input_files_to_zarr(
             chunks=chunks
             )
 
-    if raw_image_zarr_out_path.exists():
-       print("Skipping conversion of raw_image to zarr, as file already exists")
+    if (
+            (raw_image_path.suffix == ".zarr" and  raw_image_path.exists()) or
+            raw_image_zarr_out_path.exists() and
+            not overwrite
+        ):
+        print("Skipping conversion of raw_image to zarr, as file already exists")
     else:
+        print(f"Converting raw_image to zarr: {raw_image_zarr_out_path}")
         img = load_image(raw_image_path)
         chunksize = (1,) + img.shape[1:]
         save_as_zarr(
