@@ -222,10 +222,9 @@ def run_feature_extraction(
         if not img_outdir.exists():
             img_outdir.mkdir(parents=True)
 
-        combined_outdir = Path(output_dir, "analysis", "combined")
+        analysis_outdir = Path(output_dir, "analysis", cell_type)
         track_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         track_intermediate_outdir= Path(track_outdir, "intermediate_results")
-        analysis_outdir = Path(combined_outdir, cell_type)
         feature_outdir = Path(analysis_outdir, "track_features")
         
         raw_image_path = sample_metadata['raw_image_path']
@@ -243,8 +242,6 @@ def run_feature_extraction(
             overwrite=overwrite
         )
 
-        if not combined_outdir.exists():
-            combined_outdir.mkdir(parents=True)
         if not track_outdir.exists():
             track_outdir.mkdir(parents=True)
         if not track_intermediate_outdir.exists():

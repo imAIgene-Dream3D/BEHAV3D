@@ -33,7 +33,7 @@ def backproject_mean_features_behav3d(
         output_dir = config['output_dir']
         metadata = pd.read_csv(config["metadata_csv_path"])
         
-    analysis_outdir = Path(output_dir, "analysis/combined/tcell")
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
     results_outdir = Path(analysis_outdir, "results")
     backproj_outdir = Path(analysis_outdir, "backprojection")
     feature_outdir = Path(analysis_outdir, "track_features")

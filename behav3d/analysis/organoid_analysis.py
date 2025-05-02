@@ -34,20 +34,21 @@ def run_organoid_analysis(
     if output_dir is None:
         output_dir = config['output_dir']
         
-    sample_outdir = Path(output_dir, "analysis", "per_sample")
-    combined_outdir = Path(output_dir, "analysis", "combined")
-    analysis_outdir = Path(combined_outdir, "organoid")
+    
+    analysis_outdir = Path(output_dir, "analysis", "organoid")
     feature_outdir = Path(analysis_outdir, "track_features")
+    results_outdir = Path(analysis_outdir, "results")
+    sample_outdir = Path(results_outdir, "per_sample")
     
     if not sample_outdir.exists():
         sample_outdir.mkdir(parents=True)
-    if not combined_outdir.exists():
-        combined_outdir.mkdir(parents=True)
     if not analysis_outdir.exists():
         analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
         feature_outdir.mkdir(parents=True)    
-    
+    if not results_outdir.exists():
+        results_outdir.mkdir(parents=True)    
+        
     if df_tracks_path is None:
         df_tracks_path = Path(feature_outdir, f"BEHAV3D_organoid_combined_track_features_filtered.csv")
     # if df_tracks_summarized_path is None:
@@ -112,14 +113,14 @@ def run_organoid_analysis(
     df_general["percentage_dead"]=df_general["nr_dead"] / df_general["nr_organoids_t0"]
     df_general["percentage_alive"]= 1.0 - df_general["percentage_dead"]
     
-    df_general_outpath = Path(analysis_outdir, f"combined_general_organoid_dynamics_analysis.csv")
+    df_general_outpath = Path(results_outdir, f"combined_general_organoid_dynamics_analysis.csv")
     df_general.to_csv(
         df_general_outpath,
         sep=",",
         index=False
     )
         
-    general_pdf_outpath = Path(analysis_outdir, f"combined_general_organoid_dynamics_analysis.pdf")
+    general_pdf_outpath = Path(results_outdir, f"combined_general_organoid_dynamics_analysis.pdf")
     
     plot_general_organoid_analysis(
             df_general=df_general,
@@ -225,7 +226,7 @@ def filter_organoid_tracks(
     #     min_track_length = config[f'{cell_type}_min_track_length']
     #     max_track_length = config[f'{cell_type}_max_track_length']
     
-    analysis_outdir = Path(output_dir, "analysis", "combined", cell_type)
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     qc_outdir = Path(analysis_outdir, "quality_control")
     
@@ -501,9 +502,16 @@ def plot_general_organoid_analysis(
         ax.set_xlabel('Timepoint')
         ax.set_ylabel('')
         ax.set_title(f'Percentage Alive Organoids')
+        ax.legend(
+            bbox_to_anchor=(1.05, 1),  # Position to the right
+            loc='upper left',
+            borderaxespad=0,
+            prop={'size': 5},  # Smaller font size
+            title=''  # Optional: keep or remove the title
+            ).set_title('Sample Name', prop={'size': 6})
         
         ### Plot the barplot organoid death of all samples
-        ax = fig.add_subplot(gs[2, 0])
+        ax = fig.add_subplot(gs[2, :])
         df_end = df_general[df_general["position_t"] == df_general["position_t"].max()]
         df_end = df_end[["sample_name", "percentage_dead", "percentage_alive"]]
         df_end.set_index("sample_name").plot(
@@ -523,11 +531,18 @@ def plot_general_organoid_analysis(
         ax.set_title(f'Percentage Alive Organoids at end of experiment')
         handles, labels = ax.get_legend_handles_labels()
         new_order = [1, 0]  # Dead first (red, index 0), then Alive (blue, index 1)
-        ax.legend([handles[idx] for idx in new_order], [labels[idx] for idx in new_order], loc='upper right')
+        ax.legend(
+            [handles[idx] for idx in new_order], [labels[idx] for idx in new_order],
+            bbox_to_anchor=(1.05, 1),  # Position to the right
+            loc='upper left',
+            borderaxespad=0,
+            prop={'size': 5},  # Smaller font size
+            title=''  # Optional: keep or remove the title
+            )
         
         fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
         
         plt.show()
-        pdf.savefig(fig)
+        pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
     

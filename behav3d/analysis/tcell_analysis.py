@@ -73,15 +73,9 @@ def run_tcell_analysis(
     if output_dir is None:
         output_dir = config['output_dir']
         
-    sample_outdir = Path(output_dir, "analysis", "per_sample")
-    combined_outdir = Path(output_dir, "analysis", "combined")
-    analysis_outdir = Path(combined_outdir, "tcell")
+    analysis_outdir = Path(output_dir, "analysis", "tcell")
     feature_outdir = Path(analysis_outdir, "track_features")
     
-    if not sample_outdir.exists():
-        sample_outdir.mkdir(parents=True)
-    if not combined_outdir.exists():
-        combined_outdir.mkdir(parents=True)
     if not analysis_outdir.exists():
         analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
@@ -164,13 +158,10 @@ def filter_tcell_tracks(
     #     min_track_length = config[f'{cell_type}_min_track_length']
     #     max_track_length = config[f'{cell_type}_max_track_length']
     
-    combined_outdir = Path(output_dir, "analysis", "combined")
-    analysis_outdir = Path(combined_outdir, cell_type)
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     qc_outdir = Path(analysis_outdir, "quality_control")
-    
-    if not combined_outdir.exists():
-        combined_outdir.mkdir(parents=True)
+
     if not analysis_outdir.exists():
         analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
@@ -310,13 +301,10 @@ def summarize_track_features(
         else:
             imaris = False
             
-    combined_outdir = Path(output_dir, "analysis", "combined")
-    analysis_outdir = Path(combined_outdir, cell_type)
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     qc_outdir = Path(analysis_outdir, "quality_control")
     
-    if not combined_outdir.exists():
-        combined_outdir.mkdir(parents=True)
     if not analysis_outdir.exists():
         analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
@@ -406,17 +394,17 @@ def rolling_classification(
     df_tracks,
     window_size=20,
     features=[
-        "elongation",
-        "sphericity",
-        "percentage_dead_mask",
-        "nr_dead_mask_pixels",
+        # "elongation",
+        # "sphericity",
+        # "percentage_dead_mask",
+        # "nr_dead_mask_pixels",
         "organoid_contact",
-        "tcell_contact",
-        "displacement",
-        "mean_square_displacement",
+        # "tcell_contact",
+        # "displacement",
+        # "mean_square_displacement",
         "speed",
-        # "dead",
-        "active_tcell_contact",
+        # # "dead",
+        # "active_tcell_contact",
         # "position_t"
     ]
     ):
@@ -424,7 +412,7 @@ def rolling_classification(
     df_rolling = df_tracks[features].rolling(window=window_size, min_periods=window_size).mean()
     df_rolling = df_rolling.dropna()
     
-    # scaler = StandardScaler()
+    scaler = StandardScaler()
     scaler = RobustScaler()
     df_rolling = pd.DataFrame(scaler.fit_transform(df_rolling), columns=df_rolling.columns)
 
@@ -432,9 +420,6 @@ def rolling_classification(
     n_neighbors=15
     min_dist=0.1
     
-    pca = PCA(n_components=min(10, len(features)))
-    X_pca = pca.fit_transform(df_rolling[features])
-    umap_result = umap_model.fit_transform(X_pca)
     umap_model = umap.UMAP(
         n_components=n_components, 
         n_neighbors=n_neighbors, 
@@ -443,6 +428,12 @@ def rolling_classification(
         # random_state=123,
         metric="euclidean", 
         )
+    
+    # pca = PCA(n_components=min(10, len(features)))
+    pca = PCA(n_components=0.95)
+    X_pca = pca.fit_transform(df_rolling[features])
+    umap_result = umap_model.fit_transform(X_pca)
+    
     umap_result = umap_model.fit_transform(df_rolling)
     
     fig = plt.figure()
@@ -457,10 +448,10 @@ def rolling_classification(
         ax.scatter(umap_result[:,0], umap_result[:,1], umap_result[:,2], c=np.arange(len(umap_result)), s=1, alpha=0.5)
 
     clusterer = HDBSCAN(
-        min_cluster_size=500,         # Minimum size of a cluster
-        min_samples=20,               # Controls outlier sensitivity (higher = stricter)
-        cluster_selection_epsilon=0.0,# Optional: smooths cluster boundaries
-        cluster_selection_method='eom',  # Default is good; use 'leaf' if you want more granularity
+        min_cluster_size=100,         # Minimum size of a cluster
+        # min_samples=20,               # Controls outlier sensitivity (higher = stricter)
+        # cluster_selection_epsilon=0.0,# Optional: smooths cluster boundaries
+        # cluster_selection_method='eom',  # Default is good; use 'leaf' if you want more granularity
         )
     cluster_labels = clusterer.fit_predict(umap_result)
 
@@ -510,6 +501,8 @@ def rolling_classification(
         plt.tight_layout()
         plt.show()
     
+    labels = KMeans(n_clusters=5).fit_predict(df_rolling)  # on raw 2 features
+    plt.scatter(df_rolling.iloc[:,0], df_rolling.iloc[:,1], c=labels, cmap="Spectral", s=2)
     
 def fit_umap(
     dtw_distance_matrix,
@@ -563,7 +556,7 @@ def cluster_umap(
         output_dir = Path(config['output_dir'])
         nr_of_clusters=config["nr_of_clusters"]
     
-    tcell_outdir = Path(output_dir, "analysis/combined/tcell")
+    tcell_outdir = Path(output_dir, "analysis", "tcell")
     feature_outdir = Path(tcell_outdir, "track_features")
     results_outdir = Path(tcell_outdir, "results")
     if not tcell_outdir.exists():
