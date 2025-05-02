@@ -1013,6 +1013,22 @@ def calculate_segment_intensity(segments, intensity_image, calculation="mean"):
     df_intensity=df_intensity.rename(columns=column_mapping)
     return(df_intensity)
 
+def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID"):
+    def relative_increase(group):
+        # Ensure the group is sorted by time or an equivalent index
+        # group = group.sort_index()
+        increases = [0] * len(group)  # Default to 0 if not enough data
+        for i in range(0, len(group)):
+            current_value = group.iloc[i]
+            if i < nr_timepoints_back:  # If there are not enough points
+                previous_value = group.iloc[0]  # Use the first available value
+            else:
+                previous_value = group.iloc[i - nr_timepoints_back]
+            increases[i] = current_value - previous_value
+        return pd.Series(increases, index=group.index)
+    increase = df.groupby(groupby)[column].apply(relative_increase).reset_index(0, drop=True)
+    return increase.reindex(df.index)
+            
 def calculate_dead_mask(segments, dead_mask):
     """
     Calculates the intensity of a specific marker features for each segment.
@@ -1028,9 +1044,15 @@ def calculate_dead_mask(segments, dead_mask):
         properties.rename(columns={"intensity_mean":"percentage_dead_mask"}, inplace=True)
         properties["nr_dead_mask_pixels"] = properties["num_pixels"] * properties["percentage_dead_mask"]
         properties=properties.rename(columns={"label":"TrackID"})
-        properties = properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]]
+        properties = properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels", "increase_dead_mask"]]
         df_intensity.append(properties)
     df_intensity = pd.concat(df_intensity)
+    df_intensity["increase_dead_mask"] = calculate_relative_increase(
+            df = df_intensity,
+            column="nr_dead_mask_pixels",
+            nr_timepoints_back=10,
+            groupby="TrackID"
+        )
     return(df_intensity)
 
 def _calculate_morphology_single_timepoint(args):
