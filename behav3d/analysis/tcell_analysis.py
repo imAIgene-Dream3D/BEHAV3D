@@ -394,17 +394,17 @@ def rolling_classification(
     df_tracks,
     window_size=20,
     features=[
-        # "elongation",
-        # "sphericity",
-        # "percentage_dead_mask",
-        # "nr_dead_mask_pixels",
+        "elongation",
+        "sphericity",
+        "percentage_dead_mask",
+        "nr_dead_mask_pixels",
         "organoid_contact",
-        # "tcell_contact",
-        # "displacement",
-        # "mean_square_displacement",
+        "tcell_contact",
+        "displacement",
+        "mean_square_displacement",
         "speed",
         # # "dead",
-        # "active_tcell_contact",
+        "active_tcell_contact",
         # "position_t"
     ]
     ):
@@ -429,8 +429,8 @@ def rolling_classification(
         metric="euclidean", 
         )
     
-    # pca = PCA(n_components=min(10, len(features)))
-    pca = PCA(n_components=0.95)
+    pca = PCA(n_components=min(10, len(features)))
+    # pca = PCA(n_components=0.95)
     X_pca = pca.fit_transform(df_rolling[features])
     umap_result = umap_model.fit_transform(X_pca)
     
