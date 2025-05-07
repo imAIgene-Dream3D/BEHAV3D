@@ -35,6 +35,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.gridspec import GridSpec
 import random
 
+
+from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans, HDBSCAN
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.decomposition import PCA
@@ -394,17 +396,21 @@ def rolling_classification(
     df_tracks,
     window_size=20,
     features=[
-        # "elongation",
-        # "sphericity",
-        # "percentage_dead_mask",
-        # "nr_dead_mask_pixels",
+        "elongation",
+        "sphericity",
+        "percentage_dead_mask",
+        "nr_dead_mask_pixels",
         "organoid_contact",
-        # "tcell_contact",
-        # "displacement",
-        # "mean_square_displacement",
+        "tcell_contact",
+        "displacement",
+        "mean_square_displacement",
         "speed",
+<<<<<<< HEAD
         # # "dead",
-        # "active_tcell_contact",
+=======
+        # "dead",
+>>>>>>> faa9d58d8b02640514bec139e618efbbfc42634a
+        "active_tcell_contact",
         # "position_t"
     ]
     ):
@@ -412,10 +418,50 @@ def rolling_classification(
     df_rolling = df_tracks[features].rolling(window=window_size, min_periods=window_size).mean()
     df_rolling = df_rolling.dropna()
     
-    scaler = StandardScaler()
+    # scaler = StandardScaler()
     scaler = RobustScaler()
     df_rolling = pd.DataFrame(scaler.fit_transform(df_rolling), columns=df_rolling.columns)
 
+    n_components = 3
+    # Step 3: Dimensionality reductions
+    pca_model = PCA(n_components=n_components)
+    pca_result = pca_model.fit_transform(df_rolling)
+
+    tsne_model = TSNE(n_components=n_components, random_state=123, perplexity=30)
+    tsne_result = tsne_model.fit_transform(df_rolling)
+
+    umap_model = umap.UMAP(n_components=n_components, n_neighbors=15, min_dist=0.1, init="random", random_state=123)
+    umap_result = umap_model.fit_transform(df_rolling)
+    
+    # Step 4: Plot all three embeddings side by side
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+    embeddings = [pca_result, tsne_result, umap_result]
+    titles = ["PCA", "t-SNE", "UMAP"]
+    
+    if n_components == 2:
+        for ax, emb, title in zip(axs, embeddings, titles):
+            scatter = ax.scatter(emb[:, 0], emb[:, 1], c=np.arange(len(emb)), cmap="viridis", s=2, alpha=0.7)
+            ax.set_title(title)
+            ax.set_xlabel(f'{title} 1')
+            ax.set_ylabel(f'{title} 2')
+        
+        plt.tight_layout()
+        plt.show()
+    else:
+        for i, (emb, title) in enumerate(zip(embeddings, titles), 1):
+            ax = fig.add_subplot(1, 3, i, projection='3d')
+            scatter = ax.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=np.arange(len(emb)), cmap="viridis", s=2, alpha=0.7)
+            ax.set_title(title)
+            ax.set_xlabel(f'{title} 1')
+            ax.set_ylabel(f'{title} 2')
+            ax.set_zlabel(f'{title} 3')
+
+        plt.tight_layout()
+        plt.show()
+    
+    
+    
+    
     n_components=2
     n_neighbors=15
     min_dist=0.1
@@ -424,13 +470,13 @@ def rolling_classification(
         n_components=n_components, 
         n_neighbors=n_neighbors, 
         min_dist=min_dist, 
-        # init="random", 
-        # random_state=123,
+        init="random", 
+        random_state=123,
         metric="euclidean", 
         )
     
-    # pca = PCA(n_components=min(10, len(features)))
-    pca = PCA(n_components=0.95)
+    pca = PCA(n_components=min(10, len(features)))
+    # pca = PCA(n_components=0.95)
     X_pca = pca.fit_transform(df_rolling[features])
     umap_result = umap_model.fit_transform(X_pca)
     
