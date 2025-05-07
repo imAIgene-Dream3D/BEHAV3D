@@ -405,11 +405,7 @@ def rolling_classification(
         "displacement",
         "mean_square_displacement",
         "speed",
-<<<<<<< HEAD
         # # "dead",
-=======
-        # "dead",
->>>>>>> faa9d58d8b02640514bec139e618efbbfc42634a
         "active_tcell_contact",
         # "position_t"
     ]

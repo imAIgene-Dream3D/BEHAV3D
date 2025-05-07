@@ -108,12 +108,7 @@ def run_organoid_analysis(
     df_t0 = df_tracks[df_tracks["position_t"] == 0].groupby("sample_name").agg(
         nr_organoids_t0=("TrackID", "nunique"),
     ).reset_index()
-<<<<<<< HEAD
-    
-<<<<<<< Updated upstream:behav3d/analysis/organoid_analysis.py
-    
-    #### TODO FIX THE LINE GOING BACK UP AFTER DYING!!!!!
-=======
+
     df_dead = df_tracks.groupby(["sample_name", "position_t"]).agg(
         nr_organoids=("TrackID", lambda x: x.nunique()),
         nr_dead=("TrackID", lambda x: x[df_tracks.loc[x.index, "dead"]].nunique())
@@ -121,13 +116,7 @@ def run_organoid_analysis(
     
     df_general = df_dead.merge(df_t0, on="sample_name", how="left")
     df_general["nr_dead"] = df_general["nr_dead"] + df_general["nr_organoids_t0"] - df_general["nr_organoids"]
-    # df_general = df_tracks.groupby(["sample_name", "position_t"]).agg(
-    #     nr_organoids_t0=("TrackID", lambda x: x.nunique()),
-    #     nr_dead=("TrackID", lambda x: x[df_tracks.loc[x.index, "dead"]].nunique()),
-    # ).reset_index()
->>>>>>> Stashed changes:behav3d/analysis/organoid_analysis - Copy.py
-=======
->>>>>>> parent of 5e1ab98 (small change)
+
     df_general["nr_alive"]=df_general["nr_organoids_t0"] - df_general["nr_dead"]
     df_general["percentage_dead"]=df_general["nr_dead"]  / df_general["nr_organoids_t0"]
     df_general["percentage_alive"]= 1.0 - df_general["percentage_dead"]
