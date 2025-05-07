@@ -109,6 +109,9 @@ def run_organoid_analysis(
         nr_organoids_t0=("TrackID", lambda x: x.nunique()),
         nr_dead=("TrackID", lambda x: x[df_tracks.loc[x.index, "dead"]].nunique()),
     ).reset_index()
+    
+    
+    #### TODO FIX THE LINE GOING BACK UP AFTER DYING!!!!!
     df_general["nr_alive"]=df_general["nr_organoids_t0"] - df_general["nr_dead"]
     df_general["percentage_dead"]=df_general["nr_dead"] / df_general["nr_organoids_t0"]
     df_general["percentage_alive"]= 1.0 - df_general["percentage_dead"]
