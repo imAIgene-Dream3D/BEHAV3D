@@ -395,44 +395,63 @@ def calculate_dtw(
 def rolling_classification(
     df_tracks,
     window_size=20,
+    groupby=["sample_name", "TrackID"],
     features=[
-        "elongation",
-        "sphericity",
+        # "elongation",
+        # "sphericity",
         "percentage_dead_mask",
-        "nr_dead_mask_pixels",
+        # "nr_dead_mask_pixels",
         "organoid_contact",
         "tcell_contact",
-        "displacement",
-        "mean_square_displacement",
+        # "displacement",
+        # "mean_square_displacement",
         "speed",
         # # "dead",
-        "active_tcell_contact",
+        # "active_tcell_contact",
         # "position_t"
     ]
     ):
+    df_tracks = df_tracks.sort_values(by=groupby + ["position_t"])
+
+    # df_rolling = df_tracks.groupby(groupby)[features].rolling(window=window_size, min_periods=window_size).mean().reset_index().drop(columns='level_2')
+    df_rolling = (
+        df_tracks
+        .groupby(groupby)[features]
+        .rolling(window=window_size, min_periods=window_size)
+        .mean()
+        # .reset_index(drop=True)
+        .reset_index()
+        .drop(columns='level_2')
+        # This gives you sample_name, TrackID, and the original index
+    )
+    df_rolling["position_t"] = df_tracks["position_t"].values
+    # df_rolling = pd.concat([df_tracks[['sample_name', 'TrackID', 'position_t']], df_rolling], axis=1)
+
     
-    df_rolling = df_tracks[features].rolling(window=window_size, min_periods=window_size).mean()
+    # df_rolling = df_tracks[features].rolling(window=window_size, min_periods=window_size).mean()
     df_rolling = df_rolling.dropna()
     
-    # scaler = StandardScaler()
+    df_rolling_features = df_rolling[features]
+    
+    scaler = StandardScaler()
     scaler = RobustScaler()
-    df_rolling = pd.DataFrame(scaler.fit_transform(df_rolling), columns=df_rolling.columns)
+    df_rolling_features = pd.DataFrame(scaler.fit_transform(df_rolling_features), columns=df_rolling_features.columns)
 
-    n_components = 3
+    n_components = 2
     # Step 3: Dimensionality reductions
     pca_model = PCA(n_components=n_components)
-    pca_result = pca_model.fit_transform(df_rolling)
+    pca_result = pca_model.fit_transform(df_rolling_features)
 
     tsne_model = TSNE(n_components=n_components, random_state=123, perplexity=30)
-    tsne_result = tsne_model.fit_transform(df_rolling)
+    tsne_result = tsne_model.fit_transform(df_rolling_features)
 
     umap_model = umap.UMAP(n_components=n_components, n_neighbors=15, min_dist=0.1, init="random", random_state=123)
-    umap_result = umap_model.fit_transform(df_rolling)
+    umap_result = umap_model.fit_transform(df_rolling_features)
     
     # Step 4: Plot all three embeddings side by side
     fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-    embeddings = [pca_result, tsne_result, umap_result]
-    titles = ["PCA", "t-SNE", "UMAP"]
+    embeddings = [pca_result, umap_result]
+    titles = ["PCA", "UMAP"]
     
     if n_components == 2:
         for ax, emb, title in zip(axs, embeddings, titles):
@@ -473,10 +492,10 @@ def rolling_classification(
     
     pca = PCA(n_components=min(10, len(features)))
     # pca = PCA(n_components=0.95)
-    X_pca = pca.fit_transform(df_rolling[features])
+    X_pca = pca.fit_transform(df_rolling_features[features])
     umap_result = umap_model.fit_transform(X_pca)
     
-    umap_result = umap_model.fit_transform(df_rolling)
+    umap_result = umap_model.fit_transform(df_rolling_features)
     
     fig = plt.figure()
     if n_components == 1:
@@ -499,7 +518,7 @@ def rolling_classification(
 
     ### TODO Do the clustering based straight on the DTW distances
     ### Miguel suggested clusters are more meaningful before the umap embedding
-    df_rolling['cluster'] = cluster_labels
+    df_rolling_features['cluster'] = cluster_labels
 
     # Plot UMAP colored by HDBSCAN clusters
     plt.figure(figsize=(10, 8))
@@ -526,12 +545,12 @@ def rolling_classification(
     plt.show()
     
     # Plot UMAP colored by each selected feature
-    for feature in df_rolling.columns:
+    for feature in df_rolling_features.columns:
         plt.figure(figsize=(8, 6))
         plt.scatter(
             umap_result[:, 0], 
             umap_result[:, 1], 
-            c=df_rolling[feature], 
+            c=df_rolling_features[feature], 
             # cmap='viridis', 
             s=5, 
             alpha=0.8
@@ -543,8 +562,8 @@ def rolling_classification(
         plt.tight_layout()
         plt.show()
     
-    labels = KMeans(n_clusters=5).fit_predict(df_rolling)  # on raw 2 features
-    plt.scatter(df_rolling.iloc[:,0], df_rolling.iloc[:,1], c=labels, cmap="Spectral", s=2)
+    labels = KMeans(n_clusters=5).fit_predict(df_rolling_features)  # on raw 2 features
+    plt.scatter(df_rolling_features.iloc[:,0], df_rolling_features.iloc[:,1], c=labels, cmap="Spectral", s=2)
     
 def fit_umap(
     dtw_distance_matrix,
