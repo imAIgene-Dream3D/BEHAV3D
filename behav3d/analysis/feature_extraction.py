@@ -182,6 +182,7 @@ def run_feature_extraction(
     df_all_tracks=pd.DataFrame()
     
     for _, sample_metadata in metadata.iterrows():
+        
         print(f"--------------- Processing {cell_type}: {sample_metadata['sample_name']} ---------------")
         start_time = time.time()
 
@@ -1044,7 +1045,7 @@ def calculate_dead_mask(segments, dead_mask):
         properties.rename(columns={"intensity_mean":"percentage_dead_mask"}, inplace=True)
         properties["nr_dead_mask_pixels"] = properties["num_pixels"] * properties["percentage_dead_mask"]
         properties=properties.rename(columns={"label":"TrackID"})
-        properties = properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels", "increase_dead_mask"]]
+        properties = properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]]
         df_intensity.append(properties)
     df_intensity = pd.concat(df_intensity)
     df_intensity["increase_dead_mask"] = calculate_relative_increase(
@@ -1179,12 +1180,12 @@ def calculate_morphology_features(segments_path, voxel_spacing=(1.0, 1.0, 1.0), 
 
     return pd.concat(results, ignore_index=True)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
-    parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
-    args = parser.parse_args()
-    with open(args.config, "r") as parameters:
-        config=yaml.load(parameters, Loader=yaml.SafeLoader)
-    metadata = pd.read_csv(config["metadata_csv_path"])
-    run_behav3d_feature_extraction(config, metadata)
+# if __name__ == "__main__":
+#     parser = argparse.ArgumentParser()
+#     parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
+#     parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
+#     args = parser.parse_args()
+#     with open(args.config, "r") as parameters:
+#         config=yaml.load(parameters, Loader=yaml.SafeLoader)
+#     metadata = pd.read_csv(config["metadata_csv_path"])
+#     run_behav3d_feature_extraction(config, metadata)
