@@ -19,11 +19,11 @@ def get_filepath_stem(path):
         path = Path(path.stem)
     return(path.stem)
 
-def load_image(path, axis_order="TCZYX", group=None, mode="r"):
+def load_image(path, axis_order="TCZYX", group=None, mode="r", **kwargs):
     path = Path(path)
     default_axis_order = "TCZYX"
     if path.suffix==".czi":
-        img = load_czi(path)
+        img = load_czi(path, **kwargs)
     elif path.suffix==".h5":
         img = load_h5(path, substruct=group)
     elif path.suffix==".ims":

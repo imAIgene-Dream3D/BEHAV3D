@@ -136,6 +136,10 @@ def run_organoid_analysis(
             figsize=(8.27, 11.69)
             )
     
+    ## TODO PLOT A STACKED BARPLOT OVER TIME WHERE THE TOTAL BAR IS 
+    # THE DETECTED ORGANOIDS AT THAT TIMEPOINT. 
+    # STACK ALIVE AND DEAD. 
+    # THIS CAN SHOW IF ORGANOIDS DISSAPPEAR OR ACTUALLY DIE OVER TIME
     
     for sample_name in df_tracks["sample_name"].unique():
         """

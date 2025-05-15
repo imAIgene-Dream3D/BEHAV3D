@@ -1,59 +1,48 @@
-from aicspylibczi import CziFile
 from pathlib import Path
 import numpy as np
+import time
+
+import napari
 from magicgui import magicgui
 from magicgui.widgets import PushButton
-import napari
+
+from aicspylibczi import CziFile
+
 from skimage import data, segmentation, feature, future
-from sklearn.ensemble import RandomForestClassifier
-from functools import partial
-from scipy.ndimage import binary_fill_holes
-from behav3d.utils.preprocessing import open_mask, dilate_mask
 from skimage.measure import label
-from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt
 from skimage.segmentation import watershed, relabel_sequential
 
+from sklearn.ensemble import RandomForestClassifier
+from scipy.ndimage import binary_fill_holes
+
+from behav3d.utils.preprocessing import open_mask, dilate_mask
+from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt
+from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image
+
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
+
+import joblib
+from functools import partial
 
 ## TODO create a function for BEHAV3D notebook
 
 
-path = r"D:\BHVD_BEHAV3D\BEHAV3D_python\data\Jess_ROCHE\ROCHE_JM1_Exp011_Img04_169M_50KTcells_withTCB.czi"
-path = Path(path)
-czi = CziFile(path)
+path = r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/data/Jess_ROCHE/ROCHE_JM1_Exp011_Img04_169M_50KTcells_withTCB.czi"
+output_dir = r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE_Isa"
 
-max_t = czi.get_dims_shape()[0]["T"][1] - 1
+sigma_min = 1
+sigma_max = 30
+features_func = partial(
+        feature.multiscale_basic_features,
+        intensity=True,
+        edges=True,
+        texture=True,
+        sigma_min=sigma_min,
+        # sigma_max=sigma_max,
+        channel_axis=0,
+    )
 
-img_f, _ = czi.read_image(T=0)
-img_f = np.squeeze(img_f)
-img_m, _ = czi.read_image(T=int(max_t/2))
-img_m = np.squeeze(img_m)
-img_l, _ = czi.read_image(T=max_t)
-img_l = np.squeeze(img_l)
-
-img = np.stack([img_f, img_m, img_l])
-feature_img = []
-for idx, ch_img in enumerate(img):
-    print(idx)
-    sigma_min = 1
-    sigma_max = 30
-    features_func = partial(
-            feature.multiscale_basic_features,
-            intensity=True,
-            edges=True,
-            texture=True,
-            sigma_min=sigma_min,
-            # sigma_max=sigma_max,
-            channel_axis=0,
-        )
-    feature_img.append(features_func(ch_img))
-feature_img = np.stack(feature_img, axis=0)
-    
-img = np.transpose(img, [1,0,2,3,4])
-    
-    
-# viewer=napari.Viewer()
-# viewer.add_image(np.transpose(feature_img, [0,4,1,2,3]), name="image")
-# napari.run()  
 def postprocess_mask(mask, fill_holes=True, opening_nr_pixels=1):
     if fill_holes:
         
@@ -74,82 +63,174 @@ def segment_mask(mask, segment_splitting_edt, segment_size_min, use_dims):
     segments = segment_size_filter(segments, size_min=segment_size_min)
     segments, _, _ = relabel_sequential(segments, offset)
     return(segments)
-    
-def segment_and_update(
-    tcell_edt_threshold: float = 2.5,
+
+def train_pixel_classifier(
+    output_dir,
+    metadata,
+    examples_per_sample = 4,
+    sample_specific_classifier=False,
+    n_workers=4
     ):
-    print("Running segmentation")
-    current_timepoint = int(viewer.dims.current_step[0])
-    # feature_img_t = feature_img[current_timepoint]
     
-    # Access the label layer and feature image
-    label_layer = viewer.layers['User Provided Labels']
-    label_data = label_layer.data
+    pixel_class_outdir = Path(output_dir, "images", "PixelClassification")
+    pixel_class_outdir.mkdir(exist_ok=True)
     
-    clf = RandomForestClassifier(
-        n_estimators=100,
-        n_jobs=-1, 
-        max_depth=20, 
-        max_samples=0.05,
-        class_weight="balanced"
-        )
-    
-    clf = future.fit_segmenter(label_data, feature_img, clf)
-    pixel_class = future.predict_segmenter(feature_img, clf)
-
-    full_seg_organoid=[]
-    full_seg_tcell=[]
-    for idx, t_pixel_class in enumerate(pixel_class):
-        mask_organoid = t_pixel_class==2
-        mask_tcell = t_pixel_class==3
+    all_images = []
+    all_features = []
+    for idx, sample in metadata.iterrows():
         
-        mask_tcell = postprocess_mask(mask_tcell, opening_nr_pixels=1)
-        mask_organoid = postprocess_mask(mask_organoid, opening_nr_pixels=3)
-
-        seg_organoid = segment_mask(
-            mask=mask_organoid,
-            segment_size_min=500,
-            segment_splitting_edt=10,
-            use_dims=3
-        )
+        sample_name = sample['sample_name']
+        print(f"Calculating features for: {sample_name}")
         
-        seg_tcell = segment_mask(
-            mask=mask_organoid,
-            segment_size_min=10,
-            segment_splitting_edt=tcell_edt_threshold,
-            use_dims=3
-        )
-
-        full_seg_organoid.append(seg_organoid)
-        full_seg_tcell.append(seg_tcell)
-    full_seg_organoid = np.stack(full_seg_organoid, axis=0)
-    full_seg_tcell = np.stack(full_seg_tcell, axis=0)
+        raw_image_path = Path(sample['raw_image_path'])
+        raw_image_zarr =  pixel_class_outdir = Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
+        try:   
+            images = load_image(raw_image_zarr)
+        except:
+            images = load_image(raw_image_path)
+        max_t = images.shape[0]-1
         
-    viewer.layers["Pixel Classification"].data = pixel_class
-    viewer.layers["Organoid Segments"].data = full_seg_organoid
-    viewer.layers["Tcell Segments"].data = full_seg_tcell
-    print("DONE")
+        idc = np.linspace(0, max_t, examples_per_sample, dtype=int)
+        print(f"Taking timepoints: {idc}")
+        
+        sample_images = [np.asarray(images[t]) for t in idc]
+        # for idx in idc:
+        #     sample_images.append(images[idx])      
+        
+        all_images+=sample_images
+            
+        args_list = [(img) for img in sample_images]
+        if n_workers > 1:
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                all_features+=list(tqdm(executor.map(features_func, args_list), total=len(sample_images)))
+        else:
+            all_features+=[features_func(args) for args in tqdm(args_list) ]
+
+    all_images = np.stack(all_images)
+    all_images = np.transpose(all_images, [1,0,2,3,4])
+    all_features = np.stack(all_features, axis=0)     
     
-# Create Napari viewer
-viewer = napari.Viewer()
-img_layer = viewer.add_image(img, name="Image", contrast_limits=(0,np.percentile(img[1], 99)))
-img_layer.contrast_limits_range = (img.min(), img.max())
 
-viewer.add_labels(np.zeros(img.shape[1:]).astype(np.int16), name="User Provided Labels", opacity=0.3)
-viewer.add_labels(np.zeros(img.shape[1:]).astype(np.int16), name="Pixel Classification", opacity=0.7, visible=False)
-viewer.add_labels(np.zeros(img.shape[1:]).astype(np.int16), name="Organoid Segments", opacity=0.7, visible=False)
-viewer.add_labels(np.zeros(img.shape[1:]).astype(np.int16), name="Tcell Segments", opacity=0.7, visible=False)
-# Create interactive sliders
-# Create interactive sliders
+    def segment_and_update(
+        pixel_class_outdir,
+        tcell_edt_threshold: float = 2.5,
+        ):
+        start_time = time.time()
+        print("###### Running Segmentation")
+        # Access the label layer and feature image
+        
+        image_layer = viewer.layers['Image']
+        image_data = image_layer.data
+        
+        label_layer = viewer.layers['User Provided Labels']
+        label_data = label_layer.data
+        
+        print("Training Random Forest Classifier")
+        clf = RandomForestClassifier(
+            n_estimators=100,
+            n_jobs=-1, 
+            max_depth=20, 
+            max_samples=0.05,
+            class_weight="balanced"
+            )
+        
+        clf = future.fit_segmenter(label_data, all_features, clf)
+        
+        print("Predicting Background, T-cells and Organoid pixels")
+        pixel_class = future.predict_segmenter(all_features, clf)
 
-# Create interactive sliders
-gui = magicgui(segment_and_update, 
-               tcell_edt_threshold={"widget_type": "FloatSlider", "min": 1.0, "max": 15.0, "step": 0.5}
-              )
-viewer.window.add_dock_widget(gui)
-napari.run()
-# viewer = NapariViewer(
-#     img = [img_f, mask_dead, segmentation_results["segments"]],
-#     label = ["image", "image",  "label"],    
-# )
-# viewer.view()
+        print("Segment Cell and Organoid Instances")
+        full_seg_organoid=[]
+        full_seg_tcell=[]
+        for idx, t_pixel_class in enumerate(pixel_class):
+            mask_organoid = t_pixel_class==2
+            mask_tcell = t_pixel_class==3
+            
+            mask_tcell = postprocess_mask(mask_tcell, opening_nr_pixels=1)
+            mask_organoid = postprocess_mask(mask_organoid, opening_nr_pixels=3)
+
+            seg_organoid = segment_mask(
+                mask=mask_organoid,
+                segment_size_min=500,
+                segment_splitting_edt=10,
+                use_dims=3
+            )
+            
+            seg_tcell = segment_mask(
+                mask=mask_tcell,
+                segment_size_min=10,
+                segment_splitting_edt=tcell_edt_threshold,
+                use_dims=3
+            )
+
+            full_seg_organoid.append(seg_organoid)
+            full_seg_tcell.append(seg_tcell)
+        full_seg_organoid = np.stack(full_seg_organoid, axis=0)
+        full_seg_tcell = np.stack(full_seg_tcell, axis=0)
+        
+        print("Updating Napari Data")
+        viewer.layers["Pixel Classification"].data = pixel_class
+        viewer.layers["Organoid Segments"].data = full_seg_organoid
+        viewer.layers["Tcell Segments"].data = full_seg_tcell
+        
+        print("Saving RandomForest, Sparse labels and input images to {pixel_class_outdir}")
+        ### SAVE 
+        random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_RandomForest.joblib')
+        joblib.dump(clf, random_forest_outpath)
+        
+        labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserLabels.zarr')
+        save_as_zarr(label_data, labels_outpath)
+        
+        image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
+        save_as_zarr(image_data, image_outpath)
+        
+        print(f"###### DONE time elapsed: {time.time() - start_time:.2f} s")
+        
+    # Create Napari viewer
+    viewer = napari.Viewer()
+    img_layer = viewer.add_image(all_images, name="Image", contrast_limits=(0,np.percentile(all_images[1], 99)))
+    img_layer.contrast_limits_range = (all_images.min(), all_images.max())
+
+    labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserLabels.zarr')
+    
+    if labels_outpath.exists():
+        print("Loading existing user labelled data")
+        user_labels = np.asarray(load_zarr(labels_outpath))
+    else:
+        user_labels = np.zeros(all_images.shape[1:]).astype(np.int16)
+        
+    viewer.add_labels(user_labels, name="User Provided Labels", opacity=0.3)
+    viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name="Pixel Classification", opacity=0.7, visible=False)
+    viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name="Organoid Segments", opacity=0.7, visible=False)
+    viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name="Tcell Segments", opacity=0.7, visible=False)
+
+    update_function = partial(segment_and_update, pixel_class_outdir=pixel_class_outdir)
+    gui = magicgui(update_function, 
+                tcell_edt_threshold={"widget_type": "FloatSlider", "min": 1.0, "max": 15.0, "step": 0.5}
+                )
+    viewer.window.add_dock_widget(gui)
+    napari.run()
+    
+def run_pixel_classifier(
+    classifier_path,
+    metadata,
+    ):
+    
+    clf = joblib.load(classifier_path)
+    
+    for idx, sample in metadata.iterrows():
+        print(f"Processing sample: {sample['sample_name']}")
+        start_time = time.time()
+        sample_name = sample['sample_name']
+        raw_image_path = Path(sample['raw_image_path'])
+        
+        img_outdir = Path(output_dir, "images", sample_name)
+        if not img_outdir.exists():
+            img_outdir.mkdir(parents=True)
+
+        img = load_image(raw_image_path)
+        img = np.transpose(img, [1,0,2,3,4])
+        
+        metadata.at[idx, "tcell_segments_image_path"] = str(segmenter.tcell_segments_outpath)
+        metadata.at[idx, "organoid_tracks_image_path"] = str(segmenter.organoid_segments_outpath)
+    return(metadata)

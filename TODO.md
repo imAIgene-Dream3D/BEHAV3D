@@ -1,3 +1,6 @@
+# Add a check (during segmentation?) that check for a certain threshold of SNR of Foreground to be needed, cuts the timepoints down to when it reaches this for extinguishing dyes
+
+
 # For T cell analysis, Add the separate CD8 to CD4 distance calculation (Right now it only does distances between itself, so CD4 to CD4)
 
 # Create behavioral clustering based on features, as projecting new samples on DTW clustered data is not possible (To dispaly together,e verything has to be recalculated)
