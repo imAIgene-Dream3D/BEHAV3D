@@ -25,21 +25,18 @@ from tqdm import tqdm
 import joblib
 from functools import partial
 
+import dask.array as da
 ## TODO create a function for BEHAV3D notebook
 
 
-path = r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/data/Jess_ROCHE/ROCHE_JM1_Exp011_Img04_169M_50KTcells_withTCB.czi"
-output_dir = r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE_Isa"
-
-sigma_min = 1
-sigma_max = 30
+sigma_max = 16
 features_func = partial(
         feature.multiscale_basic_features,
         intensity=True,
         edges=True,
         texture=True,
-        sigma_min=sigma_min,
-        # sigma_max=sigma_max,
+        # sigma_min=sigma_min,
+        sigma_max=sigma_max,
         channel_axis=0,
     )
 
@@ -69,7 +66,7 @@ def train_pixel_classifier(
     metadata,
     examples_per_sample = 4,
     sample_specific_classifier=False,
-    n_workers=4
+    n_workers=16
     ):
     
     pixel_class_outdir = Path(output_dir, "images", "PixelClassification")
@@ -77,40 +74,54 @@ def train_pixel_classifier(
     
     all_images = []
     all_features = []
+    
+    ### TEST
+    metadata = metadata.loc[:1]
     for idx, sample in metadata.iterrows():
         
         sample_name = sample['sample_name']
+        
+        tcell_ch=sample['tcell_channel']
+        live_ch=sample['live_channel']
+        dead_ch=sample['dead_channel']
+        
         print(f"Calculating features for: {sample_name}")
         
         raw_image_path = Path(sample['raw_image_path'])
         raw_image_zarr =  pixel_class_outdir = Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
-        try:   
-            images = load_image(raw_image_zarr)
-        except:
-            images = load_image(raw_image_path)
+        
+        images = load_image(raw_image_zarr)
         max_t = images.shape[0]-1
         
         idc = np.linspace(0, max_t, examples_per_sample, dtype=int)
         print(f"Taking timepoints: {idc}")
         
-        sample_images = [np.asarray(images[t]) for t in idc]
+        sample_images = [images[t, [tcell_ch, live_ch, dead_ch]] for t in idc]
         # for idx in idc:
         #     sample_images.append(images[idx])      
         
         all_images+=sample_images
-            
-        args_list = [(img) for img in sample_images]
-        if n_workers > 1:
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                all_features+=list(tqdm(executor.map(features_func, args_list), total=len(sample_images)))
-        else:
-            all_features+=[features_func(args) for args in tqdm(args_list) ]
-
-    all_images = np.stack(all_images)
-    all_images = np.transpose(all_images, [1,0,2,3,4])
-    all_features = np.stack(all_features, axis=0)     
+        all_features+=[features_func(img) for img in tqdm(sample_images)]
+        
+        # def calculate_features(args):
+        #     path, t = args
+        #     img = load_image(path)
+        #     img = img[t]
+        #     return features_func(img)
+        
+        # args_list = [(raw_image_zarr, t) for t in idc]
+        # if n_workers > 1:
+        #     with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        #         all_features+=list(tqdm(executor.map(calculate_features, args_list), total=len(idc)))
+        # else:
+        #     all_features+=[calculate_features(args) for args in tqdm(args_list) ]
+        
+    # all_images = [np.asarray(img) for img in all_images]
+    all_images = da.stack(all_images)
+    all_images = all_images.transpose(1, 0, 2, 3, 4)
+    all_features = da.stack(all_features, axis=0)
     
-
+    all_images.shape
     def segment_and_update(
         pixel_class_outdir,
         tcell_edt_threshold: float = 2.5,
