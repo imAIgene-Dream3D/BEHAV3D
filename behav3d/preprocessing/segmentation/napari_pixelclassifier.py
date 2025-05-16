@@ -1,6 +1,7 @@
 from pathlib import Path
 import numpy as np
 import time
+import shutil
 
 import napari
 from magicgui import magicgui
@@ -17,7 +18,7 @@ from scipy.ndimage import binary_fill_holes
 
 from behav3d.utils.preprocessing import open_mask, dilate_mask
 from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt
-from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image
+from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr
 
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
@@ -26,6 +27,8 @@ import joblib
 from functools import partial
 
 import dask.array as da
+import gc
+
 ## TODO create a function for BEHAV3D notebook
 
 
@@ -75,53 +78,73 @@ def train_pixel_classifier(
     all_images = []
     all_features = []
     
-    ### TEST
-    metadata = metadata.loc[:1]
-    for idx, sample in metadata.iterrows():
-        
-        sample_name = sample['sample_name']
-        
-        tcell_ch=sample['tcell_channel']
-        live_ch=sample['live_channel']
-        dead_ch=sample['dead_channel']
-        
-        print(f"Calculating features for: {sample_name}")
-        
-        raw_image_path = Path(sample['raw_image_path'])
-        raw_image_zarr =  pixel_class_outdir = Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
-        
-        images = load_image(raw_image_zarr)
-        max_t = images.shape[0]-1
-        
-        idc = np.linspace(0, max_t, examples_per_sample, dtype=int)
-        print(f"Taking timepoints: {idc}")
-        
-        sample_images = [images[t, [tcell_ch, live_ch, dead_ch]] for t in idc]
-        # for idx in idc:
-        #     sample_images.append(images[idx])      
-        
-        all_images+=sample_images
-        all_features+=[features_func(img) for img in tqdm(sample_images)]
-        
-        # def calculate_features(args):
-        #     path, t = args
-        #     img = load_image(path)
-        #     img = img[t]
-        #     return features_func(img)
-        
-        # args_list = [(raw_image_zarr, t) for t in idc]
-        # if n_workers > 1:
-        #     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        #         all_features+=list(tqdm(executor.map(calculate_features, args_list), total=len(idc)))
-        # else:
-        #     all_features+=[calculate_features(args) for args in tqdm(args_list) ]
-        
-    # all_images = [np.asarray(img) for img in all_images]
-    all_images = da.stack(all_images)
-    all_images = all_images.transpose(1, 0, 2, 3, 4)
-    all_features = da.stack(all_features, axis=0)
+    features_outpath = Path(pixel_class_outdir, 'PixelClassifier_Features.zarr')
+    image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
     
-    all_images.shape
+    ### TEST
+    if not features_outpath.exists() or not image_outpath.exists():
+        if image_outpath.exists():
+            shutil.rmtree(image_outpath)
+        if features_outpath.exists():
+            shutil.rmtree(features_outpath)
+            
+        for idx, sample in metadata.iterrows():
+            
+            sample_name = sample['sample_name']
+            
+            tcell_ch=sample['tcell_channel']
+            live_ch=sample['live_channel']
+            dead_ch=sample['dead_channel']
+            
+            print(f"Calculating features for: {sample_name}")
+            
+            raw_image_path = Path(sample['raw_image_path'])
+            raw_image_zarr =  Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
+            
+            images = load_image(raw_image_zarr)
+            max_t = images.shape[0]-1
+            
+            idc = np.linspace(0, max_t, examples_per_sample, dtype=int)
+            print(f"Taking timepoints: {idc}")
+            
+            sample_images = [images[t, [tcell_ch, live_ch, dead_ch]] for t in idc]
+            # for idx in idc:
+            #     sample_images.append(images[idx])      
+            
+            all_images+=sample_images
+            
+            for img in tqdm(sample_images):
+                append_to_zarr(np.expand_dims(features_func(img), axis=0), features_outpath)
+            # all_features+=[features_func(img) for img in tqdm(sample_images)]
+            
+            # def calculate_features(args):
+            #     path, t = args
+            #     img = load_image(path)
+            #     img = img[t]
+            #     return features_func(img)
+            
+            # args_list = [(raw_image_zarr, t) for t in idc]
+            # if n_workers > 1:
+            #     with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            #         all_features+=list(tqdm(executor.map(calculate_features, args_list), total=len(idc)))
+            # else:
+            #     all_features+=[calculate_features(args) for args in tqdm(args_list) ]
+        all_images = da.stack(all_images)
+        all_images = all_images.transpose(1, 0, 2, 3, 4)
+        save_as_zarr(all_images, image_outpath)
+        del all_images
+        gc.collect()
+        all_images = load_zarr(image_outpath)
+        
+        # all_features = da.stack(all_features)
+        # save_as_zarr(all_features, features_outpath)
+        # del all_features
+        # gc.collect()
+        all_features = load_zarr(features_outpath)
+    else:
+        all_images = load_image(image_outpath)
+        all_features = load_image(features_outpath)     
+
     def segment_and_update(
         pixel_class_outdir,
         tcell_edt_threshold: float = 2.5,
@@ -199,8 +222,8 @@ def train_pixel_classifier(
         
     # Create Napari viewer
     viewer = napari.Viewer()
-    img_layer = viewer.add_image(all_images, name="Image", contrast_limits=(0,np.percentile(all_images[1], 99)))
-    img_layer.contrast_limits_range = (all_images.min(), all_images.max())
+    img_layer = viewer.add_image(all_images, name="Image", contrast_limits=(0,float(da.percentile(all_images[1,0].reshape(-1), 99).compute()[0])))
+    img_layer.contrast_limits_range = (0, int(all_images.max().compute()))
 
     labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserLabels.zarr')
     
