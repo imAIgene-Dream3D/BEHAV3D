@@ -6,6 +6,7 @@ import shutil
 import napari
 from magicgui import magicgui
 from magicgui.widgets import PushButton
+from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout
 
 from aicspylibczi import CziFile
 
@@ -26,6 +27,7 @@ from tqdm import tqdm
 import joblib
 from functools import partial
 
+import zarr
 import dask.array as da
 import gc
 
@@ -64,6 +66,13 @@ def segment_mask(mask, segment_splitting_edt, segment_size_min, use_dims):
     segments, _, _ = relabel_sequential(segments, offset)
     return(segments)
 
+def predict_classes(args):
+    clf_path, path, outpath, idx = args
+    clf = joblib.load(clf_path)
+    features = load_image(path, mode="r")[idx]
+    prediction = load_image(outpath, mode="r+")
+    prediction[idx] = future.predict_segmenter(features, clf)
+        
 def train_pixel_classifier(
     output_dir,
     metadata,
@@ -75,9 +84,6 @@ def train_pixel_classifier(
     pixel_class_outdir = Path(output_dir, "images", "PixelClassification")
     pixel_class_outdir.mkdir(exist_ok=True)
     
-    all_images = []
-    all_features = []
-    
     features_outpath = Path(pixel_class_outdir, 'PixelClassifier_Features.zarr')
     image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
     
@@ -87,7 +93,9 @@ def train_pixel_classifier(
             shutil.rmtree(image_outpath)
         if features_outpath.exists():
             shutil.rmtree(features_outpath)
-            
+        
+        all_images = []
+        all_features = []
         for idx, sample in metadata.iterrows():
             
             sample_name = sample['sample_name']
@@ -103,7 +111,7 @@ def train_pixel_classifier(
             
             images = load_image(raw_image_zarr)
             max_t = images.shape[0]-1
-            
+            print(images.shape)
             idc = np.linspace(0, max_t, examples_per_sample, dtype=int)
             print(f"Taking timepoints: {idc}")
             
@@ -115,7 +123,6 @@ def train_pixel_classifier(
             
             for img in tqdm(sample_images):
                 append_to_zarr(np.expand_dims(features_func(img), axis=0), features_outpath)
-            # all_features+=[features_func(img) for img in tqdm(sample_images)]
             
             # def calculate_features(args):
             #     path, t = args
@@ -134,12 +141,8 @@ def train_pixel_classifier(
         save_as_zarr(all_images, image_outpath)
         del all_images
         gc.collect()
-        all_images = load_zarr(image_outpath)
         
-        # all_features = da.stack(all_features)
-        # save_as_zarr(all_features, features_outpath)
-        # del all_features
-        # gc.collect()
+        all_images = load_zarr(image_outpath)
         all_features = load_zarr(features_outpath)
     else:
         all_images = load_image(image_outpath)
@@ -148,9 +151,10 @@ def train_pixel_classifier(
     def segment_and_update(
         pixel_class_outdir,
         tcell_edt_threshold: float = 2.5,
+        log=print
         ):
         start_time = time.time()
-        print("###### Running Segmentation")
+        log("###### Running Segmentation")
         # Access the label layer and feature image
         
         image_layer = viewer.layers['Image']
@@ -159,7 +163,18 @@ def train_pixel_classifier(
         label_layer = viewer.layers['User Provided Labels']
         label_data = label_layer.data
         
-        print("Training Random Forest Classifier")
+        log("Training Random Forest Classifier")
+        
+        flat_label_data = label_data.ravel()
+        flat_features = all_features.reshape(-1, all_features.shape[-1])  # shape: (N_total, 90)
+
+        # Get 1D indices where labels exist
+        label_indices = np.flatnonzero(flat_label_data > 0)
+
+        selected_features = flat_features[label_indices].compute()  # (N_selected, 90)
+        selected_labels = flat_label_data[label_indices]   
+        log(f"Found {len(selected_labels)} labeled pixels")
+        
         clf = RandomForestClassifier(
             n_estimators=100,
             n_jobs=-1, 
@@ -168,12 +183,44 @@ def train_pixel_classifier(
             class_weight="balanced"
             )
         
-        clf = future.fit_segmenter(label_data, all_features, clf)
+        clf = future.fit_segmenter(selected_labels, selected_features, clf)
         
-        print("Predicting Background, T-cells and Organoid pixels")
-        pixel_class = future.predict_segmenter(all_features, clf)
-
-        print("Segment Cell and Organoid Instances")
+        log("Saving RandomForest, Sparse labels and input images to {pixel_class_outdir}")
+        ### SAVE 
+        random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_RandomForest.joblib')
+        joblib.dump(clf, random_forest_outpath)
+        
+        log("Predicting Background, T-cells and Organoid pixels")
+        pred_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_PredictedLabels.zarr')
+        # parts_outpath = Path(pred_labels_outpath.parent, "pred_parts")
+        
+        if pred_labels_outpath.exists():
+            shutil.rmtree(pred_labels_outpath)
+        # if parts_outpath.exists():
+        #     shutil.rmtree(parts_outpath)
+            
+        # parts_outpath.mkdir(exist_ok=True)
+        # Create an empty (uninitialized) Dask array
+        pred_labels = da.empty(label_data.shape, chunks=(1,) + label_data.shape[1:], dtype='int16')
+        save_as_zarr(pred_labels, pred_labels_outpath)
+     
+        test=[]
+        args_list = [(str(random_forest_outpath), str(features_outpath), str(pred_labels_outpath), idx) for idx in range(all_features.shape[0])]
+        if n_workers > 1:
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                test+=list(tqdm(executor.map(predict_classes, args_list), total=len(args_list)))
+        else:
+            for args in tqdm(args_list, total=len(args_list)):
+                predict_classes(args)
+        
+        pixel_class = load_image(pred_labels_outpath)
+        
+        # for _, img in tqdm(enumerate(all_features), total=len(all_features)):
+        #     img = np.asarray(img)
+        #     pred = np.expand_dims(future.predict_segmenter(img, clf), axis=0)
+        #     append_to_zarr(pred, pred_labels_outpath)
+            
+        log("Segment Cell and Organoid Instances")
         full_seg_organoid=[]
         full_seg_tcell=[]
         for idx, t_pixel_class in enumerate(pixel_class):
@@ -202,15 +249,10 @@ def train_pixel_classifier(
         full_seg_organoid = np.stack(full_seg_organoid, axis=0)
         full_seg_tcell = np.stack(full_seg_tcell, axis=0)
         
-        print("Updating Napari Data")
+        log("Updating Napari Data")
         viewer.layers["Pixel Classification"].data = pixel_class
         viewer.layers["Organoid Segments"].data = full_seg_organoid
         viewer.layers["Tcell Segments"].data = full_seg_tcell
-        
-        print("Saving RandomForest, Sparse labels and input images to {pixel_class_outdir}")
-        ### SAVE 
-        random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_RandomForest.joblib')
-        joblib.dump(clf, random_forest_outpath)
         
         labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserLabels.zarr')
         save_as_zarr(label_data, labels_outpath)
@@ -218,11 +260,11 @@ def train_pixel_classifier(
         image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
         save_as_zarr(image_data, image_outpath)
         
-        print(f"###### DONE time elapsed: {time.time() - start_time:.2f} s")
+        log(f"###### DONE time elapsed: {time.time() - start_time:.2f} s")
         
     # Create Napari viewer
     viewer = napari.Viewer()
-    img_layer = viewer.add_image(all_images, name="Image", contrast_limits=(0,float(da.percentile(all_images[1,0].reshape(-1), 99).compute()[0])))
+    img_layer = viewer.add_image(all_images, name="Image", contrast_limits=(0,float(da.percentile(all_images[1,-1].reshape(-1), 99).compute()[0])))
     img_layer.contrast_limits_range = (0, int(all_images.max().compute()))
 
     labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserLabels.zarr')
@@ -238,11 +280,25 @@ def train_pixel_classifier(
     viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name="Organoid Segments", opacity=0.7, visible=False)
     viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name="Tcell Segments", opacity=0.7, visible=False)
 
-    update_function = partial(segment_and_update, pixel_class_outdir=pixel_class_outdir)
+    log_output = QPlainTextEdit()
+    log_output.setReadOnly(True)
+    log_widget = QWidget()
+    layout = QVBoxLayout()
+    layout.addWidget(log_output)
+    log_widget.setLayout(layout)
+    viewer.window.add_dock_widget(log_widget, area="right", name="Log Output")
+    
+    update_function = partial(
+        segment_and_update, 
+        pixel_class_outdir=pixel_class_outdir,
+        log=log_output.appendPlainText
+        )
     gui = magicgui(update_function, 
                 tcell_edt_threshold={"widget_type": "FloatSlider", "min": 1.0, "max": 15.0, "step": 0.5}
                 )
     viewer.window.add_dock_widget(gui)
+    
+    
     napari.run()
     
 def run_pixel_classifier(

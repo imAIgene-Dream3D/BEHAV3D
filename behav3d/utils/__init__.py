@@ -2,6 +2,11 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 
+def predict_classes(args):
+    clf_path, path, outpath, idx = args
+    # clf = joblib.load(clf_path)
+    return(1)
+
 def load_behav3d_metadata(
     metadata_path
     ):

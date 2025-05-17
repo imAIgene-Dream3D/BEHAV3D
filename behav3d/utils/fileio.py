@@ -205,12 +205,14 @@ def load_zarr(path, group=None, mode="r"):
         zarr_store = zarr.storage.ZipStore(path)
     else:
         zarr_store = zarr.storage.LocalStore(path)
+        
     
     if group:
-        zarr_obj = zarr.open(zarr_store, mode=mode)[group]
+        # zarr_obj = zarr.open(zarr_store, mode=mode)[group]
+        dask_img = da.from_zarr(zarr_store, component=group)
     else:
-        zarr_obj = zarr.open(zarr_store, mode=mode)
-    dask_img = da.from_zarr(zarr_obj)
+        dask_img = da.from_zarr(zarr_store)
+    # dask_img = da.from_zarr(zarr_obj)
     return(dask_img)
 
 
