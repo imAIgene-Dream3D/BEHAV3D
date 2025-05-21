@@ -215,7 +215,6 @@ def load_zarr(path, group=None, mode="r"):
     # dask_img = da.from_zarr(zarr_obj)
     return(dask_img)
 
-
 def save_as_zarr(
     img, 
     path, 
@@ -237,9 +236,9 @@ def save_as_zarr(
         zarr_store = zarr.storage.LocalStore(path)
         # If group is specified, create or open that group
         if group:
-            da.to_zarr(img, zarr_store, component=group, overwrite=True)
+            da.to_zarr(img, zarr_store, component=group, compute=True, overwrite=True)
         else:
-            da.to_zarr(img, zarr_store, overwrite=True)
+            da.to_zarr(img, zarr_store, compute=True, overwrite=True)
         
     img=None
     if zipping:
