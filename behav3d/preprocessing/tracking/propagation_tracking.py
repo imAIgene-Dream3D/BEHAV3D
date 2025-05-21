@@ -1,4 +1,4 @@
-from behav3d.utils.fileio import load_image, append_to_zarr
+from behav3d.utils.fileio import load_image, append_to_zarr, save_as_zarr
 from behav3d.utils.preprocessing import dilate_mask
 from behav3d.utils.segmentation import segment_size_filter
 from skimage.segmentation import watershed
@@ -6,13 +6,34 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 import zarr
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import shutil
+import dask.array as da
 
+# def propagate_segmentation(args):
+#     zarr_path, t, dilation_nr_pixels, segment_size_min = args
+#     t_seg = np.asarray(load_image(zarr_path)[t])
+#     seg_prev_tp = np.asarray(load_image(zarr_path)[max(0, t-1)])
+#     mask = t_seg!=0
+#     seg_prev_tp[mask==0]=0
+#     # seeds = keep_largest_connected_components(seeds)
+#     new_seg = watershed(mask, markers = seg_prev_tp, mask=mask)
+#     mask_dilated = dilate_mask(mask, nr_pixels=dilation_nr_pixels)
+#     new_seg = watershed(mask_dilated, markers = new_seg, mask=mask_dilated)
+#     new_seg[mask==0]=0
+#     new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
+#     return new_seg
 
-def propagate_segmentation(args):
-    zarr_path, t, dilation_nr_pixels, segment_size_min = args
-    t_seg = zarr.open(zarr_path, mode='r+')[t]
-    seg_prev_tp = zarr.open(zarr_path, mode='r+')[max(0, t-1)]
-    mask = t_seg!=0
+def propagate_segmentation(
+    t_seg,
+    seg_prev_tp,
+    outpath,
+    dilation_nr_pixels=2,
+    segment_size_min=100,
+    ):
+
+    mask = t_seg != 0
     seg_prev_tp[mask==0]=0
     # seeds = keep_largest_connected_components(seeds)
     new_seg = watershed(mask, markers = seg_prev_tp, mask=mask)
@@ -20,9 +41,10 @@ def propagate_segmentation(args):
     new_seg = watershed(mask_dilated, markers = new_seg, mask=mask_dilated)
     new_seg[mask==0]=0
     new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
-    append_to_zarr(new_seg, tracked_img_outpath)
-    
-def copytrack_image(
+    return(new_seg)
+    # return new_seg
+
+def propagate_tracks(
     segments_path,
     tracked_img_outpath,
     tracked_csv_outpath,
@@ -32,32 +54,39 @@ def copytrack_image(
     ):
     
     seg = load_image(segments_path)
-    seg_prev_tp = seg[0]
     
-    for t, t_seg in enumerate(seg):
+    if tracked_img_outpath.exists():
+        shutil.rmtree(tracked_img_outpath)
+    
+    seg_prev_tp = seg[0]
+    for t, t_seg in tqdm(enumerate(seg), total=seg.shape[0]):
         t_seg = np.asarray(t_seg)
-        seeds = seg_prev_tp.copy()
-        mask = t_seg!=0
-        seeds[mask==0]=0
-        # seeds = keep_largest_connected_components(seeds)
-        new_seg = watershed(mask, markers = seeds, mask=mask)
-        mask_dilated = dilate_mask(mask, nr_pixels=dilation_nr_pixels)
-        new_seg = watershed(mask_dilated, markers = new_seg, mask=mask_dilated)
-        new_seg[mask==0]=0
-        new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
-        append_to_zarr(new_seg, tracked_img_outpath)
+        
+        if t==0:
+            t_tracked_seg = np.asarray(t_seg)
+        else:
+            t_tracked_seg = propagate_segmentation(
+                t_seg,
+                seg_prev_tp,
+                outpath = tracked_img_outpath,
+                dilation_nr_pixels=dilation_nr_pixels,
+                segment_size_min=segment_size_min,
+            )
+        seg_prev_tp = t_tracked_seg.copy()
+        t_tracked_seg = np.expand_dims(t_tracked_seg, axis=0)
+        append_to_zarr(t_tracked_seg, tracked_img_outpath)
 
-def run_tcell_laptracking(
+def run_propagation_tracking(
     metadata,
     output_dir,
-    cell_type="tcell",
+    cell_type="organoid",
     overwrite=False,
     **kwargs
     ):
     for idx, sample in metadata.iterrows():
         sample_name=sample['sample_name']
         print(f"Tracking sample: {sample_name}")
-        
+
         tracked_img_outdir = Path(output_dir, "images", sample_name)
         tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         
@@ -75,7 +104,7 @@ def run_tcell_laptracking(
                 not tracked_img_outpath.exists()
             ) or overwrite
             ):
-            copytrack_image(
+            propagate_tracks(
                 segments_path=segments_path,
                 tracked_img_outpath=tracked_img_outpath,
                 tracked_csv_outpath=tracked_csv_outpath,

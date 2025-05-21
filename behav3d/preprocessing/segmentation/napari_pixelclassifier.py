@@ -6,7 +6,7 @@ import shutil
 import napari
 from magicgui import magicgui
 from magicgui.widgets import PushButton
-from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout
+from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout, QApplication
 
 from aicspylibczi import CziFile
 
@@ -15,7 +15,7 @@ from skimage.measure import label
 from skimage.segmentation import watershed, relabel_sequential
 
 from sklearn.ensemble import RandomForestClassifier
-from scipy.ndimage import binary_fill_holes
+from scipy.ndimage import binary_fill_holes, find_objects
 
 from behav3d.utils.preprocessing import open_mask, dilate_mask
 from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt
@@ -48,7 +48,12 @@ features_func = partial(
 
 def postprocess_mask(mask, fill_holes=True, opening_nr_pixels=1):
     if fill_holes:  
-        mask = binary_fill_holes(mask)
+        # mask = binary_fill_holes(mask)
+        # Assume `mask` is a 3D binary array: (Z, Y, X)
+        filled_mask = np.zeros_like(mask)
+        for i in range(mask.shape[0]):
+            filled_mask[i] = binary_fill_holes(mask[i])
+        mask = filled_mask
     if opening_nr_pixels>0 and opening_nr_pixels is not None:
         mask = open_mask(mask)
     return(mask)
@@ -56,71 +61,102 @@ def postprocess_mask(mask, fill_holes=True, opening_nr_pixels=1):
 
 def refine_segment(args):
     """Refine a single segment by reapplying EDT-based splitting."""
-    label_id, segment_mask, full_edt, edt_threshold, segment_size_min = args
-    if np.sum(segment_mask) == 0:
-        return np.zeros_like(segment_mask)
-
-    edt_local = full_edt * segment_mask
-    # edt = calculate_edt(segment_mask)
-    seeds = label(edt_local > edt_threshold)[0]
-    if np.max(seeds) == 0:
-        return (segment_mask.astype(np.uint16) * label_id)  # return as is
-
-    new_seg = watershed(-edt_local, markers=seeds, mask=segment_mask)
+    # start_time = time.time()
+    # label_id, segment_mask, full_edt, edt_threshold, segment_size_min = args
+    local_mask, local_edt, edt_thr_refined, segment_size_min, minc = args
+    # if np.sum(segment_mask) == 0:
+    #     return np.zeros_like(segment_mask)
+   
+    local_seeds = label(local_edt >= edt_thr_refined)
+    # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
+    if np.max(local_seeds) < 2:
+        return (local_mask.astype(np.int32), tuple(minc))
+    
+    new_seg = watershed(-local_edt, markers=local_seeds, mask=local_mask)
+    # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
     new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
-    new_seg = watershed(-edt_local, markers=new_seg, mask=segment_mask)
-    return new_seg
+    # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
+    new_seg = watershed(-local_edt, markers=new_seg, mask=local_mask)
+    # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
+    new_seg, _, _ = relabel_sequential(new_seg)
+    # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
+    return (new_seg, tuple(minc))
 
-def segment_mask(mask, edt_thr=1.5, edt_thr_refined=2.5, segment_size_min=15, use_dims=3, n_workers=None):
+def segment_mask(mask, edt_thr=1.5, edt_thr_refined=[2, 2.5, 3], segment_size_min=15, use_dims=3, n_workers=1):
     offset = 1
+    start_time = time.time()
     # Step 1: Initial segmentation
     edt = calculate_edt(mask, use_dims=use_dims)
-    seeds = label(edt > edt_thr)
-    segments = watershed(mask, markers = seeds, mask=mask)
+    seeds = label(edt >= edt_thr)
+    segments = watershed(-edt, markers = seeds, mask=mask)
     seeds2 = label(mask * (segments==0))
     seeds2[seeds2!=0] += seeds.max()
     # Relabel last segments to keep unique labels
     segments[segments==0]=seeds2[segments==0]
     segments = segment_size_filter(segments, size_min=segment_size_min)
-    segments = watershed(mask, markers = segments, mask=mask)
-    segments, _, _ = relabel_sequential(segments, offset)
-
+    segments = watershed(-edt, markers = segments, mask=mask)
+    # segments, _, _ = relabel_sequential(segments, offset)
+    
+    # If edt_thr_refined ois not list, turn into list
+    if not isinstance(edt_thr_refined, list):
+        if edt_thr_refined is not None:
+            edt_thr_refined = [edt_thr_refined]
+        
     if edt_thr_refined is not None:
-        # Step 2: Prepare for per-label refinement
-        unique_labels = np.unique(segments)
-        unique_labels = unique_labels[unique_labels != 0]  # Exclude background
+        for thr in edt_thr_refined:
+            # Step 2: Prepare for per-label refinement
+            start_time = time.time()
+            unique_labels = np.unique(segments)
+            unique_labels = unique_labels[unique_labels != 0]  # Exclude background
+            args_list = []
+    
+            slices = find_objects(segments)
+            for i, slc in enumerate(slices):
+                label_id = i + 1  # Because label 0 is background and ignored
 
-        args_list = []
-        for label_id in unique_labels:
-            seg_mask = (segments == label_id)
-            args_list.append((label_id, seg_mask, edt, edt_thr_refined, segment_size_min))
+                if slc is None:
+                    continue  # This label is not present
 
-        if n_workers is None:
-            n_workers = multiprocessing.cpu_count()
+                local_mask = segments[slc] == label_id
+                local_edt = edt[slc]
+                minc = [s.start for s in slc]
 
-        refined_segments = np.zeros_like(mask, dtype=np.uint16)
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            results = list(executor.map(refine_segment, args_list))
-        # Step 4: Combine results and relabel
-        current_label = 1
-        for seg in results:
-            seg, _, _ = relabel_sequential(seg, offset=current_label)
-            refined_segments[seg > 0] = seg[seg > 0]
-            current_label = refined_segments.max() + 1
-        refined_segments = segment_size_filter(refined_segments, size_min=segment_size_min)
-        return refined_segments
+                args_list.append((local_mask, local_edt, thr, segment_size_min, minc))
+
+            if n_workers is None:
+                n_workers = multiprocessing.cpu_count()
+
+            results = []
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                results += list(executor.map(refine_segment, args_list))
+           
+            current_label = 0
+            segments = np.zeros_like(mask, dtype=np.uint16)
+            for result in results:
+                local_segment, minc = result
+                z0, y0, x0 = minc
+                z1, y1, x1 = z0 + local_segment.shape[0], y0 + local_segment.shape[1], x0 + local_segment.shape[2]
+
+                # Assign to global array with label offset
+                nonzero_mask = local_segment > 0
+                local_segment[nonzero_mask] += current_label
+                segments[z0:z1, y0:y1, x0:x1][nonzero_mask] = local_segment[nonzero_mask]
+
+                current_label = segments.max() + 1  # Update for next segment
+        return segments
     else:
+        segments, _, _ = relabel_sequential(segments, offset)
         return(segments)
 
 def segment_tcell_and_organoid(
-    prediction_mask,
-    tcell_val=3,
-    organoid_val=2,
+    # mask_organoid,
+    # mask_tcell,
+    args,
     tcell_edt_threshold=1.5,
-    tcell_edt_threshold_refined=2.5,
+    tcell_edt_threshold_refined=[2, 2.5, 3],
     tcell_segment_size_min=10,
-    organoid_edt_threshold=10,
-    organoid_segment_size_min=500,
+    organoid_edt_threshold=12,
+    organoid_segment_size_min=1000,
     ):
     """
     Segment T-cells and organoids from the prediction mask.
@@ -147,44 +183,68 @@ def segment_tcell_and_organoid(
     segments : np.ndarray
         The segmented T-cells and organoids.
     """
-    mask_organoid = prediction_mask==organoid_val
-    mask_tcell = prediction_mask==tcell_val
-    
-    mask_tcell = postprocess_mask(mask_tcell, opening_nr_pixels=1)
-    mask_organoid = postprocess_mask(mask_organoid, opening_nr_pixels=3)
+    organoid, tcell, tcell_edt_threshold =  args
+    tcell = postprocess_mask(tcell, opening_nr_pixels=0)
+    organoid = postprocess_mask(organoid, opening_nr_pixels=3)
 
-    seg_organoid = segment_mask(
-        mask=mask_organoid,
+    start_time = time.time()
+    organoid = segment_mask(
+        mask=organoid,
         segment_size_min=organoid_segment_size_min,
         edt_thr=organoid_edt_threshold,
         edt_thr_refined=None,
         use_dims=3
     )
     
-    seg_tcell = segment_mask(
-        mask=mask_tcell,
+    start_time = time.time()
+    tcell = segment_mask(
+        mask=tcell,
         segment_size_min=tcell_segment_size_min,
         edt_thr=tcell_edt_threshold,
         edt_thr_refined=tcell_edt_threshold_refined,
         use_dims=3
     )
-    return(seg_organoid, seg_tcell)
+    return(organoid, tcell)
 
-def predict_classes(args):
-    clf_path, path, outpath, idx = args
-    clf = joblib.load(clf_path)
+def _apply_classifier(args):
+    clf, path, outpath, idx = args
     features = np.asarray(load_image(path, mode="r")[idx])
     prediction = zarr.open(outpath, mode="r+")
     prediction[idx] = future.predict_segmenter(features, clf)
+
+# def apply_classifier_in_memory(args):
+#     clf, path, outpath, idx = args
+#     features = np.asarray(load_image(path, mode="r")[idx])
+#     prediction = zarr.open(outpath, mode="r+")
+#     prediction[idx] = future.predict_segmenter(features, clf)
+
+
+def apply_classifier(classifier, features_outpath, pred_labels_outpath, n_workers=4):
+    shape = load_image(features_outpath).shape
+    pred_labels = da.zeros(shape[:-1], chunks=(1,) + shape[1:-1], dtype='int16')
+    save_as_zarr(pred_labels, pred_labels_outpath)
+    args_list = [(classifier, str(features_outpath), str(pred_labels_outpath), idx) for idx in range(pred_labels.shape[0])]
+    test=[]
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        test+=list(tqdm(executor.map(_apply_classifier, args_list), total=len(args_list)))
+    
+    pixel_class = load_image(pred_labels_outpath)
+    pixel_class[pixel_class==1] = 0
+    # pixel_class[pixel_class>0] -= 1
+    pixel_class = pixel_class.compute()
+    return pixel_class
         
 def train_pixel_classifier(
     output_dir,
     metadata,
     examples_per_sample = 3,
     sample_specific_classifier=False,
-    n_workers=2
+    n_workers=None
     ):
     
+    if n_workers is None:
+        n_workers = multiprocessing.cpu_count()
+        
     pixel_class_outdir = Path(output_dir, "images", "PixelClassification")
     pixel_class_outdir.mkdir(exist_ok=True)
     
@@ -257,140 +317,137 @@ def train_pixel_classifier(
     def segment_and_update(
         pixel_class_outdir,
         tcell_edt_threshold: float = 2.5,
-        n_workers: int = 2,
+        n_workers: int = 16,
         log=print
         ):
         start_time = time.time()
-        log("###### Running Segmentation")
+        log("###### Running Segmentation\n")
+        QApplication.processEvents()
         # Access the label layer and feature image
         
         image_layer = viewer.layers['Image']
         image_data = image_layer.data
         
-        label_layer = viewer.layers['User Provided Labels']
-        label_data = label_layer.data
+        org_label_layer = viewer.layers['User Provided Labels (Organoid)']
+        org_label_data = org_label_layer.data
         
-        labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserLabels.zarr')
-        save_as_zarr(label_data, labels_outpath)
+        tcell_label_layer = viewer.layers['User Provided Labels (Tcell)']
+        tcell_label_data = tcell_label_layer.data
         
-        log("Training Random Forest Classifier")
+        dead_label_layer = viewer.layers['User Provided Labels (Dead)']
+        dead_label_data = dead_label_layer.data
         
-        flat_label_data = label_data.ravel()
-        flat_features = all_features.reshape(-1, all_features.shape[-1])  # shape: (N_total, 90)
+        org_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserOrganoidLabels.zarr')
+        tcell_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserTcellLabels.zarr')
+        dead_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserDeadLabels.zarr')
+        save_as_zarr(org_label_data, org_labels_outpath)
+        save_as_zarr(tcell_label_data, tcell_labels_outpath)
+        save_as_zarr(dead_label_data, dead_labels_outpath)
+   
+        def train_classifier(user_labels, features):
+            flat_label_data = user_labels.ravel()
+            flat_features = features.reshape(-1, features.shape[-1])  # shape: (N_total, 90)
 
-        # Get 1D indices where labels exist
-        label_indices = np.flatnonzero(flat_label_data > 0)
+            # Get 1D indices where labels exist
+            label_indices = np.flatnonzero(flat_label_data > 0)
 
-        selected_features = flat_features[label_indices].compute()  # (N_selected, 90)
-        selected_labels = flat_label_data[label_indices]   
+            selected_features = flat_features[label_indices].compute()  # (N_selected, 90)
+            selected_labels = flat_label_data[label_indices]   
+            
+            nr_bg_pix = int(np.sum(selected_labels==1))
+            nr_fg_pix = int(np.sum(selected_labels==2))
+            total_pix = nr_bg_pix + nr_fg_pix
+            
+            log(f"Found {nr_bg_pix} background pixels")
+            log(f"Found {nr_fg_pix} foreground pixels")
+            
+            class_weights = {
+                1: nr_bg_pix / total_pix,
+                2: nr_fg_pix / total_pix,
+            }
+            clf = RandomForestClassifier(
+                n_estimators=50,
+                n_jobs=-1, 
+                max_depth=20, 
+                # max_samples=0.05,
+                class_weight=class_weights
+                )
+            
+            clf = future.fit_segmenter(selected_labels, selected_features, clf)
+            return clf
         
-        nr_bg_pix = int(np.sum(selected_labels==1))
-        nr_organoid_pix = int(np.sum(selected_labels==2))
-        nr_tcell_pix = int(np.sum(selected_labels==3))
+        log("\n### Training Random Forest Classifier (Organoids)")
+        clf_organoids = train_classifier(org_label_data, all_features)
+        org_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid.joblib')
+        log("Saving RandomForest, Sparse labels and input images to {org_random_forest_outpath}")
+        joblib.dump(clf_organoids, org_random_forest_outpath)
+        QApplication.processEvents()
         
-        log(f"Found {len(selected_labels)} labeled pixels")
-        log(f"Found {nr_bg_pix} background pixels")
-        log(f"Found {nr_organoid_pix} organoid pixels")
-        log(f"Found {nr_tcell_pix} T-cell pixels")
+        log("\n### Training Random Forest Classifier (T-cells)")
+        clf_tcells = train_classifier(tcell_label_data, all_features)
+        tcell_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Tcell.joblib')
+        log("Saving RandomForest, Sparse labels and input images to {tcell_random_forest_outpath}")
+        joblib.dump(clf_tcells, tcell_random_forest_outpath)
+        QApplication.processEvents()
         
-        class_weights = {
-            1: nr_bg_pix,
-            2: nr_organoid_pix,
-            3: nr_tcell_pix
-        }
-        clf = RandomForestClassifier(
-            n_estimators=50,
-            n_jobs=-1, 
-            max_depth=20, 
-            # max_samples=0.05,
-            class_weight=class_weights
-            )
+        log("\n### Training Random Forest Classifier (Cell Death)")
+        clf_death = train_classifier(dead_label_data, all_features)
+        death_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Death.joblib')
+        log("Saving RandomForest, Sparse labels and input images to {death_random_forest_outpath}")
+        joblib.dump(clf_death, death_random_forest_outpath)
+        QApplication.processEvents()
         
-        clf = future.fit_segmenter(selected_labels, selected_features, clf)
         
-        log("Saving RandomForest, Sparse labels and input images to {pixel_class_outdir}")
-        ### SAVE 
-        random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_RandomForest.joblib')
-        joblib.dump(clf, random_forest_outpath)
-        
-        log("Predicting Background, T-cells and Organoid pixels")
-        pred_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_PredictedLabels.zarr')
+        pred_org_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid_PredictedLabels.zarr')
+        pred_tcell_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Tcell_PredictedLabels.zarr')
+        pred_death_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Death_PredictedLabels.zarr')
         # parts_outpath = Path(pred_labels_outpath.parent, "pred_parts")
         
-        if pred_labels_outpath.exists():
-            shutil.rmtree(pred_labels_outpath)
-        # if parts_outpath.exists():
-        #     shutil.rmtree(parts_outpath)
-            
-        # parts_outpath.mkdir(exist_ok=True)
-        # Create an empty (uninitialized) Dask array
-        pred_labels = da.zeros(label_data.shape, chunks=(1,) + label_data.shape[1:], dtype='int16')
-        save_as_zarr(pred_labels, pred_labels_outpath)
+        if pred_org_labels_outpath.exists():
+            shutil.rmtree(pred_org_labels_outpath)
+        if pred_tcell_labels_outpath.exists():
+            shutil.rmtree(pred_tcell_labels_outpath)
+        if pred_death_labels_outpath.exists():
+            shutil.rmtree(pred_death_labels_outpath)
 
-        args_list = [(str(random_forest_outpath), str(features_outpath), str(pred_labels_outpath), idx) for idx in range(all_features.shape[0])]
-        # prediction = zarr.open(pred_labels_outpath, mode="r+")
-        # features = load_image(features_outpath, mode="r")
-        # for idx in tqdm(range(pred_labels.shape[0]), total=pred_labels.shape[0]):
-        #     prediction[idx] = future.predict_segmenter(features[idx], clf)
-        test=[]
-        if n_workers > 1:
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                test+=list(tqdm(executor.map(predict_classes, args_list), total=len(args_list)))
-        else:
-            for args in tqdm(args_list, total=len(args_list)):
-                predict_classes(args)
+        log("\n### Predicting Organoid Pixels")
+        QApplication.processEvents()
+        pred_org_mask = apply_classifier(clf_organoids, features_outpath, pred_org_labels_outpath)
         
-        pixel_class = load_image(pred_labels_outpath)
-        pixel_class[pixel_class==1] = 0
-        pixel_class = pixel_class.compute()
-        # for _, img in tqdm(enumerate(all_features), total=len(all_features)):
-        #     img = np.asarray(img)
-        #     pred = np.expand_dims(future.predict_segmenter(img, clf), axis=0)
-        #     append_to_zarr(pred, pred_labels_outpath)
-            
-        log("Segment Cell and Organoid Instances")
-        full_seg_organoid=[]
-        full_seg_tcell=[]
-        for idx, t_pixel_class in tqdm(enumerate(pixel_class), total=len(pixel_class)):
-            # mask_organoid = t_pixel_class==2
-            # mask_tcell = t_pixel_class==3
-            
-            # mask_tcell = postprocess_mask(mask_tcell, opening_nr_pixels=1)
-            # mask_organoid = postprocess_mask(mask_organoid, opening_nr_pixels=3)
+        log("\n### Predicting T-cell Pixels")
+        QApplication.processEvents()
+        pred_tcell_mask = apply_classifier(clf_tcells, features_outpath, pred_tcell_labels_outpath)
+        
+        log("\n### Predicting Death Pixels")
+        QApplication.processEvents()
+        pred_death_mask = apply_classifier(clf_death, features_outpath, pred_death_labels_outpath)
+        
+        viewer.layers["Pixel Classification (Organoid)"].data = pred_org_mask
+        viewer.layers["Pixel Classification (Tcell)"].data = pred_tcell_mask
+        viewer.layers["Pixel Classification (Dead)"].data = pred_death_mask
 
-            # seg_organoid = segment_mask(
-            #     mask=mask_organoid,
-            #     segment_size_min=500,
-            #     segment_splitting_edt=10,
-            #     use_dims=3
-            # )
-            
-            # seg_tcell = segment_mask(
-            #     mask=mask_tcell,
-            #     segment_size_min=10,
-            #     segment_splitting_edt=tcell_edt_threshold,
-            #     use_dims=3
-            # )
-            seg_organoid, seg_tcell = segment_tcell_and_organoid(
-                prediction_mask=t_pixel_class,
-                tcell_edt_threshold=tcell_edt_threshold,
-            )
-            full_seg_organoid.append(seg_organoid)
-            full_seg_tcell.append(seg_tcell)
+        log("\n### Segment Cell and Organoid Instances")
+        QApplication.processEvents()
+        args_list = [(pred_org_mask[idx], pred_tcell_mask[idx], tcell_edt_threshold) for idx in range(org_label_data.shape[0])]
+        results=[]
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            results+=list(tqdm(executor.map(segment_tcell_and_organoid, args_list), total=len(args_list)))
+        full_seg_organoid, full_seg_tcell = zip(*results)
+
         full_seg_organoid = np.stack(full_seg_organoid, axis=0)
         full_seg_tcell = np.stack(full_seg_tcell, axis=0)
         
-        log("Updating Napari Data")
-        viewer.layers["Pixel Classification"].data = pixel_class
+        log("\n### Updating Napari Data")
+        
         viewer.layers["Organoid Segments"].data = full_seg_organoid
         viewer.layers["Tcell Segments"].data = full_seg_tcell
         
         image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
         save_as_zarr(image_data, image_outpath)
         
-        log(f"###### DONE time elapsed: {time.time() - start_time:.2f} s")
+        log(f"\n###### DONE time elapsed: {time.time() - start_time:.2f} s")
     
-    def save_pixel_classification(log=None):
+    def save_pixel_classification(log=print):
         label_layer = viewer.layers['User Provided Labels']
         label_data = label_layer.data
 
@@ -403,16 +460,47 @@ def train_pixel_classifier(
     img_layer = viewer.add_image(all_images, name="Image", contrast_limits=(0,float(np.percentile(all_images[1,-1].reshape(-1), 99))))
     img_layer.contrast_limits_range = (0, all_images.max())
 
-    labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserLabels.zarr')
+    org_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserOrganoidLabels.zarr')
+    tcell_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserTcellLabels.zarr')
+    dead_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserDeadLabels.zarr')
     
-    if labels_outpath.exists():
-        print("Loading existing user labelled data")
-        user_labels = np.asarray(load_zarr(labels_outpath))
+    
+    if org_labels_outpath.exists():
+        print("Loading existing user labelled organoid data")
+        org_user_labels = np.asarray(load_zarr(org_labels_outpath))
     else:
-        user_labels = np.zeros(all_images.shape[1:]).astype(np.int16)
+        org_user_labels = np.zeros(all_images.shape[1:]).astype(np.int16)
         
-    viewer.add_labels(user_labels, name="User Provided Labels", opacity=0.3)
-    viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name="Pixel Classification", opacity=0.7, visible=False)
+    if tcell_labels_outpath.exists():
+        print("Loading existing user labelled Tcell data")
+        tcell_user_labels = np.asarray(load_zarr(tcell_labels_outpath))
+    else:
+        tcell_user_labels = np.zeros(all_images.shape[1:]).astype(np.int16)
+        
+    if dead_labels_outpath.exists():
+        print("Loading existing user labelled dead data")
+        dead_user_labels = np.asarray(load_zarr(dead_labels_outpath))
+    else:
+        dead_user_labels = np.zeros(all_images.shape[1:]).astype(np.int16)
+    
+    user_layers = {
+        "User Provided Labels (Organoid)": org_user_labels,
+        "User Provided Labels (Tcell)": tcell_user_labels,
+        "User Provided Labels (Dead)": dead_user_labels,
+    }
+
+    for name, data in user_layers.items():
+        layer = viewer.add_labels(data, name=name, opacity=0.3)
+       
+    pixelclass_layers = {
+        "Pixel Classification (Organoid)": np.zeros(all_images.shape[1:]).astype(np.int16),
+        "Pixel Classification (Tcell)": np.zeros(all_images.shape[1:]).astype(np.int16),
+        "Pixel Classification (Dead)": np.zeros(all_images.shape[1:]).astype(np.int16),
+    }
+    
+    for name, data in pixelclass_layers.items():
+        layer = viewer.add_labels(data, name=name, opacity=0.3, visible=False)
+   
     viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name="Organoid Segments", opacity=0.7, visible=False)
     viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name="Tcell Segments", opacity=0.7, visible=False)
 
@@ -461,8 +549,13 @@ def run_pixel_classifier(
     metadata,
     ):
     
-    classifier_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_RandomForest.joblib')
-    clf = joblib.load(classifier_path)
+    clf_org_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_Organoid.joblib')
+    clf_tcell_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_Tcell.joblib')
+    clf_death_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_Death.joblib')
+  
+    clf_org = joblib.load(clf_org_path)
+    clf_tcell = joblib.load(clf_tcell_path)
+    clf_death = joblib.load(clf_death_path)
     
     for idx, sample in metadata.iterrows():
         print(f"Processing sample: {sample['sample_name']}")
@@ -480,7 +573,8 @@ def run_pixel_classifier(
             img_outdir.mkdir(parents=True)
             
         tcell_segments_outpath = Path(img_outdir, f"{sample_name}_tcell_segments.zarr")
-        organoid_segments_outpath = Path(img_outdir, f"{sample_name}_organoid_tracked.zarr")
+        organoid_segments_outpath = Path(img_outdir, f"{sample_name}_organoid_segments.zarr")
+        death_mask_outpath = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
         
         if not raw_image_zarr.exists():
             img = load_image(raw_image_path)
@@ -500,13 +594,28 @@ def run_pixel_classifier(
             
             for t, t_img in tqdm(enumerate(img), total=img.shape[0]):
                 features = features_func(t_img)
-                result = future.predict_segmenter(features, clf)
+                # result = future.predict_segmenter(features, clf)
+                    
+                print("\n### Predicting Organoid Pixels")
+                pred_org_mask = future.predict_segmenter(features, clf_org)
+                pred_org_mask[pred_org_mask>0] -= 1
+                
+                print("\n### Predicting T-cell Pixels")
+                pred_tcell_mask = future.predict_segmenter(features, clf_tcell)
+                pred_tcell_mask[pred_tcell_mask>0] -= 1
+                
+                print("\n### Predicting Death Pixels")
+                pred_death_mask = future.predict_segmenter(features, clf_death)
+                pred_death_mask[pred_death_mask>0] -= 1
+                
+                print("\n### Segmenting Organoids and T-cells")
                 seg_organoid, seg_tcell = segment_tcell_and_organoid(
-                    prediction_mask=result,
-                    # tcell_edt_threshold=2
+                    args = (pred_org_mask, pred_tcell_mask, 1.5)  
                 )
+                
                 append_to_zarr(np.expand_dims(seg_organoid, axis=0), organoid_segments_outpath)
                 append_to_zarr(np.expand_dims(seg_tcell, axis=0), tcell_segments_outpath)
+                append_to_zarr(np.expand_dims(pred_death_mask, axis=0), death_mask_outpath)
                 
         metadata.at[idx, "tcell_segments_image_path"] = str(tcell_segments_outpath)
         metadata.at[idx, "organoid_tracks_image_path"] = str(organoid_segments_outpath)
