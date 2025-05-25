@@ -4,16 +4,22 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import math
-from behav3d.utils.fileio import load_image,save_as_zarr, append_to_zarr
+from behav3d.utils.fileio import load_image, save_as_zarr, append_to_zarr
 import shutil
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 def convert_segments_to_tracks(
     df_tracks,
     segments,
-    outpath
+    outpath,
+    n_workers=None
     ):
     # tracked_img = np.zeros_like(segments)
+    if n_workers is None:
+        n_workers = multiprocessing.cpu_count()
+        
     outpath = Path(outpath)
     if outpath.exists():
         if outpath.is_dir():
@@ -29,19 +35,37 @@ def convert_segments_to_tracks(
     
     assert outpath.suffix == ".zarr", "Supplied outpath is not .zarr or .zarr.zip"
     
-    for t, t_seg in tqdm(enumerate(segments), total=len(segments)):
-        t_seg = np.asarray(t_seg)
-        tracked_img = np.zeros_like(t_seg)
-        t_df_tracks = df_tracks[df_tracks["position_t"]==t]
+    def _apply_segment_to_track(args):
+        t_segment_img, t_df_tracks, t, track_out_path = args
+        
+        t_segment_img = np.asarray(t_segment_img)
+        t_tracked_img = np.zeros_like(t_segment_img)
+        
         for _, row in t_df_tracks.iterrows():
             # print(row["SegmentID"], row["TrackID"], (tracked_img[t]==row["SegmentID"]).any())
-            tracked_img[t_seg==row["SegmentID"]] = row["TrackID"]
+            t_tracked_img[t_segment_img==row["SegmentID"]] = row["TrackID"]
+        return t_tracked_img
+        
+    args_list = [(t_segments, df_tracks[df_tracks["position_t"]==t] , t, outpath) for t, t_segments in enumerate(segments)]
+    result=[]
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        result+=list(tqdm(executor.map(_apply_segment_to_track, args_list), total=len(args_list)))
+    
+    tracked_img = np.stack(result, axis=0)
+    save_as_zarr(tracked_img, path=outpath)
+    # for t, t_seg in tqdm(enumerate(segments), total=len(segments)):
+    #     t_seg = np.asarray(t_seg)
+    #     tracked_img = np.zeros_like(t_seg)
+    #     t_df_tracks = df_tracks[df_tracks["position_t"]==t]
+    #     for _, row in t_df_tracks.iterrows():
+    #         # print(row["SegmentID"], row["TrackID"], (tracked_img[t]==row["SegmentID"]).any())
+    #         tracked_img[t_seg==row["SegmentID"]] = row["TrackID"]
 
-        tracked_img = np.expand_dims(tracked_img, axis=0)
-        append_to_zarr(
-            img=tracked_img, 
-            outpath=outpath
-            )
+    #     tracked_img = np.expand_dims(tracked_img, axis=0)
+    #     append_to_zarr(
+    #         img=tracked_img, 
+    #         outpath=outpath
+    #         )
 
 def convert_all_tracked_images_to_csv(
     metadata,

@@ -2,6 +2,8 @@ import numpy as np
 from skimage.measure import label, find_contours
 from behav3d.utils import rel_elsize
 from scipy.ndimage import distance_transform_edt
+from skimage.measure import regionprops
+from collections import defaultdict
 
 def keep_largest_connected_components(segments):
     """
@@ -30,6 +32,47 @@ def segment_size_filter(segments, size_min=None, size_max=None):
             if count > size_max:
                 segments[segments == label] = 0
     return(segments)
+
+def segment_2d_filter(segments):
+    """
+    Remove segments from a 3D labeled array that are 2D in any axis (Z, Y, or X).
+    
+    Parameters:
+    - segments (ndarray): 3D labeled array (z, y, x)
+    
+    Returns:
+    - ndarray: 3D labeled array with 2D segments removed (set to 0)
+    """
+    segments = segments.copy()
+    coords = np.argwhere(segments > 0)  # [z, y, x]
+    if coords.size == 0:
+        return segments
+
+    labels = segments[segments > 0]
+    if labels.size == 0:
+        return segments
+
+    # Build axis-wise mappings
+    label_to_z = defaultdict(set)
+    label_to_y = defaultdict(set)
+    label_to_x = defaultdict(set)
+
+    for (z, y, x), label in zip(coords, labels):
+        label_to_z[label].add(z)
+        label_to_y[label].add(y)
+        label_to_x[label].add(x)
+
+    # Identify flat (2D) labels: only 1 slice along any axis
+    flat_labels = {
+        label for label in set(labels)
+        if len(label_to_z[label]) == 1 or len(label_to_y[label]) == 1 or len(label_to_x[label]) == 1
+    }
+
+    # Zero out flat segments
+    mask = np.isin(segments, list(flat_labels))
+    segments[mask] = 0
+
+    return segments
 
 def get_border_segments(segments):
     """

@@ -18,7 +18,7 @@ from sklearn.ensemble import RandomForestClassifier
 from scipy.ndimage import binary_fill_holes, find_objects
 
 from behav3d.utils.preprocessing import open_mask, dilate_mask
-from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt
+from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt, segment_2d_filter
 from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr
 
 import multiprocessing
@@ -143,10 +143,12 @@ def segment_mask(mask, edt_thr=1.5, edt_thr_refined=[2, 2.5, 3], segment_size_mi
                 segments[z0:z1, y0:y1, x0:x1][nonzero_mask] = local_segment[nonzero_mask]
 
                 current_label = segments.max() + 1  # Update for next segment
-        return segments
     else:
         segments, _, _ = relabel_sequential(segments, offset)
-        return(segments)
+        
+    # FIlter out 2D segments
+    segments = segment_2d_filter(segments)
+    return(segments)
 
 def segment_tcell_and_organoid(
     # mask_organoid,
@@ -183,7 +185,7 @@ def segment_tcell_and_organoid(
     segments : np.ndarray
         The segmented T-cells and organoids.
     """
-    organoid, tcell, tcell_edt_threshold =  args
+    organoid, tcell =  args
     tcell = postprocess_mask(tcell, opening_nr_pixels=0)
     organoid = postprocess_mask(organoid, opening_nr_pixels=3)
 
@@ -428,7 +430,7 @@ def train_pixel_classifier(
 
         log("\n### Segment Cell and Organoid Instances")
         QApplication.processEvents()
-        args_list = [(pred_org_mask[idx], pred_tcell_mask[idx], tcell_edt_threshold) for idx in range(org_label_data.shape[0])]
+        args_list = [(pred_org_mask[idx], pred_tcell_mask[idx]) for idx in range(org_label_data.shape[0])]
         results=[]
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             results+=list(tqdm(executor.map(segment_tcell_and_organoid, args_list), total=len(args_list)))
@@ -544,7 +546,7 @@ def apply_pixel_classifier(
     prediction = zarr.open(outpath, mode="r+")
     prediction[idx] = future.predict_segmenter(features, clf)
     
-def run_pixel_classifier(
+def run_pixel_classifier_segmentation(
     output_dir,
     metadata,
     ):
@@ -596,21 +598,21 @@ def run_pixel_classifier(
                 features = features_func(t_img)
                 # result = future.predict_segmenter(features, clf)
                     
-                print("\n### Predicting Organoid Pixels")
+                # print("\n### Predicting Organoid Pixels")
                 pred_org_mask = future.predict_segmenter(features, clf_org)
                 pred_org_mask[pred_org_mask>0] -= 1
                 
-                print("\n### Predicting T-cell Pixels")
+                # print("\n### Predicting T-cell Pixels")
                 pred_tcell_mask = future.predict_segmenter(features, clf_tcell)
                 pred_tcell_mask[pred_tcell_mask>0] -= 1
                 
-                print("\n### Predicting Death Pixels")
+                # print("\n### Predicting Death Pixels")
                 pred_death_mask = future.predict_segmenter(features, clf_death)
                 pred_death_mask[pred_death_mask>0] -= 1
                 
-                print("\n### Segmenting Organoids and T-cells")
+                # print("\n### Segmenting Organoids and T-cells")
                 seg_organoid, seg_tcell = segment_tcell_and_organoid(
-                    args = (pred_org_mask, pred_tcell_mask, 1.5)  
+                    args = (pred_org_mask, pred_tcell_mask),  
                 )
                 
                 append_to_zarr(np.expand_dims(seg_organoid, axis=0), organoid_segments_outpath)

@@ -182,7 +182,7 @@ def run_feature_extraction(
     df_all_tracks=pd.DataFrame()
     
     for _, sample_metadata in metadata.iterrows():
-        
+    
         print(f"--------------- Processing {cell_type}: {sample_metadata['sample_name']} ---------------")
         start_time = time.time()
 
@@ -548,34 +548,74 @@ def generalize_units_of_track_features(
     df_tracks["time_unit"] = "h"
     return(df_tracks)
     
-def calculate_tcell_specific_track_features(
-    df_tracks,
-    dead_mask_percentage_threshold=None,
-    ):
+# def calculate_tcell_specific_track_features(
+#     df_tracks,
+#     dead_mask_percentage_threshold=None,
+#     ):
+
+#     if dead_mask_percentage_threshold is not None:
+#         print(f"{get_current_time()} - Calculating cell death based on defined dead_dye_threshold {dead_mask_percentage_threshold}")
+#         df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
+        
+#     # Calculate various movement features such as speed and mean square displacement of the tracks  
+    
+#     print(f"{get_current_time()} - Determining active contact of T cells")
+#     # Determining if a T cell is actively interacting with another T cell based on speed
+#     # More explanation at the top of this code
+#     df_tracks['list_touching_tcells'] = df_tracks['touching_tcells'].apply(
+#         lambda x: [] if pd.isna(x) or x=="" else list(map(int, x.split(',')))
+#         )
+    
+#     active_interaction = []
+#     for _, row in df_tracks.iterrows():
+#         if row['tcell_contact']:
+#             max_mean_speed = max(row['mean_speed'], df_tracks.loc[df_tracks['SegmentID'].isin(row['list_touching_tcells']), 'mean_speed'].max())
+#             active_interaction.append(row['mean_speed'] == max_mean_speed)
+#         else:
+#             active_interaction.append(False)
+#     df_tracks=df_tracks.drop('list_touching_tcells', axis=1)      
+#     df_tracks['active_tcell_contact'] = active_interaction
+#     return(df_tracks)
+def calculate_tcell_specific_track_features(df_tracks, dead_mask_percentage_threshold=None):
 
     if dead_mask_percentage_threshold is not None:
         print(f"{get_current_time()} - Calculating cell death based on defined dead_dye_threshold {dead_mask_percentage_threshold}")
         df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
-        
-    # Calculate various movement features such as speed and mean square displacement of the tracks  
-    
+
     print(f"{get_current_time()} - Determining active contact of T cells")
-    # Determining if a T cell is actively interacting with another T cell based on speed
-    # More explanation at the top of this code
-    df_tracks['list_touching_tcells'] = df_tracks['touching_tcells'].apply(
-        lambda x: [] if pd.isna(x) or x=="" else list(map(int, x.split(',')))
-        )
-    
-    active_interaction = []
-    for _, row in df_tracks.iterrows():
-        if row['tcell_contact']:
-            max_mean_speed = max(row['mean_speed'], df_tracks.loc[df_tracks['SegmentID'].isin(row['list_touching_tcells']), 'mean_speed'].max())
-            active_interaction.append(row['mean_speed'] == max_mean_speed)
-        else:
-            active_interaction.append(False)
-    df_tracks=df_tracks.drop('list_touching_tcells', axis=1)      
-    df_tracks['active_tcell_contact'] = active_interaction
-    return(df_tracks)
+
+    # --- Step 1: Explode touching_tcells ---
+    df_explode = (
+        df_tracks[['TrackID', 'position_t', 'touching_tcells']]
+        .dropna()
+        .assign(touching_tcells=lambda d: d['touching_tcells'].astype(str).str.split(','))
+        .explode('touching_tcells')
+    )
+    df_explode = df_explode[df_explode['touching_tcells'].str.strip() != '']
+    df_explode['touching_tcells'] = df_explode['touching_tcells'].astype(int)
+
+    # --- Step 2: Get mean_speed of each touching_tcell ---
+    speed_map = df_tracks[['TrackID', 'position_t', 'mean_speed']].rename(columns={'TrackID': 'touching_tcells', 'mean_speed': 'touching_speed'})
+    df_explode = df_explode.merge(speed_map, on=['touching_tcells', 'position_t'], how='left')
+
+    # --- Step 3: Aggregate max touching speed for each SegmentID ---
+    max_touching_speed = df_explode.groupby(['TrackID', 'position_t'])['touching_speed'].max()
+
+    # --- Step 4: Compare own speed with max of touching ---
+    df_tracks = df_tracks.set_index(['TrackID', 'position_t'])
+    df_tracks['max_touching_speed'] = max_touching_speed
+    df_tracks['max_touching_speed'] = df_tracks['max_touching_speed'].fillna(-1)
+
+    df_tracks['active_tcell_contact'] = (
+        (df_tracks['tcell_contact']) & 
+        (df_tracks['mean_speed'] >= df_tracks['max_touching_speed'])
+    )
+
+    df_tracks.reset_index(inplace=True)
+    df_tracks.drop(columns=['max_touching_speed'], inplace=True)
+
+    return df_tracks
+
 
 def calculate_organoid_specific_track_features(
     df_tracks,
@@ -712,7 +752,10 @@ def interpolate_missing_positions(
         # "position_y", 
         # "position_x",
         # "mean_dead_dye"
-        ]
+        ],
+    col_to_none = [
+        "SegmentID",
+    ]
     ):
     """
     As not every track has a segment at every timepoint, interpolate the missing values of
@@ -729,6 +772,7 @@ def interpolate_missing_positions(
     if  cols_to_interpolate is None or cols_to_interpolate == []:
         # Select all columns that are not in cols_to_copy
         cols_to_interpolate = df_tracks.columns.difference(cols_to_copy).tolist()
+        cols_to_interpolate = [col for col in cols_to_interpolate if col not in col_to_none]
      
     grouped_df = df_tracks.groupby('TrackID')
     def interpolate_group(group, cols_to_interpolate, cols_to_copy):
@@ -1016,19 +1060,43 @@ def calculate_segment_intensity(segments, intensity_image, calculation="mean"):
 
 def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID"):
     def relative_increase(group):
-        # Ensure the group is sorted by time or an equivalent index
-        # group = group.sort_index()
-        increases = [0] * len(group)  # Default to 0 if not enough data
-        for i in range(0, len(group)):
-            current_value = group.iloc[i]
-            if i < nr_timepoints_back:  # If there are not enough points
-                previous_value = group.iloc[0]  # Use the first available value
+        values = group[column].values
+        increases = []
+        for i in range(len(group)):
+            if i < nr_timepoints_back:
+                prev = values[0]
             else:
-                previous_value = group.iloc[i - nr_timepoints_back]
-            increases[i] = current_value - previous_value
+                prev = values[i - nr_timepoints_back]
+            increases.append(values[i] - prev)
         return pd.Series(increases, index=group.index)
-    increase = df.groupby(groupby)[column].apply(relative_increase).reset_index(0, drop=True)
-    return increase.reindex(df.index)
+
+    return df.groupby(groupby).apply(relative_increase, include_groups=False).reset_index(drop=True).values
+
+def calculate_relative_increase(df, column, nr_timepoints_back, groupby):
+    df = df.sort_values(by=[groupby, "position_t"]).copy()
+
+    def compute_increase(group):
+        values = group[column].values
+        increases = []
+        for i in range(len(values)):
+            if i >= nr_timepoints_back:
+                ref = values[i - nr_timepoints_back]
+            else:
+                ref = values[0]
+            current = values[i]
+            if ref == 0:
+                increase = float('inf') if current > 0 else 0.0
+            else:
+                increase = (current - ref) / ref
+            increases.append(increase)
+        return pd.Series(increases, index=group.index)
+
+    # Use `transform`-like behavior by resetting the index before recombining
+    result = df.groupby(groupby).apply(compute_increase)
+    result.index = result.index.droplevel(0)  # Remove groupby level to flatten index
+
+    return result
+
             
 def calculate_dead_mask(segments, dead_mask):
     """
@@ -1048,6 +1116,7 @@ def calculate_dead_mask(segments, dead_mask):
         properties = properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]]
         df_intensity.append(properties)
     df_intensity = pd.concat(df_intensity)
+    df_intensity = df_intensity.sort_values(by=["TrackID", "position_t"]).reset_index(drop=True)
     df_intensity["increase_dead_mask"] = calculate_relative_increase(
             df = df_intensity,
             column="nr_dead_mask_pixels",
@@ -1062,18 +1131,22 @@ def _calculate_morphology_single_timepoint(args):
     segments = load_image(segments_path)
     stack = segments[t]
     stack = np.asarray(stack)
-    properties = pd.DataFrame(
-        regionprops_table(
-            label_image=stack,
-            properties=[
-                "label", "num_pixels", "area", "bbox_area", 
-                "extent", "solidity", "equivalent_diameter",
-                "major_axis_length", "minor_axis_length", "inertia_tensor", 
-                "inertia_tensor_eigvals", "moments_central"
-            ],
-            spacing=voxel_spacing
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*convex hull image.*")
+        warnings.filterwarnings("ignore", message="divide by zero encountered in scalar divide")
+        
+        properties = pd.DataFrame(
+            regionprops_table(
+                label_image=stack,
+                properties=[
+                    "label", "num_pixels", "area", "bbox_area", 
+                    "extent", "solidity", "equivalent_diameter",
+                    "major_axis_length", "minor_axis_length", "inertia_tensor", 
+                    "inertia_tensor_eigvals", "moments_central"
+                ],
+                spacing=voxel_spacing
+            )
         )
-    )
     properties.rename(columns={
         "label": "TrackID",
         "area": "volume",
@@ -1100,7 +1173,9 @@ def _calculate_morphology_single_timepoint(args):
             volume = properties.loc[properties["TrackID"] == region_label, "volume"].values[0]
 
             # Surface area + sphericity via marching cubes
-            if np.count_nonzero(mask) >= 4:  # sanity check for marching_cubes
+            z_coords = coords[:, 0]  # assuming axis 0 = z
+            if (z_coords.max() - z_coords.min()) >= 1 and np.count_nonzero(mask) >= 4:
+            # if np.count_nonzero(mask) >= 4:  # sanity check for marching_cubes
                 try:
                     verts, faces, _, _ = marching_cubes(mask.astype(float), spacing=voxel_spacing)
                     surface_area = mesh_surface_area(verts, faces)
@@ -1118,7 +1193,7 @@ def _calculate_morphology_single_timepoint(args):
             if coords.shape[0] >= 4:
                 try:
                     scaled_coords = coords * np.array(voxel_spacing)
-                    hull = ConvexHull(scaled_coords)
+                    hull = ConvexHull(scaled_coords, qhull_options='QJ')
                     convex_volume = hull.volume
                 except Exception:
                     convex_volume = np.nan

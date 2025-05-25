@@ -15,12 +15,13 @@ def laptrack_image(
     element_size_x=1,
     element_size_y=1,
     element_size_z=1,
-    track_cost_cutoff=45**2, 
+    track_cost_cutoff=25**2, 
     gap_closing_cost_cutoff=60**2,
     gap_closing_max_frame_count=3,
     merging_cost_cutoff=False,
     splitting_cost_cutoff=False,
-    return_trackimg=True
+    return_trackimg=True,
+    
     ):
     
     assert segments is not None or segments_path is not None, "Either segments or segments_path must be provided"

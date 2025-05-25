@@ -1,6 +1,8 @@
 from behav3d.utils.fileio import load_image, append_to_zarr, save_as_zarr
 from behav3d.utils.preprocessing import dilate_mask
 from behav3d.utils.segmentation import segment_size_filter
+from behav3d.utils.tracking import convert_tracked_image_to_csv
+
 from skimage.segmentation import watershed
 import numpy as np
 import pandas as pd
@@ -48,6 +50,9 @@ def propagate_tracks(
     segments_path,
     tracked_img_outpath,
     tracked_csv_outpath,
+    element_size_x=1,
+    element_size_y=1,
+    element_size_z=1,
     dilation_nr_pixels=2,
     segment_size_min=100,
     **kwargs
@@ -75,7 +80,15 @@ def propagate_tracks(
         seg_prev_tp = t_tracked_seg.copy()
         t_tracked_seg = np.expand_dims(t_tracked_seg, axis=0)
         append_to_zarr(t_tracked_seg, tracked_img_outpath)
-
+        
+    df_tracks = convert_tracked_image_to_csv(
+            img_path=tracked_img_outpath,
+            outpath=tracked_csv_outpath,
+            element_size_x=element_size_x,
+            element_size_y=element_size_y,
+            element_size_z=element_size_z
+        )
+    # Save the tracked image as zarr
 def run_propagation_tracking(
     metadata,
     output_dir,
@@ -87,6 +100,10 @@ def run_propagation_tracking(
         sample_name=sample['sample_name']
         print(f"Tracking sample: {sample_name}")
 
+        element_size_x = sample["pixel_distance_xy"]
+        element_size_y = sample["pixel_distance_xy"]
+        element_size_z = sample["pixel_distance_z"]
+        
         tracked_img_outdir = Path(output_dir, "images", sample_name)
         tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         
@@ -108,6 +125,9 @@ def run_propagation_tracking(
                 segments_path=segments_path,
                 tracked_img_outpath=tracked_img_outpath,
                 tracked_csv_outpath=tracked_csv_outpath,
+                element_size_x=element_size_x,
+                element_size_y=element_size_y,
+                element_size_z=element_size_z,
             )
         else:
             print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
