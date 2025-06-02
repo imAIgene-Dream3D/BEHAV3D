@@ -252,8 +252,7 @@ def train_pixel_classifier(
     
     features_outpath = Path(pixel_class_outdir, 'PixelClassifier_Features.zarr')
     image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
-    
-    ### TEST
+ 
     if not features_outpath.exists() or not image_outpath.exists():
         if image_outpath.exists():
             shutil.rmtree(image_outpath)
@@ -535,16 +534,16 @@ def train_pixel_classifier(
 
     napari.run()
 
-def apply_pixel_classifier(
-    classifier,
-    img,
-    t
-    ):
-    clf_path, path, outpath, idx = args
-    clf = joblib.load(clf_path)
-    features = np.asarray(load_image(path, mode="r")[idx])
-    prediction = zarr.open(outpath, mode="r+")
-    prediction[idx] = future.predict_segmenter(features, clf)
+# def apply_pixel_classifier(
+#     classifier,
+#     img,
+#     t
+#     ):
+#     clf_path, path, outpath, idx = args
+#     clf = joblib.load(clf_path)
+#     features = np.asarray(load_image(path, mode="r")[idx])
+#     prediction = zarr.open(outpath, mode="r+")
+#     prediction[idx] = future.predict_segmenter(features, clf)
     
 def run_pixel_classifier_segmentation(
     output_dir,
