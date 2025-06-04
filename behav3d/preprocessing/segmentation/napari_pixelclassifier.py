@@ -559,7 +559,7 @@ def run_pixel_classifier_segmentation(
     clf_death = joblib.load(clf_death_path)
     
     for idx, sample in metadata.iterrows():
-        print(f"Processing sample: {sample['sample_name']}")
+        print(f"Processing sample: {sample['sample_name']}") 
         start_time = time.time()
         sample_name = sample['sample_name']
         

@@ -5,6 +5,20 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 
+# def smooth_value_over_time(
+#     df, 
+#     column, 
+#     rolling_meanspeed_window, 
+#     min_periods=1,
+#     groupby=["TrackID", "sample_name"]
+#     ):
+#     smoothed_column = df.groupby(groupby)[column].apply(
+#         lambda x: x.rolling(
+#             window=rolling_meanspeed_window, 
+#             min_periods=min_periods
+#             ).mean()
+#         ).reset_index(drop=True)
+#     return(smoothed_column)
 def smooth_value_over_time(
     df, 
     column, 
@@ -12,14 +26,14 @@ def smooth_value_over_time(
     min_periods=1,
     groupby=["TrackID", "sample_name"]
     ):
-    smoothed_column = df.groupby(groupby)[column].apply(
+    smoothed_column = df.groupby(groupby)[column].transform(
         lambda x: x.rolling(
             window=rolling_meanspeed_window, 
             min_periods=min_periods
-            ).mean()
-        ).reset_index(drop=True)
-    return(smoothed_column)
-            
+        ).mean()
+    )
+    return smoothed_column   
+   
 def plot_filter_count(
     df_track_counts,
     outpath,
