@@ -162,6 +162,14 @@ for feature in features:
     )
     plt.show()
 
+"""
+#############################
+
+TSFRESH
+
+#############################
+"""
+
 
 from tsfresh import select_features
 from tsfresh.utilities.dataframe_functions import impute
@@ -192,8 +200,6 @@ if min_track_length is not None:
 if max_track_length is not None:
     df_tracks_tsfresh=df_tracks_tsfresh.groupby(id_columns).apply(lambda group: group.iloc[:max_track_length]).reset_index(drop=True)
     
-
-
     
 df_tracks_tsfresh["composite_id"] = (
     df_tracks_tsfresh["sample_name"] + "--" + df_tracks_tsfresh["TrackID"].astype(str)
@@ -206,47 +212,103 @@ df_tracks_tsfresh["tcell_contact"] = df_tracks_tsfresh["tcell_contact"].astype(n
 ### Z-scale certain features
 scaler = StandardScaler()
 # scaler = RobustScaler()
-df_tracks_tsfresh["speed"] = pd.DataFrame(scaler.fit_transform(df_tracks_tsfresh["speed"]), columns=df_tracks_tsfresh["speed"].columns)
+df_tracks_tsfresh[features] = pd.DataFrame(scaler.fit_transform(pd.DataFrame(df_tracks_tsfresh[features])), columns=features)
 
 
 extracted_features = extract_features(
     df_tracks_tsfresh, 
     column_id="composite_id", 
     column_sort="position_t",
-    impute_function=impute
+    impute_function=impute,
+    n_jobs=0
     )
 
-summarized_features = df_tracks_tsfresh.groupby(["composite_id"])[features].mean().reset_index()
-summarized_features[["sample_name", "TrackID"]] = summarized_features["composite_id"].str.split("--", expand=True)
-summarized_features["sample_name"] = summarized_features["sample_name"].astype(str)
-summarized_features["TrackID"] = summarized_features["TrackID"].astype(int)
+extracted_features_scaled = extracted_features.copy()
+scaler = StandardScaler()
+extracted_features_scaled = scaler.fit_transform(extracted_features)
+extracted_features_scaled = pd.DataFrame(extracted_features_scaled, 
+                                         index=extracted_features.index, 
+                                         columns=extracted_features.columns)
+# Start with your extracted tsfresh features
+features = extracted_features_scaled.copy()  # just to be safe
+
+# 1. Drop columns that are all NaN
+features_clean = features.dropna(axis=1, how='all')
+
+# 2. Drop constant columns (no variance)
+features_clean = features_clean.loc[:, features_clean.nunique() > 1]
+
+# 3. Drop highly correlated columns (e.g., correlation > 0.95)
+corr_matrix = features_clean.corr().abs()
+upper_triangle = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+to_drop = [col for col in upper_triangle.columns if any(upper_triangle[col] > 0.95)]
+features_clean = features_clean.drop(columns=to_drop)
+
+# # 4. (Optional) Standardize features (for later clustering)
+# scaler = StandardScaler()
+# features_scaled = scaler.fit_transform(features_clean)
+
+# # 5. Keep as DataFrame with original index and column names
+# features_clean_scaled = pd.DataFrame(features_scaled, 
+#                                      index=features_clean.index, 
+#                                      columns=features_clean.columns)
+
+# extracted_features.index.name = 'composite_id'
+# features_clean = features_clean.reset_index()
+# df_extracted_features.index.name = 'index'
+# summarized_features = df_tracks_tsfresh.groupby(["composite_id"])[features].mean().reset_index()
+# summarized_features = extracted_features.groupby(["composite_id"]).mean().reset_index()
+df_extracted_features = features_clean.copy()
+df_extracted_features = df_extracted_features.reset_index()
+
+df_extracted_features[["sample_name", "TrackID"]] = df_extracted_features["composite_id"].str.split("--", expand=True)
+df_extracted_features["sample_name"] = df_extracted_features["sample_name"].astype(str)
+df_extracted_features["TrackID"] = df_extracted_features["TrackID"].astype(int)
+
+umap_features = df_extracted_features.drop(columns=["composite_id", "sample_name", "TrackID"])
+pca = PCA(n_components=20)
+X_pca = pca.fit_transform(umap_features)
 
 umap_model = umap.UMAP(
         n_components=2, 
-        n_neighbors=15, 
+        n_neighbors=30, 
         min_dist=0.1, 
         init="random", 
         random_state=123,
         # metric="precomputed", 
         )
 
-umap_embedding = umap_model.fit_transform(extracted_features)
-
-extracted_features = extracted_features.reset_index().rename(columns={"index": "composite_id"})
-extracted_features[["sample_name","TrackID"]] = extracted_features["composite_id"].str.split("--", expand=True)
-extracted_features["sample_name"] = extracted_features["sample_name"].astype(str)
-extracted_features["TrackID"] = extracted_features["TrackID"].astype(int)
+# umap_embedding = umap_model.fit_transform(umap_features)
+umap_embedding = umap_model.fit_transform(X_pca)
+# df_extracted_features = df_extracted_features.reset_index().rename(columns={"index": "composite_id"})
+df_extracted_features[["sample_name","TrackID"]] = df_extracted_features["composite_id"].str.split("--", expand=True)
+df_extracted_features["sample_name"] = df_extracted_features["sample_name"].astype(str)
+df_extracted_features["TrackID"] = df_extracted_features["TrackID"].astype(int)
 
 umap_embedding = pd.DataFrame(umap_embedding, columns=['UMAP1', 'UMAP2'])
 
 df_umap = umap_embedding
-df_umap["sample_name"] = extracted_features["sample_name"]
-df_umap["TrackID"] = extracted_features["TrackID"]
-df_umap = pd.merge(df_umap, summarized_features, how="left", on=["TrackID", "sample_name"])
+df_umap["sample_name"] = df_extracted_features["sample_name"]
+df_umap["TrackID"] = df_extracted_features["TrackID"]
+df_umap = pd.merge(df_umap, df_extracted_features, how="left", on=["TrackID", "sample_name"])
 
+sns.scatterplot(
+            data=df_umap,
+            x="UMAP1",
+            y="UMAP2",
+            # hue=feature,
+            s=40,
+            alpha=0.95,
+            palette="viridis",
+            # legend=False
+        )
+
+summarized_features = df_tracks_tsfresh.groupby(["composite_id"])[features].mean().reset_index()
+
+df_umap_plot = pd.merge(df_umap, summarized_features, how="left", on=["composite_id"])
 for feature in features:
     sns.scatterplot(
-            data=df_umap,
+            data=df_umap_plot,
             x="UMAP1",
             y="UMAP2",
             hue=feature,
