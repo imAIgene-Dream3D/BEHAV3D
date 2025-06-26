@@ -248,7 +248,7 @@ def train_pixel_classifier(
         n_workers = multiprocessing.cpu_count()
         
     pixel_class_outdir = Path(output_dir, "images", "PixelClassification")
-    pixel_class_outdir.mkdir(exist_ok=True)
+    pixel_class_outdir.mkdir(exist_ok=True, parents=True)
     
     features_outpath = Path(pixel_class_outdir, 'PixelClassifier_Features.zarr')
     image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
@@ -274,6 +274,16 @@ def train_pixel_classifier(
             raw_image_path = Path(sample['raw_image_path'])
             raw_image_zarr =  Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
             
+            if not raw_image_zarr.exists():
+                print(f"- Converting raw image to .zarr for memory efficiency...")
+                images = load_image(raw_image_path)
+                chunksize = (1,) + images.shape[1:]
+                save_as_zarr(
+                    img=images, 
+                    path=raw_image_zarr, 
+                    chunks=chunksize
+                    )
+                        
             images = load_image(raw_image_zarr)
             max_t = images.shape[0]-1
             print(images.shape)
