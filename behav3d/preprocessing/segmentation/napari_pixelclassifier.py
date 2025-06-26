@@ -157,7 +157,7 @@ def segment_tcell_and_organoid(
     tcell_edt_threshold=1.5,
     tcell_edt_threshold_refined=[2, 2.5, 3],
     tcell_segment_size_min=10,
-    organoid_edt_threshold=12,
+    # organoid_edt_threshold=12,
     organoid_segment_size_min=1000,
     ):
     """
@@ -185,7 +185,7 @@ def segment_tcell_and_organoid(
     segments : np.ndarray
         The segmented T-cells and organoids.
     """
-    organoid, tcell =  args
+    organoid, tcell, organoid_edt_threshold =  args
     tcell = postprocess_mask(tcell, opening_nr_pixels=0)
     organoid = postprocess_mask(organoid, opening_nr_pixels=3)
 
@@ -327,7 +327,9 @@ def train_pixel_classifier(
     
     def segment_and_update(
         pixel_class_outdir,
-        tcell_edt_threshold: float = 2.5,
+        only_segment=False,
+        tcell_edt_threshold=2.5,
+        organoid_edt_threshold: float = 12,
         n_workers: int = 16,
         log=print
         ):
@@ -354,7 +356,7 @@ def train_pixel_classifier(
         save_as_zarr(org_label_data, org_labels_outpath)
         save_as_zarr(tcell_label_data, tcell_labels_outpath)
         save_as_zarr(dead_label_data, dead_labels_outpath)
-   
+    
         def train_classifier(user_labels, features):
             flat_label_data = user_labels.ravel()
             flat_features = features.reshape(-1, features.shape[-1])  # shape: (N_total, 90)
@@ -387,26 +389,27 @@ def train_pixel_classifier(
             clf = future.fit_segmenter(selected_labels, selected_features, clf)
             return clf
         
-        log("\n### Training Random Forest Classifier (Organoids)")
-        clf_organoids = train_classifier(org_label_data, all_features)
-        org_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid.joblib')
-        log("Saving RandomForest, Sparse labels and input images to {org_random_forest_outpath}")
-        joblib.dump(clf_organoids, org_random_forest_outpath)
-        QApplication.processEvents()
-        
-        log("\n### Training Random Forest Classifier (T-cells)")
-        clf_tcells = train_classifier(tcell_label_data, all_features)
-        tcell_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Tcell.joblib')
-        log("Saving RandomForest, Sparse labels and input images to {tcell_random_forest_outpath}")
-        joblib.dump(clf_tcells, tcell_random_forest_outpath)
-        QApplication.processEvents()
-        
-        log("\n### Training Random Forest Classifier (Cell Death)")
-        clf_death = train_classifier(dead_label_data, all_features)
-        death_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Death.joblib')
-        log("Saving RandomForest, Sparse labels and input images to {death_random_forest_outpath}")
-        joblib.dump(clf_death, death_random_forest_outpath)
-        QApplication.processEvents()
+        if not only_segment:
+            log("\n### Training Random Forest Classifier (Organoids)")
+            clf_organoids = train_classifier(org_label_data, all_features)
+            org_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid.joblib')
+            log("Saving RandomForest, Sparse labels and input images to {org_random_forest_outpath}")
+            joblib.dump(clf_organoids, org_random_forest_outpath)
+            QApplication.processEvents()
+            
+            log("\n### Training Random Forest Classifier (T-cells)")
+            clf_tcells = train_classifier(tcell_label_data, all_features)
+            tcell_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Tcell.joblib')
+            log("Saving RandomForest, Sparse labels and input images to {tcell_random_forest_outpath}")
+            joblib.dump(clf_tcells, tcell_random_forest_outpath)
+            QApplication.processEvents()
+            
+            log("\n### Training Random Forest Classifier (Cell Death)")
+            clf_death = train_classifier(dead_label_data, all_features)
+            death_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Death.joblib')
+            log("Saving RandomForest, Sparse labels and input images to {death_random_forest_outpath}")
+            joblib.dump(clf_death, death_random_forest_outpath)
+            QApplication.processEvents()
         
         
         pred_org_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid_PredictedLabels.zarr')
@@ -414,35 +417,57 @@ def train_pixel_classifier(
         pred_death_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Death_PredictedLabels.zarr')
         # parts_outpath = Path(pred_labels_outpath.parent, "pred_parts")
         
-        if pred_org_labels_outpath.exists():
-            shutil.rmtree(pred_org_labels_outpath)
-        if pred_tcell_labels_outpath.exists():
-            shutil.rmtree(pred_tcell_labels_outpath)
-        if pred_death_labels_outpath.exists():
-            shutil.rmtree(pred_death_labels_outpath)
+        if not only_segment:
+            if pred_org_labels_outpath.exists():
+                shutil.rmtree(pred_org_labels_outpath)
+            if pred_tcell_labels_outpath.exists():
+                shutil.rmtree(pred_tcell_labels_outpath)
+            if pred_death_labels_outpath.exists():
+                shutil.rmtree(pred_death_labels_outpath)
 
-        log("\n### Predicting Organoid Pixels")
-        QApplication.processEvents()
-        pred_org_mask = apply_classifier(clf_organoids, features_outpath, pred_org_labels_outpath)
-        
-        log("\n### Predicting T-cell Pixels")
-        QApplication.processEvents()
-        pred_tcell_mask = apply_classifier(clf_tcells, features_outpath, pred_tcell_labels_outpath)
-        
-        log("\n### Predicting Death Pixels")
-        QApplication.processEvents()
-        pred_death_mask = apply_classifier(clf_death, features_outpath, pred_death_labels_outpath)
-        
-        viewer.layers["Pixel Classification (Organoid)"].data = pred_org_mask
-        viewer.layers["Pixel Classification (Tcell)"].data = pred_tcell_mask
-        viewer.layers["Pixel Classification (Dead)"].data = pred_death_mask
+            log("\n### Predicting Organoid Pixels")
+            QApplication.processEvents()
+            pred_org_mask = apply_classifier(clf_organoids, features_outpath, pred_org_labels_outpath)
+            
+            log("\n### Predicting T-cell Pixels")
+            QApplication.processEvents()
+            pred_tcell_mask = apply_classifier(clf_tcells, features_outpath, pred_tcell_labels_outpath)
+            
+            log("\n### Predicting Death Pixels")
+            QApplication.processEvents()
+            pred_death_mask = apply_classifier(clf_death, features_outpath, pred_death_labels_outpath)
+            
+            viewer.layers["Pixel Classification (Organoid)"].data = pred_org_mask
+            viewer.layers["Pixel Classification (Tcell)"].data = pred_tcell_mask
+            viewer.layers["Pixel Classification (Dead)"].data = pred_death_mask
 
+        else:
+            log("\n### Loading Organoid Prediction Mask")
+            QApplication.processEvents()
+            pred_org_mask = viewer.layers["Pixel Classification (Organoid)"].data
+            pred_org_mask[pred_org_mask==1] = 0
+            viewer.layers["Pixel Classification (Organoid)"].data = pred_org_mask
+            
+            log("\n### Loading T-cell Prediction Mask")
+            QApplication.processEvents()
+            pred_tcell_mask = viewer.layers["Pixel Classification (Tcell)"].data
+            pred_tcell_mask[pred_tcell_mask==1] = 0
+            viewer.layers["Pixel Classification (Tcell)"].data = pred_tcell_mask
+            
+            log("\n### Loading Death Prediction Mask")
+            QApplication.processEvents()
+            pred_death_mask = viewer.layers["Pixel Classification (Dead)"].data
+            pred_death_mask[pred_death_mask==1] = 0
+            viewer.layers["Pixel Classification (Dead)"].data = pred_death_mask
+            
         log("\n### Segment Cell and Organoid Instances")
         QApplication.processEvents()
-        args_list = [(pred_org_mask[idx], pred_tcell_mask[idx]) for idx in range(org_label_data.shape[0])]
+        args_list = [(pred_org_mask[idx], pred_tcell_mask[idx], organoid_edt_threshold) for idx in range(org_label_data.shape[0])]
         results=[]
+
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             results+=list(tqdm(executor.map(segment_tcell_and_organoid, args_list), total=len(args_list)))
+
         full_seg_organoid, full_seg_tcell = zip(*results)
 
         full_seg_organoid = np.stack(full_seg_organoid, axis=0)
@@ -502,12 +527,22 @@ def train_pixel_classifier(
 
     for name, data in user_layers.items():
         layer = viewer.add_labels(data, name=name, opacity=0.3)
-       
-    pixelclass_layers = {
-        "Pixel Classification (Organoid)": np.zeros(all_images.shape[1:]).astype(np.int16),
-        "Pixel Classification (Tcell)": np.zeros(all_images.shape[1:]).astype(np.int16),
-        "Pixel Classification (Dead)": np.zeros(all_images.shape[1:]).astype(np.int16),
-    }
+    
+    pred_org_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid_PredictedLabels.zarr')
+    pred_tcell_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Tcell_PredictedLabels.zarr')
+    pred_death_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Death_PredictedLabels.zarr')
+    if not pred_org_labels_outpath.exists():
+        pixelclass_layers = {
+            "Pixel Classification (Organoid)": np.zeros(all_images.shape[1:]).astype(np.int16),
+            "Pixel Classification (Tcell)": np.zeros(all_images.shape[1:]).astype(np.int16),
+            "Pixel Classification (Dead)": np.zeros(all_images.shape[1:]).astype(np.int16),
+        }
+    else:
+        pixelclass_layers = {
+            "Pixel Classification (Organoid)": np.asarray(load_zarr(pred_org_labels_outpath)),
+            "Pixel Classification (Tcell)": np.asarray(load_zarr(pred_tcell_labels_outpath)),
+            "Pixel Classification (Dead)": np.asarray(load_zarr(pred_death_labels_outpath)),
+        }
     
     for name, data in pixelclass_layers.items():
         layer = viewer.add_labels(data, name=name, opacity=0.3, visible=False)
@@ -530,10 +565,12 @@ def train_pixel_classifier(
         log=log_output.appendPlainText
         )
     gui = magicgui(update_function, 
-                tcell_edt_threshold={"widget_type": "FloatSlider", "min": 1.0, "max": 15.0, "step": 0.5}
+                tcell_edt_threshold={"widget_type": "FloatSlider", "min": 1.0, "max": 15.0, "step": 0.5},
+                organoid_edt_threshold={"widget_type": "FloatSlider", "min": 1.0, "max": 20.0, "step": 0.5},
+                only_segment={"widget_type": "Checkbox", "text": "Only Segment"}
                 )
     viewer.window.add_dock_widget(gui)
-    
+        
     save_button = PushButton(label="Save User Labels")
     save_function = partial(
         save_pixel_classification,
@@ -558,6 +595,7 @@ def train_pixel_classifier(
 def run_pixel_classifier_segmentation(
     output_dir,
     metadata,
+    organoid_edt_threshold=12
     ):
     
     clf_org_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_Organoid.joblib')
@@ -621,7 +659,7 @@ def run_pixel_classifier_segmentation(
                 
                 # print("\n### Segmenting Organoids and T-cells")
                 seg_organoid, seg_tcell = segment_tcell_and_organoid(
-                    args = (pred_org_mask, pred_tcell_mask),  
+                    args = (pred_org_mask, pred_tcell_mask, organoid_edt_threshold),  
                 )
                 
                 append_to_zarr(np.expand_dims(seg_organoid, axis=0), organoid_segments_outpath)
