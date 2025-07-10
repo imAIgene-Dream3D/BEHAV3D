@@ -591,6 +591,34 @@ def train_pixel_classifier(
 #     features = np.asarray(load_image(path, mode="r")[idx])
 #     prediction = zarr.open(outpath, mode="r+")
 #     prediction[idx] = future.predict_segmenter(features, clf)
+def _run_single_timepoint_segmentation(
+    t_img,
+    clf_org,
+    clf_tcell,
+    clf_death,
+    organoid_edt_threshold=6,
+    ):
+    features = features_func(t_img)
+    # result = future.predict_segmenter(features, clf)
+        
+    # print("\n### Predicting Organoid Pixels")
+    pred_org_mask = future.predict_segmenter(features, clf_org)
+    pred_org_mask[pred_org_mask>0] -= 1
+    
+    # print("\n### Predicting T-cell Pixels")
+    pred_tcell_mask = future.predict_segmenter(features, clf_tcell)
+    pred_tcell_mask[pred_tcell_mask>0] -= 1
+    
+    # print("\n### Predicting Death Pixels")
+    pred_death_mask = future.predict_segmenter(features, clf_death)
+    pred_death_mask[pred_death_mask>0] -= 1
+    
+    # print("\n### Segmenting Organoids and T-cells")
+    seg_organoid, seg_tcell = segment_tcell_and_organoid(
+        args = (pred_org_mask, pred_tcell_mask, organoid_edt_threshold),  
+    )
+    
+    return(seg_organoid, seg_tcell, pred_death_mask)
     
 def run_pixel_classifier_segmentation(
     output_dir,
@@ -642,26 +670,33 @@ def run_pixel_classifier_segmentation(
                 shutil.rmtree(organoid_segments_outpath)
             
             for t, t_img in tqdm(enumerate(img), total=img.shape[0]):
-                features = features_func(t_img)
-                # result = future.predict_segmenter(features, clf)
+                # features = features_func(t_img)
+                # # result = future.predict_segmenter(features, clf)
                     
-                # print("\n### Predicting Organoid Pixels")
-                pred_org_mask = future.predict_segmenter(features, clf_org)
-                pred_org_mask[pred_org_mask>0] -= 1
+                # # print("\n### Predicting Organoid Pixels")
+                # pred_org_mask = future.predict_segmenter(features, clf_org)
+                # pred_org_mask[pred_org_mask>0] -= 1
                 
-                # print("\n### Predicting T-cell Pixels")
-                pred_tcell_mask = future.predict_segmenter(features, clf_tcell)
-                pred_tcell_mask[pred_tcell_mask>0] -= 1
+                # # print("\n### Predicting T-cell Pixels")
+                # pred_tcell_mask = future.predict_segmenter(features, clf_tcell)
+                # pred_tcell_mask[pred_tcell_mask>0] -= 1
                 
-                # print("\n### Predicting Death Pixels")
-                pred_death_mask = future.predict_segmenter(features, clf_death)
-                pred_death_mask[pred_death_mask>0] -= 1
+                # # print("\n### Predicting Death Pixels")
+                # pred_death_mask = future.predict_segmenter(features, clf_death)
+                # pred_death_mask[pred_death_mask>0] -= 1
                 
-                # print("\n### Segmenting Organoids and T-cells")
-                seg_organoid, seg_tcell = segment_tcell_and_organoid(
-                    args = (pred_org_mask, pred_tcell_mask, organoid_edt_threshold),  
+                # # print("\n### Segmenting Organoids and T-cells")
+                # seg_organoid, seg_tcell = segment_tcell_and_organoid(
+                #     args = (pred_org_mask, pred_tcell_mask, organoid_edt_threshold),  
+                # )
+                
+                seg_organoid, seg_tcell, pred_death_mask = _run_single_timepoint_segmentation(
+                    t_img=t_img,
+                    clf_org=clf_org,
+                    clf_tcell=clf_tcell,
+                    clf_death=clf_death,
+                    organoid_edt_threshold=organoid_edt_threshold
                 )
-                
                 append_to_zarr(np.expand_dims(seg_organoid, axis=0), organoid_segments_outpath)
                 append_to_zarr(np.expand_dims(seg_tcell, axis=0), tcell_segments_outpath)
                 append_to_zarr(np.expand_dims(pred_death_mask, axis=0), death_mask_outpath)

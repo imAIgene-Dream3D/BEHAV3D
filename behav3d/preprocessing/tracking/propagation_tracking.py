@@ -27,7 +27,7 @@ import dask.array as da
 #     new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
 #     return new_seg
 
-def propagate_segmentation(
+def _run_single_timepoint_propagation(
     t_seg,
     seg_prev_tp,
     outpath,
@@ -70,7 +70,7 @@ def propagate_tracks(
         if t==0:
             t_tracked_seg = np.asarray(t_seg)
         else:
-            t_tracked_seg = propagate_segmentation(
+            t_tracked_seg = _run_single_timepoint_propagation(
                 t_seg,
                 seg_prev_tp,
                 outpath = tracked_img_outpath,
