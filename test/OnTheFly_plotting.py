@@ -24,8 +24,8 @@ from PIL import ImageChops
 from skimage import measure
 from scipy.ndimage import binary_erosion
 
-output_dir = r"/Volumes/T7_Sam//BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
-metadata_csv_path = r"/Volumes/T7_Sam//BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
+output_dir = r"D:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
+metadata_csv_path = r"D:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata_windows_home.csv"
 metadata = load_behav3d_metadata(metadata_csv_path)
 
 
@@ -43,7 +43,9 @@ org_tracks_path = Path(sample_metadata["organoid_tracks_image_path"])
 tcell_tracks_path = Path(sample_metadata["tcell_tracks_image_path"])
 tcell_tracks_csv_path = Path(sample_metadata["tcell_tracks_csv_path"])
 dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
-organoid_track_csv_path = f"/Volumes/T7_Sam//BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/analysis/organoid/results/per_sample/ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)/organoid/ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)_organoid_track_analysis.csv"
+organoid_track_csv_path = f"D:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/analysis/organoid/results/per_sample/ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)/organoid/ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)_organoid_track_analysis.csv"
+organoid_track_csv_path = f"D:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/analysis/organoid/results/per_sample/ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)/organoid/ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)_organoid_track_analysis.csv"
+
 tcell_segments_path = Path(sample_metadata["tcell_segments_image_path"])
 
 raw_image = load_image(raw_image_path)
@@ -95,7 +97,7 @@ def compute_2d_borders_from_3d_labels(label_image_4d):
 org_borders = compute_2d_borders_from_3d_labels(org_tracks.compute())
 
 #Visualized for behav3d(4): 5, 15
-segment_id = 46
+segment_id = 39
 mask = org_tracks == segment_id
 
 raw_image_tcell[~mask] = 0
@@ -106,7 +108,7 @@ raw_image_death[~mask] = 0
 # raw_image_death = raw_image[:,2]
 
 napari_tracks_full = tcell_tracks_csv[["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
-
+# org_tracks_full = org_tracks_csv[["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
 elsize = (sample_metadata["pixel_distance_z"], sample_metadata["pixel_distance_xy"], sample_metadata["pixel_distance_xy"])
 viewer = napari.Viewer()
 
@@ -115,10 +117,10 @@ viewer.add_image(raw_image_org, name='Raw Image (Organoid)', colormap= "yellow",
 viewer.add_image(raw_image_death, name='Raw Image (Death)', colormap= "red", scale=elsize, blending='additive')
 viewer.add_tracks(napari_tracks_full, name='All T-cell Tracks',  tail_length=20)
 viewer.add_image(dead_mask, name='Dead Mask', scale=elsize, blending='additive')
-viewer.add_labels(tcell_segments, name='T-cell Segments', scale=elsize, blending='additive')
+# viewer.add_labels(tcell_segments, name='T-cell Segments', scale=elsize, blending='additive')
 viewer.add_labels(tcell_tracks, name='T-cell Tracks', opacity=0.5, scale=elsize)
 viewer.add_labels(org_tracks, name='Organoid Tracks', opacity=0.5, scale=elsize)
-viewer.add_labels(org_borders, name='Organoid Tracks (borders)', opacity=0.5, scale=elsize)
+# viewer.add_labels(org_borders, name='Organoid Tracks (borders)', opacity=0.5, scale=elsize)
 viewer.add_image(dying_orgs, name='Dying Organoids', colormap='yellow', scale=elsize, blending='additive')
 # viewer.add_shapes(contours, shape_type='polygon', edge_color='red', name="Contours")
 # viewer.close()
@@ -161,9 +163,9 @@ frames_np = [np.array(img) for img in images]
 
 # Save as .mp4 with h.264 encoding
 iio.imwrite(
-    "/Users/s.deblank-3/Downloads/ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)_DeadMask.mp4",
+    "C:/Users/Samde/Downloads/ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)_ChannelsCombined.mp4",
     frames_np,
-    fps=20,
+    fps=15,
     codec="libx264",
     quality=8,  # 0–10 (10 = best)
     pixelformat="yuv420p",  # ensure compatibility
@@ -175,7 +177,7 @@ iio.imwrite(
 
 
 
-df = pd.read_csv(r"/Volumes/T7_Sam/\BHVD_BEHAV3D\BEHAV3D_python\runs\ROCHE\analysis\organoid\results\per_sample\ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)\organoid\ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)_organoid_general_analysis.csv")
+df = pd.read_csv(r"D:\BHVD_BEHAV3D\BEHAV3D_python\runs\ROCHE\analysis\organoid\results\per_sample\ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)\organoid\ROCHE_JM1_Exp016-1_Img02_MAGEA4_TCB_Behav3d(4)_organoid_general_analysis.csv")
 
 time = df['position_t']
 alive = df['nr_alive']
