@@ -15,6 +15,7 @@ from skimage.measure import label
 from skimage.segmentation import watershed, relabel_sequential
 
 from sklearn.ensemble import RandomForestClassifier
+# from napari_apoc import PixelClassifier  # Commented out - use scikit-learn instead
 from scipy.ndimage import binary_fill_holes, find_objects
 
 from behav3d.utils.preprocessing import open_mask, dilate_mask
@@ -379,13 +380,14 @@ def train_pixel_classifier(
                 1: nr_bg_pix / total_pix,
                 2: nr_fg_pix / total_pix,
             }
+            # Use scikit-learn RandomForestClassifier (fallback if napari_apoc not available)
             clf = RandomForestClassifier(
                 n_estimators=50,
                 n_jobs=-1, 
                 max_depth=20, 
                 # max_samples=0.05,
                 class_weight=class_weights
-                )
+            )
             
             clf = future.fit_segmenter(selected_labels, selected_features, clf)
             return clf
@@ -723,5 +725,5 @@ def run_pixel_classifier_segmentation(
                 append_to_zarr(np.expand_dims(pred_death_mask, axis=0), death_mask_outpath)
                 
         metadata.at[idx, "tcell_segments_image_path"] = str(tcell_segments_outpath)
-        metadata.at[idx, "organoid_tracks_image_path"] = str(organoid_segments_outpath)
+        metadata.at[idx, "organoid_segments_image_path"] = str(organoid_segments_outpath)
     return(metadata)
