@@ -321,11 +321,17 @@ def plot_sample_organoid_analysis(
     seg_img = load_image(organoid_seg_path)
     dead_mask = load_image(dead_mask_path)
     
-    t_middle = raw_img.shape[0] // 2
-    
     raw_img = calc_z_projection(raw_img, projection="max", z_axis=-3)
     seg_img = calc_z_projection(seg_img, projection="max", z_axis=-3)
     dead_mask = calc_z_projection(dead_mask, projection="max", z_axis=-3)
+    
+    # Use segmentation image time dimension as reference (since it was actually processed)
+    seg_timepoints = seg_img.shape[0]
+    
+    # Truncate raw image to match segmentation timepoints
+    raw_img = raw_img[:seg_timepoints]
+    
+    t_middle = raw_img.shape[0] // 2
     
     t_start_img = np.asarray(raw_img[0])
     t_mid_img = np.asarray(raw_img[t_middle])
