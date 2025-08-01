@@ -2,14 +2,35 @@
 
 ## Installation
 
-If required, install [miniforge](https://github.com/conda-forge/miniforge)
-
+If required, install [miniforge](https://github.com/conda-forge/miniforge) or [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
+ - Mamba is a faster version of conda but both work the same
+ - On Windows, isntallation with the mamba .exe might be blocked. If so, open a command terminal (cmd.exe) and run:
 ```
-mamba env create --file env_*.yml
+start /wait "" Miniforge3-Windows-x86_64.exe /InstallationType=JustMe /RegisterPython=0 /S /D=%UserProfile%\Miniforge3
+```
+
+1. Open a miniforge terminal or conda terminal
+2. Navigate to the BEHAV3D repository
+```
+cd <path/to/this/behav3/repository>
+```
+
+1. Create a python environment and install required packages
+- Choose [env_mac.yml](./env_mac.yml) or [env_windows.yml](./env_windows.yml) dependent on what operating system you are on
+
+Mac install:
+```
+mamba env create --file env_mac.yml
 mamba activate behav3d
-pip install -e <path/to/this/behav3/repository>
+pip install -e .
 ```
 
+Windows install:
+```
+mamba env create --file env_windows.yml
+mamba activate behav3d
+pip install -e .
+```
 
 ## How to run
 

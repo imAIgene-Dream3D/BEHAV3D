@@ -290,7 +290,8 @@ def train_pixel_classifier(
             idc = np.linspace(0, max_t, examples_per_sample, dtype=int)
             print(f"Taking timepoints: {idc}")
             
-            sample_images = [images[t, [tcell_ch, live_ch, dead_ch]] for t in idc]
+            # sample_images = [images[t, [tcell_ch, live_ch, dead_ch]] for t in idc]
+            sample_images = [images[t] for t in idc]
             # for idx in idc:
             #     sample_images.append(images[idx])      
             
