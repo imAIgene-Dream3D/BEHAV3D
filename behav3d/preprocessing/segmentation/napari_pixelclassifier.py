@@ -338,9 +338,9 @@ def train_pixel_classifier(
         log("###### Running Segmentation\n")
         QApplication.processEvents()
         # Access the label layer and feature image
-        
-        image_layer = viewer.layers['Image']
-        image_data = image_layer.data
+        # Get the first channel layer for reference (all channels have same shape)
+        image_layer = viewer.layers[f'Channel 1 (red)'] if 'Channel 1 (red)' in viewer.layers else viewer.layers[0]
+        image_data = all_images  # Use the original all_images data
         
         org_label_layer = viewer.layers['User Provided Labels (Organoid)']
         org_label_data = org_label_layer.data
@@ -494,8 +494,34 @@ def train_pixel_classifier(
             
     # Create Napari viewer
     viewer = napari.Viewer()
-    img_layer = viewer.add_image(all_images, name="Image", contrast_limits=(0,float(np.percentile(all_images[1,-1].reshape(-1), 99))))
-    img_layer.contrast_limits_range = (0, all_images.max())
+    
+    # Split channels and add them as separate colored layers
+    # all_images shape is (channels, time, z, y, x)
+    n_channels = all_images.shape[0]
+    
+    # Define colors for different channels
+    channel_colors = ['red', 'green', 'blue', 'cyan', 'magenta', 'yellow']
+    
+    for ch in range(n_channels):
+        channel_data = all_images[ch]  # Shape: (time, z, y, x)
+        
+        # Calculate contrast limits for this channel
+        channel_percentile = float(np.percentile(channel_data.reshape(-1), 99))
+        contrast_limits = (0, channel_percentile)
+        
+        # Add channel as separate layer with color
+        channel_name = f"Channel {ch+1}"
+        if ch < len(channel_colors):
+            channel_name = f"Channel {ch+1} ({channel_colors[ch]})"
+        
+        img_layer = viewer.add_image(
+            channel_data, 
+            name=channel_name, 
+            contrast_limits=contrast_limits,
+            colormap=channel_colors[ch] if ch < len(channel_colors) else 'gray',
+            blending='additive'  # This allows channels to blend together
+        )
+        img_layer.contrast_limits_range = (0, channel_data.max())
 
     org_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserOrganoidLabels.zarr')
     tcell_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserTcellLabels.zarr')
@@ -624,7 +650,8 @@ def _run_single_timepoint_segmentation(
 def run_pixel_classifier_segmentation(
     output_dir,
     metadata,
-    organoid_edt_threshold=12
+    organoid_edt_threshold=12,
+    timepoint_range=None
     ):
     
     clf_org_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_Organoid.joblib')
@@ -670,7 +697,20 @@ def run_pixel_classifier_segmentation(
             if organoid_segments_outpath.exists():
                 shutil.rmtree(organoid_segments_outpath)
             
-            for t, t_img in tqdm(enumerate(img), total=img.shape[0]):
+            # Determine which timepoints to process
+            if timepoint_range is not None:
+                start_t, end_t = timepoint_range
+                # Ensure range is within bounds
+                start_t = max(0, min(start_t, img.shape[0]-1))
+                end_t = max(start_t, min(end_t, img.shape[0]-1))
+                timepoint_indices = list(range(start_t, end_t + 1))
+                print(f"Processing timepoints: {start_t} to {end_t} (total: {len(timepoint_indices)})")
+            else:
+                timepoint_indices = list(range(img.shape[0]))
+                print(f"Processing all timepoints: 0 to {img.shape[0]-1}")
+            
+            for t in tqdm(timepoint_indices, total=len(timepoint_indices)):
+                t_img = img[t]
                 seg_organoid, seg_tcell, pred_death_mask = _run_single_timepoint_segmentation(
                     t_img=t_img,
                     clf_org=clf_org,
