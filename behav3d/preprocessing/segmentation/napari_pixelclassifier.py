@@ -242,9 +242,19 @@ def train_pixel_classifier(
     metadata,
     examples_per_sample = 3,
     sample_specific_classifier=False,
-    n_workers=None
+    n_workers=None,
+    manual_dim_order=None  # Optional: tuple/list for custom dimension order in transpose
     ):
-    
+    """
+    Train a pixel classifier for segmentation.
+    Args:
+        output_dir: Output directory
+        metadata: Metadata DataFrame
+        examples_per_sample: Number of timepoints per sample
+        sample_specific_classifier: Whether to use sample-specific classifier
+        n_workers: Number of workers
+        manual_dim_order: Optional. Tuple/list specifying the order for transpose, e.g. (1,0,2,3,4) for (C,T,Z,Y,X)
+    """
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
         
@@ -278,12 +288,28 @@ def train_pixel_classifier(
             if not raw_image_zarr.exists():
                 print(f"- Converting raw image to .zarr for memory efficiency...")
                 images = load_image(raw_image_path)
+                print(f"Original image shape: {images.shape}")
+                default_order = ("T", "C", "Z", "Y", "X")  # T, C, Z, Y, X
+                if manual_dim_order is not None:
+                    # Convert to tuple of characters if string
+                    if isinstance(manual_dim_order, str):
+                        manual_dim_order = tuple(manual_dim_order)
+                    if manual_dim_order != default_order:
+                        # Compute permutation: for each axis in default_order, find its index in manual_dim_order
+                        perm = [manual_dim_order.index(ax) for ax in default_order]
+                        print(f"Transposing image from {manual_dim_order} to {default_order} using permutation {perm}")
+                        images = images.transpose(perm)
+                        print(f"New image shape: {images.shape}")
+                    else:
+                        print("Image is already in default order (T, C, Z, Y, X).")
+                else:
+                    print("No manual_dim_order provided, assuming image is already in default order.")
                 chunksize = (1,) + images.shape[1:]
                 save_as_zarr(
                     img=images, 
                     path=raw_image_zarr, 
                     chunks=chunksize
-                    )
+                )
                         
             images = load_image(raw_image_zarr)
             max_t = images.shape[0]-1
@@ -313,8 +339,9 @@ def train_pixel_classifier(
             #         all_features+=list(tqdm(executor.map(calculate_features, args_list), total=len(idc)))
             # else:
             #     all_features+=[calculate_features(args) for args in tqdm(args_list) ]
+        # Allow manual override of dimension order for transpose
         all_images = da.stack(all_images)
-        all_images = all_images.transpose(1, 0, 2, 3, 4)
+        all_images = all_images.transpose(1, 0, 2, 3, 4) ## this order corresponds to (C, T, Z, Y, X)
         save_as_zarr(all_images, image_outpath)
         del all_images
         gc.collect()
@@ -727,3 +754,15 @@ def run_pixel_classifier_segmentation(
         metadata.at[idx, "tcell_segments_image_path"] = str(tcell_segments_outpath)
         metadata.at[idx, "organoid_segments_image_path"] = str(organoid_segments_outpath)
     return(metadata)
+
+def print_image_shape(image_path):
+    """
+    Loads an image and prints its shape and axis sizes.
+    Args:
+        image_path: Path to the image file (zarr, tif, etc.)
+    """
+    img = load_image(image_path)
+    print(f"Image loaded from: {image_path}")
+    print(f"Shape: {img.shape}")
+
+    return img.shape
