@@ -25,9 +25,10 @@ from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import pandas as pd
 
 from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr
-
+from skimage.filters import threshold_otsu
 # Cellpose import is relatively expensive – only load when we actually need it.
 try:
     from cellpose import models  # noqa: WPS433 (allow external import)
@@ -183,6 +184,7 @@ def run_cellpose_segmentation(
     metadata,
     pretrained_model_dir: str | Path,
     *,
+    label_name: str = "tcell", 
     manual_dim_order=None, 
     timepoint_range: Optional[Tuple[int, int]] = None,
     overwrite: bool = False,
@@ -216,21 +218,21 @@ def run_cellpose_segmentation(
     -------
     metadata:
         The input ``DataFrame`` with an additional (or overwritten) column
-        ``tcell_segments_image_path`` that points at the generated mask Zarr.
+        ``{label_name}_segments_image_path`` that points at the generated mask Zarr.
     """
     import pandas as pd  # local import to avoid heavy dependency at module import
 
     assert isinstance(metadata, pd.DataFrame), "metadata must be a pandas DataFrame"
 
     output_dir = Path(output_dir)
-    cellpose_dir = output_dir / "images" / "CellPose"
-    cellpose_dir.mkdir(parents=True, exist_ok=True)
+    
 
     for idx, sample in metadata.iterrows():
         sample_name = sample['sample_name']
 
         print(f"Calculating features for: {sample_name}")
-
+        cellpose_dir = output_dir / "images" / f"{sample_name}"
+        cellpose_dir.mkdir(parents=True, exist_ok=True)
         raw_image_path = Path(sample['raw_image_path'])
         raw_image_zarr = Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
 
@@ -264,11 +266,11 @@ def run_cellpose_segmentation(
         max_t = images.shape[0] - 1
         print(images.shape)
 
-        masks_outpath = cellpose_dir / f"{sample_name}_tcell_segments.zarr"
+        masks_outpath = cellpose_dir / f"{sample_name}_{label_name}_segments.zarr"
 
         if masks_outpath.exists() and not overwrite:
             # Skip computation; just record the path.
-            metadata.at[idx, "tcell_segments_image_path"] = str(masks_outpath)
+            metadata.at[idx, f"{label_name}_segments_image_path"] = str(masks_outpath)
             continue
 
         # Run Cellpose – we force saving directly to *masks_outpath* by setting
@@ -286,129 +288,152 @@ def run_cellpose_segmentation(
         # Write to disk
         save_as_zarr(masks, masks_outpath)
 
-        metadata.at[idx, "tcell_segments_image_path"] = str(masks_outpath)
+        metadata.at[idx, f"{label_name}_segments_image_path"] = str(masks_outpath)
 
     return metadata
 
 
+
+def run_otsu_threshold_segmentation_from_zarr(
+    output_dir: str | Path,
+    metadata,
+    *,
+    channel: int = 2,
+    mask_suffix: str = "_mask_dead",
+    timepoint_range: tuple[int, int] | None = None,
+    overwrite: bool = False,
+):
+    from pathlib import Path
+    import numpy as np
+    from skimage.filters import threshold_otsu
+    from behav3d.utils.fileio import load_image, save_as_zarr
+
+    output_dir = Path(output_dir)
+
+    for idx, sample in metadata.iterrows():
+        sample_name = sample['sample_name']
+        print(f"\nProcessing {sample_name}...")
+        
+        mask_dir = output_dir / "images" / sample_name
+        mask_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_image_zarr = mask_dir / f"{sample_name}.zarr"
+        if not raw_image_zarr.exists():
+            print(f"[SKIP] Zarr file missing for {sample_name}, run image preprocessing first.")
+            continue
+
+        # Load image in (T, C, Z, Y, X)
+        images = load_image(raw_image_zarr)
+
+        # Time cropping
+        if timepoint_range is not None:
+            start_t, end_t = timepoint_range
+            images = images[start_t:end_t + 1]
+
+        # Select single channel: (T, Z, Y, X)
+        channel_img = images[:, channel]
+
+        # Flatten to compute global threshold
+        flat_vals = channel_img.ravel()
+        global_thresh = threshold_otsu(flat_vals)
+        print(f"[INFO] Global Otsu threshold: {global_thresh}")
+
+        # Apply threshold to the entire 4D array (T, Z, Y, X)
+        masks = (channel_img > global_thresh).astype(np.uint8)
+
+        masks_outpath = mask_dir / f"{sample_name}{mask_suffix}.zarr"
+        if masks_outpath.exists() and not overwrite:
+            print(f"[SKIP] Mask already exists: {masks_outpath}")
+            continue
+
+        save_as_zarr(masks, masks_outpath)
+        print(f"[SAVED] 3D mask at {masks_outpath}")
+
 # -----------------------------------------------------------------------------
 # 3. Quick visualization helper (Napari)
 # -----------------------------------------------------------------------------
-
 def visualize_cellpose_sample(
-    metadata,
+    output_dir: str | Path,
     sample_name: str,
     *,
     timepoint_range: Optional[Tuple[int, int]] = None,
     channel_colors: Sequence[str] = ("red", "green", "blue", "cyan", "magenta", "yellow"),
 ) -> None:
-    """Open a Napari viewer showing raw channels + Cellpose masks.
+    import napari
+    import numpy as np
+    from pathlib import Path
+    from behav3d.utils.fileio import load_zarr as _lz
 
-    Parameters
-    ----------
-    image_path:
-        Path to the raw image file.
-    masks:
-        Either a path to the mask *zarr* (or tiff) produced by
-        :pyfunc:`run_cellpose_prediction` **or** an in-memory :class:`numpy.ndarray`.
-        Expected shape ``(T,Z,Y,X)``.
-    manual_dim_order:
-        Same meaning as in :pyfunc:`run_cellpose_prediction` – supply when the
-        file is stored in a non-standard axis order so it can be brought to
-        default TCZYX.
-    timepoint_range:
-        Optional ``(start_t, end_t)`` tuple to restrict the viewer to a subset of
-        time points.
-    channel_colors:
-        Colors for the first six channels; repeat or extend as needed.
-    """
-    # Lazy import so that the module can be used in headless environments.
-    import napari  # noqa: WPS433
+    print(f"Sample selected: {sample_name}")
+    print(f"Timepoint range: {timepoint_range}")
 
-    # ------------------------------------------------------------------
-    # Load data
-    # ------------------------------------------------------------------
-    import pandas as pd  # local import
+    output_dir = Path(output_dir)
+    raw_image_zarr = Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
 
-    assert isinstance(metadata, pd.DataFrame), "metadata must be a DataFrame"
-    match = metadata[metadata["sample_name"] == sample_name]
-    if match.empty:
-        raise ValueError(f"Sample '{sample_name}' not found in metadata.")
-    if len(match) > 1:
-        raise ValueError(f"Multiple rows found for sample '{sample_name}'. Provide unique sample_name.")
-    raw_image_col = "raw_image_path"
-    masks_col = "tcell_segments_image_path"
-    row = match.iloc[0]
-    raw_image_path = Path(row[raw_image_col])
-    mask_path      = Path(row[masks_col]) if not pd.isna(row[masks_col]) else None
+    # Define all possible masks with descriptive names
+    mask_files = {
+        "tcell_segments": Path(output_dir, "images", sample_name, f"{sample_name}_tcell_segments.zarr"),
+        "organoid_segments": Path(output_dir, "images", sample_name, f"{sample_name}_organoid_segments.zarr"),
+        "mask_dead": Path(output_dir, "images", sample_name, f"{sample_name}_mask_dead.zarr"),
+    }
 
-    if mask_path is None or not mask_path.exists():
-        raise ValueError(f"Mask file '{mask_path}' does not exist for sample '{sample_name}'.")
+    for name, path in mask_files.items():
+        print(f"Mask '{name}' path: {path}")
 
-    # ------------------------------------------------------------------
-    # Slice and load ONLY requested timepoints (lazy for Zarr)
-    # ------------------------------------------------------------------
-    # Load raw image and masks lazily (dask arrays) so we can slice before
-    # materialising anything into memory. We skip `load_image` here because
-    # axis-order is already TCZYX inside our own Zarr files.
-    from behav3d.utils.fileio import load_zarr
+    # Load masks that exist
+    loaded_masks = {}
+    for name, path in mask_files.items():
+        if path.exists():
+            mask_arr = _lz(path)
+            loaded_masks[name] = mask_arr
+        else:
+            print(f"[Warning] Mask '{name}' file not found: {path}")
 
-    # Use Zarr loader only if the file is a Zarr store, otherwise fall back to load_image
-    from behav3d.utils.fileio import load_zarr as _lz, load_image as _li
+    # Load raw image
+    img_arr = _lz(raw_image_zarr)
+    print(f"Original image shape: {img_arr.shape}")
 
-    if raw_image_path.suffix == ".zarr" or str(raw_image_path).endswith(".zarr.zip"):
-        img_arr = _lz(raw_image_path)
-    else:
-        img_arr = _li(raw_image_path)   # may return dask array depending on backend
-
-    mask_arr = _lz(mask_path)
-
-    # ------------------------------------------------------------------
-    # Slice ONLY requested timepoints (lazy) before computing to NumPy.
-    # ------------------------------------------------------------------
+    # Slice timepoints
     if timepoint_range is not None:
         start_t, end_t = timepoint_range
-        start_t = max(0, min(start_t, img_arr.shape[0]-1))
-        end_t   = max(start_t, min(end_t,   img_arr.shape[0]-1))
-        img_arr  = img_arr[start_t:end_t+1]
-        mask_arr = mask_arr[start_t:end_t+1]
+        start_t = max(0, min(start_t, img_arr.shape[0] - 1))
+        end_t = max(start_t, min(end_t, img_arr.shape[0] - 1))
+        print(f"Slicing timepoints from {start_t} to {end_t}")
+        img_arr = img_arr[start_t:end_t + 1]
+        for name in loaded_masks:
+            loaded_masks[name] = loaded_masks[name][start_t:end_t + 1]
 
-    # Bring slices into memory for Napari
-    img_np   = np.asarray(img_arr)
-    masks_np = np.asarray(mask_arr)
+    # Convert to NumPy
+    img_np = np.asarray(img_arr)
 
-    # ------------------------------------------------------------------
-    # Optional cropping in time
-    # ------------------------------------------------------------------
-    if timepoint_range is not None:
-        start_t, end_t = timepoint_range
-        start_t = max(0, min(start_t, img_np.shape[0] - 1))
-        end_t = max(start_t, min(end_t, img_np.shape[0] - 1))
-        img_np = img_np[start_t : end_t + 1]
-        masks_np = masks_np[start_t : end_t + 1]
+    for name in loaded_masks:
+        loaded_masks[name] = np.asarray(loaded_masks[name])
 
-    # ------------------------------------------------------------------
     # Launch viewer
-    # ------------------------------------------------------------------
     viewer = napari.Viewer()
+
+    if img_np.ndim != 5:
+        raise ValueError(f"Expected image shape (T, C, Z, Y, X), got {img_np.shape}")
 
     T, C, Z, Y, X = img_np.shape
     for ch in range(C):
-        channel_data = img_np[:, ch]  # shape (T,Z,Y,X)
-        # Dynamic contrast per channel
-        perc_99 = float(np.percentile(channel_data, 99))
+        channel_data = img_np[:, ch]  # (T, Z, Y, X)
         viewer.add_image(
             channel_data,
             name=f"channel_{ch+1}",
-            contrast_limits=(0, perc_99),
             colormap=channel_colors[ch % len(channel_colors)],
             scale=(1, 1, 1, 1),  # T, Z, Y, X
             blending="additive",
+            channel_axis=None,
         )
 
-    viewer.add_labels(masks_np, name="cellpose_masks", scale=(1, 1, 1, 1))
+    # Add all masks as separate label layers
+    if loaded_masks:
+        for name, mask_np in loaded_masks.items():
+            print(f"Adding mask layer '{name}' to viewer...")
+            viewer.add_labels(mask_np, name=name, scale=(1, 1, 1, 1))
+    else:
+        print("No mask layers added.")
 
+    print("Launching Napari viewer...")
     napari.run()
-
-
-
