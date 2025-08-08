@@ -29,6 +29,8 @@ import pandas as pd
 
 from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr
 from skimage.filters import threshold_otsu
+from behav3d.utils.segmentation import segment_2d_filter
+
 # Cellpose import is relatively expensive – only load when we actually need it.
 try:
     from cellpose import models  # noqa: WPS433 (allow external import)
@@ -48,7 +50,7 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) – unavoidable for pi
     nchan: int = 3,
     channels: Optional[Sequence[int]] = None,
     diameter: Optional[int | float] = None,
-    min_size: int = 10,
+    min_size: int = 25,
     anisotropy: Optional[float] = 4.655 / 1.17365196872,
     manual_dim_order: Optional[str | Sequence[str]] = None,
     timepoint_range: Optional[Tuple[int, int]] = None,
@@ -154,9 +156,9 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) – unavoidable for pi
             z_axis=1,
             anisotropy=anisotropy,
         )
-
+        mask_t = segment_2d_filter(mask_t)
         masks[t] = mask_t.astype(np.uint16)
-
+        
         if end_ts is not None:
             end_ts.record()
             torch.cuda.synchronize()
