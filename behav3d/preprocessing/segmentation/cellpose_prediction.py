@@ -29,12 +29,10 @@ import pandas as pd
 
 from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr
 from skimage.filters import threshold_otsu
-from behav3d.utils.segmentation import segment_2d_filter
-
-# Cellpose import is relatively expensive – only load when we actually need it.
+from behav3d.utils.segmentation import segment_2d_filter# Cellpose import is relatively expensive  only load when we actually need it.
 try:
     from cellpose import models  # noqa: WPS433 (allow external import)
-except ImportError as err:  # pragma: no cover – handled at runtime
+except ImportError as err:  # pragma: no cover  handled at runtime
     raise ImportError(
         "cellpose is required for `behav3d.preprocessing.segmentation.cellpose_prediction`. "
         "Please install it via `pip install cellpose>=4.0` (or compatible).",
@@ -42,7 +40,7 @@ except ImportError as err:  # pragma: no cover – handled at runtime
 
 
 
-def run_cellpose_prediction(  # noqa: WPS231 (complexity) – unavoidable for pipeline function
+def run_cellpose_prediction(  # noqa: WPS231 (complexity)  unavoidable for pipeline function
     image: np.ndarray,  #already loaded image
     pretrained_model_dir: str | Path,
     *,
@@ -50,7 +48,7 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) – unavoidable for pi
     nchan: int = 3,
     channels: Optional[Sequence[int]] = None,
     diameter: Optional[int | float] = None,
-    min_size: int = 25,
+    min_size: int = 30,
     anisotropy: Optional[float] = 4.655 / 1.17365196872,
     manual_dim_order: Optional[str | Sequence[str]] = None,
     timepoint_range: Optional[Tuple[int, int]] = None,
@@ -97,7 +95,9 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) – unavoidable for pi
     # ---------------------------------------------------------------------
     # 1. Prepare input & model
     # ---------------------------------------------------------------------
-    image_np = image
+    
+    image=image[:,[1,2,0],...] ##For the trained cellpose mode the order of the channesl has to be Organoid-dead-Tcell. Note to later implement a flexible read from the metdata to do this aitomatically
+    image_np=image
 
     if verbose:
         print("Loaded image with shape (T, C, Z, Y, X):", image_np.shape)
@@ -109,7 +109,7 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) – unavoidable for pi
         end_t = max(start_t, min(end_t, image_np.shape[0] - 1))
         image_np = image_np[start_t : end_t + 1]
         if verbose:
-            print(f"Using timepoints {start_t}–{end_t} (total {image_np.shape[0]})")
+            print(f"Using timepoints {start_t}{end_t} (total {image_np.shape[0]})")
 
     # Determine computation device.
     torch_device = (
@@ -134,15 +134,16 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) – unavoidable for pi
         print("Starting Cellpose prediction...")
 
     for t in range(T):
-        # Extract data for one time point – shape (C, Z, Y, X).
+        # Extract data for one time point  shape (C, Z, Y, X).
         img_t = image_np[t]
 
         if verbose:
-            print(f"  • Time-point {t+1}/{T} …", end="", flush=True)
+            print(f"   Time-point {t+1}/{T} ", end="", flush=True)
         start_ts = torch.cuda.Event(enable_timing=True) if torch_device.type == "cuda" else None
         end_ts = torch.cuda.Event(enable_timing=True) if torch_device.type == "cuda" else None
         if start_ts is not None:
             start_ts.record()
+
 
         # Cellpose expects channels first (C, Z, Y, X) with channel_axis=0, z_axis=1.
         mask_t, *_ = model.eval(
@@ -156,13 +157,14 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) – unavoidable for pi
             z_axis=1,
             anisotropy=anisotropy,
         )
-        mask_t = segment_2d_filter(mask_t)
+        mask_t=segment_2d_filter(mask_t)
+
         masks[t] = mask_t.astype(np.uint16)
-        
+
         if end_ts is not None:
             end_ts.record()
             torch.cuda.synchronize()
-            dur = start_ts.elapsed_time(end_ts) / 1000  # ms → s
+            dur = start_ts.elapsed_time(end_ts) / 1000  # ms ? s
             if verbose:
                 print(f" done in {dur:.2f} s.")
         elif verbose:
@@ -208,7 +210,7 @@ def run_cellpose_segmentation(
     pretrained_model_dir:
         Folder that contains the pretrained Cellpose weights.
     timepoint_range:
-        Optional ``(start_t, end_t)`` tuple – if given the returned *mask*
+        Optional ``(start_t, end_t)`` tuple  if given the returned *mask*
         Zarrs are cropped to that time-window. ``None`` means all time points.
     overwrite:
         If ``True`` existing mask Zarr files are recomputed.
@@ -275,7 +277,7 @@ def run_cellpose_segmentation(
             metadata.at[idx, f"{label_name}_segments_image_path"] = str(masks_outpath)
             continue
 
-        # Run Cellpose – we force saving directly to *masks_outpath* by setting
+        # Run Cellpose  we force saving directly to *masks_outpath* by setting
         # save_masks=False and writing ourselves to ensure consistent naming.
         masks, _ = run_cellpose_prediction(
             image=images,
