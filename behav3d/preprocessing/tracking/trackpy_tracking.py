@@ -5,6 +5,8 @@ import shutil
 from skimage.measure import regionprops, regionprops_table
 from scipy.ndimage import distance_transform_edt
 from behav3d.utils.fileio import load_image, save_as_zarr
+from behav3d.utils.tracking import convert_segments_to_tracks
+from typing import Optional, Tuple, Sequence
 
 try:
     import trackpy as tp
@@ -142,6 +144,130 @@ def run_trackpy_tracking(
     
 
 
+def run_tcell_trackpy_tracking(
+    metadata,
+    output_dir,
+    overwrite=False,
+    cell_type="tcell",
+    search_range=31,
+    memory=2,
+    adaptive_stop=10.0,
+    adaptive_step=0.95,
+    return_trackimg=True,
+    **kwargs
+):
+    """Run trackpy tracking on T cells.
+    
+    Parameters
+    ----------
+    metadata : pd.DataFrame
+        DataFrame containing sample information
+    output_dir : str or Path
+        Root output directory
+    cell_type : str
+        Should be "tcell" for this function
+    search_range : float
+        Maximum distance cells can move between frames
+    memory : int
+        Number of frames objects can disappear
+    adaptive_stop : float
+        Stop adaptive search when correlation coefficient falls below this value
+    adaptive_step : float
+        Reduce search range by this factor when searching fails
+    return_trackimg : bool
+        Whether to return and save tracked image
+    """
+    output_dir = Path(output_dir)
+    
+    for idx, sample in metadata.iterrows():
+        sample_name = sample["sample_name"]
+        print(f"\nProcessing {sample_name}...")
+        
+        # Set up paths
+        tracked_img_outdir = Path(output_dir, "images", sample_name)
+        tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
+        
+        segments_path = sample[f"{cell_type}_segments_image_path"]
+        tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr")
+        tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_{cell_type}_tracks.csv")
+    
+        if not tracked_img_outdir.exists():
+            tracked_img_outdir.mkdir(parents=True)
+        if not tracked_csv_outdir.exists():
+            tracked_csv_outdir.mkdir(parents=True)
+            
+        element_size_x = sample["pixel_distance_xy"]
+        element_size_y = sample["pixel_distance_xy"]
+        element_size_z = sample["pixel_distance_z"]
+        
+        if (
+            (
+                not tracked_csv_outpath.exists() or 
+                not tracked_img_outpath.exists()
+            ) or overwrite
+            ):
+            
+            print(f"Loading segments from {segments_path}")
+            segments = load_image(segments_path)
+            print(f"Running trackpy tracking on {len(segments)} frames")
+            
+            df_centroids = []
+            for t, object_stack in enumerate(segments):
+                object_stack = np.asarray(object_stack)
+                properties = pd.DataFrame(regionprops_table(label_image=object_stack, properties=['label', f'centroid']))
+                properties["position_t"] = t
+                df_centroids.append(properties)
+            df_centroids = pd.concat(df_centroids)
+            df_centroids["position_z"] = df_centroids["centroid-0"]*element_size_z
+            df_centroids["position_y"] = df_centroids["centroid-1"]*element_size_y
+            df_centroids["position_x"] = df_centroids["centroid-2"]*element_size_x
+            
+            print("Running trackpy tracking...")
+            # Tracking
+            df_tracks = tp.link(df_centroids, search_range, memory=memory, 
+                              adaptive_stop=adaptive_stop, adaptive_step=adaptive_step,
+                              pos_columns=['position_z','position_y','position_x'], 
+                              t_column='position_t')
+            
+            # Rename columns to match BEHAV3D convention
+            df_tracks = df_tracks.reset_index()
+            df_tracks.rename(
+                columns={
+                    'particle': 'TrackID',
+                    'label': 'SegmentID',
+                    'centroid-0': "pixel_position_z",
+                    'centroid-1': "pixel_position_y",
+                    'centroid-2': "pixel_position_x",
+                }, 
+                inplace=True
+            )
+            df_tracks["TrackID"] += 1
+            
+            # Select only needed columns
+            df_tracks = df_tracks[[
+                "TrackID", "SegmentID", "position_t", "position_x", "position_y", "position_z",
+                "pixel_position_x", "pixel_position_y", "pixel_position_z"
+            ]]
+            
+            print(f"Saving tracks CSV to {tracked_csv_outpath}")
+            df_tracks.to_csv(tracked_csv_outpath, sep=",", index=False)
+            
+            if return_trackimg:
+                print(f"Converting segments to tracks and saving to {tracked_img_outpath}")
+                tracked_img_outpath = convert_segments_to_tracks(
+                    df_tracks=df_tracks,
+                    segments=segments,
+                    outpath=tracked_img_outpath
+                )
+        else:
+            print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
+        
+        metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
+        metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
+        
+    return metadata
+
+
 def run_organoid_trackpy_tracking(
     metadata,
     output_dir,
@@ -190,7 +316,7 @@ def run_organoid_trackpy_tracking(
         element_size_x = sample["pixel_distance_xy"]
         element_size_y = sample["pixel_distance_xy"]
         element_size_z = sample["pixel_distance_z"]
-        segments = load_image(segments_path)
+        segments = np.asarray(load_image(segments_path))
 
         if (
             (
@@ -274,3 +400,93 @@ def run_organoid_trackpy_tracking(
         metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
 
     return metadata
+
+
+
+
+def visualize_tracks(
+    output_dir: str | Path,
+    sample_name: str,
+    *,
+    timepoint_range: Optional[Tuple[int, int]] = None,
+    channel_colors: Sequence[str] = ("red", "green", "blue", "cyan", "magenta", "yellow"),
+) -> None:
+    import napari
+    import numpy as np
+    from pathlib import Path
+    from behav3d.utils.fileio import load_zarr as _lz
+
+    print(f"Sample selected: {sample_name}")
+    print(f"Timepoint range: {timepoint_range}")
+
+    output_dir = Path(output_dir)
+    raw_image_zarr = Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
+    
+
+    # Define all possible masks with descriptive names
+    mask_files = {
+        "tcell_segments": Path(output_dir, "images", sample_name, f"{sample_name}_tcell_tracked.zarr"),
+        "organoid_segments": Path(output_dir, "images", sample_name, f"{sample_name}_organoid_tracked.zarr"),
+        "mask_dead": Path(output_dir, "images", sample_name, f"{sample_name}_mask_dead.zarr"),
+    }
+
+    for name, path in mask_files.items():
+        print(f"Mask '{name}' path: {path}")
+
+    # Load masks that exist
+    loaded_masks = {}
+    for name, path in mask_files.items():
+        if path.exists():
+            mask_arr = _lz(path)
+            loaded_masks[name] = mask_arr
+        else:
+            print(f"[Warning] Mask '{name}' file not found: {path}")
+
+    # Load raw image
+    img_arr = _lz(raw_image_zarr)
+    print(f"Original image shape: {img_arr.shape}")
+
+    # Slice timepoints
+    if timepoint_range is not None:
+        start_t, end_t = timepoint_range
+        start_t = max(0, min(start_t, img_arr.shape[0] - 1))
+        end_t = max(start_t, min(end_t, img_arr.shape[0] - 1))
+        print(f"Slicing timepoints from {start_t} to {end_t}")
+        img_arr = img_arr[start_t:end_t + 1]
+        for name in loaded_masks:
+            loaded_masks[name] = loaded_masks[name][start_t:end_t + 1]
+
+    # Convert to NumPy
+    img_np = np.asarray(img_arr)
+
+    for name in loaded_masks:
+        loaded_masks[name] = np.asarray(loaded_masks[name])
+
+    # Launch viewer
+    viewer = napari.Viewer()
+
+    if img_np.ndim != 5:
+        raise ValueError(f"Expected image shape (T, C, Z, Y, X), got {img_np.shape}")
+
+    T, C, Z, Y, X = img_np.shape
+    for ch in range(C):
+        channel_data = img_np[:, ch]  # (T, Z, Y, X)
+        viewer.add_image(
+            channel_data,
+            name=f"channel_{ch+1}",
+            colormap=channel_colors[ch % len(channel_colors)],
+            scale=(1, 1, 1, 1),  # T, Z, Y, X
+            blending="additive",
+            channel_axis=None,
+        )
+
+    # Add all masks as separate label layers
+    if loaded_masks:
+        for name, mask_np in loaded_masks.items():
+            print(f"Adding mask layer '{name}' to viewer...")
+            viewer.add_labels(mask_np, name=name, scale=(1, 1, 1, 1))
+    else:
+        print("No mask layers added.")
+
+    print("Launching Napari viewer...")
+    napari.run()
