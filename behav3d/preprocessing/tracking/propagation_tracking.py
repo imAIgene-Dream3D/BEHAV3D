@@ -30,7 +30,6 @@ import dask.array as da
 def _run_single_timepoint_propagation(
     t_seg,
     seg_prev_tp,
-    outpath,
     dilation_nr_pixels=2,
     segment_size_min=100,
     ):
