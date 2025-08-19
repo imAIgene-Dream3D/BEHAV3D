@@ -168,7 +168,7 @@ def run_feature_extraction(
     config=None,
     output_dir=None,
     cell_type="tcell",
-    extra_features_choice=["intensity", "morphology"],
+    features_choice=["movement", "intensity", "morphology", "contact", "death"],
     imaris=False,
     dead_mask_percentage_threshold=None,
     rolling_meanspeed_window=10,
@@ -273,42 +273,47 @@ def run_feature_extraction(
         time_interval=convert_time(time_interval, time_unit)
         time_unit = "h"
         
-        ### Calculate image based features (per timepoint)
-        print(f"{get_current_time()} - Calculating single-timepoint image-based features...")
-        df_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_intensity.csv")
-        df_contacts_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_contact.csv")
-        df_dead_mask_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_dead_mask.csv")
-        df_morphology_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_morphology.csv")
-        
-        if imaris:
-            df_tracks=calculate_imaris_track_features(
-                df_tracks=df_tracks,
-                organoid_contact_threshold=organoid_contact_threshold,
-                tcell_contact_threshold=tcell_contact_threshold,
-                distance_unit=distance_unit,
-            )
+        required_features = {"morphology", "intensity", "contact", "dead_mask"}
+
+        if any(feature in features_choice for feature in required_features):
+            ### Calculate image based features (per timepoint)
+            print(f"{get_current_time()} - Calculating single-timepoint image-based features...")
+            df_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_intensity.csv")
+            df_contacts_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_contact.csv")
+            df_dead_mask_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_dead_mask.csv")
+            df_morphology_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_morphology.csv")
+            
+            if imaris:
+                df_tracks=calculate_imaris_track_features(
+                    df_tracks=df_tracks,
+                    organoid_contact_threshold=organoid_contact_threshold,
+                    tcell_contact_threshold=tcell_contact_threshold,
+                    distance_unit=distance_unit,
+                )
+            else:
+                df_tracks=calculate_image_based_track_features(
+                    df_tracks=df_tracks,
+                    cell_type=cell_type,
+                    features_choice=features_choice,
+                    df_dead_mask_outpath=df_dead_mask_outpath,
+                    df_morphology_outpath=df_morphology_outpath,
+                    df_intensity_outpath=df_intensity_outpath,
+                    df_contacts_outpath=df_contacts_outpath,
+                    dead_channel=dead_channel,
+                    contact_threshold=contact_threshold,
+                    element_size_x=element_size_x,
+                    element_size_y=element_size_y,
+                    element_size_z=element_size_z,
+                    raw_image_path=raw_image_path,
+                    dead_mask_path=dead_mask_path,
+                    organoid_segments_path=organoid_segments_path,
+                    tcell_segments_path=tcell_segments_path,
+                    overwrite=overwrite,
+                    n_workers=n_workers
+                )
         else:
-            df_tracks=calculate_image_based_track_features(
-                df_tracks=df_tracks,
-                cell_type=cell_type,
-                extra_features_choice=extra_features_choice,
-                df_dead_mask_outpath=df_dead_mask_outpath,
-                df_morphology_outpath=df_morphology_outpath,
-                df_intensity_outpath=df_intensity_outpath,
-                df_contacts_outpath=df_contacts_outpath,
-                dead_channel=dead_channel,
-                contact_threshold=contact_threshold,
-                element_size_x=element_size_x,
-                element_size_y=element_size_y,
-                element_size_z=element_size_z,
-                raw_image_path=raw_image_path,
-                dead_mask_path=dead_mask_path,
-                organoid_segments_path=organoid_segments_path,
-                tcell_segments_path=tcell_segments_path,
-                overwrite=overwrite,
-                n_workers=n_workers
-            )
-        
+            print(f"{get_current_time()} - Skipping image-based features as none requested in features_choice (morphology, intensity, contact, death)")
+            
         
         print(f"{get_current_time()} - Interpolating missing timepoints based on time interval")
         # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
@@ -316,42 +321,46 @@ def run_feature_extraction(
         # More explanation within the function
         df_tracks= interpolate_missing_positions(df_tracks)
 
-        print(f"{get_current_time()} - Calculating movement features...")
-        df_tracks=calculate_movement_features(
-            df_tracks,
-            time_interval = time_interval,
-            rolling_meanspeed_window=rolling_meanspeed_window
-            )
-        df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
-        
-        if cell_type=="tcell":
-            print(f"{get_current_time()} - Calculating T-cell specific features...")
-            df_tracks = calculate_tcell_specific_track_features(
+        if "movement" in features_choice:
+            print(f"{get_current_time()} - Calculating movement features...")
+            df_tracks=calculate_movement_features(
                 df_tracks,
-                dead_mask_percentage_threshold=dead_mask_percentage_threshold
-                # dead_dye_threshold=dead_dye_threshold,
+                time_interval = time_interval,
+                rolling_meanspeed_window=rolling_meanspeed_window
                 )
-            
-        elif cell_type=="organoid":
-            print(f"{get_current_time()} - Calculating organoid specific features...")
-            df_tracks = calculate_organoid_specific_track_features(
-                df_tracks,
-                dead_mask_percentage_threshold=dead_mask_percentage_threshold
-                # dead_dye_threshold=dead_dye_threshold,
-                )
-            #TODO Add organoid specific features
+            df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
         else:
-            print(f"{get_current_time()} - No cell type specified, skipping cell type specific features...")
-        
-        print(f"{get_current_time()} - Perform z-normalization on selected feature columns")
-        df_tracks=normalize_track_features(
-            df_tracks, 
-            columns=[
-                "mean_square_displacement",
-                "speed",
-                "mean_dead_dye"
-            ]
-        )
+            print(f"{get_current_time()} - Skipping movement features as not requested in features_choice")
+            
+        if "contact" in features_choice:
+            if cell_type=="tcell":
+                print(f"{get_current_time()} - Calculating T-cell specific features...")
+                df_tracks = calculate_tcell_specific_track_features(
+                    df_tracks,
+                    dead_mask_percentage_threshold=dead_mask_percentage_threshold
+                    # dead_dye_threshold=dead_dye_threshold,
+                    )
+                
+            elif cell_type=="organoid":
+                print(f"{get_current_time()} - Calculating organoid specific features...")
+                df_tracks = calculate_organoid_specific_track_features(
+                    df_tracks,
+                    dead_mask_percentage_threshold=dead_mask_percentage_threshold
+                    # dead_dye_threshold=dead_dye_threshold,
+                    )
+                #TODO Add organoid specific features
+            else:
+                print(f"{get_current_time()} - No cell type specified, skipping cell type specific features...")
+       
+        # print(f"{get_current_time()} - Perform z-normalization on selected feature columns")
+        # df_tracks=normalize_track_features(
+        #     df_tracks, 
+        #     columns=[
+        #         "mean_square_displacement",
+        #         "speed",
+        #         "mean_dead_dye"
+        #     ]
+        # )
             
         tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
         print(f"{get_current_time()} - Writing output to {tracks_out_path}")
@@ -375,7 +384,7 @@ def calculate_image_based_track_features(
     cell_type,
     dead_channel,
     
-    extra_features_choice,
+    features_choice,
     
     contact_threshold,
     element_size_x,
@@ -427,7 +436,7 @@ def calculate_image_based_track_features(
         segments= organoid_segments
         segments_path = organoid_segments_path
     
-    if "morphology" in extra_features_choice:
+    if "morphology" in features_choice:
         print(f"{get_current_time()} - Calculating morphology features...")
         morph_dtypes = {
             "TrackID": int,
@@ -447,7 +456,7 @@ def calculate_image_based_track_features(
         }
         
         if df_morphology_outpath.exists() and not overwrite:
-            print("Morphology calculation .csv already exists. Loading in intensity information...")
+            print("Morphology calculation .csv already exists. Loading in morphology information...")
             df_morphology = pd.read_csv(df_morphology_outpath, dtype=morph_dtypes)
             df_morphology["orientation_vector"] = df_morphology["orientation_vector"].apply(ast.literal_eval)
         else:
@@ -462,7 +471,10 @@ def calculate_image_based_track_features(
                 df_morphology.to_csv(df_morphology_outpath, sep=",", index=False)  
         df_tracks = pd.merge(df_tracks, df_morphology, how="left")
     
-    if "intensity" in extra_features_choice:
+    else:
+        print(f"{get_current_time()} - Skipping morphology features as not requested in features_choice")
+
+    if "intensity" in features_choice:
         print(f"{get_current_time()} - Calculating channel and especially death dye intensities...")
         
         intensity_image = load_image(raw_image_path)
@@ -481,57 +493,65 @@ def calculate_image_based_track_features(
             if df_intensity_outpath != "":
                 df_intensity.to_csv(df_intensity_outpath, sep=",", index=False)
         df_tracks = pd.merge(df_tracks, df_intensity, how="left")
-    
-    print(f"{get_current_time()} - Calculating number of dead mask pixels...")
-    if df_dead_mask_outpath.exists() and not overwrite:
-        print("Dead mask calculation .csv already exists. Loading in intensity information...")
-        df_dead_mask = pd.read_csv(df_dead_mask_outpath)
     else:
-        df_dead_mask=calculate_dead_mask(
-            segments=segments,
-            dead_mask=dead_mask
-        )
-        if df_dead_mask_outpath != "":
-            df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
-    df_tracks = pd.merge(df_tracks, df_dead_mask, how="left")
+        print(f"{get_current_time()} - Skipping intensity features as not requested in features_choice")
     
-    print(f"{get_current_time()} - Calculating contact with organoids and other T cells...")
-    print(f"Using a contact threshold of {contact_threshold} um")
-    # Calculate the contact od each T cell with an organoid or a T cell
-    # Explanation on how in the function itself
-    contact_dtypes = {
-                'TrackID': int,
-                'position_t': float,
-                'organoid_contact': bool,
-                'organoid_contact_pixels': bool,
-                'touching_organoids': str,
-                'tcell_contact': bool,
-                'tcell_contact_pixels': bool,
-                'touching_tcells': str
-                }
-    if df_contacts_outpath.exists() and not overwrite:
-        print("Contact .csv already exists. Loading in contact information...")
-        df_contacts = pd.read_csv(
-            df_contacts_outpath,
-            dtype=contact_dtypes
+    if "death" in features_choice:
+        print(f"{get_current_time()} - Calculating number of dead mask pixels...")
+        if df_dead_mask_outpath.exists() and not overwrite:
+            print("Dead mask calculation .csv already exists. Loading in dead mask calculation information...")
+            df_dead_mask = pd.read_csv(df_dead_mask_outpath)
+        else:
+            df_dead_mask=calculate_dead_mask(
+                segments=segments,
+                dead_mask=dead_mask
             )
-
+            if df_dead_mask_outpath != "":
+                df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
+        df_tracks = pd.merge(df_tracks, df_dead_mask, how="left")
     else:
-        df_contacts=calculate_organoid_and_tcell_contact(
-            tcell_segments_path=tcell_segments_path,
-            organoid_segments_path=organoid_segments_path,
-            element_size_x=element_size_x,
-            element_size_y=element_size_y,
-            element_size_z=element_size_z,
-            contact_threshold=contact_threshold,
-            calculate_from=cell_type,
-            n_workers=n_workers
-        ) 
-        df_contacts = df_contacts.astype(contact_dtypes)
-        if df_contacts_outpath != "":
-            df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
-    
-    df_tracks = pd.merge(df_tracks, df_contacts, how="left")
+        print(f"{get_current_time()} - Skipping dead mask calculations as not requested in features_choice")
+        
+    if "contact" in features_choice:
+        print(f"{get_current_time()} - Calculating contact with organoids and other T cells...")
+        print(f"Using a contact threshold of {contact_threshold} um")
+        # Calculate the contact od each T cell with an organoid or a T cell
+        # Explanation on how in the function itself
+        contact_dtypes = {
+                    'TrackID': int,
+                    'position_t': float,
+                    'organoid_contact': bool,
+                    'organoid_contact_pixels': bool,
+                    'touching_organoids': str,
+                    'tcell_contact': bool,
+                    'tcell_contact_pixels': bool,
+                    'touching_tcells': str
+                    }
+        if df_contacts_outpath.exists() and not overwrite:
+            print("Contact .csv already exists. Loading in contact information...")
+            df_contacts = pd.read_csv(
+                df_contacts_outpath,
+                dtype=contact_dtypes
+                )
+
+        else:
+            df_contacts=calculate_organoid_and_tcell_contact(
+                tcell_segments_path=tcell_segments_path,
+                organoid_segments_path=organoid_segments_path,
+                element_size_x=element_size_x,
+                element_size_y=element_size_y,
+                element_size_z=element_size_z,
+                contact_threshold=contact_threshold,
+                calculate_from=cell_type,
+                n_workers=n_workers
+            ) 
+            df_contacts = df_contacts.astype(contact_dtypes)
+            if df_contacts_outpath != "":
+                df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
+        df_tracks = pd.merge(df_tracks, df_contacts, how="left")
+    else:
+        print(f"{get_current_time()} - Skipping contact calculations as not requested in features_choice")
+        
     return(df_tracks)
 
 def generalize_units_of_track_features(
@@ -564,34 +584,6 @@ def generalize_units_of_track_features(
     df_tracks["time_unit"] = "h"
     return(df_tracks)
     
-# def calculate_tcell_specific_track_features(
-#     df_tracks,
-#     dead_mask_percentage_threshold=None,
-#     ):
-
-#     if dead_mask_percentage_threshold is not None:
-#         print(f"{get_current_time()} - Calculating cell death based on defined dead_dye_threshold {dead_mask_percentage_threshold}")
-#         df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
-        
-#     # Calculate various movement features such as speed and mean square displacement of the tracks  
-    
-#     print(f"{get_current_time()} - Determining active contact of T cells")
-#     # Determining if a T cell is actively interacting with another T cell based on speed
-#     # More explanation at the top of this code
-#     df_tracks['list_touching_tcells'] = df_tracks['touching_tcells'].apply(
-#         lambda x: [] if pd.isna(x) or x=="" else list(map(int, x.split(',')))
-#         )
-    
-#     active_interaction = []
-#     for _, row in df_tracks.iterrows():
-#         if row['tcell_contact']:
-#             max_mean_speed = max(row['mean_speed'], df_tracks.loc[df_tracks['SegmentID'].isin(row['list_touching_tcells']), 'mean_speed'].max())
-#             active_interaction.append(row['mean_speed'] == max_mean_speed)
-#         else:
-#             active_interaction.append(False)
-#     df_tracks=df_tracks.drop('list_touching_tcells', axis=1)      
-#     df_tracks['active_tcell_contact'] = active_interaction
-#     return(df_tracks)
 def calculate_tcell_specific_track_features(df_tracks, dead_mask_percentage_threshold=None):
 
     if dead_mask_percentage_threshold is not None:
