@@ -712,7 +712,7 @@ def run_pixel_classifier_segmentation(
         
         if not raw_image_zarr.exists():
             img = load_image(raw_image_path)
-            img = img[:, [tcell_ch, live_ch, dead_ch]]
+            # img = img[:, [tcell_ch, live_ch, dead_ch]]
             save_as_zarr(img, raw_image_zarr)
         img = load_image(raw_image_zarr)
         print(img.shape)
