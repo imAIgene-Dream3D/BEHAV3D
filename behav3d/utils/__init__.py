@@ -66,8 +66,9 @@ def check_behav3d_metadata(
         "organoid_tracks_csv_path"
     ]
     missing_columns = set(required_columns) - set(metadata.columns)
-    column_string = "\n".join(missing_columns)
-    assert all(col in metadata.columns for col in required_columns), f"Not all required columns are present in the metadata .csv file\n{column_string}"
+    missing_string = '\n'.join(missing_columns)
+    assert all(col in metadata.columns for col in required_columns), f"Not all required columns are present in the metadata .csv file\n{missing_string}"
+
     assert not any(metadata.drop(columns=[
         "tcell_segments_image_path", 
         "tcell_tracks_image_path", 

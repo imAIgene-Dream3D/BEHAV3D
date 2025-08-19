@@ -168,6 +168,7 @@ def run_feature_extraction(
     config=None,
     output_dir=None,
     cell_type="tcell",
+    extra_features_choice=["intensity", "morphology"],
     imaris=False,
     dead_mask_percentage_threshold=None,
     rolling_meanspeed_window=10,
@@ -290,6 +291,7 @@ def run_feature_extraction(
             df_tracks=calculate_image_based_track_features(
                 df_tracks=df_tracks,
                 cell_type=cell_type,
+                extra_features_choice=extra_features_choice,
                 df_dead_mask_outpath=df_dead_mask_outpath,
                 df_morphology_outpath=df_morphology_outpath,
                 df_intensity_outpath=df_intensity_outpath,
@@ -373,19 +375,23 @@ def calculate_image_based_track_features(
     cell_type,
     dead_channel,
     
+    extra_features_choice,
+    
     contact_threshold,
     element_size_x,
     element_size_y,
     element_size_z,
     #Paths
-    raw_image_path,
+   
     dead_mask_path,
     organoid_segments_path,
     tcell_segments_path,
-    df_dead_mask_outpath,
-    df_morphology_outpath,
-    df_intensity_outpath,
-    df_contacts_outpath,
+    raw_image_path = "",
+    
+    df_dead_mask_outpath="",
+    df_morphology_outpath="",
+    df_intensity_outpath="",
+    df_contacts_outpath="",
     # Overwrite/redo df_intensity_outpath and df_contacts_outpath
     dead_mask_percentage_threshold=None,
     n_workers=1,
@@ -412,7 +418,6 @@ def calculate_image_based_track_features(
     # Load in the images containing the organoid segments and T cell segments
     organoid_segments=load_image(organoid_segments_path)
     tcell_segments=load_image(tcell_segments_path)
-    intensity_image = load_image(raw_image_path)
     dead_mask = load_image(dead_mask_path)
     
     if cell_type=="tcell":
@@ -421,52 +426,61 @@ def calculate_image_based_track_features(
     elif cell_type=="organoid":
         segments= organoid_segments
         segments_path = organoid_segments_path
+    
+    if "morphology" in extra_features_choice:
+        print(f"{get_current_time()} - Calculating morphology features...")
+        morph_dtypes = {
+            "TrackID": int,
+            "position_t": int,
+            "nr_pixels": int,
+            "volume": float,
+            "bbox_volume": float,
+            "elongation": float,
+            "extent": float,
+            "equivalent_diameter": float,
+            "major_axis_length": float,
+            "minor_axis_length": float,
+            "surface_area": float,
+            "sphericity": float,
+            "convex_volume": float,
+            "orientation_vector": object,
+        }
         
-    print(f"{get_current_time()} - Calculating morphology features...")
-    morph_dtypes = {
-        "TrackID": int,
-        "position_t": int,
-        "nr_pixels": int,
-        "volume": float,
-        "bbox_volume": float,
-        "elongation": float,
-        "extent": float,
-        "equivalent_diameter": float,
-        "major_axis_length": float,
-        "minor_axis_length": float,
-        "surface_area": float,
-        "sphericity": float,
-        "convex_volume": float,
-        "orientation_vector": object,
-    }
+        if df_morphology_outpath.exists() and not overwrite:
+            print("Morphology calculation .csv already exists. Loading in intensity information...")
+            df_morphology = pd.read_csv(df_morphology_outpath, dtype=morph_dtypes)
+            df_morphology["orientation_vector"] = df_morphology["orientation_vector"].apply(ast.literal_eval)
+        else:
+            df_morphology=calculate_morphology_features(
+                segments_path=segments_path,
+                n_workers=n_workers,
+                voxel_spacing=(element_size_z, element_size_y, element_size_x)
+            )
+            df_morphology = df_morphology.astype(morph_dtypes)
+            
+            if df_morphology_outpath != "":
+                df_morphology.to_csv(df_morphology_outpath, sep=",", index=False)  
+        df_tracks = pd.merge(df_tracks, df_morphology, how="left")
     
-    if df_morphology_outpath.exists() and not overwrite:
-        print("Morphology calculation .csv already exists. Loading in intensity information...")
-        df_morphology = pd.read_csv(df_morphology_outpath, dtype=morph_dtypes)
-        df_morphology["orientation_vector"] = df_morphology["orientation_vector"].apply(ast.literal_eval)
-    else:
-        df_morphology=calculate_morphology_features(
-            segments_path=segments_path,
-            n_workers=n_workers,
-            voxel_spacing=(element_size_z, element_size_y, element_size_x)
-        )
-        df_morphology = df_morphology.astype(morph_dtypes)
-        df_morphology.to_csv(df_morphology_outpath, sep=",", index=False)  
-    df_tracks = pd.merge(df_tracks, df_morphology, how="left")
-    
-    print(f"{get_current_time()} - Calculating channel and especially death dye intensities...")
-    if df_intensity_outpath.exists() and not overwrite:
-        print("Intensity calculation .csv already exists. Loading in intensity information...")
-        df_intensity = pd.read_csv(df_intensity_outpath)
-    else:
-        df_intensity=calculate_segment_intensity(
-            segments=segments,
-            intensity_image=intensity_image
-        )
-        if dead_channel is not None:
-            df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{dead_channel}":"mean_dead_dye"})
-        df_intensity.to_csv(df_intensity_outpath, sep=",", index=False)
-    df_tracks = pd.merge(df_tracks, df_intensity, how="left")
+    if "intensity" in extra_features_choice:
+        print(f"{get_current_time()} - Calculating channel and especially death dye intensities...")
+        
+        intensity_image = load_image(raw_image_path)
+        
+        if df_intensity_outpath.exists() and not overwrite:
+            print("Intensity calculation .csv already exists. Loading in intensity information...")
+            df_intensity = pd.read_csv(df_intensity_outpath)
+        else:
+            df_intensity=calculate_segment_intensity(
+                segments=segments,
+                intensity_image=intensity_image
+            )
+            if dead_channel is not None:
+                df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{dead_channel}":"mean_dead_dye"})
+            
+            if df_intensity_outpath != "":
+                df_intensity.to_csv(df_intensity_outpath, sep=",", index=False)
+        df_tracks = pd.merge(df_tracks, df_intensity, how="left")
     
     print(f"{get_current_time()} - Calculating number of dead mask pixels...")
     if df_dead_mask_outpath.exists() and not overwrite:
@@ -477,7 +491,8 @@ def calculate_image_based_track_features(
             segments=segments,
             dead_mask=dead_mask
         )
-        df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
+        if df_dead_mask_outpath != "":
+            df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
     df_tracks = pd.merge(df_tracks, df_dead_mask, how="left")
     
     print(f"{get_current_time()} - Calculating contact with organoids and other T cells...")
@@ -513,7 +528,8 @@ def calculate_image_based_track_features(
             n_workers=n_workers
         ) 
         df_contacts = df_contacts.astype(contact_dtypes)
-        df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
+        if df_contacts_outpath != "":
+            df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
     
     df_tracks = pd.merge(df_tracks, df_contacts, how="left")
     return(df_tracks)
