@@ -1,55 +1,287 @@
 # behav3d_widgets.py
 import ipywidgets as widgets
+from ipyfilechooser import FileChooser
 from IPython.display import display, clear_output
 from behav3d.utils import load_behav3d_metadata, check_behav3d_metadata
+from behav3d.preprocessing import convert_input_files_to_zarr
 import builtins
-
-
+from pathlib import Path
+from traitlets import Any, Unicode, Bool
+import os
 ##Define widgets
-#Widnget for output dir and metadata
-output_dir_widget = widgets.Text(
-    value=r"D:/SURF_2/Scripts/Python/BEHAV3D3_0/output",
-    description='Output Dir:', style={'description_width': '70px'},
-    layout=widgets.Layout(width='100%')
-)
+class PathPicker(widgets.VBox):
+    """
+    Displayable widget for picking a file or directory.
+    - mode: 'file' or 'dir'
+    - start_dir: starting directory for the chooser
+    - default: default filename (file mode) or starting path (dir mode)
+    - filter_pattern: e.g. '*.csv' (file mode only)
+    """
+    def __init__(
+        self,
+        mode='file',
+        start_dir='.',
+        default='',
+        description='Path:',
+        button_description='Browse…',
+        placeholder='Type a path or click Browse…',
+        filter_pattern=None,
+        description_width='90px',
+        width='100%',
+    ):
+        assert mode in ('file', 'dir')
+        self._mode = mode
 
-metadata_path_widget = widgets.Text(
-    value=r"D:/SURF_2/Scripts/Python/BEHAV3D3_0/metadata.csv",
-    description='Metadata:',
-    layout=widgets.Layout(width='100%')
-)
+        # Text box (the only persistent UI)
+        self.text = widgets.Textarea(
+            value=str(default or ''),
+            description=description,
+            placeholder=placeholder,
+            style={'description_width': description_width},
+            layout=widgets.Layout(width=width, height='32px'),
+        )
 
-load_button1 = widgets.Button(description="Load Metadata", button_style='success')
-output_area1 = widgets.Output()
-output_dir =None
-metadata_csv_path = None
-metadata = None
+        # Browse button
+        self.button = widgets.Button(
+            description=button_description, icon='folder-open',
+            tooltip=f"Choose a {'folder' if mode=='dir' else 'file'}"
+        )
 
-def on_load_clicked1(b):
-    global_vars = globals()  # get the global namespace of this module
-    # or better, assign to the notebook's global namespace explicitly:
-    import __main__
-    global_vars = __main__.__dict__
+        # Resolve starting directory & filename
+        start_dir = start_dir or '.'
+        filename = ''
+        if mode == 'file' and default:
+            p = Path(default)
+            if p.is_absolute():
+                start_dir = str(p.parent if p.parent.exists() else start_dir)
+                filename = p.name
+            else:
+                filename = str(default)
+        elif mode == 'dir' and default and os.path.isdir(default):
+            start_dir = str(default)
 
-    output_dir_val = output_dir_widget.value
-    metadata_csv_path_val = metadata_path_widget.value
+        # FileChooser (hidden until button click)
+        self.fc = FileChooser(path=start_dir, filename=filename)
+        self.fc.title = f"<b>Select {'directory' if mode=='dir' else 'file'}</b>"
+        self.fc.show_only_dirs = (mode == 'dir')
+        self.fc.use_dir_icons = True
+        if filter_pattern and mode == 'file':
+            self.fc.filter_pattern = filter_pattern
 
-    metadata_val = load_behav3d_metadata(metadata_csv_path_val)
+        # Container: row with Text + Button (chooser injected below when needed)
+        self._row = widgets.HBox([self.text, self.button])
+        super().__init__([self._row])
 
-    with output_area1:
-        clear_output()
-        print(f"Loading metadata from:\nOutput Dir: {output_dir_val}\nMetadata CSV: {metadata_csv_path_val}")
-        display(metadata_val)
-        print("Checking metadata...")
-        check_behav3d_metadata(metadata_val)
-        print("✅ Metadata checks passed!")
+        # Wire events
+        self.button.on_click(self._toggle_chooser)
+        self.fc.register_callback(self._on_select)
+        self.text.observe(self._on_text_change, names='value')
 
-    # Update notebook globals directly:
-    global_vars['output_dir'] = output_dir_val
-    global_vars['metadata_csv_path'] = metadata_csv_path_val
-    global_vars['metadata'] = metadata_val
+    # ---- public API ----
+    @property
+    def value(self) -> str:
+        """Current selected path (string)."""
+        return self.text.value
 
+    @value.setter
+    def value(self, path: str):
+        """Set the path programmatically (updates chooser location if possible)."""
+        self.text.value = str(path or '')
 
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    # ---- internal helpers ----
+    def _toggle_chooser(self, _=None):
+        if self.fc in self.children:
+            # hide
+            self.children = tuple(c for c in self.children if c is not self.fc)
+        else:
+            # show
+            self.children = tuple(list(self.children) + [self.fc])
+
+    def _on_select(self, chooser):
+        # Fill text and hide chooser
+        if self._mode == 'dir':
+            self.text.value = chooser.selected_path
+        else:
+            self.text.value = chooser.selected
+        if self.fc in self.children:
+            self.children = tuple(c for c in self.children if c is not self.fc)
+
+    def _on_text_change(self, change):
+        # Keep chooser in sync when user types/pastes a path
+        newv = (change.get('new') or '').strip()
+        if not newv:
+            return
+        try:
+            if self._mode == 'dir':
+                if os.path.isdir(newv):
+                    self.fc.reset(path=newv)
+            else:
+                # file mode: split into directory + filename
+                parent = os.path.dirname(newv) or '.'
+                fname = os.path.basename(newv)
+                if os.path.isdir(parent):
+                    if fname:
+                        self.fc.reset(path=parent, filename=fname)
+                    else:
+                        self.fc.reset(path=parent)
+        except Exception:
+            # Don't crash UI if reset fails; ignore silently
+            pass
+class MetadataLoader(widgets.VBox):
+    """
+    A VBox widget that wraps a file PathPicker and a 'Load' button.
+    After clicking the button, `value` holds the loaded pandas DataFrame,
+    and `path` holds the CSV path. Works without globals; read .value later.
+
+    Parameters
+    ----------
+    file_picker : a widget with a `.value` path (e.g., your PathPicker)
+        If None, you can pass one later via set_file_picker().
+    button_description : str
+        Button label text.
+    """
+    _busy = Bool(default_value=False).tag(sync=False)
+    _handler_bound = Bool(default_value=False).tag(sync=False)
+    
+    def __init__(
+        self,
+        metadata_path_picker,
+        output_dir_picker,
+        button_description: str = "Load metadata",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.file_picker = metadata_path_picker
+        self.output_dir_picker = output_dir_picker
+        
+        self.button = widgets.Button(description=button_description, button_style='success')
+        self.out = widgets.Output()
+
+        # self.button.on_click(self._on_click)
+        self._click_handler = self._on_click
+        self.button.on_click(self._click_handler)
+        # Build UI (file_picker may be None initially)
+        children = []
+        if self.output_dir_picker is not None:
+            children.append(self.output_dir_picker)
+        if self.file_picker is not None:
+            children.append(self.file_picker)  
+        children += [self.button, self.out]
+        self.children = tuple(children)
+
+   
+    def set_file_picker(self, file_picker: widgets.Widget):
+        """Attach/replace the file picker widget (must have a `.value` path)."""
+        self.file_picker = file_picker
+        # Rebuild children with the new picker at the top
+        # self.children = (self.file_picker, self.button, self.out)
+
+    def load(self, path = None):
+        """Programmatic load (same as clicking the button)."""
+        if path is None:
+            if self.file_picker is None:
+                raise ValueError("No file_picker attached and no path provided.")
+            path = self.file_picker.value
+
+        with self.out:
+            clear_output(wait=True)
+                
+            if not path or not str(path).lower().endswith(".csv"):
+                print("Please choose a .csv file.")
+                return
+
+            self.metadata = load_behav3d_metadata(path)
+            self.output_dir = self.output_dir_picker.value
+            self.metadata_csv_path = str(path)
+            
+            check_behav3d_metadata(self.metadata)
+
+            print("✅ Checks passed!")
+            display(self.metadata)
+           
+            
+            # import __main__
+            # global_vars = __main__.__dict__
+            # global_vars['output_dir'] = self.output_dir_picker.value
+            # global_vars['metadata_csv_path'] = self.path
+            # global_vars['metadata'] = self.metadata
+   
+    # Button handler
+    def _on_click(self, _):
+        if self._busy:
+            return  # re-entrancy guard prevents double execution
+        self._busy = True
+        try:
+            self.load()
+        except Exception as e:
+            with self.out:
+                print(f"❌ Error: {e}")
+        finally:
+            self._busy = False
+
+def convert_zarr_button(
+        MetadataLoader
+    ):
+    btn = widgets.Button(
+    description="Convert to Zarr",
+    button_style="success",  # 'success', 'info', 'warning', 'danger' or ''
+    icon="cogs"
+    )
+    out = widgets.Output()
+
+    def _run_conversion(_):
+        with out:
+            out.clear_output()
+            print("Starting conversion…")
+            btn.disabled = True
+            try:
+                result = convert_input_files_to_zarr(
+                    metadata=MetadataLoader.metadata,
+                    output_dir=MetadataLoader.output_dir
+                    )  # add args here if needed
+                print("Done ✅")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+            finally:
+                btn.disabled = False
+
+    btn.on_click(_run_conversion)
+    display(widgets.VBox([btn, out]))
+
+def set_dim_order(
+        MetadataLoader
+    ):
+    manual_dim_order_widget = widgets.Dropdown(
+        options=dim_order_options,
+        value=('T', 'C', 'Z', 'Y', 'X'),  # default
+        description='Select Order:',
+        style={'description_width': 'initial'},
+        layout=widgets.Layout(width='300px')
+    )
+    out = widgets.Output()
+
+    def _run_conversion(_):
+        with out:
+            out.clear_output()
+            print("Starting conversion…")
+            btn.disabled = True
+            try:
+                result = convert_input_files_to_zarr(
+                    metadata=MetadataLoader.metadata,
+                    output_dir=MetadataLoader.output_dir
+                    )  # add args here if needed
+                print("Done ✅")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+            finally:
+                btn.disabled = False
+
+    btn.on_click(_run_conversion)
+    display(widgets.VBox([btn, out]))
 #widget for dimensions
 dim_order_options = [
     ('T, C, Z, Y, X', ('T', 'C', 'Z', 'Y', 'X')),
@@ -251,23 +483,23 @@ def on_select_clicked4(b):
 select_button4.on_click(on_select_clicked4)
 # --------------------
 
-__all__ = [
-    "output_dir_widget", "metadata_path_widget", "load_button1", "output_area1",
-    "manual_dim_order_widget", "manual_dim_order",
-    "output_dir", "metadata_csv_path", "metadata",
-    "exp_duration_widget", "min_track_length_widget", "max_track_length_widget",
-    "set_params_button", "output_area_params",
-    "checkboxes", "checkboxes_box", "save_button2", "output_area2",
-    "umap_distance_widget", "umap_neighbors_widget", "num_clusters_widget",
-    "save_button3", "output_area3","on_load_clicked1",
-    "on_set_params_clicked",
-    "on_save_clicked",
-    "on_save_clicked3",
-    "on_dim_order_change",
-    "on_select_clicked4",
-    "sample_dropdown",
-    "select_button4",
-    "sample_output",
-    "sample_to_backproject",
-    "setup_sample_selection_widgets"
-]
+# __all__ = [
+#     "output_dir_widget", "metadata_path_widget", "load_button1", "output_area1",
+#     "manual_dim_order_widget", "manual_dim_order",
+#     "output_dir", "metadata_csv_path", "metadata",
+#     "exp_duration_widget", "min_track_length_widget", "max_track_length_widget",
+#     "set_params_button", "output_area_params",
+#     "checkboxes", "checkboxes_box", "save_button2", "output_area2",
+#     "umap_distance_widget", "umap_neighbors_widget", "num_clusters_widget",
+#     "save_button3", "output_area3","on_load_clicked1",
+#     "on_set_params_clicked",
+#     "on_save_clicked",
+#     "on_save_clicked3",
+#     "on_dim_order_change",
+#     "on_select_clicked4",
+#     "sample_dropdown",
+#     "select_button4",
+#     "sample_output",
+#     "sample_to_backproject",
+#     "setup_sample_selection_widgets"
+# ]

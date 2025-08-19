@@ -754,15 +754,3 @@ def run_pixel_classifier_segmentation(
         metadata.at[idx, "tcell_segments_image_path"] = str(tcell_segments_outpath)
         metadata.at[idx, "organoid_segments_image_path"] = str(organoid_segments_outpath)
     return(metadata)
-
-def print_image_shape(image_path):
-    """
-    Loads an image and prints its shape and axis sizes.
-    Args:
-        image_path: Path to the image file (zarr, tif, etc.)
-    """
-    img = load_image(image_path)
-    print(f"Image loaded from: {image_path}")
-    print(f"Shape: {img.shape}")
-
-    return img.shape
