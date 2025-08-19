@@ -105,7 +105,7 @@ def run_tcell_analysis(
         dtw_distance_matrix=dtw_distance_matrix,
         umap_n_neighbors=umap_n_neighbors,
         umap_minimal_distance=umap_minimal_distance,
-        random_state=None
+        random_state=123
     )
     
     df_clusters = cluster_umap(
@@ -114,7 +114,7 @@ def run_tcell_analysis(
         nr_of_clusters=nr_of_clusters,
         df_tracks=df_tracks,
         df_tracks_summarized=df_tracks_summarized,
-        random_state=None
+        random_state=123
     )
     end_time = time.time()
     h,m,s = format_time(start_time, end_time)

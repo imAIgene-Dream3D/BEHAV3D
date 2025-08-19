@@ -15,6 +15,7 @@ from skimage.measure import label
 from skimage.segmentation import watershed, relabel_sequential
 
 from sklearn.ensemble import RandomForestClassifier
+# from napari_apoc import PixelClassifier  # Commented out - use scikit-learn instead
 from scipy.ndimage import binary_fill_holes, find_objects
 
 from behav3d.utils.preprocessing import open_mask, dilate_mask
@@ -241,9 +242,19 @@ def train_pixel_classifier(
     metadata,
     examples_per_sample = 3,
     sample_specific_classifier=False,
-    n_workers=None
+    n_workers=None,
+    manual_dim_order=None  # Optional: tuple/list for custom dimension order in transpose
     ):
-    
+    """
+    Train a pixel classifier for segmentation.
+    Args:
+        output_dir: Output directory
+        metadata: Metadata DataFrame
+        examples_per_sample: Number of timepoints per sample
+        sample_specific_classifier: Whether to use sample-specific classifier
+        n_workers: Number of workers
+        manual_dim_order: Optional. Tuple/list specifying the order for transpose, e.g. (1,0,2,3,4) for (C,T,Z,Y,X)
+    """
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
         
@@ -277,12 +288,28 @@ def train_pixel_classifier(
             if not raw_image_zarr.exists():
                 print(f"- Converting raw image to .zarr for memory efficiency...")
                 images = load_image(raw_image_path)
+                print(f"Original image shape: {images.shape}")
+                default_order = ("T", "C", "Z", "Y", "X")  # T, C, Z, Y, X
+                if manual_dim_order is not None:
+                    # Convert to tuple of characters if string
+                    if isinstance(manual_dim_order, str):
+                        manual_dim_order = tuple(manual_dim_order)
+                    if manual_dim_order != default_order:
+                        # Compute permutation: for each axis in default_order, find its index in manual_dim_order
+                        perm = [manual_dim_order.index(ax) for ax in default_order]
+                        print(f"Transposing image from {manual_dim_order} to {default_order} using permutation {perm}")
+                        images = images.transpose(perm)
+                        print(f"New image shape: {images.shape}")
+                    else:
+                        print("Image is already in default order (T, C, Z, Y, X).")
+                else:
+                    print("No manual_dim_order provided, assuming image is already in default order.")
                 chunksize = (1,) + images.shape[1:]
                 save_as_zarr(
                     img=images, 
                     path=raw_image_zarr, 
                     chunks=chunksize
-                    )
+                )
                         
             images = load_image(raw_image_zarr)
             max_t = images.shape[0]-1
@@ -312,8 +339,9 @@ def train_pixel_classifier(
             #         all_features+=list(tqdm(executor.map(calculate_features, args_list), total=len(idc)))
             # else:
             #     all_features+=[calculate_features(args) for args in tqdm(args_list) ]
+        # Allow manual override of dimension order for transpose
         all_images = da.stack(all_images)
-        all_images = all_images.transpose(1, 0, 2, 3, 4)
+        all_images = all_images.transpose(1, 0, 2, 3, 4) ## this order corresponds to (C, T, Z, Y, X)
         save_as_zarr(all_images, image_outpath)
         del all_images
         gc.collect()
@@ -338,9 +366,9 @@ def train_pixel_classifier(
         log("###### Running Segmentation\n")
         QApplication.processEvents()
         # Access the label layer and feature image
-        
-        image_layer = viewer.layers['Image']
-        image_data = image_layer.data
+        # Get the first channel layer for reference (all channels have same shape)
+        image_layer = viewer.layers[f'Channel 1 (red)'] if 'Channel 1 (red)' in viewer.layers else viewer.layers[0]
+        image_data = all_images  # Use the original all_images data
         
         org_label_layer = viewer.layers['User Provided Labels (Organoid)']
         org_label_data = org_label_layer.data
@@ -379,13 +407,14 @@ def train_pixel_classifier(
                 1: nr_bg_pix / total_pix,
                 2: nr_fg_pix / total_pix,
             }
+            # Use scikit-learn RandomForestClassifier (fallback if napari_apoc not available)
             clf = RandomForestClassifier(
                 n_estimators=50,
                 n_jobs=-1, 
                 max_depth=20, 
                 # max_samples=0.05,
                 class_weight=class_weights
-                )
+            )
             
             clf = future.fit_segmenter(selected_labels, selected_features, clf)
             return clf
@@ -494,8 +523,34 @@ def train_pixel_classifier(
             
     # Create Napari viewer
     viewer = napari.Viewer()
-    img_layer = viewer.add_image(all_images, name="Image", contrast_limits=(0,float(np.percentile(all_images[1,-1].reshape(-1), 99))))
-    img_layer.contrast_limits_range = (0, all_images.max())
+    
+    # Split channels and add them as separate colored layers
+    # all_images shape is (channels, time, z, y, x)
+    n_channels = all_images.shape[0]
+    
+    # Define colors for different channels
+    channel_colors = ['red', 'green', 'blue', 'cyan', 'magenta', 'yellow']
+    
+    for ch in range(n_channels):
+        channel_data = all_images[ch]  # Shape: (time, z, y, x)
+        
+        # Calculate contrast limits for this channel
+        channel_percentile = float(np.percentile(channel_data.reshape(-1), 99))
+        contrast_limits = (0, channel_percentile)
+        
+        # Add channel as separate layer with color
+        channel_name = f"Channel {ch+1}"
+        if ch < len(channel_colors):
+            channel_name = f"Channel {ch+1} ({channel_colors[ch]})"
+        
+        img_layer = viewer.add_image(
+            channel_data, 
+            name=channel_name, 
+            contrast_limits=contrast_limits,
+            colormap=channel_colors[ch] if ch < len(channel_colors) else 'gray',
+            blending='additive'  # This allows channels to blend together
+        )
+        img_layer.contrast_limits_range = (0, channel_data.max())
 
     org_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserOrganoidLabels.zarr')
     tcell_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserTcellLabels.zarr')
@@ -624,7 +679,8 @@ def _run_single_timepoint_segmentation(
 def run_pixel_classifier_segmentation(
     output_dir,
     metadata,
-    organoid_edt_threshold=12
+    organoid_edt_threshold=12,
+    timepoint_range=None
     ):
     
     clf_org_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_Organoid.joblib')
@@ -670,7 +726,20 @@ def run_pixel_classifier_segmentation(
             if organoid_segments_outpath.exists():
                 shutil.rmtree(organoid_segments_outpath)
             
-            for t, t_img in tqdm(enumerate(img), total=img.shape[0]):
+            # Determine which timepoints to process
+            if timepoint_range is not None:
+                start_t, end_t = timepoint_range
+                # Ensure range is within bounds
+                start_t = max(0, min(start_t, img.shape[0]-1))
+                end_t = max(start_t, min(end_t, img.shape[0]-1))
+                timepoint_indices = list(range(start_t, end_t + 1))
+                print(f"Processing timepoints: {start_t} to {end_t} (total: {len(timepoint_indices)})")
+            else:
+                timepoint_indices = list(range(img.shape[0]))
+                print(f"Processing all timepoints: 0 to {img.shape[0]-1}")
+            
+            for t in tqdm(timepoint_indices, total=len(timepoint_indices)):
+                t_img = img[t]
                 seg_organoid, seg_tcell, pred_death_mask = _run_single_timepoint_segmentation(
                     t_img=t_img,
                     clf_org=clf_org,
@@ -683,5 +752,17 @@ def run_pixel_classifier_segmentation(
                 append_to_zarr(np.expand_dims(pred_death_mask, axis=0), death_mask_outpath)
                 
         metadata.at[idx, "tcell_segments_image_path"] = str(tcell_segments_outpath)
-        metadata.at[idx, "organoid_tracks_image_path"] = str(organoid_segments_outpath)
+        metadata.at[idx, "organoid_segments_image_path"] = str(organoid_segments_outpath)
     return(metadata)
+
+def print_image_shape(image_path):
+    """
+    Loads an image and prints its shape and axis sizes.
+    Args:
+        image_path: Path to the image file (zarr, tif, etc.)
+    """
+    img = load_image(image_path)
+    print(f"Image loaded from: {image_path}")
+    print(f"Shape: {img.shape}")
+
+    return img.shape

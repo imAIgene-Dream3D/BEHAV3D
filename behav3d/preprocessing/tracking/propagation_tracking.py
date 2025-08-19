@@ -2,6 +2,7 @@ from behav3d.utils.fileio import load_image, append_to_zarr, save_as_zarr
 from behav3d.utils.preprocessing import dilate_mask
 from behav3d.utils.segmentation import segment_size_filter
 from behav3d.utils.tracking import convert_tracked_image_to_csv
+import pandas as pd
 
 from skimage.segmentation import watershed
 import numpy as np
@@ -107,6 +108,17 @@ def run_propagation_tracking(
         tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         
         segments_path = sample[f"{cell_type}_segments_image_path"]
+        
+        # Check if segments_path is valid
+        if pd.isna(segments_path) or segments_path is None:
+            print(f"Warning: No segmentation data found for {sample_name}. Skipping tracking.")
+            continue
+            
+        segments_path = Path(segments_path)
+        if not segments_path.exists():
+            print(f"Warning: Segmentation file not found: {segments_path}. Skipping tracking.")
+            continue
+            
         tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr")
         tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_{cell_type}_tracks.csv")
     
