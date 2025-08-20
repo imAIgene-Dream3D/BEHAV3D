@@ -8,6 +8,11 @@ import builtins
 from pathlib import Path
 from traitlets import Any, Unicode, Bool
 import os
+from behav3d.utils.fileio import load_image, get_image_shape, get_image_dimension_order
+import asyncio
+import pandas as pd
+from behav3d.preprocessing.segmentation.napari_pixelclassifier import train_pixel_classifier, run_pixel_classifier_segmentation
+import traceback
 ##Define widgets
 class PathPicker(widgets.VBox):
     """
@@ -155,6 +160,10 @@ class MetadataLoader(widgets.VBox):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self.metadata = None
+        self.output_dir = None
+        self.metadata_csv_path = None
+            
         self.file_picker = metadata_path_picker
         self.output_dir_picker = output_dir_picker
         
@@ -202,13 +211,6 @@ class MetadataLoader(widgets.VBox):
 
             print("✅ Checks passed!")
             display(self.metadata)
-           
-            
-            # import __main__
-            # global_vars = __main__.__dict__
-            # global_vars['output_dir'] = self.output_dir_picker.value
-            # global_vars['metadata_csv_path'] = self.path
-            # global_vars['metadata'] = self.metadata
    
     # Button handler
     def _on_click(self, _):
@@ -224,7 +226,8 @@ class MetadataLoader(widgets.VBox):
             self._busy = False
 
 def convert_zarr_button(
-        MetadataLoader
+        metadata_loader,
+        dim_order_widget
     ):
     btn = widgets.Button(
     description="Convert to Zarr",
@@ -240,8 +243,8 @@ def convert_zarr_button(
             btn.disabled = True
             try:
                 result = convert_input_files_to_zarr(
-                    metadata=MetadataLoader.metadata,
-                    output_dir=MetadataLoader.output_dir
+                    metadata=metadata_loader.metadata,
+                    output_dir=metadata_loader.output_dir
                     )  # add args here if needed
                 print("Done ✅")
             except Exception as e:
@@ -251,77 +254,564 @@ def convert_zarr_button(
 
     btn.on_click(_run_conversion)
     display(widgets.VBox([btn, out]))
+class DimOrderTable:
+    DIM_ORDER_OPTIONS = [
+        "TCZYX",
+        "TZCYX",
+        "ZCTYX",
+        "ZTCYX",
+        "CZTYX",
+        "CTZYX",
+    ]
+    DEFAULT_ORDER = "TCZYX"
 
-def set_dim_order(
-        MetadataLoader
+
+    def __init__(
+        self,
+        metadata_loader,
+        sample_col="sample_name",
+        path_col="raw_image_path",
+        widths=("40%","30%","30%"),
+        dim_col="dimension_order",                 # <-- column to write string like 'TCZYX'
+        auto_write=False                    # <-- if True, update metadata table on each change
     ):
-    manual_dim_order_widget = widgets.Dropdown(
-        options=dim_order_options,
-        value=('T', 'C', 'Z', 'Y', 'X'),  # default
-        description='Select Order:',
-        style={'description_width': 'initial'},
-        layout=widgets.Layout(width='300px')
-    )
-    out = widgets.Output()
+        self.metadata_loader = metadata_loader
+        self.sample_col = sample_col
+        self.path_col = path_col
+        self.dim_col = dim_col
+        self.auto_write = auto_write
 
-    def _run_conversion(_):
-        with out:
-            out.clear_output()
-            print("Starting conversion…")
-            btn.disabled = True
+        self._width_sample, self._width_shape, self._width_order = widths
+
+        # State
+        self._rows = []          # [{'sample','path','shape_label','dd'}, ...]
+        self._selections = {}    # sample_name -> dim order tuple
+
+        # Precompute allowed tuples for validation / prefill
+        self._allowed_orders = self.DIM_ORDER_OPTIONS
+
+        # UI skeleton
+        self._status = widgets.HTML("<b>Waiting for user to load metadata…</b>")
+        self._refresh_btn = widgets.Button(description="Refresh", tooltip="Build/Update table from metadata")
+        self._refresh_btn.on_click(self._on_refresh)
+
+        self._apply_all_dd = widgets.Dropdown(
+            options=self.DIM_ORDER_OPTIONS,
+            value=self.DEFAULT_ORDER,
+            description="Apply to all:",
+            style={'description_width': 'initial'},
+            layout=widgets.Layout(width="350px", margin="6px 8px 6px 0")
+        )
+        self._apply_all_btn = widgets.Button(description="Apply", layout=widgets.Layout(width="100px"))
+        self._apply_all_btn.on_click(lambda _: self.set_all(self._apply_all_dd.value))
+
+        self._header = widgets.HBox([
+            widgets.Label("Sample", layout=widgets.Layout(width=self._width_sample, overflow="hidden")),
+            widgets.Label("Image shape", layout=widgets.Layout(width=self._width_shape, overflow="hidden")),
+            widgets.Label("Dim order", layout=widgets.Layout(width=self._width_order, overflow="hidden")),
+        ])
+        self._table_body = widgets.VBox()
+        self._out = widgets.Output()
+
+        self.widget = widgets.VBox([
+            self._status,
+            widgets.HBox([self._refresh_btn]),
+            self._header,
+            self._table_body,
+            widgets.HBox([self._apply_all_dd, self._apply_all_btn]),
+            self._out
+        ])
+        
+    def display(self):
+        display(self.widget)
+
+    def get_selections(self) -> dict:
+        """Return dict: sample_name -> 'TCZYX' """
+        return dict(self._selections)
+
+    def get_selections_str(self) -> dict:
+        """Return dict: sample_name -> 'TCZYX'"""
+        return {s: self._order_to_str(o) for s, o in self._selections.items()}
+
+    def write_dimorder_to_metadata(self, col=None):
+        """
+        Write string dimorder (e.g. 'TCZYX') into metadata_loader.metadata[col].
+        Returns the updated DataFrame.
+        """
+        col = col or self.dim_col
+        df = getattr(self.metadata_loader, "metadata", None)
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("metadata_loader.metadata is not a DataFrame yet.")
+        if df.empty:
+            raise ValueError("metadata_loader.metadata is empty.")
+        if self.sample_col not in df.columns:
+            raise ValueError(f"metadata is missing '{self.sample_col}' column.")
+        # Map selections by sample name
+        str_map = self.get_selections_str()
+        self.metadata_loader.metadata[col] = df[self.sample_col].map(str_map)
+        return self.metadata_loader.metadata
+
+    def set_all(self, order_tuple):
+        """Programmatically set all rows to the given order tuple."""
+        for row in self._rows:
+            row['dd'].value = order_tuple  # triggers observers -> updates _selections (+ auto_write)
+
+    def refresh_shapes(self):
+        """Recompute shape labels (e.g., after mounting a drive)."""
+        for row in self._rows:
+            row['shape_label'].value = self._probe_image_shape(row['path'])
+
+    def to_dataframe(self):
+        """
+        Return a pandas.DataFrame with:
+          sample_name, raw_image_path, image_shape, dim_order (tuple), dimorder (string)
+        """
+        data = []
+        for row in self._rows:
+            tup = row["dd"].value
+            data.append({
+                "sample_name": row["sample"],
+                "raw_image_path": row["path"],
+                "image_shape": row["shape_label"].value,
+                "dim_order": tup,
+                self.dim_col: self._order_to_str(tup),
+            })
+        return pd.DataFrame(data)
+
+    def _on_refresh(self, _btn):
+        df = getattr(self.metadata_loader, "metadata", None)
+        if not (isinstance(df, pd.DataFrame) and not df.empty):
+            self._status.value = "<b>Waiting for user to load metadata…</b>"
+            return
+        missing = [c for c in (self.sample_col, self.path_col) if c not in df.columns]
+        if missing:
+            self._status.value = f"<b>Metadata missing columns: {missing}</b>"
+            return
+
+        self._build_rows_from(df)
+        self._status.value = "<span style='color:green'>Metadata loaded ✅</span>"
+
+    def _build_rows_from(self, df: pd.DataFrame):
+        # Reset state
+        self._rows.clear()
+        self._selections.clear()
+        row_boxes = []
+
+        # Optional: prefill from existing string column if present
+        prefill = None
+        if self.dim_col in df.columns:
+            prefill = df[self.dim_col].astype(str).to_dict()  # index -> string
+
+        for idx, r in df.iterrows():
+            sample = str(r[self.sample_col])
+            path = r[self.path_col]
+
+            probed_shape = self._probe_image_shape(path)
+            sample_lbl = widgets.Label(sample, layout=widgets.Layout(width=self._width_sample, overflow="hidden"))
+            shape_lbl  = widgets.Label(probed_shape, layout=widgets.Layout(width=self._width_shape, overflow="hidden"))
+
+            # Determine default dropdown value (from prefill if valid)
+            default_val = get_image_dimension_order(path)
+            if default_val is None:
+                default_val = self.DEFAULT_ORDER
+            if prefill is not None:
+                s = prefill.get(idx, None)
+                if isinstance(s, str):
+                    tu = tuple(s.upper())
+                    if tu in self._allowed_orders:
+                        default_val = tu
+
+            dd = widgets.Dropdown(
+                options=self.DIM_ORDER_OPTIONS,
+                value=default_val,
+                layout=widgets.Layout(width=self._width_order),
+            )
+
+            # keep live selection
+            self._selections[sample] = dd.value
+            dd.observe(lambda ch, s=sample: self._on_dd_changed(s, ch), names='value')
+
+            self._rows.append({"sample": sample, "path": path, "shape_label": shape_lbl, "dd": dd})
+            row_boxes.append(widgets.HBox([sample_lbl, shape_lbl, dd]))
+
+        # Swap UI body
+        self._table_body.children = tuple(row_boxes)
+
+    def _on_dd_changed(self, sample_name, change):
+        if change.get('name') == 'value':
+            new_tuple = change['new']
+            self._selections[sample_name] = new_tuple
+            if self.auto_write:
+                # live-write into metadata table (string form) for matching rows
+                df = getattr(self.metadata_loader, "metadata", None)
+                if isinstance(df, pd.DataFrame) and self.sample_col in df.columns:
+                    mask = df[self.sample_col].astype(str) == str(sample_name)
+                    df.loc[mask, self.dim_col] = self._order_to_str(new_tuple)
+
+    def _probe_image_shape(self, path):
+        path = Path(path)
+        if not path.exists():
+            return "⛔ missing"
+        try:
+            shape = get_image_shape(path)
+            return "×".join(map(str, shape)) if shape else "unknown"
+        except Exception as e:
+            return f"⚠️ {type(e).__name__}"
+
+    @staticmethod
+    def _order_to_str(order_tuple):
+        return "".join(order_tuple)
+
+def _mk_timepoint_range(use_all: bool, start: int, end: int):
+    if use_all:
+        return None
+    return (int(start), int(end))
+
+class PixelClassifierPanel:
+    def __init__(self, metadata_loader):
+        self.metadata_loader = metadata_loader
+
+        # -------- Train controls --------
+        self.examples_per_sample = widgets.IntSlider(
+            description="Examples per sample", value=3, min=1, max=50, step=1, continuous_update=False
+        )
+        self.sample_specific_classifier = widgets.Checkbox(
+            description="Sample-specific classifier", value=False
+        )
+        self.n_workers = widgets.IntSlider(
+            description="Workers", value=(os.cpu_count() or 8), min=1, max=max(8, (os.cpu_count() or 8)),
+            step=1, continuous_update=False
+        )
+
+        # -------- Apply controls --------
+        self.organoid_edt_threshold = widgets.FloatSlider(
+            description="Organoid EDT thr",
+            value=12.0, min=0.0, max=50.0, step=0.5, readout_format=".1f",
+            continuous_update=False,
+            style={'description_width': '160px'}  # wider label
+        )
+        self.use_all_timepoints = widgets.Checkbox(
+            description="Process ALL timepoints", value=True
+        )
+        self.tp_start = widgets.IntText(description="Start t", value=0)
+        self.tp_end   = widgets.IntText(description="End t", value=0)
+
+        # Show/hide start/end boxes based on checkbox
+        self.use_all_timepoints.observe(self._toggle_timepoint_inputs, names='value')
+        self._toggle_timepoint_inputs()  # initialize
+
+        # Buttons + log
+        self.btn_train = widgets.Button(description="Train", button_style="primary")
+        self.btn_apply = widgets.Button(description="Apply", button_style="success")
+        self.btn_train.on_click(self._on_train_clicked)
+        self.btn_apply.on_click(self._on_apply_clicked)
+        self.out = widgets.Output()
+
+        # Layout
+        train_box = widgets.VBox([
+            widgets.HTML("<b>Train pixel classifier</b>"),
+            widgets.HBox([self.examples_per_sample, self.n_workers]),
+            self.sample_specific_classifier,
+            self.btn_train,
+        ])
+
+        self.tp_row = widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end])
+
+        apply_box = widgets.VBox([
+            widgets.HTML("<b>Apply segmentation</b>"),
+            self.organoid_edt_threshold,
+            self.tp_row,
+            self.btn_apply,
+        ])
+
+        self.ui = widgets.VBox([train_box, widgets.HTML("<hr>"), apply_box, widgets.HTML("<hr>"), self.out])
+
+    def _toggle_timepoint_inputs(self, change=None):
+        show = not self.use_all_timepoints.value
+        disp = None if show else 'none'
+        self.tp_start.layout.display = disp
+        self.tp_end.layout.display   = disp
+        self.tp_start.disabled = not show
+        self.tp_end.disabled   = not show
+
+    def display(self):
+        display(self.ui)
+
+    def _lock(self, state: bool):
+        for w in [
+            self.btn_train, self.btn_apply,
+            self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
+            self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end,
+        ]:
+            w.disabled = state
+
+    # ---- callbacks ----
+    def _on_train_clicked(self, _):
+        self._lock(True)
+        with self.out:
+            self.out.clear_output()
             try:
-                result = convert_input_files_to_zarr(
-                    metadata=MetadataLoader.metadata,
-                    output_dir=MetadataLoader.output_dir
-                    )  # add args here if needed
-                print("Done ✅")
-            except Exception as e:
-                import traceback; traceback.print_exc()
+                odir = Path(self.metadata_loader.output_dir).expanduser()
+                odir.mkdir(parents=True, exist_ok=True)
+
+                print("▶️ Training pixel classifier…", flush=True)
+                print(f"  output_dir={odir}")
+                print(f"  examples_per_sample={self.examples_per_sample.value}")
+                print(f"  sample_specific_classifier={self.sample_specific_classifier.value}")
+                print(f"  n_workers={self.n_workers.value}")
+
+                train_pixel_classifier(
+                    output_dir=str(odir),
+                    metadata=self.metadata_loader.metadata,
+                    examples_per_sample=int(self.examples_per_sample.value),
+                    sample_specific_classifier=bool(self.sample_specific_classifier.value),
+                    n_workers=int(self.n_workers.value),
+                )
+                print("✅ Training finished.", flush=True)
+            except Exception:
+                traceback.print_exc()
             finally:
-                btn.disabled = False
+                self._lock(False)
 
-    btn.on_click(_run_conversion)
-    display(widgets.VBox([btn, out]))
-#widget for dimensions
-dim_order_options = [
-    ('T, C, Z, Y, X', ('T', 'C', 'Z', 'Y', 'X')),
-    ('T, Z, C, Y, X', ('T', 'Z', 'C', 'Y', 'X')),
-    ('Z, C, T, Y, X', ('Z', 'C', 'T', 'Y', 'X')),
-    ('Z, T, C, Y, X', ('Z', 'T', 'C', 'Y', 'X')),
-    ('C, Z, T, Y, X', ('C', 'Z', 'T', 'Y', 'X')),
-    ('C, T, Z, Y, X', ('C', 'T', 'Z', 'Y', 'X')),
-]
+    def _on_apply_clicked(self, _):
+        self._lock(True)
+        with self.out:
+            self.out.clear_output()
+            try:
+                odir = Path(self.metadata_loader.output_dir).expanduser()
+                odir.mkdir(parents=True, exist_ok=True)
 
-# Dropdown widget with labels and values
-manual_dim_order_widget = widgets.Dropdown(
-    options=dim_order_options,
-    value=('T', 'C', 'Z', 'Y', 'X'),  # default
-    description='Select Order:',
-    style={'description_width': 'initial'},
-    layout=widgets.Layout(width='300px')
-)
+                tpr = _mk_timepoint_range(
+                    use_all=bool(self.use_all_timepoints.value),
+                    start=int(self.tp_start.value),
+                    end=int(self.tp_end.value),
+                )
 
-# Variable to store the selected order
-manual_dim_order = manual_dim_order_widget.value
+                print("▶️ Applying pixel classifier segmentation…", flush=True)
+                print(f"  output_dir={odir}")
+                print(f"  organoid_edt_threshold={self.organoid_edt_threshold.value}")
+                print(f"  timepoint_range={tpr}", flush=True)
 
-# Handler to update variable on change
-def on_dim_order_change(change):
-    new_val = change['new']
+                new_md = run_pixel_classifier_segmentation(
+                    output_dir=str(odir),
+                    metadata=self.metadata_loader.metadata,
+                    organoid_edt_threshold=float(self.organoid_edt_threshold.value),
+                    timepoint_range=tpr
+                )
 
-    import __main__
-    global_vars = __main__.__dict__
+                # Update loader + ALWAYS save CSV
+                self.metadata_loader.metadata = new_md
+                csv_path = Path(self.metadata_loader.metadata_csv_path).expanduser()
+                print(f"💾 Saving metadata to: {csv_path}", flush=True)
+                new_md.to_csv(csv_path, sep=",", index=False)
 
-    # Update local variable (optional)
-    global manual_dim_order
-    manual_dim_order = new_val
+                print("✅ Apply finished.", flush=True)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._lock(False)
 
-    # Update notebook global
-    global_vars['manual_dim_order'] = new_val
+import traceback
+from pathlib import Path
+import ipywidgets as widgets
+from IPython.display import display
 
-    print(f"Selected manual_dim_order: {new_val}")
+class TrackingPanel:
+    """
+    Minimal UI for tracking (LAP, TrackPy, or Propagation).
+    - Uses metadata_loader.output_dir and metadata_loader.metadata_csv_path directly
+    - Updates metadata_loader.metadata and always saves CSV
+    - cell_type is supplied in __init__
+    """
+    def __init__(self, metadata_loader, cell_type="tcell"):
+        self.metadata_loader = metadata_loader
+        self.cell_type = str(cell_type).strip()
 
+        # Method selector (now includes Propagation)
+        self.method = widgets.Dropdown(
+            description="Tracking method",
+            options=[("LAP (laptrack)", "lap"),
+                     ("TrackPy", "trackpy"),
+                     ("Propagation", "prop")],
+            value="lap",
+            style={'description_width': '160px'}
+        )
 
-# Widgets for parameters
+        # Shared controls
+        self.overwrite = widgets.Checkbox(description="Overwrite existing", value=False)
+
+        # LAP params (distances in pixels; squared when calling)
+        self.track_cost_dist = widgets.IntSlider(
+            description="Track cost (px)", value=45, min=1, max=200, step=1,
+            continuous_update=False, style={'description_width':'160px'}
+        )
+        self.gap_cost_dist = widgets.IntSlider(
+            description="Gap close cost (px)", value=60, min=1, max=300, step=1,
+            continuous_update=False, style={'description_width':'160px'}
+        )
+        self.gap_max_frames = widgets.IntSlider(
+            description="Gap close max frames", value=3, min=0, max=20, step=1,
+            continuous_update=False, style={'description_width':'160px'}
+        )
+        self.merging_cost_dist = widgets.IntText(
+            description="Merging cost (px)", value=0, style={'description_width':'160px'}
+        )
+        self.splitting_cost_dist = widgets.IntText(
+            description="Splitting cost (px)", value=0, style={'description_width':'160px'}
+        )
+        self.lap_params = widgets.VBox([
+            widgets.HTML("<b>LAP parameters</b>"),
+            self.track_cost_dist, self.gap_cost_dist, self.gap_max_frames,
+            self.merging_cost_dist, self.splitting_cost_dist
+        ])
+
+        # TrackPy params
+        self.tp_search_range = widgets.IntSlider(
+            description="Search range (px)", value=31, min=1, max=200, step=1,
+            continuous_update=False, style={'description_width':'160px'}
+        )
+        self.tp_memory = widgets.IntSlider(
+            description="Memory (frames)", value=2, min=0, max=20, step=1,
+            continuous_update=False, style={'description_width':'160px'}
+        )
+        self.tp_adaptive_stop = widgets.FloatSlider(
+            description="Adaptive stop", value=10.0, min=0.0, max=50.0, step=0.5,
+            readout_format=".1f", continuous_update=False, style={'description_width':'160px'}
+        )
+        self.tp_adaptive_step = widgets.FloatSlider(
+            description="Adaptive step", value=0.95, min=0.1, max=1.0, step=0.01,
+            readout_format=".2f", continuous_update=False, style={'description_width':'160px'}
+        )
+        self.tp_params = widgets.VBox([
+            widgets.HTML("<b>TrackPy parameters</b>"),
+            self.tp_search_range, self.tp_memory, self.tp_adaptive_stop, self.tp_adaptive_step
+        ])
+
+        # Propagation params (none needed; just an info box)
+        self.prop_params = widgets.VBox([
+            widgets.HTML("<b>Propagation tracking</b>"),
+            widgets.HTML("<i>No tunable parameters.</i>")
+        ])
+
+        # Swap param groups on method change
+        self.param_container = widgets.VBox()
+        self.method.observe(self._toggle_param_groups, names='value')
+        self._toggle_param_groups()
+
+        # Run + log
+        self.btn_run = widgets.Button(description="Run tracking", button_style="success")
+        self.btn_run.on_click(self._on_run_clicked)
+        self.out = widgets.Output()
+
+        # Layout
+        self.ui = widgets.VBox([
+            widgets.HTML("<b>Tracking</b>"),
+            self.method,
+            widgets.HBox([self.overwrite]),
+            self.param_container,
+            self.btn_run,
+            widgets.HTML("<hr>"),
+            self.out
+        ])
+
+    def display(self):
+        display(self.ui)
+
+    def _toggle_param_groups(self, change=None):
+        if self.method.value == "lap":
+            self.param_container.children = (self.lap_params,)
+        elif self.method.value == "trackpy":
+            self.param_container.children = (self.tp_params,)
+        else:  # "prop"
+            self.param_container.children = (self.prop_params,)
+
+    def _lock(self, state: bool):
+        for w in [
+            self.method, self.overwrite,
+            self.track_cost_dist, self.gap_cost_dist, self.gap_max_frames,
+            self.merging_cost_dist, self.splitting_cost_dist,
+            self.tp_search_range, self.tp_memory, self.tp_adaptive_stop, self.tp_adaptive_step,
+            self.btn_run
+        ]:
+            if hasattr(w, "disabled"):
+                w.disabled = state
+
+    def _on_run_clicked(self, _):
+        self._lock(True)
+        with self.out:
+            self.out.clear_output()
+            try:
+                out_dir = Path(self.metadata_loader.output_dir).expanduser()
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                csv_path = Path(self.metadata_loader.metadata_csv_path).expanduser()
+
+                method = self.method.value
+                if method == "lap":
+                    # Square distances for laptracking (function expects px^2)
+                    tc = int(self.track_cost_dist.value) ** 2
+                    gc = int(self.gap_cost_dist.value) ** 2
+                    mc = int(self.merging_cost_dist.value)
+                    sc = int(self.splitting_cost_dist.value)
+                    merging  = (mc ** 2) if mc > 0 else False
+                    splitting = (sc ** 2) if sc > 0 else False
+
+                    print("▶️ LAP tracking…", flush=True)
+                    print(f"  track_cost_cutoff={tc}, gap_closing_cost_cutoff={gc}")
+                    print(f"  gap_closing_max_frame_count={self.gap_max_frames.value}")
+                    print(f"  merging_cost_cutoff={merging}, splitting_cost_cutoff={splitting}", flush=True)
+
+                    from __main__ import run_tcell_laptracking
+                    new_md = run_tcell_laptracking(
+                        metadata=self.metadata_loader.metadata,
+                        output_dir=str(out_dir),
+                        track_cost_cutoff=tc,
+                        gap_closing_cost_cutoff=gc,
+                        gap_closing_max_frame_count=int(self.gap_max_frames.value),
+                        merging_cost_cutoff=merging,
+                        splitting_cost_cutoff=splitting,
+                        cell_type=self.cell_type,
+                        overwrite=bool(self.overwrite.value),
+                    )
+
+                elif method == "trackpy":
+                    print("▶️ TrackPy tracking…", flush=True)
+                    print(f"  search_range={self.tp_search_range.value}, memory={self.tp_memory.value}")
+                    print(f"  adaptive_stop={self.tp_adaptive_stop.value}, adaptive_step={self.tp_adaptive_step.value}", flush=True)
+
+                    from __main__ import run_tcell_trackpy_tracking
+                    new_md = run_tcell_trackpy_tracking(
+                        metadata=self.metadata_loader.metadata,
+                        output_dir=str(out_dir),
+                        overwrite=bool(self.overwrite.value),
+                        cell_type=self.cell_type,
+                        search_range=int(self.tp_search_range.value),
+                        memory=int(self.tp_memory.value),
+                        adaptive_stop=float(self.tp_adaptive_stop.value),
+                        adaptive_step=float(self.tp_adaptive_step.value),
+                    )
+
+                else:  # "prop" propagation
+                    print("▶️ Propagation tracking…", flush=True)
+                    from __main__ import run_propagation_tracking
+                    new_md = run_propagation_tracking(
+                        metadata=self.metadata_loader.metadata,
+                        output_dir=str(out_dir),
+                        cell_type=self.cell_type,      # e.g., "organoid" or "tcell"
+                        overwrite=bool(self.overwrite.value),
+                    )
+
+                # Update loader + ALWAYS save CSV
+                self.metadata_loader.metadata = new_md
+                print(f"💾 Saving metadata to: {csv_path}", flush=True)
+                new_md.to_csv(csv_path, sep=",", index=False)
+                print("✅ Tracking finished.", flush=True)
+
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._lock(False)
+                
 exp_duration_widget = widgets.IntText(
     value=1000,  # or your default experiment duration
     description='Exp Duration:',

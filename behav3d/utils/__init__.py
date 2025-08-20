@@ -26,6 +26,7 @@ def load_behav3d_metadata(
         "distance_unit": str,
         "time_interval": float,  # Assuming it could be a float
         "time_unit": str,
+        "dimension_order": str, 
         "raw_image_path": str,  # Keeping as str for easy handling
         "tcell_segments_image_path": str,
         "tcell_tracks_image_path": str,
@@ -57,6 +58,7 @@ def check_behav3d_metadata(
         "distance_unit", 
         "time_interval", 
         "time_unit",
+        "dimension_order", 
         "raw_image_path",
         "tcell_segments_image_path", 
         "tcell_tracks_image_path", 

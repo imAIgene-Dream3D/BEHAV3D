@@ -1,5 +1,5 @@
 import time
-from behav3d.utils.fileio import convert_file_to_zarr
+from behav3d.utils.fileio import convert_file_to_zarr, get_image_shape
 from pathlib import Path
 
 def convert_input_files_to_zarr(
@@ -28,3 +28,17 @@ def convert_input_files_to_zarr(
                 
         metadata.at[idx, "raw_image_path"] = str(raw_image_zarr)
     return(metadata)
+
+def get_all_image_shapes(metadata):
+    """
+    Get the shapes of all images in the metadata.
+    """
+    shapes = []
+    for _, row in metadata.iterrows():
+        path = Path(row['raw_image_path'])
+        if path.exists():
+            shape = get_image_shape(path)
+            shapes.append((row['sample_name'], shape))
+        else:
+            shapes.append((row['sample_name'], "File not found"))
+    return shapes

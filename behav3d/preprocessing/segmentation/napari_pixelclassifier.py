@@ -302,8 +302,8 @@ def train_pixel_classifier(
                         print(f"New image shape: {images.shape}")
                     else:
                         print("Image is already in default order (T, C, Z, Y, X).")
-                else:
-                    print("No manual_dim_order provided, assuming image is already in default order.")
+                # else:
+                #     print("No manual_dim_order provided, assuming image is already in default order.")
                 chunksize = (1,) + images.shape[1:]
                 save_as_zarr(
                     img=images, 

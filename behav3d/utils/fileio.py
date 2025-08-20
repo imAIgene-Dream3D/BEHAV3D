@@ -504,14 +504,48 @@ def load_elsizes_czi(path):
         "time_interval_unit": "s"   
     }
 
-def print_image_shape(image_path):
+
+def get_image_shape(path):
     """
     Loads an image and prints its shape and axis sizes.
     Args:
         image_path: Path to the image file (zarr, tif, etc.)
     """
-    img = load_image(image_path)
-    print(f"Image loaded from: {image_path}")
-    print(f"Shape: {img.shape}")
+    path = Path(path)
+    if path.suffix == ".zarr":
+        # Load zarr image
+        img = load_zarr(path)
+        shape = img.shape
+    elif path.suffix == ".czi":
+        shape = get_czi_shape(path)
+    shape = tuple(shape)
+    return shape
 
-    return img.shape
+def get_czi_shape(path, take_dims="TCZYX"):
+    """
+    Get the shape of a CZI image.
+    Args:
+    """
+    path = Path(path)
+    if path.suffix == ".czi":
+        czifile = CziFile(path)
+        dim_order = czifile.dims
+        shape = czifile.get_dims_shape()[0]
+        size_by_dim = {ax: int(sz[1]) for ax, sz in shape.items()}
+
+        shape = [size_by_dim.get(ax, 1) for ax in dim_order if ax in take_dims]
+        return(shape)
+    else:
+        print(f"{path} is not a .czi")
+        
+def get_image_dimension_order(path):
+    """
+    Loads an image and prints its shape and axis sizes.
+    Args:
+        image_path: Path to the image file (zarr, tif, etc.)
+    """
+    path = Path(path)
+    if path.suffix == ".czi":
+        czifile = CziFile(path)
+        dim_order = czifile.dims[-5:]
+    return dim_order
