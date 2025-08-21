@@ -548,4 +548,6 @@ def get_image_dimension_order(path):
     if path.suffix == ".czi":
         czifile = CziFile(path)
         dim_order = czifile.dims[-5:]
+    else:
+        dim_order = "TCZYX"
     return dim_order

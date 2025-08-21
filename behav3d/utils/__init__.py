@@ -14,11 +14,11 @@ def load_behav3d_metadata(
         "sample_name": str,
         "organoid_line": str,
         "tcell_line": str,
-        "exp_nr": int,
+        "exp_nr": "Int64",
         "well": str,
-        "tcell_channel": int,
-        "live_channel": int,
-        "dead_channel": int,
+        "tcell_channel": "Int64",
+        "live_channel": "Int64",
+        "dead_channel": "Int64",
         "dead_dye_threshold": float,
         "contact_threshold": float,
         "pixel_distance_xy": float,
@@ -37,6 +37,7 @@ def load_behav3d_metadata(
         
     }
     metadata = pd.read_csv(metadata_path, dtype=dtype_dict)
+    metadata = metadata.dropna(how="all").reset_index(drop=True)
     return metadata 
 
 def check_behav3d_metadata(

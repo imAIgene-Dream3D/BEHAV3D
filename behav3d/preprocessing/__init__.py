@@ -14,12 +14,7 @@ def convert_input_files_to_zarr(
         sample_name = sample['sample_name']
         raw_image_path = Path(sample['raw_image_path'])
         raw_image_zarr =  Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
-        
-        # organoid_segments_path = sample_metadata['organoid_tracks_image_path']
-        # tcell_segments_path = sample_metadata['tcell_tracks_image_path']
-        # organoid_tracks_path = sample_metadata['organoid_tracks_image_path']
-        # tcell_tracks_path = sample_metadata['tcell_tracks_image_path']
-        
+
         convert_file_to_zarr(
             path=raw_image_path, 
             outpath=raw_image_zarr, 
@@ -27,6 +22,7 @@ def convert_input_files_to_zarr(
         )
                 
         metadata.at[idx, "raw_image_path"] = str(raw_image_zarr)
+    
     return(metadata)
 
 def get_all_image_shapes(metadata):
