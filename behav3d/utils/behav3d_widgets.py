@@ -316,15 +316,8 @@ class MetadataLoader(widgets.VBox):
         finally:
             self._busy = False
 
-def convert_zarr_button(
-        metadata_loader,
-        dim_order_widget
-    ):
-    btn = widgets.Button(
-        description="Convert to Zarr",
-        button_style="success",
-        icon="cogs"
-    )
+def convert_zarr_button(metadata_loader, dim_order_widget):
+    btn = widgets.Button(description="Convert to Zarr", button_style="success", icon="cogs")
     out = widgets.Output()
 
     def _run_conversion(_):
@@ -332,12 +325,20 @@ def convert_zarr_button(
             out.clear_output()
             print("Starting conversion…")
             btn.disabled = True
+            # make sure current dim-order choices are written first (optional but handy)
+            try:
+                dim_order_widget.write_dimorder_to_metadata()
+            except Exception:
+                pass
+
+            # ensure `result` is always defined even if conversion errors
+            result = metadata_loader.metadata
             try:
                 result = convert_input_files_to_zarr(
                     metadata=metadata_loader.metadata,
                     output_dir=metadata_loader.output_dir
                 )
-            except Exception as e:
+            except Exception:
                 import traceback; traceback.print_exc()
             finally:
                 metadata_loader.metadata = result
@@ -346,7 +347,8 @@ def convert_zarr_button(
                 btn.disabled = False
 
     btn.on_click(_run_conversion)
-    display(widgets.VBox([btn, out]))
+    # ⬇️ return the widget; do not display here
+    return widgets.VBox([btn, out])
 class DimOrderTable:
     DIM_ORDER_OPTIONS = [
         "TCZYX",
@@ -417,6 +419,43 @@ class DimOrderTable:
             widgets.HBox([self._apply_all_dd, self._apply_all_btn]),
             self._out
         ])
+
+        # NEW: auto-load immediately if metadata already exists
+        self._maybe_autoload()
+
+    # NEW: helper that only shows “waiting” if metadata is None; otherwise loads
+    def _maybe_autoload(self):
+        df = getattr(self.metadata_loader, "metadata", None)
+        if df is None:
+            self._status.value = "<b>Waiting for user to load metadata…</b>"
+            return
+        if not isinstance(df, pd.DataFrame):
+            self._status.value = "<b>metadata_loader.metadata must be a pandas DataFrame.</b>"
+            return
+        missing = [c for c in (self.sample_col, self.path_col) if c not in df.columns]
+        if missing:
+            self._status.value = f"<b>Metadata missing columns: {missing}</b>"
+            return
+        self._build_rows_from(df)
+        self._status.value = "<span style='color:green'>Metadata loaded ✅</span>"
+
+    # UPDATED: only show “waiting” when metadata is None; otherwise load/refresh
+    def _on_refresh(self, _btn):
+        df = getattr(self.metadata_loader, "metadata", None)
+        if df is None:
+            self._status.value = "<b>Waiting for user to load metadata…</b>"
+            return
+        if not isinstance(df, pd.DataFrame):
+            self._status.value = "<b>metadata_loader.metadata must be a pandas DataFrame.</b>"
+            return
+
+        missing = [c for c in (self.sample_col, self.path_col) if c not in df.columns]
+        if missing:
+            self._status.value = f"<b>Metadata missing columns: {missing}</b>"
+            return
+
+        self._build_rows_from(df)
+        self._status.value = "<span style='color:green'>Metadata loaded ✅</span>"
         
     def display(self):
         display(self.widget)
