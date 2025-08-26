@@ -1101,7 +1101,8 @@ def calculate_relative_increase(df, column, nr_timepoints_back, groupby):
 
     # Use `transform`-like behavior by resetting the index before recombining
     result = df.groupby(groupby).apply(compute_increase)
-    result.index = result.index.droplevel(0)  # Remove groupby level to flatten index
+    if isinstance(result.index, pd.MultiIndex):
+        result.index = result.index.droplevel(0)
 
     return result
 
