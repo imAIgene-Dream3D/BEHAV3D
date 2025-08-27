@@ -234,16 +234,19 @@ def apply_classifier(classifier, features_outpath, pred_labels_outpath, n_worker
     pixel_class = load_image(pred_labels_outpath)
     pixel_class[pixel_class==1] = 0
     # pixel_class[pixel_class>0] -= 1
-    pixel_class = pixel_class.compute()
+    # pixel_class = pixel_class.compute()
+    pixel_class = np.asarray(pixel_class)
+
     return pixel_class
         
 def train_pixel_classifier(
     output_dir,
-    metadata,
+    metadata=None,
     examples_per_sample = 3,
     sample_specific_classifier=False,
     n_workers=None,
-    manual_dim_order=None  # Optional: tuple/list for custom dimension order in transpose
+    manual_dim_order=None,
+    images=None
     ):
     """
     Train a pixel classifier for segmentation.
@@ -255,6 +258,7 @@ def train_pixel_classifier(
         n_workers: Number of workers
         manual_dim_order: Optional. Tuple/list specifying the order for transpose, e.g. (1,0,2,3,4) for (C,T,Z,Y,X)
     """
+    assert images is not None or metadata is not None, "Either supply a BEHAV3D metadata table or a list of images"
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
         
@@ -263,96 +267,97 @@ def train_pixel_classifier(
     
     features_outpath = Path(pixel_class_outdir, 'PixelClassifier_Features.zarr')
     image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
- 
-    if not features_outpath.exists() or not image_outpath.exists():
-        if image_outpath.exists():
-            shutil.rmtree(image_outpath)
-        if features_outpath.exists():
-            shutil.rmtree(features_outpath)
-        
+    
+    if images is None:
+        if not features_outpath.exists() or not image_outpath.exists():
+            if image_outpath.exists():
+                shutil.rmtree(image_outpath)
+            if features_outpath.exists():
+                shutil.rmtree(features_outpath)
+            
+            all_images = []
+            all_features = []
+            for idx, sample in metadata.iterrows():
+                
+                sample_name = sample['sample_name']
+                
+                tcell_ch=sample['tcell_channel']
+                live_ch=sample['live_channel']
+                dead_ch=sample['dead_channel']
+                
+                print(f"Calculating features for: {sample_name}")
+                
+                raw_image_path = Path(sample['raw_image_path'])
+                raw_image_zarr =  Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
+                
+                if not raw_image_zarr.exists():
+                    print(f"- Converting raw image to .zarr for memory efficiency...")
+                    images = load_image(raw_image_path)
+                    print(f"Original image shape: {images.shape}")
+                    default_order = ("T", "C", "Z", "Y", "X")  # T, C, Z, Y, X
+                    if manual_dim_order is not None:
+                        # Convert to tuple of characters if string
+                        if isinstance(manual_dim_order, str):
+                            manual_dim_order = tuple(manual_dim_order)
+                        if manual_dim_order != default_order:
+                            # Compute permutation: for each axis in default_order, find its index in manual_dim_order
+                            perm = [manual_dim_order.index(ax) for ax in default_order]
+                            print(f"Transposing image from {manual_dim_order} to {default_order} using permutation {perm}")
+                            images = images.transpose(perm)
+                            print(f"New image shape: {images.shape}")
+                        else:
+                            print("Image is already in default order (T, C, Z, Y, X).")
+                    # else:
+                    #     print("No manual_dim_order provided, assuming image is already in default order.")
+                    chunksize = (1,) + images.shape[1:]
+                    save_as_zarr(
+                        img=images, 
+                        path=raw_image_zarr, 
+                        chunks=chunksize
+                    )
+                            
+                images = load_image(raw_image_zarr)
+                max_t = images.shape[0]-1
+                print(images.shape)
+                idc = np.linspace(0, max_t, examples_per_sample, dtype=int)
+                print(f"Taking timepoints: {idc}")
+                
+                # sample_images = [images[t, [tcell_ch, live_ch, dead_ch]] for t in idc]
+                sample_images = [images[t] for t in idc]
+                # for idx in idc:
+                #     sample_images.append(images[idx])      
+                
+                all_images+=sample_images
+                
+                for img in tqdm(sample_images):
+                    append_to_zarr(np.expand_dims(features_func(img), axis=0), features_outpath)
+                
+            # Allow manual override of dimension order for transpose
+            all_images = da.stack(all_images)
+            all_images = all_images.transpose(1, 0, 2, 3, 4) ## this order corresponds to (C, T, Z, Y, X)
+            save_as_zarr(all_images, image_outpath)
+            del all_images
+            gc.collect()
+            
+            all_images = load_zarr(image_outpath)
+            all_features = load_zarr(features_outpath)
+        else:
+            all_images = load_image(image_outpath)
+            all_features = load_image(features_outpath) 
+        all_images = np.asarray(all_images)
+    else:     
         all_images = []
         all_features = []
-        for idx, sample in metadata.iterrows():
-            
-            sample_name = sample['sample_name']
-            
-            tcell_ch=sample['tcell_channel']
-            live_ch=sample['live_channel']
-            dead_ch=sample['dead_channel']
-            
-            print(f"Calculating features for: {sample_name}")
-            
-            raw_image_path = Path(sample['raw_image_path'])
-            raw_image_zarr =  Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
-            
-            if not raw_image_zarr.exists():
-                print(f"- Converting raw image to .zarr for memory efficiency...")
-                images = load_image(raw_image_path)
-                print(f"Original image shape: {images.shape}")
-                default_order = ("T", "C", "Z", "Y", "X")  # T, C, Z, Y, X
-                if manual_dim_order is not None:
-                    # Convert to tuple of characters if string
-                    if isinstance(manual_dim_order, str):
-                        manual_dim_order = tuple(manual_dim_order)
-                    if manual_dim_order != default_order:
-                        # Compute permutation: for each axis in default_order, find its index in manual_dim_order
-                        perm = [manual_dim_order.index(ax) for ax in default_order]
-                        print(f"Transposing image from {manual_dim_order} to {default_order} using permutation {perm}")
-                        images = images.transpose(perm)
-                        print(f"New image shape: {images.shape}")
-                    else:
-                        print("Image is already in default order (T, C, Z, Y, X).")
-                # else:
-                #     print("No manual_dim_order provided, assuming image is already in default order.")
-                chunksize = (1,) + images.shape[1:]
-                save_as_zarr(
-                    img=images, 
-                    path=raw_image_zarr, 
-                    chunks=chunksize
-                )
-                        
-            images = load_image(raw_image_zarr)
-            max_t = images.shape[0]-1
-            print(images.shape)
-            idc = np.linspace(0, max_t, examples_per_sample, dtype=int)
-            print(f"Taking timepoints: {idc}")
-            
-            # sample_images = [images[t, [tcell_ch, live_ch, dead_ch]] for t in idc]
-            sample_images = [images[t] for t in idc]
-            # for idx in idc:
-            #     sample_images.append(images[idx])      
-            
-            all_images+=sample_images
-            
-            for img in tqdm(sample_images):
-                append_to_zarr(np.expand_dims(features_func(img), axis=0), features_outpath)
-            
-            # def calculate_features(args):
-            #     path, t = args
-            #     img = load_image(path)
-            #     img = img[t]
-            #     return features_func(img)
-            
-            # args_list = [(raw_image_zarr, t) for t in idc]
-            # if n_workers > 1:
-            #     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            #         all_features+=list(tqdm(executor.map(calculate_features, args_list), total=len(idc)))
-            # else:
-            #     all_features+=[calculate_features(args) for args in tqdm(args_list) ]
-        # Allow manual override of dimension order for transpose
-        all_images = da.stack(all_images)
-        all_images = all_images.transpose(1, 0, 2, 3, 4) ## this order corresponds to (C, T, Z, Y, X)
-        save_as_zarr(all_images, image_outpath)
-        del all_images
-        gc.collect()
+        for img in images:
+            feature_img = features_func(img)
+            all_images.append(img)
+            all_features.append(feature_img)
         
-        all_images = load_zarr(image_outpath)
-        all_features = load_zarr(features_outpath)
-    else:
-        all_images = load_image(image_outpath)
-        all_features = load_image(features_outpath) 
-            
-    all_images = np.asarray(all_images)
+        all_images = np.stack(all_images, axis=0)
+        all_images = all_images.transpose(1, 0, 2, 3, 4)
+        save_as_zarr(all_images, image_outpath)
+        all_features = np.stack(all_features, axis=0)
+        save_as_zarr(all_features, features_outpath)
     
     def segment_and_update(
         pixel_class_outdir,
@@ -393,7 +398,7 @@ def train_pixel_classifier(
             # Get 1D indices where labels exist
             label_indices = np.flatnonzero(flat_label_data > 0)
 
-            selected_features = flat_features[label_indices].compute()  # (N_selected, 90)
+            selected_features = np.asarray(flat_features[label_indices]) # (N_selected, 90)
             selected_labels = flat_label_data[label_indices]   
             
             nr_bg_pix = int(np.sum(selected_labels==1))
@@ -529,7 +534,7 @@ def train_pixel_classifier(
     n_channels = all_images.shape[0]
     
     # Define colors for different channels
-    channel_colors = ['red', 'green', 'blue', 'cyan', 'magenta', 'yellow']
+    channel_colors = ['cyan', 'yellow', 'red', 'green', 'magenta', 'blue']
     
     for ch in range(n_channels):
         channel_data = all_images[ch]  # Shape: (time, z, y, x)
