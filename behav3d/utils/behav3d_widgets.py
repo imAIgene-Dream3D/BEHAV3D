@@ -1,8 +1,10 @@
 # behav3d_widgets.py
+import random
+
 import ipywidgets as widgets
 from ipyfilechooser import FileChooser
 from IPython.display import display, clear_output
-from behav3d.utils import load_behav3d_metadata, check_behav3d_metadata
+from behav3d.utils import load_behav3d_metadata, check_behav3d_metadata, expand_column_patterns
 from behav3d.preprocessing import convert_input_files_to_zarr
 import builtins
 from pathlib import Path
@@ -16,20 +18,63 @@ import traceback
 from behav3d.preprocessing.tracking import visualize_tracks
 import json
 from copy import deepcopy
+import yaml
+import fnmatch
 
+behav3d_calculated_features = {
+    "morphology": [
+        "nr_pixels",
+        "volume",
+        "bbox_volume",
+        "extent",
+        "solidity",
+        "equivalent_diameter",
+        "major_axis_length",
+        "minor_axis_length",
+        "elongation",
+        "surface_area",
+        "sphericity",
+        "convex_volume",
+        "orientation_vector",
+    ],
+    "movement": [
+        "displacement",
+        "cumulative_displacement",
+        "displacement_from_origin",
+        "mean_square_displacement",
+        "speed",
+        "mean_speed",
+    ],
+    "intensity": [
+        "mean_intensity_*",
+        "mean_dead_dye",
+    ],
+    "death": [
+        "percentage_dead_mask",
+        "nr_dead_mask_pixels",
+        "increase_dead_mask",
+        "dead",
+    ],
+    "contact": [
+        "organoid_contact",
+        "organoid_contact_pixels",
+        "tcell_contact",
+        "tcell_contact_pixels",
+        "active_tcell_contact",
+    ],
+}
 # ===============================
 # JSON CONFIG (loader + defaults)
 # ===============================
-CONFIG_PATH = Path("behav3d_config.json")  # adjust if you prefer a different location
+CONFIG_PATH = Path("behav3d_config.yml")  # adjust if you prefer a different location
 
 _DEFAULT_CONFIG = {
+    "seed": 42,
     "paths": {
-        "metadata_csv": r"/Volumes/T7_Sam//BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv",
-        "output_dir": r"/Volumes/T7_Sam//BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/"
+        "metadata_csv": r"F:\BHVD_BEHAV3D\BEHAV3D_python\runs\ROCHE\metadata_windows_home.csv",
+        "output_dir": r"F:\BHVD_BEHAV3D\BEHAV3D_python\runs\ROCHE"
     },
-    "dim_order": {
-        "default_apply_all": "TCZYX"
-    },
+    "dim_order": {"default_apply_all": "TCZYX"},
     "pixel_classifier": {
         "examples_per_sample": 3,
         "sample_specific_classifier": False,
@@ -40,20 +85,39 @@ _DEFAULT_CONFIG = {
         "tp_end": 0
     },
     "tracking": {
-        "method": "lap",
-        "overwrite": False,
-        "lap": {
-            "track_cost_px": 45,
-            "gap_close_cost_px": 60,
-            "gap_close_max_frames": 3,
-            "merging_cost_px": 0,
-            "splitting_cost_px": 0
+        "tcell": {
+            "method": "lap",
+            "overwrite": False,
+            "lap": {
+                "track_cost_px": 45,
+                "gap_close_cost_px": 60,
+                "gap_close_max_frames": 3,
+                "merging_cost_px": 0,
+                "splitting_cost_px": 0
+            },
+            "trackpy": {
+                "search_range_px": 31,
+                "memory_frames": 2,
+                "adaptive_stop": 10.0,
+                "adaptive_step": 0.95
+            }
         },
-        "trackpy": {
-            "search_range_px": 31,
-            "memory_frames": 2,
-            "adaptive_stop": 10.0,
-            "adaptive_step": 0.95
+        "organoid": {
+            "method": "lap",
+            "overwrite": False,
+            "lap": {
+                "track_cost_px": 60,
+                "gap_close_cost_px": 80,
+                "gap_close_max_frames": 3,
+                "merging_cost_px": 0,
+                "splitting_cost_px": 0
+            },
+            "trackpy": {
+                "search_range_px": 35,
+                "memory_frames": 2,
+                "adaptive_stop": 10.0,
+                "adaptive_step": 0.95
+            }
         }
     },
     "tracking_visualization": {
@@ -62,6 +126,60 @@ _DEFAULT_CONFIG = {
         "start_t": 0,
         "end_t": 0,
         "channel_colors": ["cyan", "yellow", "red", "green", "magenta", "blue"]
+    },
+    "features": {
+        "tcell": {
+            "dead_mask_percentage_threshold": 0.05,
+            "features_choice": ["movement", "intensity", "morphology", "contact", "death"],
+            "n_workers": 16,
+            "overwrite": False
+        },
+        "organoid": {
+            "dead_mask_percentage_threshold": 0.02,
+            "features_choice": ["morphology", "intensity", "death"],
+            "n_workers": 8,
+            "overwrite": False
+        }
+    },
+    "track_filtering": {
+        "tcell": {
+            "exp_duration": 24.0,
+            "exp_duration_enabled": False,
+            "min_track_length": 3,
+            "min_track_length_enabled": False,
+            "max_track_length": 999999,
+            "max_track_length_enabled": False,
+            "filter_t0_dead": True,
+            "filter_t0_dead_enabled": False
+        },
+        "organoid": {
+            "exp_duration": 24.0,
+            "exp_duration_enabled": False,
+            "min_track_length": 3,
+            "min_track_length_enabled": False,
+            "max_track_length": 999999,
+            "max_track_length_enabled": False,
+            "filter_t0_dead": False,
+            "filter_t0_dead_enabled": False
+        }
+    },
+    "analysis": {
+        "tcell": {
+            "seed": 42,
+            "umap_min_dist": 0.1,
+            "umap_n_neighbors": 15,
+            "nr_of_clusters": 5,
+            "dtw_feature_groups_enabled": {
+                "morphology": False,
+                "movement": False,
+                "intensity": False,
+                "death": False,
+                "contact": False,
+            },
+            "dtw_features_input": [],      # patterns allowed (e.g. "mean_intensity_*")
+            "dtw_features_resolved": [],   # expanded at run
+            "z_normalize": {},             # {feature_name: bool}
+        }
     }
 }
 
@@ -78,11 +196,12 @@ def _load_config(path: Path = CONFIG_PATH) -> dict:
     cfg = deepcopy(_DEFAULT_CONFIG)
     if path.exists():
         try:
-            user = json.loads(path.read_text())
-            cfg = _deep_merge(cfg, user)
-        except Exception:
+            user = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if isinstance(user, dict):
+                cfg = _deep_merge(cfg, user)
+        except Exception as e:
             # ignore malformed files; keep defaults
-            pass
+            print(f"⚠️ Failed to load config {path}: {e}")
     return cfg
 
 def _cfg_get(cfg: dict, dotted_key: str, default=None):
@@ -95,6 +214,21 @@ def _cfg_get(cfg: dict, dotted_key: str, default=None):
 
 CFG = _load_config()
 
+spinning_loader = (
+                '<div style="display:flex;align-items:center;gap:6px;">'
+                # circular spinner (animated via SVG, no CSS needed)
+                '<svg width="18" height="18" viewBox="0 0 44 44" stroke="#1f77b4">'
+                '  <g fill="none" fill-rule="evenodd" stroke-width="4">'
+                '    <circle cx="22" cy="22" r="18" stroke-opacity=".2"></circle>'
+                '    <path d="M40 22c0-9.94-8.06-18-18-18">'
+                '      <animateTransform attributeName="transform" type="rotate"'
+                '        from="0 22 22" to="360 22 22" dur="0.8s" repeatCount="indefinite"/>'
+                '    </path>'
+                '  </g>'
+                '</svg>'
+                '<span style="font-size:12px;color:#555;">Running…</span>'
+                '</div>'
+            )
 def _mk_timepoint_range(use_all: bool, start: int, end: int):
     if use_all:
         return None
@@ -149,11 +283,13 @@ class PathPicker(widgets.VBox):
         filename = ''
         if mode == 'file' and default:
             p = Path(default)
-            if p.is_absolute():
-                start_dir = str(p.parent if p.parent.exists() else start_dir)
-                filename = p.name
-            else:
-                filename = str(default)
+            start_dir = str(p.parent if p.parent.exists() else start_dir)
+            filename = p.name
+            # if p.is_absolute():
+            #     start_dir = str(p.parent if p.parent.exists() else start_dir)
+            #     filename = p.name
+            # else:
+            #     filename = str(default)
         elif mode == 'dir' and default and os.path.isdir(default):
             start_dir = str(default)
 
@@ -299,22 +435,35 @@ class MetadataLoader(widgets.VBox):
             self.output_dir = self.output_dir_picker.value if self.output_dir_picker is not None else ""
             self.metadata_csv_path = str(path)
             
+            self.behav3d_parameters_path = Path(self.output_dir, "behav3d_parameters.yml")
+            
+            if self.behav3d_parameters_path.exists():
+                self.behav3d_parameters = _load_config(path = self.behav3d_parameters_path)
+            else:
+                self.behav3d_parameters = deepcopy(_DEFAULT_CONFIG)
+                
+            self.behav3d_parameters["paths"]["metadata_csv"] = str(self.metadata_csv_path)
+            self.behav3d_parameters["paths"]["output_dir"]   = str(self.output_dir)
+            yaml.safe_dump(self.behav3d_parameters, self.behav3d_parameters_path.open("w"), sort_keys=False)
+            
             check_behav3d_metadata(self.metadata)
             print("✅ Checks passed!")
             display(self.metadata)
-   
+
+            
     # Button handler
     def _on_click(self, _):
         if self._busy:
             return  # re-entrancy guard prevents double execution
         self._busy = True
-        try:
-            self.load()
-        except Exception as e:
-            with self.out:
-                print(f"❌ Error: {e}")
-        finally:
-            self._busy = False
+        self.load()
+        # try:
+        #     self.load()
+        # except Exception as e:
+        #     with self.out:
+        #         print(f"❌ Error: {e}")
+        # finally:
+        self._busy = False
 
 def convert_zarr_button(metadata_loader, dim_order_widget):
     btn = widgets.Button(description="Convert to Zarr", button_style="success", icon="cogs")
@@ -389,7 +538,7 @@ class DimOrderTable:
         self._refresh_btn = widgets.Button(description="Refresh", tooltip="Build/Update table from metadata")
         self._refresh_btn.on_click(self._on_refresh)
 
-        _apply_default = str(_cfg_get(CFG, "dim_order.default_apply_all", self.DEFAULT_ORDER))
+        _apply_default = str(_cfg_get(self.metadata_loader.behav3d_parameters, "dim_order.default_apply_all", self.DEFAULT_ORDER))
         if _apply_default not in self.DIM_ORDER_OPTIONS:
             _apply_default = self.DEFAULT_ORDER
 
@@ -592,7 +741,7 @@ class DimOrderTable:
 class PixelClassifierPanel:
     def __init__(self, metadata_loader):
         self.metadata_loader = metadata_loader
-        pc = _cfg_get(CFG, "pixel_classifier", {})
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
 
         # -------- Train controls --------
         self.examples_per_sample = widgets.IntSlider(
@@ -662,6 +811,21 @@ class PixelClassifierPanel:
 
         self.ui = widgets.VBox([train_box, widgets.HTML("<hr>"), apply_box, widgets.HTML("<hr>"), self.out])
 
+    def _persist_params(self):
+        """Update CFG with current widget values and save to file."""
+    
+        # pixel classifier section
+        self.metadata_loader.behav3d_parameters["pixel_classifier"]["examples_per_sample"] = int(self.examples_per_sample.value)
+        self.metadata_loader.behav3d_parameters["pixel_classifier"]["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
+        self.metadata_loader.behav3d_parameters["pixel_classifier"]["workers"] = int(self.n_workers.value)
+        self.metadata_loader.behav3d_parameters["pixel_classifier"]["organoid_edt_threshold"] = float(self.organoid_edt_threshold.value)
+        self.metadata_loader.behav3d_parameters["pixel_classifier"]["use_all_timepoints"] = bool(self.use_all_timepoints.value)
+        self.metadata_loader.behav3d_parameters["pixel_classifier"]["tp_start"] = int(self.tp_start.value)
+        self.metadata_loader.behav3d_parameters["pixel_classifier"]["tp_end"]   = int(self.tp_end.value)
+        # write to disk
+        yaml.safe_dump(self.metadata_loader.behav3d_parameters, self.metadata_loader.behav3d_parameters_path.open("w"), sort_keys=False)
+
+                
     def _toggle_timepoint_inputs(self, change=None):
         show = not self.use_all_timepoints.value
         disp = None if show else 'none'
@@ -687,6 +851,7 @@ class PixelClassifierPanel:
         with self.out:
             self.out.clear_output()
             try:
+                self._persist_params()
                 odir = Path(self.metadata_loader.output_dir).expanduser()
                 odir.mkdir(parents=True, exist_ok=True)
 
@@ -713,6 +878,7 @@ class PixelClassifierPanel:
         self._lock(True)
         with self.out:
             self.out.clear_output()
+            self._persist_params()
             try:
                 odir = Path(self.metadata_loader.output_dir).expanduser()
                 odir.mkdir(parents=True, exist_ok=True)
@@ -735,17 +901,12 @@ class PixelClassifierPanel:
                     timepoint_range=tpr
                 )
 
-                # Update loader + ALWAYS save CSV
-                self.metadata_loader.metadata = new_md
-                csv_path = Path(self.metadata_loader.metadata_csv_path).expanduser()
-                print(f"💾 Saving metadata to: {csv_path}", flush=True)
-                new_md.to_csv(csv_path, sep=",", index=False)
-
                 print("✅ Apply finished.", flush=True)
             except Exception:
                 import traceback; traceback.print_exc()
             finally:
                 self._lock(False)
+
 class TrackingPanel:
     """
     Minimal UI for tracking (LAP, TrackPy, or Propagation).
@@ -756,7 +917,9 @@ class TrackingPanel:
     def __init__(self, metadata_loader, cell_type="tcell"):
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
-        tcfg = _cfg_get(CFG, "tracking", {})
+        # --- choose profile defaults ---
+        
+        tcfg = _cfg_get(self.metadata_loader.behav3d_parameters, f"tracking.{self.cell_type}", {}) or {}
 
         # Method selector
         self.method = widgets.Dropdown(
@@ -859,7 +1022,7 @@ class TrackingPanel:
 
         # Layout
         self.ui = widgets.VBox([
-            widgets.HTML("<b>Tracking</b>"),
+            widgets.HTML(f"<b> {cell_type} Tracking</b>"),
             self.method,
             widgets.HBox([self.overwrite]),
             self.param_container,
@@ -871,6 +1034,26 @@ class TrackingPanel:
     def display(self):
         display(self.ui)
 
+    def _persist_params(self):
+        # CFG.setdefault("tracking", {}).setdefault(self.cell_type, {})
+        prof = self.metadata_loader.behav3d_parameters["tracking"][self.cell_type]
+        prof["method"] = str(self.method.value)
+        prof["overwrite"] = bool(self.overwrite.value)
+
+        prof["lap"]["track_cost_px"] = int(self.track_cost_dist.value)
+        prof["lap"]["gap_close_cost_px"] = int(self.gap_cost_dist.value)
+        prof["lap"]["gap_close_max_frames"] = int(self.gap_max_frames.value)
+        prof["lap"]["merging_cost_px"] = int(self.merging_cost_dist.value)
+        prof["lap"]["splitting_cost_px"] = int(self.splitting_cost_dist.value)
+
+        prof["trackpy"]["search_range_px"] = int(self.tp_search_range.value)
+        prof["trackpy"]["memory_frames"] = int(self.tp_memory.value)
+        prof["trackpy"]["adaptive_stop"] = float(self.tp_adaptive_stop.value)
+        prof["trackpy"]["adaptive_step"] = float(self.tp_adaptive_step.value)
+
+        yaml.safe_dump(self.metadata_loader.behav3d_parameters, self.metadata_loader.behav3d_parameters_path.open("w"), sort_keys=False)
+
+                
     def _toggle_param_groups(self, change=None):
         if self.method.value == "lap":
             self.param_container.children = (self.lap_params,)
@@ -895,6 +1078,7 @@ class TrackingPanel:
         with self.out:
             self.out.clear_output()
             try:
+                self._persist_params()
                 out_dir = Path(self.metadata_loader.output_dir).expanduser()
                 out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -965,6 +1149,7 @@ class TrackingPanel:
                 import traceback; traceback.print_exc()
             finally:
                 self._lock(False)
+
 class TrackingVisualizationPanel:
     def __init__(
         self,
@@ -975,7 +1160,7 @@ class TrackingVisualizationPanel:
         self.metadata_loader = metadata_loader
         # prefer JSON channel colors if not passed
         self.channel_colors = tuple(channel_colors or _cfg_get(
-            CFG, "tracking_visualization.channel_colors",
+            self.metadata_loader.behav3d_parameters, "tracking_visualization.channel_colors",
             ["cyan", "yellow", "red", "green", "magenta", "blue"]
         ))
 
@@ -1001,7 +1186,7 @@ class TrackingVisualizationPanel:
         # Tickbox to enable/disable time range (from JSON)
         self.use_range = widgets.Checkbox(
             description="Use custom time range",
-            value=bool(_cfg_get(CFG, "tracking_visualization.use_range", False)),
+            value=bool(_cfg_get(self.metadata_loader.behav3d_parameters, "tracking_visualization.use_range", False)),
             indent=False,
         )
 
@@ -1009,8 +1194,8 @@ class TrackingVisualizationPanel:
         if isinstance(default_time_range, (tuple, list)) and len(default_time_range) == 2:
             _start_default, _end_default = map(int, default_time_range)
         else:
-            _start_default = int(_cfg_get(CFG, "tracking_visualization.start_t", 0))
-            _end_default   = int(_cfg_get(CFG, "tracking_visualization.end_t", 0))
+            _start_default = int(_cfg_get(self.metadata_loader.behav3d_parameters, "tracking_visualization.start_t", 0))
+            _end_default   = int(_cfg_get(self.metadata_loader.behav3d_parameters, "tracking_visualization.end_t", 0))
 
         self.start_t = widgets.IntText(
             description="Start T:",
@@ -1132,7 +1317,7 @@ class TrackingVisualizationPanel:
             self.open_button.disabled = True
             return
 
-        desired = _cfg_get(CFG, "tracking_visualization.sample_name", None)
+        desired = _cfg_get(self.metadata_loader.behav3d_parameters, "tracking_visualization.sample_name", None)
         self.sample_dropdown.options = sample_names
         self.sample_dropdown.value = desired if (desired in sample_names) else sample_names[0]
         self.sample_dropdown.disabled = False
@@ -1163,1151 +1348,996 @@ class TrackingVisualizationPanel:
                 self._maybe_build_from_loader()
             except Exception as e:
                 print(f"Refresh failed: {e}")
-                
-# ##Define widgets
-# class PathPicker(widgets.VBox):
-#     """
-#     Displayable widget for picking a file or directory.
-#     - mode: 'file' or 'dir'
-#     - start_dir: starting directory for the chooser
-#     - default: default filename (file mode) or starting path (dir mode)
-#     - filter_pattern: e.g. '*.csv' (file mode only)
-#     """
-#     def __init__(
-#         self,
-#         mode='file',
-#         start_dir='.',
-#         default='',
-#         description='Path:',
-#         button_description='Browse…',
-#         placeholder='Type a path or click Browse…',
-#         filter_pattern=None,
-#         description_width='90px',
-#         width='100%',
-#     ):
-#         assert mode in ('file', 'dir')
-#         self._mode = mode
+       
+class FeatureExtractionPanel:
+    """
+    Minimal UI for feature extraction (per-cell-type), mirroring TrackingPanel style.
+    - Uses metadata_loader.output_dir and metadata_loader.metadata_csv_path directly
+    - Updates metadata_loader.metadata and always saves CSV
+    - Persists used settings to behav3d_parameters.yml under features.<cell_type>
+    """
+    def __init__(self, metadata_loader, cell_type="tcell"):
+        self.metadata_loader = metadata_loader
+        self.cell_type = str(cell_type).strip()
 
-#         # Text box (the only persistent UI)
-#         self.text = widgets.Textarea(
-#             value=str(default or ''),
-#             description=description,
-#             placeholder=placeholder,
-#             style={'description_width': description_width},
-#             layout=widgets.Layout(width=width, height='32px'),
-#         )
+        fcfg = _cfg_get(self.metadata_loader.behav3d_parameters,
+                        f"features.{self.cell_type}", {}) or {}
 
-#         # Browse button
-#         self.button = widgets.Button(
-#             description=button_description, icon='folder-open',
-#             tooltip=f"Choose a {'folder' if mode=='dir' else 'file'}"
-#         )
+        # --- Controls ---
+        self.dead_mask_threshold = widgets.FloatSlider(
+            description="Dead mask % thr",
+            value=float(fcfg.get("dead_mask_percentage_threshold", 0.05)),
+            min=0.0, max=1.0, step=0.01,
+            readout_format=".2f", continuous_update=False,
+            style={'description_width':'160px'}
+        )
 
-#         # Resolve starting directory & filename
-#         start_dir = start_dir or '.'
-#         filename = ''
-#         if mode == 'file' and default:
-#             p = Path(default)
-#             if p.is_absolute():
-#                 start_dir = str(p.parent if p.parent.exists() else start_dir)
-#                 filename = p.name
-#             else:
-#                 filename = str(default)
-#         elif mode == 'dir' and default and os.path.isdir(default):
-#             start_dir = str(default)
+        self._all_features = ["movement", "intensity", "morphology", "contact", "death"]
+        default_feats = fcfg.get("features_choice", self._all_features)
+        if not isinstance(default_feats, (list, tuple)):
+            default_feats = self._all_features
+        default_feats = [f for f in default_feats if f in self._all_features] or self._all_features
 
-#         # FileChooser (hidden until button click)
-#         self.fc = FileChooser(path=start_dir, filename=filename)
-#         self.fc.title = f"<b>Select {'directory' if mode=='dir' else 'file'}</b>"
-#         self.fc.show_only_dirs = (mode == 'dir')
-#         self.fc.use_dir_icons = True
-#         if filter_pattern and mode == 'file':
-#             self.fc.filter_pattern = filter_pattern
+        self.feature_checks = {
+            f: widgets.Checkbox(description=f.capitalize(), value=(f in default_feats), indent=False)
+            for f in self._all_features
+        }
+        self.features_box = widgets.VBox(
+            [widgets.HTML("<b>Features</b>")] + [self.feature_checks[f] for f in self._all_features]
+        )
 
-#         # Container: row with Text + Button (chooser injected below when needed)
-#         self._row = widgets.HBox([self.text, self.button])
-#         super().__init__([self._row])
+        self.n_workers = widgets.IntSlider(
+            description="Workers",
+            value=int(fcfg.get("n_workers", max(8, (os.cpu_count() or 8)))),
+            min=1, max=max(8, (os.cpu_count() or 8)),
+            step=1, continuous_update=False,
+            style={'description_width':'160px'}
+        )
 
-#         # Wire events
-#         self.button.on_click(self._toggle_chooser)
-#         self.fc.register_callback(self._on_select)
-#         self.text.observe(self._on_text_change, names='value')
+        # NEW: overwrite checkbox
+        self.overwrite = widgets.Checkbox(
+            description="Overwrite existing",
+            value=bool(fcfg.get("overwrite", False))
+        )
 
-#     # ---- public API ----
-#     @property
-#     def value(self) -> str:
-#         """Current selected path (string)."""
-#         return self.text.value
-
-#     @value.setter
-#     def value(self, path: str):
-#         """Set the path programmatically (updates chooser location if possible)."""
-#         self.text.value = str(path or '')
-
-#     @property
-#     def mode(self) -> str:
-#         return self._mode
-
-#     # ---- internal helpers ----
-#     def _toggle_chooser(self, _=None):
-#         if self.fc in self.children:
-#             # hide
-#             self.children = tuple(c for c in self.children if c is not self.fc)
-#         else:
-#             # show
-#             self.children = tuple(list(self.children) + [self.fc])
-
-#     def _on_select(self, chooser):
-#         # Fill text and hide chooser
-#         if self._mode == 'dir':
-#             self.text.value = chooser.selected_path
-#         else:
-#             self.text.value = chooser.selected
-#         if self.fc in self.children:
-#             self.children = tuple(c for c in self.children if c is not self.fc)
-
-#     def _on_text_change(self, change):
-#         # Keep chooser in sync when user types/pastes a path
-#         newv = (change.get('new') or '').strip()
-#         if not newv:
-#             return
-#         try:
-#             if self._mode == 'dir':
-#                 if os.path.isdir(newv):
-#                     self.fc.reset(path=newv)
-#             else:
-#                 # file mode: split into directory + filename
-#                 parent = os.path.dirname(newv) or '.'
-#                 fname = os.path.basename(newv)
-#                 if os.path.isdir(parent):
-#                     if fname:
-#                         self.fc.reset(path=parent, filename=fname)
-#                     else:
-#                         self.fc.reset(path=parent)
-#         except Exception:
-#             # Don't crash UI if reset fails; ignore silently
-#             pass
-# class MetadataLoader(widgets.VBox):
-#     """
-#     A VBox widget that wraps a file PathPicker and a 'Load' button.
-#     After clicking the button, `value` holds the loaded pandas DataFrame,
-#     and `path` holds the CSV path. Works without globals; read .value later.
-
-#     Parameters
-#     ----------
-#     file_picker : a widget with a `.value` path (e.g., your PathPicker)
-#         If None, you can pass one later via set_file_picker().
-#     button_description : str
-#         Button label text.
-#     """
-#     _busy = Bool(default_value=False).tag(sync=False)
-#     _handler_bound = Bool(default_value=False).tag(sync=False)
-    
-#     def __init__(
-#         self,
-#         metadata_path_picker,
-#         output_dir_picker,
-#         button_description: str = "Load metadata",
-#         **kwargs,
-#     ):
-#         super().__init__(**kwargs)
-#         self.metadata = None
-#         self.output_dir = None
-#         self.metadata_csv_path = None
-            
-#         self.file_picker = metadata_path_picker
-#         self.output_dir_picker = output_dir_picker
+        # Run + log
+        self.btn_run = widgets.Button(description="Run feature extraction", button_style="success")
+        self.btn_run.on_click(self._on_run_clicked)
         
-#         self.button = widgets.Button(description=button_description, button_style='success')
-#         self.out = widgets.Output()
+        self.spinner_html = widgets.HTML(
+            value=spinning_loader
+        )
+        self.spinner_html.layout.display = "none"  # hidden until run starts
 
-#         # self.button.on_click(self._on_click)
-#         self._click_handler = self._on_click
-#         self.button.on_click(self._click_handler)
-#         # Build UI (file_picker may be None initially)
-#         children = []
-#         if self.output_dir_picker is not None:
-#             children.append(self.output_dir_picker)
-#         if self.file_picker is not None:
-#             children.append(self.file_picker)  
-#         children += [self.button, self.out]
-#         self.children = tuple(children)
+        
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_html],
+            layout=widgets.Layout(align_items="center", gap="10px")
+        )
+        
+        self.out = widgets.Output()
 
-   
-#     def set_file_picker(self, file_picker: widgets.Widget):
-#         """Attach/replace the file picker widget (must have a `.value` path)."""
-#         self.file_picker = file_picker
-#         # Rebuild children with the new picker at the top
-#         # self.children = (self.file_picker, self.button, self.out)
+        # Layout
+        self.ui = widgets.VBox([
+            widgets.HTML(f"<b> {self.cell_type} Feature Extraction</b>"),
+            widgets.HBox([self.dead_mask_threshold, self.n_workers]),
+            self.features_box,
+            self.overwrite,             # <- new row
+            self.run_row,
+            widgets.HTML("<hr>"),
+            self.out
+        ])
 
-#     def load(self, path = None):
-#         """Programmatic load (same as clicking the button)."""
-#         if path is None:
-#             if self.file_picker is None:
-#                 raise ValueError("No file_picker attached and no path provided.")
-#             path = self.file_picker.value
+    def _selected_features(self):
+        return [f for f in self._all_features if self.feature_checks[f].value]
 
-#         with self.out:
-#             clear_output(wait=True)
+    def _persist_params(self):
+        params = self.metadata_loader.behav3d_parameters
+        params.setdefault("features", {})
+        params["features"].setdefault(self.cell_type, {})
+        prof = params["features"][self.cell_type]
+
+        prof["dead_mask_percentage_threshold"] = float(self.dead_mask_threshold.value)
+        prof["features_choice"] = self._selected_features()
+        prof["n_workers"] = int(self.n_workers.value)
+        prof["overwrite"] = bool(self.overwrite.value)   # <- save overwrite
+
+        params.setdefault("paths", {})
+        if getattr(self.metadata_loader, "metadata_csv_path", None):
+            params["paths"]["metadata_csv"] = str(Path(self.metadata_loader.metadata_csv_path).expanduser())
+        if getattr(self.metadata_loader, "output_dir", None):
+            params["paths"]["output_dir"] = str(Path(self.metadata_loader.output_dir).expanduser())
+
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(params, f, sort_keys=False)
+
+    def _lock(self, state: bool):
+        for w in [self.dead_mask_threshold, self.n_workers, self.overwrite,
+                  self.btn_run, *self.feature_checks.values()]:
+            if hasattr(w, "disabled"):
+                w.disabled = state
+
+    def _on_run_clicked(self, _):
+        self._lock(True)
+        self.spinner_html.layout.display = None
+        with self.out:
+            self.out.clear_output()
+            try:
+                self._persist_params()
+
+                out_dir = Path(self.metadata_loader.output_dir).expanduser()
+                out_dir.mkdir(parents=True, exist_ok=True)
+                csv_path = Path(self.metadata_loader.metadata_csv_path).expanduser()
+
+                thr = float(self.dead_mask_threshold.value)
+                feats = self._selected_features()
+                workers = int(self.n_workers.value)
+                ow = bool(self.overwrite.value)
+
+                print("▶️ Running feature extraction…", flush=True)
+                print(f"  dead_mask_percentage_threshold={thr}")
+                print(f"  features_choice={feats}")
+                print(f"  n_workers={workers}, overwrite={ow}")
+                print(f"  output_dir={out_dir}", flush=True)
+
+                from __main__ import run_feature_extraction
+                new_md = run_feature_extraction(
+                    dead_mask_percentage_threshold=thr,
+                    metadata=self.metadata_loader.metadata,
+                    output_dir=str(out_dir),
+                    features_choice=feats,
+                    cell_type=self.cell_type,
+                    n_workers=workers,
+                    overwrite=ow                # <- pass overwrite here
+                )
+                print("✅ Feature extraction finished.", flush=True)
+            except Exception:
+                import traceback; traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
+
+class TrackFilterPanel:
+    def __init__(self, metadata_loader, cell_type="tcell"):
+        self.metadata_loader = metadata_loader
+        self.cell_type = str(cell_type).strip()
+
+        # seed config
+        params = self.metadata_loader.behav3d_parameters
+        params.setdefault("track_filtering", {})
+        if self.cell_type not in params["track_filtering"]:
+            from copy import deepcopy
+            params["track_filtering"][self.cell_type] = deepcopy(
+                _DEFAULT_CONFIG["track_filtering"][self.cell_type]
+            )
+            with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(params, f, sort_keys=False)
+
+        cfg = params["track_filtering"][self.cell_type]
+
+        # ---- exp_duration ----
+        self.en_exp_duration = widgets.Checkbox(
+            description="Trim down full time series to supplied duration",
+            value=bool(cfg.get("exp_duration_enabled", False)),
+            indent=False
+        )
+        # REPLACED FloatSlider -> FloatText
+        self.exp_duration = widgets.FloatText(
+            description="Exp. duration (h)",
+            value=float(cfg.get("exp_duration", 24.0)),
+            style={'description_width': '160px'},
+            continuous_update=False
+        )
+        self.row_exp = widgets.HBox([self.exp_duration], layout=widgets.Layout(display="none"))
+        self.en_exp_duration.observe(
+            lambda c: self.row_exp.layout.__setattr__("display", None if self.en_exp_duration.value else "none"),
+            names="value"
+        )
+        if self.en_exp_duration.value:
+            self.row_exp.layout.display = None
+
+        # ---- min_track_length ----
+        self.en_min_len = widgets.Checkbox(
+            description="Select only tracks with minimal length",
+            value=bool(cfg.get("min_track_length_enabled", False)),
+            indent=False
+        )
+        # REPLACED IntSlider -> IntText
+        self.min_track_length = widgets.IntText(
+            description="Minimal length",
+            value=int(cfg.get("min_track_length", 3)),
+            style={'description_width': '160px'},
+            continuous_update=False
+        )
+        self.row_min = widgets.HBox([self.min_track_length], layout=widgets.Layout(display="none"))
+        self.en_min_len.observe(
+            lambda c: self.row_min.layout.__setattr__("display", None if self.en_min_len.value else "none"),
+            names="value"
+        )
+        if self.en_min_len.value:
+            self.row_min.layout.display = None
+
+        # ---- max_track_length ----
+        self.en_max_len = widgets.Checkbox(
+            description="Trim down tracks to supplied length",
+            value=bool(cfg.get("max_track_length_enabled", False)),
+            indent=False
+        )
+        # REPLACED IntSlider -> IntText
+        self.max_track_length = widgets.IntText(
+            description="Maximal length",
+            value=int(cfg.get("max_track_length", 999999)),
+            style={'description_width': '160px'},
+            continuous_update=False
+        )
+        self.row_max = widgets.HBox([self.max_track_length], layout=widgets.Layout(display="none"))
+        self.en_max_len.observe(
+            lambda c: self.row_max.layout.__setattr__("display", None if self.en_max_len.value else "none"),
+            names="value"
+        )
+        if self.en_max_len.value:
+            self.row_max.layout.display = None
+
+        # ---- filter_t0_dead ----
+        self.filter_t0_dead = widgets.Checkbox(
+            description="Filter tracks that are dead at t=0",
+            value=bool(cfg.get("filter_t0_dead", False)),
+            indent=False
+        )
+        
+        # Run button + output
+        self.btn_run = widgets.Button(description="Filter tracks & summarize", button_style="success")
+        self.btn_run.on_click(self._on_run_clicked)
+        
+        self.spinner_html = widgets.HTML(
+            value=spinning_loader
+        )
+        self.spinner_html.layout.display = "none"  # hidden until run starts
+
+        
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_html],
+            layout=widgets.Layout(align_items="center", gap="10px")
+        )
+        
+        self.out = widgets.Output()
+
+        # Full layout
+        self.ui = widgets.VBox([
+            widgets.HTML(f"<b>{self.cell_type} Track Filtering</b>"),
+            self.en_exp_duration, self.row_exp,
+            self.en_min_len, self.row_min,
+            self.en_max_len, self.row_max,
+            self.filter_t0_dead,
+            self.run_row,
+            widgets.HTML("<hr>"),
+            self.out
+        ])
+
+        # results
+        self.df_tracks_filt = None
+        self.df_tracks_summ = None
+
+    def display(self):
+        display(self.ui)
+
+    def _effective_values(self):
+        exp_duration = float(self.exp_duration.value) if self.en_exp_duration.value else 999999.0
+        min_len      = int(self.min_track_length.value) if self.en_min_len.value else 0
+        max_len      = int(self.max_track_length.value) if self.en_max_len.value else 999999
+        filt_dead    = bool(self.filter_t0_dead.value)  # single checkbox is the value
+        return exp_duration, min_len, max_len, filt_dead
+
+    def _persist_params(self):
+        params = self.metadata_loader.behav3d_parameters
+        prof = params["track_filtering"][self.cell_type]
+
+        # Save enable flags
+        prof["exp_duration_enabled"]      = bool(self.en_exp_duration.value)
+        prof["min_track_length_enabled"]  = bool(self.en_min_len.value)
+        prof["max_track_length_enabled"]  = bool(self.en_max_len.value)
+
+        # Always save the text values exactly as the user set them
+        prof["exp_duration"]      = float(self.exp_duration.value)
+        prof["min_track_length"]  = int(self.min_track_length.value)
+        prof["max_track_length"]  = int(self.max_track_length.value)
+
+        # Persist checkbox directly
+        prof["filter_t0_dead"] = bool(self.filter_t0_dead.value)
+
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(params, f, sort_keys=False)
+
+    def _lock(self, state: bool):
+        for w in [
+            self.en_exp_duration, self.exp_duration,
+            self.en_min_len, self.min_track_length,
+            self.en_max_len, self.max_track_length,
+            self.filter_t0_dead, self.btn_run
+        ]:
+            if hasattr(w, "disabled"):
+                w.disabled = state
+
+    def _on_run_clicked(self, _):
+        self._lock(True)
+        self.spinner_html.layout.display = None
+        with self.out:
+            self.out.clear_output()
+            try:
+                out_dir = Path(self.metadata_loader.output_dir).expanduser()
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                exp_duration, min_len, max_len, filt_t0 = self._effective_values()
+                print("▶️ Filtering tracks…")
+                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, filter_t0_dead={filt_t0}")
+
+                self._persist_params()
                 
-#             if not path or not str(path).lower().endswith(".csv"):
-#                 print("Please choose a .csv file.")
-#                 return
+                from __main__ import filter_tcell_tracks, summarize_track_features
 
-#             self.metadata = load_behav3d_metadata(path)
-#             self.output_dir = self.output_dir_picker.value
-#             self.metadata_csv_path = str(path)
-            
-#             check_behav3d_metadata(self.metadata)
+                self.df_tracks_filt = filter_tcell_tracks(
+                    metadata=self.metadata_loader.metadata,
+                    output_dir=str(out_dir),
+                    exp_duration=exp_duration,
+                    min_track_length=min_len,
+                    max_track_length=max_len,
+                    filter_t0_dead=filt_t0,
+                    cell_type=self.cell_type
+                )
+                print("✅ Filtering done. Summarizing…")
 
-#             print("✅ Checks passed!")
-#             display(self.metadata)
-   
-#     # Button handler
-#     def _on_click(self, _):
-#         if self._busy:
-#             return  # re-entrancy guard prevents double execution
-#         self._busy = True
-#         try:
-#             self.load()
-#         except Exception as e:
-#             with self.out:
-#                 print(f"❌ Error: {e}")
-#         finally:
-#             self._busy = False
+                self.df_tracks_summ = summarize_track_features(
+                    output_dir=str(out_dir),
+                    cell_type=self.cell_type
+                )
 
-# def convert_zarr_button(
-#         metadata_loader,
-#         dim_order_widget
-#     ):
-#     btn = widgets.Button(
-#     description="Convert to Zarr",
-#     button_style="success",  # 'success', 'info', 'warning', 'danger' or ''
-#     icon="cogs"
+                from IPython.display import display as _disp
+                print("— Filtered tracks (head) —")
+                try: _disp(self.df_tracks_filt.head(10))
+                except Exception: print(f"[df_tracks_filt] shape={getattr(self.df_tracks_filt,'shape',None)}")
+                print("\n— Summary (head) —")
+                try: _disp(self.df_tracks_summ.head(10))
+                except Exception: print(f"[df_tracks_summ] shape={getattr(self.df_tracks_summ,'shape',None)}")
+                print("✅ Finished.")
+
+            except Exception:
+                import traceback; traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
+
+class TCellAnalysisPanel:
+    def __init__(self, metadata_loader):
+        self.metadata_loader = metadata_loader
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+
+        # ---- config bootstrap (load + ensure defaults) ----
+        try:
+            groups = behav3d_calculated_features
+        except NameError:
+            raise RuntimeError("Define behav3d_calculated_features before creating TCellAnalysisPanel.")
+
+        params = dict(self.metadata_loader.behav3d_parameters or {})
+        params.setdefault("analysis", {})
+        params["analysis"].setdefault("tcell", self._default_panel_config(groups))
+        self._params = params
+        self._panel_cfg = self._params["analysis"]["tcell"]
+
+        # ---- headings ----
+        self.section_title = widgets.HTML('<div style="font-size:22px;font-weight:700;">T cell analysis</div>')
+        self.sel_title     = widgets.HTML('<div style="font-size:20px;font-weight:700;">Select features to use for Dynamic Time Warping (DTW):</div>')
+        self.norm_title    = widgets.HTML('<div style="font-size:20px;font-weight:700;">Normalize</div>')
+
+        # ---- Seed ----
+        self.seed_widget = widgets.IntText(
+            description="Seed",
+            value=int(self._panel_cfg.get("seed", self._params.get("seed", 42))),
+            style={"description_width": "80px"},
+        )
+
+        # ---------- layout helpers (shared by both sections) ----------
+        def _grid_for(children, indent_px="24px", columns=3):
+            # Force 3 columns for every group
+            return widgets.GridBox(
+                children,
+                layout=widgets.Layout(
+                    grid_template_columns=" ".join(["max-content"] * columns),
+                    grid_gap="6px 18px",
+                    margin=f"0 0 0 {indent_px}",
+                )
+            )
+
+        # ---- SELECTION (grouped; always visible) ----
+        self._group_rows = {}  # group -> {"group_cb","child_cbs","grid","container","group_handler","child_handler"}
+        sel_group_boxes = []
+
+        preset = list(self._panel_cfg.get("dtw_features_input", []))
+        preset_set = set(preset)
+        groups_enabled = dict(self._panel_cfg.get("dtw_feature_groups_enabled", {}))
+
+        for group_name, feats in groups.items():
+            # Children init from preset; group init from saved flag or "all children on"
+            child_cbs = [
+                widgets.Checkbox(value=(f in preset_set), description=f, indent=True)
+                for f in feats
+            ]
+            g_init = bool(groups_enabled.get(group_name, all(cb.value for cb in child_cbs)))
+
+            gcb = widgets.Checkbox(value=g_init, indent=False)
+            glabel = widgets.HTML(f"<b>{group_name}</b>")
+            header = widgets.HBox([gcb, glabel])
+
+            grid = _grid_for(child_cbs, columns=3)   # ALWAYS 3 columns
+            container = widgets.VBox([header, grid])
+
+            self._group_rows[group_name] = {
+                "group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container
+            }
+            sel_group_boxes.append(container)
+
+        self.checkboxes_box = widgets.VBox(sel_group_boxes)
+        # Wire selection events (batched)
+        def make_group_handler(grp_name):
+            def _on_group(change):
+                if change["name"] != "value":
+                    return
+                val = bool(change["new"])
+                row = self._group_rows[grp_name]
+                # batch set children values only (no hiding/disable)
+                for cb in row["child_cbs"]:
+                    cb.unobserve(row["child_handler"], names="value")
+                for cb in row["child_cbs"]:
+                    cb.value = val
+                for cb in row["child_cbs"]:
+                    cb.observe(row["child_handler"], names="value")
+                # sync normalize for this group (once)
+                self._sync_normalize_visibility_batched([grp_name])
+            return _on_group
+
+        def make_child_handler(grp_name):
+            def _on_child(change):
+                if change["name"] != "value":
+                    return
+                row = self._group_rows[grp_name]
+                all_on = all(cb.value for cb in row["child_cbs"])
+                row["group_cb"].unobserve(row["group_handler"], names="value")
+                row["group_cb"].value = all_on
+                row["group_cb"].observe(row["group_handler"], names="value")
+                self._sync_normalize_visibility_batched([grp_name])
+            return _on_child
+
+        for grp_name, row in self._group_rows.items():
+            row["group_handler"] = make_group_handler(grp_name)
+            row["child_handler"] = make_child_handler(grp_name)
+            row["group_cb"].observe(row["group_handler"], names="value")
+            for cb in row["child_cbs"]:
+                cb.observe(row["child_handler"], names="value")
+
+        # ---- top-level selection actions ----
+        self.btn_select_all = widgets.Button(description="Select all")
+        self.btn_clear_all  = widgets.Button(description="Clear")
+        self.btn_select_all.on_click(lambda *_: self._set_all(True))
+        self.btn_clear_all.on_click(lambda *_: self._set_all(False))
+
+        self.output_area_features = widgets.Output()
+
+        # ---- NORMALIZE (3 columns like selection; only selected visible) ----
+        self._norm_group_rows = {}  # group -> {"group_cb","child_cbs","grid","container","group_handler"}
+        norm_group_boxes = []
+        for group_name, feats in groups.items():
+            gcb = widgets.Checkbox(value=False, indent=False)  # master for visible children
+            glabel = widgets.HTML(f"<b>{group_name}</b>")
+            header = widgets.HBox([gcb, glabel])
+
+            # Same child order & widgets; visibility controls position
+            child_cbs = []
+            for f in feats:
+                cb = widgets.Checkbox(
+                    value=bool(self._panel_cfg.get("z_normalize", {}).get(f, False)),
+                    description=f,
+                    indent=True
+                )
+                cb.layout.visibility = 'hidden'  # start hidden; will show if selected
+                child_cbs.append(cb)
+
+            grid = _grid_for(child_cbs, columns=3)  # force 3 columns
+            container = widgets.VBox([header, grid])
+
+            self._norm_group_rows[group_name] = {
+                "group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container
+            }
+            norm_group_boxes.append(container)
+
+        # normalize group master toggles only currently visible children
+        def make_norm_group_handler(grp_name):
+            def _on_group(change):
+                if change["name"] != "value":
+                    return
+                val = bool(change["new"])
+                row = self._norm_group_rows[grp_name]
+                for cb in row["child_cbs"]:
+                    if cb.layout.visibility != 'hidden':
+                        cb.value = val
+            return _on_group
+        for grp_name, row in self._norm_group_rows.items():
+            row["group_handler"] = make_norm_group_handler(grp_name)
+            row["group_cb"].observe(row["group_handler"], names="value")
+
+        # Global normalize controls (like selection)
+        self.norm_select_all_btn = widgets.Button(description="Select all")
+        self.norm_clear_all_btn  = widgets.Button(description="Clear")
+        self.norm_select_all_btn.on_click(self._on_norm_select_all)
+        self.norm_clear_all_btn.on_click(self._on_norm_clear_all)
+
+        self.normalize_section = widgets.VBox([
+            self.norm_title,
+            widgets.HBox([self.norm_select_all_btn, self.norm_clear_all_btn],
+                         layout=widgets.Layout(gap="8px")),
+            widgets.VBox(norm_group_boxes)
+        ])
+
+        # ---- UMAP / clustering ----
+        self.umap_distance_widget  = widgets.FloatText(description="UMAP min_dist",
+                                                       value=float(self._panel_cfg.get("umap_min_dist", 0.1)),
+                                                       style={"description_width": "140px"})
+        self.umap_neighbors_widget = widgets.IntText(description="UMAP n_neighbors",
+                                                     value=int(self._panel_cfg.get("umap_n_neighbors", 15)),
+                                                     style={"description_width": "140px"})
+        self.num_clusters_widget   = widgets.IntText(description="# clusters",
+                                                     value=int(self._panel_cfg.get("nr_of_clusters", 5)),
+                                                     style={"description_width": "140px"})
+        self.output_area_params = widgets.Output()
+
+        # ---- Run ----
+        self.btn_run = widgets.Button(
+            description="Run analysis",
+            button_style="success",
+            layout=widgets.Layout(width="300px")
+        )
+        self.btn_run.on_click(self._on_run_clicked)
+        
+        
+        # Tiny inline SVG spinner + label (hidden by default)
+        self.spinner_html = widgets.HTML(
+            value=spinning_loader
+        )
+        self.spinner_html.layout.display = "none"  # hidden until run starts
+
+        
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_html],
+            layout=widgets.Layout(align_items="center", gap="10px")
+        )
+        
+        self.out_run = widgets.Output()
+
+        # ---- UI ----
+        self.ui = widgets.VBox([
+            self.section_title,
+            self.seed_widget,
+            self.sel_title,
+            widgets.HBox([self.btn_select_all, self.btn_clear_all], layout=widgets.Layout(gap="8px")),
+            self.checkboxes_box,
+            self.output_area_features,
+            self.normalize_section,
+            widgets.HTML("<hr>"),
+            widgets.HBox([self.umap_distance_widget, self.umap_neighbors_widget, self.num_clusters_widget],
+                         layout=widgets.Layout(flex_flow="row wrap", gap="12px")),
+            self.output_area_params,
+            widgets.HTML("<hr>"),
+            self.run_row,
+            self.out_run,
+        ])
+
+        # internal state
+        self.dtw_features = self._selected_features()
+        self.umap_minimal_distance = float(self.umap_distance_widget.value)
+        self.umap_n_neighbors = int(self.umap_neighbors_widget.value)
+        self.nr_of_clusters = int(self.num_clusters_widget.value)
+        self.df_tracks_clustered = None
+
+        # initial normalize visibility sync (keep positions; only selected visible)
+        self._sync_normalize_visibility_batched(list(self._group_rows.keys()))
+
+    # ---------- defaults & persistence ----------
+    def _selected_normalize_patterns(self):
+        """
+        Return the list of pattern names whose normalize checkbox is ON (visible items only).
+        """
+        pats = []
+        for grp_name, row in self._norm_group_rows.items():
+            for cb in row["child_cbs"]:
+                # visible in Normalize panel means it's part of the DTW selection
+                if cb.layout.visibility != 'hidden' and cb.value:
+                    pats.append(cb.description)
+        # de-dup preserve order
+        seen, out = set(), []
+        for p in pats:
+            if p not in seen:
+                out.append(p); seen.add(p)
+        return out
+
+
+    def _default_panel_config(self, groups_dict):
+        return {
+            "seed": 42,
+            "umap_min_dist": 0.1,
+            "umap_n_neighbors": 15,
+            "nr_of_clusters": 5,
+            "dtw_feature_groups_enabled": {g: True for g in groups_dict.keys()},
+            "dtw_features_input": [],
+            "dtw_features_resolved": [],
+            "z_normalize": {},
+        }
+
+    def _persist_params(self, *, resolved_use=None, resolved_norm=None):
+        # snapshot current UI state to parameter dict
+        self._panel_cfg["seed"] = int(self.seed_widget.value)
+        self._panel_cfg["umap_min_dist"] = float(self.umap_distance_widget.value)
+        self._panel_cfg["umap_n_neighbors"] = int(self.umap_neighbors_widget.value)
+        self._panel_cfg["nr_of_clusters"] = int(self.num_clusters_widget.value)
+
+        # DTW selection (patterns as shown in the UI)
+        self._panel_cfg["dtw_features_input"] = list(self._selected_features())
+        self._panel_cfg["dtw_feature_groups_enabled"] = {
+            g: row["group_cb"].value for g, row in self._group_rows.items()
+        }
+
+        # Normalize selections (pattern-level switches as shown in the UI)
+        self._panel_cfg["z_normalize"] = self._collect_znorm_map()  # {feature(pattern): bool}
+        self._panel_cfg["columns_to_normalize_input"] = self._selected_normalize_patterns()
+
+        # Optionally store resolved (expanded) columns
+        if resolved_use is not None:
+            self._panel_cfg["dtw_features_resolved"] = list(resolved_use)
+            self._panel_cfg["columns_to_use_resolved"] = list(resolved_use)
+        if resolved_norm is not None:
+            self._panel_cfg["columns_to_normalize_resolved"] = list(resolved_norm)
+
+        # write back to loader + disk
+        self._params["analysis"]["tcell"] = self._panel_cfg
+        self.metadata_loader.behav3d_parameters = self._params
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(self._params, f, sort_keys=False)
+
+    # ---------- helpers ----------
+    def display(self):
+        display(self.ui)
+
+    def _set_all(self, val: bool):
+        # Bulk toggle: set all group masters and all children
+        for grp_name, row in self._group_rows.items():
+            row["group_cb"].unobserve(row["group_handler"], names="value")
+            for cb in row["child_cbs"]:
+                cb.unobserve(row["child_handler"], names="value")
+            row["group_cb"].value = val
+            for cb in row["child_cbs"]:
+                cb.value = val
+            for cb in row["child_cbs"]:
+                cb.observe(row["child_handler"], names="value")
+            row["group_cb"].observe(row["group_handler"], names="value")
+        # One batched normalize refresh
+        self._sync_normalize_visibility_batched(list(self._group_rows.keys()))
+
+    def _all_child_checkboxes(self):
+        out = []
+        for row in self._group_rows.values():
+            out.extend(row["child_cbs"])
+        return out
+
+    def _selected_features(self):
+        seen, selected = set(), []
+        for cb in self._all_child_checkboxes():
+            if cb.value and cb.description not in seen:
+                selected.append(cb.description); seen.add(cb.description)
+        return selected
+
+    def _infer_available_columns(self):
+        for attr in ("available_columns", "feature_columns"):
+            cols = getattr(self.metadata_loader, attr, None)
+            if cols:
+                return list(cols)
+        meta = getattr(self.metadata_loader, "metadata", None)
+        if meta is not None and hasattr(meta, "columns"):
+            try:
+                return list(meta.columns)
+            except Exception:
+                pass
+        return None
+
+    def _expand_patterns(self, selected):
+        cols = self._infer_available_columns()
+        if not cols:
+            return selected
+        out = []
+        for name in selected:
+            if any(ch in name for ch in "*?["):
+                matches = [c for c in cols if fnmatch.fnmatchcase(c, name)]
+                out.extend(matches if matches else [name])
+            else:
+                out.append(name)
+        seen, uniq = set(), []
+        for f in out:
+            if f not in seen:
+                uniq.append(f); seen.add(f)
+        return uniq
+
+    # ---- normalize layout sync ----
+    def _visible_norm_children(self, grp_name):
+        row = self._norm_group_rows[grp_name]
+        return [cb for cb in row["child_cbs"] if cb.layout.visibility != 'hidden']
+
+    def _sync_normalize_visibility_batched(self, groups_to_update):
+        """
+        Mirror DTW selection to normalize:
+        - keep grid structure identical using visibility
+        - show only selected features in their original slots
+        - hide a normalize group container if none of its features are selected
+        """
+        selected = set(self._selected_features())
+
+        for grp_name in groups_to_update:
+            sel_row = self._group_rows[grp_name]
+            nrow = self._norm_group_rows[grp_name]
+
+            any_visible = False
+            for cb_sel in sel_row["child_cbs"]:
+                feat = cb_sel.description
+                cb_norm = next(c for c in nrow["child_cbs"] if c.description == feat)
+                is_selected = cb_sel.value
+                cb_norm.layout.visibility = None if is_selected else 'hidden'
+                any_visible = any_visible or is_selected
+
+            # normalize group master reflects only visible children
+            vis_children = self._visible_norm_children(grp_name)
+            gh = nrow.get("group_handler")
+            nrow["group_cb"].unobserve(gh, names="value")
+            nrow["group_cb"].value = bool(vis_children) and all(cb.value for cb in vis_children)
+            nrow["group_cb"].observe(gh, names="value")
+
+            # show container only if something visible
+            nrow["container"].layout.display = None if any_visible else "none"
+
+        # hide whole section if nothing visible
+        any_group_visible = any(self._norm_group_rows[g]["container"].layout.display != "none"
+                                for g in self._norm_group_rows)
+        self.normalize_section.layout.display = None if any_group_visible else "none"
+
+    def _collect_znorm_map(self):
+        # Persist only visible (selected) normalize choices
+        out = {}
+        for grp_name, row in self._norm_group_rows.items():
+            for cb in row["child_cbs"]:
+                if cb.layout.visibility != 'hidden':
+                    out[cb.description] = bool(cb.value)
+        return out
+
+    # ---- normalize global actions ----
+    def _on_norm_select_all(self, *_):
+        # Set all visible normalize checkboxes to True, then update each group's master
+        for grp_name, row in self._norm_group_rows.items():
+            for cb in row["child_cbs"]:
+                if cb.layout.visibility != 'hidden':
+                    cb.value = True
+            gh = row.get("group_handler")
+            vis_children = self._visible_norm_children(grp_name)
+            row["group_cb"].unobserve(gh, names="value")
+            row["group_cb"].value = bool(vis_children) and all(cb.value for cb in vis_children)
+            row["group_cb"].observe(gh, names="value")
+
+    def _on_norm_clear_all(self, *_):
+        # Set all visible normalize checkboxes to False, then update each group's master
+        for grp_name, row in self._norm_group_rows.items():
+            for cb in row["child_cbs"]:
+                if cb.layout.visibility != 'hidden':
+                    cb.value = False
+            gh = row.get("group_handler")
+            vis_children = self._visible_norm_children(grp_name)
+            row["group_cb"].unobserve(gh, names="value")
+            row["group_cb"].value = False if vis_children else False
+            row["group_cb"].observe(gh, names="value")
+
+    def _lock(self, locked):
+        # Selection widgets
+        for row in self._group_rows.values():
+            row["group_cb"].disabled = locked
+            for cb in row["child_cbs"]:
+                cb.disabled = locked
+        # Normalize widgets
+        for row in self._norm_group_rows.values():
+            row["group_cb"].disabled = locked
+            for cb in row["child_cbs"]:
+                cb.disabled = locked
+        for w in [
+            self.seed_widget, self.btn_select_all, self.btn_clear_all,
+            self.umap_distance_widget, self.umap_neighbors_widget, self.num_clusters_widget,
+            self.norm_select_all_btn, self.norm_clear_all_btn, self.btn_run
+        ]:
+            w.disabled = locked
+
+    # ---------- run ----------
+    def _on_run_clicked(self, *_):
+        self._lock(True)
+        self.out_run.clear_output()
+        self.spinner_html.layout.display = None
+        with self.out_run:
+            try:
+                print("▶️ Running T-cell behavioral analysis…")
+
+                # Read current UI state
+                seed = int(self.seed_widget.value)
+                self.umap_minimal_distance = float(self.umap_distance_widget.value)
+                self.umap_n_neighbors      = int(self.umap_neighbors_widget.value)
+                self.nr_of_clusters        = int(self.num_clusters_widget.value)
+
+                # Selection patterns (always visible)
+                dtw_patterns = self._selected_features()
+                if not dtw_patterns:
+                    print("⚠️ Please select at least one DTW feature.")
+                    return
+
+                # Normalize patterns (only those you ticked in Normalize)
+                norm_patterns = self._selected_normalize_patterns()
+
+                # Expand any globs (e.g. mean_intensity_*)
+                columns_to_use       = self._expand_patterns(dtw_patterns)
+                columns_to_normalize = self._expand_patterns(norm_patterns)
+
+                # Persist both pattern-level and resolved lists
+                self._persist_params(resolved_use=columns_to_use, resolved_norm=columns_to_normalize)
+
+                # Sanity printout
+                print(f"  output_dir                = {self.output_dir}")
+                print(f"  seed                     = {seed}")
+                print(f"  UMAP: n_neighbors={self.umap_n_neighbors}, min_dist={self.umap_minimal_distance}")
+                print(f"  clusters                 = {self.nr_of_clusters}")
+                print(f"  columns_to_use (resolved)       [{len(columns_to_use)}]: {columns_to_use}")
+                print(f"  columns_to_normalize (resolved) [{len(columns_to_normalize)}]: {columns_to_normalize}")
+
+                # Ensure output dir
+                Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+                random.seed(seed)
+
+                # Import the user’s function and verify it
+                try:
+                    from __main__ import run_tcell_analysis
+                except Exception as e:
+                    print("❌ Could not import run_tcell_analysis from __main__.")
+                    import traceback; traceback.print_exc()
+                    return
+                if not callable(run_tcell_analysis):
+                    print("❌ run_tcell_analysis is not callable.")
+                    return
+
+                # Call with the new signature
+                self.df_tracks_clustered = run_tcell_analysis(
+                    output_dir=self.output_dir,
+                    umap_minimal_distance=self.umap_minimal_distance,
+                    umap_n_neighbors=self.umap_n_neighbors,
+                    nr_of_clusters=self.nr_of_clusters,
+                    columns_to_use=columns_to_use,
+                    columns_to_normalize=columns_to_normalize,
+                )
+
+                # Show preview if it quacks like a DataFrame
+                try:
+                    from IPython.display import display as _disp
+                    print("✅ Done. Preview (head):")
+                    _disp(self.df_tracks_clustered.head(10))
+                except Exception:
+                    print("✅ Done. Result object:", type(self.df_tracks_clustered))
+
+            except Exception:
+                import traceback
+                print("❌ Error while running analysis:")
+                traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
+
+# default_selected = {
+#     "z_mean_square_displacement", 
+#     "z_speed", 
+#     "z_mean_dead_dye", 
+#     "tcell_contact", 
+#     "organoid_contact"
+# }
+
+# checkboxes = []
+# for feature in all_features:
+#     cb = widgets.Checkbox(
+#         value=(feature in default_selected),
+#         description=feature,
+#         indent=False,
+#         layout=widgets.Layout(width='300px')
 #     )
-#     out = widgets.Output()
-
-#     def _run_conversion(_):
-#         with out:
-#             out.clear_output()
-#             print("Starting conversion…")
-#             btn.disabled = True
-#             try:
-#                 result = convert_input_files_to_zarr(
-#                     metadata=metadata_loader.metadata,
-#                     output_dir=metadata_loader.output_dir
-#                     )  # add args here if needed 
-#             except Exception as e:
-#                 import traceback; traceback.print_exc()
-#             finally:
-#                 metadata_loader.metadata = result
-#                 metadata_loader.metadata.to_csv(metadata_loader.metadata_csv_path, index=False)
-#                 print("Done ✅")
-#                 btn.disabled = False
-
-#     btn.on_click(_run_conversion)
-#     display(widgets.VBox([btn, out]))
-# class DimOrderTable:
-#     DIM_ORDER_OPTIONS = [
-#         "TCZYX",
-#         "TZCYX",
-#         "ZCTYX",
-#         "ZTCYX",
-#         "CZTYX",
-#         "CTZYX",
-#     ]
-#     DEFAULT_ORDER = "TCZYX"
-
-
-#     def __init__(
-#         self,
-#         metadata_loader,
-#         sample_col="sample_name",
-#         path_col="raw_image_path",
-#         widths=("40%","30%","30%"),
-#         dim_col="dimension_order",                 # <-- column to write string like 'TCZYX'
-#         auto_write=False                    # <-- if True, update metadata table on each change
-#     ):
-#         self.metadata_loader = metadata_loader
-#         self.sample_col = sample_col
-#         self.path_col = path_col
-#         self.dim_col = dim_col
-#         self.auto_write = auto_write
-
-#         self._width_sample, self._width_shape, self._width_order = widths
-
-#         # State
-#         self._rows = []          # [{'sample','path','shape_label','dd'}, ...]
-#         self._selections = {}    # sample_name -> dim order tuple
-
-#         # Precompute allowed tuples for validation / prefill
-#         self._allowed_orders = self.DIM_ORDER_OPTIONS
-
-#         # UI skeleton
-#         self._status = widgets.HTML("<b>Waiting for user to load metadata…</b>")
-#         self._refresh_btn = widgets.Button(description="Refresh", tooltip="Build/Update table from metadata")
-#         self._refresh_btn.on_click(self._on_refresh)
-
-#         self._apply_all_dd = widgets.Dropdown(
-#             options=self.DIM_ORDER_OPTIONS,
-#             value=self.DEFAULT_ORDER,
-#             description="Apply to all:",
-#             style={'description_width': 'initial'},
-#             layout=widgets.Layout(width="350px", margin="6px 8px 6px 0")
-#         )
-#         self._apply_all_btn = widgets.Button(description="Apply", layout=widgets.Layout(width="100px"))
-#         self._apply_all_btn.on_click(lambda _: self.set_all(self._apply_all_dd.value))
-
-#         self._header = widgets.HBox([
-#             widgets.Label("Sample", layout=widgets.Layout(width=self._width_sample, overflow="hidden")),
-#             widgets.Label("Image shape", layout=widgets.Layout(width=self._width_shape, overflow="hidden")),
-#             widgets.Label("Dim order", layout=widgets.Layout(width=self._width_order, overflow="hidden")),
-#         ])
-#         self._table_body = widgets.VBox()
-#         self._out = widgets.Output()
-
-#         self.widget = widgets.VBox([
-#             self._status,
-#             widgets.HBox([self._refresh_btn]),
-#             self._header,
-#             self._table_body,
-#             widgets.HBox([self._apply_all_dd, self._apply_all_btn]),
-#             self._out
-#         ])
-        
-#     def display(self):
-#         display(self.widget)
-
-#     def get_selections(self) -> dict:
-#         """Return dict: sample_name -> 'TCZYX' """
-#         return dict(self._selections)
-
-#     def get_selections_str(self) -> dict:
-#         """Return dict: sample_name -> 'TCZYX'"""
-#         return {s: self._order_to_str(o) for s, o in self._selections.items()}
-
-#     def write_dimorder_to_metadata(self, col=None):
-#         """
-#         Write string dimorder (e.g. 'TCZYX') into metadata_loader.metadata[col].
-#         Returns the updated DataFrame.
-#         """
-#         col = col or self.dim_col
-#         df = getattr(self.metadata_loader, "metadata", None)
-#         if not isinstance(df, pd.DataFrame):
-#             raise ValueError("metadata_loader.metadata is not a DataFrame yet.")
-#         if df.empty:
-#             raise ValueError("metadata_loader.metadata is empty.")
-#         if self.sample_col not in df.columns:
-#             raise ValueError(f"metadata is missing '{self.sample_col}' column.")
-#         # Map selections by sample name
-#         str_map = self.get_selections_str()
-#         self.metadata_loader.metadata[col] = df[self.sample_col].map(str_map)
-#         return self.metadata_loader.metadata
-
-#     def set_all(self, order_tuple):
-#         """Programmatically set all rows to the given order tuple."""
-#         for row in self._rows:
-#             row['dd'].value = order_tuple  # triggers observers -> updates _selections (+ auto_write)
-
-#     def refresh_shapes(self):
-#         """Recompute shape labels (e.g., after mounting a drive)."""
-#         for row in self._rows:
-#             row['shape_label'].value = self._probe_image_shape(row['path'])
-
-#     def to_dataframe(self):
-#         """
-#         Return a pandas.DataFrame with:
-#           sample_name, raw_image_path, image_shape, dim_order (tuple), dimorder (string)
-#         """
-#         data = []
-#         for row in self._rows:
-#             tup = row["dd"].value
-#             data.append({
-#                 "sample_name": row["sample"],
-#                 "raw_image_path": row["path"],
-#                 "image_shape": row["shape_label"].value,
-#                 "dim_order": tup,
-#                 self.dim_col: self._order_to_str(tup),
-#             })
-#         return pd.DataFrame(data)
-
-#     def _on_refresh(self, _btn):
-#         df = getattr(self.metadata_loader, "metadata", None)
-#         if not (isinstance(df, pd.DataFrame) and not df.empty):
-#             self._status.value = "<b>Waiting for user to load metadata…</b>"
-#             return
-#         missing = [c for c in (self.sample_col, self.path_col) if c not in df.columns]
-#         if missing:
-#             self._status.value = f"<b>Metadata missing columns: {missing}</b>"
-#             return
-
-#         self._build_rows_from(df)
-#         self._status.value = "<span style='color:green'>Metadata loaded ✅</span>"
-
-#     def _build_rows_from(self, df: pd.DataFrame):
-#         # Reset state
-#         self._rows.clear()
-#         self._selections.clear()
-#         row_boxes = []
-
-#         # Optional: prefill from existing string column if present
-#         prefill = None
-#         if self.dim_col in df.columns:
-#             prefill = df[self.dim_col].astype(str).to_dict()  # index -> string
-
-#         for idx, r in df.iterrows():
-#             sample = str(r[self.sample_col])
-#             path = r[self.path_col]
-
-#             probed_shape = self._probe_image_shape(path)
-#             sample_lbl = widgets.Label(sample, layout=widgets.Layout(width=self._width_sample, overflow="hidden"))
-#             shape_lbl  = widgets.Label(probed_shape, layout=widgets.Layout(width=self._width_shape, overflow="hidden"))
-
-#             # Determine default dropdown value (from prefill if valid)
-#             default_val = get_image_dimension_order(path)
-#             if default_val is None:
-#                 default_val = self.DEFAULT_ORDER
-#             if prefill is not None:
-#                 s = prefill.get(idx, None)
-#                 if isinstance(s, str):
-#                     tu = tuple(s.upper())
-#                     if tu in self._allowed_orders:
-#                         default_val = tu
-
-#             dd = widgets.Dropdown(
-#                 options=self.DIM_ORDER_OPTIONS,
-#                 value=default_val,
-#                 layout=widgets.Layout(width=self._width_order),
-#             )
-
-#             # keep live selection
-#             self._selections[sample] = dd.value
-#             dd.observe(lambda ch, s=sample: self._on_dd_changed(s, ch), names='value')
-
-#             self._rows.append({"sample": sample, "path": path, "shape_label": shape_lbl, "dd": dd})
-#             row_boxes.append(widgets.HBox([sample_lbl, shape_lbl, dd]))
-
-#         # Swap UI body
-#         self._table_body.children = tuple(row_boxes)
-
-#     def _on_dd_changed(self, sample_name, change):
-#         if change.get('name') == 'value':
-#             new_tuple = change['new']
-#             self._selections[sample_name] = new_tuple
-#             if self.auto_write:
-#                 # live-write into metadata table (string form) for matching rows
-#                 df = getattr(self.metadata_loader, "metadata", None)
-#                 if isinstance(df, pd.DataFrame) and self.sample_col in df.columns:
-#                     mask = df[self.sample_col].astype(str) == str(sample_name)
-#                     df.loc[mask, self.dim_col] = self._order_to_str(new_tuple)
-
-#     def _probe_image_shape(self, path):
-#         path = Path(path)
-#         if not path.exists():
-#             return "⛔ missing"
-#         try:
-#             shape = get_image_shape(path)
-#             return "×".join(map(str, shape)) if shape else "unknown"
-#         except Exception as e:
-#             return f"⚠️ {type(e).__name__}"
-
-#     @staticmethod
-#     def _order_to_str(order_tuple):
-#         return "".join(order_tuple)
-
-# def _mk_timepoint_range(use_all: bool, start: int, end: int):
-#     if use_all:
-#         return None
-#     return (int(start), int(end))
-
-# class PixelClassifierPanel:
-#     def __init__(self, metadata_loader):
-#         self.metadata_loader = metadata_loader
-
-#         # -------- Train controls --------
-#         self.examples_per_sample = widgets.IntSlider(
-#             description="Examples per sample", value=3, min=1, max=50, step=1, continuous_update=False
-#         )
-#         self.sample_specific_classifier = widgets.Checkbox(
-#             description="Sample-specific classifier", value=False
-#         )
-#         self.n_workers = widgets.IntSlider(
-#             description="Workers", value=(os.cpu_count() or 8), min=1, max=max(8, (os.cpu_count() or 8)),
-#             step=1, continuous_update=False
-#         )
-
-#         # -------- Apply controls --------
-#         self.organoid_edt_threshold = widgets.FloatSlider(
-#             description="Organoid EDT thr",
-#             value=12.0, min=0.0, max=50.0, step=0.5, readout_format=".1f",
-#             continuous_update=False,
-#             style={'description_width': '160px'}  # wider label
-#         )
-#         self.use_all_timepoints = widgets.Checkbox(
-#             description="Process ALL timepoints", value=True
-#         )
-#         self.tp_start = widgets.IntText(description="Start t", value=0)
-#         self.tp_end   = widgets.IntText(description="End t", value=0)
-
-#         # Show/hide start/end boxes based on checkbox
-#         self.use_all_timepoints.observe(self._toggle_timepoint_inputs, names='value')
-#         self._toggle_timepoint_inputs()  # initialize
-
-#         # Buttons + log
-#         self.btn_train = widgets.Button(description="Train", button_style="primary")
-#         self.btn_apply = widgets.Button(description="Apply", button_style="success")
-#         self.btn_train.on_click(self._on_train_clicked)
-#         self.btn_apply.on_click(self._on_apply_clicked)
-#         self.out = widgets.Output()
-
-#         # Layout
-#         train_box = widgets.VBox([
-#             widgets.HTML("<b>Train pixel classifier</b>"),
-#             widgets.HBox([self.examples_per_sample, self.n_workers]),
-#             self.sample_specific_classifier,
-#             self.btn_train,
-#         ])
-
-#         self.tp_row = widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end])
-
-#         apply_box = widgets.VBox([
-#             widgets.HTML("<b>Apply segmentation</b>"),
-#             self.organoid_edt_threshold,
-#             self.tp_row,
-#             self.btn_apply,
-#         ])
-
-#         self.ui = widgets.VBox([train_box, widgets.HTML("<hr>"), apply_box, widgets.HTML("<hr>"), self.out])
-
-#     def _toggle_timepoint_inputs(self, change=None):
-#         show = not self.use_all_timepoints.value
-#         disp = None if show else 'none'
-#         self.tp_start.layout.display = disp
-#         self.tp_end.layout.display   = disp
-#         self.tp_start.disabled = not show
-#         self.tp_end.disabled   = not show
-
-#     def display(self):
-#         display(self.ui)
-
-#     def _lock(self, state: bool):
-#         for w in [
-#             self.btn_train, self.btn_apply,
-#             self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
-#             self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end,
-#         ]:
-#             w.disabled = state
-
-#     # ---- callbacks ----
-#     def _on_train_clicked(self, _):
-#         self._lock(True)
-#         with self.out:
-#             self.out.clear_output()
-#             try:
-#                 odir = Path(self.metadata_loader.output_dir).expanduser()
-#                 odir.mkdir(parents=True, exist_ok=True)
-
-#                 print("▶️ Training pixel classifier…", flush=True)
-#                 print(f"  output_dir={odir}")
-#                 print(f"  examples_per_sample={self.examples_per_sample.value}")
-#                 print(f"  sample_specific_classifier={self.sample_specific_classifier.value}")
-#                 print(f"  n_workers={self.n_workers.value}")
-
-#                 train_pixel_classifier(
-#                     output_dir=str(odir),
-#                     metadata=self.metadata_loader.metadata,
-#                     examples_per_sample=int(self.examples_per_sample.value),
-#                     sample_specific_classifier=bool(self.sample_specific_classifier.value),
-#                     n_workers=int(self.n_workers.value),
-#                 )
-#                 print("✅ Training finished.", flush=True)
-#             except Exception:
-#                 traceback.print_exc()
-#             finally:
-#                 self._lock(False)
-
-#     def _on_apply_clicked(self, _):
-#         self._lock(True)
-#         with self.out:
-#             self.out.clear_output()
-#             try:
-#                 odir = Path(self.metadata_loader.output_dir).expanduser()
-#                 odir.mkdir(parents=True, exist_ok=True)
-
-#                 tpr = _mk_timepoint_range(
-#                     use_all=bool(self.use_all_timepoints.value),
-#                     start=int(self.tp_start.value),
-#                     end=int(self.tp_end.value),
-#                 )
-
-#                 print("▶️ Applying pixel classifier segmentation…", flush=True)
-#                 print(f"  output_dir={odir}")
-#                 print(f"  organoid_edt_threshold={self.organoid_edt_threshold.value}")
-#                 print(f"  timepoint_range={tpr}", flush=True)
-
-#                 new_md = run_pixel_classifier_segmentation(
-#                     output_dir=str(odir),
-#                     metadata=self.metadata_loader.metadata,
-#                     organoid_edt_threshold=float(self.organoid_edt_threshold.value),
-#                     timepoint_range=tpr
-#                 )
-
-#                 # Update loader + ALWAYS save CSV
-#                 self.metadata_loader.metadata = new_md
-#                 csv_path = Path(self.metadata_loader.metadata_csv_path).expanduser()
-#                 print(f"💾 Saving metadata to: {csv_path}", flush=True)
-#                 new_md.to_csv(csv_path, sep=",", index=False)
-
-#                 print("✅ Apply finished.", flush=True)
-#             except Exception:
-#                 traceback.print_exc()
-#             finally:
-#                 self._lock(False)
-
-# class TrackingPanel:
-#     """
-#     Minimal UI for tracking (LAP, TrackPy, or Propagation).
-#     - Uses metadata_loader.output_dir and metadata_loader.metadata_csv_path directly
-#     - Updates metadata_loader.metadata and always saves CSV
-#     - cell_type is supplied in __init__
-#     """
-#     def __init__(self, metadata_loader, cell_type="tcell"):
-#         self.metadata_loader = metadata_loader
-#         self.cell_type = str(cell_type).strip()
-
-#         # Method selector (now includes Propagation)
-#         self.method = widgets.Dropdown(
-#             description="Tracking method",
-#             options=[("LAP (laptrack)", "lap"),
-#                      ("TrackPy", "trackpy"),
-#                      ("Propagation", "prop")],
-#             value="lap",
-#             style={'description_width': '160px'}
-#         )
-
-#         # Shared controls
-#         self.overwrite = widgets.Checkbox(description="Overwrite existing", value=False)
-
-#         # LAP params (distances in pixels; squared when calling)
-#         self.track_cost_dist = widgets.IntSlider(
-#             description="Track cost (px)", value=45, min=1, max=200, step=1,
-#             continuous_update=False, style={'description_width':'160px'}
-#         )
-#         self.gap_cost_dist = widgets.IntSlider(
-#             description="Gap close cost (px)", value=60, min=1, max=300, step=1,
-#             continuous_update=False, style={'description_width':'160px'}
-#         )
-#         self.gap_max_frames = widgets.IntSlider(
-#             description="Gap close max frames", value=3, min=0, max=20, step=1,
-#             continuous_update=False, style={'description_width':'160px'}
-#         )
-#         self.merging_cost_dist = widgets.IntText(
-#             description="Merging cost (px)", value=0, style={'description_width':'160px'}
-#         )
-#         self.splitting_cost_dist = widgets.IntText(
-#             description="Splitting cost (px)", value=0, style={'description_width':'160px'}
-#         )
-#         self.lap_params = widgets.VBox([
-#             widgets.HTML("<b>LAP parameters</b>"),
-#             self.track_cost_dist, self.gap_cost_dist, self.gap_max_frames,
-#             self.merging_cost_dist, self.splitting_cost_dist
-#         ])
-
-#         # TrackPy params
-#         self.tp_search_range = widgets.IntSlider(
-#             description="Search range (px)", value=31, min=1, max=200, step=1,
-#             continuous_update=False, style={'description_width':'160px'}
-#         )
-#         self.tp_memory = widgets.IntSlider(
-#             description="Memory (frames)", value=2, min=0, max=20, step=1,
-#             continuous_update=False, style={'description_width':'160px'}
-#         )
-#         self.tp_adaptive_stop = widgets.FloatSlider(
-#             description="Adaptive stop", value=10.0, min=0.0, max=50.0, step=0.5,
-#             readout_format=".1f", continuous_update=False, style={'description_width':'160px'}
-#         )
-#         self.tp_adaptive_step = widgets.FloatSlider(
-#             description="Adaptive step", value=0.95, min=0.1, max=1.0, step=0.01,
-#             readout_format=".2f", continuous_update=False, style={'description_width':'160px'}
-#         )
-#         self.tp_params = widgets.VBox([
-#             widgets.HTML("<b>TrackPy parameters</b>"),
-#             self.tp_search_range, self.tp_memory, self.tp_adaptive_stop, self.tp_adaptive_step
-#         ])
-
-#         # Propagation params (none needed; just an info box)
-#         self.prop_params = widgets.VBox([
-#             widgets.HTML("<b>Propagation tracking</b>"),
-#             widgets.HTML("<i>No tunable parameters.</i>")
-#         ])
-
-#         # Swap param groups on method change
-#         self.param_container = widgets.VBox()
-#         self.method.observe(self._toggle_param_groups, names='value')
-#         self._toggle_param_groups()
-
-#         # Run + log
-#         self.btn_run = widgets.Button(description="Run tracking", button_style="success")
-#         self.btn_run.on_click(self._on_run_clicked)
-#         self.out = widgets.Output()
-
-#         # Layout
-#         self.ui = widgets.VBox([
-#             widgets.HTML("<b>Tracking</b>"),
-#             self.method,
-#             widgets.HBox([self.overwrite]),
-#             self.param_container,
-#             self.btn_run,
-#             widgets.HTML("<hr>"),
-#             self.out
-#         ])
-
-#     def display(self):
-#         display(self.ui)
-
-#     def _toggle_param_groups(self, change=None):
-#         if self.method.value == "lap":
-#             self.param_container.children = (self.lap_params,)
-#         elif self.method.value == "trackpy":
-#             self.param_container.children = (self.tp_params,)
-#         else:  # "prop"
-#             self.param_container.children = (self.prop_params,)
-
-#     def _lock(self, state: bool):
-#         for w in [
-#             self.method, self.overwrite,
-#             self.track_cost_dist, self.gap_cost_dist, self.gap_max_frames,
-#             self.merging_cost_dist, self.splitting_cost_dist,
-#             self.tp_search_range, self.tp_memory, self.tp_adaptive_stop, self.tp_adaptive_step,
-#             self.btn_run
-#         ]:
-#             if hasattr(w, "disabled"):
-#                 w.disabled = state
-
-#     def _on_run_clicked(self, _):
-#         self._lock(True)
-#         with self.out:
-#             self.out.clear_output()
-#             try:
-#                 out_dir = Path(self.metadata_loader.output_dir).expanduser()
-#                 out_dir.mkdir(parents=True, exist_ok=True)
-
-#                 csv_path = Path(self.metadata_loader.metadata_csv_path).expanduser()
-
-#                 method = self.method.value
-#                 if method == "lap":
-#                     # Square distances for laptracking (function expects px^2)
-#                     tc = int(self.track_cost_dist.value) ** 2
-#                     gc = int(self.gap_cost_dist.value) ** 2
-#                     mc = int(self.merging_cost_dist.value)
-#                     sc = int(self.splitting_cost_dist.value)
-#                     merging  = (mc ** 2) if mc > 0 else False
-#                     splitting = (sc ** 2) if sc > 0 else False
-
-#                     print("▶️ LAP tracking…", flush=True)
-#                     print(f"  track_cost_cutoff={tc}, gap_closing_cost_cutoff={gc}")
-#                     print(f"  gap_closing_max_frame_count={self.gap_max_frames.value}")
-#                     print(f"  merging_cost_cutoff={merging}, splitting_cost_cutoff={splitting}", flush=True)
-
-#                     from __main__ import run_tcell_laptracking
-#                     new_md = run_tcell_laptracking(
-#                         metadata=self.metadata_loader.metadata,
-#                         output_dir=str(out_dir),
-#                         track_cost_cutoff=tc,
-#                         gap_closing_cost_cutoff=gc,
-#                         gap_closing_max_frame_count=int(self.gap_max_frames.value),
-#                         merging_cost_cutoff=merging,
-#                         splitting_cost_cutoff=splitting,
-#                         cell_type=self.cell_type,
-#                         overwrite=bool(self.overwrite.value),
-#                     )
-
-#                 elif method == "trackpy":
-#                     print("▶️ TrackPy tracking…", flush=True)
-#                     print(f"  search_range={self.tp_search_range.value}, memory={self.tp_memory.value}")
-#                     print(f"  adaptive_stop={self.tp_adaptive_stop.value}, adaptive_step={self.tp_adaptive_step.value}", flush=True)
-
-#                     from __main__ import run_tcell_trackpy_tracking
-#                     new_md = run_tcell_trackpy_tracking(
-#                         metadata=self.metadata_loader.metadata,
-#                         output_dir=str(out_dir),
-#                         overwrite=bool(self.overwrite.value),
-#                         cell_type=self.cell_type,
-#                         search_range=int(self.tp_search_range.value),
-#                         memory=int(self.tp_memory.value),
-#                         adaptive_stop=float(self.tp_adaptive_stop.value),
-#                         adaptive_step=float(self.tp_adaptive_step.value),
-#                     )
-
-#                 else:  # "prop" propagation
-#                     print("▶️ Propagation tracking…", flush=True)
-#                     from __main__ import run_propagation_tracking
-#                     new_md = run_propagation_tracking(
-#                         metadata=self.metadata_loader.metadata,
-#                         output_dir=str(out_dir),
-#                         cell_type=self.cell_type,      # e.g., "organoid" or "tcell"
-#                         overwrite=bool(self.overwrite.value),
-#                     )
-
-#                 # Update loader + ALWAYS save CSV
-#                 self.metadata_loader.metadata = new_md
-#                 print(f"💾 Saving metadata to: {csv_path}", flush=True)
-#                 new_md.to_csv(csv_path, sep=",", index=False)
-#                 print("✅ Tracking finished.", flush=True)
-
-#             except Exception:
-#                 traceback.print_exc()
-#             finally:
-#                 self._lock(False)
-
-# class TrackingVisualizationPanel:
-#     def __init__(
-#         self,
-#         metadata_loader,
-#         default_time_range=None,
-#         channel_colors=("cyan", "yellow", "red", "green", "magenta", "blue"),
-#     ):
-#         self.metadata_loader = metadata_loader
-#         self.channel_colors = channel_colors
-
-#         self._viewer = None
-        
-#         # --- UI: status + refresh
-#         self._status = widgets.HTML("<b>Waiting for user to load metadata…</b>")
-#         self._refresh_btn = widgets.Button(
-#             description="Refresh",
-#             tooltip="Build/Update selector from metadata_loader.metadata",
-#         )
-#         self._refresh_btn.on_click(self._on_refresh_clicked)
-
-#         # --- Main controls (disabled until metadata present)
-#         self.sample_dropdown = widgets.Dropdown(
-#             options=[],
-#             value=None,
-#             description="Sample:",
-#             layout=widgets.Layout(width="350px"),
-#             disabled=True,
-#         )
-
-#         # Tickbox to enable/disable time range
-#         self.use_range = widgets.Checkbox(
-#             description="Use custom time range",
-#             value=False,
-#             indent=False,
-#         )
-
-#         # Start/End boxes (wrapped in a container we can show/hide)
-#         self.start_t = widgets.IntText(description="Start T:", layout=widgets.Layout(width="180px"))
-#         self.end_t   = widgets.IntText(description="End T:",   layout=widgets.Layout(width="180px"))
-
-#         if isinstance(default_time_range, (tuple, list)) and len(default_time_range) == 2:
-#             self.start_t.value = int(default_time_range[0])
-#             self.end_t.value   = int(default_time_range[1])
-#             self.use_range.value = True
-#         else:
-#             self.start_t.value = 0
-#             self.end_t.value   = 0
-#             self.use_range.value = False
-
-#         self.range_box = widgets.HBox([self.start_t, self.end_t])
-#         self.range_box.layout.display = "flex" if self.use_range.value else "none"
-
-#         def _toggle_range_visibility(change):
-#             self.range_box.layout.display = "flex" if change["new"] else "none"
-#         self.use_range.observe(_toggle_range_visibility, names="value")
-
-#         self.open_button = widgets.Button(
-#             description="Visualize segmentation and tracking results",
-#             button_style="primary",
-#             tooltip="Launch Napari for the selected sample",
-#             icon="eye",
-#             layout=widgets.Layout(width="300px"),
-#             disabled=True,
-#         )
-
-#         self.close_button = widgets.Button(
-#             description="Close viewer",
-#             button_style="danger",
-#             icon="stop",
-#             tooltip="Close the active Napari viewer",
-#             layout=widgets.Layout(width="200px", display="none"),  # hidden by default
-#         )
-        
-#         self.msg = widgets.Output()
-
-#         # Events
-#         self.open_button.on_click(self._on_open_clicked)
-#         self.close_button.on_click(self._on_close_clicked)
-
-#         # Layout
-#         self._panel = widgets.VBox(
-#             [
-#                 widgets.HBox([self._status, self._refresh_btn]),
-#                 self.sample_dropdown,
-#                 self.use_range,
-#                 self.range_box,
-#                 widgets.HBox([self.open_button, self.close_button]),
-#                 self.msg,
-#             ]
-#         )
-
-#         # Try immediate build if metadata already present
-#         self._maybe_build_from_loader()
-
-#     # ---------------- Public API ----------------
-#     def display(self):
-#         display(self._panel)
-
-#     def get_selected_row(self) -> pd.Series:
-#         self._ensure_metadata_ready()
-#         name = self.sample_dropdown.value
-#         df = self.metadata_loader.metadata
-#         row = df[df["sample_name"].astype(str) == str(name)]
-#         if row.empty:
-#             raise KeyError(f"sample_name '{name}' not found in metadata.")
-#         return row.iloc[0]
-
-#     def open_viewer(self):
-#         row = self.get_selected_row()
-
-#         # only use range if tickbox checked
-#         if self.use_range.value:
-#             start_t, end_t = int(self.start_t.value), int(self.end_t.value)
-#             if end_t < start_t:
-#                 start_t, end_t = end_t, start_t
-#             time_range = (start_t, end_t)
-#         else:
-#             time_range = None
-
-#         with self.msg:
-#             self.msg.clear_output()
-#             try:
-#                 print(f"Opening viewer for: {row['sample_name']}")
-#                 self._viewer = visualize_tracks(
-#                     metadata_row=row,
-#                     timepoint_range=time_range,
-#                     channel_colors=self.channel_colors,
-#                 )
-#             except Exception as e:
-#                 print(f"Error: {e}")
-#             self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
-
-#     # ---------------- Internal helpers ----------------
-#     def _ensure_metadata_ready(self):
-#         df = getattr(self.metadata_loader, "metadata", None)
-#         if not isinstance(df, pd.DataFrame) or df.empty:
-#             raise RuntimeError("Metadata not loaded yet. Click 'Refresh' once metadata_loader.metadata is set.")
-   
-#     def _maybe_build_from_loader(self):
-#         df = getattr(self.metadata_loader, "metadata", None)
-#         if isinstance(df, pd.DataFrame) and not df.empty and ("sample_name" in df.columns):
-#             self._build_from_metadata(df)
-#             self._status.value = "<span style='color:green'>Metadata loaded ✅</span>"
-#         else:
-#             self._status.value = "<b>Waiting for user to load metadata…</b>"
-#             self.sample_dropdown.disabled = True
-#             self.open_button.disabled = True
-
-#     def _build_from_metadata(self, df: pd.DataFrame):
-#         sample_names = df["sample_name"].astype(str).unique().tolist()
-#         if not sample_names:
-#             self._status.value = "<b>No sample_name values found in metadata.</b>"
-#             self.sample_dropdown.options = []
-#             self.sample_dropdown.value = None
-#             self.sample_dropdown.disabled = True
-#             self.open_button.disabled = True
-#             return
-
-#         self.sample_dropdown.options = sample_names
-#         self.sample_dropdown.value = sample_names[0]
-#         self.sample_dropdown.disabled = False
-#         self.open_button.disabled = False
-
-#     # ---------------- Callbacks ----------------
-#     def _on_open_clicked(self, _):
-#         self.open_viewer()
-
-#     def _on_close_clicked(self, _):
-#         # Only relevant when we’re in non-blocking mode and hold a viewer
-#         with self.msg:
-#             try:
-#                 if self._viewer is not None:
-#                     print("Closing viewer…")
-#                     self._viewer.close()
-#                     self._viewer = None
-#                 else:
-#                     print("No active viewer to close (viewer was likely opened in blocking mode).")
-#             finally:
-#                 # Hide the button regardless
-#                 self.close_button.layout.display = "none"
-                
-#     def _on_refresh_clicked(self, _):
-#         with self.msg:
-#             self.msg.clear_output()
-#             try:
-#                 self._maybe_build_from_loader()
-#             except Exception as e:
-#                 print(f"Refresh failed: {e}")
-           
-exp_duration_widget = widgets.IntText(
-    value=1000,  # or your default experiment duration
-    description='Exp Duration:',
-    style={'description_width': '110px'},
-    layout=widgets.Layout(width='300px')
-)
-
-min_track_length_widget = widgets.IntSlider(
-    value=100, min=0, max=1000, step=1,
-    description='Min Track Length:',
-    style={'description_width': '130px'},
-    layout=widgets.Layout(width='300px')
-)
-
-max_track_length_widget = widgets.IntSlider(
-    value=500, min=0, max=1000, step=1,
-    description='Max Track Length:',
-    style={'description_width': '130px'},
-    layout=widgets.Layout(width='300px')
-)
-
-set_params_button = widgets.Button(description="Set Parameters", button_style='info')
-output_area_params = widgets.Output()
-
-def on_set_params_clicked(b):
-    exp_duration_val = exp_duration_widget.value
-    tcell_min_track_length_val = min_track_length_widget.value
-    tcell_max_track_length_val = max_track_length_widget.value
-
-    with output_area_params:
-        clear_output()
-        print(f"Parameters set:")
-        print(f"  Experiment Duration: {exp_duration_val}")
-        print(f"  Min Track Length: {tcell_min_track_length_val}")
-        print(f"  Max Track Length: {tcell_max_track_length_val}")
-
-    import __main__
-    global_vars = __main__.__dict__
-    global_vars['exp_duration'] = exp_duration_val
-    global_vars['tcell_min_track_length'] = tcell_min_track_length_val
-    global_vars['tcell_max_track_length'] = tcell_max_track_length_val
-
-
-## Widgets to select the parameters for classification
-all_features = [
-    'nr_pixels', 'volume', 'bbox_volume', 'extent', 'solidity', 'equivalent_diameter', 
-    'major_axis_length', 'minor_axis_length', 'elongation', 'surface_area', 'sphericity',
-    'convex_volume', 'orientation_vector', 'mean_intensity_ch1', 'mean_intensity_ch2', 
-    'mean_dead_dye', 'mean_intensity_ch4', 'percentage_dead_mask', 'nr_dead_mask_pixels', 
-    'increase_dead_mask', 'organoid_contact', 'organoid_contact_pixels', 'touching_organoids',
-    'tcell_contact', 'tcell_contact_pixels', 'touching_tcells', 'interpolated', 'displacement',
-    'cumulative_displacement', 'displacement_from_origin', 'mean_square_displacement', 'speed',
-    'mean_speed', 'dead', 'active_tcell_contact', 'z_mean_square_displacement', 'z_speed', 
-    'z_mean_dead_dye'
-]
-
-default_selected = {
-    "z_mean_square_displacement", 
-    "z_speed", 
-    "z_mean_dead_dye", 
-    "tcell_contact", 
-    "organoid_contact"
-}
-
-checkboxes = []
-for feature in all_features:
-    cb = widgets.Checkbox(
-        value=(feature in default_selected),
-        description=feature,
-        indent=False,
-        layout=widgets.Layout(width='300px')
-    )
-    checkboxes.append(cb)
-
-checkboxes_box = widgets.VBox(checkboxes, layout=widgets.Layout(
-    overflow='auto',
-    height='300px',
-    border='1px solid gray',
-    padding='5px'
-))
-
-save_button2 = widgets.Button(description="Save DTW Features", button_style='success', layout=widgets.Layout(width='200px'))
-output_area2 = widgets.Output()
-
-def on_save_clicked(b):
-    selected_features = [cb.description for cb in checkboxes if cb.value]
-
-    with output_area2:
-        clear_output()
-        print("Selected DTW features:")
-        for f in selected_features:
-            print(f"- {f}")
-
-    import __main__
-    global_vars = __main__.__dict__
-    global_vars['dtw_features'] = selected_features
-
-# Widgets for UMAP and clustering parameters
-umap_distance_widget = widgets.FloatSlider(
-    value=0.1, min=0.0, max=1.0, step=0.05, 
-    style={'description_width': '64px'}, description='UMAP dist:'
-)
-
-umap_neighbors_widget = widgets.IntSlider(
-    value=5, min=2, max=50, step=1, 
-    style={'description_width': '101px'}, description='UMAP neighbors:'
-)
-
-num_clusters_widget = widgets.IntSlider(
-    value=6, min=2, max=20, step=1, 
-    style={'description_width': '80px'}, description='Num Clusters:'
-)
-
-save_button3 = widgets.Button(description="UMAP&Clustering Params", button_style='success',layout=widgets.Layout(width='250px'))
-output_area3 = widgets.Output()
-
-def on_save_clicked3(b):
-    umap_dist_val = umap_distance_widget.value
-    umap_neighbors_val = umap_neighbors_widget.value
-    nr_clusters_val = num_clusters_widget.value
-
-    with output_area3:
-        clear_output()
-        print(f"Saved parameters:\nUMAP distance: {umap_dist_val}\nUMAP neighbors: {umap_neighbors_val}\nNumber of clusters: {nr_clusters_val}")
-
-    import __main__
-    global_vars = __main__.__dict__
-    global_vars['umap_minimal_distance'] = umap_dist_val
-    global_vars['umap_n_neighbors'] = umap_neighbors_val
-    global_vars['nr_of_clusters'] = nr_clusters_val
-
-
-# Define placeholders
-# Create widgets once, globally
-sample_dropdown = widgets.Dropdown(description='Sample:', layout=widgets.Layout(width='50%'), style={'description_width': 'initial'})
-select_button4 = widgets.Button(description="Select Sample", button_style='success', layout=widgets.Layout(width='30%'))
-sample_output = widgets.Output()
-
-sample_to_backproject = None  # will hold selected sample name
-
-def setup_sample_selection_widgets(metadata):
-    # Update dropdown options based on metadata
-    sample_names = metadata["sample_name"].unique().tolist()
-    sample_dropdown.options = sample_names
-    if sample_names:
-        sample_dropdown.value = sample_names[0]
-
-def on_select_clicked4(b):
-    import __main__
-    global sample_to_backproject
-    sample_to_backproject = sample_dropdown.value
-    __main__.sample_to_backproject = sample_to_backproject  # push to notebook globals
-
-    with sample_output:
-        clear_output()
-        print(f"✅ Sample selected for backprojection: {sample_to_backproject}")
-
-# Attach callback once
-select_button4.on_click(on_select_clicked4)
+#     checkboxes.append(cb)
+
+# checkboxes_box = widgets.VBox(checkboxes, layout=widgets.Layout(
+#     overflow='auto',
+#     height='300px',
+#     border='1px solid gray',
+#     padding='5px'
+# ))
+
+# save_button2 = widgets.Button(description="Save DTW Features", button_style='success', layout=widgets.Layout(width='200px'))
+# output_area2 = widgets.Output()
+
+# def on_save_clicked(b):
+#     selected_features = [cb.description for cb in checkboxes if cb.value]
+
+#     with output_area2:
+#         clear_output()
+#         print("Selected DTW features:")
+#         for f in selected_features:
+#             print(f"- {f}")
+
+#     import __main__
+#     global_vars = __main__.__dict__
+#     global_vars['dtw_features'] = selected_features
+
+# # Widgets for UMAP and clustering parameters
+# umap_distance_widget = widgets.FloatSlider(
+#     value=0.1, min=0.0, max=1.0, step=0.05, 
+#     style={'description_width': '64px'}, description='UMAP dist:'
+# )
+
+# umap_neighbors_widget = widgets.IntSlider(
+#     value=5, min=2, max=50, step=1, 
+#     style={'description_width': '101px'}, description='UMAP neighbors:'
+# )
+
+# num_clusters_widget = widgets.IntSlider(
+#     value=6, min=2, max=20, step=1, 
+#     style={'description_width': '80px'}, description='Num Clusters:'
+# )
+
+# save_button3 = widgets.Button(description="UMAP&Clustering Params", button_style='success',layout=widgets.Layout(width='250px'))
+# output_area3 = widgets.Output()
+
+# def on_save_clicked3(b):
+#     umap_dist_val = umap_distance_widget.value
+#     umap_neighbors_val = umap_neighbors_widget.value
+#     nr_clusters_val = num_clusters_widget.value
+
+#     with output_area3:
+#         clear_output()
+#         print(f"Saved parameters:\nUMAP distance: {umap_dist_val}\nUMAP neighbors: {umap_neighbors_val}\nNumber of clusters: {nr_clusters_val}")
+
+#     import __main__
+#     global_vars = __main__.__dict__
+#     global_vars['umap_minimal_distance'] = umap_dist_val
+#     global_vars['umap_n_neighbors'] = umap_neighbors_val
+#     global_vars['nr_of_clusters'] = nr_clusters_val
+
+
+# # Define placeholders
+# # Create widgets once, globally
+# sample_dropdown = widgets.Dropdown(description='Sample:', layout=widgets.Layout(width='50%'), style={'description_width': 'initial'})
+# select_button4 = widgets.Button(description="Select Sample", button_style='success', layout=widgets.Layout(width='30%'))
+# sample_output = widgets.Output()
+
+# sample_to_backproject = None  # will hold selected sample name
+
+# def setup_sample_selection_widgets(metadata):
+#     # Update dropdown options based on metadata
+#     sample_names = metadata["sample_name"].unique().tolist()
+#     sample_dropdown.options = sample_names
+#     if sample_names:
+#         sample_dropdown.value = sample_names[0]
+
+# def on_select_clicked4(b):
+#     import __main__
+#     global sample_to_backproject
+#     sample_to_backproject = sample_dropdown.value
+#     __main__.sample_to_backproject = sample_to_backproject  # push to notebook globals
+
+#     with sample_output:
+#         clear_output()
+#         print(f"✅ Sample selected for backprojection: {sample_to_backproject}")
+
+# # Attach callback once
+# select_button4.on_click(on_select_clicked4)
 # --------------------
 
 # __all__ = [

@@ -1,11 +1,12 @@
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+import fnmatch
 
-def predict_classes(args):
-    clf_path, path, outpath, idx = args
-    # clf = joblib.load(clf_path)
-    return(1)
+# def predict_classes(args):
+#     clf_path, path, outpath, idx = args
+#     # clf = joblib.load(clf_path)
+#     return(1)
 
 def load_behav3d_metadata(
     metadata_path
@@ -207,3 +208,54 @@ def rel_elsize(elsize):
     min_size=min(elsize)
     elsize_scaled= [round(x/min_size, 2) for x in elsize]
     return(elsize_scaled)
+
+def expand_column_patterns(selected, available_columns):
+    """
+    Expand glob-style patterns (e.g. 'mean_intensity_*') against available column names.
+    - Accepts 'selected' as either a single string or an iterable of strings.
+    - Works when 'available_columns' is a pandas.Index, list, tuple, etc.
+    - Deduplicates while preserving order.
+    """
+    # Normalize selected -> list[str]
+    if selected is None:
+        selected_list = []
+    elif isinstance(selected, str):
+        selected_list = [selected]
+    else:
+        selected_list = list(selected)
+
+    # Normalize available_columns -> list[str]
+    if available_columns is None:
+        avail = []
+    else:
+        # pandas.Index has .tolist()
+        if hasattr(available_columns, "tolist"):
+            avail = list(available_columns.tolist())
+        else:
+            avail = list(available_columns)
+
+    # If nothing to match against, return input (deduped)
+    if len(avail) == 0:
+        # de-dup preserving order
+        seen, out = set(), []
+        for name in selected_list:
+            if name not in seen:
+                out.append(name); seen.add(name)
+        return out
+
+    # Expand patterns
+    out = []
+    for name in selected_list:
+        name = str(name)
+        if any(ch in name for ch in "*?["):
+            matches = [c for c in avail if fnmatch.fnmatchcase(str(c), name)]
+            out.extend(matches if matches else [name])  # keep pattern if nothing matched
+        else:
+            out.append(name)
+
+    # De-dup while preserving order
+    seen, uniq = set(), []
+    for f in out:
+        if f not in seen:
+            uniq.append(f); seen.add(f)
+    return uniq

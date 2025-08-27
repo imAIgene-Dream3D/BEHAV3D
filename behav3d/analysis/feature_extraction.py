@@ -273,7 +273,7 @@ def run_feature_extraction(
         time_interval=convert_time(time_interval, time_unit)
         time_unit = "h"
         
-        required_features = {"morphology", "intensity", "contact", "dead_mask"}
+        required_features = {"morphology", "intensity", "contact", "death"}
 
         if any(feature in features_choice for feature in required_features):
             ### Calculate image based features (per timepoint)
@@ -352,15 +352,6 @@ def run_feature_extraction(
             else:
                 print(f"{get_current_time()} - No cell type specified, skipping cell type specific features...")
        
-        # print(f"{get_current_time()} - Perform z-normalization on selected feature columns")
-        # df_tracks=normalize_track_features(
-        #     df_tracks, 
-        #     columns=[
-        #         "mean_square_displacement",
-        #         "speed",
-        #         "mean_dead_dye"
-        #     ]
-        # )
             
         tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
         print(f"{get_current_time()} - Writing output to {tracks_out_path}")
@@ -726,19 +717,6 @@ def calculate_death(
             first_threshold_index = threshold_indices.min()
             df_tracks.loc[track_df.index[first_threshold_index:], "dead"] = True
     return df_tracks
-
-def normalize_track_features(
-    df_tracks,
-    columns = [
-        "mean_square_displacement",
-        "speed",
-        "mean_dead_dye"
-    ]
-    ):
-    
-    for column_name in columns:
-        df_tracks.loc[:, f'z_{column_name}'] = df_tracks[column_name].transform(lambda x: (x - x.mean()) / x.std())
-    return (df_tracks)
            
 def interpolate_missing_positions(
     df_tracks,
