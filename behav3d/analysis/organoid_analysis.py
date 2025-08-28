@@ -530,37 +530,84 @@ def plot_general_organoid_analysis(
         
         ### Plot the barplot organoid death of all samples
         ax = fig.add_subplot(gs[2, :])
-        df_end = df_general[df_general["position_t"] == df_general["position_t"].max()]
-        df_end = df_end[["sample_name", "percentage_dead", "percentage_alive"]]
-        df_end.set_index("sample_name").plot(
-            kind='bar', 
-            stacked=True, 
-            ax=ax, 
-            color=["#CC6666", "#6699CC"], 
+        # df_end = df_general[df_general["position_t"] == df_general["position_t"].max()]
+        # df_end = df_end[["sample_name", "percentage_dead", "percentage_alive"]]
+        
+        # df_end.set_index("sample_name").plot(
+        #     kind='bar', 
+        #     stacked=True, 
+        #     ax=ax, 
+        #     color=["#CC6666", "#6699CC"], 
+        #     alpha=1.0,
+        #     width=0.25,
+        #     zorder=2
+        #     )
+        # ax.grid(True, linestyle=':', linewidth=1, alpha=0.5, zorder=1)
+        # ax.set_ylim(0, 1.1)
+        # ax.set_xlabel('')
+        # ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', size=6)
+        # ax.set_ylabel('')
+        # ax.set_title(f'Percentage Alive Organoids at end of experiment')
+        # handles, labels = ax.get_legend_handles_labels()
+        # new_order = [1, 0]  # Dead first (red, index 0), then Alive (blue, index 1)
+        # ax.legend(
+        #     [handles[idx] for idx in new_order], [labels[idx] for idx in new_order],
+        #     bbox_to_anchor=(1.05, 1),  # Position to the right
+        #     loc='upper left',
+        #     borderaxespad=0,
+        #     prop={'size': 5},  # Smaller font size
+        #     title=''  # Optional: keep or remove the title
+        #     )
+        
+        # Take each sample's own endpoint
+        idx = df_general.groupby("sample_name")["position_t"].idxmax()
+        df_end = (
+            df_general.loc[idx, ["sample_name", "percentage_alive", "percentage_dead"]]
+            .copy()
+            .sort_values("sample_name")
+        )
+
+        # If percentage_dead is missing, compute it from alive
+        if "percentage_dead" not in df_end.columns:
+            df_end["percentage_dead"] = 1.0 - df_end["percentage_alive"]
+
+        # Keep the plotting columns in the intended order: dead (red) then alive (blue)
+        plot_cols = ["percentage_dead", "percentage_alive"]
+
+        df_end.set_index("sample_name")[plot_cols].plot(
+            kind="bar",
+            stacked=True,
+            ax=ax,
+            color=["#CC6666", "#6699CC"],
             alpha=1.0,
             width=0.25,
-            zorder=2
-            )
-        ax.grid(True, linestyle=':', linewidth=1, alpha=0.5, zorder=1)
+            zorder=2,
+        )
+
+        ax.grid(True, linestyle=":", linewidth=1, alpha=0.5, zorder=1)
         ax.set_ylim(0, 1.1)
-        ax.set_xlabel('')
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', size=6)
-        ax.set_ylabel('')
-        ax.set_title(f'Percentage Alive Organoids at end of experiment')
+        ax.set_xlabel("")
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", size=6)
+        ax.set_ylabel("")
+        ax.set_title("Percentage Alive Organoids at end of experiment")
+
+        # Legend: Dead first, then Alive (matches bar order/colors)
         handles, labels = ax.get_legend_handles_labels()
-        new_order = [1, 0]  # Dead first (red, index 0), then Alive (blue, index 1)
+        order = [0, 1]  # 0=Dead (red), 1=Alive (blue)
         ax.legend(
-            [handles[idx] for idx in new_order], [labels[idx] for idx in new_order],
-            bbox_to_anchor=(1.05, 1),  # Position to the right
-            loc='upper left',
+            [handles[i] for i in order],
+            [labels[i] for i in order],
+            bbox_to_anchor=(1.05, 1),
+            loc="upper left",
             borderaxespad=0,
-            prop={'size': 5},  # Smaller font size
-            title=''  # Optional: keep or remove the title
-            )
-        
+            prop={"size": 5},
+            title="",
+        )
+
         fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
         
         plt.show()
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
+
     

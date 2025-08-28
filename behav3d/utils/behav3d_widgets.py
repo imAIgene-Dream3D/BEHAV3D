@@ -1934,7 +1934,7 @@ class TCellAnalysisPanel:
 
         # ---- Run ----
         self.btn_run = widgets.Button(
-            description="Run analysis",
+            description=f"Run T cell analysis",
             button_style="success",
             layout=widgets.Layout(width="300px")
         )
@@ -2255,10 +2255,11 @@ class TCellAnalysisPanel:
                 # Show preview if it quacks like a DataFrame
                 try:
                     from IPython.display import display as _disp
-                    print("✅ Done. Preview (head):")
+                    # print("✅ Done. Preview (head):")
                     _disp(self.df_tracks_clustered.head(10))
                 except Exception:
-                    print("✅ Done. Result object:", type(self.df_tracks_clustered))
+                    pass
+                # print("✅ Done. Result object:", type(self.df_tracks_clustered))
 
             except Exception:
                 import traceback
