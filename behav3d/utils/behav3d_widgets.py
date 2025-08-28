@@ -16,10 +16,20 @@ import pandas as pd
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import train_pixel_classifier, run_pixel_classifier_segmentation
 import traceback
 from behav3d.preprocessing.tracking import visualize_tracks
+from behav3d.preprocessing.tracking.laptracking import run_tcell_laptracking
+from behav3d.preprocessing.tracking.trackpy_tracking import run_tcell_trackpy_tracking
+from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
+
 import json
 from copy import deepcopy
 import yaml
 import fnmatch
+from behav3d.analysis import summarize_track_features
+from behav3d.analysis.feature_extraction import run_feature_extraction
+from behav3d.analysis.tcell_analysis import filter_tcell_tracks, run_tcell_analysis 
+from behav3d.analysis.organoid_analysis import filter_organoid_tracks, run_organoid_analysis 
+
+from behav3d.analysis.backprojection import backproject_mean_features_behav3d, backproject_time_features_behav3d
 
 behav3d_calculated_features = {
     "morphology": [
@@ -153,14 +163,14 @@ _DEFAULT_CONFIG = {
             "filter_t0_dead_enabled": False
         },
         "organoid": {
-            "exp_duration": 24.0,
             "exp_duration_enabled": False,
-            "min_track_length": 3,
+            "exp_duration": 999999,      # timepoints
             "min_track_length_enabled": False,
-            "max_track_length": 999999,
+            "min_track_length": 0,       # frames
             "max_track_length_enabled": False,
-            "filter_t0_dead": False,
-            "filter_t0_dead_enabled": False
+            "max_track_length": 999999,  # frames
+            "min_size_enabled": True,
+            "min_size": 1000,
         }
     },
     "analysis": {
@@ -179,7 +189,26 @@ _DEFAULT_CONFIG = {
             "dtw_features_input": [],      # patterns allowed (e.g. "mean_intensity_*")
             "dtw_features_resolved": [],   # expanded at run
             "z_normalize": {},             # {feature_name: bool}
+        },
+        "organoid": {
+            "dead_perc_threshold": 1e-7,
+            "df_tracks_path_enabled": False,
+            "df_tracks_path": ""
         }
+    },
+    "backprojection": {
+        "mode": "mean",              # "mean" or "time"
+        "save": False,               # if False, widget prevents writing .zarr files
+        "last_sample": None,         # remember last picked sample
+        "feature_groups_enabled": {
+            "morphology": True,
+            "movement": True,
+            "intensity": True,
+            "death": True,
+            "contact": True,
+        },
+        "columns_input": [],         # patterns selected in the UI (e.g., "mean_intensity_*")
+        "columns_resolved": [],      # expanded exact column names (filled at run)
     }
 }
 
@@ -400,7 +429,10 @@ class MetadataLoader(widgets.VBox):
         except Exception:
             pass
         
-        self.button = widgets.Button(description=button_description, button_style='success')
+        self.button = widgets.Button(description=button_description, button_style='success', layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
         self.out = widgets.Output()
 
         self._click_handler = self._on_click
@@ -466,7 +498,10 @@ class MetadataLoader(widgets.VBox):
         self._busy = False
 
 def convert_zarr_button(metadata_loader, dim_order_widget):
-    btn = widgets.Button(description="Convert to Zarr", button_style="success", icon="cogs")
+    btn = widgets.Button(description="Convert to Zarr", button_style="success", icon="cogs", layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
     out = widgets.Output()
 
     def _run_conversion(_):
@@ -786,8 +821,14 @@ class PixelClassifierPanel:
         self._toggle_timepoint_inputs()  # initialize
 
         # Buttons + log
-        self.btn_train = widgets.Button(description="Train", button_style="primary")
-        self.btn_apply = widgets.Button(description="Apply", button_style="success")
+        self.btn_train = widgets.Button(description="Train pixel classifier", button_style="primary", layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
+        self.btn_apply = widgets.Button(description="Apply pixel classifier", button_style="success", layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
         self.btn_train.on_click(self._on_train_clicked)
         self.btn_apply.on_click(self._on_apply_clicked)
         self.out = widgets.Output()
@@ -1016,7 +1057,10 @@ class TrackingPanel:
         self._toggle_param_groups()
 
         # Run + log
-        self.btn_run = widgets.Button(description="Run tracking", button_style="success")
+        self.btn_run = widgets.Button(description=f"Run {cell_type} tracking", button_style="success", layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
         self.btn_run.on_click(self._on_run_clicked)
         self.out = widgets.Output()
 
@@ -1099,7 +1143,6 @@ class TrackingPanel:
                     print(f"  gap_closing_max_frame_count={self.gap_max_frames.value}")
                     print(f"  merging_cost_cutoff={merging}, splitting_cost_cutoff={splitting}", flush=True)
 
-                    from __main__ import run_tcell_laptracking
                     new_md = run_tcell_laptracking(
                         metadata=self.metadata_loader.metadata,
                         output_dir=str(out_dir),
@@ -1117,7 +1160,6 @@ class TrackingPanel:
                     print(f"  search_range={self.tp_search_range.value}, memory={self.tp_memory.value}")
                     print(f"  adaptive_stop={self.tp_adaptive_stop.value}, adaptive_step={self.tp_adaptive_step.value}", flush=True)
 
-                    from __main__ import run_tcell_trackpy_tracking
                     new_md = run_tcell_trackpy_tracking(
                         metadata=self.metadata_loader.metadata,
                         output_dir=str(out_dir),
@@ -1131,7 +1173,6 @@ class TrackingPanel:
 
                 else:  # "prop" propagation
                     print("▶️ Propagation tracking…", flush=True)
-                    from __main__ import run_propagation_tracking
                     new_md = run_propagation_tracking(
                         metadata=self.metadata_loader.metadata,
                         output_dir=str(out_dir),
@@ -1401,7 +1442,10 @@ class FeatureExtractionPanel:
         )
 
         # Run + log
-        self.btn_run = widgets.Button(description="Run feature extraction", button_style="success")
+        self.btn_run = widgets.Button(description=f"Run {cell_type} feature extraction", button_style="success", layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
         self.btn_run.on_click(self._on_run_clicked)
         
         self.spinner_html = widgets.HTML(
@@ -1480,7 +1524,6 @@ class FeatureExtractionPanel:
                 print(f"  n_workers={workers}, overwrite={ow}")
                 print(f"  output_dir={out_dir}", flush=True)
 
-                from __main__ import run_feature_extraction
                 new_md = run_feature_extraction(
                     dead_mask_percentage_threshold=thr,
                     metadata=self.metadata_loader.metadata,
@@ -1586,7 +1629,10 @@ class TrackFilterPanel:
         )
         
         # Run button + output
-        self.btn_run = widgets.Button(description="Filter tracks & summarize", button_style="success")
+        self.btn_run = widgets.Button(description=f"Filter {cell_type} tracks & summarize", button_style="success", layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
         self.btn_run.on_click(self._on_run_clicked)
         
         self.spinner_html = widgets.HTML(
@@ -1673,8 +1719,6 @@ class TrackFilterPanel:
 
                 self._persist_params()
                 
-                from __main__ import filter_tcell_tracks, summarize_track_features
-
                 self.df_tracks_filt = filter_tcell_tracks(
                     metadata=self.metadata_loader.metadata,
                     output_dir=str(out_dir),
@@ -2198,17 +2242,6 @@ class TCellAnalysisPanel:
                 Path(self.output_dir).mkdir(parents=True, exist_ok=True)
                 random.seed(seed)
 
-                # Import the user’s function and verify it
-                try:
-                    from __main__ import run_tcell_analysis
-                except Exception as e:
-                    print("❌ Could not import run_tcell_analysis from __main__.")
-                    import traceback; traceback.print_exc()
-                    return
-                if not callable(run_tcell_analysis):
-                    print("❌ run_tcell_analysis is not callable.")
-                    return
-
                 # Call with the new signature
                 self.df_tracks_clustered = run_tcell_analysis(
                     output_dir=self.output_dir,
@@ -2235,128 +2268,665 @@ class TCellAnalysisPanel:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
 
-# default_selected = {
-#     "z_mean_square_displacement", 
-#     "z_speed", 
-#     "z_mean_dead_dye", 
-#     "tcell_contact", 
-#     "organoid_contact"
-# }
+class OrganoidFilterPanel:
+    """
+    Styled like your TrackFilterPanel example, but wired to filter_organoid_tracks(...).
+    """
+    def __init__(self, metadata_loader, cell_type="organoid"):
+        self.metadata_loader = metadata_loader
+        self.cell_type = str(cell_type).strip() or "organoid"
 
-# checkboxes = []
-# for feature in all_features:
-#     cb = widgets.Checkbox(
-#         value=(feature in default_selected),
-#         description=feature,
-#         indent=False,
-#         layout=widgets.Layout(width='300px')
-#     )
-#     checkboxes.append(cb)
+        # ---- bootstrap config ----
+        params = self.metadata_loader.behav3d_parameters or {}
+        params.setdefault("track_filtering", {})
+        if self.cell_type not in params["track_filtering"]:
+            # try to seed from global _DEFAULT_CONFIG if present
+            try:
+                base = _DEFAULT_CONFIG["track_filtering"][self.cell_type]  # type: ignore[name-defined]
+            except Exception:
+                base = _DEFAULT_TRACK_FILTERING[self.cell_type]
+            params["track_filtering"][self.cell_type] = dict(base)
+            # persist immediately
+            with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(params, f, sort_keys=False)
+        self._params = params
+        cfg = params["track_filtering"][self.cell_type]
 
-# checkboxes_box = widgets.VBox(checkboxes, layout=widgets.Layout(
-#     overflow='auto',
-#     height='300px',
-#     border='1px solid gray',
-#     padding='5px'
-# ))
+        # ---- exp_duration ----
+        self.en_exp_duration = widgets.Checkbox(
+            description="Trim down full time series to supplied duration (timepoints)",
+            value=bool(cfg.get("exp_duration_enabled", False)),
+            indent=False
+        )
+        self.exp_duration = widgets.IntText(
+            description="Max timepoints",
+            value=int(cfg.get("exp_duration", 999999)),
+            style={'description_width': '160px'},
+            continuous_update=False
+        )
+        self.row_exp = widgets.HBox([self.exp_duration], layout=widgets.Layout(display="none"))
+        self.en_exp_duration.observe(
+            lambda c: self.row_exp.layout.__setattr__("display", None if self.en_exp_duration.value else "none"),
+            names="value"
+        )
+        if self.en_exp_duration.value:
+            self.row_exp.layout.display = None
 
-# save_button2 = widgets.Button(description="Save DTW Features", button_style='success', layout=widgets.Layout(width='200px'))
-# output_area2 = widgets.Output()
+        # ---- min_track_length ----
+        self.en_min_len = widgets.Checkbox(
+            description="Select only tracks with minimal length",
+            value=bool(cfg.get("min_track_length_enabled", False)),
+            indent=False
+        )
+        self.min_track_length = widgets.IntText(
+            description="Minimal length (frames)",
+            value=int(cfg.get("min_track_length", 0)),
+            style={'description_width': '160px'},
+            continuous_update=False
+        )
+        self.row_min = widgets.HBox([self.min_track_length], layout=widgets.Layout(display="none"))
+        self.en_min_len.observe(
+            lambda c: self.row_min.layout.__setattr__("display", None if self.en_min_len.value else "none"),
+            names="value"
+        )
+        if self.en_min_len.value:
+            self.row_min.layout.display = None
 
-# def on_save_clicked(b):
-#     selected_features = [cb.description for cb in checkboxes if cb.value]
+        # ---- max_track_length ----
+        self.en_max_len = widgets.Checkbox(
+            description="Trim down tracks to supplied length",
+            value=bool(cfg.get("max_track_length_enabled", False)),
+            indent=False
+        )
+        self.max_track_length = widgets.IntText(
+            description="Maximal length (frames)",
+            value=int(cfg.get("max_track_length", 999999)),
+            style={'description_width': '160px'},
+            continuous_update=False
+        )
+        self.row_max = widgets.HBox([self.max_track_length], layout=widgets.Layout(display="none"))
+        self.en_max_len.observe(
+            lambda c: self.row_max.layout.__setattr__("display", None if self.en_max_len.value else "none"),
+            names="value"
+        )
+        if self.en_max_len.value:
+            self.row_max.layout.display = None
 
-#     with output_area2:
-#         clear_output()
-#         print("Selected DTW features:")
-#         for f in selected_features:
-#             print(f"- {f}")
+        # ---- min_size ----
+        self.en_min_size = widgets.Checkbox(
+            description="Filter by minimal size at t=1",
+            value=bool(cfg.get("min_size_enabled", True)),
+            indent=False
+        )
+        self.min_size = widgets.IntText(
+            description="Minimal size (px @ t=1)",
+            value=int(cfg.get("min_size", 1000)),
+            style={'description_width': '160px'},
+            continuous_update=False
+        )
+        self.row_min_size = widgets.HBox([self.min_size], layout=widgets.Layout(display="none"))
+        self.en_min_size.observe(
+            lambda c: self.row_min_size.layout.__setattr__("display", None if self.en_min_size.value else "none"),
+            names="value"
+        )
+        if self.en_min_size.value:
+            self.row_min_size.layout.display = None
 
-#     import __main__
-#     global_vars = __main__.__dict__
-#     global_vars['dtw_features'] = selected_features
+        # ---- run row ----
+        self.btn_run = widgets.Button(description=f"Filter {cell_type} tracks & summarize", button_style="success", layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
+        self.btn_run.on_click(self._on_run_clicked)
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
 
-# # Widgets for UMAP and clustering parameters
-# umap_distance_widget = widgets.FloatSlider(
-#     value=0.1, min=0.0, max=1.0, step=0.05, 
-#     style={'description_width': '64px'}, description='UMAP dist:'
-# )
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_html],
+            layout=widgets.Layout(align_items="center", gap="10px")
+        )
 
-# umap_neighbors_widget = widgets.IntSlider(
-#     value=5, min=2, max=50, step=1, 
-#     style={'description_width': '101px'}, description='UMAP neighbors:'
-# )
+        self.out = widgets.Output()
 
-# num_clusters_widget = widgets.IntSlider(
-#     value=6, min=2, max=20, step=1, 
-#     style={'description_width': '80px'}, description='Num Clusters:'
-# )
+        # ---- full UI ----
+        self.ui = widgets.VBox([
+            widgets.HTML(f"<b>{self.cell_type.title()} Track Filtering</b>"),
+            self.en_exp_duration, self.row_exp,
+            self.en_min_len, self.row_min,
+            self.en_max_len, self.row_max,
+            self.en_min_size, self.row_min_size,
+            self.run_row,
+            widgets.HTML("<hr>"),
+            self.out
+        ])
 
-# save_button3 = widgets.Button(description="UMAP&Clustering Params", button_style='success',layout=widgets.Layout(width='250px'))
-# output_area3 = widgets.Output()
+        # results
+        self.df_tracks_filt = None
 
-# def on_save_clicked3(b):
-#     umap_dist_val = umap_distance_widget.value
-#     umap_neighbors_val = umap_neighbors_widget.value
-#     nr_clusters_val = num_clusters_widget.value
+    # ---------- public ----------
+    def display(self):
+        display(self.ui)
 
-#     with output_area3:
-#         clear_output()
-#         print(f"Saved parameters:\nUMAP distance: {umap_dist_val}\nUMAP neighbors: {umap_neighbors_val}\nNumber of clusters: {nr_clusters_val}")
+    # ---------- internals ----------
+    def _effective_values(self):
+        exp_duration = int(self.exp_duration.value) if self.en_exp_duration.value else None
+        min_len      = int(self.min_track_length.value) if self.en_min_len.value else None
+        max_len      = int(self.max_track_length.value) if self.en_max_len.value else None
+        min_size     = int(self.min_size.value) if self.en_min_size.value else None
+        return exp_duration, min_len, max_len, min_size
 
-#     import __main__
-#     global_vars = __main__.__dict__
-#     global_vars['umap_minimal_distance'] = umap_dist_val
-#     global_vars['umap_n_neighbors'] = umap_neighbors_val
-#     global_vars['nr_of_clusters'] = nr_clusters_val
+    def _persist_params(self):
+        params = self._params
+        prof = params["track_filtering"][self.cell_type]
 
+        prof["exp_duration_enabled"]      = bool(self.en_exp_duration.value)
+        prof["min_track_length_enabled"]  = bool(self.en_min_len.value)
+        prof["max_track_length_enabled"]  = bool(self.en_max_len.value)
+        prof["min_size_enabled"]          = bool(self.en_min_size.value)
 
-# # Define placeholders
-# # Create widgets once, globally
-# sample_dropdown = widgets.Dropdown(description='Sample:', layout=widgets.Layout(width='50%'), style={'description_width': 'initial'})
-# select_button4 = widgets.Button(description="Select Sample", button_style='success', layout=widgets.Layout(width='30%'))
-# sample_output = widgets.Output()
+        prof["exp_duration"]     = int(self.exp_duration.value)
+        prof["min_track_length"] = int(self.min_track_length.value)
+        prof["max_track_length"] = int(self.max_track_length.value)
+        prof["min_size"]         = int(self.min_size.value)
 
-# sample_to_backproject = None  # will hold selected sample name
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(params, f, sort_keys=False)
 
-# def setup_sample_selection_widgets(metadata):
-#     # Update dropdown options based on metadata
-#     sample_names = metadata["sample_name"].unique().tolist()
-#     sample_dropdown.options = sample_names
-#     if sample_names:
-#         sample_dropdown.value = sample_names[0]
+    def _lock(self, state: bool):
+        for w in [
+            self.en_exp_duration, self.exp_duration,
+            self.en_min_len, self.min_track_length,
+            self.en_max_len, self.max_track_length,
+            self.en_min_size, self.min_size,
+            self.btn_run
+        ]:
+            if hasattr(w, "disabled"):
+                w.disabled = state
 
-# def on_select_clicked4(b):
-#     import __main__
-#     global sample_to_backproject
-#     sample_to_backproject = sample_dropdown.value
-#     __main__.sample_to_backproject = sample_to_backproject  # push to notebook globals
+    def _on_run_clicked(self, _):
+        self._lock(True)
+        self.spinner_html.layout.display = None
+        with self.out:
+            self.out.clear_output()
+            try:
+                out_dir = Path(self.metadata_loader.output_dir).expanduser()
+                out_dir.mkdir(parents=True, exist_ok=True)
 
-#     with sample_output:
-#         clear_output()
-#         print(f"✅ Sample selected for backprojection: {sample_to_backproject}")
+                exp_duration, min_len, max_len, min_size = self._effective_values()
+                print("▶️ Filtering tracks…")
+                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, min_size={min_size}")
 
-# # Attach callback once
-# select_button4.on_click(on_select_clicked4)
-# --------------------
+                # persist UI state
+                self._persist_params()
 
-# __all__ = [
-#     "output_dir_widget", "metadata_path_widget", "load_button1", "output_area1",
-#     "manual_dim_order_widget", "manual_dim_order",
-#     "output_dir", "metadata_csv_path", "metadata",
-#     "exp_duration_widget", "min_track_length_widget", "max_track_length_widget",
-#     "set_params_button", "output_area_params",
-#     "checkboxes", "checkboxes_box", "save_button2", "output_area2",
-#     "umap_distance_widget", "umap_neighbors_widget", "num_clusters_widget",
-#     "save_button3", "output_area3","on_load_clicked1",
-#     "on_set_params_clicked",
-#     "on_save_clicked",
-#     "on_save_clicked3",
-#     "on_dim_order_change",
-#     "on_select_clicked4",
-#     "sample_dropdown",
-#     "select_button4",
-#     "sample_output",
-#     "sample_to_backproject",
-#     "setup_sample_selection_widgets"
-# ]
+                # call your function
+                self.df_tracks_filt = filter_organoid_tracks(
+                    metadata=self.metadata_loader.metadata,
+                    output_dir=str(out_dir),
+                    exp_duration=exp_duration,
+                    min_track_length=min_len,
+                    max_track_length=max_len,
+                    min_size=min_size,
+                    cell_type=self.cell_type
+                )
+                print("✅ Filtering complete.")
+
+                # locations
+                analysis_outdir = out_dir / "analysis" / self.cell_type
+                feature_outdir  = analysis_outdir / "track_features"
+                qc_outdir       = analysis_outdir / "quality_control"
+
+                combined_csv = feature_outdir / f"BEHAV3D_{self.cell_type}_combined_track_features.csv"
+                filtered_csv = feature_outdir / f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv"
+                filter_plot  = qc_outdir      / "BEHAV3D_filter_counts.pdf"
+
+                print("\nOutputs:")
+                print(f"  Combined tracks: {combined_csv}")
+                print(f"  Filtered tracks: {filtered_csv}")
+                print(f"  Filter counts:   {filter_plot}")
+
+                # preview
+                try:
+                    from IPython.display import display as _disp
+                    print("\n— Filtered tracks (head) —")
+                    _disp(self.df_tracks_filt.head(10))
+                except Exception:
+                    print(f"(preview unavailable) shape={getattr(self.df_tracks_filt,'shape',None)}")
+
+                # quick per-sample summary before/after
+                try:
+                    group_cols = ['sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
+
+                    def _count(df):
+                        return (
+                            df.groupby(group_cols, dropna=False)["TrackID"]
+                              .nunique()
+                              .reset_index(name="nr_tracks")
+                              .groupby("sample_name", dropna=False)["nr_tracks"]
+                              .sum()
+                              .reset_index()
+                        )
+
+                    before_df = pd.read_csv(combined_csv)
+                    after_df  = pd.read_csv(filtered_csv)
+                    before_counts = _count(before_df).rename(columns={"nr_tracks": "tracks_before"})
+                    after_counts  = _count(after_df).rename(columns={"nr_tracks": "tracks_after"})
+                    summary = before_counts.merge(after_counts, on="sample_name", how="outer").fillna(0)
+                    summary["removed"] = summary["tracks_before"] - summary["tracks_after"]
+
+                    print("\n— Track counts by sample —")
+                    _disp(summary)
+                except Exception as e:
+                    print(f"(Could not compute summary counts: {e})")
+
+                print("\n✅ Finished.")
+            except Exception:
+                import traceback; traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
+                
+                
+class OrganoidAnalysisPanel:
+    """Dead-%-only panel. Persists to behav3d_parameters['analysis']['organoid'] and writes YAML on run."""
+    def __init__(self, metadata_loader):
+        self.metadata_loader = metadata_loader
+        self.cell_type = "organoid"
+
+        # --- load + seed config from _DEFAULT_CONFIG (preserve user values) ---
+        params_on_disk = self.metadata_loader.behav3d_parameters or {}
+        params = deepcopy(params_on_disk)
+        _deep_merge(params, deepcopy(_DEFAULT_CONFIG))
+        if params != params_on_disk:
+            with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(params, f, sort_keys=False)
+        self._params = params
+        self._org = params["analysis"][self.cell_type]
+
+        # --- UI ---
+        self.title = widgets.HTML("<b>Organoid Death Analysis</b>")
+
+        self.dead_perc_threshold = widgets.FloatText(
+            description="Dead % threshold",
+            value=float(self._org.get("dead_perc_threshold", 1e-7)),
+            style={'description_width': '160px'},
+            continuous_update=False,
+        )
+
+        self.btn_run = widgets.Button(
+            description="Run organoid analysis",
+            button_style="success",
+            layout=widgets.Layout(width="360px")   # wider button
+        )
+        self.btn_run.on_click(self._on_run_clicked)
+
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
+
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_html],
+            layout=widgets.Layout(align_items="center", gap="10px")
+        )
+
+        self.out = widgets.Output()
+
+        self.ui = widgets.VBox([
+            self.title,
+            self.dead_perc_threshold,
+            self.run_row,
+            widgets.HTML("<hr>"),
+            self.out
+        ])
+
+    # ---------- public ----------
+    def display(self):
+        display(self.ui)
+
+    # ---------- internals ----------
+    def _resolve_output_dir(self) -> Path:
+        ml_out = getattr(self.metadata_loader, "output_dir", None)
+        if ml_out:
+            return Path(ml_out).expanduser()
+        return Path(self._params["paths"]["output_dir"]).expanduser()
+
+    def _persist_params(self):
+        self._org["dead_perc_threshold"] = float(self.dead_perc_threshold.value)
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(self._params, f, sort_keys=False)
+
+    def _lock(self, locked: bool):
+        self.dead_perc_threshold.disabled = locked
+        self.btn_run.disabled = locked
+
+    # ---------- run ----------
+    def _on_run_clicked(self, _):
+        self._lock(True)
+        self.spinner_html.layout.display = None
+        with self.out:
+            self.out.clear_output()
+            try:
+                out_dir = self._resolve_output_dir()
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                # overwrite config values with current UI selection
+                self._persist_params()
+
+                dth = float(self.dead_perc_threshold.value)
+                print("▶️ Running organoid analysis…")
+                print(f"  dead_perc_threshold = {dth}")
+
+                run_organoid_analysis(
+                    dead_perc_threshold=dth,
+                    output_dir=str(out_dir),
+                    df_tracks_path=None
+                )
+
+                # show outputs (optional preview)
+                results_outdir = out_dir / "analysis" / "organoid" / "results"
+                general_csv = results_outdir / "combined_general_organoid_dynamics_analysis.csv"
+                general_pdf = results_outdir / "combined_general_organoid_dynamics_analysis.pdf"
+
+                print("\nOutputs:")
+                print(f"  Results CSV: {general_csv}")
+                print(f"  Results PDF: {general_pdf}")
+
+                if general_csv.exists():
+                    try:
+                        df_general = pd.read_csv(general_csv)
+                        print("\n— General results (head) —")
+                        display(df_general.head(10))
+                    except Exception as e:
+                        print(f"(Could not read {general_csv}: {e})")
+
+                print("\n✅ Finished.")
+            except Exception:
+                import traceback; traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
+                
+class BackprojectionPanel:
+    def __init__(self, metadata_loader, cell_type="tcell"):
+        self.metadata_loader = metadata_loader
+        self.cell_type = str(cell_type)
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+
+        # ---- load config under top-level "backprojection" ----
+        try:
+            groups = behav3d_calculated_features  # dict: group -> [features/patterns]
+        except NameError:
+            raise RuntimeError("Define behav3d_calculated_features before creating BackprojectionPanel.")
+
+        params = dict(self.metadata_loader.behav3d_parameters or {})
+        params.setdefault("backprojection", self._default_backproj_config(groups))
+        self._params = params
+        self._cfg = self._params["backprojection"]
+
+        # ---- headings ----
+        self.title     = widgets.HTML('<div style="font-size:22px;font-weight:700;">Backproject features to images (napari)</div>')
+        self.sel_title = widgets.HTML('<div style="font-size:20px;font-weight:700;">Select feature columns</div>')
+
+        # ---- sample selector ----
+        md = self.metadata_loader.metadata
+        if md is None or "sample_name" not in md.columns:
+            raise RuntimeError("metadata_loader.metadata must have a 'sample_name' column.")
+        sample_list = sorted(map(str, md["sample_name"].unique().tolist()))
+        last_sample = self._cfg.get("last_sample") or (sample_list[0] if sample_list else None)
+        self.sample_dd = widgets.Dropdown(description="Sample", options=sample_list, value=last_sample,
+                                          layout=widgets.Layout(width="360px"))
+        self.sample_dd.style.description_width = "80px"
+
+        # ---- mode (mean/time) + save ----
+        mode_map = {"Mean features": "mean", "Time features": "time"}
+        inv_mode_map = {v: k for k, v in mode_map.items()}
+        self.mode_tb = widgets.ToggleButtons(
+            options=list(mode_map.keys()),
+            value=inv_mode_map.get(self._cfg.get("mode", "mean"), "Mean features"),
+            description="Mode",
+            layout=widgets.Layout(width="360px")
+        )
+        self.mode_tb.style.button_width = "160px"
+        self.mode_tb.style.description_width = "80px"
+
+        self.save_cb = widgets.Checkbox(description="Save .zarr backprojection to disk",
+                                        value=bool(self._cfg.get("save", False)))
+
+        # ---- grouped feature selection (always visible; 3 columns; same as extraction widget) ----
+        def _grid_for(children, indent_px="24px", columns=3):
+            return widgets.GridBox(
+                children,
+                layout=widgets.Layout(
+                    grid_template_columns=" ".join(["max-content"] * columns),
+                    grid_gap="6px 18px",
+                    margin=f"0 0 0 {indent_px}",
+                )
+            )
+
+        self._group_rows = {}  # group -> {group_cb, child_cbs, grid, container, group_handler, child_handler}
+        sel_group_boxes = []
+
+        preset = list(self._cfg.get("columns_input", []))
+        preset_set = set(preset)
+        groups_enabled = dict(self._cfg.get("feature_groups_enabled", {}))
+
+        for group_name, feats in groups.items():
+            child_cbs = [widgets.Checkbox(value=(f in preset_set), description=f, indent=True) for f in feats]
+            g_init = bool(groups_enabled.get(group_name, all(cb.value for cb in child_cbs)))
+
+            gcb = widgets.Checkbox(value=g_init, indent=False)
+            glabel = widgets.HTML(f"<b>{group_name}</b>")
+            header = widgets.HBox([gcb, glabel])
+
+            grid = _grid_for(child_cbs, columns=3)
+            container = widgets.VBox([header, grid])
+
+            self._group_rows[group_name] = {"group_cb": gcb, "child_cbs": child_cbs,
+                                            "grid": grid, "container": container}
+            sel_group_boxes.append(container)
+
+        # wire events (batched)
+        def make_group_handler(grp):
+            def _on(change):
+                if change["name"] != "value": return
+                val = bool(change["new"])
+                row = self._group_rows[grp]
+                for cb in row["child_cbs"]: cb.unobserve(row["child_handler"], names="value")
+                for cb in row["child_cbs"]: cb.value = val
+                for cb in row["child_cbs"]: cb.observe(row["child_handler"], names="value")
+            return _on
+
+        def make_child_handler(grp):
+            def _on(change):
+                if change["name"] != "value": return
+                row = self._group_rows[grp]
+                all_on = all(cb.value for cb in row["child_cbs"])
+                row["group_cb"].unobserve(row["group_handler"], names="value")
+                row["group_cb"].value = all_on
+                row["group_cb"].observe(row["group_handler"], names="value")
+            return _on
+
+        for grp_name, row in self._group_rows.items():
+            row["group_handler"] = make_group_handler(grp_name)
+            row["child_handler"] = make_child_handler(grp_name)
+            row["group_cb"].observe(row["group_handler"], names="value")
+            for cb in row["child_cbs"]:
+                cb.observe(row["child_handler"], names="value")
+
+        self.btn_select_all = widgets.Button(description="Select all")
+        self.btn_clear_all  = widgets.Button(description="Clear")
+        self.btn_select_all.on_click(lambda *_: self._set_all(True))
+        self.btn_clear_all.on_click(lambda *_: self._set_all(False))
+
+        # ---- run (with spinner) ----
+        self.btn_run = widgets.Button(description="Run backprojection", button_style="success",
+                                      layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
+        self.btn_run.on_click(self._on_run_clicked)
+        self.spinner_html = widgets.HTML(
+            value=spinning_loader
+        )
+        self.spinner_html.layout.display = "none"
+        self.run_row = widgets.HBox([self.btn_run, self.spinner_html],
+                                    layout=widgets.Layout(align_items="center", gap="10px"))
+        self.out = widgets.Output()
+
+        # ---- UI ----
+        self.ui = widgets.VBox([
+            self.title,
+            widgets.HBox([self.sample_dd, self.mode_tb], layout=widgets.Layout(gap="16px", flex_flow="row wrap")),
+            self.save_cb,
+            self.sel_title,
+            widgets.HBox([self.btn_select_all, self.btn_clear_all], layout=widgets.Layout(gap="8px")),
+            widgets.VBox(sel_group_boxes),
+            widgets.HTML("<hr>"),
+            self.run_row,
+            self.out
+        ])
+
+    # ---------- config ----------
+    def _default_backproj_config(self, groups_dict):
+        return {
+            "mode": "mean",                # "mean" or "time"
+            "save": False,
+            "last_sample": None,
+            "feature_groups_enabled": {g: True for g in groups_dict.keys()},
+            "columns_input": [],           # patterns picked in UI
+            "columns_resolved": [],        # filled at run
+        }
+
+    def _persist(self, *, resolved=None):
+        # snapshot current UI state into top-level "backprojection"
+        mode_map = {"Mean features": "mean", "Time features": "time"}
+        self._cfg["mode"] = mode_map[self.mode_tb.value]
+        self._cfg["save"] = bool(self.save_cb.value)
+        self._cfg["last_sample"] = self.sample_dd.value
+        self._cfg["feature_groups_enabled"] = {g: row["group_cb"].value for g, row in self._group_rows.items()}
+        self._cfg["columns_input"] = list(self._selected_patterns())
+        if resolved is not None:
+            self._cfg["columns_resolved"] = list(resolved)
+
+        self._params["backprojection"] = self._cfg
+        self.metadata_loader.behav3d_parameters = self._params
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(self._params, f, sort_keys=False)
+
+    # ---------- helpers ----------
+    def display(self): display(self.ui)
+
+    def _set_all(self, val: bool):
+        for grp_name, row in self._group_rows.items():
+            row["group_cb"].unobserve(row["group_handler"], names="value")
+            for cb in row["child_cbs"]: cb.unobserve(row["child_handler"], names="value")
+            row["group_cb"].value = val
+            for cb in row["child_cbs"]: cb.value = val
+            for cb in row["child_cbs"]: cb.observe(row["child_handler"], names="value")
+            row["group_cb"].observe(row["group_handler"], names="value")
+
+    def _all_child_cbs(self):
+        out = []
+        for row in self._group_rows.values(): out.extend(row["child_cbs"])
+        return out
+
+    def _selected_patterns(self):
+        seen, sel = set(), []
+        for cb in self._all_child_cbs():
+            if cb.value and cb.description not in seen:
+                sel.append(cb.description); seen.add(cb.description)
+        return sel
+
+    def _expand_patterns(self, selected, available_columns):
+        if available_columns is None:
+            return list(dict.fromkeys(selected))
+        avail = list(available_columns.tolist() if hasattr(available_columns, "tolist") else list(available_columns))
+        out = []
+        for name in selected:
+            if any(ch in name for ch in "*?["):
+                matches = [c for c in avail if fnmatch.fnmatchcase(str(c), name)]
+                out.extend(matches if matches else [name])
+            else:
+                out.append(name)
+        # de-dup preserve order
+        seen, uniq = set(), []
+        for f in out:
+            if f not in seen:
+                uniq.append(f); seen.add(f)
+        return uniq
+
+    def _lock(self, state: bool):
+        for row in self._group_rows.values():
+            row["group_cb"].disabled = state
+            for cb in row["child_cbs"]:
+                cb.disabled = state
+        for w in [self.sample_dd, self.mode_tb, self.save_cb, self.btn_select_all, self.btn_clear_all, self.btn_run]:
+            w.disabled = state
+
+    # ---------- run ----------
+    def _on_run_clicked(self, *_):
+        self._lock(True)
+        self.spinner_html.layout.display = None
+        self.out.clear_output()
+        with self.out:
+            try:
+                import pandas as pd
+
+                sample = self.sample_dd.value
+                mode = {"Mean features": "mean", "Time features": "time"}[self.mode_tb.value]
+                save = bool(self.save_cb.value)
+                patterns = self._selected_patterns()
+
+                print(f"▶️ Backprojecting… sample={sample} | mode={mode} | save={save}")
+
+                # Resolve available columns from clustered CSV header (fast)
+                results_dir = Path(self.output_dir, "analysis", self.cell_type, "results")
+                clustered_csv = Path(results_dir, f"BEHAV3D_{self.cell_type}_combined_track_features_clustered.csv")
+                try:
+                    cols = pd.read_csv(clustered_csv, nrows=1).columns
+                except Exception:
+                    cols = None
+                columns_resolved = self._expand_patterns(patterns, cols)
+                self._persist(resolved=columns_resolved)
+
+                # Respect Save checkbox by temporarily disabling save_as_zarr when save=False
+                patched = False
+                if not save:
+                    try:
+                        import behav3d.utils.fileio as fio
+                        self._orig_save_as_zarr = fio.save_as_zarr
+                        def _noop_save_as_zarr(*args, **kwargs): return None
+                        fio.save_as_zarr = _noop_save_as_zarr
+                        patched = True
+                    except Exception:
+                        print("⚠️ Could not patch save_as_zarr; results may be written.")
+
+                fn = backproject_mean_features_behav3d if mode == "mean" else backproject_time_features_behav3d
+
+                result = fn(
+                    metadata=self.metadata_loader.metadata,
+                    sample_name=sample,
+                    config=None,
+                    output_dir=self.output_dir,
+                    cell_type=self.cell_type,
+                    columns=columns_resolved if patterns else [],  # [] lets function choose default
+                    save=save
+                )
+
+                print("✅ Done. (napari launched inside function)")
+                if isinstance(result, dict):
+                    print(f"  path: {result.get('path')}")
+                    k = list((result.get('data') or {}).keys())
+                    print(f"  layers: {k[:8]}{'…' if len(k)>8 else ''}")
+
+            except Exception:
+                import traceback; traceback.print_exc()
+            finally:
+                # restore save
+                try:
+                    if patched:
+                        import behav3d.utils.fileio as fio
+                        fio.save_as_zarr = self._orig_save_as_zarr
+                except Exception:
+                    pass
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
