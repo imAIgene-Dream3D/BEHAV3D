@@ -897,7 +897,7 @@ def plot_clustering_feature_heatmap(
     rows_first_img = 4,
     figsize = (8.27, 11.69),
     plot_results=True,
-    show_points=True,        # overlay individual samples
+    show_points=False,        # overlay individual samples
     point_alpha=0.5,         # transparency for individual samples
     point_size=8,            # size for individual points
     mean_marker_size=60,     # size for mean markers
