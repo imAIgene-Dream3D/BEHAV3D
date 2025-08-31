@@ -73,7 +73,6 @@ def propagate_tracks(
             t_tracked_seg = _run_single_timepoint_propagation(
                 t_seg,
                 seg_prev_tp,
-                outpath = tracked_img_outpath,
                 dilation_nr_pixels=dilation_nr_pixels,
                 segment_size_min=segment_size_min,
             )

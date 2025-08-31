@@ -15,8 +15,7 @@ except ImportError:
         "trackpy is required for tracking. "
         "Install via: pip install trackpy"
     )
-
-
+tp.quiet()
 
 def mask_from_one_hot_encoding_3D(one_hot):
     mask = np.zeros((one_hot.shape[1:]), dtype='int')
@@ -125,7 +124,16 @@ def run_trackpy_tracking(
     df_centroids["position_y"]=df_centroids["centroid-1"]*element_size_y
     df_centroids["position_x"]=df_centroids["centroid-2"]*element_size_x
     # Tracking
-    df_tracks = tp.link(df_centroids, search_range, memory=memory, adaptive_stop=adaptive_stop, adaptive_step=adaptive_step,pos_columns=['position_z','position_y','position_x'],t_column='position_t')
+
+    df_tracks = tp.link(
+        df_centroids, 
+        search_range, 
+        memory=memory, 
+        adaptive_stop=adaptive_stop, 
+        adaptive_step=adaptive_step,
+        pos_columns=['position_z','position_y','position_x'],
+        t_column='position_t'
+        )
     df_tracks=df_tracks.rename(columns={'particle':'track_id'})
     df_tracks = df_tracks.reset_index()
     df_tracks["track_id"]+=1
@@ -225,10 +233,10 @@ def run_tcell_trackpy_tracking(
             print("Running trackpy tracking...")
             # Tracking
             df_tracks = tp.link(df_centroids, search_range, memory=memory, 
-                              adaptive_stop=adaptive_stop, adaptive_step=adaptive_step,
-                              pos_columns=['position_z','position_y','position_x'], 
-                              t_column='position_t')
-            
+                            adaptive_stop=adaptive_stop, adaptive_step=adaptive_step,
+                            pos_columns=['position_z','position_y','position_x'], 
+                            t_column='position_t')
+                
             # Rename columns to match BEHAV3D convention
             df_tracks = df_tracks.reset_index()
             df_tracks.rename(

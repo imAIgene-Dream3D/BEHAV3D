@@ -40,7 +40,8 @@ def plot_filter_count(
     nr_cols=3,
     rows_per_page = 3,
     figsize=(8.27, 11.69),
-    filter_cols=["nr_tracks_before_filtering", "nr_tracks_exp_duration", "nr_tracks_min_track_length", "nr_tracks_dead_t1"]
+    filter_cols=["nr_tracks_before_filtering", "nr_tracks_exp_duration", "nr_tracks_min_track_length", "nr_tracks_dead_t1"],
+    plot_results=False
     ):
     
     sample_names = df_track_counts["sample_name"].unique()

@@ -96,24 +96,24 @@ _DEFAULT_CONFIG = {
     },
     "tracking": {
         "tcell": {
-            "method": "trackpy",
+            "method": "lap",
             "overwrite": False,
             "lap": {
-                "track_cost_px": 60,
-                "gap_close_cost_px": 45,
-                "gap_close_max_frames": 5,
+                "track_cost_px": 45,
+                "gap_close_cost_px": 60,
+                "gap_close_max_frames": 3,
                 "merging_cost_px": 0,
                 "splitting_cost_px": 0
             },
             "trackpy": {
                 "search_range_px": 31,
-                "memory_frames": 5,
+                "memory_frames": 2,
                 "adaptive_stop": 10.0,
                 "adaptive_step": 0.95
             }
         },
         "organoid": {
-            "method": "propagation",
+            "method": "lap",
             "overwrite": False,
             "lap": {
                 "track_cost_px": 60,
@@ -139,14 +139,14 @@ _DEFAULT_CONFIG = {
     },
     "features": {
         "tcell": {
-            "dead_mask_percentage_threshold": 0.25,
-            "features_choice": ["movement", "intensity", "contact", "death"],
+            "dead_mask_percentage_threshold": 0.05,
+            "features_choice": ["movement", "intensity", "morphology", "contact", "death"],
             "n_workers": 16,
             "overwrite": False
         },
         "organoid": {
             "dead_mask_percentage_threshold": 0.02,
-            "features_choice": ["intensity", "death"],
+            "features_choice": ["morphology", "intensity", "death"],
             "n_workers": 8,
             "overwrite": False
         }
@@ -155,9 +155,9 @@ _DEFAULT_CONFIG = {
         "tcell": {
             "exp_duration": 24.0,
             "exp_duration_enabled": False,
-            "min_track_length": 100,
+            "min_track_length": 3,
             "min_track_length_enabled": False,
-            "max_track_length": 100,
+            "max_track_length": 999999,
             "max_track_length_enabled": False,
             "filter_t0_dead": True,
             "filter_t0_dead_enabled": False
@@ -166,9 +166,9 @@ _DEFAULT_CONFIG = {
             "exp_duration_enabled": False,
             "exp_duration": 999999,      # timepoints
             "min_track_length_enabled": False,
-            "min_track_length": 100,       # frames
+            "min_track_length": 0,       # frames
             "max_track_length_enabled": False,
-            "max_track_length": 100,  # frames
+            "max_track_length": 999999,  # frames
             "min_size_enabled": True,
             "min_size": 1000,
         }
@@ -186,24 +186,14 @@ _DEFAULT_CONFIG = {
                 "death": False,
                 "contact": False,
             },
-            'dtw_features_input': [
-                'mean_square_displacement',
-                'speed',
-                'mean_dead_dye',
-                'organoid_contact',
-                'tcell_contact'
-            ],      # patterns allowed (e.g. "mean_intensity_*")
+            "dtw_features_input": [],      # patterns allowed (e.g. "mean_intensity_*")
             "dtw_features_resolved": [],   # expanded at run
-            'z_normalize': {
-                'mean_square_displacement': True,
-                'speed': True,
-                'mean_dead_dye': True,
-                'organoid_contact': False,
-                'tcell_contact': False
-            },             # {feature_name: bool}
+            "z_normalize": {},             # {feature_name: bool}
         },
         "organoid": {
-            "dead_perc_threshold": 0.02
+            "dead_perc_threshold": 1e-7,
+            "df_tracks_path_enabled": False,
+            "df_tracks_path": ""
         }
     },
     "backprojection": {
@@ -789,22 +779,28 @@ class PixelClassifierPanel:
         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
 
         # -------- Train controls --------
-        self.examples_per_sample = widgets.IntText(
+        self.examples_per_sample = widgets.IntSlider(
             description="Examples per sample",
-            value=int(pc.get("examples_per_sample", 3)))
+            value=int(pc.get("examples_per_sample", 3)),
+            min=1, max=50, step=1, continuous_update=False
+        )
         self.sample_specific_classifier = widgets.Checkbox(
             description="Sample-specific classifier",
             value=bool(pc.get("sample_specific_classifier", False))
         )
-        self.n_workers = widgets.IntText(
+        self.n_workers = widgets.IntSlider(
             description="Workers",
             value=int(pc.get("workers", (os.cpu_count() or 8))),
-            max=max(8, (os.cpu_count() or 8)))
+            min=1, max=max(8, (os.cpu_count() or 8)),
+            step=1, continuous_update=False
+        )
 
         # -------- Apply controls --------
-        self.organoid_edt_threshold = widgets.FloatText(
+        self.organoid_edt_threshold = widgets.FloatSlider(
             description="Organoid EDT thr",
             value=float(pc.get("organoid_edt_threshold", 12.0)),
+            min=0.0, max=50.0, step=0.5, readout_format=".1f",
+            continuous_update=False,
             style={'description_width': '160px'}
         )
         self.use_all_timepoints = widgets.Checkbox(
@@ -951,7 +947,7 @@ class PixelClassifierPanel:
                 import traceback; traceback.print_exc()
             finally:
                 self._lock(False)
-
+            
 class TrackingPanel:
     """
     Minimal UI for tracking (LAP, TrackPy, or Propagation).
@@ -962,18 +958,16 @@ class TrackingPanel:
     def __init__(self, metadata_loader, cell_type="tcell"):
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
-
-        # Ensure config skeleton exists, then read profile
-        self._ensure_cfg_skeleton()
-        params = dict(self.metadata_loader.behav3d_parameters or {})
-        tcfg = params["tracking"][self.cell_type]
+        # --- choose profile defaults ---
+        
+        tcfg = _cfg_get(self.metadata_loader.behav3d_parameters, f"tracking.{self.cell_type}", {}) or {}
 
         # Method selector
         self.method = widgets.Dropdown(
             description="Tracking method",
             options=[("LAP (laptrack)", "lap"),
                      ("TrackPy", "trackpy"),
-                     ("Propagation", "propagation")],
+                     ("Propagation", "prop")],
             value=str(tcfg.get("method", "lap")),
             style={'description_width': '160px'}
         )
@@ -986,22 +980,24 @@ class TrackingPanel:
 
         # LAP params (distances in pixels; squared when calling)
         lap = tcfg.get("lap", {})
-        self.track_cost_dist = widgets.IntText(
+        self.track_cost_dist = widgets.IntSlider(
             description="Track cost (px)",
             value=int(lap.get("track_cost_px", 45)),
-            style={'description_width':'160px'}
+            min=1, max=200, step=1,
+            continuous_update=False, style={'description_width':'160px'}
         )
-        self.gap_cost_dist = widgets.IntText(
+        self.gap_cost_dist = widgets.IntSlider(
             description="Gap close cost (px)",
             value=int(lap.get("gap_close_cost_px", 60)),
-            style={'description_width':'160px'}
+            min=1, max=300, step=1,
+            continuous_update=False, style={'description_width':'160px'}
         )
-        self.gap_max_frames = widgets.IntText(
+        self.gap_max_frames = widgets.IntSlider(
             description="Gap close max frames",
             value=int(lap.get("gap_close_max_frames", 3)),
-            style={'description_width':'160px'}
+            min=0, max=20, step=1,
+            continuous_update=False, style={'description_width':'160px'}
         )
-        # Text boxes are the ones that don't commit until blur/Enter:
         self.merging_cost_dist = widgets.IntText(
             description="Merging cost (px)",
             value=int(lap.get("merging_cost_px", 0)),
@@ -1020,25 +1016,29 @@ class TrackingPanel:
 
         # TrackPy params
         tpy = tcfg.get("trackpy", {})
-        self.tp_search_range = widgets.IntText(
+        self.tp_search_range = widgets.IntSlider(
             description="Search range (px)",
             value=int(tpy.get("search_range_px", 31)),
-            style={'description_width':'160px'}
+            min=1, max=200, step=1,
+            continuous_update=False, style={'description_width':'160px'}
         )
-        self.tp_memory = widgets.IntText(
+        self.tp_memory = widgets.IntSlider(
             description="Memory (frames)",
             value=int(tpy.get("memory_frames", 2)),
-            style={'description_width':'160px'}
+            min=0, max=20, step=1,
+            continuous_update=False, style={'description_width':'160px'}
         )
-        self.tp_adaptive_stop = widgets.FloatText(
+        self.tp_adaptive_stop = widgets.FloatSlider(
             description="Adaptive stop",
             value=float(tpy.get("adaptive_stop", 10.0)),
-            style={'description_width':'160px'}
+            min=0.0, max=50.0, step=0.5,
+            readout_format=".1f", continuous_update=False, style={'description_width':'160px'}
         )
-        self.tp_adaptive_step = widgets.FloatText(
+        self.tp_adaptive_step = widgets.FloatSlider(
             description="Adaptive step",
             value=float(tpy.get("adaptive_step", 0.95)),
-            style={'description_width':'160px'}
+            min=0.1, max=1.0, step=0.01,
+            readout_format=".2f", continuous_update=False, style={'description_width':'160px'}
         )
         self.tp_params = widgets.VBox([
             widgets.HTML("<b>TrackPy parameters</b>"),
@@ -1057,20 +1057,16 @@ class TrackingPanel:
         self._toggle_param_groups()
 
         # Run + log
-        self.btn_run = widgets.Button(
-            description=f"Run {cell_type} tracking",
-            button_style="success",
-            layout=widgets.Layout(
-                width="fit-content",  # shrink-to-fit text
-                flex="0 0 auto"       # don't stretch
-            )
-        )
+        self.btn_run = widgets.Button(description=f"Run {cell_type} tracking", button_style="success", layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
         self.btn_run.on_click(self._on_run_clicked)
         self.out = widgets.Output()
 
         # Layout
         self.ui = widgets.VBox([
-            widgets.HTML(f"<b>{cell_type} Tracking</b>"),
+            widgets.HTML(f"<b> {cell_type} Tracking</b>"),
             self.method,
             widgets.HBox([self.overwrite]),
             self.param_container,
@@ -1079,10 +1075,29 @@ class TrackingPanel:
             self.out
         ])
 
-    # ---------------- UI helpers ----------------
     def display(self):
         display(self.ui)
 
+    def _persist_params(self):
+        # CFG.setdefault("tracking", {}).setdefault(self.cell_type, {})
+        prof = self.metadata_loader.behav3d_parameters["tracking"][self.cell_type]
+        prof["method"] = str(self.method.value)
+        prof["overwrite"] = bool(self.overwrite.value)
+
+        prof["lap"]["track_cost_px"] = int(self.track_cost_dist.value)
+        prof["lap"]["gap_close_cost_px"] = int(self.gap_cost_dist.value)
+        prof["lap"]["gap_close_max_frames"] = int(self.gap_max_frames.value)
+        prof["lap"]["merging_cost_px"] = int(self.merging_cost_dist.value)
+        prof["lap"]["splitting_cost_px"] = int(self.splitting_cost_dist.value)
+
+        prof["trackpy"]["search_range_px"] = int(self.tp_search_range.value)
+        prof["trackpy"]["memory_frames"] = int(self.tp_memory.value)
+        prof["trackpy"]["adaptive_stop"] = float(self.tp_adaptive_stop.value)
+        prof["trackpy"]["adaptive_step"] = float(self.tp_adaptive_step.value)
+
+        yaml.safe_dump(self.metadata_loader.behav3d_parameters, self.metadata_loader.behav3d_parameters_path.open("w"), sort_keys=False)
+
+                
     def _toggle_param_groups(self, change=None):
         if self.method.value == "lap":
             self.param_container.children = (self.lap_params,)
@@ -1102,81 +1117,15 @@ class TrackingPanel:
             if hasattr(w, "disabled"):
                 w.disabled = state
 
-    def _force_commit_pending_changes(self):
-        """Ensure IntText/FloatText edits are committed (they only send on blur/Enter)."""
-        try:
-            from IPython.display import Javascript, display
-            display(Javascript("document.activeElement && document.activeElement.blur();"))
-            import time as _t; _t.sleep(0.08)  # tiny pause for the comm to deliver
-        except Exception:
-            pass
-
-    # ---------------- config I/O ----------------
-    def _ensure_cfg_skeleton(self):
-        p = dict(self.metadata_loader.behav3d_parameters or {})
-        p.setdefault("tracking", {})
-        p["tracking"].setdefault(self.cell_type, {})
-        prof = p["tracking"][self.cell_type]
-        prof.setdefault("method", "lap")
-        prof.setdefault("overwrite", False)
-        prof.setdefault("lap", {
-            "track_cost_px": 45,
-            "gap_close_cost_px": 60,
-            "gap_close_max_frames": 3,
-            "merging_cost_px": 0,
-            "splitting_cost_px": 0
-        })
-        prof.setdefault("trackpy", {
-            "search_range_px": 31,
-            "memory_frames": 2,
-            "adaptive_stop": 10.0,
-            "adaptive_step": 0.95
-        })
-        self.metadata_loader.behav3d_parameters = p  # keep loader in sync
-
-    def _persist_params(self):
-        # Make sure the skeleton exists
-        self._ensure_cfg_skeleton()
-        params = dict(self.metadata_loader.behav3d_parameters or {})
-        params.setdefault("tracking", {})
-        params["tracking"].setdefault(self.cell_type, {"lap": {}, "trackpy": {}})
-        prof = params["tracking"][self.cell_type]
-
-        prof["method"] = str(self.method.value)
-        prof["overwrite"] = bool(self.overwrite.value)
-
-        prof.setdefault("lap", {})
-        prof["lap"]["track_cost_px"]        = int(self.track_cost_dist.value)
-        prof["lap"]["gap_close_cost_px"]    = int(self.gap_cost_dist.value)
-        prof["lap"]["gap_close_max_frames"] = int(self.gap_max_frames.value)
-        prof["lap"]["merging_cost_px"]      = int(self.merging_cost_dist.value)
-        prof["lap"]["splitting_cost_px"]    = int(self.splitting_cost_dist.value)
-
-        prof.setdefault("trackpy", {})
-        prof["trackpy"]["search_range_px"]  = int(self.tp_search_range.value)
-        prof["trackpy"]["memory_frames"]    = int(self.tp_memory.value)
-        prof["trackpy"]["adaptive_stop"]    = float(self.tp_adaptive_stop.value)
-        prof["trackpy"]["adaptive_step"]    = float(self.tp_adaptive_step.value)
-
-        # Write back to loader + disk
-        self.metadata_loader.behav3d_parameters = params
-        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(params, f, sort_keys=False)
-
-    # ---------------- run ----------------
     def _on_run_clicked(self, _):
         self._lock(True)
         with self.out:
             self.out.clear_output()
             try:
-                # Commit any in-progress text edits BEFORE reading values / persisting
-                self._force_commit_pending_changes()
-
-                # Persist current UI to YAML
                 self._persist_params()
-
                 out_dir = Path(self.metadata_loader.output_dir).expanduser()
                 out_dir.mkdir(parents=True, exist_ok=True)
+
                 csv_path = Path(self.metadata_loader.metadata_csv_path).expanduser()
 
                 method = self.method.value
@@ -1211,32 +1160,16 @@ class TrackingPanel:
                     print(f"  search_range={self.tp_search_range.value}, memory={self.tp_memory.value}")
                     print(f"  adaptive_stop={self.tp_adaptive_stop.value}, adaptive_step={self.tp_adaptive_step.value}", flush=True)
 
-                    # Silence TrackPy progress output in widget
-                    try:
-                        import trackpy as tp
-                        with tp.quiet():
-                            new_md = run_tcell_trackpy_tracking(
-                                metadata=self.metadata_loader.metadata,
-                                output_dir=str(out_dir),
-                                overwrite=bool(self.overwrite.value),
-                                cell_type=self.cell_type,
-                                search_range=int(self.tp_search_range.value),
-                                memory=int(self.tp_memory.value),
-                                adaptive_stop=float(self.tp_adaptive_stop.value),
-                                adaptive_step=float(self.tp_adaptive_step.value),
-                            )
-                    except Exception:
-                        # Fallback if tp.quiet not available
-                        new_md = run_tcell_trackpy_tracking(
-                            metadata=self.metadata_loader.metadata,
-                            output_dir=str(out_dir),
-                            overwrite=bool(self.overwrite.value),
-                            cell_type=self.cell_type,
-                            search_range=int(self.tp_search_range.value),
-                            memory=int(self.tp_memory.value),
-                            adaptive_stop=float(self.tp_adaptive_stop.value),
-                            adaptive_step=float(self.tp_adaptive_step.value),
-                        )
+                    new_md = run_tcell_trackpy_tracking(
+                        metadata=self.metadata_loader.metadata,
+                        output_dir=str(out_dir),
+                        overwrite=bool(self.overwrite.value),
+                        cell_type=self.cell_type,
+                        search_range=int(self.tp_search_range.value),
+                        memory=int(self.tp_memory.value),
+                        adaptive_stop=float(self.tp_adaptive_stop.value),
+                        adaptive_step=float(self.tp_adaptive_step.value),
+                    )
 
                 else:  # "prop" propagation
                     print("▶️ Propagation tracking…", flush=True)
@@ -1257,7 +1190,7 @@ class TrackingPanel:
                 import traceback; traceback.print_exc()
             finally:
                 self._lock(False)
-   
+
 class TrackingVisualizationPanel:
     def __init__(
         self,
@@ -1472,9 +1405,11 @@ class FeatureExtractionPanel:
                         f"features.{self.cell_type}", {}) or {}
 
         # --- Controls ---
-        self.dead_mask_threshold = widgets.FloatText(
+        self.dead_mask_threshold = widgets.FloatSlider(
             description="Dead mask % thr",
             value=float(fcfg.get("dead_mask_percentage_threshold", 0.05)),
+            min=0.0, max=1.0, step=0.01,
+            readout_format=".2f", continuous_update=False,
             style={'description_width':'160px'}
         )
 
@@ -1492,10 +1427,11 @@ class FeatureExtractionPanel:
             [widgets.HTML("<b>Features</b>")] + [self.feature_checks[f] for f in self._all_features]
         )
 
-        self.n_workers = widgets.IntText(
+        self.n_workers = widgets.IntSlider(
             description="Workers",
             value=int(fcfg.get("n_workers", max(8, (os.cpu_count() or 8)))),
-            max=max(8, (os.cpu_count() or 8)),
+            min=1, max=max(8, (os.cpu_count() or 8)),
+            step=1, continuous_update=False,
             style={'description_width':'160px'}
         )
 
@@ -1835,7 +1771,7 @@ class TCellAnalysisPanel:
         self.section_title = widgets.HTML('<div style="font-size:22px;font-weight:700;">T cell analysis</div>')
         self.sel_title     = widgets.HTML('<div style="font-size:20px;font-weight:700;">Select features to use for Dynamic Time Warping (DTW):</div>')
         self.norm_title    = widgets.HTML('<div style="font-size:20px;font-weight:700;">Normalize</div>')
-        self.umap_title    = widgets.HTML('<div style="font-size:20px;font-weight:700;">UMAP settings</div>')
+
         # ---- Seed ----
         self.seed_widget = widgets.IntText(
             description="Seed",
@@ -1984,7 +1920,6 @@ class TCellAnalysisPanel:
             widgets.VBox(norm_group_boxes)
         ])
 
-        
         # ---- UMAP / clustering ----
         self.umap_distance_widget  = widgets.FloatText(description="UMAP min_dist",
                                                        value=float(self._panel_cfg.get("umap_min_dist", 0.1)),
@@ -1995,13 +1930,6 @@ class TCellAnalysisPanel:
         self.num_clusters_widget   = widgets.IntText(description="# clusters",
                                                      value=int(self._panel_cfg.get("nr_of_clusters", 5)),
                                                      style={"description_width": "140px"})
-        
-        self.umap_box = widgets.VBox([
-            self.umap_title,
-            widgets.HBox([self.umap_distance_widget, self.umap_neighbors_widget, self.num_clusters_widget],
-                         layout=widgets.Layout(flex_flow="row wrap", gap="12px"))
-        ])
-        
         self.output_area_params = widgets.Output()
 
         # ---- Run ----
@@ -2037,7 +1965,8 @@ class TCellAnalysisPanel:
             self.output_area_features,
             self.normalize_section,
             widgets.HTML("<hr>"),
-            self.umap_box,
+            widgets.HBox([self.umap_distance_widget, self.umap_neighbors_widget, self.num_clusters_widget],
+                         layout=widgets.Layout(flex_flow="row wrap", gap="12px")),
             self.output_area_params,
             widgets.HTML("<hr>"),
             self.run_row,
@@ -2321,7 +2250,6 @@ class TCellAnalysisPanel:
                     nr_of_clusters=self.nr_of_clusters,
                     columns_to_use=columns_to_use,
                     columns_to_normalize=columns_to_normalize,
-                    seed=seed
                 )
 
                 # Show preview if it quacks like a DataFrame
