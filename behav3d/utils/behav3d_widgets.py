@@ -1332,32 +1332,16 @@ class TrackingPanel:
                     print(f"  search_range={self.tp_search_range.value}, memory={self.tp_memory.value}")
                     print(f"  adaptive_stop={self.tp_adaptive_stop.value}, adaptive_step={self.tp_adaptive_step.value}", flush=True)
 
-                    # Silence TrackPy progress output in widget
-                    try:
-                        import trackpy as tp
-                        with tp.quiet():
-                            new_md = run_tcell_trackpy_tracking(
-                                metadata=self.metadata_loader.metadata,
-                                output_dir=str(out_dir),
-                                overwrite=bool(self.overwrite.value),
-                                cell_type=self.cell_type,
-                                search_range=int(self.tp_search_range.value),
-                                memory=int(self.tp_memory.value),
-                                adaptive_stop=float(self.tp_adaptive_stop.value),
-                                adaptive_step=float(self.tp_adaptive_step.value),
-                            )
-                    except Exception:
-                        # Fallback if tp.quiet not available
-                        new_md = run_tcell_trackpy_tracking(
-                            metadata=self.metadata_loader.metadata,
-                            output_dir=str(out_dir),
-                            overwrite=bool(self.overwrite.value),
-                            cell_type=self.cell_type,
-                            search_range=int(self.tp_search_range.value),
-                            memory=int(self.tp_memory.value),
-                            adaptive_stop=float(self.tp_adaptive_stop.value),
-                            adaptive_step=float(self.tp_adaptive_step.value),
-                        )
+                    new_md = run_tcell_trackpy_tracking(
+                        metadata=self.metadata_loader.metadata,
+                        output_dir=str(out_dir),
+                        overwrite=bool(self.overwrite.value),
+                        cell_type=self.cell_type,
+                        search_range=int(self.tp_search_range.value),
+                        memory=int(self.tp_memory.value),
+                        adaptive_stop=float(self.tp_adaptive_stop.value),
+                        adaptive_step=float(self.tp_adaptive_step.value),
+                    )
 
                 else:  # "propagation"
                     print("▶️ Propagation tracking…", flush=True)

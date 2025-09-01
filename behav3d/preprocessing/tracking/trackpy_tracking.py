@@ -25,7 +25,7 @@ def mask_from_one_hot_encoding_3D(one_hot):
 
 def one_hot_encoding_3D(img):
     object_labels=np.unique(img)
-    one_hot = np.zeros((len(object_labels), img.shape[0], img.shape[1], img.shape[2]), dtype='bool')
+    one_hot = np.zeros((len(object_labels), img.shape[0], img.shape[1], img.shape[2]), dtypef='bool')
     for i, unique_value in enumerate(object_labels):
         one_hot[i,...][img == unique_value] = True
     return one_hot
@@ -229,14 +229,39 @@ def run_tcell_trackpy_tracking(
             df_centroids["position_z"] = df_centroids["centroid-0"]*element_size_z
             df_centroids["position_y"] = df_centroids["centroid-1"]*element_size_y
             df_centroids["position_x"] = df_centroids["centroid-2"]*element_size_x
-            
-            print("Running trackpy tracking...")
+
+            # print("Running trackpy tracking...")
             # Tracking
-            df_tracks = tp.link(df_centroids, search_range, memory=memory, 
-                            adaptive_stop=adaptive_stop, adaptive_step=adaptive_step,
-                            pos_columns=['position_z','position_y','position_x'], 
-                            t_column='position_t')
-                
+            from trackpy.linking.utils import SubnetOversizeException
+
+            try:
+                # print("Trying fast Numba-based linking...")
+                df_tracks = tp.link(
+                    df_centroids,
+                    search_range=search_range,
+                    memory=memory,
+                    adaptive_stop=adaptive_stop,
+                    adaptive_step=adaptive_step,
+                    pos_columns=['position_z', 'position_y', 'position_x'],
+                    t_column='position_t',
+                    # link_strategy='recursive'
+                    # use_numba=True  # default, but explicit here
+                )
+            except SubnetOversizeException as e:
+                print(f"Numba linking failed due to large subnet: {e}")
+                print("Falling back to slower non-Numba linking...")
+
+                df_tracks = tp.link(
+                    df_centroids,
+                    search_range=search_range,
+                    memory=memory,
+                    adaptive_stop=adaptive_stop,
+                    adaptive_step=adaptive_step,
+                    pos_columns=['position_z', 'position_y', 'position_x'],
+                    t_column='position_t',
+                    link_strategy='recursive'
+                )
+                 
             # Rename columns to match BEHAV3D convention
             df_tracks = df_tracks.reset_index()
             df_tracks.rename(
