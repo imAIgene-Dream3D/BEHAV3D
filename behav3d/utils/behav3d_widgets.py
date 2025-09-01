@@ -109,7 +109,7 @@ _DEFAULT_CONFIG = {
             "trackpy": {
                 "search_range_px": 31,
                 "memory_frames": 5,
-                "adaptive_stop": 10.0,
+                "adaptive_stop": 5,
                 "adaptive_step": 0.95
             }
         },
