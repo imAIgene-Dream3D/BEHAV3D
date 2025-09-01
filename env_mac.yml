@@ -291,6 +291,7 @@ dependencies:
   - torchvision=0.19.1
   - tornado=6.4.2
   - tqdm=4.67.1
+  - trackpy
   - traitlets=5.14.3
   - typer=0.15.2
   - typer-slim=0.15.2

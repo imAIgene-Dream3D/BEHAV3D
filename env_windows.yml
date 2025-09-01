@@ -1,4 +1,4 @@
-name: behav3dma
+name: behav3d
 channels:
   - pytorch
   - defaults
@@ -273,6 +273,7 @@ dependencies:
   - torchvision=0.19.1
   - tornado=6.5.1
   - tqdm=4.67.1
+  - trackpy
   - traitlets=5.14.3
   - typer=0.16.0
   - typer-slim=0.16.0
@@ -307,4 +308,4 @@ dependencies:
   - zstd=1.5.7
   - pip:
       - torchsummary==1.5.1
-prefix: C:\Users\akrashen\Miniforge3\envs\behav3dma
+prefix: C:\Users\akrashen\Miniforge3\envs\behav3d
