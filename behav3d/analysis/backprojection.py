@@ -137,7 +137,7 @@ def backproject_mean_features_behav3d(
     visualize_data = {**raw_img_data, **backproject_data}
     
     print("- Visualizing backprojection in napari")
-    view_napari(
+    viewer = view_napari(
         visualize_data, 
         df_tracks_full=df_tracks_all,
         df_tracks_clustered=df_tracks_full_clustered, 
@@ -153,11 +153,12 @@ def backproject_mean_features_behav3d(
     end_time = time.time()
     h,m,s = format_time(start_time, end_time)
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
-    return({
-        "path": backproj_out_path,
-        "data": visualize_data,
-        "elsize": elsize
-        })
+    return viewer
+    # return({
+    #     "path": backproj_out_path,
+    #     "data": visualize_data,
+    #     "elsize": elsize
+    #     })
 
 def load_backprojection_h5(backprojection_h5_path):
     data_dict = {}
@@ -299,7 +300,7 @@ def backproject_time_features_behav3d(
     visualize_data = {**raw_img_data, **backproject_data}
     
     print("- Visualizing backprojection in napari")
-    view_napari(
+    viewer = view_napari(
         visualize_data, 
         df_tracks_full=df_tracks_all,
         df_tracks_clustered=df_tracks_full_clustered, 
@@ -315,11 +316,12 @@ def backproject_time_features_behav3d(
     end_time = time.time()
     h,m,s = format_time(start_time, end_time)
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
-    return({
-        "path": backproj_out_path,
-        "data": visualize_data,
-        "elsize": elsize
-        })
+    return viewer
+    # return({
+    #     "path": backproj_out_path,
+    #     "data": visualize_data,
+    #     "elsize": elsize
+    #     })
 
 def load_backprojection_h5(backprojection_h5_path):
     data_dict = {}
@@ -395,6 +397,7 @@ def view_napari(
     viewer.add_tracks(napari_tracks_clustered, name='Filtered T-cell Tracks', properties=features, features=features, color_by="ClusterID", tail_length=75)
     viewer.add_tracks(napari_tracks_full, name='All T-cell Tracks',  tail_length=75)
     napari.run()  
+    return(viewer)
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -503,6 +503,7 @@ def load_elsizes_czi(path):
         # For some reason there doesnt seem 
         "time_interval_unit": "s"   
     }
+    return(elsizes)
 
 
 def get_image_shape(path):

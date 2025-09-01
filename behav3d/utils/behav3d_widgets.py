@@ -30,6 +30,7 @@ from behav3d.analysis.tcell_analysis import filter_tcell_tracks, run_tcell_analy
 from behav3d.analysis.organoid_analysis import filter_organoid_tracks, run_organoid_analysis 
 
 from behav3d.analysis.backprojection import backproject_mean_features_behav3d, backproject_time_features_behav3d
+import napari
 
 behav3d_calculated_features = {
     "morphology": [
@@ -81,8 +82,8 @@ CONFIG_PATH = Path("behav3d_config.yml")  # adjust if you prefer a different loc
 _DEFAULT_CONFIG = {
     "seed": 42,
     "paths": {
-        "metadata_csv": r"F:\BHVD_BEHAV3D\BEHAV3D_python\runs\ROCHE\metadata_windows_home.csv",
-        "output_dir": r"F:\BHVD_BEHAV3D\BEHAV3D_python\runs\ROCHE"
+        "metadata_csv": r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv",
+        "output_dir": r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
     },
     "dim_order": {"default_apply_all": "TCZYX"},
     "pixel_classifier": {
@@ -211,11 +212,11 @@ _DEFAULT_CONFIG = {
         "save": False,               # if False, widget prevents writing .zarr files
         "last_sample": None,         # remember last picked sample
         "feature_groups_enabled": {
-            "morphology": True,
-            "movement": True,
-            "intensity": True,
-            "death": True,
-            "contact": True,
+            "morphology": False,
+            "movement": False,
+            "intensity": False,
+            "death": False,
+            "contact": False,
         },
         "columns_input": [],         # patterns selected in the UI (e.g., "mean_intensity_*")
         "columns_resolved": [],      # expanded exact column names (filled at run)
@@ -508,18 +509,30 @@ class MetadataLoader(widgets.VBox):
         self._busy = False
 
 def convert_zarr_button(metadata_loader, dim_order_widget):
-    btn = widgets.Button(description="Convert to Zarr", button_style="success", icon="cogs", layout=widgets.Layout(
-        width="fit-content",   # size to content
-        flex="0 0 auto"        # don't stretch in HBox/VBox
-    ))
+    btn = widgets.Button(
+        description="Convert to Zarr",
+        button_style="success",
+        icon="cogs",
+        layout=widgets.Layout(
+            width="fit-content",   # size to content
+            flex="0 0 auto"        # don't stretch in HBox/VBox
+        )
+    )
+    spinner = widgets.HTML(value=spinning_loader)  # uses the same spinner HTML used elsewhere
+    spinner.layout.display = "none"                # hidden by default
     out = widgets.Output()
+
+    # Button row: button + spinner
+    row = widgets.HBox([btn, spinner], layout=widgets.Layout(align_items="center", gap="8px"))
 
     def _run_conversion(_):
         with out:
             out.clear_output()
             print("Starting conversion…")
             btn.disabled = True
-            # make sure current dim-order choices are written first (optional but handy)
+            spinner.layout.display = None  # show spinner
+
+            # Optionally persist current dim-order choices before converting
             try:
                 dim_order_widget.write_dimorder_to_metadata()
             except Exception:
@@ -536,13 +549,17 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
                 import traceback; traceback.print_exc()
             finally:
                 metadata_loader.metadata = result
-                metadata_loader.metadata.to_csv(metadata_loader.metadata_csv_path, index=False)
+                try:
+                    metadata_loader.metadata.to_csv(metadata_loader.metadata_csv_path, index=False)
+                except Exception:
+                    import traceback; traceback.print_exc()
                 print("Done ✅")
                 btn.disabled = False
+                spinner.layout.display = "none"  # hide spinner
 
     btn.on_click(_run_conversion)
-    # ⬇️ return the widget; do not display here
-    return widgets.VBox([btn, out])
+    # Return the row (button + spinner) and the log output area
+    return widgets.VBox([row, out])
 class DimOrderTable:
     DIM_ORDER_OPTIONS = [
         "TCZYX",
@@ -783,6 +800,7 @@ class DimOrderTable:
     @staticmethod
     def _order_to_str(order_tuple):
         return "".join(order_tuple)
+
 class PixelClassifierPanel:
     def __init__(self, metadata_loader):
         self.metadata_loader = metadata_loader
@@ -791,7 +809,8 @@ class PixelClassifierPanel:
         # -------- Train controls --------
         self.examples_per_sample = widgets.IntText(
             description="Examples per sample",
-            value=int(pc.get("examples_per_sample", 3)))
+            value=int(pc.get("examples_per_sample", 3))
+        )
         self.sample_specific_classifier = widgets.Checkbox(
             description="Sample-specific classifier",
             value=bool(pc.get("sample_specific_classifier", False))
@@ -799,7 +818,8 @@ class PixelClassifierPanel:
         self.n_workers = widgets.IntText(
             description="Workers",
             value=int(pc.get("workers", (os.cpu_count() or 8))),
-            max=max(8, (os.cpu_count() or 8)))
+            max=max(8, (os.cpu_count() or 8))
+        )
 
         # -------- Apply controls --------
         self.organoid_edt_threshold = widgets.FloatText(
@@ -811,30 +831,54 @@ class PixelClassifierPanel:
             description="Process ALL timepoints",
             value=bool(pc.get("use_all_timepoints", True))
         )
-        self.tp_start = widgets.IntText(
-            description="Start t",
-            value=int(pc.get("tp_start", 0))
-        )
-        self.tp_end   = widgets.IntText(
-            description="End t",
-            value=int(pc.get("tp_end", 0))
-        )
+        self.tp_start = widgets.IntText(description="Start t", value=int(pc.get("tp_start", 0)))
+        self.tp_end   = widgets.IntText(description="End t",   value=int(pc.get("tp_end", 0)))
 
-        # Show/hide start/end boxes based on checkbox
+        # Start/End visibility
         self.use_all_timepoints.observe(self._toggle_timepoint_inputs, names='value')
-        self._toggle_timepoint_inputs()  # initialize
+        self._toggle_timepoint_inputs()
 
-        # Buttons + log
-        self.btn_train = widgets.Button(description="Train pixel classifier", button_style="primary", layout=widgets.Layout(
-        width="fit-content",   # size to content
-        flex="0 0 auto"        # don't stretch in HBox/VBox
-    ))
-        self.btn_apply = widgets.Button(description="Apply pixel classifier", button_style="success", layout=widgets.Layout(
-        width="fit-content",   # size to content
-        flex="0 0 auto"        # don't stretch in HBox/VBox
-    ))
+        # -------- Buttons / spinner / close (like TrackingVisualizationPanel) --------
+        self.btn_train = widgets.Button(
+            description="Train pixel classifier",
+            button_style="primary",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
+        self.close_button = widgets.Button(
+            description="Close viewer",
+            button_style="danger",
+            icon="stop",
+            tooltip="Close the active Napari viewer",
+            layout=widgets.Layout(width="200px", display="none")  # hidden until a viewer is open
+        )
+        # Uses the same global spinner HTML you use elsewhere
+        self.spinner_train = widgets.HTML(value=spinning_loader)
+        self.spinner_train.layout.display = "none"
+
+        # Row: Train | Close viewer | spinner
+        self.train_row = widgets.HBox(
+            [self.btn_train, self.close_button, self.spinner_train],
+            layout=widgets.Layout(align_items="center", gap="8px")
+        )
+
+        # Apply button + spinner
+        self.btn_apply = widgets.Button(
+            description="Apply pixel classifier",
+            button_style="success",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
+        self.spinner_apply = widgets.HTML(value=spinning_loader)
+        self.spinner_apply.layout.display = "none"
+        self.apply_row = widgets.HBox(
+            [self.btn_apply, self.spinner_apply],
+            layout=widgets.Layout(align_items="center", gap="8px")
+        )
+
+        # Wire handlers
         self.btn_train.on_click(self._on_train_clicked)
+        self.close_button.on_click(self._on_close_clicked)
         self.btn_apply.on_click(self._on_apply_clicked)
+
         self.out = widgets.Output()
 
         # Layout
@@ -842,7 +886,7 @@ class PixelClassifierPanel:
             widgets.HTML("<b>Train pixel classifier</b>"),
             widgets.HBox([self.examples_per_sample, self.n_workers]),
             self.sample_specific_classifier,
-            self.btn_train,
+            self.train_row,
         ])
 
         self.tp_row = widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end])
@@ -851,26 +895,33 @@ class PixelClassifierPanel:
             widgets.HTML("<b>Apply segmentation</b>"),
             self.organoid_edt_threshold,
             self.tp_row,
-            self.btn_apply,
+            self.apply_row,
         ])
 
         self.ui = widgets.VBox([train_box, widgets.HTML("<hr>"), apply_box, widgets.HTML("<hr>"), self.out])
 
-    def _persist_params(self):
-        """Update CFG with current widget values and save to file."""
-    
-        # pixel classifier section
-        self.metadata_loader.behav3d_parameters["pixel_classifier"]["examples_per_sample"] = int(self.examples_per_sample.value)
-        self.metadata_loader.behav3d_parameters["pixel_classifier"]["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
-        self.metadata_loader.behav3d_parameters["pixel_classifier"]["workers"] = int(self.n_workers.value)
-        self.metadata_loader.behav3d_parameters["pixel_classifier"]["organoid_edt_threshold"] = float(self.organoid_edt_threshold.value)
-        self.metadata_loader.behav3d_parameters["pixel_classifier"]["use_all_timepoints"] = bool(self.use_all_timepoints.value)
-        self.metadata_loader.behav3d_parameters["pixel_classifier"]["tp_start"] = int(self.tp_start.value)
-        self.metadata_loader.behav3d_parameters["pixel_classifier"]["tp_end"]   = int(self.tp_end.value)
-        # write to disk
-        yaml.safe_dump(self.metadata_loader.behav3d_parameters, self.metadata_loader.behav3d_parameters_path.open("w"), sort_keys=False)
+        # viewer handle (if training opens napari and returns a viewer)
+        self._viewer = None
 
-                
+    # ---------- config ----------
+    def _persist_params(self):
+        self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        pc = self.metadata_loader.behav3d_parameters["pixel_classifier"]
+        pc["examples_per_sample"] = int(self.examples_per_sample.value)
+        pc["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
+        pc["workers"] = int(self.n_workers.value)
+        pc["organoid_edt_threshold"] = float(self.organoid_edt_threshold.value)
+        pc["use_all_timepoints"] = bool(self.use_all_timepoints.value)
+        pc["tp_start"] = int(self.tp_start.value)
+        pc["tp_end"]   = int(self.tp_end.value)
+
+        yaml.safe_dump(
+            self.metadata_loader.behav3d_parameters,
+            self.metadata_loader.behav3d_parameters_path.open("w"),
+            sort_keys=False
+        )
+
+    # ---------- UI helpers ----------
     def _toggle_timepoint_inputs(self, change=None):
         show = not self.use_all_timepoints.value
         disp = None if show else 'none'
@@ -883,6 +934,7 @@ class PixelClassifierPanel:
         display(self.ui)
 
     def _lock(self, state: bool):
+        # keep close_button enabled so user can close at any time
         for w in [
             self.btn_train, self.btn_apply,
             self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
@@ -890,9 +942,8 @@ class PixelClassifierPanel:
         ]:
             w.disabled = state
 
-    # ---- callbacks ----
+    # ---------- callbacks ----------
     def _on_train_clicked(self, _):
-        self._lock(True)
         with self.out:
             self.out.clear_output()
             try:
@@ -906,18 +957,71 @@ class PixelClassifierPanel:
                 print(f"  sample_specific_classifier={self.sample_specific_classifier.value}")
                 print(f"  n_workers={self.n_workers.value}")
 
-                train_pixel_classifier(
+                # UI state
+                self._lock(True)
+                self.spinner_train.layout.display = None
+
+                # Run training (synchronously). If it opens napari non-blocking and
+                # returns a viewer, store it so the Close button can close it.
+                try:
+                    from behav3d.preprocessing.segmentation.napari_pixelclassifier import train_pixel_classifier
+                except Exception:
+                    # If your train function is imported elsewhere, rely on that name in globals
+                    pass
+
+                ret = train_pixel_classifier(
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
                     examples_per_sample=int(self.examples_per_sample.value),
                     sample_specific_classifier=bool(self.sample_specific_classifier.value),
                     n_workers=int(self.n_workers.value),
                 )
-                print("✅ Training finished.", flush=True)
+
+                # Try to capture a viewer handle
+                self._viewer = None
+                try:
+                    if ret is not None and hasattr(ret, "close"):
+                        self._viewer = ret
+                    else:
+                        # best-effort: some environments expose current viewer getter
+                        get_curr = getattr(napari, "current_viewer", None)
+                        if callable(get_curr):
+                            self._viewer = get_curr()
+                except Exception:
+                    pass
+
+                # UI finalize for train
+                self.spinner_train.layout.display = "none"
+                # Show Close button only if we have a viewer to close
+                self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
+                if self._viewer is None:
+                    print("✅ Training finished.", flush=True)
+                else:
+                    print("✅ Training UI opened in Napari (use 'Close viewer' to close).", flush=True)
+
             except Exception:
                 import traceback; traceback.print_exc()
+                self.spinner_train.layout.display = "none"
+                self.close_button.layout.display = "none"
             finally:
+                # Re-enable inputs regardless; close button stays visible if viewer exists
                 self._lock(False)
+
+    def _on_close_clicked(self, _):
+        """Close the active Napari viewer, like TrackingVisualizationPanel."""
+        with self.out:
+            try:
+                if self._viewer is not None:
+                    print("Closing viewer…")
+                    try:
+                        self._viewer.close()
+                    except Exception as e:
+                        print(f"Error closing viewer: {e}")
+                    self._viewer = None
+                else:
+                    print("No active viewer to close (viewer may have been opened in blocking mode).")
+            finally:
+                self.close_button.layout.display = "none"
 
     def _on_apply_clicked(self, _):
         self._lock(True)
@@ -939,6 +1043,8 @@ class PixelClassifierPanel:
                 print(f"  organoid_edt_threshold={self.organoid_edt_threshold.value}")
                 print(f"  timepoint_range={tpr}", flush=True)
 
+                self.spinner_apply.layout.display = None
+
                 new_md = run_pixel_classifier_segmentation(
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
@@ -946,10 +1052,18 @@ class PixelClassifierPanel:
                     timepoint_range=tpr
                 )
 
+                try:
+                    if new_md is not None:
+                        self.metadata_loader.metadata = new_md
+                        new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
+                except Exception:
+                    import traceback; traceback.print_exc()
+
                 print("✅ Apply finished.", flush=True)
             except Exception:
                 import traceback; traceback.print_exc()
             finally:
+                self.spinner_apply.layout.display = "none"
                 self._lock(False)
 
 class TrackingPanel:
@@ -984,7 +1098,7 @@ class TrackingPanel:
             value=bool(tcfg.get("overwrite", False))
         )
 
-        # LAP params (distances in pixels; squared when calling)
+        # LAP params (all as text boxes)
         lap = tcfg.get("lap", {})
         self.track_cost_dist = widgets.IntText(
             description="Track cost (px)",
@@ -1001,7 +1115,6 @@ class TrackingPanel:
             value=int(lap.get("gap_close_max_frames", 3)),
             style={'description_width':'160px'}
         )
-        # Text boxes are the ones that don't commit until blur/Enter:
         self.merging_cost_dist = widgets.IntText(
             description="Merging cost (px)",
             value=int(lap.get("merging_cost_px", 0)),
@@ -1056,7 +1169,7 @@ class TrackingPanel:
         self.method.observe(self._toggle_param_groups, names='value')
         self._toggle_param_groups()
 
-        # Run + log
+        # Run + spinner + log
         self.btn_run = widgets.Button(
             description=f"Run {cell_type} tracking",
             button_style="success",
@@ -1065,6 +1178,13 @@ class TrackingPanel:
                 flex="0 0 auto"       # don't stretch
             )
         )
+        self.spinner_run = widgets.HTML(value=spinning_loader)
+        self.spinner_run.layout.display = "none"
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_run],
+            layout=widgets.Layout(align_items="center", gap="8px")
+        )
+
         self.btn_run.on_click(self._on_run_clicked)
         self.out = widgets.Output()
 
@@ -1074,7 +1194,7 @@ class TrackingPanel:
             self.method,
             widgets.HBox([self.overwrite]),
             self.param_container,
-            self.btn_run,
+            self.run_row,
             widgets.HTML("<hr>"),
             self.out
         ])
@@ -1088,7 +1208,7 @@ class TrackingPanel:
             self.param_container.children = (self.lap_params,)
         elif self.method.value == "trackpy":
             self.param_container.children = (self.tp_params,)
-        else:  # "prop"
+        else:  # "propagation"
             self.param_container.children = (self.prop_params,)
 
     def _lock(self, state: bool):
@@ -1166,6 +1286,7 @@ class TrackingPanel:
     # ---------------- run ----------------
     def _on_run_clicked(self, _):
         self._lock(True)
+        self.spinner_run.layout.display = None  # show spinner
         with self.out:
             self.out.clear_output()
             try:
@@ -1238,7 +1359,7 @@ class TrackingPanel:
                             adaptive_step=float(self.tp_adaptive_step.value),
                         )
 
-                else:  # "prop" propagation
+                else:  # "propagation"
                     print("▶️ Propagation tracking…", flush=True)
                     new_md = run_propagation_tracking(
                         metadata=self.metadata_loader.metadata,
@@ -1256,8 +1377,9 @@ class TrackingPanel:
             except Exception:
                 import traceback; traceback.print_exc()
             finally:
+                self.spinner_run.layout.display = "none"  # hide spinner
                 self._lock(False)
-   
+
 class TrackingVisualizationPanel:
     def __init__(
         self,
@@ -2718,20 +2840,21 @@ class OrganoidAnalysisPanel:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
                 
+                
 class BackprojectionPanel:
     def __init__(self, metadata_loader, cell_type="tcell"):
         self.metadata_loader = metadata_loader
-        self.cell_type = str(cell_type)
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
 
-        # ---- load config under top-level "backprojection" ----
+        # ---- load groups ----
         try:
-            groups = behav3d_calculated_features  # dict: group -> [features/patterns]
+            self._base_groups = behav3d_calculated_features  # dict[group] -> list[str/pattern]
         except NameError:
             raise RuntimeError("Define behav3d_calculated_features before creating BackprojectionPanel.")
 
+        # ---- config bootstrap ----
         params = dict(self.metadata_loader.behav3d_parameters or {})
-        params.setdefault("backprojection", self._default_backproj_config(groups))
+        params.setdefault("backprojection", self._default_backproj_config(self._base_groups, cell_type))
         self._params = params
         self._cfg = self._params["backprojection"]
 
@@ -2749,11 +2872,24 @@ class BackprojectionPanel:
                                           layout=widgets.Layout(width="360px"))
         self.sample_dd.style.description_width = "80px"
 
-        # ---- mode (mean/time) + save ----
-        mode_map = {"Mean features": "mean", "Time features": "time"}
-        inv_mode_map = {v: k for k, v in mode_map.items()}
+        # ---- cell type toggle ----
+        self._celltype_map = {"T cell": "tcell", "Organoid": "organoid"}
+        inv_ct_map = {v: k for k, v in self._celltype_map.items()}
+        ct_default = inv_ct_map.get(str(self._cfg.get("cell_type", cell_type)).lower(), "T cell")
+        self.celltype_tb = widgets.ToggleButtons(
+            options=list(self._celltype_map.keys()),
+            value=ct_default,
+            description="Cell type",
+            layout=widgets.Layout(width="360px")
+        )
+        self.celltype_tb.style.button_width = "160px"
+        self.celltype_tb.style.description_width = "80px"
+
+        # ---- mode (mean/time) ----
+        self._mode_map = {"Mean features": "mean", "Time features": "time"}
+        inv_mode_map = {v: k for k, v in self._mode_map.items()}
         self.mode_tb = widgets.ToggleButtons(
-            options=list(mode_map.keys()),
+            options=list(self._mode_map.keys()),
             value=inv_mode_map.get(self._cfg.get("mode", "mean"), "Mean features"),
             description="Mode",
             layout=widgets.Layout(width="360px")
@@ -2761,156 +2897,309 @@ class BackprojectionPanel:
         self.mode_tb.style.button_width = "160px"
         self.mode_tb.style.description_width = "80px"
 
-        self.save_cb = widgets.Checkbox(description="Save .zarr backprojection to disk",
-                                        value=bool(self._cfg.get("save", False)))
+        # ---- save toggle ----
+        self.save_cb = widgets.Checkbox(
+            description="Save .zarr backprojection to disk",
+            value=bool(self._cfg.get("save", False)),
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
 
-        # ---- grouped feature selection (always visible; 3 columns; same as extraction widget) ----
-        def _grid_for(children, indent_px="24px", columns=3):
-            return widgets.GridBox(
-                children,
-                layout=widgets.Layout(
-                    grid_template_columns=" ".join(["max-content"] * columns),
-                    grid_gap="6px 18px",
-                    margin=f"0 0 0 {indent_px}",
-                )
-            )
+        # ---- status + refresh ----
+        self.status_html = widgets.HTML("")
+        self.refresh_btn = widgets.Button(description="Refresh", icon="refresh", layout=widgets.Layout(width="120px"))
+        self.refresh_btn.on_click(self._on_refresh_clicked)
 
-        self._group_rows = {}  # group -> {group_cb, child_cbs, grid, container, group_handler, child_handler}
-        sel_group_boxes = []
+        # ---- TIME MODE selection (grouped patterns; 3 columns) ----
+        self._time_group_rows = {}  # group -> {group_cb, child_cbs, grid, container}
+        self.time_selection_box = self._build_time_selection_box()
 
-        preset = list(self._cfg.get("columns_input", []))
-        preset_set = set(preset)
-        groups_enabled = dict(self._cfg.get("feature_groups_enabled", {}))
+        # ---- MEAN MODE selection (grouped actual columns from UMAP_clusters.csv; 3 columns) ----
+        self._mean_group_rows = {}  # group -> {group_cb, child_cbs, grid, container}
+        self.mean_selection_box = widgets.VBox([])
+        self._rebuild_mean_selection_from_file()  # initial
 
-        for group_name, feats in groups.items():
-            child_cbs = [widgets.Checkbox(value=(f in preset_set), description=f, indent=True) for f in feats]
-            g_init = bool(groups_enabled.get(group_name, all(cb.value for cb in child_cbs)))
+        # ---- selection container (swaps by mode) ----
+        self.selection_container = widgets.VBox([])
+        self._swap_selection_ui()
 
-            gcb = widgets.Checkbox(value=g_init, indent=False)
-            glabel = widgets.HTML(f"<b>{group_name}</b>")
-            header = widgets.HBox([gcb, glabel])
+        # react to changes
+        self.mode_tb.observe(lambda ch: (self._swap_selection_ui(), self._update_status_for_mode()), names='value')
+        self.celltype_tb.observe(lambda ch: (self._on_celltype_changed(), self._update_status_for_mode()), names='value')
 
-            grid = _grid_for(child_cbs, columns=3)
-            container = widgets.VBox([header, grid])
-
-            self._group_rows[group_name] = {"group_cb": gcb, "child_cbs": child_cbs,
-                                            "grid": grid, "container": container}
-            sel_group_boxes.append(container)
-
-        # wire events (batched)
-        def make_group_handler(grp):
-            def _on(change):
-                if change["name"] != "value": return
-                val = bool(change["new"])
-                row = self._group_rows[grp]
-                for cb in row["child_cbs"]: cb.unobserve(row["child_handler"], names="value")
-                for cb in row["child_cbs"]: cb.value = val
-                for cb in row["child_cbs"]: cb.observe(row["child_handler"], names="value")
-            return _on
-
-        def make_child_handler(grp):
-            def _on(change):
-                if change["name"] != "value": return
-                row = self._group_rows[grp]
-                all_on = all(cb.value for cb in row["child_cbs"])
-                row["group_cb"].unobserve(row["group_handler"], names="value")
-                row["group_cb"].value = all_on
-                row["group_cb"].observe(row["group_handler"], names="value")
-            return _on
-
-        for grp_name, row in self._group_rows.items():
-            row["group_handler"] = make_group_handler(grp_name)
-            row["child_handler"] = make_child_handler(grp_name)
-            row["group_cb"].observe(row["group_handler"], names="value")
-            for cb in row["child_cbs"]:
-                cb.observe(row["child_handler"], names="value")
-
+        # ---- Select/Clear (affects current UI) ----
         self.btn_select_all = widgets.Button(description="Select all")
         self.btn_clear_all  = widgets.Button(description="Clear")
         self.btn_select_all.on_click(lambda *_: self._set_all(True))
         self.btn_clear_all.on_click(lambda *_: self._set_all(False))
 
-        # ---- run (with spinner) ----
-        self.btn_run = widgets.Button(description="Run backprojection", button_style="success",
-                                      layout=widgets.Layout(
-        width="fit-content",   # size to content
-        flex="0 0 auto"        # don't stretch in HBox/VBox
-    ))
-        self.btn_run.on_click(self._on_run_clicked)
-        self.spinner_html = widgets.HTML(
-            value=spinning_loader
+        # ---- Run + spinner + Stop viewer ----
+        self.btn_run = widgets.Button(
+            description="Run backprojection",
+            button_style="success",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
         )
+        self.btn_run.on_click(self._on_run_clicked)
+
+        # uses a global `spinning_loader` HTML snippet you've defined elsewhere
+        self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
-        self.run_row = widgets.HBox([self.btn_run, self.spinner_html],
-                                    layout=widgets.Layout(align_items="center", gap="10px"))
+
+        self.btn_stop = widgets.Button(
+            description="Close viewer",
+            button_style="danger",
+            icon="stop",
+            tooltip="Close the active Napari viewer",
+            layout=widgets.Layout(width="fit-content", display="none")
+        )
+        self.btn_stop.on_click(self._on_stop_clicked)
+
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_html, self.btn_stop],
+            layout=widgets.Layout(align_items="center", gap="10px")
+        )
+
         self.out = widgets.Output()
 
         # ---- UI ----
         self.ui = widgets.VBox([
             self.title,
-            widgets.HBox([self.sample_dd, self.mode_tb], layout=widgets.Layout(gap="16px", flex_flow="row wrap")),
+            self.sample_dd,
+            self.celltype_tb,   # under sample
+            self.mode_tb,       # under cell type
             self.save_cb,
+            widgets.HBox([self.status_html, self.refresh_btn], layout=widgets.Layout(align_items="center", gap="12px")),
             self.sel_title,
             widgets.HBox([self.btn_select_all, self.btn_clear_all], layout=widgets.Layout(gap="8px")),
-            widgets.VBox(sel_group_boxes),
+            self.selection_container,
             widgets.HTML("<hr>"),
             self.run_row,
             self.out
         ])
 
-    # ---------- config ----------
-    def _default_backproj_config(self, groups_dict):
+        self._viewer = None
+        self._update_status_for_mode()
+
+    # ---------- defaults ----------
+    def _default_backproj_config(self, groups_dict, cell_type_default):
         return {
+            "cell_type": str(cell_type_default),
             "mode": "mean",                # "mean" or "time"
             "save": False,
             "last_sample": None,
-            "feature_groups_enabled": {g: True for g in groups_dict.keys()},
-            "columns_input": [],           # patterns picked in UI
-            "columns_resolved": [],        # filled at run
+            "columns_input_time": [],
+            "columns_input_mean": [],
         }
 
-    def _persist(self, *, resolved=None):
-        # snapshot current UI state into top-level "backprojection"
-        mode_map = {"Mean features": "mean", "Time features": "time"}
-        self._cfg["mode"] = mode_map[self.mode_tb.value]
-        self._cfg["save"] = bool(self.save_cb.value)
-        self._cfg["last_sample"] = self.sample_dd.value
-        self._cfg["feature_groups_enabled"] = {g: row["group_cb"].value for g, row in self._group_rows.items()}
-        self._cfg["columns_input"] = list(self._selected_patterns())
-        if resolved is not None:
-            self._cfg["columns_resolved"] = list(resolved)
+    # ---------- helpers for paths & status ----------
+    def _current_results_csv_path(self):
+        cell_type = self._celltype_map[self.celltype_tb.value]
+        mode = self._mode_map[self.mode_tb.value]
+        results_dir = Path(self.output_dir, "analysis", cell_type, "results")
+        if mode == "mean":
+            return Path(results_dir, f"BEHAV3D_{cell_type}_UMAP_clusters.csv")
+        else:
+            # not strictly required for selection, but useful for status
+            return Path(results_dir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv")
 
-        self._params["backprojection"] = self._cfg
-        self.metadata_loader.behav3d_parameters = self._params
-        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(self._params, f, sort_keys=False)
+    def _update_status_for_mode(self):
+        p = self._current_results_csv_path()
+        if self._mode_map[self.mode_tb.value] == "mean":
+            if not p.exists():
+                self.status_html.value = f"<span style='color:#b00'>Cannot find results yet at:<br><code>{p}</code></span>"
+            else:
+                self.status_html.value = f"<span style='color:#070'>Results detected:<br><code>{p.name}</code></span>"
+        else:
+            # time mode does not need a file to show patterns
+            if p.exists():
+                self.status_html.value = f"<span style='color:#070'>Data present (header available):<br><code>{p.name}</code></span>"
+            else:
+                self.status_html.value = "<span>Ready (no file required for selection)</span>"
 
-    # ---------- helpers ----------
-    def display(self): display(self.ui)
+    def _on_refresh_clicked(self, *_):
+        # Rebuild mean selection (since it depends on the file), then update status.
+        if self._mode_map[self.mode_tb.value] == "mean":
+            self._rebuild_mean_selection_from_file()
+            self._swap_selection_ui()
+        self._update_status_for_mode()
+
+    # ---------- UI builders ----------
+    def _grid_for(self, children, indent_px="24px", columns=3):
+        return widgets.GridBox(
+            children,
+            layout=widgets.Layout(
+                grid_template_columns=" ".join(["max-content"] * columns),
+                grid_gap="6px 18px",
+                margin=f"0 0 0 {indent_px}",
+            )
+        )
+
+    def _build_time_selection_box(self):
+        preset_time = list(self._cfg.get("columns_input_time", self._cfg.get("columns_input", [])))
+        preset_set = set(preset_time)
+
+        rows = {}
+        boxes = []
+        for group_name, feats in self._base_groups.items():
+            child_cbs = [widgets.Checkbox(value=(f in preset_set), description=f, indent=True) for f in feats]
+            gcb = widgets.Checkbox(value=all(cb.value for cb in child_cbs), indent=False)
+            glabel = widgets.HTML(f"<b>{group_name}</b>")
+            header = widgets.HBox([gcb, glabel])
+
+            grid = self._grid_for(child_cbs, columns=3)
+            container = widgets.VBox([header, grid])
+
+            # handlers
+            def make_group_handler(gc, cc_list):
+                def _on(change):
+                    if change["name"] != "value": return
+                    val = bool(change["new"])
+                    for cb in cc_list: cb.unobserve(child_handler, names="value")
+                    for cb in cc_list: cb.value = val
+                    for cb in cc_list: cb.observe(child_handler, names="value")
+                return _on
+
+            def make_child_handler(gc, cc_list):
+                def _on(change):
+                    if change["name"] != "value": return
+                    all_on = all(cb.value for cb in cc_list)
+                    gc.unobserve(group_handler, names="value")
+                    gc.value = all_on
+                    gc.observe(group_handler, names="value")
+                return _on
+
+            group_handler = make_group_handler(gcb, child_cbs)
+            child_handler = make_child_handler(gcb, child_cbs)
+            gcb.observe(group_handler, names="value")
+            for cb in child_cbs:
+                cb.observe(child_handler, names="value")
+
+            rows[group_name] = {"group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container}
+            boxes.append(container)
+
+        self._time_group_rows = rows
+        return widgets.VBox(boxes)
+
+    def _rebuild_mean_selection_from_file(self):
+        """Build grouped checkboxes from the UMAP_clusters.csv header, using mean_ prefixed versions of base names."""
+        # File for current cell type
+        clusters_csv = self._current_results_csv_path()
+        cols = []
+        if clusters_csv.exists():
+            try:
+                cols = pd.read_csv(clusters_csv, nrows=1).columns.tolist()
+            except Exception:
+                cols = []
+
+        # Prepare target patterns per group: add mean_ if not already present
+        def to_mean_pattern(name: str) -> str:
+            return name if str(name).startswith("mean_") else ("mean_" + str(name))
+
+        group_to_columns = {}
+        for gname, base_feats in self._base_groups.items():
+            present = []
+            for raw in base_feats:
+                patt = to_mean_pattern(raw)
+                if any(ch in patt for ch in "*?["):
+                    present.extend([c for c in cols if fnmatch.fnmatchcase(str(c), patt)])
+                else:
+                    if patt in cols:
+                        present.append(patt)
+            # de-dup keep order
+            seen = set(); present = [x for x in present if not (x in seen or seen.add(x))]
+            group_to_columns[gname] = present
+
+        # Build rows or placeholder
+        preset_mean = set(self._cfg.get("columns_input_mean", []))
+        rows = {}
+        boxes = []
+
+        if not cols:  # file missing or unreadable
+            msg = widgets.HTML("<i>Cannot find results yet. Run analysis, then click <b>Refresh</b>.</i>")
+            self._mean_group_rows = {}
+            self.mean_selection_box.children = (msg,)
+            return
+
+        for gname, gcols in group_to_columns.items():
+            child_cbs = [widgets.Checkbox(value=(c in preset_mean), description=c, indent=True) for c in gcols]
+            gcb = widgets.Checkbox(value=(bool(child_cbs) and all(cb.value for cb in child_cbs)), indent=False)
+            glabel = widgets.HTML(f"<b>{gname}</b>")
+            header = widgets.HBox([gcb, glabel])
+
+            grid = self._grid_for(child_cbs, columns=3)
+            container = widgets.VBox([header, grid])
+
+            # handlers
+            def make_group_handler(gc, cc_list):
+                def _on(change):
+                    if change["name"] != "value": return
+                    val = bool(change["new"])
+                    for cb in cc_list: cb.value = val
+                return _on
+
+            def make_child_handler(gc, cc_list):
+                def _on(change):
+                    if change["name"] != "value": return
+                    gc.value = (bool(cc_list) and all(cb.value for cb in cc_list))
+                return _on
+
+            gh = make_group_handler(gcb, child_cbs)
+            ch = make_child_handler(gcb, child_cbs)
+            gcb.observe(gh, names="value")
+            for cb in child_cbs:
+                cb.observe(ch, names="value")
+
+            rows[gname] = {"group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container}
+            boxes.append(container)
+
+        self._mean_group_rows = rows
+        self.mean_selection_box.children = boxes
+
+    def _swap_selection_ui(self):
+        mode = self._mode_map[self.mode_tb.value]
+        if mode == "mean":
+            # make sure mean UI is up-to-date with current cell type's file
+            self._rebuild_mean_selection_from_file()
+            self.selection_container.children = (self.mean_selection_box,)
+        else:
+            self.selection_container.children = (self.time_selection_box,)
+
+    def _on_celltype_changed(self):
+        # Rebuild mean-selection UI because the source CSV depends on cell type
+        if self._mode_map[self.mode_tb.value] == "mean":
+            self._rebuild_mean_selection_from_file()
+
+    # ---------- general helpers ----------
+    def display(self): 
+        display(self.ui)
 
     def _set_all(self, val: bool):
-        for grp_name, row in self._group_rows.items():
-            row["group_cb"].unobserve(row["group_handler"], names="value")
-            for cb in row["child_cbs"]: cb.unobserve(row["child_handler"], names="value")
+        if self._mode_map[self.mode_tb.value] == "mean":
+            rows = self._mean_group_rows
+        else:
+            rows = self._time_group_rows
+        for row in rows.values():
             row["group_cb"].value = val
-            for cb in row["child_cbs"]: cb.value = val
-            for cb in row["child_cbs"]: cb.observe(row["child_handler"], names="value")
-            row["group_cb"].observe(row["group_handler"], names="value")
+            for cb in row["child_cbs"]:
+                cb.value = val
 
-    def _all_child_cbs(self):
-        out = []
-        for row in self._group_rows.values(): out.extend(row["child_cbs"])
-        return out
-
-    def _selected_patterns(self):
+    def _selected_time_patterns(self):
         seen, sel = set(), []
-        for cb in self._all_child_cbs():
-            if cb.value and cb.description not in seen:
-                sel.append(cb.description); seen.add(cb.description)
+        for row in self._time_group_rows.values():
+            for cb in row["child_cbs"]:
+                if cb.value and cb.description not in seen:
+                    sel.append(cb.description); seen.add(cb.description)
+        return sel
+
+    def _selected_mean_columns(self):
+        seen, sel = set(), []
+        for row in self._mean_group_rows.values():
+            for cb in row["child_cbs"]:
+                if cb.value and cb.description not in seen:
+                    sel.append(cb.description); seen.add(cb.description)
         return sel
 
     def _expand_patterns(self, selected, available_columns):
-        if available_columns is None:
+        if not available_columns:
             return list(dict.fromkeys(selected))
         avail = list(available_columns.tolist() if hasattr(available_columns, "tolist") else list(available_columns))
         out = []
@@ -2921,75 +3210,558 @@ class BackprojectionPanel:
             else:
                 out.append(name)
         # de-dup preserve order
-        seen, uniq = set(), []
-        for f in out:
-            if f not in seen:
-                uniq.append(f); seen.add(f)
-        return uniq
+        return list(dict.fromkeys(out))
 
     def _lock(self, state: bool):
-        for row in self._group_rows.values():
-            row["group_cb"].disabled = state
-            for cb in row["child_cbs"]:
-                cb.disabled = state
-        for w in [self.sample_dd, self.mode_tb, self.save_cb, self.btn_select_all, self.btn_clear_all, self.btn_run]:
+        for w in [self.sample_dd, self.celltype_tb, self.mode_tb, self.save_cb,
+                  self.btn_select_all, self.btn_clear_all, self.btn_run, self.refresh_btn]:
             w.disabled = state
+        for rows in (self._time_group_rows, self._mean_group_rows):
+            for row in rows.values():
+                row["group_cb"].disabled = state
+                for cb in row["child_cbs"]:
+                    cb.disabled = state
+
+    def _persist(self, *, resolved=None):
+        mode = self._mode_map[self.mode_tb.value]
+        self._cfg["cell_type"] = self._celltype_map[self.celltype_tb.value]
+        self._cfg["mode"] = mode
+        self._cfg["save"] = bool(self.save_cb.value)
+        self._cfg["last_sample"] = self.sample_dd.value
+
+        if mode == "time":
+            self._cfg["columns_input_time"] = list(self._selected_time_patterns())
+        else:
+            self._cfg["columns_input_mean"] = list(self._selected_mean_columns())
+
+        if resolved is not None:
+            self._cfg["columns_resolved"] = list(resolved)
+
+        self._params["backprojection"] = self._cfg
+        self.metadata_loader.behav3d_parameters = self._params
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(self._params, f, sort_keys=False)
 
     # ---------- run ----------
     def _on_run_clicked(self, *_):
         self._lock(True)
         self.spinner_html.layout.display = None
+        self.btn_stop.layout.display = "inline-block"  # allow user to try closing viewer
         self.out.clear_output()
+
         with self.out:
+            patched = False
             try:
-                import pandas as pd
-
                 sample = self.sample_dd.value
-                mode = {"Mean features": "mean", "Time features": "time"}[self.mode_tb.value]
+                cell_type = self._celltype_map[self.celltype_tb.value]
+                mode = self._mode_map[self.mode_tb.value]
                 save = bool(self.save_cb.value)
-                patterns = self._selected_patterns()
 
-                print(f"▶️ Backprojecting… sample={sample} | mode={mode} | save={save}")
+                print(f"▶️ Backprojecting… sample={sample} | cell_type={cell_type} | mode={mode} | save={save}")
 
-                # Resolve available columns from clustered CSV header (fast)
-                results_dir = Path(self.output_dir, "analysis", self.cell_type, "results")
-                clustered_csv = Path(results_dir, f"BEHAV3D_{self.cell_type}_combined_track_features_clustered.csv")
-                try:
-                    cols = pd.read_csv(clustered_csv, nrows=1).columns
-                except Exception:
-                    cols = None
-                columns_resolved = self._expand_patterns(patterns, cols)
-                self._persist(resolved=columns_resolved)
+                # Resolve columns to use
+                if mode == "mean":
+                    cols_to_use = self._selected_mean_columns()
+                    resolved = cols_to_use
+                else:
+                    results_dir = Path(self.output_dir, "analysis", cell_type, "results")
+                    clustered_csv = Path(results_dir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv")
+                    try:
+                        header_cols = pd.read_csv(clustered_csv, nrows=1).columns
+                    except Exception:
+                        header_cols = None
+                    patterns = self._selected_time_patterns()
+                    resolved = self._expand_patterns(patterns, header_cols)
+                    cols_to_use = resolved
+
+                self._persist(resolved=resolved)
 
                 # Respect Save checkbox by temporarily disabling save_as_zarr when save=False
-                patched = False
                 if not save:
                     try:
                         import behav3d.utils.fileio as fio
                         self._orig_save_as_zarr = fio.save_as_zarr
-                        def _noop_save_as_zarr(*args, **kwargs): return None
-                        fio.save_as_zarr = _noop_save_as_zarr
+                        def _noop(*args, **kwargs): return None
+                        fio.save_as_zarr = _noop
                         patched = True
                     except Exception:
                         print("⚠️ Could not patch save_as_zarr; results may be written.")
 
+                # Choose function
                 fn = backproject_mean_features_behav3d if mode == "mean" else backproject_time_features_behav3d
 
-                result = fn(
+                # Run (these functions launch napari internally)
+                _ = fn(
                     metadata=self.metadata_loader.metadata,
                     sample_name=sample,
                     config=None,
                     output_dir=self.output_dir,
-                    cell_type=self.cell_type,
-                    columns=columns_resolved if patterns else [],  # [] lets function choose default
+                    cell_type=cell_type,
+                    columns=cols_to_use if cols_to_use else [],  # [] lets function choose default
                     save=save
                 )
 
-                print("✅ Done. (napari launched inside function)")
-                if isinstance(result, dict):
-                    print(f"  path: {result.get('path')}")
-                    k = list((result.get('data') or {}).keys())
-                    print(f"  layers: {k[:8]}{'…' if len(k)>8 else ''}")
+                print("✅ Backprojection finished (napari was launched inside the function).")
+
+            except Exception:
+                import traceback; traceback.print_exc()
+            finally:
+                try:
+                    if patched:
+                        import behav3d.utils.fileio as fio
+                        fio.save_as_zarr = self._orig_save_as_zarr
+                except Exception:
+                    pass
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
+
+    def _on_stop_clicked(self, *_):
+        """Best-effort close of any open napari window."""
+        try:
+            import napari
+            from qtpy.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is not None:
+                for w in list(app.topLevelWidgets()):
+                    name = w.__class__.__name__.lower()
+                    if "napari" in name or "mainwindow" in name:
+                        try: w.close()
+                        except Exception: pass
+                app.processEvents()
+            else:
+                try:
+                    v = napari.current_viewer()
+                    if v is not None:
+                        v.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            with self.out:
+                print(f"Close viewer attempt: {e}")
+    def __init__(self, metadata_loader, cell_type="tcell"):
+        self.metadata_loader = metadata_loader
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+
+        # ---- load groups ----
+        try:
+            self._base_groups = behav3d_calculated_features  # dict[group] -> list[str/pattern]
+        except NameError:
+            raise RuntimeError("Define behav3d_calculated_features before creating BackprojectionPanel.")
+
+        # ---- config bootstrap ----
+        params = dict(self.metadata_loader.behav3d_parameters or {})
+        params.setdefault("backprojection", self._default_backproj_config(self._base_groups, cell_type))
+        self._params = params
+        self._cfg = self._params["backprojection"]
+
+        # ---- headings ----
+        self.title     = widgets.HTML('<div style="font-size:22px;font-weight:700;">Backproject features to images (napari)</div>')
+        self.sel_title = widgets.HTML('<div style="font-size:20px;font-weight:700;">Select feature columns</div>')
+
+        # ---- sample selector ----
+        md = self.metadata_loader.metadata
+        if md is None or "sample_name" not in md.columns:
+            raise RuntimeError("metadata_loader.metadata must have a 'sample_name' column.")
+        sample_list = sorted(map(str, md["sample_name"].unique().tolist()))
+        last_sample = self._cfg.get("last_sample") or (sample_list[0] if sample_list else None)
+        self.sample_dd = widgets.Dropdown(description="Sample", options=sample_list, value=last_sample,
+                                          layout=widgets.Layout(width="360px"))
+        self.sample_dd.style.description_width = "80px"
+
+        # ---- cell type toggle ----
+        self._celltype_map = {"T cell": "tcell", "Organoid": "organoid"}
+        inv_ct_map = {v: k for k, v in self._celltype_map.items()}
+        ct_default = inv_ct_map.get(str(self._cfg.get("cell_type", cell_type)).lower(), "T cell")
+        self.celltype_tb = widgets.ToggleButtons(
+            options=list(self._celltype_map.keys()),
+            value=ct_default,
+            description="Cell type",
+            layout=widgets.Layout(width="360px")
+        )
+        self.celltype_tb.style.button_width = "160px"
+        self.celltype_tb.style.description_width = "80px"
+
+        # ---- mode (mean/time) ----
+        self._mode_map = {"Mean features": "mean", "Time features": "time"}
+        inv_mode_map = {v: k for k, v in self._mode_map.items()}
+        self.mode_tb = widgets.ToggleButtons(
+            options=list(self._mode_map.keys()),
+            value=inv_mode_map.get(self._cfg.get("mode", "mean"), "Mean features"),
+            description="Mode",
+            layout=widgets.Layout(width="360px")
+        )
+        self.mode_tb.style.button_width = "160px"
+        self.mode_tb.style.description_width = "80px"
+
+        # ---- save toggle ----
+        self.save_cb = widgets.Checkbox(
+            description="Save .zarr backprojection to disk",
+            value=bool(self._cfg.get("save", False)),
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
+
+        # ---- TIME MODE selection (grouped patterns; 3 columns) ----
+        self._time_group_rows = {}  # group -> {group_cb, child_cbs, grid, container}
+        self.time_selection_box = self._build_time_selection_box()
+
+        # ---- MEAN MODE selection (grouped actual columns from UMAP_clusters.csv; 3 columns) ----
+        self._mean_group_rows = {}  # group -> {group_cb, child_cbs, grid, container}
+        self.mean_selection_box = widgets.VBox([])
+        self._rebuild_mean_selection_from_file()  # initial
+
+        # ---- selection container (swaps by mode) ----
+        self.selection_container = widgets.VBox([])
+        self._swap_selection_ui()
+
+        # react to changes
+        self.mode_tb.observe(lambda ch: self._swap_selection_ui(), names='value')
+        self.celltype_tb.observe(lambda ch: self._on_celltype_changed(), names='value')
+
+        # ---- Select/Clear for whichever UI is visible ----
+        self.btn_select_all = widgets.Button(description="Select all")
+        self.btn_clear_all  = widgets.Button(description="Clear")
+        self.btn_select_all.on_click(lambda *_: self._set_all(True))
+        self.btn_clear_all.on_click(lambda *_: self._set_all(False))
+
+        # ---- Run + spinner + Stop viewer ----
+        self.btn_run = widgets.Button(
+            description="Run backprojection",
+            button_style="success",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
+        self.btn_run.on_click(self._on_run_clicked)
+
+        # uses a global `spinning_loader` HTML snippet you've defined elsewhere
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
+
+        self.btn_stop = widgets.Button(
+            description="Close viewer",
+            button_style="danger",
+            icon="stop",
+            tooltip="Close the active Napari viewer",
+            layout=widgets.Layout(width="fit-content", display="none")
+        )
+        self.btn_stop.on_click(self._on_stop_clicked)
+
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_html, self.btn_stop],
+            layout=widgets.Layout(align_items="center", gap="10px")
+        )
+
+        self.out = widgets.Output()
+
+        # ---- UI ----
+        self.ui = widgets.VBox([
+            self.title,
+            self.sample_dd,
+            self.celltype_tb,   # under sample
+            self.mode_tb,       # under cell type (as requested)
+            # self.save_cb,
+            self.sel_title,
+            widgets.HBox([self.btn_select_all, self.btn_clear_all], layout=widgets.Layout(gap="8px")),
+            self.selection_container,
+            widgets.HTML("<hr>"),
+            self.run_row,
+            self.out
+        ])
+
+        self._viewer = None  # we don't actually receive a viewer handle; used as a flag only
+
+    # ---------- defaults ----------
+    def _default_backproj_config(self, groups_dict, cell_type_default):
+        return {
+            "cell_type": str(cell_type_default),
+            "mode": "mean",                # "mean" or "time"
+            "save": False,
+            "last_sample": None,
+            # Persist separate picks per mode (backward compatible with "columns_input")
+            "columns_input_time": [],
+            "columns_input_mean": [],
+        }
+
+    # ---------- UI builders ----------
+    def _grid_for(self, children, indent_px="24px", columns=3):
+        return widgets.GridBox(
+            children,
+            layout=widgets.Layout(
+                grid_template_columns=" ".join(["max-content"] * columns),
+                grid_gap="6px 18px",
+                margin=f"0 0 0 {indent_px}",
+            )
+        )
+
+    def _build_time_selection_box(self):
+        preset_time = list(self._cfg.get("columns_input_time", self._cfg.get("columns_input", [])))
+        preset_set = set(preset_time)
+
+        rows = {}
+        boxes = []
+        for group_name, feats in self._base_groups.items():
+            child_cbs = [widgets.Checkbox(value=(f in preset_set), description=f, indent=True) for f in feats]
+            gcb = widgets.Checkbox(value=all(cb.value for cb in child_cbs), indent=False)
+            glabel = widgets.HTML(f"<b>{group_name}</b>")
+            header = widgets.HBox([gcb, glabel])
+
+            grid = self._grid_for(child_cbs, columns=3)
+            container = widgets.VBox([header, grid])
+
+            # handlers
+            def make_group_handler(gc, cc_list):
+                def _on(change):
+                    if change["name"] != "value": return
+                    val = bool(change["new"])
+                    for cb in cc_list: cb.unobserve(child_handler, names="value")
+                    for cb in cc_list: cb.value = val
+                    for cb in cc_list: cb.observe(child_handler, names="value")
+                return _on
+
+            def make_child_handler(gc, cc_list):
+                def _on(change):
+                    if change["name"] != "value": return
+                    all_on = all(cb.value for cb in cc_list)
+                    gc.unobserve(group_handler, names="value")
+                    gc.value = all_on
+                    gc.observe(group_handler, names="value")
+                return _on
+
+            group_handler = make_group_handler(gcb, child_cbs)
+            child_handler = make_child_handler(gcb, child_cbs)
+            gcb.observe(group_handler, names="value")
+            for cb in child_cbs:
+                cb.observe(child_handler, names="value")
+
+            rows[group_name] = {"group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container}
+            boxes.append(container)
+
+        self._time_group_rows = rows
+        return widgets.VBox(boxes)
+
+    def _rebuild_mean_selection_from_file(self):
+        """Build grouped checkboxes from the UMAP_clusters.csv header, using mean_ prefixed versions of base names."""
+        # Read columns from UMAP_clusters.csv for current cell type
+        cell_type = self._celltype_map[self.celltype_tb.value]
+        results_dir = Path(self.output_dir, "analysis", cell_type, "results")
+        clusters_csv = Path(results_dir, f"BEHAV3D_{cell_type}_UMAP_clusters.csv")
+        try:
+            cols = pd.read_csv(clusters_csv, nrows=1).columns.tolist()
+        except Exception:
+            cols = []
+
+        # Prepare target patterns per group: add mean_ if not already present
+        def to_mean_pattern(name: str) -> str:
+            return name if str(name).startswith("mean_") else ("mean_" + str(name))
+
+        group_to_columns = {}
+        for gname, base_feats in self._base_groups.items():
+            present = []
+            for raw in base_feats:
+                patt = to_mean_pattern(raw)
+                if any(ch in patt for ch in "*?["):
+                    present.extend([c for c in cols if fnmatch.fnmatchcase(str(c), patt)])
+                else:
+                    if patt in cols:
+                        present.append(patt)
+            # de-dup keep order
+            seen = set(); present = [x for x in present if not (x in seen or seen.add(x))]
+            group_to_columns[gname] = present
+
+        # Build rows
+        preset_mean = set(self._cfg.get("columns_input_mean", []))
+        rows = {}
+        boxes = []
+        for gname, gcols in group_to_columns.items():
+            if not gcols:
+                # Keep empty groups visible for consistent layout (can hide if you prefer)
+                child_cbs = []
+            else:
+                child_cbs = [widgets.Checkbox(value=(c in preset_mean), description=c, indent=True) for c in gcols]
+            gcb = widgets.Checkbox(value=(bool(child_cbs) and all(cb.value for cb in child_cbs)), indent=False)
+            glabel = widgets.HTML(f"<b>{gname}</b>")
+            header = widgets.HBox([gcb, glabel])
+
+            grid = self._grid_for(child_cbs, columns=3)
+            container = widgets.VBox([header, grid])
+
+            # handlers
+            def make_group_handler(gc, cc_list):
+                def _on(change):
+                    if change["name"] != "value": return
+                    val = bool(change["new"])
+                    for cb in cc_list: cb.value = val
+                return _on
+
+            def make_child_handler(gc, cc_list):
+                def _on(change):
+                    if change["name"] != "value": return
+                    gc.value = (bool(cc_list) and all(cb.value for cb in cc_list))
+                return _on
+
+            gh = make_group_handler(gcb, child_cbs)
+            ch = make_child_handler(gcb, child_cbs)
+            gcb.observe(gh, names="value")
+            for cb in child_cbs:
+                cb.observe(ch, names="value")
+
+            rows[gname] = {"group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container}
+            boxes.append(container)
+
+        self._mean_group_rows = rows
+        self.mean_selection_box.children = boxes
+
+    def _swap_selection_ui(self):
+        mode = self._mode_map[self.mode_tb.value]
+        if mode == "mean":
+            # make sure mean UI is up-to-date with current cell type's file
+            self._rebuild_mean_selection_from_file()
+            self.selection_container.children = (self.mean_selection_box,)
+        else:
+            self.selection_container.children = (self.time_selection_box,)
+
+    def _on_celltype_changed(self):
+        # Rebuild mean-selection UI because the source CSV depends on cell type
+        if self._mode_map[self.mode_tb.value] == "mean":
+            self._rebuild_mean_selection_from_file()
+
+    # ---------- helpers ----------
+    def display(self): 
+        display(self.ui)
+
+    def _set_all(self, val: bool):
+        if self._mode_map[self.mode_tb.value] == "mean":
+            rows = self._mean_group_rows
+        else:
+            rows = self._time_group_rows
+        for row in rows.values():
+            row["group_cb"].value = val
+            for cb in row["child_cbs"]:
+                cb.value = val
+
+    def _selected_time_patterns(self):
+        seen, sel = set(), []
+        for row in self._time_group_rows.values():
+            for cb in row["child_cbs"]:
+                if cb.value and cb.description not in seen:
+                    sel.append(cb.description); seen.add(cb.description)
+        return sel
+
+    def _selected_mean_columns(self):
+        seen, sel = set(), []
+        for row in self._mean_group_rows.values():
+            for cb in row["child_cbs"]:
+                if cb.value and cb.description not in seen:
+                    sel.append(cb.description); seen.add(cb.description)
+        return sel
+
+    def _expand_patterns(self, selected, available_columns):
+        if not available_columns:
+            return list(dict.fromkeys(selected))
+        avail = list(available_columns.tolist() if hasattr(available_columns, "tolist") else list(available_columns))
+        out = []
+        for name in selected:
+            if any(ch in name for ch in "*?["):
+                matches = [c for c in avail if fnmatch.fnmatchcase(str(c), name)]
+                out.extend(matches if matches else [name])
+            else:
+                out.append(name)
+        # de-dup preserve order
+        return list(dict.fromkeys(out))
+
+    def _lock(self, state: bool):
+        # disable main controls during run
+        for w in [self.sample_dd, self.celltype_tb, self.mode_tb, self.save_cb,
+                  self.btn_select_all, self.btn_clear_all, self.btn_run]:
+            w.disabled = state
+        # disable checkboxes
+        for rows in (self._time_group_rows, self._mean_group_rows):
+            for row in rows.values():
+                row["group_cb"].disabled = state
+                for cb in row["child_cbs"]:
+                    cb.disabled = state
+
+    def _persist(self, *, resolved=None):
+        # snapshot current UI state
+        mode = self._mode_map[self.mode_tb.value]
+        self._cfg["cell_type"] = self._celltype_map[self.celltype_tb.value]
+        self._cfg["mode"] = mode
+        self._cfg["save"] = bool(self.save_cb.value)
+        self._cfg["last_sample"] = self.sample_dd.value
+
+        if mode == "time":
+            self._cfg["columns_input_time"] = list(self._selected_time_patterns())
+        else:
+            self._cfg["columns_input_mean"] = list(self._selected_mean_columns())
+
+        if resolved is not None:
+            self._cfg["columns_resolved"] = list(resolved)
+
+        self._params["backprojection"] = self._cfg
+        self.metadata_loader.behav3d_parameters = self._params
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(self._params, f, sort_keys=False)
+
+    # ---------- run ----------
+    def _on_run_clicked(self, *_):
+        self._lock(True)
+        self.spinner_html.layout.display = None
+        self.btn_stop.layout.display = "inline-block"  # allow user to try closing viewer
+        self.out.clear_output()
+
+        with self.out:
+            patched = False
+            try:
+                sample = self.sample_dd.value
+                cell_type = self._celltype_map[self.celltype_tb.value]
+                mode = self._mode_map[self.mode_tb.value]
+                save = bool(self.save_cb.value)
+
+                print(f"▶️ Backprojecting… sample={sample} | cell_type={cell_type} | mode={mode} | save={save}")
+
+                # Resolve columns to use
+                if mode == "mean":
+                    # already concrete column names
+                    cols_to_use = self._selected_mean_columns()
+                    resolved = cols_to_use
+                else:
+                    # expand patterns against header of clustered tracks (summarized DF not needed for time)
+                    results_dir = Path(self.output_dir, "analysis", cell_type, "results")
+                    clustered_csv = Path(results_dir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv")
+                    try:
+                        header_cols = pd.read_csv(clustered_csv, nrows=1).columns
+                    except Exception:
+                        header_cols = None
+                    patterns = self._selected_time_patterns()
+                    resolved = self._expand_patterns(patterns, header_cols)
+                    cols_to_use = resolved
+
+                self._persist(resolved=resolved)
+
+                # Respect Save checkbox by temporarily disabling save_as_zarr when save=False
+                if not save:
+                    try:
+                        import behav3d.utils.fileio as fio
+                        self._orig_save_as_zarr = fio.save_as_zarr
+                        def _noop(*args, **kwargs): return None
+                        fio.save_as_zarr = _noop
+                        patched = True
+                    except Exception:
+                        print("⚠️ Could not patch save_as_zarr; results may be written.")
+
+                # Choose function
+                fn = backproject_mean_features_behav3d if mode == "mean" else backproject_time_features_behav3d
+
+                # Run (these functions launch napari internally)
+                _ = fn(
+                    metadata=self.metadata_loader.metadata,
+                    sample_name=sample,
+                    config=None,
+                    output_dir=self.output_dir,
+                    cell_type=cell_type,
+                    columns=cols_to_use if cols_to_use else [],  # [] lets function choose default
+                    save=save
+                )
+
+                print("✅ Backprojection finished (napari was launched inside the function).")
 
             except Exception:
                 import traceback; traceback.print_exc()
@@ -3003,3 +3775,29 @@ class BackprojectionPanel:
                     pass
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
+
+    def _on_stop_clicked(self, *_):
+        """Best-effort close of any open napari window."""
+        try:
+            import napari
+            from qtpy.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is not None:
+                # Close all top-level windows that look like napari
+                for w in list(app.topLevelWidgets()):
+                    name = w.__class__.__name__.lower()
+                    if "napari" in name or "mainwindow" in name:
+                        try: w.close()
+                        except Exception: pass
+                app.processEvents()
+            else:
+                # Fallback: try current viewer handle if available
+                try:
+                    v = napari.current_viewer()
+                    if v is not None:
+                        v.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            with self.out:
+                print(f"Close viewer attempt: {e}")
