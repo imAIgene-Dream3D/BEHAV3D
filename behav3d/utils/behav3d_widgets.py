@@ -157,9 +157,9 @@ _DEFAULT_CONFIG = {
             "exp_duration": 24.0,
             "exp_duration_enabled": False,
             "min_track_length": 100,
-            "min_track_length_enabled": False,
+            "min_track_length_enabled": True,
             "max_track_length": 100,
-            "max_track_length_enabled": False,
+            "max_track_length_enabled": True,
             "filter_t0_dead": True,
             "filter_t0_dead_enabled": False
         },
