@@ -3,6 +3,12 @@
 ## Installation
 
 If required, install [miniforge](https://github.com/conda-forge/miniforge) or [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
+
+https://github.com/conda-forge/miniforge/releases/latest/
+https://conda-forge.org/download/
+
+
+
  - Mamba is a faster version of conda but both work the same
  - On Windows, isntallation with the mamba .exe might be blocked. If so, open a command terminal (cmd.exe) and run:
 ```
@@ -23,6 +29,7 @@ Mac install:
 mamba env create --file env_mac.yml
 mamba activate behav3d
 pip install -e .
+python -m ipykernel install --user --name=behav3d --display-name "behav3d"
 ```
 
 Windows install:
@@ -30,6 +37,7 @@ Windows install:
 mamba env create --file env_windows.yml
 mamba activate behav3d
 pip install -e .
+python -m ipykernel install --user --name=behav3d --display-name "behav3d"
 ```
 
 ## How to run
