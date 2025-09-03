@@ -147,7 +147,7 @@ _DEFAULT_CONFIG = {
         },
         "organoid": {
             "dead_mask_percentage_threshold": 0.02,
-            "features_choice": ["intensity", "death"],
+            "features_choice": ["intensity", "death", "morphology"],
             "n_workers": 8,
             "overwrite": False
         }
