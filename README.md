@@ -27,6 +27,8 @@ cd <path/to/this/behav3/repository>
 This creates a python environment and installes required packages
 Use the code below [env_mac.yml](./env_mac.yml) or [env_windows.yml](./env_windows.yml) dependent on what operating system you are on
 
+You might get asked to confirm changes in the terminal, so just type Y for *yes*
+
 *Mac install*:
 In the terminal copy paste and enter the following:
 
