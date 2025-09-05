@@ -60,7 +60,7 @@ BEHAV3D is run through a ipython notebook, in for example:
 ### Required files
 
 [REQUIRED]
-- A [metadata .csv](./configs/metadata.csv) that contains all samples that should be analyzed
+- A [metadata .csv](./configs/metadata.csv) that contains all samples that should be analyzed. To manage the metadata.csv in windows we recommend using https://www.moderncsv.com/ as it doesn't modify the format upon saving.
 - Per sample, a raw microscopy image (.czi, .tiff, .zarr)
 
 [Optional]
