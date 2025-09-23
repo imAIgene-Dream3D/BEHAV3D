@@ -13,6 +13,8 @@ import os
 from behav3d.utils.fileio import load_image, get_image_shape, get_image_dimension_order
 import asyncio
 import pandas as pd
+from behav3d.preprocessing.unmixing import visualize_unmix
+from behav3d.preprocessing.unmixing.signal_unmixing import signal_unmixing
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import train_pixel_classifier, run_pixel_classifier_segmentation
 import traceback
 from behav3d.preprocessing.tracking import visualize_tracks
@@ -86,6 +88,23 @@ _DEFAULT_CONFIG = {
         "output_dir": r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
     },
     "dim_order": {"default_apply_all": "TCZYX"},
+    "signal_unmixing": {
+        "sink_channel": 2,
+        "source_channels": "0, 1",
+        "train_z": "4,5,6",
+        "train_t": "1,3,6",
+        "bg_percentile": 1,
+        "median_size": 3,
+        "gaussian_sigma": 4,
+        "visualize_napari": True,
+        "training_log": False,
+        "timepoints": 0,
+        "use_all_timepoints": True,
+        "use_range": False,
+        "start_t": 0,
+        "end_t": 0,
+        "channel_colors": ["cyan", "yellow", "red", "green", "magenta", "blue"]
+    },
     "pixel_classifier": {
         "examples_per_sample": 3,
         "sample_specific_classifier": False,
@@ -800,6 +819,538 @@ class DimOrderTable:
     @staticmethod
     def _order_to_str(order_tuple):
         return "".join(order_tuple)
+    
+
+
+class SignalUnmixingPanel:
+    def __init__(
+            self, 
+            metadata_loader,
+            default_time_range=None,
+            channel_colors=None):
+        
+        self.metadata_loader = metadata_loader
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "signal_unmixing", {})
+
+        # -------- Run params --------
+        self.sink_channel = widgets.IntText(
+            description="Sink channel",
+            value=int(pc.get("sink_channel", 2))
+        )
+        self.source_channels = widgets.Text(
+            value=pc.get("source_channels", "0,1"), 
+            description="Source channels",
+            style={"description_width": "initial"}, 
+        )
+        self.train_z = widgets.Text(
+            value=pc.get("train_z", "4,5,6"), 
+            description="Train Z", 
+        )
+        self.train_t = widgets.Text(
+            value=pc.get("train_t", "1,3,6"), 
+            description="Train T", 
+        )
+        self.bg_percentile = widgets.IntText(
+            value=int(pc.get("bg_percentile", 1)), 
+            description="BG percentile", 
+        )
+        self.median_size = widgets.IntText(
+            value=int(pc.get("median_size", 3)), 
+            description="Median size",
+        )
+        self.gaussian_sigma = widgets.IntText(
+            value=int(pc.get("gaussian_sigma", 4)), 
+            description="Gaussian sigma",
+            style={"description_width": "initial"}, 
+        )  
+        self.use_all_timepoints = widgets.Checkbox(
+            description="Process ALL timepoints",
+            value=bool(pc.get("use_all_timepoints", True))
+        )
+        self.tp_n = widgets.IntText(
+            description="Number of Timepoints", 
+            value=int(pc.get("timepoints", 0)),
+            style={"description_width": "initial"}  # Show full description
+        )
+
+        # Start/End visibility
+        self.use_all_timepoints.observe(self._toggle_timepoint_inputs, names='value')
+        self._toggle_timepoint_inputs()
+
+        self.training_log = widgets.Checkbox(
+            description="Show Training Log",
+            value=bool(pc.get("training_log", True))
+        )
+
+        # -------- sum_scale table --------
+        sum_scale_widgets = []
+        rows = []
+        file_list = self.metadata_loader.metadata.sample_name.to_list()
+
+        # Header (first row)
+        header = widgets.HBox([
+            widgets.Label(value="File Name", layout=widgets.Layout(width='200px')),
+            widgets.Label(value="sum_scale (source1, source2)", layout=widgets.Layout(width='150px')),
+            widgets.Label(value="")  # Placeholder for the button column
+        ])
+        rows.append(header) 
+
+        # Shared function to apply all
+        def apply_to_all_callback(btn):
+            first_value = sum_scale_widgets[0]['input'].value
+            for i, row in enumerate(sum_scale_widgets):
+                if i == 0:
+                    continue  # Skip first
+                row['input'].value = first_value
+                # row['input'].style = {'description_width': 'initial', 'background': '#f0f0f0'}  # grey
+
+        sum_scale_config = pc.get("sum_scale", "20,30")
+
+        for i, file in enumerate(file_list):
+            file_label = widgets.Label(value=file, layout=widgets.Layout(width='200px'))
+
+            # Determine the value for this file
+            if isinstance(sum_scale_config, dict):
+                file_sum = sum_scale_config.get(file, [20, 30])  # fallback default if missing
+                value_str = ", ".join(str(x) for x in file_sum)
+            elif isinstance(sum_scale_config, str):
+                value_str = sum_scale_config  # global default
+            else:
+                value_str = "20,30"  # final fallback
+
+            sum_scale_input = widgets.Text(
+                value=value_str,
+                description='',
+                layout=widgets.Layout(width='150px')
+            )
+
+            sum_scale_input.style = {'description_width': 'initial'}
+
+            if i == 0:
+                # Add "Apply to all" button only on the first row
+                apply_button = widgets.Button(description="Apply to all", layout=widgets.Layout(width='120px'))
+                apply_button.on_click(apply_to_all_callback)
+            else:
+                apply_button = widgets.Label(value="")  # Empty placeholder
+
+            # Track widgets
+            sum_scale_widgets.append({
+                'label': file_label,
+                'input': sum_scale_input,
+                'button': apply_button
+            })
+
+            # Add the row as an HBox
+            row = widgets.HBox([file_label, sum_scale_input, apply_button])
+            rows.append(row)
+
+        # Store for later use
+        self.sum_scale_widgets = sum_scale_widgets
+
+
+        # -------- Buttons / spinner / close (like TrackingVisualizationPanel) --------
+        self.btn_unmix = widgets.Button(
+            description="Run signal unmixing",
+            button_style="primary",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
+
+        # Uses the same global spinner HTML you use elsewhere
+        self.spinner_unmix = widgets.HTML(value=spinning_loader)
+        self.spinner_unmix.layout.display = "none"
+
+        # Row: Unmix | spinner
+        self.unmix_row = widgets.HBox(
+            [self.btn_unmix, self.spinner_unmix],
+            layout=widgets.Layout(align_items="center", gap="8px")
+        )
+        # -------- Viewer buttons (like TrackingVisualizationPanel) --------
+        # vis_files_path = Path(self.metadata_loader.output_dir, "images/SignalUnmixing").expanduser()
+
+        # # Get list of directory names inside the folder
+        # if vis_files_path.exists():
+        #     options = [p.name for p in vis_files_path.iterdir() if p.is_dir()]
+        #     if not options:
+        #         options = ["(no directories)"]
+        # else:
+        #     options = ["(path not found)"]
+
+        # self.file_sel = widgets.Dropdown(
+        #     options=options,
+        #     description="Select file to visualize:"
+        # )
+
+        self.channel_colors = tuple(channel_colors or _cfg_get(
+            self.metadata_loader.behav3d_parameters, "signal_unmixing.channel_colors",
+            ["cyan", "yellow", "red", "green", "magenta", "blue"]
+        ))
+
+        self._viewer = None
+        
+        # --- UI: status + refresh
+        self._status = widgets.HTML("<b>Waiting for user to load metadata…</b>")
+        self._refresh_btn = widgets.Button(
+            description="Refresh",
+            tooltip="Build/Update selector from metadata_loader.metadata",
+        )
+        self._refresh_btn.on_click(self._on_refresh_clicked)
+
+        # --- Main controls (disabled until metadata present)
+        self.sample_dropdown = widgets.Dropdown(
+            options=[],
+            value=None,
+            description="Sample:",
+            layout=widgets.Layout(width="350px"),
+            disabled=True,
+        )
+
+        # Tickbox to enable/disable time range (from JSON)
+        self.use_range = widgets.Checkbox(
+            description="Use custom time range",
+            value=bool(_cfg_get(self.metadata_loader.behav3d_parameters, "signal_unmixing.use_range", False)),
+            indent=False,
+        )
+
+        # Start/End boxes (defaults from constructor OR JSON)
+        if isinstance(default_time_range, (tuple, list)) and len(default_time_range) == 2:
+            _start_default, _end_default = map(int, default_time_range)
+        else:
+            _start_default = int(_cfg_get(self.metadata_loader.behav3d_parameters, "signal_unmixing.start_t", 0))
+            _end_default   = int(_cfg_get(self.metadata_loader.behav3d_parameters, "signal_unmixing.end_t", 0))
+
+        self.start_t = widgets.IntText(
+            description="Start T:",
+            value=_start_default,
+            layout=widgets.Layout(width="180px")
+        )
+        self.end_t   = widgets.IntText(
+            description="End T:",
+            value=_end_default,
+            layout=widgets.Layout(width="180px")
+        )
+
+        self.range_box = widgets.HBox([self.start_t, self.end_t])
+        self.range_box.layout.display = "flex" if self.use_range.value else "none"
+
+        def _toggle_range_visibility(change):
+            self.range_box.layout.display = "flex" if change["new"] else "none"
+        self.use_range.observe(_toggle_range_visibility, names="value")
+
+        self.open_button = widgets.Button(
+            description="Visualize Signal Unmixing results",
+            button_style="primary",
+            tooltip="Launch Napari for the selected sample",
+            icon="eye",
+            layout=widgets.Layout(width="300px"),
+            disabled=True,
+        )
+
+        self.close_button = widgets.Button(
+            description="Close viewer",
+            button_style="danger",
+            icon="stop",
+            tooltip="Close the active Napari viewer",
+            layout=widgets.Layout(width="200px", display="none"),  # hidden by default
+        )
+        
+
+        # Try immediate build if metadata already present
+        self._maybe_build_from_loader()
+
+        # -------- Save button + spinner (like TrackingVisualizationPanel) --------
+        self.btn_save = widgets.Button(
+            description="Save Signal Unmixing",
+            button_style="success",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
+        self.spinner_save = widgets.HTML(value=spinning_loader)
+        self.spinner_save.layout.display = "none"
+        self.save_row = widgets.HBox(
+            [self.btn_save, self.spinner_save],
+            layout=widgets.Layout(align_items="center", gap="8px")
+        )
+
+        # Wire handlers COMMENT FOR NOW
+        self.btn_unmix.on_click(self._on_btn_unmix_clicked)
+        self.open_button.on_click(self._on_open_clicked)
+        self.close_button.on_click(self._on_close_clicked)
+        self.btn_save.on_click(self._on_save_clicked)
+
+        self.out = widgets.Output()
+
+        # Layout
+        unmix_box = widgets.VBox([
+            widgets.HTML("<b>Run Signal Unmixing</b>"),
+            widgets.VBox(rows),
+            widgets.HBox([self.sink_channel, self.source_channels]),
+            widgets.HBox([self.train_z, self.train_t]),
+            widgets.HBox([self.bg_percentile, self.median_size, self.gaussian_sigma]),
+            widgets.HBox([self.training_log]),
+            widgets.HBox([self.use_all_timepoints, self.tp_n]),
+            self.unmix_row,
+        ])
+
+        visualize_box = widgets.VBox([
+                widgets.HTML("<b>Visualize Signal Unmixing Result</b>"),
+                widgets.HBox([self._status, self._refresh_btn]),
+                self.sample_dropdown,
+                self.use_range,
+                self.range_box,
+                widgets.HBox([self.open_button, self.close_button]),
+        ])
+        
+        save_box = widgets.VBox([
+            widgets.HTML("<b>Save Signal Unmixing Result</b>"),
+            widgets.HTML("Modifies the tcell channel to  the new unmixed channel and saves a new metadata file."),
+            self.save_row,
+        ])
+
+
+        self.ui = widgets.VBox([unmix_box, widgets.HTML("<hr>"), visualize_box, widgets.HTML("<hr>"), save_box, widgets.HTML("<hr>"), self.out])
+
+        ####### Viewer section
+        
+        # viewer handle (if training opens napari and returns a viewer)
+        self._viewer = None
+
+ #######################BUTTON FUNCTIONS####################
+    def display(self):
+        display(self.ui)
+
+
+    def _toggle_timepoint_inputs(self, change=None):
+        show = not self.use_all_timepoints.value
+        disp = None if show else 'none'
+        self.tp_n.layout.display = disp
+        self.tp_n.disabled = not show
+        self.tp_n.value = 0 if self.use_all_timepoints.value else self.tp_n.value
+
+    def _persist_params(self):
+        self.metadata_loader.behav3d_parameters.setdefault("signal_unmixing", {})
+        pc = self.metadata_loader.behav3d_parameters["signal_unmixing"]
+        pc["sink_channel"] = int(self.sink_channel.value)
+        pc["source_channels"] = str(self.source_channels.value)
+        pc["train_z"] = str(self.train_z.value)
+        pc["train_t"] = str(self.train_t.value)
+        pc["bg_percentile"] = int(self.bg_percentile.value)
+        pc["median_size"] = int(self.median_size.value)
+        pc["gaussian_sigma"]   = int(self.gaussian_sigma.value)
+        pc["training_log"] = bool(self.training_log.value)
+        pc["tp_n"] = int(self.tp_n.value)
+        pc["use_all_timepoints"] = bool(self.use_all_timepoints.value)
+        # Save per-file sum_scale values
+        sum_scale = {}
+        for row in self.sum_scale_widgets:
+            filename = row['label'].value
+            input_str = row['input'].value
+            try:
+                # Parse as a pair of integers
+                parts = [int(s.strip()) for s in input_str.split(",") if s.strip().isdigit()]
+                if len(parts) == 2:
+                    sum_scale[filename] = parts
+                else:
+                    print(f"⚠️ Skipping file '{filename}' — invalid sum_scale: '{input_str}'")
+            except Exception as e:
+                print(f"⚠️ Error parsing sum_scale for '{filename}': {e}")
+
+        pc["sum_scale"] = sum_scale
+
+        yaml.safe_dump(
+            self.metadata_loader.behav3d_parameters,
+            self.metadata_loader.behav3d_parameters_path.open("w"),
+            sort_keys=False
+        )
+
+    def _on_btn_unmix_clicked(self, _):
+        with self.out:
+            self.out.clear_output()
+            # Save previous parameters to compare
+            previous_pc = deepcopy(_cfg_get(self.metadata_loader.behav3d_parameters, "signal_unmixing", {}))
+            self._persist_params()
+            try:
+                odir = Path(self.metadata_loader.output_dir).expanduser()
+                odir.mkdir(parents=True, exist_ok=True)
+                sum_scale_per_file = {}
+                for row in self.sum_scale_widgets:
+                    filename = row['label'].value
+                    val = row['input'].value
+                    try:
+                        parts = [int(s.strip()) for s in val.split(",") if s.strip().isdigit()]
+                        if len(parts) == 2:
+                            sum_scale_per_file[filename] = parts
+                        else:
+                            print(f"⚠️ Skipping file '{filename}' due to invalid sum_scale: {val}")
+                    except Exception as e:
+                        print(f"⚠️ Error parsing sum_scale for file '{filename}': {e}")
+
+
+                print(f"▶️ Applying signal unmixing to channel {self.sink_channel.value}…", flush=True)
+                print(f"  output_dir={odir}\\images\\SignalUnmixing", flush=True)
+                print(f"  sum_scales=\n{sum_scale_per_file}", flush=True)
+                print(f"  sink_channel={self.sink_channel.value}")
+                print(f"  source_channels={self.source_channels.value}")
+                print(f"  train_z={self.train_z.value}")
+                print(f"  train_t={self.train_t.value}")
+                print(f"  bg_percentile={self.bg_percentile.value}")
+                print(f"  median_size={self.median_size.value}")
+                print(f"  gaussian_sigma={self.gaussian_sigma.value}")
+                print(f"  tp_n={self.tp_n.value}")
+                print(f"  training_log={self.training_log.value}", flush=True)
+
+                self.spinner_unmix.layout.display = None
+
+                new_md = signal_unmixing(
+                    metadata=self.metadata_loader.metadata,
+                    output_dir=str(odir),
+                    sink_channel=int(self.sink_channel.value),
+                    source_channels=[int(s.strip()) for s in str(self.source_channels.value).split(",") if s.strip().isdigit()],
+                    sum_scale=sum_scale_per_file, # dict: filename -> [int, int]
+                    train_z=[int(s.strip()) for s in str(self.train_z.value).split(",") if s.strip().isdigit()],
+                    train_t=[int(s.strip()) for s in str(self.train_t.value).split(",") if s.strip().isdigit()],
+                    bg_percentile=int(self.bg_percentile.value),    
+                    median_size=int(self.median_size.value),
+                    gaussian_sigma=int(self.gaussian_sigma.value),
+                    training_log=bool(self.training_log.value),
+                    timepoints=int(self.tp_n.value),
+                    previous_pc=previous_pc,
+                )
+                try:
+                    if new_md is not None:
+                        self.metadata_loader.metadata = new_md
+                        new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
+                except Exception:
+                    import traceback; traceback.print_exc()
+
+                print("✅ Unmixing finished.", flush=True)
+            except Exception:
+                import traceback; traceback.print_exc()
+            finally:
+                self.spinner_unmix.layout.display = "none"
+
+
+    ######### CHECKKKKKKK##########################``
+
+    # ---------------- Public API ----------------
+    def display(self):
+        display(self._panel)
+
+    def get_selected_row(self) -> pd.Series:
+        self._ensure_metadata_ready()
+        name = self.sample_dropdown.value
+        df = self.metadata_loader.metadata
+        row = df[df["sample_name"].astype(str) == str(name)]
+        if row.empty:
+            raise KeyError(f"sample_name '{name}' not found in metadata.")
+        return row.iloc[0]
+    
+    
+    def open_viewer(self):
+        row = self.get_selected_row()
+
+        # only use range if tickbox checked
+        if self.use_range.value:
+            start_t, end_t = int(self.start_t.value), int(self.end_t.value)
+            if end_t < start_t:
+                start_t, end_t = end_t, start_t
+            time_range = (start_t, end_t)
+        else:
+            time_range = None
+
+        with self.out:
+            self.out.clear_output()
+            try:
+                print(f"Opening viewer for: {row['sample_name']}")
+                self._viewer = visualize_unmix(
+                    metadata_row=row,
+                    timepoint_range=time_range,
+                    channel_colors=self.channel_colors,
+                )
+            except Exception as e:
+                print(f"Error: {e}")
+            self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
+
+    # ---------------- Internal helpers ----------------
+    def _ensure_metadata_ready(self):
+        df = getattr(self.metadata_loader, "metadata", None)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            raise RuntimeError("Metadata not loaded yet. Click 'Refresh' once metadata_loader.metadata is set.")
+   
+    def _maybe_build_from_loader(self):
+        df = getattr(self.metadata_loader, "metadata", None)
+        if isinstance(df, pd.DataFrame) and not df.empty and ("sample_name" in df.columns):
+            self._build_from_metadata(df)
+            self._status.value = "<span style='color:green'>Metadata loaded ✅</span>"
+        else:
+            self._status.value = "<b>Waiting for user to load metadata…</b>"
+            self.sample_dropdown.disabled = True
+            self.open_button.disabled = True
+
+    def _build_from_metadata(self, df: pd.DataFrame):
+        sample_names = df["sample_name"].astype(str).unique().tolist()
+        if not sample_names:
+            self._status.value = "<b>No sample_name values found in metadata.</b>"
+            self.sample_dropdown.options = []
+            self.sample_dropdown.value = None
+            self.sample_dropdown.disabled = True
+            self.open_button.disabled = True
+            return
+
+        desired = _cfg_get(self.metadata_loader.behav3d_parameters, "signal_unmixing.sample_name", None)
+        self.sample_dropdown.options = sample_names
+        self.sample_dropdown.value = desired if (desired in sample_names) else sample_names[0]
+        self.sample_dropdown.disabled = False
+        self.open_button.disabled = False
+
+    # ---------------- Callbacks ----------------
+    def _on_open_clicked(self, _):
+        self.open_viewer()
+
+    def _on_close_clicked(self, _):
+        # Only relevant when we’re in non-blocking mode and hold a viewer
+        with self.out:
+            try:
+                if self._viewer is not None:
+                    print("Closing viewer…")
+                    self._viewer.close()
+                    self._viewer = None
+                else:
+                    print("No active viewer to close (viewer was likely opened in blocking mode).")
+            finally:
+                # Hide the button regardless
+                self.close_button.layout.display = "none"
+                
+    def _on_refresh_clicked(self, _):
+        with self.out:
+            self.out.clear_output()
+            try:
+                self._maybe_build_from_loader()
+            except Exception as e:
+                print(f"Refresh failed: {e}")
+
+    def _on_save_clicked(self, _):
+        with self.out:
+            self.out.clear_output()
+            try:
+                self._persist_params()
+                metadata = self.metadata_loader.metadata
+                for idx, sample in metadata.iterrows():
+                    unmix_path = Path(sample["signal_unmixing_image_path"]).expanduser()
+                    image = load_image(unmix_path)
+                    # Unmixed channel is always the last one
+                    new_tcell_channel = image.shape[1] - 1  # assuming shape is (T, C, Z, Y, X)
+                    print(f"Sample '{sample['sample_name']}': setting tcell_channel to {new_tcell_channel}") 
+                    metadata.at[idx, 'tcell_channel'] = new_tcell_channel
+                    try:
+                        if metadata is not None:
+                            self.metadata_loader.metadata = metadata
+                            metadata.to_csv(self.metadata_loader.metadata_csv_path, index=False)
+                    except Exception:
+                        import traceback; traceback.print_exc()
+
+                print(f"✅ Saved updated metadata")
+            except Exception as e:
+                print(f"Error saving metadata: {e}")
+
 
 class PixelClassifierPanel:
     def __init__(self, metadata_loader):
@@ -814,6 +1365,12 @@ class PixelClassifierPanel:
         self.sample_specific_classifier = widgets.Checkbox(
             description="Sample-specific classifier",
             value=bool(pc.get("sample_specific_classifier", False))
+        )        
+        
+        # Checkbox for two organoid types (e.g., WT vs. KO)
+        self.two_org_types = widgets.Checkbox(
+            description="Segment 2 organoid types",
+              value=bool(pc.get("two_org_types", False))  
         )
         self.n_workers = widgets.IntText(
             description="Workers",
@@ -886,6 +1443,7 @@ class PixelClassifierPanel:
             widgets.HTML("<b>Train pixel classifier</b>"),
             widgets.HBox([self.examples_per_sample, self.n_workers]),
             self.sample_specific_classifier,
+            self.two_org_types,
             self.train_row,
         ])
 
@@ -914,6 +1472,7 @@ class PixelClassifierPanel:
         pc["use_all_timepoints"] = bool(self.use_all_timepoints.value)
         pc["tp_start"] = int(self.tp_start.value)
         pc["tp_end"]   = int(self.tp_end.value)
+        pc["two_org_types"] = bool(self.two_org_types.value)
 
         yaml.safe_dump(
             self.metadata_loader.behav3d_parameters,
@@ -937,7 +1496,7 @@ class PixelClassifierPanel:
         # keep close_button enabled so user can close at any time
         for w in [
             self.btn_train, self.btn_apply,
-            self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
+            self.examples_per_sample, self.sample_specific_classifier, self.n_workers, self.two_org_types,
             self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end,
         ]:
             w.disabled = state
@@ -955,6 +1514,7 @@ class PixelClassifierPanel:
                 print(f"  output_dir={odir}")
                 print(f"  examples_per_sample={self.examples_per_sample.value}")
                 print(f"  sample_specific_classifier={self.sample_specific_classifier.value}")
+                print(f"  two_org_types={self.two_org_types.value}")
                 print(f"  n_workers={self.n_workers.value}")
 
                 # UI state
@@ -975,6 +1535,7 @@ class PixelClassifierPanel:
                     examples_per_sample=int(self.examples_per_sample.value),
                     sample_specific_classifier=bool(self.sample_specific_classifier.value),
                     n_workers=int(self.n_workers.value),
+                    two_org_types=bool(self.two_org_types.value),
                 )
 
                 # Try to capture a viewer handle
@@ -1049,7 +1610,8 @@ class PixelClassifierPanel:
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
                     organoid_edt_threshold=float(self.organoid_edt_threshold.value),
-                    timepoint_range=tpr
+                    timepoint_range=tpr,
+                    two_org_types=bool(self.two_org_types.value),
                 )
 
                 try:
