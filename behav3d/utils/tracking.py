@@ -53,6 +53,7 @@ def convert_segments_to_tracks(
     
     tracked_img = np.stack(result, axis=0)
     save_as_zarr(tracked_img, path=outpath)
+    
     # for t, t_seg in tqdm(enumerate(segments), total=len(segments)):
     #     t_seg = np.asarray(t_seg)
     #     tracked_img = np.zeros_like(t_seg)
@@ -66,6 +67,8 @@ def convert_segments_to_tracks(
     #         img=tracked_img, 
     #         outpath=outpath
     #         )
+
+    return(outpath)
 
 def convert_all_tracked_images_to_csv(
     metadata,
