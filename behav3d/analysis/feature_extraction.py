@@ -232,6 +232,13 @@ def run_feature_extraction(
         raw_image_path = sample_metadata['raw_image_path']
         organoid_segments_path = sample_metadata['organoid_tracks_image_path']
         tcell_segments_path = sample_metadata['tcell_tracks_image_path']
+
+        # Add additional organoid type info
+        organoid_2_segments_path = None
+
+        if sample_metadata['organoid_2_tracks_image_path'] and Path(sample_metadata['organoid_2_tracks_image_path']).exists():
+            organoid_2_segments_path = sample_metadata['organoid_2_tracks_image_path']
+
         dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
         
         print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
@@ -258,8 +265,10 @@ def run_feature_extraction(
             df_tracks_path = sample_metadata["tcell_tracks_csv_path"]
         elif cell_type=="organoid":
             df_tracks_path = sample_metadata["organoid_tracks_csv_path"]
+        elif cell_type=="organoid_2":
+            df_tracks_path = sample_metadata["organoid_2_tracks_csv_path"]
         else:
-            raise ValueError(f"Unknown cell type: {cell_type}. Expected 'tcell' or 'organoid'.")
+            raise ValueError(f"Unknown cell type: {cell_type}. Expected 'tcell' or 'organoid' or 'organoid_2.")
         
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
         
@@ -308,6 +317,7 @@ def run_feature_extraction(
                     dead_mask_path=dead_mask_path,
                     organoid_segments_path=organoid_segments_path,
                     tcell_segments_path=tcell_segments_path,
+                    organoid_2_segments_path=organoid_2_segments_path,
                     overwrite=overwrite,
                     n_workers=n_workers
                 )
@@ -386,6 +396,7 @@ def calculate_image_based_track_features(
     dead_mask_path,
     organoid_segments_path,
     tcell_segments_path,
+    organoid_2_segments_path,
     raw_image_path = "",
     
     df_dead_mask_outpath="",
@@ -419,6 +430,8 @@ def calculate_image_based_track_features(
     organoid_segments=load_image(organoid_segments_path)
     tcell_segments=load_image(tcell_segments_path)
     dead_mask = load_image(dead_mask_path)
+    if organoid_2_segments_path:
+        organoid_2_segments=load_image(organoid_2_segments_path)
     
     if cell_type=="tcell":
         segments= tcell_segments
@@ -426,6 +439,9 @@ def calculate_image_based_track_features(
     elif cell_type=="organoid":
         segments= organoid_segments
         segments_path = organoid_segments_path
+    elif cell_type=="organoid_2":
+        segments= organoid_2_segments
+        segments_path = organoid_2_segments_path
     
     if "morphology" in features_choice:
         print(f"{get_current_time()} - Calculating morphology features...")
@@ -529,6 +545,7 @@ def calculate_image_based_track_features(
             df_contacts=calculate_organoid_and_tcell_contact(
                 tcell_segments_path=tcell_segments_path,
                 organoid_segments_path=organoid_segments_path,
+                organoid_2_segments_path=organoid_2_segments_path,
                 element_size_x=element_size_x,
                 element_size_y=element_size_y,
                 element_size_z=element_size_z,
@@ -728,6 +745,9 @@ def interpolate_missing_positions(
         "tcell_contact",
         "tcell_contact_pixels",
         "touching_tcells",
+        "organoid_2_contact",
+        "organoid_2_contact_pixels",
+        "touching_organoid_2s",
         "distance_unit",
         "time_unit",
         "orientation_vector"
@@ -890,6 +910,7 @@ def _calculate_organoid_and_tcell_contact_single_timepoint(args):
         t,
         tcell_segments_path,
         organoid_segments_path,
+        organoid_2_segments_path,
         element_size_x,
         element_size_y,
         element_size_z,
@@ -899,11 +920,16 @@ def _calculate_organoid_and_tcell_contact_single_timepoint(args):
     
     tcell_segments = np.asarray(load_image(tcell_segments_path)[t])
     organoid_segments = np.asarray(load_image(organoid_segments_path)[t])
+
+    if organoid_2_segments_path:
+        organoid_2_segments = np.asarray(load_image(organoid_2_segments_path)[t])
     
     if calculate_from == "tcell":
         segments_stack = tcell_segments
     elif calculate_from == "organoid":
         segments_stack = organoid_segments
+    elif calculate_from == "organoid_2":
+        segments_stack = organoid_2_segments
     else:
         raise ValueError(f"calculate_from has to be either 'tcell' or 'organoid', got {calculate_from}")
     
@@ -931,6 +957,8 @@ def _calculate_organoid_and_tcell_contact_single_timepoint(args):
         
         tcell_cutout = tcell_segments[slicer]
         org_cutout = organoid_segments[slicer]
+        if organoid_2_segments_path:
+            org_2_cutout = organoid_2_segments[slicer]
         seg_cutout = segments_stack[slicer]
         
         real_distances = distance_transform_edt(
@@ -963,7 +991,21 @@ def _calculate_organoid_and_tcell_contact_single_timepoint(args):
         ]
         pix_tcell_contact = len(pix_tcell_contacts) > 0
 
-        df_contacts.append(pd.DataFrame([{
+        # Organoid 2 information
+        if organoid_2_segments_path:
+            organoid_2_contacts = [
+                str(x) for x in np.unique(org_2_cutout[real_distances <= contact_threshold]) if x != 0
+            ]
+            if calculate_from == "organoid_2":
+                organoid_2_contacts = [x for x in organoid_2_contacts if x != str(segment_id)]
+            real_organoid_2_contact = len(organoid_2_contacts) > 0
+
+            pix_organoid_2_contacts = [
+                str(x) for x in np.unique(org_2_cutout[pix_distances <= 1.73]) if x != 0
+            ]
+            pix_organoid_2_contact = len(pix_organoid_2_contacts) > 0
+
+        contact_data = {
             'TrackID': segment_id,
             'position_t': t,
             'organoid_contact': real_organoid_contact,
@@ -972,13 +1014,26 @@ def _calculate_organoid_and_tcell_contact_single_timepoint(args):
             'tcell_contact': real_tcell_contact,
             'tcell_contact_pixels': pix_tcell_contact,
             'touching_tcells': ",".join(tcell_contacts) if real_tcell_contact else ""
-        }]))
+        }
+
+        # Add only if organoid_2
+        if organoid_2_segments_path:
+            contact_data.update({
+                'organoid_2_contact': real_organoid_2_contact,
+                'organoid_2_contact_pixels': pix_organoid_2_contact,
+                'touching_organoid_2s': ",".join(organoid_2_contacts) if real_organoid_2_contact else ""
+            })
+
+        df_contacts.append(pd.DataFrame([contact_data]))
+
+
 
     return pd.concat(df_contacts)
 
 def calculate_organoid_and_tcell_contact(
     tcell_segments_path,
     organoid_segments_path,
+    organoid_2_segments_path,
     contact_threshold,
     element_size_x,
     element_size_y,
@@ -1000,6 +1055,7 @@ def calculate_organoid_and_tcell_contact(
             t,
             tcell_segments_path,
             organoid_segments_path,
+            organoid_2_segments_path,
             element_size_x,
             element_size_y,
             element_size_z,

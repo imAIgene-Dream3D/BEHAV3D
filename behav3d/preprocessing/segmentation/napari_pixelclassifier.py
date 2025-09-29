@@ -160,7 +160,7 @@ def segment_tcell_and_organoid(
     tcell_segment_size_min=10,
     # organoid_edt_threshold=12,
     organoid_segment_size_min=1000,
-    two_org_types=False,
+    # two_org_types=False,
     ):
     """
     Segment T-cells and organoids from the prediction mask.
@@ -187,11 +187,11 @@ def segment_tcell_and_organoid(
     segments : np.ndarray
         The segmented T-cells and organoids.
     """
-    if two_org_types:
-            organoid, organoid_2, tcell, organoid_edt_threshold =  args
+    if len(args) == 5:
+            organoid, organoid_2, tcell, organoid_edt_threshold, two_org_types =  args
             organoid_2 = postprocess_mask(organoid_2, opening_nr_pixels=3)
     else:
-        organoid, tcell, organoid_edt_threshold =  args
+        organoid, tcell, organoid_edt_threshold, two_org_types =  args
 
     tcell = postprocess_mask(tcell, opening_nr_pixels=0)
     organoid = postprocess_mask(organoid, opening_nr_pixels=3)
@@ -459,7 +459,7 @@ def train_pixel_classifier(
             log("\n### Training Random Forest Classifier (Organoids)")
             clf_organoids = train_classifier(org_label_data, all_features)
             org_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid.joblib')
-            log("Saving RandomForest, Sparse labels and input images to {org_random_forest_outpath}")
+            log(f"Saving RandomForest, Sparse labels and input images to {org_random_forest_outpath}")
             joblib.dump(clf_organoids, org_random_forest_outpath)
             QApplication.processEvents()
 
@@ -467,21 +467,21 @@ def train_pixel_classifier(
                 log("\n### Training Random Forest Classifier (Organoids 2)")
                 clf_organoids_2 = train_classifier(org_2_label_data, all_features)
                 org_2_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid2.joblib')
-                log("Saving RandomForest, Sparse labels and input images to {org_2_random_forest_outpath}")
+                log(f"Saving RandomForest, Sparse labels and input images to {org_2_random_forest_outpath}")
                 joblib.dump(clf_organoids_2, org_2_random_forest_outpath)
                 QApplication.processEvents()
             
             log("\n### Training Random Forest Classifier (T-cells)")
             clf_tcells = train_classifier(tcell_label_data, all_features)
             tcell_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Tcell.joblib')
-            log("Saving RandomForest, Sparse labels and input images to {tcell_random_forest_outpath}")
+            log(f"Saving RandomForest, Sparse labels and input images to {tcell_random_forest_outpath}")
             joblib.dump(clf_tcells, tcell_random_forest_outpath)
             QApplication.processEvents()
             
             log("\n### Training Random Forest Classifier (Cell Death)")
             clf_death = train_classifier(dead_label_data, all_features)
             death_random_forest_outpath = Path(pixel_class_outdir, 'PixelClassifier_Death.joblib')
-            log("Saving RandomForest, Sparse labels and input images to {death_random_forest_outpath}")
+            log(f"Saving RandomForest, Sparse labels and input images to {death_random_forest_outpath}")
             joblib.dump(clf_death, death_random_forest_outpath)
             QApplication.processEvents()
         
@@ -554,11 +554,15 @@ def train_pixel_classifier(
             
         log("\n### Segment Cell and Organoid Instances")
         QApplication.processEvents()
-        args_list = [(pred_org_mask[idx], pred_org_2_mask[idx], pred_tcell_mask[idx], organoid_edt_threshold) for idx in range(org_label_data.shape[0])]
+        if two_org_types:
+            args_list = [(pred_org_mask[idx], pred_org_2_mask[idx], pred_tcell_mask[idx], organoid_edt_threshold, two_org_types) for idx in range(org_label_data.shape[0])]
+        else: 
+            args_list = [(pred_org_mask[idx], pred_tcell_mask[idx], organoid_edt_threshold, two_org_types) for idx in range(org_label_data.shape[0])]
+        
         results=[]
 
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            results+=list(tqdm(executor.map(segment_tcell_and_organoid, args_list, two_org_types), total=len(args_list)))
+            results+=list(tqdm(executor.map(segment_tcell_and_organoid, args_list), total=len(args_list)))
 
         if two_org_types:
             full_seg_organoid, full_seg_organoid_2, full_seg_tcell = zip(*results)
@@ -566,6 +570,8 @@ def train_pixel_classifier(
             full_seg_organoid = np.stack(full_seg_organoid, axis=0)
             full_seg_organoid_2 = np.stack(full_seg_organoid_2, axis=0)
             full_seg_tcell = np.stack(full_seg_tcell, axis=0)
+
+            log("\n### Updating Napari Data")
             
             viewer.layers["Organoid Segments"].data = full_seg_organoid
             viewer.layers["Organoid 2 Segments"].data = full_seg_organoid_2
@@ -612,9 +618,16 @@ def train_pixel_classifier(
     for ch in range(n_channels):
         channel_data = all_images[ch]  # Shape: (time, z, y, x)
         
-        # Calculate contrast limits for this channel
-        channel_percentile = float(np.percentile(channel_data.reshape(-1), 99))
-        contrast_limits = (0, channel_percentile)
+        # Flatten and filter out zero pixels
+        flat_vals = channel_data.reshape(-1)
+        nonzero_vals = flat_vals[flat_vals > 0]
+
+        if nonzero_vals.size > 0:
+            channel_percentile = float(np.percentile(nonzero_vals, 99))
+            contrast_limits = (0, channel_percentile)
+        else:
+            print(f"⚠️ Channel {ch} appears empty. Using fallback contrast limits.")
+            contrast_limits = (0, 1e-3)  # or any small dummy range
         
         # Add channel as separate layer with color
         channel_name = f"Channel {ch+1}"
@@ -769,14 +782,15 @@ def _run_single_timepoint_segmentation(
     
     # print("\n### Segmenting Organoids and T-cells")
     if clf_org_2 is not None:
+        two_org_types = True
         seg_organoid, seg_organoid_2, seg_tcell = segment_tcell_and_organoid(
-            args = (pred_org_mask, pred_org_2_mask, pred_tcell_mask, organoid_edt_threshold),  
-            two_org_types=True
+            args = (pred_org_mask, pred_org_2_mask, pred_tcell_mask, organoid_edt_threshold, two_org_types)
         )
         return(seg_organoid, seg_organoid_2, seg_tcell, pred_death_mask)
     else:
+        two_org_types = False
         seg_organoid, seg_tcell = segment_tcell_and_organoid(
-            args = (pred_org_mask, pred_tcell_mask, organoid_edt_threshold),  
+            args = (pred_org_mask, pred_tcell_mask, organoid_edt_threshold, two_org_types),  
         )
         
         return(seg_organoid, seg_tcell, pred_death_mask)

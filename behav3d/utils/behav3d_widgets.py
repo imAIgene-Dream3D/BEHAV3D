@@ -890,7 +890,7 @@ class SignalUnmixingPanel:
         # Header (first row)
         header = widgets.HBox([
             widgets.Label(value="File Name", layout=widgets.Layout(width='200px')),
-            widgets.Label(value="sum_scale (source1, source2)", layout=widgets.Layout(width='150px')),
+            widgets.Label(value="sum_scale (source1, source2)", layout=widgets.Layout(width='200px')),
             widgets.Label(value="")  # Placeholder for the button column
         ])
         rows.append(header) 
