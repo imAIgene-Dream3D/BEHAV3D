@@ -142,12 +142,14 @@ _DEFAULT_CONFIG = {
         "tcell": {
             "dead_mask_percentage_threshold": 0.25,
             "features_choice": ["movement", "intensity", "contact", "death"],
+            "contact_threshold": 0,
             "n_workers": 16,
             "overwrite": False
         },
         "organoid": {
             "dead_mask_percentage_threshold": 0.02,
             "features_choice": ["intensity", "death", "morphology"],
+            "contact_threshold": 0,
             "n_workers": 8,
             "overwrite": False
         }
@@ -1594,8 +1596,37 @@ class FeatureExtractionPanel:
             f: widgets.Checkbox(description=f.capitalize(), value=(f in default_feats), indent=False)
             for f in self._all_features
         }
+        
+        contact_thr_default = float(fcfg.get("contact_threshold", 0.0))
+        self.contact_threshold = widgets.FloatText(
+            description="Contact Threshold (µm)",
+            value=contact_thr_default,
+            layout=widgets.Layout(width="240px"),
+            style={'description_width': '180px'}
+        )
+
+        # Build "Features" box; put contact_threshold to the right of the Contact checkbox
+        contact_row = widgets.HBox([
+            self.feature_checks["contact"],
+            self.contact_threshold
+        ], layout=widgets.Layout(align_items="center", gap="12px"))
+
+        def _toggle_contact_threshold(change=None):
+            show = bool(self.feature_checks["contact"].value)
+            self.contact_threshold.layout.display = None if show else "none"
+
+        _toggle_contact_threshold()  # set initial visibility
+        self.feature_checks["contact"].observe(_toggle_contact_threshold, names="value")
+
+        feat_rows = []
+        for f in self._all_features:
+            if f == "contact":
+                feat_rows.append(contact_row)
+            else:
+                feat_rows.append(self.feature_checks[f])
+                
         self.features_box = widgets.VBox(
-            [widgets.HTML("<b>Features</b>")] + [self.feature_checks[f] for f in self._all_features]
+            [widgets.HTML("<b>Features</b>")] + feat_rows
         )
 
         self.n_workers = widgets.IntText(
@@ -1605,7 +1636,6 @@ class FeatureExtractionPanel:
             style={'description_width':'160px'}
         )
 
-        # NEW: overwrite checkbox
         self.overwrite = widgets.Checkbox(
             description="Overwrite existing",
             value=bool(fcfg.get("overwrite", False))
@@ -1655,7 +1685,8 @@ class FeatureExtractionPanel:
         prof["features_choice"] = self._selected_features()
         prof["n_workers"] = int(self.n_workers.value)
         prof["overwrite"] = bool(self.overwrite.value)   # <- save overwrite
-
+        prof["contact_threshold"] = float(self.contact_threshold.value)
+        
         params.setdefault("paths", {})
         if getattr(self.metadata_loader, "metadata_csv_path", None):
             params["paths"]["metadata_csv"] = str(Path(self.metadata_loader.metadata_csv_path).expanduser())
