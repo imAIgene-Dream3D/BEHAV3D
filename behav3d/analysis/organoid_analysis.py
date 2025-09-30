@@ -5,7 +5,8 @@ import pandas as pd
 import numpy as np
 
 from behav3d.utils import format_time
-from behav3d.utils.analysis import plot_filter_count, smooth_value_over_time
+from behav3d.utils.analysis import smooth_value_over_time
+from behav3d.utils.filtering import plot_filter_count, filter_by_full_duration, filter_minimal_track_length, trim_to_maximal_track_length
 from behav3d.utils.preprocessing import calc_z_projection
 from behav3d.utils.fileio import load_image
 
@@ -207,6 +208,7 @@ def filter_organoid_tracks(
     min_track_length=None,
     max_track_length=None,
     min_size=None,
+    time_type="frames",
     cell_type="organoid"
     ):
     """
@@ -253,7 +255,11 @@ def filter_organoid_tracks(
     df_all_tracks = pd.read_csv(df_all_tracks_path)
     
     group_cols = ['TrackID', 'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
-    df_all_tracks_filt = pd.merge(df_all_tracks, metadata, how="left", on="sample_name")
+    
+    cols_present = [c for c in group_cols if c in metadata.columns]
+    metadata_info = metadata.loc[:, cols_present].copy()
+    
+    df_all_tracks_filt = pd.merge(df_all_tracks, metadata_info, how="left", on="sample_name")
 
     # Function to count the number of unique tracks in the DataFrame
     def count_tracks(df_all_tracks, col_name="nr_tracks", df_track_counts=None):
@@ -271,15 +277,39 @@ def filter_organoid_tracks(
     
     # Filtering the tracks based on the total experimental duration
     # Any timepoint after this will be filtered out 
-    if exp_duration is not None:
-        df_all_tracks_filt=df_all_tracks_filt.drop(df_all_tracks_filt[df_all_tracks_filt["position_t"]>exp_duration].index)
+    if time_type=="real_time":
+        time_column="time"
+    else:
+        time_column="position_t"
+        exp_duration = exp_duration-1
+        min_track_length = min_track_length-1
+        max_track_length = max_track_length-1
+        
+    # Filtering the tracks based on the total experimental duration
+    # Any timepoint after this will be filtered out 
+    df_all_tracks_filt=filter_by_full_duration(
+        df=df_all_tracks_filt,
+        time_column=time_column,
+        exp_duration=exp_duration
+        )
+    
     df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_exp_duration", df_track_counts=df_track_counts)
 
     # Filtering out tracks under specific track length and cutting them down to specified max track length
-    if min_track_length is not None:
-        df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).filter(lambda group: len(group) >= min_track_length).reset_index(drop=True)
-    if max_track_length is not None:
-        df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).apply(lambda group: group.iloc[:max_track_length]).reset_index(drop=True)
+    df_all_tracks_filt = filter_minimal_track_length(
+        df=df_all_tracks_filt,
+        min_track_length=min_track_length,
+        time_column=time_column,
+        group_cols=group_cols
+    )
+    
+    df_all_tracks_filt = trim_to_maximal_track_length(
+        df=df_all_tracks_filt,
+        max_track_length=max_track_length,
+        time_column=time_column,
+        group_cols=group_cols
+    )
+    
     df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_min_track_length", df_track_counts=df_track_counts)
 
     if min_size is not None:

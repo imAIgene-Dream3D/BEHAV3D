@@ -169,9 +169,9 @@ _DEFAULT_CONFIG = {
             "exp_duration_enabled": False,
             "exp_duration": 999999,      # timepoints
             "min_track_length_enabled": False,
-            "min_track_length": 100,       # frames
+            "min_track_length": 0,       # frames
             "max_track_length_enabled": False,
-            "max_track_length": 100,  # frames
+            "max_track_length": 999999,  # frames
             "min_size_enabled": True,
             "min_size": 1000,
         }
@@ -1741,7 +1741,7 @@ class FeatureExtractionPanel:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
 
-class TrackFilterPanel:
+class TcellFilterPanel:
     def __init__(self, metadata_loader, cell_type="tcell"):
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
@@ -1759,37 +1759,36 @@ class TrackFilterPanel:
 
         cfg = params["track_filtering"][self.cell_type]
 
-        # ---- exp_duration ----
         self.en_exp_duration = widgets.Checkbox(
             description="Trim down full time series to supplied duration",
             value=bool(cfg.get("exp_duration_enabled", False)),
-            indent=False
+            indent=False,
+            style={'description_width': '240px'}
         )
-        # REPLACED FloatSlider -> FloatText
-        self.exp_duration = widgets.FloatText(
-            description="Exp. duration (h)",
-            value=float(cfg.get("exp_duration", 24.0)),
+        self.exp_duration = widgets.IntText(
+            description="Max timepoints",
+            value=int(cfg.get("exp_duration", 999999)),
             style={'description_width': '160px'},
             continuous_update=False
         )
+        
         self.row_exp = widgets.HBox([self.exp_duration], layout=widgets.Layout(display="none"))
         self.en_exp_duration.observe(
             lambda c: self.row_exp.layout.__setattr__("display", None if self.en_exp_duration.value else "none"),
             names="value"
         )
+        self.en_exp_duration.observe(lambda c: _update_unit_toggle_visibility(), names="value")
         if self.en_exp_duration.value:
             self.row_exp.layout.display = None
 
-        # ---- min_track_length ----
         self.en_min_len = widgets.Checkbox(
             description="Select only tracks with minimal length",
             value=bool(cfg.get("min_track_length_enabled", False)),
             indent=False
         )
-        # REPLACED IntSlider -> IntText
         self.min_track_length = widgets.IntText(
-            description="Minimal length",
-            value=int(cfg.get("min_track_length", 3)),
+            description="Minimal length (frames)",
+            value=int(cfg.get("min_track_length", 0)),
             style={'description_width': '160px'},
             continuous_update=False
         )
@@ -1798,27 +1797,29 @@ class TrackFilterPanel:
             lambda c: self.row_min.layout.__setattr__("display", None if self.en_min_len.value else "none"),
             names="value"
         )
+        self.en_min_len.observe(lambda c: _update_unit_toggle_visibility(), names="value")
+
         if self.en_min_len.value:
             self.row_min.layout.display = None
 
-        # ---- max_track_length ----
         self.en_max_len = widgets.Checkbox(
             description="Trim down tracks to supplied length",
             value=bool(cfg.get("max_track_length_enabled", False)),
             indent=False
         )
-        # REPLACED IntSlider -> IntText
         self.max_track_length = widgets.IntText(
-            description="Maximal length",
+            description="Maximal length (frames)",
             value=int(cfg.get("max_track_length", 999999)),
             style={'description_width': '160px'},
             continuous_update=False
         )
+        
         self.row_max = widgets.HBox([self.max_track_length], layout=widgets.Layout(display="none"))
         self.en_max_len.observe(
             lambda c: self.row_max.layout.__setattr__("display", None if self.en_max_len.value else "none"),
             names="value"
         )
+        self.en_max_len.observe(lambda c: _update_unit_toggle_visibility(), names="value")
         if self.en_max_len.value:
             self.row_max.layout.display = None
 
@@ -1841,6 +1842,43 @@ class TrackFilterPanel:
         )
         self.spinner_html.layout.display = "none"  # hidden until run starts
 
+                # ----- time unit toggle (Frames / Hours) -----
+        _TIME_TYPE_OPTIONS = [("frames", "Frames"), ("hours", "real_time")]
+        default_time_type = str(cfg.get("time_type", "Frames"))
+        default_label = next((lbl for (lbl, val) in _TIME_TYPE_OPTIONS if val == default_time_type), "frames")
+
+        self.time_type_toggle = widgets.ToggleButtons(
+            options=_TIME_TYPE_OPTIONS,  # [('frames','Frames'), ('hours','real_time')]
+            value=next(val for (lbl, val) in _TIME_TYPE_OPTIONS if lbl == default_label),
+            description="Unit to use for time-based filters:",
+            button_style="info",
+            layout=widgets.Layout(width="auto")
+        )
+
+        # Update field labels to match units
+        def _refresh_labels(time_type_value: str):
+            if time_type_value == "real_time":
+                self.exp_duration.description = "Max duration (hours)"
+                self.min_track_length.description = "Minimal length (hours)"
+                self.max_track_length.description = "Maximal length (hours)"
+            else:
+                self.exp_duration.description = "Max timepoints (frames)"
+                self.min_track_length.description = "Minimal length (frames)"
+                self.max_track_length.description = "Maximal length (frames)"
+
+        _refresh_labels(self.time_type_toggle.value)
+        self.time_type_toggle.observe(lambda c: _refresh_labels(self.time_type_toggle.value), names="value")
+
+        # Wrap the toggle in a row that we can show/hide
+        self.row_unit = widgets.HBox([self.time_type_toggle], layout=widgets.Layout(display="none"))
+
+        # Show the row only if any filter is enabled
+        def _update_unit_toggle_visibility():
+            visible = self.en_exp_duration.value or self.en_min_len.value or self.en_max_len.value
+            self.row_unit.layout.display = None if visible else "none"
+
+        # Call once now, and whenever any enabling checkbox changes
+        _update_unit_toggle_visibility()
         
         self.run_row = widgets.HBox(
             [self.btn_run, self.spinner_html],
@@ -1856,6 +1894,7 @@ class TrackFilterPanel:
             self.en_min_len, self.row_min,
             self.en_max_len, self.row_max,
             self.filter_t0_dead,
+            self.row_unit,
             self.run_row,
             widgets.HTML("<hr>"),
             self.out
@@ -1872,8 +1911,9 @@ class TrackFilterPanel:
         exp_duration = float(self.exp_duration.value) if self.en_exp_duration.value else 999999.0
         min_len      = int(self.min_track_length.value) if self.en_min_len.value else 0
         max_len      = int(self.max_track_length.value) if self.en_max_len.value else 999999
-        filt_dead    = bool(self.filter_t0_dead.value)  # single checkbox is the value
-        return exp_duration, min_len, max_len, filt_dead
+        filt_dead    = bool(self.filter_t0_dead.value)
+        time_type    = str(self.time_type_toggle.value)  # "frames" or "real_time"
+        return exp_duration, min_len, max_len, filt_dead, time_type
 
     def _persist_params(self):
         params = self.metadata_loader.behav3d_parameters
@@ -1891,6 +1931,7 @@ class TrackFilterPanel:
 
         # Persist checkbox directly
         prof["filter_t0_dead"] = bool(self.filter_t0_dead.value)
+        prof["time_type"] = str(self.time_type_toggle.value)
 
         with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(params, f, sort_keys=False)
@@ -1914,9 +1955,10 @@ class TrackFilterPanel:
                 out_dir = Path(self.metadata_loader.output_dir).expanduser()
                 out_dir.mkdir(parents=True, exist_ok=True)
 
-                exp_duration, min_len, max_len, filt_t0 = self._effective_values()
+                exp_duration, min_len, max_len, filt_t0, time_type = self._effective_values()
                 print("▶️ Filtering tracks…")
-                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, filter_t0_dead={filt_t0}")
+                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, "
+                      f"filter_t0_dead={filt_t0}, unit={'frames' if time_type=='Frames' else 'hours'}")
 
                 self._persist_params()
                 
@@ -1927,8 +1969,10 @@ class TrackFilterPanel:
                     min_track_length=min_len,
                     max_track_length=max_len,
                     filter_t0_dead=filt_t0,
-                    cell_type=self.cell_type
+                    cell_type=self.cell_type,
+                    time_type=time_type,
                 )
+                
                 print("✅ Filtering done. Summarizing…")
 
                 self.df_tracks_summ = summarize_track_features(
@@ -2479,34 +2523,28 @@ class TCellAnalysisPanel:
                 self._lock(False)
 
 class OrganoidFilterPanel:
-    """
-    Styled like your TrackFilterPanel example, but wired to filter_organoid_tracks(...).
-    """
     def __init__(self, metadata_loader, cell_type="organoid"):
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip() or "organoid"
 
-        # ---- bootstrap config ----
         params = self.metadata_loader.behav3d_parameters or {}
         params.setdefault("track_filtering", {})
         if self.cell_type not in params["track_filtering"]:
-            # try to seed from global _DEFAULT_CONFIG if present
             try:
                 base = _DEFAULT_CONFIG["track_filtering"][self.cell_type]  # type: ignore[name-defined]
             except Exception:
                 base = _DEFAULT_TRACK_FILTERING[self.cell_type]
             params["track_filtering"][self.cell_type] = dict(base)
-            # persist immediately
             with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
                 yaml.safe_dump(params, f, sort_keys=False)
         self._params = params
         cfg = params["track_filtering"][self.cell_type]
 
-        # ---- exp_duration ----
         self.en_exp_duration = widgets.Checkbox(
-            description="Trim down full time series to supplied duration (timepoints)",
+            description="Trim down full time series to supplied duration",
             value=bool(cfg.get("exp_duration_enabled", False)),
-            indent=False
+            indent=False,
+            style={'description_width': '240px'}
         )
         self.exp_duration = widgets.IntText(
             description="Max timepoints",
@@ -2522,7 +2560,6 @@ class OrganoidFilterPanel:
         if self.en_exp_duration.value:
             self.row_exp.layout.display = None
 
-        # ---- min_track_length ----
         self.en_min_len = widgets.Checkbox(
             description="Select only tracks with minimal length",
             value=bool(cfg.get("min_track_length_enabled", False)),
@@ -2542,7 +2579,6 @@ class OrganoidFilterPanel:
         if self.en_min_len.value:
             self.row_min.layout.display = None
 
-        # ---- max_track_length ----
         self.en_max_len = widgets.Checkbox(
             description="Trim down tracks to supplied length",
             value=bool(cfg.get("max_track_length_enabled", False)),
@@ -2562,7 +2598,36 @@ class OrganoidFilterPanel:
         if self.en_max_len.value:
             self.row_max.layout.display = None
 
-        # ---- min_size ----
+        # ---- Frames / Hours toggle (shown only if any filter is enabled) ----
+        _TIME_TYPE_OPTIONS = [("frames", "Frames"), ("hours", "real_time")]
+        default_time_type = str(cfg.get("time_type", "Frames"))
+        self.time_type_toggle = widgets.ToggleButtons(
+            options=_TIME_TYPE_OPTIONS,
+            value=default_time_type if default_time_type in ("Frames", "real_time") else "Frames",
+            description="Unit",
+            button_style="info",
+            layout=widgets.Layout(width="auto")
+        )
+        def _refresh_labels(val: str):
+            if val == "real_time":
+                self.exp_duration.description = "Max duration (hours)"
+                self.min_track_length.description = "Minimal length (hours)"
+                self.max_track_length.description = "Maximal length (hours)"
+            else:
+                self.exp_duration.description = "Max timepoints (frames)"
+                self.min_track_length.description = "Minimal length (frames)"
+                self.max_track_length.description = "Maximal length (frames)"
+        _refresh_labels(self.time_type_toggle.value)
+        self.time_type_toggle.observe(lambda c: _refresh_labels(self.time_type_toggle.value), names="value")
+
+        self.row_unit = widgets.HBox([self.time_type_toggle], layout=widgets.Layout(display="none"))
+        def _update_unit_toggle_visibility(_=None):
+            show = self.en_exp_duration.value or self.en_min_len.value or self.en_max_len.value
+            self.row_unit.layout.display = None if show else "none"
+        for cb in (self.en_exp_duration, self.en_min_len, self.en_max_len):
+            cb.observe(_update_unit_toggle_visibility, names="value")
+        _update_unit_toggle_visibility()
+
         self.en_min_size = widgets.Checkbox(
             description="Filter by minimal size at t=1",
             value=bool(cfg.get("min_size_enabled", True)),
@@ -2582,63 +2647,52 @@ class OrganoidFilterPanel:
         if self.en_min_size.value:
             self.row_min_size.layout.display = None
 
-        # ---- run row ----
         self.btn_run = widgets.Button(description=f"Filter {cell_type} tracks & summarize", button_style="success", layout=widgets.Layout(
-        width="fit-content",   # size to content
-        flex="0 0 auto"        # don't stretch in HBox/VBox
-    ))
+            width="fit-content", flex="0 0 auto"
+        ))
         self.btn_run.on_click(self._on_run_clicked)
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
-
-        self.run_row = widgets.HBox(
-            [self.btn_run, self.spinner_html],
-            layout=widgets.Layout(align_items="center", gap="10px")
-        )
-
+        self.run_row = widgets.HBox([self.btn_run, self.spinner_html], layout=widgets.Layout(align_items="center", gap="10px"))
         self.out = widgets.Output()
 
-        # ---- full UI ----
         self.ui = widgets.VBox([
             widgets.HTML(f"<b>{self.cell_type.title()} Track Filtering</b>"),
             self.en_exp_duration, self.row_exp,
             self.en_min_len, self.row_min,
             self.en_max_len, self.row_max,
             self.en_min_size, self.row_min_size,
+            self.row_unit,
             self.run_row,
             widgets.HTML("<hr>"),
             self.out
         ])
 
-        # results
         self.df_tracks_filt = None
 
-    # ---------- public ----------
     def display(self):
         display(self.ui)
 
-    # ---------- internals ----------
     def _effective_values(self):
-        exp_duration = int(self.exp_duration.value) if self.en_exp_duration.value else None
-        min_len      = int(self.min_track_length.value) if self.en_min_len.value else None
-        max_len      = int(self.max_track_length.value) if self.en_max_len.value else None
-        min_size     = int(self.min_size.value) if self.en_min_size.value else None
-        return exp_duration, min_len, max_len, min_size
+        exp_duration = int(self.exp_duration.value) if self.en_exp_duration.value else 999999
+        min_len      = int(self.min_track_length.value) if self.en_min_len.value else 0
+        max_len      = int(self.max_track_length.value) if self.en_max_len.value else 999999
+        min_size     = int(self.min_size.value) if self.en_min_size.value else 0
+        time_type    = str(self.time_type_toggle.value)
+        return exp_duration, min_len, max_len, min_size, time_type
 
     def _persist_params(self):
         params = self._params
         prof = params["track_filtering"][self.cell_type]
-
         prof["exp_duration_enabled"]      = bool(self.en_exp_duration.value)
         prof["min_track_length_enabled"]  = bool(self.en_min_len.value)
         prof["max_track_length_enabled"]  = bool(self.en_max_len.value)
         prof["min_size_enabled"]          = bool(self.en_min_size.value)
-
         prof["exp_duration"]     = int(self.exp_duration.value)
         prof["min_track_length"] = int(self.min_track_length.value)
         prof["max_track_length"] = int(self.max_track_length.value)
         prof["min_size"]         = int(self.min_size.value)
-
+        prof["time_type"]        = str(self.time_type_toggle.value)
         with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(params, f, sort_keys=False)
 
@@ -2647,6 +2701,7 @@ class OrganoidFilterPanel:
             self.en_exp_duration, self.exp_duration,
             self.en_min_len, self.min_track_length,
             self.en_max_len, self.max_track_length,
+            self.time_type_toggle,
             self.en_min_size, self.min_size,
             self.btn_run
         ]:
@@ -2662,14 +2717,12 @@ class OrganoidFilterPanel:
                 out_dir = Path(self.metadata_loader.output_dir).expanduser()
                 out_dir.mkdir(parents=True, exist_ok=True)
 
-                exp_duration, min_len, max_len, min_size = self._effective_values()
+                exp_duration, min_len, max_len, min_size, time_type = self._effective_values()
                 print("▶️ Filtering tracks…")
-                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, min_size={min_size}")
+                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, min_size={min_size}, unit={'hours' if time_type=='real_time' else 'frames'}")
 
-                # persist UI state
                 self._persist_params()
 
-                # call your function
                 self.df_tracks_filt = filter_organoid_tracks(
                     metadata=self.metadata_loader.metadata,
                     output_dir=str(out_dir),
@@ -2677,11 +2730,11 @@ class OrganoidFilterPanel:
                     min_track_length=min_len,
                     max_track_length=max_len,
                     min_size=min_size,
-                    cell_type=self.cell_type
+                    cell_type=self.cell_type,
+                    time_type=time_type
                 )
                 print("✅ Filtering complete.")
 
-                # locations
                 analysis_outdir = out_dir / "analysis" / self.cell_type
                 feature_outdir  = analysis_outdir / "track_features"
                 qc_outdir       = analysis_outdir / "quality_control"
@@ -2695,7 +2748,6 @@ class OrganoidFilterPanel:
                 print(f"  Filtered tracks: {filtered_csv}")
                 print(f"  Filter counts:   {filter_plot}")
 
-                # preview
                 try:
                     from IPython.display import display as _disp
                     print("\n— Filtered tracks (head) —")
@@ -2703,10 +2755,8 @@ class OrganoidFilterPanel:
                 except Exception:
                     print(f"(preview unavailable) shape={getattr(self.df_tracks_filt,'shape',None)}")
 
-                # quick per-sample summary before/after
                 try:
                     group_cols = ['sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
-
                     def _count(df):
                         return (
                             df.groupby(group_cols, dropna=False)["TrackID"]
@@ -2716,14 +2766,12 @@ class OrganoidFilterPanel:
                               .sum()
                               .reset_index()
                         )
-
                     before_df = pd.read_csv(combined_csv)
                     after_df  = pd.read_csv(filtered_csv)
                     before_counts = _count(before_df).rename(columns={"nr_tracks": "tracks_before"})
                     after_counts  = _count(after_df).rename(columns={"nr_tracks": "tracks_after"})
                     summary = before_counts.merge(after_counts, on="sample_name", how="outer").fillna(0)
                     summary["removed"] = summary["tracks_before"] - summary["tracks_after"]
-
                     print("\n— Track counts by sample —")
                     _disp(summary)
                 except Exception as e:
@@ -2735,8 +2783,7 @@ class OrganoidFilterPanel:
             finally:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
-                
-                
+                            
 class OrganoidAnalysisPanel:
     """Dead-%-only panel. Persists to behav3d_parameters['analysis']['organoid'] and writes YAML on run."""
     def __init__(self, metadata_loader):
