@@ -49,7 +49,7 @@ def load_image_metadata(path):
     elif path.suffix==".h5":
         pass
     elif path.suffix==".ims":
-        pass
+        metadata = load_ims_metadata(path)
     elif path.suffix==".zarr" or str(path).endswith(".zarr.zip"):
         pass
     elif path.suffix==".tif" or path.suffix==".tiff":
@@ -146,14 +146,14 @@ def load_h5(path, substruct):
     img = h5file[substruct][:]
     return(img)
 
-def load_ims(path):
+def load_ims_as_numpy(path):
     """
     Loading .ims images
     """
     imsfile = h5py.File(name=path, mode="r")
 
     nr_timepoints = len([x for x in imsfile['/DataSet/ResolutionLevel 0/']])
-    nr_channels = len([x for x in imsfile['/DataSet/ResolutionLevel 0/Timepoint 0']])
+    nr_channels = len([x for x in imsfile['/DataSet/ResolutionLevel 0/TimePoint 0']])
 
     image_channels = []
     for channel in range(nr_channels):
@@ -163,13 +163,13 @@ def load_ims(path):
             for timepoint in range(nr_timepoints):
                 # Loads in single timepoint and single channel
                 # print("Loading TimePoint {}".format(timepoint))
-                time_img=imsfile[f'/DataSet/ResolutionLevel 0/Timepoint {timepoint}/Channel {channel}/Data'][:]
+                time_img=imsfile[f'/DataSet/ResolutionLevel 0/TimePoint {timepoint}/Channel {channel}/Data'][:]
                 image_timepoints.append(time_img)
                 
             #Stack all timepoints to create single channel image over all timepoints
             image_timepoints = np.stack(image_timepoints, axis=0)
         else:
-            image_timepoints = imsfile[f'/DataSet/ResolutionLevel 0/Timepoint 0/Channel {channel}/Data'][:]
+            image_timepoints = imsfile[f'/DataSet/ResolutionLevel 0/TimePoint 0/Channel {channel}/Data'][:]
             
         image_channels.append(image_timepoints)
     
@@ -177,6 +177,64 @@ def load_ims(path):
     img=np.stack(image_channels, axis=0)
     return(img)
 
+def load_ims(path, as_numpy=False):
+    f = h5py.File(path, "r")  # keep open while dask graph exists
+    g0 = f["/DataSet/ResolutionLevel 0"]
+
+    # Find all timepoints and channels
+    time_keys = sorted(
+        [k for k in g0.keys() if k.startswith("TimePoint ")],
+        key=lambda s: int(s.split()[-1])
+    )
+    chan_keys = sorted(
+        [k for k in g0["TimePoint 0"].keys() if k.startswith("Channel ")],
+        key=lambda s: int(s.split()[-1])
+    )
+
+    # Look at first dataset to get full ZYX shape
+    sample = g0[f"{time_keys[0]}/{chan_keys[0]}/Data"]
+    chunks_spatial = sample.shape  # (Z, Y, X)
+
+    t_blocks = []
+    for t in time_keys:
+        c_blocks = []
+        for c in chan_keys:
+            ds = g0[f"{t}/{c}/Data"]  # h5py.Dataset
+            a = da.from_array(
+                ds,
+                chunks=chunks_spatial,  # entire ZYX volume in one chunk
+                lock=True,
+                asarray=False,
+            )
+            a = a[None, None, ...]  # -> (1,1,Z,Y,X)
+            c_blocks.append(a)
+        ccat = da.concatenate(c_blocks, axis=1)  # (1,C,Z,Y,X)
+        t_blocks.append(ccat)
+
+    darr = da.concatenate(t_blocks, axis=0)      # (T,C,Z,Y,X)
+    darr = darr.rechunk((1,1) + chunks_spatial)  # enforce chunking
+    
+    if as_numpy:
+        darr = darr.compute()
+    return darr
+
+def load_ims_metadata(path):
+    with h5py.File("image.ims", "r") as f:
+        g0 = f["/DataSet/ResolutionLevel 0"]
+
+        time_keys = sorted([k for k in g0.keys() if k.startswith("TimePoint ")],
+                        key=lambda s: int(s.split()[-1]))
+        chan_keys = sorted([k for k in g0[time_keys[0]].keys() if k.startswith("Channel ")],
+                        key=lambda s: int(s.split()[-1]))
+
+        ds = g0[f"{time_keys[0]}/{chan_keys[0]}/Data"]
+        z, y, x = ds.shape
+
+        t = len(time_keys)
+        c = len(chan_keys)
+
+        return (t, c, z, y, x)
+    
 def append_to_zarr(img, outpath):
         """
         Append a timepoint to an existing .zarr array
