@@ -823,6 +823,62 @@ class PixelClassifierPanel:
             max=max(8, (os.cpu_count() or 8))
         )
 
+        # ---- Manual classifier toggle ----
+        self.manual_clf_paths = widgets.Checkbox(
+            description="Manually supply classifiers",
+            value=bool(pc.get("manual_clf_paths", False)),
+            indent=False
+        )
+
+        # -------- Classifier path pickers (default EMPTY) --------
+        self.clf_dir = PathPicker(
+            mode='dir',
+            description='Classifier dir:',
+            default="", 
+            description_width='160px',
+            width='100%',
+        )
+        self.clf_org_path = PathPicker(
+            mode='file',
+            description='Organoid clf:',
+            default="", 
+            filter_pattern='*.joblib',
+            description_width='160px',
+            width='100%',
+        )
+        self.clf_tcell_path = PathPicker(
+            mode='file',
+            description='T-cell clf:',
+            default="",   
+            filter_pattern='*.joblib',
+            description_width='160px',
+            width='100%',
+        )
+        self.clf_death_path = PathPicker(
+            mode='file',
+            description='Death clf:',
+            default="",         
+            filter_pattern='*.joblib',
+            description_width='160px',
+            width='100%',
+        )
+
+        # If user previously saved manual paths AND toggle is True, restore them now.
+        if self.manual_clf_paths.value:
+            self.clf_dir.value        = str(pc.get("clf_dir", "") or "")
+            self.clf_org_path.value   = str(pc.get("clf_org_path", "") or "")
+            self.clf_tcell_path.value = str(pc.get("clf_tcell_path", "") or "")
+            self.clf_death_path.value = str(pc.get("clf_death_path", "") or "")
+
+        # When directory changes, auto-fill file pickers (only when manual mode is enabled)
+        def _dir_changed(change):
+            if not self.manual_clf_paths.value:
+                return
+            newd = (change.get('new') or '').strip()
+            if newd:
+                self._apply_dir_to_clf_paths(newd)
+        self.clf_dir.text.observe(_dir_changed, names='value')
+
         # -------- Apply controls --------
         self.organoid_edt_threshold = widgets.FloatText(
             description="Organoid EDT thr",
@@ -840,7 +896,7 @@ class PixelClassifierPanel:
         self.use_all_timepoints.observe(self._toggle_timepoint_inputs, names='value')
         self._toggle_timepoint_inputs()
 
-        # -------- Buttons / spinner / close (like TrackingVisualizationPanel) --------
+        # -------- Buttons / spinner / close --------
         self.btn_train = widgets.Button(
             description="Train pixel classifier",
             button_style="primary",
@@ -851,19 +907,16 @@ class PixelClassifierPanel:
             button_style="danger",
             icon="stop",
             tooltip="Close the active Napari viewer",
-            layout=widgets.Layout(width="200px", display="none")  # hidden until a viewer is open
+            layout=widgets.Layout(width="200px", display="none")
         )
-        # Uses the same global spinner HTML you use elsewhere
         self.spinner_train = widgets.HTML(value=spinning_loader)
         self.spinner_train.layout.display = "none"
 
-        # Row: Train | Close viewer | spinner
         self.train_row = widgets.HBox(
             [self.btn_train, self.close_button, self.spinner_train],
             layout=widgets.Layout(align_items="center", gap="8px")
         )
 
-        # Apply button + spinner
         self.btn_apply = widgets.Button(
             description="Apply pixel classifier",
             button_style="success",
@@ -883,6 +936,18 @@ class PixelClassifierPanel:
 
         self.out = widgets.Output()
 
+        self.clf_paths_box = widgets.VBox([
+            widgets.HTML("<b>Classifier paths</b>"),
+            self.clf_dir,
+            self.clf_org_path,
+            self.clf_tcell_path,
+            self.clf_death_path,
+        ])
+        
+        # Show/hide according to the checkbox
+        self.manual_clf_paths.observe(self._toggle_clf_path_section, names='value')
+        self._toggle_clf_path_section()  # set initial visibility
+
         # Layout
         train_box = widgets.VBox([
             widgets.HTML("<b>Train pixel classifier</b>"),
@@ -895,6 +960,9 @@ class PixelClassifierPanel:
 
         apply_box = widgets.VBox([
             widgets.HTML("<b>Apply segmentation</b>"),
+            self.manual_clf_paths,               
+            self.clf_paths_box,   
+            widgets.HTML("<b>Segmentation setting</b>"),              
             self.organoid_edt_threshold,
             self.tp_row,
             self.apply_row,
@@ -917,6 +985,14 @@ class PixelClassifierPanel:
         pc["tp_start"] = int(self.tp_start.value)
         pc["tp_end"]   = int(self.tp_end.value)
 
+        pc["manual_clf_paths"] = bool(self.manual_clf_paths.value)
+        if self.manual_clf_paths.value:
+            pc["clf_dir"]        = str(self.clf_dir.value or "")
+            pc["clf_org_path"]   = str(self.clf_org_path.value or "")
+            pc["clf_tcell_path"] = str(self.clf_tcell_path.value or "")
+            pc["clf_death_path"] = str(self.clf_death_path.value or "")
+
+
         yaml.safe_dump(
             self.metadata_loader.behav3d_parameters,
             self.metadata_loader.behav3d_parameters_path.open("w"),
@@ -932,6 +1008,29 @@ class PixelClassifierPanel:
         self.tp_start.disabled = not show
         self.tp_end.disabled   = not show
 
+    # >>> helper: compute default file paths for a directory
+    def _default_clf_paths_for_dir(self, d: str):
+        if not d:
+            return ("", "", "")
+        p = Path(d).expanduser()
+        return (str(p / 'PixelClassifier_Organoid.joblib'),
+                str(p / 'PixelClassifier_TCell.joblib'),
+                str(p / 'PixelClassifier_Death.joblib'))
+
+    def _apply_dir_to_clf_paths(self, d: str):
+        org, tcell, death = self._default_clf_paths_for_dir(d)
+        self.clf_org_path.value = org
+        self.clf_tcell_path.value = tcell
+        self.clf_death_path.value = death
+
+    def _toggle_clf_path_section(self, change=None):
+        manual = bool(self.manual_clf_paths.value)
+        self.clf_paths_box.layout.display = (None if manual else 'none')
+        # When turning OFF manual mode, blank all four fields
+        if not manual:
+            for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, self.clf_death_path]:
+                p.value = ""
+
     def display(self):
         display(self.ui)
 
@@ -941,8 +1040,17 @@ class PixelClassifierPanel:
             self.btn_train, self.btn_apply,
             self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
             self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end,
+            self.manual_clf_paths,
         ]:
             w.disabled = state
+
+        # also lock/unlock the path pickers
+        try:
+            for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, self.clf_death_path]:
+                p.text.disabled = state
+                p.button.disabled = state
+        except Exception:
+            pass
 
     # ---------- callbacks ----------
     def _on_train_clicked(self, _):
@@ -963,12 +1071,9 @@ class PixelClassifierPanel:
                 self._lock(True)
                 self.spinner_train.layout.display = None
 
-                # Run training (synchronously). If it opens napari non-blocking and
-                # returns a viewer, store it so the Close button can close it.
                 try:
                     from behav3d.preprocessing.segmentation.napari_pixelclassifier import train_pixel_classifier
                 except Exception:
-                    # If your train function is imported elsewhere, rely on that name in globals
                     pass
 
                 ret = train_pixel_classifier(
@@ -979,22 +1084,18 @@ class PixelClassifierPanel:
                     n_workers=int(self.n_workers.value),
                 )
 
-                # Try to capture a viewer handle
                 self._viewer = None
                 try:
                     if ret is not None and hasattr(ret, "close"):
                         self._viewer = ret
                     else:
-                        # best-effort: some environments expose current viewer getter
                         get_curr = getattr(napari, "current_viewer", None)
                         if callable(get_curr):
                             self._viewer = get_curr()
                 except Exception:
                     pass
 
-                # UI finalize for train
                 self.spinner_train.layout.display = "none"
-                # Show Close button only if we have a viewer to close
                 self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
                 if self._viewer is None:
                     print("✅ Training finished.", flush=True)
@@ -1006,11 +1107,9 @@ class PixelClassifierPanel:
                 self.spinner_train.layout.display = "none"
                 self.close_button.layout.display = "none"
             finally:
-                # Re-enable inputs regardless; close button stays visible if viewer exists
                 self._lock(False)
 
     def _on_close_clicked(self, _):
-        """Close the active Napari viewer, like TrackingVisualizationPanel."""
         with self.out:
             try:
                 if self._viewer is not None:
@@ -1045,13 +1144,23 @@ class PixelClassifierPanel:
                 print(f"  organoid_edt_threshold={self.organoid_edt_threshold.value}")
                 print(f"  timepoint_range={tpr}", flush=True)
 
+                # Echo chosen classifier paths if manual mode is on
+                if self.manual_clf_paths.value:
+                    print(f"  clf_dir={self.clf_dir.value}")
+                    print(f"  clf_org_path={self.clf_org_path.value}")
+                    print(f"  clf_tcell_path={self.clf_tcell_path.value}")
+                    print(f"  clf_death_path={self.clf_death_path.value}")
+
                 self.spinner_apply.layout.display = None
 
                 new_md = run_pixel_classifier_segmentation(
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
                     organoid_edt_threshold=float(self.organoid_edt_threshold.value),
-                    timepoint_range=tpr
+                    timepoint_range=tpr,
+                    clf_org_path=self.clf_org_path.value,
+                    clf_tcell_path=self.clf_tcell_path.value,
+                    clf_death_path=self.clf_death_path.value,
                 )
 
                 try:
@@ -1067,6 +1176,271 @@ class PixelClassifierPanel:
             finally:
                 self.spinner_apply.layout.display = "none"
                 self._lock(False)
+                
+# class PixelClassifierPanel:
+#     def __init__(self, metadata_loader):
+#         self.metadata_loader = metadata_loader
+#         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+
+#         # -------- Train controls --------
+#         self.examples_per_sample = widgets.IntText(
+#             description="Examples per sample",
+#             value=int(pc.get("examples_per_sample", 3))
+#         )
+#         self.sample_specific_classifier = widgets.Checkbox(
+#             description="Sample-specific classifier",
+#             value=bool(pc.get("sample_specific_classifier", False))
+#         )
+#         self.n_workers = widgets.IntText(
+#             description="Workers",
+#             value=int(pc.get("workers", (os.cpu_count() or 8))),
+#             max=max(8, (os.cpu_count() or 8))
+#         )
+
+#         # -------- Apply controls --------
+#         self.organoid_edt_threshold = widgets.FloatText(
+#             description="Organoid EDT thr",
+#             value=float(pc.get("organoid_edt_threshold", 12.0)),
+#             style={'description_width': '160px'}
+#         )
+#         self.use_all_timepoints = widgets.Checkbox(
+#             description="Process ALL timepoints",
+#             value=bool(pc.get("use_all_timepoints", True))
+#         )
+#         self.tp_start = widgets.IntText(description="Start t", value=int(pc.get("tp_start", 0)))
+#         self.tp_end   = widgets.IntText(description="End t",   value=int(pc.get("tp_end", 0)))
+
+#         # Start/End visibility
+#         self.use_all_timepoints.observe(self._toggle_timepoint_inputs, names='value')
+#         self._toggle_timepoint_inputs()
+
+#         # -------- Buttons / spinner / close (like TrackingVisualizationPanel) --------
+#         self.btn_train = widgets.Button(
+#             description="Train pixel classifier",
+#             button_style="primary",
+#             layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+#         )
+#         self.close_button = widgets.Button(
+#             description="Close viewer",
+#             button_style="danger",
+#             icon="stop",
+#             tooltip="Close the active Napari viewer",
+#             layout=widgets.Layout(width="200px", display="none")  # hidden until a viewer is open
+#         )
+#         # Uses the same global spinner HTML you use elsewhere
+#         self.spinner_train = widgets.HTML(value=spinning_loader)
+#         self.spinner_train.layout.display = "none"
+
+#         # Row: Train | Close viewer | spinner
+#         self.train_row = widgets.HBox(
+#             [self.btn_train, self.close_button, self.spinner_train],
+#             layout=widgets.Layout(align_items="center", gap="8px")
+#         )
+
+#         # Apply button + spinner
+#         self.btn_apply = widgets.Button(
+#             description="Apply pixel classifier",
+#             button_style="success",
+#             layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+#         )
+#         self.spinner_apply = widgets.HTML(value=spinning_loader)
+#         self.spinner_apply.layout.display = "none"
+#         self.apply_row = widgets.HBox(
+#             [self.btn_apply, self.spinner_apply],
+#             layout=widgets.Layout(align_items="center", gap="8px")
+#         )
+
+#         # Wire handlers
+#         self.btn_train.on_click(self._on_train_clicked)
+#         self.close_button.on_click(self._on_close_clicked)
+#         self.btn_apply.on_click(self._on_apply_clicked)
+
+#         self.out = widgets.Output()
+
+#         # Layout
+#         train_box = widgets.VBox([
+#             widgets.HTML("<b>Train pixel classifier</b>"),
+#             widgets.HBox([self.examples_per_sample, self.n_workers]),
+#             self.sample_specific_classifier,
+#             self.train_row,
+#         ])
+
+#         self.tp_row = widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end])
+
+#         apply_box = widgets.VBox([
+#             widgets.HTML("<b>Apply segmentation</b>"),
+#             self.organoid_edt_threshold,
+#             self.tp_row,
+#             self.apply_row,
+#         ])
+
+#         self.ui = widgets.VBox([train_box, widgets.HTML("<hr>"), apply_box, widgets.HTML("<hr>"), self.out])
+
+#         # viewer handle (if training opens napari and returns a viewer)
+#         self._viewer = None
+
+#     # ---------- config ----------
+#     def _persist_params(self):
+#         self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+#         pc = self.metadata_loader.behav3d_parameters["pixel_classifier"]
+#         pc["examples_per_sample"] = int(self.examples_per_sample.value)
+#         pc["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
+#         pc["workers"] = int(self.n_workers.value)
+#         pc["organoid_edt_threshold"] = float(self.organoid_edt_threshold.value)
+#         pc["use_all_timepoints"] = bool(self.use_all_timepoints.value)
+#         pc["tp_start"] = int(self.tp_start.value)
+#         pc["tp_end"]   = int(self.tp_end.value)
+
+#         yaml.safe_dump(
+#             self.metadata_loader.behav3d_parameters,
+#             self.metadata_loader.behav3d_parameters_path.open("w"),
+#             sort_keys=False
+#         )
+
+#     # ---------- UI helpers ----------
+#     def _toggle_timepoint_inputs(self, change=None):
+#         show = not self.use_all_timepoints.value
+#         disp = None if show else 'none'
+#         self.tp_start.layout.display = disp
+#         self.tp_end.layout.display   = disp
+#         self.tp_start.disabled = not show
+#         self.tp_end.disabled   = not show
+
+#     def display(self):
+#         display(self.ui)
+
+#     def _lock(self, state: bool):
+#         # keep close_button enabled so user can close at any time
+#         for w in [
+#             self.btn_train, self.btn_apply,
+#             self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
+#             self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end,
+#         ]:
+#             w.disabled = state
+
+#     # ---------- callbacks ----------
+#     def _on_train_clicked(self, _):
+#         with self.out:
+#             self.out.clear_output()
+#             try:
+#                 self._persist_params()
+#                 odir = Path(self.metadata_loader.output_dir).expanduser()
+#                 odir.mkdir(parents=True, exist_ok=True)
+
+#                 print("▶️ Training pixel classifier…", flush=True)
+#                 print(f"  output_dir={odir}")
+#                 print(f"  examples_per_sample={self.examples_per_sample.value}")
+#                 print(f"  sample_specific_classifier={self.sample_specific_classifier.value}")
+#                 print(f"  n_workers={self.n_workers.value}")
+
+#                 # UI state
+#                 self._lock(True)
+#                 self.spinner_train.layout.display = None
+
+#                 # Run training (synchronously). If it opens napari non-blocking and
+#                 # returns a viewer, store it so the Close button can close it.
+#                 try:
+#                     from behav3d.preprocessing.segmentation.napari_pixelclassifier import train_pixel_classifier
+#                 except Exception:
+#                     # If your train function is imported elsewhere, rely on that name in globals
+#                     pass
+
+#                 ret = train_pixel_classifier(
+#                     output_dir=str(odir),
+#                     metadata=self.metadata_loader.metadata,
+#                     examples_per_sample=int(self.examples_per_sample.value),
+#                     sample_specific_classifier=bool(self.sample_specific_classifier.value),
+#                     n_workers=int(self.n_workers.value),
+#                 )
+
+#                 # Try to capture a viewer handle
+#                 self._viewer = None
+#                 try:
+#                     if ret is not None and hasattr(ret, "close"):
+#                         self._viewer = ret
+#                     else:
+#                         # best-effort: some environments expose current viewer getter
+#                         get_curr = getattr(napari, "current_viewer", None)
+#                         if callable(get_curr):
+#                             self._viewer = get_curr()
+#                 except Exception:
+#                     pass
+
+#                 # UI finalize for train
+#                 self.spinner_train.layout.display = "none"
+#                 # Show Close button only if we have a viewer to close
+#                 self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
+#                 if self._viewer is None:
+#                     print("✅ Training finished.", flush=True)
+#                 else:
+#                     print("✅ Training UI opened in Napari (use 'Close viewer' to close).", flush=True)
+
+#             except Exception:
+#                 import traceback; traceback.print_exc()
+#                 self.spinner_train.layout.display = "none"
+#                 self.close_button.layout.display = "none"
+#             finally:
+#                 # Re-enable inputs regardless; close button stays visible if viewer exists
+#                 self._lock(False)
+
+#     def _on_close_clicked(self, _):
+#         """Close the active Napari viewer, like TrackingVisualizationPanel."""
+#         with self.out:
+#             try:
+#                 if self._viewer is not None:
+#                     print("Closing viewer…")
+#                     try:
+#                         self._viewer.close()
+#                     except Exception as e:
+#                         print(f"Error closing viewer: {e}")
+#                     self._viewer = None
+#                 else:
+#                     print("No active viewer to close (viewer may have been opened in blocking mode).")
+#             finally:
+#                 self.close_button.layout.display = "none"
+
+#     def _on_apply_clicked(self, _):
+#         self._lock(True)
+#         with self.out:
+#             self.out.clear_output()
+#             self._persist_params()
+#             try:
+#                 odir = Path(self.metadata_loader.output_dir).expanduser()
+#                 odir.mkdir(parents=True, exist_ok=True)
+
+#                 tpr = _mk_timepoint_range(
+#                     use_all=bool(self.use_all_timepoints.value),
+#                     start=int(self.tp_start.value),
+#                     end=int(self.tp_end.value),
+#                 )
+
+#                 print("▶️ Applying pixel classifier segmentation…", flush=True)
+#                 print(f"  output_dir={odir}")
+#                 print(f"  organoid_edt_threshold={self.organoid_edt_threshold.value}")
+#                 print(f"  timepoint_range={tpr}", flush=True)
+
+#                 self.spinner_apply.layout.display = None
+
+#                 new_md = run_pixel_classifier_segmentation(
+#                     output_dir=str(odir),
+#                     metadata=self.metadata_loader.metadata,
+#                     organoid_edt_threshold=float(self.organoid_edt_threshold.value),
+#                     timepoint_range=tpr
+#                 )
+
+#                 try:
+#                     if new_md is not None:
+#                         self.metadata_loader.metadata = new_md
+#                         new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
+#                 except Exception:
+#                     import traceback; traceback.print_exc()
+
+#                 print("✅ Apply finished.", flush=True)
+#             except Exception:
+#                 import traceback; traceback.print_exc()
+#             finally:
+#                 self.spinner_apply.layout.display = "none"
+#                 self._lock(False)
 
 class TrackingPanel:
     """
@@ -2901,8 +3275,7 @@ class OrganoidAnalysisPanel:
             finally:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
-                
-                
+                              
 class BackprojectionPanel:
     def __init__(self, metadata_loader, cell_type="tcell"):
         self.metadata_loader = metadata_loader
