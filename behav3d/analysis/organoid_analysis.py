@@ -5,7 +5,8 @@ import pandas as pd
 import numpy as np
 
 from behav3d.utils import format_time
-from behav3d.utils.analysis import plot_filter_count, smooth_value_over_time
+from behav3d.utils.analysis import smooth_value_over_time
+from behav3d.utils.filtering import plot_filter_count, filter_by_full_duration, filter_minimal_track_length, trim_to_maximal_track_length
 from behav3d.utils.preprocessing import calc_z_projection
 from behav3d.utils.fileio import load_image
 
@@ -23,9 +24,10 @@ def run_organoid_analysis(
     config=None,
     output_dir=None,
     df_tracks_path=None,
+    org_type="organoid",
     # df_tracks_summarized_path=None,
     ):
-    print(f"--------------- Performing T-cell behavioral analysis ---------------")
+    print(f"--------------- Performing Organoid Death Dynamics analysis ---------------")
     start_time = time.time()
     assert config is not None or all(
         [output_dir]
@@ -35,7 +37,7 @@ def run_organoid_analysis(
         output_dir = config['output_dir']
         
     
-    analysis_outdir = Path(output_dir, "analysis", "organoid")
+    analysis_outdir = Path(output_dir, "analysis", org_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     results_outdir = Path(analysis_outdir, "results")
     sample_outdir = Path(results_outdir, "per_sample")
@@ -50,7 +52,7 @@ def run_organoid_analysis(
         results_outdir.mkdir(parents=True)    
         
     if df_tracks_path is None:
-        df_tracks_path = Path(feature_outdir, f"BEHAV3D_organoid_combined_track_features_filtered.csv")
+        df_tracks_path = Path(feature_outdir, f"BEHAV3D_{org_type}_combined_track_features_filtered.csv")
     # if df_tracks_summarized_path is None:
     #     df_tracks_summarized_path = Path(feature_outdir, f"BEHAV3D_organoid_combined_track_features_summarized.csv")
     
@@ -121,14 +123,14 @@ def run_organoid_analysis(
     df_general["percentage_dead"]=df_general["nr_dead"]  / df_general["nr_organoids_t0"]
     df_general["percentage_alive"]= 1.0 - df_general["percentage_dead"]
     
-    df_general_outpath = Path(results_outdir, f"combined_general_organoid_dynamics_analysis.csv")
+    df_general_outpath = Path(results_outdir, f"combined_general_{org_type}_dynamics_analysis.csv")
     df_general.to_csv(
         df_general_outpath,
         sep=",",
         index=False
     )
         
-    general_pdf_outpath = Path(results_outdir, f"combined_general_organoid_dynamics_analysis.pdf")
+    general_pdf_outpath = Path(results_outdir, f"combined_general_{org_type}_dynamics_analysis.pdf")
     
     plot_general_organoid_analysis(
             df_general=df_general,
@@ -145,7 +147,7 @@ def run_organoid_analysis(
         """
         Create a analysis pdf for each sample separately
         """
-        analysis_sample_outdir = Path(sample_outdir, sample_name, "organoid")
+        analysis_sample_outdir = Path(sample_outdir, sample_name, org_type)
         if not analysis_sample_outdir.exists():
             analysis_sample_outdir.mkdir(parents=True)
             
@@ -153,7 +155,7 @@ def run_organoid_analysis(
         
         img_outdir = Path(output_dir, "images", sample_name)
         
-        df_tracks_sample_outpath = Path(analysis_sample_outdir, f"{sample_name}_organoid_track_analysis.csv")
+        df_tracks_sample_outpath = Path(analysis_sample_outdir, f"{sample_name}_{org_type}_track_analysis.csv")
         df_tracks_sample.to_csv(
             df_tracks_sample_outpath,
             sep=",",
@@ -168,17 +170,17 @@ def run_organoid_analysis(
         df_experiment_sample["percentage_dead"]=df_experiment_sample["nr_dead"] / df_experiment_sample["nr_organoids_t0"]
         df_experiment_sample["percentage_alive"]= 1.0 - df_experiment_sample["percentage_dead"]
         
-        df_experiment_outpath = Path(analysis_sample_outdir, f"{sample_name}_organoid_general_analysis.csv")
+        df_experiment_outpath = Path(analysis_sample_outdir, f"{sample_name}_{org_type}_general_analysis.csv")
         df_experiment_sample.to_csv(
             df_experiment_outpath,
             sep=",",
             index=False
         )
         
-        sample_pdf_outpath = Path(analysis_sample_outdir, f"{sample_name}_organoid_analysis.pdf")
+        sample_pdf_outpath = Path(analysis_sample_outdir, f"{sample_name}_{org_type}_analysis.pdf")
     
         raw_img_path = Path(img_outdir, f"{sample_name}.zarr")
-        organoid_seg_path = Path(img_outdir, f"{sample_name}_organoid_tracked.zarr")
+        organoid_seg_path = Path(img_outdir, f"{sample_name}_{org_type}_tracked.zarr")
         dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
 
         ### Plot analysis results per sample
@@ -207,6 +209,7 @@ def filter_organoid_tracks(
     min_track_length=None,
     max_track_length=None,
     min_size=None,
+    time_type="frames",
     cell_type="organoid"
     ):
     """
@@ -253,8 +256,11 @@ def filter_organoid_tracks(
     df_all_tracks = pd.read_csv(df_all_tracks_path)
     
     group_cols = ['TrackID', 'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
-    df_all_tracks_filt = pd.merge(df_all_tracks, metadata, how="left", on="sample_name")
-
+    cols_present = [c for c in group_cols if c in metadata.columns]
+    metadata_info = metadata.loc[:, cols_present].copy()
+    
+    df_all_tracks_filt = pd.merge(df_all_tracks, metadata_info, how="left", on="sample_name")
+    
     # Function to count the number of unique tracks in the DataFrame
     def count_tracks(df_all_tracks, col_name="nr_tracks", df_track_counts=None):
         nr_tracks=df_all_tracks.groupby([
@@ -271,15 +277,39 @@ def filter_organoid_tracks(
     
     # Filtering the tracks based on the total experimental duration
     # Any timepoint after this will be filtered out 
-    if exp_duration is not None:
-        df_all_tracks_filt=df_all_tracks_filt.drop(df_all_tracks_filt[df_all_tracks_filt["position_t"]>exp_duration].index)
+    if time_type=="real_time":
+        time_column="time"
+    else:
+        time_column="position_t"
+        exp_duration = exp_duration-1
+        min_track_length = min_track_length-1
+        max_track_length = max_track_length-1
+        
+    # Filtering the tracks based on the total experimental duration
+    # Any timepoint after this will be filtered out 
+    df_all_tracks_filt=filter_by_full_duration(
+        df=df_all_tracks_filt,
+        time_column=time_column,
+        exp_duration=exp_duration
+        )
+    
     df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_exp_duration", df_track_counts=df_track_counts)
 
     # Filtering out tracks under specific track length and cutting them down to specified max track length
-    if min_track_length is not None:
-        df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).filter(lambda group: len(group) >= min_track_length).reset_index(drop=True)
-    if max_track_length is not None:
-        df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).apply(lambda group: group.iloc[:max_track_length]).reset_index(drop=True)
+    df_all_tracks_filt = filter_minimal_track_length(
+        df=df_all_tracks_filt,
+        min_track_length=min_track_length,
+        time_column=time_column,
+        group_cols=group_cols
+    )
+    
+    df_all_tracks_filt = trim_to_maximal_track_length(
+        df=df_all_tracks_filt,
+        max_track_length=max_track_length,
+        time_column=time_column,
+        group_cols=group_cols
+    )
+    
     df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_min_track_length", df_track_counts=df_track_counts)
 
     if min_size is not None:

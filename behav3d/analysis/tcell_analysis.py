@@ -43,8 +43,7 @@ from sklearn.decomposition import PCA
 
 from pathlib import Path
 from behav3d.utils import format_time, expand_column_patterns
-from behav3d.utils.analysis import plot_filter_count
-
+from behav3d.utils.filtering import plot_filter_count, filter_by_full_duration, filter_minimal_track_length, trim_to_maximal_track_length
 import yaml
 import time
 import seaborn as sns
@@ -156,6 +155,7 @@ def filter_tcell_tracks(
     max_track_length=None,
     filter_t0_dead=True,
     cell_type="tcell",
+    time_type="frames", #can also be "relative_time"
     plot_results=True
     ):
     """
@@ -180,7 +180,7 @@ def filter_tcell_tracks(
     start_time = time.time()
     
     print(f"--------------- Filtering tracks ---------------")
-    
+    print(f"Basing filtering on {time_type}")
     # if not all([output_dir, exp_duration, min_track_length, max_track_length]):
     #     output_dir = config['output_dir']
     #     exp_duration = config[f'{cell_type}_exp_duration']
@@ -205,7 +205,9 @@ def filter_tcell_tracks(
     metadata['sample_name'] = metadata['sample_name'].astype(str)
 
     group_cols = ['TrackID', 'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
-    df_all_tracks_filt = pd.merge(df_all_tracks, metadata, how="left", on="sample_name")
+    cols_present = [c for c in group_cols if c in metadata.columns]
+    metadata_info = metadata.loc[:, cols_present].copy()
+    df_all_tracks_filt = pd.merge(df_all_tracks, metadata_info, how="left", on="sample_name")
 
     # Function to count the number of unique tracks in the DataFrame
     def count_tracks(df_all_tracks, col_name="nr_tracks", df_track_counts=None):
@@ -223,17 +225,50 @@ def filter_tcell_tracks(
     
     # Filtering the tracks based on the total experimental duration
     # Any timepoint after this will be filtered out 
-    if exp_duration is not None:
-       df_all_tracks_filt=df_all_tracks_filt.drop(df_all_tracks_filt[df_all_tracks_filt["position_t"]>exp_duration].index)
-    df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_exp_duration", df_track_counts=df_track_counts)
+    if time_type=="real_time":
+        time_column="time"
+    else:
+        time_column="position_t"
+        exp_duration = exp_duration-1
+        min_track_length = min_track_length-1
+        max_track_length = max_track_length-1
+    
+    df_all_tracks_filt = df_all_tracks_filt.sort_values(group_cols + [time_column]).reset_index(drop=True)
 
-    # Filtering out tracks under specific track length and cutting them down to specified max track length
-    if min_track_length is not None:
-        df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).filter(lambda group: len(group) >= min_track_length).reset_index(drop=True)
-    if max_track_length is not None:
-        df_all_tracks_filt=df_all_tracks_filt.groupby(group_cols).apply(lambda group: group.iloc[:max_track_length]).reset_index(drop=True)
-    df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_min_track_length", df_track_counts=df_track_counts)
+    df_all_tracks_filt=filter_by_full_duration(
+        df=df_all_tracks_filt,
+        time_column=time_column,
+        exp_duration=exp_duration
+        )
+    
+    df_track_counts=count_tracks(
+        df_all_tracks_filt, 
+        col_name="nr_tracks_exp_duration", 
+        df_track_counts=df_track_counts
+        )
+    
+    # Filtering out tracks under specific track length
+    df_all_tracks_filt = filter_minimal_track_length(
+        df=df_all_tracks_filt,
+        min_track_length=min_track_length,
+        time_column=time_column,
+        group_cols=group_cols
+    )
 
+    # Cutting down tracks to maximal track length    
+    df_all_tracks_filt = trim_to_maximal_track_length(
+        df=df_all_tracks_filt,
+        max_track_length=max_track_length,
+        time_column=time_column,
+        group_cols=group_cols
+    )
+    
+    df_track_counts = count_tracks(
+            df_all_tracks_filt, 
+            col_name="nr_tracks_min_track_length", 
+            df_track_counts=df_track_counts
+        )
+    
     # Plot the number of cells having contact with another T cell and Organoid for analysis
     # of the set contact_threshold
     if "tcell_contact" in df_all_tracks_filt.columns:
@@ -305,6 +340,13 @@ def filter_tcell_tracks(
     # Write the filtered tracks to a .csv
     filt_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
     print(f"- Writing filtered tracks to {filt_tracks_out_path}")
+    df_all_tracks_filt = df_all_tracks_filt.sort_values(
+        by=["sample_name", "TrackID", "position_t"], 
+        ascending=[True, True, True]  # example: last column sorted descending
+    )    
+    new_order = ["sample_name"] + [c for c in df_all_tracks_filt.columns.tolist() if c != "sample_name"]
+    df_all_tracks_filt = df_all_tracks_filt[new_order]
+    
     df_all_tracks_filt.to_csv(filt_tracks_out_path, sep=",", index=False)
     end_time = time.time()
     h,m,s = format_time(start_time, end_time)
@@ -430,9 +472,6 @@ def rolling_classification(
 
         plt.tight_layout()
         plt.show()
-    
-    
-    
     
     n_components=2
     n_neighbors=15

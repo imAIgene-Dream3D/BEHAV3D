@@ -10,7 +10,7 @@ import builtins
 from pathlib import Path
 from traitlets import Any, Unicode, Bool
 import os
-from behav3d.utils.fileio import load_image, get_image_shape, get_image_dimension_order
+from behav3d .utils.fileio import load_image, get_image_shape, get_image_dimension_order
 import asyncio
 import pandas as pd
 from behav3d.preprocessing.unmixing import visualize_unmix
@@ -148,6 +148,23 @@ _DEFAULT_CONFIG = {
                 "adaptive_stop": 10.0,
                 "adaptive_step": 0.95
             }
+        },
+        "organoid_2": {
+            "method": "propagation",
+            "overwrite": False,
+            "lap": {
+                "track_cost_px": 60,
+                "gap_close_cost_px": 80,
+                "gap_close_max_frames": 3,
+                "merging_cost_px": 0,
+                "splitting_cost_px": 0
+            },
+            "trackpy": {
+                "search_range_px": 35,
+                "memory_frames": 2,
+                "adaptive_stop": 10.0,
+                "adaptive_step": 0.95
+            }
         }
     },
     "tracking_visualization": {
@@ -161,12 +178,21 @@ _DEFAULT_CONFIG = {
         "tcell": {
             "dead_mask_percentage_threshold": 0.25,
             "features_choice": ["movement", "intensity", "contact", "death"],
+            "contact_threshold": 0,
             "n_workers": 16,
             "overwrite": False
         },
         "organoid": {
             "dead_mask_percentage_threshold": 0.02,
             "features_choice": ["intensity", "death", "morphology"],
+            "contact_threshold": 0,
+            "n_workers": 8,
+            "overwrite": False
+        },
+        "organoid_2": {
+            "dead_mask_percentage_threshold": 0.02,
+            "features_choice": ["intensity", "death", "morphology"],
+            "contact_threshold": 0,
             "n_workers": 8,
             "overwrite": False
         }
@@ -175,14 +201,24 @@ _DEFAULT_CONFIG = {
         "tcell": {
             "exp_duration": 24.0,
             "exp_duration_enabled": False,
-            "min_track_length": 100,
+            "min_track_length": 0, # frames
             "min_track_length_enabled": True,
-            "max_track_length": 100,
+            "max_track_length": 999999, # frames
             "max_track_length_enabled": True,
             "filter_t0_dead": True,
             "filter_t0_dead_enabled": False
         },
         "organoid": {
+            "exp_duration_enabled": False,
+            "exp_duration": 999999,      # timepoints
+            "min_track_length_enabled": False,
+            "min_track_length": 100,       # frames
+            "max_track_length_enabled": False,
+            "max_track_length": 100,  # frames
+            "min_size_enabled": True,
+            "min_size": 1000,
+        },
+        "organoid_2": {
             "exp_duration_enabled": False,
             "exp_duration": 999999,      # timepoints
             "min_track_length_enabled": False,
@@ -223,6 +259,9 @@ _DEFAULT_CONFIG = {
             },             # {feature_name: bool}
         },
         "organoid": {
+            "dead_perc_threshold": 0.02
+        },
+        "organoid_2": {
             "dead_perc_threshold": 0.02
         }
     },
@@ -1070,7 +1109,7 @@ class SignalUnmixingPanel:
             layout=widgets.Layout(align_items="center", gap="8px")
         )
 
-        # Wire handlers COMMENT FOR NOW
+        # Wire handlers
         self.btn_unmix.on_click(self._on_btn_unmix_clicked)
         self.open_button.on_click(self._on_open_clicked)
         self.close_button.on_click(self._on_close_clicked)
@@ -1378,6 +1417,73 @@ class PixelClassifierPanel:
             max=max(8, (os.cpu_count() or 8))
         )
 
+        # ---- Manual classifier toggle ----
+        self.manual_clf_paths = widgets.Checkbox(
+            description="Manually supply classifiers",
+            value=bool(pc.get("manual_clf_paths", False)),
+            indent=False
+        )
+
+        # -------- Classifier path pickers (default EMPTY) --------
+        self.clf_dir = PathPicker(
+            mode='dir',
+            description='Classifier dir:',
+            default="", 
+            description_width='160px',
+            width='100%',
+        )
+        self.clf_org_path = PathPicker(
+            mode='file',
+            description='Organoid clf:',
+            default="", 
+            filter_pattern='*.joblib',
+            description_width='160px',
+            width='100%',
+        )
+        self.clf_org2_path = PathPicker(
+            mode='file',
+            description='Organoid 2 clf:',
+            default="", 
+            filter_pattern='*.joblib',
+            description_width='160px',
+            width='100%',
+        )
+        self.clf_tcell_path = PathPicker(
+            mode='file',
+            description='T-cell clf:',
+            default="",   
+            filter_pattern='*.joblib',
+            description_width='160px',
+            width='100%',
+        )
+        self.clf_death_path = PathPicker(
+            mode='file',
+            description='Death clf:',
+            default="",         
+            filter_pattern='*.joblib',
+            description_width='160px',
+            width='100%',
+        )
+
+        # If user previously saved manual paths AND toggle is True, restore them now.
+        if self.manual_clf_paths.value:
+            self.clf_dir.value        = str(pc.get("clf_dir", "") or "")
+            self.clf_org_path.value   = str(pc.get("clf_org_path", "") or "")
+            self.clf_tcell_path.value = str(pc.get("clf_tcell_path", "") or "")
+            self.clf_death_path.value = str(pc.get("clf_death_path", "") or "")
+            if self.two_org_types.value:
+                self.clf_org2_path.value   = str(pc.get("clf_org2_path", "") or "")
+
+
+        # When directory changes, auto-fill file pickers (only when manual mode is enabled)
+        def _dir_changed(change):
+            if not self.manual_clf_paths.value:
+                return
+            newd = (change.get('new') or '').strip()
+            if newd:
+                self._apply_dir_to_clf_paths(newd)
+        self.clf_dir.text.observe(_dir_changed, names='value')
+
         # -------- Apply controls --------
         self.organoid_edt_threshold = widgets.FloatText(
             description="Organoid EDT thr",
@@ -1438,6 +1544,27 @@ class PixelClassifierPanel:
 
         self.out = widgets.Output()
 
+        clf_path_widgets = [
+            widgets.HTML("<b>Classifier paths</b>"),
+            self.clf_dir,
+            self.clf_org_path,
+            self.clf_tcell_path,
+            self.clf_death_path,
+        ]
+
+        # Conditionally add the second organization path
+        if self.two_org_types.value:
+            clf_path_widgets.append(self.clf_org2_path)
+
+        self.clf_paths_box = widgets.VBox(clf_path_widgets)
+        
+        # Show/hide according to the checkbox
+        self.manual_clf_paths.observe(self._toggle_clf_path_section, names='value')
+        self._toggle_clf_path_section()  # set initial visibility
+
+        self.two_org_types.observe(self._on_two_org_types_change, names='value')
+        self._build_clf_paths_box()
+
         # Layout
         train_box = widgets.VBox([
             widgets.HTML("<b>Train pixel classifier</b>"),
@@ -1451,6 +1578,9 @@ class PixelClassifierPanel:
 
         apply_box = widgets.VBox([
             widgets.HTML("<b>Apply segmentation</b>"),
+            self.manual_clf_paths,               
+            self.clf_paths_box,   
+            widgets.HTML("<b>Segmentation setting</b>"),  
             self.organoid_edt_threshold,
             self.tp_row,
             self.apply_row,
@@ -1474,6 +1604,16 @@ class PixelClassifierPanel:
         pc["tp_end"]   = int(self.tp_end.value)
         pc["two_org_types"] = bool(self.two_org_types.value)
 
+        pc["manual_clf_paths"] = bool(self.manual_clf_paths.value)
+        if self.manual_clf_paths.value:
+            pc["clf_dir"]        = str(self.clf_dir.value or "")
+            pc["clf_org_path"]   = str(self.clf_org_path.value or "")
+            pc["clf_tcell_path"] = str(self.clf_tcell_path.value or "")
+            pc["clf_death_path"] = str(self.clf_death_path.value or "")
+            if self.two_org_types.value:
+                pc["clf_org2_path"]   = str(self.clf_org2_path.value or "")
+
+
         yaml.safe_dump(
             self.metadata_loader.behav3d_parameters,
             self.metadata_loader.behav3d_parameters_path.open("w"),
@@ -1489,6 +1629,70 @@ class PixelClassifierPanel:
         self.tp_start.disabled = not show
         self.tp_end.disabled   = not show
 
+    # >>> helper: compute default file paths for a directory
+    def _default_clf_paths_for_dir(self, d: str):
+        if not d:
+            if self.two_org_types.value:
+                return ("", "", "", "")
+            else:
+                return ("", "", "")
+            
+        p = Path(d).expanduser()
+        org_path = str(p / 'PixelClassifier_Organoid.joblib')
+        tcell_path = str(p / 'PixelClassifier_TCell.joblib')
+        death_path = str(p / 'PixelClassifier_Death.joblib')
+
+        if self.two_org_types.value:
+            org2_path = str(p / 'PixelClassifier_Organoid2.joblib')
+            return (org_path, tcell_path, death_path, org2_path)
+        else:
+            return (org_path, tcell_path, death_path)
+
+    def _apply_dir_to_clf_paths(self, d: str):
+        paths = self._default_clf_paths_for_dir(d)
+
+        self.clf_org_path.value = paths[0]
+        self.clf_tcell_path.value = paths[1]
+        self.clf_death_path.value = paths[2]
+
+        if self.two_org_types.value and len(paths) > 3:
+            self.clf_org2_path.value = paths[3]
+
+    def _toggle_clf_path_section(self, change=None):
+        manual = bool(self.manual_clf_paths.value)
+        self.clf_paths_box.layout.display = (None if manual else 'none')
+        # When turning OFF manual mode, blank all four fields
+        if not manual:
+            for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, self.clf_death_path]:
+                p.value = ""
+            if self.two_org_types.value:
+                self.clf_org2_path.value = ""
+
+    def _on_two_org_types_change(self, change):
+        self.clf_paths_box()
+
+    def _build_clf_paths_box(self):
+        # Base children widgets
+        children = [
+            widgets.HTML("<b>Classifier paths</b>"),
+            self.clf_dir,
+            self.clf_org_path,
+        ]
+
+        # Conditionally include clf_org2_path if two_org_types is checked
+        if self.two_org_types.value:
+            children.append(self.clf_org2_path)
+
+        # Add the remaining classifier paths
+        children.extend([
+            self.clf_tcell_path,
+            self.clf_death_path,
+        ])
+
+        self.clf_paths_box.children = children
+
+
+
     def display(self):
         display(self.ui)
 
@@ -1497,9 +1701,17 @@ class PixelClassifierPanel:
         for w in [
             self.btn_train, self.btn_apply,
             self.examples_per_sample, self.sample_specific_classifier, self.n_workers, self.two_org_types,
-            self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end,
+            self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end, self.manual_clf_pahts,
         ]:
             w.disabled = state
+
+        # also lock/unlock the path pickers
+        try:
+            for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, self.clf_death_path, self.clf_org2_path]:
+                p.text.disabled = state
+                p.button.disabled = state
+        except Exception:
+            pass
 
     # ---------- callbacks ----------
     def _on_train_clicked(self, _):
@@ -1603,6 +1815,14 @@ class PixelClassifierPanel:
                 print(f"  output_dir={odir}")
                 print(f"  organoid_edt_threshold={self.organoid_edt_threshold.value}")
                 print(f"  timepoint_range={tpr}", flush=True)
+                # Echo chosen classifier paths if manual mode is on
+                if self.manual_clf_paths.value:
+                    print(f"  clf_dir={self.clf_dir.value}")
+                    print(f"  clf_org_path={self.clf_org_path.value}")
+                    if self.two_org_types.value:
+                        print(f"  clf_org2_path={self.clf_org2_path.value}")
+                    print(f"  clf_tcell_path={self.clf_tcell_path.value}")
+                    print(f"  clf_death_path={self.clf_death_path.value}")
 
                 self.spinner_apply.layout.display = None
 
@@ -1612,6 +1832,11 @@ class PixelClassifierPanel:
                     organoid_edt_threshold=float(self.organoid_edt_threshold.value),
                     timepoint_range=tpr,
                     two_org_types=bool(self.two_org_types.value),
+                    clf_org_path=self.clf_org_path.value,
+                    clf_tcell_path=self.clf_tcell_path.value,
+                    clf_death_path=self.clf_death_path.value,
+                    clf_org2_path=self.clf_org2_path.value if self.two_org_types.value else None,
+
                 )
 
                 try:
@@ -2156,8 +2381,37 @@ class FeatureExtractionPanel:
             f: widgets.Checkbox(description=f.capitalize(), value=(f in default_feats), indent=False)
             for f in self._all_features
         }
+
+        contact_thr_default = float(fcfg.get("contact_threshold", 0.0))
+        self.contact_threshold = widgets.FloatText(
+            description="Contact Threshold (µm)",
+            value=contact_thr_default,
+            layout=widgets.Layout(width="240px"),
+            style={'description_width': '180px'}
+        )
+
+        # Build "Features" box; put contact_threshold to the right of the Contact checkbox
+        contact_row = widgets.HBox([
+            self.feature_checks["contact"],
+            self.contact_threshold
+        ], layout=widgets.Layout(align_items="center", gap="12px"))
+
+        def _toggle_contact_threshold(change=None):
+            show = bool(self.feature_checks["contact"].value)
+            self.contact_threshold.layout.display = None if show else "none"
+
+        _toggle_contact_threshold()  # set initial visibility
+        self.feature_checks["contact"].observe(_toggle_contact_threshold, names="value")
+
+        feat_rows = []
+        for f in self._all_features:
+            if f == "contact":
+                feat_rows.append(contact_row)
+            else:
+                feat_rows.append(self.feature_checks[f])
+                
         self.features_box = widgets.VBox(
-            [widgets.HTML("<b>Features</b>")] + [self.feature_checks[f] for f in self._all_features]
+            [widgets.HTML("<b>Features</b>")] + feat_rows
         )
 
         self.n_workers = widgets.IntText(
@@ -2217,6 +2471,8 @@ class FeatureExtractionPanel:
         prof["features_choice"] = self._selected_features()
         prof["n_workers"] = int(self.n_workers.value)
         prof["overwrite"] = bool(self.overwrite.value)   # <- save overwrite
+        prof["contact_threshold"] = float(self.contact_threshold.value)
+
 
         params.setdefault("paths", {})
         if getattr(self.metadata_loader, "metadata_csv_path", None):
@@ -2272,7 +2528,7 @@ class FeatureExtractionPanel:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
 
-class TrackFilterPanel:
+class TcellFilterPanel:
     def __init__(self, metadata_loader, cell_type="tcell"):
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
@@ -2294,20 +2550,23 @@ class TrackFilterPanel:
         self.en_exp_duration = widgets.Checkbox(
             description="Trim down full time series to supplied duration",
             value=bool(cfg.get("exp_duration_enabled", False)),
-            indent=False
+            indent=False,
+            style={'description_width': '240px'}
         )
-        # REPLACED FloatSlider -> FloatText
-        self.exp_duration = widgets.FloatText(
-            description="Exp. duration (h)",
-            value=float(cfg.get("exp_duration", 24.0)),
+        self.exp_duration = widgets.IntText(
+            description="Max timepoints",
+            value=int(cfg.get("exp_duration", 999999)),
             style={'description_width': '160px'},
             continuous_update=False
         )
+
         self.row_exp = widgets.HBox([self.exp_duration], layout=widgets.Layout(display="none"))
         self.en_exp_duration.observe(
             lambda c: self.row_exp.layout.__setattr__("display", None if self.en_exp_duration.value else "none"),
             names="value"
         )
+        self.en_exp_duration.observe(lambda c: _update_unit_toggle_visibility(), names="value")
+
         if self.en_exp_duration.value:
             self.row_exp.layout.display = None
 
@@ -2319,8 +2578,8 @@ class TrackFilterPanel:
         )
         # REPLACED IntSlider -> IntText
         self.min_track_length = widgets.IntText(
-            description="Minimal length",
-            value=int(cfg.get("min_track_length", 3)),
+            description="Minimal length (frames)",
+            value=int(cfg.get("min_track_length", 0)),
             style={'description_width': '160px'},
             continuous_update=False
         )
@@ -2329,6 +2588,8 @@ class TrackFilterPanel:
             lambda c: self.row_min.layout.__setattr__("display", None if self.en_min_len.value else "none"),
             names="value"
         )
+        self.en_min_len.observe(lambda c: _update_unit_toggle_visibility(), names="value")
+
         if self.en_min_len.value:
             self.row_min.layout.display = None
 
@@ -2340,7 +2601,7 @@ class TrackFilterPanel:
         )
         # REPLACED IntSlider -> IntText
         self.max_track_length = widgets.IntText(
-            description="Maximal length",
+            description="Maximal length (frames)",
             value=int(cfg.get("max_track_length", 999999)),
             style={'description_width': '160px'},
             continuous_update=False
@@ -2350,6 +2611,8 @@ class TrackFilterPanel:
             lambda c: self.row_max.layout.__setattr__("display", None if self.en_max_len.value else "none"),
             names="value"
         )
+        self.en_max_len.observe(lambda c: _update_unit_toggle_visibility(), names="value")
+
         if self.en_max_len.value:
             self.row_max.layout.display = None
 
@@ -2372,6 +2635,43 @@ class TrackFilterPanel:
         )
         self.spinner_html.layout.display = "none"  # hidden until run starts
 
+                # ----- time unit toggle (Frames / Hours) -----
+        _TIME_TYPE_OPTIONS = [("frames", "Frames"), ("hours", "real_time")]
+        default_time_type = str(cfg.get("time_type", "Frames"))
+        default_label = next((lbl for (lbl, val) in _TIME_TYPE_OPTIONS if val == default_time_type), "frames")
+
+        self.time_type_toggle = widgets.ToggleButtons(
+            options=_TIME_TYPE_OPTIONS,  # [('frames','Frames'), ('hours','real_time')]
+            value=next(val for (lbl, val) in _TIME_TYPE_OPTIONS if lbl == default_label),
+            description="Unit to use for time-based filters:",
+            button_style="info",
+            layout=widgets.Layout(width="auto")
+        )
+
+        # Update field labels to match units
+        def _refresh_labels(time_type_value: str):
+            if time_type_value == "real_time":
+                self.exp_duration.description = "Max duration (hours)"
+                self.min_track_length.description = "Minimal length (hours)"
+                self.max_track_length.description = "Maximal length (hours)"
+            else:
+                self.exp_duration.description = "Max timepoints (frames)"
+                self.min_track_length.description = "Minimal length (frames)"
+                self.max_track_length.description = "Maximal length (frames)"
+
+        _refresh_labels(self.time_type_toggle.value)
+        self.time_type_toggle.observe(lambda c: _refresh_labels(self.time_type_toggle.value), names="value")
+
+        # Wrap the toggle in a row that we can show/hide
+        self.row_unit = widgets.HBox([self.time_type_toggle], layout=widgets.Layout(display="none"))
+
+        # Show the row only if any filter is enabled
+        def _update_unit_toggle_visibility():
+            visible = self.en_exp_duration.value or self.en_min_len.value or self.en_max_len.value
+            self.row_unit.layout.display = None if visible else "none"
+
+        # Call once now, and whenever any enabling checkbox changes
+        _update_unit_toggle_visibility()
         
         self.run_row = widgets.HBox(
             [self.btn_run, self.spinner_html],
@@ -2387,6 +2687,7 @@ class TrackFilterPanel:
             self.en_min_len, self.row_min,
             self.en_max_len, self.row_max,
             self.filter_t0_dead,
+            self.row_unit,
             self.run_row,
             widgets.HTML("<hr>"),
             self.out
@@ -2403,8 +2704,9 @@ class TrackFilterPanel:
         exp_duration = float(self.exp_duration.value) if self.en_exp_duration.value else 999999.0
         min_len      = int(self.min_track_length.value) if self.en_min_len.value else 0
         max_len      = int(self.max_track_length.value) if self.en_max_len.value else 999999
-        filt_dead    = bool(self.filter_t0_dead.value)  # single checkbox is the value
-        return exp_duration, min_len, max_len, filt_dead
+        filt_dead    = bool(self.filter_t0_dead.value)
+        time_type    = str(self.time_type_toggle.value)  # "frames" or "real_time"
+        return exp_duration, min_len, max_len, filt_dead, time_type
 
     def _persist_params(self):
         params = self.metadata_loader.behav3d_parameters
@@ -2422,6 +2724,7 @@ class TrackFilterPanel:
 
         # Persist checkbox directly
         prof["filter_t0_dead"] = bool(self.filter_t0_dead.value)
+        prof["time_type"] = str(self.time_type_toggle.value)
 
         with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(params, f, sort_keys=False)
@@ -2445,10 +2748,10 @@ class TrackFilterPanel:
                 out_dir = Path(self.metadata_loader.output_dir).expanduser()
                 out_dir.mkdir(parents=True, exist_ok=True)
 
-                exp_duration, min_len, max_len, filt_t0 = self._effective_values()
+                exp_duration, min_len, max_len, filt_t0, time_type = self._effective_values()
                 print("▶️ Filtering tracks…")
-                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, filter_t0_dead={filt_t0}")
-
+                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, "
+                      f"filter_t0_dead={filt_t0}, unit={'frames' if time_type=='Frames' else 'hours'}")
                 self._persist_params()
                 
                 self.df_tracks_filt = filter_tcell_tracks(
@@ -2458,7 +2761,8 @@ class TrackFilterPanel:
                     min_track_length=min_len,
                     max_track_length=max_len,
                     filter_t0_dead=filt_t0,
-                    cell_type=self.cell_type
+                    cell_type=self.cell_type,
+                    time_type=time_type,
                 )
                 print("✅ Filtering done. Summarizing…")
 
@@ -3035,9 +3339,10 @@ class OrganoidFilterPanel:
 
         # ---- exp_duration ----
         self.en_exp_duration = widgets.Checkbox(
-            description="Trim down full time series to supplied duration (timepoints)",
+            description="Trim down full time series to supplied duration",
             value=bool(cfg.get("exp_duration_enabled", False)),
-            indent=False
+            indent=False,
+            style={'description_width': '240px'}
         )
         self.exp_duration = widgets.IntText(
             description="Max timepoints",
@@ -3093,7 +3398,36 @@ class OrganoidFilterPanel:
         if self.en_max_len.value:
             self.row_max.layout.display = None
 
-        # ---- min_size ----
+        # ---- Frames / Hours toggle (shown only if any filter is enabled) ----
+        _TIME_TYPE_OPTIONS = [("frames", "Frames"), ("hours", "real_time")]
+        default_time_type = str(cfg.get("time_type", "Frames"))
+        self.time_type_toggle = widgets.ToggleButtons(
+            options=_TIME_TYPE_OPTIONS,
+            value=default_time_type if default_time_type in ("Frames", "real_time") else "Frames",
+            description="Unit",
+            button_style="info",
+            layout=widgets.Layout(width="auto")
+        )
+        def _refresh_labels(val: str):
+            if val == "real_time":
+                self.exp_duration.description = "Max duration (hours)"
+                self.min_track_length.description = "Minimal length (hours)"
+                self.max_track_length.description = "Maximal length (hours)"
+            else:
+                self.exp_duration.description = "Max timepoints (frames)"
+                self.min_track_length.description = "Minimal length (frames)"
+                self.max_track_length.description = "Maximal length (frames)"
+        _refresh_labels(self.time_type_toggle.value)
+        self.time_type_toggle.observe(lambda c: _refresh_labels(self.time_type_toggle.value), names="value")
+
+        self.row_unit = widgets.HBox([self.time_type_toggle], layout=widgets.Layout(display="none"))
+        def _update_unit_toggle_visibility(_=None):
+            show = self.en_exp_duration.value or self.en_min_len.value or self.en_max_len.value
+            self.row_unit.layout.display = None if show else "none"
+        for cb in (self.en_exp_duration, self.en_min_len, self.en_max_len):
+            cb.observe(_update_unit_toggle_visibility, names="value")
+        _update_unit_toggle_visibility()
+        
         self.en_min_size = widgets.Checkbox(
             description="Filter by minimal size at t=1",
             value=bool(cfg.get("min_size_enabled", True)),
@@ -3115,8 +3449,7 @@ class OrganoidFilterPanel:
 
         # ---- run row ----
         self.btn_run = widgets.Button(description=f"Filter {cell_type} tracks & summarize", button_style="success", layout=widgets.Layout(
-        width="fit-content",   # size to content
-        flex="0 0 auto"        # don't stretch in HBox/VBox
+            width="fit-content", flex="0 0 auto"
     ))
         self.btn_run.on_click(self._on_run_clicked)
         self.spinner_html = widgets.HTML(value=spinning_loader)
@@ -3136,6 +3469,7 @@ class OrganoidFilterPanel:
             self.en_min_len, self.row_min,
             self.en_max_len, self.row_max,
             self.en_min_size, self.row_min_size,
+            self.row_unit,
             self.run_row,
             widgets.HTML("<hr>"),
             self.out
@@ -3150,11 +3484,12 @@ class OrganoidFilterPanel:
 
     # ---------- internals ----------
     def _effective_values(self):
-        exp_duration = int(self.exp_duration.value) if self.en_exp_duration.value else None
-        min_len      = int(self.min_track_length.value) if self.en_min_len.value else None
-        max_len      = int(self.max_track_length.value) if self.en_max_len.value else None
-        min_size     = int(self.min_size.value) if self.en_min_size.value else None
-        return exp_duration, min_len, max_len, min_size
+        exp_duration = int(self.exp_duration.value) if self.en_exp_duration.value else 999999
+        min_len      = int(self.min_track_length.value) if self.en_min_len.value else 0
+        max_len      = int(self.max_track_length.value) if self.en_max_len.value else 999999
+        min_size     = int(self.min_size.value) if self.en_min_size.value else 0
+        time_type    = str(self.time_type_toggle.value)
+        return exp_duration, min_len, max_len, min_size, time_type
 
     def _persist_params(self):
         params = self._params
@@ -3169,6 +3504,7 @@ class OrganoidFilterPanel:
         prof["min_track_length"] = int(self.min_track_length.value)
         prof["max_track_length"] = int(self.max_track_length.value)
         prof["min_size"]         = int(self.min_size.value)
+        prof["time_type"]        = str(self.time_type_toggle.value)
 
         with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(params, f, sort_keys=False)
@@ -3178,6 +3514,7 @@ class OrganoidFilterPanel:
             self.en_exp_duration, self.exp_duration,
             self.en_min_len, self.min_track_length,
             self.en_max_len, self.max_track_length,
+            self.time_type_toggle,
             self.en_min_size, self.min_size,
             self.btn_run
         ]:
@@ -3193,9 +3530,9 @@ class OrganoidFilterPanel:
                 out_dir = Path(self.metadata_loader.output_dir).expanduser()
                 out_dir.mkdir(parents=True, exist_ok=True)
 
-                exp_duration, min_len, max_len, min_size = self._effective_values()
+                exp_duration, min_len, max_len, min_size, time_type = self._effective_values()
                 print("▶️ Filtering tracks…")
-                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, min_size={min_size}")
+                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, min_size={min_size}, unit={'hours' if time_type=='real_time' else 'frames'}")
 
                 # persist UI state
                 self._persist_params()
@@ -3208,7 +3545,8 @@ class OrganoidFilterPanel:
                     min_track_length=min_len,
                     max_track_length=max_len,
                     min_size=min_size,
-                    cell_type=self.cell_type
+                    cell_type=self.cell_type,
+                    time_type=time_type
                 )
                 print("✅ Filtering complete.")
 
@@ -3267,12 +3605,11 @@ class OrganoidFilterPanel:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
                 
-                
 class OrganoidAnalysisPanel:
     """Dead-%-only panel. Persists to behav3d_parameters['analysis']['organoid'] and writes YAML on run."""
-    def __init__(self, metadata_loader):
+    def __init__(self, metadata_loader, cell_type):
         self.metadata_loader = metadata_loader
-        self.cell_type = "organoid"
+        self.cell_type = cell_type
 
         # --- load + seed config from _DEFAULT_CONFIG (preserve user values) ---
         params_on_disk = self.metadata_loader.behav3d_parameters or {}
@@ -3353,19 +3690,20 @@ class OrganoidAnalysisPanel:
                 self._persist_params()
 
                 dth = float(self.dead_perc_threshold.value)
-                print("▶️ Running organoid analysis…")
+                print(f"▶️ Running {self.cell_type} analysis…")
                 print(f"  dead_perc_threshold = {dth}")
 
                 run_organoid_analysis(
                     dead_perc_threshold=dth,
                     output_dir=str(out_dir),
-                    df_tracks_path=None
+                    df_tracks_path=None,
+                    org_type=self.cell_type
                 )
 
                 # show outputs (optional preview)
-                results_outdir = out_dir / "analysis" / "organoid" / "results"
-                general_csv = results_outdir / "combined_general_organoid_dynamics_analysis.csv"
-                general_pdf = results_outdir / "combined_general_organoid_dynamics_analysis.pdf"
+                results_outdir = out_dir / "analysis" / self.cell_type / "results"
+                general_csv = results_outdir / f"combined_general_{self.cell_type}_dynamics_analysis.csv"
+                general_pdf = results_outdir / f"combined_general_{self.cell_type}_dynamics_analysis.pdf"
 
                 print("\nOutputs:")
                 print(f"  Results CSV: {general_csv}")

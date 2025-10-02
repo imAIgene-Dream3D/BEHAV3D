@@ -800,16 +800,46 @@ def run_pixel_classifier_segmentation(
     metadata,
     organoid_edt_threshold=12,
     timepoint_range=None,
+    clf_org_path=None,
+    clf_org2_path=None,
+    clf_tcell_path=None,
+    clf_death_path=None,
     two_org_types=False,
     ):
+
+
+    pixelclass_dir = Path(output_dir, "images", "PixelClassification")
+    if not pixelclass_dir.exists():
+        pixelclass_dir.mkdir()
+        
+    curr_clf_org_path = Path(pixelclass_dir, 'PixelClassifier_Organoid.joblib')
+    if clf_org_path is None:
+        clf_org_path = curr_clf_org_path
+    else:
+        shutil.copy(clf_org_path, curr_clf_org_path)
+        
+    curr_clf_tcell_path = Path(pixelclass_dir, 'PixelClassifier_Tcell.joblib')
+        
+    if clf_tcell_path is None:
+        clf_tcell_path = curr_clf_tcell_path
+    else:
+        shutil.copy(clf_org_path, curr_clf_tcell_path)
     
-    clf_org_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_Organoid.joblib')
+    curr_clf_death_path = Path(pixelclass_dir, 'PixelClassifier_Death.joblib')
+    if clf_death_path is None:
+        clf_death_path = curr_clf_death_path
+    else:
+        shutil.copy(clf_death_path, curr_clf_death_path)
+
     if two_org_types:
-        clf_org_2_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_Organoid2.joblib')
-        clf_org_2 = joblib.load(clf_org_2_path)
-    clf_tcell_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_Tcell.joblib')
-    clf_death_path = Path(output_dir, "images", "PixelClassification", 'PixelClassifier_Death.joblib')
-  
+        curr_clf_org2_path = Path(pixelclass_dir, 'PixelClassifier_Organoid2.joblib')
+        if clf_org2_path is None:
+            clf_org2_path = curr_clf_org2_path
+        else:
+            shutil.copy(clf_org2_path, curr_clf_org2_path)
+
+        clf_org_2 = joblib.load(clf_org2_path)
+
     clf_org = joblib.load(clf_org_path)
     clf_tcell = joblib.load(clf_tcell_path)
     clf_death = joblib.load(clf_death_path)

@@ -66,6 +66,7 @@ def convert_segments_to_tracks(
     #         img=tracked_img, 
     #         outpath=outpath
     #         )
+    return(outpath)
 
 def convert_all_tracked_images_to_csv(
     metadata,
