@@ -190,6 +190,7 @@ def signal_unmixing(
             raw_image_path = Path(sample['raw_image_path'])
             raw_image_zarr =  Path(output_dir, sample_name, f"{sample_name}.zarr")
 
+            # TODO: Should we remove timepoint-specific naming?
             if timepoints != 0:
                 all_outputs_path = Path(signal_unmix_outdir, sample_name, f"{sample_name}_t{timepoints}.zarr")
             else:
@@ -213,7 +214,7 @@ def signal_unmixing(
                 prev_gaussian_sigma = previous_pc.get('gaussian_sigma')
                 prev_timepoints = previous_pc.get('tp_n')
 
-                print(f"Previous timepoints: {prev_timepoints}, current timepoints: {timepoints}")
+                # print(f"Previous timepoints: {prev_timepoints}, current timepoints: {timepoints}")
 
                 if (prev_sum_scale == sum_scale_per_file and
                     prev_sink_channel == sink_channel and
@@ -232,7 +233,13 @@ def signal_unmixing(
             else:
                 print(f"➡️ Unmixed output will be saved to {all_outputs_path}.")
 
-            if not raw_image_zarr.exists():
+            if  (
+                (raw_image_path.suffix == ".zarr" and raw_image_path.exists()) or 
+                raw_image_zarr.exists()
+                ):
+                print("Skipping conversion to zarr, as file already exists")
+            
+            else:
                 print(f"- Converting raw image to .zarr for memory efficiency...")
                 images = load_image(raw_image_path)
                 # print(f"Original image shape: {images.shape}")
@@ -258,6 +265,9 @@ def signal_unmixing(
                     chunks=chunksize
                 )
 
+                metadata.at[idx, "raw_image_path"] = str(raw_image_zarr)
+
+            raw_image_zarr= metadata.at[idx, "raw_image_path"]
             # --- Read from Zarr and process only the first N timepoints ---
             lazy_data = da.from_zarr(raw_image_zarr)
             T, C, Z, Y, X = lazy_data.shape

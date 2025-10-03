@@ -560,6 +560,13 @@ def calculate_image_based_track_features(
     else:
         print(f"{get_current_time()} - Skipping contact calculations as not requested in features_choice")
         
+    df_tracks = df_tracks.sort_values(
+        by=["sample_name", "TrackID", "position_t"], 
+        ascending=[True, True, True]  # example: last column sorted descending
+    )    
+    new_order = ["sample_name"] + [c for c in df_tracks.columns.tolist() if c != "sample_name"]
+    df_tracks = df_tracks[new_order]
+    
     return(df_tracks)
 
 def generalize_units_of_track_features(

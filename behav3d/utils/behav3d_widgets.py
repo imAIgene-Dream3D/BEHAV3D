@@ -103,6 +103,7 @@ _DEFAULT_CONFIG = {
         "use_range": False,
         "start_t": 0,
         "end_t": 0,
+        "use_unmix_path": False,
         "channel_colors": ["cyan", "yellow", "red", "green", "magenta", "blue"]
     },
     "pixel_classifier": {
@@ -475,6 +476,7 @@ class MetadataLoader(widgets.VBox):
         self,
         metadata_path_picker,
         output_dir_picker,
+        func=False,
         button_description: str = "Load metadata",
         **kwargs,
     ):
@@ -482,7 +484,8 @@ class MetadataLoader(widgets.VBox):
         self.metadata = None
         self.output_dir = None
         self.metadata_csv_path = None
-            
+
+        self.func = func
         self.file_picker = metadata_path_picker
         self.output_dir_picker = output_dir_picker
 
@@ -547,7 +550,7 @@ class MetadataLoader(widgets.VBox):
             self.behav3d_parameters["paths"]["output_dir"]   = str(self.output_dir)
             yaml.safe_dump(self.behav3d_parameters, self.behav3d_parameters_path.open("w"), sort_keys=False)
             
-            check_behav3d_metadata(self.metadata)
+            check_behav3d_metadata(self.metadata, self.func)
             print("✅ Checks passed!")
             display(self.metadata)
 
@@ -618,6 +621,7 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
     btn.on_click(_run_conversion)
     # Return the row (button + spinner) and the log output area
     return widgets.VBox([row, out])
+
 class DimOrderTable:
     DIM_ORDER_OPTIONS = [
         "TCZYX",
@@ -957,30 +961,30 @@ class SignalUnmixingPanel:
             else:
                 value_str = "20,30"  # final fallback
 
-            sum_scale_input = widgets.Text(
+            self.sum_scale_input = widgets.Text(
                 value=value_str,
                 description='',
                 layout=widgets.Layout(width='150px')
             )
 
-            sum_scale_input.style = {'description_width': 'initial'}
+            self.sum_scale_input.style = {'description_width': 'initial'}
 
             if i == 0:
                 # Add "Apply to all" button only on the first row
-                apply_button = widgets.Button(description="Apply to all", layout=widgets.Layout(width='120px'))
-                apply_button.on_click(apply_to_all_callback)
+                self.apply_button = widgets.Button(description="Apply to all", layout=widgets.Layout(width='120px'))
+                self.apply_button.on_click(apply_to_all_callback)
             else:
-                apply_button = widgets.Label(value="")  # Empty placeholder
+                self.apply_button = widgets.Label(value="")  # Empty placeholder
 
             # Track widgets
             sum_scale_widgets.append({
                 'label': file_label,
-                'input': sum_scale_input,
-                'button': apply_button
+                'input': self.sum_scale_input,
+                'button': self.apply_button
             })
 
             # Add the row as an HBox
-            row = widgets.HBox([file_label, sum_scale_input, apply_button])
+            row = widgets.HBox([file_label, self.sum_scale_input, self.apply_button])
             rows.append(row)
 
         # Store for later use
@@ -1102,6 +1106,11 @@ class SignalUnmixingPanel:
             button_style="success",
             layout=widgets.Layout(width="fit-content", flex="0 0 auto")
         )
+        self.use_unmix_path = widgets.Checkbox(
+            description="Use Unmix as raw path",
+            value=bool(_cfg_get(self.metadata_loader.behav3d_parameters, "signal_unmixing.use_unmix_path", False)),
+            indent=False,
+        )
         self.spinner_save = widgets.HTML(value=spinning_loader)
         self.spinner_save.layout.display = "none"
         self.save_row = widgets.HBox(
@@ -1141,6 +1150,7 @@ class SignalUnmixingPanel:
         save_box = widgets.VBox([
             widgets.HTML("<b>Save Signal Unmixing Result</b>"),
             widgets.HTML("Modifies the tcell channel to  the new unmixed channel and saves a new metadata file."),
+            self.use_unmix_path,
             self.save_row,
         ])
 
@@ -1177,6 +1187,7 @@ class SignalUnmixingPanel:
         pc["training_log"] = bool(self.training_log.value)
         pc["tp_n"] = int(self.tp_n.value)
         pc["use_all_timepoints"] = bool(self.use_all_timepoints.value)
+        pc["timepoints"] = int(self.tp_n.value)
         # Save per-file sum_scale values
         sum_scale = {}
         for row in self.sum_scale_widgets:
@@ -1203,6 +1214,7 @@ class SignalUnmixingPanel:
     def _on_btn_unmix_clicked(self, _):
         with self.out:
             self.out.clear_output()
+            self._lock(True)
             # Save previous parameters to compare
             previous_pc = deepcopy(_cfg_get(self.metadata_loader.behav3d_parameters, "signal_unmixing", {}))
             self._persist_params()
@@ -1265,6 +1277,7 @@ class SignalUnmixingPanel:
                 import traceback; traceback.print_exc()
             finally:
                 self.spinner_unmix.layout.display = "none"
+                self._lock(False)
 
 
     ######### CHECKKKKKKK##########################``
@@ -1340,9 +1353,30 @@ class SignalUnmixingPanel:
         self.sample_dropdown.disabled = False
         self.open_button.disabled = False
 
+    
+    def _lock(self, state: bool):
+        # keep close_button enabled so user can close at any time
+        for w in [
+            self.sample_dropdown, self.sink_channel, self.sum_scale_input, self.apply_button,
+            self.source_channels, self.gaussian_sigma, self.median_size, self.bg_percentile,
+            self.btn_save, self.btn_unmix, self.use_all_timepoints, self.tp_n, self.use_range, self.train_t, self.end_t,
+            self.start_t, self.train_z, self.training_log, self.open_button, self.close_button, self.range_box, self.save_row, self.use_unmix_path
+        ]:
+            w.disabled = state
+
+        # # also lock/unlock the path pickers
+        # try:
+        #     for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, self.clf_death_path, self.clf_org2_path]:
+        #         p.text.disabled = state
+        #         p.button.disabled = state
+        # except Exception:
+        #     pass
+
     # ---------------- Callbacks ----------------
     def _on_open_clicked(self, _):
+        self._lock(True)
         self.open_viewer()
+        self._lock(False)
 
     def _on_close_clicked(self, _):
         # Only relevant when we’re in non-blocking mode and hold a viewer
@@ -1379,6 +1413,10 @@ class SignalUnmixingPanel:
                     new_tcell_channel = image.shape[1] - 1  # assuming shape is (T, C, Z, Y, X)
                     print(f"Sample '{sample['sample_name']}': setting tcell_channel to {new_tcell_channel}") 
                     metadata.at[idx, 'tcell_channel'] = new_tcell_channel
+                    if self.use_unmix_path:
+                        if sample["signal_unmixing_image_path"] != metadata.at[idx, 'raw_image_path']:
+                            metadata.at[idx, 'original_raw_image_path'] = sample["raw_image_path"]
+                            metadata.at[idx, 'raw_image_path'] = sample["signal_unmixing_image_path"]
                     try:
                         if metadata is not None:
                             self.metadata_loader.metadata = metadata
@@ -1474,16 +1512,6 @@ class PixelClassifierPanel:
             if self.two_org_types.value:
                 self.clf_org2_path.value   = str(pc.get("clf_org2_path", "") or "")
 
-
-        # When directory changes, auto-fill file pickers (only when manual mode is enabled)
-        def _dir_changed(change):
-            if not self.manual_clf_paths.value:
-                return
-            newd = (change.get('new') or '').strip()
-            if newd:
-                self._apply_dir_to_clf_paths(newd)
-        self.clf_dir.text.observe(_dir_changed, names='value')
-
         # -------- Apply controls --------
         self.organoid_edt_threshold = widgets.FloatText(
             description="Organoid EDT thr",
@@ -1559,11 +1587,20 @@ class PixelClassifierPanel:
         self.clf_paths_box = widgets.VBox(clf_path_widgets)
         
         # Show/hide according to the checkbox
+        self.two_org_types.observe(self._on_two_org_types_changed, names='value')
         self.manual_clf_paths.observe(self._toggle_clf_path_section, names='value')
-        self._toggle_clf_path_section()  # set initial visibility
 
-        self.two_org_types.observe(self._on_two_org_types_change, names='value')
         self._build_clf_paths_box()
+        self._toggle_clf_path_section()
+
+        # When directory changes, auto-fill file pickers (only when manual mode is enabled)
+        def _dir_changed(change):
+            if not self.manual_clf_paths.value:
+                return
+            newd = (change.get('new') or '').strip()
+            if newd:
+                self._apply_dir_to_clf_paths(newd)
+        self.clf_dir.text.observe(_dir_changed, names='value')
 
         # Layout
         train_box = widgets.VBox([
@@ -1661,35 +1698,35 @@ class PixelClassifierPanel:
     def _toggle_clf_path_section(self, change=None):
         manual = bool(self.manual_clf_paths.value)
         self.clf_paths_box.layout.display = (None if manual else 'none')
-        # When turning OFF manual mode, blank all four fields
+        
         if not manual:
-            for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, self.clf_death_path]:
+            for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, 
+                    self.clf_death_path, self.clf_org2_path]:
                 p.value = ""
-            if self.two_org_types.value:
-                self.clf_org2_path.value = ""
-
-    def _on_two_org_types_change(self, change):
-        self.clf_paths_box()
 
     def _build_clf_paths_box(self):
-        # Base children widgets
         children = [
             widgets.HTML("<b>Classifier paths</b>"),
             self.clf_dir,
             self.clf_org_path,
         ]
 
-        # Conditionally include clf_org2_path if two_org_types is checked
         if self.two_org_types.value:
             children.append(self.clf_org2_path)
 
-        # Add the remaining classifier paths
         children.extend([
             self.clf_tcell_path,
             self.clf_death_path,
         ])
 
         self.clf_paths_box.children = children
+
+    def _on_two_org_types_changed(self, change=None):
+        self._build_clf_paths_box()
+
+        if self.manual_clf_paths.value and self.clf_dir.value:
+            self._apply_dir_to_clf_paths(self.clf_dir.value)
+
 
 
 
@@ -1701,7 +1738,7 @@ class PixelClassifierPanel:
         for w in [
             self.btn_train, self.btn_apply,
             self.examples_per_sample, self.sample_specific_classifier, self.n_workers, self.two_org_types,
-            self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end, self.manual_clf_pahts,
+            self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end, self.manual_clf_paths,
         ]:
             w.disabled = state
 
