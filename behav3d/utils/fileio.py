@@ -234,7 +234,7 @@ def load_ims_metadata(path):
         c = len(chan_keys)
 
         return (t, c, z, y, x)
-
+    
 def append_to_zarr(img, outpath):
         """
         Append a timepoint to an existing .zarr array

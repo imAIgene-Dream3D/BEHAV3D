@@ -51,10 +51,11 @@ def summarize_track_features(
     Output:
     - A .csv file containing all tracks from all experiments with their track-summarized features
     """
+    
     assert config is not None or output_dir is not None, "Either 'config' or 'output_dir' must be supplied"
     
     start_time = time.time()
-
+            
     print(f"--------------- Summarizing track features ---------------")
     
     if output_dir is None:

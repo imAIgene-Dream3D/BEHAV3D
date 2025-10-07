@@ -2,7 +2,7 @@
 
 ## Installation
 
-If required, install [miniforge](https://github.com/conda-forge/miniforge) or [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
+**Step 0** If required, install [miniforge](https://github.com/conda-forge/miniforge) or [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
 
 https://github.com/conda-forge/miniforge/releases/latest/
 https://conda-forge.org/download/
@@ -15,16 +15,23 @@ https://conda-forge.org/download/
 start /wait "" Miniforge3-Windows-x86_64.exe /InstallationType=JustMe /RegisterPython=0 /S /D=%UserProfile%\Miniforge3
 ```
 
-1. Open a miniforge terminal or conda terminal
-2. Navigate to the BEHAV3D repository
+**Step 1** Open a miniforge terminal or conda terminal by typing *miniforge* in your application search tab
+
+**Step 2** Download the BEHAV3D repository from this github page, by clicking *Code* > *Download zip*. Unzip the file and place its content to a folder that from now on we call BEHAV3D reposotory.
+
+**Step 3** Adapt location of this directory to your own one as indicated below and paste the following in the terminal to navigate to the BEHAV3D repository
 ```
 cd <path/to/this/behav3/repository>
 ```
+**Step 4**
+This creates a python environment and installes required packages
+Use the code below [env_mac.yml](./env_mac.yml) or [env_windows.yml](./env_windows.yml) dependent on what operating system you are on
 
-1. Create a python environment and install required packages
-- Choose [env_mac.yml](./env_mac.yml) or [env_windows.yml](./env_windows.yml) dependent on what operating system you are on
+You might get asked to confirm changes in the terminal, so just type Y for *yes*
 
-Mac install:
+*Mac install*:
+In the terminal copy paste and enter the following:
+
 ```
 mamba env create --file env_mac.yml
 mamba activate behav3d
@@ -32,7 +39,8 @@ pip install -e .
 python -m ipykernel install --user --name=behav3d --display-name "behav3d"
 ```
 
-Windows install:
+*Windows install*
+In the terminal copy paste and enter the following:
 ```
 mamba env create --file env_windows.yml
 mamba activate behav3d
@@ -43,15 +51,16 @@ python -m ipykernel install --user --name=behav3d --display-name "behav3d"
 ## How to run
 
 BEHAV3D is run through a ipython notebook, in for example:
-- Visual Code with an ipython extension
-- Ipython notebook in a web browser
 
-The script to run BEHAV3D: [run_behav3d.ipynb](./notebooks/run_behav3d.ipynb) (BEHAV3D/notebooks/run_behav3d.ipynb)
+- Visual Code with an ipython extension (Recommended). Install VisualCode from here https://code.visualstudio.com/Download. Once installed open the program and go to extensions and install the ipython extension. Once this is done you can go to *select kernel* > *python* > *behav3d*     
+  Open the following file that is in your BEHAV3D repository : [run_behav3d.ipynb](./notebooks/run_behav3d.ipynb) (BEHAV3D/notebooks/run_behav3d.ipynb)
+
+- Ipython notebook in a web browser
 
 ### Required files
 
 [REQUIRED]
-- A [metadata .csv](./configs/metadata.csv) that contains all samples that should be analyzed
+- A [metadata .csv](./configs/metadata.csv) that contains all samples that should be analyzed. To manage the metadata.csv in windows we recommend using https://www.moderncsv.com/ as it doesn't modify the format upon saving.
 - Per sample, a raw microscopy image (.czi, .tiff, .zarr)
 
 [Optional]

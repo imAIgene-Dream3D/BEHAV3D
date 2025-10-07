@@ -205,10 +205,11 @@ def filter_tcell_tracks(
     metadata['sample_name'] = metadata['sample_name'].astype(str)
 
     group_cols = ['TrackID', 'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
+
     cols_present = [c for c in group_cols if c in metadata.columns]
     metadata_info = metadata.loc[:, cols_present].copy()
     df_all_tracks_filt = pd.merge(df_all_tracks, metadata_info, how="left", on="sample_name")
-
+    
     # Function to count the number of unique tracks in the DataFrame
     def count_tracks(df_all_tracks, col_name="nr_tracks", df_track_counts=None):
         nr_tracks=df_all_tracks.groupby([
@@ -246,7 +247,7 @@ def filter_tcell_tracks(
         col_name="nr_tracks_exp_duration", 
         df_track_counts=df_track_counts
         )
-    
+
     # Filtering out tracks under specific track length
     df_all_tracks_filt = filter_minimal_track_length(
         df=df_all_tracks_filt,
@@ -472,7 +473,7 @@ def rolling_classification(
 
         plt.tight_layout()
         plt.show()
-    
+
     n_components=2
     n_neighbors=15
     min_dist=0.1
