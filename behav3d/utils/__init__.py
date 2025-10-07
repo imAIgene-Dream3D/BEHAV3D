@@ -21,7 +21,6 @@ def load_behav3d_metadata(
         "live_channel": "Int64",
         "dead_channel": "Int64",
         "dead_dye_threshold": float,
-        "contact_threshold": float,
         "pixel_distance_xy": float,
         "pixel_distance_z": float,
         "distance_unit": str,
@@ -35,14 +34,26 @@ def load_behav3d_metadata(
         "organoid_segments_image_path": str,
         "organoid_tracks_image_path": str,
         "organoid_tracks_csv_path": str,
-        
+        "signal_unmixing_image_path": str, #FUNC
+        "organoid_2_segments_image_path": str, #FUNC
+        "organoid_2_tracks_image_path": str, #FUNC
+        "organoid_2_tracks_csv_path": str, #FUNC
+        "original_raw_image_path": str, # FUNC
     }
+
     metadata = pd.read_csv(metadata_path, dtype=dtype_dict)
+
+    # Apply dtypes only to columns that exist --> Avoid ValueError, later we check_behav3d_metadata
+    # for col, dtype in dtype_dict.items():
+    #     if col in metadata.columns:
+    #         metadata[col] = metadata[col].astype(dtype)
+
     metadata = metadata.dropna(how="all").reset_index(drop=True)
     return metadata 
 
 def check_behav3d_metadata(
-    metadata
+    metadata,
+    func=False
     ):
     
     required_columns = [
@@ -54,7 +65,6 @@ def check_behav3d_metadata(
         "tcell_channel", 
         "live_channel", 
         "dead_channel", 
-        "contact_threshold", 
         "pixel_distance_xy", 
         "pixel_distance_z", 
         "distance_unit", 
@@ -69,17 +79,32 @@ def check_behav3d_metadata(
         "organoid_tracks_image_path", 
         "organoid_tracks_csv_path"
     ]
+
+    func_columns = [
+            "signal_unmixing_image_path",
+            "organoid_2_segments_image_path",
+            "organoid_2_tracks_image_path",
+            "organoid_2_tracks_csv_path",
+            # "original_raw_image_path"  # Not included bacouse it is added later if signal unmixing 
+        ]
+
     missing_columns = set(required_columns) - set(metadata.columns)
     missing_string = '\n'.join(missing_columns)
-    assert all(col in metadata.columns for col in required_columns), f"Not all required columns are present in the metadata .csv file\n{missing_string}"
 
-    assert not any(metadata.drop(columns=[
+    columns = [
         "tcell_segments_image_path", 
         "tcell_tracks_image_path", 
         "tcell_tracks_csv_path", 
         "organoid_segments_image_path",
         "organoid_tracks_image_path", 
-        "organoid_tracks_csv_path"]).isna().any()), "Some column values have not been supplied. Make sure you correctly supply values for all columns in the metadata .csv"
+        "organoid_tracks_csv_path"]
+    
+    if func:
+        assert all(col in metadata.columns for col in required_columns+func_columns), f"Not all required columns are present in the metadata .csv file\n{missing_string}"
+        assert not any(metadata.drop(columns=columns+func_columns).isna().any()), "Some column values have not been supplied. Make sure you correctly supply values for all columns in the metadata .csv"
+    else:
+        assert all(col in metadata.columns for col in required_columns), f"Not all required columns are present in the metadata .csv file\n{missing_string}"
+        assert not any(metadata.drop(columns=columns).isna().any()), "Some column values have not been supplied. Make sure you correctly supply values for all columns in the metadata .csv"
     
     ok = True
     for rowidx, sample_metadata in metadata.iterrows():
@@ -126,9 +151,37 @@ def check_behav3d_metadata(
         else:
             print(f"!!! No tracked organoid .csv is supplied. Please run tracking below.")
             ok=False
+
+        ### FUNC
+        if func:        
+            ### Organoids 2 paths
+            if not pd.isna(sample_metadata["organoid_2_segments_image_path"]):
+                assert Path(sample_metadata["organoid_2_segments_image_path"]).exists(), f"The organoid_2_segments_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+            elif pd.isna(sample_metadata["organoid_2_tracks_image_path"]):
+                print(f"!!! No segmented or tracked organoid_2 image is supplied. If 2 organoid types, please run segmentation and tracking below.")
+                ok=False
+            if not pd.isna(sample_metadata["organoid_2_tracks_image_path"]):
+                assert Path(sample_metadata["organoid_2_tracks_image_path"]).exists(), f"The organoid_2_tracks_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+            else:
+                print(f"!!! No tracked organoid_2 image is supplied. If 2 organoid types, please run tracking below.")
+                ok=False
+            if not pd.isna(sample_metadata["organoid_2_tracks_csv_path"]):
+                assert Path(sample_metadata["organoid_2_tracks_csv_path"]).exists(), f"The organoid_2_tracks_csv_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+            else:
+                print(f"!!! No tracked organoid_2 .csv is supplied.If 2 organoid types, please run tracking below.")
+                ok=False
+            ### Signal unmixing
+            if not pd.isna(sample_metadata["signal_unmixing_image_path"]):
+                print(f"--------{sample_metadata["signal_unmixing_image_path"]}--------------")
+                assert Path(sample_metadata["signal_unmixing_image_path"]).exists(), f"The signal_unmixing_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+            else:
+                print(f"!!! No signal unmixed image is supplied. If including signal unmixing, please run it below.")
+                ok=False
+
         print("")
     if ok:
         print("Metadata file is complete and correct")
+
     
 def format_time(
     start_time,

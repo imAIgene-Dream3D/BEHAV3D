@@ -37,7 +37,7 @@ def smooth_value_over_time(
         ).mean()
     )
     return smoothed_column   
-
+   
 def summarize_track_features(
     config=None,
     output_dir=None,
@@ -63,8 +63,8 @@ def summarize_track_features(
         if "imaris" in config.keys():
             imaris = config["imaris"]
         else:
-            imaris = False
-            
+            imaris = False        
+
     analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     qc_outdir = Path(analysis_outdir, "quality_control")

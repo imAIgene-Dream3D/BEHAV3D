@@ -50,6 +50,13 @@ def backproject_mean_features_behav3d(
     track_img_path = Path(df_sample["tcell_tracks_image_path"].values[0])
     
     org_track_img_path = Path(df_sample["organoid_tracks_image_path"].values[0])
+
+    if "organoid_2_tracks_image_path" in df_sample.columns and pd.notna(df_sample["organoid_2_tracks_image_path"].values[0]):
+        two_org_types = True
+        org2_track_img_path = Path(df_sample["organoid_2_tracks_image_path"].values[0])
+    else:
+        two_org_types = False
+
     df_tracks_path = Path(df_sample["tcell_tracks_csv_path"].values[0])
     
     df_tracks_full_clustered_path = Path(results_outdir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv")
@@ -79,6 +86,11 @@ def backproject_mean_features_behav3d(
     print("- Loading in tracked segments")
     track_img = load_image(track_img_path)
     org_track_img = load_image(org_track_img_path)
+
+    if two_org_types:
+        org2_track_img = load_image(org2_track_img_path)
+        org2_track_img = np.expand_dims(org2_track_img, axis=1)
+        org2_track_img = da.tile(org2_track_img, (1,raw_img.shape[-4],1,1,1))
     
     track_img = np.expand_dims(track_img, axis=1)
     org_track_img = np.expand_dims(org_track_img, axis=1)
@@ -112,6 +124,12 @@ def backproject_mean_features_behav3d(
             "type":"label"
             }
         }
+    
+    if two_org_types:    
+        trackid_data["Organoid2_TrackID"] = {
+            "img":org2_track_img, 
+            "type":"label"
+            }
     
     if columns==[]:
         columns=[x for x in df_tracks_clustered.columns if x not in metadata.columns.tolist()+["TrackID", "UMAP1", "UMAP2"]]
@@ -213,6 +231,12 @@ def backproject_time_features_behav3d(
     track_img_path = Path(df_sample["tcell_tracks_image_path"].values[0])
     
     org_track_img_path = Path(df_sample["organoid_tracks_image_path"].values[0])
+
+    if "organoid_2_tracks_image_path" in df_sample.columns and pd.notna(df_sample["organoid_2_tracks_image_path"].values[0]):
+        two_org_types = True
+        org2_track_img_path = Path(df_sample["organoid_2_tracks_image_path"].values[0])
+    else:
+        two_org_types = False
     df_tracks_path = Path(df_sample["tcell_tracks_csv_path"].values[0])
     
     df_tracks_full_clustered_path = Path(results_outdir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv")
@@ -257,6 +281,11 @@ def backproject_time_features_behav3d(
     
     track_img = da.tile(track_img, (1,raw_img.shape[-4],1,1,1))
     
+    if two_org_types:
+        org2_track_img = load_image(org2_track_img_path)
+        org2_track_img = np.expand_dims(org2_track_img, axis=1)
+        org2_track_img = da.tile(org2_track_img, (1,raw_img.shape[-4],1,1,1))
+    
     trackid_data = {
         "Tcell_TrackID":{
             "img":track_img, 
@@ -275,6 +304,12 @@ def backproject_time_features_behav3d(
             "type":"label"
             }
         }
+    
+    if two_org_types:    
+        trackid_data["Organoid2_TrackID"] = {
+            "img":org2_track_img, 
+            "type":"label"
+            }
     
     if columns==[]:
         columns=[x for x in df_tracks_clustered.columns if x not in metadata.columns.tolist()+["TrackID", "UMAP1", "UMAP2"]]

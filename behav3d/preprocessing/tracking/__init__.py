@@ -19,6 +19,15 @@ def visualize_tracks(
     tcell_tracks_csv_path = Path(metadata_row['tcell_tracks_csv_path'])
     organoid_tracks_csv_path = Path(metadata_row['organoid_tracks_csv_path'])
 
+    two_org_types=False
+
+    if metadata_row['organoid_2_tracks_image_path'] and Path(metadata_row['organoid_2_tracks_image_path']).exists():
+        two_org_types=True
+        organoid_2_tracks_zarr = Path(metadata_row['organoid_2_tracks_image_path'])
+        organoid_2_tracks_csv_path = Path(metadata_row['organoid_2_tracks_csv_path'])
+        organoid_2_tracks = load_zarr(organoid_2_tracks_zarr)
+        df_organoid_2_tracks = pd.read_csv(organoid_2_tracks_csv_path)
+
     elsize_xy = metadata_row['pixel_distance_xy']
     elsize_z = metadata_row['pixel_distance_z']
     elsizes = (1, elsize_z, elsize_xy, elsize_xy)
@@ -42,6 +51,8 @@ def visualize_tracks(
         raw_image = raw_image[start_t:end_t + 1]
         tcell_tracks = tcell_tracks[start_t:end_t + 1]
         organoid_tracks = organoid_tracks[start_t:end_t + 1]
+        if two_org_types:
+            organoid_2_tracks = organoid_2_tracks[start_t:end_t + 1]
 
     # for name in loaded_masks:
     #     loaded_masks[name] = np.asarray(loaded_masks[name])
@@ -65,12 +76,17 @@ def visualize_tracks(
 
     viewer.add_labels(tcell_tracks, name="T cell segments (tracked)", scale=elsizes)
     viewer.add_labels(organoid_tracks, name="Organoid segments (tracked)", scale=elsizes)
+    if two_org_types:
+        viewer.add_labels(organoid_2_tracks, name="organoid segments (tracked)", scale=elsizes)
     
     tcell_track_coords = df_tcell_tracks[["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
     organoid_track_coords = df_organoid_tracks[["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
 
     viewer.add_tracks(tcell_track_coords, name='T-cell Tracks', colormap="cyan", tail_length=20)
     viewer.add_tracks(organoid_track_coords, name='Organoid Tracks',  colormap="cyan", tail_length=20)
+    if two_org_types:
+        organoid_2_track_coords = df_organoid_2_tracks[["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
+        viewer.add_tracks(organoid_2_track_coords, name='Organoid 2 Tracks', colormap="cyan", tail_length=20)
     
 
     print("Launching Napari viewer...")

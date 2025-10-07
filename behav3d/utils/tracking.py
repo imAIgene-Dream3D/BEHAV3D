@@ -67,6 +67,7 @@ def convert_segments_to_tracks(
     #         img=tracked_img, 
     #         outpath=outpath
     #         )
+    return(outpath)
 
     return(outpath)
 
