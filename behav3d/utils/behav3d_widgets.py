@@ -2831,6 +2831,18 @@ class TCellAnalysisPanel:
         # ---- config bootstrap (load + ensure defaults) ----
         try:
             groups = behav3d_calculated_features
+            md = self.metadata_loader.metadata
+            # Detect if organoid_2 features should be added
+            self.two_org_types = False
+            if md is not None and 'organoid_2_tracks_csv_path' in md.columns:
+                s = md['organoid_2_tracks_csv_path'].dropna()
+                if not s.empty and Path(str(s.iloc[0])).exists():
+                    self.two_org_types = True 
+                    # Add organoid_2 contact features
+                    groups["contact"].extend([
+                        "organoid_2_contact",
+                        "organoid_2_contact_pixels",
+            ])
         except NameError:
             raise RuntimeError("Define behav3d_calculated_features before creating TCellAnalysisPanel.")
 
@@ -3770,6 +3782,18 @@ class BackprojectionPanel:
         # ---- load groups ----
         try:
             self._base_groups = behav3d_calculated_features  # dict[group] -> list[str/pattern]
+            md = self.metadata_loader.metadata
+            self.two_org_types = False
+            # Conditional addition of organoid_2
+            if md is not None and 'organoid_2_tracks_csv_path' in md.columns:
+                s = md['organoid_2_tracks_csv_path'].dropna()
+                if not s.empty and Path(str(s.iloc[0])).exists():
+                    self.two_org_types = True
+                    # Add organoid_2 contact features
+                    self._base_groups["contact"].extend([
+                        "organoid_2_contact",
+                        "organoid_2_contact_pixels",
+                    ])
         except NameError:
             raise RuntimeError("Define behav3d_calculated_features before creating BackprojectionPanel.")
 
@@ -3794,7 +3818,12 @@ class BackprojectionPanel:
         self.sample_dd.style.description_width = "80px"
 
         # ---- cell type toggle ----
-        self._celltype_map = {"T cell": "tcell", "Organoid": "organoid"}
+        # Safely check for the column and for at least one existing, non-empty path before using it.
+        if self.two_org_types:
+           self._celltype_map = {"T cell": "tcell", "Organoid": "organoid", "Organoid 2": "organoid_2"}
+        else:
+            self._celltype_map = {"T cell": "tcell", "Organoid": "organoid"}
+
         inv_ct_map = {v: k for k, v in self._celltype_map.items()}
         ct_default = inv_ct_map.get(str(self._cfg.get("cell_type", cell_type)).lower(), "T cell")
         self.celltype_tb = widgets.ToggleButtons(
@@ -4041,7 +4070,11 @@ class BackprojectionPanel:
             return
 
         for gname, gcols in group_to_columns.items():
-            child_cbs = [widgets.Checkbox(value=(c in preset_mean), description=c, indent=True) for c in gcols]
+            if not gcols:
+                # Keep empty groups visible for consistent layout (can hide if you prefer)
+                child_cbs = []
+            else:
+                child_cbs = [widgets.Checkbox(value=(c in preset_mean), description=c, indent=True) for c in gcols]
             gcb = widgets.Checkbox(value=(bool(child_cbs) and all(cb.value for cb in child_cbs)), indent=False)
             glabel = widgets.HTML(f"<b>{gname}</b>")
             header = widgets.HBox([gcb, glabel])
@@ -4250,469 +4283,6 @@ class BackprojectionPanel:
                         except Exception: pass
                 app.processEvents()
             else:
-                try:
-                    v = napari.current_viewer()
-                    if v is not None:
-                        v.close()
-                except Exception:
-                    pass
-        except Exception as e:
-            with self.out:
-                print(f"Close viewer attempt: {e}")
-    def __init__(self, metadata_loader, cell_type="tcell"):
-        self.metadata_loader = metadata_loader
-        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
-
-        # ---- load groups ----
-        try:
-            self._base_groups = behav3d_calculated_features  # dict[group] -> list[str/pattern]
-        except NameError:
-            raise RuntimeError("Define behav3d_calculated_features before creating BackprojectionPanel.")
-
-        # ---- config bootstrap ----
-        params = dict(self.metadata_loader.behav3d_parameters or {})
-        params.setdefault("backprojection", self._default_backproj_config(self._base_groups, cell_type))
-        self._params = params
-        self._cfg = self._params["backprojection"]
-
-        # ---- headings ----
-        self.title     = widgets.HTML('<div style="font-size:22px;font-weight:700;">Backproject features to images (napari)</div>')
-        self.sel_title = widgets.HTML('<div style="font-size:20px;font-weight:700;">Select feature columns</div>')
-
-        # ---- sample selector ----
-        md = self.metadata_loader.metadata
-        if md is None or "sample_name" not in md.columns:
-            raise RuntimeError("metadata_loader.metadata must have a 'sample_name' column.")
-        sample_list = sorted(map(str, md["sample_name"].unique().tolist()))
-        last_sample = self._cfg.get("last_sample") or (sample_list[0] if sample_list else None)
-        self.sample_dd = widgets.Dropdown(description="Sample", options=sample_list, value=last_sample,
-                                          layout=widgets.Layout(width="360px"))
-        self.sample_dd.style.description_width = "80px"
-
-        # ---- cell type toggle ----
-        self._celltype_map = {"T cell": "tcell", "Organoid": "organoid"}
-        inv_ct_map = {v: k for k, v in self._celltype_map.items()}
-        ct_default = inv_ct_map.get(str(self._cfg.get("cell_type", cell_type)).lower(), "T cell")
-        self.celltype_tb = widgets.ToggleButtons(
-            options=list(self._celltype_map.keys()),
-            value=ct_default,
-            description="Cell type",
-            layout=widgets.Layout(width="360px")
-        )
-        self.celltype_tb.style.button_width = "160px"
-        self.celltype_tb.style.description_width = "80px"
-
-        # ---- mode (mean/time) ----
-        self._mode_map = {"Mean features": "mean", "Time features": "time"}
-        inv_mode_map = {v: k for k, v in self._mode_map.items()}
-        self.mode_tb = widgets.ToggleButtons(
-            options=list(self._mode_map.keys()),
-            value=inv_mode_map.get(self._cfg.get("mode", "mean"), "Mean features"),
-            description="Mode",
-            layout=widgets.Layout(width="360px")
-        )
-        self.mode_tb.style.button_width = "160px"
-        self.mode_tb.style.description_width = "80px"
-
-        # ---- save toggle ----
-        self.save_cb = widgets.Checkbox(
-            description="Save .zarr backprojection to disk",
-            value=bool(self._cfg.get("save", False)),
-            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
-        )
-
-        # ---- TIME MODE selection (grouped patterns; 3 columns) ----
-        self._time_group_rows = {}  # group -> {group_cb, child_cbs, grid, container}
-        self.time_selection_box = self._build_time_selection_box()
-
-        # ---- MEAN MODE selection (grouped actual columns from UMAP_clusters.csv; 3 columns) ----
-        self._mean_group_rows = {}  # group -> {group_cb, child_cbs, grid, container}
-        self.mean_selection_box = widgets.VBox([])
-        self._rebuild_mean_selection_from_file()  # initial
-
-        # ---- selection container (swaps by mode) ----
-        self.selection_container = widgets.VBox([])
-        self._swap_selection_ui()
-
-        # react to changes
-        self.mode_tb.observe(lambda ch: self._swap_selection_ui(), names='value')
-        self.celltype_tb.observe(lambda ch: self._on_celltype_changed(), names='value')
-
-        # ---- Select/Clear for whichever UI is visible ----
-        self.btn_select_all = widgets.Button(description="Select all")
-        self.btn_clear_all  = widgets.Button(description="Clear")
-        self.btn_select_all.on_click(lambda *_: self._set_all(True))
-        self.btn_clear_all.on_click(lambda *_: self._set_all(False))
-
-        # ---- Run + spinner + Stop viewer ----
-        self.btn_run = widgets.Button(
-            description="Run backprojection",
-            button_style="success",
-            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
-        )
-        self.btn_run.on_click(self._on_run_clicked)
-
-        # uses a global `spinning_loader` HTML snippet you've defined elsewhere
-        self.spinner_html = widgets.HTML(value=spinning_loader)
-        self.spinner_html.layout.display = "none"
-
-        self.btn_stop = widgets.Button(
-            description="Close viewer",
-            button_style="danger",
-            icon="stop",
-            tooltip="Close the active Napari viewer",
-            layout=widgets.Layout(width="fit-content", display="none")
-        )
-        self.btn_stop.on_click(self._on_stop_clicked)
-
-        self.run_row = widgets.HBox(
-            [self.btn_run, self.spinner_html, self.btn_stop],
-            layout=widgets.Layout(align_items="center", gap="10px")
-        )
-
-        self.out = widgets.Output()
-
-        # ---- UI ----
-        self.ui = widgets.VBox([
-            self.title,
-            self.sample_dd,
-            self.celltype_tb,   # under sample
-            self.mode_tb,       # under cell type (as requested)
-            # self.save_cb,
-            self.sel_title,
-            widgets.HBox([self.btn_select_all, self.btn_clear_all], layout=widgets.Layout(gap="8px")),
-            self.selection_container,
-            widgets.HTML("<hr>"),
-            self.run_row,
-            self.out
-        ])
-
-        self._viewer = None  # we don't actually receive a viewer handle; used as a flag only
-
-    # ---------- defaults ----------
-    def _default_backproj_config(self, groups_dict, cell_type_default):
-        return {
-            "cell_type": str(cell_type_default),
-            "mode": "mean",                # "mean" or "time"
-            "save": False,
-            "last_sample": None,
-            # Persist separate picks per mode (backward compatible with "columns_input")
-            "columns_input_time": [],
-            "columns_input_mean": [],
-        }
-
-    # ---------- UI builders ----------
-    def _grid_for(self, children, indent_px="24px", columns=3):
-        return widgets.GridBox(
-            children,
-            layout=widgets.Layout(
-                grid_template_columns=" ".join(["max-content"] * columns),
-                grid_gap="6px 18px",
-                margin=f"0 0 0 {indent_px}",
-            )
-        )
-
-    def _build_time_selection_box(self):
-        preset_time = list(self._cfg.get("columns_input_time", self._cfg.get("columns_input", [])))
-        preset_set = set(preset_time)
-
-        rows = {}
-        boxes = []
-        for group_name, feats in self._base_groups.items():
-            child_cbs = [widgets.Checkbox(value=(f in preset_set), description=f, indent=True) for f in feats]
-            gcb = widgets.Checkbox(value=all(cb.value for cb in child_cbs), indent=False)
-            glabel = widgets.HTML(f"<b>{group_name}</b>")
-            header = widgets.HBox([gcb, glabel])
-
-            grid = self._grid_for(child_cbs, columns=3)
-            container = widgets.VBox([header, grid])
-
-            # handlers
-            def make_group_handler(gc, cc_list):
-                def _on(change):
-                    if change["name"] != "value": return
-                    val = bool(change["new"])
-                    for cb in cc_list: cb.unobserve(child_handler, names="value")
-                    for cb in cc_list: cb.value = val
-                    for cb in cc_list: cb.observe(child_handler, names="value")
-                return _on
-
-            def make_child_handler(gc, cc_list):
-                def _on(change):
-                    if change["name"] != "value": return
-                    all_on = all(cb.value for cb in cc_list)
-                    gc.unobserve(group_handler, names="value")
-                    gc.value = all_on
-                    gc.observe(group_handler, names="value")
-                return _on
-
-            group_handler = make_group_handler(gcb, child_cbs)
-            child_handler = make_child_handler(gcb, child_cbs)
-            gcb.observe(group_handler, names="value")
-            for cb in child_cbs:
-                cb.observe(child_handler, names="value")
-
-            rows[group_name] = {"group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container}
-            boxes.append(container)
-
-        self._time_group_rows = rows
-        return widgets.VBox(boxes)
-
-    def _rebuild_mean_selection_from_file(self):
-        """Build grouped checkboxes from the UMAP_clusters.csv header, using mean_ prefixed versions of base names."""
-        # Read columns from UMAP_clusters.csv for current cell type
-        cell_type = self._celltype_map[self.celltype_tb.value]
-        results_dir = Path(self.output_dir, "analysis", cell_type, "results")
-        clusters_csv = Path(results_dir, f"BEHAV3D_{cell_type}_UMAP_clusters.csv")
-        try:
-            cols = pd.read_csv(clusters_csv, nrows=1).columns.tolist()
-        except Exception:
-            cols = []
-
-        # Prepare target patterns per group: add mean_ if not already present
-        def to_mean_pattern(name: str) -> str:
-            return name if str(name).startswith("mean_") else ("mean_" + str(name))
-
-        group_to_columns = {}
-        for gname, base_feats in self._base_groups.items():
-            present = []
-            for raw in base_feats:
-                patt = to_mean_pattern(raw)
-                if any(ch in patt for ch in "*?["):
-                    present.extend([c for c in cols if fnmatch.fnmatchcase(str(c), patt)])
-                else:
-                    if patt in cols:
-                        present.append(patt)
-            # de-dup keep order
-            seen = set(); present = [x for x in present if not (x in seen or seen.add(x))]
-            group_to_columns[gname] = present
-
-        # Build rows
-        preset_mean = set(self._cfg.get("columns_input_mean", []))
-        rows = {}
-        boxes = []
-        for gname, gcols in group_to_columns.items():
-            if not gcols:
-                # Keep empty groups visible for consistent layout (can hide if you prefer)
-                child_cbs = []
-            else:
-                child_cbs = [widgets.Checkbox(value=(c in preset_mean), description=c, indent=True) for c in gcols]
-            gcb = widgets.Checkbox(value=(bool(child_cbs) and all(cb.value for cb in child_cbs)), indent=False)
-            glabel = widgets.HTML(f"<b>{gname}</b>")
-            header = widgets.HBox([gcb, glabel])
-
-            grid = self._grid_for(child_cbs, columns=3)
-            container = widgets.VBox([header, grid])
-
-            # handlers
-            def make_group_handler(gc, cc_list):
-                def _on(change):
-                    if change["name"] != "value": return
-                    val = bool(change["new"])
-                    for cb in cc_list: cb.value = val
-                return _on
-
-            def make_child_handler(gc, cc_list):
-                def _on(change):
-                    if change["name"] != "value": return
-                    gc.value = (bool(cc_list) and all(cb.value for cb in cc_list))
-                return _on
-
-            gh = make_group_handler(gcb, child_cbs)
-            ch = make_child_handler(gcb, child_cbs)
-            gcb.observe(gh, names="value")
-            for cb in child_cbs:
-                cb.observe(ch, names="value")
-
-            rows[gname] = {"group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container}
-            boxes.append(container)
-
-        self._mean_group_rows = rows
-        self.mean_selection_box.children = boxes
-
-    def _swap_selection_ui(self):
-        mode = self._mode_map[self.mode_tb.value]
-        if mode == "mean":
-            # make sure mean UI is up-to-date with current cell type's file
-            self._rebuild_mean_selection_from_file()
-            self.selection_container.children = (self.mean_selection_box,)
-        else:
-            self.selection_container.children = (self.time_selection_box,)
-
-    def _on_celltype_changed(self):
-        # Rebuild mean-selection UI because the source CSV depends on cell type
-        if self._mode_map[self.mode_tb.value] == "mean":
-            self._rebuild_mean_selection_from_file()
-
-    # ---------- helpers ----------
-    def display(self): 
-        display(self.ui)
-
-    def _set_all(self, val: bool):
-        if self._mode_map[self.mode_tb.value] == "mean":
-            rows = self._mean_group_rows
-        else:
-            rows = self._time_group_rows
-        for row in rows.values():
-            row["group_cb"].value = val
-            for cb in row["child_cbs"]:
-                cb.value = val
-
-    def _selected_time_patterns(self):
-        seen, sel = set(), []
-        for row in self._time_group_rows.values():
-            for cb in row["child_cbs"]:
-                if cb.value and cb.description not in seen:
-                    sel.append(cb.description); seen.add(cb.description)
-        return sel
-
-    def _selected_mean_columns(self):
-        seen, sel = set(), []
-        for row in self._mean_group_rows.values():
-            for cb in row["child_cbs"]:
-                if cb.value and cb.description not in seen:
-                    sel.append(cb.description); seen.add(cb.description)
-        return sel
-
-    def _expand_patterns(self, selected, available_columns):
-        if not available_columns:
-            return list(dict.fromkeys(selected))
-        avail = list(available_columns.tolist() if hasattr(available_columns, "tolist") else list(available_columns))
-        out = []
-        for name in selected:
-            if any(ch in name for ch in "*?["):
-                matches = [c for c in avail if fnmatch.fnmatchcase(str(c), name)]
-                out.extend(matches if matches else [name])
-            else:
-                out.append(name)
-        # de-dup preserve order
-        return list(dict.fromkeys(out))
-
-    def _lock(self, state: bool):
-        # disable main controls during run
-        for w in [self.sample_dd, self.celltype_tb, self.mode_tb, self.save_cb,
-                  self.btn_select_all, self.btn_clear_all, self.btn_run]:
-            w.disabled = state
-        # disable checkboxes
-        for rows in (self._time_group_rows, self._mean_group_rows):
-            for row in rows.values():
-                row["group_cb"].disabled = state
-                for cb in row["child_cbs"]:
-                    cb.disabled = state
-
-    def _persist(self, *, resolved=None):
-        # snapshot current UI state
-        mode = self._mode_map[self.mode_tb.value]
-        self._cfg["cell_type"] = self._celltype_map[self.celltype_tb.value]
-        self._cfg["mode"] = mode
-        self._cfg["save"] = bool(self.save_cb.value)
-        self._cfg["last_sample"] = self.sample_dd.value
-
-        if mode == "time":
-            self._cfg["columns_input_time"] = list(self._selected_time_patterns())
-        else:
-            self._cfg["columns_input_mean"] = list(self._selected_mean_columns())
-
-        if resolved is not None:
-            self._cfg["columns_resolved"] = list(resolved)
-
-        self._params["backprojection"] = self._cfg
-        self.metadata_loader.behav3d_parameters = self._params
-        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(self._params, f, sort_keys=False)
-
-    # ---------- run ----------
-    def _on_run_clicked(self, *_):
-        self._lock(True)
-        self.spinner_html.layout.display = None
-        self.btn_stop.layout.display = "inline-block"  # allow user to try closing viewer
-        self.out.clear_output()
-
-        with self.out:
-            patched = False
-            try:
-                sample = self.sample_dd.value
-                cell_type = self._celltype_map[self.celltype_tb.value]
-                mode = self._mode_map[self.mode_tb.value]
-                save = bool(self.save_cb.value)
-
-                print(f"▶️ Backprojecting… sample={sample} | cell_type={cell_type} | mode={mode} | save={save}")
-
-                # Resolve columns to use
-                if mode == "mean":
-                    # already concrete column names
-                    cols_to_use = self._selected_mean_columns()
-                    resolved = cols_to_use
-                else:
-                    # expand patterns against header of clustered tracks (summarized DF not needed for time)
-                    results_dir = Path(self.output_dir, "analysis", cell_type, "results")
-                    clustered_csv = Path(results_dir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv")
-                    try:
-                        header_cols = pd.read_csv(clustered_csv, nrows=1).columns
-                    except Exception:
-                        header_cols = None
-                    patterns = self._selected_time_patterns()
-                    resolved = self._expand_patterns(patterns, header_cols)
-                    cols_to_use = resolved
-
-                self._persist(resolved=resolved)
-
-                # Respect Save checkbox by temporarily disabling save_as_zarr when save=False
-                if not save:
-                    try:
-                        import behav3d.utils.fileio as fio
-                        self._orig_save_as_zarr = fio.save_as_zarr
-                        def _noop(*args, **kwargs): return None
-                        fio.save_as_zarr = _noop
-                        patched = True
-                    except Exception:
-                        print("⚠️ Could not patch save_as_zarr; results may be written.")
-
-                # Choose function
-                fn = backproject_mean_features_behav3d if mode == "mean" else backproject_time_features_behav3d
-
-                # Run (these functions launch napari internally)
-                _ = fn(
-                    metadata=self.metadata_loader.metadata,
-                    sample_name=sample,
-                    config=None,
-                    output_dir=self.output_dir,
-                    cell_type=cell_type,
-                    columns=cols_to_use if cols_to_use else [],  # [] lets function choose default
-                    save=save
-                )
-
-                print("✅ Backprojection finished (napari was launched inside the function).")
-
-            except Exception:
-                import traceback; traceback.print_exc()
-            finally:
-                # restore save
-                try:
-                    if patched:
-                        import behav3d.utils.fileio as fio
-                        fio.save_as_zarr = self._orig_save_as_zarr
-                except Exception:
-                    pass
-                self.spinner_html.layout.display = "none"
-                self._lock(False)
-
-    def _on_stop_clicked(self, *_):
-        """Best-effort close of any open napari window."""
-        try:
-            import napari
-            from qtpy.QtWidgets import QApplication
-            app = QApplication.instance()
-            if app is not None:
-                # Close all top-level windows that look like napari
-                for w in list(app.topLevelWidgets()):
-                    name = w.__class__.__name__.lower()
-                    if "napari" in name or "mainwindow" in name:
-                        try: w.close()
-                        except Exception: pass
-                app.processEvents()
-            else:
-                # Fallback: try current viewer handle if available
                 try:
                     v = napari.current_viewer()
                     if v is not None:
