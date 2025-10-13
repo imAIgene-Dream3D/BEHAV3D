@@ -646,7 +646,16 @@ def cluster_umap(
     
     ### TODO Do the clustering based straight on the DTW distances
     ### Miguel suggested clusters are more meaningful before the umap embedding
-    df_umap["ClusterID"] = kmeans.fit_predict(umap_embedding.drop(columns=["TrackID","sample_name"]))
+    
+    umap_embedding.columns.difference(df_tracks_summarized.columns)
+    
+    df_umap["ClusterID"] = kmeans.fit_predict(
+        df_umap[umap_embedding.columns.difference(df_tracks_summarized.columns)]
+        )
+    
+    # df_umap["ClusterID"] = kmeans.fit_predict(
+    #     umap_embedding.drop(columns=["TrackID","sample_name"])
+    #     )
     # df_umap["cluster2"] = kmeans.fit_predict(umap_embedding)
     
     # Set cluster index to start from 1 for backprojection purposes
