@@ -813,27 +813,27 @@ def run_pixel_classifier_segmentation(
         pixelclass_dir.mkdir()
         
     curr_clf_org_path = Path(pixelclass_dir, 'PixelClassifier_Organoid.joblib')
-    if clf_org_path is None:
+    if not clf_org_path:
         clf_org_path = curr_clf_org_path
     else:
         shutil.copy(clf_org_path, curr_clf_org_path)
         
     curr_clf_tcell_path = Path(pixelclass_dir, 'PixelClassifier_Tcell.joblib')
         
-    if clf_tcell_path is None:
+    if not clf_tcell_path:
         clf_tcell_path = curr_clf_tcell_path
     else:
         shutil.copy(clf_org_path, curr_clf_tcell_path)
     
     curr_clf_death_path = Path(pixelclass_dir, 'PixelClassifier_Death.joblib')
-    if clf_death_path is None:
+    if not clf_death_path:
         clf_death_path = curr_clf_death_path
     else:
         shutil.copy(clf_death_path, curr_clf_death_path)
 
     if two_org_types:
         curr_clf_org2_path = Path(pixelclass_dir, 'PixelClassifier_Organoid2.joblib')
-        if clf_org2_path is None:
+        if not clf_org2_path:
             clf_org2_path = curr_clf_org2_path
         else:
             shutil.copy(clf_org2_path, curr_clf_org2_path)

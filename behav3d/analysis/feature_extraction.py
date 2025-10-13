@@ -236,7 +236,7 @@ def run_feature_extraction(
         # Add additional organoid type info
         organoid_2_segments_path = None
 
-        if sample_metadata['organoid_2_tracks_image_path'] and Path(sample_metadata['organoid_2_tracks_image_path']).exists():
+        if 'organoid_2_tracks_image_path' in sample_metadata and Path(sample_metadata['organoid_2_tracks_image_path']).exists():
             organoid_2_segments_path = sample_metadata['organoid_2_tracks_image_path']
 
         dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
@@ -271,6 +271,8 @@ def run_feature_extraction(
             raise ValueError(f"Unknown cell type: {cell_type}. Expected 'tcell' or 'organoid' or 'organoid_2.")
         
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
+        # Adding a sample name for later combination of multiple track experiments
+        df_tracks['sample_name']=sample_name
         
         print(f"{get_current_time()} - Generalizing the units of position and time to um and hours")
         df_tracks = generalize_units_of_track_features(
@@ -367,8 +369,6 @@ def run_feature_extraction(
         print(f"{get_current_time()} - Writing output to {tracks_out_path}")
         df_tracks.to_csv(tracks_out_path, sep=",", index=False)
         
-        # Adding a sample name for later combination of multiple track experiments
-        df_tracks['sample_name']=sample_name
         df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
         df_all_tracks = pd.concat([df_all_tracks, df_tracks])
         
@@ -562,7 +562,7 @@ def calculate_image_based_track_features(
         
     df_tracks = df_tracks.sort_values(
         by=["sample_name", "TrackID", "position_t"], 
-        ascending=[True, True, True]  # example: last column sorted descending
+        ascending=[True, True, True]
     )    
     new_order = ["sample_name"] + [c for c in df_tracks.columns.tolist() if c != "sample_name"]
     df_tracks = df_tracks[new_order]
@@ -745,6 +745,7 @@ def calculate_death(
 def interpolate_missing_positions(
     df_tracks,
     cols_to_copy=[
+        "sample_name",
         "TrackID",
         "organoid_contact",
         "organoid_contact_pixels",

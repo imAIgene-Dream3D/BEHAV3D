@@ -991,7 +991,6 @@ class SignalUnmixingPanel:
         self.sum_scale_widgets = sum_scale_widgets
 
 
-        # -------- Buttons / spinner / close (like TrackingVisualizationPanel) --------
         self.btn_unmix = widgets.Button(
             description="Run signal unmixing",
             button_style="primary",
@@ -1007,21 +1006,6 @@ class SignalUnmixingPanel:
             [self.btn_unmix, self.spinner_unmix],
             layout=widgets.Layout(align_items="center", gap="8px")
         )
-        # -------- Viewer buttons (like TrackingVisualizationPanel) --------
-        # vis_files_path = Path(self.metadata_loader.output_dir, "images/SignalUnmixing").expanduser()
-
-        # # Get list of directory names inside the folder
-        # if vis_files_path.exists():
-        #     options = [p.name for p in vis_files_path.iterdir() if p.is_dir()]
-        #     if not options:
-        #         options = ["(no directories)"]
-        # else:
-        #     options = ["(path not found)"]
-
-        # self.file_sel = widgets.Dropdown(
-        #     options=options,
-        #     description="Select file to visualize:"
-        # )
 
         self.channel_colors = tuple(channel_colors or _cfg_get(
             self.metadata_loader.behav3d_parameters, "signal_unmixing.channel_colors",
@@ -1100,7 +1084,6 @@ class SignalUnmixingPanel:
         # Try immediate build if metadata already present
         self._maybe_build_from_loader()
 
-        # -------- Save button + spinner (like TrackingVisualizationPanel) --------
         self.btn_save = widgets.Button(
             description="Save Signal Unmixing",
             button_style="success",
@@ -1529,7 +1512,6 @@ class PixelClassifierPanel:
         self.use_all_timepoints.observe(self._toggle_timepoint_inputs, names='value')
         self._toggle_timepoint_inputs()
 
-        # -------- Buttons / spinner / close (like TrackingVisualizationPanel) --------
         self.btn_train = widgets.Button(
             description="Train pixel classifier",
             button_style="primary",
@@ -1542,7 +1524,7 @@ class PixelClassifierPanel:
             tooltip="Close the active Napari viewer",
             layout=widgets.Layout(width="200px", display="none")  # hidden until a viewer is open
         )
-        # Uses the same global spinner HTML you use elsewhere
+
         self.spinner_train = widgets.HTML(value=spinning_loader)
         self.spinner_train.layout.display = "none"
 
@@ -1818,7 +1800,6 @@ class PixelClassifierPanel:
                 self._lock(False)
 
     def _on_close_clicked(self, _):
-        """Close the active Napari viewer, like TrackingVisualizationPanel."""
         with self.out:
             try:
                 if self._viewer is not None:
