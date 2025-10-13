@@ -1109,6 +1109,7 @@ def calculate_segment_intensity(segments, intensity_image, calculation="mean"):
     return(df_intensity)
 
 def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID"):
+    df = df.sort_values(by=[groupby, "position_t"]).copy()
     def relative_increase(group):
         values = group[column].values
         increases = []
@@ -1122,31 +1123,34 @@ def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID
 
     return df.groupby(groupby).apply(relative_increase, include_groups=False).reset_index(drop=True).values
 
-def calculate_relative_increase(df, column, nr_timepoints_back, groupby):
-    df = df.sort_values(by=[groupby, "position_t"]).copy()
+# def calculate_relative_increase(df, column, nr_timepoints_back, groupby):
+#     """
+#     Calculate the percentage increase of a column compared to the value
+#     """
+#     df = df.sort_values(by=[groupby, "position_t"]).copy()
 
-    def compute_increase(group):
-        values = group[column].values
-        increases = []
-        for i in range(len(values)):
-            if i >= nr_timepoints_back:
-                ref = values[i - nr_timepoints_back]
-            else:
-                ref = values[0]
-            current = values[i]
-            if ref == 0:
-                increase = float('inf') if current > 0 else 0.0
-            else:
-                increase = (current - ref) / ref
-            increases.append(increase)
-        return pd.Series(increases, index=group.index)
+#     def compute_increase(group):
+#         values = group[column].values
+#         increases = []
+#         for i in range(len(values)):
+#             if i >= nr_timepoints_back:
+#                 ref = values[i - nr_timepoints_back]
+#             else:
+#                 ref = values[0]
+#             current = values[i]
+#             if ref == 0:
+#                 increase = float('inf') if current > 0 else 0.0
+#             else:
+#                 increase = (current - ref) / ref
+#             increases.append(increase)
+#         return pd.Series(increases, index=group.index)
 
-    # Use `transform`-like behavior by resetting the index before recombining
-    result = df.groupby(groupby).apply(compute_increase)
-    if isinstance(result.index, pd.MultiIndex):
-        result.index = result.index.droplevel(0)
+#     # Use `transform`-like behavior by resetting the index before recombining
+#     result = df.groupby(groupby).apply(compute_increase)
+#     if isinstance(result.index, pd.MultiIndex):
+#         result.index = result.index.droplevel(0)
 
-    return result
+#     return result
 
             
 def calculate_dead_mask(segments, dead_mask):
