@@ -171,6 +171,7 @@ def run_feature_extraction(
     features_choice=["movement", "intensity", "morphology", "contact", "death"],
     imaris=False,
     dead_mask_percentage_threshold=None,
+    contact_threshold=None,
     rolling_meanspeed_window=10,
     overwrite=False,
     n_workers=1
@@ -215,8 +216,7 @@ def run_feature_extraction(
         if imaris:
             tcell_contact_threshold = sample_metadata["tcell_contact_threshold"]
             organoid_contact_threshold = sample_metadata["organoid_contact_threshold"]
-        else:
-            contact_threshold = sample_metadata["contact_threshold"]
+
         dead_channel=sample_metadata['dead_channel']
         
         print("###### Running track feature calculation")

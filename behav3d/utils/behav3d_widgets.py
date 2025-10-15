@@ -2522,16 +2522,19 @@ class FeatureExtractionPanel:
                 thr = float(self.dead_mask_threshold.value)
                 feats = self._selected_features()
                 workers = int(self.n_workers.value)
+                contact_thr = float(self.contact_threshold.value)
                 ow = bool(self.overwrite.value)
 
                 print("▶️ Running feature extraction…", flush=True)
                 print(f"  dead_mask_percentage_threshold={thr}")
                 print(f"  features_choice={feats}")
                 print(f"  n_workers={workers}, overwrite={ow}")
+                print(f"  contact_threshold={contact_thr}")
                 print(f"  output_dir={out_dir}", flush=True)
 
                 new_md = run_feature_extraction(
                     dead_mask_percentage_threshold=thr,
+                    contact_threshold=contact_thr,
                     metadata=self.metadata_loader.metadata,
                     output_dir=str(out_dir),
                     features_choice=feats,
