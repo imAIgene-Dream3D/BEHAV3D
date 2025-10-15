@@ -242,3 +242,41 @@ def sauvola_thresholding(
         mask |= override_mask
 
     return(mask)
+
+
+def zeropad_image_to_match_shape(img, target_shape, axes=[-3, -2, -1]):
+    """
+    Zero-pad an image array only along specified axes to match the target shape.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Input image of shape (e.g. (C, T, Z, Y, X)).
+    target_shape : tuple of int
+        Desired final shape.
+    axes : list of int
+        Axes along which to pad (default: last three spatial axes [-3, -2, -1]).
+        
+    Returns
+    -------
+    np.ndarray
+        Padded image matching target_shape along the specified axes.
+    """
+    # Ensure positive axis indices
+    ndim = img.ndim
+    axes = [a if a >= 0 else ndim + a for a in axes]
+    
+    # Initialize output same as input
+    padded = img
+
+    # Pad each specified axis if needed
+    pad_width = [(0, 0)] * ndim
+    for ax in axes:
+        diff = target_shape[ax] - img.shape[ax]
+        if diff > 0:
+            pad_width[ax] = (0, diff)  # pad zeros at the end
+
+    # Apply padding only where needed
+    padded = np.pad(padded, pad_width=pad_width, mode='constant', constant_values=0)
+
+    return padded

@@ -18,9 +18,9 @@ from sklearn.ensemble import RandomForestClassifier
 # from napari_apoc import PixelClassifier  # Commented out - use scikit-learn instead
 from scipy.ndimage import binary_fill_holes, find_objects
 
-from behav3d.utils.preprocessing import open_mask, dilate_mask
+from behav3d.utils.preprocessing import open_mask, dilate_mask, zeropad_image_to_match_shape
 from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt, segment_2d_filter
-from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr
+from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr, get_image_shape
 
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -289,6 +289,7 @@ def train_pixel_classifier(
     features_outpath = Path(pixel_class_outdir, 'PixelClassifier_Features.zarr')
     image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
     
+    
     if images is None:
         if not features_outpath.exists() or not image_outpath.exists():
             if image_outpath.exists():
@@ -298,6 +299,24 @@ def train_pixel_classifier(
             
             all_images = []
             all_features = []
+            
+            channels = []
+            for _, sample in metadata.iterrows():
+                raw_image_path = Path(sample['raw_image_path'])
+                raw_image_shape = get_image_shape(raw_image_path)
+                nr_channels = raw_image_shape[-4]
+                channels.append(nr_channels)
+                
+            shapes_info = "\n".join(
+                [f"{sample['sample_name']}: {get_image_shape(Path(sample['raw_image_path']))}"
+                for _, sample in metadata.iterrows()]
+            )
+
+            assert len(set(channels)) == 1, (
+                "All samples must have the same number of channels.\n"
+                f"Image shapes:\n{shapes_info}"
+            )
+                
             for idx, sample in metadata.iterrows():
                 
                 sample_name = sample['sample_name']
@@ -305,9 +324,7 @@ def train_pixel_classifier(
                 tcell_ch=sample['tcell_channel']
                 live_ch=sample['live_channel']
                 dead_ch=sample['dead_channel']
-                
-                print(f"Calculating features for: {sample_name}")
-                
+                        
                 raw_image_path = Path(sample['raw_image_path'])
                 raw_image_zarr =  Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
                 
@@ -345,14 +362,27 @@ def train_pixel_classifier(
                 
                 # sample_images = [images[t, [tcell_ch, live_ch, dead_ch]] for t in idc]
                 sample_images = [images[t] for t in idc]
-                # for idx in idc:
-                #     sample_images.append(images[idx])      
-                
                 all_images+=sample_images
-                
-                for img in tqdm(sample_images):
-                    append_to_zarr(np.expand_dims(features_func(img), axis=0), features_outpath)
-                
+            
+            # Calculate the maximum shape that the images need to be in each dimension
+            max_shape = tuple(max(img.shape[i] for img in all_images) for i in range(images[0].ndim))
+
+            print(f"Calculating features...")
+            for img in tqdm(all_images):
+                append_to_zarr(
+                    np.expand_dims(
+                        zeropad_image_to_match_shape(
+                            img = features_func(img),
+                            target_shape=max_shape[-3:],
+                            axes=[-4, -3, -2]
+                        ), axis=0), 
+                    features_outpath
+                    )
+            
+            
+            all_images = [zeropad_image_to_match_shape(img, max_shape) for img in all_images]
+            
+            print(f"Max shape found for padding input images: {max_shape}")
             # Allow manual override of dimension order for transpose
             all_images = da.stack(all_images)
             all_images = all_images.transpose(1, 0, 2, 3, 4) ## this order corresponds to (C, T, Z, Y, X)
