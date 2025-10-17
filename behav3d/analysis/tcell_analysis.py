@@ -761,20 +761,31 @@ def plot_cluster_percentage_bars(
                 if i == 0:
                     ax.set_title(f'{organoid_line}', fontsize=30)
                 if j == 0:
-                    ax.set_ylabel(f'{tcell_line}', fontsize=30) 
+                    ax.text(
+                        -0.05, 0.5,
+                        f'{tcell_line}',
+                        ha='right', va='center',
+                        rotation=0,
+                        transform=ax.transAxes,
+                        fontsize=30
+                    )
+                    # ax.set_ylabel(f'{tcell_line}', fontsize=30, rotation=0, labelpad=40, va='center') 
                 if subset.empty:
-                    ax.spines['top'].set_visible(False)
-                    ax.spines['right'].set_visible(False)
-                    ax.spines['left'].set_visible(False)
-                    ax.spines['bottom'].set_visible(False)
+                    ax.axis('off')
                     continue
                 subset_pivot = subset.pivot(index='tcell_line', columns='ClusterID', values='percentage').fillna(0)
                 subset_pivot.plot(kind='barh', stacked=True, ax=ax, legend=False)
                 if i == 0:
                     ax.set_title(f'{organoid_line}', fontsize=30)
                 if j == 0:
-                    print(tcell_line)
-                    ax.set_ylabel(f'{tcell_line}', fontsize=30) 
+                    ax.text(
+                        -0.05, 0.5,
+                        f'{tcell_line}',
+                        ha='right', va='center',
+                        rotation=0,
+                        transform=ax.transAxes,
+                        fontsize=30
+                    )
     
                 num_cells = subset['count'].sum()
                 ax.text(
@@ -786,16 +797,7 @@ def plot_cluster_percentage_bars(
                     transform=ax.transAxes, 
                     fontsize=20
                     )
-                
-                ax.set_xticks([])
-                ax.set_yticks([])
-                ax.set_xticklabels([])
-                ax.set_yticklabels([])
-                ax.spines['top'].set_visible(False)
-                ax.spines['right'].set_visible(False)
-                ax.spines['left'].set_visible(False)
-                ax.spines['bottom'].set_visible(False)
-                
+                ax.axis('off')
                 # ax.set_xlabel('Percentage')
 
          # Add legend
