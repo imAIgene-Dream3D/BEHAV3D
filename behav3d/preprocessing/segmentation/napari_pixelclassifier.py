@@ -1,3 +1,5 @@
+import os
+
 from pathlib import Path
 import numpy as np
 import time
@@ -845,27 +847,27 @@ def run_pixel_classifier_segmentation(
     curr_clf_org_path = Path(pixelclass_dir, 'PixelClassifier_Organoid.joblib')
     if not clf_org_path:
         clf_org_path = curr_clf_org_path
-    else:
+    elif not os.path.samefile(clf_org_path, curr_clf_org_path):
         shutil.copy(clf_org_path, curr_clf_org_path)
         
     curr_clf_tcell_path = Path(pixelclass_dir, 'PixelClassifier_Tcell.joblib')
         
     if not clf_tcell_path:
         clf_tcell_path = curr_clf_tcell_path
-    else:
+    elif not os.path.samefile(clf_tcell_path, curr_clf_tcell_path):
         shutil.copy(clf_org_path, curr_clf_tcell_path)
     
     curr_clf_death_path = Path(pixelclass_dir, 'PixelClassifier_Death.joblib')
     if not clf_death_path:
         clf_death_path = curr_clf_death_path
-    else:
+    elif not os.path.samefile(clf_death_path, curr_clf_death_path):
         shutil.copy(clf_death_path, curr_clf_death_path)
 
     if two_org_types:
         curr_clf_org2_path = Path(pixelclass_dir, 'PixelClassifier_Organoid2.joblib')
         if not clf_org2_path:
             clf_org2_path = curr_clf_org2_path
-        else:
+        elif not os.path.samefile(clf_org2_path, curr_clf_org2_path):
             shutil.copy(clf_org2_path, curr_clf_org2_path)
 
         clf_org_2 = joblib.load(clf_org2_path)
