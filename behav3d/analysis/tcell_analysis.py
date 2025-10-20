@@ -666,7 +666,7 @@ def cluster_umap(
     print(f"- Writing clustered tracks to {df_umap_out_path}")
     df_umap.to_csv(df_umap_out_path, sep=",", index=False)
 
-    sample_cols = ["organoid_line", "tcell_line"]
+    sample_cols = ["organoid_line", "tcell_line", "sample_name", "well", "exp_nr"]
     info_cols = df_umap.drop(columns=["TrackID", "sample_name", "well", "exp_nr", "UMAP1", "UMAP2", "ClusterID"]).columns
     
     cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_clusters.pdf")
@@ -849,7 +849,7 @@ def plot_feature_umap(
                     y="UMAP2",
                     hue="ClusterID",
                     s=40,
-                    alpha=0.95,
+                    alpha=0.7,
                     palette="Set1",
                     ax=ax,
                 )
@@ -892,7 +892,7 @@ def plot_feature_umap(
                         y="UMAP2",
                         s=40,
                         hue=colorcol,
-                        alpha=0.8,
+                        alpha=0.7,
                         palette="Set2",
                         ax=ax
                     )

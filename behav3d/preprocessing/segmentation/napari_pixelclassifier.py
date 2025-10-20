@@ -43,7 +43,7 @@ features_func = partial(
         feature.multiscale_basic_features,
         intensity=True,
         edges=True,
-        texture=True,
+        texture=False,
         # sigma_min=sigma_min,
         sigma_max=sigma_max,
         channel_axis=0,
