@@ -5,8 +5,8 @@ import shutil
 
 import napari
 from magicgui import magicgui
-from magicgui.widgets import PushButton
-from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout, QApplication
+from magicgui.widgets import PushButton, FloatSlider, Container
+from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout, QApplication, QLabel
 
 from aicspylibczi import CziFile
 
@@ -21,6 +21,7 @@ from scipy.ndimage import binary_fill_holes, find_objects
 from behav3d.utils.preprocessing import open_mask, dilate_mask
 from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt, segment_2d_filter
 from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr
+from behav3d.utils import detect_immune_cell_types_from_metadata
 
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -282,6 +283,12 @@ def train_pixel_classifier(
     assert images is not None or metadata is not None, "Either supply a BEHAV3D metadata table or a list of images"
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
+    
+    # Detect immune cell types from metadata
+    immune_cell_types = []
+    if metadata is not None:
+        immune_cell_types = detect_immune_cell_types_from_metadata(metadata)
+        print(f"Detected immune cell types: {immune_cell_types}")
         
     pixel_class_outdir = Path(output_dir, "images", "PixelClassification")
     pixel_class_outdir.mkdir(exist_ok=True, parents=True)
@@ -386,7 +393,8 @@ def train_pixel_classifier(
         tcell_edt_threshold=2.5,
         organoid_edt_threshold: float = 12,
         n_workers: int = 16,
-        log=print
+        log=print,
+        immune_edt_thresholds=None
         ):
         start_time = time.time()
         log("###### Running Segmentation\n")
@@ -398,8 +406,6 @@ def train_pixel_classifier(
         
         org_label_layer = viewer.layers['User Provided Labels (Organoid)']
         org_label_data = org_label_layer.data
-
-
         
         tcell_label_layer = viewer.layers['User Provided Labels (Tcell)']
         tcell_label_data = tcell_label_layer.data
@@ -408,7 +414,6 @@ def train_pixel_classifier(
         dead_label_data = dead_label_layer.data
         
         org_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserOrganoidLabels.zarr')
-
         tcell_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserTcellLabels.zarr')
         dead_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserDeadLabels.zarr')
         save_as_zarr(org_label_data, org_labels_outpath)
@@ -420,6 +425,15 @@ def train_pixel_classifier(
             org_2_label_data = org_2_label_layer.data
             org_2_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserOrganoid2Labels.zarr')
             save_as_zarr(org_2_label_data, org_2_labels_outpath)
+        
+        # Save immune cell type labels
+        immune_label_data = {}
+        immune_labels_outpaths = {}
+        for immune_type in immune_cell_types:
+            immune_label_layer = viewer.layers[f'User Provided Labels ({immune_type.title()})']
+            immune_label_data[immune_type] = immune_label_layer.data
+            immune_labels_outpaths[immune_type] = Path(pixel_class_outdir, f'PixelClassifier_User{immune_type.title()}Labels.zarr')
+            save_as_zarr(immune_label_data[immune_type], immune_labels_outpaths[immune_type])
 
 
         def train_classifier(user_labels, features):
@@ -484,6 +498,17 @@ def train_pixel_classifier(
             log(f"Saving RandomForest, Sparse labels and input images to {death_random_forest_outpath}")
             joblib.dump(clf_death, death_random_forest_outpath)
             QApplication.processEvents()
+            
+            # Train immune cell classifiers
+            clf_immune = {}
+            immune_random_forest_outpaths = {}
+            for immune_type in immune_cell_types:
+                log(f"\n### Training Random Forest Classifier ({immune_type.title()})")
+                clf_immune[immune_type] = train_classifier(immune_label_data[immune_type], all_features)
+                immune_random_forest_outpaths[immune_type] = Path(pixel_class_outdir, f'PixelClassifier_{immune_type.title()}.joblib')
+                log(f"Saving RandomForest, Sparse labels and input images to {immune_random_forest_outpaths[immune_type]}")
+                joblib.dump(clf_immune[immune_type], immune_random_forest_outpaths[immune_type])
+                QApplication.processEvents()
         
         
         pred_org_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid_PredictedLabels.zarr')
@@ -491,6 +516,11 @@ def train_pixel_classifier(
             pred_org_2_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid2_PredictedLabels.zarr')
         pred_tcell_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Tcell_PredictedLabels.zarr')
         pred_death_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Death_PredictedLabels.zarr')
+        
+        # Immune cell prediction paths
+        pred_immune_labels_outpaths = {}
+        for immune_type in immune_cell_types:
+            pred_immune_labels_outpaths[immune_type] = Path(pixel_class_outdir, f'PixelClassifier_{immune_type.title()}_PredictedLabels.zarr')
         # parts_outpath = Path(pred_labels_outpath.parent, "pred_parts")
         
         if not only_segment:
@@ -502,6 +532,11 @@ def train_pixel_classifier(
                 shutil.rmtree(pred_tcell_labels_outpath)
             if pred_death_labels_outpath.exists():
                 shutil.rmtree(pred_death_labels_outpath)
+            
+            # Remove immune cell prediction paths
+            for immune_type in immune_cell_types:
+                if pred_immune_labels_outpaths[immune_type].exists():
+                    shutil.rmtree(pred_immune_labels_outpaths[immune_type])
 
             log("\n### Predicting Organoid Pixels")
             QApplication.processEvents()
@@ -520,11 +555,22 @@ def train_pixel_classifier(
             QApplication.processEvents()
             pred_death_mask = apply_classifier(clf_death, features_outpath, pred_death_labels_outpath)
             
+            # Predict immune cell pixels
+            pred_immune_masks = {}
+            for immune_type in immune_cell_types:
+                log(f"\n### Predicting {immune_type.title()} Pixels")
+                QApplication.processEvents()
+                pred_immune_masks[immune_type] = apply_classifier(clf_immune[immune_type], features_outpath, pred_immune_labels_outpaths[immune_type])
+            
             viewer.layers["Pixel Classification (Organoid)"].data = pred_org_mask
             if two_org_types:
                 viewer.layers["Pixel Classification (Organoid 2)"].data = pred_org_2_mask
             viewer.layers["Pixel Classification (Tcell)"].data = pred_tcell_mask
             viewer.layers["Pixel Classification (Dead)"].data = pred_death_mask
+            
+            # Update immune cell pixel classification layers
+            for immune_type in immune_cell_types:
+                viewer.layers[f"Pixel Classification ({immune_type.title()})"].data = pred_immune_masks[immune_type]
 
         else:
             log("\n### Loading Organoid Prediction Mask")
@@ -551,6 +597,15 @@ def train_pixel_classifier(
             pred_death_mask = viewer.layers["Pixel Classification (Dead)"].data
             pred_death_mask[pred_death_mask==1] = 0
             viewer.layers["Pixel Classification (Dead)"].data = pred_death_mask
+            
+            # Load immune cell prediction masks
+            pred_immune_masks = {}
+            for immune_type in immune_cell_types:
+                log(f"\n### Loading {immune_type.title()} Prediction Mask")
+                QApplication.processEvents()
+                pred_immune_masks[immune_type] = viewer.layers[f"Pixel Classification ({immune_type.title()})"].data
+                pred_immune_masks[immune_type][pred_immune_masks[immune_type]==1] = 0
+                viewer.layers[f"Pixel Classification ({immune_type.title()})"].data = pred_immune_masks[immune_type]
             
         log("\n### Segment Cell and Organoid Instances")
         QApplication.processEvents()
@@ -596,6 +651,39 @@ def train_pixel_classifier(
             save_as_zarr(image_data, image_outpath)
             
             log(f"\n###### DONE time elapsed: {time.time() - start_time:.2f} s")
+        
+        # Segment immune cells
+        full_seg_immune = {}
+        for immune_type in immune_cell_types:
+            # Get threshold for this immune type, default to tcell threshold
+            if immune_edt_thresholds and immune_type in immune_edt_thresholds:
+                immune_threshold = immune_edt_thresholds[immune_type]
+            else:
+                immune_threshold = tcell_edt_threshold
+            
+            log(f"\n### Segmenting {immune_type.title()} Instances (EDT threshold: {immune_threshold})")
+            QApplication.processEvents()
+            
+            immune_segments = []
+            for idx in range(org_label_data.shape[0]):
+                # Postprocess the immune mask
+                immune_mask_processed = postprocess_mask(pred_immune_masks[immune_type][idx], opening_nr_pixels=0)
+                
+                # Segment immune cells with specific threshold
+                seg_immune = segment_mask(
+                    mask=immune_mask_processed,
+                    segment_size_min=10,  # Same as tcell_segment_size_min
+                    edt_thr=immune_threshold,
+                    edt_thr_refined=[2, 2.5, 3],  # Same as tcell_edt_threshold_refined
+                    use_dims=3
+                )
+                immune_segments.append(seg_immune)
+            
+            full_seg_immune[immune_type] = np.stack(immune_segments, axis=0)
+            
+            # Update Napari layer
+            viewer.layers[f"{immune_type.title()} Segments"].data = full_seg_immune[immune_type]
+            log(f"### {immune_type.title()} Segmentation Complete")
     
     def save_pixel_classification(log=print):
         label_layer = viewer.layers['User Provided Labels']
@@ -649,6 +737,10 @@ def train_pixel_classifier(
     tcell_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserTcellLabels.zarr')
     dead_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserDeadLabels.zarr')
     
+    # Immune cell label paths
+    immune_labels_outpaths = {}
+    for immune_type in immune_cell_types:
+        immune_labels_outpaths[immune_type] = Path(pixel_class_outdir, f'PixelClassifier_User{immune_type.title()}Labels.zarr')
     
     if org_labels_outpath.exists():
         print("Loading existing user labelled organoid data")
@@ -674,12 +766,25 @@ def train_pixel_classifier(
     else:
         dead_user_labels = np.zeros(all_images.shape[1:]).astype(np.int16)
     
+    # Load or create immune cell user labels
+    immune_user_labels = {}
+    for immune_type in immune_cell_types:
+        if immune_labels_outpaths[immune_type].exists():
+            print(f"Loading existing user labelled {immune_type} data")
+            immune_user_labels[immune_type] = np.asarray(load_zarr(immune_labels_outpaths[immune_type]))
+        else:
+            immune_user_labels[immune_type] = np.zeros(all_images.shape[1:]).astype(np.int16)
+    
     user_layers = {
         "User Provided Labels (Organoid)": org_user_labels,
         **({"User Provided Labels (Organoid 2)": org_2_user_labels} if two_org_types else {}),
         "User Provided Labels (Tcell)": tcell_user_labels,
         "User Provided Labels (Dead)": dead_user_labels,
     }
+    
+    # Add immune cell user label layers
+    for immune_type in immune_cell_types:
+        user_layers[f"User Provided Labels ({immune_type.title()})"] = immune_user_labels[immune_type]
 
     for name, data in user_layers.items():
         layer = viewer.add_labels(data, name=name, opacity=0.3)
@@ -689,6 +794,12 @@ def train_pixel_classifier(
         pred_org_2_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Organoid2_PredictedLabels.zarr')
     pred_tcell_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Tcell_PredictedLabels.zarr')
     pred_death_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_Death_PredictedLabels.zarr')
+    
+    # Immune cell prediction paths
+    pred_immune_labels_outpaths_init = {}
+    for immune_type in immune_cell_types:
+        pred_immune_labels_outpaths_init[immune_type] = Path(pixel_class_outdir, f'PixelClassifier_{immune_type.title()}_PredictedLabels.zarr')
+    
     if not pred_org_labels_outpath.exists():
         pixelclass_layers = {
             "Pixel Classification (Organoid)": np.zeros(all_images.shape[1:]).astype(np.int16),
@@ -696,6 +807,10 @@ def train_pixel_classifier(
             "Pixel Classification (Tcell)": np.zeros(all_images.shape[1:]).astype(np.int16),
             "Pixel Classification (Dead)": np.zeros(all_images.shape[1:]).astype(np.int16),
         }
+        
+        # Add immune cell pixel classification layers
+        for immune_type in immune_cell_types:
+            pixelclass_layers[f"Pixel Classification ({immune_type.title()})"] = np.zeros(all_images.shape[1:]).astype(np.int16)
     else:
         pixelclass_layers = {
             "Pixel Classification (Organoid)": np.asarray(load_zarr(pred_org_labels_outpath)),
@@ -703,6 +818,13 @@ def train_pixel_classifier(
             "Pixel Classification (Tcell)": np.asarray(load_zarr(pred_tcell_labels_outpath)),
             "Pixel Classification (Dead)": np.asarray(load_zarr(pred_death_labels_outpath)),
         }
+        
+        # Add immune cell pixel classification layers
+        for immune_type in immune_cell_types:
+            if pred_immune_labels_outpaths_init[immune_type].exists():
+                pixelclass_layers[f"Pixel Classification ({immune_type.title()})"] = np.asarray(load_zarr(pred_immune_labels_outpaths_init[immune_type]))
+            else:
+                pixelclass_layers[f"Pixel Classification ({immune_type.title()})"] = np.zeros(all_images.shape[1:]).astype(np.int16)
     
     for name, data in pixelclass_layers.items():
         layer = viewer.add_labels(data, name=name, opacity=0.3, visible=False)
@@ -711,6 +833,10 @@ def train_pixel_classifier(
     if two_org_types:
         viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name="Organoid 2 Segments", opacity=0.7, visible=False)
     viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name="Tcell Segments", opacity=0.7, visible=False)
+    
+    # Add immune cell segment layers
+    for immune_type in immune_cell_types:
+        viewer.add_labels(np.zeros(all_images.shape[1:]).astype(np.int16), name=f"{immune_type.title()} Segments", opacity=0.7, visible=False)
 
     log_output = QPlainTextEdit()
     log_output.setReadOnly(True)
@@ -729,8 +855,56 @@ def train_pixel_classifier(
     gui = magicgui(update_function, 
                 tcell_edt_threshold={"widget_type": "FloatSlider", "min": 1.0, "max": 15.0, "step": 0.5},
                 organoid_edt_threshold={"widget_type": "FloatSlider", "min": 1.0, "max": 20.0, "step": 0.5},
-                only_segment={"widget_type": "Checkbox", "text": "Only Segment"}
+                only_segment={"widget_type": "Checkbox", "text": "Only Segment"},
+                auto_call=False
                 )
+    
+    # Create dynamic sliders for immune cell types
+    immune_sliders = {}
+    for immune_type in immune_cell_types:
+        # Create a label for the slider
+        label = QLabel(f"{immune_type} edt threshold")
+        gui.native.layout().addWidget(label)
+        
+        # Create the slider
+        slider = FloatSlider(
+            value=2.5,  # Default same as tcell
+            min=1.0,
+            max=15.0,
+            step=0.5,
+            name=f"{immune_type}_edt_threshold"
+        )
+        immune_sliders[immune_type] = slider
+        # Add slider to gui layout
+        gui.native.layout().addWidget(slider.native)
+    
+    # Override the call behavior to include immune thresholds
+    def custom_call():
+        # Get immune thresholds from sliders
+        immune_thresholds = {
+            immune_type: slider.value 
+            for immune_type, slider in immune_sliders.items()
+        }
+        # Call with immune thresholds
+        return segment_and_update(
+            pixel_class_outdir=pixel_class_outdir,
+            only_segment=gui.only_segment.value,
+            tcell_edt_threshold=gui.tcell_edt_threshold.value,
+            organoid_edt_threshold=gui.organoid_edt_threshold.value,
+            n_workers=n_workers,
+            log=log_output.appendPlainText,
+            immune_edt_thresholds=immune_thresholds
+        )
+    
+    # Replace default call button behavior
+    # Remove the default call button and create custom one
+    try:
+        # Try to disconnect all existing connections safely
+        gui.called.disconnect()
+    except:
+        pass
+    gui.called.connect(custom_call)
+    
     viewer.window.add_dock_widget(gui)
         
     save_button = PushButton(label="Save User Labels")
@@ -759,6 +933,7 @@ def _run_single_timepoint_segmentation(
     clf_org_2,
     clf_tcell,
     clf_death,
+    clf_immune=None,
     organoid_edt_threshold=6,
     ):
     features = features_func(t_img)
@@ -780,20 +955,38 @@ def _run_single_timepoint_segmentation(
     pred_death_mask = future.predict_segmenter(features, clf_death)
     pred_death_mask[pred_death_mask>0] -= 1
     
+    # Predict immune cell pixels
+    pred_immune_masks = {}
+    seg_immune = {}
+    if clf_immune:  
+        for immune_type, clf in clf_immune.items():
+            pred_immune_masks[immune_type] = future.predict_segmenter(features, clf)
+            pred_immune_masks[immune_type][pred_immune_masks[immune_type]>0] -= 1
+            
+            # Segment immune cells (similar to T-cells)
+            immune_mask_processed = postprocess_mask(pred_immune_masks[immune_type], opening_nr_pixels=0)
+            seg_immune[immune_type] = segment_mask(
+                mask=immune_mask_processed,
+                segment_size_min=10,  # Same as tcell_segment_size_min
+                edt_thr=1.5,  # Same as tcell_edt_threshold
+                edt_thr_refined=[2, 2.5, 3],  # Same as tcell_edt_threshold_refined
+                use_dims=3
+            )
+    
     # print("\n### Segmenting Organoids and T-cells")
     if clf_org_2 is not None:
         two_org_types = True
         seg_organoid, seg_organoid_2, seg_tcell = segment_tcell_and_organoid(
             args = (pred_org_mask, pred_org_2_mask, pred_tcell_mask, organoid_edt_threshold, two_org_types)
         )
-        return(seg_organoid, seg_organoid_2, seg_tcell, pred_death_mask)
+        return(seg_organoid, seg_organoid_2, seg_tcell, pred_death_mask, seg_immune)
     else:
         two_org_types = False
         seg_organoid, seg_tcell = segment_tcell_and_organoid(
             args = (pred_org_mask, pred_tcell_mask, organoid_edt_threshold, two_org_types),  
         )
         
-        return(seg_organoid, seg_tcell, pred_death_mask)
+        return(seg_organoid, seg_tcell, pred_death_mask, seg_immune)
     
 def run_pixel_classifier_segmentation(
     output_dir,
@@ -804,9 +997,14 @@ def run_pixel_classifier_segmentation(
     clf_org2_path=None,
     clf_tcell_path=None,
     clf_death_path=None,
+    clf_immune_paths=None,
     two_org_types=False,
     ):
 
+
+    # Detect immune cell types from metadata
+    immune_cell_types = detect_immune_cell_types_from_metadata(metadata)
+    print(f"Detected immune cell types: {immune_cell_types}")
 
     pixelclass_dir = Path(output_dir, "images", "PixelClassification")
     if not pixelclass_dir.exists():
@@ -844,6 +1042,53 @@ def run_pixel_classifier_segmentation(
     clf_tcell = joblib.load(clf_tcell_path)
     clf_death = joblib.load(clf_death_path)
     
+    # Load immune cell classifiers
+    clf_immune = {}
+    if clf_immune_paths is not None:
+        for immune_type in immune_cell_types:
+            if immune_type in clf_immune_paths:
+                immune_clf_path = clf_immune_paths[immune_type]
+                curr_clf_immune_path = Path(pixelclass_dir, f'PixelClassifier_{immune_type.title()}.joblib')
+                if immune_clf_path is not None:
+                    '''shutil.copy(immune_clf_path, curr_clf_immune_path)
+                    clf_immune[immune_type] = joblib.load(curr_clf_immune_path)
+                    print(f"✓ Loaded {immune_type} classifier from: {immune_clf_path}")'''
+                    if Path(immune_clf_path).resolve() != curr_clf_immune_path.resolve():
+                        shutil.copy(immune_clf_path, curr_clf_immune_path)
+                        print(f"✓ Copied {immune_type} classifier from: {immune_clf_path}")
+                    else:
+                        print(f"✓ Using existing {immune_type} classifier (already in place)")
+                    
+                    clf_immune[immune_type] = joblib.load(curr_clf_immune_path)
+                    
+                elif curr_clf_immune_path.exists():
+                    clf_immune[immune_type] = joblib.load(curr_clf_immune_path)
+                    print(f"✓ Loaded {immune_type} classifier from: {curr_clf_immune_path}")
+                else:
+                    print(f"⚠️  No classifier found for {immune_type}. Segments will not be generated.")
+            else:
+                print(f"⚠️  {immune_type} not in clf_immune_paths. Checking for existing classifier...")
+                curr_clf_immune_path = Path(pixelclass_dir, f'PixelClassifier_{immune_type.title()}.joblib')
+                if curr_clf_immune_path.exists():
+                    clf_immune[immune_type] = joblib.load(curr_clf_immune_path)
+                    print(f"✓ Loaded existing {immune_type} classifier from: {curr_clf_immune_path}")
+                else:
+                    print(f"⚠️  No classifier found for {immune_type}. Segments will not be generated.")
+    else:
+        print(f"⚠️  clf_immune_paths is None. Checking for existing classifiers...")
+        for immune_type in immune_cell_types:
+            curr_clf_immune_path = Path(pixelclass_dir, f'PixelClassifier_{immune_type.title()}.joblib')
+            if curr_clf_immune_path.exists():
+                clf_immune[immune_type] = joblib.load(curr_clf_immune_path)
+                print(f"✓ Loaded existing {immune_type} classifier from: {curr_clf_immune_path}")
+            else:
+                print(f"⚠️  No classifier found for {immune_type}. Segments will not be generated.")
+    
+    if not clf_immune and immune_cell_types:
+        print(f"⚠️  WARNING: No immune cell classifiers loaded for types: {immune_cell_types}")
+        print(f"    To segment immune cells, you must first train a pixel classifier for each cell type.")
+        print(f"    Use 'Train pixel classifier' button and label {immune_cell_types} cells in Napari.")
+    
     for idx, sample in metadata.iterrows():
         print(f"Processing sample: {sample['sample_name']}") 
         start_time = time.time()
@@ -865,6 +1110,11 @@ def run_pixel_classifier_segmentation(
             organoid_2_segments_outpath = Path(img_outdir, f"{sample_name}_organoid2_segments.zarr")
         death_mask_outpath = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
         
+        # Immune cell segment paths
+        immune_segments_outpaths = {}
+        for immune_type in immune_cell_types:
+            immune_segments_outpaths[immune_type] = Path(img_outdir, f"{sample_name}_{immune_type}_segments.zarr")
+        
         if not raw_image_zarr.exists():
             img = load_image(raw_image_path)
             # img = img[:, [tcell_ch, live_ch, dead_ch]]
@@ -872,8 +1122,11 @@ def run_pixel_classifier_segmentation(
         img = load_image(raw_image_zarr)
         print(img.shape)
         
-        if (tcell_segments_outpath.exists() and 
-            organoid_segments_outpath.exists()):
+        # Check if all required files exist
+        all_exist = (tcell_segments_outpath.exists() and organoid_segments_outpath.exists() and
+                     all(immune_segments_outpaths[it].exists() for it in immune_cell_types))
+        
+        if all_exist:
             print("Already segmented, skipping")
         else:   
             if tcell_segments_outpath.exists():
@@ -882,6 +1135,11 @@ def run_pixel_classifier_segmentation(
                 shutil.rmtree(organoid_segments_outpath)
             if two_org_types and organoid_2_segments_outpath.exists():
                 shutil.rmtree(organoid_2_segments_outpath)
+            
+            # Remove immune cell segment paths
+            for immune_type in immune_cell_types:
+                if immune_segments_outpaths[immune_type].exists():
+                    shutil.rmtree(immune_segments_outpaths[immune_type])
             
             # Determine which timepoints to process
             if timepoint_range is not None:
@@ -904,19 +1162,31 @@ def run_pixel_classifier_segmentation(
                     clf_org_2=clf_org_2 if two_org_types else None,
                     clf_tcell=clf_tcell,
                     clf_death=clf_death,
+                    clf_immune=clf_immune if clf_immune else None,
                     organoid_edt_threshold=organoid_edt_threshold
                 )
                 if two_org_types:
-                    seg_organoid, seg_organoid_2, seg_tcell, pred_death_mask = result
+                    seg_organoid, seg_organoid_2, seg_tcell, pred_death_mask, seg_immune = result
                     append_to_zarr(np.expand_dims(seg_organoid_2, axis=0), organoid_2_segments_outpath)
                 else:
-                    seg_organoid, seg_tcell, pred_death_mask = result
+                    seg_organoid, seg_tcell, pred_death_mask, seg_immune = result
                 append_to_zarr(np.expand_dims(seg_organoid, axis=0), organoid_segments_outpath)
                 append_to_zarr(np.expand_dims(seg_tcell, axis=0), tcell_segments_outpath)
                 append_to_zarr(np.expand_dims(pred_death_mask, axis=0), death_mask_outpath)
+                
+                # Save immune cell segments
+                for immune_type in immune_cell_types:
+                    if immune_type in seg_immune:
+                        append_to_zarr(np.expand_dims(seg_immune[immune_type], axis=0), immune_segments_outpaths[immune_type])
                 
         metadata.at[idx, "tcell_segments_image_path"] = str(tcell_segments_outpath)
         metadata.at[idx, "organoid_segments_image_path"] = str(organoid_segments_outpath)
         if two_org_types:
             metadata.at[idx, "organoid_2_segments_image_path"] = str(organoid_2_segments_outpath)
+        
+        # Update metadata with immune cell segment paths (only if files were created)
+        for immune_type in immune_cell_types:
+            if immune_segments_outpaths[immune_type].exists():
+                metadata.at[idx, f"{immune_type}_segments_image_path"] = str(immune_segments_outpaths[immune_type])
+    
     return(metadata)

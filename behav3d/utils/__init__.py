@@ -8,6 +8,28 @@ import fnmatch
 #     # clf = joblib.load(clf_path)
 #     return(1)
 
+def detect_immune_cell_types_from_metadata(metadata):
+   
+    immune_cell_types = set()
+    
+    immune_patterns = ['_line', '_channel', '_segments_image_path', '_tracks_image_path', '_tracks_csv_path']
+
+    # Not detect these as new immune cell types
+    excluded_exact = ['tcell']
+    
+    # Do not detect these
+    excluded_prefixes = ['organoid', 'live', 'dead', 'exp_nr', 'well', 'pixel_distance', 'distance_unit', 'time', 'dimension', 'raw_image', 'signal_unmixing', 'original']
+    
+    for pattern in immune_patterns:
+        matching_columns = [col for col in metadata.columns if col.endswith(pattern)]
+        for column in matching_columns:
+            cell_type = column.replace(pattern, '')
+            if (cell_type not in excluded_exact and 
+                not any(cell_type.startswith(prefix) for prefix in excluded_prefixes)):
+                immune_cell_types.add(cell_type)
+    
+    return sorted(list(immune_cell_types))
+
 def load_behav3d_metadata(
     metadata_path
     ):
@@ -41,7 +63,22 @@ def load_behav3d_metadata(
         "original_raw_image_path": str, # FUNC
     }
 
-    metadata = pd.read_csv(metadata_path, dtype=dtype_dict)
+    headers = pd.read_csv(metadata_path, nrows=0)
+    immune_cell_types = detect_immune_cell_types_from_metadata(headers)
+    for cell_type in immune_cell_types:
+        dtype_dict.update({
+            f"{cell_type}_line": str,
+            f"{cell_type}_channel": "Int64",
+            f"{cell_type}_segments_image_path": str,
+            f"{cell_type}_tracks_image_path": str,
+            f"{cell_type}_tracks_csv_path": str
+        })
+
+    # Only use dtype_dict for columns that actually exist in the CSV
+    available_columns = pd.read_csv(metadata_path, nrows=0).columns
+    filtered_dtype_dict = {k: v for k, v in dtype_dict.items() if k in available_columns}
+
+    metadata = pd.read_csv(metadata_path, dtype=filtered_dtype_dict)
 
     # Apply dtypes only to columns that exist --> Avoid ValueError, later we check_behav3d_metadata
     # for col, dtype in dtype_dict.items():
@@ -55,6 +92,9 @@ def check_behav3d_metadata(
     metadata,
     func=False
     ):
+
+    immune_cell_types = detect_immune_cell_types_from_metadata(metadata)
+    print(f"Detected immune cell types: {immune_cell_types}")
     
     required_columns = [
         "sample_name", 
@@ -88,6 +128,15 @@ def check_behav3d_metadata(
             # "original_raw_image_path"  # Not included bacouse it is added later if signal unmixing 
         ]
 
+    for cell_type in immune_cell_types:
+            required_columns.extend([
+                f"{cell_type}_line",
+                f"{cell_type}_channel",
+                f"{cell_type}_segments_image_path",
+                f"{cell_type}_tracks_image_path",
+                f"{cell_type}_tracks_csv_path"
+            ])
+
     missing_columns = set(required_columns) - set(metadata.columns)
     missing_string = '\n'.join(missing_columns)
 
@@ -98,6 +147,14 @@ def check_behav3d_metadata(
         "organoid_segments_image_path",
         "organoid_tracks_image_path", 
         "organoid_tracks_csv_path"]
+
+    # Add immune cell type optional columns
+    for cell_type in immune_cell_types:
+        columns.extend([
+            f"{cell_type}_segments_image_path",
+            f"{cell_type}_tracks_image_path",
+            f"{cell_type}_tracks_csv_path"
+        ])
     
     if func:
         assert all(col in metadata.columns for col in required_columns+func_columns), f"Not all required columns are present in the metadata .csv file\n{missing_string}"
@@ -176,6 +233,24 @@ def check_behav3d_metadata(
                 assert Path(sample_metadata["signal_unmixing_image_path"]).exists(), f"The signal_unmixing_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
             else:
                 print(f"!!! No signal unmixed image is supplied. If including signal unmixing, please run it below.")
+                ok=False
+
+        ### Immune cell types paths
+        for cell_type in immune_cell_types:
+            if not pd.isna(sample_metadata[f"{cell_type}_segments_image_path"]):
+                assert Path(sample_metadata[f"{cell_type}_segments_image_path"]).exists(), f"The {cell_type}_segments_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+            elif pd.isna(sample_metadata[f"{cell_type}_tracks_image_path"]):
+                print(f"!!! No segmented or tracked {cell_type} image is supplied. Please run segmentation and tracking below.")
+                ok=False
+            if not pd.isna(sample_metadata[f"{cell_type}_tracks_image_path"]):
+                assert Path(sample_metadata[f"{cell_type}_tracks_image_path"]).exists(), f"The {cell_type}_tracks_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+            else:
+                print(f"!!! No tracked {cell_type} image is supplied. Please run tracking below.")
+                ok=False
+            if not pd.isna(sample_metadata[f"{cell_type}_tracks_csv_path"]):
+                assert Path(sample_metadata[f"{cell_type}_tracks_csv_path"]).exists(), f"The {cell_type}_tracks_csv_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+            else:
+                print(f"!!! No tracked {cell_type} .csv is supplied. Please run tracking below.")
                 ok=False
 
         print("")

@@ -4,7 +4,7 @@ import random
 import ipywidgets as widgets
 from ipyfilechooser import FileChooser
 from IPython.display import display, clear_output
-from behav3d.utils import load_behav3d_metadata, check_behav3d_metadata, expand_column_patterns
+from behav3d.utils import load_behav3d_metadata, check_behav3d_metadata, expand_column_patterns, detect_immune_cell_types_from_metadata
 from behav3d.preprocessing import convert_input_files_to_zarr
 import builtins
 from pathlib import Path
@@ -1462,6 +1462,9 @@ class PixelClassifierPanel:
             indent=False
         )
 
+        # -------- Detect cell types dynamically --------
+        self._detect_cell_types()
+
         # -------- Classifier path pickers (default EMPTY) --------
         self.clf_dir = PathPicker(
             mode='dir',
@@ -1503,6 +1506,18 @@ class PixelClassifierPanel:
             width='100%',
         )
 
+        # Dynamic classifier paths for immune cell types
+        self.immune_clf_paths = {}
+        for immune_type in self.detected_immune_types:
+            self.immune_clf_paths[immune_type] = PathPicker(
+                mode='file',
+                description=f'{immune_type.title()} clf:',
+                default="",         
+                filter_pattern='*.joblib',
+                description_width='160px',
+                width='100%',
+            )
+
         # If user previously saved manual paths AND toggle is True, restore them now.
         if self.manual_clf_paths.value:
             self.clf_dir.value        = str(pc.get("clf_dir", "") or "")
@@ -1511,6 +1526,11 @@ class PixelClassifierPanel:
             self.clf_death_path.value = str(pc.get("clf_death_path", "") or "")
             if self.two_org_types.value:
                 self.clf_org2_path.value   = str(pc.get("clf_org2_path", "") or "")
+
+            # Restore immune cell classifier paths
+            for immune_type, picker in self.immune_clf_paths.items():
+                saved_path = pc.get(f"clf_{immune_type}_path", "")
+                picker.value = str(saved_path or "")
 
         # -------- Apply controls --------
         self.organoid_edt_threshold = widgets.FloatText(
@@ -1572,7 +1592,7 @@ class PixelClassifierPanel:
 
         self.out = widgets.Output()
 
-        clf_path_widgets = [
+        '''clf_path_widgets = [
             widgets.HTML("<b>Classifier paths</b>"),
             self.clf_dir,
             self.clf_org_path,
@@ -1584,7 +1604,13 @@ class PixelClassifierPanel:
         if self.two_org_types.value:
             clf_path_widgets.append(self.clf_org2_path)
 
-        self.clf_paths_box = widgets.VBox(clf_path_widgets)
+        # Add dynamic immune cell classifier paths
+        for picker in self.immune_clf_paths.values():
+            clf_path_widgets.append(picker)
+
+
+        self.clf_paths_box = widgets.VBox(clf_path_widgets)'''
+        self.clf_paths_box = self._create_clf_paths_box()
         
         # Show/hide according to the checkbox
         self.two_org_types.observe(self._on_two_org_types_changed, names='value')
@@ -1628,6 +1654,83 @@ class PixelClassifierPanel:
         # viewer handle (if training opens napari and returns a viewer)
         self._viewer = None
 
+    # ---------- dynamic cell type detection ----------
+    def _detect_cell_types(self):
+        """Detect immune cell types from metadata and store them."""
+        self.detected_immune_types = []
+        
+        # Try to detect from current metadata if available
+        if hasattr(self.metadata_loader, 'metadata') and self.metadata_loader.metadata is not None:
+            try:
+                detected = detect_immune_cell_types_from_metadata(self.metadata_loader.metadata)
+                #self.detected_immune_types = [t for t in detected if t not in ['organoid', 'tcell']]
+                self.detected_immune_types = detected
+                if self.detected_immune_types:
+                    print(f"🔬 Detected additional immune cell types: {self.detected_immune_types}")
+            except Exception as e:
+                print(f"Warning: Could not detect immune cell types: {e}")
+                self.detected_immune_types = []
+        else:
+            # If no metadata yet, we'll update this later when metadata is loaded
+            self.detected_immune_types = []
+        
+        # Create complete list including base types + detected immune types
+        #base_types = ['organoid', 'tcell', 'dead']
+        #self.detected_cell_types = base_types + self.detected_immune_types
+
+    def _update_immune_cell_paths(self):
+        """Update immune cell classifier paths when metadata changes."""
+        old_types = set(self.immune_clf_paths.keys()) if hasattr(self, 'immune_clf_paths') else set()
+        self._detect_cell_types()
+        new_types = set(self.detected_immune_types)
+        
+        # Remove paths for cell types no longer present
+        for old_type in old_types - new_types:
+            if hasattr(self, 'immune_clf_paths') and old_type in self.immune_clf_paths:
+                del self.immune_clf_paths[old_type]
+        
+        # Add paths for new cell types
+        if not hasattr(self, 'immune_clf_paths'):
+            self.immune_clf_paths = {}
+            
+        for new_type in new_types - old_types:
+            self.immune_clf_paths[new_type] = PathPicker(
+                mode='file',
+                description=f'{new_type.title()} clf:',
+                default="",         
+                filter_pattern='*.joblib',
+                description_width='160px',
+                width='100%',
+            )
+        
+        # Rebuild the UI paths box if it exists
+        if hasattr(self, 'clf_paths_box'):
+            self._rebuild_clf_paths_box()
+
+    def _create_clf_paths_box(self):
+        """Create the classifier paths box with dynamic immune cell types."""
+        children = [
+            widgets.HTML("<b>Classifier paths</b>"),
+            self.clf_dir,
+            self.clf_org_path,
+            self.clf_tcell_path,
+            self.clf_death_path,
+        ]
+
+        if self.two_org_types.value:
+            children.append(self.clf_org2_path)
+
+        # Add immune cell classifier paths
+        for immune_type, picker in self.immune_clf_paths.items():
+            children.append(picker)
+            
+        return widgets.VBox(children)
+        
+    def _rebuild_clf_paths_box(self):
+        """Rebuild the classifier paths box when immune cell types change."""
+        if hasattr(self, 'clf_paths_box'):
+            self.clf_paths_box.children = self._create_clf_paths_box().children
+
     # ---------- config ----------
     def _persist_params(self):
         self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
@@ -1650,6 +1753,9 @@ class PixelClassifierPanel:
             if self.two_org_types.value:
                 pc["clf_org2_path"]   = str(self.clf_org2_path.value or "")
 
+            # Save immune cell classifier paths
+            for immune_type, picker in self.immune_clf_paths.items():
+                pc[f"clf_{immune_type}_path"] = str(picker.value or "")
 
         yaml.safe_dump(
             self.metadata_loader.behav3d_parameters,
@@ -1669,31 +1775,49 @@ class PixelClassifierPanel:
     # >>> helper: compute default file paths for a directory
     def _default_clf_paths_for_dir(self, d: str):
         if not d:
+            base_paths = ("", "", "")
+
             if self.two_org_types.value:
-                return ("", "", "", "")
+                org2_path = ("")
+                return base_paths, org2_path
             else:
-                return ("", "", "")
+                immune_paths = {immune_type: "" for immune_type in self.detected_immune_types}
+                return base_paths, immune_paths
             
         p = Path(d).expanduser()
-        org_path = str(p / 'PixelClassifier_Organoid.joblib')
-        tcell_path = str(p / 'PixelClassifier_TCell.joblib')
-        death_path = str(p / 'PixelClassifier_Death.joblib')
+        base_paths = (str(p / 'PixelClassifier_Organoid.joblib'),
+                     str(p / 'PixelClassifier_TCell.joblib'),
+                     str(p / 'PixelClassifier_Death.joblib'))
+
+        immune_paths = {}
+        for immune_type in self.detected_immune_types:
+            immune_paths[immune_type] = str(p / f'PixelClassifier_{immune_type.title()}.joblib')
 
         if self.two_org_types.value:
             org2_path = str(p / 'PixelClassifier_Organoid2.joblib')
-            return (org_path, tcell_path, death_path, org2_path)
+            return (base_paths, org2_path)
         else:
-            return (org_path, tcell_path, death_path)
+            return (base_paths, immune_paths)
+        
 
     def _apply_dir_to_clf_paths(self, d: str):
         paths = self._default_clf_paths_for_dir(d)
 
-        self.clf_org_path.value = paths[0]
-        self.clf_tcell_path.value = paths[1]
-        self.clf_death_path.value = paths[2]
-
-        if self.two_org_types.value and len(paths) > 3:
-            self.clf_org2_path.value = paths[3]
+        if self.two_org_types.value:
+            base_paths, org2_path = paths
+            self.clf_org_path.value = base_paths[0]
+            self.clf_tcell_path.value = base_paths[1]
+            self.clf_death_path.value = base_paths[2]
+            self.clf_org2_path.value = org2_path
+        else:
+            base_paths, immune_paths = paths
+            self.clf_org_path.value = base_paths[0]
+            self.clf_tcell_path.value = base_paths[1]
+            self.clf_death_path.value = base_paths[2]
+        
+            for immune_type, path in immune_paths.items():
+                if immune_type in self.immune_clf_paths:
+                    self.immune_clf_paths[immune_type].value = path
 
     def _toggle_clf_path_section(self, change=None):
         manual = bool(self.manual_clf_paths.value)
@@ -1702,7 +1826,9 @@ class PixelClassifierPanel:
         if not manual:
             for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, 
                     self.clf_death_path, self.clf_org2_path]:
-                p.value = ""
+                p.value = "" 
+            for picker in self.immune_clf_paths.values():
+                picker.value = ""
 
     def _build_clf_paths_box(self):
         children = [
@@ -1719,6 +1845,10 @@ class PixelClassifierPanel:
             self.clf_death_path,
         ])
 
+        # Add immune cell classifier paths
+        for immune_type, picker in self.immune_clf_paths.items():
+            children.append(picker)
+
         self.clf_paths_box.children = children
 
     def _on_two_org_types_changed(self, change=None):
@@ -1726,9 +1856,6 @@ class PixelClassifierPanel:
 
         if self.manual_clf_paths.value and self.clf_dir.value:
             self._apply_dir_to_clf_paths(self.clf_dir.value)
-
-
-
 
     def display(self):
         display(self.ui)
@@ -1747,6 +1874,12 @@ class PixelClassifierPanel:
             for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, self.clf_death_path, self.clf_org2_path]:
                 p.text.disabled = state
                 p.button.disabled = state
+
+            # Immune cell path pickers
+            for p in self.immune_clf_paths.values():
+                p.text.disabled = state
+                p.button.disabled = state
+       
         except Exception:
             pass
 
@@ -1861,19 +1994,60 @@ class PixelClassifierPanel:
                     print(f"  clf_tcell_path={self.clf_tcell_path.value}")
                     print(f"  clf_death_path={self.clf_death_path.value}")
 
+                    # Echo immune cell classifier paths
+                    for immune_type, picker in self.immune_clf_paths.items():
+                        print(f"  clf_{immune_type}_path={picker.value}")
+
                 self.spinner_apply.layout.display = None
+
+                # Update immune cell types from current metadata
+                self._update_immune_cell_paths()
+
+                '''# Prepare classifier paths for immune cells
+                # Create immune cell classifier paths dictionary
+                clf_immune_paths = {}
+                for immune_type, picker in self.immune_clf_paths.items():
+                    if picker.value:
+                        clf_immune_paths[immune_type] = picker.value
 
                 new_md = run_pixel_classifier_segmentation(
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
                     organoid_edt_threshold=float(self.organoid_edt_threshold.value),
                     timepoint_range=tpr,
-                    two_org_types=bool(self.two_org_types.value),
-                    clf_org_path=self.clf_org_path.value,
-                    clf_tcell_path=self.clf_tcell_path.value,
-                    clf_death_path=self.clf_death_path.value,
+                    clf_org_path=self.clf_org_path.value if self.clf_org_path.value else None,
                     clf_org2_path=self.clf_org2_path.value if self.two_org_types.value else None,
+                    clf_tcell_path=self.clf_tcell_path.value if self.clf_tcell_path.value else None,
+                    clf_death_path=self.clf_death_path.value if self.clf_death_path.value else None,
+                    clf_immune_paths=clf_immune_paths if clf_immune_paths else None,
+                    two_org_types=bool(self.two_org_types.value),
+                )'''
+                # Prepare classifier paths for immune cells
+                # Create immune cell classifier paths dictionary
+                clf_immune_paths = {}
+                pixelclass_dir = Path(odir, "images", "PixelClassification")
+                
+                for immune_type, picker in self.immune_clf_paths.items():
+                    if picker.value:
+                        clf_immune_paths[immune_type] = picker.value
+                        print(f"✓ Using manual {immune_type} classifier: {picker.value}")
+                    else:
+                        auto_clf_path = Path(pixelclass_dir, f'PixelClassifier_{immune_type.title()}.joblib')
+                        if auto_clf_path.exists():
+                            clf_immune_paths[immune_type] = str(auto_clf_path)
+                            print(f"✓ Auto-detected {immune_type} classifier: {auto_clf_path}")
 
+                new_md = run_pixel_classifier_segmentation(
+                    output_dir=str(odir),
+                    metadata=self.metadata_loader.metadata,
+                    organoid_edt_threshold=float(self.organoid_edt_threshold.value),
+                    timepoint_range=tpr,
+                    clf_org_path=self.clf_org_path.value if self.clf_org_path.value else None,
+                    clf_org2_path=self.clf_org2_path.value if self.two_org_types.value else None,
+                    clf_tcell_path=self.clf_tcell_path.value if self.clf_tcell_path.value else None,
+                    clf_death_path=self.clf_death_path.value if self.clf_death_path.value else None,
+                    clf_immune_paths=clf_immune_paths,  # ⬅️ Cambiado: siempre pasa el dict
+                    two_org_types=bool(self.two_org_types.value),
                 )
 
                 try:
