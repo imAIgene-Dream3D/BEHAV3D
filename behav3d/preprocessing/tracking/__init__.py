@@ -21,7 +21,7 @@ def visualize_tracks(
 
     two_org_types=False
 
-    if metadata_row['organoid_2_tracks_image_path'] and Path(metadata_row['organoid_2_tracks_image_path']).exists():
+    if 'organoid_2_tracks_image_path' in metadata_row and Path(metadata_row['organoid_2_tracks_image_path']).exists():
         two_org_types=True
         organoid_2_tracks_zarr = Path(metadata_row['organoid_2_tracks_image_path'])
         organoid_2_tracks_csv_path = Path(metadata_row['organoid_2_tracks_csv_path'])

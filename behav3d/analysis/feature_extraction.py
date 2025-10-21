@@ -171,6 +171,7 @@ def run_feature_extraction(
     features_choice=["movement", "intensity", "morphology", "contact", "death"],
     imaris=False,
     dead_mask_percentage_threshold=None,
+    contact_threshold=None,
     rolling_meanspeed_window=10,
     overwrite=False,
     n_workers=1
@@ -215,8 +216,7 @@ def run_feature_extraction(
         if imaris:
             tcell_contact_threshold = sample_metadata["tcell_contact_threshold"]
             organoid_contact_threshold = sample_metadata["organoid_contact_threshold"]
-        else:
-            contact_threshold = sample_metadata["contact_threshold"]
+
         dead_channel=sample_metadata['dead_channel']
         
         print("###### Running track feature calculation")
@@ -236,7 +236,7 @@ def run_feature_extraction(
         # Add additional organoid type info
         organoid_2_segments_path = None
 
-        if sample_metadata['organoid_2_tracks_image_path'] and Path(sample_metadata['organoid_2_tracks_image_path']).exists():
+        if 'organoid_2_tracks_image_path' in sample_metadata and Path(sample_metadata['organoid_2_tracks_image_path']).exists():
             organoid_2_segments_path = sample_metadata['organoid_2_tracks_image_path']
 
         dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
@@ -271,6 +271,8 @@ def run_feature_extraction(
             raise ValueError(f"Unknown cell type: {cell_type}. Expected 'tcell' or 'organoid' or 'organoid_2.")
         
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
+        # Adding a sample name for later combination of multiple track experiments
+        df_tracks['sample_name']=sample_name
         
         print(f"{get_current_time()} - Generalizing the units of position and time to um and hours")
         df_tracks = generalize_units_of_track_features(
@@ -367,8 +369,6 @@ def run_feature_extraction(
         print(f"{get_current_time()} - Writing output to {tracks_out_path}")
         df_tracks.to_csv(tracks_out_path, sep=",", index=False)
         
-        # Adding a sample name for later combination of multiple track experiments
-        df_tracks['sample_name']=sample_name
         df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
         df_all_tracks = pd.concat([df_all_tracks, df_tracks])
         
@@ -479,7 +479,21 @@ def calculate_image_based_track_features(
         df_tracks = pd.merge(df_tracks, df_morphology, how="left")
     
     else:
-        print(f"{get_current_time()} - Skipping morphology features as not requested in features_choice")
+        print(f"{get_current_time()} - Skipping full morphology features, only computing fast nr_pixels & volume")
+        df_basic = calculate_basic_morphology(
+            segments_path=segments_path,
+            voxel_spacing=(element_size_z, element_size_y, element_size_x),
+            n_workers=n_workers,
+        )
+
+        basic_dtypes = {
+            "TrackID": int,
+            "position_t": int,
+            "nr_pixels": int,
+            "volume": float,
+        }
+        df_basic = df_basic.astype(basic_dtypes, copy=False)
+        df_tracks = pd.merge(df_tracks, df_basic, how="left")
 
     if "intensity" in features_choice:
         print(f"{get_current_time()} - Calculating channel and especially death dye intensities...")
@@ -562,7 +576,7 @@ def calculate_image_based_track_features(
         
     df_tracks = df_tracks.sort_values(
         by=["sample_name", "TrackID", "position_t"], 
-        ascending=[True, True, True]  # example: last column sorted descending
+        ascending=[True, True, True]
     )    
     new_order = ["sample_name"] + [c for c in df_tracks.columns.tolist() if c != "sample_name"]
     df_tracks = df_tracks[new_order]
@@ -745,6 +759,7 @@ def calculate_death(
 def interpolate_missing_positions(
     df_tracks,
     cols_to_copy=[
+        "sample_name",
         "TrackID",
         "organoid_contact",
         "organoid_contact_pixels",
@@ -1108,6 +1123,7 @@ def calculate_segment_intensity(segments, intensity_image, calculation="mean"):
     return(df_intensity)
 
 def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID"):
+    df = df.sort_values(by=[groupby, "position_t"]).copy()
     def relative_increase(group):
         values = group[column].values
         increases = []
@@ -1121,31 +1137,34 @@ def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID
 
     return df.groupby(groupby).apply(relative_increase, include_groups=False).reset_index(drop=True).values
 
-def calculate_relative_increase(df, column, nr_timepoints_back, groupby):
-    df = df.sort_values(by=[groupby, "position_t"]).copy()
+# def calculate_relative_increase(df, column, nr_timepoints_back, groupby):
+#     """
+#     Calculate the percentage increase of a column compared to the value
+#     """
+#     df = df.sort_values(by=[groupby, "position_t"]).copy()
 
-    def compute_increase(group):
-        values = group[column].values
-        increases = []
-        for i in range(len(values)):
-            if i >= nr_timepoints_back:
-                ref = values[i - nr_timepoints_back]
-            else:
-                ref = values[0]
-            current = values[i]
-            if ref == 0:
-                increase = float('inf') if current > 0 else 0.0
-            else:
-                increase = (current - ref) / ref
-            increases.append(increase)
-        return pd.Series(increases, index=group.index)
+#     def compute_increase(group):
+#         values = group[column].values
+#         increases = []
+#         for i in range(len(values)):
+#             if i >= nr_timepoints_back:
+#                 ref = values[i - nr_timepoints_back]
+#             else:
+#                 ref = values[0]
+#             current = values[i]
+#             if ref == 0:
+#                 increase = float('inf') if current > 0 else 0.0
+#             else:
+#                 increase = (current - ref) / ref
+#             increases.append(increase)
+#         return pd.Series(increases, index=group.index)
 
-    # Use `transform`-like behavior by resetting the index before recombining
-    result = df.groupby(groupby).apply(compute_increase)
-    if isinstance(result.index, pd.MultiIndex):
-        result.index = result.index.droplevel(0)
+#     # Use `transform`-like behavior by resetting the index before recombining
+#     result = df.groupby(groupby).apply(compute_increase)
+#     if isinstance(result.index, pd.MultiIndex):
+#         result.index = result.index.droplevel(0)
 
-    return result
+#     return result
 
             
 def calculate_dead_mask(segments, dead_mask):
@@ -1175,57 +1194,129 @@ def calculate_dead_mask(segments, dead_mask):
         )
     return(df_intensity)
 
+def _basic_counts_single_timepoint(args):
+    """
+    Worker: compute nr_pixels and volume for one timepoint using np.bincount.
+    """
+    t, segments_path, voxel_volume = args
+    seg_t = load_image(segments_path)[t]  # expects a (Z, Y, X) label image at time t
+    labels = np.asarray(seg_t, dtype=np.int64).ravel()
+
+    if labels.size == 0:
+        return pd.DataFrame(columns=["TrackID", "position_t", "nr_pixels", "volume"])
+
+    # Count voxels per label (0 is background)
+    counts = np.bincount(labels)
+    if counts.size <= 1:
+        # no foreground labels
+        return pd.DataFrame(columns=["TrackID", "position_t", "nr_pixels", "volume"])
+
+    # Build per-object table (skip background index 0)
+    track_ids = np.nonzero(counts[1:] > 0)[0] + 1
+    nr_pixels = counts[track_ids]
+    volumes = nr_pixels.astype(np.float64) * float(voxel_volume)
+
+    return pd.DataFrame(
+        {
+            "TrackID": track_ids.astype(np.int64),
+            "position_t": np.full(track_ids.shape[0], t, dtype=np.int64),
+            "nr_pixels": nr_pixels.astype(np.int64),
+            "volume": volumes.astype(np.float64),
+        }
+    )
+
+def calculate_basic_morphology(segments_path, voxel_spacing=(1.0, 1.0, 1.0), n_workers=8):
+    """
+    Fast calculation of nr_pixels and volume per object per timepoint.
+
+    Parameters:
+        segments_path: path to segments .zarr
+        voxel_spacing: (z, y, x) physical spacing
+        n_workers: number of processes
+
+    Returns:
+        pd.DataFrame with columns: TrackID, position_t, nr_pixels, volume
+    """
+    segments = load_image(segments_path)
+    timepoints = int(segments.shape[0])
+    vz, vy, vx = map(float, voxel_spacing)
+    voxel_volume = vz * vy * vx
+
+    args_list = [(t, segments_path, voxel_volume) for t in range(timepoints)]
+    if n_workers and n_workers > 1:
+        with ProcessPoolExecutor(max_workers=int(n_workers)) as ex:
+            results = list(
+                tqdm(
+                    ex.map(_basic_counts_single_timepoint, args_list),
+                    total=len(args_list),
+                    # desc="Fast morphology (nr_pixels & volume)",
+                )
+            )
+    else:
+        results = [
+            _basic_counts_single_timepoint(args)
+            for args in tqdm(
+                args_list, 
+                # desc="Fast morphology (nr_pixels & volume)"
+                )
+        ]
+
+    if not results:
+        return pd.DataFrame(columns=["TrackID", "position_t", "nr_pixels", "volume"])
+
+    return pd.concat(results, ignore_index=True)
+
 def _calculate_morphology_single_timepoint(args):
-    """Helper function to compute morphology features for a single timepoint."""
+    """Helper function to compute morphology features for a single timepoint """
     t, segments_path, voxel_spacing = args
     segments = load_image(segments_path)
-    stack = segments[t]
-    stack = np.asarray(stack)
+    stack = np.asarray(segments[t])
+
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*convex hull image.*")
         warnings.filterwarnings("ignore", message="divide by zero encountered in scalar divide")
-        
+
         properties = pd.DataFrame(
             regionprops_table(
                 label_image=stack,
                 properties=[
-                    "label", "num_pixels", "area", "bbox_area", 
+                    "label", "num_pixels", "area", "bbox_area",
                     "extent", "solidity", "equivalent_diameter",
-                    "major_axis_length", "minor_axis_length", "inertia_tensor", 
+                    "major_axis_length", "minor_axis_length", "inertia_tensor",
                     "inertia_tensor_eigvals", "moments_central"
                 ],
                 spacing=voxel_spacing
             )
         )
+
     properties.rename(columns={
         "label": "TrackID",
         "area": "volume",
         "bbox_area": "bbox_volume",
         "num_pixels": "nr_pixels",
     }, inplace=True)
+
+    # Derived scalar features
     properties["elongation"] = properties["major_axis_length"] / properties["minor_axis_length"]
     properties["position_t"] = t
 
-    # Suppress known/harmless warnings
+    # Expensive per-region metrics
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="divide by zero encountered in scalar divide")
         warnings.filterwarnings("ignore", message=".*convex hull image.*")
-        
 
         surface_areas = []
         sphericities = []
         convex_volumes = []
-        orientations = []
 
         for region_label in properties["TrackID"]:
             mask = (stack == region_label)
             coords = np.argwhere(mask)
             volume = properties.loc[properties["TrackID"] == region_label, "volume"].values[0]
 
-            # Surface area + sphericity via marching cubes
-            z_coords = coords[:, 0]  # assuming axis 0 = z
+            # Surface area + sphericity via marching cubes (requires 3D support)
+            z_coords = coords[:, 0] if coords.size else np.array([0])
             if (z_coords.max() - z_coords.min()) >= 1 and np.count_nonzero(mask) >= 4:
-            # if np.count_nonzero(mask) >= 4:  # sanity check for marching_cubes
                 try:
                     verts, faces, _, _ = marching_cubes(mask.astype(float), spacing=voxel_spacing)
                     surface_area = mesh_surface_area(verts, faces)
@@ -1236,10 +1327,11 @@ def _calculate_morphology_single_timepoint(args):
             else:
                 surface_area = np.nan
                 sphericity = np.nan
-                
+
             surface_areas.append(surface_area)
             sphericities.append(sphericity)
 
+            # Convex hull volume (in physical units)
             if coords.shape[0] >= 4:
                 try:
                     scaled_coords = coords * np.array(voxel_spacing)
@@ -1249,38 +1341,39 @@ def _calculate_morphology_single_timepoint(args):
                     convex_volume = np.nan
             else:
                 convex_volume = np.nan
+
             convex_volumes.append(convex_volume)
-
-            # Extract all the inertia tensor components from the DataFrame
-            tensor_columns = [f"inertia_tensor-{i}-{j}" for i in range(3) for j in range(3)]
-
-            orientations = []
-            for idx, row in properties.iterrows():
-                try:
-                    tensor_values = np.array([row[col] for col in tensor_columns])
-                    inertia_tensor = tensor_values.reshape((3, 3))
-                    eigvals, eigvecs = np.linalg.eigh(inertia_tensor)
-                    major_axis_vector = eigvecs[:, np.argmax(eigvals)]
-                    orientations.append(major_axis_vector.tolist())
-                except Exception:
-                    orientations.append([np.nan, np.nan, np.nan])
 
         properties["surface_area"] = surface_areas
         properties["sphericity"] = sphericities
         properties["convex_volume"] = convex_volumes
+
         # Guard against divide-by-zero in solidity calculation
         with np.errstate(divide='ignore', invalid='ignore'):
-            # Lower solidity = more protrusions or invaginations
             properties["solidity"] = properties["volume"] / properties["convex_volume"]
-            
-        # properties["solidity"] = properties["volume"] / properties["convex_volume"]
-        properties["orientation_vector"] = orientations
 
-    columns_to_drop = [col for col in properties.columns 
-                   if col.startswith("inertia_tensor") 
-                   or col.startswith("inertia_tensor_eigvals") 
-                   or col.startswith("moments_central")]
+    # ---- FIXED ORIENTATION COMPUTATION (O(R) instead of O(R^2)) ----
+    tensor_columns = [f"inertia_tensor-{i}-{j}" for i in range(3) for j in range(3)]
+    try:
+        T = properties[tensor_columns].to_numpy(dtype=float).reshape(-1, 3, 3)  # (R,3,3)
+        # Eigen-decomposition for all regions at once
+        eigvals, eigvecs = np.linalg.eigh(T)  # eigvecs shape: (R,3,3), columns are eigenvectors
+        max_idx = np.argmax(eigvals, axis=1)  # (R,)
+        # Select major-axis eigenvector per region
+        major_vecs = np.stack([eigvecs[i][:, max_idx[i]] for i in range(eigvecs.shape[0])], axis=0)
+        properties["orientation_vector"] = major_vecs.tolist()
+    except Exception:
+        # Fallback if any tensors are missing/NaN
+        properties["orientation_vector"] = [[np.nan, np.nan, np.nan]] * len(properties)
+    # ----------------------------------------------------------------
+
+    # Drop heavy intermediate columns
+    columns_to_drop = [col for col in properties.columns
+                       if col.startswith("inertia_tensor")
+                       or col.startswith("inertia_tensor_eigvals")
+                       or col.startswith("moments_central")]
     properties = properties.drop(columns=columns_to_drop)
+
     return properties
 
 def calculate_morphology_features(segments_path, voxel_spacing=(1.0, 1.0, 1.0), n_workers=8):
