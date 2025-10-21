@@ -463,6 +463,440 @@ class PathPicker(widgets.VBox):
         except Exception:
             # Don't crash UI if reset fails; ignore silently
             pass
+
+
+class MetadataBuilder(widgets.VBox):
+    """
+    Interactive widget for building BEHAV3D metadata from scratch.
+    Allows users to define samples, organoid populations, and immune cell populations
+    with a form-based interface.
+    """
+    
+    def __init__(self, output_dir_picker=None, **kwargs):
+        super().__init__(**kwargs)
+        
+        self.output_dir_picker = output_dir_picker
+        self.metadata = None
+        self.metadata_path = None
+        
+        # Data storage
+        self.samples_data = []
+        self.num_samples = 0
+        self.num_organoids = 0
+        self.num_immune_cells = 0
+        self.immune_cell_names = []
+        
+        # Build UI
+        self._build_ui()
+        
+    def _build_ui(self):
+        """Build the initial configuration UI."""
+        
+        # Title
+        title = widgets.HTML("<h3>📝 Metadata Builder</h3>")
+        
+        # Number of samples
+        self.num_samples_input = widgets.IntText(
+            value=1,
+            min=1,
+            description='Number of samples:',
+            style={'description_width': '150px'},
+            layout=widgets.Layout(width='300px')
+        )
+        
+        # Number of organoid populations
+        self.num_organoids_input = widgets.IntText(
+            value=1,
+            min=0,
+            description='Organoid populations:',
+            style={'description_width': '150px'},
+            layout=widgets.Layout(width='300px')
+        )
+        
+        # Number of immune cell populations
+        self.num_immune_input = widgets.IntText(
+            value=1,
+            min=0,
+            description='Immune cell populations:',
+            style={'description_width': '150px'},
+            layout=widgets.Layout(width='300px')
+        )
+        
+        # Button to configure
+        self.configure_btn = widgets.Button(
+            description='Configure Populations',
+            button_style='primary',
+            icon='gear',
+            layout=widgets.Layout(width='200px')
+        )
+        self.configure_btn.on_click(self._on_configure_populations)
+        
+        # Container for dynamic content
+        self.dynamic_container = widgets.VBox()
+        
+        # Output area
+        self.out = widgets.Output()
+        
+        # Initial layout
+        config_box = widgets.VBox([
+            title,
+            widgets.HTML("<p>Define the structure of your experiment</p>"),
+            self.num_samples_input,
+            self.num_organoids_input,
+            self.num_immune_input,
+            self.configure_btn,
+            self.out
+        ])
+        
+        self.children = [config_box, self.dynamic_container]
+    
+    def _on_configure_populations(self, btn):
+        """Handle the configure button click."""
+        with self.out:
+            clear_output(wait=True)
+            
+            self.num_samples = self.num_samples_input.value
+            self.num_organoids = self.num_organoids_input.value
+            self.num_immune_cells = self.num_immune_input.value
+            
+            if self.num_organoids == 0 and self.num_immune_cells == 0:
+                print("⚠️ Warning: You must have at least one organoid or immune cell population!")
+                return
+            
+            # Get names for immune cell populations
+            if self.num_immune_cells > 0:
+                self._show_immune_cell_naming()
+            else:
+                self.immune_cell_names = []
+                self._build_data_entry_form()
+    
+    def _show_immune_cell_naming(self):
+        """Show form to name immune cell populations."""
+        with self.out:
+            clear_output(wait=True)
+            print("Please name your immune cell populations (e.g., 'tcell').:")
+        
+        # Create text inputs for naming immune cells
+        naming_widgets = []
+        self.immune_name_inputs = []
+        
+        for i in range(self.num_immune_cells):
+            name_input = widgets.Text(
+                value=f'immune{i+1}' if i > 0 else 'tcell',  # Default first to 'tcell'
+                description=f'Population {i+1}:',
+                style={'description_width': '100px'},
+                layout=widgets.Layout(width='300px')
+            )
+            self.immune_name_inputs.append(name_input)
+            naming_widgets.append(name_input)
+        
+        # Button to proceed
+        proceed_btn = widgets.Button(
+            description='Create Data Entry Form',
+            button_style='success',
+            icon='check',
+            layout=widgets.Layout(width='200px')
+        )
+        proceed_btn.on_click(self._on_immune_names_confirmed)
+        
+        naming_box = widgets.VBox([
+            widgets.HTML("<p>Name your immune cell populations</p>"),
+            *naming_widgets,
+            proceed_btn
+        ])
+        
+        self.dynamic_container.children = [naming_box]
+    
+    def _on_immune_names_confirmed(self, btn):
+        """Handle immune cell naming confirmation."""
+        with self.out:
+            clear_output(wait=True)
+            
+            # Collect and validate names
+            self.immune_cell_names = []
+            for inp in self.immune_name_inputs:
+                name = inp.value.strip().lower()
+                if not name:
+                    print("⚠️ All immune cell populations must have names!")
+                    return
+                if name in self.immune_cell_names:
+                    print(f"⚠️ Duplicate name '{name}'! Each population must have a unique name.")
+                    return
+                # Check for invalid characters
+                if not name.isalnum():
+                    print(f"⚠️ Invalid name '{name}'! Use only letters and numbers.")
+                    return
+                self.immune_cell_names.append(name)
+            
+            print(f"✅ Immune cell populations configured: {', '.join(self.immune_cell_names)}")
+        
+        self._build_data_entry_form()
+    
+    def _build_data_entry_form(self):
+        """Build the main data entry form for all samples."""
+        with self.out:
+            clear_output(wait=True)
+            print(f"Building form for {self.num_samples} sample(s)...")
+            print(f"   - {self.num_organoids} organoid population(s)")
+            print(f"   - {self.num_immune_cells} immune cell population(s): {', '.join(self.immune_cell_names) if self.immune_cell_names else 'None'}")
+        
+        # Create accordion with one panel per sample
+        sample_forms = []
+        self.sample_widgets = []
+        
+        for sample_idx in range(self.num_samples):
+            sample_form = self._create_sample_form(sample_idx)
+            self.sample_widgets.append(sample_form)
+            sample_forms.append(sample_form['container'])
+        
+        # Create accordion
+        accordion = widgets.Accordion(children=sample_forms)
+        for i in range(self.num_samples):
+            accordion.set_title(i, f'Sample {i+1}')
+        
+        # Save button
+        save_btn = widgets.Button(
+            description='💾 Save Metadata to CSV',
+            button_style='success',
+            icon='save',
+            layout=widgets.Layout(width='250px', height='40px')
+        )
+        save_btn.on_click(self._on_save_metadata)
+        
+        # Build final form
+        form_container = widgets.VBox([
+            widgets.HTML("<h4>Fill in sample data</h4>"),
+            widgets.HTML("<p><i>Fields marked with * are required. Path fields can be left empty and filled later.</i></p>"),
+            accordion,
+            widgets.HTML("<br>"),
+            save_btn
+        ])
+        
+        self.dynamic_container.children = [form_container]
+    
+    def _create_sample_form(self, sample_idx):
+        """Create form widgets for a single sample."""
+        widgets_dict = {}
+        
+        # Base metadata fields (required)
+        base_fields = [
+            ('sample_name', 'text', True, f'sample_{sample_idx+1}'),
+            ('exp_nr', 'int', True, 1),
+            ('well', 'text', True, f'well_{sample_idx+1}'),
+            ('pixel_distance_xy', 'float', True, 1.0),
+            ('pixel_distance_z', 'float', True, 1.0),
+            ('distance_unit', 'text', True, 'μm'),
+            ('time_interval', 'float', True, 1.0),
+            ('time_unit', 'text', True, 's'),
+            ('dimension_order', 'text', True, 'TCZYX'),
+            ('raw_image_path', 'text', True, ''),
+        ]
+        
+        form_items = []
+        
+        # Section: Base Information
+        form_items.append(widgets.HTML("<h5>Base Information</h5>"))
+        
+        for field_name, field_type, required, default_val in base_fields:
+            label = field_name.replace('_', ' ').title()
+            if required:
+                label += ' *'
+            
+            if field_type == 'text':
+                w = widgets.Text(
+                    value=str(default_val),
+                    description=label,
+                    style={'description_width': '150px'},
+                    layout=widgets.Layout(width='500px')
+                )
+            elif field_type == 'int':
+                w = widgets.IntText(
+                    value=default_val,
+                    description=label,
+                    style={'description_width': '150px'},
+                    layout=widgets.Layout(width='500px')
+                )
+            elif field_type == 'float':
+                w = widgets.FloatText(
+                    value=default_val,
+                    description=label,
+                    style={'description_width': '150px'},
+                    layout=widgets.Layout(width='500px')
+                )
+            
+            widgets_dict[field_name] = {'widget': w, 'required': required}
+            form_items.append(w)
+        
+        # Section: Organoid Populations
+        if self.num_organoids > 0:
+            form_items.append(widgets.HTML("<br><h5>Organoid Populations</h5>"))
+            
+            for org_idx in range(self.num_organoids):
+                org_name = f'organoid{org_idx+1}'
+                form_items.append(widgets.HTML(f"<b>{org_name.upper()}</b>"))
+                
+                # Required fields
+                for field_suffix, field_type, default_val in [
+                    ('line', 'text', ''),
+                    ('live_channel', 'int', 0),
+                    ('dead_channel', 'int', 1),
+                ]:
+                    field_name = f'{org_name}_{field_suffix}'
+                    label = field_suffix.replace('_', ' ').title() + ' *'
+                    
+                    if field_type == 'text':
+                        w = widgets.Text(
+                            value=str(default_val),
+                            description=label,
+                            style={'description_width': '150px'},
+                            layout=widgets.Layout(width='500px')
+                        )
+                    else:
+                        w = widgets.IntText(
+                            value=default_val,
+                            description=label,
+                            style={'description_width': '150px'},
+                            layout=widgets.Layout(width='500px')
+                        )
+                    
+                    widgets_dict[field_name] = {'widget': w, 'required': True}
+                    form_items.append(w)
+                
+                # Optional path fields
+                for field_suffix in ['segments_image_path', 'tracks_image_path', 'tracks_csv_path']:
+                    field_name = f'{org_name}_{field_suffix}'
+                    label = field_suffix.replace('_', ' ').title()
+                    
+                    w = widgets.Text(
+                        value='',
+                        description=label,
+                        style={'description_width': '150px'},
+                        layout=widgets.Layout(width='500px')
+                    )
+                    
+                    widgets_dict[field_name] = {'widget': w, 'required': False}
+                    form_items.append(w)
+        
+        # Section: Immune Cell Populations
+        if self.num_immune_cells > 0:
+            form_items.append(widgets.HTML("<br><h5>Immune Cell Populations</h5>"))
+            
+            for immune_name in self.immune_cell_names:
+                form_items.append(widgets.HTML(f"<b>{immune_name.upper()}</b>"))
+                
+                # Required fields
+                for field_suffix, field_type, default_val in [
+                    ('line', 'text', ''),
+                    ('channel', 'int', 0),
+                ]:
+                    field_name = f'{immune_name}_{field_suffix}'
+                    label = field_suffix.replace('_', ' ').title() + ' *'
+                    
+                    if field_type == 'text':
+                        w = widgets.Text(
+                            value=str(default_val),
+                            description=label,
+                            style={'description_width': '150px'},
+                            layout=widgets.Layout(width='500px')
+                        )
+                    else:
+                        w = widgets.IntText(
+                            value=default_val,
+                            description=label,
+                            style={'description_width': '150px'},
+                            layout=widgets.Layout(width='500px')
+                        )
+                    
+                    widgets_dict[field_name] = {'widget': w, 'required': True}
+                    form_items.append(w)
+                
+                # Optional path fields
+                for field_suffix in ['segments_image_path', 'tracks_image_path', 'tracks_csv_path']:
+                    field_name = f'{immune_name}_{field_suffix}'
+                    label = field_suffix.replace('_', ' ').title()
+                    
+                    w = widgets.Text(
+                        value='',
+                        description=label,
+                        style={'description_width': '150px'},
+                        layout=widgets.Layout(width='500px')
+                    )
+                    
+                    widgets_dict[field_name] = {'widget': w, 'required': False}
+                    form_items.append(w)
+        
+        container = widgets.VBox(form_items)
+        
+        return {
+            'container': container,
+            'widgets': widgets_dict,
+            'sample_idx': sample_idx
+        }
+    
+    def _on_save_metadata(self, btn):
+        """Collect data from all forms and save to CSV."""
+        with self.out:
+            clear_output(wait=True)
+            print("💾 Validating and saving metadata...")
+            
+            # Validate and collect data
+            all_rows = []
+            
+            for sample_data in self.sample_widgets:
+                row = {}
+                widgets_dict = sample_data['widgets']
+                sample_idx = sample_data['sample_idx']
+                
+                # Validate required fields
+                has_error = False
+                for field_name, field_info in widgets_dict.items():
+                    widget = field_info['widget']
+                    required = field_info['required']
+                    value = widget.value
+                    
+                    if required:
+                        if isinstance(value, str) and value.strip() == '':
+                            print(f"❌ Sample {sample_idx+1}: '{field_name}' is required but empty!")
+                            has_error = True
+                        elif isinstance(value, (int, float)) and field_name.endswith('_channel'):
+                            if value < 0:
+                                print(f"❌ Sample {sample_idx+1}: '{field_name}' must be >= 0!")
+                                has_error = True
+                    
+                    # Store value (convert empty strings to NaN for optional fields)
+                    if isinstance(value, str):
+                        row[field_name] = value.strip() if value.strip() else ''
+                    else:
+                        row[field_name] = value
+                
+                if has_error:
+                    print("\n⚠️ Please fix the errors above and try again.")
+                    return
+                
+                all_rows.append(row)
+            
+            # Create DataFrame
+            self.metadata = pd.DataFrame(all_rows)
+            
+            # Determine save path
+            if self.output_dir_picker and self.output_dir_picker.value:
+                output_dir = Path(self.output_dir_picker.value)
+            else:
+                output_dir = Path.cwd() / 'configs'
+            
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self.metadata_path = output_dir / 'metadata.csv'
+            
+            # Save to CSV
+            self.metadata.to_csv(self.metadata_path, index=False)
+            
+            print(f"✅ Metadata saved successfully!")
+            print(f"📁 Location: {self.metadata_path}")
+            print(f"📊 {len(self.metadata)} sample(s), {len(self.metadata.columns)} column(s)")
+            print("\nMetadata preview:")
+            display(self.metadata)
+
+
 class MetadataLoader(widgets.VBox):
     """
     A VBox widget that wraps a file PathPicker and a 'Load' button.
