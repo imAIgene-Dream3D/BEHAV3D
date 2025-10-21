@@ -792,41 +792,66 @@ def _run_single_timepoint_segmentation(
     clf_tcell,
     clf_death,
     organoid_edt_threshold=6,
+    organoid_min_size=1000,
+    only_segment=False,
+    tcell_mask=None,
+    organoid_mask=None,
+    organoid_mask_2=None,
     ):
-    features = features_func(t_img)
-    # result = future.predict_segmenter(features, clf)
-        
-    # print("\n### Predicting Organoid Pixels")
-    pred_org_mask = future.predict_segmenter(features, clf_org)
-    pred_org_mask[pred_org_mask>0] -= 1
+    if only_segment:
+        assert tcell_mask is not None, "tcell_segments must be provided when only_segment is True"
+        assert organoid_mask is not None, "organoid_segments must be provided when only_segment is True"
+        if clf_org_2 is not None:
+            assert organoid_mask_2 is not None, "organoid_segments_2 must be provided when only_segment is True and clf_org_2 is not None"
+        death_mask=None
+    else:
+        features = features_func(t_img)
+        # result = future.predict_segmenter(features, clf)
+            
+        # print("\n### Predicting Organoid Pixels")
+        organoid_mask = future.predict_segmenter(features, clf_org)
+        organoid_mask[organoid_mask>0] -= 1
 
-    if clf_org_2 is not None:
-        pred_org_2_mask = future.predict_segmenter(features, clf_org_2)
-        pred_org_2_mask[pred_org_2_mask>0] -= 1
+        if clf_org_2 is not None:
+            organoid_mask_2 = future.predict_segmenter(features, clf_org_2)
+            organoid_mask_2[organoid_mask_2>0] -= 1
+        
+        # print("\n### Predicting T-cell Pixels")
+        tcell_mask = future.predict_segmenter(features, clf_tcell)
+        tcell_mask[tcell_mask>0] -= 1
+        
+        # print("\n### Predicting Death Pixels")
+        death_mask = future.predict_segmenter(features, clf_death)
+        death_mask[death_mask>0] -= 1
     
-    # print("\n### Predicting T-cell Pixels")
-    pred_tcell_mask = future.predict_segmenter(features, clf_tcell)
-    pred_tcell_mask[pred_tcell_mask>0] -= 1
-    
-    # print("\n### Predicting Death Pixels")
-    pred_death_mask = future.predict_segmenter(features, clf_death)
-    pred_death_mask[pred_death_mask>0] -= 1
     
     # print("\n### Segmenting Organoids and T-cells")
     if clf_org_2 is not None:
         two_org_types = True
         seg_organoid, seg_organoid_2, seg_tcell = segment_tcell_and_organoid(
-            args = (pred_org_mask, pred_org_2_mask, pred_tcell_mask, organoid_edt_threshold, two_org_types)
+            args = (organoid_mask, organoid_mask_2, tcell_mask, organoid_edt_threshold, two_org_types)
         )
-        return(seg_organoid, seg_organoid_2, seg_tcell, pred_death_mask)
+        # return(seg_organoid, seg_organoid_2, seg_tcell, pred_death_mask)
     else:
         two_org_types = False
         seg_organoid, seg_tcell = segment_tcell_and_organoid(
-            args = (pred_org_mask, pred_tcell_mask, organoid_edt_threshold, two_org_types),  
+            args = (organoid_mask, tcell_mask, organoid_edt_threshold, two_org_types),  
         )
         
-        return(seg_organoid, seg_tcell, pred_death_mask)
+        # return(seg_organoid, seg_tcell, pred_death_mask, pred_org_mask, pred_tcell_mask)
+    return_dict = {
+        "segments_organoid": seg_organoid,
+        "segments_tcell": seg_tcell,
+        "death_mask": death_mask,
+        "mask_tcell": tcell_mask,
+        "mask_organoid": organoid_mask
+    }
     
+    if two_org_types:
+        return_dict["segments_organoid_2"] = seg_organoid_2
+    
+    return return_dict
+
 def run_pixel_classifier_segmentation(
     output_dir,
     metadata,
@@ -837,8 +862,20 @@ def run_pixel_classifier_segmentation(
     clf_tcell_path=None,
     clf_death_path=None,
     two_org_types=False,
+    only_segment=False,
+    overwrite_existing=False,
     ):
 
+    # if only_segment:
+    #     assert pred_org_mask is not None, "pred_org_mask must be provided when only_segment is True"
+    #     assert Path(pred_org_mask).exists(), "pred_org_mask path does not exist"
+        
+    #     assert pred_tcell_mask is not None, "pred_tcell_mask must be provided when only_segment is True"
+    #     assert Path(pred_tcell_mask).exists(), "pred_tcell_mask path does not exist"
+        
+    #     if clf_org_2 is not None:
+    #         assert pred_org_2_mask is not None, "pred_org_2_mask must be provided when only_segment is True and clf_org_2 is not None"
+    #         assert Path(pred_org_2_mask).exists(), "pred_org_2_mask path does not exist"
 
     pixelclass_dir = Path(output_dir, "images", "PixelClassification")
     if not pixelclass_dir.exists():
@@ -896,7 +933,9 @@ def run_pixel_classifier_segmentation(
         if two_org_types:
             organoid_2_segments_outpath = Path(img_outdir, f"{sample_name}_organoid2_segments.zarr")
         death_mask_outpath = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
-        
+        tcell_mask_outpath = Path(img_outdir, f"{sample_name}_tcell_mask.zarr")
+        organoid_mask_outpath = Path(img_outdir, f"{sample_name}_organoid_mask.zarr")
+
         if not raw_image_zarr.exists():
             img = load_image(raw_image_path)
             # img = img[:, [tcell_ch, live_ch, dead_ch]]
@@ -905,7 +944,10 @@ def run_pixel_classifier_segmentation(
         print(img.shape)
         
         if (tcell_segments_outpath.exists() and 
-            organoid_segments_outpath.exists()):
+            organoid_segments_outpath.exists() and
+            not overwrite_existing and
+            not only_segment
+            ):
             print("Already segmented, skipping")
         else:   
             if tcell_segments_outpath.exists():
@@ -915,6 +957,19 @@ def run_pixel_classifier_segmentation(
             if two_org_types and organoid_2_segments_outpath.exists():
                 shutil.rmtree(organoid_2_segments_outpath)
             
+            if only_segment:
+                tcell_mask = load_image(tcell_mask_outpath)
+                organoid_mask = load_image(organoid_mask_outpath)
+                if two_org_types:
+                    organoid_2_mask = load_image(organoid_2_segments_outpath)
+            else:
+                if death_mask_outpath.exists():
+                    shutil.rmtree(death_mask_outpath)
+                if tcell_mask_outpath.exists():
+                    shutil.rmtree(tcell_mask_outpath)
+                if organoid_mask_outpath.exists():
+                    shutil.rmtree(organoid_mask_outpath)
+                                             
             # Determine which timepoints to process
             if timepoint_range is not None:
                 start_t, end_t = timepoint_range
@@ -936,17 +991,31 @@ def run_pixel_classifier_segmentation(
                     clf_org_2=clf_org_2 if two_org_types else None,
                     clf_tcell=clf_tcell,
                     clf_death=clf_death,
-                    organoid_edt_threshold=organoid_edt_threshold
+                    organoid_edt_threshold=organoid_edt_threshold,
+                    only_segment=only_segment,
+                    tcell_mask=np.asarray(tcell_mask[t]) if only_segment else None,
+                    organoid_mask=np.asarray(organoid_mask[t]) if only_segment else None,
+                    organoid_mask_2=np.asarray(organoid_2_mask[t]) if only_segment and two_org_types else None,
                 )
                 if two_org_types:
-                    seg_organoid, seg_organoid_2, seg_tcell, pred_death_mask = result
+                    seg_organoid_2 = result["segments_organoid_2"]
+                    # seg_organoid, seg_organoid_2, seg_tcell, pred_death_mask = result
                     append_to_zarr(np.expand_dims(seg_organoid_2, axis=0), organoid_2_segments_outpath)
-                else:
-                    seg_organoid, seg_tcell, pred_death_mask = result
+                
+                seg_organoid = result["segments_organoid"]
+                seg_tcell = result["segments_tcell"]
+                
                 append_to_zarr(np.expand_dims(seg_organoid, axis=0), organoid_segments_outpath)
                 append_to_zarr(np.expand_dims(seg_tcell, axis=0), tcell_segments_outpath)
-                append_to_zarr(np.expand_dims(pred_death_mask, axis=0), death_mask_outpath)
                 
+                if not only_segment:
+                    pred_death_mask = result["death_mask"]
+                    pred_tcell_mask = result["mask_tcell"]
+                    pred_organoid_mask = result["mask_organoid"]
+                    append_to_zarr(np.expand_dims(pred_death_mask, axis=0), death_mask_outpath)
+                    append_to_zarr(np.expand_dims(pred_tcell_mask, axis=0), tcell_mask_outpath)
+                    append_to_zarr(np.expand_dims(pred_organoid_mask, axis=0), organoid_mask_outpath)
+                    
         metadata.at[idx, "tcell_segments_image_path"] = str(tcell_segments_outpath)
         metadata.at[idx, "organoid_segments_image_path"] = str(organoid_segments_outpath)
         if two_org_types:

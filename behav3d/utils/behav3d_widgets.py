@@ -22,6 +22,7 @@ from behav3d.preprocessing.tracking.laptracking import run_tcell_laptracking
 from behav3d.preprocessing.tracking.trackpy_tracking import run_tcell_trackpy_tracking
 from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
 
+
 import json
 from copy import deepcopy
 import yaml
@@ -33,6 +34,8 @@ from behav3d.analysis.organoid_analysis import filter_organoid_tracks, run_organ
 
 from behav3d.analysis.backprojection import backproject_mean_features_behav3d, backproject_time_features_behav3d
 import napari
+
+from functools import partial
 
 behav3d_calculated_features = {
     "morphology": [
@@ -863,8 +866,6 @@ class DimOrderTable:
     def _order_to_str(order_tuple):
         return "".join(order_tuple)
     
-
-
 class SignalUnmixingPanel:
     def __init__(
             self, 
@@ -1411,7 +1412,6 @@ class SignalUnmixingPanel:
             except Exception as e:
                 print(f"Error saving metadata: {e}")
 
-
 class PixelClassifierPanel:
     def __init__(self, metadata_loader):
         self.metadata_loader = metadata_loader
@@ -1425,12 +1425,12 @@ class PixelClassifierPanel:
         self.sample_specific_classifier = widgets.Checkbox(
             description="Sample-specific classifier",
             value=bool(pc.get("sample_specific_classifier", False))
-        )        
-        
+        )
+
         # Checkbox for two organoid types (e.g., WT vs. KO)
         self.two_org_types = widgets.Checkbox(
             description="Segment 2 organoid types",
-              value=bool(pc.get("two_org_types", False))  
+            value=bool(pc.get("two_org_types", False))
         )
         self.n_workers = widgets.IntText(
             description="Workers",
@@ -1445,18 +1445,24 @@ class PixelClassifierPanel:
             indent=False
         )
 
+        # NEW: Overwrite existing outputs toggle
+        self.overwrite_existing = widgets.Checkbox(
+            description="Overwrite existing",
+            value=bool(pc.get("overwrite_existing", False))
+        )
+
         # -------- Classifier path pickers (default EMPTY) --------
         self.clf_dir = PathPicker(
             mode='dir',
             description='Classifier dir:',
-            default="", 
+            default="",
             description_width='160px',
             width='100%',
         )
         self.clf_org_path = PathPicker(
             mode='file',
             description='Organoid clf:',
-            default="", 
+            default="",
             filter_pattern='*.joblib',
             description_width='160px',
             width='100%',
@@ -1464,7 +1470,7 @@ class PixelClassifierPanel:
         self.clf_org2_path = PathPicker(
             mode='file',
             description='Organoid 2 clf:',
-            default="", 
+            default="",
             filter_pattern='*.joblib',
             description_width='160px',
             width='100%',
@@ -1472,7 +1478,7 @@ class PixelClassifierPanel:
         self.clf_tcell_path = PathPicker(
             mode='file',
             description='T-cell clf:',
-            default="",   
+            default="",
             filter_pattern='*.joblib',
             description_width='160px',
             width='100%',
@@ -1480,7 +1486,7 @@ class PixelClassifierPanel:
         self.clf_death_path = PathPicker(
             mode='file',
             description='Death clf:',
-            default="",         
+            default="",
             filter_pattern='*.joblib',
             description_width='160px',
             width='100%',
@@ -1493,7 +1499,7 @@ class PixelClassifierPanel:
             self.clf_tcell_path.value = str(pc.get("clf_tcell_path", "") or "")
             self.clf_death_path.value = str(pc.get("clf_death_path", "") or "")
             if self.two_org_types.value:
-                self.clf_org2_path.value   = str(pc.get("clf_org2_path", "") or "")
+                self.clf_org2_path.value = str(pc.get("clf_org2_path", "") or "")
 
         # -------- Apply controls --------
         self.organoid_edt_threshold = widgets.FloatText(
@@ -1534,26 +1540,36 @@ class PixelClassifierPanel:
             layout=widgets.Layout(align_items="center", gap="8px")
         )
 
-        # Apply button + spinner
-        self.btn_apply = widgets.Button(
-            description="Apply pixel classifier",
+        # Two Apply buttons + spinner
+        self.btn_run = widgets.Button(
+            description="Run segmentation",
             button_style="success",
             layout=widgets.Layout(width="fit-content", flex="0 0 auto")
         )
+        self.btn_resegment = widgets.Button(
+            description="Only resegment",
+            button_style="warning",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
+        
+        self.btn_apply = self.btn_run
+        
         self.spinner_apply = widgets.HTML(value=spinning_loader)
         self.spinner_apply.layout.display = "none"
         self.apply_row = widgets.HBox(
-            [self.btn_apply, self.spinner_apply],
+            [self.btn_run, self.btn_resegment, self.spinner_apply],
             layout=widgets.Layout(align_items="center", gap="8px")
         )
 
         # Wire handlers
         self.btn_train.on_click(self._on_train_clicked)
         self.close_button.on_click(self._on_close_clicked)
-        self.btn_apply.on_click(self._on_apply_clicked)
+        self.btn_run.on_click(partial(self._on_apply_clicked, only_segment=False))
+        self.btn_resegment.on_click(partial(self._on_apply_clicked, only_segment=True))
 
         self.out = widgets.Output()
 
+        # Classifier paths box
         clf_path_widgets = [
             widgets.HTML("<b>Classifier paths</b>"),
             self.clf_dir,
@@ -1561,13 +1577,10 @@ class PixelClassifierPanel:
             self.clf_tcell_path,
             self.clf_death_path,
         ]
-
-        # Conditionally add the second organization path
         if self.two_org_types.value:
             clf_path_widgets.append(self.clf_org2_path)
-
         self.clf_paths_box = widgets.VBox(clf_path_widgets)
-        
+
         # Show/hide according to the checkbox
         self.two_org_types.observe(self._on_two_org_types_changed, names='value')
         self.manual_clf_paths.observe(self._toggle_clf_path_section, names='value')
@@ -1597,10 +1610,11 @@ class PixelClassifierPanel:
 
         apply_box = widgets.VBox([
             widgets.HTML("<b>Apply segmentation</b>"),
-            self.manual_clf_paths,               
-            self.clf_paths_box,   
-            widgets.HTML("<b>Segmentation setting</b>"),  
+            self.manual_clf_paths,
+            self.clf_paths_box,
+            widgets.HTML("<b>Segmentation setting</b>"),
             self.organoid_edt_threshold,
+            self.overwrite_existing,          # NEW control appears in the UI
             self.tp_row,
             self.apply_row,
         ])
@@ -1624,14 +1638,14 @@ class PixelClassifierPanel:
         pc["two_org_types"] = bool(self.two_org_types.value)
 
         pc["manual_clf_paths"] = bool(self.manual_clf_paths.value)
+        pc["overwrite_existing"] = bool(self.overwrite_existing.value)  # persist new setting
         if self.manual_clf_paths.value:
             pc["clf_dir"]        = str(self.clf_dir.value or "")
             pc["clf_org_path"]   = str(self.clf_org_path.value or "")
             pc["clf_tcell_path"] = str(self.clf_tcell_path.value or "")
             pc["clf_death_path"] = str(self.clf_death_path.value or "")
             if self.two_org_types.value:
-                pc["clf_org2_path"]   = str(self.clf_org2_path.value or "")
-
+                pc["clf_org2_path"] = str(self.clf_org2_path.value or "")
 
         yaml.safe_dump(
             self.metadata_loader.behav3d_parameters,
@@ -1655,7 +1669,7 @@ class PixelClassifierPanel:
                 return ("", "", "", "")
             else:
                 return ("", "", "")
-            
+
         p = Path(d).expanduser()
         org_path = str(p / 'PixelClassifier_Organoid.joblib')
         tcell_path = str(p / 'PixelClassifier_TCell.joblib')
@@ -1669,21 +1683,18 @@ class PixelClassifierPanel:
 
     def _apply_dir_to_clf_paths(self, d: str):
         paths = self._default_clf_paths_for_dir(d)
-
         self.clf_org_path.value = paths[0]
         self.clf_tcell_path.value = paths[1]
         self.clf_death_path.value = paths[2]
-
         if self.two_org_types.value and len(paths) > 3:
             self.clf_org2_path.value = paths[3]
 
     def _toggle_clf_path_section(self, change=None):
         manual = bool(self.manual_clf_paths.value)
         self.clf_paths_box.layout.display = (None if manual else 'none')
-        
         if not manual:
-            for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, 
-                    self.clf_death_path, self.clf_org2_path]:
+            for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path,
+                      self.clf_death_path, self.clf_org2_path]:
                 p.value = ""
 
     def _build_clf_paths_box(self):
@@ -1692,25 +1703,15 @@ class PixelClassifierPanel:
             self.clf_dir,
             self.clf_org_path,
         ]
-
         if self.two_org_types.value:
             children.append(self.clf_org2_path)
-
-        children.extend([
-            self.clf_tcell_path,
-            self.clf_death_path,
-        ])
-
+        children.extend([self.clf_tcell_path, self.clf_death_path])
         self.clf_paths_box.children = children
 
     def _on_two_org_types_changed(self, change=None):
         self._build_clf_paths_box()
-
         if self.manual_clf_paths.value and self.clf_dir.value:
             self._apply_dir_to_clf_paths(self.clf_dir.value)
-
-
-
 
     def display(self):
         display(self.ui)
@@ -1718,9 +1719,10 @@ class PixelClassifierPanel:
     def _lock(self, state: bool):
         # keep close_button enabled so user can close at any time
         for w in [
-            self.btn_train, self.btn_apply,
+            self.btn_train, self.btn_run, self.btn_resegment,
             self.examples_per_sample, self.sample_specific_classifier, self.n_workers, self.two_org_types,
-            self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end, self.manual_clf_paths,
+            self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end,
+            self.manual_clf_paths, self.overwrite_existing,
         ]:
             w.disabled = state
 
@@ -1752,12 +1754,10 @@ class PixelClassifierPanel:
                 self._lock(True)
                 self.spinner_train.layout.display = None
 
-                # Run training (synchronously). If it opens napari non-blocking and
-                # returns a viewer, store it so the Close button can close it.
+                # Import where available; allow fallback to global
                 try:
                     from behav3d.preprocessing.segmentation.napari_pixelclassifier import train_pixel_classifier
                 except Exception:
-                    # If your train function is imported elsewhere, rely on that name in globals
                     pass
 
                 ret = train_pixel_classifier(
@@ -1775,7 +1775,6 @@ class PixelClassifierPanel:
                     if ret is not None and hasattr(ret, "close"):
                         self._viewer = ret
                     else:
-                        # best-effort: some environments expose current viewer getter
                         get_curr = getattr(napari, "current_viewer", None)
                         if callable(get_curr):
                             self._viewer = get_curr()
@@ -1784,7 +1783,6 @@ class PixelClassifierPanel:
 
                 # UI finalize for train
                 self.spinner_train.layout.display = "none"
-                # Show Close button only if we have a viewer to close
                 self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
                 if self._viewer is None:
                     print("✅ Training finished.", flush=True)
@@ -1796,7 +1794,6 @@ class PixelClassifierPanel:
                 self.spinner_train.layout.display = "none"
                 self.close_button.layout.display = "none"
             finally:
-                # Re-enable inputs regardless; close button stays visible if viewer exists
                 self._lock(False)
 
     def _on_close_clicked(self, _):
@@ -1814,7 +1811,7 @@ class PixelClassifierPanel:
             finally:
                 self.close_button.layout.display = "none"
 
-    def _on_apply_clicked(self, _):
+    def _on_apply_clicked(self, _, only_segment=False):
         self._lock(True)
         with self.out:
             self.out.clear_output()
@@ -1833,6 +1830,8 @@ class PixelClassifierPanel:
                 print(f"  output_dir={odir}")
                 print(f"  organoid_edt_threshold={self.organoid_edt_threshold.value}")
                 print(f"  timepoint_range={tpr}", flush=True)
+                print(f"  only_segment={only_segment}")
+                print(f"  overwrite_existing={bool(self.overwrite_existing.value)}")
                 # Echo chosen classifier paths if manual mode is on
                 if self.manual_clf_paths.value:
                     print(f"  clf_dir={self.clf_dir.value}")
@@ -1844,7 +1843,8 @@ class PixelClassifierPanel:
 
                 self.spinner_apply.layout.display = None
 
-                new_md = run_pixel_classifier_segmentation(
+                # Build kwargs (with overwrite_existing spelled exactly as requested)
+                call_kwargs = dict(
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
                     organoid_edt_threshold=float(self.organoid_edt_threshold.value),
@@ -1854,8 +1854,17 @@ class PixelClassifierPanel:
                     clf_tcell_path=self.clf_tcell_path.value,
                     clf_death_path=self.clf_death_path.value,
                     clf_org2_path=self.clf_org2_path.value if self.two_org_types.value else None,
-
+                    only_segment=bool(only_segment),
+                    overwrite_existing=bool(self.overwrite_existing.value),
                 )
+
+                # Call the segmentation function, retry without overwrite_existing if not supported.
+                try:
+                    new_md = run_pixel_classifier_segmentation(**call_kwargs)
+                except TypeError:
+                    # Backward compatibility: older versions with no overwrite_existing parameter
+                    call_kwargs.pop("overwrite_existing", None)
+                    new_md = run_pixel_classifier_segmentation(**call_kwargs)
 
                 try:
                     if new_md is not None:
@@ -1870,6 +1879,462 @@ class PixelClassifierPanel:
             finally:
                 self.spinner_apply.layout.display = "none"
                 self._lock(False)
+                
+# class PixelClassifierPanel:
+#     def __init__(self, metadata_loader):
+#         self.metadata_loader = metadata_loader
+#         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+
+#         # -------- Train controls --------
+#         self.examples_per_sample = widgets.IntText(
+#             description="Examples per sample",
+#             value=int(pc.get("examples_per_sample", 3))
+#         )
+#         self.sample_specific_classifier = widgets.Checkbox(
+#             description="Sample-specific classifier",
+#             value=bool(pc.get("sample_specific_classifier", False))
+#         )        
+        
+#         # Checkbox for two organoid types (e.g., WT vs. KO)
+#         self.two_org_types = widgets.Checkbox(
+#             description="Segment 2 organoid types",
+#               value=bool(pc.get("two_org_types", False))  
+#         )
+#         self.n_workers = widgets.IntText(
+#             description="Workers",
+#             value=int(pc.get("workers", (os.cpu_count() or 8))),
+#             max=max(8, (os.cpu_count() or 8))
+#         )
+
+#         # ---- Manual classifier toggle ----
+#         self.manual_clf_paths = widgets.Checkbox(
+#             description="Manually supply classifiers",
+#             value=bool(pc.get("manual_clf_paths", False)),
+#             indent=False
+#         )
+
+#         # -------- Classifier path pickers (default EMPTY) --------
+#         self.clf_dir = PathPicker(
+#             mode='dir',
+#             description='Classifier dir:',
+#             default="", 
+#             description_width='160px',
+#             width='100%',
+#         )
+#         self.clf_org_path = PathPicker(
+#             mode='file',
+#             description='Organoid clf:',
+#             default="", 
+#             filter_pattern='*.joblib',
+#             description_width='160px',
+#             width='100%',
+#         )
+#         self.clf_org2_path = PathPicker(
+#             mode='file',
+#             description='Organoid 2 clf:',
+#             default="", 
+#             filter_pattern='*.joblib',
+#             description_width='160px',
+#             width='100%',
+#         )
+#         self.clf_tcell_path = PathPicker(
+#             mode='file',
+#             description='T-cell clf:',
+#             default="",   
+#             filter_pattern='*.joblib',
+#             description_width='160px',
+#             width='100%',
+#         )
+#         self.clf_death_path = PathPicker(
+#             mode='file',
+#             description='Death clf:',
+#             default="",         
+#             filter_pattern='*.joblib',
+#             description_width='160px',
+#             width='100%',
+#         )
+
+#         # If user previously saved manual paths AND toggle is True, restore them now.
+#         if self.manual_clf_paths.value:
+#             self.clf_dir.value        = str(pc.get("clf_dir", "") or "")
+#             self.clf_org_path.value   = str(pc.get("clf_org_path", "") or "")
+#             self.clf_tcell_path.value = str(pc.get("clf_tcell_path", "") or "")
+#             self.clf_death_path.value = str(pc.get("clf_death_path", "") or "")
+#             if self.two_org_types.value:
+#                 self.clf_org2_path.value   = str(pc.get("clf_org2_path", "") or "")
+
+#         # -------- Apply controls --------
+#         self.organoid_edt_threshold = widgets.FloatText(
+#             description="Organoid EDT thr",
+#             value=float(pc.get("organoid_edt_threshold", 12.0)),
+#             style={'description_width': '160px'}
+#         )
+#         self.use_all_timepoints = widgets.Checkbox(
+#             description="Process ALL timepoints",
+#             value=bool(pc.get("use_all_timepoints", True))
+#         )
+#         self.tp_start = widgets.IntText(description="Start t", value=int(pc.get("tp_start", 0)))
+#         self.tp_end   = widgets.IntText(description="End t",   value=int(pc.get("tp_end", 0)))
+
+#         # Start/End visibility
+#         self.use_all_timepoints.observe(self._toggle_timepoint_inputs, names='value')
+#         self._toggle_timepoint_inputs()
+
+#         self.btn_train = widgets.Button(
+#             description="Train pixel classifier",
+#             button_style="primary",
+#             layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+#         )
+#         self.close_button = widgets.Button(
+#             description="Close viewer",
+#             button_style="danger",
+#             icon="stop",
+#             tooltip="Close the active Napari viewer",
+#             layout=widgets.Layout(width="200px", display="none")  # hidden until a viewer is open
+#         )
+
+#         self.spinner_train = widgets.HTML(value=spinning_loader)
+#         self.spinner_train.layout.display = "none"
+
+#         # Row: Train | Close viewer | spinner
+#         self.train_row = widgets.HBox(
+#             [self.btn_train, self.close_button, self.spinner_train],
+#             layout=widgets.Layout(align_items="center", gap="8px")
+#         )
+
+#         # Apply button + spinner
+#         self.btn_apply = widgets.Button(
+#             description="Apply pixel classifier",
+#             button_style="success",
+#             layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+#         )
+#         self.spinner_apply = widgets.HTML(value=spinning_loader)
+#         self.spinner_apply.layout.display = "none"
+#         self.apply_row = widgets.HBox(
+#             [self.btn_apply, self.spinner_apply],
+#             layout=widgets.Layout(align_items="center", gap="8px")
+#         )
+
+#         # Wire handlers
+#         self.btn_train.on_click(self._on_train_clicked)
+#         self.close_button.on_click(self._on_close_clicked)
+#         self.btn_apply.on_click(self._on_apply_clicked)
+
+#         self.out = widgets.Output()
+
+#         clf_path_widgets = [
+#             widgets.HTML("<b>Classifier paths</b>"),
+#             self.clf_dir,
+#             self.clf_org_path,
+#             self.clf_tcell_path,
+#             self.clf_death_path,
+#         ]
+
+#         # Conditionally add the second organization path
+#         if self.two_org_types.value:
+#             clf_path_widgets.append(self.clf_org2_path)
+
+#         self.clf_paths_box = widgets.VBox(clf_path_widgets)
+        
+#         # Show/hide according to the checkbox
+#         self.two_org_types.observe(self._on_two_org_types_changed, names='value')
+#         self.manual_clf_paths.observe(self._toggle_clf_path_section, names='value')
+
+#         self._build_clf_paths_box()
+#         self._toggle_clf_path_section()
+
+#         # When directory changes, auto-fill file pickers (only when manual mode is enabled)
+#         def _dir_changed(change):
+#             if not self.manual_clf_paths.value:
+#                 return
+#             newd = (change.get('new') or '').strip()
+#             if newd:
+#                 self._apply_dir_to_clf_paths(newd)
+#         self.clf_dir.text.observe(_dir_changed, names='value')
+
+#         # Layout
+#         train_box = widgets.VBox([
+#             widgets.HTML("<b>Train pixel classifier</b>"),
+#             widgets.HBox([self.examples_per_sample, self.n_workers]),
+#             self.sample_specific_classifier,
+#             self.two_org_types,
+#             self.train_row,
+#         ])
+
+#         self.tp_row = widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end])
+
+#         apply_box = widgets.VBox([
+#             widgets.HTML("<b>Apply segmentation</b>"),
+#             self.manual_clf_paths,               
+#             self.clf_paths_box,   
+#             widgets.HTML("<b>Segmentation setting</b>"),  
+#             self.organoid_edt_threshold,
+#             self.tp_row,
+#             self.apply_row,
+#         ])
+
+#         self.ui = widgets.VBox([train_box, widgets.HTML("<hr>"), apply_box, widgets.HTML("<hr>"), self.out])
+
+#         # viewer handle (if training opens napari and returns a viewer)
+#         self._viewer = None
+
+#     # ---------- config ----------
+#     def _persist_params(self):
+#         self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+#         pc = self.metadata_loader.behav3d_parameters["pixel_classifier"]
+#         pc["examples_per_sample"] = int(self.examples_per_sample.value)
+#         pc["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
+#         pc["workers"] = int(self.n_workers.value)
+#         pc["organoid_edt_threshold"] = float(self.organoid_edt_threshold.value)
+#         pc["use_all_timepoints"] = bool(self.use_all_timepoints.value)
+#         pc["tp_start"] = int(self.tp_start.value)
+#         pc["tp_end"]   = int(self.tp_end.value)
+#         pc["two_org_types"] = bool(self.two_org_types.value)
+
+#         pc["manual_clf_paths"] = bool(self.manual_clf_paths.value)
+#         if self.manual_clf_paths.value:
+#             pc["clf_dir"]        = str(self.clf_dir.value or "")
+#             pc["clf_org_path"]   = str(self.clf_org_path.value or "")
+#             pc["clf_tcell_path"] = str(self.clf_tcell_path.value or "")
+#             pc["clf_death_path"] = str(self.clf_death_path.value or "")
+#             if self.two_org_types.value:
+#                 pc["clf_org2_path"]   = str(self.clf_org2_path.value or "")
+
+
+#         yaml.safe_dump(
+#             self.metadata_loader.behav3d_parameters,
+#             self.metadata_loader.behav3d_parameters_path.open("w"),
+#             sort_keys=False
+#         )
+
+#     # ---------- UI helpers ----------
+#     def _toggle_timepoint_inputs(self, change=None):
+#         show = not self.use_all_timepoints.value
+#         disp = None if show else 'none'
+#         self.tp_start.layout.display = disp
+#         self.tp_end.layout.display   = disp
+#         self.tp_start.disabled = not show
+#         self.tp_end.disabled   = not show
+
+#     # >>> helper: compute default file paths for a directory
+#     def _default_clf_paths_for_dir(self, d: str):
+#         if not d:
+#             if self.two_org_types.value:
+#                 return ("", "", "", "")
+#             else:
+#                 return ("", "", "")
+            
+#         p = Path(d).expanduser()
+#         org_path = str(p / 'PixelClassifier_Organoid.joblib')
+#         tcell_path = str(p / 'PixelClassifier_TCell.joblib')
+#         death_path = str(p / 'PixelClassifier_Death.joblib')
+
+#         if self.two_org_types.value:
+#             org2_path = str(p / 'PixelClassifier_Organoid2.joblib')
+#             return (org_path, tcell_path, death_path, org2_path)
+#         else:
+#             return (org_path, tcell_path, death_path)
+
+#     def _apply_dir_to_clf_paths(self, d: str):
+#         paths = self._default_clf_paths_for_dir(d)
+
+#         self.clf_org_path.value = paths[0]
+#         self.clf_tcell_path.value = paths[1]
+#         self.clf_death_path.value = paths[2]
+
+#         if self.two_org_types.value and len(paths) > 3:
+#             self.clf_org2_path.value = paths[3]
+
+#     def _toggle_clf_path_section(self, change=None):
+#         manual = bool(self.manual_clf_paths.value)
+#         self.clf_paths_box.layout.display = (None if manual else 'none')
+        
+#         if not manual:
+#             for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, 
+#                     self.clf_death_path, self.clf_org2_path]:
+#                 p.value = ""
+
+#     def _build_clf_paths_box(self):
+#         children = [
+#             widgets.HTML("<b>Classifier paths</b>"),
+#             self.clf_dir,
+#             self.clf_org_path,
+#         ]
+
+#         if self.two_org_types.value:
+#             children.append(self.clf_org2_path)
+
+#         children.extend([
+#             self.clf_tcell_path,
+#             self.clf_death_path,
+#         ])
+
+#         self.clf_paths_box.children = children
+
+#     def _on_two_org_types_changed(self, change=None):
+#         self._build_clf_paths_box()
+
+#         if self.manual_clf_paths.value and self.clf_dir.value:
+#             self._apply_dir_to_clf_paths(self.clf_dir.value)
+
+#     def display(self):
+#         display(self.ui)
+
+#     def _lock(self, state: bool):
+#         # keep close_button enabled so user can close at any time
+#         for w in [
+#             self.btn_train, self.btn_apply,
+#             self.examples_per_sample, self.sample_specific_classifier, self.n_workers, self.two_org_types,
+#             self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end, self.manual_clf_paths,
+#         ]:
+#             w.disabled = state
+
+#         # also lock/unlock the path pickers
+#         try:
+#             for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, self.clf_death_path, self.clf_org2_path]:
+#                 p.text.disabled = state
+#                 p.button.disabled = state
+#         except Exception:
+#             pass
+
+#     # ---------- callbacks ----------
+#     def _on_train_clicked(self, _):
+#         with self.out:
+#             self.out.clear_output()
+#             try:
+#                 self._persist_params()
+#                 odir = Path(self.metadata_loader.output_dir).expanduser()
+#                 odir.mkdir(parents=True, exist_ok=True)
+
+#                 print("▶️ Training pixel classifier…", flush=True)
+#                 print(f"  output_dir={odir}")
+#                 print(f"  examples_per_sample={self.examples_per_sample.value}")
+#                 print(f"  sample_specific_classifier={self.sample_specific_classifier.value}")
+#                 print(f"  two_org_types={self.two_org_types.value}")
+#                 print(f"  n_workers={self.n_workers.value}")
+
+#                 # UI state
+#                 self._lock(True)
+#                 self.spinner_train.layout.display = None
+
+#                 # Run training (synchronously). If it opens napari non-blocking and
+#                 # returns a viewer, store it so the Close button can close it.
+#                 try:
+#                     from behav3d.preprocessing.segmentation.napari_pixelclassifier import train_pixel_classifier
+#                 except Exception:
+#                     # If your train function is imported elsewhere, rely on that name in globals
+#                     pass
+
+#                 ret = train_pixel_classifier(
+#                     output_dir=str(odir),
+#                     metadata=self.metadata_loader.metadata,
+#                     examples_per_sample=int(self.examples_per_sample.value),
+#                     sample_specific_classifier=bool(self.sample_specific_classifier.value),
+#                     n_workers=int(self.n_workers.value),
+#                     two_org_types=bool(self.two_org_types.value),
+#                 )
+
+#                 # Try to capture a viewer handle
+#                 self._viewer = None
+#                 try:
+#                     if ret is not None and hasattr(ret, "close"):
+#                         self._viewer = ret
+#                     else:
+#                         # best-effort: some environments expose current viewer getter
+#                         get_curr = getattr(napari, "current_viewer", None)
+#                         if callable(get_curr):
+#                             self._viewer = get_curr()
+#                 except Exception:
+#                     pass
+
+#                 # UI finalize for train
+#                 self.spinner_train.layout.display = "none"
+#                 # Show Close button only if we have a viewer to close
+#                 self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
+#                 if self._viewer is None:
+#                     print("✅ Training finished.", flush=True)
+#                 else:
+#                     print("✅ Training UI opened in Napari (use 'Close viewer' to close).", flush=True)
+
+#             except Exception:
+#                 import traceback; traceback.print_exc()
+#                 self.spinner_train.layout.display = "none"
+#                 self.close_button.layout.display = "none"
+#             finally:
+#                 # Re-enable inputs regardless; close button stays visible if viewer exists
+#                 self._lock(False)
+
+#     def _on_close_clicked(self, _):
+#         with self.out:
+#             try:
+#                 if self._viewer is not None:
+#                     print("Closing viewer…")
+#                     try:
+#                         self._viewer.close()
+#                     except Exception as e:
+#                         print(f"Error closing viewer: {e}")
+#                     self._viewer = None
+#                 else:
+#                     print("No active viewer to close (viewer may have been opened in blocking mode).")
+#             finally:
+#                 self.close_button.layout.display = "none"
+
+#     def _on_apply_clicked(self, _):
+#         self._lock(True)
+#         with self.out:
+#             self.out.clear_output()
+#             self._persist_params()
+#             try:
+#                 odir = Path(self.metadata_loader.output_dir).expanduser()
+#                 odir.mkdir(parents=True, exist_ok=True)
+
+#                 tpr = _mk_timepoint_range(
+#                     use_all=bool(self.use_all_timepoints.value),
+#                     start=int(self.tp_start.value),
+#                     end=int(self.tp_end.value),
+#                 )
+
+#                 print("▶️ Applying pixel classifier segmentation…", flush=True)
+#                 print(f"  output_dir={odir}")
+#                 print(f"  organoid_edt_threshold={self.organoid_edt_threshold.value}")
+#                 print(f"  timepoint_range={tpr}", flush=True)
+#                 # Echo chosen classifier paths if manual mode is on
+#                 if self.manual_clf_paths.value:
+#                     print(f"  clf_dir={self.clf_dir.value}")
+#                     print(f"  clf_org_path={self.clf_org_path.value}")
+#                     if self.two_org_types.value:
+#                         print(f"  clf_org2_path={self.clf_org2_path.value}")
+#                     print(f"  clf_tcell_path={self.clf_tcell_path.value}")
+#                     print(f"  clf_death_path={self.clf_death_path.value}")
+
+#                 self.spinner_apply.layout.display = None
+
+#                 new_md = run_pixel_classifier_segmentation(
+#                     output_dir=str(odir),
+#                     metadata=self.metadata_loader.metadata,
+#                     organoid_edt_threshold=float(self.organoid_edt_threshold.value),
+#                     timepoint_range=tpr,
+#                     two_org_types=bool(self.two_org_types.value),
+#                     clf_org_path=self.clf_org_path.value,
+#                     clf_tcell_path=self.clf_tcell_path.value,
+#                     clf_death_path=self.clf_death_path.value,
+#                     clf_org2_path=self.clf_org2_path.value if self.two_org_types.value else None,
+
+#                 )
+
+#                 try:
+#                     if new_md is not None:
+#                         self.metadata_loader.metadata = new_md
+#                         new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
+#                 except Exception:
+#                     import traceback; traceback.print_exc()
+
+#                 print("✅ Apply finished.", flush=True)
+#             except Exception:
+#                 import traceback; traceback.print_exc()
+#             finally:
+#                 self.spinner_apply.layout.display = "none"
+#                 self._lock(False)
 
 class TrackingPanel:
     """
