@@ -849,6 +849,7 @@ def calculate_movement_features(
             squared_displacements = np.sum((track_coordinates[:i+1] - track_coordinates[i])**2, axis=1)
             msd_values[i] = np.mean(squared_displacements)
         return msd_values
+    
     ## split by unique trackID2 and process
     df_tracks_processed = []
     for track in df_tracks['TrackID'].unique():
