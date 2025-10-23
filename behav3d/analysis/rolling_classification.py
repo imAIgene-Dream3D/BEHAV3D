@@ -43,7 +43,14 @@ from behav3d.utils.filtering import plot_filter_count
 import yaml
 import time
 import seaborn as sns
-import hdbscan
+# import hdbscan
+
+from pandas.api.types import is_numeric_dtype
+import math
+
+seed = 123
+random.seed(seed)
+np.random.seed(seed)
 
 output_dir = r"/Volumes/T7_sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
 metadata_csv_path = r"/Volumes/T7_sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
@@ -63,8 +70,8 @@ df_tracks_orig=df_tracks_orig.sort_values(by=["sample_name", "TrackID", "positio
 window_size=100
 chosen_intervals = 50
 
-window_size=None
-chosen_intervals = None
+# window_size=None
+# chosen_intervals = None
 
 
 groupby=["sample_name", "TrackID"]
@@ -123,40 +130,89 @@ df_analysis = df_windows_descriptive.copy()
 # --- PCA ---
 X_scaled = StandardScaler().fit_transform(X_reduced)
 
-pca_model = PCA(n_components=0.95, random_state=123)
+pca_model = PCA(n_components=0.95, random_state=seed)
 X_pca = pca_model.fit_transform(X_scaled)
 
 # df_pca = pd.DataFrame(X_pca[:, :2], columns=["PC1", "PC2"], index=df_windows_descriptive.index)
 # df_analysis = pd.concat([df_windows_descriptive, df_pca], axis=1)
 df_analysis["PC1"] = X_pca[:, 0]
 df_analysis["PC2"] = X_pca[:, 1]
-# --- Clustering ---
-# Option A: KMeans
-n_clusters = 4  # you can tune this
-kmeans = KMeans(n_clusters=n_clusters, random_state=123, n_init="auto")
-cluster_labels = kmeans.fit_predict(X_pca)
-df_analysis["cluster_label_kmeans"] = cluster_labels
 
-
-# Option B: (alternative) HDBSCAN (for variable density clusters)
-clusterer = hdbscan.HDBSCAN(min_cluster_size=50, metric='euclidean')
-cluster_labels = clusterer.fit_predict(X_pca)
-df_analysis["cluster_label_hdbscan"] = cluster_labels
-
-# --- UMAP ---
+"""
+UMAP on raw features
+"""
 umap_model = umap.UMAP(
             n_components=2, 
             n_neighbors=100, 
             min_dist=0.1, 
             # init="random", 
             metric = "cosine",
-            random_state=123,
+            random_state=seed,
             )
-
 umap_embedding = umap_model.fit_transform(X_pca)
 df_analysis["UMAP1"] = umap_embedding[:,0]
 df_analysis["UMAP2"] = umap_embedding[:,1]
-    
+
+clusterer=HDBSCAN(
+    min_cluster_size=100,
+    min_samples=50,
+    metric="euclidean",
+    alpha=1.0,
+    cluster_selection_method="eom",
+    cluster_selection_epsilon=0.0,
+    allow_single_cluster=False,
+    leaf_size=40,
+    algorithm="auto",                # sklearn’s default
+    n_jobs=None,
+    copy=False
+    )
+cluster_labels = clusterer.fit_predict(umap_embedding)
+df_analysis["cluster_label_hdbscan"] = cluster_labels
+df_analysis["ClusterID"] = cluster_labels
+
+n_clusters = 8  # you can tune this
+kmeans = KMeans(n_clusters=n_clusters, random_state=seed, n_init="auto")
+cluster_labels = kmeans.fit_predict(umap_embedding)
+df_analysis["cluster_label_kmeans"] = cluster_labels
+
+
+#############
+### DTW
+#############
+dtw_features=[
+    # "elongation",
+    # "sphericity",
+    "percentage_dead_mask",
+    # "nr_dead_mask_pixels",
+    "organoid_contact_pixels",
+    "tcell_contact_pixels",
+    # "displacement",
+    "mean_square_displacement",
+    "speed",
+    # # "dead",
+    # "active_tcell_contact",
+    # "position_t"
+]
+non_binary = [c for c in dtw_features if "contact" not in c]
+dtw_result = compute_dtw_window_clusters(
+    df_tracks=df_tracks,                     # from your code
+    df_windows=df_windows_descriptive,       
+    features=dtw_features,
+    non_binary_features=non_binary,
+    min_cluster_size=50,
+    umap_n_neighbors=15,
+    umap_min_dist=0.1,
+    random_state=seed,
+    sample_frac=None,        # set e.g. 0.2 if it’s too big
+    max_windows=None         # or set e.g. 4000 to cap
+)
+join_keys = [k for k in ["sample_name","TrackID","sub_TrackID","window_start_position_t","window_end_position_t"]
+             if k in dtw_result.columns and k in df_analysis.columns]
+df_analysis = df_analysis.merge(
+    dtw_result[join_keys + ["DTW_UMAP1","DTW_UMAP2","cluster_label_dtw_hdbscan"]],
+    on=join_keys,
+    how="left"
+)
 # ---------- 1) PCA & UMAP quick looks ----------
 plt.figure(figsize=(12,5))
 plt.subplot(1,2,1)
@@ -169,27 +225,22 @@ plt.title("UMAP (2D)")
 plt.tight_layout()
 plt.show()
 
-# ---------- 2) PCA colored by clusters ----------
-if "cluster_label_kmeans" in df_analysis.columns:
-    plt.figure(figsize=(6,5))
-    sns.scatterplot(
-        data=df_analysis, x="PC1", y="PC2",
-        hue="cluster_label_kmeans", palette="tab20",
-        s=10, alpha=0.8, edgecolor=None, legend=False
-    )
-    plt.title("PCA colored by KMeans clusters")
-    plt.show()
+plot_umap_feature_grid(df_analysis, feature_cols=feature_cols)
+plot_clustering_feature_heatmap(
+    df_umap=df_analysis,
+    info_cols=feature_cols,
+    sample_cols=non_feature_cols,
+    outpath="/Users/s.deblank-3/Downloads/test.pdf",
+    rows_per_page = 7,
+    nr_cols = 2,
+    figsize = (8.27, 11.69),
+    plot_results=True,
+    show_points=False,        # overlay individual samples
+    point_alpha=0.5,         # transparency for individual samples
+    point_size=8,            # size for individual points
+    mean_marker_size=60,     # size for mean markers
+)
 
-if "cluster_label_hdbscan" in df_analysis.columns:
-    # HDBSCAN uses -1 for noise; use a palette that includes it
-    plt.figure(figsize=(6,5))
-    sns.scatterplot(
-        data=df_analysis, x="PC1", y="PC2",
-        hue="cluster_label_hdbscan", palette="tab20",
-        s=10, alpha=0.8, edgecolor=None, legend=False
-    )
-    plt.title("PCA colored by HDBSCAN clusters (−1 = noise)")
-    plt.show()
 
 # ---------- 3) UMAP colored by clusters ----------
 if "cluster_label_kmeans" in df_analysis.columns:
@@ -211,6 +262,37 @@ if "cluster_label_hdbscan" in df_analysis.columns:
     )
     plt.title("UMAP colored by HDBSCAN clusters (−1 = noise)")
     plt.show()
+
+if "cluster_label_dtw_hdbscan" in df_analysis.columns:
+    plt.figure(figsize=(6,5))
+    sns.scatterplot(
+        data=df_analysis, x="UMAP1", y="UMAP2",
+        hue="cluster_label_dtw_hdbscan", palette="tab20",
+        s=10, alpha=0.8, edgecolor=None, legend=False
+    )
+    plt.title("UMAP colored by HDBSCAN clusters (−1 = noise)")
+    plt.show()
+    
+    plt.figure(figsize=(6,5))
+    sns.scatterplot(
+        data=df_analysis, x="DTW_UMAP1", y="DTW_UMAP2",
+        hue="cluster_label_dtw_hdbscan", palette="tab20",
+        s=10, alpha=0.8, edgecolor=None, legend=False
+    )
+    plt.title("UMAP colored by HDBSCAN clusters (−1 = noise)")
+    plt.show()
+    
+if "cluster_label_hdbscan" in df_analysis.columns:
+    # HDBSCAN uses -1 for noise; use a palette that includes it
+    plt.figure(figsize=(6,5))
+    sns.scatterplot(
+        data=df_analysis, x="PC1", y="PC2",
+        hue="cluster_label_hdbscan", palette="tab20",
+        s=10, alpha=0.8, edgecolor=None, legend=False
+    )
+    plt.title("PCA colored by HDBSCAN clusters (−1 = noise)")
+    plt.show()
+
 
 # ---------- 4) Optional: PCA explained variance curve ----------
 if hasattr(pca_model, "explained_variance_ratio_"):
@@ -240,118 +322,8 @@ if "cluster_label_hdbscan" in df_analysis.columns:
     plt.xlabel("Cluster"); plt.ylabel("Count")
     plt.show()
     
-# df_umap = pd.merge(df_tracks, umap_embedding, how="left")
-# df_umap = pd.merge(df_rolling, umap_embedding, how="left")
-for feature in feature_cols:
-    sns.scatterplot(
-        data=df_analysis,
-        x="UMAP1",
-        y="UMAP2",
-        hue=feature,
-        s=5,
-        alpha=0.5,
-        palette="viridis",
-        # legend=False
-    )
-    plt.show()
-        
-    
-from pandas.api.types import is_numeric_dtype
-def plot_umap_feature_grid(
-    df: pd.DataFrame,
-    feature_cols: list[str],
-    x_col: str = "UMAP1",
-    y_col: str = "UMAP2",
-    ncols: int = 4,
-    max_plots: int | None = None,
-    point_size: int = 5,
-    alpha: float = 0.5,
-    numeric_cmap: str = "viridis",
-    categorical_palette: str = "tab20",
-    add_colorbar: bool = True,
-    page: int = 0,   # for pagination: 0-based page index
-    ):
-    """
-    Creates a multi-row, multi-column grid of UMAP scatterplots colored by each feature in feature_cols.
-    Filters out non-scalar or missing features automatically. Supports pagination via `page`.
-    """
-    # Filter valid features (exist, scalar, not all NaN)
-    valid = []
-    for c in feature_cols:
-        if c in df.columns and _is_scalar_series(df[c]) and df[c].notna().any():
-            valid.append(c)
-    if max_plots is not None:
-        valid = valid[:max_plots]
 
-    if len(valid) == 0:
-        raise ValueError("No valid features to plot.")
 
-    n = len(valid)
-    nrows = math.ceil(n / ncols)
-
-    # Pagination support: choose a slice of features per page
-    per_page = nrows * ncols
-    start = page * per_page
-    end = min(start + per_page, len(valid))
-    feats = valid[start:end]
-    if len(feats) == 0:
-        raise ValueError(f"No features to plot on page {page} (only {math.ceil(len(valid)/per_page)} page(s) available).")
-
-    # Axes limits shared across panels
-    x_min, x_max = df[x_col].min(), df[x_col].max()
-    y_min, y_max = df[y_col].min(), df[y_col].max()
-
-    # Build grid
-    fig, axes = plt.subplots(
-        nrows=math.ceil(len(feats)/ncols),
-        ncols=ncols,
-        figsize=(4*ncols, 3.5*math.ceil(len(feats)/ncols)),
-        squeeze=False,
-        constrained_layout=True
-    )
-
-    for i, feat in enumerate(feats):
-        r, c = divmod(i, ncols)
-        ax = axes[r, c]
-
-        s = df[feat]
-        # Numeric vs categorical handling
-        if is_numeric_dtype(s):
-            # Numeric: use matplotlib scatter for easy colorbar handling
-            sc = ax.scatter(
-                df[x_col], df[y_col],
-                s=point_size, alpha=alpha,
-                c=s, cmap=numeric_cmap, edgecolors="none"
-            )
-            if add_colorbar:
-                cb = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-                cb.ax.tick_params(labelsize=8)
-        else:
-            # Categorical: enforce category dtype and use seaborn palette
-            s_cat = s.astype("category")
-            tmp = df.copy()
-            tmp[feat] = s_cat
-            sns.scatterplot(
-                data=tmp, x=x_col, y=y_col, hue=feat,
-                palette=categorical_palette, s=point_size, alpha=alpha,
-                legend=False, ax=ax
-            )
-
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
-        ax.set_title(feat, fontsize=10)
-        ax.set_xlabel("")
-        ax.set_ylabel("")
-
-    # Hide any unused axes (if grid not full)
-    total_cells = axes.size
-    for j in range(len(feats), total_cells):
-        r, c = divmod(j, ncols)
-        axes[r, c].axis("off")
-
-    # Add a common title
-    fig.suptitle("UMAP colored by features", fontsize=14)
-    plt.show()     
       
       
         
@@ -405,7 +377,7 @@ def dynamic_time_warping():
             n_neighbors=15, 
             min_dist=0.1, 
             init="random", 
-            random_state=123,
+            random_state=seed,
             metric="precomputed", 
             )
 
@@ -558,7 +530,7 @@ umap_model = umap.UMAP(
         n_neighbors=30, 
         min_dist=0.1, 
         init="random", 
-        random_state=123,
+        random_state=seed,
         # metric="precomputed", 
         )
 
@@ -602,3 +574,32 @@ for feature in features:
             # legend=False
         )
     plt.show()
+
+
+# --- Clustering ---
+# Option A: KMeans
+# n_clusters = 4  # you can tune this
+# kmeans = KMeans(n_clusters=n_clusters, random_state=seed, n_init="auto")
+# cluster_labels = kmeans.fit_predict(X_pca)
+# df_analysis["cluster_label_kmeans"] = cluster_labels
+
+
+# # Option B: (alternative) HDBSCAN (for variable density clusters)
+# clusterer = hdbscan.HDBSCAN(min_cluster_size=50, metric='euclidean')
+# cluster_labels = clusterer.fit_predict(X_pca)
+# df_analysis["cluster_label_hdbscan"] = cluster_labels
+
+# --- UMAP ---
+# umap_model = umap.UMAP(
+#             n_components=2, 
+#             n_neighbors=100, 
+#             min_dist=0.1, 
+#             # init="random", 
+#             metric = "cosine",
+#             random_state=seed,
+#             )
+
+# umap_embedding = umap_model.fit_transform(X_pca)
+# df_analysis["UMAP1"] = umap_embedding[:,0]
+# df_analysis["UMAP2"] = umap_embedding[:,1]
+    

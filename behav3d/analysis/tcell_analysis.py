@@ -48,7 +48,7 @@ import yaml
 import time
 import seaborn as sns
 # df_tracks=df_tracks[df_tracks["relative_time"]<=30]
-
+    
 def run_tcell_analysis(
     config=None,
     output_dir=None,
@@ -934,55 +934,33 @@ def plot_clustering_feature_heatmap(
     outpath,
     rows_per_page = 7,
     nr_cols = 2,
-    rows_first_img = 4,
     figsize = (8.27, 11.69),
     plot_results=True,
-    show_points=False,        # overlay individual samples
-    point_alpha=0.5,         # transparency for individual samples
-    point_size=8,            # size for individual points
-    mean_marker_size=60,     # size for mean markers
+    show_points=False,
+    point_alpha=0.5,
+    point_size=8,
+    mean_marker_size=60,
 ):
     """
     Produce a PDF with:
-      • an overview (min-max scaled) heatmap of cluster means (top of first page)
-      • per-feature VIOLIN plots (original value scaling) tiled below & across pages,
-        showing the distribution of every sample in each cluster and the cluster mean.
-
-    Robust to non-finite values by:
-      • coercing to numeric,
-      • replacing ±inf with NaN,
-      • dropping all-NaN columns for the overview scaler,
-      • filling remaining NaNs with column median before scaling (overview only).
-
-    Parameters added:
-      • show_points (bool): overlay each sample as jittered points on top of violins.
-      • point_alpha (float), point_size (int): styling for sample points.
-      • mean_marker_size (int): styling for the mean marker per cluster.
+      • Page 1: full-page min–max scaled heatmap of cluster means.
+      • Subsequent pages: per-feature violin plots tiled across pages.
     """
-    import numpy as np
-    import pandas as pd
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-    from matplotlib.gridspec import GridSpec
-    from sklearn.preprocessing import MinMaxScaler
 
-    # Accept iterables for cols
     info_cols   = list(info_cols) if info_cols is not None else []
     sample_cols = list(sample_cols) if sample_cols is not None else []
 
-    # Helper: tolerant tick rounding if round_legend_ticks doesn't exist
+    # ---- Helper ----
     def _round_legend_ticks(max_val):
         try:
-            return round_legend_ticks(max_val)  # provided elsewhere in your codebase
+            return round_legend_ticks(max_val)
         except Exception:
-            # Simple fallback: round up to 1-2 significant digits
             if not np.isfinite(max_val) or max_val <= 0:
                 return 1.0
             magnitude = 10.0 ** np.floor(np.log10(max_val))
             return float(np.ceil(max_val / magnitude) * magnitude)
 
-    # ---- Compute cluster means (numeric only) for overview ----
+    # ---- Cluster means ----
     df_for_means = (
         df_umap[list(info_cols) + ["ClusterID"]]
         .drop(columns=sample_cols, errors="ignore")
@@ -994,89 +972,79 @@ def plot_clustering_feature_heatmap(
         .reset_index()
     )
 
-    # ---- Overview heatmap: min-max scale each feature across clusters ----
+    # ---- Min-max scaling ----
     cluster_means_scaled = cluster_means.copy()
     scale_columns = [c for c in cluster_means.columns if c != "ClusterID"]
 
-    # Coerce to numeric, clean infinities, drop all-NaN columns, fill NaNs with median
     X = cluster_means_scaled[scale_columns].apply(pd.to_numeric, errors="coerce")
     X = X.replace([np.inf, -np.inf], np.nan)
-
-    # Drop columns that are entirely NaN
     all_nan_cols = X.columns[X.isna().all()].tolist()
     if all_nan_cols:
         X = X.drop(columns=all_nan_cols)
         scale_columns = [c for c in scale_columns if c not in all_nan_cols]
 
-    # Build overview pivot if we have anything left to scale
     if len(scale_columns) > 0:
         X_filled = X.copy()
         med = X_filled.median(numeric_only=True)
         X_filled = X_filled.fillna(med)
         cluster_means_scaled[scale_columns] = MinMaxScaler().fit_transform(X_filled[scale_columns])
-
         df_heatmap_scaled = cluster_means_scaled.melt(id_vars="ClusterID", var_name="var", value_name="AU")
         overall_heatmap_data = df_heatmap_scaled.pivot(index="var", columns="ClusterID", values="AU")
     else:
         overall_heatmap_data = pd.DataFrame()
 
-    # ---- Long-form per-sample data for violin plots ----
-    # Take original per-sample values, coerce numeric, keep ClusterID
+    # ---- Prepare violin plot data ----
     value_cols = [c for c in info_cols if c not in set(sample_cols)]
     df_values = df_umap[["ClusterID"] + value_cols].copy()
-
-    # Clean values
     for c in value_cols:
         df_values[c] = pd.to_numeric(df_values[c], errors="coerce")
     df_values.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-    # Melt to long form: one row per sample-feature
     df_long = df_values.melt(id_vars="ClusterID", var_name="var", value_name="value")
-    # Keep cluster ordering stable and explicit
-    cluster_order = sorted(df_values["ClusterID"].dropna().unique().tolist())
 
-    # Features list (preserve input order from info_cols but only those present)
+    cluster_order = sorted(df_values["ClusterID"].dropna().unique().tolist())
     feat_names = [c for c in value_cols if c in df_long["var"].unique()]
     n_plots = len(feat_names)
-
-    # ---- Pagination math for per-feature plots ----
     rows_for_plots = (n_plots + nr_cols - 1) // nr_cols
-    total_rows     = rows_first_img + rows_for_plots
-    nr_pages       = max(1, (total_rows + rows_per_page - 1) // rows_per_page)
+    nr_pages = max(1, (rows_for_plots + rows_per_page - 1) // rows_per_page)
 
     with PdfPages(outpath) as pdf:
-        plot_idx = 0  # index into feat_names
+        # ---- Page 1: Full-page heatmap ----
+        fig, ax = plt.subplots(figsize=figsize)
+        if not overall_heatmap_data.empty:
+            try:
+                heatmap = sns.heatmap(
+                    overall_heatmap_data,
+                    ax=ax,
+                    cmap="viridis",
+                    cbar=True,
+                    yticklabels=True
+                )
+                ax.set_title("Min–Max Scaled Cluster Means", fontsize=14, pad=14)
+                ax.set_xlabel("ClusterID", fontsize=10)
+                ax.set_ylabel("", fontsize=10)
+                ax.tick_params(axis="y", labelsize=6)
+                ax.tick_params(axis="x", labelsize=8, rotation=0)
+                cbar = heatmap.collections[0].colorbar
+                cbar.ax.tick_params(labelsize=8)
+                fig.tight_layout(pad=2.0)
+            except Exception:
+                ax.text(0.5, 0.5, "Overview heatmap unavailable", ha="center", va="center")
+                ax.axis("off")
+        else:
+            ax.text(0.5, 0.5, "No features available for overview scaling", ha="center", va="center")
+            ax.axis("off")
 
+        pdf.savefig(fig, dpi=600)
+        plt.close(fig)
+
+        # ---- Remaining pages: Violin plots ----
+        plot_idx = 0
         for page in range(nr_pages):
             fig = plt.figure(figsize=figsize)
             gs = GridSpec(rows_per_page, nr_cols, figure=fig, hspace=1.5, wspace=0.3)
-
-            # ---- First page overview heatmap (if available) ----
-            start_row = 0
-            if page == 0 and not overall_heatmap_data.empty:
-                ax = fig.add_subplot(gs[:rows_first_img, :])
-                try:
-                    heatmap = sns.heatmap(overall_heatmap_data, ax=ax, cmap="viridis", cbar=True)
-                    ax.set_title("Min–Max scaled heatmap", fontsize=16)
-                    ax.set_xlabel("ClusterID")
-                    ax.set_ylabel("")
-                    ax.tick_params(axis="y", labelsize=8)
-                    cbar = heatmap.collections[0].colorbar
-                    cbar.ax.tick_params(labelsize=12)
-                except Exception:
-                    ax.text(0.5, 0.5, "Overview heatmap unavailable", ha="center", va="center")
-                    ax.axis("off")
-                start_row = rows_first_img
-            elif page == 0:
-                ax = fig.add_subplot(gs[:rows_first_img, :])
-                ax.text(0.5, 0.5, "No features available for overview scaling", ha="center", va="center")
-                ax.axis("off")
-                start_row = rows_first_img
-
-            # ---- Remaining per-feature VIOLIN plots on this page ----
             remaining_axes = [
                 fig.add_subplot(gs[r, c])
-                for r in range(start_row, rows_per_page)
+                for r in range(rows_per_page)
                 for c in range(nr_cols)
             ]
 
@@ -1086,17 +1054,13 @@ def plot_clustering_feature_heatmap(
                     continue
 
                 feat = feat_names[plot_idx]
-                sub = df_long.loc[df_long["var"] == feat, ["ClusterID", "value"]].copy()
-
-                # Drop rows with no cluster or value
-                sub = sub.dropna(subset=["ClusterID", "value"])
+                sub = df_long.loc[df_long["var"] == feat, ["ClusterID", "value"]].dropna(subset=["ClusterID", "value"])
                 if sub.empty:
                     ax.text(0.5, 0.5, f"{feat}\n(no finite data)", ha="center", va="center")
                     ax.axis("off")
                     plot_idx += 1
                     continue
 
-                # Violin plot per cluster (distribution)
                 try:
                     sns.violinplot(
                         data=sub,
@@ -1108,54 +1072,42 @@ def plot_clustering_feature_heatmap(
                         cut=0
                     )
                 except Exception:
-                    # Fallback if seaborn struggles for some reason
                     ax.text(0.5, 0.5, f"{feat}\n(plot unavailable)", ha="center", va="center")
                     ax.axis("off")
                     plot_idx += 1
                     continue
 
-                # Overlay all points (each sample), jittered
                 if show_points:
-                    try:
-                        sns.stripplot(
-                            data=sub,
-                            x="ClusterID",
-                            y="value",
-                            order=cluster_order,
-                            ax=ax,
-                            dodge=False,
-                            jitter=0.2,
-                            alpha=point_alpha,
-                            size=point_size
-                        )
-                    except Exception:
-                        pass
-
-                # Overlay mean marker per cluster
-                try:
-                    means = sub.groupby("ClusterID", observed=False)["value"].mean().reindex(cluster_order)
-                    # X positions correspond to categorical ticks [0..n-1]
-                    x_pos = np.arange(len(cluster_order))
-                    ax.scatter(
-                        x_pos,
-                        means.values,
-                        s=mean_marker_size,
-                        edgecolor="black",
-                        linewidths=0.8,
-                        zorder=3
+                    sns.stripplot(
+                        data=sub,
+                        x="ClusterID",
+                        y="value",
+                        order=cluster_order,
+                        ax=ax,
+                        dodge=False,
+                        jitter=0.2,
+                        alpha=point_alpha,
+                        size=point_size
                     )
-                except Exception:
-                    pass
 
-                ax.set_title(feat)
-                ax.set_xlabel("ClusterID")
-                ax.set_ylabel("Value")
-                ax.tick_params(axis="x", rotation=0)
+                means = sub.groupby("ClusterID", observed=False)["value"].mean().reindex(cluster_order)
+                ax.scatter(
+                    np.arange(len(cluster_order)),
+                    means.values,
+                    s=mean_marker_size,
+                    edgecolor="black",
+                    linewidths=0.8,
+                    zorder=3
+                )
 
+                ax.set_title(feat, fontsize=9)
+                ax.set_xlabel("ClusterID", fontsize=8)
+                ax.set_ylabel("Value", fontsize=8)
+                ax.tick_params(axis="x", rotation=0, labelsize=7)
+                ax.tick_params(axis="y", labelsize=7)
                 plot_idx += 1
 
-            # Layout and save page
-            fig.subplots_adjust(left=0.12, right=0.98, top=0.95, bottom=0.08)
+            fig.subplots_adjust(left=0.20, right=0.98, top=0.95, bottom=0.08)
             pdf.savefig(fig, dpi=600)
             plt.close(fig)
 

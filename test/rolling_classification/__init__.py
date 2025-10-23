@@ -2,6 +2,15 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, Dict, Literal, List
 from pandas.api.types import is_numeric_dtype
+import matplotlib.pyplot as plt
+import math
+
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from dtaidistance import dtw, dtw_ndim
+import seaborn as sns
+from sklearn.cluster import KMeans, HDBSCAN
+import umap
+
 
 SignalType = Literal["binary", "count", "bounded", "continuous"]
 
@@ -404,7 +413,6 @@ def create_windowed_track_dataset(
 
     return result
 
-
 def drop_highly_correlated_features(
     df: pd.DataFrame,
     feature_cols: list,
@@ -523,3 +531,395 @@ def drop_highly_correlated_features(
     ).reset_index(drop=True)
 
     return X, dropped, report
+
+def plot_umap_feature_grid(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    x_col: str = "UMAP1",
+    y_col: str = "UMAP2",
+    ncols: int = 4,
+    max_plots: int | None = None,
+    point_size: int = 5,
+    alpha: float = 0.5,
+    numeric_cmap: str = "viridis",
+    categorical_palette: str = "tab20",
+    add_colorbar: bool = True,
+    page: int = 0,   # for pagination: 0-based page index
+    ):
+    """
+    Creates a multi-row, multi-column grid of UMAP scatterplots colored by each feature in feature_cols.
+    Filters out non-scalar or missing features automatically. Supports pagination via `page`.
+    """
+    # Filter valid features (exist, scalar, not all NaN)
+    valid = []
+    for c in feature_cols:
+        if c in df.columns and df[c].notna().any():
+            valid.append(c)
+    if max_plots is not None:
+        valid = valid[:max_plots]
+
+    if len(valid) == 0:
+        raise ValueError("No valid features to plot.")
+
+    n = len(valid)
+    nrows = math.ceil(n / ncols)
+
+    # Pagination support: choose a slice of features per page
+    per_page = nrows * ncols
+    start = page * per_page
+    end = min(start + per_page, len(valid))
+    feats = valid[start:end]
+    if len(feats) == 0:
+        raise ValueError(f"No features to plot on page {page} (only {math.ceil(len(valid)/per_page)} page(s) available).")
+
+    # Axes limits shared across panels
+    x_min, x_max = df[x_col].min(), df[x_col].max()
+    y_min, y_max = df[y_col].min(), df[y_col].max()
+
+    # Build grid
+    fig, axes = plt.subplots(
+        nrows=math.ceil(len(feats)/ncols),
+        ncols=ncols,
+        figsize=(4*ncols, 3.5*math.ceil(len(feats)/ncols)),
+        squeeze=False,
+        constrained_layout=True
+    )
+
+    for i, feat in enumerate(feats):
+        r, c = divmod(i, ncols)
+        ax = axes[r, c]
+
+        s = df[feat]
+        # Numeric vs categorical handling
+        if is_numeric_dtype(s):
+            # Numeric: use matplotlib scatter for easy colorbar handling
+            sc = ax.scatter(
+                df[x_col], df[y_col],
+                s=point_size, alpha=alpha,
+                c=s, cmap=numeric_cmap, edgecolors="none"
+            )
+            if add_colorbar:
+                cb = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+                cb.ax.tick_params(labelsize=8)
+        else:
+            # Categorical: enforce category dtype and use seaborn palette
+            s_cat = s.astype("category")
+            tmp = df.copy()
+            tmp[feat] = s_cat
+            sns.scatterplot(
+                data=tmp, x=x_col, y=y_col, hue=feat,
+                palette=categorical_palette, s=point_size, alpha=alpha,
+                legend=False, ax=ax
+            )
+
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_title(feat, fontsize=10)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+    # Hide any unused axes (if grid not full)
+    total_cells = axes.size
+    for j in range(len(feats), total_cells):
+        r, c = divmod(j, ncols)
+        axes[r, c].axis("off")
+
+    # Add a common title
+    fig.suptitle("UMAP colored by features", fontsize=14)
+    plt.show()     
+    
+def compute_dtw_window_clusters(
+    df_tracks: pd.DataFrame,
+    df_windows: pd.DataFrame,
+    features: list,
+    non_binary_features: list = None,
+    min_cluster_size: int = 50,
+    umap_n_neighbors: int = 15,
+    umap_min_dist: float = 0.1,
+    random_state: int = 123,
+    sample_frac: float = None,     # e.g. 0.25 to use 25% of windows
+    max_windows: int = None        # e.g. 5000 to cap windows for DTW
+):
+    """
+    Returns a DataFrame with keys + DTW_UMAP1/2 + cluster_label_dtw_hdbscan
+    Keys will be the intersection of:
+      ['sample_name','TrackID','sub_TrackID','window_start_position_t','window_end_position_t']
+    present in df_windows.
+    """
+    # ---- 1) choose keys available to join on ----
+    possible_keys = ["sample_name","TrackID","sub_TrackID","window_start_position_t","window_end_position_t"]
+    join_keys = [k for k in possible_keys if k in df_windows.columns]
+
+    if len(join_keys) < 2:
+        raise ValueError("Need at least two window-identifying columns to merge (e.g. sample_name, TrackID, sub_TrackID).")
+
+    # ---- 2) scale only non-binary (non-contact) features globally on the track table ----
+    if non_binary_features is None:
+        non_binary_features = [c for c in features if "contact" not in c]
+
+    df_tracks_scaled = df_tracks.copy()
+    if len(non_binary_features) > 0:
+        scaler = StandardScaler()
+        df_tracks_scaled[non_binary_features] = scaler.fit_transform(df_tracks_scaled[non_binary_features])
+
+    # ---- 3) (optional) subsample windows to control DTW O(n^2) cost ----
+    dfw = df_windows[join_keys].drop_duplicates().copy()
+    if sample_frac is not None:
+        dfw = dfw.sample(frac=sample_frac, random_state=random_state)
+    if (max_windows is not None) and (len(dfw) > max_windows):
+        dfw = dfw.sample(n=max_windows, random_state=random_state)
+
+    # ---- 4) build per-window sequences using your window start/end in frames ----
+    sequences = []
+    meta_rows = []   # same length as sequences, for later merge
+    # For faster filtering, pre-index df_tracks_scaled by (sample_name, TrackID)
+    grp = df_tracks_scaled.groupby(["sample_name", "TrackID"], sort=False)
+
+    for _, w in dfw.iterrows():
+        # filter rows for this window
+        sn = w.get("sample_name")
+        tid = w.get("TrackID")
+        # fall back to full table if group missing (shouldn't happen)
+        g = grp.get_group((sn, tid)) if (sn, tid) in grp.groups else df_tracks_scaled
+
+        # time slicing
+        start_t = w.get("window_start_position_t", None)
+        end_t   = w.get("window_end_position_t", None)
+        if start_t is not None and end_t is not None:
+            mask = (g["position_t"] >= start_t) & (g["position_t"] <= end_t)
+            gwin = g.loc[mask]
+        else:
+            # if start/end not present, just use all rows of the sub_TrackID (or entire track)
+            if "sub_TrackID" in join_keys and "sub_TrackID" in g.columns:
+                gwin = g[g["sub_TrackID"] == w["sub_TrackID"]]
+            else:
+                gwin = g
+
+        seq = gwin[features].to_numpy(dtype=np.float64)
+        # need at least 2 timepoints for DTW to be meaningful
+        if seq.shape[0] < 2:
+            continue
+
+        sequences.append(seq)
+        meta_rows.append(w.to_dict())
+
+    if len(sequences) < 2:
+        raise ValueError("Not enough valid windows to run DTW (need >= 2).")
+
+    meta = pd.DataFrame(meta_rows)
+
+    # ---- 5) DTW distance matrix (multivariate) ----
+    # Note: uses fast C implementation; still O(n^2)
+    D = dtw_ndim.distance_matrix_fast(sequences)  # shape (n_windows, n_windows)
+
+    # ---- 6) UMAP on precomputed distances ----
+    um = umap.UMAP(
+        n_components=2,
+        n_neighbors=umap_n_neighbors,
+        min_dist=umap_min_dist,
+        init="random",
+        metric="precomputed",
+        random_state=random_state,
+    )
+    emb = um.fit_transform(D)  # (n_windows, 2)
+
+    # ---- 7) HDBSCAN clustering on the embedding (or on D via metric='precomputed') ----
+    # Clustering on the embedding is common for noisy high-dim distances.
+    hdb = HDBSCAN(min_cluster_size=min_cluster_size, metric="euclidean")
+    labels = hdb.fit_predict(emb)
+
+    out = meta.copy()
+    out["DTW_UMAP1"] = emb[:, 0]
+    out["DTW_UMAP2"] = emb[:, 1]
+    out["cluster_label_dtw_hdbscan"] = labels
+
+    return out
+
+
+def plot_clustering_feature_heatmap(
+    df_umap,
+    info_cols,
+    sample_cols,
+    outpath,
+    rows_per_page = 7,
+    nr_cols = 2,
+    figsize = (8.27, 11.69),
+    plot_results=True,
+    show_points=False,
+    point_alpha=0.5,
+    point_size=8,
+    mean_marker_size=60,
+):
+    """
+    Produce a PDF with:
+      • Page 1: full-page min–max scaled heatmap of cluster means.
+      • Subsequent pages: per-feature violin plots tiled across pages.
+    """
+
+    info_cols   = list(info_cols) if info_cols is not None else []
+    sample_cols = list(sample_cols) if sample_cols is not None else []
+
+    # ---- Helper ----
+    def _round_legend_ticks(max_val):
+        try:
+            return round_legend_ticks(max_val)
+        except Exception:
+            if not np.isfinite(max_val) or max_val <= 0:
+                return 1.0
+            magnitude = 10.0 ** np.floor(np.log10(max_val))
+            return float(np.ceil(max_val / magnitude) * magnitude)
+
+    # ---- Cluster means ----
+    df_for_means = (
+        df_umap[list(info_cols) + ["ClusterID"]]
+        .drop(columns=sample_cols, errors="ignore")
+    )
+    cluster_means = (
+        df_for_means
+        .groupby("ClusterID", observed=False)
+        .mean(numeric_only=True)
+        .reset_index()
+    )
+
+    # ---- Min-max scaling ----
+    cluster_means_scaled = cluster_means.copy()
+    scale_columns = [c for c in cluster_means.columns if c != "ClusterID"]
+
+    X = cluster_means_scaled[scale_columns].apply(pd.to_numeric, errors="coerce")
+    X = X.replace([np.inf, -np.inf], np.nan)
+    all_nan_cols = X.columns[X.isna().all()].tolist()
+    if all_nan_cols:
+        X = X.drop(columns=all_nan_cols)
+        scale_columns = [c for c in scale_columns if c not in all_nan_cols]
+
+    if len(scale_columns) > 0:
+        X_filled = X.copy()
+        med = X_filled.median(numeric_only=True)
+        X_filled = X_filled.fillna(med)
+        cluster_means_scaled[scale_columns] = MinMaxScaler().fit_transform(X_filled[scale_columns])
+        df_heatmap_scaled = cluster_means_scaled.melt(id_vars="ClusterID", var_name="var", value_name="AU")
+        overall_heatmap_data = df_heatmap_scaled.pivot(index="var", columns="ClusterID", values="AU")
+    else:
+        overall_heatmap_data = pd.DataFrame()
+
+    # ---- Prepare violin plot data ----
+    value_cols = [c for c in info_cols if c not in set(sample_cols)]
+    df_values = df_umap[["ClusterID"] + value_cols].copy()
+    for c in value_cols:
+        df_values[c] = pd.to_numeric(df_values[c], errors="coerce")
+    df_values.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_long = df_values.melt(id_vars="ClusterID", var_name="var", value_name="value")
+
+    cluster_order = sorted(df_values["ClusterID"].dropna().unique().tolist())
+    feat_names = [c for c in value_cols if c in df_long["var"].unique()]
+    n_plots = len(feat_names)
+    rows_for_plots = (n_plots + nr_cols - 1) // nr_cols
+    nr_pages = max(1, (rows_for_plots + rows_per_page - 1) // rows_per_page)
+
+    with PdfPages(outpath) as pdf:
+        # ---- Page 1: Full-page heatmap ----
+        fig, ax = plt.subplots(figsize=figsize)
+        if not overall_heatmap_data.empty:
+            try:
+                heatmap = sns.heatmap(
+                    overall_heatmap_data,
+                    ax=ax,
+                    cmap="viridis",
+                    cbar=True,
+                    yticklabels=True
+                )
+                ax.set_title("Min–Max Scaled Cluster Means", fontsize=14, pad=14)
+                ax.set_xlabel("ClusterID", fontsize=10)
+                ax.set_ylabel("", fontsize=10)
+                ax.tick_params(axis="y", labelsize=6)
+                ax.tick_params(axis="x", labelsize=8, rotation=0)
+                cbar = heatmap.collections[0].colorbar
+                cbar.ax.tick_params(labelsize=8)
+                fig.tight_layout(pad=2.0)
+            except Exception:
+                ax.text(0.5, 0.5, "Overview heatmap unavailable", ha="center", va="center")
+                ax.axis("off")
+        else:
+            ax.text(0.5, 0.5, "No features available for overview scaling", ha="center", va="center")
+            ax.axis("off")
+
+        pdf.savefig(fig, dpi=600)
+        plt.close(fig)
+
+        # ---- Remaining pages: Violin plots ----
+        plot_idx = 0
+        for page in range(nr_pages):
+            fig = plt.figure(figsize=figsize)
+            gs = GridSpec(rows_per_page, nr_cols, figure=fig, hspace=1.5, wspace=0.3)
+            remaining_axes = [
+                fig.add_subplot(gs[r, c])
+                for r in range(rows_per_page)
+                for c in range(nr_cols)
+            ]
+
+            for ax in remaining_axes:
+                if plot_idx >= n_plots:
+                    ax.remove()
+                    continue
+
+                feat = feat_names[plot_idx]
+                sub = df_long.loc[df_long["var"] == feat, ["ClusterID", "value"]].dropna(subset=["ClusterID", "value"])
+                if sub.empty:
+                    ax.text(0.5, 0.5, f"{feat}\n(no finite data)", ha="center", va="center")
+                    ax.axis("off")
+                    plot_idx += 1
+                    continue
+
+                try:
+                    sns.violinplot(
+                        data=sub,
+                        x="ClusterID",
+                        y="value",
+                        order=cluster_order,
+                        inner=None,
+                        ax=ax,
+                        cut=0
+                    )
+                except Exception:
+                    ax.text(0.5, 0.5, f"{feat}\n(plot unavailable)", ha="center", va="center")
+                    ax.axis("off")
+                    plot_idx += 1
+                    continue
+
+                if show_points:
+                    sns.stripplot(
+                        data=sub,
+                        x="ClusterID",
+                        y="value",
+                        order=cluster_order,
+                        ax=ax,
+                        dodge=False,
+                        jitter=0.2,
+                        alpha=point_alpha,
+                        size=point_size
+                    )
+
+                means = sub.groupby("ClusterID", observed=False)["value"].mean().reindex(cluster_order)
+                ax.scatter(
+                    np.arange(len(cluster_order)),
+                    means.values,
+                    s=mean_marker_size,
+                    edgecolor="black",
+                    linewidths=0.8,
+                    zorder=3
+                )
+
+                ax.set_title(feat, fontsize=9)
+                ax.set_xlabel("ClusterID", fontsize=8)
+                ax.set_ylabel("Value", fontsize=8)
+                ax.tick_params(axis="x", rotation=0, labelsize=7)
+                ax.tick_params(axis="y", labelsize=7)
+                plot_idx += 1
+
+            fig.subplots_adjust(left=0.20, right=0.98, top=0.95, bottom=0.08)
+            pdf.savefig(fig, dpi=600)
+            plt.close(fig)
+
+    if plot_results:
+        print(f"Saved PDF to: {outpath}")
+        
