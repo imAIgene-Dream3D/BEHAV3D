@@ -85,43 +85,56 @@ def run_organoid_analysis(
             groupby=["TrackID", "sample_name"]
         )
     
-    df_tracks["dead"]=df_tracks["smoothed_percentage_dead_mask"] > dead_perc_threshold
-    df_tracks["dead"] = df_tracks.groupby(["sample_name", "TrackID"])["dead"].transform(lambda x: x.cummax())
-    df_tracks = df_tracks[[
-            "TrackID",
-            "sample_name",
-            "organoid_line",
-            "tcell_line",
-            "exp_nr",
-            "well",
-            "relative_time",
-            "position_t",
-            "nr_pixels",
-            "nr_dead_mask_pixels",
-            "percentage_dead_mask",
-            "mean_dead_dye",
-            "smoothed_nr_dead_mask_pixels",
-            "smoothed_percentage_dead_mask",
-            "smoothed_mean_dead_dye",
-            "volume",
-            "dead"]
-            ]
-    
-    df_t0 = df_tracks[df_tracks["position_t"] == 0].groupby("sample_name").agg(
-        nr_organoids_t0=("TrackID", "nunique"),
-    ).reset_index()
+    df_tracks["dead"] = (df_tracks["smoothed_percentage_dead_mask"] > dead_perc_threshold)
+    df_tracks["dead"] = df_tracks.groupby(["sample_name","TrackID"])["dead"].transform(lambda x: x.cummax())
 
-    df_dead = df_tracks.groupby(["sample_name", "position_t"]).agg(
-        nr_organoids=("TrackID", lambda x: x.nunique()),
-        nr_dead=("TrackID", lambda x: x[df_tracks.loc[x.index, "dead"]].nunique())
-    ).reset_index()
-    
-    df_general = df_dead.merge(df_t0, on="sample_name", how="left")
-    df_general["nr_dead"] = df_general["nr_dead"] + df_general["nr_organoids_t0"] - df_general["nr_organoids"]
+    # Summarize tracks to their time of death
+    summ = (
+        df_tracks
+        .groupby(["sample_name","TrackID"])
+        .agg(
+            t_first=("position_t","min"),
+            t_last =("position_t","max"),
+            # first time it is ever dead (NaN if never dead)
+            t_dead =("position_t", lambda s: s[df_tracks.loc[s.index, "dead"]].min()
+                    if (df_tracks.loc[s.index,"dead"]).any() else np.nan)
+        )
+        .reset_index()
+    )
 
-    df_general["nr_alive"]=df_general["nr_organoids_t0"] - df_general["nr_dead"]
-    df_general["percentage_dead"]=df_general["nr_dead"]  / df_general["nr_organoids_t0"]
-    df_general["percentage_alive"]= 1.0 - df_general["percentage_dead"]
+    timeline = df_tracks[["sample_name", "position_t"]].drop_duplicates()
+    
+    grid = timeline.merge(summ, on="sample_name", how="left")
+    t = grid["position_t"]
+
+    dead_at_t = grid["t_dead"].notna() & (t >= grid["t_dead"])
+    seen_at_t = (t >= grid["t_first"]) & (t <= grid["t_last"])
+    never_dead = grid["t_dead"].isna()
+    disappeared_by_t = (t > grid["t_last"]) & never_dead
+    alive_at_t = seen_at_t & (~dead_at_t)
+    
+    counts = (
+        grid.assign(alive=alive_at_t, dead=dead_at_t, disappeared=disappeared_by_t)
+            .groupby(["sample_name","position_t"])
+            .agg(
+                nr_alive=("alive","sum"),
+                nr_dead=("dead","sum"),
+                nr_disappeared=("disappeared","sum"),
+            )
+            .reset_index()
+    )
+
+    df_t0 = (
+        df_tracks[df_tracks["position_t"]==0]
+        .groupby("sample_name")
+        .agg(nr_organoids_t0=("TrackID","nunique"))
+        .reset_index()
+    )
+
+    df_general = counts.merge(df_t0, on="sample_name", how="left")
+    df_general["percentage_dead"]        = df_general["nr_dead"]        / df_general["nr_organoids_t0"]
+    df_general["percentage_alive"]       = df_general["nr_alive"]       / df_general["nr_organoids_t0"]
+    df_general["percentage_disappeared"] = df_general["nr_disappeared"] / df_general["nr_organoids_t0"]
     
     df_general_outpath = Path(results_outdir, f"combined_general_{org_type}_dynamics_analysis.csv")
     df_general.to_csv(
@@ -540,7 +553,7 @@ def plot_general_organoid_analysis(
         sns.lineplot(
             data = df_general,
             x = 'position_t', 
-            y = 'percentage_alive', 
+            y = 'percentage_dead', 
             hue = 'sample_name',
             ax = ax,
             )
@@ -549,7 +562,7 @@ def plot_general_organoid_analysis(
         ax.set_xlim(0)
         ax.set_xlabel('Timepoint')
         ax.set_ylabel('')
-        ax.set_title(f'Percentage Alive Organoids')
+        ax.set_title(f'Percentage Dead Organoids')
         ax.legend(
             bbox_to_anchor=(1.05, 1),  # Position to the right
             loc='upper left',
@@ -592,7 +605,7 @@ def plot_general_organoid_analysis(
         # Take each sample's own endpoint
         idx = df_general.groupby("sample_name")["position_t"].idxmax()
         df_end = (
-            df_general.loc[idx, ["sample_name", "percentage_alive", "percentage_dead"]]
+            df_general.loc[idx, ["sample_name", "percentage_alive", "percentage_dead", "percentage_disappeared"]]
             .copy()
             .sort_values("sample_name")
         )
@@ -602,13 +615,13 @@ def plot_general_organoid_analysis(
             df_end["percentage_dead"] = 1.0 - df_end["percentage_alive"]
 
         # Keep the plotting columns in the intended order: dead (red) then alive (blue)
-        plot_cols = ["percentage_dead", "percentage_alive"]
+        plot_cols = ["percentage_alive", "percentage_dead", "percentage_disappeared"]
 
         df_end.set_index("sample_name")[plot_cols].plot(
             kind="bar",
             stacked=True,
             ax=ax,
-            color=["#CC6666", "#6699CC"],
+            color=["#6699CC", "#CC6666", "#898989"],  # Red for Dead, Blue for Alive, Grey for Disappeared
             alpha=1.0,
             width=0.25,
             zorder=2,
@@ -623,7 +636,7 @@ def plot_general_organoid_analysis(
 
         # Legend: Dead first, then Alive (matches bar order/colors)
         handles, labels = ax.get_legend_handles_labels()
-        order = [0, 1]  # 0=Dead (red), 1=Alive (blue)
+        order = [2, 0, 1]  # 0=Dead (red), 1=Alive (blue), 2=Disappeared (grey)
         ax.legend(
             [handles[i] for i in order],
             [labels[i] for i in order],

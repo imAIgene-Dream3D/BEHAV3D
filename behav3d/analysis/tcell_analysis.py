@@ -646,7 +646,16 @@ def cluster_umap(
     
     ### TODO Do the clustering based straight on the DTW distances
     ### Miguel suggested clusters are more meaningful before the umap embedding
-    df_umap["ClusterID"] = kmeans.fit_predict(umap_embedding.drop(columns=["TrackID","sample_name"]))
+    
+    umap_embedding.columns.difference(df_tracks_summarized.columns)
+    
+    df_umap["ClusterID"] = kmeans.fit_predict(
+        df_umap[umap_embedding.columns.difference(df_tracks_summarized.columns)]
+        )
+    
+    # df_umap["ClusterID"] = kmeans.fit_predict(
+    #     umap_embedding.drop(columns=["TrackID","sample_name"])
+    #     )
     # df_umap["cluster2"] = kmeans.fit_predict(umap_embedding)
     
     # Set cluster index to start from 1 for backprojection purposes
@@ -657,8 +666,8 @@ def cluster_umap(
     print(f"- Writing clustered tracks to {df_umap_out_path}")
     df_umap.to_csv(df_umap_out_path, sep=",", index=False)
 
-    sample_cols = ["organoid_line", "tcell_line"]
-    info_cols = df_umap.drop(columns=["TrackID", "sample_name", "well", "exp_nr", "UMAP1", "UMAP2", "ClusterID"]).columns
+    sample_cols = ["organoid_line", "tcell_line", "sample_name", "well", "exp_nr"]
+    info_cols = df_umap.drop(columns=["TrackID", "UMAP1", "UMAP2", "ClusterID"]).columns
     
     cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_clusters.pdf")
     print(f"- Plotting clustered UMAP plots with displayed Track features to {cluster_UMAP_path}")
@@ -690,17 +699,37 @@ def cluster_umap(
         plot_results=plot_results
     )
 
-    df_clust_perc = df_umap.groupby(["organoid_line", "tcell_line", "ClusterID"]).size().reset_index(name='count')
-    total_counts = df_clust_perc.groupby(['organoid_line', 'tcell_line'])['count'].sum().reset_index(name='total_count')
+    df_clust_perc = (
+        df_umap
+        .groupby(["organoid_line", "tcell_line", "sample_name", "ClusterID"])
+        .size()
+        .reset_index(name="count")
+    )
     
-    df_clust_perc = pd.merge(df_clust_perc, total_counts)
-    df_clust_perc["percentage"] = (df_clust_perc['count'] / df_clust_perc['total_count'])
+    sample_totals = (
+        df_clust_perc
+        .groupby(["organoid_line", "tcell_line", "sample_name"])["count"]
+        .sum()
+        .reset_index(name="sample_total")
+    )
     
-    cluster_percentage_plot_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_cluster_percentages.pdf")
-    print(f"- Plotting percentage plots of each cluster per combination of T-cell and organoid line to {cluster_percentage_plot_path}")
+    combo_totals = (
+        df_clust_perc
+        .groupby(["organoid_line", "tcell_line"])["count"]
+        .sum()
+        .reset_index(name="combo_total")
+    )
+    
+    df_clust_perc = df_clust_perc.merge(sample_totals, how="left")
+    df_clust_perc = df_clust_perc.merge(combo_totals,  how="left")
+    df_clust_perc["percentage"] = (df_clust_perc["count"] / df_clust_perc["sample_total"])
+    
+    cluster_percentage_plot_prefix = Path(results_outdir, "BEHAV3D_tcell_UMAP_cluster_percentages")
+    print(f"- Plotting percentage plots of each cluster per T-cell × organoid to {cluster_percentage_plot_prefix}_*.pdf")
+
     plot_cluster_percentage_bars(
         df_clust_perc,
-        cluster_percentage_plot_path,
+        cluster_percentage_plot_prefix,  # <— prefix, not a file
         plot_results=plot_results
     )
         
@@ -730,81 +759,239 @@ def normalize_track_features(
     return (df_tracks)
 
 def plot_cluster_percentage_bars(
-    df_clust_perc,
-    outpath,
-    plot_results=True
-    ):
-    with PdfPages(outpath) as pdf:
-        tcell_lines = df_clust_perc['tcell_line'].unique()
-        organoid_lines = df_clust_perc['organoid_line'].unique()
-        
-        fig, axes = plt.subplots(
-            len(tcell_lines), 
-            len(organoid_lines), 
-            figsize=(20, 10), sharex=True, sharey=True)
+    df_clust_perc: pd.DataFrame,
+    outprefix,
+    plot_results=True,
+    # Page 1 (combined grid) sizing
+    grid_figsize=(20, 10),
+    # Page 2 (per-sample panels) sizing
+    ncols_samples=3,
+    sample_panel_width=6.0,
+    sample_row_height=2.8,
+    # Fonts
+    title_fontsize=24,
+    label_fontsize=12,
+    info_fontsize=10
+):
+    """
+    Produce a single PDF with two pages:
 
-        axes = np.atleast_2d(axes)
-        # Plot horizontal stacked bar charts
+    Page 1: 'Combined' view (samples pooled). Grid layout:
+             rows = tcell_line, columns = organoid_line.
+             Each panel is a single horizontal stacked bar showing
+             ClusterID percentages for that (tcell_line, organoid_line) combo,
+             computed from pooled counts across all samples in that combo.
+
+    Page 2: 'Per-sample' view. Panels laid out in 3 columns (configurable).
+             Each panel is a single horizontal stacked bar of ClusterID percentages
+             for one sample_name (aggregated across all (tcell_line, organoid_line)).
+
+    Assumes df_clust_perc has columns:
+      ['organoid_line','tcell_line','sample_name','ClusterID','count','sample_total','combo_total','percentage']
+    where 'percentage' = count / sample_total (per-sample).
+    """
+    outprefix = Path(outprefix)
+    outpdf = outprefix.with_suffix(".pdf")
+
+    # ------------- Page 1: Combined (pooled across samples) grid -------------
+    # Compute pooled counts per combo (tcell_line, organoid_line, ClusterID)
+    pooled = (
+        df_clust_perc
+        .groupby(['tcell_line', 'organoid_line', 'ClusterID'], as_index=False)['count']
+        .sum()
+    )
+    # Total count per combo (across ClusterID)
+    pooled_combo_totals = (
+        pooled.groupby(['tcell_line', 'organoid_line'])['count']
+        .sum()
+        .reset_index(name='combo_total_pooled')
+    )
+    pooled = pooled.merge(pooled_combo_totals, on=['tcell_line', 'organoid_line'], how='left')
+    pooled['percentage_pooled'] = pooled['count'] / pooled['combo_total_pooled']
+
+    tcell_lines = pooled['tcell_line'].drop_duplicates().tolist()
+    organoid_lines = pooled['organoid_line'].drop_duplicates().tolist()
+
+    # ------------- Page 2: Per-sample (one panel per sample) -------------
+    # Aggregate to per-sample ClusterID composition
+    per_sample = (
+        df_clust_perc
+        .groupby(['sample_name', 'ClusterID'], as_index=False)['count']
+        .sum()
+    )
+    per_sample_totals = (
+        per_sample.groupby('sample_name')['count']
+        .sum()
+        .reset_index(name='sample_total_all')
+    )
+    per_sample = per_sample.merge(per_sample_totals, on='sample_name', how='left')
+    per_sample['percentage_overall'] = per_sample['count'] / per_sample['sample_total_all']
+    samples = per_sample['sample_name'].drop_duplicates().tolist()
+
+    # Common ClusterID ordering for consistent legends across pages
+    cluster_order = (
+        df_clust_perc['ClusterID']
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
+    )
+
+    with PdfPages(outpdf) as pdf:
+        # ------------------------------- PAGE 1 -------------------------------
+        fig1, axes1 = plt.subplots(
+            len(tcell_lines),
+            len(organoid_lines),
+            figsize=grid_figsize,
+            sharex=True,
+            sharey=True,
+            squeeze=False
+        )
+
+        legend_handles_1, legend_labels_1 = None, None
+
         for i, tcell_line in enumerate(tcell_lines):
             for j, organoid_line in enumerate(organoid_lines):
-                ax = axes[i, j]
-                subset = df_clust_perc[(df_clust_perc['tcell_line'] == tcell_line) & (df_clust_perc['organoid_line'] == organoid_line)]
-                if i == 0:
-                    ax.set_title(f'{organoid_line}', fontsize=30)
-                if j == 0:
-                    ax.set_ylabel(f'{tcell_line}', fontsize=30) 
-                if subset.empty:
-                    ax.spines['top'].set_visible(False)
-                    ax.spines['right'].set_visible(False)
-                    ax.spines['left'].set_visible(False)
-                    ax.spines['bottom'].set_visible(False)
-                    continue
-                subset_pivot = subset.pivot(index='tcell_line', columns='ClusterID', values='percentage').fillna(0)
-                subset_pivot.plot(kind='barh', stacked=True, ax=ax, legend=False)
-                if i == 0:
-                    ax.set_title(f'{organoid_line}', fontsize=30)
-                if j == 0:
-                    print(tcell_line)
-                    ax.set_ylabel(f'{tcell_line}', fontsize=30) 
-    
-                num_cells = subset['count'].sum()
-                ax.text(
-                    0.5, 
-                    0.1, 
-                    f'# Cells: {num_cells}', 
-                    ha='center', 
-                    va='center', 
-                    transform=ax.transAxes, 
-                    fontsize=20
-                    )
-                
-                ax.set_xticks([])
-                ax.set_yticks([])
-                ax.set_xticklabels([])
-                ax.set_yticklabels([])
-                ax.spines['top'].set_visible(False)
-                ax.spines['right'].set_visible(False)
-                ax.spines['left'].set_visible(False)
-                ax.spines['bottom'].set_visible(False)
-                
-                # ax.set_xlabel('Percentage')
+                ax = axes1[i, j]
 
-         # Add legend
-        handles, labels = ax.get_legend_handles_labels()
-        fig.legend(
-            handles, 
-            labels, 
-            fontsize=30,
-            title='ClusterID', 
-            title_fontsize=30,
-            bbox_to_anchor=(0.9, 0.5), 
-            loc='center left')
-        fig.tight_layout(rect=[0, 0, 0.85, 1])
+                subset = pooled[
+                    (pooled['tcell_line'] == tcell_line) &
+                    (pooled['organoid_line'] == organoid_line)
+                ]
+                if i == 0:
+                    ax.set_title(f'{organoid_line}', fontsize=title_fontsize)
+                if j == 0:
+                    ax.text(
+                        -0.05, 0.5, f'{tcell_line}',
+                        ha='right', va='center',
+                        rotation=0, transform=ax.transAxes,
+                        fontsize=title_fontsize
+                    )
+
+                if subset.empty:
+                    ax.axis('off')
+                    continue
+
+                # Build a 1-row dataframe indexed by a fake single row, columns=ClusterID
+                row = (subset
+                       .set_index('ClusterID')
+                       .reindex(cluster_order)
+                       ['percentage_pooled']
+                       .fillna(0.0))
+                pivot = row.to_frame().T
+                pivot.index = ['combined']  # a single horizontal bar
+
+                bar_ax = pivot.plot(kind='barh', stacked=True, ax=ax, legend=False)
+
+                if legend_handles_1 is None:
+                    legend_handles_1, legend_labels_1 = bar_ax.get_legend_handles_labels()
+
+                # Annotate pooled #cells
+                num_cells = int(subset['combo_total_pooled'].iloc[0]) if not subset.empty else 0
+                ax.text(
+                    0.5, 0.08, f'# Cells (pooled): {num_cells}',
+                    ha='center', va='center',
+                    transform=ax.transAxes, fontsize=info_fontsize
+                )
+
+                # Clean axes
+                # ax.set_xlabel('')
+                # ax.set_ylabel('')
+                # ax.set_yticks([])
+                # ax.set_xticks([])
+                # ax.spines[['top','right','bottom','left']].set_visible(False)
+                ax.axis('off')
+        fig1.suptitle('Cluster percentages (T-cell × organoid combined)', fontsize=title_fontsize, y=0.995)
+
+        if legend_handles_1 and legend_labels_1:
+            fig1.legend(
+                legend_handles_1, legend_labels_1,
+                fontsize=label_fontsize,
+                title='ClusterID', title_fontsize=label_fontsize,
+                bbox_to_anchor=(0.92, 0.5), loc='center left'
+            )
+            fig1.tight_layout(rect=[0, 0, 0.88, 0.96])
+        else:
+            fig1.tight_layout(rect=[0, 0, 1, 0.96])
+
         if plot_results:
             plt.show()
-        pdf.savefig(fig, bbox_inches='tight', dpi=600)
-        plt.close(fig)
-            
+        pdf.savefig(fig1, bbox_inches='tight')
+        plt.close(fig1)
+
+        # ------------------------------- PAGE 2 -------------------------------
+        # One panel per sample (overall composition), in 3 columns
+        n_panels = len(samples)
+        ncols = ncols_samples
+        nrows = int(np.ceil(n_panels / ncols))
+        fig_w = sample_panel_width * ncols
+        fig_h = sample_row_height * nrows
+
+        fig2, axes2 = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), squeeze=False)
+
+        legend_handles_2, legend_labels_2 = None, None
+
+        for k, sample in enumerate(samples):
+            i, j = divmod(k, ncols)
+            ax = axes2[i, j]
+
+            sub = per_sample[per_sample['sample_name'] == sample]
+            if sub.empty:
+                ax.axis('off')
+                continue
+
+            # Build a single stacked bar for this sample
+            row = (sub
+                   .set_index('ClusterID')
+                   .reindex(cluster_order)
+                   ['percentage_overall']
+                   .fillna(0.0))
+            pivot = row.to_frame().T
+            pivot.index = [sample]
+
+            bar_ax = pivot.plot(kind='barh', stacked=True, ax=ax, legend=False)
+
+            if legend_handles_2 is None:
+                legend_handles_2, legend_labels_2 = bar_ax.get_legend_handles_labels()
+
+            # Title & #cells
+            num_cells = int(sub['sample_total_all'].iloc[0]) if not sub.empty else 0
+            ax.set_title(sample, fontsize=label_fontsize)
+            ax.text(
+                0.5, 0.08, f'# Cells: {num_cells}',
+                ha='center', va='center',
+                transform=ax.transAxes, fontsize=info_fontsize
+            )
+
+            # Clean axes
+            ax.set_xlabel('')
+            ax.set_ylabel('')
+            ax.set_yticks([])
+            ax.set_xticks([])
+            ax.spines[['top','right','bottom','left']].set_visible(False)
+
+        # Hide unused axes
+        for k in range(n_panels, nrows * ncols):
+            i, j = divmod(k, ncols)
+            axes2[i, j].axis('off')
+
+        fig2.suptitle('Per-sample cluster composition', fontsize=title_fontsize, y=0.995)
+
+        if legend_handles_2 and legend_labels_2:
+            fig2.legend(
+                legend_handles_2, legend_labels_2,
+                fontsize=label_fontsize,
+                title='ClusterID', title_fontsize=label_fontsize,
+                bbox_to_anchor=(0.92, 0.5), loc='center left'
+            )
+            fig2.tight_layout(rect=[0, 0, 0.88, 0.96])
+        else:
+            fig2.tight_layout(rect=[0, 0, 1, 0.96])
+
+        if plot_results:
+            plt.show()
+        pdf.savefig(fig2, bbox_inches='tight')
+        plt.close(fig2)
+                      
 def plot_feature_umap(
     df_umap,
     info_cols,
@@ -837,8 +1024,8 @@ def plot_feature_umap(
                     x="UMAP1",
                     y="UMAP2",
                     hue="ClusterID",
-                    s=40,
-                    alpha=0.95,
+                    s=20,
+                    alpha=0.5,
                     palette="Set1",
                     ax=ax,
                 )
@@ -879,9 +1066,9 @@ def plot_feature_umap(
                         data=df_umap,
                         x="UMAP1",
                         y="UMAP2",
-                        s=40,
+                        s=20,
                         hue=colorcol,
-                        alpha=0.8,
+                        alpha=0.5,
                         palette="Set2",
                         ax=ax
                     )
@@ -890,10 +1077,10 @@ def plot_feature_umap(
                         data=df_umap,
                         x="UMAP1",
                         y="UMAP2",
-                        s=40,
+                        s=20,
                         hue=colorcol,
                         palette="viridis",
-                        alpha=0.6,
+                        alpha=0.5,
                         ax=ax
                     )
 
@@ -1057,25 +1244,13 @@ def plot_clustering_feature_heatmap(
                 sub = df_long.loc[df_long["var"] == feat, ["ClusterID", "value"]].dropna(subset=["ClusterID", "value"])
                 if sub.empty:
                     ax.text(0.5, 0.5, f"{feat}\n(no finite data)", ha="center", va="center")
-                    ax.axis("off")
-                    plot_idx += 1
-                    continue
+                    ax.axis("off"); k += 1; continue
 
                 try:
-                    sns.violinplot(
-                        data=sub,
-                        x="ClusterID",
-                        y="value",
-                        order=cluster_order,
-                        inner=None,
-                        ax=ax,
-                        cut=0
-                    )
+                    sns.violinplot(data=sub, x="ClusterID", y="value", order=clusters, inner=None, ax=ax, cut=0)
                 except Exception:
                     ax.text(0.5, 0.5, f"{feat}\n(plot unavailable)", ha="center", va="center")
-                    ax.axis("off")
-                    plot_idx += 1
-                    continue
+                    ax.axis("off"); k += 1; continue
 
                 if show_points:
                     sns.stripplot(
