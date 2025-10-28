@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Optional, Tuple, Dict, Literal, List
+from typing import Optional, Tuple, Dict, Literal, List, Iterable
 from pandas.api.types import is_numeric_dtype
 import matplotlib.pyplot as plt
 import math
@@ -10,7 +10,22 @@ from dtaidistance import dtw, dtw_ndim
 import seaborn as sns
 from sklearn.cluster import KMeans, HDBSCAN
 import umap
+from tqdm import tqdm
 
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
+from scipy import sparse
+import igraph as ig
+import leidenalg as la
+
+from typing import Dict, Iterable, Optional
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from scipy.spatial.distance import pdist, squareform
+from scipy.cluster.hierarchy import linkage, leaves_list
 
 SignalType = Literal["binary", "count", "bounded", "continuous"]
 
@@ -175,10 +190,15 @@ def check_if_nonnegative_integer_like(signal_values: np.ndarray) -> bool:
     finite_values = np.asarray(signal_values)[np.isfinite(signal_values)]
     return finite_values.size > 0 and np.all(finite_values >= 0) and np.allclose(finite_values, np.round(finite_values))
 
-def convert_to_binary(signal_values: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+# def convert_to_binary(signal_values: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+#     """Convert a numeric signal to binary (0/1) using a threshold."""
+#     signal_values = np.asarray(signal_values, dtype=float)
+#     return np.where(np.isfinite(signal_values), (signal_values > threshold).astype(bool), np.nan)
+
+def convert_to_binary(signal_values: np.ndarray) -> np.ndarray:
     """Convert a numeric signal to binary (0/1) using a threshold."""
-    signal_values = np.asarray(signal_values, dtype=float)
-    return np.where(np.isfinite(signal_values), (signal_values > threshold).astype(float), np.nan)
+    return np.asarray(signal_values, dtype=bool)
+
 
 def compute_binary_transition_rate(binary_signal: np.ndarray) -> float:
     """Return the proportion of time steps where the binary signal switches between 0 and 1."""
@@ -198,6 +218,25 @@ def compute_longest_true_run_length(binary_signal: np.ndarray) -> float:
         else:
             cur = 0
     return float(best) if binary_signal.size else np.nan
+
+def compute_average_true_run_length(binary_signal: np.ndarray) -> float:
+    """
+    Compute the average length of contiguous True runs in a binary signal.
+    Returns NaN if there are no True runs.
+    """
+    if binary_signal.size == 0:
+        return np.nan
+
+    binary_signal = np.asarray(binary_signal, dtype=bool)
+    diff = np.diff(np.concatenate(([0], binary_signal.view(np.int8), [0])))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+
+    if starts.size == 0:
+        return 0
+
+    run_lengths = ends - starts
+    return float(np.mean(run_lengths)) if run_lengths.size else np.nan
 
 def compute_fraction_near_bounds(signal_values: np.ndarray, lower_bound=0.0, upper_bound=1.0, margin_fraction=0.05) -> Tuple[float, float]:
     """Return the fractions of values near the lower and upper bounds of a bounded signal."""
@@ -271,8 +310,11 @@ def compute_window_features(
         binary_signal = convert_to_binary(signal_values)
         # features[f"{column_name}_proportion_true"] = float(np.nanmean(binary_signal))
         features[f"{column_name}_transition_rate"] = compute_binary_transition_rate(binary_signal)
-        features[f"{column_name}_longest_true_run_length"] = compute_longest_true_run_length(binary_signal)
-
+        features[f"{column_name}_longest_true_length"] = compute_longest_true_run_length(binary_signal)
+        features[f"{column_name}_average_true_length"] = compute_average_true_run_length(binary_signal)
+        features[f"{column_name}_longest_false_length"] = compute_longest_true_run_length(~binary_signal)
+        features[f"{column_name}_average_false_length"] = compute_average_true_run_length(~binary_signal)
+    
     if signal_type == "count":
         finite = signal_values[np.isfinite(signal_values)]
         if finite.size:
@@ -338,7 +380,7 @@ def create_windowed_track_dataset(
 
     output_rows = []
 
-    for _, group in df_sorted.groupby(id_cols, sort=False):
+    for _, group in tqdm(df_sorted.groupby(id_cols, sort=False), total=len(df_sorted[id_cols].drop_duplicates())):
         group = group.reset_index(drop=True)
         n = len(group)
         if n == 0:
@@ -638,7 +680,9 @@ def compute_dtw_window_clusters(
     umap_min_dist: float = 0.1,
     random_state: int = 123,
     sample_frac: float = None,     # e.g. 0.25 to use 25% of windows
-    max_windows: int = None        # e.g. 5000 to cap windows for DTW
+    max_windows: int = None,        # e.g. 5000 to cap windows for DTW
+    clusterer = None,
+    out_col_name = None
 ):
     """
     Returns a DataFrame with keys + DTW_UMAP1/2 + cluster_label_dtw_hdbscan
@@ -725,16 +769,21 @@ def compute_dtw_window_clusters(
 
     # ---- 7) HDBSCAN clustering on the embedding (or on D via metric='precomputed') ----
     # Clustering on the embedding is common for noisy high-dim distances.
-    hdb = HDBSCAN(min_cluster_size=min_cluster_size, metric="euclidean")
-    labels = hdb.fit_predict(emb)
+    if clusterer is None:
+        hdb = HDBSCAN(min_cluster_size=min_cluster_size, metric="euclidean")
+        labels = hdb.fit_predict(emb)
+    else:
+        labels = clusterer.fit_predict(emb)
 
     out = meta.copy()
     out["DTW_UMAP1"] = emb[:, 0]
     out["DTW_UMAP2"] = emb[:, 1]
-    out["cluster_label_dtw_hdbscan"] = labels
+    if out_col_name is not None:
+        out[out_col_name] = labels
+    else:
+        out["cluster_label_dtw_hdbscan"] = labels
 
     return out
-
 
 def plot_clustering_feature_heatmap(
     df_umap,
@@ -922,4 +971,258 @@ def plot_clustering_feature_heatmap(
 
     if plot_results:
         print(f"Saved PDF to: {outpath}")
-        
+
+def compare_cluster_distribution(df, col_a, col_b):
+    counts = pd.crosstab(df[col_a], df[col_b])
+    props = counts.div(counts.sum(axis=1), axis=0)
+
+    # Majority mapping (for each cluster in A, which B is most common?)
+    maj_target = counts.idxmax(axis=1)
+    maj_count = counts.max(axis=1)
+    purity = (maj_count / counts.sum(axis=1)).fillna(0.0)
+    mapping_summary = pd.DataFrame({
+        f'{col_a}': counts.index,
+        f'major_{col_b}': maj_target.values,
+        'major_count': maj_count.values,
+        'purity': purity.values
+    }).sort_values('purity', ascending=False).reset_index(drop=True)
+
+    # Plot heatmap (matplotlib, no external styling)
+    fig, ax = plt.subplots(figsize=(max(6, props.shape[1]*0.8), max(4, props.shape[0]*0.6)))
+    im = ax.imshow(props.values, aspect='auto')
+    ax.set_xticks(np.arange(props.shape[1]))
+    ax.set_xticklabels(props.columns, rotation=45, ha='right')
+    ax.set_yticks(np.arange(props.shape[0]))
+    ax.set_yticklabels(props.index)
+    ax.set_xlabel(col_b)
+    ax.set_title(f'Proportions of {col_b} within each {col_a} (row-normalized)')
+
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.ax.set_ylabel('proportion', rotation=270, labelpad=15)
+
+    # Optional: annotate cells
+    for i in range(props.shape[0]):
+        for j in range(props.shape[1]):
+            val = props.values[i, j]
+            text = f'{val:.2f}'
+            ax.text(j, i, text, ha='center', va='center', fontsize=8)
+
+    plt.tight_layout()
+    plt.show()
+    
+def run_leiden_clustering(
+    X,
+    n_neighbors: int = 30,
+    metric: str = "euclidean",
+    resolution: float = 1.0,
+    symmetrize: str = "max",          # {"max","min","avg","none"}
+    weight_mode: str = "rbf",         # {"rbf","binary","inverse"}
+    rbf_sigma: float | None = None,   # if None → median kNN distance
+    random_state: int | None = 0,
+    n_jobs: int | None = -1,
+    return_graph: bool = False,
+):
+    """
+    Run Leiden clustering on a k-NN graph built from X.
+    Returns: labels (np.ndarray[, int]) and optionally the igraph Graph.
+    """
+    
+    # 1) k-NN distances (sparse)
+    nbrs = NearestNeighbors(
+        n_neighbors=n_neighbors,
+        metric=metric,
+        n_jobs=n_jobs
+    ).fit(X)
+    knn_dist = nbrs.kneighbors_graph(mode="distance")  # (n, n) CSR
+
+    # 2) Symmetrize
+    if symmetrize == "max":
+        A = knn_dist.maximum(knn_dist.T)
+    elif symmetrize == "min":
+        A = knn_dist.minimum(knn_dist.T)
+    elif symmetrize == "avg":
+        A = (knn_dist + knn_dist.T) * 0.5
+    elif symmetrize == "none":
+        A = knn_dist  # directed
+    else:
+        raise ValueError("symmetrize must be one of {'max','min','avg','none'}")
+
+    # 3) Convert distances → weights
+    coo = A.tocoo()
+    d = coo.data
+    if d.size == 0:
+        raise ValueError("Empty k-NN graph; try increasing n_neighbors.")
+
+    if weight_mode == "rbf":
+        if rbf_sigma is None:
+            # robust default width
+            rbf_sigma = np.median(d[d > 0]) if np.any(d > 0) else np.mean(d)
+        w = np.exp(-(d ** 2) / (2.0 * (rbf_sigma ** 2)))
+    elif weight_mode == "inverse":
+        # 1/(1+d) avoids div-by-zero; small d → large weight
+        w = 1.0 / (1.0 + d)
+    elif weight_mode == "binary":
+        # unweighted graph
+        w = np.ones_like(d)
+    else:
+        raise ValueError("weight_mode must be {'rbf','inverse','binary'}")
+
+    # Remove self-loops if any
+    mask = coo.row != coo.col
+    rows = coo.row[mask].tolist()
+    cols = coo.col[mask].tolist()
+    weights = w[mask].tolist()
+
+    # 4) Build igraph
+    n = A.shape[0]
+    g = ig.Graph(n=n)
+    if rows:
+        g.add_edges(list(zip(rows, cols)))
+        g.es["weight"] = weights
+    else:
+        # graph with isolated nodes → all singletons
+        labels = np.arange(n, dtype=int)
+        return (labels, g) if return_graph else labels
+
+    # 5) Leiden
+    partition = la.find_partition(
+        g,
+        la.RBConfigurationVertexPartition,
+        weights=g.es["weight"],
+        resolution_parameter=resolution,
+        seed=random_state,
+    )
+    labels = np.asarray(partition.membership, dtype=int)
+    return (labels, g) if return_graph else labels
+
+
+
+def plot_feature_cluster_heatmap_from_df(
+    df_analysis: pd.DataFrame,
+    feature_cols,
+    cluster_col: str = "ClusterID",
+    drop_noise_label: int | None = -1,            # set None to keep all clusters
+    feature_category_map: dict[str, str] | None = None,
+    zscore_rows: bool = True,                     # z-score features across clusters
+    row_distance: str = "abs_correlation",        # {"abs_correlation","correlation","euclidean"}
+    col_distance: str = "correlation",            # {"correlation","euclidean"}
+    row_linkage: str = "average",
+    col_linkage: str = "average",
+    cmap: str = "vlag",
+    figsize=(12, 14),
+    savepath: str | None = None,
+):
+    """
+    RNA-style clustermap:
+      - rows = features clustered by (absolute) correlation
+      - cols = clusters ordered by similarity
+      - cells = mean(feature) within each cluster
+    """
+    # --- safety checks
+    assert cluster_col in df_analysis.columns, f"{cluster_col} not found in df_analysis"
+    for c in feature_cols:
+        if c not in df_analysis.columns:
+            raise ValueError(f"Feature '{c}' not found in df_analysis")
+
+    # --- optionally remove HDBSCAN noise
+    df = df_analysis.copy()
+    if drop_noise_label is not None:
+        df = df[df[cluster_col] != drop_noise_label]
+
+    # --- compute feature x cluster matrix of means
+    cluster_means = df.groupby(cluster_col)[list(feature_cols)].mean().T
+    cluster_means = cluster_means.replace([np.inf, -np.inf], np.nan).dropna(how="all")
+
+    # remove zero-variance rows (cannot compute correlation)
+    nonconst = cluster_means.loc[cluster_means.std(axis=1) > 0]
+    if nonconst.empty:
+        raise ValueError("All features have zero variance across clusters.")
+    M = nonconst.copy()
+
+    # optional row z-scoring (emphasize patterns)
+    if zscore_rows:
+        M = (M - M.mean(axis=1).to_numpy()[:, None]) / (M.std(axis=1, ddof=0).to_numpy()[:, None] + 1e-9)
+
+    # --- row (feature) distances
+    if row_distance == "euclidean":
+        d_rows = pdist(M.values, metric="euclidean")
+    elif row_distance == "correlation":
+        d_rows = pdist(M.values, metric="correlation")  # 1 - corr
+    elif row_distance == "abs_correlation":
+        C = np.corrcoef(M.values)                       # (n_features x n_features)
+        D = 1.0 - np.abs(C)
+        np.fill_diagonal(D, 0.0)
+        d_rows = squareform(D, checks=False)
+    else:
+        raise ValueError(f"Unsupported row_distance='{row_distance}'")
+    row_link = linkage(d_rows, method=row_linkage)
+    row_order = leaves_list(row_link)
+
+    # --- column (cluster) distances
+    if col_distance == "euclidean":
+        d_cols = pdist(M.T.values, metric="euclidean")
+    elif col_distance == "correlation":
+        d_cols = pdist(M.T.values, metric="correlation")
+    else:
+        raise ValueError(f"Unsupported col_distance='{col_distance}'")
+    col_link = linkage(d_cols, method=col_linkage)
+    col_order = leaves_list(col_link)
+
+    # --- annotation bars
+    row_colors = None
+    if feature_category_map is not None:
+        cats = pd.Series([feature_category_map.get(f, "other") for f in M.index], index=M.index)
+        palette = sns.color_palette("tab20", n_colors=cats.nunique())
+        lut = dict(zip(cats.unique(), palette))
+        row_colors = cats.map(lut)
+
+    cluster_counts = df[cluster_col].value_counts().reindex(M.columns).fillna(0).astype(int)
+    norm = Normalize(vmin=cluster_counts.min(), vmax=max(cluster_counts.max(), 1))
+    col_colors = [plt.cm.Blues(norm(v)) for v in cluster_counts.values]
+
+    # --- plot
+    g = sns.clustermap(
+        M,
+        row_linkage=row_link,
+        col_linkage=col_link,
+        row_colors=row_colors,
+        col_colors=col_colors,
+        cmap=cmap,
+        figsize=figsize,
+        xticklabels=True,
+        yticklabels=True,
+        cbar_kws={"label": "mean (row z-score)" if zscore_rows else "mean"},
+        dendrogram_ratio=(0.12, 0.12),
+        colors_ratio=(0.02, 0.04),
+    )
+    g.ax_heatmap.set_xlabel("Cluster")
+    g.ax_heatmap.set_ylabel("Feature")
+
+    # row legend (feature categories), if provided
+    if feature_category_map is not None:
+        for cat, color in lut.items():
+            g.ax_col_dendrogram.bar(0, 0, color=color, label=cat, linewidth=0)
+        g.ax_col_dendrogram.legend(title="Feature category", ncols=min(3, len(lut)), loc="center",
+                                   bbox_to_anchor=(0.5, 1.2), frameon=False)
+
+    # column legend (cluster sizes)
+    import matplotlib.patches as mpatches
+    ticks = np.unique(np.linspace(cluster_counts.min(),
+                                  max(cluster_counts.max(), 1), 3).astype(int))
+    if len(ticks):
+        handles = [mpatches.Patch(color=plt.cm.Blues(norm(v)), label=f"N={v}") for v in ticks]
+        g.ax_row_dendrogram.legend(handles=handles, title="Cluster size",
+                                   loc="center", bbox_to_anchor=(0.5, 1.15), frameon=False)
+
+    plt.tight_layout()
+    if savepath:
+        g.savefig(savepath, dpi=300, bbox_inches="tight")
+
+    return g, {
+        "matrix": M,
+        "row_order": row_order,
+        "col_order": col_order,
+        "row_linkage": row_link,
+        "col_linkage": col_link,
+        "cluster_counts": cluster_counts,
+    }
