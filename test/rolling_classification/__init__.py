@@ -278,6 +278,8 @@ def compute_window_features(
     signal_type = signal_types.get(column_name, "continuous")
     features: Dict[str, float] = {}
 
+    features[f"{column_name}_inferred_signal_type"] = signal_type
+    
     # --- Basic statistics ---
     features[f"{column_name}_mean_value"] = compute_mean_value(signal_values)
     
@@ -329,8 +331,56 @@ def compute_window_features(
         else:
             features[f"{column_name}_dispersion_index_variance_over_mean"] = np.nan
             features[f"{column_name}_fraction_of_zeros"] = np.nan
+            
+    px = window_dataframe["position_x"].to_numpy(float)
+    py = window_dataframe["position_y"].to_numpy(float)
+    pz = window_dataframe["position_z"].to_numpy(float)
+    coords = np.column_stack([px, py, pz])
 
-    features[f"{column_name}_inferred_signal_type"] = signal_type
+    # Rebase so that the first point is the origin (doesn't change straightness/directionality)
+    coords_rel = coords - coords[0]
+
+    # Step vectors and lengths
+    steps = np.diff(coords_rel, axis=0)
+    if steps.size == 0:
+        # Degenerate window (<=1 point)
+        features["summed_displacement"] = 0.0
+        features["net_displacement"] = 0.0
+        features["straightness"] = 0.0
+        #directional persistance (1: straight, 0: random, -1: reversal)
+        features["directional_persistence"] = 0.0                 
+        features["median_turning_angle"] = 0.0
+        features["fraction_reversed_movement"] = 0.0
+
+    else:
+        step_len = np.linalg.norm(steps, axis=1)
+        path_length = float(np.nansum(step_len))
+        net_disp = float(np.linalg.norm(coords_rel[-1] - coords_rel[0]))
+        straightness = (net_disp / path_length) if path_length > 0 else 0.0
+
+        # Normalize steps to unit vectors (leave zeros as zeros)
+        norms = step_len[:, None]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            u = np.divide(steps, norms, out=np.zeros_like(steps), where=norms > 0)
+
+        # Directionality/persistence: cosine between successive unit step vectors
+        if u.shape[0] >= 2:
+            dots = np.sum(u[1:] * u[:-1], axis=1)
+            dots = np.clip(dots, -1.0, 1.0)  # numeric safety
+            # Turning angles (radians) between successive steps
+            turn_angles = np.arccos(dots)
+            mean_persist = float(np.nanmean(dots)) if dots.size else 0.0
+        else:
+            mean_persist = 0.0
+
+        # Expose a few helpful summary features (units noted in names where relevant)
+        features["summed_displacement"] = path_length
+        features["net_displacement"] = net_disp
+        features["straightness"] = straightness
+        #directional persistance (1: straight, 0: random, -1: reversal)
+        features["directional_persistence"] = mean_persist                 
+
+        
     return features
 
 

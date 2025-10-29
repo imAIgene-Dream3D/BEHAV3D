@@ -57,11 +57,11 @@ seed = 123
 random.seed(seed)
 np.random.seed(seed)
 
-# output_dir = r"/Volumes/T7_sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
-# metadata_csv_path = r"/Volumes/T7_sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
+output_dir = r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
+metadata_csv_path = r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
 
-output_dir = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
-metadata_csv_path = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
+# output_dir = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
+# metadata_csv_path = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
 
 metadata = load_behav3d_metadata(metadata_csv_path)
 
@@ -102,7 +102,7 @@ features=[
 
 df_tracks = df_tracks_orig[features+["sample_name", "TrackID", "position_t"]]
 df_windows_descriptive = create_windowed_track_dataset(
-    df_tracks=df_tracks,
+    df_tracks=df_tracks_orig,
     columns_to_summarize=features,
     window_size = window_size,
     step_size = chosen_intervals,
@@ -277,20 +277,28 @@ plt.tight_layout()
 plt.show()
 
 plot_umap_feature_grid(df_analysis, feature_cols=feature_cols)
-plot_clustering_feature_heatmap(
-    df_umap=df_analysis,
-    info_cols=feature_cols,
-    sample_cols=non_feature_cols,
-    outpath=r"C:\Users\Samde\Downloads/test.pdf",
-    rows_per_page = 7,
-    nr_cols = 2,
-    figsize = (8.27, 11.69),
-    plot_results=True,
-    show_points=False,        # overlay individual samples
-    point_alpha=0.5,         # transparency for individual samples
-    point_size=8,            # size for individual points
-    mean_marker_size=60,     # size for mean markers
+
+plot_feature_cluster_heatmap(
+    df_analysis,
+    feature_cols=feature_cols,
+    cluster_col="cluster_label_leiden",
+    figsize=(8.27, 11.69),
 )
+
+# plot_clustering_feature_heatmap(
+#     df_umap=df_analysis,
+#     info_cols=feature_cols,
+#     sample_cols=non_feature_cols,
+#     outpath=r"/Users/s.deblank-3/Downloads/test.pdf",
+#     rows_per_page = 7,
+#     nr_cols = 2,
+#     figsize = (8.27, 11.69),
+#     plot_results=True,
+#     show_points=False,        # overlay individual samples
+#     point_alpha=0.5,         # transparency for individual samples
+#     point_size=8,            # size for individual points
+#     mean_marker_size=60,     # size for mean markers
+# )
 compare_cluster_distribution(df_analysis, "cluster_label_hdbscan", "cluster_label_kmeans")
 
 # ---------- 3) UMAP colored by clusters ----------
@@ -321,7 +329,7 @@ sns.scatterplot(
     s=10, alpha=0.8, edgecolor=None
 )
 plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-plt.title("UMAP colored by HDBSCAN clusters (−1 = noise)")
+plt.title("UMAP colored by Leiden clusters (−1 = noise)")
 plt.show()
 
 
