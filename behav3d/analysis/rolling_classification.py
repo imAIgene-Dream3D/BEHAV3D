@@ -91,7 +91,6 @@ features=[
     "nr_dead_mask_pixels",
     "organoid_contact_pixels",
     "tcell_contact_pixels",
-    "displacement",
     "mean_square_displacement",
     "speed",
     # # "dead",
@@ -276,6 +275,12 @@ plt.title("UMAP (2D)")
 plt.tight_layout()
 plt.show()
 
+plot_all_clusters_window_max_projection(
+    df_tracks_orig,
+    df_analysis,
+    cluster_col="cluster_label_hdbscan",
+)
+    
 plot_umap_feature_grid(df_analysis, feature_cols=feature_cols)
 
 plot_feature_cluster_heatmap(
@@ -310,6 +315,7 @@ sns.scatterplot(
 )
 plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
 plt.title("UMAP colored by KMeans clusters")
+plt.savefig(r"/Users/s.deblank-3/Downloads/umapKmeans.pdf", bbox_inches="tight")
 plt.show()
 
 plt.figure(figsize=(6,5))
@@ -330,9 +336,9 @@ sns.scatterplot(
 )
 plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
 plt.title("UMAP colored by Leiden clusters (−1 = noise)")
+
+plt.savefig(r"/Users/s.deblank-3/Downloads/umapLeiden.pdf", bbox_inches="tight")
 plt.show()
-
-
 
 # plt.figure(figsize=(6,5))
 # sns.scatterplot(
