@@ -8,12 +8,15 @@ import math
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from dtaidistance import dtw, dtw_ndim
 import seaborn as sns
-from sklearn.cluster import KMeans, HDBSCAN
+from sklearn.cluster import KMeans, HDBSCAN, AgglomerativeClustering
 import umap
 from tqdm import tqdm
 
+from sklearn.metrics import adjusted_rand_score
+from sklearn.cluster import AgglomerativeClustering
+from itertools import combinations
+
 import numpy as np
-from sklearn.neighbors import NearestNeighbors
 from scipy import sparse
 import igraph as ig
 import leidenalg as la
@@ -24,12 +27,19 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
+
 from scipy.spatial.distance import pdist, squareform
 from scipy.cluster.hierarchy import linkage, leaves_list
+from scipy import sparse
+
+import scanpy
 
 from collections import defaultdict
 from pathlib import Path
 from matplotlib.backends.backend_pdf import PdfPages
+
+from behav3d.utils.fileio import load_zarr
+from behav3d.utils.preprocessing import calc_z_projection
 
 SignalType = Literal["binary", "count", "bounded", "continuous"]
 
@@ -689,13 +699,13 @@ def plot_umap_feature_grid(
         # Numeric vs categorical handling
         if is_numeric_dtype(s):
             # Numeric: use matplotlib scatter for easy colorbar handling
-            sc = ax.scatter(
+            scanpy = ax.scatter(
                 df[x_col], df[y_col],
                 s=point_size, alpha=alpha,
                 c=s, cmap=numeric_cmap, edgecolors="none"
             )
             if add_colorbar:
-                cb = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+                cb = plt.colorbar(scanpy, ax=ax, fraction=0.046, pad=0.04)
                 cb.ax.tick_params(labelsize=8)
         else:
             # Categorical: enforce category dtype and use seaborn palette
@@ -1064,91 +1074,200 @@ def compare_cluster_distribution(df, col_a, col_b):
     plt.tight_layout()
     plt.show()
     
+# def run_leiden_clustering(
+#     X,
+#     n_neighbors: int = 30,
+#     metric: str = "euclidean",
+#     resolution: float = 1.0,
+#     symmetrize: str = "max",          # {"max","min","avg","none"}
+#     weight_mode: str = "rbf",         # {"rbf","binary","inverse"}
+#     rbf_sigma: float | None = None,   # if None → median kNN distance
+#     random_state: int | None = 0,
+#     n_jobs: int | None = -1,
+#     return_graph: bool = False,
+# ):
+#     """
+#     Run Leiden clustering on a k-NN graph built from X.
+#     Returns: labels (np.ndarray[, int]) and optionally the igraph Graph.
+#     """
+    
+#     # 1) k-NN distances (sparse)
+#     nbrs = NearestNeighbors(
+#         n_neighbors=n_neighbors,
+#         metric=metric,
+#         n_jobs=n_jobs
+#     ).fit(X)
+#     knn_dist = nbrs.kneighbors_graph(mode="distance")  # (n, n) CSR
+
+#     # 2) Symmetrize
+#     if symmetrize == "max":
+#         A = knn_dist.maximum(knn_dist.T)
+#     elif symmetrize == "min":
+#         A = knn_dist.minimum(knn_dist.T)
+#     elif symmetrize == "avg":
+#         A = (knn_dist + knn_dist.T) * 0.5
+#     elif symmetrize == "none":
+#         A = knn_dist  # directed
+#     else:
+#         raise ValueError("symmetrize must be one of {'max','min','avg','none'}")
+
+#     # 3) Convert distances → weights
+#     coo = A.tocoo()
+#     d = coo.data
+#     if d.size == 0:
+#         raise ValueError("Empty k-NN graph; try increasing n_neighbors.")
+
+#     if weight_mode == "rbf":
+#         if rbf_sigma is None:
+#             # robust default width
+#             rbf_sigma = np.median(d[d > 0]) if np.any(d > 0) else np.mean(d)
+#         w = np.exp(-(d ** 2) / (2.0 * (rbf_sigma ** 2)))
+#     elif weight_mode == "inverse":
+#         # 1/(1+d) avoids div-by-zero; small d → large weight
+#         w = 1.0 / (1.0 + d)
+#     elif weight_mode == "binary":
+#         # unweighted graph
+#         w = np.ones_like(d)
+#     else:
+#         raise ValueError("weight_mode must be {'rbf','inverse','binary'}")
+
+#     # Remove self-loops if any
+#     mask = coo.row != coo.col
+#     rows = coo.row[mask].tolist()
+#     cols = coo.col[mask].tolist()
+#     weights = w[mask].tolist()
+
+#     # 4) Build igraph
+#     n = A.shape[0]
+#     g = ig.Graph(n=n)
+#     if rows:
+#         g.add_edges(list(zip(rows, cols)))
+#         g.es["weight"] = weights
+#     else:
+#         # graph with isolated nodes → all singletons
+#         labels = np.arange(n, dtype=int)
+#         return (labels, g) if return_graph else labels
+
+#     # 5) Leiden
+#     partition = la.find_partition(
+#         g,
+#         la.RBConfigurationVertexPartition,
+#         weights=g.es["weight"],
+#         resolution_parameter=resolution,
+#         seed=random_state,
+#     )
+#     labels = np.asarray(partition.membership, dtype=int)
+#     return (labels, g) if return_graph else labels
+
 def run_leiden_clustering(
     X,
     n_neighbors: int = 30,
     metric: str = "euclidean",
     resolution: float = 1.0,
-    symmetrize: str = "max",          # {"max","min","avg","none"}
-    weight_mode: str = "rbf",         # {"rbf","binary","inverse"}
-    rbf_sigma: float | None = None,   # if None → median kNN distance
     random_state: int | None = 0,
-    n_jobs: int | None = -1,
-    return_graph: bool = False,
+    stability_resolutions=(0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0),
+    n_stability_repeats: int = 8
 ):
-    """
-    Run Leiden clustering on a k-NN graph built from X.
-    Returns: labels (np.ndarray[, int]) and optionally the igraph Graph.
-    """
-    
-    # 1) k-NN distances (sparse)
-    nbrs = NearestNeighbors(
+    if isinstance(X, scanpy.AnnData):
+        adata = X.copy()
+    else:
+        adata = scanpy.AnnData(X)
+
+    scanpy.pp.neighbors(
+        adata,
         n_neighbors=n_neighbors,
         metric=metric,
-        n_jobs=n_jobs
-    ).fit(X)
-    knn_dist = nbrs.kneighbors_graph(mode="distance")  # (n, n) CSR
-
-    # 2) Symmetrize
-    if symmetrize == "max":
-        A = knn_dist.maximum(knn_dist.T)
-    elif symmetrize == "min":
-        A = knn_dist.minimum(knn_dist.T)
-    elif symmetrize == "avg":
-        A = (knn_dist + knn_dist.T) * 0.5
-    elif symmetrize == "none":
-        A = knn_dist  # directed
-    else:
-        raise ValueError("symmetrize must be one of {'max','min','avg','none'}")
-
-    # 3) Convert distances → weights
-    coo = A.tocoo()
-    d = coo.data
-    if d.size == 0:
-        raise ValueError("Empty k-NN graph; try increasing n_neighbors.")
-
-    if weight_mode == "rbf":
-        if rbf_sigma is None:
-            # robust default width
-            rbf_sigma = np.median(d[d > 0]) if np.any(d > 0) else np.mean(d)
-        w = np.exp(-(d ** 2) / (2.0 * (rbf_sigma ** 2)))
-    elif weight_mode == "inverse":
-        # 1/(1+d) avoids div-by-zero; small d → large weight
-        w = 1.0 / (1.0 + d)
-    elif weight_mode == "binary":
-        # unweighted graph
-        w = np.ones_like(d)
-    else:
-        raise ValueError("weight_mode must be {'rbf','inverse','binary'}")
-
-    # Remove self-loops if any
-    mask = coo.row != coo.col
-    rows = coo.row[mask].tolist()
-    cols = coo.col[mask].tolist()
-    weights = w[mask].tolist()
-
-    # 4) Build igraph
-    n = A.shape[0]
-    g = ig.Graph(n=n)
-    if rows:
-        g.add_edges(list(zip(rows, cols)))
-        g.es["weight"] = weights
-    else:
-        # graph with isolated nodes → all singletons
-        labels = np.arange(n, dtype=int)
-        return (labels, g) if return_graph else labels
-
-    # 5) Leiden
-    partition = la.find_partition(
-        g,
-        la.RBConfigurationVertexPartition,
-        weights=g.es["weight"],
-        resolution_parameter=resolution,
-        seed=random_state,
+        method="umap",     # standard Scanpy neighbors
+        knn=True,
     )
-    labels = np.asarray(partition.membership, dtype=int)
-    return (labels, g) if return_graph else labels
 
+    # 3. Either optimize resolution or run fixed Leiden
+    if resolution in ("auto", None):
+        labels, best_res, summary = _leiden_stability_search(
+            adata,
+            resolutions=stability_resolutions,
+            n_repeats=n_stability_repeats,
+        )
+        adata.uns["leiden_stability_summary"] = summary
+        adata.uns["leiden_stability_best_res"] = best_res
+        print(f"[auto] Selected Leiden resolution = {best_res:.3f}")
+    else:
+        scanpy.tl.leiden(
+            adata,
+            resolution=resolution,
+            random_state=random_state,
+            key_added="leiden_custom",
+        )
+        labels = adata.obs["leiden_custom"].astype("category").cat.codes.to_numpy()
+        best_res = resolution
+        
+    return labels
+
+def _leiden_stability_search(
+    adata,
+    resolutions=(0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0),
+    n_repeats=8,
+    random_states=None,
+    restrict_k_range=(3, 80),
+):
+    """
+    Internal helper: find the most stable Leiden resolution via mean pairwise ARI.
+    Returns (best_labels, best_res, summary_df)
+    """
+    if "neighbors" not in adata.uns:
+        raise ValueError("adata must have neighbors computed before stability search.")
+
+    if random_states is None:
+        random_states = list(range(1, n_repeats + 1))
+
+    results, per_res_labels = [], {}
+
+    for res in resolutions:
+        runs = []
+        for rs in random_states:
+            key = f"leiden_tmp_{res:.3f}_{rs}"
+            scanpy.tl.leiden(adata, resolution=res, random_state=rs, key_added=key)
+            runs.append(adata.obs[key].to_numpy())
+
+        # pairwise ARIs
+        aris = [
+            adjusted_rand_score(runs[i], runs[j])
+            for i, j in combinations(range(len(runs)), 2)
+        ]
+        k_counts = [len(np.unique(r)) for r in runs]
+
+        results.append(
+            dict(
+                resolution=res,
+                mean_ari=np.mean(aris),
+                std_ari=np.std(aris),
+                median_k=np.median(k_counts),
+            )
+        )
+        per_res_labels[res] = runs
+
+    summary = pd.DataFrame(results)
+    # restrict range of cluster counts
+    if restrict_k_range is not None:
+        lo, hi = restrict_k_range
+        mask = (summary["median_k"] >= lo) & (summary["median_k"] <= hi)
+        if mask.any():
+            summary = summary.loc[mask]
+
+    # pick best resolution
+    best_res = summary.loc[summary["mean_ari"].idxmax(), "resolution"]
+
+    # pick representative labeling at best_res
+    best_runs = per_res_labels[best_res]
+    avg_aris = [
+        np.mean(
+            [adjusted_rand_score(a, b) for j, b in enumerate(best_runs) if j != i]
+        )
+        for i, a in enumerate(best_runs)
+    ]
+    best_labels = best_runs[int(np.argmax(avg_aris))]
+
+    return best_labels, float(best_res), summary
 
 
 def plot_feature_cluster_heatmap(
@@ -1303,7 +1422,6 @@ def _align_keep_origin(points):
     R = _pca_rotation(points)
     return points @ R.T
 
-# === 1) Single-cluster, window-level max-projection plotter ===
 def plot_cluster_window_max_projection(
     df_positions,
     df_windows,
@@ -1434,8 +1552,6 @@ def plot_cluster_window_max_projection(
     fig.suptitle(f"{title_prefix} {cluster_id}  |  windows plotted: {n_plotted}", y=1.02, fontsize=12)
     return fig, axes
 
-
-# === 2) Compute shared PC axis limits across many clusters/windows ===
 def compute_global_pc_axis_limits_for_windows(
     df_positions,
     df_windows,
@@ -1536,8 +1652,6 @@ def compute_global_pc_axis_limits_for_windows(
 
     return {"pc1": float(max_abs_pc[0]), "pc2": float(max_abs_pc[1]), "pc3": float(max_abs_pc[2])}
 
-
-# === 3) Wrapper: one figure per cluster, with optional saving & shared axes ===
 def plot_all_clusters_window_max_projection(
     df_positions,
     df_windows,
@@ -1637,3 +1751,321 @@ def plot_all_clusters_window_max_projection(
             pdf.close()
 
     return out
+
+def plot_per_cluster_proportions(
+    df,
+    groupby = ["ClusterID", "sample_name"],
+    show=True
+    ):
+    prop_df = (
+        df
+        .groupby(groupby)
+        .size()
+        .groupby(level=0)
+        .apply(lambda x: x / x.sum())  # normalize within each cluster
+        .unstack(fill_value=0)         # make sample_name columns
+    )
+    # Plot stacked bar chart
+    prop_df.index = prop_df.index.get_level_values(0)
+    # Create stacked bar plot
+    ax = prop_df.plot(kind='bar', stacked=True, figsize=(10, 6))
+
+    plt.title("Proportion of sample_name per ClusterID")
+    plt.xlabel("ClusterID")
+    plt.ylabel("Proportion")
+    plt.legend(title="Sample Name", bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    # Ensure upright tick labels
+    plt.xticks(ticks=range(len(prop_df.index)), labels=prop_df.index.astype(str), rotation=0, ha='center')
+
+    plt.tight_layout()
+
+    if show:
+        plt.show()
+    else:
+        return ax
+ 
+def plot_number_per_clusters(
+    df,
+    show=True
+    ):
+    plt.figure(figsize=(6, 3))
+    h_counts = df["ClusterID"].value_counts().sort_index()
+    ax = sns.barplot(x=h_counts.index.astype(str), y=h_counts.values, color="tab:green")
+    ax.bar_label(ax.containers[0], padding=3)
+    plt.title("Cluster sizes")
+    plt.xlabel("Cluster")
+    plt.ylabel("Count")
+    ax.margins(y=0.15)
+    plt.tight_layout()
+    
+    if show:
+        plt.show()
+    else:
+        return ax
+     
+def stratified_pick_examples(
+    windows_df: pd.DataFrame, 
+    X: int, 
+    seed: int = 0
+    ):
+    """
+    For each ClusterID in `windows_df`, pick X rows while approximating the
+    `sample_name` distribution within that cluster.
+    """
+    rng = np.random.default_rng(seed)
+    selections = []
+
+    for cluster_id, sub in windows_df.groupby("ClusterID"):
+        counts = sub["sample_name"].value_counts(normalize=True)
+        # Round targets; ensure >=1 per present sample
+        targets = {s: max(1, int(round(p * X))) for s, p in counts.items()}
+        # Adjust to sum to X
+        while sum(targets.values()) > X:
+            key = max(targets, key=lambda k: targets[k])
+            targets[key] -= 1
+        while sum(targets.values()) < X:
+            residuals = {s: (counts[s] * X) - targets[s] for s in targets}
+            key = max(residuals, key=lambda k: residuals[k])
+            targets[key] += 1
+
+
+        parts = []
+        for s, k in targets.items():
+            pool = sub[sub["sample_name"] == s]
+            if len(pool) <= k:
+                parts.append(pool)
+            else:
+                parts.append(pool.sample(n=k, random_state=seed))
+        picked = pd.concat(parts, ignore_index=True)
+        if len(picked) > X:
+            picked = picked.sample(n=X, random_state=seed)
+        selections.append(picked)
+    return pd.concat(selections, ignore_index=True)
+
+def create_max_projection_cutout(
+    df_row,
+    df_tracks,
+    output_folder,
+    margin = 10,
+    pmin = 0,
+    pmax = 99.99
+    ):
+    
+    sample_name = df_row["sample_name"]
+    start_t = int(df_row["window_start_position_t"])
+    end_t = int(df_row["window_end_position_t"])
+    
+    df_track = df_tracks[
+        (df_tracks["sample_name"] == sample_name) &
+        (df_tracks["TrackID"] == df_row["TrackID"])
+    ]
+    
+    zarr_path = Path(output_folder, "images", sample_name, f"{sample_name}.zarr")
+    zarr = load_zarr(zarr_path)
+    T, C, Z, Y, X = zarr.shape
+    
+    p_img = np.asarray(zarr[-1])
+    percentiles = {}
+    for c in range(C):
+        ch = p_img[c]
+        lo = np.percentile(ch, pmin)
+        hi = np.percentile(ch, pmax)
+
+        if hi <= lo:
+            hi = lo + 1e-6  # avoid div0
+        percentiles[c] = (float(lo), float(hi))
+    
+    
+    masked = np.zeros_like(zarr)
+    for t in range(start_t, end_t+1):
+        df_track_t = df_track[df_track["position_t"] == t]
+        pos_x = int(df_track_t["pixel_position_x"].values[0])
+        pos_y = int(df_track_t["pixel_position_y"].values[0])
+        pos_z = int(df_track_t["pixel_position_z"].values[0])
+        
+        x0 = max(0, pos_x - margin)
+        x1 = min(X, pos_x + margin + 1)
+        y0 = max(0, pos_y - margin)
+        y1 = min(Y, pos_y + margin + 1)
+        z0 = max(0, pos_z - margin)
+        z1 = min(Z, pos_z + margin + 1)
+        
+        masked[t, :, z0:z1, y0:y1, x0:x1] = zarr[t, :, z0:z1, y0:y1, x0:x1]
+        
+    z_min = int(df_track["pixel_position_z"].min())
+    z_max = int(df_track["pixel_position_z"].max())
+    y_min = int(df_track["pixel_position_y"].min())
+    y_max = int(df_track["pixel_position_y"].max())
+    x_min = int(df_track["pixel_position_x"].min())
+    x_max = int(df_track["pixel_position_x"].max())
+    
+    z_min = max(0, int(z_min - margin))
+    y_min = max(0, int(y_min - margin))
+    x_min = max(0, int(x_min - margin))
+
+    z_max = min(Z - 1, int(z_max + margin))
+    y_max = min(Y - 1, int(y_max + margin))
+    x_max = min(X - 1, int(x_max + margin))
+    
+    cropped_img = masked[
+        start_t:end_t,
+        :,
+        z_min:z_max,
+        y_min:y_max,
+        x_min:x_max
+        ]
+    
+    xy_proj = calc_z_projection(cropped_img, z_axis=-3, projection='max')
+    xz_proj = calc_z_projection(cropped_img, z_axis=-2, projection='max')
+    yz_proj = calc_z_projection(cropped_img, z_axis=-1, projection='max')
+    
+    xy_proj_rgb = colorize_channels_to_rgb(xy_proj, percentiles=percentiles)
+    xz_proj_rgb = colorize_channels_to_rgb(xz_proj, percentiles=percentiles)
+    yz_proj_rgb = colorize_channels_to_rgb(yz_proj, percentiles=percentiles)
+    
+
+def colorize_channels_to_rgb(
+    img, 
+    channel_axis=1, 
+    colors=None, 
+    clip=True,
+    percentiles=None,
+    ):
+
+    if colors is None:
+        colors = [
+            (0, 255, 255),   # cyan
+            (255, 255, 0),   # yellow
+            (255, 0, 0),     # red
+            (0, 255, 0),     # green
+            (255, 105, 180), # pink
+        ]
+
+    img = np.asarray(img)
+    C = img.shape[channel_axis]
+    img_moved = np.moveaxis(img, channel_axis, -1)  # shape (..., C)
+
+    img_moved = img_moved.astype(np.float32)
+    
+    for c in range(C):
+        lo, hi = percentiles[c]
+        ch = img_moved[..., c]
+        img_moved[..., c] = np.clip((ch - lo) / (hi - lo), 0.0, 1.0)
+    
+
+    rgb = np.zeros((*img_moved.shape[:-1], 3), dtype=np.float32)
+    for c in range(C):
+        color = np.array(colors[c % len(colors)], dtype=np.float32) / 255.0
+        rgb += img_moved[..., c, None] * color  # broadcast color
+
+    if clip:
+        np.clip(rgb, 0.0, 1.0, out=rgb)
+
+    rgb = (rgb * 255.0).astype(np.uint8)
+    return rgb
+
+# import cv2
+
+# def _ensure_hwc_uint8(frame):
+#     """Accept (H,W,3) uint8 or (3,H,W) uint8 and return (H,W,3) uint8."""
+#     if frame.dtype != np.uint8:
+#         frame = np.clip(frame, 0, 255).astype(np.uint8)
+#     if frame.ndim != 3 or frame.shape[-1] not in (3,) and frame.shape[0] not in (3,):
+#         raise ValueError(f"Expected RGB image with 3 channels; got shape {frame.shape}")
+#     if frame.shape[0] == 3 and frame.shape[-1] != 3:
+#         frame = np.transpose(frame, (1, 2, 0))
+#     return frame
+
+# def _get_T(arr):
+#     """Return number of frames T for 4D arrays in either (T,H,W,3) or (T,3,H,W)."""
+#     if arr.ndim != 4:
+#         raise ValueError(f"Expected 4D array (T,*,*,3); got {arr.shape}")
+#     return arr.shape[0]
+
+# def _get_frame(arr, t):
+#     """Return frame t as (H,W,3) uint8 regardless of channel order."""
+#     # Accept (T,H,W,3) or (T,3,H,W)
+#     if arr.ndim != 4:
+#         raise ValueError(f"Expected 4D array (T,*,*,3); got {arr.shape}")
+#     frame = arr[t]
+#     return _ensure_hwc_uint8(frame)
+
+# def _put_label(img_hwc, text, margin=8):
+#     """Overlay a solid label background and put text near top-left."""
+#     h, w = img_hwc.shape[:2]
+#     font = cv2.FONT_HERSHEY_SIMPLEX
+#     scale = max(h, w) / 800.0  # scales reasonably with image size
+#     thickness = max(1, int(2 * scale))
+#     (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+#     rect_h = th + baseline + 2 * margin
+#     rect_w = tw + 2 * margin
+#     overlay = img_hwc.copy()
+#     cv2.rectangle(overlay, (0, 0), (rect_w, rect_h), (0, 0, 0), -1)
+#     # Slight transparency for label background
+#     cv2.addWeighted(overlay, 0.35, img_hwc, 0.65, 0, img_hwc)
+#     cv2.putText(img_hwc, text, (margin, margin + th), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+#     return img_hwc
+
+# def write_projections_mp4(
+#     xy_proj_rgb,
+#     xz_proj_rgb,
+#     yz_proj_rgb,
+#     out_path,
+#     fps=10,
+#     label_xy="XY max",
+#     label_xz="XZ max",
+#     label_yz="YZ max",
+#     target_height=None,
+# ):
+#     """
+#     Write a side-by-side MP4 of three RGB projection sequences with labels.
+#     Inputs are expected as 4D arrays with time first:
+#       - (T, H, W, 3) uint8 OR (T, 3, H, W) uint8.
+#     """
+#     T = min(_get_T(xy_proj_rgb), _get_T(xz_proj_rgb), _get_T(yz_proj_rgb))
+#     # Determine target height (max of first frames unless provided)
+#     f0_xy = _get_frame(xy_proj_rgb, 0)
+#     f0_xz = _get_frame(xz_proj_rgb, 0)
+#     f0_yz = _get_frame(yz_proj_rgb, 0)
+#     if target_height is None:
+#         target_height = max(f0_xy.shape[0], f0_xz.shape[0], f0_yz.shape[0])
+
+#     def _resize_to_height(img, H):
+#         h, w = img.shape[:2]
+#         if h == H:
+#             return img
+#         new_w = int(round(w * (H / h)))
+#         return cv2.resize(img, (new_w, H), interpolation=cv2.INTER_AREA)
+
+#     # Compute output frame size from first frames
+#     f0_xy_r = _resize_to_height(f0_xy.copy(), target_height)
+#     f0_xz_r = _resize_to_height(f0_xz.copy(), target_height)
+#     f0_yz_r = _resize_to_height(f0_yz.copy(), target_height)
+#     out_h = target_height
+#     out_w = f0_xy_r.shape[1] + f0_xz_r.shape[1] + f0_yz_r.shape[1]
+
+#     out_path = str(Path(out_path))
+#     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+#     writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
+
+#     try:
+#         for t in range(T):
+#             f_xy = _resize_to_height(_get_frame(xy_proj_rgb, t).copy(), target_height)
+#             f_xz = _resize_to_height(_get_frame(xz_proj_rgb, t).copy(), target_height)
+#             f_yz = _resize_to_height(_get_frame(yz_proj_rgb, t).copy(), target_height)
+
+#             f_xy = _put_label(f_xy, label_xy)
+#             f_xz = _put_label(f_xz, label_xz)
+#             f_yz = _put_label(f_yz, label_yz)
+
+#             # Concatenate horizontally
+#             stacked = np.concatenate([f_xy, f_xz, f_yz], axis=1)
+
+#             # Convert RGB -> BGR for OpenCV video writer
+#             stacked_bgr = cv2.cvtColor(stacked, cv2.COLOR_RGB2BGR)
+#             writer.write(stacked_bgr)
+#     finally:
+#         writer.release()
+
+#     return out_path
