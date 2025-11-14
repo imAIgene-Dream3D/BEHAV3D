@@ -1,0 +1,641 @@
+import numpy as np
+import pandas as pd
+from typing import Optional, Tuple, Dict, Literal, List, Iterable
+from pandas.api.types import is_numeric_dtype
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+import math
+
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from dtaidistance import dtw, dtw_ndim
+import seaborn as sns
+from sklearn.cluster import KMeans, HDBSCAN, AgglomerativeClustering
+import umap
+from tqdm import tqdm
+
+from sklearn.metrics import adjusted_rand_score
+from sklearn.cluster import AgglomerativeClustering
+from itertools import combinations
+
+import numpy as np
+from scipy import sparse
+import igraph as ig
+import leidenalg as la
+
+from typing import Dict, Iterable, Optional
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+
+from scipy.spatial.distance import pdist, squareform
+from scipy.cluster.hierarchy import linkage, leaves_list
+from scipy import sparse
+
+import scanpy
+
+from collections import defaultdict
+from pathlib import Path
+from matplotlib.backends.backend_pdf import PdfPages
+
+from behav3d.utils.fileio import load_zarr
+from behav3d.utils.preprocessing import calc_z_projection
+
+import imageio_ffmpeg as iioff
+
+from dataclasses import dataclass
+from pathlib import Path as _Path
+from typing import Tuple, Optional, List, Dict
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+import imageio
+import imageio_ffmpeg
+
+def stratified_pick_examples(
+    df_windows: pd.DataFrame, 
+    X: int, 
+    seed: int = 0
+    ):
+    """
+    For each ClusterID in `windows_df`, pick X rows while approximating the
+    `sample_name` distribution within that cluster.
+    """
+    rng = np.random.default_rng(seed)
+    selections = []
+
+    for cluster_id, sub in df_windows.groupby("ClusterID"):
+        counts = sub["sample_name"].value_counts(normalize=True)
+        # Round targets; ensure >=1 per present sample
+        targets = {s: max(1, int(round(p * X))) for s, p in counts.items()}
+        # Adjust to sum to X
+        while sum(targets.values()) > X:
+            key = max(targets, key=lambda k: targets[k])
+            targets[key] -= 1
+        while sum(targets.values()) < X:
+            residuals = {s: (counts[s] * X) - targets[s] for s in targets}
+            key = max(residuals, key=lambda k: residuals[k])
+            targets[key] += 1
+
+
+        parts = []
+        for s, k in targets.items():
+            pool = sub[sub["sample_name"] == s]
+            if len(pool) <= k:
+                parts.append(pool)
+            else:
+                parts.append(pool.sample(n=k, random_state=seed))
+        picked = pd.concat(parts, ignore_index=True)
+        if len(picked) > X:
+            picked = picked.sample(n=X, random_state=seed)
+        selections.append(picked)
+    return pd.concat(selections, ignore_index=True)
+
+def create_max_projection_cutout(
+    df_window,
+    df_positions,
+    output_folder,
+    margin = 10,
+    pmin = 0,
+    pmax = 99.99,
+    mask_margin = False
+    ):
+    
+    sample_name = df_window["sample_name"]
+    start_t = int(df_window["window_start_position_t"])
+    end_t = int(df_window["window_end_position_t"])
+    
+    df_track = df_positions[
+        (df_positions["sample_name"] == sample_name) &
+        (df_positions["TrackID"] == df_window["TrackID"])
+    ]
+    
+    zarr_path = Path(output_folder, "images", sample_name, f"{sample_name}.zarr")
+    zarr = load_zarr(zarr_path)
+    T, C, Z, Y, X = zarr.shape
+    
+    p_img = np.asarray(zarr[-1])
+    percentiles = {}
+    for c in range(C):
+        ch = p_img[c]
+        lo = np.percentile(ch, pmin)
+        hi = np.percentile(ch, pmax)
+
+        if hi <= lo:
+            hi = lo + 1e-6  # avoid div0
+        percentiles[c] = (float(lo), float(hi))
+    
+    if mask_margin:
+        masked = np.zeros_like(zarr)
+        for t in range(start_t, end_t+1):
+            df_track_t = df_track[df_track["position_t"] == t]
+            pos_x = int(df_track_t["pixel_position_x"].values[0])
+            pos_y = int(df_track_t["pixel_position_y"].values[0])
+            pos_z = int(df_track_t["pixel_position_z"].values[0])
+            
+            x0 = max(0, pos_x - margin)
+            x1 = min(X, pos_x + margin + 1)
+            y0 = max(0, pos_y - margin)
+            y1 = min(Y, pos_y + margin + 1)
+            z0 = max(0, pos_z - margin)
+            z1 = min(Z, pos_z + margin + 1)
+            
+            masked[t, :, z0:z1, y0:y1, x0:x1] = zarr[t, :, z0:z1, y0:y1, x0:x1]
+    else:  
+        masked = zarr 
+        
+    z_min = int(df_track["pixel_position_z"].min())
+    z_max = int(df_track["pixel_position_z"].max())
+    y_min = int(df_track["pixel_position_y"].min())
+    y_max = int(df_track["pixel_position_y"].max())
+    x_min = int(df_track["pixel_position_x"].min())
+    x_max = int(df_track["pixel_position_x"].max())
+    
+    z_min = max(0, int(z_min - margin))
+    y_min = max(0, int(y_min - margin))
+    x_min = max(0, int(x_min - margin))
+
+    z_max = min(Z - 1, int(z_max + margin))
+    y_max = min(Y - 1, int(y_max + margin))
+    x_max = min(X - 1, int(x_max + margin))
+    
+    cropped_img = masked[
+        start_t:end_t,
+        :,
+        z_min:z_max,
+        y_min:y_max,
+        x_min:x_max
+        ]
+    
+    cropped_img = np.asarray(cropped_img)
+    xy_proj = calc_z_projection(cropped_img, z_axis=-3, projection='max')
+    xz_proj = calc_z_projection(cropped_img, z_axis=-2, projection='max')
+    yz_proj = calc_z_projection(cropped_img, z_axis=-1, projection='max')
+    
+    xy_proj_rgb = colorize_channels_to_rgb(xy_proj, percentiles=percentiles)
+    xz_proj_rgb = colorize_channels_to_rgb(xz_proj, percentiles=percentiles)
+    yz_proj_rgb = colorize_channels_to_rgb(yz_proj, percentiles=percentiles)
+    
+    return(xy_proj_rgb, xz_proj_rgb, yz_proj_rgb)
+
+def create_centered_max_projection_cutout(
+    df_window,
+    df_positions,
+    output_folder,
+    margin=10,              # half-size in pixels/voxels for X/Y/Z (use ints or (mz,my,mx))
+    normalize_per_channel=True,
+    pmin=0.0,
+    pmax=99.99,
+    ):
+    """
+    For the (sample_name, TrackID) window in df_window, build per-time centered crops
+    of size (2*mz+1, 2*my+1, 2*mx+1) around the cell position. Pads at edges so every
+    frame is the same size and centered on the cell. Returns RGB max-projection stacks
+    for XY, XZ, YZ with shape (T_window, H, W, 3).
+
+    Requires helpers:
+      - load_zarr(path) -> array with shape (T, C, Z, Y, X)
+      - calc_z_projection(arr, z_axis, projection='max')
+      - colorize_channels_to_rgb(arr, percentiles=...)
+    """
+
+    # Normalize margins to (mz, my, mx)
+    if isinstance(margin, (list, tuple)):
+        assert len(margin) == 3, "margin must be int or (mz,my,mx)"
+        mz, my, mx = map(int, margin)
+    else:
+        mz = my = mx = int(margin)
+
+    sample_name = df_window["sample_name"]
+    start_t = int(df_window["window_start_position_t"])
+    end_t   = int(df_window["window_end_position_t"])
+
+    df_track = df_positions[
+        (df_positions["sample_name"] == sample_name) &
+        (df_positions["TrackID"] == df_window["TrackID"])
+    ]
+
+    zarr_path = Path(output_folder, "images", sample_name, f"{sample_name}.zarr")
+    zarr = load_zarr(zarr_path)  # (T, C, Z, Y, X)
+    T, C, Z, Y, X = zarr.shape
+
+    if normalize_per_channel:
+        # Percentiles per channel from the last timepoint (like your current fn)
+        p_img = np.asarray(zarr[-1])
+        percentiles = {}
+        for c in range(C):
+            ch = p_img[c]
+            lo = np.percentile(ch, pmin)
+            hi = np.percentile(ch, pmax)
+            if hi <= lo:
+                hi = lo + 1e-6
+            percentiles[c] = (float(lo), float(hi))
+    else:
+        percentiles=None
+
+    # Helper: centered crop with padding (Z,Y,X)
+    def _centered_crop_zyx(vol_czyx, cz, cy, cx, mz, my, mx):
+        """
+        vol_czyx: (C, Z, Y, X)
+        center: integer cz,cy,cx in original coords
+        returns (C, 2*mz+1, 2*my+1, 2*mx+1)
+        """
+        z0 = cz - mz; z1 = cz + mz + 1
+        y0 = cy - my; y1 = cy + my + 1
+        x0 = cx - mx; x1 = cx + mx + 1
+
+        pad_before = [max(0, -z0), max(0, -y0), max(0, -x0)]
+        pad_after  = [max(0,  z1 - Z), max(0,  y1 - Y), max(0,  x1 - X)]
+
+        sz0 = max(0, z0); sz1 = min(Z, z1)
+        sy0 = max(0, y0); sy1 = min(Y, y1)
+        sx0 = max(0, x0); sx1 = min(X, x1)
+
+        crop = vol_czyx[:, sz0:sz1, sy0:sy1, sx0:sx1]
+
+        if any(pad_before) or any(pad_after):
+            # np.pad expects ((before,after), ...) per axis
+            pad_spec = (
+                (0, 0),  # C
+                (pad_before[0], pad_after[0]),
+                (pad_before[1], pad_after[1]),
+                (pad_before[2], pad_after[2]),
+            )
+            crop = np.pad(crop, pad_spec, mode="constant", constant_values=0)
+
+        # Ensure exact target shape (C, 2*mz+1, 2*my+1, 2*mx+1)
+        target = (C, 2*mz+1, 2*my+1, 2*mx+1)
+        if crop.shape != target:
+            # Final safety: pad or trim if off by 1 due to rounding
+            pad_z = max(0, target[1]-crop.shape[1])
+            pad_y = max(0, target[2]-crop.shape[2])
+            pad_x = max(0, target[3]-crop.shape[3])
+            crop = np.pad(
+                crop,
+                ((0,0), (0,pad_z), (0,pad_y), (0,pad_x)),
+                mode="constant",
+                constant_values=0,
+            )
+            crop = crop[:, :target[1], :target[2], :target[3]]
+        return crop
+
+    # Build the time stack of centered crops: (T_w, C, Zc, Yc, Xc)
+    crops = []
+    for t in range(start_t, end_t + 1):
+        df_t = df_track[df_track["position_t"] == t]
+        if len(df_t) == 0:
+            # If no position for this time, repeat last or put zeros
+            if len(crops) == 0:
+                crops.append(np.zeros((C, 2*mz+1, 2*my+1, 2*mx+1), dtype=zarr.dtype))
+            else:
+                crops.append(crops[-1])
+            continue
+
+        cx = int(df_t["pixel_position_x"].values[0])
+        cy = int(df_t["pixel_position_y"].values[0])
+        cz = int(df_t["pixel_position_z"].values[0])
+
+        vol_czyx = zarr[t]  # (C, Z, Y, X)
+        crop = _centered_crop_zyx(vol_czyx, cz, cy, cx, mz, my, mx)
+        crops.append(crop)
+
+    crops = np.stack(crops, axis=0)  # (T_w, C, Zc, Yc, Xc)
+
+    # Projections along the Z/Y/X for XY, XZ, YZ respectively
+    # crops axes: (T, C, Z, Y, X)
+    xy_proj = calc_z_projection(crops, z_axis=-3, projection='max')  # -> (T, C, Y, X)
+    xz_proj = calc_z_projection(crops, z_axis=-2, projection='max')  # -> (T, C, Z, X)
+    yz_proj = calc_z_projection(crops, z_axis=-1, projection='max')  # -> (T, C, Z, Y)
+
+    # Colorize per your helper (expects channel_axis=1)
+    xy_proj_rgb = colorize_channels_to_rgb(xy_proj, percentiles=percentiles)
+    xz_proj_rgb = colorize_channels_to_rgb(xz_proj, percentiles=percentiles)
+    yz_proj_rgb = colorize_channels_to_rgb(yz_proj, percentiles=percentiles)
+
+    return xy_proj_rgb, xz_proj_rgb, yz_proj_rgb
+
+def colorize_channels_to_rgb(
+    img, 
+    channel_axis=1, 
+    colors=None, 
+    clip=True,
+    percentiles=None,
+    ):
+
+    if colors is None:
+        colors = [
+            (0, 255, 255),   # cyan
+            (255, 255, 0),   # yellow
+            (255, 0, 0),     # red
+            (0, 255, 0),     # green
+            (255, 105, 180), # pink
+        ]
+
+    img = np.asarray(img)
+    C = img.shape[channel_axis]
+    img_moved = np.moveaxis(img, channel_axis, -1)  # shape (..., C)
+    
+    if percentiles is not None:
+        img_moved = img_moved.astype(np.float32)
+        for c in range(C):
+            lo, hi = percentiles[c]
+            ch = img_moved[..., c]
+            img_moved[..., c] = np.clip((ch - lo) / (hi - lo), 0.0, 1.0)
+    else:
+        dtype_max = np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
+        img_moved = img_moved.astype(np.float32)
+        img_moved = img_moved / dtype_max
+        
+    rgb = np.zeros((*img_moved.shape[:-1], 3), dtype=np.float32)
+    for c in range(C):
+        color = np.array(colors[c % len(colors)], dtype=np.float32) / 255.0
+        rgb += img_moved[..., c, None] * color  # broadcast color
+
+    if clip:
+        np.clip(rgb, 0.0, 1.0, out=rgb)
+
+    rgb = (rgb * 255.0).astype(np.uint8)
+    return rgb
+
+@dataclass
+class VideoConfig:
+    fps: int = 12
+    dpi: int = 200
+    margin: Tuple[int, int, int] = (10, 10, 10)  # (mz, my, mx) for centered crops
+    pmin: float = 0.0
+    pmax: float = 100
+    examples_per_cluster: int = 3
+    seed: int = 0
+    # Figure layout
+    figsize_per_row: Tuple[float, float] = (12.0, 4.0)  # roughly width x height for 1 row of 4 panels
+    # Trajectory panel padding
+    traj_pad_frac: float = 0.05  # add small padding around projected coords
+
+def _pca_project_xyz(xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    PCA over 3D points (N,3). Returns (proj_2d, mean, components_3x3).
+    proj_2d uses the first two principal axes (PC1, PC2).
+    """
+    assert xyz.ndim == 2 and xyz.shape[1] == 3, "xyz must be (N,3)"
+    mean = xyz.mean(axis=0)
+    X = xyz - mean
+    # SVD for PCA
+    U, S, Vt = np.linalg.svd(X, full_matrices=False)
+    components = Vt  # rows are principal directions, shape (3,3)
+    proj2 = X @ components[:2].T  # (N,2)
+    return proj2, mean, components
+
+def _prep_traj_limits(traj2: np.ndarray, pad_frac: float) -> Tuple[float, float, float, float]:
+    """
+    Compute symmetric axes limits for a pleasant view, with a small padding.
+    """
+    xmin, ymin = traj2.min(axis=0)
+    xmax, ymax = traj2.max(axis=0)
+    dx = xmax - xmin
+    dy = ymax - ymin
+    span = max(dx, dy)
+    if span == 0:
+        span = 1.0
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
+    pad = span * pad_frac
+    return cx - span/2 - pad, cx + span/2 + pad, cy - span/2 - pad, cy + span/2 + pad
+
+def _render_frame_row(
+    xy_rgb: np.ndarray, xz_rgb: np.ndarray, yz_rgb: np.ndarray,
+    traj2: np.ndarray, t_idx: int, fig_w: float, fig_h: float, dpi: int,
+    xy_title: str = "XY", xz_title: str = "XZ", yz_title: str = "YZ"
+) -> np.ndarray:
+    """
+    Render a single frame showing three projections and the trajectory (up to t_idx).
+    Returns an RGB uint8 image array.
+    """
+    # Create figure with 1x4 grid
+    fig, axes = plt.subplots(1, 4, figsize=(fig_w, fig_h), dpi=dpi,
+                             gridspec_kw={"width_ratios": [1,1,1,1]}, constrained_layout=True)
+    ax_xy, ax_xz, ax_yz, ax_traj = axes
+
+    # --- Projections (RGB images expected: HxWx3) ---
+    for ax, img, title in zip([ax_xy, ax_xz, ax_yz], [xy_rgb, xz_rgb, yz_rgb], [xy_title, xz_title, yz_title]):
+        ax.imshow(img)
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    # --- Trajectory panel ---
+    ax_traj.set_title("Track (PC1–PC2)")
+    # draw history up to t_idx (inclusive)
+    if traj2.shape[0] > 0:
+        t_clamped = max(0, min(t_idx, traj2.shape[0]-1))
+        seg = traj2[:t_clamped+1]
+        ax_traj.plot(seg[:,0], seg[:,1], linewidth=1.5)
+        ax_traj.scatter([seg[-1,0]], [seg[-1,1]], s=10)  # current point
+
+        # Set nice equal/aspect limits
+        xmin, xmax, ymin, ymax = _prep_traj_limits(traj2, pad_frac=0.05)
+        ax_traj.set_xlim(xmin, xmax)
+        ax_traj.set_ylim(ymin, ymax)
+        ax_traj.set_aspect("equal", adjustable="box")
+
+        ax_traj.set_xticks([])
+        ax_traj.set_yticks([])
+
+    # Draw to array
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    buf = np.asarray(canvas.buffer_rgba())
+    plt.close(fig)
+    # Convert RGBA -> RGB
+    rgb = buf[...,:3].copy()
+    return rgb
+
+def _stack_frame_row(xy_t: np.ndarray, xz_t: np.ndarray, yz_t: np.ndarray,
+                     traj2: np.ndarray, t_idx: int, cfg: VideoConfig,
+                     labels: Tuple[str, str, str]) -> np.ndarray:
+    """
+    Build one row (three projections + trajectory) as a single RGB frame.
+    """
+    return _render_frame_row(
+        xy_rgb=xy_t, xz_rgb=xz_t, yz_rgb=yz_t,
+        traj2=traj2, t_idx=t_idx,
+        fig_w=cfg.figsize_per_row[0], fig_h=cfg.figsize_per_row[1], dpi=cfg.dpi,
+        xy_title=labels[0], xz_title=labels[1], yz_title=labels[2]
+    )
+
+def _concat_rows_vertically(rows: List[np.ndarray]) -> np.ndarray:
+    """
+    Concatenate row images vertically, padding widths as needed.
+    """
+    widths = [r.shape[1] for r in rows]
+    max_w = max(widths)
+    out_h = sum(r.shape[0] for r in rows)
+    out = np.zeros((out_h, max_w, 3), dtype=np.uint8)
+    y = 0
+    for r in rows:
+        h, w = r.shape[:2]
+        out[y:y+h, :w] = r
+        y += h
+    return out
+
+def _build_traj2_for_window(df_track: pd.DataFrame, t_start: int, t_end: int) -> np.ndarray:
+    """
+    Extract XYZ over [t_start, t_end], do PCA once over all timepoints,
+    and return the 2D projected coords (N,2) in window order.
+    Missing time steps are filled by repeating the last known position.
+    """
+    # Gather per-time points
+    xyz = []
+    times = list(range(t_start, t_end+1))
+    last = None
+    for t in times:
+        row = df_track[df_track["position_t"] == t]
+        if len(row) == 0:
+            if last is None:
+                xyz.append([0.0, 0.0, 0.0])
+            else:
+                xyz.append(last)
+        else:
+            p = [float(row["pixel_position_x"].values[0]),
+                 float(row["pixel_position_y"].values[0]),
+                 float(row["pixel_position_z"].values[0])]
+            xyz.append(p)
+            last = p
+    xyz = np.asarray(xyz, dtype=float)
+    traj2, mean, comps = _pca_project_xyz(xyz)
+    return traj2
+
+def create_cluster_videos(
+    df_windows: pd.DataFrame,
+    df_positions: pd.DataFrame,
+    output_folder: str,
+    clusters: Optional[List[int]] = None,
+    cfg: Optional[VideoConfig] = None,
+    out_dir: str = "cluster_videos",
+    normalize_per_channel=False
+) -> Dict[int, str]:
+  
+    if cfg is None:
+        cfg = VideoConfig()
+
+    out_path = _Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # Filter windows to selected clusters
+    if clusters is not None:
+        dfw = df_windows[df_windows["ClusterID"].isin(clusters)].copy()
+    else:
+        dfw = df_windows.copy()
+
+    # Choose exemplars (X per cluster) using stratified sampler (respects sample_name distribution)
+    picks = stratified_pick_examples(dfw, X=cfg.examples_per_cluster, seed=cfg.seed)
+
+    # Process per cluster
+    results: Dict[int, str] = {}
+    for cluster_id, sub in picks.groupby("ClusterID"):
+        print(f"Processing Cluster {cluster_id} with {len(sub)} exemplars...")
+        # Collect rows for this video (each row is one exemplar track)
+        rows_info = []
+        max_T = 0
+
+        for _, w in sub.iterrows():
+            sample_name = w["sample_name"]
+            t0 = int(w["window_start_position_t"])
+            t1 = int(w["window_end_position_t"])
+            track_id = int(w["TrackID"])
+
+            df_track = df_positions[
+                (df_positions["sample_name"] == sample_name) &
+                (df_positions["TrackID"] == track_id)
+            ].copy()
+
+            # Build projections stacks centered per-time
+            xy_stack, xz_stack, yz_stack = create_centered_max_projection_cutout(
+                w, df_positions, output_folder, normalize_per_channel=normalize_per_channel,
+                margin=cfg.margin, pmin=cfg.pmin, pmax=cfg.pmax
+            )
+            # Shapes: (T_w, H, W, 3)
+            T_w = xy_stack.shape[0]
+            max_T = max(max_T, T_w)
+
+            # Build projected trajectory (PC1-PC2) for the window
+            traj2 = _build_traj2_for_window(df_track, t0, t1)
+
+            rows_info.append({
+                "label": f"{sample_name} • Track {track_id}",
+                "xy": xy_stack, "xz": xz_stack, "yz": yz_stack,
+                "traj2": traj2,
+                "T": T_w
+            })
+
+        # Build frames by time index
+        video_path = out_path / f"cluster_{int(cluster_id)}.mp4"
+        
+        if video_path.exists():
+            video_path.unlink()
+        writer = imageio.get_writer(
+            video_path, fps=cfg.fps, codec="libx264",
+            ffmpeg_log_level="warning", quality=9
+        )
+
+        try:
+            for t in range(max_T):
+                row_imgs = []
+                for r in rows_info:
+                    # Clamp t to row length
+                    ti = min(t, r["T"] - 1)
+                    frame = _stack_frame_row(
+                        xy_t=r["xy"][ti], xz_t=r["xz"][ti], yz_t=r["yz"][ti],
+                        traj2=r["traj2"], t_idx=ti,
+                        cfg=cfg, labels=(f'{r["label"]} • XY', "XZ", "YZ")
+                    )
+                    row_imgs.append(frame)
+                # Vertical concat rows -> full frame
+                full_frame = _concat_rows_vertically(row_imgs)
+                writer.append_data(full_frame)
+        finally:
+            writer.close()
+
+        results[int(cluster_id)] = str(video_path)
+
+    return results
+
+def test():
+    # Example usage (assuming df_analysis is defined)
+    import pandas as pd
+    import numpy as np
+
+    df_analysis.to_csv("/Users/s.deblank-3/Downloads/df_windows.csv")
+    df_tracks_orig.to_csv("/Users/s.deblank-3/Downloads/df_positions.csv")
+
+    df_windows = pd.read_csv("/Users/s.deblank-3/Downloads/df_windows.csv")
+    df_positions = pd.read_csv("/Users/s.deblank-3/Downloads/df_positions.csv")
+
+    output_folder="/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
+
+    test = stratified_pick_examples(
+        df_windows,
+        X=3
+    )
+    
+    chosen_idx=3
+    for idx, w in test.iterrows():
+        if idx != chosen_idx:
+            continue
+        xy_stack, xz_stack, yz_stack = create_centered_max_projection_cutout(
+            w, df_positions, output_folder, pmax=100
+        )
+        break
+
+
+    
+    import napari
+    viewer = napari.Viewer()
+    viewer.add_image(projections[0], rgb=True)

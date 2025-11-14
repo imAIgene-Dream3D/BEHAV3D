@@ -57,8 +57,8 @@ seed = 123
 random.seed(seed)
 np.random.seed(seed)
 
-# ssd_dir = r"/Volumes/T7_Sam/"
-ssd_dir = r"F:/"
+ssd_dir = r"/Volumes/T7_Sam/"
+# ssd_dir = r"F:/"
 ssd_dir = Path(ssd_dir)
 output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
 metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv")
