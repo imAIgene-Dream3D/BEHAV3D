@@ -45,8 +45,7 @@ from behav3d.utils.preprocessing import calc_z_projection
 
 import imageio_ffmpeg as iioff
 
-from dataclasses import dataclass
-from pathlib import Path as _Path
+from pathlib import Path
 from typing import Tuple, Optional, List, Dict
 
 import numpy as np
@@ -365,20 +364,6 @@ def colorize_channels_to_rgb(
     rgb = (rgb * 255.0).astype(np.uint8)
     return rgb
 
-@dataclass
-class VideoConfig:
-    fps: int = 12
-    dpi: int = 200
-    margin: Tuple[int, int, int] = (10, 10, 10)  # (mz, my, mx) for centered crops
-    pmin: float = 0.0
-    pmax: float = 100
-    examples_per_cluster: int = 3
-    seed: int = 0
-    # Figure layout
-    figsize_per_row: Tuple[float, float] = (12.0, 4.0)  # roughly width x height for 1 row of 4 panels
-    # Trajectory panel padding
-    traj_pad_frac: float = 0.05  # add small padding around projected coords
-
 def _pca_project_xyz(xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     PCA over 3D points (N,3). Returns (proj_2d, mean, components_3x3).
@@ -412,7 +397,8 @@ def _prep_traj_limits(traj2: np.ndarray, pad_frac: float) -> Tuple[float, float,
 def _render_frame_row(
     xy_rgb: np.ndarray, xz_rgb: np.ndarray, yz_rgb: np.ndarray,
     traj2: np.ndarray, t_idx: int, fig_w: float, fig_h: float, dpi: int,
-    xy_title: str = "XY", xz_title: str = "XZ", yz_title: str = "YZ"
+    xy_title: str = "XY", xz_title: str = "XZ", yz_title: str = "YZ",
+    pad_frac: float = 0.05
 ) -> np.ndarray:
     """
     Render a single frame showing three projections and the trajectory (up to t_idx).
@@ -434,15 +420,23 @@ def _render_frame_row(
     ax_traj.set_title("Track (PC1–PC2)")
     # draw history up to t_idx (inclusive)
     if traj2.shape[0] > 0:
-        t_clamped = max(0, min(t_idx, traj2.shape[0]-1))
-        seg = traj2[:t_clamped+1]
-        ax_traj.plot(seg[:,0], seg[:,1], linewidth=1.5)
-        ax_traj.scatter([seg[-1,0]], [seg[-1,1]], s=10)  # current point
+        t_clamped = max(0, min(t_idx, traj2.shape[0] - 1))
 
-        # Set nice equal/aspect limits
-        xmin, xmax, ymin, ymax = _prep_traj_limits(traj2, pad_frac=0.05)
-        ax_traj.set_xlim(xmin, xmax)
-        ax_traj.set_ylim(ymin, ymax)
+        # Fixed global axes in "pixel units"
+        ax_min, ax_max = 0.0, 50.0
+        center = 0.5 * (ax_min + ax_max)  # 50
+
+        # PCA output is mean-centered (around 0), so we just shift it
+        # so that the mean of the track sits around the center (50, 50).
+        traj_shift = traj2 + center
+
+        seg = traj_shift[:t_clamped + 1]
+        ax_traj.plot(seg[:, 0], seg[:, 1], linewidth=1.5)
+        ax_traj.scatter([seg[-1, 0]], [seg[-1, 1]], s=10)  # current point
+
+        # Use the SAME axes for all tracks, all clusters
+        ax_traj.set_xlim(ax_min, ax_max)
+        ax_traj.set_ylim(ax_min, ax_max)
         ax_traj.set_aspect("equal", adjustable="box")
 
         ax_traj.set_xticks([])
@@ -458,7 +452,9 @@ def _render_frame_row(
     return rgb
 
 def _stack_frame_row(xy_t: np.ndarray, xz_t: np.ndarray, yz_t: np.ndarray,
-                     traj2: np.ndarray, t_idx: int, cfg: VideoConfig,
+                     traj2: np.ndarray, t_idx: int,
+                     fig_w: float, fig_h: float, dpi: int,
+                     pad_frac: float,
                      labels: Tuple[str, str, str]) -> np.ndarray:
     """
     Build one row (three projections + trajectory) as a single RGB frame.
@@ -466,8 +462,9 @@ def _stack_frame_row(xy_t: np.ndarray, xz_t: np.ndarray, yz_t: np.ndarray,
     return _render_frame_row(
         xy_rgb=xy_t, xz_rgb=xz_t, yz_rgb=yz_t,
         traj2=traj2, t_idx=t_idx,
-        fig_w=cfg.figsize_per_row[0], fig_h=cfg.figsize_per_row[1], dpi=cfg.dpi,
-        xy_title=labels[0], xz_title=labels[1], yz_title=labels[2]
+        fig_w=fig_w, fig_h=fig_h, dpi=dpi,
+        xy_title=labels[0], xz_title=labels[1], yz_title=labels[2],
+        pad_frac=pad_frac
     )
 
 def _concat_rows_vertically(rows: List[np.ndarray]) -> np.ndarray:
@@ -483,6 +480,23 @@ def _concat_rows_vertically(rows: List[np.ndarray]) -> np.ndarray:
         h, w = r.shape[:2]
         out[y:y+h, :w] = r
         y += h
+    return out
+
+def _concat_examples_horizontally(examples: List[np.ndarray]) -> np.ndarray:
+    """
+    Concatenate example images horizontally, padding heights as needed.
+    Each example is a full row from _stack_frame_row (projections + track).
+    """
+    heights = [e.shape[0] for e in examples]
+    max_h = max(heights)
+    out_w = sum(e.shape[1] for e in examples)
+    out = np.zeros((max_h, out_w, 3), dtype=np.uint8)
+
+    x = 0
+    for e in examples:
+        h, w = e.shape[:2]
+        out[:h, x:x+w] = e
+        x += w
     return out
 
 def _build_traj2_for_window(df_track: pd.DataFrame, t_start: int, t_end: int) -> np.ndarray:
@@ -512,20 +526,52 @@ def _build_traj2_for_window(df_track: pd.DataFrame, t_start: int, t_end: int) ->
     traj2, mean, comps = _pca_project_xyz(xyz)
     return traj2
 
+def _add_row_title(row_img: np.ndarray, title: str,
+                   fontsize: int = 40) -> np.ndarray:
+    """
+    Add a bold title centered above a row image using matplotlib.
+    Returns a new RGB image.
+    """
+    h, w = row_img.shape[:2]
+
+    # Choose figure size proportional to pixel size so resolution stays reasonable
+    dpi = 100
+    fig_w = w / dpi
+    fig_h = (h + 40) / dpi  # a bit of extra room for the title
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+    ax.imshow(row_img)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    ax.set_title(title, fontsize=fontsize, fontweight="bold", pad=10)
+
+    fig.tight_layout(pad=0.1)
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    buf = np.asarray(canvas.buffer_rgba())[..., :3]
+    plt.close(fig)
+    return buf
+
 def create_cluster_videos(
     df_windows: pd.DataFrame,
     df_positions: pd.DataFrame,
     output_folder: str,
     clusters: Optional[List[int]] = None,
-    cfg: Optional[VideoConfig] = None,
     out_dir: str = "cluster_videos",
-    normalize_per_channel=False
+    normalize_per_channel: bool = False,
+    fps: int = 12,
+    dpi: int = 200,
+    margin=(10, 10, 10),
+    pmin: float = 0.0,
+    pmax: float = 100.0,
+    examples_per_cluster: int = 3,
+    seed: int = 0,
+    figsize_per_row=(12.0, 4.0),
+    traj_pad_frac: float = 0.05,
 ) -> Dict[int, str]:
-  
-    if cfg is None:
-        cfg = VideoConfig()
 
-    out_path = _Path(out_dir)
+    out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     # Filter windows to selected clusters
@@ -535,7 +581,7 @@ def create_cluster_videos(
         dfw = df_windows.copy()
 
     # Choose exemplars (X per cluster) using stratified sampler (respects sample_name distribution)
-    picks = stratified_pick_examples(dfw, X=cfg.examples_per_cluster, seed=cfg.seed)
+    picks = stratified_pick_examples(dfw, X=examples_per_cluster, seed=seed)
 
     # Process per cluster
     results: Dict[int, str] = {}
@@ -559,7 +605,7 @@ def create_cluster_videos(
             # Build projections stacks centered per-time
             xy_stack, xz_stack, yz_stack = create_centered_max_projection_cutout(
                 w, df_positions, output_folder, normalize_per_channel=normalize_per_channel,
-                margin=cfg.margin, pmin=cfg.pmin, pmax=cfg.pmax
+                margin=margin, pmin=pmin, pmax=pmax
             )
             # Shapes: (T_w, H, W, 3)
             T_w = xy_stack.shape[0]
@@ -581,7 +627,7 @@ def create_cluster_videos(
         if video_path.exists():
             video_path.unlink()
         writer = imageio.get_writer(
-            video_path, fps=cfg.fps, codec="libx264",
+            video_path, fps=fps, codec="libx264",
             ffmpeg_log_level="warning", quality=9
         )
 
@@ -594,7 +640,9 @@ def create_cluster_videos(
                     frame = _stack_frame_row(
                         xy_t=r["xy"][ti], xz_t=r["xz"][ti], yz_t=r["yz"][ti],
                         traj2=r["traj2"], t_idx=ti,
-                        cfg=cfg, labels=(f'{r["label"]} • XY', "XZ", "YZ")
+                        fig_w=figsize_per_row[0], fig_h=figsize_per_row[1], dpi=dpi,
+                        pad_frac=traj_pad_frac,
+                        labels=('XY', "XZ", "YZ")
                     )
                     row_imgs.append(frame)
                 # Vertical concat rows -> full frame
@@ -607,18 +655,136 @@ def create_cluster_videos(
 
     return results
 
+def create_cluster_overview_video(
+    df_windows: pd.DataFrame,
+    df_positions: pd.DataFrame,
+    output_folder: str,
+    clusters: Optional[List[int]] = None,
+    out_dir: str = "cluster_videos",
+    normalize_per_channel: bool = False,
+    fps: int = 12,
+    dpi: int = 200,
+    margin=(10, 10, 10),
+    pmin: float = 0.0,
+    pmax: float = 100.0,
+    examples_per_cluster: int = 1,
+    seed: int = 0,
+    figsize_per_example=(12.0, 4.0),
+    traj_pad_frac: float = 0.05,
+) -> str:
+    
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    video_path = out_path / "clusters_overview.mp4"
+
+    # Filter windows to selected clusters
+    if clusters is not None:
+        dfw = df_windows[df_windows["ClusterID"].isin(clusters)].copy()
+    else:
+        dfw = df_windows.copy()
+
+    # Pick exemplars per cluster (same stratified logic as create_cluster_videos)
+    picks = stratified_pick_examples(dfw, X=examples_per_cluster, seed=seed)
+
+    # cluster_id -> list of example dicts
+    clusters_info: Dict[int, List[Dict]] = {}
+    global_max_T = 0
+
+    for cluster_id, sub in picks.groupby("ClusterID"):
+        cluster_rows = []
+        for _, w in sub.iterrows():
+            sample_name = w["sample_name"]
+            t0 = int(w["window_start_position_t"])
+            t1 = int(w["window_end_position_t"])
+            track_id = int(w["TrackID"])
+
+            df_track = df_positions[
+                (df_positions["sample_name"] == sample_name) &
+                (df_positions["TrackID"] == track_id)
+            ].copy()
+
+            xy_stack, xz_stack, yz_stack = create_centered_max_projection_cutout(
+                w, df_positions, output_folder,
+                normalize_per_channel=normalize_per_channel,
+                margin=margin, pmin=pmin, pmax=pmax
+            )
+            T_w = xy_stack.shape[0]
+            global_max_T = max(global_max_T, T_w)
+
+            traj2 = _build_traj2_for_window(df_track, t0, t1)
+
+            cluster_rows.append({
+                "cluster_id": int(cluster_id),
+                "track_id": track_id,
+                "xy": xy_stack, "xz": xz_stack, "yz": yz_stack,
+                "traj2": traj2,
+                "T": T_w
+            })
+
+        clusters_info[int(cluster_id)] = cluster_rows[:examples_per_cluster]
+
+    # Prepare writer for a single overview video
+    if video_path.exists():
+        video_path.unlink()
+    writer = imageio.get_writer(
+        video_path, fps=fps, codec="libx264",
+        ffmpeg_log_level="warning", quality=9
+    )
+
+    try:
+        # Loop over time, showing all clusters at once
+        for t in range(global_max_T):
+            cluster_row_imgs = []
+
+            # Sort clusters by ID for consistent row order
+            for cluster_id in sorted(clusters_info.keys()):
+                examples = clusters_info[cluster_id]
+                example_imgs = []
+
+                for r in examples:
+                    ti = min(t, r["T"] - 1)
+                    frame = _stack_frame_row(
+                        xy_t=r["xy"][ti],
+                        xz_t=r["xz"][ti],
+                        yz_t=r["yz"][ti],
+                        traj2=r["traj2"],
+                        t_idx=ti,
+                        fig_w=figsize_per_example[0],
+                        fig_h=figsize_per_example[1],
+                        dpi=dpi,
+                        pad_frac=traj_pad_frac,
+                        # No sample name here; just track id + projection
+                        labels=(f'Track {r["track_id"]} • XY', "XZ", "YZ"),
+                    )
+                    example_imgs.append(frame)
+
+                # Concatenate examples horizontally to make one row for this cluster
+                row_img = _concat_examples_horizontally(example_imgs)
+
+                # Add big bold "Cluster X" above the row
+                row_with_title = _add_row_title(row_img, f"Cluster {cluster_id}")
+                cluster_row_imgs.append(row_with_title)
+
+            # Stack all cluster rows vertically to make the full frame
+            full_frame = _concat_rows_vertically(cluster_row_imgs)
+            writer.append_data(full_frame)
+    finally:
+        writer.close()
+
+    return str(video_path)
+
 def test():
     # Example usage (assuming df_analysis is defined)
     import pandas as pd
     import numpy as np
 
-    df_analysis.to_csv("/Users/s.deblank-3/Downloads/df_windows.csv")
-    df_tracks_orig.to_csv("/Users/s.deblank-3/Downloads/df_positions.csv")
+    df_analysis.to_csv(r"C:\Users\Samde\Downloads/df_windows.csv")
+    df_tracks_orig.to_csv(r"C:\Users\Samde\Downloads/df_positions.csv")
 
-    df_windows = pd.read_csv("/Users/s.deblank-3/Downloads/df_windows.csv")
-    df_positions = pd.read_csv("/Users/s.deblank-3/Downloads/df_positions.csv")
+    df_windows = pd.read_csv(r"C:\Users\Samde\Downloads/df_windows.csv")
+    df_positions = pd.read_csv(r"C:\Users\Samde\Downloads/df_positions.csv")
 
-    output_folder="/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
+    output_folder=r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
 
     test = stratified_pick_examples(
         df_windows,
@@ -633,9 +799,41 @@ def test():
             w, df_positions, output_folder, pmax=100
         )
         break
-
-
     
     import napari
     viewer = napari.Viewer()
     viewer.add_image(projections[0], rgb=True)
+    
+    
+    create_cluster_videos(
+        df_windows,
+        df_positions,
+        output_folder= output_folder,
+        out_dir = r"C:\Users\Samde\Downloads",
+        # normalize_per_channel: bool = False,
+        fps = 6,
+        # dpi: int = 200,
+        margin = (20, 20, 20),
+        pmin = 0.0,
+        pmax = 99,
+        examples_per_cluster = 6,
+        # seed: int = 0,
+        # figsize_per_row=(12.0, 4.0),
+        # traj_pad_frac: float = 0.05,
+    )
+    
+    create_cluster_overview_video(
+        df_windows,
+        df_positions,
+        output_folder=output_folder,
+        out_dir=r"C:\Users\Samde\Downloads",
+        examples_per_cluster=3,   # 1 example per cluster per row
+        fps=6,
+        margin = (20, 20, 20),
+        pmin = 0.0,
+        pmax = 99.99,
+        normalize_per_channel=True,
+        seed=123
+        # figsize_per_example=(6.0, 3.0),  # smaller per example if many clusters
+    )
+    
