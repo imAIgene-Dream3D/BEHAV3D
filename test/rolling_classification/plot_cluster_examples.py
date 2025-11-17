@@ -150,7 +150,7 @@ def create_max_projection_cutout(
             masked[t, :, z0:z1, y0:y1, x0:x1] = zarr[t, :, z0:z1, y0:y1, x0:x1]
     else:  
         masked = zarr 
-        
+    
     z_min = int(df_track["pixel_position_z"].min())
     z_max = int(df_track["pixel_position_z"].max())
     y_min = int(df_track["pixel_position_y"].min())
@@ -422,6 +422,14 @@ def _render_frame_row(
     # --- Projections (RGB images expected: HxWx3) ---
     for ax, img, title in zip([ax_xy, ax_xz, ax_yz], [xy_rgb, xz_rgb, yz_rgb], [xy_title, xz_title, yz_title]):
         ax.imshow(img)
+        h, w = img.shape[:2]
+        rect = plt.Rectangle(
+            (0, 0), w, h,
+            linewidth=2,
+            edgecolor='white',
+            facecolor='none'
+        )
+        ax.add_patch(rect)
         ax.set_title(title)
         ax.set_xticks([])
         ax.set_yticks([])
@@ -557,6 +565,223 @@ def _add_row_title(row_img: np.ndarray, title: str,
     ax.set_title(title, fontsize=fontsize, fontweight="bold", pad=10)
 
     fig.tight_layout(pad=0.1)
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    buf = np.asarray(canvas.buffer_rgba())[..., :3]
+    plt.close(fig)
+    return buf
+
+def create_fulltrack_max_projection_stacks_with_track(
+    df_window,
+    df_positions,
+    output_folder,
+    margin=10,
+    pmin=0,
+    pmax=99.99,
+    mask_margin=False,
+    normalize_per_channel=True,
+):
+    """
+      * crops a fixed box that covers the *full track* (min/max over time + margin)
+      * computes per-time max-projection stacks (XY, XZ, YZ)
+      * returns 2D track coordinates in crop space for each projection so that
+        we can overlay the track on top of the max-projection videos.
+    """
+    sample_name = df_window["sample_name"]
+    start_t = int(df_window["window_start_position_t"])
+    end_t = int(df_window["window_end_position_t"])
+
+    # track over all times (we'll index into it per t)
+    df_track = df_positions[
+        (df_positions["sample_name"] == sample_name)
+        & (df_positions["TrackID"].astype(int) == int(df_window["TrackID"]))
+    ]
+
+    zarr_path = Path(output_folder, "images", sample_name, f"{sample_name}.zarr")
+    zarr = load_zarr(zarr_path)  # (T, C, Z, Y, X)
+    T, C, Z, Y, X = zarr.shape
+
+    # Normalize per channel from last timepoint like in create_max_projection_cutout
+    if normalize_per_channel:
+        p_img = np.asarray(zarr[-1])
+        percentiles = {}
+        for c in range(C):
+            ch = p_img[c]
+            lo = np.percentile(ch, pmin)
+            hi = np.percentile(ch, pmax)
+            if hi <= lo:
+                hi = lo + 1e-6
+            percentiles[c] = (float(lo), float(hi))
+    else:
+        percentiles = None
+
+    # Optionally mask outside a small margin around the track before cropping
+    if mask_margin:
+        masked = np.zeros_like(zarr)
+        for t in range(start_t, end_t + 1):
+            df_track_t = df_track[df_track["position_t"] == t]
+            if len(df_track_t) == 0:
+                continue
+            pos_x = int(df_track_t["pixel_position_x"].values[0])
+            pos_y = int(df_track_t["pixel_position_y"].values[0])
+            pos_z = int(df_track_t["pixel_position_z"].values[0])
+
+            x0 = max(0, pos_x - margin)
+            x1 = min(X, pos_x + margin + 1)
+            y0 = max(0, pos_y - margin)
+            y1 = min(Y, pos_y + margin + 1)
+            z0 = max(0, pos_z - margin)
+            z1 = min(Z, pos_z + margin + 1)
+
+            masked[t, :, z0:z1, y0:y1, x0:x1] = zarr[t, :, z0:z1, y0:y1, x0:x1]
+    else:
+        masked = zarr
+
+        # Compute bounding box of the track *within the current time window*
+    df_track_window = df_track[
+        (df_track["position_t"] >= start_t) & (df_track["position_t"] <= end_t)
+    ]
+    if len(df_track_window) == 0:
+        # Fallback: use the full track if, for some reason, there are no
+        # detections inside the window.
+        df_bbox = df_track
+    else:
+        df_bbox = df_track_window
+        
+    z_min = int(df_bbox["pixel_position_z"].min())
+    z_max = int(df_bbox["pixel_position_z"].max())
+    y_min = int(df_bbox["pixel_position_y"].min())
+    y_max = int(df_bbox["pixel_position_y"].max())
+    x_min = int(df_bbox["pixel_position_x"].min())
+    x_max = int(df_bbox["pixel_position_x"].max())
+
+    # lower bounds: inclusive
+    z_min = max(0, int(z_min - margin))
+    y_min = max(0, int(y_min - margin))
+    x_min = max(0, int(x_min - margin))
+
+    # upper bounds: make them *exclusive* and clip to array size
+    z_max = min(Z, int(z_max + margin + 1))
+    y_max = min(Y, int(y_max + margin + 1))
+    x_max = min(X, int(x_max + margin + 1))
+
+    # Crop volumes over the time window, fixed spatial box
+# Crop volumes over the time window, fixed spatial box
+    cropped_img = masked[
+        start_t : end_t + 1,
+        :,
+        z_min:z_max,
+        y_min:y_max,
+        x_min:x_max,
+    ]
+    cropped_img = np.asarray(cropped_img)
+    # Shapes now: (T_window, C, Zc, Yc, Xc)
+    T_window = cropped_img.shape[0]
+
+    # Max-projections per time point
+    xy_proj = calc_z_projection(cropped_img, z_axis=-3, projection="max")  # (T_w, C, Yc, Xc)
+    xz_proj = calc_z_projection(cropped_img, z_axis=-2, projection="max")  # (T_w, C, Zc, Xc)
+    yz_proj = calc_z_projection(cropped_img, z_axis=-1, projection="max")  # (T_w, C, Zc, Yc)
+
+    xy_proj_rgb = colorize_channels_to_rgb(xy_proj, percentiles=percentiles)
+    xz_proj_rgb = colorize_channels_to_rgb(xz_proj, percentiles=percentiles)
+    yz_proj_rgb = colorize_channels_to_rgb(yz_proj, percentiles=percentiles)
+
+    # Build track coords in crop-space for each timepoint
+    track_xy = np.full((T_window, 2), np.nan, dtype=float)
+    track_xz = np.full((T_window, 2), np.nan, dtype=float)
+    track_yz = np.full((T_window, 2), np.nan, dtype=float)
+
+    for idx, t in enumerate(range(start_t, end_t + 1)):
+        df_t = df_track[df_track["position_t"] == t]
+        if len(df_t) == 0:
+            continue
+        pos_x = float(df_t["pixel_position_x"].values[0])
+        pos_y = float(df_t["pixel_position_y"].values[0])
+        pos_z = float(df_t["pixel_position_z"].values[0])
+
+        # local coords within the cropped box
+        x_local = pos_x - x_min
+        y_local = pos_y - y_min
+        z_local = pos_z - z_min
+
+        # XY projection: axes (Y, X)
+        track_xy[idx, 0] = x_local
+        track_xy[idx, 1] = y_local
+
+        # XZ projection: axes (Z, X)
+        track_xz[idx, 0] = x_local
+        track_xz[idx, 1] = z_local
+
+        # YZ projection: axes (Z, Y)
+        track_yz[idx, 0] = y_local
+        track_yz[idx, 1] = z_local
+
+    return xy_proj_rgb, xz_proj_rgb, yz_proj_rgb, track_xy, track_xz, track_yz
+
+def _render_fulltrack_frame_with_overlay(
+    xy_rgb: np.ndarray,
+    xz_rgb: np.ndarray,
+    yz_rgb: np.ndarray,
+    track_xy: np.ndarray,
+    track_xz: np.ndarray,
+    track_yz: np.ndarray,
+    t_idx: int,
+    fig_w: float,
+    fig_h: float,
+    dpi: int,
+    titles: Tuple[str, str, str] = ("XY", "XZ", "YZ"),
+    track_color: str = "green",
+    ):
+    """
+    Render a single frame with three projections and an overlaid track that grows
+    over time up to t_idx.
+    """
+    fig, axes = plt.subplots(
+        1, 3, figsize=(fig_w, fig_h), dpi=dpi,
+        constrained_layout=True
+    )
+    ax_xy, ax_xz, ax_yz = axes
+
+    # Helper for plotting a growing polyline with a current point
+    def _plot_track(ax, track):
+        if track is None:
+            return
+        t_clamped = max(0, min(t_idx, track.shape[0] - 1))
+        coords = track[: t_clamped + 1]
+        mask = ~np.isnan(coords[:, 0])
+        coords = coords[mask]
+        if coords.shape[0] == 0:
+            return
+        ax.plot(coords[:, 0], coords[:, 1], linewidth=1.5, color=track_color)
+        ax.scatter(
+            coords[-1, 0],
+            coords[-1, 1],
+            s=10,
+            color=track_color,
+        )
+
+    # XY
+    ax_xy.imshow(xy_rgb)
+    _plot_track(ax_xy, track_xy)
+    ax_xy.set_title(titles[0])
+    ax_xy.set_xticks([])
+    ax_xy.set_yticks([])
+
+    # XZ
+    ax_xz.imshow(xz_rgb)
+    _plot_track(ax_xz, track_xz)
+    ax_xz.set_title(titles[1])
+    ax_xz.set_xticks([])
+    ax_xz.set_yticks([])
+
+    # YZ
+    ax_yz.imshow(yz_rgb)
+    _plot_track(ax_yz, track_yz)
+    ax_yz.set_title(titles[2])
+    ax_yz.set_xticks([])
+    ax_yz.set_yticks([])
+
     canvas = FigureCanvasAgg(fig)
     canvas.draw()
     buf = np.asarray(canvas.buffer_rgba())[..., :3]
@@ -783,6 +1008,135 @@ def create_cluster_overview_video(
 
     return str(video_path)
 
+def create_fulltrack_cluster_videos(
+    df_windows: pd.DataFrame,
+    df_positions: pd.DataFrame,
+    output_folder: str,
+    clusters: Optional[List[int]] = None,
+    out_dir: str = "cluster_videos_fulltrack",
+    fps: int = 12,
+    dpi: int = 200,
+    margin: int = 10,
+    pmin: float = 0.0,
+    pmax: float = 99.99,
+    examples_per_cluster: int = 3,
+    seed: int = 0,
+    figsize_per_row: Tuple[float, float] = (9.0, 3.0),
+    normalize_per_channel: bool = True,
+    mask_margin: bool = False,
+    track_color: str = "green",
+    ):
+    """
+    Create one video per cluster where, for each exemplar:
+      * we crop a fixed 3D box that contains the entire track (with `margin`)
+      * we compute per-time max projections (XY, XZ, YZ)
+      * we overlay the cumulative track of the selected cell center directly
+        on top of those max-projection images.
+
+    Returns a non-centered video of selected example T cells
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # Filter windows to selected clusters
+    if clusters is not None:
+        dfw = df_windows[df_windows["ClusterID"].isin(clusters)].copy()
+    else:
+        dfw = df_windows.copy()
+
+    # Choose exemplars using same sampler as before
+    picks = stratified_pick_examples(dfw, X=examples_per_cluster, seed=seed)
+
+    results: Dict[int, str] = {}
+
+    for cluster_id, sub in picks.groupby("ClusterID"):
+        print(f"[fulltrack] Processing Cluster {cluster_id} with {len(sub)} exemplars...")
+        rows_info = []
+        max_T = 0
+
+        for _, w in sub.iterrows():
+            sample_name = w["sample_name"]
+            track_id = int(w["TrackID"])
+            t0 = int(w["window_start_position_t"])
+            t1 = int(w["window_end_position_t"])
+
+            (
+                xy_stack,
+                xz_stack,
+                yz_stack,
+                track_xy,
+                track_xz,
+                track_yz,
+            ) = create_fulltrack_max_projection_stacks_with_track(
+                w,
+                df_positions,
+                output_folder,
+                margin=margin,
+                pmin=pmin,
+                pmax=pmax,
+                mask_margin=mask_margin,
+                normalize_per_channel=normalize_per_channel,
+            )
+
+            T_w = xy_stack.shape[0]
+            max_T = max(max_T, T_w)
+
+            rows_info.append(
+                {
+                    "label": f"{sample_name} • Track {track_id}",
+                    "xy": xy_stack,
+                    "xz": xz_stack,
+                    "yz": yz_stack,
+                    "track_xy": track_xy,
+                    "track_xz": track_xz,
+                    "track_yz": track_yz,
+                    "T": T_w,
+                }
+            )
+
+        video_path = out_path / f"cluster_{int(cluster_id)}_fulltrack.mp4"
+        if video_path.exists():
+            video_path.unlink()
+
+        writer = imageio.get_writer(
+            video_path,
+            fps=fps,
+            codec="libx264",
+            ffmpeg_log_level="warning",
+            quality=9,
+        )
+
+        try:
+            for t in range(max_T):
+                row_imgs = []
+                for r in rows_info:
+                    ti = min(t, r["T"] - 1)
+                    frame_row = _render_fulltrack_frame_with_overlay(
+                        xy_rgb=r["xy"][ti],
+                        xz_rgb=r["xz"][ti],
+                        yz_rgb=r["yz"][ti],
+                        track_xy=r["track_xy"],
+                        track_xz=r["track_xz"],
+                        track_yz=r["track_yz"],
+                        t_idx=ti,
+                        fig_w=figsize_per_row[0],
+                        fig_h=figsize_per_row[1],
+                        dpi=dpi,
+                        titles=("XY", "XZ", "YZ"),
+                        track_color=track_color,
+                    )
+                    row_imgs.append(frame_row)
+
+                # stack exemplar rows vertically
+                full_frame = _concat_rows_vertically(row_imgs)
+                writer.append_data(full_frame)
+        finally:
+            writer.close()
+
+        results[int(cluster_id)] = str(video_path)
+
+    return results
+
 def test():
     # Example usage (assuming df_analysis is defined)
     import pandas as pd
@@ -792,8 +1146,8 @@ def test():
     # ssd_dir = Path(ssd_dir)
     # output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
     
-    downloads_folder = Path("/Users/s.deblank-3/Downloads")
-    
+    # downloads_folder = Path("/Users/s.deblank-3/Downloads")
+    downloads_folder = Path(r"C:\Users\Samde\Downloads")
     df_windows_path = downloads_folder / "df_windows.csv"
     df_positions_path = downloads_folder / "df_positions.csv"
     
@@ -803,7 +1157,7 @@ def test():
     df_windows = pd.read_csv(df_windows_path)
     df_positions = pd.read_csv(df_positions_path)
 
-    output_folder=r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
+    output_folder=r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
 
     test = stratified_pick_examples(
         df_windows,
@@ -834,7 +1188,7 @@ def test():
         # dpi: int = 200,
         margin = (20, 20, 20),
         pmin = 0.0,
-        pmax = 99,a
+        pmax = 99.99,
         examples_per_cluster = 6,
         # seed: int = 0,
         # figsize_per_row=(12.0, 4.0),
@@ -855,4 +1209,20 @@ def test():
         seed=1234
         # figsize_per_example=(6.0, 3.0),  # smaller per example if many clusters
     )
-    
+
+    create_fulltrack_cluster_videos(
+        df_windows=df_windows,
+        df_positions=df_positions,
+        output_folder=output_folder,  # folder containing images/<sample>/<sample>.zarr
+        out_dir=r"C:\Users\Samde\Downloads",
+        clusters=None,                # or e.g. [0, 1, 2]
+        fps=6,
+        margin=20,
+        track_color="#63ff33",
+        pmin=0.0,
+        pmax=99.99,
+        examples_per_cluster=4,
+        seed=412,
+        normalize_per_channel=True,
+        mask_margin=False,
+    )

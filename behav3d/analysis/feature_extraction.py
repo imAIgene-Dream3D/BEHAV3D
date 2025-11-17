@@ -459,8 +459,8 @@ def calculate_image_based_track_features(
             "axis1_length": float,
             "axis2_length": float,
             "axis3_length": float,
-            "ellipticity_oblate": float,
-            "ellipticity_prolate": float,
+            "oblateness": float,
+            "prolateness": float,
             "surface_area": float,
             "sphericity": float,
             "convex_volume": float,
@@ -1288,7 +1288,7 @@ def _calculate_morphology_single_timepoint(args):
     - sphericity
     - convex_volume
     - orientation_vector
-    - ellipticity_oblate
+    - oblateness
     - axis_length_a
     - axis_length_b
     - axis_length_c
@@ -1339,8 +1339,8 @@ def _calculate_morphology_single_timepoint(args):
         axis_length_a_list = []
         axis_length_b_list = []
         axis_length_c_list = []
-        ellipticity_oblate_list = []
-        ellipticity_prolate_list = []
+        oblateness_list = []
+        prolateness_list = []
         principal_axes_list = []  # each entry is 3x3, columns are unit vectors for a,b,c
 
         for region_label in properties["TrackID"]:
@@ -1404,21 +1404,21 @@ def _calculate_morphology_single_timepoint(args):
                     axis_length_a_list.append(a)
                     axis_length_b_list.append(b)
                     axis_length_c_list.append(c)
-                    ellipticity_oblate_list.append(e_ob)
-                    ellipticity_prolate_list.append(e_pro)
+                    oblateness_list.append(e_ob)
+                    prolateness_list.append(e_pro)
                     principal_axes_list.append(V_sorted.tolist())
                 except Exception:
                     axis_length_a_list.append(np.nan)
                     axis_length_b_list.append(np.nan)
                     axis_length_c_list.append(np.nan)
-                    ellipticity_oblate_list.append(np.nan)
-                    ellipticity_prolate_list.append(np.nan)
+                    oblateness_list.append(np.nan)
+                    prolateness_list.append(np.nan)
                     principal_axes_list.append([[np.nan, np.nan, np.nan]] * 3)
             else:
                 axis_length_a_list.append(np.nan)
                 axis_length_b_list.append(np.nan)
                 axis_length_c_list.append(np.nan)
-                ellipticity_oblate_list.append(np.nan)
+                oblateness_list.append(np.nan)
                 principal_axes_list.append([[np.nan, np.nan, np.nan]] * 3)
             # ----------------------------------------------------------------
 
@@ -1429,13 +1429,13 @@ def _calculate_morphology_single_timepoint(args):
         # Guard against divide-by-zero in solidity calculation
         with np.errstate(divide='ignore', invalid='ignore'):
             properties["solidity"] = properties["volume"] / properties["convex_volume"]
-
+            properties["surfrace_to_volume_ratio"] = properties["surface_area"] / properties["volume"]
         # Attach NEW principal-axis results
         properties["axis1_length"] = axis_length_a_list
         properties["axis2_length"] = axis_length_b_list
         properties["axis3_length"] = axis_length_c_list
-        properties["ellipticity_oblate"] = ellipticity_oblate_list
-        properties["ellipticity_prolate"] = ellipticity_prolate_list
+        properties["oblateness"] = oblateness_list
+        properties["prolateness"] = prolateness_list
         properties["principal_axes"] = principal_axes_list  # columns: a,b,c
 
     # ---- FIXED ORIENTATION COMPUTATION (O(R) instead of O(R^2)) ----
