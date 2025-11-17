@@ -242,17 +242,16 @@ def create_centered_max_projection_cutout(
 
     # Helper: centered crop with padding (Z,Y,X)
     def _centered_crop_zyx(vol_czyx, cz, cy, cx, mz, my, mx):
-        """
-        vol_czyx: (C, Z, Y, X)
-        center: integer cz,cy,cx in original coords
-        returns (C, 2*mz+1, 2*my+1, 2*mx+1)
-        """
         z0 = cz - mz; z1 = cz + mz + 1
         y0 = cy - my; y1 = cy + my + 1
         x0 = cx - mx; x1 = cx + mx + 1
 
         pad_before = [max(0, -z0), max(0, -y0), max(0, -x0)]
-        pad_after  = [max(0,  z1 - Z), max(0,  y1 - Y), max(0,  x1 - X)]
+        pad_after  = [max(0,  z1 - vol_czyx.shape[1]),
+                    max(0,  y1 - vol_czyx.shape[2]),
+                    max(0,  x1 - vol_czyx.shape[3])]
+
+        Z, Y, X = vol_czyx.shape[1], vol_czyx.shape[2], vol_czyx.shape[3]
 
         sz0 = max(0, z0); sz1 = min(Z, z1)
         sy0 = max(0, y0); sy1 = min(Y, y1)
@@ -260,31 +259,42 @@ def create_centered_max_projection_cutout(
 
         crop = vol_czyx[:, sz0:sz1, sy0:sy1, sx0:sx1]
 
+        # # choose a padding value that will become bright/white after normalization
+        # if np.issubdtype(vol_czyx.dtype, np.integer):
+        #     pad_val = np.iinfo(vol_czyx.dtype).max  # e.g. 65535 for uint16
+        # else:
+        #     pad_val = 1.0  # for float data
+        pad_val = 0
         if any(pad_before) or any(pad_after):
-            # np.pad expects ((before,after), ...) per axis
             pad_spec = (
                 (0, 0),  # C
                 (pad_before[0], pad_after[0]),
                 (pad_before[1], pad_after[1]),
                 (pad_before[2], pad_after[2]),
             )
-            crop = np.pad(crop, pad_spec, mode="constant", constant_values=0)
-
-        # Ensure exact target shape (C, 2*mz+1, 2*my+1, 2*mx+1)
-        target = (C, 2*mz+1, 2*my+1, 2*mx+1)
-        if crop.shape != target:
-            # Final safety: pad or trim if off by 1 due to rounding
-            pad_z = max(0, target[1]-crop.shape[1])
-            pad_y = max(0, target[2]-crop.shape[2])
-            pad_x = max(0, target[3]-crop.shape[3])
             crop = np.pad(
                 crop,
-                ((0,0), (0,pad_z), (0,pad_y), (0,pad_x)),
+                pad_spec,
                 mode="constant",
-                constant_values=0,
+                constant_values=pad_val,
+            )
+
+        # Ensure exact target shape (C, 2*mz+1, 2*my+1, 2*mx+1)
+        target = (vol_czyx.shape[0], 2*mz+1, 2*my+1, 2*mx+1)
+        if crop.shape != target:
+            pad_z = max(0, target[1] - crop.shape[1])
+            pad_y = max(0, target[2] - crop.shape[2])
+            pad_x = max(0, target[3] - crop.shape[3])
+            crop = np.pad(
+                crop,
+                ((0, 0), (0, pad_z), (0, pad_y), (0, pad_x)),
+                mode="constant",
+                constant_values=pad_val,
             )
             crop = crop[:, :target[1], :target[2], :target[3]]
+
         return crop
+
 
     # Build the time stack of centered crops: (T_w, C, Zc, Yc, Xc)
     crops = []
@@ -777,14 +787,23 @@ def test():
     # Example usage (assuming df_analysis is defined)
     import pandas as pd
     import numpy as np
+    
+    # ssd_dir = r"F:/"
+    # ssd_dir = Path(ssd_dir)
+    # output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
+    
+    downloads_folder = Path("/Users/s.deblank-3/Downloads")
+    
+    df_windows_path = downloads_folder / "df_windows.csv"
+    df_positions_path = downloads_folder / "df_positions.csv"
+    
+    # df_analysis.to_csv(df_windows_path)
+    # df_tracks_orig.to_csv(df_positions_path)
 
-    df_analysis.to_csv(r"C:\Users\Samde\Downloads/df_windows.csv")
-    df_tracks_orig.to_csv(r"C:\Users\Samde\Downloads/df_positions.csv")
+    df_windows = pd.read_csv(df_windows_path)
+    df_positions = pd.read_csv(df_positions_path)
 
-    df_windows = pd.read_csv(r"C:\Users\Samde\Downloads/df_windows.csv")
-    df_positions = pd.read_csv(r"C:\Users\Samde\Downloads/df_positions.csv")
-
-    output_folder=r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
+    output_folder=r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
 
     test = stratified_pick_examples(
         df_windows,
@@ -815,7 +834,7 @@ def test():
         # dpi: int = 200,
         margin = (20, 20, 20),
         pmin = 0.0,
-        pmax = 99,
+        pmax = 99,a
         examples_per_cluster = 6,
         # seed: int = 0,
         # figsize_per_row=(12.0, 4.0),
@@ -826,14 +845,14 @@ def test():
         df_windows,
         df_positions,
         output_folder=output_folder,
-        out_dir=r"C:\Users\Samde\Downloads",
+        out_dir=downloads_folder,
         examples_per_cluster=3,   # 1 example per cluster per row
         fps=6,
         margin = (20, 20, 20),
         pmin = 0.0,
         pmax = 99.99,
         normalize_per_channel=True,
-        seed=123
+        seed=1234
         # figsize_per_example=(6.0, 3.0),  # smaller per example if many clusters
     )
     

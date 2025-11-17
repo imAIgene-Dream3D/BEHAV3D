@@ -75,8 +75,8 @@ analysis_outdir = Path(output_dir, "analysis", "tcell")
 feature_outdir = Path(analysis_outdir, "track_features")
 df_tracks_path = Path(feature_outdir, f"BEHAV3D_tcell_combined_track_features_filtered.csv")
 # df_tracks_path = Path(feature_outdir, f"BEHAV3D_tcell_combined_track_features.csv")
-df_tracks_orig = pd.read_csv(df_tracks_path)
-df_tracks_orig=df_tracks_orig.sort_values(by=["sample_name", "TrackID", "position_t"])
+df_positions = pd.read_csv(df_tracks_path)
+df_positions=df_positions.sort_values(by=["sample_name", "TrackID", "position_t"])
 
 # --- Create descriptive features per value ---
 window_size=100
@@ -95,9 +95,9 @@ features=[
     "speed",
 ]
 
-df_tracks = df_tracks_orig[features+["sample_name", "TrackID", "position_t"]]
+df_tracks = df_positions[features+["sample_name", "TrackID", "position_t"]]
 df_windows_descriptive = create_windowed_track_dataset(
-    df_tracks=df_tracks_orig,
+    df_tracks=df_positions,
     columns_to_summarize=features,
     window_size = window_size,
     step_size = chosen_intervals,
@@ -230,7 +230,7 @@ df_analysis["ClusterID"].value_counts()
 
 
 plot_all_clusters_window_max_projection(
-    df_tracks_orig,
+    df_positions,
     df_analysis,
     max_windows=5,
     cluster_col="cluster_label_hdbscan",
