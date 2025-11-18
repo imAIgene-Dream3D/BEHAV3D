@@ -268,10 +268,6 @@ def compute_fraction_near_bounds(signal_values: np.ndarray, lower_bound=0.0, upp
         float(np.mean(signal_values[valid] >= upper_cutoff))
     )
 
-# ---------------------------------------------------------------------
-# ---------- Main orchestrator: compute all per-window features ----------
-# ---------------------------------------------------------------------
-
 def compute_window_features(
     window_dataframe: pd.DataFrame, 
     column_name: str, 
@@ -401,12 +397,12 @@ def compute_window_features(
 def create_windowed_track_dataset(
     df_tracks: pd.DataFrame,
     columns_to_summarize: List[str],
-    window_size: Optional[int] = None,                  # None => full-track window
-    step_size: Optional[int] = None,             # ignored when window_size is None
+    window_size: Optional[int] = None,
+    step_size: Optional[int] = None,
     time_col: str = "position_t",
     id_cols: List[str] = ["sample_name", "TrackID"],
-    signal_types: Optional[Dict[str, str]] = None,   # pass a global map if you have one
-    ) -> pd.DataFrame:
+    signal_types: Optional[Dict[str, str]] = None,
+    ):
     """
     Split each track into windows and compute descriptive features per window.
     If window_size is None, compute features over the *entire track* (one window per track).
@@ -438,12 +434,9 @@ def create_windowed_track_dataset(
         - window_start_<time_col>, window_end_<time_col>, window_length_frames
         - computed features for each requested column
     """
-    # sort globally for consistency, then group
     df_sorted = df_tracks.sort_values(id_cols + [time_col], kind="mergesort")
 
-    # Infer signal types once if not given
     if signal_types is None:
-        # assumes you have this helper defined elsewhere
         signal_types = infer_signal_types(df_sorted, columns=columns_to_summarize)
 
     output_rows = []
@@ -454,7 +447,6 @@ def create_windowed_track_dataset(
         if n == 0:
             continue
 
-        # ----- Full-track mode -----
         if window_size is None:
             window_df = group
             start_t = window_df[time_col].iloc[0]
@@ -479,14 +471,13 @@ def create_windowed_track_dataset(
             output_rows.append(base)
             continue  # next track
 
-        # ----- Sliding-window mode -----
         if n < window_size:
             continue  # too short for any window
 
         stride = step_size if step_size is not None else window_size
 
         for start_idx in range(0, n - window_size + 1, stride):
-            end_idx = start_idx + window_size  # exclusive
+            end_idx = start_idx + window_size
             window_df = group.iloc[start_idx:end_idx]
 
             start_t = window_df[time_col].iloc[0]
@@ -512,7 +503,6 @@ def create_windowed_track_dataset(
 
     result = pd.DataFrame(output_rows)
 
-    # Optional: nice column ordering
     if not result.empty:
         front_cols = [
             id_cols[0], id_cols[1], "sub_TrackID",
@@ -529,9 +519,9 @@ def drop_highly_correlated_features(
     threshold: float = 0.98,
     prefer_keep: list | None = None,
     also_drop_constant: bool = True,
-    redundancy_tolerance_abs: float = 0.02,       # apply prefer_keep only if |Δredundancy| <= this
+    redundancy_tolerance_abs: float = 0.02,
     redundancy_tolerance_rel: float = 0.05,
-) -> tuple[pd.DataFrame, list, pd.DataFrame]:
+    ):
     """
     Remove one feature from any pair with |corr| > threshold.
     Returns:
@@ -539,16 +529,14 @@ def drop_highly_correlated_features(
       dropped   : list of dropped feature names
       report    : DataFrame logging each decision: kept, dropped, correlation, reason
     """
-    # prefer_keep = set(prefer_keep or [])
     prefer_keep = [f for f in feature_cols if "median" in f]
     prefer_keep += [f for f in feature_cols if "mean" in f]
-    # Work on a numeric-only copy (keep order)
+
     X = df[feature_cols].copy()
-    # Cast non-numeric to numeric where possible, otherwise drop
+
     cols_ok = [c for c in X.columns if is_numeric_dtype(X[c])]
     X = X[cols_ok]
 
-    # Replace infs and optionally drop constants
     X = X.replace([np.inf, -np.inf], np.nan)
     dropped: list[str] = []
     decisions: list[dict] = []
@@ -571,7 +559,6 @@ def drop_highly_correlated_features(
         report = pd.DataFrame(decisions, columns=["kept_feature","dropped_feature","abs_correlation","reason"])
         return X, dropped, report
 
-    # Impute NaNs (mean) so corr works; PCA later will use its own scaling
     X_impute = X.fillna(X.mean(numeric_only=True))
 
     # Absolute correlation matrix and its upper triangle
