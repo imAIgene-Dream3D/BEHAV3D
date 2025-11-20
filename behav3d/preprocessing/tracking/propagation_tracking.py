@@ -91,10 +91,34 @@ def propagate_tracks(
 def run_propagation_tracking(
     metadata,
     output_dir,
-    cell_type="organoid",
+    cell_type,
     overwrite=False,
+    dilation_nr_pixels=2,
+    segment_size_min=100,
     **kwargs
     ):
+    """Run propagation-based tracking on any cell type.
+    
+    This method propagates segmentation from one timepoint to the next using
+    watershed with the previous timepoint's segmentation as markers.
+    Typically used for large, slow-moving objects like organoids.
+    
+    Parameters
+    ----------
+    metadata : pd.DataFrame
+        DataFrame containing sample information
+    output_dir : str or Path
+        Root output directory
+    cell_type : str
+        Name of the cell type to track
+    overwrite : bool
+        Whether to overwrite existing tracking results
+    dilation_nr_pixels : int
+        Number of pixels to dilate the mask for watershed propagation
+    segment_size_min : int
+        Minimum segment size in voxels (smaller segments are filtered out)
+    **kwargs : dict
+    """
     for idx, sample in metadata.iterrows():
         sample_name=sample['sample_name']
         print(f"Tracking sample: {sample_name}")
@@ -106,11 +130,23 @@ def run_propagation_tracking(
         tracked_img_outdir = Path(output_dir, "images", sample_name)
         tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         
-        segments_path = sample[f"{cell_type}_segments_image_path"]
+        # Find the correct prefixed column (or_, im_, ot_)
+        segments_col = None
+        for prefix in ['or', 'im', 'ot']:
+            col_name = f"{prefix}_{cell_type}_segments_image_path"
+            if col_name in sample.index and pd.notna(sample[col_name]):
+                segments_col = col_name
+                break
+        
+        if segments_col is None:
+            # Fallback to old non-prefixed format for backward compatibility
+            segments_col = f"{cell_type}_segments_image_path"
+        
+        segments_path = sample.get(segments_col)
         
         # Check if segments_path is valid
         if pd.isna(segments_path) or segments_path is None:
-            print(f"Warning: No segmentation data found for {sample_name}. Skipping tracking.")
+            print(f"Warning: No segmentation data found for {sample_name}, {cell_type}. Skipping tracking.")
             continue
             
         segments_path = Path(segments_path)
@@ -138,11 +174,21 @@ def run_propagation_tracking(
                 element_size_x=element_size_x,
                 element_size_y=element_size_y,
                 element_size_z=element_size_z,
+                dilation_nr_pixels=dilation_nr_pixels,
+                segment_size_min=segment_size_min,
             )
         else:
             print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
         
-        metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
-        metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
+        # Update metadata with prefixed column names
+        if segments_col is not None and segments_col.startswith(('or_', 'im_', 'ot_')):
+            # Use the same prefix as the segments column
+            prefix = segments_col.split('_')[0]
+            metadata.at[idx, f"{prefix}_{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
+            metadata.at[idx, f"{prefix}_{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
+        else:
+            # Fallback to old non-prefixed format
+            metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
+            metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
         
     return metadata
