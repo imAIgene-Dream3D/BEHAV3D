@@ -24,10 +24,10 @@ def run_organoid_analysis(
     config=None,
     output_dir=None,
     df_tracks_path=None,
-    org_type="organoid",
+    org_type="organoid",  # This parameter already supports custom cell types!
     # df_tracks_summarized_path=None,
     ):
-    print(f"--------------- Performing Organoid Death Dynamics analysis ---------------")
+    print(f"--------------- Performing {org_type} Death Dynamics analysis ---------------")
     start_time = time.time()
     assert config is not None or all(
         [output_dir]
@@ -268,7 +268,9 @@ def filter_organoid_tracks(
     df_all_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
     df_all_tracks = pd.read_csv(df_all_tracks_path)
     
-    group_cols = ['TrackID', 'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
+    # Dynamically detect *_line_condition columns from metadata
+    line_condition_cols = [c for c in metadata.columns if c.endswith('_line_condition')]
+    group_cols = ['TrackID', 'sample_name'] + line_condition_cols + ['exp_nr', 'well']
     cols_present = [c for c in group_cols if c in metadata.columns]
     metadata_info = metadata.loc[:, cols_present].copy()
     
@@ -276,9 +278,14 @@ def filter_organoid_tracks(
     
     # Function to count the number of unique tracks in the DataFrame
     def count_tracks(df_all_tracks, col_name="nr_tracks", df_track_counts=None):
-        nr_tracks=df_all_tracks.groupby([
-            'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
-            ).agg(nr_tracks=pd.NamedAgg(column='TrackID', aggfunc='nunique')).reset_index()
+        # Dynamically detect *_line_condition columns
+        line_cols_in_tracks = [c for c in df_all_tracks.columns if c.endswith('_line_condition')]
+        potential_group_cols = ['sample_name'] + line_cols_in_tracks + ['exp_nr', 'well']
+        group_cols_for_count = [c for c in potential_group_cols if c in df_all_tracks.columns]
+        
+        nr_tracks=df_all_tracks.groupby(group_cols_for_count).agg(
+            nr_tracks=pd.NamedAgg(column='TrackID', aggfunc='nunique')
+        ).reset_index()
         nr_tracks=nr_tracks.rename(columns={"nr_tracks":col_name})
         if df_track_counts is None:
             return(nr_tracks)
@@ -294,19 +301,25 @@ def filter_organoid_tracks(
         time_column="time"
     else:
         time_column="position_t"
-        exp_duration = exp_duration-1
-        min_track_length = min_track_length-1
-        max_track_length = max_track_length-1
+        if exp_duration is not None:
+            exp_duration = exp_duration-1
+        if min_track_length is not None:
+            min_track_length = min_track_length-1
+        if max_track_length is not None:
+            max_track_length = max_track_length-1
         
     # Filtering the tracks based on the total experimental duration
     # Any timepoint after this will be filtered out 
-    df_all_tracks_filt=filter_by_full_duration(
-        df=df_all_tracks_filt,
-        time_column=time_column,
-        exp_duration=exp_duration
-        )
-    
-    df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_exp_duration", df_track_counts=df_track_counts)
+    if exp_duration is not None:
+        df_all_tracks_filt=filter_by_full_duration(
+            df=df_all_tracks_filt,
+            time_column=time_column,
+            exp_duration=exp_duration
+            )
+        
+        df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_exp_duration", df_track_counts=df_track_counts)
+    else:
+        df_track_counts["nr_tracks_exp_duration"] = df_track_counts["nr_tracks_before_filtering"]
 
     # Filtering out tracks under specific track length and cutting them down to specified max track length
     df_all_tracks_filt = filter_minimal_track_length(
@@ -340,6 +353,45 @@ def filter_organoid_tracks(
         rows_per_page = 3,
         filter_cols=["nr_tracks_before_filtering", "nr_tracks_exp_duration", "nr_tracks_min_track_length", "nr_tracks_min_size"]
     )
+    
+    # Plot touching distributions for all contact types (same as immune/other cells)
+    from behav3d.analysis.tcell_analysis import plot_touching_nontouching_distribution
+    contact_columns = [col for col in df_all_tracks_filt.columns if col.endswith('_contact') and not col.startswith('active_')]
+    for contact_col in contact_columns:
+        target_type = contact_col.replace('_contact', '')
+        plot_touching_outpath = Path(qc_outdir, f"BEHAV3D_{target_type}_touching_distribution.pdf")
+        print(f"- Plotting {target_type} touching distribution to {plot_touching_outpath}")
+        plot_touching_nontouching_distribution(
+            df_all_tracks_filt, 
+            outpath=plot_touching_outpath,
+            contact_column=contact_col,
+            nr_cols=3,
+            rows_per_page=3,
+            )
+    
+    # Plot dead dye distribution if dead channel exists
+    if "mean_dead_dye" in df_all_tracks_filt.columns:
+        from behav3d.analysis.tcell_analysis import plot_dead_dye_distribution
+        
+        # Plot distribution at all timepoints
+        plot_dead_dye_distr_outpath = Path(qc_outdir, f"BEHAV3D_dead_dye_distribution.pdf")
+        print(f"- Plotting dead dye distribution at all timepoints to {plot_dead_dye_distr_outpath}")
+        plot_dead_dye_distribution(
+            df_all_tracks_filt,
+            outpath=plot_dead_dye_distr_outpath,
+            nr_cols=2,
+            rows_per_page=2
+        )
+        
+        # Plot distribution at timepoint 1
+        plot_dead_dye_distr_t0_outpath = Path(qc_outdir, f"BEHAV3D_dead_dye_distribution_t0.pdf")
+        print(f"- Plotting dead dye distribution at timepoint 1 to {plot_dead_dye_distr_t0_outpath}")
+        plot_dead_dye_distribution(
+            df_all_tracks_filt[df_all_tracks_filt["relative_time"]==1],
+            outpath=plot_dead_dye_distr_t0_outpath,
+            nr_cols=2,
+            rows_per_page=2
+        )
     
     filt_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
     print(f"- Writing filtered tracks to {filt_tracks_out_path}")
