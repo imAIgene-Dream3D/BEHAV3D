@@ -17,10 +17,6 @@ def load_behav3d_metadata(
         "tcell_line": str,
         "exp_nr": "Int64",
         "well": str,
-        "tcell_channel": "Int64",
-        "live_channel": "Int64",
-        "dead_channel": "Int64",
-        "dead_dye_threshold": float,
         "pixel_distance_xy": float,
         "pixel_distance_z": float,
         "distance_unit": str,
@@ -39,6 +35,8 @@ def load_behav3d_metadata(
         "organoid_2_tracks_image_path": str, #FUNC
         "organoid_2_tracks_csv_path": str, #FUNC
         "original_raw_image_path": str, # FUNC
+        "number_of_channels": "Int64",
+
     }
 
     metadata = pd.read_csv(metadata_path, dtype=dtype_dict)
@@ -62,9 +60,6 @@ def check_behav3d_metadata(
         "tcell_line", 
         "exp_nr", 
         "well", 
-        "tcell_channel", 
-        "live_channel", 
-        "dead_channel", 
         "pixel_distance_xy", 
         "pixel_distance_z", 
         "distance_unit", 
@@ -77,7 +72,8 @@ def check_behav3d_metadata(
         "tcell_tracks_csv_path", 
         "organoid_segments_image_path",
         "organoid_tracks_image_path", 
-        "organoid_tracks_csv_path"
+        "organoid_tracks_csv_path",
+        "number_of_channels"
     ]
 
     func_columns = [
@@ -105,7 +101,7 @@ def check_behav3d_metadata(
     else:
         assert all(col in metadata.columns for col in required_columns), f"Not all required columns are present in the metadata .csv file\n{missing_string}"
         assert not any(metadata.drop(columns=columns).isna().any()), "Some column values have not been supplied. Make sure you correctly supply values for all columns in the metadata .csv"
-    
+
     ok = True
     for rowidx, sample_metadata in metadata.iterrows():
         print(f"Row {rowidx+1}: {sample_metadata['sample_name']}")
@@ -117,6 +113,13 @@ def check_behav3d_metadata(
         # assert sample_metadata["pixel_distance_xy"] == elsizes["x"], f"Pixel distance xy supplied for 'row {rowidx+1}: {sample_name}' does not match the x pixel distance {elsizes['x']} retrieved from the raw image metadata"
         # assert sample_metadata["pixel_distance_xy"] == elsizes["x"], f"Pixel distance xy supplied for 'row {rowidx+1}: {sample_name}' does not match the y pixel distance {elsizes['y']} retrieved from the raw image metadata"
         # assert sample_metadata["pixel_distance_z"] == elsizes["z"], f"Pixel distance z supplied for 'row {rowidx+1}: {sample_name}' does not match the z pixel distance {elsizes['z']} in the image"
+
+        channel_columns = ['channel'+str(i) for i in range(sample_metadata['number_of_channels'])]
+
+        channel_values=sample_metadata[channel_columns].values
+        assert 'tcell' in channel_values, f"T cells have no dedicated channel for Row {rowidx+1} '{sample_name}' \n"
+        assert 'organoid' in channel_values or ('live' in channel_values and 'death' in channel_values), f"Organoids have no dedicated channels for Row {rowidx+1} '{sample_name}' or live and death channels are not provided to segment the organoids\n"
+        assert 'death' in channel_values, f"You have no death channel for Row {rowidx+1} '{sample_name}' \n"
         
         ### T cell paths
         if not pd.isna(sample_metadata["tcell_segments_image_path"]):

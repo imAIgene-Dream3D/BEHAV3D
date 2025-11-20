@@ -26,31 +26,31 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 import torch
 import pandas as pd
+import napari
+from skimage.filters import threshold_otsu
 
 from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr
 from skimage.filters import threshold_otsu
-from behav3d.utils.segmentation import segment_2d_filter# Cellpose import is relatively expensive  only load when we actually need it.
+from behav3d.utils.segmentation import segment_2d_filter# Cellpose import is relatively expensive - only load when we actually need it.
 try:
     from cellpose import models  # noqa: WPS433 (allow external import)
-except ImportError as err:  # pragma: no cover  handled at runtime
+except ImportError as err:  # pragma: no cover - handled at runtime
     raise ImportError(
         "cellpose is required for `behav3d.preprocessing.segmentation.cellpose_prediction`. "
-        "Please install it via `pip install cellpose>=4.0` (or compatible).",
+        "Please install it via `pip install cellpose==3.1.1.2` (or compatible).",
     ) from err
 
 
 
-def run_cellpose_prediction(  # noqa: WPS231 (complexity)  unavoidable for pipeline function
+def run_cellpose_prediction(  # noqa: WPS231 (complexity) - unavoidable for pipeline function
     image: np.ndarray,  #already loaded image
     pretrained_model_dir: str | Path,
-    *,
     raw_image_path: str | Path, 
-    nchan: int = 3,
     channels: Optional[Sequence[int]] = None,
     diameter: Optional[int | float] = None,
     min_size: int = 30,
+    nchan: int = 2,
     anisotropy: Optional[float] = 4.655 / 1.17365196872,
-    manual_dim_order: Optional[str | Sequence[str]] = None,
     timepoint_range: Optional[Tuple[int, int]] = None,
     device: Optional[str] = None,
     convert_tiff_to_zarr: bool = True,
@@ -67,8 +67,10 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity)  unavoidable for pip
     pretrained_model_dir:
         Directory that contains the pretrained Cellpose weights (same argument
         as *pretrained_model* in ``cellpose.models.CellposeModel``).
-    nchan, channels, diameter, anisotropy, min_size:
+    channels, diameter, anisotropy, min_size:
         Passed through to ``CellposeModel.eval``.
+    nchan:
+        Passed when building the model through ``CellposeModel``.
     device:
         CUDA device string (e.g. ``"cuda:0"``); when ``None`` the function will
         automatically pick GPU if available otherwise CPU.
@@ -95,21 +97,24 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity)  unavoidable for pip
     # ---------------------------------------------------------------------
     # 1. Prepare input & model
     # ---------------------------------------------------------------------
-    
-    image=image[:,[1,2,0],...] ##For the trained cellpose mode the order of the channesl has to be Organoid-dead-Tcell. Note to later implement a flexible read from the metdata to do this aitomatically
-    image_np=image
-
     if verbose:
-        print("Loaded image with shape (T, C, Z, Y, X):", image_np.shape)
-
+        print("Loaded image with shape (T, C, Z, Y, X):", image.shape)
+    
     # Optional time sub-setting
     if timepoint_range is not None:
         start_t, end_t = timepoint_range
-        start_t = max(0, min(start_t, image_np.shape[0] - 1))
-        end_t = max(start_t, min(end_t, image_np.shape[0] - 1))
-        image_np = image_np[start_t : end_t + 1]
+        start_t = max(0, min(start_t, image.shape[0] - 1))
+        end_t = max(start_t, min(end_t, image.shape[0] - 1))
+        image = image[start_t : end_t + 1]
         if verbose:
-            print(f"Using timepoints {start_t}{end_t} (total {image_np.shape[0]})")
+            print(f"Using timepoints {start_t}-{end_t} (total {image.shape[0]})")
+            
+    T, C, Z, Y, X = image.shape
+
+    # Cellpose works with at least 2 channels. If we have one, include an additional empty one
+    if (C==1):
+        image=np.concatenate((image,np.zeros_like(image)),axis=1)
+        nchan=2
 
     # Determine computation device.
     torch_device = (
@@ -119,26 +124,25 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity)  unavoidable for pip
     # Initialise Cellpose model.
     model = models.CellposeModel(
         pretrained_model=str(pretrained_model_dir),
-        gpu=torch_device.type == "cuda",
+        gpu=True,
         nchan=nchan,
-        device=torch_device,
+        device=torch_device
     )
 
     # ---------------------------------------------------------------------
     # 2. Run prediction per time point
     # ---------------------------------------------------------------------
-    T, C, Z, Y, X = image_np.shape
     masks = np.zeros((T, Z, Y, X), dtype=np.uint16)
 
     if verbose:
         print("Starting Cellpose prediction...")
 
     for t in range(T):
-        # Extract data for one time point  shape (C, Z, Y, X).
-        img_t = image_np[t]
+        # Extract data for one time point - shape (C, Z, Y, X).
+        img_t = image[t]
 
         if verbose:
-            print(f"   Time-point {t+1}/{T} ", end="", flush=True)
+            print(f"  - Timepoint {t+1}/{T} -", end="", flush=True)
         start_ts = torch.cuda.Event(enable_timing=True) if torch_device.type == "cuda" else None
         end_ts = torch.cuda.Event(enable_timing=True) if torch_device.type == "cuda" else None
         if start_ts is not None:
@@ -187,9 +191,9 @@ def run_cellpose_segmentation(
     output_dir: str | Path,
     metadata,
     pretrained_model_dir: str | Path,
-    *,
+    input_channels: list(str),
     label_name: str = "tcell", 
-    manual_dim_order=None, 
+    label_type: str = "tcell", 
     timepoint_range: Optional[Tuple[int, int]] = None,
     overwrite: bool = False,
     **cellpose_kwargs,
@@ -209,8 +213,14 @@ def run_cellpose_segmentation(
         ``raw_image_path``.
     pretrained_model_dir:
         Folder that contains the pretrained Cellpose weights.
+    input_channels:
+        Channels to evaluate Cellpose.
+    label_name:
+        Label to segment
+    label_type:
+        "organoid" or "tcell", for selecting the model
     timepoint_range:
-        Optional ``(start_t, end_t)`` tuple  if given the returned *mask*
+        Optional ``(start_t, end_t)`` tuple - if given the returned *mask*
         Zarrs are cropped to that time-window. ``None`` means all time points.
     overwrite:
         If ``True`` existing mask Zarr files are recomputed.
@@ -224,51 +234,22 @@ def run_cellpose_segmentation(
         The input ``DataFrame`` with an additional (or overwritten) column
         ``{label_name}_segments_image_path`` that points at the generated mask Zarr.
     """
-    import pandas as pd  # local import to avoid heavy dependency at module import
-
     assert isinstance(metadata, pd.DataFrame), "metadata must be a pandas DataFrame"
 
     output_dir = Path(output_dir)
-    
 
     for idx, sample in metadata.iterrows():
         sample_name = sample['sample_name']
 
-        print(f"Calculating features for: {sample_name}")
+        print(f"Segmenting the {label_name} channel with Cellpose for: {sample_name}")
         cellpose_dir = output_dir / "images" / f"{sample_name}"
         cellpose_dir.mkdir(parents=True, exist_ok=True)
         raw_image_path = Path(sample['raw_image_path'])
         raw_image_zarr = Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
-
-        if not raw_image_zarr.exists():
-            print(f"- Converting raw image to .zarr for memory efficiency...")
-            images = load_image(raw_image_path)
-            print(f"Original image shape: {images.shape}")
-            default_order = ("T", "C", "Z", "Y", "X")  # T, C, Z, Y, X
-            if manual_dim_order is not None:
-                # Convert to tuple of characters if string
-                if isinstance(manual_dim_order, str):
-                    manual_dim_order = tuple(manual_dim_order)
-                if manual_dim_order != default_order:
-                    # Compute permutation: for each axis in default_order, find its index in manual_dim_order
-                    perm = [manual_dim_order.index(ax) for ax in default_order]
-                    print(f"Transposing image from {manual_dim_order} to {default_order} using permutation {perm}")
-                    images = images.transpose(perm)
-                    print(f"New image shape: {images.shape}")
-                else:
-                    print("Image is already in default order (T, C, Z, Y, X).")
-            else:
-                print("No manual_dim_order provided, assuming image is already in default order.")
-            chunksize = (1,) + images.shape[1:]
-            save_as_zarr(
-                img=images,
-                path=raw_image_zarr,
-                chunks=chunksize
-            )
-
+        
         images = load_image(raw_image_zarr)
+        
         max_t = images.shape[0] - 1
-        print(images.shape)
 
         masks_outpath = cellpose_dir / f"{sample_name}_{label_name}_segments.zarr"
 
@@ -277,15 +258,32 @@ def run_cellpose_segmentation(
             metadata.at[idx, f"{label_name}_segments_image_path"] = str(masks_outpath)
             continue
 
-        # Run Cellpose  we force saving directly to *masks_outpath* by setting
+        # Extract the channels
+        channels=[]
+        for i in range(len(input_channels)):
+            channels.append(int(sample.index[sample == input_channels[i]].tolist()[0].split('channel')[-1]))
+        # Set the minimum size depending on the object to segment
+        if (label_type=='organoid'):
+            min_size=1000
+        elif (label_type=='tcell'):
+            min_size=10
+
+        # Extract the anisotropy
+        anisotropy=sample['pixel_distance_z']/sample['pixel_distance_xy']
+
+        # Run Cellpose - we force saving directly to *masks_outpath* by setting
         # save_masks=False and writing ourselves to ensure consistent naming.
         masks, _ = run_cellpose_prediction(
-            image=images,
+            image=images[:,channels,...],
             pretrained_model_dir=pretrained_model_dir,
             raw_image_path=raw_image_path,
             save_masks=True,
             verbose=True,
             timepoint_range=timepoint_range,
+            channels=None,
+            anisotropy=anisotropy,
+            min_size=min_size,
+            nchan=len(channels),
             **cellpose_kwargs,
         )
 
@@ -301,23 +299,18 @@ def run_cellpose_segmentation(
 def run_otsu_threshold_segmentation_from_zarr(
     output_dir: str | Path,
     metadata,
-    *,
-    channel: int = 2,
     mask_suffix: str = "_mask_dead",
     timepoint_range: tuple[int, int] | None = None,
     overwrite: bool = False,
 ):
-    from pathlib import Path
-    import numpy as np
-    from skimage.filters import threshold_otsu
-    from behav3d.utils.fileio import load_image, save_as_zarr
 
     output_dir = Path(output_dir)
 
     for idx, sample in metadata.iterrows():
         sample_name = sample['sample_name']
         print(f"\nProcessing {sample_name}...")
-        
+        # Extract the death channel
+        death_channel=int(list(sample[sample=='death'].index)[0].split('channel')[-1])
         mask_dir = output_dir / "images" / sample_name
         mask_dir.mkdir(parents=True, exist_ok=True)
 
@@ -335,11 +328,11 @@ def run_otsu_threshold_segmentation_from_zarr(
             images = images[start_t:end_t + 1]
 
         # Select single channel: (T, Z, Y, X)
-        channel_img = images[:, channel]
+        channel_img = images[:, death_channel]
 
         # Flatten to compute global threshold
         flat_vals = channel_img.ravel()
-        global_thresh = threshold_otsu(flat_vals)
+        global_thresh = threshold_otsu(flat_vals.compute())
         print(f"[INFO] Global Otsu threshold: {global_thresh}")
 
         # Apply threshold to the entire 4D array (T, Z, Y, X)
@@ -359,14 +352,9 @@ def run_otsu_threshold_segmentation_from_zarr(
 def visualize_cellpose_sample(
     output_dir: str | Path,
     sample_name: str,
-    *,
     timepoint_range: Optional[Tuple[int, int]] = None,
     channel_colors: Sequence[str] = ("red", "green", "blue", "cyan", "magenta", "yellow"),
 ) -> None:
-    import napari
-    import numpy as np
-    from pathlib import Path
-    from behav3d.utils.fileio import load_zarr as _lz
 
     print(f"Sample selected: {sample_name}")
     print(f"Timepoint range: {timepoint_range}")
@@ -388,13 +376,13 @@ def visualize_cellpose_sample(
     loaded_masks = {}
     for name, path in mask_files.items():
         if path.exists():
-            mask_arr = _lz(path)
+            mask_arr = load_zarr(path)
             loaded_masks[name] = mask_arr
         else:
             print(f"[Warning] Mask '{name}' file not found: {path}")
 
     # Load raw image
-    img_arr = _lz(raw_image_zarr)
+    img_arr = load_zarr(raw_image_zarr)
     print(f"Original image shape: {img_arr.shape}")
 
     # Slice timepoints

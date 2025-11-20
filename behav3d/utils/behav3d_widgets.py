@@ -487,7 +487,7 @@ class MetadataLoader(widgets.VBox):
         self.metadata = None
         self.output_dir = None
         self.metadata_csv_path = None
-
+        
         self.func = func
         self.file_picker = metadata_path_picker
         self.output_dir_picker = output_dir_picker
