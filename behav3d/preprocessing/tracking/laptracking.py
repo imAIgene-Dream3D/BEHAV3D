@@ -89,19 +89,45 @@ def laptrack_image(
             outpath=tracked_img_outpath
         )
    
-def run_tcell_laptracking(
+def run_laptracking(
     metadata,
     output_dir,
+    cell_type,
     track_cost_cutoff=45**2, 
     gap_closing_cost_cutoff=60**2,
     gap_closing_max_frame_count=3,
     merging_cost_cutoff=False,
     splitting_cost_cutoff=False,
     return_trackimg=True,
-    cell_type="tcell",
     overwrite=False,
     **kwargs
     ):
+    """Run LAP tracking on any cell type.
+    
+    Parameters
+    ----------
+    metadata : pd.DataFrame
+        DataFrame containing sample information
+    output_dir : str or Path
+        Root output directory
+    cell_type : str
+        Name of the cell type to track
+    track_cost_cutoff : float
+        Maximum cost for linking detections between consecutive frames
+    gap_closing_cost_cutoff : float
+        Maximum cost for closing gaps (linking across missing frames)
+    gap_closing_max_frame_count : int
+        Maximum number of frames a track can be missing
+    merging_cost_cutoff : float or False
+        Maximum cost for merging tracks (False to disable)
+    splitting_cost_cutoff : float or False
+        Maximum cost for splitting tracks (False to disable)
+    return_trackimg : bool
+        Whether to save tracked image
+    overwrite : bool
+        Whether to overwrite existing tracking results
+    **kwargs : dict
+     """
     for idx, sample in metadata.iterrows():
         sample_name=sample['sample_name']
         print(f"Tracking sample: {sample_name}")
@@ -109,7 +135,19 @@ def run_tcell_laptracking(
         tracked_img_outdir = Path(output_dir, "images", sample_name)
         tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         
-        segments_path = sample[f"{cell_type}_segments_image_path"]
+        # Find the correct prefixed column (or_, im_, ot_)
+        segments_col = None
+        for prefix in ['or', 'im', 'ot']:
+            col_name = f"{prefix}_{cell_type}_segments_image_path"
+            if col_name in sample.index and pd.notna(sample[col_name]):
+                segments_col = col_name
+                break
+        
+        if segments_col is None:
+            # Fallback to old non-prefixed format for backward compatibility
+            segments_col = f"{cell_type}_segments_image_path"
+        
+        segments_path = sample[segments_col]
         tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr")
         tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_{cell_type}_tracks.csv")
     
@@ -145,7 +183,15 @@ def run_tcell_laptracking(
         else:
             print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
         
-        metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
-        metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
+        # Update metadata with prefixed column names
+        if segments_col is not None and segments_col.startswith(('or_', 'im_', 'ot_')):
+            # Use the same prefix as the segments column
+            prefix = segments_col.split('_')[0]
+            metadata.at[idx, f"{prefix}_{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
+            metadata.at[idx, f"{prefix}_{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
+        else:
+            # Fallback to old non-prefixed format
+            metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
+            metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
         
     return metadata

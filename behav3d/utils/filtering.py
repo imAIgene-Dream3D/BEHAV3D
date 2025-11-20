@@ -95,7 +95,12 @@ def plot_filter_count(
                 ax.set_title(sample, fontsize=10, loc='center')
                 ax.set_xlabel("")
                 ax.set_ylabel("Count")
-                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+                
+                # Force y-axis to use integer formatting (track counts should always be whole numbers)
+                ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+                
+                # Use plt.setp for better compatibility with matplotlib
+                plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
                 
                 plot_idx += 1
             

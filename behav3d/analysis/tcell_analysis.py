@@ -54,6 +54,7 @@ def run_tcell_analysis(
     output_dir=None,
     df_tracks_path=None,
     df_tracks_summarized_path=None,
+    cell_type="tcell",
     columns_to_use=[
         "mean_square_displacement",
         "speed",
@@ -79,7 +80,7 @@ def run_tcell_analysis(
     plot_results=True,
     seed=42
     ):
-    print(f"--------------- Performing T-cell behavioral analysis ---------------")
+    print(f"--------------- Performing {cell_type} behavioral analysis ---------------")
     start_time = time.time()
     # assert config is not None or all(
     #     [output_dir, umap_minimal_distance, umap_n_neighbors, nr_of_clusters]
@@ -88,7 +89,7 @@ def run_tcell_analysis(
     if output_dir is None:
         output_dir = config['output_dir']
         
-    analysis_outdir = Path(output_dir, "analysis", "tcell")
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
     
     if not analysis_outdir.exists():
@@ -97,9 +98,9 @@ def run_tcell_analysis(
         feature_outdir.mkdir(parents=True)    
     
     if df_tracks_path is None:
-        df_tracks_path = Path(feature_outdir, f"BEHAV3D_tcell_combined_track_features_filtered.csv")
+        df_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
     if df_tracks_summarized_path is None:
-        df_tracks_summarized_path = Path(feature_outdir, f"BEHAV3D_tcell_combined_track_features_summarized.csv")
+        df_tracks_summarized_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_summarized.csv")
     
     df_tracks = pd.read_csv(df_tracks_path, low_memory=False)
     df_tracks_summarized = pd.read_csv(df_tracks_summarized_path, low_memory=False)
@@ -107,7 +108,7 @@ def run_tcell_analysis(
     
     if df_tracks_summarized["track_length"].nunique() != 1:
         print("Warning: The track lengths are not cut to similar length, this might influence dynamic time warping")
-        print("Set 'tcell_min_track_length' and 'tcell_max_track_length' to the same value to create equal tracks")
+        print("Set 'min_track_length' and 'max_track_length' to the same value to create equal tracks")
 
     non_wildcard_cols_to_normalize = []
     for col in columns_to_normalize:
@@ -138,6 +139,7 @@ def run_tcell_analysis(
         nr_of_clusters=nr_of_clusters,
         df_tracks=df_tracks,
         df_tracks_summarized=df_tracks_summarized,
+        cell_type=cell_type,
         plot_results=plot_results,
         random_state=seed
     )
@@ -146,7 +148,7 @@ def run_tcell_analysis(
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
     return(df_clusters)
 
-def filter_tcell_tracks(
+def filter_cell_tracks(
     metadata,
     config=None,
     output_dir=None,
@@ -162,12 +164,12 @@ def filter_tcell_tracks(
     This code filters tracks based on supplied parameters in the config.yml
     
     Filtering is based on:
-    - Maximum experiment length (tcell_exp_duration)    
-    - Minimum track length (tcell_min_track_length)
+    - Maximum experiment length (exp_duration)    
+    - Minimum track length (min_track_length)
     - Tracks starting at timepoint 1 with a dead dye mean over the dead_dye_threshold (dead_dye_threshold)
     
     Additonally, all tracks are cut down to:
-    - Maximum track length (tcell_max_track_length)
+    - Maximum track length (max_track_length)
     
     Output:
     - A .csv file containing filtered tracks from all experiments
@@ -204,7 +206,9 @@ def filter_tcell_tracks(
     df_all_tracks['sample_name'] = df_all_tracks['sample_name'].astype(str)
     metadata['sample_name'] = metadata['sample_name'].astype(str)
 
-    group_cols = ['TrackID', 'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
+    # Dynamically detect *_line_condition columns from metadata
+    line_condition_cols = [c for c in metadata.columns if c.endswith('_line_condition')]
+    group_cols = ['TrackID', 'sample_name'] + line_condition_cols + ['exp_nr', 'well']
 
     cols_present = [c for c in group_cols if c in metadata.columns]
     metadata_info = metadata.loc[:, cols_present].copy()
@@ -212,9 +216,14 @@ def filter_tcell_tracks(
     
     # Function to count the number of unique tracks in the DataFrame
     def count_tracks(df_all_tracks, col_name="nr_tracks", df_track_counts=None):
-        nr_tracks=df_all_tracks.groupby([
-            'sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
-            ).agg(nr_tracks=pd.NamedAgg(column='TrackID', aggfunc='nunique')).reset_index()
+        # Dynamically detect which grouping columns are present (including *_line_condition columns)
+        line_cols_in_tracks = [c for c in df_all_tracks.columns if c.endswith('_line_condition')]
+        potential_group_cols = ['sample_name'] + line_cols_in_tracks + ['exp_nr', 'well']
+        group_cols_for_count = [c for c in potential_group_cols if c in df_all_tracks.columns]
+        
+        nr_tracks=df_all_tracks.groupby(group_cols_for_count).agg(
+            nr_tracks=pd.NamedAgg(column='TrackID', aggfunc='nunique')
+        ).reset_index()
         nr_tracks=nr_tracks.rename(columns={"nr_tracks":col_name})
         if df_track_counts is None:
             return(nr_tracks)
@@ -226,9 +235,10 @@ def filter_tcell_tracks(
     
     # Filtering the tracks based on the total experimental duration
     # Any timepoint after this will be filtered out 
-    if time_type=="real_time":
-        time_column="time"
-    else:
+    if time_type=="real_time" or time_type=="hours":
+        time_column="time"  # 'time' column contains actual hours
+        # Don't subtract 1 for real time units (hours)
+    else:  # frames
         time_column="position_t"
         exp_duration = exp_duration-1
         min_track_length = min_track_length-1
@@ -270,26 +280,18 @@ def filter_tcell_tracks(
             df_track_counts=df_track_counts
         )
     
-    # Plot the number of cells having contact with another T cell and Organoid for analysis
-    # of the set contact_threshold
-    if "tcell_contact" in df_all_tracks_filt.columns:
-        plot_tcell_touching_outpath = Path(qc_outdir, f"BEHAV3D_tcell_touching_distribution.pdf")
-        print(f"- Plotting tcell touching distribution to {plot_tcell_touching_outpath}")
+    # Plot the number of cells having contact with other cell types
+    # Dynamically detect all *_contact columns
+    contact_columns = [col for col in df_all_tracks_filt.columns if col.endswith('_contact') and not col.startswith('active_')]
+    for contact_col in contact_columns:
+        # Extract the target cell type from column name (e.g., "organoid1_contact" -> "organoid1")
+        target_type = contact_col.replace('_contact', '')
+        plot_touching_outpath = Path(qc_outdir, f"BEHAV3D_{target_type}_touching_distribution.pdf")
+        print(f"- Plotting {target_type} touching distribution to {plot_touching_outpath}")
         plot_touching_nontouching_distribution(
             df_all_tracks_filt, 
-            outpath=plot_tcell_touching_outpath,
-            contact_column="tcell_contact",
-            nr_cols=3,
-            rows_per_page = 3,
-            )
-    
-    if "organoid_contact" in df_all_tracks_filt.columns:
-        plot_organoid_touching_outpath = Path(qc_outdir, f"BEHAV3D_organoid_touching_distribution.pdf")
-        print(f"- Plotting organoid touching distribution to {plot_organoid_touching_outpath}")
-        plot_touching_nontouching_distribution(
-            df_all_tracks_filt, 
-            outpath=plot_organoid_touching_outpath,
-            contact_column="organoid_contact",
+            outpath=plot_touching_outpath,
+            contact_column=contact_col,
             nr_cols=3,
             rows_per_page=3,
             )
@@ -604,6 +606,7 @@ def cluster_umap(
     df_tracks_summarized=None,
     random_state=None,
     output_dir = None,
+    cell_type="tcell",
     plot_results=True
     ):
     
@@ -616,11 +619,11 @@ def cluster_umap(
         output_dir = Path(config['output_dir'])
         nr_of_clusters=config["nr_of_clusters"]
     
-    tcell_outdir = Path(output_dir, "analysis", "tcell")
-    feature_outdir = Path(tcell_outdir, "track_features")
-    results_outdir = Path(tcell_outdir, "results")
-    if not tcell_outdir.exists():
-        tcell_outdir.mkdir(parents=True)
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
+    feature_outdir = Path(analysis_outdir, "track_features")
+    results_outdir = Path(analysis_outdir, "results")
+    if not analysis_outdir.exists():
+        analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
         feature_outdir.mkdir(parents=True)
     if not results_outdir.exists():
@@ -662,14 +665,20 @@ def cluster_umap(
     df_umap["ClusterID"]=df_umap["ClusterID"]+1
     df_umap["ClusterID"]=df_umap["ClusterID"].astype('category')
     
-    df_umap_out_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_clusters.csv")
+    df_umap_out_path = Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_clusters.csv")
     print(f"- Writing clustered tracks to {df_umap_out_path}")
     df_umap.to_csv(df_umap_out_path, sep=",", index=False)
 
-    sample_cols = ["organoid_line", "tcell_line", "sample_name", "well", "exp_nr"]
+    # Dynamically detect *_line_condition columns instead of hardcoding
+    line_cols = [c for c in df_tracks_summarized.columns if c.endswith('_line_condition')]
+    sample_cols = line_cols + ["sample_name"]
+    if "well" in df_tracks_summarized.columns:
+        sample_cols.append("well")
+    if "exp_nr" in df_tracks_summarized.columns:
+        sample_cols.append("exp_nr")
     info_cols = df_umap.drop(columns=["TrackID", "UMAP1", "UMAP2", "ClusterID"]).columns
     
-    cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_clusters.pdf")
+    cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_clusters.pdf")
     print(f"- Plotting clustered UMAP plots with displayed Track features to {cluster_UMAP_path}")
     plot_feature_umap(
         df_umap=df_umap,
@@ -685,7 +694,7 @@ def cluster_umap(
     
     ### Producing a heatmap of the summarized features again summarized over all tracks
     ### Belonging to that cluster
-    cluster_features_heatmap_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_cluster_feature_heatmap.pdf")
+    cluster_features_heatmap_path = Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_cluster_feature_heatmap.pdf")
     print(f"- Plotting heatmaps with summarized cluster features to {cluster_features_heatmap_path}")
     plot_clustering_feature_heatmap(
         df_umap,
@@ -694,38 +703,52 @@ def cluster_umap(
         cluster_features_heatmap_path,
         rows_per_page = 7,
         nr_cols = 2,
-        rows_first_img = 4,
         figsize = (8.27, 11.69),
         plot_results=plot_results
     )
 
+    # Dynamically detect ALL line_condition columns (for grid plotting across all cell types)
+    all_line_cols = [c for c in df_umap.columns if c.endswith('_line_condition')]
+    
+    # Prioritize THIS cell type's line_condition to be first (for rows in grid)
+    # Look for line columns that match this cell_type
+    this_cell_line_cols = [c for c in all_line_cols if f"_{cell_type}_" in c]
+    other_line_cols = [c for c in all_line_cols if c not in this_cell_line_cols]
+    
+    # Arrange: this cell type's conditions first, then others
+    line_cols = this_cell_line_cols + other_line_cols
+    
+    group_cols_sample = line_cols + ["sample_name", "ClusterID"]
+    group_cols_sample_only = line_cols + ["sample_name"]
+    
     df_clust_perc = (
         df_umap
-        .groupby(["organoid_line", "tcell_line", "sample_name", "ClusterID"])
+        .groupby(group_cols_sample, observed=True)
         .size()
         .reset_index(name="count")
     )
     
     sample_totals = (
         df_clust_perc
-        .groupby(["organoid_line", "tcell_line", "sample_name"])["count"]
+        .groupby(group_cols_sample_only, observed=True)["count"]
         .sum()
         .reset_index(name="sample_total")
     )
     
     combo_totals = (
         df_clust_perc
-        .groupby(["organoid_line", "tcell_line"])["count"]
+        .groupby(line_cols, observed=True)["count"]
         .sum()
         .reset_index(name="combo_total")
-    )
+    ) if line_cols else None
     
-    df_clust_perc = df_clust_perc.merge(sample_totals, how="left")
-    df_clust_perc = df_clust_perc.merge(combo_totals,  how="left")
+    df_clust_perc = df_clust_perc.merge(sample_totals, how="left", on=group_cols_sample_only)
+    if combo_totals is not None:
+        df_clust_perc = df_clust_perc.merge(combo_totals, how="left", on=line_cols)
     df_clust_perc["percentage"] = (df_clust_perc["count"] / df_clust_perc["sample_total"])
     
-    cluster_percentage_plot_prefix = Path(results_outdir, "BEHAV3D_tcell_UMAP_cluster_percentages")
-    print(f"- Plotting percentage plots of each cluster per T-cell × organoid to {cluster_percentage_plot_prefix}_*.pdf")
+    cluster_percentage_plot_prefix = Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_cluster_percentages")
+    print(f"- Plotting percentage plots of each cluster per sample to {cluster_percentage_plot_prefix}_*.pdf")
 
     plot_cluster_percentage_bars(
         df_clust_perc,
@@ -734,12 +757,12 @@ def cluster_umap(
     )
         
     df_clust_perc = df_clust_perc.reset_index(drop=True)
-    df_clust_perc_out_path = Path(results_outdir, f"BEHAV3D_tcell_UMAP_cluster_percentages.csv")
+    df_clust_perc_out_path = Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_cluster_percentages.csv")
     print(f"- Writing cluster percentages to {df_clust_perc_out_path}")
     df_clust_perc.to_csv(df_clust_perc_out_path, sep=",", index=False)
     
-    df_clust_tracks_out_path = Path(results_outdir, f"BEHAV3D_tcell_combined_track_features_clustered.csv")
-    print(f"- Writing clustered track info to {df_clust_perc_out_path}")
+    df_clust_tracks_out_path = Path(results_outdir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv")
+    print(f"- Writing clustered track info to {df_clust_tracks_out_path}")
     df_tracks = pd.merge(df_tracks, df_umap[["TrackID", "ClusterID"]], on='TrackID', how='left')
     
     df_tracks.to_csv(df_clust_tracks_out_path, sep=",", index=False)
@@ -755,7 +778,28 @@ def normalize_track_features(
     ):
     
     for column_name in columns:
-        df_tracks.loc[:, f'z_{column_name}'] = df_tracks[column_name].transform(lambda x: (x - x.mean()) / x.std())
+        # Skip if column doesn't exist
+        if column_name not in df_tracks.columns:
+            continue
+        
+        # Skip non-numeric columns (e.g., orientation_vector which is a string representation)
+        if df_tracks[column_name].dtype == 'object':
+            # Try to convert to numeric, skip if it fails
+            try:
+                df_tracks[column_name] = pd.to_numeric(df_tracks[column_name], errors='coerce')
+            except:
+                print(f"⚠️  Skipping normalization of non-numeric column: {column_name}")
+                continue
+        
+        # Check if column has valid numeric data and variance
+        if df_tracks[column_name].std() > 0:
+            df_tracks.loc[:, f'z_{column_name}'] = df_tracks[column_name].transform(
+                lambda x: (x - x.mean()) / x.std() if x.std() > 0 else 0
+            )
+        else:
+            print(f"⚠️  Skipping normalization of zero-variance column: {column_name}")
+            df_tracks[f'z_{column_name}'] = 0
+    
     return (df_tracks)
 
 def plot_cluster_percentage_bars(
@@ -793,34 +837,35 @@ def plot_cluster_percentage_bars(
     outprefix = Path(outprefix)
     outpdf = outprefix.with_suffix(".pdf")
 
+    # Dynamically detect *_line_condition columns
+    line_cols = [c for c in df_clust_perc.columns if c.endswith('_line_condition')]
+    
     # ------------- Page 1: Combined (pooled across samples) grid -------------
-    # Compute pooled counts per combo (tcell_line, organoid_line, ClusterID)
+    # Compute pooled counts per combo (*_line_condition columns + ClusterID)
+    group_cols_with_cluster = line_cols + ['ClusterID']
     pooled = (
         df_clust_perc
-        .groupby(['tcell_line', 'organoid_line', 'ClusterID'], as_index=False)['count']
+        .groupby(group_cols_with_cluster, as_index=False, observed=True)['count']
         .sum()
     )
     # Total count per combo (across ClusterID)
     pooled_combo_totals = (
-        pooled.groupby(['tcell_line', 'organoid_line'])['count']
+        pooled.groupby(line_cols, observed=True)['count']
         .sum()
         .reset_index(name='combo_total_pooled')
     )
-    pooled = pooled.merge(pooled_combo_totals, on=['tcell_line', 'organoid_line'], how='left')
+    pooled = pooled.merge(pooled_combo_totals, on=line_cols, how='left')
     pooled['percentage_pooled'] = pooled['count'] / pooled['combo_total_pooled']
-
-    tcell_lines = pooled['tcell_line'].drop_duplicates().tolist()
-    organoid_lines = pooled['organoid_line'].drop_duplicates().tolist()
 
     # ------------- Page 2: Per-sample (one panel per sample) -------------
     # Aggregate to per-sample ClusterID composition
     per_sample = (
         df_clust_perc
-        .groupby(['sample_name', 'ClusterID'], as_index=False)['count']
+        .groupby(['sample_name', 'ClusterID'], as_index=False, observed=True)['count']
         .sum()
     )
     per_sample_totals = (
-        per_sample.groupby('sample_name')['count']
+        per_sample.groupby('sample_name', observed=True)['count']
         .sum()
         .reset_index(name='sample_total_all')
     )
@@ -835,88 +880,167 @@ def plot_cluster_percentage_bars(
         .sort_values()
         .tolist()
     )
+    
+    # Create multiple grids: THIS cell type (rows) × EACH other cell type (columns)
+    # line_cols[0] = this cell type's conditions (rows)
+    # line_cols[1:] = all other cell types' conditions (one grid per other type)
+    
+    grids_to_plot = []
+    
+    if len(line_cols) >= 2:
+        # Multiple grids: rows = first line_col, columns = each other line_col
+        line_col_rows = line_cols[0]
+        line_values_rows = pooled[line_col_rows].drop_duplicates().sort_values().tolist()
+        nrows = len(line_values_rows)
+        
+        for line_col_cols in line_cols[1:]:
+            line_values_cols = pooled[line_col_cols].drop_duplicates().sort_values().tolist()
+            ncols = len(line_values_cols)
+            grids_to_plot.append({
+                'line_col_1': line_col_rows,
+                'line_values_1': line_values_rows,
+                'line_col_2': line_col_cols,
+                'line_values_2': line_values_cols,
+                'nrows': nrows,
+                'ncols': ncols
+            })
+    elif len(line_cols) == 1:
+        # 1D layout: one row per line value
+        line_col_1 = line_cols[0]
+        line_values_1 = pooled[line_col_1].drop_duplicates().sort_values().tolist()
+        grids_to_plot.append({
+            'line_col_1': line_col_1,
+            'line_values_1': line_values_1,
+            'line_col_2': None,
+            'line_values_2': [None],
+            'nrows': len(line_values_1),
+            'ncols': 1
+        })
+    else:
+        # No line columns: single panel
+        grids_to_plot.append({
+            'line_col_1': None,
+            'line_values_1': [None],
+            'line_col_2': None,
+            'line_values_2': [None],
+            'nrows': 1,
+            'ncols': 1
+        })
 
     with PdfPages(outpdf) as pdf:
-        # ------------------------------- PAGE 1 -------------------------------
-        fig1, axes1 = plt.subplots(
-            len(tcell_lines),
-            len(organoid_lines),
-            figsize=grid_figsize,
-            sharex=True,
-            sharey=True,
-            squeeze=False
-        )
+        # Generate one combined grid per "other cell type"
+        for grid_idx, grid_config in enumerate(grids_to_plot):
+            line_col_1 = grid_config['line_col_1']
+            line_values_1 = grid_config['line_values_1']
+            line_col_2 = grid_config['line_col_2']
+            line_values_2 = grid_config['line_values_2']
+            nrows = grid_config['nrows']
+            ncols = grid_config['ncols']
+            
+            # ------------------------------- GRID PAGE -------------------------------
+            fig1, axes1 = plt.subplots(
+                nrows,
+                ncols,
+                figsize=grid_figsize,
+                sharex=True,
+                sharey=True,
+                squeeze=False
+            )
 
-        legend_handles_1, legend_labels_1 = None, None
+            legend_handles_1, legend_labels_1 = None, None
 
-        for i, tcell_line in enumerate(tcell_lines):
-            for j, organoid_line in enumerate(organoid_lines):
-                ax = axes1[i, j]
+            for i, val_1 in enumerate(line_values_1):
+                for j, val_2 in enumerate(line_values_2):
+                    ax = axes1[i, j]
 
-                subset = pooled[
-                    (pooled['tcell_line'] == tcell_line) &
-                    (pooled['organoid_line'] == organoid_line)
-                ]
-                if i == 0:
-                    ax.set_title(f'{organoid_line}', fontsize=title_fontsize)
-                if j == 0:
+                    # Build subset filter dynamically
+                    if line_col_2 is not None:
+                        subset = pooled[
+                            (pooled[line_col_1] == val_1) &
+                            (pooled[line_col_2] == val_2)
+                        ]
+                    elif line_col_1 is not None:
+                        subset = pooled[pooled[line_col_1] == val_1]
+                    else:
+                        subset = pooled
+                    
+                    # Set titles based on available line columns
+                    if i == 0 and val_2 is not None:
+                        ax.set_title(f'{val_2}', fontsize=title_fontsize)
+                    if j == 0 and val_1 is not None:
+                        ax.text(
+                            -0.05, 0.5, f'{val_1}',
+                            ha='right', va='center',
+                            rotation=0, transform=ax.transAxes,
+                            fontsize=title_fontsize
+                        )
+
+                    if subset.empty:
+                        ax.axis('off')
+                        continue
+
+                    # Ensure one row per ClusterID (drop duplicates if any)
+                    subset_unique = subset.drop_duplicates(subset=['ClusterID'], keep='first')
+                    
+                    # Build a 1-row dataframe indexed by a fake single row, columns=ClusterID
+                    row = (subset_unique
+                           .set_index('ClusterID')
+                           .reindex(cluster_order)
+                           ['percentage_pooled']
+                           .fillna(0.0))
+                    pivot = row.to_frame().T
+                    pivot.index = ['combined']  # a single horizontal bar
+
+                    bar_ax = pivot.plot(kind='barh', stacked=True, ax=ax, legend=False)
+
+                    if legend_handles_1 is None:
+                        legend_handles_1, legend_labels_1 = bar_ax.get_legend_handles_labels()
+
+                    # Annotate pooled #cells
+                    num_cells = int(subset['combo_total_pooled'].iloc[0]) if not subset.empty else 0
                     ax.text(
-                        -0.05, 0.5, f'{tcell_line}',
-                        ha='right', va='center',
-                        rotation=0, transform=ax.transAxes,
-                        fontsize=title_fontsize
+                        0.5, 0.08, f'# Cells (pooled): {num_cells}',
+                        ha='center', va='center',
+                        transform=ax.transAxes, fontsize=info_fontsize
                     )
 
-                if subset.empty:
+                    # Clean axes
+                    # ax.set_xlabel('')
+                    # ax.set_ylabel('')
+                    # ax.set_yticks([])
+                    # ax.set_xticks([])
+                    # ax.spines[['top','right','bottom','left']].set_visible(False)
                     ax.axis('off')
-                    continue
+                    
+            # Create grid title showing which cell types are crossed
+            if line_col_2 is not None:
+                # Extract cell type names from column names
+                type_1_name = line_col_1.replace('_line_condition', '').replace('_', ' ').title()
+                type_2_name = line_col_2.replace('_line_condition', '').replace('_', ' ').title()
+                title_text = f'Cluster percentages: {type_1_name} × {type_2_name}'
+            elif line_col_1 is not None:
+                # Single line condition
+                condition_name = line_col_1.replace('_line_condition', '').replace('_', ' ').title()
+                title_text = f'Cluster percentages by {condition_name}'
+            else:
+                title_text = f'Cluster percentages (combined)'
+            fig1.suptitle(title_text, fontsize=title_fontsize, y=0.995)
 
-                # Build a 1-row dataframe indexed by a fake single row, columns=ClusterID
-                row = (subset
-                       .set_index('ClusterID')
-                       .reindex(cluster_order)
-                       ['percentage_pooled']
-                       .fillna(0.0))
-                pivot = row.to_frame().T
-                pivot.index = ['combined']  # a single horizontal bar
-
-                bar_ax = pivot.plot(kind='barh', stacked=True, ax=ax, legend=False)
-
-                if legend_handles_1 is None:
-                    legend_handles_1, legend_labels_1 = bar_ax.get_legend_handles_labels()
-
-                # Annotate pooled #cells
-                num_cells = int(subset['combo_total_pooled'].iloc[0]) if not subset.empty else 0
-                ax.text(
-                    0.5, 0.08, f'# Cells (pooled): {num_cells}',
-                    ha='center', va='center',
-                    transform=ax.transAxes, fontsize=info_fontsize
+            if legend_handles_1 and legend_labels_1:
+                fig1.legend(
+                    legend_handles_1, legend_labels_1,
+                    fontsize=label_fontsize,
+                    title='ClusterID', title_fontsize=label_fontsize,
+                    bbox_to_anchor=(0.92, 0.5), loc='center left'
                 )
+                fig1.tight_layout(rect=[0, 0, 0.88, 0.96])
+            else:
+                fig1.tight_layout(rect=[0, 0, 1, 0.96])
 
-                # Clean axes
-                # ax.set_xlabel('')
-                # ax.set_ylabel('')
-                # ax.set_yticks([])
-                # ax.set_xticks([])
-                # ax.spines[['top','right','bottom','left']].set_visible(False)
-                ax.axis('off')
-        fig1.suptitle('Cluster percentages (T-cell × organoid combined)', fontsize=title_fontsize, y=0.995)
-
-        if legend_handles_1 and legend_labels_1:
-            fig1.legend(
-                legend_handles_1, legend_labels_1,
-                fontsize=label_fontsize,
-                title='ClusterID', title_fontsize=label_fontsize,
-                bbox_to_anchor=(0.92, 0.5), loc='center left'
-            )
-            fig1.tight_layout(rect=[0, 0, 0.88, 0.96])
-        else:
-            fig1.tight_layout(rect=[0, 0, 1, 0.96])
-
-        if plot_results:
-            plt.show()
-        pdf.savefig(fig1, bbox_inches='tight')
-        plt.close(fig1)
+            if plot_results:
+                plt.show()
+            pdf.savefig(fig1, bbox_inches='tight')
+            plt.close(fig1)
 
         # ------------------------------- PAGE 2 -------------------------------
         # One panel per sample (overall composition), in 3 columns
@@ -939,8 +1063,11 @@ def plot_cluster_percentage_bars(
                 ax.axis('off')
                 continue
 
+            # Ensure one row per ClusterID (drop duplicates if any)
+            sub_unique = sub.drop_duplicates(subset=['ClusterID'], keep='first')
+            
             # Build a single stacked bar for this sample
-            row = (sub
+            row = (sub_unique
                    .set_index('ClusterID')
                    .reindex(cluster_order)
                    ['percentage_overall']
@@ -1244,13 +1371,13 @@ def plot_clustering_feature_heatmap(
                 sub = df_long.loc[df_long["var"] == feat, ["ClusterID", "value"]].dropna(subset=["ClusterID", "value"])
                 if sub.empty:
                     ax.text(0.5, 0.5, f"{feat}\n(no finite data)", ha="center", va="center")
-                    ax.axis("off"); k += 1; continue
+                    ax.axis("off"); plot_idx += 1; continue
 
                 try:
-                    sns.violinplot(data=sub, x="ClusterID", y="value", order=clusters, inner=None, ax=ax, cut=0)
+                    sns.violinplot(data=sub, x="ClusterID", y="value", order=cluster_order, inner=None, ax=ax, cut=0)
                 except Exception:
                     ax.text(0.5, 0.5, f"{feat}\n(plot unavailable)", ha="center", va="center")
-                    ax.axis("off"); k += 1; continue
+                    ax.axis("off"); plot_idx += 1; continue
 
                 if show_points:
                     sns.stripplot(
@@ -1585,23 +1712,33 @@ def plot_touching_nontouching_distribution(
                     continue
                 
                 sample = sample_names[plot_idx]
-                df_subset = df_tracks[(df_tracks["sample_name"] == sample)]
+                df_subset = df_tracks[(df_tracks["sample_name"] == sample)].copy()
 
-                sns.histplot(
-                    df_subset, 
-                    x=contact_column, 
-                    multiple="dodge", 
-                    shrink=0.8, 
-                    discrete=True, 
-                    ax=ax
-                    )
+                # Convert contact to binary: ANY value > 0 means touching (1), else not touching (0)
+                # This handles both boolean (True/False) and numeric contact columns
+                df_subset['contact_binary'] = (df_subset[contact_column].astype(float) > 0).astype(int)
+                
+                # Count touching vs not touching
+                touching_counts = df_subset['contact_binary'].value_counts().reindex([0, 1], fill_value=0)
+                
+                # Create bar chart with exactly 2 bars
+                bars = ax.bar([0, 1], [touching_counts[0], touching_counts[1]], 
+                              color='steelblue', width=0.6, edgecolor='black', linewidth=1)
+                
+                ax.set_xlabel('Touching', fontsize=9)
+                ax.set_ylabel('Count', fontsize=9)
+                ax.set_xticks([0, 1])
+                ax.set_xticklabels(['No', 'Yes'])
                 ax.set_title(f"{sample}", fontsize=10)
+                ax.set_xlim(-0.5, 1.5)
+                
+                # Force integer y-axis
+                ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+                
                 plot_idx += 1
-            # Add a global title
-            if contact_column == "organoid_contact":
-                fig.suptitle("Touching vs. Non-touching Organoids", fontsize=14, fontweight="bold")
-            elif contact_column == "tcell_contact":
-                fig.suptitle("Touching vs. Non-touching T cells", fontsize=14, fontweight="bold")
+            # Add a global title (dynamic based on contact_column)
+            target_type = contact_column.replace('_contact', '').replace('_', ' ').title()
+            fig.suptitle(f"Touching vs. Non-touching {target_type}", fontsize=14, fontweight="bold")
 
             # Adjust layout and save
             # plt.tight_layout(rect=[0, 0, 1, 0.96])

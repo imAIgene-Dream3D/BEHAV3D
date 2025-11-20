@@ -152,11 +152,11 @@ def run_trackpy_tracking(
     
 
 
-def run_tcell_trackpy_tracking(
+def run_trackpy_tracking_generic(
     metadata,
     output_dir,
+    cell_type,
     overwrite=False,
-    cell_type="tcell",
     search_range=31,
     memory=2,
     adaptive_stop=10.0,
@@ -164,7 +164,7 @@ def run_tcell_trackpy_tracking(
     return_trackimg=True,
     **kwargs
 ):
-    """Run trackpy tracking on T cells.
+    """Run trackpy tracking on any cell type.
     
     Parameters
     ----------
@@ -173,17 +173,20 @@ def run_tcell_trackpy_tracking(
     output_dir : str or Path
         Root output directory
     cell_type : str
-        Should be "tcell" for this function
+        Name of the cell type to track 
+    overwrite : bool
+        Whether to overwrite existing tracking results
     search_range : float
-        Maximum distance cells can move between frames
+        Maximum distance cells can move between frames (in physical units)
     memory : int
-        Number of frames objects can disappear
+        Number of frames objects can disappear before being considered lost
     adaptive_stop : float
         Stop adaptive search when correlation coefficient falls below this value
     adaptive_step : float
-        Reduce search range by this factor when searching fails
+        Reduce search range by this factor when adaptive search fails
     return_trackimg : bool
         Whether to return and save tracked image
+    **kwargs : dict
     """
     output_dir = Path(output_dir)
     
@@ -195,7 +198,18 @@ def run_tcell_trackpy_tracking(
         tracked_img_outdir = Path(output_dir, "images", sample_name)
         tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         
-        segments_path = sample[f"{cell_type}_segments_image_path"]
+        # Find the correct prefixed column (or_, im_, ot_)
+        segments_col = None
+        for prefix in ['or', 'im', 'ot']:
+            col_name = f"{prefix}_{cell_type}_segments_image_path"
+            if col_name in sample.index and pd.notna(sample[col_name]):
+                segments_col = col_name
+                break
+        
+        if segments_col is None:
+            raise ValueError(f"No segments found for {cell_type} in sample {sample_name}. Expected prefixed column (or_/im_/ot_).")
+        
+        segments_path = sample[segments_col]
         tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr")
         tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_{cell_type}_tracks.csv")
     
@@ -295,28 +309,35 @@ def run_tcell_trackpy_tracking(
         else:
             print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
         
-        metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
-        metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
+        # Update metadata with prefixed column names
+        prefix = segments_col.split('_')[0]
+        img_col = f"{prefix}_{cell_type}_tracks_image_path"
+        csv_col = f"{prefix}_{cell_type}_tracks_csv_path"
+        # Ensure columns are object dtype to avoid FutureWarning
+        if img_col not in metadata.columns or metadata[img_col].dtype != object:
+            metadata[img_col] = metadata.get(img_col, pd.Series(dtype=object)).astype(object)
+        if csv_col not in metadata.columns or metadata[csv_col].dtype != object:
+            metadata[csv_col] = metadata.get(csv_col, pd.Series(dtype=object)).astype(object)
+        metadata.at[idx, img_col] = str(tracked_img_outpath)
+        metadata.at[idx, csv_col] = str(tracked_csv_outpath)
         
     return metadata
 
 
-def run_organoid_trackpy_tracking(
+def run_trackpy_tracking_with_method(
     metadata,
     output_dir,
+    cell_type,
     overwrite=False,
-    cell_type="tcell",
-    element_size_x=1,
-    element_size_y=1,
-    element_size_z=1,
     search_range=31,
     memory=2,
     adaptive_stop=10.0,
     adaptive_step=0.95,
     tracking_method='trackpy_post',
+    **kwargs
 ):
-    """Run tracking on segmented objects.
-    
+    """Run tracking on any cell type with specified tracking method.
+        
     Parameters
     ----------
     metadata : pd.DataFrame
@@ -324,9 +345,20 @@ def run_organoid_trackpy_tracking(
     output_dir : str or Path
         Root output directory
     cell_type : str
-        Either "tcell" or "organoid"
+        Name of the cell type to track (e.g., 'organoid1', 'organoid2', 'tcell', 'macro', 'tum')
+    overwrite : bool
+        Whether to overwrite existing tracking results
+    search_range : float
+        Maximum distance cells can move between frames (in physical units)
+    memory : int
+        Number of frames objects can disappear before being considered lost
+    adaptive_stop : float
+        Stop adaptive search when correlation coefficient falls below this value
+    adaptive_step : float
+        Reduce search range by this factor when adaptive search fails
     tracking_method : str
         Either "trackpy_post" or "cc3D"
+    **kwargs : dict
     """
     output_dir = Path(output_dir)
     
@@ -338,7 +370,18 @@ def run_organoid_trackpy_tracking(
         tracked_img_outdir = Path(output_dir, "images", sample_name)
         tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         
-        segments_path = sample[f"{cell_type}_segments_image_path"]
+        # Find the correct prefixed column (or_, im_, ot_)
+        segments_col = None
+        for prefix in ['or', 'im', 'ot']:
+            col_name = f"{prefix}_{cell_type}_segments_image_path"
+            if col_name in sample.index and pd.notna(sample[col_name]):
+                segments_col = col_name
+                break
+        
+        if segments_col is None:
+            raise ValueError(f"No segments found for {cell_type} in sample {sample_name}. Expected prefixed column (or_/im_/ot_).")
+        
+        segments_path = sample[segments_col]
         tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr")
         tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_{cell_type}_tracks.csv")
     
@@ -428,8 +471,16 @@ def run_organoid_trackpy_tracking(
         else:
             print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
 
-        # Update metadata with BEHAV3D standard paths
-        metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
-        metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
+        # Update metadata with prefixed column names
+        prefix = segments_col.split('_')[0]
+        img_col = f"{prefix}_{cell_type}_tracks_image_path"
+        csv_col = f"{prefix}_{cell_type}_tracks_csv_path"
+        # Ensure columns are object dtype to avoid FutureWarning
+        if img_col not in metadata.columns or metadata[img_col].dtype != object:
+            metadata[img_col] = metadata.get(img_col, pd.Series(dtype=object)).astype(object)
+        if csv_col not in metadata.columns or metadata[csv_col].dtype != object:
+            metadata[csv_col] = metadata.get(csv_col, pd.Series(dtype=object)).astype(object)
+        metadata.at[idx, img_col] = str(tracked_img_outpath)
+        metadata.at[idx, csv_col] = str(tracked_csv_outpath)
 
     return metadata
