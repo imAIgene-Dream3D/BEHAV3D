@@ -2,51 +2,123 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import fnmatch
+import re
 
 # def predict_classes(args):
 #     clf_path, path, outpath, idx = args
 #     # clf = joblib.load(clf_path)
 #     return(1)
 
+def detect_organoid_types_from_metadata(metadata):
+    """
+    Detect organoid types from metadata column names.
+    Looks for columns matching pattern: or_{organoidtype}_line_condition, or_{organoidtype}_segments_image_path, etc.
+    Returns list of organoid type names (e.g., ['organoid1', 'organoid2'])
+    """
+    if metadata is None:
+        return []
+    
+    organoid_types = set()
+    # Pattern: columns starting with 'or_' prefix
+    for col in metadata.columns:
+        if col.startswith('or_'):
+            # Extract cell type name: or_organoid1_line_condition -> organoid1
+            parts = col[3:].split('_', 1)  # Remove 'or_' prefix and split
+            if parts:
+                cell_type = parts[0]
+                organoid_types.add(cell_type)
+    
+    return sorted(list(organoid_types))
+
+def detect_immune_cell_types_from_metadata(metadata):
+    """
+    Detect immune cell types from metadata column names.
+    Looks for columns matching pattern: im_{celltype}_line_condition, im_{celltype}_segments_image_path, etc.
+    Returns list of immune cell type names (e.g., ['tcell', 'macro', 'nk'])
+    """
+    if metadata is None:
+        return []
+    
+    immune_types = set()
+    # Pattern: columns starting with 'im_' prefix
+    for col in metadata.columns:
+        if col.startswith('im_'):
+            # Extract cell type name: im_tcell_line_condition -> tcell
+            parts = col[3:].split('_', 1)  # Remove 'im_' prefix and split
+            if parts:
+                cell_type = parts[0]
+                immune_types.add(cell_type)
+    
+    return sorted(list(immune_types))
+
+def detect_other_cell_types_from_metadata(metadata):
+    """
+    Detect 'other' cell types from metadata column names.
+    Looks for columns matching pattern: ot_{celltype}_line_condition, ot_{celltype}_segments_image_path, etc.
+    Returns list of other cell type names (e.g., ['tumor1', 'fibroblast'])
+    """
+    if metadata is None:
+        return []
+    
+    other_types = set()
+    # Pattern: columns starting with 'ot_' prefix
+    for col in metadata.columns:
+        if col.startswith('ot_'):
+            # Extract cell type name: ot_tumor1_line_condition -> tumor1
+            parts = col[3:].split('_', 1)  # Remove 'ot_' prefix and split
+            if parts:
+                cell_type = parts[0]
+                other_types.add(cell_type)
+    
+    return sorted(list(other_types))
+
+def has_dead_channel(metadata):
+    """
+    Check if dead_channel column exists and has non-null values in metadata.
+    Returns True if dead channel is present, False otherwise.
+    """
+    if metadata is None:
+        return False
+    
+    if 'dead_channel' not in metadata.columns:
+        return False
+    
+    # Check if any row has a non-null dead_channel value
+    return metadata['dead_channel'].notna().any()
+
 def load_behav3d_metadata(
     metadata_path
     ):
+    """
+    Load metadata CSV with dynamic cell type support.
+    Uses prefixed columns: or_*, im_*, ot_* for organoid, immune, and other cell types.
+    """
+    # Basic dtype dict for common columns (cell-type specific columns are dynamic)
     dtype_dict = {
         "sample_name": str,
-        "organoid_line": str,
-        "tcell_line": str,
         "exp_nr": "Int64",
         "well": str,
-        "tcell_channel": "Int64",
-        "live_channel": "Int64",
         "dead_channel": "Int64",
-        "dead_dye_threshold": float,
         "pixel_distance_xy": float,
         "pixel_distance_z": float,
         "distance_unit": str,
-        "time_interval": float,  # Assuming it could be a float
+        "time_interval": float,
         "time_unit": str,
         "dimension_order": str, 
-        "raw_image_path": str,  # Keeping as str for easy handling
-        "tcell_segments_image_path": str,
-        "tcell_tracks_image_path": str,
-        "tcell_tracks_csv_path": str,
-        "organoid_segments_image_path": str,
-        "organoid_tracks_image_path": str,
-        "organoid_tracks_csv_path": str,
+        "raw_image_path": str,
         "signal_unmixing_image_path": str, #FUNC
-        "organoid_2_segments_image_path": str, #FUNC
-        "organoid_2_tracks_image_path": str, #FUNC
-        "organoid_2_tracks_csv_path": str, #FUNC
         "original_raw_image_path": str, # FUNC
     }
 
-    metadata = pd.read_csv(metadata_path, dtype=dtype_dict)
-
-    # Apply dtypes only to columns that exist --> Avoid ValueError, later we check_behav3d_metadata
-    # for col, dtype in dtype_dict.items():
-    #     if col in metadata.columns:
-    #         metadata[col] = metadata[col].astype(dtype)
+    metadata = pd.read_csv(metadata_path)
+    
+    # Apply dtypes only to columns that exist
+    for col, dtype in dtype_dict.items():
+        if col in metadata.columns:
+            try:
+                metadata[col] = metadata[col].astype(dtype)
+            except:
+                pass  # Skip if conversion fails
 
     metadata = metadata.dropna(how="all").reset_index(drop=True)
     return metadata 
@@ -55,16 +127,20 @@ def check_behav3d_metadata(
     metadata,
     func=False
     ):
+    """
+    Validate metadata with dynamic cell type support.
+    Uses prefixed columns: or_*, im_*, ot_* for organoid, immune, and other cell types.
+    """
+    # Detect cell types dynamically
+    organoid_types = detect_organoid_types_from_metadata(metadata)
+    immune_types = detect_immune_cell_types_from_metadata(metadata)
+    other_types = detect_other_cell_types_from_metadata(metadata)
     
+    # Basic required columns (always needed)
     required_columns = [
         "sample_name", 
-        "organoid_line", 
-        "tcell_line", 
         "exp_nr", 
         "well", 
-        "tcell_channel", 
-        "live_channel", 
-        "dead_channel", 
         "pixel_distance_xy", 
         "pixel_distance_z", 
         "distance_unit", 
@@ -72,115 +148,115 @@ def check_behav3d_metadata(
         "time_unit",
         "dimension_order", 
         "raw_image_path",
-        "tcell_segments_image_path", 
-        "tcell_tracks_image_path", 
-        "tcell_tracks_csv_path", 
-        "organoid_segments_image_path",
-        "organoid_tracks_image_path", 
-        "organoid_tracks_csv_path"
     ]
-
-    func_columns = [
-            "signal_unmixing_image_path",
-            "organoid_2_segments_image_path",
-            "organoid_2_tracks_image_path",
-            "organoid_2_tracks_csv_path",
-            # "original_raw_image_path"  # Not included bacouse it is added later if signal unmixing 
-        ]
-
-    missing_columns = set(required_columns) - set(metadata.columns)
-    missing_string = '\n'.join(missing_columns)
-
-    columns = [
-        "tcell_segments_image_path", 
-        "tcell_tracks_image_path", 
-        "tcell_tracks_csv_path", 
-        "organoid_segments_image_path",
-        "organoid_tracks_image_path", 
-        "organoid_tracks_csv_path"]
     
+    # Build dynamic required columns for each detected cell type
+    path_columns = []  # Columns that can be empty (filled by pipeline)
+    
+    for org_type in organoid_types:
+        required_columns.append(f"or_{org_type}_line_condition")
+        path_columns.extend([
+            f"or_{org_type}_segments_image_path",
+            f"or_{org_type}_tracks_image_path",
+            f"or_{org_type}_tracks_csv_path"
+        ])
+    
+    for immune_type in immune_types:
+        required_columns.append(f"im_{immune_type}_line_condition")
+        path_columns.extend([
+            f"im_{immune_type}_segments_image_path",
+            f"im_{immune_type}_tracks_image_path",
+            f"im_{immune_type}_tracks_csv_path"
+        ])
+    
+    for other_type in other_types:
+        required_columns.append(f"ot_{other_type}_line_condition")
+        path_columns.extend([
+            f"ot_{other_type}_segments_image_path",
+            f"ot_{other_type}_tracks_image_path",
+            f"ot_{other_type}_tracks_csv_path"
+        ])
+    
+    # Optional func columns
+    func_columns = []
     if func:
-        assert all(col in metadata.columns for col in required_columns+func_columns), f"Not all required columns are present in the metadata .csv file\n{missing_string}"
-        assert not any(metadata.drop(columns=columns+func_columns).isna().any()), "Some column values have not been supplied. Make sure you correctly supply values for all columns in the metadata .csv"
-    else:
-        assert all(col in metadata.columns for col in required_columns), f"Not all required columns are present in the metadata .csv file\n{missing_string}"
-        assert not any(metadata.drop(columns=columns).isna().any()), "Some column values have not been supplied. Make sure you correctly supply values for all columns in the metadata .csv"
+        if "signal_unmixing_image_path" in metadata.columns:
+            func_columns.append("signal_unmixing_image_path")
+        if "original_raw_image_path" in metadata.columns:
+            func_columns.append("original_raw_image_path")
     
+    # Check required columns exist
+    missing_columns = set(required_columns) - set(metadata.columns)
+    if missing_columns:
+        missing_string = '\n'.join(missing_columns)
+        raise AssertionError(f"Not all required columns are present in the metadata .csv file\n{missing_string}")
+    
+    # Check that non-path columns are filled
+    columns_to_check = [col for col in required_columns if col not in path_columns]
+    for col in columns_to_check:
+        if metadata[col].isna().any():
+            raise AssertionError(f"Column '{col}' has missing values. All required fields must be filled.")
+    
+    # Validate paths per row
     ok = True
+    all_cell_types = [(f"or_{t}", t) for t in organoid_types] + \
+                     [(f"im_{t}", t) for t in immune_types] + \
+                     [(f"ot_{t}", t) for t in other_types]
+    
     for rowidx, sample_metadata in metadata.iterrows():
         print(f"Row {rowidx+1}: {sample_metadata['sample_name']}")
         sample_name = sample_metadata['sample_name']
         
-        assert Path(sample_metadata["raw_image_path"]).exists(), f"The image_path supplied for 'row {rowidx+1}: {sample_name}' does not exist"
+        # Check raw image exists
+        assert Path(sample_metadata["raw_image_path"]).exists(), \
+            f"The raw_image_path supplied for 'row {rowidx+1}: {sample_name}' does not exist"
         
-        # elsizes = load_elsizes(sample_metadata["raw_image_path"])
-        # assert sample_metadata["pixel_distance_xy"] == elsizes["x"], f"Pixel distance xy supplied for 'row {rowidx+1}: {sample_name}' does not match the x pixel distance {elsizes['x']} retrieved from the raw image metadata"
-        # assert sample_metadata["pixel_distance_xy"] == elsizes["x"], f"Pixel distance xy supplied for 'row {rowidx+1}: {sample_name}' does not match the y pixel distance {elsizes['y']} retrieved from the raw image metadata"
-        # assert sample_metadata["pixel_distance_z"] == elsizes["z"], f"Pixel distance z supplied for 'row {rowidx+1}: {sample_name}' does not match the z pixel distance {elsizes['z']} in the image"
-        
-        ### T cell paths
-        if not pd.isna(sample_metadata["tcell_segments_image_path"]):
-            assert Path(sample_metadata["tcell_segments_image_path"]).exists(), f"The tcell_segments_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
-        elif pd.isna(sample_metadata["tcell_tracks_image_path"]):
-            print(f"!!! No segmented or tracked tcell image is supplied. Please run segmentation and tracking below.")
-            ok=False
-        if not pd.isna(sample_metadata["tcell_tracks_image_path"]):
-            assert Path(sample_metadata["tcell_tracks_image_path"]).exists(), f"The tcell_tracks_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
-        else:
-            print(f"!!! No tracked tcell image is supplied. Please run tracking below.")
-            ok=False
-        if not pd.isna(sample_metadata["tcell_tracks_csv_path"]):
-            assert Path(sample_metadata["tcell_tracks_csv_path"]).exists(), f"The tcell_tracks_csv_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
-        else:
-            print(f"!!! No tracked tcell .csv is supplied. Please run tracking below.")
-            ok=False
+        # Check each cell type's paths
+        for prefix_type, display_type in all_cell_types:
+            segments_col = f"{prefix_type}_segments_image_path"
+            tracks_img_col = f"{prefix_type}_tracks_image_path"
+            tracks_csv_col = f"{prefix_type}_tracks_csv_path"
             
-        ### Organoids paths
-        if not pd.isna(sample_metadata["organoid_segments_image_path"]):
-            assert Path(sample_metadata["organoid_segments_image_path"]).exists(), f"The organoid_segments_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
-        elif pd.isna(sample_metadata["organoid_tracks_image_path"]):
-            print(f"!!! No segmented or tracked organoid image is supplied. Please run segmentation and tracking below.")
-            ok=False
-        if not pd.isna(sample_metadata["organoid_tracks_image_path"]):
-            assert Path(sample_metadata["organoid_tracks_image_path"]).exists(), f"The organoid_tracks_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
-        else:
-            print(f"!!! No tracked organoid image is supplied. Please run tracking below.")
-            ok=False
-        if not pd.isna(sample_metadata["organoid_tracks_csv_path"]):
-            assert Path(sample_metadata["organoid_tracks_csv_path"]).exists(), f"The organoid_tracks_csv_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
-        else:
-            print(f"!!! No tracked organoid .csv is supplied. Please run tracking below.")
-            ok=False
-
-        ### FUNC
-        if func:        
-            ### Organoids 2 paths
-            if not pd.isna(sample_metadata["organoid_2_segments_image_path"]):
-                assert Path(sample_metadata["organoid_2_segments_image_path"]).exists(), f"The organoid_2_segments_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
-            elif pd.isna(sample_metadata["organoid_2_tracks_image_path"]):
-                print(f"!!! No segmented or tracked organoid_2 image is supplied. If 2 organoid types, please run segmentation and tracking below.")
-                ok=False
-            if not pd.isna(sample_metadata["organoid_2_tracks_image_path"]):
-                assert Path(sample_metadata["organoid_2_tracks_image_path"]).exists(), f"The organoid_2_tracks_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+            # Check segments
+            if not pd.isna(sample_metadata[segments_col]) and sample_metadata[segments_col]:
+                if not Path(sample_metadata[segments_col]).exists():
+                    print(f"⚠️ {segments_col} path does not exist")
             else:
-                print(f"!!! No tracked organoid_2 image is supplied. If 2 organoid types, please run tracking below.")
-                ok=False
-            if not pd.isna(sample_metadata["organoid_2_tracks_csv_path"]):
-                assert Path(sample_metadata["organoid_2_tracks_csv_path"]).exists(), f"The organoid_2_tracks_csv_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+                print(f"!!! No segmented {display_type} image. Please run segmentation below.")
+                ok = False
+            
+            # Check tracks image
+            if not pd.isna(sample_metadata[tracks_img_col]) and sample_metadata[tracks_img_col]:
+                if not Path(sample_metadata[tracks_img_col]).exists():
+                    print(f"⚠️ {tracks_img_col} path does not exist")
             else:
-                print(f"!!! No tracked organoid_2 .csv is supplied.If 2 organoid types, please run tracking below.")
-                ok=False
-            ### Signal unmixing
-            if not pd.isna(sample_metadata["signal_unmixing_image_path"]):
-                print(f"--------{sample_metadata["signal_unmixing_image_path"]}--------------")
-                assert Path(sample_metadata["signal_unmixing_image_path"]).exists(), f"The signal_unmixing_image_path supplied for Row {rowidx+1} '{sample_name}' does not exist"
+                print(f"!!! No tracked {display_type} image. Please run tracking below.")
+                ok = False
+            
+            # Check tracks CSV
+            if not pd.isna(sample_metadata[tracks_csv_col]) and sample_metadata[tracks_csv_col]:
+                if not Path(sample_metadata[tracks_csv_col]).exists():
+                    print(f"⚠️ {tracks_csv_col} path does not exist")
             else:
-                print(f"!!! No signal unmixed image is supplied. If including signal unmixing, please run it below.")
-                ok=False
-
+                print(f"!!! No tracked {display_type} CSV. Please run tracking below.")
+                ok = False
+        
+        # Check func columns if needed
+        if func:
+            if "signal_unmixing_image_path" in func_columns:
+                if not pd.isna(sample_metadata["signal_unmixing_image_path"]):
+                    assert Path(sample_metadata["signal_unmixing_image_path"]).exists(), \
+                        f"signal_unmixing_image_path for Row {rowidx+1} '{sample_name}' does not exist"
+                else:
+                    print(f"!!! No signal unmixed image supplied.")
+                    ok = False
+        
         print("")
+    
     if ok:
-        print("Metadata file is complete and correct")
+        print("✅ Metadata file is complete and correct")
+    else:
+        print("⚠️ Some processing steps need to be run (see warnings above)")
 
     
 def format_time(

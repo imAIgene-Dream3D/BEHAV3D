@@ -18,8 +18,8 @@ from behav3d.preprocessing.unmixing.signal_unmixing import signal_unmixing
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import train_pixel_classifier, run_pixel_classifier_segmentation
 import traceback
 from behav3d.preprocessing.tracking import visualize_tracks
-from behav3d.preprocessing.tracking.laptracking import run_tcell_laptracking
-from behav3d.preprocessing.tracking.trackpy_tracking import run_tcell_trackpy_tracking
+from behav3d.preprocessing.tracking.laptracking import run_laptracking
+from behav3d.preprocessing.tracking.trackpy_tracking import run_trackpy_tracking_generic
 from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
 
 
@@ -29,13 +29,79 @@ import yaml
 import fnmatch
 from behav3d.analysis import summarize_track_features
 from behav3d.analysis.feature_extraction import run_feature_extraction
-from behav3d.analysis.tcell_analysis import filter_tcell_tracks, run_tcell_analysis 
-from behav3d.analysis.organoid_analysis import filter_organoid_tracks, run_organoid_analysis 
+# Analysis functions imported from adapted tcell_analysis and organoid_analysis
+from behav3d.analysis.tcell_analysis import filter_cell_tracks, run_tcell_analysis
+from behav3d.analysis.organoid_analysis import filter_organoid_tracks, run_organoid_analysis
 
 from behav3d.analysis.backprojection import backproject_mean_features_behav3d, backproject_time_features_behav3d
 import napari
 
 from functools import partial
+
+
+# ===============================
+# UNIFIED CATEGORY DETECTION
+# ===============================
+def detect_cell_type_category(cell_type, metadata):
+    """
+    Unified category detection for ANY panel in the pipeline.
+    
+    Determines if a cell_type belongs to 'organoid', 'immune', or 'other' category
+    by checking metadata column prefixes (or_, im_, ot_).
+    
+    Parameters
+    ----------
+    cell_type : str
+        The cell type name (e.g., 'organoid1', 'tcell', 'macro', 'tum')
+    metadata : pd.DataFrame
+        The loaded metadata with prefixed columns
+        
+    Returns
+    -------
+    str
+        One of: 'organoid', 'immune', 'other'
+        
+    Raises
+    ------
+    ValueError
+        If cell_type not found in any detected category
+        
+    Examples
+    --------
+    >>> detect_cell_type_category('organoid1', metadata)
+    'organoid'
+    >>> detect_cell_type_category('tcell', metadata)
+    'immune'
+    >>> detect_cell_type_category('tumor', metadata)
+    'other'
+    """
+    from behav3d.utils import (
+        detect_organoid_types_from_metadata,
+        detect_immune_cell_types_from_metadata,
+        detect_other_cell_types_from_metadata
+    )
+    
+    organoid_types = detect_organoid_types_from_metadata(metadata)
+    immune_types = detect_immune_cell_types_from_metadata(metadata)
+    other_types = detect_other_cell_types_from_metadata(metadata)
+    
+    if cell_type in organoid_types:
+        return 'organoid'
+    elif cell_type in immune_types:
+        return 'immune'
+    elif cell_type in other_types:
+        return 'other'
+    else:
+        # Fallback: check if "organoid" substring exists
+        if 'organoid' in cell_type.lower():
+            return 'organoid'
+        else:
+            raise ValueError(
+                f"Cell type '{cell_type}' not found in metadata. "
+                f"Detected: organoid={organoid_types}, immune={immune_types}, other={other_types}. "
+                f"Ensure metadata has columns with prefixes: or_{cell_type}_*, im_{cell_type}_*, or ot_{cell_type}_*"
+            )
+
 
 behav3d_calculated_features = {
     "morphology": [
@@ -72,11 +138,15 @@ behav3d_calculated_features = {
         "dead",
     ],
     "contact": [
-        "organoid_contact",
-        "organoid_contact_pixels",
-        "tcell_contact",
-        "tcell_contact_pixels",
-        "active_tcell_contact",
+        # Contact features are DYNAMIC - generated for ALL cell types in metadata:
+        # - {cell_type}_contact           (bool)
+        # - {cell_type}_contact_pixels    (int)  
+        # - touching_{cell_type}s         (str)
+        # - active_{cell_type}_contact    (float) - works for ANY cell type
+        "*_contact",
+        "*_contact_pixels",
+        "touching_*",
+        "active_*_contact",
     ],
 }
 # ===============================
@@ -107,19 +177,21 @@ _DEFAULT_CONFIG = {
         "start_t": 0,
         "end_t": 0,
         "use_unmix_path": False,
-        "channel_colors": ["cyan", "yellow", "red", "green", "magenta", "blue"]
+        "channel_colors": ["cyan", "yellow", "red", "green", "magenta", "blue",
+                           "gray", "turbo", "viridis", "plasma", "inferno", "twilight"]
     },
     "pixel_classifier": {
         "examples_per_sample": 3,
         "sample_specific_classifier": False,
         "workers": 8,
-        "organoid_edt_threshold": 12.0,
         "use_all_timepoints": True,
         "tp_start": 0,
-        "tp_end": 0
+        "tp_end": 0,
+        # Dynamic EDT thresholds are stored as "{celltype}_edt_threshold"
+
     },
     "tracking": {
-        "tcell": {
+        "immune": {
             "method": "trackpy",
             "overwrite": False,
             "lap": {
@@ -132,7 +204,24 @@ _DEFAULT_CONFIG = {
             "trackpy": {
                 "search_range_px": 31,
                 "memory_frames": 5,
-                "adaptive_stop": 5,
+                "adaptive_stop": 5.0,
+                "adaptive_step": 0.95
+            }
+        },
+        "other": {
+            "method": "trackpy",
+            "overwrite": False,
+            "lap": {
+                "track_cost_px": 60,
+                "gap_close_cost_px": 45,
+                "gap_close_max_frames": 5,
+                "merging_cost_px": 0,
+                "splitting_cost_px": 0
+            },
+            "trackpy": {
+                "search_range_px": 31,
+                "memory_frames": 5,
+                "adaptive_stop": 5.0,
                 "adaptive_step": 0.95
             }
         },
@@ -152,34 +241,21 @@ _DEFAULT_CONFIG = {
                 "adaptive_stop": 10.0,
                 "adaptive_step": 0.95
             }
-        },
-        "organoid_2": {
-            "method": "propagation",
-            "overwrite": False,
-            "lap": {
-                "track_cost_px": 60,
-                "gap_close_cost_px": 80,
-                "gap_close_max_frames": 3,
-                "merging_cost_px": 0,
-                "splitting_cost_px": 0
-            },
-            "trackpy": {
-                "search_range_px": 35,
-                "memory_frames": 2,
-                "adaptive_stop": 10.0,
-                "adaptive_step": 0.95
-            }
         }
+        # Specific cell types will be added dynamically
     },
     "tracking_visualization": {
         "sample_name": None,
         "use_range": False,
         "start_t": 0,
         "end_t": 0,
-        "channel_colors": ["cyan", "yellow", "red", "green", "magenta", "blue"]
+        "channel_colors": ["cyan", "yellow", "red", "green", "magenta", "blue",
+                           "gray", "turbo", "viridis", "plasma", "inferno", "twilight"]
     },
     "features": {
-        "tcell": {
+        # Category templates - specific cell types inherit these settings
+        # Cell types are auto-detected from metadata (im_*, or_*, ot_* prefixes)
+        "immune": {
             "dead_mask_percentage_threshold": 0.25,
             "features_choice": ["movement", "intensity", "contact", "death"],
             "contact_threshold": 0,
@@ -193,16 +269,17 @@ _DEFAULT_CONFIG = {
             "n_workers": 8,
             "overwrite": False
         },
-        "organoid_2": {
-            "dead_mask_percentage_threshold": 0.02,
-            "features_choice": ["intensity", "death", "morphology"],
+        "other": {
+            "dead_mask_percentage_threshold": 0.10,
+            "features_choice": ["movement", "intensity", "contact"],
             "contact_threshold": 0,
             "n_workers": 8,
             "overwrite": False
         }
     },
     "track_filtering": {
-        "tcell": {
+        # Category templates - specific cell types inherit these settings
+        "immune": {
             "exp_duration": 24.0,
             "exp_duration_enabled": False,
             "min_track_length": 0, # frames
@@ -210,31 +287,32 @@ _DEFAULT_CONFIG = {
             "max_track_length": 999999, # frames
             "max_track_length_enabled": True,
             "filter_t0_dead": True,
-            "filter_t0_dead_enabled": False
+            "filter_t0_dead_enabled": True,  # Enabled - remove dead cells added at start
         },
         "organoid": {
             "exp_duration_enabled": False,
-            "exp_duration": 999999,      # timepoints
+            "exp_duration": 24.0,        # hours (disabled by default - organoids persist)
             "min_track_length_enabled": False,
-            "min_track_length": 100,       # frames
+            "min_track_length": 50,      # frames (disabled - adjust based on experiment length)
             "max_track_length_enabled": False,
-            "max_track_length": 100,  # frames
-            "min_size_enabled": True,
-            "min_size": 1000,
+            "max_track_length": 999999,  # frames (disabled - organoids should persist)
+            "filter_t0_dead": True,
+            "filter_t0_dead_enabled": True,
         },
-        "organoid_2": {
+        "other": {
+            "exp_duration": 24.0,
             "exp_duration_enabled": False,
-            "exp_duration": 999999,      # timepoints
-            "min_track_length_enabled": False,
-            "min_track_length": 100,       # frames
-            "max_track_length_enabled": False,
-            "max_track_length": 100,  # frames
-            "min_size_enabled": True,
-            "min_size": 1000,
+            "min_track_length": 0, # frames
+            "min_track_length_enabled": True,
+            "max_track_length": 999999, # frames
+            "max_track_length_enabled": True,
+            "filter_t0_dead": False,
+            "filter_t0_dead_enabled": False
         }
     },
     "analysis": {
-        "tcell": {
+        # Category templates - specific cell types inherit these settings
+        "immune": {
             "seed": 42,
             "umap_min_dist": 0.1,
             "umap_n_neighbors": 15,
@@ -246,27 +324,43 @@ _DEFAULT_CONFIG = {
                 "death": False,
                 "contact": False,
             },
-            'dtw_features_input': [
-                'mean_square_displacement',
-                'speed',
-                'mean_dead_dye',
-                'organoid_contact',
-                'tcell_contact'
-            ],      # patterns allowed (e.g. "mean_intensity_*")
+            'dtw_features_input': [],  # Empty list = use groups
             "dtw_features_resolved": [],   # expanded at run
-            'z_normalize': {
-                'mean_square_displacement': True,
-                'speed': True,
-                'mean_dead_dye': True,
-                'organoid_contact': False,
-                'tcell_contact': False
-            },             # {feature_name: bool}
+            'z_normalize': {},  # Auto-determined at runtime
         },
         "organoid": {
+            "seed": 42,
+            "umap_min_dist": 0.1,
+            "umap_n_neighbors": 15,
+            "nr_of_clusters": 3,
+            "dtw_feature_groups_enabled": {
+                "morphology": False,
+                "movement": False,
+                "intensity": False,
+                "death": False,
+                "contact": False,
+            },
+            'dtw_features_input': [],  # Empty list = use groups
+            "dtw_features_resolved": [],
+            'z_normalize': {},  # Auto-determined at runtime
             "dead_perc_threshold": 0.02
         },
-        "organoid_2": {
-            "dead_perc_threshold": 0.02
+        "other": {
+            "seed": 42,
+            "umap_min_dist": 0.1,
+            "umap_n_neighbors": 15,
+            "nr_of_clusters": 5,
+            "dtw_feature_groups_enabled": {
+                "morphology": False,
+                "movement": False,
+                "intensity": False,
+                "death": False,
+                "contact": False,
+            },
+            'dtw_features_input': [],  # Empty list = use groups
+            "dtw_features_resolved": [],
+            'z_normalize': {},  # Auto-determined at runtime
+            "dead_perc_threshold": 0.10
         }
     },
     "backprojection": {
@@ -466,6 +560,697 @@ class PathPicker(widgets.VBox):
         except Exception:
             # Don't crash UI if reset fails; ignore silently
             pass
+
+class MetadataBuilder(widgets.VBox):
+    """
+    Interactive widget for creating/editing BEHAV3D metadata CSV files.
+    Supports:
+    - Dynamic number of samples
+    - Organoid, immune, and other cell type populations
+    - Dead channel only (yes/no toggle)
+    - Fill-down from sample 1
+    - Load existing CSV for editing
+    """
+    def __init__(self, output_dir_picker=None, **kwargs):
+        super().__init__(**kwargs)
+        self.output_dir_picker = output_dir_picker
+        
+        # Population configuration
+        self.n_organoid_types = 0
+        self.n_immune_types = 0
+        self.n_other_types = 0
+        self.organoid_names = []
+        self.immune_names = []
+        self.other_names = []
+        
+        # Sample data storage
+        self.sample_forms = []
+        
+        # Store loaded dataframe for re-population
+        self.loaded_df = None
+        
+        self._build_ui()
+    
+    def _build_ui(self):
+        """Build the initial configuration UI"""
+        # Header
+        header = widgets.HTML('<h3>Metadata Builder</h3>')
+        instructions = widgets.HTML(
+            '<p>Define the number of samples and configure cell type populations. '
+            'Fields marked with * are required.</p>'
+        )
+        
+        # Number of samples
+        self.n_samples_input = widgets.IntText(
+            value=1,
+            description='Number of samples*:',
+            style={'description_width': '150px'}
+        )
+        
+        # Load CSV button (NEW)
+        self.btn_load_csv = widgets.Button(
+            description='Load Existing CSV',
+            button_style='info',
+            icon='upload',
+            tooltip='Load an existing metadata CSV to edit'
+        )
+        self.btn_load_csv.on_click(self._on_load_csv)
+        
+        # Configure populations button
+        self.btn_configure = widgets.Button(
+            description='Configure Cell Types',
+            button_style='primary',
+            icon='cog'
+        )
+        self.btn_configure.on_click(self._on_configure_populations)
+        
+        # Container for dynamic content
+        self.main_container = widgets.VBox()
+        
+        # Assembly
+        self.children = [
+            header,
+            instructions,
+            widgets.HBox([self.n_samples_input, self.btn_load_csv]),
+            self.btn_configure,
+            self.main_container
+        ]
+    
+    def _on_load_csv(self, btn):
+        """Load existing CSV and populate the form"""
+        if self.output_dir_picker is None:
+            self.main_container.children = [widgets.HTML('<p style="color:red">⚠️ No output directory picker provided</p>')]
+            return
+        
+        output_dir = Path(self.output_dir_picker.value)
+        if not output_dir.exists():
+            self.main_container.children = [widgets.HTML('<p style="color:red">⚠️ Output directory does not exist</p>')]
+            return
+        
+        # Look for metadata.csv in the output directory ***pending: create a path to load the name.cvs you want
+        csv_path = output_dir / 'metadata.csv'
+        if not csv_path.exists():
+            self.main_container.children = [widgets.HTML(f'<p style="color:red">⚠️ No metadata.csv found in {output_dir}</p>')] #
+            return
+        
+        try:
+            df = pd.read_csv(csv_path)
+            self._populate_from_dataframe(df)
+            self.main_container.children = [widgets.HTML('<p style="color:green">✅ CSV loaded successfully! Scroll down to edit.</p>')]
+        except Exception as e:
+            self.main_container.children = [widgets.HTML(f'<p style="color:red">⚠️ Error loading CSV: {e}</p>')]
+    
+    def _populate_from_dataframe(self, df):
+        """Populate the form from an existing DataFrame"""
+        from behav3d.utils import detect_organoid_types_from_metadata, detect_immune_cell_types_from_metadata, detect_other_cell_types_from_metadata
+        
+        # Store loaded dataframe for re-population
+        self.loaded_df = df.copy()
+        
+        # Detect cell types from columns (with new prefix system: or_, im_, ot_)
+        organoid_types = detect_organoid_types_from_metadata(df)
+        immune_types = detect_immune_cell_types_from_metadata(df)
+        other_types = detect_other_cell_types_from_metadata(df)
+               
+        self.n_organoid_types = len(organoid_types)
+        self.n_immune_types = len(immune_types)
+        self.n_other_types = len(other_types)
+        self.organoid_names = organoid_types
+        self.immune_names = immune_types
+        self.other_names = other_types
+        
+        # Set number of samples
+        self.n_samples_input.value = len(df)
+        
+        # Build the form
+        self._build_data_entry_form()
+    
+    def _populate_form_fields(self, df):
+        """Populate form fields from DataFrame"""
+        # Populate fields from DataFrame
+        for idx, row in df.iterrows():
+            if idx >= len(self.sample_forms):
+                break
+            
+            form = self.sample_forms[idx]
+            
+            # Basic fields
+            for field_name, widget in form['basic'].items():
+                if field_name in row and pd.notna(row[field_name]):
+                    try:
+                        if isinstance(widget, widgets.IntText):
+                            widget.value = int(row[field_name])
+                        elif isinstance(widget, widgets.FloatText):
+                            widget.value = float(row[field_name])
+                        else:
+                            widget.value = str(row[field_name])
+                    except (ValueError, TypeError):
+                        # If conversion fails, try as string
+                        widget.value = str(row[field_name]) if row[field_name] != '' else ''
+            
+            # Cell type fields with line_condition splitting
+            # Need to determine prefix for each cell type
+            for cell_type, fields_dict in form['cell_types'].items():
+                # Determine prefix based on which category this cell type belongs to
+                if cell_type in self.organoid_names:
+                    prefix = 'or'
+                elif cell_type in self.immune_names:
+                    prefix = 'im'
+                elif cell_type in self.other_names:
+                    prefix = 'ot'
+                else:
+                    continue  # Skip unknown types
+                
+                # Handle line_condition splitting with prefix
+                line_cond_col = f'{prefix}_{cell_type}_line_condition'
+                if line_cond_col in row and pd.notna(row[line_cond_col]) and str(row[line_cond_col]).strip() != '':
+                    # Split "32_ko" -> line="32", condition="ko"
+                    value = str(row[line_cond_col]).strip()
+                    parts = value.split('_', 1)
+                    if 'line' in fields_dict:
+                        fields_dict['line'].value = parts[0] if parts[0] else ''
+                    if 'condition' in fields_dict and len(parts) > 1:
+                        fields_dict['condition'].value = parts[1] if parts[1] else ''
+                    elif 'condition' in fields_dict:
+                        fields_dict['condition'].value = ''
+                
+                # Load optional path fields if they exist
+                for path_field in ['segments_image_path', 'tracks_image_path', 'tracks_csv_path']:
+                    col_name = f'{prefix}_{cell_type}_{path_field}'
+                    if col_name in row and pd.notna(row[col_name]) and path_field in fields_dict:
+                        fields_dict[path_field].value = str(row[col_name]).strip()
+            
+            # Dead channel
+            if 'dead_channel' in row and pd.notna(row['dead_channel']) and str(row['dead_channel']).strip() != '':
+                try:
+                    form['dead_channel']['enabled'].value = True
+                    form['dead_channel']['number'].value = int(row['dead_channel'])
+                except (ValueError, TypeError):
+                    # If conversion fails, leave dead channel disabled
+                    form['dead_channel']['enabled'].value = False
+    
+    def _on_configure_populations(self, btn):
+        """Show population configuration UI"""
+        # Organoid types
+        org_label = widgets.HTML('<h4>Organoid Populations</h4>')
+        self.n_organoid_input = widgets.IntText(
+            value=self.n_organoid_types,
+            description='Number of types:',
+            style={'description_width': '120px'}
+        )
+        
+        # Immune cell types
+        immune_label = widgets.HTML('<h4>Immune Cell Populations</h4>')
+        self.n_immune_input = widgets.IntText(
+            value=self.n_immune_types,
+            description='Number of types:',
+            style={'description_width': '120px'}
+        )
+        
+        # Other cell types  
+        other_label = widgets.HTML('<h4>Other Cell Types</h4>')
+        self.n_other_input = widgets.IntText(
+            value=self.n_other_types,
+            description='Number of types:',
+            style={'description_width': '120px'}
+        )
+        
+        btn_confirm = widgets.Button(description='Next: Name Cell Types', button_style='success')
+        btn_confirm.on_click(self._show_cell_type_naming)
+        
+        self.main_container.children = [
+            org_label,
+            self.n_organoid_input,
+            immune_label,
+            self.n_immune_input,
+            other_label,
+            self.n_other_input,
+            btn_confirm
+        ]
+    
+    def _show_cell_type_naming(self, btn):
+        """Show UI to name each cell type"""
+        self.n_organoid_types = self.n_organoid_input.value
+        self.n_immune_types = self.n_immune_input.value
+        self.n_other_types = self.n_other_input.value
+        
+        naming_widgets = []
+        self.organoid_name_inputs = []
+        self.immune_name_inputs = []
+        self.other_name_inputs = []
+        
+        # Organoid naming
+        if self.n_organoid_types > 0:
+            naming_widgets.append(widgets.HTML('<h4>Name Your Organoid Types</h4>'))
+            for i in range(self.n_organoid_types):
+                default = self.organoid_names[i] if i < len(self.organoid_names) else f'organoid{i+1}'
+                w = widgets.Text(
+                    value=default,
+                    description=f'Organoid {i+1}:',
+                    placeholder='e.g., organoid1, organoidWT',
+                    style={'description_width': '100px'}
+                )
+                self.organoid_name_inputs.append(w)
+                naming_widgets.append(w)
+        
+        # Immune cell naming
+        if self.n_immune_types > 0:
+            naming_widgets.append(widgets.HTML('<h4>Name Your Immune Cell Types</h4>'))
+            for i in range(self.n_immune_types):
+                default = self.immune_names[i] if i < len(self.immune_names) else f'immune{i+1}'
+                w = widgets.Text(
+                    value=default,
+                    description=f'Immune {i+1}:',
+                    placeholder='e.g., tcells, nk',
+                    style={'description_width': '100px'}
+                )
+                self.immune_name_inputs.append(w)
+                naming_widgets.append(w)
+        
+        # Other cell naming
+        if self.n_other_types > 0:
+            naming_widgets.append(widgets.HTML('<h4>Name Your Other Cell Types</h4>'))
+            for i in range(self.n_other_types):
+                default = self.other_names[i] if i < len(self.other_names) else f'other{i+1}'
+                w = widgets.Text(
+                    value=default,
+                    description=f'Other {i+1}:',
+                    placeholder='e.g., tumorcells, fibroblast',
+                    style={'description_width': '100px'}
+                )
+                self.other_name_inputs.append(w)
+                naming_widgets.append(w)
+        
+        btn_next = widgets.Button(description='Create Data Entry Form', button_style='success')
+        btn_next.on_click(self._on_names_confirmed)
+        naming_widgets.append(btn_next)
+        
+        self.main_container.children = naming_widgets
+    
+    def _on_names_confirmed(self, btn):
+        """Collect names and build data entry form"""
+        self.organoid_names = [w.value.strip() for w in self.organoid_name_inputs]
+        self.immune_names = [w.value.strip() for w in self.immune_name_inputs]
+        self.other_names = [w.value.strip() for w in self.other_name_inputs]
+        
+        self._build_data_entry_form()
+    
+    def _build_data_entry_form(self):
+        """Build the main data entry form for all samples"""
+        n_samples = self.n_samples_input.value
+        self.sample_forms = []
+        
+        form_widgets = [widgets.HTML('<h3> Sample Data Entry</h3>')]
+        
+        # Fill-down button (NEW)
+        btn_fill_down = widgets.Button(
+            description='Fill All from Sample 1',
+            button_style='warning',
+            icon='arrow-down',
+            tooltip='Copy all values from Sample 1 to all other samples (except sample names)'
+        )
+        btn_fill_down.on_click(self._on_fill_down)
+        form_widgets.append(btn_fill_down)
+        
+        # Create form for each sample
+        for i in range(n_samples):
+            sample_form = self._create_sample_form(i)
+            self.sample_forms.append(sample_form)
+            form_widgets.append(sample_form['widget'])
+        
+        # Save button
+        btn_save = widgets.Button(
+            description='Save Metadata to CSV',
+            button_style='success',
+            icon='save'
+        )
+        btn_save.on_click(self._on_save_metadata)
+        
+        self.save_output = widgets.Output()
+        
+        form_widgets.extend([btn_save, self.save_output])
+        self.main_container.children = form_widgets
+        
+        # If we have a loaded dataframe, re-populate the forms
+        if self.loaded_df is not None:
+            self._populate_form_fields(self.loaded_df)
+    
+    def _on_fill_down(self, btn):
+        """Copy all values from Sample 1 to all other samples (except sample_name)"""
+        if len(self.sample_forms) < 2:
+            return
+        
+        source_form = self.sample_forms[0]
+        
+        for i in range(1, len(self.sample_forms)):
+            target_form = self.sample_forms[i]
+            
+            # Copy basic fields (except sample_name)
+            for field_name, src_widget in source_form['basic'].items():
+                if field_name != 'sample_name':
+                    target_form['basic'][field_name].value = src_widget.value
+            
+            # Copy cell type fields
+            for cell_type in source_form['cell_types']:
+                for field_name, src_widget in source_form['cell_types'][cell_type].items():
+                    target_form['cell_types'][cell_type][field_name].value = src_widget.value
+            
+            # Copy dead channel
+            target_form['dead_channel']['enabled'].value = source_form['dead_channel']['enabled'].value
+            target_form['dead_channel']['number'].value = source_form['dead_channel']['number'].value
+        
+        with self.save_output:
+            self.save_output.clear_output()
+            print('✅ Filled all samples from Sample 1!')
+    
+    def _create_sample_form(self, sample_idx):
+        """Create form widgets for a single sample"""
+        form_data = {
+            'basic': {},
+            'cell_types': {},
+            'dead_channel': {},
+            'widget': None
+        }
+        
+        # Sample header
+        header = widgets.HTML(f'<h4 style="background:#e1f5fe;padding:8px;">Sample {sample_idx + 1}</h4>')
+        
+        # Basic fields
+        form_data['basic']['sample_name'] = widgets.Text(
+            description='Sample name*:',
+            placeholder='e.g., Sample001',
+            style={'description_width': '150px'},
+            layout=widgets.Layout(width='400px')
+        )
+        
+        form_data['basic']['exp_nr'] = widgets.IntText(
+            description='Exp number*:',
+            value=1,
+            style={'description_width': '150px'}
+        )
+        
+        form_data['basic']['well'] = widgets.Text(
+            description='Well*:',
+            placeholder='e.g., A1',
+            style={'description_width': '150px'}
+        )
+        
+        form_data['basic']['raw_image_path'] = widgets.Text(
+            description='Raw image path*:',
+            placeholder='/path/to/image.czi',
+            style={'description_width': '150px'},
+            layout=widgets.Layout(width='600px')
+        )
+        
+        form_data['basic']['dimension_order'] = widgets.Text(
+            description='Dimension order:',
+            placeholder='Optional - e.g., TCZYX',
+            style={'description_width': '150px'}
+        )
+        
+        # Pixel/time metadata
+        form_data['basic']['pixel_distance_xy'] = widgets.FloatText(
+            description='Pixel xy (μm)*:',
+            value=0.5,
+            style={'description_width': '150px'}
+        )
+        
+        form_data['basic']['pixel_distance_z'] = widgets.FloatText(
+            description='Pixel z (μm)*:',
+            value=2.0,
+            style={'description_width': '150px'}
+        )
+        
+        form_data['basic']['distance_unit'] = widgets.Text(
+            description='Distance unit*:',
+            value='μm',
+            style={'description_width': '150px'}
+        )
+        
+        form_data['basic']['time_interval'] = widgets.FloatText(
+            description='Time interval*:',
+            value=1.0,
+            style={'description_width': '150px'}
+        )
+        
+        form_data['basic']['time_unit'] = widgets.Text(
+            description='Time unit*:',
+            value='s',
+            style={'description_width': '150px'}
+        )
+        
+        # Dead channel
+        dead_channel_label = widgets.HTML('<h5>Dead Channel</h5>')
+        dead_enabled = widgets.Checkbox(
+            description='Include dead channel',
+            value=True
+        )
+        dead_number = widgets.IntText(
+            description='Dead channel #:',
+            value=0,
+            style={'description_width': '120px'}
+        )
+        
+        # Toggle visibility
+        def _toggle_dead(change):
+            dead_number.layout.display = None if change['new'] else 'none'
+        dead_enabled.observe(_toggle_dead, names='value')
+        _toggle_dead({'new': dead_enabled.value})
+        
+        form_data['dead_channel']['enabled'] = dead_enabled
+        form_data['dead_channel']['number'] = dead_number
+        
+        # Cell type sections
+        cell_type_widgets = []
+        
+        # Organoids
+        for org_name in self.organoid_names:
+            cell_type_widgets.append(widgets.HTML(f'<h5>{org_name.capitalize()}</h5>'))
+            fields = {}
+            fields['line'] = widgets.Text(
+                description='Line*:',
+                placeholder='e.g., 32',
+                style={'description_width': '100px'}
+            )
+            fields['condition'] = widgets.Text(
+                description='Condition*:',
+                placeholder='e.g., ko, wt',
+                style={'description_width': '100px'}
+            )
+            # Optional path fields
+            fields['segments_image_path'] = widgets.Text(
+                description='Segments path:',
+                placeholder='Optional - filled by pipeline',
+                style={'description_width': '130px'},
+                layout=widgets.Layout(width='500px')
+            )
+            fields['tracks_image_path'] = widgets.Text(
+                description='Tracks img path:',
+                placeholder='Optional - filled by pipeline',
+                style={'description_width': '130px'},
+                layout=widgets.Layout(width='500px')
+            )
+            fields['tracks_csv_path'] = widgets.Text(
+                description='Tracks csv path:',
+                placeholder='Optional - filled by pipeline',
+                style={'description_width': '130px'},
+                layout=widgets.Layout(width='500px')
+            )
+            form_data['cell_types'][org_name] = fields
+            cell_type_widgets.extend([
+                fields['line'], 
+                fields['condition'],
+                fields['segments_image_path'],
+                fields['tracks_image_path'],
+                fields['tracks_csv_path']
+            ])
+        
+        # Immune cells
+        for immune_name in self.immune_names:
+            cell_type_widgets.append(widgets.HTML(f'<h5>{immune_name.capitalize()}</h5>'))
+            fields = {}
+            fields['line'] = widgets.Text(
+                description='Line*:',
+                placeholder='e.g., CD8',
+                style={'description_width': '100px'}
+            )
+            fields['condition'] = widgets.Text(
+                description='Condition*:',
+                placeholder='e.g., activated',
+                style={'description_width': '100px'}
+            )
+            # Optional path fields
+            fields['segments_image_path'] = widgets.Text(
+                description='Segments path:',
+                placeholder='Optional - filled by pipeline',
+                style={'description_width': '130px'},
+                layout=widgets.Layout(width='500px')
+            )
+            fields['tracks_image_path'] = widgets.Text(
+                description='Tracks img path:',
+                placeholder='Optional - filled by pipeline',
+                style={'description_width': '130px'},
+                layout=widgets.Layout(width='500px')
+            )
+            fields['tracks_csv_path'] = widgets.Text(
+                description='Tracks csv path:',
+                placeholder='Optional - filled by pipeline',
+                style={'description_width': '130px'},
+                layout=widgets.Layout(width='500px')
+            )
+            form_data['cell_types'][immune_name] = fields
+            cell_type_widgets.extend([
+                fields['line'], 
+                fields['condition'],
+                fields['segments_image_path'],
+                fields['tracks_image_path'],
+                fields['tracks_csv_path']
+            ])
+        
+        # Other cells
+        for other_name in self.other_names:
+            cell_type_widgets.append(widgets.HTML(f'<h5>{other_name.capitalize()}</h5>'))
+            fields = {}
+            fields['line'] = widgets.Text(
+                description='Line*:',
+                placeholder='e.g., WT',
+                style={'description_width': '100px'}
+            )
+            fields['condition'] = widgets.Text(
+                description='Condition*:',
+                placeholder='e.g., control',
+                style={'description_width': '100px'}
+            )
+            # Optional path fields
+            fields['segments_image_path'] = widgets.Text(
+                description='Segments path:',
+                placeholder='Optional - filled by pipeline',
+                style={'description_width': '130px'},
+                layout=widgets.Layout(width='500px')
+            )
+            fields['tracks_image_path'] = widgets.Text(
+                description='Tracks img path:',
+                placeholder='Optional - filled by pipeline',
+                style={'description_width': '130px'},
+                layout=widgets.Layout(width='500px')
+            )
+            fields['tracks_csv_path'] = widgets.Text(
+                description='Tracks csv path:',
+                placeholder='Optional - filled by pipeline',
+                style={'description_width': '130px'},
+                layout=widgets.Layout(width='500px')
+            )
+            form_data['cell_types'][other_name] = fields
+            cell_type_widgets.extend([
+                fields['line'], 
+                fields['condition'],
+                fields['segments_image_path'],
+                fields['tracks_image_path'],
+                fields['tracks_csv_path']
+            ])
+        
+        # Assemble form
+        form_widget = widgets.VBox([
+            header,
+            widgets.HTML('<h5>Basic Information</h5>'),
+            form_data['basic']['sample_name'],
+            form_data['basic']['exp_nr'],
+            form_data['basic']['well'],
+            form_data['basic']['raw_image_path'],
+            form_data['basic']['dimension_order'],
+            widgets.HTML('<h5>Imaging Parameters</h5>'),
+            form_data['basic']['pixel_distance_xy'],
+            form_data['basic']['pixel_distance_z'],
+            form_data['basic']['distance_unit'],
+            form_data['basic']['time_interval'],
+            form_data['basic']['time_unit'],
+            dead_channel_label,
+            dead_enabled,
+            dead_number,
+            widgets.HTML('<h5>Cell Type Configuration</h5>'),
+            *cell_type_widgets,
+            widgets.HTML('<hr>')
+        ])
+        
+        form_data['widget'] = form_widget
+        return form_data
+    
+    def _on_save_metadata(self, btn):
+        """Save all form data to CSV"""
+        if self.output_dir_picker is None:
+            with self.save_output:
+                self.save_output.clear_output()
+                print('⚠️ No output directory picker provided')
+            return
+        
+        output_dir = Path(self.output_dir_picker.value)
+        if not output_dir.exists():
+            with self.save_output:
+                self.save_output.clear_output()
+                print(f'⚠️ Output directory does not exist: {output_dir}')
+            return
+        
+        # Collect data from all forms
+        rows = []
+        for form in self.sample_forms:
+            row = {}
+            
+            # Basic fields (includes dimension_order now)
+            for field_name, widget in form['basic'].items():
+                row[field_name] = widget.value
+            
+            # Dead channel
+            if form['dead_channel']['enabled'].value:
+                row['dead_channel'] = form['dead_channel']['number'].value
+            else:
+                row['dead_channel'] = ''
+            
+            # Cell types with line_condition merging and prefixes
+            for cell_type, fields in form['cell_types'].items():
+                # Determine prefix based on category
+                if cell_type in self.organoid_names:
+                    prefix = 'or'
+                elif cell_type in self.immune_names:
+                    prefix = 'im'
+                elif cell_type in self.other_names:
+                    prefix = 'ot'
+                else:
+                    continue  # Skip unknown types
+                
+                line = fields['line'].value.strip()
+                condition = fields['condition'].value.strip()
+                
+                # Merge line_condition as "{prefix}_{celltype}_line_condition"
+                col_name = f'{prefix}_{cell_type}_line_condition'
+                if line and condition:
+                    row[col_name] = f'{line}_{condition}'
+                elif line:
+                    row[col_name] = line
+                elif condition:
+                    row[col_name] = f'_{condition}'
+                else:
+                    row[col_name] = ''
+                
+                # Optional path fields - save if filled, otherwise empty
+                row[f'{prefix}_{cell_type}_segments_image_path'] = fields.get('segments_image_path', widgets.Text()).value.strip()
+                row[f'{prefix}_{cell_type}_tracks_image_path'] = fields.get('tracks_image_path', widgets.Text()).value.strip()
+                row[f'{prefix}_{cell_type}_tracks_csv_path'] = fields.get('tracks_csv_path', widgets.Text()).value.strip()
+            
+            rows.append(row)
+        
+        # Create DataFrame
+        df = pd.DataFrame(rows)
+        
+        # Save to CSV
+        csv_path = output_dir / 'metadata.csv'
+        df.to_csv(csv_path, index=False)
+        
+        with self.save_output:
+            self.save_output.clear_output()
+            print(f'Metadata saved to: {csv_path}')
+            print(f'{len(df)} samples, {len(df.columns)} columns')
+            display(df)
+
 class MetadataLoader(widgets.VBox):
     """
     A VBox widget that wraps a file PathPicker and a 'Load' button.
@@ -1416,6 +2201,14 @@ class PixelClassifierPanel:
     def __init__(self, metadata_loader):
         self.metadata_loader = metadata_loader
         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+        
+        # Detect cell types from metadata
+        self._detect_cell_types()
+        
+        print(f"Detected organoid types: {self.organoid_types}")
+        print(f"Detected immune cell types: {self.immune_types}")
+        print(f"Detected other cell types: {self.other_types}")
+        print(f"Dead channel present: {self.has_death}")
 
         # -------- Train controls --------
         self.examples_per_sample = widgets.IntText(
@@ -1426,12 +2219,7 @@ class PixelClassifierPanel:
             description="Sample-specific classifier",
             value=bool(pc.get("sample_specific_classifier", False))
         )
-
-        # Checkbox for two organoid types (e.g., WT vs. KO)
-        self.two_org_types = widgets.Checkbox(
-            description="Segment 2 organoid types",
-            value=bool(pc.get("two_org_types", False))
-        )
+        
         self.n_workers = widgets.IntText(
             description="Workers",
             value=int(pc.get("workers", (os.cpu_count() or 8))),
@@ -1451,7 +2239,7 @@ class PixelClassifierPanel:
             value=bool(pc.get("overwrite_existing", False))
         )
 
-        # -------- Classifier path pickers (default EMPTY) --------
+        # -------- Dynamic classifier path pickers --------
         self.clf_dir = PathPicker(
             mode='dir',
             description='Classifier dir:',
@@ -1459,30 +2247,12 @@ class PixelClassifierPanel:
             description_width='160px',
             width='100%',
         )
-        self.clf_org_path = PathPicker(
-            mode='file',
-            description='Organoid clf:',
-            default="",
-            filter_pattern='*.joblib',
-            description_width='160px',
-            width='100%',
-        )
-        self.clf_org2_path = PathPicker(
-            mode='file',
-            description='Organoid 2 clf:',
-            default="",
-            filter_pattern='*.joblib',
-            description_width='160px',
-            width='100%',
-        )
-        self.clf_tcell_path = PathPicker(
-            mode='file',
-            description='T-cell clf:',
-            default="",
-            filter_pattern='*.joblib',
-            description_width='160px',
-            width='100%',
-        )
+        
+        # Create path pickers for each cell type dynamically
+        self.clf_paths = {}
+        self._create_clf_path_pickers()
+        
+        # Death mask classifier (conditionally displayed)
         self.clf_death_path = PathPicker(
             mode='file',
             description='Death clf:',
@@ -1491,22 +2261,21 @@ class PixelClassifierPanel:
             description_width='160px',
             width='100%',
         )
-
-        # If user previously saved manual paths AND toggle is True, restore them now.
+        
+        # Restore saved paths if manual mode is enabled
         if self.manual_clf_paths.value:
-            self.clf_dir.value        = str(pc.get("clf_dir", "") or "")
-            self.clf_org_path.value   = str(pc.get("clf_org_path", "") or "")
-            self.clf_tcell_path.value = str(pc.get("clf_tcell_path", "") or "")
+            self.clf_dir.value = str(pc.get("clf_dir", "") or "")
             self.clf_death_path.value = str(pc.get("clf_death_path", "") or "")
-            if self.two_org_types.value:
-                self.clf_org2_path.value = str(pc.get("clf_org2_path", "") or "")
+            # Restore dynamic cell type paths
+            for cell_type in self.all_cell_types:
+                if cell_type in self.clf_paths:
+                    saved_path = pc.get(f"clf_{cell_type}_path", "")
+                    if saved_path:
+                        self.clf_paths[cell_type].value = str(saved_path)
 
-        # -------- Apply controls --------
-        self.organoid_edt_threshold = widgets.FloatText(
-            description="Organoid EDT thr",
-            value=float(pc.get("organoid_edt_threshold", 12.0)),
-            style={'description_width': '160px'}
-        )
+        # -------- Dynamic EDT thresholds for each cell type --------
+        self.edt_thresholds = {}
+        self._create_edt_threshold_inputs()
         self.use_all_timepoints = widgets.Checkbox(
             description="Process ALL timepoints",
             value=bool(pc.get("use_all_timepoints", True))
@@ -1569,23 +2338,12 @@ class PixelClassifierPanel:
 
         self.out = widgets.Output()
 
-        # Classifier paths box
-        clf_path_widgets = [
-            widgets.HTML("<b>Classifier paths</b>"),
-            self.clf_dir,
-            self.clf_org_path,
-            self.clf_tcell_path,
-            self.clf_death_path,
-        ]
-        if self.two_org_types.value:
-            clf_path_widgets.append(self.clf_org2_path)
-        self.clf_paths_box = widgets.VBox(clf_path_widgets)
-
-        # Show/hide according to the checkbox
-        self.two_org_types.observe(self._on_two_org_types_changed, names='value')
-        self.manual_clf_paths.observe(self._toggle_clf_path_section, names='value')
-
+        # Build the classifier paths box
+        self.clf_paths_box = widgets.VBox()
         self._build_clf_paths_box()
+        
+        # Wire observers
+        self.manual_clf_paths.observe(self._toggle_clf_path_section, names='value')
         self._toggle_clf_path_section()
 
         # When directory changes, auto-fill file pickers (only when manual mode is enabled)
@@ -1602,19 +2360,38 @@ class PixelClassifierPanel:
             widgets.HTML("<b>Train pixel classifier</b>"),
             widgets.HBox([self.examples_per_sample, self.n_workers]),
             self.sample_specific_classifier,
-            self.two_org_types,
             self.train_row,
         ])
 
         self.tp_row = widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end])
+        
+        # Build dynamic threshold widgets layout
+        threshold_widgets = [widgets.HTML("<b>EDT Thresholds per cell type</b>")]
+        
+        if self.organoid_types:
+            threshold_widgets.append(widgets.HTML("<i>Organoids:</i>"))
+            for org_type in self.organoid_types:
+                if org_type in self.edt_thresholds:
+                    threshold_widgets.append(self.edt_thresholds[org_type])
+        
+        if self.immune_types:
+            threshold_widgets.append(widgets.HTML("<i>Immune cells:</i>"))
+            for immune_type in self.immune_types:
+                if immune_type in self.edt_thresholds:
+                    threshold_widgets.append(self.edt_thresholds[immune_type])
+        
+        if self.other_types:
+            threshold_widgets.append(widgets.HTML("<i>Other cells:</i>"))
+            for other_type in self.other_types:
+                if other_type in self.edt_thresholds:
+                    threshold_widgets.append(self.edt_thresholds[other_type])
 
         apply_box = widgets.VBox([
             widgets.HTML("<b>Apply segmentation</b>"),
             self.manual_clf_paths,
             self.clf_paths_box,
-            widgets.HTML("<b>Segmentation setting</b>"),
-            self.organoid_edt_threshold,
-            self.overwrite_existing,          # NEW control appears in the UI
+            *threshold_widgets,
+            self.overwrite_existing,
             self.tp_row,
             self.apply_row,
         ])
@@ -1624,6 +2401,65 @@ class PixelClassifierPanel:
         # viewer handle (if training opens napari and returns a viewer)
         self._viewer = None
 
+    # ---------- Cell type detection ----------
+    def _detect_cell_types(self):
+        """Detect all cell types from metadata"""
+        from behav3d.utils import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel
+        )
+        
+        metadata = self.metadata_loader.metadata
+        self.organoid_types = detect_organoid_types_from_metadata(metadata)
+        self.immune_types = detect_immune_cell_types_from_metadata(metadata)
+        self.other_types = detect_other_cell_types_from_metadata(metadata)
+        self.has_death = has_dead_channel(metadata)
+        
+        # Combined list for iteration
+        self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
+    
+    def _create_clf_path_pickers(self):
+        """Create path pickers for each detected cell type"""
+        for cell_type in self.all_cell_types:
+            self.clf_paths[cell_type] = PathPicker(
+                mode='file',
+                description=f'{cell_type.capitalize()} clf:',
+                default="",
+                filter_pattern='*.joblib',
+                description_width='160px',
+                width='100%',
+            )
+    
+    def _create_edt_threshold_inputs(self):
+        """Create EDT threshold inputs for each cell type with appropriate defaults"""
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+        
+        for cell_type in self.all_cell_types:
+            # Determine default threshold based on cell type category
+            if cell_type in self.organoid_types:
+                default_threshold = 12.0  # Large objects
+            elif cell_type in self.immune_types:
+                default_threshold = 2.5   # Small objects
+            else:  # other types
+                default_threshold = 1.0   # User must adjust
+            
+            # Check if saved in config
+            saved_threshold = pc.get(f"{cell_type}_edt_threshold", default_threshold)
+            
+            self.edt_thresholds[cell_type] = widgets.FloatText(
+                description=f"{cell_type.capitalize()} EDT:",
+                value=float(saved_threshold),
+                style={'description_width': '160px'},
+                tooltip=f"EDT threshold for {cell_type} segmentation"
+            )
+    
+   #def _update_immune_cell_paths(self):
+        #"""Update classifier paths when directory changes (for backward compatibility)"""
+        # This method helps auto-populate paths based on directory
+        #pass
+    
     # ---------- config ----------
     def _persist_params(self):
         self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
@@ -1631,21 +2467,22 @@ class PixelClassifierPanel:
         pc["examples_per_sample"] = int(self.examples_per_sample.value)
         pc["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
         pc["workers"] = int(self.n_workers.value)
-        pc["organoid_edt_threshold"] = float(self.organoid_edt_threshold.value)
         pc["use_all_timepoints"] = bool(self.use_all_timepoints.value)
         pc["tp_start"] = int(self.tp_start.value)
         pc["tp_end"]   = int(self.tp_end.value)
-        pc["two_org_types"] = bool(self.two_org_types.value)
-
         pc["manual_clf_paths"] = bool(self.manual_clf_paths.value)
-        pc["overwrite_existing"] = bool(self.overwrite_existing.value)  # persist new setting
+        pc["overwrite_existing"] = bool(self.overwrite_existing.value)
+        
+        # Save dynamic EDT thresholds
+        for cell_type, threshold_widget in self.edt_thresholds.items():
+            pc[f"{cell_type}_edt_threshold"] = float(threshold_widget.value)
+        
+        # Save dynamic classifier paths if manual mode
         if self.manual_clf_paths.value:
-            pc["clf_dir"]        = str(self.clf_dir.value or "")
-            pc["clf_org_path"]   = str(self.clf_org_path.value or "")
-            pc["clf_tcell_path"] = str(self.clf_tcell_path.value or "")
+            pc["clf_dir"] = str(self.clf_dir.value or "")
             pc["clf_death_path"] = str(self.clf_death_path.value or "")
-            if self.two_org_types.value:
-                pc["clf_org2_path"] = str(self.clf_org2_path.value or "")
+            for cell_type, path_picker in self.clf_paths.items():
+                pc[f"clf_{cell_type}_path"] = str(path_picker.value or "")
 
         yaml.safe_dump(
             self.metadata_loader.behav3d_parameters,
@@ -1662,75 +2499,113 @@ class PixelClassifierPanel:
         self.tp_start.disabled = not show
         self.tp_end.disabled   = not show
 
-    # >>> helper: compute default file paths for a directory
+    # >>> helper: compute default file paths for a directory (dynamic)
     def _default_clf_paths_for_dir(self, d: str):
+        """Generate default classifier paths for all cell types"""
         if not d:
-            if self.two_org_types.value:
-                return ("", "", "", "")
-            else:
-                return ("", "", "")
-
+            return {}
+        
         p = Path(d).expanduser()
-        org_path = str(p / 'PixelClassifier_Organoid.joblib')
-        tcell_path = str(p / 'PixelClassifier_TCell.joblib')
-        death_path = str(p / 'PixelClassifier_Death.joblib')
-
-        if self.two_org_types.value:
-            org2_path = str(p / 'PixelClassifier_Organoid2.joblib')
-            return (org_path, tcell_path, death_path, org2_path)
-        else:
-            return (org_path, tcell_path, death_path)
+        paths = {}
+        
+        # Generate path for each cell type
+        for cell_type in self.all_cell_types:
+            # Capitalize first letter for filename
+            filename = f'PixelClassifier_{cell_type.capitalize()}.joblib'
+            paths[cell_type] = str(p / filename)
+        
+        # Death classifier
+        paths['death'] = str(p / 'PixelClassifier_Death.joblib')
+        
+        return paths
 
     def _apply_dir_to_clf_paths(self, d: str):
+        """Apply directory to all classifier path pickers"""
         paths = self._default_clf_paths_for_dir(d)
-        self.clf_org_path.value = paths[0]
-        self.clf_tcell_path.value = paths[1]
-        self.clf_death_path.value = paths[2]
-        if self.two_org_types.value and len(paths) > 3:
-            self.clf_org2_path.value = paths[3]
+        
+        for cell_type, path in paths.items():
+            if cell_type == 'death':
+                self.clf_death_path.value = path
+            elif cell_type in self.clf_paths:
+                self.clf_paths[cell_type].value = path
 
     def _toggle_clf_path_section(self, change=None):
         manual = bool(self.manual_clf_paths.value)
         self.clf_paths_box.layout.display = (None if manual else 'none')
         if not manual:
-            for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path,
-                      self.clf_death_path, self.clf_org2_path]:
-                p.value = ""
+            # Clear all paths
+            self.clf_dir.value = ""
+            self.clf_death_path.value = ""
+            for picker in self.clf_paths.values():
+                picker.value = ""
 
     def _build_clf_paths_box(self):
+        """Build classifier paths box with dynamic cell types"""
         children = [
             widgets.HTML("<b>Classifier paths</b>"),
             self.clf_dir,
-            self.clf_org_path,
         ]
-        if self.two_org_types.value:
-            children.append(self.clf_org2_path)
-        children.extend([self.clf_tcell_path, self.clf_death_path])
+        
+        # Add organoid classifiers
+        if self.organoid_types:
+            children.append(widgets.HTML("<i>Organoids:</i>"))
+            for org_type in self.organoid_types:
+                if org_type in self.clf_paths:
+                    children.append(self.clf_paths[org_type])
+        
+        # Add immune cell classifiers
+        if self.immune_types:
+            children.append(widgets.HTML("<i>Immune cells:</i>"))
+            for immune_type in self.immune_types:
+                if immune_type in self.clf_paths:
+                    children.append(self.clf_paths[immune_type])
+        
+        # Add other cell classifiers
+        if self.other_types:
+            children.append(widgets.HTML("<i>Other cells:</i>"))
+            for other_type in self.other_types:
+                if other_type in self.clf_paths:
+                    children.append(self.clf_paths[other_type])
+        
+        # Death classifier - only if dead channel is present
+        if self.has_death:
+            children.append(widgets.HTML("<i>Death mask:</i>"))
+            children.append(self.clf_death_path)
+        
         self.clf_paths_box.children = children
-
-    def _on_two_org_types_changed(self, change=None):
-        self._build_clf_paths_box()
-        if self.manual_clf_paths.value and self.clf_dir.value:
-            self._apply_dir_to_clf_paths(self.clf_dir.value)
 
     def display(self):
         display(self.ui)
 
     def _lock(self, state: bool):
         # keep close_button enabled so user can close at any time
-        for w in [
+        widgets_to_lock = [
             self.btn_train, self.btn_run, self.btn_resegment,
-            self.examples_per_sample, self.sample_specific_classifier, self.n_workers, self.two_org_types,
-            self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end,
+            self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
+            self.use_all_timepoints, self.tp_start, self.tp_end,
             self.manual_clf_paths, self.overwrite_existing,
-        ]:
+        ]
+        
+        # Add dynamic threshold widgets
+        widgets_to_lock.extend(self.edt_thresholds.values())
+        
+        for w in widgets_to_lock:
             w.disabled = state
 
-        # also lock/unlock the path pickers
+        # Lock/unlock path pickers
         try:
-            for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, self.clf_death_path, self.clf_org2_path]:
-                p.text.disabled = state
-                p.button.disabled = state
+            self.clf_dir.text.disabled = state
+            self.clf_dir.button.disabled = state
+            
+            # Death path - only if present
+            if self.has_death:
+                self.clf_death_path.text.disabled = state
+                self.clf_death_path.button.disabled = state
+            
+            # Dynamic cell type pickers
+            for picker in self.clf_paths.values():
+                picker.text.disabled = state
+                picker.button.disabled = state
         except Exception:
             pass
 
@@ -1747,7 +2622,9 @@ class PixelClassifierPanel:
                 print(f"  output_dir={odir}")
                 print(f"  examples_per_sample={self.examples_per_sample.value}")
                 print(f"  sample_specific_classifier={self.sample_specific_classifier.value}")
-                print(f"  two_org_types={self.two_org_types.value}")
+                print(f"  organoid_types={self.organoid_types}")
+                print(f"  immune_types={self.immune_types}")
+                print(f"  other_types={self.other_types}")
                 print(f"  n_workers={self.n_workers.value}")
 
                 # UI state
@@ -1766,7 +2643,9 @@ class PixelClassifierPanel:
                     examples_per_sample=int(self.examples_per_sample.value),
                     sample_specific_classifier=bool(self.sample_specific_classifier.value),
                     n_workers=int(self.n_workers.value),
-                    two_org_types=bool(self.two_org_types.value),
+                    organoid_types=self.organoid_types,
+                    immune_types=self.immune_types,
+                    other_types=self.other_types,
                 )
 
                 # Try to capture a viewer handle
@@ -1826,43 +2705,90 @@ class PixelClassifierPanel:
                     end=int(self.tp_end.value),
                 )
 
+                # Build EDT threshold dictionaries
+                organoid_edt_thresholds = {
+                    cell_type: float(self.edt_thresholds[cell_type].value)
+                    for cell_type in self.organoid_types
+                    if cell_type in self.edt_thresholds
+                }
+                immune_edt_thresholds = {
+                    cell_type: float(self.edt_thresholds[cell_type].value)
+                    for cell_type in self.immune_types
+                    if cell_type in self.edt_thresholds
+                }
+                other_edt_thresholds = {
+                    cell_type: float(self.edt_thresholds[cell_type].value)
+                    for cell_type in self.other_types
+                    if cell_type in self.edt_thresholds
+                }
+
                 print("▶️ Applying pixel classifier segmentation…", flush=True)
                 print(f"  output_dir={odir}")
-                print(f"  organoid_edt_threshold={self.organoid_edt_threshold.value}")
+                print(f"  organoid_edt_thresholds={organoid_edt_thresholds}")
+                print(f"  immune_edt_thresholds={immune_edt_thresholds}")
+                print(f"  other_edt_thresholds={other_edt_thresholds}")
                 print(f"  timepoint_range={tpr}", flush=True)
                 print(f"  only_segment={only_segment}")
                 print(f"  overwrite_existing={bool(self.overwrite_existing.value)}")
-                # Echo chosen classifier paths if manual mode is on
+                
+                # Build classifier path dictionaries if manual mode
+                clf_organoid_paths = None
+                clf_immune_paths = None
+                clf_other_paths = None
+                clf_death_path = None
+                
                 if self.manual_clf_paths.value:
-                    print(f"  clf_dir={self.clf_dir.value}")
-                    print(f"  clf_org_path={self.clf_org_path.value}")
-                    if self.two_org_types.value:
-                        print(f"  clf_org2_path={self.clf_org2_path.value}")
-                    print(f"  clf_tcell_path={self.clf_tcell_path.value}")
-                    print(f"  clf_death_path={self.clf_death_path.value}")
+                    clf_organoid_paths = {
+                        cell_type: str(self.clf_paths[cell_type].value)
+                        for cell_type in self.organoid_types
+                        if cell_type in self.clf_paths and self.clf_paths[cell_type].value
+                    }
+                    clf_immune_paths = {
+                        cell_type: str(self.clf_paths[cell_type].value)
+                        for cell_type in self.immune_types
+                        if cell_type in self.clf_paths and self.clf_paths[cell_type].value
+                    }
+                    clf_other_paths = {
+                        cell_type: str(self.clf_paths[cell_type].value)
+                        for cell_type in self.other_types
+                        if cell_type in self.clf_paths and self.clf_paths[cell_type].value
+                    }
+                    # Death path - only if death channel is present
+                    if self.has_death:
+                        clf_death_path = str(self.clf_death_path.value) if self.clf_death_path.value else None
+                    
+                    print(f"  Manual classifier paths:")
+                    print(f"    Organoids: {clf_organoid_paths}")
+                    print(f"    Immune: {clf_immune_paths}")
+                    print(f"    Other: {clf_other_paths}")
+                    print(f"    Death: {clf_death_path}")
 
                 self.spinner_apply.layout.display = None
 
-                # Build kwargs (with overwrite_existing spelled exactly as requested)
+                # Build kwargs for new API (with dictionaries)
                 call_kwargs = dict(
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
-                    organoid_edt_threshold=float(self.organoid_edt_threshold.value),
+                    organoid_edt_thresholds=organoid_edt_thresholds,
+                    immune_edt_thresholds=immune_edt_thresholds,
+                    other_edt_thresholds=other_edt_thresholds,
                     timepoint_range=tpr,
-                    two_org_types=bool(self.two_org_types.value),
-                    clf_org_path=self.clf_org_path.value,
-                    clf_tcell_path=self.clf_tcell_path.value,
-                    clf_death_path=self.clf_death_path.value,
-                    clf_org2_path=self.clf_org2_path.value if self.two_org_types.value else None,
+                    clf_organoid_paths=clf_organoid_paths,
+                    clf_immune_paths=clf_immune_paths,
+                    clf_other_paths=clf_other_paths,
+                    clf_death_path=clf_death_path,
                     only_segment=bool(only_segment),
                     overwrite_existing=bool(self.overwrite_existing.value),
+                    n_workers=int(self.n_workers.value),
                 )
 
-                # Call the segmentation function, retry without overwrite_existing if not supported.
+                # Call the segmentation function
                 try:
                     new_md = run_pixel_classifier_segmentation(**call_kwargs)
-                except TypeError:
-                    # Backward compatibility: older versions with no overwrite_existing parameter
+                except TypeError as e:
+                    # Try backward compatibility fallback (if needed)
+                    print(f"⚠️ TypeError: {e}")
+                    print("Attempting backward compatibility mode...")
                     call_kwargs.pop("overwrite_existing", None)
                     new_md = run_pixel_classifier_segmentation(**call_kwargs)
 
@@ -1880,477 +2806,33 @@ class PixelClassifierPanel:
                 self.spinner_apply.layout.display = "none"
                 self._lock(False)
                 
-# class PixelClassifierPanel:
-#     def __init__(self, metadata_loader):
-#         self.metadata_loader = metadata_loader
-#         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
 
-#         # -------- Train controls --------
-#         self.examples_per_sample = widgets.IntText(
-#             description="Examples per sample",
-#             value=int(pc.get("examples_per_sample", 3))
-#         )
-#         self.sample_specific_classifier = widgets.Checkbox(
-#             description="Sample-specific classifier",
-#             value=bool(pc.get("sample_specific_classifier", False))
-#         )        
-        
-#         # Checkbox for two organoid types (e.g., WT vs. KO)
-#         self.two_org_types = widgets.Checkbox(
-#             description="Segment 2 organoid types",
-#               value=bool(pc.get("two_org_types", False))  
-#         )
-#         self.n_workers = widgets.IntText(
-#             description="Workers",
-#             value=int(pc.get("workers", (os.cpu_count() or 8))),
-#             max=max(8, (os.cpu_count() or 8))
-#         )
-
-#         # ---- Manual classifier toggle ----
-#         self.manual_clf_paths = widgets.Checkbox(
-#             description="Manually supply classifiers",
-#             value=bool(pc.get("manual_clf_paths", False)),
-#             indent=False
-#         )
-
-#         # -------- Classifier path pickers (default EMPTY) --------
-#         self.clf_dir = PathPicker(
-#             mode='dir',
-#             description='Classifier dir:',
-#             default="", 
-#             description_width='160px',
-#             width='100%',
-#         )
-#         self.clf_org_path = PathPicker(
-#             mode='file',
-#             description='Organoid clf:',
-#             default="", 
-#             filter_pattern='*.joblib',
-#             description_width='160px',
-#             width='100%',
-#         )
-#         self.clf_org2_path = PathPicker(
-#             mode='file',
-#             description='Organoid 2 clf:',
-#             default="", 
-#             filter_pattern='*.joblib',
-#             description_width='160px',
-#             width='100%',
-#         )
-#         self.clf_tcell_path = PathPicker(
-#             mode='file',
-#             description='T-cell clf:',
-#             default="",   
-#             filter_pattern='*.joblib',
-#             description_width='160px',
-#             width='100%',
-#         )
-#         self.clf_death_path = PathPicker(
-#             mode='file',
-#             description='Death clf:',
-#             default="",         
-#             filter_pattern='*.joblib',
-#             description_width='160px',
-#             width='100%',
-#         )
-
-#         # If user previously saved manual paths AND toggle is True, restore them now.
-#         if self.manual_clf_paths.value:
-#             self.clf_dir.value        = str(pc.get("clf_dir", "") or "")
-#             self.clf_org_path.value   = str(pc.get("clf_org_path", "") or "")
-#             self.clf_tcell_path.value = str(pc.get("clf_tcell_path", "") or "")
-#             self.clf_death_path.value = str(pc.get("clf_death_path", "") or "")
-#             if self.two_org_types.value:
-#                 self.clf_org2_path.value   = str(pc.get("clf_org2_path", "") or "")
-
-#         # -------- Apply controls --------
-#         self.organoid_edt_threshold = widgets.FloatText(
-#             description="Organoid EDT thr",
-#             value=float(pc.get("organoid_edt_threshold", 12.0)),
-#             style={'description_width': '160px'}
-#         )
-#         self.use_all_timepoints = widgets.Checkbox(
-#             description="Process ALL timepoints",
-#             value=bool(pc.get("use_all_timepoints", True))
-#         )
-#         self.tp_start = widgets.IntText(description="Start t", value=int(pc.get("tp_start", 0)))
-#         self.tp_end   = widgets.IntText(description="End t",   value=int(pc.get("tp_end", 0)))
-
-#         # Start/End visibility
-#         self.use_all_timepoints.observe(self._toggle_timepoint_inputs, names='value')
-#         self._toggle_timepoint_inputs()
-
-#         self.btn_train = widgets.Button(
-#             description="Train pixel classifier",
-#             button_style="primary",
-#             layout=widgets.Layout(width="fit-content", flex="0 0 auto")
-#         )
-#         self.close_button = widgets.Button(
-#             description="Close viewer",
-#             button_style="danger",
-#             icon="stop",
-#             tooltip="Close the active Napari viewer",
-#             layout=widgets.Layout(width="200px", display="none")  # hidden until a viewer is open
-#         )
-
-#         self.spinner_train = widgets.HTML(value=spinning_loader)
-#         self.spinner_train.layout.display = "none"
-
-#         # Row: Train | Close viewer | spinner
-#         self.train_row = widgets.HBox(
-#             [self.btn_train, self.close_button, self.spinner_train],
-#             layout=widgets.Layout(align_items="center", gap="8px")
-#         )
-
-#         # Apply button + spinner
-#         self.btn_apply = widgets.Button(
-#             description="Apply pixel classifier",
-#             button_style="success",
-#             layout=widgets.Layout(width="fit-content", flex="0 0 auto")
-#         )
-#         self.spinner_apply = widgets.HTML(value=spinning_loader)
-#         self.spinner_apply.layout.display = "none"
-#         self.apply_row = widgets.HBox(
-#             [self.btn_apply, self.spinner_apply],
-#             layout=widgets.Layout(align_items="center", gap="8px")
-#         )
-
-#         # Wire handlers
-#         self.btn_train.on_click(self._on_train_clicked)
-#         self.close_button.on_click(self._on_close_clicked)
-#         self.btn_apply.on_click(self._on_apply_clicked)
-
-#         self.out = widgets.Output()
-
-#         clf_path_widgets = [
-#             widgets.HTML("<b>Classifier paths</b>"),
-#             self.clf_dir,
-#             self.clf_org_path,
-#             self.clf_tcell_path,
-#             self.clf_death_path,
-#         ]
-
-#         # Conditionally add the second organization path
-#         if self.two_org_types.value:
-#             clf_path_widgets.append(self.clf_org2_path)
-
-#         self.clf_paths_box = widgets.VBox(clf_path_widgets)
-        
-#         # Show/hide according to the checkbox
-#         self.two_org_types.observe(self._on_two_org_types_changed, names='value')
-#         self.manual_clf_paths.observe(self._toggle_clf_path_section, names='value')
-
-#         self._build_clf_paths_box()
-#         self._toggle_clf_path_section()
-
-#         # When directory changes, auto-fill file pickers (only when manual mode is enabled)
-#         def _dir_changed(change):
-#             if not self.manual_clf_paths.value:
-#                 return
-#             newd = (change.get('new') or '').strip()
-#             if newd:
-#                 self._apply_dir_to_clf_paths(newd)
-#         self.clf_dir.text.observe(_dir_changed, names='value')
-
-#         # Layout
-#         train_box = widgets.VBox([
-#             widgets.HTML("<b>Train pixel classifier</b>"),
-#             widgets.HBox([self.examples_per_sample, self.n_workers]),
-#             self.sample_specific_classifier,
-#             self.two_org_types,
-#             self.train_row,
-#         ])
-
-#         self.tp_row = widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end])
-
-#         apply_box = widgets.VBox([
-#             widgets.HTML("<b>Apply segmentation</b>"),
-#             self.manual_clf_paths,               
-#             self.clf_paths_box,   
-#             widgets.HTML("<b>Segmentation setting</b>"),  
-#             self.organoid_edt_threshold,
-#             self.tp_row,
-#             self.apply_row,
-#         ])
-
-#         self.ui = widgets.VBox([train_box, widgets.HTML("<hr>"), apply_box, widgets.HTML("<hr>"), self.out])
-
-#         # viewer handle (if training opens napari and returns a viewer)
-#         self._viewer = None
-
-#     # ---------- config ----------
-#     def _persist_params(self):
-#         self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
-#         pc = self.metadata_loader.behav3d_parameters["pixel_classifier"]
-#         pc["examples_per_sample"] = int(self.examples_per_sample.value)
-#         pc["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
-#         pc["workers"] = int(self.n_workers.value)
-#         pc["organoid_edt_threshold"] = float(self.organoid_edt_threshold.value)
-#         pc["use_all_timepoints"] = bool(self.use_all_timepoints.value)
-#         pc["tp_start"] = int(self.tp_start.value)
-#         pc["tp_end"]   = int(self.tp_end.value)
-#         pc["two_org_types"] = bool(self.two_org_types.value)
-
-#         pc["manual_clf_paths"] = bool(self.manual_clf_paths.value)
-#         if self.manual_clf_paths.value:
-#             pc["clf_dir"]        = str(self.clf_dir.value or "")
-#             pc["clf_org_path"]   = str(self.clf_org_path.value or "")
-#             pc["clf_tcell_path"] = str(self.clf_tcell_path.value or "")
-#             pc["clf_death_path"] = str(self.clf_death_path.value or "")
-#             if self.two_org_types.value:
-#                 pc["clf_org2_path"]   = str(self.clf_org2_path.value or "")
-
-
-#         yaml.safe_dump(
-#             self.metadata_loader.behav3d_parameters,
-#             self.metadata_loader.behav3d_parameters_path.open("w"),
-#             sort_keys=False
-#         )
-
-#     # ---------- UI helpers ----------
-#     def _toggle_timepoint_inputs(self, change=None):
-#         show = not self.use_all_timepoints.value
-#         disp = None if show else 'none'
-#         self.tp_start.layout.display = disp
-#         self.tp_end.layout.display   = disp
-#         self.tp_start.disabled = not show
-#         self.tp_end.disabled   = not show
-
-#     # >>> helper: compute default file paths for a directory
-#     def _default_clf_paths_for_dir(self, d: str):
-#         if not d:
-#             if self.two_org_types.value:
-#                 return ("", "", "", "")
-#             else:
-#                 return ("", "", "")
-            
-#         p = Path(d).expanduser()
-#         org_path = str(p / 'PixelClassifier_Organoid.joblib')
-#         tcell_path = str(p / 'PixelClassifier_TCell.joblib')
-#         death_path = str(p / 'PixelClassifier_Death.joblib')
-
-#         if self.two_org_types.value:
-#             org2_path = str(p / 'PixelClassifier_Organoid2.joblib')
-#             return (org_path, tcell_path, death_path, org2_path)
-#         else:
-#             return (org_path, tcell_path, death_path)
-
-#     def _apply_dir_to_clf_paths(self, d: str):
-#         paths = self._default_clf_paths_for_dir(d)
-
-#         self.clf_org_path.value = paths[0]
-#         self.clf_tcell_path.value = paths[1]
-#         self.clf_death_path.value = paths[2]
-
-#         if self.two_org_types.value and len(paths) > 3:
-#             self.clf_org2_path.value = paths[3]
-
-#     def _toggle_clf_path_section(self, change=None):
-#         manual = bool(self.manual_clf_paths.value)
-#         self.clf_paths_box.layout.display = (None if manual else 'none')
-        
-#         if not manual:
-#             for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, 
-#                     self.clf_death_path, self.clf_org2_path]:
-#                 p.value = ""
-
-#     def _build_clf_paths_box(self):
-#         children = [
-#             widgets.HTML("<b>Classifier paths</b>"),
-#             self.clf_dir,
-#             self.clf_org_path,
-#         ]
-
-#         if self.two_org_types.value:
-#             children.append(self.clf_org2_path)
-
-#         children.extend([
-#             self.clf_tcell_path,
-#             self.clf_death_path,
-#         ])
-
-#         self.clf_paths_box.children = children
-
-#     def _on_two_org_types_changed(self, change=None):
-#         self._build_clf_paths_box()
-
-#         if self.manual_clf_paths.value and self.clf_dir.value:
-#             self._apply_dir_to_clf_paths(self.clf_dir.value)
-
-#     def display(self):
-#         display(self.ui)
-
-#     def _lock(self, state: bool):
-#         # keep close_button enabled so user can close at any time
-#         for w in [
-#             self.btn_train, self.btn_apply,
-#             self.examples_per_sample, self.sample_specific_classifier, self.n_workers, self.two_org_types,
-#             self.organoid_edt_threshold, self.use_all_timepoints, self.tp_start, self.tp_end, self.manual_clf_paths,
-#         ]:
-#             w.disabled = state
-
-#         # also lock/unlock the path pickers
-#         try:
-#             for p in [self.clf_dir, self.clf_org_path, self.clf_tcell_path, self.clf_death_path, self.clf_org2_path]:
-#                 p.text.disabled = state
-#                 p.button.disabled = state
-#         except Exception:
-#             pass
-
-#     # ---------- callbacks ----------
-#     def _on_train_clicked(self, _):
-#         with self.out:
-#             self.out.clear_output()
-#             try:
-#                 self._persist_params()
-#                 odir = Path(self.metadata_loader.output_dir).expanduser()
-#                 odir.mkdir(parents=True, exist_ok=True)
-
-#                 print("▶️ Training pixel classifier…", flush=True)
-#                 print(f"  output_dir={odir}")
-#                 print(f"  examples_per_sample={self.examples_per_sample.value}")
-#                 print(f"  sample_specific_classifier={self.sample_specific_classifier.value}")
-#                 print(f"  two_org_types={self.two_org_types.value}")
-#                 print(f"  n_workers={self.n_workers.value}")
-
-#                 # UI state
-#                 self._lock(True)
-#                 self.spinner_train.layout.display = None
-
-#                 # Run training (synchronously). If it opens napari non-blocking and
-#                 # returns a viewer, store it so the Close button can close it.
-#                 try:
-#                     from behav3d.preprocessing.segmentation.napari_pixelclassifier import train_pixel_classifier
-#                 except Exception:
-#                     # If your train function is imported elsewhere, rely on that name in globals
-#                     pass
-
-#                 ret = train_pixel_classifier(
-#                     output_dir=str(odir),
-#                     metadata=self.metadata_loader.metadata,
-#                     examples_per_sample=int(self.examples_per_sample.value),
-#                     sample_specific_classifier=bool(self.sample_specific_classifier.value),
-#                     n_workers=int(self.n_workers.value),
-#                     two_org_types=bool(self.two_org_types.value),
-#                 )
-
-#                 # Try to capture a viewer handle
-#                 self._viewer = None
-#                 try:
-#                     if ret is not None and hasattr(ret, "close"):
-#                         self._viewer = ret
-#                     else:
-#                         # best-effort: some environments expose current viewer getter
-#                         get_curr = getattr(napari, "current_viewer", None)
-#                         if callable(get_curr):
-#                             self._viewer = get_curr()
-#                 except Exception:
-#                     pass
-
-#                 # UI finalize for train
-#                 self.spinner_train.layout.display = "none"
-#                 # Show Close button only if we have a viewer to close
-#                 self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
-#                 if self._viewer is None:
-#                     print("✅ Training finished.", flush=True)
-#                 else:
-#                     print("✅ Training UI opened in Napari (use 'Close viewer' to close).", flush=True)
-
-#             except Exception:
-#                 import traceback; traceback.print_exc()
-#                 self.spinner_train.layout.display = "none"
-#                 self.close_button.layout.display = "none"
-#             finally:
-#                 # Re-enable inputs regardless; close button stays visible if viewer exists
-#                 self._lock(False)
-
-#     def _on_close_clicked(self, _):
-#         with self.out:
-#             try:
-#                 if self._viewer is not None:
-#                     print("Closing viewer…")
-#                     try:
-#                         self._viewer.close()
-#                     except Exception as e:
-#                         print(f"Error closing viewer: {e}")
-#                     self._viewer = None
-#                 else:
-#                     print("No active viewer to close (viewer may have been opened in blocking mode).")
-#             finally:
-#                 self.close_button.layout.display = "none"
-
-#     def _on_apply_clicked(self, _):
-#         self._lock(True)
-#         with self.out:
-#             self.out.clear_output()
-#             self._persist_params()
-#             try:
-#                 odir = Path(self.metadata_loader.output_dir).expanduser()
-#                 odir.mkdir(parents=True, exist_ok=True)
-
-#                 tpr = _mk_timepoint_range(
-#                     use_all=bool(self.use_all_timepoints.value),
-#                     start=int(self.tp_start.value),
-#                     end=int(self.tp_end.value),
-#                 )
-
-#                 print("▶️ Applying pixel classifier segmentation…", flush=True)
-#                 print(f"  output_dir={odir}")
-#                 print(f"  organoid_edt_threshold={self.organoid_edt_threshold.value}")
-#                 print(f"  timepoint_range={tpr}", flush=True)
-#                 # Echo chosen classifier paths if manual mode is on
-#                 if self.manual_clf_paths.value:
-#                     print(f"  clf_dir={self.clf_dir.value}")
-#                     print(f"  clf_org_path={self.clf_org_path.value}")
-#                     if self.two_org_types.value:
-#                         print(f"  clf_org2_path={self.clf_org2_path.value}")
-#                     print(f"  clf_tcell_path={self.clf_tcell_path.value}")
-#                     print(f"  clf_death_path={self.clf_death_path.value}")
-
-#                 self.spinner_apply.layout.display = None
-
-#                 new_md = run_pixel_classifier_segmentation(
-#                     output_dir=str(odir),
-#                     metadata=self.metadata_loader.metadata,
-#                     organoid_edt_threshold=float(self.organoid_edt_threshold.value),
-#                     timepoint_range=tpr,
-#                     two_org_types=bool(self.two_org_types.value),
-#                     clf_org_path=self.clf_org_path.value,
-#                     clf_tcell_path=self.clf_tcell_path.value,
-#                     clf_death_path=self.clf_death_path.value,
-#                     clf_org2_path=self.clf_org2_path.value if self.two_org_types.value else None,
-
-#                 )
-
-#                 try:
-#                     if new_md is not None:
-#                         self.metadata_loader.metadata = new_md
-#                         new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
-#                 except Exception:
-#                     import traceback; traceback.print_exc()
-
-#                 print("✅ Apply finished.", flush=True)
-#             except Exception:
-#                 import traceback; traceback.print_exc()
-#             finally:
-#                 self.spinner_apply.layout.display = "none"
-#                 self._lock(False)
 
 class TrackingPanel:
     """
-    Minimal UI for tracking (LAP, TrackPy, or Propagation).
+    Minimal UI for tracking (LAP, TrackPy, or Propagation) for any cell type.
+    - Automatically detects cell type category (organoid/immune/other)
+    - Loads appropriate default configuration based on category
     - Uses metadata_loader.output_dir and metadata_loader.metadata_csv_path directly
     - Updates metadata_loader.metadata and always saves CSV
     - cell_type is supplied in __init__
     """
-    def __init__(self, metadata_loader, cell_type="tcell"):
+    def __init__(self, metadata_loader, cell_type):
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
+
+        # Detect ALL cell types from metadata
+        self._detect_all_cell_types()
+        
+        # Detect category for THIS specific cell_type
+        self._detect_category()
 
         # Ensure config skeleton exists, then read profile
         self._ensure_cfg_skeleton()
         params = dict(self.metadata_loader.behav3d_parameters or {})
-        tcfg = params["tracking"][self.cell_type]
+        
+        # Load config based on category
+        tcfg = self._get_config_for_cell_type(params)
 
         # Method selector
         self.method = widgets.Dropdown(
@@ -2473,6 +2955,52 @@ class TrackingPanel:
     def display(self):
         display(self.ui)
 
+    def _detect_all_cell_types(self):
+        """Detect all cell types from metadata"""
+        from behav3d.utils import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata
+        )
+        
+        metadata = self.metadata_loader.metadata
+        if metadata is None:
+            raise ValueError(
+                f"Metadata must be loaded before creating TrackingPanel for '{self.cell_type}'. "
+                "Please load metadata first using MetadataLoader."
+            )
+        
+        self.organoid_types = detect_organoid_types_from_metadata(metadata)
+        self.immune_types = detect_immune_cell_types_from_metadata(metadata)
+        self.other_types = detect_other_cell_types_from_metadata(metadata)
+        self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
+
+    def _detect_category(self):
+        """Detect if THIS cell_type is organoid, immune, or other category."""
+        # Use unified category detection function
+        self.category = detect_cell_type_category(self.cell_type, self.metadata_loader.metadata)
+    
+    def _get_config_for_cell_type(self, params):
+        """Get tracking config based on cell type category.
+        
+        - Organoid types: use 'organoid' config
+        - Immune types: use 'immune' config
+        - Other types: use 'other' config
+        """
+        tracking_cfg = params.get("tracking", {})
+        
+        # Check if cell_type has specific config
+        if self.cell_type in tracking_cfg:
+            return tracking_cfg[self.cell_type]
+        
+        # Otherwise use category-specific defaults
+        if self.category == 'organoid':
+            return tracking_cfg.get('organoid', {})
+        elif self.category == 'immune':
+            return tracking_cfg.get('immune', {})
+        else:  # other
+            return tracking_cfg.get('other', {})
+
     def _toggle_param_groups(self, change=None):
         if self.method.value == "lap":
             self.param_container.children = (self.lap_params,)
@@ -2503,25 +3031,69 @@ class TrackingPanel:
 
     # ---------------- config I/O ----------------
     def _ensure_cfg_skeleton(self):
+        """Ensure config skeleton exists with category-appropriate defaults."""
         p = dict(self.metadata_loader.behav3d_parameters or {})
         p.setdefault("tracking", {})
-        p["tracking"].setdefault(self.cell_type, {})
-        prof = p["tracking"][self.cell_type]
-        prof.setdefault("method", "lap")
-        prof.setdefault("overwrite", False)
-        prof.setdefault("lap", {
-            "track_cost_px": 45,
-            "gap_close_cost_px": 60,
+        
+        # Ensure base configs exist for all three categories
+        p["tracking"].setdefault("immune", {})
+        p["tracking"].setdefault("other", {})
+        p["tracking"].setdefault("organoid", {})
+        
+        # Set defaults for immune cell types
+        immune_cfg = p["tracking"]["immune"]
+        immune_cfg.setdefault("method", "trackpy")
+        immune_cfg.setdefault("overwrite", False)
+        immune_cfg.setdefault("lap", {
+            "track_cost_px": 60,
+            "gap_close_cost_px": 45,
+            "gap_close_max_frames": 5,
+            "merging_cost_px": 0,
+            "splitting_cost_px": 0
+        })
+        immune_cfg.setdefault("trackpy", {
+            "search_range_px": 31,
+            "memory_frames": 5,
+            "adaptive_stop": 5.0,
+            "adaptive_step": 0.95
+        })
+        
+        # Set defaults for other cell types (same as immune for now)
+        other_cfg = p["tracking"]["other"]
+        other_cfg.setdefault("method", "trackpy")
+        other_cfg.setdefault("overwrite", False)
+        other_cfg.setdefault("lap", {
+            "track_cost_px": 60,
+            "gap_close_cost_px": 45,
+            "gap_close_max_frames": 5,
+            "merging_cost_px": 0,
+            "splitting_cost_px": 0
+        })
+        other_cfg.setdefault("trackpy", {
+            "search_range_px": 31,
+            "memory_frames": 5,
+            "adaptive_stop": 5.0,
+            "adaptive_step": 0.95
+        })
+        
+        # Set defaults for organoid types
+        organoid_cfg = p["tracking"]["organoid"]
+        organoid_cfg.setdefault("method", "propagation")
+        organoid_cfg.setdefault("overwrite", False)
+        organoid_cfg.setdefault("lap", {
+            "track_cost_px": 60,
+            "gap_close_cost_px": 80,
             "gap_close_max_frames": 3,
             "merging_cost_px": 0,
             "splitting_cost_px": 0
         })
-        prof.setdefault("trackpy", {
-            "search_range_px": 31,
+        organoid_cfg.setdefault("trackpy", {
+            "search_range_px": 35,
             "memory_frames": 2,
             "adaptive_stop": 10.0,
             "adaptive_step": 0.95
         })
+        
         self.metadata_loader.behav3d_parameters = p  # keep loader in sync
 
     def _persist_params(self):
@@ -2585,15 +3157,15 @@ class TrackingPanel:
                     print(f"  gap_closing_max_frame_count={self.gap_max_frames.value}")
                     print(f"  merging_cost_cutoff={merging}, splitting_cost_cutoff={splitting}", flush=True)
 
-                    new_md = run_tcell_laptracking(
+                    new_md = run_laptracking(
                         metadata=self.metadata_loader.metadata,
                         output_dir=str(out_dir),
+                        cell_type=self.cell_type,
                         track_cost_cutoff=tc,
                         gap_closing_cost_cutoff=gc,
                         gap_closing_max_frame_count=int(self.gap_max_frames.value),
                         merging_cost_cutoff=merging,
                         splitting_cost_cutoff=splitting,
-                        cell_type=self.cell_type,
                         overwrite=bool(self.overwrite.value),
                     )
 
@@ -2602,11 +3174,11 @@ class TrackingPanel:
                     print(f"  search_range={self.tp_search_range.value}, memory={self.tp_memory.value}")
                     print(f"  adaptive_stop={self.tp_adaptive_stop.value}, adaptive_step={self.tp_adaptive_step.value}", flush=True)
 
-                    new_md = run_tcell_trackpy_tracking(
+                    new_md = run_trackpy_tracking_generic(
                         metadata=self.metadata_loader.metadata,
                         output_dir=str(out_dir),
-                        overwrite=bool(self.overwrite.value),
                         cell_type=self.cell_type,
+                        overwrite=bool(self.overwrite.value),
                         search_range=int(self.tp_search_range.value),
                         memory=int(self.tp_memory.value),
                         adaptive_stop=float(self.tp_adaptive_stop.value),
@@ -2848,11 +3420,20 @@ class FeatureExtractionPanel:
                         f"features.{self.cell_type}", {}) or {}
 
         # --- Controls ---
+        # Check if any sample has a dead_channel defined in metadata
+        has_dead_channel = False
+        if hasattr(metadata_loader, 'metadata') and metadata_loader.metadata is not None:
+            has_dead_channel = 'dead_channel' in metadata_loader.metadata.columns and \
+                              metadata_loader.metadata['dead_channel'].notna().any()
+        
         self.dead_mask_threshold = widgets.FloatText(
             description="Dead mask % thr",
             value=float(fcfg.get("dead_mask_percentage_threshold", 0.05)),
             style={'description_width':'160px'}
         )
+        # Hide dead mask threshold if no dead_channel in metadata
+        if not has_dead_channel:
+            self.dead_mask_threshold.layout.display = "none"
 
         self._all_features = ["movement", "intensity", "morphology", "contact", "death"]
         default_feats = fcfg.get("features_choice", self._all_features)
@@ -2890,6 +3471,9 @@ class FeatureExtractionPanel:
         for f in self._all_features:
             if f == "contact":
                 feat_rows.append(contact_row)
+            elif f == "death" and not has_dead_channel:
+                # Skip death feature if no dead_channel in metadata
+                continue
             else:
                 feat_rows.append(self.feature_checks[f])
                 
@@ -3014,308 +3598,456 @@ class FeatureExtractionPanel:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
 
-class TcellFilterPanel:
-    def __init__(self, metadata_loader, cell_type="tcell"):
+class TrackFilterPanel:
+    """
+    Generic track filtering panel that works for ANY cell type.
+    """
+    
+    def __init__(self, metadata_loader, cell_type):
+        """
+        Parameters
+        ----------
+        metadata_loader : object
+            Metadata loader instance with behav3d_parameters
+        cell_type : str
+            Name of the cell type to filter (e.g., "tcell", "organoid", "macrophage")
+        """
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
-
-        # seed config
+        
+        # Use unified category detection
+        self.category = detect_cell_type_category(self.cell_type, metadata_loader.metadata)
+        
+        # Load/init config
         params = self.metadata_loader.behav3d_parameters
         params.setdefault("track_filtering", {})
         if self.cell_type not in params["track_filtering"]:
-            from copy import deepcopy
-            params["track_filtering"][self.cell_type] = deepcopy(
-                _DEFAULT_CONFIG["track_filtering"][self.cell_type]
-            )
+            # Use category defaults from _DEFAULT_CONFIG
+            cat_cfg = _DEFAULT_CONFIG["track_filtering"].get(self.category, {})
+            params["track_filtering"][self.cell_type] = deepcopy(cat_cfg)
             with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
                 yaml.safe_dump(params, f, sort_keys=False)
-
+        
         cfg = params["track_filtering"][self.cell_type]
-
-        # ---- exp_duration ----
+        
+        # ---- Title ----
+        self.section_title = widgets.HTML(
+            f'<div style="font-size:22px;font-weight:700;">{self.cell_type.capitalize()} Track Filtering</div>'
+        )
+        
+        # ---- Experiment duration ----
         self.en_exp_duration = widgets.Checkbox(
             description="Trim down full time series to supplied duration",
-            value=bool(cfg.get("exp_duration_enabled", False)),
-            indent=False,
-            style={'description_width': '240px'}
+            value=bool(cfg.get("exp_duration_enabled", True)),
+            indent=False
         )
         self.exp_duration = widgets.IntText(
-            description="Max timepoints",
-            value=int(cfg.get("exp_duration", 999999)),
-            style={'description_width': '160px'},
-            continuous_update=False
+            description="Max timepoints (frames)",
+            value=int(cfg.get("exp_duration", 350)),
+            style={'description_width': '180px'}
         )
-
-        self.row_exp = widgets.HBox([self.exp_duration], layout=widgets.Layout(display="none"))
+        self.row_exp = widgets.HBox([self.exp_duration])
+        if not self.en_exp_duration.value:
+            self.row_exp.layout.display = "none"
         self.en_exp_duration.observe(
-            lambda c: self.row_exp.layout.__setattr__("display", None if self.en_exp_duration.value else "none"),
+            lambda c: self.row_exp.layout.__setattr__("display", None if c["new"] else "none"),
             names="value"
         )
-        self.en_exp_duration.observe(lambda c: _update_unit_toggle_visibility(), names="value")
-
-        if self.en_exp_duration.value:
-            self.row_exp.layout.display = None
-
-        # ---- min_track_length ----
-        self.en_min_len = widgets.Checkbox(
+        
+        # ---- Minimum track length ----
+        self.en_min_length = widgets.Checkbox(
             description="Select only tracks with minimal length",
-            value=bool(cfg.get("min_track_length_enabled", False)),
+            value=bool(cfg.get("min_length_enabled", True)),
             indent=False
         )
-        # REPLACED IntSlider -> IntText
         self.min_track_length = widgets.IntText(
             description="Minimal length (frames)",
-            value=int(cfg.get("min_track_length", 0)),
-            style={'description_width': '160px'},
-            continuous_update=False
+            value=int(cfg.get("min_track_length", 30)),
+            style={'description_width': '180px'}
         )
-        self.row_min = widgets.HBox([self.min_track_length], layout=widgets.Layout(display="none"))
-        self.en_min_len.observe(
-            lambda c: self.row_min.layout.__setattr__("display", None if self.en_min_len.value else "none"),
+        self.row_min = widgets.HBox([self.min_track_length])
+        if not self.en_min_length.value:
+            self.row_min.layout.display = "none"
+        self.en_min_length.observe(
+            lambda c: self.row_min.layout.__setattr__("display", None if c["new"] else "none"),
             names="value"
         )
-        self.en_min_len.observe(lambda c: _update_unit_toggle_visibility(), names="value")
-
-        if self.en_min_len.value:
-            self.row_min.layout.display = None
-
-        # ---- max_track_length ----
-        self.en_max_len = widgets.Checkbox(
+        
+        # ---- Maximum track length (trim) ----
+        self.en_max_length = widgets.Checkbox(
             description="Trim down tracks to supplied length",
-            value=bool(cfg.get("max_track_length_enabled", False)),
+            value=bool(cfg.get("max_length_enabled", True)),
             indent=False
         )
-        # REPLACED IntSlider -> IntText
         self.max_track_length = widgets.IntText(
             description="Maximal length (frames)",
-            value=int(cfg.get("max_track_length", 999999)),
-            style={'description_width': '160px'},
-            continuous_update=False
+            value=int(cfg.get("max_track_length", 30)),
+            style={'description_width': '180px'}
         )
-        self.row_max = widgets.HBox([self.max_track_length], layout=widgets.Layout(display="none"))
-        self.en_max_len.observe(
-            lambda c: self.row_max.layout.__setattr__("display", None if self.en_max_len.value else "none"),
+        self.row_max = widgets.HBox([self.max_track_length])
+        if not self.en_max_length.value:
+            self.row_max.layout.display = "none"
+        self.en_max_length.observe(
+            lambda c: self.row_max.layout.__setattr__("display", None if c["new"] else "none"),
             names="value"
         )
-        self.en_max_len.observe(lambda c: _update_unit_toggle_visibility(), names="value")
-
-        if self.en_max_len.value:
-            self.row_max.layout.display = None
-
-        # ---- filter_t0_dead ----
-        self.filter_t0_dead = widgets.Checkbox(
-            description="Filter tracks that are dead at t=0",
-            value=bool(cfg.get("filter_t0_dead", False)),
-            indent=False
+        
+        # ---- Filter t0 dead OR min size at t=1 ----
+        from behav3d.utils import has_dead_channel
+        self.has_dead = has_dead_channel(self.metadata_loader.metadata)
+        
+        if self.category == "organoid":
+            # Organoids: filter by minimal size at t=1
+            self.filter_t0_dead = widgets.Checkbox(
+                description="Filter by minimal size at t=1",
+                value=bool(cfg.get("filter_min_size_t1", True)),
+                indent=False
+            )
+            self.min_size_t1 = widgets.IntText(
+                description="Minimal size (px @ t=1)",
+                value=int(cfg.get("min_size_t1", 1000)),
+                style={'description_width': '180px'}
+            )
+            self.row_size_t1 = widgets.HBox([self.min_size_t1])
+            if not self.filter_t0_dead.value:
+                self.row_size_t1.layout.display = "none"
+            self.filter_t0_dead.observe(
+                lambda c: self.row_size_t1.layout.__setattr__("display", None if c["new"] else "none"),
+                names="value"
+            )
+        else:
+            # Immune/other: filter by dead at t=0
+            self.filter_t0_dead = widgets.Checkbox(
+                description="Filter tracks that are dead at t=0",
+                value=bool(cfg.get("filter_t0_dead", True)),
+                indent=False
+            )
+            self.min_size_t1 = None
+            self.row_size_t1 = None
+            # Show only if dead channel exists
+            if not self.has_dead:
+                self.filter_t0_dead.layout.display = "none"
+        
+        # ---- Time unit toggle buttons (not shown for organoid category) ----
+        self.time_unit_label = widgets.HTML(
+            value='<div style="margin-top:10px;"><b>Unit to use for time-based filters:</b></div>'
+        )
+        self.time_type = widgets.ToggleButtons(
+            options=["frames", "hours"],
+            value=cfg.get("time_type", "frames"),
+            button_style="",
+            style={'button_width': '100px'}
         )
         
-        # Run button + output
-        self.btn_run = widgets.Button(description=f"Filter {cell_type} tracks & summarize", button_style="success", layout=widgets.Layout(
-        width="fit-content",   # size to content
-        flex="0 0 auto"        # don't stretch in HBox/VBox
-    ))
+        # Hide time unit toggle for organoid category
+        if self.category == "organoid":
+            self.time_unit_label.layout.display = "none"
+            self.time_type.layout.display = "none"
+        
+        # Update labels when time unit changes
+        def _on_time_unit_change(change):
+            if change['name'] == 'value':
+                unit = change['new']
+                self.exp_duration.description = f"Max timepoints ({unit})"
+                self.min_track_length.description = f"Minimal length ({unit})"
+                self.max_track_length.description = f"Maximal length ({unit})"
+        
+        self.time_type.observe(_on_time_unit_change, names='value')
+        
+        # ---- Run button ----
+        self.btn_run = widgets.Button(
+            description=f"Filter {self.cell_type} tracks & summarize",
+            button_style="success",
+            layout=widgets.Layout(width="fit-content")
+        )
         self.btn_run.on_click(self._on_run_clicked)
         
-        self.spinner_html = widgets.HTML(
-            value=spinning_loader
-        )
-        self.spinner_html.layout.display = "none"  # hidden until run starts
-
-                # ----- time unit toggle (Frames / Hours) -----
-        _TIME_TYPE_OPTIONS = [("frames", "Frames"), ("hours", "real_time")]
-        default_time_type = str(cfg.get("time_type", "Frames"))
-        default_label = next((lbl for (lbl, val) in _TIME_TYPE_OPTIONS if val == default_time_type), "frames")
-
-        self.time_type_toggle = widgets.ToggleButtons(
-            options=_TIME_TYPE_OPTIONS,  # [('frames','Frames'), ('hours','real_time')]
-            value=next(val for (lbl, val) in _TIME_TYPE_OPTIONS if lbl == default_label),
-            description="Unit to use for time-based filters:",
-            button_style="info",
-            layout=widgets.Layout(width="auto")
-        )
-
-        # Update field labels to match units
-        def _refresh_labels(time_type_value: str):
-            if time_type_value == "real_time":
-                self.exp_duration.description = "Max duration (hours)"
-                self.min_track_length.description = "Minimal length (hours)"
-                self.max_track_length.description = "Maximal length (hours)"
-            else:
-                self.exp_duration.description = "Max timepoints (frames)"
-                self.min_track_length.description = "Minimal length (frames)"
-                self.max_track_length.description = "Maximal length (frames)"
-
-        _refresh_labels(self.time_type_toggle.value)
-        self.time_type_toggle.observe(lambda c: _refresh_labels(self.time_type_toggle.value), names="value")
-
-        # Wrap the toggle in a row that we can show/hide
-        self.row_unit = widgets.HBox([self.time_type_toggle], layout=widgets.Layout(display="none"))
-
-        # Show the row only if any filter is enabled
-        def _update_unit_toggle_visibility():
-            visible = self.en_exp_duration.value or self.en_min_len.value or self.en_max_len.value
-            self.row_unit.layout.display = None if visible else "none"
-
-        # Call once now, and whenever any enabling checkbox changes
-        _update_unit_toggle_visibility()
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
         
         self.run_row = widgets.HBox(
             [self.btn_run, self.spinner_html],
             layout=widgets.Layout(align_items="center", gap="10px")
         )
         
-        self.out = widgets.Output()
-
-        # Full layout
-        self.ui = widgets.VBox([
-            widgets.HTML(f"<b>{self.cell_type} Track Filtering</b>"),
-            self.en_exp_duration, self.row_exp,
-            self.en_min_len, self.row_min,
-            self.en_max_len, self.row_max,
+        self.out_run = widgets.Output()
+        
+        # ---- UI ----
+        layout_widgets = [
+            self.section_title,
+            self.en_exp_duration,
+            self.row_exp,
+            self.en_min_length,
+            self.row_min,
+            self.en_max_length,
+            self.row_max,
             self.filter_t0_dead,
-            self.row_unit,
+        ]
+        
+        # Add size filter row for organoids
+        if self.category == "organoid" and self.row_size_t1 is not None:
+            layout_widgets.append(self.row_size_t1)
+        
+        layout_widgets.extend([
+            self.time_unit_label,
+            self.time_type,
             self.run_row,
-            widgets.HTML("<hr>"),
-            self.out
+            self.out_run,
         ])
-
-        # results
-        self.df_tracks_filt = None
-        self.df_tracks_summ = None
-
-    def display(self):
-        display(self.ui)
-
-    def _effective_values(self):
-        exp_duration = float(self.exp_duration.value) if self.en_exp_duration.value else 999999.0
-        min_len      = int(self.min_track_length.value) if self.en_min_len.value else 0
-        max_len      = int(self.max_track_length.value) if self.en_max_len.value else 999999
-        filt_dead    = bool(self.filter_t0_dead.value)
-        time_type    = str(self.time_type_toggle.value)  # "frames" or "real_time"
-        return exp_duration, min_len, max_len, filt_dead, time_type
-
-    def _persist_params(self):
-        params = self.metadata_loader.behav3d_parameters
-        prof = params["track_filtering"][self.cell_type]
-
-        # Save enable flags
-        prof["exp_duration_enabled"]      = bool(self.en_exp_duration.value)
-        prof["min_track_length_enabled"]  = bool(self.en_min_len.value)
-        prof["max_track_length_enabled"]  = bool(self.en_max_len.value)
-
-        # Always save the text values exactly as the user set them
-        prof["exp_duration"]      = float(self.exp_duration.value)
-        prof["min_track_length"]  = int(self.min_track_length.value)
-        prof["max_track_length"]  = int(self.max_track_length.value)
-
-        # Persist checkbox directly
-        prof["filter_t0_dead"] = bool(self.filter_t0_dead.value)
-        prof["time_type"] = str(self.time_type_toggle.value)
-
-        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(params, f, sort_keys=False)
-
-    def _lock(self, state: bool):
-        for w in [
-            self.en_exp_duration, self.exp_duration,
-            self.en_min_len, self.min_track_length,
-            self.en_max_len, self.max_track_length,
-            self.filter_t0_dead, self.btn_run
-        ]:
-            if hasattr(w, "disabled"):
-                w.disabled = state
-
-    def _on_run_clicked(self, _):
+        
+        self.ui = widgets.VBox(layout_widgets)
+        
+        # Choose the correct filter function based on category
+        if self.category == "organoid":
+            self._filter_tracks = filter_organoid_tracks
+        else:
+            self._filter_tracks = filter_cell_tracks
+    
+    def _lock(self, locked):
+        """Lock/unlock all controls"""
+        lock_widgets = [self.en_exp_duration, self.exp_duration, self.en_min_length,
+                  self.min_track_length, self.en_max_length, self.max_track_length,
+                  self.filter_t0_dead, self.time_type, self.btn_run]
+        
+        # Add organoid-specific widgets if they exist
+        if self.category == "organoid" and self.min_size_t1 is not None:
+            lock_widgets.append(self.min_size_t1)
+        
+        for w in lock_widgets:
+            w.disabled = locked
+    
+    def _on_run_clicked(self, *_):
+        """Run filtering when button clicked"""
         self._lock(True)
+        self.out_run.clear_output()
         self.spinner_html.layout.display = None
-        with self.out:
-            self.out.clear_output()
+        
+        with self.out_run:
             try:
-                out_dir = Path(self.metadata_loader.output_dir).expanduser()
-                out_dir.mkdir(parents=True, exist_ok=True)
-
-                exp_duration, min_len, max_len, filt_t0, time_type = self._effective_values()
-                print("▶️ Filtering tracks…")
-                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, "
-                      f"filter_t0_dead={filt_t0}, unit={'frames' if time_type=='Frames' else 'hours'}")
-                self._persist_params()
+                print(f"▶️ Filtering {self.cell_type} tracks...")
                 
-                self.df_tracks_filt = filter_tcell_tracks(
-                    metadata=self.metadata_loader.metadata,
-                    output_dir=str(out_dir),
-                    exp_duration=exp_duration,
-                    min_track_length=min_len,
-                    max_track_length=max_len,
-                    filter_t0_dead=filt_t0,
-                    cell_type=self.cell_type,
-                    time_type=time_type,
-                )
-                print("✅ Filtering done. Summarizing…")
-
+                # Gather parameters
+                output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+                metadata = self.metadata_loader.metadata
+                
+                exp_duration = int(self.exp_duration.value) if self.en_exp_duration.value else None
+                min_track_length = int(self.min_track_length.value) if self.en_min_length.value else None
+                max_track_length = int(self.max_track_length.value) if self.en_max_length.value else None
+                
+                # For organoids: size filter at t=1 instead of dead filter
+                if self.category == "organoid":
+                    filter_t0_dead = False
+                    min_size_t1 = int(self.min_size_t1.value) if self.filter_t0_dead.value else None
+                else:
+                    # Immune/other: dead filter (only if dead channel exists)
+                    filter_t0_dead = bool(self.filter_t0_dead.value) if self.has_dead else False
+                    min_size_t1 = None
+                
+                time_type = str(self.time_type.value)
+                plot_results = True  # Always generate plots
+                
+                # Persist to config
+                cfg = self.metadata_loader.behav3d_parameters["track_filtering"][self.cell_type]
+                cfg["exp_duration_enabled"] = self.en_exp_duration.value
+                cfg["exp_duration"] = int(self.exp_duration.value)
+                cfg["min_length_enabled"] = self.en_min_length.value
+                cfg["min_track_length"] = int(self.min_track_length.value)
+                cfg["max_length_enabled"] = self.en_max_length.value
+                cfg["max_track_length"] = int(self.max_track_length.value)
+                cfg["time_type"] = time_type
+                cfg["plot_results"] = plot_results
+                
+                # Save category-specific configs
+                if self.category == "organoid":
+                    cfg["filter_min_size_t1"] = self.filter_t0_dead.value
+                    cfg["min_size_t1"] = int(self.min_size_t1.value) if self.min_size_t1 else 500
+                else:
+                    cfg["filter_t0_dead"] = filter_t0_dead
+                
+                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+                    yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
+                
+                print(f"  output_dir = {output_dir}")
+                if exp_duration is not None:
+                    print(f"  exp_duration = {exp_duration}")
+                if min_track_length is not None:
+                    print(f"  min_track_length = {min_track_length}")
+                if max_track_length is not None:
+                    print(f"  max_track_length = {max_track_length}")
+                if self.category == "organoid":
+                    if min_size_t1 is not None:
+                        print(f"  min_size_t1 = {min_size_t1}")
+                elif self.has_dead:
+                    print(f"  filter_t0_dead = {filter_t0_dead}")
+                
+                # Call adapted filter function (organoid or tcell)
+                if self.category == "organoid":
+                    self._filter_tracks(
+                        metadata=metadata,
+                        output_dir=output_dir,
+                        exp_duration=exp_duration,
+                        min_track_length=min_track_length,
+                        max_track_length=max_track_length,
+                        min_size=min_size_t1,
+                        time_type=time_type,
+                        cell_type=self.cell_type
+                    )
+                    
+                    # Summarize tracks after filtering (needed for behavioral analysis)
+                    print("✅ Filtering done. Summarizing tracks...")
+                    self.df_tracks_summ = summarize_track_features(
+                        output_dir=str(output_dir),
+                        cell_type=self.cell_type
+                    )
+                else:
+                    self._filter_tracks(
+                        metadata=metadata,
+                        output_dir=output_dir,
+                        exp_duration=exp_duration,
+                        min_track_length=min_track_length,
+                        max_track_length=max_track_length,
+                        filter_t0_dead=filter_t0_dead,
+                        cell_type=self.cell_type,
+                        time_type=time_type,
+                        plot_results=plot_results
+                    )
+                
+                # Summarize tracks after filtering (needed for behavioral analysis)
+                print("✅ Filtering done. Summarizing tracks...")
                 self.df_tracks_summ = summarize_track_features(
-                    output_dir=str(out_dir),
+                    output_dir=str(output_dir),
                     cell_type=self.cell_type
                 )
-
-                from IPython.display import display as _disp
-                print("— Filtered tracks (head) —")
-                try: _disp(self.df_tracks_filt.head(10))
-                except Exception: print(f"[df_tracks_filt] shape={getattr(self.df_tracks_filt,'shape',None)}")
-                print("\n— Summary (head) —")
-                try: _disp(self.df_tracks_summ.head(10))
-                except Exception: print(f"[df_tracks_summ] shape={getattr(self.df_tracks_summ,'shape',None)}")
-                print("✅ Finished.")
-
+                
+                print(f"✅ {self.cell_type} filtering complete!")
+                
             except Exception:
-                import traceback; traceback.print_exc()
+                import traceback
+                print(f"❌ Error while filtering {self.cell_type} tracks:")
+                traceback.print_exc()
             finally:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
 
-class TCellAnalysisPanel:
-    def __init__(self, metadata_loader):
+
+class MotileCellAnalysisPanel:
+    """
+    Generic behavioral analysis panel (DTW/UMAP/clustering) for ANY cell type.
+    
+    """
+    
+    def __init__(self, metadata_loader, cell_type):
+        """
+        Parameters
+        ----------
+        metadata_loader : object
+            Metadata loader instance
+        cell_type : str
+            Name of the cell type (e.g., "tcell", "organoid", "macrophage")
+        """
+        from behav3d.utils import expand_column_patterns
+        
         self.metadata_loader = metadata_loader
+        self.cell_type = str(cell_type).strip()
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
-
-        # ---- config bootstrap (load + ensure defaults) ----
-        try:
-            groups = behav3d_calculated_features
-            md = self.metadata_loader.metadata
-            # Detect if organoid_2 features should be added
-            self.two_org_types = False
-            if md is not None and 'organoid_2_tracks_csv_path' in md.columns:
-                s = md['organoid_2_tracks_csv_path'].dropna()
-                if not s.empty and Path(str(s.iloc[0])).exists():
-                    self.two_org_types = True 
-                    # Add organoid_2 contact features
-                    groups["contact"].extend([
-                        "organoid_2_contact",
-                        "organoid_2_contact_pixels",
-            ])
-        except NameError:
-            raise RuntimeError("Define behav3d_calculated_features before creating TCellAnalysisPanel.")
-
+        
+        # Use unified category detection
+        self.category = detect_cell_type_category(self.cell_type, metadata_loader.metadata)
+        
+        # Load config
         params = dict(self.metadata_loader.behav3d_parameters or {})
         params.setdefault("analysis", {})
-        params["analysis"].setdefault("tcell", self._default_panel_config(groups))
+        if self.cell_type not in params["analysis"]:
+            cat_cfg = _DEFAULT_CONFIG["analysis"].get(self.category, {})
+            params["analysis"][self.cell_type] = deepcopy(cat_cfg)
         self._params = params
-        self._panel_cfg = self._params["analysis"]["tcell"]
-
-        # ---- headings ----
-        self.section_title = widgets.HTML('<div style="font-size:22px;font-weight:700;">T cell analysis</div>')
-        self.sel_title     = widgets.HTML('<div style="font-size:20px;font-weight:700;">Select features to use for Dynamic Time Warping (DTW):</div>')
-        self.norm_title    = widgets.HTML('<div style="font-size:20px;font-weight:700;">Normalize</div>')
-        self.umap_title    = widgets.HTML('<div style="font-size:20px;font-weight:700;">UMAP settings</div>')
+        self._panel_cfg = self._params["analysis"][self.cell_type]
+        
+        # Feature groups - expand wildcards based on ACTUAL DATA
+        groups = deepcopy(behav3d_calculated_features)
+        
+        # Load a sample of the data to get actual column names
+        feature_outdir = Path(self.output_dir, "analysis", self.cell_type, "track_features")
+        df_tracks_path_filt = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
+        df_tracks_path_unfilt = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features.csv")
+        
+        actual_columns = []
+        # Try filtered first, then unfiltered as fallback
+        for df_tracks_path in [df_tracks_path_filt, df_tracks_path_unfilt]:
+            if df_tracks_path.exists():
+                try:
+                    # Read just the first row to get column names
+                    import pandas as pd
+                    df_sample = pd.read_csv(df_tracks_path, nrows=0)
+                    actual_columns = list(df_sample.columns)
+                    print(f"[MotileCellAnalysisPanel] Loaded {len(actual_columns)} columns from {df_tracks_path.name} for {self.cell_type}")
+                    break  # Stop after first successful load
+                except Exception as e:
+                    print(f"[MotileCellAnalysisPanel] Failed to load {df_tracks_path.name}: {e}")
+                    pass
+        
+        if not actual_columns:
+            print(f"[MotileCellAnalysisPanel] WARNING: No CSV found for {self.cell_type} - using template features only")
+        
+        # Check if death features actually exist in the data
+        has_death_features = False
+        if actual_columns:
+            death_cols = {'mean_dead_dye', 'percentage_dead_mask', 'nr_dead_mask_pixels', 'increase_dead_mask', 'dead'}
+            has_death_features = bool(death_cols.intersection(set(actual_columns)))
+        
+        # Remove death features if not present in actual data
+        if not has_death_features:
+            print(f"[MotileCellAnalysisPanel] No death features found in {self.cell_type} data - hiding death group")
+            if "death" in groups:
+                del groups["death"]
+            if "intensity" in groups:
+                groups["intensity"] = [f for f in groups["intensity"] if f != "mean_dead_dye"]
+        
+        # Expand wildcards in feature groups to show actual columns
+        if actual_columns:
+            expanded_groups = {}
+            for group_name, patterns in groups.items():
+                expanded_features = []
+                for pattern in patterns:
+                    if '*' in pattern or '?' in pattern or '[' in pattern:
+                        # This is a wildcard - expand it
+                        matches = expand_column_patterns(pattern, actual_columns)
+                        # Filter out non-numeric columns
+                        matches = [m for m in matches if m != 'orientation_vector' and not m.startswith('touching_')]
+                        expanded_features.extend(matches)
+                    else:
+                        # Exact match - include if exists
+                        if pattern in actual_columns:
+                            expanded_features.append(pattern)
+                # Only include groups that have at least one feature
+                if expanded_features:
+                    expanded_groups[group_name] = sorted(set(expanded_features))
+            groups = expanded_groups
+            print(f"[MotileCellAnalysisPanel] Expanded to {sum(len(v) for v in groups.values())} total features across {len(groups)} groups")
+        
+        # ---- Titles ----
+        self.section_title = widgets.HTML(
+            f'<div style="font-size:22px;font-weight:700;">{self.cell_type} behavioral analysis</div>'
+        )
+        self.sel_title = widgets.HTML(
+            '<div style="font-size:20px;font-weight:700;">Select features for DTW:</div>'
+        )
+        self.norm_title = widgets.HTML(
+            '<div style="font-size:20px;font-weight:700;">Normalize (z-score):</div>'
+        )
+        self.umap_title = widgets.HTML(
+            '<div style="font-size:20px;font-weight:700;">UMAP settings:</div>'
+        )
+        
         # ---- Seed ----
         self.seed_widget = widgets.IntText(
             description="Seed",
             value=int(self._panel_cfg.get("seed", self._params.get("seed", 42))),
             style={"description_width": "80px"},
         )
-
-        # ---------- layout helpers (shared by both sections) ----------
+        
+        # ---- Grid layout helper ----
         def _grid_for(children, indent_px="24px", columns=3):
-            # Force 3 columns for every group
             return widgets.GridBox(
                 children,
                 layout=widgets.Layout(
@@ -3324,54 +4056,92 @@ class TCellAnalysisPanel:
                     margin=f"0 0 0 {indent_px}",
                 )
             )
-
-        # ---- SELECTION (grouped; always visible) ----
-        self._group_rows = {}  # group -> {"group_cb","child_cbs","grid","container","group_handler","child_handler"}
+        
+        # ---- SELECTION (feature groups) ----
+        self._group_rows = {}
         sel_group_boxes = []
-
+        
         preset = list(self._panel_cfg.get("dtw_features_input", []))
         preset_set = set(preset)
         groups_enabled = dict(self._panel_cfg.get("dtw_feature_groups_enabled", {}))
-
+        
+        # Get all available features from expanded groups
+        all_expanded_features = set()
+        for feats in groups.values():
+            all_expanded_features.update(feats)
+        
+        # Check if saved config is stale:
+        # 1. Has wildcards (e.g., mean_intensity_*)
+        # 2. Saved features don't exist in expanded set
+        # 3. Saved config is too incomplete (< 20% of available features)
+        has_wildcards_in_config = any('*' in f or '?' in f or '[' in f for f in preset)
+        features_dont_exist = preset_set and not preset_set.intersection(all_expanded_features)
+        too_incomplete = len(preset_set) > 0 and len(preset_set) < len(all_expanded_features) * 0.2
+        
+        config_is_stale = has_wildcards_in_config or features_dont_exist or too_incomplete
+        
+        # If stale config detected, reset to show nothing selected (user will select what they want)
+        if config_is_stale:
+            if too_incomplete:
+                print(f"[MotileCellAnalysisPanel] Incomplete config for {self.cell_type} ({len(preset_set)}/{len(all_expanded_features)} features) - clearing selection")
+            else:
+                print(f"[MotileCellAnalysisPanel] Stale config detected for {self.cell_type} - clearing selection")
+            preset_set.clear()
+            # Update saved config to clear the stale data
+            self._panel_cfg["dtw_features_input"] = []
+            self._panel_cfg["z_normalize"] = {}
+            # Don't auto-select features - let user choose
+        elif not preset_set:
+            # No saved config at all - start with enabled groups
+            print(f"[MotileCellAnalysisPanel] No saved config for {self.cell_type} - using category defaults")
+            for group_name, feats in groups.items():
+                if groups_enabled.get(group_name, False):
+                    preset_set.update(feats)
+            if preset_set:
+                print(f"[MotileCellAnalysisPanel] Initialized {len(preset_set)} features from enabled groups")
+                # Update config with initialized features
+                self._panel_cfg["dtw_features_input"] = list(preset_set)
+            else:
+                print(f"[MotileCellAnalysisPanel] No features auto-selected (all groups disabled in category defaults)")
+        
         for group_name, feats in groups.items():
-            # Children init from preset; group init from saved flag or "all children on"
             child_cbs = [
                 widgets.Checkbox(value=(f in preset_set), description=f, indent=True)
                 for f in feats
             ]
-            g_init = bool(groups_enabled.get(group_name, all(cb.value for cb in child_cbs)))
-
+            # Group checkbox: use saved state if available, otherwise check if any children selected
+            g_init = groups_enabled.get(group_name, any(cb.value for cb in child_cbs)) if groups_enabled else any(cb.value for cb in child_cbs)
+            
             gcb = widgets.Checkbox(value=g_init, indent=False)
             glabel = widgets.HTML(f"<b>{group_name}</b>")
             header = widgets.HBox([gcb, glabel])
-
-            grid = _grid_for(child_cbs, columns=3)   # ALWAYS 3 columns
+            
+            grid = _grid_for(child_cbs, columns=3)
             container = widgets.VBox([header, grid])
-
+            
             self._group_rows[group_name] = {
                 "group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container
             }
             sel_group_boxes.append(container)
-
+        
         self.checkboxes_box = widgets.VBox(sel_group_boxes)
-        # Wire selection events (batched)
+        
+        # Wire selection events
         def make_group_handler(grp_name):
             def _on_group(change):
                 if change["name"] != "value":
                     return
                 val = bool(change["new"])
                 row = self._group_rows[grp_name]
-                # batch set children values only (no hiding/disable)
                 for cb in row["child_cbs"]:
                     cb.unobserve(row["child_handler"], names="value")
                 for cb in row["child_cbs"]:
                     cb.value = val
                 for cb in row["child_cbs"]:
                     cb.observe(row["child_handler"], names="value")
-                # sync normalize for this group (once)
                 self._sync_normalize_visibility_batched([grp_name])
             return _on_group
-
+        
         def make_child_handler(grp_name):
             def _on_child(change):
                 if change["name"] != "value":
@@ -3383,31 +4153,29 @@ class TCellAnalysisPanel:
                 row["group_cb"].observe(row["group_handler"], names="value")
                 self._sync_normalize_visibility_batched([grp_name])
             return _on_child
-
+        
         for grp_name, row in self._group_rows.items():
             row["group_handler"] = make_group_handler(grp_name)
             row["child_handler"] = make_child_handler(grp_name)
             row["group_cb"].observe(row["group_handler"], names="value")
             for cb in row["child_cbs"]:
                 cb.observe(row["child_handler"], names="value")
-
-        # ---- top-level selection actions ----
+        
+        # Selection action buttons
         self.btn_select_all = widgets.Button(description="Select all")
-        self.btn_clear_all  = widgets.Button(description="Clear")
+        self.btn_clear_all = widgets.Button(description="Clear")
         self.btn_select_all.on_click(lambda *_: self._set_all(True))
         self.btn_clear_all.on_click(lambda *_: self._set_all(False))
-
-        self.output_area_features = widgets.Output()
-
-        # ---- NORMALIZE (3 columns like selection; only selected visible) ----
-        self._norm_group_rows = {}  # group -> {"group_cb","child_cbs","grid","container","group_handler"}
+        
+        # ---- NORMALIZE (mirrors selection) ----
+        self._norm_group_rows = {}
         norm_group_boxes = []
+        
         for group_name, feats in groups.items():
-            gcb = widgets.Checkbox(value=False, indent=False)  # master for visible children
+            gcb = widgets.Checkbox(value=False, indent=False)
             glabel = widgets.HTML(f"<b>{group_name}</b>")
             header = widgets.HBox([gcb, glabel])
-
-            # Same child order & widgets; visibility controls position
+            
             child_cbs = []
             for f in feats:
                 cb = widgets.Checkbox(
@@ -3415,18 +4183,18 @@ class TCellAnalysisPanel:
                     description=f,
                     indent=True
                 )
-                cb.layout.visibility = 'hidden'  # start hidden; will show if selected
+                cb.layout.visibility = 'hidden'
                 child_cbs.append(cb)
-
-            grid = _grid_for(child_cbs, columns=3)  # force 3 columns
+            
+            grid = _grid_for(child_cbs, columns=3)
             container = widgets.VBox([header, grid])
-
+            
             self._norm_group_rows[group_name] = {
                 "group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container
             }
             norm_group_boxes.append(container)
-
-        # normalize group master toggles only currently visible children
+        
+        # Normalize group handlers
         def make_norm_group_handler(grp_name):
             def _on_group(change):
                 if change["name"] != "value":
@@ -3437,34 +4205,40 @@ class TCellAnalysisPanel:
                     if cb.layout.visibility != 'hidden':
                         cb.value = val
             return _on_group
+        
         for grp_name, row in self._norm_group_rows.items():
             row["group_handler"] = make_norm_group_handler(grp_name)
             row["group_cb"].observe(row["group_handler"], names="value")
-
-        # Global normalize controls (like selection)
+        
+        # Normalize action buttons
         self.norm_select_all_btn = widgets.Button(description="Select all")
-        self.norm_clear_all_btn  = widgets.Button(description="Clear")
+        self.norm_clear_all_btn = widgets.Button(description="Clear")
         self.norm_select_all_btn.on_click(self._on_norm_select_all)
         self.norm_clear_all_btn.on_click(self._on_norm_clear_all)
-
+        
         self.normalize_section = widgets.VBox([
             self.norm_title,
             widgets.HBox([self.norm_select_all_btn, self.norm_clear_all_btn],
                          layout=widgets.Layout(gap="8px")),
             widgets.VBox(norm_group_boxes)
         ])
-
         
-        # ---- UMAP / clustering ----
-        self.umap_distance_widget  = widgets.FloatText(description="UMAP min_dist",
-                                                       value=float(self._panel_cfg.get("umap_min_dist", 0.1)),
-                                                       style={"description_width": "140px"})
-        self.umap_neighbors_widget = widgets.IntText(description="UMAP n_neighbors",
-                                                     value=int(self._panel_cfg.get("umap_n_neighbors", 15)),
-                                                     style={"description_width": "140px"})
-        self.num_clusters_widget   = widgets.IntText(description="# clusters",
-                                                     value=int(self._panel_cfg.get("nr_of_clusters", 5)),
-                                                     style={"description_width": "140px"})
+        # ---- UMAP settings ----
+        self.umap_distance_widget = widgets.FloatText(
+            description="UMAP min_dist",
+            value=float(self._panel_cfg.get("umap_min_dist", 0.1)),
+            style={"description_width": "140px"}
+        )
+        self.umap_neighbors_widget = widgets.IntText(
+            description="UMAP n_neighbors",
+            value=int(self._panel_cfg.get("umap_n_neighbors", 15)),
+            style={"description_width": "140px"}
+        )
+        self.num_clusters_widget = widgets.IntText(
+            description="# clusters",
+            value=int(self._panel_cfg.get("nr_of_clusters", 5)),
+            style={"description_width": "140px"}
+        )
         
         self.umap_box = widgets.VBox([
             self.umap_title,
@@ -3472,23 +4246,16 @@ class TCellAnalysisPanel:
                          layout=widgets.Layout(flex_flow="row wrap", gap="12px"))
         ])
         
-        self.output_area_params = widgets.Output()
-
-        # ---- Run ----
+        # ---- Run button ----
         self.btn_run = widgets.Button(
-            description=f"Run T cell analysis",
+            description=f"Run {self.cell_type} analysis",
             button_style="success",
             layout=widgets.Layout(width="300px")
         )
         self.btn_run.on_click(self._on_run_clicked)
         
-        
-        # Tiny inline SVG spinner + label (hidden by default)
-        self.spinner_html = widgets.HTML(
-            value=spinning_loader
-        )
-        self.spinner_html.layout.display = "none"  # hidden until run starts
-
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
         
         self.run_row = widgets.HBox(
             [self.btn_run, self.spinner_html],
@@ -3496,7 +4263,7 @@ class TCellAnalysisPanel:
         )
         
         self.out_run = widgets.Output()
-
+        
         # ---- UI ----
         self.ui = widgets.VBox([
             self.section_title,
@@ -3504,167 +4271,52 @@ class TCellAnalysisPanel:
             self.sel_title,
             widgets.HBox([self.btn_select_all, self.btn_clear_all], layout=widgets.Layout(gap="8px")),
             self.checkboxes_box,
-            self.output_area_features,
             self.normalize_section,
             widgets.HTML("<hr>"),
             self.umap_box,
-            self.output_area_params,
             widgets.HTML("<hr>"),
             self.run_row,
             self.out_run,
         ])
-
-        # internal state
-        self.dtw_features = self._selected_features()
-        self.umap_minimal_distance = float(self.umap_distance_widget.value)
-        self.umap_n_neighbors = int(self.umap_neighbors_widget.value)
-        self.nr_of_clusters = int(self.num_clusters_widget.value)
+        
+        # Internal state
         self.df_tracks_clustered = None
-
-        # initial normalize visibility sync (keep positions; only selected visible)
+        
+        # Store function reference
+        self._expand_column_patterns = expand_column_patterns
+        
+        # Initial normalize visibility sync
         self._sync_normalize_visibility_batched(list(self._group_rows.keys()))
-
-    # ---------- defaults & persistence ----------
-    def _selected_normalize_patterns(self):
-        """
-        Return the list of pattern names whose normalize checkbox is ON (visible items only).
-        """
-        pats = []
-        for grp_name, row in self._norm_group_rows.items():
+    
+    def _selected_features(self):
+        """Get list of selected feature patterns"""
+        feats = []
+        for row in self._group_rows.values():
             for cb in row["child_cbs"]:
-                # visible in Normalize panel means it's part of the DTW selection
+                if cb.value:
+                    feats.append(cb.description)
+        return feats
+    
+    def _selected_normalize_patterns(self):
+        """Get list of normalize patterns (only visible ones that are checked)"""
+        pats = []
+        for row in self._norm_group_rows.values():
+            for cb in row["child_cbs"]:
                 if cb.layout.visibility != 'hidden' and cb.value:
                     pats.append(cb.description)
-        # de-dup preserve order
-        seen, out = set(), []
-        for p in pats:
-            if p not in seen:
-                out.append(p); seen.add(p)
-        return out
-
-
-    def _default_panel_config(self, groups_dict):
-        return {
-            "seed": 42,
-            "umap_min_dist": 0.1,
-            "umap_n_neighbors": 15,
-            "nr_of_clusters": 5,
-            "dtw_feature_groups_enabled": {g: True for g in groups_dict.keys()},
-            "dtw_features_input": [],
-            "dtw_features_resolved": [],
-            "z_normalize": {},
-        }
-
-    def _persist_params(self, *, resolved_use=None, resolved_norm=None):
-        # snapshot current UI state to parameter dict
-        self._panel_cfg["seed"] = int(self.seed_widget.value)
-        self._panel_cfg["umap_min_dist"] = float(self.umap_distance_widget.value)
-        self._panel_cfg["umap_n_neighbors"] = int(self.umap_neighbors_widget.value)
-        self._panel_cfg["nr_of_clusters"] = int(self.num_clusters_widget.value)
-
-        # DTW selection (patterns as shown in the UI)
-        self._panel_cfg["dtw_features_input"] = list(self._selected_features())
-        self._panel_cfg["dtw_feature_groups_enabled"] = {
-            g: row["group_cb"].value for g, row in self._group_rows.items()
-        }
-
-        # Normalize selections (pattern-level switches as shown in the UI)
-        self._panel_cfg["z_normalize"] = self._collect_znorm_map()  # {feature(pattern): bool}
-        self._panel_cfg["columns_to_normalize_input"] = self._selected_normalize_patterns()
-
-        # Optionally store resolved (expanded) columns
-        if resolved_use is not None:
-            self._panel_cfg["dtw_features_resolved"] = list(resolved_use)
-            self._panel_cfg["columns_to_use_resolved"] = list(resolved_use)
-        if resolved_norm is not None:
-            self._panel_cfg["columns_to_normalize_resolved"] = list(resolved_norm)
-
-        # write back to loader + disk
-        self._params["analysis"]["tcell"] = self._panel_cfg
-        self.metadata_loader.behav3d_parameters = self._params
-        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(self._params, f, sort_keys=False)
-
-    # ---------- helpers ----------
-    def display(self):
-        display(self.ui)
-
-    def _set_all(self, val: bool):
-        # Bulk toggle: set all group masters and all children
-        for grp_name, row in self._group_rows.items():
-            row["group_cb"].unobserve(row["group_handler"], names="value")
-            for cb in row["child_cbs"]:
-                cb.unobserve(row["child_handler"], names="value")
-            row["group_cb"].value = val
-            for cb in row["child_cbs"]:
-                cb.value = val
-            for cb in row["child_cbs"]:
-                cb.observe(row["child_handler"], names="value")
-            row["group_cb"].observe(row["group_handler"], names="value")
-        # One batched normalize refresh
-        self._sync_normalize_visibility_batched(list(self._group_rows.keys()))
-
-    def _all_child_checkboxes(self):
-        out = []
-        for row in self._group_rows.values():
-            out.extend(row["child_cbs"])
-        return out
-
-    def _selected_features(self):
-        seen, selected = set(), []
-        for cb in self._all_child_checkboxes():
-            if cb.value and cb.description not in seen:
-                selected.append(cb.description); seen.add(cb.description)
-        return selected
-
-    def _infer_available_columns(self):
-        for attr in ("available_columns", "feature_columns"):
-            cols = getattr(self.metadata_loader, attr, None)
-            if cols:
-                return list(cols)
-        meta = getattr(self.metadata_loader, "metadata", None)
-        if meta is not None and hasattr(meta, "columns"):
-            try:
-                return list(meta.columns)
-            except Exception:
-                pass
-        return None
-
-    def _expand_patterns(self, selected):
-        cols = self._infer_available_columns()
-        if not cols:
-            return selected
-        out = []
-        for name in selected:
-            if any(ch in name for ch in "*?["):
-                matches = [c for c in cols if fnmatch.fnmatchcase(c, name)]
-                out.extend(matches if matches else [name])
-            else:
-                out.append(name)
-        seen, uniq = set(), []
-        for f in out:
-            if f not in seen:
-                uniq.append(f); seen.add(f)
-        return uniq
-
-    # ---- normalize layout sync ----
+        return pats
+    
     def _visible_norm_children(self, grp_name):
+        """Get visible normalize checkboxes for a group"""
         row = self._norm_group_rows[grp_name]
         return [cb for cb in row["child_cbs"] if cb.layout.visibility != 'hidden']
-
+    
     def _sync_normalize_visibility_batched(self, groups_to_update):
-        """
-        Mirror DTW selection to normalize:
-        - keep grid structure identical using visibility
-        - show only selected features in their original slots
-        - hide a normalize group container if none of its features are selected
-        """
-        selected = set(self._selected_features())
-
+        """Mirror selection to normalize section"""
         for grp_name in groups_to_update:
             sel_row = self._group_rows[grp_name]
             nrow = self._norm_group_rows[grp_name]
-
+            
             any_visible = False
             for cb_sel in sel_row["child_cbs"]:
                 feat = cb_sel.description
@@ -3672,576 +4324,396 @@ class TCellAnalysisPanel:
                 is_selected = cb_sel.value
                 cb_norm.layout.visibility = None if is_selected else 'hidden'
                 any_visible = any_visible or is_selected
-
-            # normalize group master reflects only visible children
+            
+            # Update group checkbox
             vis_children = self._visible_norm_children(grp_name)
             gh = nrow.get("group_handler")
             nrow["group_cb"].unobserve(gh, names="value")
             nrow["group_cb"].value = bool(vis_children) and all(cb.value for cb in vis_children)
             nrow["group_cb"].observe(gh, names="value")
-
-            # show container only if something visible
+            
+            # Show/hide container
             nrow["container"].layout.display = None if any_visible else "none"
-
-        # hide whole section if nothing visible
-        any_group_visible = any(self._norm_group_rows[g]["container"].layout.display != "none"
-                                for g in self._norm_group_rows)
+        
+        # Show/hide whole section
+        any_group_visible = any(
+            self._norm_group_rows[g]["container"].layout.display != "none"
+            for g in self._norm_group_rows
+        )
         self.normalize_section.layout.display = None if any_group_visible else "none"
-
-    def _collect_znorm_map(self):
-        # Persist only visible (selected) normalize choices
-        out = {}
-        for grp_name, row in self._norm_group_rows.items():
+    
+    def _set_all(self, value):
+        """Select all or clear all features"""
+        for grp_name, row in self._group_rows.items():
+            row["group_cb"].unobserve(row["group_handler"], names="value")
+            row["group_cb"].value = value
+            row["group_cb"].observe(row["group_handler"], names="value")
+            
             for cb in row["child_cbs"]:
-                if cb.layout.visibility != 'hidden':
-                    out[cb.description] = bool(cb.value)
-        return out
-
-    # ---- normalize global actions ----
+                cb.unobserve(row["child_handler"], names="value")
+            for cb in row["child_cbs"]:
+                cb.value = value
+            for cb in row["child_cbs"]:
+                cb.observe(row["child_handler"], names="value")
+        
+        self._sync_normalize_visibility_batched(list(self._group_rows.keys()))
+    
     def _on_norm_select_all(self, *_):
-        # Set all visible normalize checkboxes to True, then update each group's master
+        """Select all visible normalize checkboxes"""
         for grp_name, row in self._norm_group_rows.items():
             for cb in row["child_cbs"]:
                 if cb.layout.visibility != 'hidden':
                     cb.value = True
-            gh = row.get("group_handler")
+            
             vis_children = self._visible_norm_children(grp_name)
+            gh = row.get("group_handler")
             row["group_cb"].unobserve(gh, names="value")
             row["group_cb"].value = bool(vis_children) and all(cb.value for cb in vis_children)
             row["group_cb"].observe(gh, names="value")
-
+    
     def _on_norm_clear_all(self, *_):
-        # Set all visible normalize checkboxes to False, then update each group's master
+        """Clear all visible normalize checkboxes"""
         for grp_name, row in self._norm_group_rows.items():
             for cb in row["child_cbs"]:
                 if cb.layout.visibility != 'hidden':
                     cb.value = False
+            
             gh = row.get("group_handler")
-            vis_children = self._visible_norm_children(grp_name)
             row["group_cb"].unobserve(gh, names="value")
-            row["group_cb"].value = False if vis_children else False
+            row["group_cb"].value = False
             row["group_cb"].observe(gh, names="value")
-
+    
+    def _expand_patterns(self, patterns):
+        """Expand wildcard patterns using actual CSV columns"""
+        # Load a sample CSV to get column names
+        metadata = self.metadata_loader.metadata
+        if metadata is None or len(metadata) == 0:
+            return patterns
+        
+        # Get first available CSV
+        csv_col = f"{self.cell_type}_combined_track_features_csv_path"
+        if csv_col not in metadata.columns:
+            return patterns
+        
+        csv_path = metadata[csv_col].dropna().iloc[0] if len(metadata[csv_col].dropna()) > 0 else None
+        if csv_path is None or not Path(csv_path).exists():
+            return patterns
+        
+        # Read columns
+        df = pd.read_csv(csv_path, nrows=1)
+        return self._expand_column_patterns(patterns, df.columns.tolist())
+    
     def _lock(self, locked):
-        # Selection widgets
+        """Lock/unlock all controls"""
         for row in self._group_rows.values():
             row["group_cb"].disabled = locked
             for cb in row["child_cbs"]:
                 cb.disabled = locked
-        # Normalize widgets
+        
         for row in self._norm_group_rows.values():
             row["group_cb"].disabled = locked
             for cb in row["child_cbs"]:
                 cb.disabled = locked
-        for w in [
-            self.seed_widget, self.btn_select_all, self.btn_clear_all,
-            self.umap_distance_widget, self.umap_neighbors_widget, self.num_clusters_widget,
-            self.norm_select_all_btn, self.norm_clear_all_btn, self.btn_run
-        ]:
+        
+        lock_widgets = [self.seed_widget, self.btn_select_all, self.btn_clear_all,
+                  self.umap_distance_widget, self.umap_neighbors_widget,
+                  self.num_clusters_widget, self.norm_select_all_btn,
+                  self.norm_clear_all_btn, self.btn_run]
+        
+        for w in lock_widgets:
             w.disabled = locked
-
-    # ---------- run ----------
+    
     def _on_run_clicked(self, *_):
+        """Run analysis when button clicked"""
         self._lock(True)
         self.out_run.clear_output()
         self.spinner_html.layout.display = None
+        
         with self.out_run:
             try:
-                print("▶️ Running T-cell behavioral analysis…")
-
-                # Read current UI state
+                print(f"▶️ Running {self.cell_type} behavioral analysis...")
+                
                 seed = int(self.seed_widget.value)
-                self.umap_minimal_distance = float(self.umap_distance_widget.value)
-                self.umap_n_neighbors      = int(self.umap_neighbors_widget.value)
-                self.nr_of_clusters        = int(self.num_clusters_widget.value)
-
-                # Selection patterns (always visible)
+                umap_min_dist = float(self.umap_distance_widget.value)
+                umap_n_neighbors = int(self.umap_neighbors_widget.value)
+                nr_of_clusters = int(self.num_clusters_widget.value)
+                
+                # Get selected features (patterns)
                 dtw_patterns = self._selected_features()
                 if not dtw_patterns:
                     print("⚠️ Please select at least one DTW feature.")
                     return
-
-                # Normalize patterns (only those you ticked in Normalize)
+                
+                # Get normalize patterns (from checkboxes - includes contact features if checked)
                 norm_patterns = self._selected_normalize_patterns()
-
-                # Expand any globs (e.g. mean_intensity_*)
-                columns_to_use       = self._expand_patterns(dtw_patterns)
+                
+                # Expand patterns using CSV columns
+                columns_to_use = self._expand_patterns(dtw_patterns)
                 columns_to_normalize = self._expand_patterns(norm_patterns)
-
-                # Persist both pattern-level and resolved lists
-                self._persist_params(resolved_use=columns_to_use, resolved_norm=columns_to_normalize)
-
-                # Sanity printout
-                print(f"  output_dir                = {self.output_dir}")
-                print(f"  seed                     = {seed}")
-                print(f"  UMAP: n_neighbors={self.umap_n_neighbors}, min_dist={self.umap_minimal_distance}")
-                print(f"  clusters                 = {self.nr_of_clusters}")
-                print(f"  columns_to_use (resolved)       [{len(columns_to_use)}]: {columns_to_use}")
-                print(f"  columns_to_normalize (resolved) [{len(columns_to_normalize)}]: {columns_to_normalize}")
-
-                # Ensure output dir
+                
+                # Persist config
+                self._panel_cfg["seed"] = seed
+                self._panel_cfg["umap_min_dist"] = umap_min_dist
+                self._panel_cfg["umap_n_neighbors"] = umap_n_neighbors
+                self._panel_cfg["nr_of_clusters"] = nr_of_clusters
+                self._panel_cfg["dtw_features_input"] = dtw_patterns
+                self._panel_cfg["dtw_feature_groups_enabled"] = {
+                    g: row["group_cb"].value for g, row in self._group_rows.items()
+                }
+                self._panel_cfg["z_normalize"] = {
+                    cb.description: cb.value
+                    for row in self._norm_group_rows.values()
+                    for cb in row["child_cbs"]
+                    if cb.layout.visibility != 'hidden'
+                }
+                self._panel_cfg["columns_to_normalize_input"] = norm_patterns
+                
+                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+                    yaml.safe_dump(self._params, f, sort_keys=False)
+                
+                print(f"  output_dir = {self.output_dir}")
+                print(f"  seed = {seed}")
+                print(f"  UMAP: n_neighbors={umap_n_neighbors}, min_dist={umap_min_dist}")
+                print(f"  clusters = {nr_of_clusters}")
+                print(f"  columns_to_use [{len(columns_to_use)}]: {columns_to_use}")
+                print(f"  columns_to_normalize [{len(columns_to_normalize)}]: {columns_to_normalize}")
+                
                 Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+                import random
                 random.seed(seed)
-
-                # Call with the new signature
+                
+                # Call adapted tcell_analysis with cell_type parameter
                 self.df_tracks_clustered = run_tcell_analysis(
+                    cell_type=self.cell_type,
                     output_dir=self.output_dir,
-                    umap_minimal_distance=self.umap_minimal_distance,
-                    umap_n_neighbors=self.umap_n_neighbors,
-                    nr_of_clusters=self.nr_of_clusters,
                     columns_to_use=columns_to_use,
                     columns_to_normalize=columns_to_normalize,
+                    umap_minimal_distance=umap_min_dist,
+                    umap_n_neighbors=umap_n_neighbors,
+                    nr_of_clusters=nr_of_clusters,
+                    plot_results=True,
                     seed=seed
                 )
-
-                # Show preview if it quacks like a DataFrame
+                
+                # Show preview
                 try:
-                    from IPython.display import display as _disp
-                    # print("✅ Done. Preview (head):")
-                    _disp(self.df_tracks_clustered.head(10))
+                    display(self.df_tracks_clustered.head(10))
                 except Exception:
                     pass
-                # print("✅ Done. Result object:", type(self.df_tracks_clustered))
-
+                
+                print(f"✅ {self.cell_type} analysis complete!")
+                
             except Exception:
                 import traceback
-                print("❌ Error while running analysis:")
+                print(f"❌ Error while running {self.cell_type} analysis:")
                 traceback.print_exc()
             finally:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
 
-class OrganoidFilterPanel:
+
+class DeathDynamicsPanel:
     """
-    Styled like your TrackFilterPanel example, but wired to filter_organoid_tracks(...).
+    Death dynamics analysis panel (organoid-specific).
+    
     """
-    def __init__(self, metadata_loader, cell_type="organoid"):
-        self.metadata_loader = metadata_loader
-        self.cell_type = str(cell_type).strip() or "organoid"
-
-        # ---- bootstrap config ----
-        params = self.metadata_loader.behav3d_parameters or {}
-        params.setdefault("track_filtering", {})
-        if self.cell_type not in params["track_filtering"]:
-            # try to seed from global _DEFAULT_CONFIG if present
-            try:
-                base = _DEFAULT_CONFIG["track_filtering"][self.cell_type]  # type: ignore[name-defined]
-            except Exception:
-                base = _DEFAULT_TRACK_FILTERING[self.cell_type]
-            params["track_filtering"][self.cell_type] = dict(base)
-            # persist immediately
-            with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
-                yaml.safe_dump(params, f, sort_keys=False)
-        self._params = params
-        cfg = params["track_filtering"][self.cell_type]
-
-        # ---- exp_duration ----
-        self.en_exp_duration = widgets.Checkbox(
-            description="Trim down full time series to supplied duration",
-            value=bool(cfg.get("exp_duration_enabled", False)),
-            indent=False,
-            style={'description_width': '240px'}
-        )
-        self.exp_duration = widgets.IntText(
-            description="Max timepoints",
-            value=int(cfg.get("exp_duration", 999999)),
-            style={'description_width': '160px'},
-            continuous_update=False
-        )
-        self.row_exp = widgets.HBox([self.exp_duration], layout=widgets.Layout(display="none"))
-        self.en_exp_duration.observe(
-            lambda c: self.row_exp.layout.__setattr__("display", None if self.en_exp_duration.value else "none"),
-            names="value"
-        )
-        if self.en_exp_duration.value:
-            self.row_exp.layout.display = None
-
-        # ---- min_track_length ----
-        self.en_min_len = widgets.Checkbox(
-            description="Select only tracks with minimal length",
-            value=bool(cfg.get("min_track_length_enabled", False)),
-            indent=False
-        )
-        self.min_track_length = widgets.IntText(
-            description="Minimal length (frames)",
-            value=int(cfg.get("min_track_length", 0)),
-            style={'description_width': '160px'},
-            continuous_update=False
-        )
-        self.row_min = widgets.HBox([self.min_track_length], layout=widgets.Layout(display="none"))
-        self.en_min_len.observe(
-            lambda c: self.row_min.layout.__setattr__("display", None if self.en_min_len.value else "none"),
-            names="value"
-        )
-        if self.en_min_len.value:
-            self.row_min.layout.display = None
-
-        # ---- max_track_length ----
-        self.en_max_len = widgets.Checkbox(
-            description="Trim down tracks to supplied length",
-            value=bool(cfg.get("max_track_length_enabled", False)),
-            indent=False
-        )
-        self.max_track_length = widgets.IntText(
-            description="Maximal length (frames)",
-            value=int(cfg.get("max_track_length", 999999)),
-            style={'description_width': '160px'},
-            continuous_update=False
-        )
-        self.row_max = widgets.HBox([self.max_track_length], layout=widgets.Layout(display="none"))
-        self.en_max_len.observe(
-            lambda c: self.row_max.layout.__setattr__("display", None if self.en_max_len.value else "none"),
-            names="value"
-        )
-        if self.en_max_len.value:
-            self.row_max.layout.display = None
-
-        # ---- Frames / Hours toggle (shown only if any filter is enabled) ----
-        _TIME_TYPE_OPTIONS = [("frames", "Frames"), ("hours", "real_time")]
-        default_time_type = str(cfg.get("time_type", "Frames"))
-        self.time_type_toggle = widgets.ToggleButtons(
-            options=_TIME_TYPE_OPTIONS,
-            value=default_time_type if default_time_type in ("Frames", "real_time") else "Frames",
-            description="Unit",
-            button_style="info",
-            layout=widgets.Layout(width="auto")
-        )
-        def _refresh_labels(val: str):
-            if val == "real_time":
-                self.exp_duration.description = "Max duration (hours)"
-                self.min_track_length.description = "Minimal length (hours)"
-                self.max_track_length.description = "Maximal length (hours)"
-            else:
-                self.exp_duration.description = "Max timepoints (frames)"
-                self.min_track_length.description = "Minimal length (frames)"
-                self.max_track_length.description = "Maximal length (frames)"
-        _refresh_labels(self.time_type_toggle.value)
-        self.time_type_toggle.observe(lambda c: _refresh_labels(self.time_type_toggle.value), names="value")
-
-        self.row_unit = widgets.HBox([self.time_type_toggle], layout=widgets.Layout(display="none"))
-        def _update_unit_toggle_visibility(_=None):
-            show = self.en_exp_duration.value or self.en_min_len.value or self.en_max_len.value
-            self.row_unit.layout.display = None if show else "none"
-        for cb in (self.en_exp_duration, self.en_min_len, self.en_max_len):
-            cb.observe(_update_unit_toggle_visibility, names="value")
-        _update_unit_toggle_visibility()
-        
-        self.en_min_size = widgets.Checkbox(
-            description="Filter by minimal size at t=1",
-            value=bool(cfg.get("min_size_enabled", True)),
-            indent=False
-        )
-        self.min_size = widgets.IntText(
-            description="Minimal size (px @ t=1)",
-            value=int(cfg.get("min_size", 1000)),
-            style={'description_width': '160px'},
-            continuous_update=False
-        )
-        self.row_min_size = widgets.HBox([self.min_size], layout=widgets.Layout(display="none"))
-        self.en_min_size.observe(
-            lambda c: self.row_min_size.layout.__setattr__("display", None if self.en_min_size.value else "none"),
-            names="value"
-        )
-        if self.en_min_size.value:
-            self.row_min_size.layout.display = None
-
-        # ---- run row ----
-        self.btn_run = widgets.Button(description=f"Filter {cell_type} tracks & summarize", button_style="success", layout=widgets.Layout(
-            width="fit-content", flex="0 0 auto"
-    ))
-        self.btn_run.on_click(self._on_run_clicked)
-        self.spinner_html = widgets.HTML(value=spinning_loader)
-        self.spinner_html.layout.display = "none"
-
-        self.run_row = widgets.HBox(
-            [self.btn_run, self.spinner_html],
-            layout=widgets.Layout(align_items="center", gap="10px")
-        )
-
-        self.out = widgets.Output()
-
-        # ---- full UI ----
-        self.ui = widgets.VBox([
-            widgets.HTML(f"<b>{self.cell_type.title()} Track Filtering</b>"),
-            self.en_exp_duration, self.row_exp,
-            self.en_min_len, self.row_min,
-            self.en_max_len, self.row_max,
-            self.en_min_size, self.row_min_size,
-            self.row_unit,
-            self.run_row,
-            widgets.HTML("<hr>"),
-            self.out
-        ])
-
-        # results
-        self.df_tracks_filt = None
-
-    # ---------- public ----------
-    def display(self):
-        display(self.ui)
-
-    # ---------- internals ----------
-    def _effective_values(self):
-        exp_duration = int(self.exp_duration.value) if self.en_exp_duration.value else 999999
-        min_len      = int(self.min_track_length.value) if self.en_min_len.value else 0
-        max_len      = int(self.max_track_length.value) if self.en_max_len.value else 999999
-        min_size     = int(self.min_size.value) if self.en_min_size.value else 0
-        time_type    = str(self.time_type_toggle.value)
-        return exp_duration, min_len, max_len, min_size, time_type
-
-    def _persist_params(self):
-        params = self._params
-        prof = params["track_filtering"][self.cell_type]
-
-        prof["exp_duration_enabled"]      = bool(self.en_exp_duration.value)
-        prof["min_track_length_enabled"]  = bool(self.en_min_len.value)
-        prof["max_track_length_enabled"]  = bool(self.en_max_len.value)
-        prof["min_size_enabled"]          = bool(self.en_min_size.value)
-
-        prof["exp_duration"]     = int(self.exp_duration.value)
-        prof["min_track_length"] = int(self.min_track_length.value)
-        prof["max_track_length"] = int(self.max_track_length.value)
-        prof["min_size"]         = int(self.min_size.value)
-        prof["time_type"]        = str(self.time_type_toggle.value)
-
-        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(params, f, sort_keys=False)
-
-    def _lock(self, state: bool):
-        for w in [
-            self.en_exp_duration, self.exp_duration,
-            self.en_min_len, self.min_track_length,
-            self.en_max_len, self.max_track_length,
-            self.time_type_toggle,
-            self.en_min_size, self.min_size,
-            self.btn_run
-        ]:
-            if hasattr(w, "disabled"):
-                w.disabled = state
-
-    def _on_run_clicked(self, _):
-        self._lock(True)
-        self.spinner_html.layout.display = None
-        with self.out:
-            self.out.clear_output()
-            try:
-                out_dir = Path(self.metadata_loader.output_dir).expanduser()
-                out_dir.mkdir(parents=True, exist_ok=True)
-
-                exp_duration, min_len, max_len, min_size, time_type = self._effective_values()
-                print("▶️ Filtering tracks…")
-                print(f"  exp_duration={exp_duration}, min_len={min_len}, max_len={max_len}, min_size={min_size}, unit={'hours' if time_type=='real_time' else 'frames'}")
-
-                # persist UI state
-                self._persist_params()
-
-                # call your function
-                self.df_tracks_filt = filter_organoid_tracks(
-                    metadata=self.metadata_loader.metadata,
-                    output_dir=str(out_dir),
-                    exp_duration=exp_duration,
-                    min_track_length=min_len,
-                    max_track_length=max_len,
-                    min_size=min_size,
-                    cell_type=self.cell_type,
-                    time_type=time_type
-                )
-                print("✅ Filtering complete.")
-
-                # locations
-                analysis_outdir = out_dir / "analysis" / self.cell_type
-                feature_outdir  = analysis_outdir / "track_features"
-                qc_outdir       = analysis_outdir / "quality_control"
-
-                combined_csv = feature_outdir / f"BEHAV3D_{self.cell_type}_combined_track_features.csv"
-                filtered_csv = feature_outdir / f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv"
-                filter_plot  = qc_outdir      / "BEHAV3D_filter_counts.pdf"
-
-                print("\nOutputs:")
-                print(f"  Combined tracks: {combined_csv}")
-                print(f"  Filtered tracks: {filtered_csv}")
-                print(f"  Filter counts:   {filter_plot}")
-
-                # preview
-                try:
-                    from IPython.display import display as _disp
-                    print("\n— Filtered tracks (head) —")
-                    _disp(self.df_tracks_filt.head(10))
-                except Exception:
-                    print(f"(preview unavailable) shape={getattr(self.df_tracks_filt,'shape',None)}")
-
-                # quick per-sample summary before/after
-                try:
-                    group_cols = ['sample_name', 'organoid_line', 'tcell_line', 'exp_nr', 'well']
-
-                    def _count(df):
-                        return (
-                            df.groupby(group_cols, dropna=False)["TrackID"]
-                              .nunique()
-                              .reset_index(name="nr_tracks")
-                              .groupby("sample_name", dropna=False)["nr_tracks"]
-                              .sum()
-                              .reset_index()
-                        )
-
-                    before_df = pd.read_csv(combined_csv)
-                    after_df  = pd.read_csv(filtered_csv)
-                    before_counts = _count(before_df).rename(columns={"nr_tracks": "tracks_before"})
-                    after_counts  = _count(after_df).rename(columns={"nr_tracks": "tracks_after"})
-                    summary = before_counts.merge(after_counts, on="sample_name", how="outer").fillna(0)
-                    summary["removed"] = summary["tracks_before"] - summary["tracks_after"]
-
-                    print("\n— Track counts by sample —")
-                    _disp(summary)
-                except Exception as e:
-                    print(f"(Could not compute summary counts: {e})")
-
-                print("\n✅ Finished.")
-            except Exception:
-                import traceback; traceback.print_exc()
-            finally:
-                self.spinner_html.layout.display = "none"
-                self._lock(False)
-                
-class OrganoidAnalysisPanel:
-    """Dead-%-only panel. Persists to behav3d_parameters['analysis']['organoid'] and writes YAML on run."""
+    
     def __init__(self, metadata_loader, cell_type):
+        """
+        Parameters
+        ----------
+        metadata_loader : object
+            Metadata loader instance
+        cell_type : str
+            Name of the organoid cell type (e.g., "organoid")
+        """
         self.metadata_loader = metadata_loader
-        self.cell_type = cell_type
-
-        # --- load + seed config from _DEFAULT_CONFIG (preserve user values) ---
-        params_on_disk = self.metadata_loader.behav3d_parameters or {}
-        params = deepcopy(params_on_disk)
-        _deep_merge(params, deepcopy(_DEFAULT_CONFIG))
-        if params != params_on_disk:
-            with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
-                yaml.safe_dump(params, f, sort_keys=False)
+        self.cell_type = str(cell_type).strip()
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+        
+        # Check if death features exist in the data
+        feature_outdir = Path(self.output_dir, "analysis", self.cell_type, "track_features")
+        df_tracks_path = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features.csv")
+        
+        self.has_death_features = False
+        if df_tracks_path.exists():
+            try:
+                import pandas as pd
+                df_sample = pd.read_csv(df_tracks_path, nrows=0)
+                death_cols = {'mean_dead_dye', 'percentage_dead_mask', 'nr_dead_mask_pixels'}
+                self.has_death_features = bool(death_cols.intersection(set(df_sample.columns)))
+            except Exception:
+                pass
+        
+        print(f"[DeathDynamicsPanel] Death features {'FOUND' if self.has_death_features else 'NOT FOUND'} for {self.cell_type}")
+        
+        # Load config
+        params = dict(self.metadata_loader.behav3d_parameters or {})
+        params.setdefault("death_dynamics", {})
+        if self.cell_type not in params["death_dynamics"]:
+            cat_cfg = _DEFAULT_CONFIG.get("death_dynamics", {}).get("organoid", {})
+            params["death_dynamics"][self.cell_type] = deepcopy(cat_cfg)
         self._params = params
-        self._org = params["analysis"][self.cell_type]
-
-        # --- UI ---
-        self.title = widgets.HTML("<b>Organoid Death Analysis</b>")
-
+        self._panel_cfg = self._params["death_dynamics"][self.cell_type]
+        
+        # ---- Title ----
+        self.section_title = widgets.HTML(
+            f'<div style="font-size:22px;font-weight:700;">{self.cell_type} death dynamics</div>'
+        )
+        
+        # If no death features, show warning message
+        if not self.has_death_features:
+            self.warning_html = widgets.HTML(
+                value='<div style="color:#b00;font-size:14px;padding:10px;background:#fee;border:1px solid #fcc;border-radius:4px;">'
+                      '<b>⚠️ Death Dynamics Not Available</b><br>'
+                      f'No death features found for {self.cell_type}.<br>'
+                      'Death channel was not present during feature extraction.'
+                      '</div>'
+            )
+            self.ui = widgets.VBox([self.section_title, self.warning_html])
+            return  # Don't create the rest of the UI
+        
+        # ---- Dead percentage threshold ----
         self.dead_perc_threshold = widgets.FloatText(
             description="Dead % threshold",
-            value=float(self._org.get("dead_perc_threshold", 1e-7)),
-            style={'description_width': '160px'},
-            continuous_update=False,
+            value=float(self._panel_cfg.get("dead_perc_threshold", 0.02)),
+            style={'description_width': '160px'}
         )
-
+        
+        # ---- Run button ----
         self.btn_run = widgets.Button(
-            description="Run organoid analysis",
-            button_style="success",
-            layout=widgets.Layout(width="360px")   # wider button
+            description=f"Run {self.cell_type} death dynamics",
+            button_style="warning",
+            layout=widgets.Layout(width="300px")
         )
         self.btn_run.on_click(self._on_run_clicked)
-
+        
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
-
+        
         self.run_row = widgets.HBox(
             [self.btn_run, self.spinner_html],
             layout=widgets.Layout(align_items="center", gap="10px")
         )
-
-        self.out = widgets.Output()
-
+        
+        self.out_run = widgets.Output()
+        
+        # ---- UI ----
         self.ui = widgets.VBox([
-            self.title,
+            self.section_title,
             self.dead_perc_threshold,
-            self.run_row,
             widgets.HTML("<hr>"),
-            self.out
+            self.run_row,
+            self.out_run,
         ])
-
-    # ---------- public ----------
-    def display(self):
-        display(self.ui)
-
-    # ---------- internals ----------
-    def _resolve_output_dir(self) -> Path:
-        ml_out = getattr(self.metadata_loader, "output_dir", None)
-        if ml_out:
-            return Path(ml_out).expanduser()
-        return Path(self._params["paths"]["output_dir"]).expanduser()
-
-    def _persist_params(self):
-        self._org["dead_perc_threshold"] = float(self.dead_perc_threshold.value)
-        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(self._params, f, sort_keys=False)
-
-    def _lock(self, locked: bool):
-        self.dead_perc_threshold.disabled = locked
-        self.btn_run.disabled = locked
-
-    # ---------- run ----------
-    def _on_run_clicked(self, _):
+        
+        # Internal state
+        self.death_data = None
+    
+    def _lock(self, locked):
+        """Lock/unlock all controls"""
+        for w in [self.dead_perc_threshold, self.btn_run]:
+            w.disabled = locked
+    
+    def _on_run_clicked(self, *_):
+        """Run death dynamics when button clicked"""
         self._lock(True)
+        self.out_run.clear_output()
         self.spinner_html.layout.display = None
-        with self.out:
-            self.out.clear_output()
+        
+        with self.out_run:
             try:
-                out_dir = self._resolve_output_dir()
-                out_dir.mkdir(parents=True, exist_ok=True)
-
-                # overwrite config values with current UI selection
-                self._persist_params()
-
-                dth = float(self.dead_perc_threshold.value)
-                print(f"▶️ Running {self.cell_type} analysis…")
-                print(f"  dead_perc_threshold = {dth}")
-
+                print(f"▶️ Running {self.cell_type} death dynamics...")
+                
+                dead_perc_threshold = float(self.dead_perc_threshold.value)
+                plot_results = True  # Always generate plots
+                
+                # Persist config
+                self._panel_cfg["dead_perc_threshold"] = dead_perc_threshold
+                self._panel_cfg["plot_results"] = plot_results
+                
+                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+                    yaml.safe_dump(self._params, f, sort_keys=False)
+                
+                print(f"  output_dir = {self.output_dir}")
+                print(f"  dead_perc_threshold = {dead_perc_threshold}")
+                print(f"  plot_results = {plot_results}")
+                
+                Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+                
+                # Call organoid death dynamics function
                 run_organoid_analysis(
-                    dead_perc_threshold=dth,
-                    output_dir=str(out_dir),
+                    dead_perc_threshold=dead_perc_threshold,
+                    output_dir=self.output_dir,
                     df_tracks_path=None,
                     org_type=self.cell_type
                 )
-
-                # show outputs (optional preview)
-                results_outdir = out_dir / "analysis" / self.cell_type / "results"
-                general_csv = results_outdir / f"combined_general_{self.cell_type}_dynamics_analysis.csv"
-                general_pdf = results_outdir / f"combined_general_{self.cell_type}_dynamics_analysis.pdf"
-
-                print("\nOutputs:")
-                print(f"  Results CSV: {general_csv}")
-                print(f"  Results PDF: {general_pdf}")
-
-                if general_csv.exists():
-                    try:
-                        df_general = pd.read_csv(general_csv)
-                        print("\n— General results (head) —")
-                        display(df_general.head(10))
-                    except Exception as e:
-                        print(f"(Could not read {general_csv}: {e})")
-
-                print("\n✅ Finished.")
+                
+                print(f"✅ {self.cell_type} death dynamics complete!")
+                
+                # Show preview
+                try:
+                    display(self.death_data.head(10))
+                except Exception:
+                    pass
+                
             except Exception:
-                import traceback; traceback.print_exc()
+                import traceback
+                print(f"❌ Error while running {self.cell_type} death dynamics:")
+                traceback.print_exc()
             finally:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
-                
-                
+
 class BackprojectionPanel:
-    def __init__(self, metadata_loader, cell_type="tcell"):
+    def __init__(self, metadata_loader, cell_type=None):
         self.metadata_loader = metadata_loader
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
 
+        # ---- Detect ALL cell types from metadata ----
+        from behav3d.utils import (
+            detect_immune_cell_types_from_metadata,
+            detect_organoid_types_from_metadata,
+            detect_other_cell_types_from_metadata
+        )
+        
+        md = self.metadata_loader.metadata
+        if md is None:
+            raise RuntimeError("metadata_loader.metadata must be loaded before creating BackprojectionPanel.")
+        
+        # Detect all cell types
+        immune_types = detect_immune_cell_types_from_metadata(md)
+        organoid_types = detect_organoid_types_from_metadata(md)
+        other_types = detect_other_cell_types_from_metadata(md)
+        
+        self.all_cell_types = immune_types + organoid_types + other_types
+        if not self.all_cell_types:
+            raise RuntimeError("No cell types detected in metadata. Ensure metadata has columns with prefixes: im_, or_, ot_")
+        
+        # Set default cell type
+        if cell_type is None:
+            cell_type = self.all_cell_types[0]
+        
         # ---- load groups ----
         try:
-            self._base_groups = behav3d_calculated_features  # dict[group] -> list[str/pattern]
-            md = self.metadata_loader.metadata
-            self.two_org_types = False
-            # Conditional addition of organoid_2
-            if md is not None and 'organoid_2_tracks_csv_path' in md.columns:
-                s = md['organoid_2_tracks_csv_path'].dropna()
-                if not s.empty and Path(str(s.iloc[0])).exists():
-                    self.two_org_types = True
-                    # Add organoid_2 contact features
+            from copy import deepcopy
+            from behav3d.utils import has_dead_channel
+            self._base_groups = deepcopy(behav3d_calculated_features)  # dict[group] -> list[str/pattern]
+            
+            # Check if dead channel exists and remove death features if not
+            has_dead = has_dead_channel(md)
+            if not has_dead:
+                if "death" in self._base_groups:
+                    del self._base_groups["death"]
+                if "intensity" in self._base_groups:
+                    self._base_groups["intensity"] = [f for f in self._base_groups["intensity"] if f != "mean_dead_dye"]
+            
+            # Dynamically add contact features for ALL detected cell types
+            for ct in self.all_cell_types:
+                if f"{ct}_contact" not in self._base_groups["contact"]:
                     self._base_groups["contact"].extend([
-                        "organoid_2_contact",
-                        "organoid_2_contact_pixels",
+                        f"{ct}_contact",
+                        f"{ct}_contact_pixels",
                     ])
         except NameError:
             raise RuntimeError("Define behav3d_calculated_features before creating BackprojectionPanel.")
@@ -4266,23 +4738,21 @@ class BackprojectionPanel:
                                           layout=widgets.Layout(width="360px"))
         self.sample_dd.style.description_width = "80px"
 
-        # ---- cell type toggle ----
-        # Safely check for the column and for at least one existing, non-empty path before using it.
-        if self.two_org_types:
-           self._celltype_map = {"T cell": "tcell", "Organoid": "organoid", "Organoid 2": "organoid_2"}
-        else:
-            self._celltype_map = {"T cell": "tcell", "Organoid": "organoid"}
-
+        # ---- cell type dropdown (dynamic for ALL detected cell types) ----
+        # Create human-readable labels for cell types
+        self._celltype_map = {ct.replace('_', ' ').title(): ct for ct in self.all_cell_types}
+        
+        # Get default from config or use first cell type
         inv_ct_map = {v: k for k, v in self._celltype_map.items()}
-        ct_default = inv_ct_map.get(str(self._cfg.get("cell_type", cell_type)).lower(), "T cell")
-        self.celltype_tb = widgets.ToggleButtons(
+        ct_default = inv_ct_map.get(str(self._cfg.get("cell_type", cell_type)), list(self._celltype_map.keys())[0])
+        
+        self.celltype_dd = widgets.Dropdown(
             options=list(self._celltype_map.keys()),
             value=ct_default,
             description="Cell type",
             layout=widgets.Layout(width="360px")
         )
-        self.celltype_tb.style.button_width = "160px"
-        self.celltype_tb.style.description_width = "80px"
+        self.celltype_dd.style.description_width = "80px"
 
         # ---- mode (mean/time) ----
         self._mode_map = {"Mean features": "mean", "Time features": "time"}
@@ -4323,7 +4793,7 @@ class BackprojectionPanel:
 
         # react to changes
         self.mode_tb.observe(lambda ch: (self._swap_selection_ui(), self._update_status_for_mode()), names='value')
-        self.celltype_tb.observe(lambda ch: (self._on_celltype_changed(), self._update_status_for_mode()), names='value')
+        self.celltype_dd.observe(lambda ch: (self._on_celltype_changed(), self._update_status_for_mode()), names='value')
 
         # ---- Select/Clear (affects current UI) ----
         self.btn_select_all = widgets.Button(description="Select all")
@@ -4363,7 +4833,7 @@ class BackprojectionPanel:
         self.ui = widgets.VBox([
             self.title,
             self.sample_dd,
-            self.celltype_tb,   # under sample
+            self.celltype_dd,   # under sample (now dropdown instead of toggle buttons)
             self.mode_tb,       # under cell type
             self.save_cb,
             widgets.HBox([self.status_html, self.refresh_btn], layout=widgets.Layout(align_items="center", gap="12px")),
@@ -4391,7 +4861,7 @@ class BackprojectionPanel:
 
     # ---------- helpers for paths & status ----------
     def _current_results_csv_path(self):
-        cell_type = self._celltype_map[self.celltype_tb.value]
+        cell_type = self._celltype_map[self.celltype_dd.value]
         mode = self._mode_map[self.mode_tb.value]
         results_dir = Path(self.output_dir, "analysis", cell_type, "results")
         if mode == "mean":
@@ -4472,7 +4942,14 @@ class BackprojectionPanel:
             for cb in child_cbs:
                 cb.observe(child_handler, names="value")
 
-            rows[group_name] = {"group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container}
+            rows[group_name] = {
+                "group_cb": gcb, 
+                "child_cbs": child_cbs, 
+                "grid": grid, 
+                "container": container,
+                "group_handler": group_handler,
+                "child_handler": child_handler
+            }
             boxes.append(container)
 
         self._time_group_rows = rows
@@ -4551,7 +5028,14 @@ class BackprojectionPanel:
             for cb in child_cbs:
                 cb.observe(ch, names="value")
 
-            rows[gname] = {"group_cb": gcb, "child_cbs": child_cbs, "grid": grid, "container": container}
+            rows[gname] = {
+                "group_cb": gcb, 
+                "child_cbs": child_cbs, 
+                "grid": grid, 
+                "container": container,
+                "group_handler": gh,
+                "child_handler": ch
+            }
             boxes.append(container)
 
         self._mean_group_rows = rows
@@ -4580,10 +5064,42 @@ class BackprojectionPanel:
             rows = self._mean_group_rows
         else:
             rows = self._time_group_rows
+        
+        # Temporarily disable all handlers to prevent recursion
+        for row in rows.values():
+            # Unobserve group checkbox if handler exists
+            if "group_handler" in row:
+                try:
+                    row["group_cb"].unobserve(row["group_handler"], names="value")
+                except:
+                    pass
+            # Unobserve child checkboxes if handler exists
+            if "child_handler" in row:
+                for cb in row["child_cbs"]:
+                    try:
+                        cb.unobserve(row["child_handler"], names="value")
+                    except:
+                        pass
+        
+        # Set all values
         for row in rows.values():
             row["group_cb"].value = val
             for cb in row["child_cbs"]:
                 cb.value = val
+        
+        # Re-observe handlers
+        for row in rows.values():
+            if "group_handler" in row:
+                try:
+                    row["group_cb"].observe(row["group_handler"], names="value")
+                except:
+                    pass
+            if "child_handler" in row:
+                for cb in row["child_cbs"]:
+                    try:
+                        cb.observe(row["child_handler"], names="value")
+                    except:
+                        pass
 
     def _selected_time_patterns(self):
         seen, sel = set(), []
@@ -4602,7 +5118,7 @@ class BackprojectionPanel:
         return sel
 
     def _expand_patterns(self, selected, available_columns):
-        if not available_columns:
+        if len(available_columns) == 0:
             return list(dict.fromkeys(selected))
         avail = list(available_columns.tolist() if hasattr(available_columns, "tolist") else list(available_columns))
         out = []
@@ -4616,7 +5132,7 @@ class BackprojectionPanel:
         return list(dict.fromkeys(out))
 
     def _lock(self, state: bool):
-        for w in [self.sample_dd, self.celltype_tb, self.mode_tb, self.save_cb,
+        for w in [self.sample_dd, self.celltype_dd, self.mode_tb, self.save_cb,
                   self.btn_select_all, self.btn_clear_all, self.btn_run, self.refresh_btn]:
             w.disabled = state
         for rows in (self._time_group_rows, self._mean_group_rows):
@@ -4627,7 +5143,7 @@ class BackprojectionPanel:
 
     def _persist(self, *, resolved=None):
         mode = self._mode_map[self.mode_tb.value]
-        self._cfg["cell_type"] = self._celltype_map[self.celltype_tb.value]
+        self._cfg["cell_type"] = self._celltype_map[self.celltype_dd.value]
         self._cfg["mode"] = mode
         self._cfg["save"] = bool(self.save_cb.value)
         self._cfg["last_sample"] = self.sample_dd.value
@@ -4656,7 +5172,7 @@ class BackprojectionPanel:
             patched = False
             try:
                 sample = self.sample_dd.value
-                cell_type = self._celltype_map[self.celltype_tb.value]
+                cell_type = self._celltype_map[self.celltype_dd.value]
                 mode = self._mode_map[self.mode_tb.value]
                 save = bool(self.save_cb.value)
 
