@@ -505,6 +505,11 @@ def calculate_image_based_track_features(
             "equivalent_diameter": float,
             "major_axis_length": float,
             "minor_axis_length": float,
+            "axis1_length": float,
+            "axis2_length": float,
+            "axis3_length": float,
+            "oblateness": float,
+            "prolateness": float,
             "surface_area": float,
             "sphericity": float,
             "convex_volume": float,
@@ -1376,7 +1381,28 @@ def calculate_basic_morphology(segments_path, voxel_spacing=(1.0, 1.0, 1.0), n_w
     return pd.concat(results, ignore_index=True)
 
 def _calculate_morphology_single_timepoint(args):
-    """Helper function to compute morphology features for a single timepoint """
+    """
+    Function to compute morphology features for a single timepoint 
+    
+    Features calculated:
+    - volume
+    - bbox_volume
+    - extent
+    - solidity
+    - equivalent_diameter
+    - major_axis_length
+    - minor_axis_length
+    - elongation
+    - surface_area
+    - sphericity
+    - convex_volume
+    - orientation_vector
+    - oblateness
+    - axis_length_a
+    - axis_length_b
+    - axis_length_c
+    
+    """
     t, segments_path, voxel_spacing = args
     segments = load_image(segments_path)
     stack = np.asarray(segments[t])
@@ -1418,6 +1444,14 @@ def _calculate_morphology_single_timepoint(args):
         sphericities = []
         convex_volumes = []
 
+        # NEW: principal-axis lengths & ellipticity (3D)
+        axis_length_a_list = []
+        axis_length_b_list = []
+        axis_length_c_list = []
+        oblateness_list = []
+        prolateness_list = []
+        principal_axes_list = []  # each entry is 3x3, columns are unit vectors for a,b,c
+
         for region_label in properties["TrackID"]:
             mask = (stack == region_label)
             coords = np.argwhere(mask)
@@ -1453,6 +1487,50 @@ def _calculate_morphology_single_timepoint(args):
 
             convex_volumes.append(convex_volume)
 
+            if coords.shape[0] >= 3:
+                try:
+                    pts = coords.astype(float) * np.array(voxel_spacing, dtype=float)  # (N,3)
+                    center = pts.mean(axis=0, keepdims=True)
+                    X = pts - center
+
+                    # SVD gives principal directions; Vt rows are unit vectors
+                    U, S, Vt = np.linalg.svd(X, full_matrices=False)
+                    V = Vt.T  # (3,3) columns are principal directions
+
+                    # Project onto principal directions and get extent along each
+                    proj = X @ V  # (N,3)
+                    lengths = np.ptp(proj, axis=0)  # full lengths along each axis (a',b',c')
+
+                    # Order by descending length: a >= b >= c
+                    order = np.argsort(lengths)[::-1]
+                    a, b, c = lengths[order]
+                    V_sorted = V[:, order]  # columns aligned with (a,b,c)
+
+                    # Oblate and prolate ellipticity
+                    e_ob = 1 - (c / a) if a > 0 else np.nan
+                    e_pro = 1 - (b / a) if a > 0 else np.nan
+                    
+                    axis_length_a_list.append(a)
+                    axis_length_b_list.append(b)
+                    axis_length_c_list.append(c)
+                    oblateness_list.append(e_ob)
+                    prolateness_list.append(e_pro)
+                    principal_axes_list.append(V_sorted.tolist())
+                except Exception:
+                    axis_length_a_list.append(np.nan)
+                    axis_length_b_list.append(np.nan)
+                    axis_length_c_list.append(np.nan)
+                    oblateness_list.append(np.nan)
+                    prolateness_list.append(np.nan)
+                    principal_axes_list.append([[np.nan, np.nan, np.nan]] * 3)
+            else:
+                axis_length_a_list.append(np.nan)
+                axis_length_b_list.append(np.nan)
+                axis_length_c_list.append(np.nan)
+                oblateness_list.append(np.nan)
+                principal_axes_list.append([[np.nan, np.nan, np.nan]] * 3)
+            # ----------------------------------------------------------------
+
         properties["surface_area"] = surface_areas
         properties["sphericity"] = sphericities
         properties["convex_volume"] = convex_volumes
@@ -1460,6 +1538,14 @@ def _calculate_morphology_single_timepoint(args):
         # Guard against divide-by-zero in solidity calculation
         with np.errstate(divide='ignore', invalid='ignore'):
             properties["solidity"] = properties["volume"] / properties["convex_volume"]
+            properties["surfrace_to_volume_ratio"] = properties["surface_area"] / properties["volume"]
+        # Attach NEW principal-axis results
+        properties["axis1_length"] = axis_length_a_list
+        properties["axis2_length"] = axis_length_b_list
+        properties["axis3_length"] = axis_length_c_list
+        properties["oblateness"] = oblateness_list
+        properties["prolateness"] = prolateness_list
+        properties["principal_axes"] = principal_axes_list  # columns: a,b,c
 
     # ---- FIXED ORIENTATION COMPUTATION (O(R) instead of O(R^2)) ----
     tensor_columns = [f"inertia_tensor-{i}-{j}" for i in range(3) for j in range(3)]

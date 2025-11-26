@@ -39,7 +39,51 @@ import gc
 
 ## TODO create a function for BEHAV3D notebook
 
+def calculate_image_features(
+    image,
+    intensity=True,
+    edges=True,
+    texture=False,
+    # sigma_min=sigma_min,
+    sigma_max=16,
+    channel_axis=0,
+    ):
+    """
+    Calculate multiscale basic features for a given image.
+    Possible to save as a joblib and load later
+    """
+    img = np.asarray(image)
+    orig_shape = img.shape
+    ndim = img.ndim
+    
+    # Identify spatial axes (everything except channel_axis)
+    if channel_axis is None:
+        spatial_axes = list(range(ndim))
+    else:
+        spatial_axes = [ax for ax in range(ndim) if ax != channel_axis]
+    
+    # If image is 2D, squeeze pseudo-3D-axis
+    squeeze_axes = [ax for ax in spatial_axes if orig_shape[ax] == 1]
+    if squeeze_axes:
+        img_squeezed = np.squeeze(img, axis=tuple(squeeze_axes))
+    else:
+        img_squeezed = img
+        
+    feats = features_func(
+        img_squeezed,
+        intensity=intensity,
+        edges=edges,
+        texture=texture,
+        channel_axis=channel_axis,
+        sigma_max=sigma_max,
+        )
+    
+    n_features = feats.shape[-1]
+    orig_spatial_shape = [orig_shape[ax] for ax in spatial_axes]
+    feats_restored = feats.reshape((*orig_spatial_shape, n_features))
+    return feats_restored
 
+sigma_min = 1
 sigma_max = 16
 features_func = partial(
         feature.multiscale_basic_features,
@@ -620,11 +664,11 @@ def train_pixel_classifier(
         channel_data = all_images[ch]  # Shape: (time, z, y, x)
         
         # Flatten and filter out zero pixels
-        flat_vals = channel_data.reshape(-1)
+        flat_vals = np.asarray(channel_data).reshape(-1)
         nonzero_vals = flat_vals[flat_vals > 0]
 
         if nonzero_vals.size > 0:
-            channel_percentile = float(np.percentile(nonzero_vals, 99))
+            channel_percentile = float(np.percentile(nonzero_vals, 99.8))
             contrast_limits = (0, channel_percentile)
         else:
             print(f"⚠️ Channel {ch} appears empty. Using fallback contrast limits.")
@@ -642,7 +686,7 @@ def train_pixel_classifier(
             colormap=channel_colors[ch] if ch < len(channel_colors) else 'gray',
             blending='additive'  # This allows channels to blend together
         )
-        img_layer.contrast_limits_range = (0, channel_data.max())
+        img_layer.contrast_limits_range = (0, float(channel_data.max()))
 
     # ==== DYNAMIC LAYER CREATION FOR ALL CELL TYPES ====
     # Create user label layers and predicted label layers for each detected cell type
