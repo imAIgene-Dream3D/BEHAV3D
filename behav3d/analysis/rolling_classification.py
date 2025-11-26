@@ -79,11 +79,11 @@ df_positions = pd.read_csv(df_tracks_path)
 df_positions=df_positions.sort_values(by=["sample_name", "TrackID", "position_t"])
 
 # --- Create descriptive features per value ---
-window_size=100
-chosen_intervals = 50
+# window_size=100
+# chosen_intervals = 50
 
-# window_size=None
-# chosen_intervals = None
+window_size = 25
+chosen_intervals = None
 
 groupby=["sample_name", "TrackID"]
 features=[

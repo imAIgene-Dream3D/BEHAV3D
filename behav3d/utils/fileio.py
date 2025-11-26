@@ -475,9 +475,19 @@ def convert_input_files_to_zarr(
     overwrite=False
     ):
     
-    tcell_segments_path = Path(tcell_segments_path)
-    organoid_segments_path = Path(organoid_segments_path)
-    raw_image_path = Path(raw_image_path)
+    try:
+        tcell_segments_path = Path(tcell_segments_path)
+    except:
+        tcell_segments_path = None
+        
+    try:
+        organoid_segments_path = Path(organoid_segments_path)
+    except:
+        organoid_segments_path = None
+    try:
+        raw_image_path = Path(raw_image_path)
+    except:
+        raw_image_path = None
     
     if output_dir is None:
         tcell_zarr_out_path = Path(tcell_segments_path, f"{sample_name}_tcell_tracked.zarr")
@@ -488,21 +498,24 @@ def convert_input_files_to_zarr(
         organoid_zarr_out_path = Path(output_dir, f"{sample_name}_organoid_tracked.zarr")
         raw_image_zarr_out_path = Path(output_dir, f"{sample_name}.zarr")
     
-    convert_file_to_zarr(
+    if tcell_segments_path is not None:
+        convert_file_to_zarr(
             path=tcell_segments_path, 
             outpath=tcell_zarr_out_path, 
             chunks=chunks,
             overwrite=overwrite
             )
 
-    convert_file_to_zarr(
+    if organoid_segments_path is not None:
+        convert_file_to_zarr(
             path=organoid_segments_path, 
             outpath=organoid_zarr_out_path, 
             chunks=chunks,
             overwrite=overwrite
             )
     
-    convert_file_to_zarr(
+    if raw_image_path is not None:
+        convert_file_to_zarr(
             path=raw_image_path, 
             outpath=raw_image_zarr_out_path, 
             chunks=chunks,

@@ -1146,8 +1146,8 @@ def test():
     # ssd_dir = Path(ssd_dir)
     # output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
     
-    # downloads_folder = Path("/Users/s.deblank-3/Downloads")
-    downloads_folder = Path(r"C:\Users\Samde\Downloads")
+    downloads_folder = Path("/Users/s.deblank-3/Downloads")
+    # downloads_folder = Path(r"C:\Users\Samde\Downloads")
     df_windows_path = downloads_folder / "df_windows.csv"
     df_positions_path = downloads_folder / "df_positions.csv"
     
@@ -1157,7 +1157,8 @@ def test():
     df_windows = pd.read_csv(df_windows_path)
     df_positions = pd.read_csv(df_positions_path)
 
-    output_folder=r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
+    # output_folder=r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
+    output_folder=r"/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
 
     test = stratified_pick_examples(
         df_windows,
@@ -1214,7 +1215,7 @@ def test():
         df_windows=df_windows,
         df_positions=df_positions,
         output_folder=output_folder,  # folder containing images/<sample>/<sample>.zarr
-        out_dir=r"C:\Users\Samde\Downloads",
+        out_dir=downloads_folder,
         clusters=None,                # or e.g. [0, 1, 2]
         fps=6,
         margin=20,
@@ -1222,7 +1223,7 @@ def test():
         pmin=0.0,
         pmax=99.99,
         examples_per_cluster=4,
-        seed=412,
+        seed=1234,
         normalize_per_channel=True,
         mask_margin=False,
     )

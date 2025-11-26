@@ -9,7 +9,7 @@ TSFRESH
 """
 
 
-from tsfresh import extract_features, select_features
+from test.tsfresh import extract_features, select_features
 from tsfresh.utilities.dataframe_functions import impute
 
 id_columns = ["sample_name", "TrackID"]
