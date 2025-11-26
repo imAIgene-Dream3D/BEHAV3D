@@ -5,10 +5,14 @@
 """
 This script calculates the features of tracks for BEHAV3D analysis.
 
+Flly flexible - works with ANY cell types defined in metadata using prefixes:
+- or_ = Organoid types 
+- im_ = Immune types 
+- ot_ = Other types 
+
 -------------------------------------
 --------------- INPUT ---------------
 -------------------------------------
-
 
 .csv containing the following columns:
 - TrackID       (The ID of the track a segments belongs to)
@@ -16,29 +20,34 @@ This script calculates the features of tracks for BEHAV3D analysis.
 - position_t    (The timepoint of the segment)
 - position_z
 - position_y
-- position_z
+- position_x
 
 -------------------------------------
 --------------- OUTPUT --------------
 -------------------------------------
 
 # Features of a track at each timepoint per sample in the metadata csv (.csv)
-- See "FEATURES TRACKS"
+- See "FEATURES TRACKS" below
 
 # Combined summarized features for each track for all samples in metadata csv (.csv)
-- 
+- Merged DataFrame with all features across samples
 
 -------------------------------------
 ---------- FEATURES TRACKS ---------- 
 -------------------------------------
-- organoid_contact
-- organoid_contact_pixels
-- touching_organoids
-- tcell_contact
-- tcell_contact_pixels
-- touching_tcells
-- active_tcell_interaction
-- mean_dead_dye
+
+DYNAMIC CONTACT FEATURES (generated for ALL cell types in metadata):
+- {cell_type}_contact               (bool) - Real distance-based contact
+- {cell_type}_contact_pixels        (bool) - Pixel-based contact (1.73 diagonal)
+- touching_{cell_type}s             (str)  - Comma-separated TrackIDs
+- active_{cell_type}_contact        (bool) - Active interaction (works for any cell type)
+
+MORPHOLOGY FEATURES:
+- nr_pixels, volume, bbox_volume, elongation, extent, equivalent_diameter
+- major_axis_length, minor_axis_length, surface_area, sphericity
+- convex_volume, orientation_vector
+
+MOVEMENT FEATURES:
 - displacement
 - cumulative_displacement
 - displacement_from_origin
@@ -48,43 +57,42 @@ This script calculates the features of tracks for BEHAV3D analysis.
 - interpolated
 - time
 
-### organoid_contact
+INTENSITY FEATURES:
+- mean_intensity_ch{N}  (for each channel in raw image)
+- mean_dead_dye         (if dead_channel specified in metadata)
+
+DEATH FEATURES:
+- percentage_dead_mask
+- nr_dead_mask_pixels
+- increase_dead_mask
+- dead                  (bool flag set when threshold crossed)
+
+-------------------------------------
+------ CONTACT FEATURE DETAILS ------
+-------------------------------------
+
+### {cell_type}_contact
 - True/False
-Per segment, creates a zyx cutout of the segment with a range of pixels around 
-the segment border and calculates a distance transform from the T cell border. 
-Any other segment inside a range specified by "contact_threshold" counts as a contacting organoid
+Per segment, creates a ZYX cutout with extended range around the segment border
+and calculates a distance transform using physical spacing (µm). Any other cell
+within "contact_threshold" µm counts as contacting.
 
-### organoid_contact_pixels
+### {cell_type}_contact_pixels  
 - True/False
-Same as "organoid_contact", but a contact is now specified as anotehr segment touching the segment
-based on pixels without taking pixel_distances into account.
+Same as above but uses pixel-based threshold (1.73 = diagonal distance) without
+physical spacing. More lenient threshold for pixel-touching.
 
-### touching_organoids
-- String (List separated by ",")
-These are the TrackIDs of touching organoids, separated by ",". 
-NaN if none are touching
+### touching_{cell_type}s
+- String (comma-separated TrackIDs)
+Contains TrackIDs of all contacting cells of this type. Empty string if none.
+Self-contact excluded when calculating from the same cell type.
 
-### tcell_contact
+### active_{cell_type}_contact
 - True/False
-Same as "organoid_contact", but now checks for touching T cells
-
-### tcell_contact_pixels
-- True/False
-Same as "organoid_contact_pixels", but now checks for touching T cells
-
-### touching_tcells
-- String (List separated by ",")
-Same as "touching_organoids", but now checks for touching T cells
-
-### active_tcell_interaction
-- True/False
-For cell interaction we can consider the following:
-When two cells interact it is often the one cell moves and interacts with another one that is static
-In this case one might consider that only one motile cell is actively interacting and the other cells
-are just passively interacting. To determine when a cell is actively interacting we measure for each 
-cell what was its mean_speed over the last "rolling_meanspeed_window" timepoints. We then rank the 
-T cells that are touching on mean_speed and only the one with the highest speed is labeled as an 
-active tcellinteraction.
+Identifies actively interacting cells vs passively contacted cells. When multiple
+cells of the same type contact each other, ranks by mean_speed over rolling window
+(default 10 timepoints). Only the cell with highest speed is marked as "active" interaction.
+Works for any cell type (tcell, macro, nk, organoid, etc.).
 
 ### mean_dead_dye
 - Float
@@ -119,7 +127,7 @@ The speed is the same as "displacement", but now normalized to um/h
 - Float
 The mean_speed is a rolling window over previous timepoints (defined by "rolling_meanspeed_window", default 10)
 That average these timepoints to get a better indication of the cells actual speed. Used in 
-calculating the "active_tcell_interaction"
+calculating the "active_{cell_type}_contact"
 
 ### time
 - Float
@@ -213,9 +221,15 @@ def run_feature_extraction(
         time_interval = sample_metadata['time_interval']
         time_unit = sample_metadata['time_unit']
         
+        # For Imaris: Collect all cell-type-specific contact thresholds from metadata
+        contact_thresholds = {}
         if imaris:
-            tcell_contact_threshold = sample_metadata["tcell_contact_threshold"]
-            organoid_contact_threshold = sample_metadata["organoid_contact_threshold"]
+            for col in sample_metadata.index:
+                if col.endswith('_contact_threshold'):
+                    # Extract cell type from column name (e.g., 'tcell_contact_threshold' -> 'tcell')
+                    cell_type_name = col.replace('_contact_threshold', '')
+                    if pd.notna(sample_metadata[col]):
+                        contact_thresholds[cell_type_name] = sample_metadata[col]
 
         dead_channel=sample_metadata['dead_channel']
         
@@ -230,22 +244,54 @@ def run_feature_extraction(
         feature_outdir = Path(analysis_outdir, "track_features")
         
         raw_image_path = sample_metadata['raw_image_path']
-        organoid_segments_path = sample_metadata['organoid_tracks_image_path']
-        tcell_segments_path = sample_metadata['tcell_tracks_image_path']
-
-        # Add additional organoid type info
-        organoid_2_segments_path = None
-
-        if 'organoid_2_tracks_image_path' in sample_metadata and Path(sample_metadata['organoid_2_tracks_image_path']).exists():
-            organoid_2_segments_path = sample_metadata['organoid_2_tracks_image_path']
+        
+        # Dynamically find the current cell type's segments path
+        current_cell_segments_path = None
+        for prefix in ['or', 'im', 'ot']:
+            col_name = f"{prefix}_{cell_type}_tracks_image_path"
+            if col_name in sample_metadata.index and pd.notna(sample_metadata[col_name]):
+                current_cell_segments_path = sample_metadata[col_name]
+                break
+        
+        if current_cell_segments_path is None:
+            raise ValueError(f"No tracks_image_path found for cell_type='{cell_type}' in sample {sample_name}")
+        
+        # Dynamically collect ALL organoid types' paths (for contact calculation)
+        organoid_segments_paths = {}
+        for col in sample_metadata.index:
+            if col.startswith('or_') and col.endswith('_tracks_image_path'):
+                parts = col.split('_')
+                if len(parts) >= 4:
+                    organoid_type = '_'.join(parts[1:-3])  # Extract organoid type name
+                    if pd.notna(sample_metadata[col]):
+                        organoid_segments_paths[organoid_type] = sample_metadata[col]
+        
+        # Dynamically collect ALL immune cell types' paths (for contact calculation)
+        immune_segments_paths = {}
+        for col in sample_metadata.index:
+            if col.startswith('im_') and col.endswith('_tracks_image_path'):
+                parts = col.split('_')
+                if len(parts) >= 4:
+                    immune_type = '_'.join(parts[1:-3])  # Extract immune type name
+                    if pd.notna(sample_metadata[col]):
+                        immune_segments_paths[immune_type] = sample_metadata[col]
+        
+        # Dynamically collect ALL other cell types' paths (for contact calculation)
+        other_segments_paths = {}
+        for col in sample_metadata.index:
+            if col.startswith('ot_') and col.endswith('_tracks_image_path'):
+                parts = col.split('_')
+                if len(parts) >= 4:
+                    other_type = '_'.join(parts[1:-3])  # Extract other type name
+                    if pd.notna(sample_metadata[col]):
+                        other_segments_paths[other_type] = sample_metadata[col]
 
         dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
         
         print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
-        tcell_segments_path, organoid_segments_path, raw_image_path = convert_input_files_to_zarr(
+        current_cell_segments_path, raw_image_path = convert_input_files_to_zarr(
             sample_name=sample_name,
-            tcell_segments_path=tcell_segments_path,
-            organoid_segments_path=organoid_segments_path,
+            current_cell_segments_path=current_cell_segments_path,
             raw_image_path=raw_image_path,
             output_dir=img_outdir,
             overwrite=overwrite
@@ -261,14 +307,19 @@ def run_feature_extraction(
             feature_outdir.mkdir(parents=True)
         
         print(f"{get_current_time()} - Loading in tracks csv...")
-        if cell_type=="tcell":
-            df_tracks_path = sample_metadata["tcell_tracks_csv_path"]
-        elif cell_type=="organoid":
-            df_tracks_path = sample_metadata["organoid_tracks_csv_path"]
-        elif cell_type=="organoid_2":
-            df_tracks_path = sample_metadata["organoid_2_tracks_csv_path"]
-        else:
-            raise ValueError(f"Unknown cell type: {cell_type}. Expected 'tcell' or 'organoid' or 'organoid_2.")
+        # Find the correct prefixed column (or_, im_, ot_)
+        tracks_csv_col = None
+        for prefix in ['or', 'im', 'ot']:
+            col_name = f"{prefix}_{cell_type}_tracks_csv_path"
+            if col_name in sample_metadata.index and pd.notna(sample_metadata[col_name]):
+                tracks_csv_col = col_name
+                break
+        
+        if tracks_csv_col is None:
+            # Fallback to old non-prefixed format for backward compatibility
+            tracks_csv_col = f"{cell_type}_tracks_csv_path"
+        
+        df_tracks_path = sample_metadata[tracks_csv_col]
         
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
         # Adding a sample name for later combination of multiple track experiments
@@ -297,8 +348,9 @@ def run_feature_extraction(
             if imaris:
                 df_tracks=calculate_imaris_track_features(
                     df_tracks=df_tracks,
-                    organoid_contact_threshold=organoid_contact_threshold,
-                    tcell_contact_threshold=tcell_contact_threshold,
+                    cell_type=cell_type,
+                    contact_threshold=contact_threshold,
+                    contact_thresholds=contact_thresholds,
                     distance_unit=distance_unit,
                 )
             else:
@@ -317,9 +369,10 @@ def run_feature_extraction(
                     element_size_z=element_size_z,
                     raw_image_path=raw_image_path,
                     dead_mask_path=dead_mask_path,
-                    organoid_segments_path=organoid_segments_path,
-                    tcell_segments_path=tcell_segments_path,
-                    organoid_2_segments_path=organoid_2_segments_path,
+                    current_cell_segments_path=current_cell_segments_path,
+                    organoid_segments_paths=organoid_segments_paths,
+                    immune_segments_paths=immune_segments_paths,
+                    other_segments_paths=other_segments_paths,
                     overwrite=overwrite,
                     n_workers=n_workers
                 )
@@ -345,24 +398,21 @@ def run_feature_extraction(
             print(f"{get_current_time()} - Skipping movement features as not requested in features_choice")
             
         if "contact" in features_choice:
-            if cell_type=="tcell":
-                print(f"{get_current_time()} - Calculating T-cell specific features...")
-                df_tracks = calculate_tcell_specific_track_features(
+            # Calculate death features if threshold specified and dead_channel exists
+            if dead_mask_percentage_threshold is not None and dead_channel is not None and pd.notna(dead_channel):
+                print(f"{get_current_time()} - Calculating cell death based on dead_mask_percentage_threshold {dead_mask_percentage_threshold}")
+                df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
+            
+            # Calculate active contact for any cell type with same-type contacts
+            touching_col = f'touching_{cell_type}s'
+            if touching_col in df_tracks.columns:
+                print(f"{get_current_time()} - Calculating active contact features for {cell_type}...")
+                df_tracks = calculate_active_contact_features(
                     df_tracks,
-                    dead_mask_percentage_threshold=dead_mask_percentage_threshold
-                    # dead_dye_threshold=dead_dye_threshold,
-                    )
-                
-            elif cell_type=="organoid":
-                print(f"{get_current_time()} - Calculating organoid specific features...")
-                df_tracks = calculate_organoid_specific_track_features(
-                    df_tracks,
-                    dead_mask_percentage_threshold=dead_mask_percentage_threshold
-                    # dead_dye_threshold=dead_dye_threshold,
-                    )
-                #TODO Add organoid specific features
+                    cell_type=cell_type
+                )
             else:
-                print(f"{get_current_time()} - No cell type specified, skipping cell type specific features...")
+                print(f"{get_current_time()} - No same-type contacts found for {cell_type}, skipping active_contact calculation")
        
             
         tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
@@ -394,9 +444,10 @@ def calculate_image_based_track_features(
     #Paths
    
     dead_mask_path,
-    organoid_segments_path,
-    tcell_segments_path,
-    organoid_2_segments_path,
+    current_cell_segments_path,
+    organoid_segments_paths={},
+    immune_segments_paths={},
+    other_segments_paths={},
     raw_image_path = "",
     
     df_dead_mask_outpath="",
@@ -410,38 +461,36 @@ def calculate_image_based_track_features(
     ):
     """
     This code calculates the various features for each timepoint in a track for each 
-    separate experiment
+    separate experiment.
     
-    This codes works with either:
-    - The generated segments and tracks from the BEHAV3D preprocessing modules
-    - Imaris extracted statistics
+    Fully flexible - works with any cell type from metadata.
     
     Output:
     - A .csv file containing all timepoints of all TrackIDs and their time-related 
       features
     """
 
-    #TODO Add possibility to add multiple T cell types
-    #TODO So both CD4 and CD8 segments, label the type for each track
-    #TODO Then get distance and contact between all of them
-    #TODO Perhaps allow for input of the track df that already has T cell type in there
-
-    # Load in the images containing the organoid segments and T cell segments
-    organoid_segments=load_image(organoid_segments_path)
-    tcell_segments=load_image(tcell_segments_path)
-    dead_mask = load_image(dead_mask_path)
-    if organoid_2_segments_path:
-        organoid_2_segments=load_image(organoid_2_segments_path)
+    # Load the current cell type's segments
+    segments = load_image(current_cell_segments_path)
+    segments_path = current_cell_segments_path
     
-    if cell_type=="tcell":
-        segments= tcell_segments
-        segments_path = tcell_segments_path
-    elif cell_type=="organoid":
-        segments= organoid_segments
-        segments_path = organoid_segments_path
-    elif cell_type=="organoid_2":
-        segments= organoid_2_segments
-        segments_path = organoid_2_segments_path
+    # Load dead mask
+    dead_mask = load_image(dead_mask_path)
+    
+    # Load all organoid types' segments (for contact calculation)
+    organoid_segments_dict = {}
+    for org_type, org_path in organoid_segments_paths.items():
+        organoid_segments_dict[org_type] = load_image(org_path)
+    
+    # Load all immune cell types' segments (for contact calculation)
+    immune_segments_dict = {}
+    for immune_type, immune_path in immune_segments_paths.items():
+        immune_segments_dict[immune_type] = load_image(immune_path)
+    
+    # Load all other cell types' segments (for contact calculation)
+    other_segments_dict = {}
+    for other_type, other_path in other_segments_paths.items():
+        other_segments_dict[other_type] = load_image(other_path)
     
     if "morphology" in features_choice:
         print(f"{get_current_time()} - Calculating morphology features...")
@@ -513,7 +562,7 @@ def calculate_image_based_track_features(
                 segments=segments,
                 intensity_image=intensity_image
             )
-            if dead_channel is not None:
+            if dead_channel is not None and pd.notna(dead_channel):
                 df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{dead_channel}":"mean_dead_dye"})
             
             if df_intensity_outpath != "":
@@ -523,56 +572,47 @@ def calculate_image_based_track_features(
         print(f"{get_current_time()} - Skipping intensity features as not requested in features_choice")
     
     if "death" in features_choice:
-        print(f"{get_current_time()} - Calculating number of dead mask pixels...")
-        if df_dead_mask_outpath.exists() and not overwrite:
-            print("Dead mask calculation .csv already exists. Loading in dead mask calculation information...")
-            df_dead_mask = pd.read_csv(df_dead_mask_outpath)
+        if dead_channel is not None and pd.notna(dead_channel):
+            print(f"{get_current_time()} - Calculating number of dead mask pixels...")
+            if df_dead_mask_outpath.exists() and not overwrite:
+                print("Dead mask calculation .csv already exists. Loading in dead mask calculation information...")
+                df_dead_mask = pd.read_csv(df_dead_mask_outpath)
+            else:
+                df_dead_mask=calculate_dead_mask(
+                    segments=segments,
+                    dead_mask=dead_mask
+                )
+                if df_dead_mask_outpath != "":
+                    df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
+            df_tracks = pd.merge(df_tracks, df_dead_mask, how="left")
         else:
-            df_dead_mask=calculate_dead_mask(
-                segments=segments,
-                dead_mask=dead_mask
-            )
-            if df_dead_mask_outpath != "":
-                df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
-        df_tracks = pd.merge(df_tracks, df_dead_mask, how="left")
+            print(f"{get_current_time()} - Skipping death mask calculations: no dead_channel specified in metadata")
     else:
         print(f"{get_current_time()} - Skipping dead mask calculations as not requested in features_choice")
         
     if "contact" in features_choice:
-        print(f"{get_current_time()} - Calculating contact with organoids and other T cells...")
+        print(f"{get_current_time()} - Calculating contacts between {cell_type} and all other cell types...")
         print(f"Using a contact threshold of {contact_threshold} um")
-        # Calculate the contact od each T cell with an organoid or a T cell
-        # Explanation on how in the function itself
-        contact_dtypes = {
-                    'TrackID': int,
-                    'position_t': float,
-                    'organoid_contact': bool,
-                    'organoid_contact_pixels': bool,
-                    'touching_organoids': str,
-                    'tcell_contact': bool,
-                    'tcell_contact_pixels': bool,
-                    'touching_tcells': str
-                    }
+        # Calculate contacts dynamically for all cell types found in metadata
+        # The resulting DataFrame will have columns for ALL cell types (e.g., organoid1_contact, macro_contact, etc.)
+        
         if df_contacts_outpath.exists() and not overwrite:
             print("Contact .csv already exists. Loading in contact information...")
-            df_contacts = pd.read_csv(
-                df_contacts_outpath,
-                dtype=contact_dtypes
-                )
+            df_contacts = pd.read_csv(df_contacts_outpath)
 
         else:
-            df_contacts=calculate_organoid_and_tcell_contact(
-                tcell_segments_path=tcell_segments_path,
-                organoid_segments_path=organoid_segments_path,
-                organoid_2_segments_path=organoid_2_segments_path,
+            df_contacts=calculate_contact_features(
+                current_cell_segments_path=current_cell_segments_path,
+                organoid_segments_paths=organoid_segments_paths,
+                immune_segments_paths=immune_segments_paths,
+                other_segments_paths=other_segments_paths,
                 element_size_x=element_size_x,
                 element_size_y=element_size_y,
                 element_size_z=element_size_z,
                 contact_threshold=contact_threshold,
                 calculate_from=cell_type,
                 n_workers=n_workers
-            ) 
-            df_contacts = df_contacts.astype(contact_dtypes)
+            )
             if df_contacts_outpath != "":
                 df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
         df_tracks = pd.merge(df_tracks, df_contacts, how="left")
@@ -618,38 +658,53 @@ def generalize_units_of_track_features(
     df_tracks["time_unit"] = "h"
     return(df_tracks)
     
-def calculate_tcell_specific_track_features(df_tracks, dead_mask_percentage_threshold=None):
+def calculate_active_contact_features(df_tracks, cell_type):
+    """
+    Calculate active contact features for any cell type.
+    
+    Determines which cells are "actively" interacting vs "passively" contacted.
+    When multiple cells of the same type are in contact, the one with the highest
+    mean_speed is considered to be actively engaging.
+    
+    Args:
+        df_tracks: DataFrame with track features including mean_speed and touching_{cell_type}s columns
+        cell_type: The cell type to calculate active contact
+    Returns:
+        DataFrame with added active_{cell_type}_contact column
+    """
+    touching_col = f'touching_{cell_type}s'
+    contact_col = f'{cell_type}_contact'
+    active_contact_col = f'active_{cell_type}_contact'
+    
+    print(f"{get_current_time()} - Determining active contact of {cell_type}")
 
-    if dead_mask_percentage_threshold is not None:
-        print(f"{get_current_time()} - Calculating cell death based on defined dead_dye_threshold {dead_mask_percentage_threshold}")
-        df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
-
-    print(f"{get_current_time()} - Determining active contact of T cells")
-
-    # --- Step 1: Explode touching_tcells ---
+    # --- Step 1: Explode touching cells column ---
     df_explode = (
-        df_tracks[['TrackID', 'position_t', 'touching_tcells']]
+        df_tracks[['TrackID', 'position_t', touching_col]]
         .dropna()
-        .assign(touching_tcells=lambda d: d['touching_tcells'].astype(str).str.split(','))
-        .explode('touching_tcells')
+        .assign(**{touching_col: lambda d: d[touching_col].astype(str).str.split(',')})
+        .explode(touching_col)
     )
-    df_explode = df_explode[df_explode['touching_tcells'].str.strip() != '']
-    df_explode['touching_tcells'] = df_explode['touching_tcells'].astype(int)
+    df_explode = df_explode[df_explode[touching_col].str.strip() != '']
+    df_explode[touching_col] = df_explode[touching_col].astype(int)
 
-    # --- Step 2: Get mean_speed of each touching_tcell ---
-    speed_map = df_tracks[['TrackID', 'position_t', 'mean_speed']].rename(columns={'TrackID': 'touching_tcells', 'mean_speed': 'touching_speed'})
-    df_explode = df_explode.merge(speed_map, on=['touching_tcells', 'position_t'], how='left')
+    # --- Step 2: Get mean_speed of each touching cell ---
+    speed_map = df_tracks[['TrackID', 'position_t', 'mean_speed']].rename(
+        columns={'TrackID': touching_col, 'mean_speed': 'touching_speed'}
+    )
+    df_explode = df_explode.merge(speed_map, on=[touching_col, 'position_t'], how='left')
 
-    # --- Step 3: Aggregate max touching speed for each SegmentID ---
+    # --- Step 3: Aggregate max touching speed for each cell ---
     max_touching_speed = df_explode.groupby(['TrackID', 'position_t'])['touching_speed'].max()
 
-    # --- Step 4: Compare own speed with max of touching ---
+    # --- Step 4: Compare own speed with max of touching cells ---
     df_tracks = df_tracks.set_index(['TrackID', 'position_t'])
     df_tracks['max_touching_speed'] = max_touching_speed
     df_tracks['max_touching_speed'] = df_tracks['max_touching_speed'].fillna(-1)
 
-    df_tracks['active_tcell_contact'] = (
-        (df_tracks['tcell_contact']) & 
+    # Active contact = in contact AND moving faster than all touching cells
+    df_tracks[active_contact_col] = (
+        (df_tracks[contact_col]) & 
         (df_tracks['mean_speed'] >= df_tracks['max_touching_speed'])
     )
 
@@ -659,85 +714,85 @@ def calculate_tcell_specific_track_features(df_tracks, dead_mask_percentage_thre
     return df_tracks
 
 
-def calculate_organoid_specific_track_features(
-    df_tracks,
-    dead_mask_percentage_threshold=None,
-    ):
-
-    if dead_mask_percentage_threshold is not None:
-        print(f"{get_current_time()} - Calculating cell death based on nr dead pixels {dead_mask_percentage_threshold}")
-        df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
-    
-    return(df_tracks)
 
 
 def calculate_imaris_track_features(
     df_tracks,
-    organoid_contact_threshold,
-    tcell_contact_threshold,
+    cell_type,
+    contact_threshold,
     distance_unit,
     ):
     """
-    This code calculates the various features for each timepoint in a track for each 
-    separate experiment
+    Calculate contact features from Imaris-extracted statistics.
+    Flexible - works with any cell type from metadata.
     
-    This codes works with either:
-    - The generated segments and tracks from the BEHAV3D preprocessing modules
-    - Imaris extracted statistics
+    Imaris provides pre-calculated distance columns in the CSV.
+    This function thresholds those distances to determine contacts.
+    
+    Expected Imaris distance columns in df_tracks:
+    - For organoid types: 'organoid_distance', 'organoid1_distance', 'organoid2_distance', etc.
+    - For immune types: 'tcell_distance', 'macro_distance', etc.
+    - For complementary contacts: 'complementary_{cell_type}_distance'
     
     Output:
-    - A .csv file containing all timepoints of all TrackIDs and their time-related 
-      features
+    - DataFrame with contact columns for all detected cell types
     """
     
     print("Performing feature calculation from Imaris processing..")
+    print(f"Using a contact threshold of {contact_threshold}{distance_unit}")
     
-    print(f"{get_current_time()} - Calculating contact with organoids... (From Imaris)")
-    # Threshold the distance to organoid based on the supplied "organoid_contact_threshold"
-    # This distance is calculated before in Imaris and supplied as a separate channel and
-    # Extracted as a statistic (...Intensity_Min_Ch<#>_img=<#>.csv)
-    df_tracks["organoid_contact"]=df_tracks["organoid_distance"]<=organoid_contact_threshold
+    # Detect all distance columns in the DataFrame
+    distance_cols = [col for col in df_tracks.columns if col.endswith('_distance')]
     
-    # Calculate the nearest Tcell based on the distance between the centroids of other T cells
-    # Caution: This distance, unlike the BEHAV3D processing, is between centroids of cells, not borders
-    # Thus the provided "tcell_contact_threshold" needs to reflect this
-    print(f"{get_current_time()} - Calculating contact with T cells... (From Imaris)")
-    print(f"Using a contact threshold of {tcell_contact_threshold}{distance_unit}")
+    # Calculate contacts for each distance column
+    for dist_col in distance_cols:
+        # Extract cell type name from column (e.g., 'organoid_distance' -> 'organoid')
+        other_cell_type = dist_col.replace('_distance', '').replace('complementary_', '')
+        
+        # Skip if this is the same cell type (will be handled by same-type contact below)
+        if other_cell_type == cell_type:
+            continue
+        
+        # Create contact column
+        contact_col = f"{other_cell_type}_contact"
+        df_tracks[contact_col] = df_tracks[dist_col] <= contact_threshold
+        
+        print(f"{get_current_time()} - Calculated contact with {other_cell_type} (From Imaris)")
+    
+    # Calculate same-type contacts (e.g., tcell-to-tcell, macro-to-macro)
+    # This is based on centroid distances between cells of the same type
+    print(f"{get_current_time()} - Calculating same-type contacts ({cell_type}-to-{cell_type})... (From Imaris)")
+    
     grouped = df_tracks.groupby('position_t')
     new_dfs = []
-
-    ### The following code calculates the distances between all tracks of the same
-    ### type (So between for example CD4 and other CD4 cells)
-    touching_tcells_dict = {}
-    # Calculate distances between a segment and all other segments with cdist
+    
     for group_name, group_df in grouped:
         positions = group_df[['position_x', 'position_y', 'position_z']].values
         distances = cdist(positions, positions)
         np.fill_diagonal(distances, np.inf)
-        distances_mask = distances <= tcell_contact_threshold
-
-        tcell_contacts_list = []
-        for i, row in enumerate(distances_mask):
-            tcell_contacts = np.where(row)[0].tolist()
-            tcell_contacts=[group_df.reset_index().loc[idx]["TrackID"] for idx in tcell_contacts]
-            tcell_contacts_list.append(tcell_contacts)                 
-        group_df['touching_tcells'] = tcell_contacts_list
-
-        for track_id, tcell_contacts in zip(group_df['TrackID'], tcell_contacts_list):
-            touching_tcells_dict[track_id] = tcell_contacts
-
-        group_df['tcell_contact'] = group_df['touching_tcells'].apply(lambda x: len(x) > 0)
-
-        ### As Imaris does not give interacting IDs, we can only add contact 
-        ### but leave the actual interacting ID as unknown
+        distances_mask = distances <= contact_threshold
         
-        if "complementary_tcell_distance" in df_tracks.columns:
-            # !! ADJUST THIS THRESHOLD OR MOVE TO AFTER ADDING ALL TRACKS
-            group_df['tcell_contact'] = group_df['complementary_tcell_distance']<=tcell_contact_threshold
-            group_df['touching_tcells'].append("unknown")
-        group_df['touching_tcells'] = group_df['touching_tcells'].apply(lambda x: ",".join(map(str, x)) if isinstance(x, list) and len(x) > 0 else None)
+        same_type_contacts_list = []
+        for i, row in enumerate(distances_mask):
+            contacts = np.where(row)[0].tolist()
+            contact_ids = [group_df.reset_index().loc[idx]["TrackID"] for idx in contacts]
+            same_type_contacts_list.append(contact_ids)
+        
+        group_df[f'touching_{cell_type}s'] = same_type_contacts_list
+        group_df[f'{cell_type}_contact'] = group_df[f'touching_{cell_type}s'].apply(lambda x: len(x) > 0)
+        
+        # Check for complementary distance column (if Imaris calculated it)
+        complementary_col = f'complementary_{cell_type}_distance'
+        if complementary_col in df_tracks.columns:
+            group_df[f'{cell_type}_contact'] = group_df[complementary_col] <= contact_threshold
+            group_df[f'touching_{cell_type}s'].append("unknown")
+        
+        group_df[f'touching_{cell_type}s'] = group_df[f'touching_{cell_type}s'].apply(
+            lambda x: ",".join(map(str, x)) if isinstance(x, list) and len(x) > 0 else None
+        )
         
         new_dfs.append(group_df)
+    
     df_tracks = pd.concat(new_dfs, ignore_index=True)
     return(df_tracks)
 
@@ -763,45 +818,39 @@ def calculate_death(
            
 def interpolate_missing_positions(
     df_tracks,
-    cols_to_copy=[
-        "sample_name",
-        "TrackID",
-        "organoid_contact",
-        "organoid_contact_pixels",
-        "touching_organoids",
-        "tcell_contact",
-        "tcell_contact_pixels",
-        "touching_tcells",
-        "organoid_2_contact",
-        "organoid_2_contact_pixels",
-        "touching_organoid_2s",
-        "distance_unit",
-        "time_unit",
-        "orientation_vector"
-        ],
-    cols_to_interpolate=[
-        # "position_t", 
-        # "position_z", 
-        # "position_y", 
-        # "position_x",
-        # "mean_dead_dye"
-        ],
+    cols_to_copy=None,  # Will auto-detect contact columns + metadata
+    cols_to_interpolate=None,
     col_to_none = [
         "SegmentID",
     ]
     ):
     """
     As not every track has a segment at every timepoint, interpolate the missing values of
-    the missing timepoints
+    the missing timepoints.
+    
+    Fully dynamic - automatically detects ALL contact columns from dataframe.
     
     It interpolates various columns in different ways:
     -   Interpolates the numerical columns of [cols_to_interpolate] such as speed using linear
         interpolation
     -   Copies the columns of [cols_to_copy] using a forward fill from the last non-interpolated
-        row of each TrackID
+        row of each TrackID (includes all *_contact, *_contact_pixels, touching_* columns)
     -   Puts None in any column not specified, such as SegmentID, as no actual segment exists
     """
-     # Interpolate missing timepoints so each calculation takes the same intervals
+    
+    # Auto-detect contact columns if not specified
+    if cols_to_copy is None:
+        cols_to_copy = ["sample_name", "TrackID", "distance_unit", "time_unit", "orientation_vector"]
+        
+        # Add all dynamically-generated contact columns
+        for col in df_tracks.columns:
+            if (col.endswith('_contact') or 
+                col.endswith('_contact_pixels') or 
+                col.startswith('touching_')):
+                if col not in cols_to_copy:
+                    cols_to_copy.append(col)
+    
+    # Interpolate missing timepoints so each calculation takes the same intervals
     if  cols_to_interpolate is None or cols_to_interpolate == []:
         # Select all columns that are not in cols_to_copy
         cols_to_interpolate = df_tracks.columns.difference(cols_to_copy).tolist()
@@ -904,40 +953,74 @@ def calculate_movement_features(
     df_tracks_processed=pd.merge(df_tracks, df_tracks_processed, how="left")
     return(df_tracks_processed)
 
-def calculate_organoid_distance(
-    tcell_segments, 
-    organoid_segments, 
+def calculate_cell_distance(
+    current_cell_segments, 
+    target_cell_segments, 
     element_size_x, 
     element_size_y, 
-    element_size_z
+    element_size_z,
+    current_cell_type="cell",
+    target_cell_type="target"
     ):
-    df_dist_organoid = []
-    for t, tcell_stack in tqdm(enumerate(tcell_segments), total=len(tcell_segments)):
-        org_stack = organoid_segments[t,:,:,:]
-        mask_org= np.ma.masked_where(org_stack==0, org_stack)
-        dist_org=distance_transform_edt(mask_org.mask)
-        real_dist_org=distance_transform_edt(
-            mask_org.mask,
+    """
+    Calculate distance from current cell type to target cell type.
+    Fully flexible - works with any cell type combination.
+    
+    Args:
+        current_cell_segments: Segments of the cell type being analyzed
+        target_cell_segments: Segments of the target cell type
+        element_size_x, element_size_y, element_size_z: Physical spacing in µm
+        current_cell_type: Name of current cell type (for column naming)
+        target_cell_type: Name of target cell type (for column naming)
+    
+    Returns:
+        DataFrame with distance measurements for each cell at each timepoint
+    """
+    df_dist = []
+    for t, current_stack in tqdm(enumerate(current_cell_segments), total=len(current_cell_segments)):
+        target_stack = target_cell_segments[t,:,:,:]
+        mask_target = np.ma.masked_where(target_stack==0, target_stack)
+        dist_target = distance_transform_edt(mask_target.mask)
+        real_dist_target = distance_transform_edt(
+            mask_target.mask,
             sampling=[element_size_z, element_size_y, element_size_x]
+        )
+        properties_pix = pd.DataFrame(
+            regionprops_table(
+                label_image=current_stack, 
+                intensity_image=dist_target, 
+                properties=['label', 'intensity_min']
             )
-        properties_pix=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=dist_org, properties=['label', 'intensity_min']))
-        properties_pix=properties_pix.rename(columns={"intensity_min":"pix_distance_organoids"})
-        properties_real=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=real_dist_org, properties=['label', 'intensity_min']))
-        properties_real=properties_real.rename(columns={"intensity_min":"real_distance_organoids"})
-        properties=pd.merge(properties_pix,properties_real, how="left")
-        properties["position_t"]=t
-        df_dist_organoid.append(properties)
-    df_dist_organoid = pd.concat(df_dist_organoid)
-    df_dist_organoid=df_dist_organoid.rename(columns={"label":"TrackID"})
-    df_dist_organoid["pix_organoid_contact"] =  df_dist_organoid["pix_distance_organoids"] <= 1.73
-    return(df_dist_organoid)
+        )
+        properties_pix = properties_pix.rename(columns={"intensity_min": f"pix_distance_{target_cell_type}s"})
+        properties_real = pd.DataFrame(
+            regionprops_table(
+                label_image=current_stack, 
+                intensity_image=real_dist_target, 
+                properties=['label', 'intensity_min']
+            )
+        )
+        properties_real = properties_real.rename(columns={"intensity_min": f"real_distance_{target_cell_type}s"})
+        properties = pd.merge(properties_pix, properties_real, how="left")
+        properties["position_t"] = t
+        df_dist.append(properties)
+    df_dist = pd.concat(df_dist)
+    df_dist = df_dist.rename(columns={"label": "TrackID"})
+    df_dist[f"pix_{target_cell_type}_contact"] = df_dist[f"pix_distance_{target_cell_type}s"] <= 1.73
+    return(df_dist)
 
-def _calculate_organoid_and_tcell_contact_single_timepoint(args):
+
+def _calculate_contact_single_timepoint(args):
+    """
+    Calculate contacts between current cell type and ALL other cell types.
+    Fully flexible - works with any combination of cell types.
+    """
     (
         t,
-        tcell_segments_path,
-        organoid_segments_path,
-        organoid_2_segments_path,
+        current_cell_segments_path,
+        organoid_segments_paths,
+        immune_segments_paths,
+        other_segments_paths,
         element_size_x,
         element_size_y,
         element_size_z,
@@ -945,30 +1028,33 @@ def _calculate_organoid_and_tcell_contact_single_timepoint(args):
         calculate_from
     ) = args
     
-    tcell_segments = np.asarray(load_image(tcell_segments_path)[t])
-    organoid_segments = np.asarray(load_image(organoid_segments_path)[t])
-
-    if organoid_2_segments_path:
-        organoid_2_segments = np.asarray(load_image(organoid_2_segments_path)[t])
+    # Load current cell type's segments for this timepoint
+    current_segments = np.asarray(load_image(current_cell_segments_path)[t])
     
-    if calculate_from == "tcell":
-        segments_stack = tcell_segments
-    elif calculate_from == "organoid":
-        segments_stack = organoid_segments
-    elif calculate_from == "organoid_2":
-        segments_stack = organoid_2_segments
-    else:
-        raise ValueError(f"calculate_from has to be either 'tcell' or 'organoid', got {calculate_from}")
+    # Load all organoid types' segments
+    organoid_segments_dict = {}
+    for org_type, org_path in organoid_segments_paths.items():
+        organoid_segments_dict[org_type] = np.asarray(load_image(org_path)[t])
+    
+    # Load all immune cell types' segments
+    immune_segments_dict = {}
+    for immune_type, immune_path in immune_segments_paths.items():
+        immune_segments_dict[immune_type] = np.asarray(load_image(immune_path)[t])
+    
+    # Load all other cell types' segments
+    other_segments_dict = {}
+    for other_type, other_path in other_segments_paths.items():
+        other_segments_dict[other_type] = np.asarray(load_image(other_path)[t])
     
     df_contacts = []
-    segment_ids = np.unique(segments_stack)
+    segment_ids = np.unique(current_segments)
     
     for segment_id in segment_ids:
         if segment_id == 0:
             continue
         
-        stack_max_z, stack_max_y, stack_max_x = segments_stack.shape
-        seg_locs = np.argwhere(segments_stack == segment_id)
+        stack_max_z, stack_max_y, stack_max_x = current_segments.shape
+        seg_locs = np.argwhere(current_segments == segment_id)
         min_z, min_y, min_x = seg_locs.min(axis=0)
         max_z, max_y, max_x = seg_locs.max(axis=0)
         
@@ -982,107 +1068,130 @@ def _calculate_organoid_and_tcell_contact_single_timepoint(args):
             slice(max(0, min_x - x_ext), min(stack_max_x, max_x + x_ext + 1))
         )
         
-        tcell_cutout = tcell_segments[slicer]
-        org_cutout = organoid_segments[slicer]
-        if organoid_2_segments_path:
-            org_2_cutout = organoid_2_segments[slicer]
-        seg_cutout = segments_stack[slicer]
+        seg_cutout = current_segments[slicer]
         
         real_distances = distance_transform_edt(
             seg_cutout != segment_id,
             sampling=[element_size_z, element_size_y, element_size_x]
         )
         pix_distances = distance_transform_edt(seg_cutout != segment_id)
-
-        organoid_contacts = [
-            str(x) for x in np.unique(org_cutout[real_distances <= contact_threshold]) if x != 0
-        ]
-        if calculate_from == "organoid":
-            organoid_contacts = [x for x in organoid_contacts if x != str(segment_id)]
-        real_organoid_contact = len(organoid_contacts) > 0
-
-        pix_organoid_contacts = [
-            str(x) for x in np.unique(org_cutout[pix_distances <= 1.73]) if x != 0
-        ]
-        pix_organoid_contact = len(pix_organoid_contacts) > 0
-
-        tcell_contacts = [
-            str(x) for x in np.unique(tcell_cutout[real_distances <= contact_threshold]) if x != 0
-        ]
-        if calculate_from == "tcell":
-            tcell_contacts = [x for x in tcell_contacts if x != str(segment_id)]
-        real_tcell_contact = len(tcell_contacts) > 0
-
-        pix_tcell_contacts = [
-            str(x) for x in np.unique(tcell_cutout[pix_distances <= 1.73]) if x not in [0, segment_id]
-        ]
-        pix_tcell_contact = len(pix_tcell_contacts) > 0
-
-        # Organoid 2 information
-        if organoid_2_segments_path:
-            organoid_2_contacts = [
-                str(x) for x in np.unique(org_2_cutout[real_distances <= contact_threshold]) if x != 0
-            ]
-            if calculate_from == "organoid_2":
-                organoid_2_contacts = [x for x in organoid_2_contacts if x != str(segment_id)]
-            real_organoid_2_contact = len(organoid_2_contacts) > 0
-
-            pix_organoid_2_contacts = [
-                str(x) for x in np.unique(org_2_cutout[pix_distances <= 1.73]) if x != 0
-            ]
-            pix_organoid_2_contact = len(pix_organoid_2_contacts) > 0
-
+        
         contact_data = {
             'TrackID': segment_id,
             'position_t': t,
-            'organoid_contact': real_organoid_contact,
-            'organoid_contact_pixels': pix_organoid_contact,
-            'touching_organoids': ",".join(organoid_contacts) if real_organoid_contact else "",
-            'tcell_contact': real_tcell_contact,
-            'tcell_contact_pixels': pix_tcell_contact,
-            'touching_tcells': ",".join(tcell_contacts) if real_tcell_contact else ""
         }
-
-        # Add only if organoid_2
-        if organoid_2_segments_path:
-            contact_data.update({
-                'organoid_2_contact': real_organoid_2_contact,
-                'organoid_2_contact_pixels': pix_organoid_2_contact,
-                'touching_organoid_2s': ",".join(organoid_2_contacts) if real_organoid_2_contact else ""
-            })
+        
+        # Calculate contacts with ALL organoid types
+        for org_type, org_segments in organoid_segments_dict.items():
+            org_cutout = org_segments[slicer]
+            
+            org_contacts = [
+                str(x) for x in np.unique(org_cutout[real_distances <= contact_threshold]) if x != 0
+            ]
+            # If calculating from this organoid type, exclude self-contact
+            if calculate_from == org_type:
+                org_contacts = [x for x in org_contacts if x != str(segment_id)]
+            
+            real_org_contact = len(org_contacts) > 0
+            
+            pix_org_contacts = [
+                str(x) for x in np.unique(org_cutout[pix_distances <= 1.73]) if x != 0
+            ]
+            pix_org_contact = len(pix_org_contacts) > 0
+            
+            # Add columns for this organoid type
+            contact_data[f'{org_type}_contact'] = real_org_contact
+            contact_data[f'{org_type}_contact_pixels'] = pix_org_contact
+            contact_data[f'touching_{org_type}s'] = ",".join(org_contacts) if real_org_contact else ""
+        
+        # Calculate contacts with ALL immune cell types
+        for immune_type, immune_segments in immune_segments_dict.items():
+            immune_cutout = immune_segments[slicer]
+            
+            immune_contacts = [
+                str(x) for x in np.unique(immune_cutout[real_distances <= contact_threshold]) if x != 0
+            ]
+            # If calculating from this immune type, exclude self-contact
+            if calculate_from == immune_type:
+                immune_contacts = [x for x in immune_contacts if x != str(segment_id)]
+            
+            real_immune_contact = len(immune_contacts) > 0
+            
+            pix_immune_contacts = [
+                str(x) for x in np.unique(immune_cutout[pix_distances <= 1.73]) if x != 0
+            ]
+            pix_immune_contact = len(pix_immune_contacts) > 0
+            
+            # Add columns for this immune type
+            contact_data[f'{immune_type}_contact'] = real_immune_contact
+            contact_data[f'{immune_type}_contact_pixels'] = pix_immune_contact
+            contact_data[f'touching_{immune_type}s'] = ",".join(immune_contacts) if real_immune_contact else ""
+        
+        # Calculate contacts with ALL other cell types
+        for other_type, other_segments in other_segments_dict.items():
+            other_cutout = other_segments[slicer]
+            
+            other_contacts = [
+                str(x) for x in np.unique(other_cutout[real_distances <= contact_threshold]) if x != 0
+            ]
+            # If calculating from this other type, exclude self-contact
+            if calculate_from == other_type:
+                other_contacts = [x for x in other_contacts if x != str(segment_id)]
+            
+            real_other_contact = len(other_contacts) > 0
+            
+            pix_other_contacts = [
+                str(x) for x in np.unique(other_cutout[pix_distances <= 1.73]) if x != 0
+            ]
+            pix_other_contact = len(pix_other_contacts) > 0
+            
+            # Add columns for this other type
+            contact_data[f'{other_type}_contact'] = real_other_contact
+            contact_data[f'{other_type}_contact_pixels'] = pix_other_contact
+            contact_data[f'touching_{other_type}s'] = ",".join(other_contacts) if real_other_contact else ""
 
         df_contacts.append(pd.DataFrame([contact_data]))
 
 
 
+
     return pd.concat(df_contacts)
 
-def calculate_organoid_and_tcell_contact(
-    tcell_segments_path,
-    organoid_segments_path,
-    organoid_2_segments_path,
-    contact_threshold,
-    element_size_x,
-    element_size_y,
-    element_size_z,
-    calculate_from="tcell",
+def calculate_contact_features(
+    current_cell_segments_path,
+    organoid_segments_paths={},
+    immune_segments_paths={},
+    other_segments_paths={},
+    contact_threshold=None,
+    element_size_x=None,
+    element_size_y=None,
+    element_size_z=None,
+    calculate_from=None,
     n_workers=1
     ):
     """
-    Wrapper function to parallelize contact analysis.
+    Flexible contact calculation - works with any cell types from metadata.
     
+    Args:
+        current_cell_segments_path: Path to the current cell type being analyzed
+        organoid_segments_paths: Dict of {organoid_type: path} for all organoid types
+        immune_segments_paths: Dict of {immune_type: path} for all immune types
+        other_segments_paths: Dict of {other_type: path} for all other types
+        calculate_from: The cell type we're calculating features for (required for self-contact exclusion)
+        
     Returns:
-        DataFrame of contact annotations.
+        DataFrame of contact annotations for the current cell type with ALL other cell types.
     """
-    tcell_segments = load_image(tcell_segments_path)
-    timepoints = tcell_segments.shape[0]
+    current_segments = load_image(current_cell_segments_path)
+    timepoints = current_segments.shape[0]
 
     args_list = [
         (
             t,
-            tcell_segments_path,
-            organoid_segments_path,
-            organoid_2_segments_path,
+            current_cell_segments_path,
+            organoid_segments_paths,
+            immune_segments_paths,
+            other_segments_paths,
             element_size_x,
             element_size_y,
             element_size_z,
@@ -1094,9 +1203,9 @@ def calculate_organoid_and_tcell_contact(
 
     if n_workers > 1:
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            results = list(tqdm(executor.map(_calculate_organoid_and_tcell_contact_single_timepoint, args_list), total=len(args_list)))
+            results = list(tqdm(executor.map(_calculate_contact_single_timepoint, args_list), total=len(args_list)))
     else:
-        results = [_calculate_organoid_and_tcell_contact_single_timepoint(args) for args in tqdm(args_list)]
+        results = [_calculate_contact_single_timepoint(args) for args in tqdm(args_list)]
 
     return pd.concat(results, ignore_index=True)
 

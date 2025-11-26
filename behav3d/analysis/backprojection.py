@@ -10,19 +10,80 @@ from behav3d.utils import format_time
 from behav3d.utils.fileio import get_filepath_stem, load_image, load_zarr, save_as_zarr
 from tqdm import tqdm
 import dask.array as da
-# df_tracks=df_tracks[df_tracks["relative_time"]<=30]
 
 def backproject_mean_features_behav3d(
     metadata,
     sample_name,
     config=None,
     output_dir=None,
-    cell_type = "tcell",
+    cell_type="tcell",
     columns=[],
     save=False
     ):
+    """
+    Wrapper for mean mode backprojection. Calls generic backprojection function.
+    """
+    return backproject_generic(
+        metadata=metadata,
+        sample_name=sample_name,
+        config=config,
+        output_dir=output_dir,
+        cell_type=cell_type,
+        columns=columns,
+        save=save,
+        mode="mean"
+    )
+
+
+def backproject_time_features_behav3d(
+    metadata,
+    sample_name,
+    config=None,
+    output_dir=None,
+    cell_type="tcell",
+    columns=[],
+    save=False
+    ):
+    """
+    Wrapper for time mode backprojection. Calls generic backprojection function.
+    """
+    return backproject_generic(
+        metadata=metadata,
+        sample_name=sample_name,
+        config=config,
+        output_dir=output_dir,
+        cell_type=cell_type,
+        columns=columns,
+        save=save,
+        mode="time"
+    )
+
+
+def backproject_generic(
+    metadata,
+    sample_name,
+    config=None,
+    output_dir=None,
+    cell_type="tcell",
+    columns=[],
+    save=False,
+    mode="mean"
+    ):
+    """
+    Generic backprojection function that works with ANY cell type.
     
-    print(f"--------------- Backprojecting for {sample_name} ---------------")
+    Args:
+        metadata: Metadata DataFrame
+        sample_name: Name of sample to backproject
+        config: Config dict (optional)
+        output_dir: Output directory
+        cell_type: Cell type name (e.g., 'tcell', 'organoid1', 'macro')
+        columns: List of columns to backproject
+        save: Whether to save backprojection to zarr
+        mode: 'mean' or 'time' backprojection mode
+    """
+    
+    print(f"--------------- Backprojecting {cell_type} for {sample_name} ({mode} mode) ---------------")
     start_time = time.time()
 
     assert config is not None or all(
@@ -47,136 +108,212 @@ def backproject_mean_features_behav3d(
  
     raw_img_path = Path(df_sample["raw_image_path"].values[0])
     
-    track_img_path = Path(df_sample["tcell_tracks_image_path"].values[0])
+    # ✨ Generic: Look for {cell_type}_tracks_image_path column (with or without category prefix)
+    track_img_col = f"{cell_type}_tracks_image_path"
+    if track_img_col not in df_sample.columns:
+        # Try with prefix patterns (im_, or_, ot_)
+        for prefix in ['im_', 'or_', 'ot_']:
+            alt_col = f"{prefix}{cell_type}_tracks_image_path"
+            if alt_col in df_sample.columns:
+                track_img_col = alt_col
+                break
+        else:
+            raise ValueError(f"Cannot find tracks image path column for {cell_type}. Expected: {cell_type}_tracks_image_path or {prefix}{cell_type}_tracks_image_path")
     
-    org_track_img_path = Path(df_sample["organoid_tracks_image_path"].values[0])
-
-    if "organoid_2_tracks_image_path" in df_sample.columns and pd.notna(df_sample["organoid_2_tracks_image_path"].values[0]):
-        two_org_types = True
-        org2_track_img_path = Path(df_sample["organoid_2_tracks_image_path"].values[0])
+    track_img_path = Path(df_sample[track_img_col].values[0])
+    
+    # Load UMAP clusters to get ClusterID
+    df_umap_clusters_path = Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_clusters.csv")
+    df_umap_clusters = pd.read_csv(df_umap_clusters_path)
+    
+    if mode == "mean":
+        # For mean mode: load summarized features (track-averaged)
+        df_tracks_summarized_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_summarized.csv")
+        df_tracks_full = pd.read_csv(df_tracks_summarized_path)
+        df_tracks_full = df_tracks_full[df_tracks_full["sample_name"]==sample_name]
+        
+        # Merge with ClusterID for backprojection
+        df_tracks_clustered = pd.merge(df_tracks_full, df_umap_clusters[["TrackID", "ClusterID"]], on='TrackID', how='left')
+        
+        # Also load time-varying data for napari track positions
+        df_tracks_all_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+        df_tracks_all = pd.read_csv(df_tracks_all_path)
+        df_tracks_all = df_tracks_all[df_tracks_all["sample_name"]==sample_name]
     else:
-        two_org_types = False
-
-    df_tracks_path = Path(df_sample["tcell_tracks_csv_path"].values[0])
-    
-    df_tracks_full_clustered_path = Path(results_outdir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv")
-    df_tracks_full_clustered = pd.read_csv(df_tracks_full_clustered_path)
-    df_tracks_full_clustered = df_tracks_full_clustered[df_tracks_full_clustered["sample_name"]==sample_name]
-    
-    df_tracks_all_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
-    df_tracks_all = pd.read_csv(df_tracks_all_path)
-    df_tracks_all = df_tracks_all[df_tracks_all["sample_name"]==sample_name]
+        # For time mode: load time-varying features
+        df_tracks_all_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+        df_tracks_all = pd.read_csv(df_tracks_all_path)
+        df_tracks_all = df_tracks_all[df_tracks_all["sample_name"]==sample_name]
+        
+        # Merge with ClusterID for backprojection
+        df_tracks_clustered = pd.merge(df_tracks_all, df_umap_clusters[["TrackID", "ClusterID"]], on='TrackID', how='left')
+        
+        # For time mode, df_tracks_full is same as df_tracks_all
+        df_tracks_full = df_tracks_all
     
     elsize = [
         df_sample["pixel_distance_z"].values[0],
         df_sample["pixel_distance_xy"].values[0],
         df_sample["pixel_distance_xy"].values[0]
-        ]
+    ]
     
     backproj_out_path = Path(backproj_outdir, f"{get_filepath_stem(track_img_path)}_backprojected.zarr")
     raw_img = load_image(raw_img_path)
     
     raw_img_data = {
-            "raw_data":{
-                "img":raw_img,
-                "type":"image"
-                }
-            }
-    
-    print("- Loading in tracked segments")
-    track_img = load_image(track_img_path)
-    org_track_img = load_image(org_track_img_path)
-
-    if two_org_types:
-        org2_track_img = load_image(org2_track_img_path)
-        org2_track_img = np.expand_dims(org2_track_img, axis=1)
-        org2_track_img = da.tile(org2_track_img, (1,raw_img.shape[-4],1,1,1))
-    
-    track_img = np.expand_dims(track_img, axis=1)
-    org_track_img = np.expand_dims(org_track_img, axis=1)
-    org_track_img = da.tile(org_track_img, (1,raw_img.shape[-4],1,1,1))
-    
-    dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
-    dead_mask = load_zarr(dead_mask_path)
-    dead_mask = np.expand_dims(dead_mask, axis=1)
-    dead_mask = da.tile(dead_mask, (1,raw_img.shape[-4],1,1,1))
-    
-    df_tracks_clustered=pd.read_csv(Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_clusters.csv"))
-    filt_track_img = np.where(np.isin(track_img, df_tracks_clustered["TrackID"].unique()), track_img, 0)
-    
-    track_img = da.tile(track_img, (1,raw_img.shape[-4],1,1,1))
-    
-    trackid_data = {
-        "Tcell_TrackID":{
-            "img":track_img, 
-            "type":"label"
-            },
-        "filtered_Tcell_TrackID":{
-            "img":filt_track_img, 
-            "type":"label"
-            },
-        "Organoid_TrackID":{
-            "img":org_track_img, 
-            "type":"label"
-            },
-        "Dead_Mask":{  
-            "img":dead_mask, 
-            "type":"label"
-            }
+        "raw_data": {
+            "img": raw_img,
+            "type": "image"
         }
+    }
     
-    if two_org_types:    
-        trackid_data["Organoid2_TrackID"] = {
-            "img":org2_track_img, 
-            "type":"label"
-            }
+    print(f"- Loading in tracked segments for {cell_type}")
+    track_img = load_image(track_img_path)
     
-    if columns==[]:
-        columns=[x for x in df_tracks_clustered.columns if x not in metadata.columns.tolist()+["TrackID", "UMAP1", "UMAP2"]]
+    # Expand dims and tile
+    track_img = np.expand_dims(track_img, axis=1)
+    filt_track_img = np.where(np.isin(track_img, df_tracks_clustered["TrackID"].unique()), track_img, 0)
+    track_img_tiled = da.tile(track_img, (1, raw_img.shape[-4], 1, 1, 1))
+    
+    # Build trackid_data dict
+    trackid_data = {
+        f"{cell_type}_TrackID": {
+            "img": track_img_tiled,
+            "type": "label"
+        },
+        f"filtered_{cell_type}_TrackID": {
+            "img": filt_track_img,
+            "type": "label"
+        }
+    }
+    
+    # ✨ Dynamically load ALL other cell types' tracks from metadata
+    from behav3d.utils import (
+        detect_immune_cell_types_from_metadata,
+        detect_organoid_types_from_metadata,
+        detect_other_cell_types_from_metadata
+    )
+    
+    all_cell_types = (detect_immune_cell_types_from_metadata(metadata) + 
+                      detect_organoid_types_from_metadata(metadata) + 
+                      detect_other_cell_types_from_metadata(metadata))
+    
+    # Load tracks for other cell types (for visualization context)
+    for other_ct in all_cell_types:
+        if other_ct == cell_type:
+            continue  # Skip the main cell type we're backprojecting
         
-    print("- Backprojecting all features onto each segment")
+        other_track_col = f"{other_ct}_tracks_image_path"
+        # Try with prefixes
+        if other_track_col not in df_sample.columns:
+            for prefix in ['im_', 'or_', 'ot_']:
+                alt_col = f"{prefix}{other_ct}_tracks_image_path"
+                if alt_col in df_sample.columns:
+                    other_track_col = alt_col
+                    break
+        
+        if other_track_col in df_sample.columns and pd.notna(df_sample[other_track_col].values[0]):
+            try:
+                other_track_path = Path(df_sample[other_track_col].values[0])
+                if other_track_path.exists():
+                    other_track_img = load_image(other_track_path)
+                    other_track_img = np.expand_dims(other_track_img, axis=1)
+                    other_track_img = da.tile(other_track_img, (1, raw_img.shape[-4], 1, 1, 1))
+                    
+                    trackid_data[f"{other_ct}_TrackID"] = {
+                        "img": other_track_img,
+                        "type": "label"
+                    }
+            except Exception as e:
+                print(f"  ⚠️  Could not load {other_ct} tracks: {e}")
+    
+    # Load dead mask if available
+    dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+    if dead_mask_path.exists():
+        try:
+            dead_mask = load_zarr(dead_mask_path)
+            dead_mask = np.expand_dims(dead_mask, axis=1)
+            dead_mask = da.tile(dead_mask, (1, raw_img.shape[-4], 1, 1, 1))
+            trackid_data["Dead_Mask"] = {
+                "img": dead_mask,
+                "type": "label"
+            }
+        except Exception as e:
+            print(f"  ⚠️  Could not load dead mask: {e}")
+    
+    # Select columns to backproject
+    if columns == []:
+        columns = [x for x in df_tracks_clustered.columns 
+                   if x not in metadata.columns.tolist() + ["TrackID", "UMAP1", "UMAP2"]]
+    
+    # DON'T strip 'mean_' prefix - both time and mean CSVs have mean_intensity_ch* columns
+    # (not intensity_ch* as we initially thought)
+    
+    # Check if dead channel exists
+    has_dead_channel = "dead_channel" in df_sample.columns and pd.notna(df_sample["dead_channel"].values[0])
+    
+    # ALWAYS filter columns (even if pre-selected in UI)
+    valid_columns = []
+    for col in columns:
+        # Skip if column doesn't exist in dataframe
+        if col not in df_tracks_clustered.columns:
+            print(f"  Skipping missing column: {col}")
+            continue
+        
+        # Skip string columns
+        if col.startswith('touching_') or col == 'orientation_vector':
+            print(f"  Skipping string column: {col}")
+            continue
+        
+        # Skip dead features if no dead channel
+        if not has_dead_channel and ('dead' in col.lower() or col == 'is_dead'):
+            print(f"  Skipping dead feature (no dead channel): {col}")
+            continue
+        
+        # Only include numeric columns
+        if pd.api.types.is_numeric_dtype(df_tracks_clustered[col]):
+            valid_columns.append(col)
+        else:
+            print(f"  Skipping non-numeric column: {col}")
+    
+    columns = valid_columns
+    print(f"- Backprojecting {len(columns)} features onto each segment")
     backprojected_cols = backproject_columns(
         track_img=filt_track_img,
         df_tracks_clustered=df_tracks_clustered,
         zarr_outpath=backproj_out_path,
         columns=columns
-        )
+    )
     
+    # Mark ClusterID as label type
     label_columns = ["ClusterID"]
     for col in backprojected_cols.keys():
-        ### Repeat the image so it fits with the raw image dimensionsw
-        backprojected_cols[col]["img"] = da.tile(backprojected_cols[col]["img"], (1,raw_img.shape[-4],1,1,1))
+        backprojected_cols[col]["img"] = da.tile(backprojected_cols[col]["img"], (1, raw_img.shape[-4], 1, 1, 1))
         if col in label_columns:
             backprojected_cols[col]["type"] = "label"
     
-    trackid_data["filtered_Tcell_TrackID"]["img"] = da.tile(trackid_data["filtered_Tcell_TrackID"]["img"], (1,raw_img.shape[-4],1,1,1))
+    trackid_data[f"filtered_{cell_type}_TrackID"]["img"] = da.tile(
+        trackid_data[f"filtered_{cell_type}_TrackID"]["img"], (1, raw_img.shape[-4], 1, 1, 1))
     
     backproject_data = {**trackid_data, **backprojected_cols}
     visualize_data = {**raw_img_data, **backproject_data}
     
     print("- Visualizing backprojection in napari")
-    viewer = view_napari(
-        visualize_data, 
+    viewer = view_napari_generic(
+        visualize_data,
         df_tracks_full=df_tracks_all,
-        df_tracks_clustered=df_tracks_full_clustered, 
-        elsize=elsize)
+        df_tracks_clustered=df_tracks_clustered,
+        cell_type=cell_type,
+        elsize=elsize
+    )
     
-    # if save:
-    #     # Output to .h5 format
-    #     save_backprojection(
-    #         backproj_out_path=backproj_out_path,
-    #         backprojection_data=backproject_data,
-    #         elsize=elsize
-    #     )
     end_time = time.time()
-    h,m,s = format_time(start_time, end_time)
+    h, m, s = format_time(start_time, end_time)
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
+    
+    print(f"\n✅ Backprojection finished (napari was launched inside the function).")
     return viewer
-    # return({
-    #     "path": backproj_out_path,
-    #     "data": visualize_data,
-    #     "elsize": elsize
-    #     })
+
 
 def load_backprojection_h5(backprojection_h5_path):
     data_dict = {}
@@ -187,190 +324,11 @@ def load_backprojection_h5(backprojection_h5_path):
             else:
                 data_type="image"
             data_dict[dataset_name] = {
-                'img': dataset[:],  # Assuming dataset is your actual data
+                'img': dataset[:],
                 'type': data_type
             }
     return(data_dict)
 
-
-def backproject_time_features_behav3d(
-    metadata,
-    sample_name,
-    config=None,
-    output_dir=None,
-    cell_type = "tcell",
-    columns=[],
-    save=False
-    ):
-    
-    print(f"--------------- Backprojecting for {sample_name} ---------------")
-    start_time = time.time()
-
-    assert config is not None or all(
-        [output_dir, metadata is not None]
-    ), "Either 'config' or 'output_dir and metadata' parameters must be supplied"
-    
-    if not all([output_dir, metadata is not None]):
-        output_dir = config['output_dir']
-        metadata = pd.read_csv(config["metadata_csv_path"])
-        
-    analysis_outdir = Path(output_dir, "analysis", "tcell")
-    results_outdir = Path(analysis_outdir, "results")
-    backproj_outdir = Path(analysis_outdir, "backprojection")
-    feature_outdir = Path(analysis_outdir, "track_features")
-    img_outdir = Path(output_dir, "images", sample_name)
-    
-    if not backproj_outdir.exists():
-        backproj_outdir.mkdir(parents=True)
-        
-    df_sample = metadata[metadata["sample_name"]==sample_name]
-    assert(sample_name in df_sample["sample_name"].values), f"Supplied sample name {sample_name} not in metadata"
- 
-    raw_img_path = Path(df_sample["raw_image_path"].values[0])
-    
-    track_img_path = Path(df_sample["tcell_tracks_image_path"].values[0])
-    
-    org_track_img_path = Path(df_sample["organoid_tracks_image_path"].values[0])
-
-    if "organoid_2_tracks_image_path" in df_sample.columns and pd.notna(df_sample["organoid_2_tracks_image_path"].values[0]):
-        two_org_types = True
-        org2_track_img_path = Path(df_sample["organoid_2_tracks_image_path"].values[0])
-    else:
-        two_org_types = False
-    df_tracks_path = Path(df_sample["tcell_tracks_csv_path"].values[0])
-    
-    df_tracks_full_clustered_path = Path(results_outdir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv")
-    df_tracks_full_clustered = pd.read_csv(df_tracks_full_clustered_path)
-    df_tracks_full_clustered = df_tracks_full_clustered[df_tracks_full_clustered["sample_name"]==sample_name]
-    
-    df_tracks_all_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
-    df_tracks_all = pd.read_csv(df_tracks_all_path)
-    df_tracks_all = df_tracks_all[df_tracks_all["sample_name"]==sample_name]
-    
-    elsize = [
-        df_sample["pixel_distance_z"].values[0],
-        df_sample["pixel_distance_xy"].values[0],
-        df_sample["pixel_distance_xy"].values[0]
-        ]
-    
-    backproj_out_path = Path(backproj_outdir, f"{get_filepath_stem(track_img_path)}_backprojected.zarr")
-    raw_img = load_image(raw_img_path)
-    
-    raw_img_data = {
-            "raw_data":{
-                "img":raw_img,
-                "type":"image"
-                }
-            }
-    
-    print("- Loading in tracked segments")
-    track_img = load_image(track_img_path)
-    org_track_img = load_image(org_track_img_path)
-    
-    track_img = np.expand_dims(track_img, axis=1)
-    org_track_img = np.expand_dims(org_track_img, axis=1)
-    org_track_img = da.tile(org_track_img, (1,raw_img.shape[-4],1,1,1))
-    
-    dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
-    dead_mask = load_zarr(dead_mask_path)
-    dead_mask = np.expand_dims(dead_mask, axis=1)
-    dead_mask = da.tile(dead_mask, (1,raw_img.shape[-4],1,1,1))
-    
-    df_tracks_clustered=pd.read_csv(Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_clusters.csv"))
-    filt_track_img = np.where(np.isin(track_img, df_tracks_clustered["TrackID"].unique()), track_img, 0)
-    
-    track_img = da.tile(track_img, (1,raw_img.shape[-4],1,1,1))
-    
-    if two_org_types:
-        org2_track_img = load_image(org2_track_img_path)
-        org2_track_img = np.expand_dims(org2_track_img, axis=1)
-        org2_track_img = da.tile(org2_track_img, (1,raw_img.shape[-4],1,1,1))
-    
-    trackid_data = {
-        "Tcell_TrackID":{
-            "img":track_img, 
-            "type":"label"
-            },
-        "filtered_Tcell_TrackID":{
-            "img":filt_track_img, 
-            "type":"label"
-            },
-        "Organoid_TrackID":{
-            "img":org_track_img, 
-            "type":"label"
-            },
-        "Dead_Mask":{  
-            "img":dead_mask, 
-            "type":"label"
-            }
-        }
-    
-    if two_org_types:    
-        trackid_data["Organoid2_TrackID"] = {
-            "img":org2_track_img, 
-            "type":"label"
-            }
-    
-    if columns==[]:
-        columns=[x for x in df_tracks_clustered.columns if x not in metadata.columns.tolist()+["TrackID", "UMAP1", "UMAP2"]]
-        
-    print("- Backprojecting all features onto each segment")
-    backprojected_cols = backproject_columns(
-        track_img=filt_track_img,
-        df_tracks_clustered=df_tracks_clustered,
-        zarr_outpath=backproj_out_path,
-        columns=columns
-        )
-    
-    label_columns = ["ClusterID"]
-    for col in backprojected_cols.keys():
-        ### Repeat the image so it fits with the raw image dimensionsw
-        backprojected_cols[col]["img"] = da.tile(backprojected_cols[col]["img"], (1,raw_img.shape[-4],1,1,1))
-        if col in label_columns:
-            backprojected_cols[col]["type"] = "label"
-    
-    trackid_data["filtered_Tcell_TrackID"]["img"] = da.tile(trackid_data["filtered_Tcell_TrackID"]["img"], (1,raw_img.shape[-4],1,1,1))
-    
-    backproject_data = {**trackid_data, **backprojected_cols}
-    visualize_data = {**raw_img_data, **backproject_data}
-    
-    print("- Visualizing backprojection in napari")
-    viewer = view_napari(
-        visualize_data, 
-        df_tracks_full=df_tracks_all,
-        df_tracks_clustered=df_tracks_full_clustered, 
-        elsize=elsize)
-    
-    # if save:
-    #     # Output to .h5 format
-    #     save_backprojection(
-    #         backproj_out_path=backproj_out_path,
-    #         backprojection_data=backproject_data,
-    #         elsize=elsize
-    #     )
-    end_time = time.time()
-    h,m,s = format_time(start_time, end_time)
-    print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
-    return viewer
-    # return({
-    #     "path": backproj_out_path,
-    #     "data": visualize_data,
-    #     "elsize": elsize
-    #     })
-
-def load_backprojection_h5(backprojection_h5_path):
-    data_dict = {}
-    with h5py.File(backprojection_h5_path, 'r') as backproj_h5:
-        for dataset_name, dataset in backproj_h5.items():
-            if 'type' in dataset.attrs:
-                data_type=dataset.attrs['type']
-            else:
-                data_type="image"
-            data_dict[dataset_name] = {
-                'img': dataset[:],  # Assuming dataset is your actual data
-                'type': data_type
-            }
-    return(data_dict)
 
 def backproject_columns(
     track_img,
@@ -405,6 +363,7 @@ def backproject_columns(
                     group=col
                     )
         return(mapped_imgs)
+
         
 def view_napari(
     backproject_data,
@@ -412,34 +371,69 @@ def view_napari(
     df_tracks_clustered,
     elsize
     ):
+    """Legacy function for backward compatibility"""
+    return view_napari_generic(
+        backproject_data,
+        df_tracks_full,
+        df_tracks_clustered,
+        cell_type="tcell",
+        elsize=elsize
+    )
+
+
+def view_napari_generic(
+    backproject_data,
+    df_tracks_full,
+    df_tracks_clustered,
+    cell_type,
+    elsize
+    ):
+    """
+    Generic napari viewer for any cell type.
     
-    viewer=napari.Viewer()
+    Args:
+        backproject_data: Dict of data layers to visualize
+        df_tracks_full: DataFrame with all tracks (time-varying, for positions)
+        df_tracks_clustered: DataFrame with clustered tracks (may be summarized or time-varying)
+        cell_type: Cell type being visualized
+        elsize: Element size for scaling
+    """
     
-    for idx, (k,v) in enumerate(backproject_data.items()):
-        v["img"] = np.transpose(v["img"], (1,0,2,3,4))
-        if v["type"]=="label" or v["type"]=="segment":
+    viewer = napari.Viewer()
+    
+    for idx, (k, v) in enumerate(backproject_data.items()):
+        v["img"] = np.transpose(v["img"], (1, 0, 2, 3, 4))
+        if v["type"] == "label" or v["type"] == "segment":
             viewer.add_labels(v["img"], name=k, scale=elsize)
         else:
             viewer.add_image(v["img"], name=k, scale=elsize, colormap='inferno')
-    for lay in viewer.layers: lay.visible = False
     
-    napari_tracks_clustered = df_tracks_clustered[["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
+    for lay in viewer.layers:
+        lay.visible = False
+    
+    # For napari tracks: need time-varying positions with ClusterID
+    # df_tracks_full always has positions, df_tracks_clustered has ClusterID
+    df_for_napari = pd.merge(df_tracks_full, df_tracks_clustered[["TrackID", "ClusterID"]], on='TrackID', how='left')
+    
+    napari_tracks_clustered = df_for_napari[["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
     features = {
-        'ClusterID': df_tracks_clustered["ClusterID"].to_numpy()
+        'ClusterID': df_for_napari["ClusterID"].to_numpy()
     }
     napari_tracks_full = df_tracks_full[["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
 
-    viewer.add_tracks(napari_tracks_clustered, name='Filtered T-cell Tracks', properties=features, features=features, color_by="ClusterID", tail_length=75)
-    viewer.add_tracks(napari_tracks_full, name='All T-cell Tracks',  tail_length=75)
-    napari.run()  
-    return(viewer)
+    viewer.add_tracks(napari_tracks_clustered, name=f'Filtered {cell_type} Tracks', 
+                      properties=features, features=features, color_by="ClusterID", tail_length=75)
+    viewer.add_tracks(napari_tracks_full, name=f'All {cell_type} Tracks', tail_length=75)
+    napari.run()
+    return viewer
     
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser = argparse.ArgumentParser(description='Input parameters for automatic data transfer.')
     parser.add_argument('-c', '--config', type=str, help='path to a config.yml file that stores all required paths', required=False)
     args = parser.parse_args()
     with open(args.config, "r") as parameters:
-        config=yaml.load(parameters, Loader=yaml.SafeLoader)
-    # metadata = pd.read_csv(config["metadata_csv_path"])
-    backproject_behav3d(config)
+        config = yaml.load(parameters, Loader=yaml.SafeLoader)
+    # Use generic backprojection
+    backproject_generic(config=config)
