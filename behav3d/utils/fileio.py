@@ -467,53 +467,55 @@ def convert_file_to_zarr(
     
 def convert_input_files_to_zarr(
     sample_name,
-    tcell_segments_path,
-    organoid_segments_path,
+    current_cell_segments_path,
     raw_image_path,
-    output_dir = None,
+    output_dir=None,
     chunks=None,
     overwrite=False
     ):
+    """
+    Convert cell segments and raw image to .zarr format for memory efficiency.
     
-    tcell_segments_path = Path(tcell_segments_path)
-    organoid_segments_path = Path(organoid_segments_path)
+    Args:
+        sample_name: Name of the sample
+        current_cell_segments_path: Path to the current cell type's segments (any cell type)
+        raw_image_path: Path to raw image
+        output_dir: Output directory for zarr files
+        chunks: Chunk size for zarr arrays
+        overwrite: Whether to overwrite existing zarr files
+        
+    Returns:
+        Tuple of output paths (current_cell_zarr, raw_image_zarr)
+    """
+    
+    current_cell_segments_path = Path(current_cell_segments_path)
     raw_image_path = Path(raw_image_path)
     
+    # Extract cell type from filename
+    filename = current_cell_segments_path.stem
+    
     if output_dir is None:
-        tcell_zarr_out_path = Path(tcell_segments_path, f"{sample_name}_tcell_tracked.zarr")
-        organoid_zarr_out_path = Path(organoid_segments_path, f"{sample_name}_organoid_tracked.zarr")
-        raw_image_zarr_out_path = Path(raw_image_path, f"{sample_name}.zarr")
-    else:   
-        tcell_zarr_out_path = Path(output_dir, f"{sample_name}_tcell_tracked.zarr")
-        organoid_zarr_out_path = Path(output_dir, f"{sample_name}_organoid_tracked.zarr")
+        current_cell_zarr_out_path = current_cell_segments_path if current_cell_segments_path.suffix == ".zarr" or str(current_cell_segments_path).endswith(".zarr") else Path(current_cell_segments_path.parent, f"{filename}.zarr")
+        raw_image_zarr_out_path = raw_image_path if raw_image_path.suffix == ".zarr" or str(raw_image_path).endswith(".zarr") else Path(raw_image_path.parent, f"{sample_name}.zarr")
+    else:
+        current_cell_zarr_out_path = Path(output_dir, f"{filename}.zarr")
         raw_image_zarr_out_path = Path(output_dir, f"{sample_name}.zarr")
     
     convert_file_to_zarr(
-            path=tcell_segments_path, 
-            outpath=tcell_zarr_out_path, 
-            chunks=chunks,
-            overwrite=overwrite
-            )
-
-    convert_file_to_zarr(
-            path=organoid_segments_path, 
-            outpath=organoid_zarr_out_path, 
-            chunks=chunks,
-            overwrite=overwrite
-            )
-    
-    convert_file_to_zarr(
-            path=raw_image_path, 
-            outpath=raw_image_zarr_out_path, 
-            chunks=chunks,
-            overwrite=overwrite
-            )
-    
-    return(
-        tcell_zarr_out_path,
-        organoid_zarr_out_path,
-        raw_image_zarr_out_path
+        path=current_cell_segments_path, 
+        outpath=current_cell_zarr_out_path, 
+        chunks=chunks,
+        overwrite=overwrite
     )
+    
+    convert_file_to_zarr(
+        path=raw_image_path, 
+        outpath=raw_image_zarr_out_path, 
+        chunks=chunks,
+        overwrite=overwrite
+    )
+    
+    return (current_cell_zarr_out_path, raw_image_zarr_out_path)
     
 def load_elsizes(path):
     path = Path(path)

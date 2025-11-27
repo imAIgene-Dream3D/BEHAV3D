@@ -90,30 +90,44 @@ def summarize_track_features(
     means = means.rename(columns={col: f"mean_{col}" for col in num_bool_cols})
     df_summarized_tracks = pd.merge(df_summarized_tracks, means, on=['sample_name','TrackID'], how='left')
 
-    # df_summarized_tracks['mean_dead_dye'] = grouped_df_tracks['mean_dead_dye'].mean().reset_index()["mean_dead_dye"]
-    # df_summarized_tracks['mean_MSD'] =  grouped_df_tracks['mean_square_displacement'].mean().reset_index()['mean_square_displacement']
-    # df_summarized_tracks['mean_speed'] =  grouped_df_tracks['speed'].mean().reset_index()['speed']
-    # df_summarized_tracks['mean_organoid_contact'] =  grouped_df_tracks['organoid_contact'].mean().reset_index()['organoid_contact']
-    # df_summarized_tracks['mean_tcell_contact'] =  grouped_df_tracks['tcell_contact'].mean().reset_index()['tcell_contact']
-    # df_summarized_tracks['mean_displacement'] =  grouped_df_tracks['displacement'].mean().reset_index()['displacement']
-    df_summarized_tracks['dies'] =  grouped_df_tracks['dead'].any().reset_index()["dead"]
+    # Dies column (if dead column exists)
+    if 'dead' in df_tracks.columns:
+        df_summarized_tracks['dies'] = grouped_df_tracks['dead'].any().reset_index()["dead"]
     
-    # For some values, take the maximum of the track such as "displacement_from_origin"
-    df_summarized_tracks['displacement_from_origin'] =  grouped_df_tracks['displacement_from_origin'].last().reset_index()['displacement_from_origin']
-    df_summarized_tracks['cumulative_displacement'] =  grouped_df_tracks['cumulative_displacement'].last().reset_index()['cumulative_displacement']
+    # For cumulative/displacement features: max for displacement_from_origin, last for cumulative_displacement
+    if 'displacement_from_origin' in df_tracks.columns:
+        df_summarized_tracks['displacement_from_origin'] = grouped_df_tracks['displacement_from_origin'].max().reset_index()['displacement_from_origin']
+    if 'cumulative_displacement' in df_tracks.columns:
+        df_summarized_tracks['cumulative_displacement'] = grouped_df_tracks['cumulative_displacement'].last().reset_index()['cumulative_displacement']
     
+    # Calculate active contact percentage for all *_contact columns (generic for any cell type)
     if not imaris:
-        # Calculate for the contact that occurs, what percentage has been active contact
-        # As it only takes points of contact, this can mean the mean contact is 1% (0.01)
-        # while the active contact can then still be 100% (1.0)
-        def calculate_active_contact_when_contact(group):
-            if group['tcell_contact'].any():
-                return group[group['tcell_contact']]['active_tcell_contact'].mean()
-            else:
-                return 0
-        df_summarized_tracks['active_tcell_contact'] = grouped_df_tracks.apply(calculate_active_contact_when_contact).reset_index(drop=True)
+        contact_cols = [col for col in df_tracks.columns if col.endswith('_contact') and not col.startswith('active_')]
+        for contact_col in contact_cols:
+            active_col = f"active_{contact_col}"
+            if active_col in df_tracks.columns:
+                def calculate_active_contact_when_contact(group, contact_col=contact_col, active_col=active_col):
+                    if group[contact_col].any():
+                        return group[group[contact_col]][active_col].mean()
+                    else:
+                        return 0
+                # Use include_groups=False for pandas >= 2.1.0 compatibility
+                result = grouped_df_tracks.apply(calculate_active_contact_when_contact, include_groups=False)
+                # Extract just the values (in case it returns a DataFrame)
+                if isinstance(result, pd.DataFrame):
+                    result = result.iloc[:, 0]
+                df_summarized_tracks[active_col] = result.values
 
-    df_trackinfo = df_tracks[['TrackID', 'sample_name','well', 'exp_nr', 'organoid_line', 'tcell_line']].drop_duplicates()
+    # Dynamically detect metadata columns (well, exp_nr, and any *_line columns)
+    metadata_cols = ['TrackID', 'sample_name']
+    for col in ['well', 'exp_nr']:
+        if col in df_tracks.columns:
+            metadata_cols.append(col)
+    # Add all *_line_condition columns (e.g., tcell_line_condition, organoid_line_condition, macrophage_line_condition, etc.)
+    line_cols = [col for col in df_tracks.columns if col.endswith('_line_condition')]
+    metadata_cols.extend(line_cols)
+    
+    df_trackinfo = df_tracks[metadata_cols].drop_duplicates()
     df_summarized_tracks = pd.merge(df_trackinfo, df_summarized_tracks, how="left")
     # Write the summarized features to a .csv
     summ_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_summarized.csv")
