@@ -240,9 +240,9 @@ def filter_cell_tracks(
         # Don't subtract 1 for real time units (hours)
     else:  # frames
         time_column="position_t"
-        exp_duration = exp_duration-1
-        min_track_length = min_track_length-1
-        max_track_length = max_track_length-1
+        exp_duration = exp_duration-1 if exp_duration is not None else None
+        min_track_length = min_track_length-1 if min_track_length is not None else None
+        max_track_length = max_track_length-1 if max_track_length is not None else None
     
     df_all_tracks_filt = df_all_tracks_filt.sort_values(group_cols + [time_column]).reset_index(drop=True)
 

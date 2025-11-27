@@ -840,7 +840,7 @@ def interpolate_missing_positions(
     
     # Auto-detect contact columns if not specified
     if cols_to_copy is None:
-        cols_to_copy = ["sample_name", "TrackID", "distance_unit", "time_unit", "orientation_vector"]
+        cols_to_copy = ["sample_name", "TrackID", "distance_unit", "time_unit", "orientation_vector", "principal_axes"]
         
         # Add all dynamically-generated contact columns
         for col in df_tracks.columns:
@@ -1545,7 +1545,7 @@ def _calculate_morphology_single_timepoint(args):
         properties["axis3_length"] = axis_length_c_list
         properties["oblateness"] = oblateness_list
         properties["prolateness"] = prolateness_list
-        properties["principal_axes"] = principal_axes_list  # columns: a,b,c
+        # properties["principal_axes"] = principal_axes_list  # columns: a,b,c
 
     # ---- FIXED ORIENTATION COMPUTATION (O(R) instead of O(R^2)) ----
     tensor_columns = [f"inertia_tensor-{i}-{j}" for i in range(3) for j in range(3)]

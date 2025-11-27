@@ -43,6 +43,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 from behav3d.utils.fileio import load_zarr
 from behav3d.utils.preprocessing import calc_z_projection
 
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
 import imageio_ffmpeg as iioff
 
 SignalType = Literal["binary", "count", "bounded", "continuous"]
@@ -268,55 +270,87 @@ def compute_fraction_near_bounds(signal_values: np.ndarray, lower_bound=0.0, upp
         float(np.mean(signal_values[valid] >= upper_cutoff))
     )
 
-def compute_window_features(
-    window_dataframe: pd.DataFrame, 
-    column_name: str, 
-    time_column: str = "position_t",
-    signal_types = None,
-    ) -> Dict[str, float]:
-    """
-    Compute descriptive, robust, and temporal features for one signal column in a windowed dataframe.
-    Each feature has a self-descriptive name and units inferred from context.
-    """
+def _compute_motion_features_from_xyz(px, py, pz):
+    coords = np.column_stack([px, py, pz]).astype(float, copy=False)
+    coords_rel = coords - coords[0]
+
+    steps = np.diff(coords_rel, axis=0)
+    if steps.size == 0:
+        return {
+            "summed_displacement": 0.0,
+            "net_displacement": 0.0,
+            "straightness": 0.0,
+            "directional_persistence": 0.0,
+            "median_turning_angle": 0.0,
+            "fraction_reversed_movement": 0.0,
+        }
+
+    step_len = np.linalg.norm(steps, axis=1)
+    path_length = float(np.nansum(step_len))
+    net_disp = float(np.linalg.norm(coords_rel[-1] - coords_rel[0]))
+    straightness = (net_disp / path_length) if path_length > 0 else 0.0
+
+    norms = step_len[:, None]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = np.divide(steps, norms, out=np.zeros_like(steps), where=norms > 0)
+
+    if u.shape[0] >= 2:
+        dots = np.sum(u[1:] * u[:-1], axis=1)
+        dots = np.clip(dots, -1.0, 1.0)
+        turn_angles = np.arccos(dots)
+        mean_persist = float(np.nanmean(dots)) if dots.size else 0.0
+        median_turn = float(np.nanmedian(turn_angles)) if turn_angles.size else 0.0
+        frac_reversed = float(np.mean(dots < 0)) if dots.size else 0.0
+    else:
+        mean_persist = 0.0
+        median_turn = 0.0
+        frac_reversed = 0.0
+
+    return {
+        "summed_displacement": path_length,
+        "net_displacement": net_disp,
+        "straightness": straightness,
+        "directional_persistence": mean_persist,
+        "median_turning_angle": median_turn,
+        "fraction_reversed_movement": frac_reversed,
+    }
+    
+def compute_window_features(window_dataframe, column_name, time_column="position_t", signal_types=None):
+    # NOTE: assumes window_dataframe already sorted by time_column upstream
     if time_column in window_dataframe.columns:
-        window_dataframe = window_dataframe.sort_values(time_column, kind="mergesort")
-        time_values = window_dataframe[time_column].to_numpy(float)
+        time_values = window_dataframe[time_column].to_numpy(float, copy=False)
     else:
         time_values = None
 
-    signal_values = window_dataframe[column_name].to_numpy(float)
-    signal_type = signal_types.get(column_name, "continuous")
-    features: Dict[str, float] = {}
+    signal_values = window_dataframe[column_name].to_numpy(float, copy=False)
+    signal_type = signal_types.get(column_name, "continuous") if signal_types is not None else "continuous"
 
+    features = {}
     features[f"{column_name}_inferred_signal_type"] = signal_type
-    
-    # --- Basic statistics ---
+
     features[f"{column_name}_mean_value"] = compute_mean_value(signal_values)
-    
+
     if signal_type != "binary":
         features[f"{column_name}_value_range"] = compute_value_range(signal_values)
         features[f"{column_name}_standard_deviation"] = compute_standard_deviation(signal_values)
         features[f"{column_name}_minimum_value"] = compute_minimum_value(signal_values)
         features[f"{column_name}_maximum_value"] = compute_maximum_value(signal_values)
         features[f"{column_name}_median_value"] = compute_median_value(signal_values)
-        
-    # --- Robust statistics ---
-    if signal_type != "binary":
+
         features[f"{column_name}_interquartile_range"] = compute_interquartile_range(signal_values)
         features[f"{column_name}_median_absolute_deviation"] = compute_median_absolute_deviation(signal_values)
 
-    # --- Quantiles ---
-    if signal_type != "binary":
         for q in [0.1, 0.25, 0.75, 0.9]:
             features[f"{column_name}_quantile_{int(q*100)}percent"] = compute_quantile(signal_values, q)
 
-    # --- Temporal structure ---
-    features[f"{column_name}_linear_trend_slope_per_time_unit"] = compute_linear_trend_slope(signal_values, time_values)
+    features[f"{column_name}_linear_trend_slope_per_time_unit"] = compute_linear_trend_slope(
+        signal_values, time_values
+    )
     features[f"{column_name}_lag1_autocorrelation"] = compute_lag1_autocorrelation(signal_values)
+
     if signal_type != "binary":
         features[f"{column_name}_mean_absolute_first_difference"] = compute_mean_absolute_first_difference(signal_values)
 
-    # --- Type-specific extras ---
     if signal_type == "bounded":
         low_frac, high_frac = compute_fraction_near_bounds(signal_values)
         features[f"{column_name}_fraction_near_lower_bound"] = low_frac
@@ -324,182 +358,183 @@ def compute_window_features(
 
     if signal_type == "binary":
         binary_signal = convert_to_binary(signal_values)
-        # features[f"{column_name}_proportion_true"] = float(np.nanmean(binary_signal))
         features[f"{column_name}_transition_rate"] = compute_binary_transition_rate(binary_signal)
         features[f"{column_name}_longest_true_length"] = compute_longest_true_run_length(binary_signal)
         features[f"{column_name}_average_true_length"] = compute_average_true_run_length(binary_signal)
         features[f"{column_name}_longest_false_length"] = compute_longest_true_run_length(~binary_signal)
         features[f"{column_name}_average_false_length"] = compute_average_true_run_length(~binary_signal)
-    
+
     if signal_type == "count":
         finite = signal_values[np.isfinite(signal_values)]
         if finite.size:
             mean_val = np.mean(finite)
             var_val = np.var(finite)
-            features[f"{column_name}_dispersion_index_variance_over_mean"] = var_val / mean_val if mean_val > 0 else np.nan
+            features[f"{column_name}_dispersion_index_variance_over_mean"] = (
+                var_val / mean_val if mean_val > 0 else np.nan
+            )
             features[f"{column_name}_fraction_of_zeros"] = float(np.mean(finite == 0))
         else:
             features[f"{column_name}_dispersion_index_variance_over_mean"] = np.nan
             features[f"{column_name}_fraction_of_zeros"] = np.nan
-            
-    px = window_dataframe["position_x"].to_numpy(float)
-    py = window_dataframe["position_y"].to_numpy(float)
-    pz = window_dataframe["position_z"].to_numpy(float)
-    coords = np.column_stack([px, py, pz])
 
-    # Rebase so that the first point is the origin (doesn't change straightness/directionality)
-    coords_rel = coords - coords[0]
-
-    # Step vectors and lengths
-    steps = np.diff(coords_rel, axis=0)
-    if steps.size == 0:
-        # Degenerate window (<=1 point)
-        features["summed_displacement"] = 0.0
-        features["net_displacement"] = 0.0
-        features["straightness"] = 0.0
-        #directional persistance (1: straight, 0: random, -1: reversal)
-        features["directional_persistence"] = 0.0                 
-        features["median_turning_angle"] = 0.0
-        features["fraction_reversed_movement"] = 0.0
-
-    else:
-        step_len = np.linalg.norm(steps, axis=1)
-        path_length = float(np.nansum(step_len))
-        net_disp = float(np.linalg.norm(coords_rel[-1] - coords_rel[0]))
-        straightness = (net_disp / path_length) if path_length > 0 else 0.0
-
-        # Normalize steps to unit vectors (leave zeros as zeros)
-        norms = step_len[:, None]
-        with np.errstate(divide='ignore', invalid='ignore'):
-            u = np.divide(steps, norms, out=np.zeros_like(steps), where=norms > 0)
-
-        # Directionality/persistence: cosine between successive unit step vectors
-        if u.shape[0] >= 2:
-            dots = np.sum(u[1:] * u[:-1], axis=1)
-            dots = np.clip(dots, -1.0, 1.0)  # numeric safety
-            # Turning angles (radians) between successive steps
-            turn_angles = np.arccos(dots)
-            mean_persist = float(np.nanmean(dots)) if dots.size else 0.0
-        else:
-            mean_persist = 0.0
-
-        # Expose a few helpful summary features (units noted in names where relevant)
-        features["summed_displacement"] = path_length
-        features["net_displacement"] = net_disp
-        features["straightness"] = straightness
-        #directional persistance (1: straight, 0: random, -1: reversal)
-        features["directional_persistence"] = mean_persist                 
-
-        
     return features
 
 
+def _process_track_worker(group_df, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types):
+    group_df = group_df.reset_index(drop=True)
+    n = len(group_df)
+    if n == 0:
+        return []
+
+    sample_val = group_df[id_cols[0]].iloc[0]
+    track_id_val = group_df[id_cols[1]].iloc[0]
+
+    t_all = group_df[time_col].to_numpy(float, copy=False) if time_col in group_df.columns else None
+    px_all = group_df["position_x"].to_numpy(float, copy=False)
+    py_all = group_df["position_y"].to_numpy(float, copy=False)
+    pz_all = group_df["position_z"].to_numpy(float, copy=False)
+
+    sig_arrays = {col: group_df[col].to_numpy(float, copy=False) for col in columns_to_summarize}
+
+    out_rows = []
+
+    # full-track mode
+    if window_size is None:
+        start_t = float(t_all[0]) if t_all is not None else 0.0
+        end_t = float(t_all[-1]) if t_all is not None else float(n - 1)
+
+        sub_track_id = f"{int(track_id_val)}_t{int(start_t)}-t{int(end_t)}"
+
+        base = {
+            id_cols[0]: sample_val,
+            id_cols[1]: track_id_val,
+            "sub_TrackID": sub_track_id,
+            f"window_start_{time_col}": start_t,
+            f"window_end_{time_col}": end_t,
+            "window_length_frames": n,
+        }
+
+        base.update(_compute_motion_features_from_xyz(px_all, py_all, pz_all))
+
+        # per-column signal features
+        for col in columns_to_summarize:
+            stype = signal_types.get(col, "continuous")
+            base.update(
+                compute_window_features(
+                    pd.DataFrame({col: sig_arrays[col], time_col: t_all}) if t_all is not None else pd.DataFrame({col: sig_arrays[col]}),
+                    col,
+                    time_column=time_col,
+                    signal_types={col: stype},
+                )
+            )
+
+        out_rows.append(base)
+        return out_rows
+
+    # sliding-window mode
+    if n < window_size:
+        return []
+
+    stride = step_size if step_size is not None else 1
+
+    for start_idx in range(0, n - window_size + 1, stride):
+        end_idx = start_idx + window_size
+
+        if t_all is not None:
+            t_win = t_all[start_idx:end_idx]
+            start_t = float(t_win[0])
+            end_t = float(t_win[-1])
+        else:
+            t_win = None
+            start_t = float(start_idx)
+            end_t = float(end_idx - 1)
+
+        sub_track_id = f"{int(track_id_val)}_t{int(start_t)}-t{int(end_t)}"
+
+        base = {
+            id_cols[0]: sample_val,
+            id_cols[1]: track_id_val,
+            "sub_TrackID": sub_track_id,
+            f"window_start_{time_col}": start_t,
+            f"window_end_{time_col}": end_t,
+            "window_length_frames": window_size,
+        }
+
+        base.update(
+            _compute_motion_features_from_xyz(
+                px_all[start_idx:end_idx],
+                py_all[start_idx:end_idx],
+                pz_all[start_idx:end_idx],
+            )
+        )
+
+        for col in columns_to_summarize:
+            stype = signal_types.get(col, "continuous")
+            sig_win = sig_arrays[col][start_idx:end_idx]
+
+            # minimal df wrapper to reuse original feature fns
+            if t_win is not None:
+                wdf = pd.DataFrame({col: sig_win, time_col: t_win})
+            else:
+                wdf = pd.DataFrame({col: sig_win})
+
+            base.update(
+                compute_window_features(
+                    wdf,
+                    col,
+                    time_column=time_col,
+                    signal_types={col: stype},
+                )
+            )
+
+        out_rows.append(base)
+
+    return out_rows
+
+
 def create_windowed_track_dataset(
-    df_tracks: pd.DataFrame,
-    columns_to_summarize: List[str],
-    window_size: Optional[int] = None,
-    step_size: Optional[int] = None,
-    time_col: str = "position_t",
-    id_cols: List[str] = ["sample_name", "TrackID"],
-    signal_types: Optional[Dict[str, str]] = None,
-    ):
-    """
-    Split each track into windows and compute descriptive features per window.
-    If window_size is None, compute features over the *entire track* (one window per track).
-
-    Parameters
-    ----------
-    df_tracks : DataFrame
-        Must include id_cols + time_col + the columns in columns_to_summarize.
-    columns_to_summarize : list[str]
-        Columns for which to compute per-window descriptive features.
-    window_size : int or None
-        Number of rows (frames) per window; if None, use full track as one window.
-    step_size : int or None
-        Stride between consecutive windows (ignored when window_size is None).
-        If None (and window_size is not None), defaults to window_size (non-overlapping windows).
-    time_col : str
-        Time column used to order and to label the window span in sub_TrackID.
-    id_cols : list[str]
-        Identifier columns for grouping (default ['sample_name','TrackID']).
-    signal_types : dict[str, str] or None
-        Optional pre-inferred global signal types per column. If None, will call infer_signal_types.
-
-    Returns
-    -------
-    DataFrame
-        One row per window with:
-        - sample_name, TrackID
-        - sub_TrackID like "534_t0-t50" (based on time_col values)
-        - window_start_<time_col>, window_end_<time_col>, window_length_frames
-        - computed features for each requested column
-    """
+    df_tracks,
+    columns_to_summarize,
+    window_size=None,
+    step_size=None,
+    time_col="position_t",
+    id_cols=["sample_name", "TrackID"],
+    signal_types=None,
+    n_jobs=None,      # None => os.cpu_count()
+    chunksize=8,      # tune if many small tracks
+):
     df_sorted = df_tracks.sort_values(id_cols + [time_col], kind="mergesort")
 
     if signal_types is None:
         signal_types = infer_signal_types(df_sorted, columns=columns_to_summarize)
 
+    groups = [g for _, g in df_sorted.groupby(id_cols, sort=False)]
+    total_groups = len(groups)
+
     output_rows = []
 
-    for _, group in tqdm(df_sorted.groupby(id_cols, sort=False), total=len(df_sorted[id_cols].drop_duplicates())):
-        group = group.reset_index(drop=True)
-        n = len(group)
-        if n == 0:
-            continue
-
-        if window_size is None:
-            window_df = group
-            start_t = window_df[time_col].iloc[0]
-            end_t   = window_df[time_col].iloc[-1]
-            track_id_val = window_df["TrackID"].iloc[0]
-            sub_track_id = f"{int(track_id_val)}_t{int(start_t)}-t{int(end_t)}"
-
-            base = {
-                id_cols[0]: window_df[id_cols[0]].iloc[0],
-                id_cols[1]: track_id_val,
-                "sub_TrackID": sub_track_id,
-                f"window_start_{time_col}": float(start_t),
-                f"window_end_{time_col}": float(end_t),
-                "window_length_frames": int(len(window_df)),
-            }
-            for col in columns_to_summarize:
-                base.update(
-                    compute_window_features(
-                        window_df, col, time_column=time_col, signal_types=signal_types
-                    )
-                )
-            output_rows.append(base)
-            continue  # next track
-
-        if n < window_size:
-            continue  # too short for any window
-
-        stride = step_size if step_size is not None else window_size
-
-        for start_idx in range(0, n - window_size + 1, stride):
-            end_idx = start_idx + window_size
-            window_df = group.iloc[start_idx:end_idx]
-
-            start_t = window_df[time_col].iloc[0]
-            end_t   = window_df[time_col].iloc[-1]
-            track_id_val = window_df["TrackID"].iloc[0]
-            sub_track_id = f"{int(track_id_val)}_t{int(start_t)}-t{int(end_t)}"
-
-            base = {
-                id_cols[0]: window_df[id_cols[0]].iloc[0],
-                id_cols[1]: track_id_val,
-                "sub_TrackID": sub_track_id,
-                f"window_start_{time_col}": float(start_t),
-                f"window_end_{time_col}": float(end_t),
-                "window_length_frames": int(len(window_df)),
-            }
-            for col in columns_to_summarize:
-                base.update(
-                    compute_window_features(
-                        window_df, col, time_column=time_col, signal_types=signal_types
-                    )
-                )
-            output_rows.append(base)
+    if n_jobs is None or n_jobs != 1:
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            futures = ex.map(
+                _process_track_worker,
+                groups,
+                [columns_to_summarize] * total_groups,
+                [window_size] * total_groups,
+                [step_size] * total_groups,
+                [time_col] * total_groups,
+                [id_cols] * total_groups,
+                [signal_types] * total_groups,
+                chunksize=chunksize,
+            )
+            for rows in tqdm(futures, total=total_groups):
+                if rows:
+                    output_rows.extend(rows)
+    else:
+        for g in tqdm(groups, total=total_groups):
+            rows = _process_track_worker(
+                g, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types
+            )
+            output_rows.extend(rows)
 
     result = pd.DataFrame(output_rows)
 
@@ -519,9 +554,9 @@ def drop_highly_correlated_features(
     threshold: float = 0.98,
     prefer_keep: list | None = None,
     also_drop_constant: bool = True,
-    redundancy_tolerance_abs: float = 0.02,
+    redundancy_tolerance_abs: float = 0.02,       # apply prefer_keep only if |Δredundancy| <= this
     redundancy_tolerance_rel: float = 0.05,
-    ):
+) -> tuple[pd.DataFrame, list, pd.DataFrame]:
     """
     Remove one feature from any pair with |corr| > threshold.
     Returns:
@@ -529,14 +564,16 @@ def drop_highly_correlated_features(
       dropped   : list of dropped feature names
       report    : DataFrame logging each decision: kept, dropped, correlation, reason
     """
+    # prefer_keep = set(prefer_keep or [])
     prefer_keep = [f for f in feature_cols if "median" in f]
     prefer_keep += [f for f in feature_cols if "mean" in f]
-
+    # Work on a numeric-only copy (keep order)
     X = df[feature_cols].copy()
-
+    # Cast non-numeric to numeric where possible, otherwise drop
     cols_ok = [c for c in X.columns if is_numeric_dtype(X[c])]
     X = X[cols_ok]
 
+    # Replace infs and optionally drop constants
     X = X.replace([np.inf, -np.inf], np.nan)
     dropped: list[str] = []
     decisions: list[dict] = []
@@ -559,6 +596,7 @@ def drop_highly_correlated_features(
         report = pd.DataFrame(decisions, columns=["kept_feature","dropped_feature","abs_correlation","reason"])
         return X, dropped, report
 
+    # Impute NaNs (mean) so corr works; PCA later will use its own scaling
     X_impute = X.fillna(X.mean(numeric_only=True))
 
     # Absolute correlation matrix and its upper triangle
