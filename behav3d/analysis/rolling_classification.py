@@ -48,12 +48,13 @@ random.seed(seed)
 np.random.seed(seed)
 
 if __name__ == "__main__":
-    ssd_dir = r"/Volumes/T7_Sam/"
-    # ssd_dir = r"F:/"
+    # ssd_dir = r"/Volumes/T7_Sam/"
+    ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
     metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv")
 
+    downloads_folder = r"C:/Users/Samde/Downloads"
     # output_dir = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
     # metadata_csv_path = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
 
@@ -74,7 +75,7 @@ if __name__ == "__main__":
     # chosen_intervals = 50
 
     window_size = 25
-    chosen_intervals = None
+    
 
     groupby=["sample_name", "TrackID"]
     features=[
@@ -91,37 +92,47 @@ if __name__ == "__main__":
         df_tracks=df_positions,
         columns_to_summarize=features,
         window_size = window_size,
-        step_size = chosen_intervals,
+        step_size = 1,
         time_col = "position_t",
         id_cols = ["sample_name", "TrackID"],
     )
 
+    # df_windows_descriptive.to_csv(r"C:\Users\Samde\Downloads\df_windows_descriptive.csv", index=False)
+    # df_windows_descriptive = pd.read_csv(r"C:\Users\Samde\Downloads\df_windows_descriptive.csv")
+    
+    chosen_intervals = 25
+    df_windows_subset = subset_windowed_tracks(
+        df_windowed=df_windows_descriptive,
+        step_size=chosen_intervals,
+    )
+    
     non_feature_cols = [
         "sample_name",
         "TrackID",
         "sub_TrackID",
+        "position_t",
         "window_start_position_t",
         "window_end_position_t",
         "window_length_frames",
     ]
 
+    df_analysis = df_windows_subset.copy()
     # Drop anything that ends with "_signal_type" or other metadata
     feature_cols = [
         col for col in df_windows_descriptive.columns
         if (col not in non_feature_cols)
         and (not col.endswith("_signal_type"))
     ]
+    df_analysis = df_analysis.dropna(subset=feature_cols)
 
     ### 1) Reduce redundancy of similar features
     X_reduced, dropped, report = drop_highly_correlated_features(
-        df=df_windows_descriptive,
+        df=df_analysis,
         feature_cols=feature_cols,
         threshold=0.95
     )
     print(f"Dropped {len(dropped)} features.")
     # report  # see which were kept vs dropped and why
-
-    df_analysis = df_windows_descriptive.copy()
 
     ### 2) Scale features and run PCA
     X_scaled = StandardScaler().fit_transform(X_reduced)
@@ -172,6 +183,15 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show()
 
+    plt.figure(figsize=(6,5))
+    sns.scatterplot(
+        data=df_analysis, x="UMAP1", y="UMAP2",
+        hue="cluster_label_leiden", palette="tab20",
+        s=10, alpha=0.8, edgecolor=None
+    )
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+    plt.title("UMAP colored by Leiden clusters (−1 = noise)")
+    
     plot_feature_cluster_heatmap(
         df_analysis,
         feature_cols=feature_cols,
@@ -179,6 +199,55 @@ if __name__ == "__main__":
         figsize=(8.27, 11.69),
     )
 
+    create_cluster_videos(
+        df_analysis,
+        df_positions,
+        output_folder= output_dir,
+        out_dir = downloads_folder,
+        # normalize_per_channel: bool = False,
+        fps = 6,
+        # dpi: int = 200,
+        margin = (20, 20, 20),
+        pmin = 0.0,
+        pmax = 99.99,
+        examples_per_cluster = 6,
+        # seed: int = 0,
+        # figsize_per_row=(12.0, 4.0),
+        # traj_pad_frac: float = 0.05,
+    )
+    
+    create_cluster_overview_video(
+        df_analysis,
+        df_positions,
+        output_folder=output_dir,
+        out_dir=downloads_folder,
+        examples_per_cluster=3,   # 1 example per cluster per row
+        fps=6,
+        margin = (20, 20, 20),
+        pmin = 0.0,
+        pmax = 99.99,
+        normalize_per_channel=True,
+        seed=1234
+        # figsize_per_example=(6.0, 3.0),  # smaller per example if many clusters
+    )
+
+    create_fulltrack_cluster_videos(
+        df_windows=df_analysis,
+        df_positions=df_positions,
+        output_folder=output_dir,  # folder containing images/<sample>/<sample>.zarr
+        out_dir=downloads_folder,
+        clusters=None,                # or e.g. [0, 1, 2]
+        fps=6,
+        margin=20,
+        track_color="#63ff33",
+        pmin=0.0,
+        pmax=99.99,
+        examples_per_cluster=4,
+        seed=1234,
+        normalize_per_channel=True,
+        mask_margin=False,
+    )
+    
 
 
 
@@ -274,14 +343,7 @@ if __name__ == "__main__":
     plt.title("UMAP colored by HDBSCAN clusters (−1 = noise)")
     plt.show()
 
-    plt.figure(figsize=(6,5))
-    sns.scatterplot(
-        data=df_analysis, x="UMAP1", y="UMAP2",
-        hue="cluster_label_leiden", palette="tab20",
-        s=10, alpha=0.8, edgecolor=None
-    )
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-    plt.title("UMAP colored by Leiden clusters (−1 = noise)")
+   
 
 
     plt.savefig(r"/Users/s.deblank-3/Downloads/umapLeiden.pdf", bbox_inches="tight")

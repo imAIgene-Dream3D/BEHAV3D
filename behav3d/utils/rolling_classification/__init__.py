@@ -379,8 +379,36 @@ def compute_window_features(window_dataframe, column_name, time_column="position
 
     return features
 
+def subset_windowed_tracks(
+    df_windowed, 
+    step_size, 
+    time_col="position_t",
+    id_cols=("sample_name", "TrackID"), 
+    keep="first"
+    ):
+    
+    df_windowed = df_windowed.dropna()
+    step_size = max(int(step_size), 1)
+    if step_size == 1:
+        return df_windowed
 
-def _process_track_worker(group_df, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types):
+    # ensure stable order within each track
+    dfw = df_windowed.sort_values(list(id_cols) + [time_col], kind="mergesort").copy()
+
+    if keep == "first":
+        rank = dfw.groupby(list(id_cols), sort=False).cumcount()
+        mask = (rank % step_size) == 0
+    elif keep == "last":
+        rank_from_end = dfw.groupby(list(id_cols), sort=False).cumcount(ascending=False)
+        mask = (rank_from_end % step_size) == 0
+    else:
+        raise ValueError("keep must be 'first' or 'last'")
+
+    return dfw.loc[mask].reset_index(drop=True)
+
+def _process_track_worker(
+    group_df, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types
+):
     group_df = group_df.reset_index(drop=True)
     n = len(group_df)
     if n == 0:
@@ -389,7 +417,9 @@ def _process_track_worker(group_df, columns_to_summarize, window_size, step_size
     sample_val = group_df[id_cols[0]].iloc[0]
     track_id_val = group_df[id_cols[1]].iloc[0]
 
-    t_all = group_df[time_col].to_numpy(float, copy=False) if time_col in group_df.columns else None
+    has_time = time_col in group_df.columns
+    t_all = group_df[time_col].to_numpy(float, copy=False) if has_time else None
+
     px_all = group_df["position_x"].to_numpy(float, copy=False)
     py_all = group_df["position_y"].to_numpy(float, copy=False)
     pz_all = group_df["position_z"].to_numpy(float, copy=False)
@@ -398,7 +428,9 @@ def _process_track_worker(group_df, columns_to_summarize, window_size, step_size
 
     out_rows = []
 
-    # full-track mode
+    # ---------------------------
+    # full-track mode (unchanged)
+    # ---------------------------
     if window_size is None:
         start_t = float(t_all[0]) if t_all is not None else 0.0
         end_t = float(t_all[-1]) if t_all is not None else float(n - 1)
@@ -409,6 +441,7 @@ def _process_track_worker(group_df, columns_to_summarize, window_size, step_size
             id_cols[0]: sample_val,
             id_cols[1]: track_id_val,
             "sub_TrackID": sub_track_id,
+            time_col: np.nan,  # <-- no single center timepoint in full-track mode
             f"window_start_{time_col}": start_t,
             f"window_end_{time_col}": end_t,
             "window_length_frames": n,
@@ -416,12 +449,16 @@ def _process_track_worker(group_df, columns_to_summarize, window_size, step_size
 
         base.update(_compute_motion_features_from_xyz(px_all, py_all, pz_all))
 
-        # per-column signal features
         for col in columns_to_summarize:
             stype = signal_types.get(col, "continuous")
+            df_for_feat = (
+                pd.DataFrame({col: sig_arrays[col], time_col: t_all})
+                if t_all is not None else
+                pd.DataFrame({col: sig_arrays[col]})
+            )
             base.update(
                 compute_window_features(
-                    pd.DataFrame({col: sig_arrays[col], time_col: t_all}) if t_all is not None else pd.DataFrame({col: sig_arrays[col]}),
+                    df_for_feat,
                     col,
                     time_column=time_col,
                     signal_types={col: stype},
@@ -431,54 +468,73 @@ def _process_track_worker(group_df, columns_to_summarize, window_size, step_size
         out_rows.append(base)
         return out_rows
 
-    # sliding-window mode
-    if n < window_size:
-        return []
-
+    # -----------------------------------------
+    # trailing-per-timepoint sliding window mode
+    # windows end at each selected timepoint
+    # -----------------------------------------
     stride = step_size if step_size is not None else 1
+    stride = max(int(stride), 1)
 
-    for start_idx in range(0, n - window_size + 1, stride):
-        end_idx = start_idx + window_size
+    nan_feature_template = None
 
-        if t_all is not None:
-            t_win = t_all[start_idx:end_idx]
-            start_t = float(t_win[0])
-            end_t = float(t_win[-1])
-        else:
-            t_win = None
-            start_t = float(start_idx)
-            end_t = float(end_idx - 1)
+    for end_idx in range(0, n, stride):
+        start_idx = end_idx - window_size + 1
 
+        # current/end timepoint
+        end_t = float(t_all[end_idx]) if t_all is not None else float(end_idx)
+
+        # Not enough history: emit NaNs for all features
+        if start_idx < 0:
+            row = {
+                id_cols[0]: sample_val,
+                id_cols[1]: track_id_val,
+                "sub_TrackID": f"{int(track_id_val)}_tNaN-t{int(end_t)}",
+                time_col: end_t,  # <-- keep center timepoint for merging
+                f"window_start_{time_col}": np.nan,
+                f"window_end_{time_col}": end_t,
+                "window_length_frames": np.nan,
+            }
+            if nan_feature_template is not None:
+                row.update(nan_feature_template)
+
+            out_rows.append(row)
+            continue
+
+        # Valid trailing window
+        start_t = float(t_all[start_idx]) if t_all is not None else float(start_idx)
         sub_track_id = f"{int(track_id_val)}_t{int(start_t)}-t{int(end_t)}"
 
-        base = {
+        row = {
             id_cols[0]: sample_val,
             id_cols[1]: track_id_val,
             "sub_TrackID": sub_track_id,
+            time_col: end_t,  # <-- center/endpoint timepoint for merging
             f"window_start_{time_col}": start_t,
             f"window_end_{time_col}": end_t,
             "window_length_frames": window_size,
         }
 
-        base.update(
+        # motion features for trailing window
+        row.update(
             _compute_motion_features_from_xyz(
-                px_all[start_idx:end_idx],
-                py_all[start_idx:end_idx],
-                pz_all[start_idx:end_idx],
+                px_all[start_idx:end_idx + 1],
+                py_all[start_idx:end_idx + 1],
+                pz_all[start_idx:end_idx + 1],
             )
         )
 
+        # per-column signal features over trailing window
         for col in columns_to_summarize:
             stype = signal_types.get(col, "continuous")
-            sig_win = sig_arrays[col][start_idx:end_idx]
+            sig_win = sig_arrays[col][start_idx:end_idx + 1]
 
-            # minimal df wrapper to reuse original feature fns
-            if t_win is not None:
+            if t_all is not None:
+                t_win = t_all[start_idx:end_idx + 1]
                 wdf = pd.DataFrame({col: sig_win, time_col: t_win})
             else:
                 wdf = pd.DataFrame({col: sig_win})
 
-            base.update(
+            row.update(
                 compute_window_features(
                     wdf,
                     col,
@@ -487,7 +543,26 @@ def _process_track_worker(group_df, columns_to_summarize, window_size, step_size
                 )
             )
 
-        out_rows.append(base)
+        # Build a NaN template based on first valid window
+        if nan_feature_template is None:
+            nan_feature_template = {
+                k: np.nan for k in row.keys()
+                if k not in [
+                    id_cols[0], id_cols[1], "sub_TrackID",
+                    time_col,
+                    f"window_start_{time_col}", f"window_end_{time_col}",
+                    "window_length_frames"
+                ]
+            }
+
+        out_rows.append(row)
+
+    # Backfill NaN feature keys for any early rows created before template existed
+    if nan_feature_template is not None:
+        for r in out_rows:
+            for k in nan_feature_template.keys():
+                if k not in r:
+                    r[k] = np.nan
 
     return out_rows
 
@@ -534,14 +609,17 @@ def create_windowed_track_dataset(
             rows = _process_track_worker(
                 g, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types
             )
-            output_rows.extend(rows)
+            if rows:
+                output_rows.extend(rows)
 
     result = pd.DataFrame(output_rows)
 
     if not result.empty:
         front_cols = [
             id_cols[0], id_cols[1], "sub_TrackID",
-            f"window_start_{time_col}", f"window_end_{time_col}", "window_length_frames"
+            time_col,  # <-- endpoint timepoint for merging
+            f"window_start_{time_col}", f"window_end_{time_col}",
+            "window_length_frames"
         ]
         other_cols = [c for c in result.columns if c not in front_cols]
         result = result[front_cols + other_cols]
