@@ -49,8 +49,25 @@ import imageio_ffmpeg as iioff
 
 from hmmlearn.hmm import GaussianHMM
 from sklearn.impute import SimpleImputer
+import scanpy as sc
 
 SignalType = Literal["binary", "count", "bounded", "continuous"]
+
+def df_to_adata(df, feature_cols, obs_cols=None):
+    """Create AnnData from df, store metadata in .obs."""
+    X = df[feature_cols].to_numpy()
+    adata = sc.AnnData(X)
+    adata.var_names = feature_cols
+    if obs_cols is not None:
+        adata.obs = df[obs_cols].copy()
+    return adata
+
+def adata_add_back_to_df(df, adata, cols_from_obs, prefix=None):
+    """Copy selected .obs columns back into df."""
+    for c in cols_from_obs:
+        newc = f"{prefix}{c}" if prefix else c
+        df[newc] = adata.obs[c].to_numpy()
+    return df
 
 def is_nonneg_int_like(values: np.ndarray) -> bool:
     vals = values[np.isfinite(values)]
@@ -755,7 +772,7 @@ def drop_highly_correlated_features(
             })
 
     if to_drop:
-        X = X.drop(columns=list(to_drop))
+        df = df.drop(columns=list(to_drop))
         dropped.extend(list(to_drop))
 
     report = pd.DataFrame(decisions, columns=["kept_feature","dropped_feature","abs_correlation","reason"])
@@ -766,7 +783,7 @@ def drop_highly_correlated_features(
         na_position="last"
     ).reset_index(drop=True)
 
-    return X, dropped, report
+    return df, dropped, report
 
 def plot_umap_feature_grid(
     df: pd.DataFrame,

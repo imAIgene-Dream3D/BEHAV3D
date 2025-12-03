@@ -51,8 +51,8 @@ random.seed(seed)
 np.random.seed(seed)
 
 if __name__ == "__main__":
-    ssd_dir = r"/Volumes/T7_Sam/"
-    # ssd_dir = r"F:/"
+    # ssd_dir = r"/Volumes/T7_Sam/"
+    ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
     
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
@@ -62,8 +62,8 @@ if __name__ == "__main__":
     metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/CombinedAnalysis_AmberMacrophage/metadata.csv")
 
 
-    # downloads_folder = r"C:/Users/Samde/Downloads"
-    downloads_folder = "/Users/s.deblank-3/Downloads"
+    downloads_folder = r"C:/Users/Samde/Downloads"
+    # downloads_folder = "/Users/s.deblank-3/Downloads"
     # output_dir = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
     # metadata_csv_path = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
 
@@ -107,7 +107,7 @@ if __name__ == "__main__":
     )
 
     # df_windows_descriptive.to_csv(Path(downloads_folder,r"df_windows_descriptive.csv"), index=False)
-    # df_windows_descriptive = pd.read_csv(Path(downloads_folder,r"df_windows_descriptive.csv"))
+    df_windows_descriptive = pd.read_csv(Path(downloads_folder,r"df_windows_descriptive.csv"))
     
     ### Sample the dataset (either to fraction of the tracks)
     non_feature_cols = [
@@ -119,7 +119,10 @@ if __name__ == "__main__":
         "window_end_position_t",
         "window_length_frames",
     ]
+    
+    
     df_analysis = df_windows_descriptive.copy()
+    
     # Drop anything that ends with "_signal_type" or other metadata
     descriptive_feature_cols = [
         col for col in df_windows_descriptive.columns
@@ -127,13 +130,100 @@ if __name__ == "__main__":
         and (not col.endswith("_signal_type"))
     ]
     df_analysis = df_analysis.dropna(subset=descriptive_feature_cols)
-    df_analysis[descriptive_feature_cols] = StandardScaler().fit_transform(df_analysis[descriptive_feature_cols])
-    # Windows
-    # chosen_intervals = 25
-    # df_analysis_subset = subset_windowed_tracks(
-    #     df_windowed=df_analysis,
-    #     step_size=chosen_intervals,
-    # )
+    
+    ### Reduce redundancy of similar features
+    df_analysis, dropped, report = drop_highly_correlated_features(
+        df=df_analysis,
+        feature_cols=descriptive_feature_cols,
+        threshold=0.95
+    )
+    print(f"Dropped {len(dropped)} features.")
+    descriptive_feature_cols = list(set(descriptive_feature_cols) - set(dropped))
+    
+    
+    # --- 3) Subset windows (custom) ---
+    chosen_intervals = 25
+    df_analysis_subset = subset_windowed_tracks(
+        df_windowed=df_analysis,
+        step_size=chosen_intervals,
+    )
+    
+    adata_full = df_to_adata(df_analysis, descriptive_feature_cols, obs_cols=non_feature_cols)
+    adata_sub  = df_to_adata(df_analysis_subset, descriptive_feature_cols, obs_cols=non_feature_cols)
+    
+    sc.pp.scale(adata_full, zero_center=True, max_value=None) #, max_value=10)
+    adata_sub.X = adata_full.X[df_analysis_subset.index.values, :]
+    
+    pca_var=0.95
+    sc.pp.pca(adata_sub)
+    var_ratio = adata_sub.uns["pca"]["variance_ratio"]
+    n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var) + 1)
+    adata_sub.obsm["X_pca"] = adata_sub.obsm["X_pca"][:, :n_pcs]
+    
+    sc.pp.neighbors(
+        adata_sub,
+        n_neighbors=100,
+        metric="cosine",
+        method="umap",
+        use_rep="X_pca",
+    )
+    
+    sc.tl.leiden(
+        adata_sub,
+        resolution=0.35,
+        random_state=seed,
+        key_added="ClusterID",
+    )
+    
+    sc.tl.umap(
+        adata_sub,
+        min_dist=0.1,
+        random_state=seed,
+    )
+    
+    sc.tl.ingest(
+        adata_full,
+        adata_sub,
+        obs="ClusterID",
+        embedding_method="umap"  # also transfers UMAP coords into adata_full.obsm["X_umap"]
+    )
+    
+    # write results back
+    df_analysis = adata_add_back_to_df(
+        df_analysis, adata_full,
+        cols_from_obs=["ClusterID"],
+    )
+    
+    df_analysis_subset = adata_add_back_to_df(
+        df_analysis_subset, adata_sub,
+        cols_from_obs=["ClusterID"],
+    )
+    
+    ###### ANALYSIS VALUES
+    plot_number_per_clusters(df_analysis, cluster_col="ClusterID")
+    plot_per_cluster_proportions(df_analysis)
+    
+    sc.pl.umap(adata_sub, color="ClusterID")
+    
+    plt.figure(figsize=(6,5))
+    ax = sns.scatterplot(
+    data=df_analysis, x="UMAP1", y="UMAP2",
+    hue="cluster_label_leiden", palette="tab20",
+    s=2, alpha=0.3, edgecolor=None  
+    )
+    # bigger legend dots without changing plot dots
+    leg = ax.legend(
+        bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.,
+        markerscale=6,  # <-- enlarge legend markers
+        scatterpoints=1 # keep one dot per legend entry
+    )
+    plt.title("UMAP colored by Leiden clusters (−1 = noise)")
+    plt.tight_layout()
+    
+    
+    #######################################
+    ####### HMM STATE CLASSIFICATION ######
+    #######################################
     
     # Fraction of tracks
     df_analysis_subset, sampled_keys = subset_full_tracks(
@@ -144,48 +234,6 @@ if __name__ == "__main__":
         return_selected_keys=True
     )
     
-    ### 1) Reduce redundancy of similar features
-    X_reduced, dropped, report = drop_highly_correlated_features(
-        df=df_analysis,
-        feature_cols=descriptive_feature_cols,
-        threshold=0.95
-    )
-    print(f"Dropped {len(dropped)} features.")
-    # report  # see which were kept vs dropped and why
-    
-    ### 2) Scale features and run PCA
-    # X_scaled = StandardScaler().fit_transform(X_reduced)
-    pca_model = PCA(n_components=0.95, random_state=seed)
-    X_pca = pca_model.fit_transform(df_analysis[descriptive_feature_cols])
-    df_analysis["PC1"] = X_pca[:, 0]
-    df_analysis["PC2"] = X_pca[:, 1]
-
-
-    ### 3) Embed the data using UMAP
-    umap_model = umap.UMAP(
-                n_components=2, 
-                n_neighbors=100, 
-                min_dist=0.1, 
-                # init="random", 
-                metric = "cosine",
-                random_state=seed,
-                )
-    umap_embedding = umap_model.fit_transform(X_pca)
-    df_analysis["UMAP1"] = umap_embedding[:,0]
-    df_analysis["UMAP2"] = umap_embedding[:,1]
-
-    ### 4) Run Leiden clustering
-    labels_leiden = run_leiden_clustering(
-        X=X_pca,                # or umap_embedding, or X_scaled
-        n_neighbors=80,
-        metric="cosine",
-        resolution=0.35,
-        random_state=seed,
-    )
-    df_analysis["cluster_label_leiden"] = labels_leiden
-    df_analysis["ClusterID"] = labels_leiden
-    df_analysis["ClusterID"].value_counts()
-
     df_analysis_subset, hmm_model, selection_df = run_hmm_state_classification(
         df_features=df_analysis_subset,
         feature_cols=descriptive_feature_cols,
@@ -198,10 +246,17 @@ if __name__ == "__main__":
         feature_cols=descriptive_feature_cols,
         model=hmm_model
     )
-
-    ###### ANALYSIS VALUES
-    plot_number_per_clusters(df_analysis, cluster_col="hmm_state")
-    plot_per_cluster_proportions(df_analysis)
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
 
     # ---------- 1) PCA & UMAP quick looks ----------
     plt.figure(figsize=(12,5))
@@ -288,9 +343,52 @@ if __name__ == "__main__":
         mask_margin=False,
     )
     
+    ##################################################
+    ##### OLD METHOD WITHOUT SCANPY INGESTION ########
+    ###################################################
+    df_analysis[descriptive_feature_cols] = StandardScaler().fit_transform(df_analysis[descriptive_feature_cols])
+    # Windows
+    # chosen_intervals = 25
+    # df_analysis_subset = subset_windowed_tracks(
+    #     df_windowed=df_analysis,
+    #     step_size=chosen_intervals,
+    # )
+    
+   
+    ### 2) Scale features and run PCA
+    # X_scaled = StandardScaler().fit_transform(X_reduced)
+    pca_model = PCA(n_components=0.95, random_state=seed)
+    X_pca = pca_model.fit_transform(df_analysis_subset[descriptive_feature_cols])
+    df_analysis_subset["PC1"] = X_pca[:, 0]
+    df_analysis_subset["PC2"] = X_pca[:, 1]
 
 
+    ### 3) Embed the data using UMAP
+    umap_model = umap.UMAP(
+                n_components=2, 
+                n_neighbors=100, 
+                min_dist=0.1, 
+                # init="random", 
+                metric = "cosine",
+                random_state=seed,
+                )
+    umap_embedding = umap_model.fit_transform(X_pca)
+    df_analysis_subset["UMAP1"] = umap_embedding[:,0]
+    df_analysis_subset["UMAP2"] = umap_embedding[:,1]
 
+    ### 4) Run Leiden clustering
+    labels_leiden = run_leiden_clustering(
+        X=X_pca,                # or umap_embedding, or X_scaled
+        n_neighbors=80,
+        metric="cosine",
+        resolution=0.35,
+        random_state=seed,
+    )
+    df_analysis_subset["cluster_label_leiden"] = labels_leiden
+    df_analysis_subset["ClusterID"] = labels_leiden
+    df_analysis_subset["ClusterID"].value_counts()
+    
+    
     ############
     # HDBSCAN
     ############
