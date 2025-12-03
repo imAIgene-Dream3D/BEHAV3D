@@ -47,6 +47,9 @@ from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 import imageio_ffmpeg as iioff
 
+from hmmlearn.hmm import GaussianHMM
+from sklearn.impute import SimpleImputer
+
 SignalType = Literal["binary", "count", "bounded", "continuous"]
 
 def is_nonneg_int_like(values: np.ndarray) -> bool:
@@ -379,6 +382,26 @@ def compute_window_features(window_dataframe, column_name, time_column="position
 
     return features
 
+def subset_full_tracks(
+    df: pd.DataFrame,
+    fraction: float = 0.1,
+    id_cols: list[str] = ["sample_name", "TrackID"],
+    random_state: int = 0,
+    return_selected_keys=False
+):
+    """
+    Randomly subsample a fraction of unique tracks defined by id_cols,
+    then return df restricted to those full tracks.
+    """
+    track_keys = df[id_cols].drop_duplicates()
+    sampled_keys = track_keys.sample(frac=fraction, random_state=random_state)
+    df_sub = df.merge(sampled_keys, on=id_cols, how="inner")
+    
+    if return_selected_keys:
+        return df_sub, sampled_keys
+    else:
+        return df_sub
+
 def subset_windowed_tracks(
     df_windowed, 
     step_size, 
@@ -567,7 +590,7 @@ def _process_track_worker(
     return out_rows
 
 
-def create_windowed_track_dataset(
+def create_descriptive_track_dataset(
     df_tracks,
     columns_to_summarize,
     window_size=None,
@@ -1180,91 +1203,6 @@ def compare_cluster_distribution(df, col_a, col_b):
 
     plt.tight_layout()
     plt.show()
-    
-# def run_leiden_clustering(
-#     X,
-#     n_neighbors: int = 30,
-#     metric: str = "euclidean",
-#     resolution: float = 1.0,
-#     symmetrize: str = "max",          # {"max","min","avg","none"}
-#     weight_mode: str = "rbf",         # {"rbf","binary","inverse"}
-#     rbf_sigma: float | None = None,   # if None → median kNN distance
-#     random_state: int | None = 0,
-#     n_jobs: int | None = -1,
-#     return_graph: bool = False,
-# ):
-#     """
-#     Run Leiden clustering on a k-NN graph built from X.
-#     Returns: labels (np.ndarray[, int]) and optionally the igraph Graph.
-#     """
-    
-#     # 1) k-NN distances (sparse)
-#     nbrs = NearestNeighbors(
-#         n_neighbors=n_neighbors,
-#         metric=metric,
-#         n_jobs=n_jobs
-#     ).fit(X)
-#     knn_dist = nbrs.kneighbors_graph(mode="distance")  # (n, n) CSR
-
-#     # 2) Symmetrize
-#     if symmetrize == "max":
-#         A = knn_dist.maximum(knn_dist.T)
-#     elif symmetrize == "min":
-#         A = knn_dist.minimum(knn_dist.T)
-#     elif symmetrize == "avg":
-#         A = (knn_dist + knn_dist.T) * 0.5
-#     elif symmetrize == "none":
-#         A = knn_dist  # directed
-#     else:
-#         raise ValueError("symmetrize must be one of {'max','min','avg','none'}")
-
-#     # 3) Convert distances → weights
-#     coo = A.tocoo()
-#     d = coo.data
-#     if d.size == 0:
-#         raise ValueError("Empty k-NN graph; try increasing n_neighbors.")
-
-#     if weight_mode == "rbf":
-#         if rbf_sigma is None:
-#             # robust default width
-#             rbf_sigma = np.median(d[d > 0]) if np.any(d > 0) else np.mean(d)
-#         w = np.exp(-(d ** 2) / (2.0 * (rbf_sigma ** 2)))
-#     elif weight_mode == "inverse":
-#         # 1/(1+d) avoids div-by-zero; small d → large weight
-#         w = 1.0 / (1.0 + d)
-#     elif weight_mode == "binary":
-#         # unweighted graph
-#         w = np.ones_like(d)
-#     else:
-#         raise ValueError("weight_mode must be {'rbf','inverse','binary'}")
-
-#     # Remove self-loops if any
-#     mask = coo.row != coo.col
-#     rows = coo.row[mask].tolist()
-#     cols = coo.col[mask].tolist()
-#     weights = w[mask].tolist()
-
-#     # 4) Build igraph
-#     n = A.shape[0]
-#     g = ig.Graph(n=n)
-#     if rows:
-#         g.add_edges(list(zip(rows, cols)))
-#         g.es["weight"] = weights
-#     else:
-#         # graph with isolated nodes → all singletons
-#         labels = np.arange(n, dtype=int)
-#         return (labels, g) if return_graph else labels
-
-#     # 5) Leiden
-#     partition = la.find_partition(
-#         g,
-#         la.RBConfigurationVertexPartition,
-#         weights=g.es["weight"],
-#         resolution_parameter=resolution,
-#         seed=random_state,
-#     )
-#     labels = np.asarray(partition.membership, dtype=int)
-#     return (labels, g) if return_graph else labels
 
 def run_leiden_clustering(
     X,
@@ -1376,538 +1314,145 @@ def _leiden_stability_search(
 
     return best_labels, float(best_res), summary
 
+def run_hmm_state_classification(
+    df_features: pd.DataFrame,
+    feature_cols: list[str],
+    model=None,
+    id_cols: list[str] = ["sample_name", "TrackID"],
+    time_col: str = "position_t",
 
-def plot_feature_cluster_heatmap(
-    df_analysis: pd.DataFrame,
-    feature_cols,
-    cluster_col: str = "ClusterID",
-    drop_noise_label: int | None = -1,            # set None to keep all clusters
-    feature_category_map: dict[str, str] | None = None,
-    zscore_rows: bool = True,                     # z-score features across clusters
-    row_distance: str = "abs_correlation",        # {"abs_correlation","correlation","euclidean"}
-    col_distance: str = "correlation",            # {"correlation","euclidean"}
-    row_linkage: str = "average",
-    col_linkage: str = "average",
-    cmap: str = "vlag",
-    figsize=(12, 14),
-    savepath: str | None = None,
-):
+    # n_states can be int OR "auto"
+    n_states: int | str = "auto",
+    k_min: int = 1,
+    k_max: int = 8,
+
+    covariance_type: str = "full",
+    n_iter: int = 200,
+    tol: float = 1e-3,
+    random_state: int = 0,
+    verbose: bool = False,
+    # If you *really* want to allow NaNs through, set this False
+    error_on_nans: bool = True,
+) -> tuple[pd.DataFrame, GaussianHMM, pd.DataFrame | None]:
     """
-    RNA-style clustermap:
-      - rows = features clustered by (absolute) correlation
-      - cols = clusters ordered by similarity
-      - cells = mean(feature) within each cluster
+    Fit an HMM to track time series and assign a hidden state to each timepoint.
+    If n_states="auto", choose number of states via BIC sweep from k_min..k_max.
+
+    Returns
+    -------
+    (df_with_states, fitted_model, selection_df)
+        df_with_states is df_features plus a column "hmm_state".
+        fitted_model is the chosen global model.
+        selection_df is a DataFrame with columns ["k","bic","logL"] if auto,
+        otherwise None.
     """
-    # --- safety checks
-    assert cluster_col in df_analysis.columns, f"{cluster_col} not found in df_analysis"
-    for c in feature_cols:
-        if c not in df_analysis.columns:
-            raise ValueError(f"Feature '{c}' not found in df_analysis")
 
-    # --- optionally remove HDBSCAN noise
-    df = df_analysis.copy()
-    if drop_noise_label is not None:
-        df = df[df[cluster_col] != drop_noise_label]
+    def _prep_X_and_lengths(df: pd.DataFrame):
+        req = set(id_cols + [time_col] + feature_cols)
+        missing = req - set(df.columns)
+        if missing:
+            raise ValueError(f"df_features missing columns: {missing}")
 
-    # --- compute feature x cluster matrix of means
-    cluster_means = df.groupby(cluster_col)[list(feature_cols)].mean().T
-    cluster_means = cluster_means.replace([np.inf, -np.inf], np.nan).dropna(how="all")
+        df_sorted = df.sort_values(id_cols + [time_col], kind="mergesort").copy()
 
-    # remove zero-variance rows (cannot compute correlation)
-    nonconst = cluster_means.loc[cluster_means.std(axis=1) > 0]
-    if nonconst.empty:
-        raise ValueError("All features have zero variance across clusters.")
-    M = nonconst.copy()
+        # Build concatenated observation matrix + lengths for HMM
+        sequences = []
+        lengths = []
 
-    # optional row z-scoring (emphasize patterns)
-    if zscore_rows:
-        M = (M - M.mean(axis=1).to_numpy()[:, None]) / (M.std(axis=1, ddof=0).to_numpy()[:, None] + 1e-9)
+        for _, g in df_sorted.groupby(id_cols, sort=False):
+            X = g[feature_cols].to_numpy(dtype=float)
 
-    # --- row (feature) distances
-    if row_distance == "euclidean":
-        d_rows = pdist(M.values, metric="euclidean")
-    elif row_distance == "correlation":
-        d_rows = pdist(M.values, metric="correlation")  # 1 - corr
-    elif row_distance == "abs_correlation":
-        C = np.corrcoef(M.values)                       # (n_features x n_features)
-        D = 1.0 - np.abs(C)
-        np.fill_diagonal(D, 0.0)
-        d_rows = squareform(D, checks=False)
-    else:
-        raise ValueError(f"Unsupported row_distance='{row_distance}'")
-    row_link = linkage(d_rows, method=row_linkage)
-    row_order = leaves_list(row_link)
+            if error_on_nans and np.isnan(X).any():
+                raise ValueError(
+                    "NaNs found in feature matrix. "
+                    "Please interpolate/impute before calling run_hmm_state_classification."
+                )
 
-    # --- column (cluster) distances
-    if col_distance == "euclidean":
-        d_cols = pdist(M.T.values, metric="euclidean")
-    elif col_distance == "correlation":
-        d_cols = pdist(M.T.values, metric="correlation")
-    else:
-        raise ValueError(f"Unsupported col_distance='{col_distance}'")
-    col_link = linkage(d_cols, method=col_linkage)
-    col_order = leaves_list(col_link)
+            sequences.append(X)
+            lengths.append(len(g))
 
-    # --- annotation bars
-    row_colors = None
-    if feature_category_map is not None:
-        cats = pd.Series([feature_category_map.get(f, "other") for f in M.index], index=M.index)
-        palette = sns.color_palette("tab20", n_colors=cats.nunique())
-        lut = dict(zip(cats.unique(), palette))
-        row_colors = cats.map(lut)
+        X_all = np.vstack(sequences)
+        return X_all, lengths, df_sorted
 
-    cluster_counts = df[cluster_col].value_counts().reindex(M.columns).fillna(0).astype(int)
-    norm = Normalize(vmin=cluster_counts.min(), vmax=max(cluster_counts.max(), 1))
-    col_colors = [plt.cm.Blues(norm(v)) for v in cluster_counts.values]
+    def _num_params(K: int, D: int, cov_type: str):
+        if cov_type == "full":
+            cov_params = K * (D * (D + 1) / 2)
+        elif cov_type == "diag":
+            cov_params = K * D
+        elif cov_type == "spherical":
+            cov_params = K
+        elif cov_type == "tied":
+            cov_params = (D * (D + 1) / 2)
+        else:
+            raise ValueError(f"Unknown covariance_type: {cov_type}")
+        return (K - 1) + K * (K - 1) + K * D + cov_params
 
-    n_rows = M.shape[0]
-    row_height = 0.25  # inches per feature row (adjust to taste)
-    fig_height = max(6, n_rows * row_height)
-    fig_width = figsize[0]
-    # --- plot
-    g = sns.clustermap(
-        M,
-        row_linkage=row_link,
-        col_linkage=col_link,
-        row_colors=row_colors,
-        col_colors=col_colors,
-        cmap=cmap,
-        figsize=(fig_width, fig_height),
-        xticklabels=True,
-        yticklabels=True,
-        cbar_kws={"label": "mean (row z-score)" if zscore_rows else "mean"},
-        dendrogram_ratio=(0.12, 0.12),
-        colors_ratio=(0.02, 0.04),
-    )
-    g.ax_heatmap.set_xlabel("Cluster")
-    g.ax_heatmap.set_ylabel("Feature")
+    def _bic(model: GaussianHMM, X: np.ndarray, lengths: list[int]):
+        logL = model.score(X, lengths=lengths)
+        N, D = X.shape
+        K = model.n_components
+        p = _num_params(K, D, model.covariance_type)
+        return -2 * logL + p * np.log(N)
 
-    # row legend (feature categories), if provided
-    if feature_category_map is not None:
-        for cat, color in lut.items():
-            g.ax_col_dendrogram.bar(0, 0, color=color, label=cat, linewidth=0)
-        g.ax_col_dendrogram.legend(title="Feature category", ncols=min(3, len(lut)), loc="center",
-                                   bbox_to_anchor=(0.5, 1.2), frameon=False)
+    X_all, lengths, df_sorted = _prep_X_and_lengths(df_features)
 
-    # column legend (cluster sizes)
-    import matplotlib.patches as mpatches
-    ticks = np.unique(np.linspace(cluster_counts.min(),
-                                  max(cluster_counts.max(), 1), 3).astype(int))
-    if len(ticks):
-        handles = [mpatches.Patch(color=plt.cm.Blues(norm(v)), label=f"N={v}") for v in ticks]
-        g.ax_row_dendrogram.legend(handles=handles, title="Cluster size",
-                                   loc="center", bbox_to_anchor=(0.5, 1.15), frameon=False)
+    selection_df = None
 
-    plt.tight_layout()
-    if savepath:
-        g.savefig(savepath, dpi=300, bbox_inches="tight")
+    if model is None:
+        # ---------- choose K ----------
+        if isinstance(n_states, str):
+            if n_states.lower() != "auto":
+                raise ValueError("n_states must be int or 'auto'")
+            if k_max < k_min:
+                raise ValueError("k_max must be >= k_min")
 
-    return g, {
-        "matrix": M,
-        "row_order": row_order,
-        "col_order": col_order,
-        "row_linkage": row_link,
-        "col_linkage": col_link,
-        "cluster_counts": cluster_counts,
-    }
-    
- 
-def _pca_rotation(points):
-    """
-    Get rotation matrix R from PCA (via SVD) WITHOUT changing the origin.
-    We compute R on mean-centered data but apply it to the original points.
-    Returns R such that rotated = original @ R.T
-    """
-    P0 = points - points.mean(axis=0, keepdims=True)  # only for orientation
-    _, _, Vt = np.linalg.svd(P0, full_matrices=False)
-    return Vt  # rows are principal axes
+            rows = []
+            best_k, best_bic, best_model = None, np.inf, None
 
-def _align_keep_origin(points):
-    """
-    Apply PCA rotation while preserving the current origin of `points`.
-    """
-    R = _pca_rotation(points)
-    return points @ R.T
+            for k in range(k_min, k_max + 1):
+                m = GaussianHMM(
+                    n_components=k,
+                    covariance_type=covariance_type,
+                    n_iter=n_iter,
+                    tol=tol,
+                    random_state=random_state,
+                    verbose=verbose,
+                )
+                m.fit(X_all, lengths=lengths)
+                bic_k = _bic(m, X_all, lengths)
+                logL_k = m.score(X_all, lengths=lengths)
+                rows.append({"k": k, "bic": bic_k, "logL": logL_k})
 
-def plot_cluster_window_max_projection(
-    df_positions,
-    df_windows,
-    cluster_id,
-    cluster_col="cluster_label_hdbscan",
-    # identifiers
-    sample_col="sample_name",
-    track_col="TrackID",
-    time_col="position_t",
-    window_start_col="window_start_position_t",
-    window_end_col="window_end_position_t",
-    # coordinates
-    x_col="position_x", 
-    y_col="position_y", 
-    z_col="position_z",
-    # subsampling
-    sample_frac=None,          # e.g. 0.2 keeps 20% of windows
-    max_windows=None,          # hard cap after (optional) frac sampling
-    random_state=123,
-    # aesthetics
-    line_alpha=0.15,
-    line_width=0.8,
-    figsize=(12, 4),
-    # axis control
-    axis_limits=None,          # dict {"pc1": L1, "pc2": L2, "pc3": L3} for fixed limits
-    equal_axes=True,
-    title_prefix="Max projection (PCA-aligned) for windows in cluster",
-):
-    """
-    For all windows with df_windows[cluster_col] == cluster_id:
-      - slice df_positions by (sample, track) and time ∈ [start, end],
-      - translate each window so its first point (t0) is at the origin,
-      - rotate each window so PC1 is horizontal (X),
-      - draw three 2D projections: (PC1, PC2), (PC1, PC3), (PC2, PC3).
+                if bic_k < best_bic:
+                    best_k, best_bic, best_model = k, bic_k, m
 
-    Distances remain in the same units as the coordinate columns.
-    """
-    # checks
-    req_win_cols = {sample_col, track_col, window_start_col, window_end_col, cluster_col}
-    missing = req_win_cols - set(df_windows.columns)
-    if missing:
-        raise ValueError(f"df_windows missing columns: {missing}")
-    
-    # select cluster's windows
-    wins = df_windows.loc[
-        df_windows[cluster_col] == cluster_id,
-        [sample_col, track_col, window_start_col, window_end_col]
-    ].copy()
-    if wins.empty:
-        raise ValueError(f"No windows found for {cluster_col} == {cluster_id}")
+            model = best_model
+            selection_df = pd.DataFrame(rows)
 
-    # subsample windows
-    if sample_frac is not None and 0 < sample_frac < 1:
-        wins = wins.sample(frac=sample_frac, random_state=random_state)
-    if max_windows is not None and len(wins) > max_windows:
-        wins = wins.sample(n=max_windows, random_state=random_state)
-
-    # prep positions grouped by (sample, track)
-    needed_cols = [sample_col, track_col, time_col, x_col, y_col, z_col]
-    for c in needed_cols:
-        if c not in df_positions.columns:
-            raise ValueError(f"df_positions missing column: {c}")
-    pos_sorted = df_positions[needed_cols].sort_values([sample_col, track_col, time_col])
-
-    groups = defaultdict(lambda: None)
-    for (s, t), sub in pos_sorted.groupby([sample_col, track_col], sort=False):
-        groups[(s, t)] = {
-            "t": sub[time_col].to_numpy(),
-            "xyz": sub[[x_col, y_col, z_col]].to_numpy(dtype=float)
-        }
-
-    # figure
-    fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
-    ax_xy, ax_xz, ax_yz = axes
-    all_xy, all_xz, all_yz = [], [], []
-    n_plotted = 0
-
-    # iterate windows
-    for s, t, t0, t1 in wins.itertuples(index=False, name=None):
-        buf = groups.get((s, t))
-        if buf is None:
-            continue
-        tt = buf["t"]
-        sel = (tt >= t0) & (tt <= t1)
-        if not np.any(sel):
-            continue
-
-        coords = buf["xyz"][sel]
-        if coords.shape[0] < 2:
-            continue
-
-        coords_centered = coords - coords[0]
-        coords_aligned  = _align_keep_origin(coords_centered) 
-
-        all_xy.append(coords_aligned[:, [0, 1]])
-        all_xz.append(coords_aligned[:, [0, 2]])
-        all_yz.append(coords_aligned[:, [1, 2]])
-
-        ax_xy.plot(coords_aligned[:, 0], coords_aligned[:, 1], linewidth=line_width, alpha=line_alpha)
-        ax_xz.plot(coords_aligned[:, 0], coords_aligned[:, 2], linewidth=line_width, alpha=line_alpha)
-        ax_yz.plot(coords_aligned[:, 1], coords_aligned[:, 2], linewidth=line_width, alpha=line_alpha)
-
-        n_plotted += 1
-
-    # labels
-    ax_xy.set_xlabel("PC1 (max displacement axis)"); ax_xy.set_ylabel("PC2"); ax_xy.set_title("PC1 vs PC2")
-    ax_xz.set_xlabel("PC1 (max displacement axis)"); ax_xz.set_ylabel("PC3"); ax_xz.set_title("PC1 vs PC3")
-    ax_yz.set_xlabel("PC2"); ax_yz.set_ylabel("PC3"); ax_yz.set_title("PC2 vs PC3")
-
-    # axis limits
-    if axis_limits is not None:
-        L1, L2, L3 = axis_limits["pc1"], axis_limits["pc2"], axis_limits["pc3"]
-        ax_xy.set_xlim(-L1, L1); ax_xy.set_ylim(-L2, L2); ax_xy.set_aspect("equal", adjustable="box")
-        ax_xz.set_xlim(-L1, L1); ax_xz.set_ylim(-L3, L3); ax_xz.set_aspect("equal", adjustable="box")
-        ax_yz.set_xlim(-L2, L2); ax_yz.set_ylim(-L3, L3); ax_yz.set_aspect("equal", adjustable="box")
-    elif equal_axes:
-        def _set_equal(ax, pairs):
-            if len(pairs) == 0: return
-            data = np.vstack(pairs)
-            xmin, ymin = data.min(axis=0); xmax, ymax = data.max(axis=0)
-            lim = max(abs(xmin), abs(xmax), abs(ymin), abs(ymax))
-            lim = 1.0 if lim == 0 else lim
-            pad = 0.05 * lim
-            ax.set_xlim(-lim - pad, lim + pad); ax.set_ylim(-lim - pad, lim + pad)
-            ax.set_aspect("equal", adjustable="box")
-        _set_equal(ax_xy, all_xy); _set_equal(ax_xz, all_xz); _set_equal(ax_yz, all_yz)
-
-    fig.suptitle(f"{title_prefix} {cluster_id}  |  windows plotted: {n_plotted}", y=1.02, fontsize=12)
-    return fig, axes
-
-def compute_global_pc_axis_limits_for_windows(
-    df_positions,
-    df_windows,
-    cluster_col="cluster_label_hdbscan",
-    cluster_ids=None,          # if None, use all unique in df_windows
-    include_noise=True,        # include -1 for HDBSCAN noise if present
-    # identifiers
-    sample_col="sample_name",
-    track_col="TrackID",
-    time_col="position_t",
-    window_start_col="window_start_position_t",
-    window_end_col="window_end_position_t",
-    # coordinates
-    x_col="position_x", 
-    y_col="position_y", 
-    z_col="position_z",
-    # optional subsampling for speed (applied per cluster)
-    sample_frac=None,
-    max_windows=None,
-    random_state=123,
-    # alignment function (leave None to use the same as the plotter)
-    _pca_align_fn=None,
-):
-    """
-    Returns {'pc1': L1, 'pc2': L2, 'pc3': L3}, each a half-range so you can use [-L, +L].
-    """
-    if _pca_align_fn is None:
-        def _pca_align_fn(P):
-            P = P - P.mean(axis=0, keepdims=True)
-            U, S, Vt = np.linalg.svd(P, full_matrices=False)
-            return P @ Vt.T
-
-    # choose clusters
-    clust_series = df_windows[cluster_col].dropna()
-    chosen = sorted(clust_series.unique().tolist())
-    if not include_noise and -1 in chosen:
-        chosen.remove(-1)
-    if cluster_ids is not None:
-        chosen = [c for c in chosen if c in set(cluster_ids)]
-    if not chosen:
-        raise ValueError("No clusters to compute limits on.")
-
-    # prep positions grouped by (sample, track)
-    needed_cols = [sample_col, track_col, time_col, x_col, y_col, z_col]
-    for c in needed_cols:
-        if c not in df_positions.columns:
-            raise ValueError(f"df_positions missing column: {c}")
-    pos_sorted = df_positions[needed_cols].sort_values([sample_col, track_col, time_col])
-
-    groups = defaultdict(lambda: None)
-    for (s, t), sub in pos_sorted.groupby([sample_col, track_col], sort=False):
-        groups[(s, t)] = {
-            "t": sub[time_col].to_numpy(),
-            "xyz": sub[[x_col, y_col, z_col]].to_numpy(dtype=float)
-        }
-
-    rng = np.random.RandomState(random_state)
-    max_abs_pc = np.zeros(3, dtype=float)
-
-    for cid in chosen:
-        wins = df_windows.loc[
-            df_windows[cluster_col] == cid,
-            [sample_col, track_col, window_start_col, window_end_col]
-        ]
-        if wins.empty:
-            continue
-
-        # subsampling for bounds (optional)
-        if sample_frac is not None and 0 < sample_frac < 1:
-            wins = wins.sample(frac=sample_frac, random_state=random_state)
-        if max_windows is not None and len(wins) > max_windows:
-            wins = wins.sample(n=max_windows, random_state=random_state)
-
-        for s, t, t0, t1 in wins.itertuples(index=False, name=None):
-            buf = groups.get((s, t))
-            if buf is None:
-                continue
-            tt = buf["t"]
-            sel = (tt >= t0) & (tt <= t1)
-            if not np.any(sel):
-                continue
-
-            coords = buf["xyz"][sel]
-            if coords.shape[0] < 2:
-                continue
-
-            # center at window start; PCA-align (no scaling)
-            coords_centered = coords - coords[0]
-            R = _pca_rotation(coords_centered)
-            coords_aligned = coords_centered @ R.T
-
-            # update global maxima per principal axis
-            max_abs_pc = np.maximum(max_abs_pc, np.max(np.abs(coords_aligned), axis=0))
-
-    # padding to keep lines off the border
-    pad = np.maximum(1e-9, 0.05 * max_abs_pc)
-    max_abs_pc = max_abs_pc + pad
-
-    return {"pc1": float(max_abs_pc[0]), "pc2": float(max_abs_pc[1]), "pc3": float(max_abs_pc[2])}
-
-def plot_all_clusters_window_max_projection(
-    df_positions,
-    df_windows,
-    cluster_col="cluster_label_hdbscan",
-    cluster_ids=None,          # e.g. [0,1,2]; if None, uses all unique in df_windows
-    include_noise=True,        # set False to skip -1 (HDBSCAN noise)
-    # subsampling (applied independently per cluster)
-    sample_frac=None,
-    max_windows=None,
-    random_state=123,
-    # fixed axes (pass output of compute_global_pc_axis_limits_for_windows)
-    axis_limits=None,
-    # saving
-    save_dir=None,             # e.g. r"C:\plots\clusters"
-    save_pdf_path=None,        # e.g. r"C:\plots\clusters\all_clusters.pdf"
-    file_prefix="cluster_windows_",  # filename prefix for per-cluster images
-    image_dpi=300,
-    # aesthetics forwarded to single-plotter
-    line_alpha=0.15,
-    line_width=0.8,
-    figsize=(12, 4),
-    equal_axes=True,
-    title_prefix="Max projection (PCA-aligned) for windows in cluster",
-    # id/coord column names (forwarded)
-    sample_col="sample_name",
-    track_col="TrackID",
-    time_col="position_t",
-    window_start_col="window_start_position_t",
-    window_end_col="window_end_position_t",
-    x_col="position_x", 
-    y_col="position_y", 
-    z_col="position_z",
-):
-    """
-    Creates one window-level max-projection plot per cluster_id.
-    Returns: {cluster_id: (fig, axes)}
-    """
-    # cluster list
-    clust_series = df_windows[cluster_col].dropna()
-    unique_ids = sorted(clust_series.unique().tolist())
-    if not include_noise and -1 in unique_ids:
-        unique_ids.remove(-1)
-    if cluster_ids is not None:
-        keep = set(cluster_ids)
-        unique_ids = [c for c in unique_ids if c in keep]
-    if len(unique_ids) == 0:
-        raise ValueError(f"No cluster IDs found in '{cluster_col}' with the current filters.")
-
-    # output dirs / pdf
-    if save_dir is not None:
-        Path(save_dir).mkdir(parents=True, exist_ok=True)
-    pdf = PdfPages(save_pdf_path) if save_pdf_path else None
-
-    axis_limits = compute_global_pc_axis_limits_for_windows(
-        df_positions=df_positions,
-        df_windows=df_windows,
-        cluster_col=cluster_col,
-        include_noise=False,
-        x_col=x_col, 
-        y_col=y_col, 
-        z_col=z_col,
-    )
-    
-    out = {}
-    try:
-        for cid in unique_ids:
-            fig, axes = plot_cluster_window_max_projection(
-                df_positions=df_positions,
-                df_windows=df_windows,
-                cluster_id=cid,
-                cluster_col=cluster_col,
-                sample_col=sample_col,
-                track_col=track_col,
-                time_col=time_col,
-                window_start_col=window_start_col,
-                window_end_col=window_end_col,
-                x_col=x_col, y_col=y_col, z_col=z_col,
-                sample_frac=sample_frac,
-                max_windows=max_windows,
+        else:
+            model = GaussianHMM(
+                n_components=int(n_states),
+                covariance_type=covariance_type,
+                n_iter=n_iter,
+                tol=tol,
                 random_state=random_state,
-                line_alpha=line_alpha,
-                line_width=line_width,
-                figsize=figsize,
-                axis_limits=axis_limits,   # ensure identical axes across figures (if provided)
-                equal_axes=equal_axes,
-                title_prefix=title_prefix,
+                verbose=verbose,
             )
-            out[cid] = (fig, axes)
+            model.fit(X_all, lengths=lengths)
+            
+    # ---------- decode ----------
+    states_all = model.predict(X_all, lengths=lengths)
+    out = df_sorted.copy()
+    out["hmm_state"] = states_all
 
-            if save_dir is not None:
-                fname = f"{file_prefix}{cluster_col}_{cid}.png"
-                fig.savefig(Path(save_dir) / fname, dpi=image_dpi, bbox_inches="tight")
-            if pdf is not None:
-                pdf.savefig(fig, bbox_inches="tight")
-    finally:
-        if pdf is not None:
-            pdf.close()
+    state_map = out[id_cols + [time_col, "hmm_state"]]
 
-    return out
-
-def plot_per_cluster_proportions(
-    df,
-    groupby = ["ClusterID", "sample_name"],
-    show=True
-    ):
-    prop_df = (
-        df
-        .groupby(groupby)
-        .size()
-        .groupby(level=0)
-        .apply(lambda x: x / x.sum())  # normalize within each cluster
-        .unstack(fill_value=0)         # make sample_name columns
+    df_features_clean = df_features.drop(columns=["hmm_state"], errors="ignore")
+    df_out = df_features_clean.merge(
+        state_map,
+        on=id_cols + [time_col],
+        how="left",
+        sort=False,
+        validate="many_to_one",
     )
-    # Plot stacked bar chart
-    prop_df.index = prop_df.index.get_level_values(0)
-    # Create stacked bar plot
-    ax = prop_df.plot(kind='bar', stacked=True, figsize=(10, 6))
-
-    plt.title("Proportion of sample_name per ClusterID")
-    plt.xlabel("ClusterID")
-    plt.ylabel("Proportion")
-    plt.legend(title="Sample Name", bbox_to_anchor=(1.05, 1), loc='upper left')
-
-    # Ensure upright tick labels
-    plt.xticks(ticks=range(len(prop_df.index)), labels=prop_df.index.astype(str), rotation=0, ha='center')
-
-    plt.tight_layout()
-
-    if show:
-        plt.show()
-    else:
-        return ax
- 
-def plot_number_per_clusters(
-    df,
-    show=True
-    ):
-    plt.figure(figsize=(6, 3))
-    h_counts = df["ClusterID"].value_counts().sort_index()
-    ax = sns.barplot(x=h_counts.index.astype(str), y=h_counts.values, color="tab:green")
-    ax.bar_label(ax.containers[0], padding=3)
-    plt.title("Cluster sizes")
-    plt.xlabel("Cluster")
-    plt.ylabel("Count")
-    ax.margins(y=0.15)
-    plt.tight_layout()
-    
-    if show:
-        plt.show()
-    else:
-        return ax
-     
+    return df_out, model, selection_df

@@ -43,18 +43,27 @@ from pandas.api.types import is_numeric_dtype
 import math
 
 from behav3d.utils.rolling_classification import *
+from behav3d.utils.rolling_classification.plotting import *
+%matplotlib inline
+
 seed = 123
 random.seed(seed)
 np.random.seed(seed)
 
 if __name__ == "__main__":
-    # ssd_dir = r"/Volumes/T7_Sam/"
-    ssd_dir = r"F:/"
+    ssd_dir = r"/Volumes/T7_Sam/"
+    # ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
+    
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
     metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv")
 
-    downloads_folder = r"C:/Users/Samde/Downloads"
+    output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/CombinedAnalysis_AmberMacrophage")
+    metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/CombinedAnalysis_AmberMacrophage/metadata.csv")
+
+
+    # downloads_folder = r"C:/Users/Samde/Downloads"
+    downloads_folder = "/Users/s.deblank-3/Downloads"
     # output_dir = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
     # metadata_csv_path = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
 
@@ -75,7 +84,7 @@ if __name__ == "__main__":
     # chosen_intervals = 50
 
     window_size = 25
-    
+    # window_size = None
 
     groupby=["sample_name", "TrackID"]
     features=[
@@ -88,7 +97,7 @@ if __name__ == "__main__":
     ]
 
     df_tracks = df_positions[features+["sample_name", "TrackID", "position_t"]]
-    df_windows_descriptive = create_windowed_track_dataset(
+    df_windows_descriptive = create_descriptive_track_dataset(
         df_tracks=df_positions,
         columns_to_summarize=features,
         window_size = window_size,
@@ -97,15 +106,10 @@ if __name__ == "__main__":
         id_cols = ["sample_name", "TrackID"],
     )
 
-    # df_windows_descriptive.to_csv(r"C:\Users\Samde\Downloads\df_windows_descriptive.csv", index=False)
-    # df_windows_descriptive = pd.read_csv(r"C:\Users\Samde\Downloads\df_windows_descriptive.csv")
+    # df_windows_descriptive.to_csv(Path(downloads_folder,r"df_windows_descriptive.csv"), index=False)
+    # df_windows_descriptive = pd.read_csv(Path(downloads_folder,r"df_windows_descriptive.csv"))
     
-    chosen_intervals = 25
-    df_windows_subset = subset_windowed_tracks(
-        df_windowed=df_windows_descriptive,
-        step_size=chosen_intervals,
-    )
-    
+    ### Sample the dataset (either to fraction of the tracks)
     non_feature_cols = [
         "sample_name",
         "TrackID",
@@ -115,29 +119,44 @@ if __name__ == "__main__":
         "window_end_position_t",
         "window_length_frames",
     ]
-
-    df_analysis = df_windows_subset.copy()
+    df_analysis = df_windows_descriptive.copy()
     # Drop anything that ends with "_signal_type" or other metadata
-    feature_cols = [
+    descriptive_feature_cols = [
         col for col in df_windows_descriptive.columns
         if (col not in non_feature_cols)
         and (not col.endswith("_signal_type"))
     ]
-    df_analysis = df_analysis.dropna(subset=feature_cols)
-
+    df_analysis = df_analysis.dropna(subset=descriptive_feature_cols)
+    df_analysis[descriptive_feature_cols] = StandardScaler().fit_transform(df_analysis[descriptive_feature_cols])
+    # Windows
+    # chosen_intervals = 25
+    # df_analysis_subset = subset_windowed_tracks(
+    #     df_windowed=df_analysis,
+    #     step_size=chosen_intervals,
+    # )
+    
+    # Fraction of tracks
+    df_analysis_subset, sampled_keys = subset_full_tracks(
+        df=df_analysis,
+        fraction=0.3,
+        random_state=seed,
+        id_cols=["sample_name", "TrackID"],
+        return_selected_keys=True
+    )
+    
     ### 1) Reduce redundancy of similar features
     X_reduced, dropped, report = drop_highly_correlated_features(
         df=df_analysis,
-        feature_cols=feature_cols,
+        feature_cols=descriptive_feature_cols,
         threshold=0.95
     )
     print(f"Dropped {len(dropped)} features.")
     # report  # see which were kept vs dropped and why
-
+    
     ### 2) Scale features and run PCA
-    X_scaled = StandardScaler().fit_transform(X_reduced)
+    # X_scaled = StandardScaler().fit_transform(X_reduced)
     pca_model = PCA(n_components=0.95, random_state=seed)
-    X_pca = pca_model.fit_transform(X_scaled)
+    X_pca = pca_model.fit_transform(df_analysis[descriptive_feature_cols])
     df_analysis["PC1"] = X_pca[:, 0]
     df_analysis["PC2"] = X_pca[:, 1]
 
@@ -167,8 +186,21 @@ if __name__ == "__main__":
     df_analysis["ClusterID"] = labels_leiden
     df_analysis["ClusterID"].value_counts()
 
+    df_analysis_subset, hmm_model, selection_df = run_hmm_state_classification(
+        df_features=df_analysis_subset,
+        feature_cols=descriptive_feature_cols,
+        n_states="auto"
+    )
+    
+    # Apply HMM to full dataset
+    df_analysis, _, _ = run_hmm_state_classification(
+        df_features=df_analysis,
+        feature_cols=descriptive_feature_cols,
+        model=hmm_model
+    )
+
     ###### ANALYSIS VALUES
-    plot_number_per_clusters(df_analysis)
+    plot_number_per_clusters(df_analysis, cluster_col="hmm_state")
     plot_per_cluster_proportions(df_analysis)
 
     # ---------- 1) PCA & UMAP quick looks ----------
@@ -176,7 +208,8 @@ if __name__ == "__main__":
     plt.subplot(1,2,1)
     sns.scatterplot(data=df_analysis, x="PC1", y="PC2", s=8, alpha=0.6, edgecolor=None)
     plt.title("PCA (PC1 vs PC2)")
-
+    plt.show()
+    
     plt.subplot(1,2,2)
     sns.scatterplot(data=df_analysis, x="UMAP1", y="UMAP2", s=8, alpha=0.6, edgecolor=None)
     plt.title("UMAP (2D)")
@@ -184,18 +217,24 @@ if __name__ == "__main__":
     plt.show()
 
     plt.figure(figsize=(6,5))
-    sns.scatterplot(
-        data=df_analysis, x="UMAP1", y="UMAP2",
-        hue="cluster_label_leiden", palette="tab20",
-        s=10, alpha=0.8, edgecolor=None
+    ax = sns.scatterplot(
+    data=df_analysis, x="UMAP1", y="UMAP2",
+    hue="cluster_label_leiden", palette="tab20",
+    s=2, alpha=0.3, edgecolor=None  
     )
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+    # bigger legend dots without changing plot dots
+    leg = ax.legend(
+        bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.,
+        markerscale=6,  # <-- enlarge legend markers
+        scatterpoints=1 # keep one dot per legend entry
+    )
     plt.title("UMAP colored by Leiden clusters (−1 = noise)")
+    plt.tight_layout()
     
     plot_feature_cluster_heatmap(
         df_analysis,
-        feature_cols=feature_cols,
-        cluster_col="ClusterID",
+        feature_cols=descriptive_feature_cols,
+        cluster_col="hmm_state",
         figsize=(8.27, 11.69),
     )
 
@@ -232,19 +271,20 @@ if __name__ == "__main__":
     )
 
     create_fulltrack_cluster_videos(
+        examples_per_cluster=3,
+        clusters=[0],  
         df_windows=df_analysis,
         df_positions=df_positions,
         output_folder=output_dir,  # folder containing images/<sample>/<sample>.zarr
         out_dir=downloads_folder,
-        clusters=None,                # or e.g. [0, 1, 2]
+        # clusters=None,                # or e.g. [0, 1, 2]
         fps=6,
         margin=20,
         track_color="#63ff33",
         pmin=0.0,
-        pmax=99.99,
-        examples_per_cluster=4,
+        pmax=99,
         seed=1234,
-        normalize_per_channel=True,
+        normalize_per_channel=False,
         mask_margin=False,
     )
     
@@ -296,12 +336,12 @@ if __name__ == "__main__":
         cluster_col="cluster_label_hdbscan",
     )
         
-    plot_umap_feature_grid(df_analysis, feature_cols=feature_cols)
+    plot_umap_feature_grid(df_analysis, feature_cols=descriptive_feature_cols)
 
     plot_feature_cluster_heatmap(
         df_analysis,
-        feature_cols=feature_cols,
-        cluster_col="ClusterID",
+        feature_cols=descriptive_feature_cols,
+        cluster_col="hmm_state",
         figsize=(8.27, 11.69),
     )
 
