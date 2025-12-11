@@ -48,12 +48,74 @@ from tqdm import tqdm
 import imageio_ffmpeg as iioff
 
 from hmmlearn.hmm import GaussianHMM
-from himap.base import GaussianHSMM
 
 from sklearn.impute import SimpleImputer
 import scanpy as sc
 
 SignalType = Literal["binary", "count", "bounded", "continuous"]
+
+def relabel_from_adata(
+    label_image: np.ndarray,
+    adata,
+    sample_name,
+    obs_col: str,
+    trackid_col: str = "TrackID",
+    time_col: str = "position_t",
+    sample_col = "sample_name",
+    default_value=0,
+    numeric_from_category: bool = True,
+):
+    cols = [trackid_col, time_col, obs_col]
+    if sample_col is not None:
+        cols.append(sample_col)
+
+    df = adata.obs[cols].copy()
+
+    if sample_col is not None:
+        if sample_name is None:
+            raise ValueError(
+                "sample_col is provided but sample_value is None. "
+                "Please specify which sample to select."
+            )
+        df = df[df[sample_col] == sample_name]
+
+    # If nothing left after filtering, return array filled with default_value
+    if df.empty:
+        value_dtype = np.array([default_value]).dtype
+        return np.full(label_image.shape, default_value, dtype=value_dtype)
+
+    col = df[obs_col]
+    if hasattr(col, "cat"):
+        if numeric_from_category:
+            df[obs_col] = col.cat.codes
+        else:
+            df[obs_col] = col.astype(object)
+
+    value_dtype = np.result_type(df[obs_col].dtype, np.array([default_value]).dtype)
+
+    relabeled = np.empty(label_image.shape, dtype=value_dtype)
+
+    T = label_image.shape[0]
+    grouped = df.groupby(time_col)
+
+    for t in range(T):
+        labels_t = label_image[t].astype(np.int64, copy=False)
+        max_label_t = int(labels_t.max())
+
+        lut = np.full(max_label_t + 1, default_value, dtype=value_dtype)
+
+        if t in grouped.groups:
+            df_t = grouped.get_group(t)
+            track_ids = df_t[trackid_col].to_numpy()
+            values = df_t[obs_col].to_numpy()
+
+            for tid, val in zip(track_ids, values):
+                tid_int = int(tid)
+                if 0 <= tid_int <= max_label_t:
+                    lut[tid_int] = val
+        relabeled[t] = lut[labels_t]
+
+    return relabeled
 
 def df_to_adata(df, feature_cols, obs_cols=None):
     """Create AnnData from df, store metadata in .obs."""

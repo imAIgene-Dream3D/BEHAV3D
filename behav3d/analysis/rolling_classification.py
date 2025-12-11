@@ -51,8 +51,8 @@ random.seed(seed)
 np.random.seed(seed)
 
 if __name__ == "__main__":
-    ssd_dir = r"/Volumes/T7_Sam/"
-    # ssd_dir = r"F:/"
+    # ssd_dir = r"/Volumes/T7_Sam/"
+    ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
     
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
@@ -62,8 +62,8 @@ if __name__ == "__main__":
     # metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/CombinedAnalysis_AmberMacrophage/metadata.csv")
 
 
-    # downloads_folder = r"C:/Users/Samde/Downloads"
-    downloads_folder = "/Users/s.deblank-3/Downloads"
+    downloads_folder = r"C:/Users/Samde/Downloads"
+    # downloads_folder = "/Users/s.deblank-3/Downloads"
     # output_dir = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
     # metadata_csv_path = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
 
@@ -627,12 +627,76 @@ if __name__ == "__main__":
     # adata_full.write("/Users/s.deblank-3/Downloads/adata_full.h5ad") 
     # adata_sub.write("/Users/s.deblank-3/Downloads/adata_sub.h5ad") 
     
-    adata = sc.read_h5ad("my_data.h5ad")
+    adata = sc.read_h5ad(Path(downloads_folder,"adata_full.h5ad"))
     
     adata.write_zarr("my_data.zarr")
     adata = ad.read_zarr("my_data.zarr")
     
     
+    
+    
+    
+    
+    
+    from behav3d.utils.fileio import load_image, load_zarr, save_as_zarr, append_to_zarr
+    import scanpy as sc
+    from pathlib import Path
+    
+    downloads_folder = r"C:/Users/Samde/Downloads"
+    adata = sc.read_h5ad(Path(downloads_folder,"adata_cluster_from_1.h5ad"))
+    img = load_zarr(r"F:\BHVD_BEHAV3D\BEHAV3D_python\runs\ROCHE\images\ROCHE_JM1_Exp042-8_Img02_10T_HER2I\ROCHE_JM1_Exp042-8_Img02_10T_HER2I_tcell_tracked.zarr")
+    raw = load_zarr(r"F:\BHVD_BEHAV3D\BEHAV3D_python\runs\ROCHE\images\ROCHE_JM1_Exp042-8_Img02_10T_HER2I\ROCHE_JM1_Exp042-8_Img02_10T_HER2I.zarr")
+
+    hmm_instant_img = relabel_from_adata(
+        img,
+        adata,
+        obs_col="hmm_state_instant",
+        sample_name = "ROCHE_JM1_Exp042-8_Img02_10T_HER2I"
+    )
+    hmm_instant_path=Path(downloads_folder, "hmm_raw_state_overlay.zarr")
+    # save_as_zarr(hmm_instant_img, hmm_instant_path)
+
+    hmm_desc_img = relabel_from_adata(
+        img,
+        adata,
+        obs_col="hmm_state",
+        sample_name = "ROCHE_JM1_Exp042-8_Img02_10T_HER2I"
+    )
+    hmm_descr_path = Path(downloads_folder, "hmm_descr_state_overlay.zarr")
+    # save_as_zarr(hmm_desc_img, hmm_descr_path)
+
+    leiden_img = relabel_from_adata(
+        img,
+        adata,
+        obs_col="ClusterID",
+        sample_name = "ROCHE_JM1_Exp042-8_Img02_10T_HER2I"
+    )
+    leiden_path = Path(downloads_folder, "leiden_overlay.zarr")
+    # save_as_zarr(leiden_img, leiden_path)
+
+
+    leiden_img = load_zarr(leiden_path)
+    leiden_img = np.repeat(np.expand_dims(leiden_img, 1), axis=1, repeats=3)
+    
+    hmm_desc_img = load_zarr(hmm_descr_path)
+    hmm_desc_img = np.repeat(np.expand_dims(hmm_desc_img, 1), axis=1, repeats=3)
+    
+    hmm_instant_img = load_zarr(hmm_instant_path)
+    hmm_instant_img = np.repeat(np.expand_dims(hmm_instant_img, 1), axis=1, repeats=3)
+
+    img = np.repeat(np.expand_dims(img, 1), axis=1, repeats=3)
+    
+    import napari
+    viewer = napari.Viewer()
+    viewer.add_image(raw)
+    viewer.add_labels(img)
+    viewer.add_labels(leiden_img, name="leiden")
+    viewer.add_labels(hmm_desc_img, name="hmm_descr")
+    viewer.add_labels(hmm_instant_img, name="hmm_instant")
+
+    viewer.close()
+
+
     plot_cluster_feature_heatmap(
         df_analysis_subset,
         feature_cols=descriptive_feature_cols,
