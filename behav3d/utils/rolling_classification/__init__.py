@@ -48,6 +48,8 @@ from tqdm import tqdm
 import imageio_ffmpeg as iioff
 
 from hmmlearn.hmm import GaussianHMM
+from himap.base import GaussianHSMM
+
 from sklearn.impute import SimpleImputer
 import scanpy as sc
 
@@ -69,6 +71,52 @@ def adata_add_back_to_df(df, adata, cols_from_obs, prefix=None):
         df[newc] = adata.obs[c].to_numpy()
     return df
 
+def merge_pandas_cols_into_obs_anndata(
+    cols,
+    adata,
+    df_analysis,
+    on=("sample_name", "TrackID", "position_t"),
+    obs_index_col="_obs_index",
+    how="left",
+    make_category=True,
+    astype_str=True,
+    inplace=True,
+    ):
+    if isinstance(cols, str):
+        cols = [cols]
+    else:
+        cols = list(cols)
+
+    missing_in_obs = [c for c in on if c not in adata.obs.columns]
+    missing_in_df  = [c for c in on if c not in df_analysis.columns]
+    if missing_in_obs:
+        raise KeyError("Keys missing in adata.obs: %s" % missing_in_obs)
+    if missing_in_df:
+        raise KeyError("Keys missing in df_analysis: %s" % missing_in_df)
+
+    missing_cols = [c for c in cols if c not in df_analysis.columns]
+    if missing_cols:
+        raise KeyError("Columns missing in df_analysis: %s" % missing_cols)
+
+    target = adata if inplace else adata.copy()
+
+    lookup = df_analysis[list(on) + cols].copy()
+    obs_df = target.obs.reset_index().rename(columns={"index": obs_index_col})
+    obs_df = obs_df.drop(columns=[c for c in cols if c in obs_df.columns], errors="ignore")
+    merged = obs_df.merge(lookup, on=list(on), how=how)
+    merged = merged.set_index(obs_index_col).loc[target.obs.index, cols]
+
+    for c in cols:
+        s = merged[c]
+        if astype_str:
+            s = s.astype(str)
+        if make_category:
+            s = s.astype("category")
+        target.obs[c] = s
+
+    if not inplace:
+        return target
+    
 def is_nonneg_int_like(values: np.ndarray) -> bool:
     vals = values[np.isfinite(values)]
     if vals.size == 0:
@@ -404,16 +452,31 @@ def subset_full_tracks(
     fraction: float = 0.1,
     id_cols: list[str] = ["sample_name", "TrackID"],
     random_state: int = 0,
-    return_selected_keys=False
+    return_selected_keys: bool = False,
+    sampled_keys=None,
 ):
     """
     Randomly subsample a fraction of unique tracks defined by id_cols,
     then return df restricted to those full tracks.
+
+    If `selected_keys` is provided (a DataFrame containing columns `id_cols`),
+    no random sampling is done; instead, df is restricted to the tracks
+    matching those keys. This is useful for reproducing an earlier selection.
     """
     track_keys = df[id_cols].drop_duplicates()
-    sampled_keys = track_keys.sample(frac=fraction, random_state=random_state)
-    df_sub = df.merge(sampled_keys, on=id_cols, how="inner")
-    
+
+    if sampled_keys is None:
+        sampled_keys = track_keys.sample(frac=fraction, random_state=random_state)
+    else:
+        sampled_keys = sampled_keys[id_cols].drop_duplicates()
+
+    mask = (
+        df[id_cols]
+        .merge(sampled_keys, on=id_cols, how="left", indicator=True)["_merge"]
+        .eq("both")
+    ).to_numpy()
+    df_sub = df.loc[mask]
+
     if return_selected_keys:
         return df_sub, sampled_keys
     else:
@@ -444,7 +507,7 @@ def subset_windowed_tracks(
     else:
         raise ValueError("keep must be 'first' or 'last'")
 
-    return dfw.loc[mask].reset_index(drop=True)
+    return dfw.loc[mask]
 
 def _process_track_worker(
     group_df, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types
@@ -1223,27 +1286,46 @@ def compare_cluster_distribution(df, col_a, col_b):
 
 def run_leiden_clustering(
     X,
-    n_neighbors: int = 30,
-    metric: str = "euclidean",
-    resolution: float = 1.0,
-    random_state: int | None = 0,
+    n_neighbors=30,
+    metric="euclidean",
+    resolution=1.0,
+    random_state=0,
     stability_resolutions=(0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0),
-    n_stability_repeats: int = 8
+    n_stability_repeats=8,
+    key_added="clusters_leiden",
 ):
-    if isinstance(X, scanpy.AnnData):
-        adata = X.copy()
+    """
+    If X is AnnData:
+        - modifies X in-place
+        - returns only the updated AnnData
+
+    If X is pandas DataFrame or numpy/array-like:
+        - creates temporary AnnData
+        - returns labels only
+    """
+
+    inplace = isinstance(X, scanpy.AnnData)
+
+    if inplace:
+        adata = X  # edit in place
     else:
-        adata = scanpy.AnnData(X)
+        if hasattr(X, "values"):
+            adata = scanpy.AnnData(X.values)
+            try:
+                adata.obs_names = X.index.astype(str)
+            except Exception:
+                pass
+        else:
+            adata = scanpy.AnnData(X)
 
     scanpy.pp.neighbors(
         adata,
         n_neighbors=n_neighbors,
         metric=metric,
-        method="umap",     # standard Scanpy neighbors
+        method="umap",
         knn=True,
     )
 
-    # 3. Either optimize resolution or run fixed Leiden
     if resolution in ("auto", None):
         labels, best_res, summary = _leiden_stability_search(
             adata,
@@ -1253,17 +1335,23 @@ def run_leiden_clustering(
         adata.uns["leiden_stability_summary"] = summary
         adata.uns["leiden_stability_best_res"] = best_res
         print(f"[auto] Selected Leiden resolution = {best_res:.3f}")
+
+        adata.obs[key_added] = pd.Categorical(labels)
+
     else:
         scanpy.tl.leiden(
             adata,
-            resolution=resolution,
+            resolution=float(resolution),
             random_state=random_state,
-            key_added="leiden_custom",
+            key_added=key_added,
         )
-        labels = adata.obs["leiden_custom"].astype("category").cat.codes.to_numpy()
-        best_res = resolution
-        
-    return labels
+        labels = adata.obs[key_added].astype("category").cat.codes.to_numpy()
+        adata.uns["leiden_stability_best_res"] = float(resolution)
+
+    if inplace:
+        return adata
+    else:
+        return labels
 
 def _leiden_stability_search(
     adata,
@@ -1271,6 +1359,7 @@ def _leiden_stability_search(
     n_repeats=8,
     random_states=None,
     restrict_k_range=(3, 80),
+    
 ):
     """
     Internal helper: find the most stable Leiden resolution via mean pairwise ARI.
@@ -1285,6 +1374,7 @@ def _leiden_stability_search(
     results, per_res_labels = [], {}
 
     for res in resolutions:
+        print("Testing resolution:", res)
         runs = []
         for rs in random_states:
             key = f"leiden_tmp_{res:.3f}_{rs}"
@@ -1350,7 +1440,8 @@ def run_hmm_state_classification(
     verbose: bool = False,
     # If you *really* want to allow NaNs through, set this False
     error_on_nans: bool = True,
-) -> tuple[pd.DataFrame, GaussianHMM, pd.DataFrame | None]:
+    out_col_name: str = "hmm_state",
+):
     """
     Fit an HMM to track time series and assign a hidden state to each timepoint.
     If n_states="auto", choose number of states via BIC sweep from k_min..k_max.
@@ -1460,11 +1551,11 @@ def run_hmm_state_classification(
     # ---------- decode ----------
     states_all = model.predict(X_all, lengths=lengths)
     out = df_sorted.copy()
-    out["hmm_state"] = states_all
+    out[out_col_name] = states_all
 
-    state_map = out[id_cols + [time_col, "hmm_state"]]
+    state_map = out[id_cols + [time_col, out_col_name]]
 
-    df_features_clean = df_features.drop(columns=["hmm_state"], errors="ignore")
+    df_features_clean = df_features.drop(columns=[out_col_name], errors="ignore")
     df_out = df_features_clean.merge(
         state_map,
         on=id_cols + [time_col],
@@ -1472,4 +1563,116 @@ def run_hmm_state_classification(
         sort=False,
         validate="many_to_one",
     )
+    return df_out, model, selection_df
+
+def run_hsmm_state_classification(
+    df_features: pd.DataFrame,
+    feature_cols: list[str],
+    model=None,
+    id_cols: list[str] = ["sample_name", "TrackID"],
+    time_col: str = "position_t",
+    n_states: int | str = "auto",
+    k_min: int = 1,
+    k_max: int = 8,
+    n_durations: int = 200,
+    n_iter: int = 200,
+    tol: float = 1e-3,
+    random_state: int = 0,
+    verbose: bool = False,
+    error_on_nans: bool = True,
+    out_col_name: str = "hsmm_state",
+):
+    def _prep_seq_dict(df: pd.DataFrame):
+        req = set(id_cols + [time_col] + feature_cols)
+        missing = req - set(df.columns)
+        if missing:
+            raise ValueError(f"df_features missing columns: {missing}")
+
+        df_sorted = df.sort_values(id_cols + [time_col], kind="mergesort").copy()
+
+        seqs = {}
+        for i, (_, g) in enumerate(df_sorted.groupby(id_cols, sort=False)):
+            X = g[feature_cols].to_numpy(dtype=float)
+
+            if error_on_nans and np.isnan(X).any():
+                raise ValueError(
+                    "NaNs found in feature matrix. "
+                    "Please interpolate/impute before calling run_hsmm_state_classification."
+                )
+
+            seqs[f"traj_{i}"] = X
+
+        return seqs, df_sorted
+
+    seqs, df_sorted = _prep_seq_dict(df_features)
+    selection_df = None
+
+    if model is None:
+        if isinstance(n_states, str):
+            if n_states.lower() != "auto":
+                raise ValueError("n_states must be int or 'auto'")
+            if k_max < k_min:
+                raise ValueError("k_max must be >= k_min")
+
+            rows = []
+            best_bic = np.inf
+            best_model = None
+
+            for k in range(k_min, k_max + 1):
+                m = GaussianHSMM(
+                    n_states=k,
+                    n_durations=n_durations,
+                    n_iter=n_iter,
+                    tol=tol,
+                    random_state=random_state,
+                    left_to_right=False,
+                    name="",
+                )
+                m.fit(seqs)
+
+                logL_k = m.score(seqs)
+                bic_k  = m.bic(seqs)
+
+                rows.append({"k": k, "bic": float(bic_k), "logL": float(logL_k)})
+
+                if bic_k < best_bic:
+                    best_bic = bic_k
+                    best_model = m
+
+            model = best_model
+            selection_df = pd.DataFrame(rows)
+
+        else:
+            model = GaussianHSMM(
+                n_states=int(n_states),
+                n_durations=n_durations,
+                n_iter=n_iter,
+                tol=tol,
+                random_state=random_state,
+                left_to_right=False,
+                name="",
+            )
+            model.fit(seqs)
+
+    states_all = []
+
+    for i in range(len(seqs)):
+        s_i = model.predict(seqs[f"traj_{i}"])
+        states_all.append(np.asarray(s_i, dtype=int))
+    states_all = np.concatenate(states_all)
+
+    out = df_sorted.copy()
+    out[out_col_name] = states_all
+
+    state_map = out[id_cols + [time_col, out_col_name]]
+
+    df_features_clean = df_features.drop(columns=[out_col_name], errors="ignore")
+    df_out = df_features_clean.merge(
+        state_map,
+        on=id_cols + [time_col],
+        how="left",
+        sort=False,
+        validate="many_to_one",
+    )
+
     return df_out, model, selection_df

@@ -44,26 +44,26 @@ import math
 
 from behav3d.utils.rolling_classification import *
 from behav3d.utils.rolling_classification.plotting import *
-%matplotlib inline
+# %matplotlib inline
 
 seed = 123
 random.seed(seed)
 np.random.seed(seed)
 
 if __name__ == "__main__":
-    # ssd_dir = r"/Volumes/T7_Sam/"
-    ssd_dir = r"F:/"
+    ssd_dir = r"/Volumes/T7_Sam/"
+    # ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
     
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
     metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv")
 
-    output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/CombinedAnalysis_AmberMacrophage")
-    metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/CombinedAnalysis_AmberMacrophage/metadata.csv")
+    # output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/CombinedAnalysis_AmberMacrophage")
+    # metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/CombinedAnalysis_AmberMacrophage/metadata.csv")
 
 
-    downloads_folder = r"C:/Users/Samde/Downloads"
-    # downloads_folder = "/Users/s.deblank-3/Downloads"
+    # downloads_folder = r"C:/Users/Samde/Downloads"
+    downloads_folder = "/Users/s.deblank-3/Downloads"
     # output_dir = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
     # metadata_csv_path = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
 
@@ -89,14 +89,14 @@ if __name__ == "__main__":
     groupby=["sample_name", "TrackID"]
     features=[
         "percentage_dead_mask",
-        "nr_dead_mask_pixels",
+        # "nr_dead_mask_pixels",
         "organoid_contact_pixels",
         "tcell_contact_pixels",
         "mean_square_displacement",
         "speed",
     ]
 
-    df_tracks = df_positions[features+["sample_name", "TrackID", "position_t"]]
+    # df_tracks = df_positions[["sample_name", "TrackID", "position_t"]+features]
     df_windows_descriptive = create_descriptive_track_dataset(
         df_tracks=df_positions,
         columns_to_summarize=features,
@@ -107,7 +107,7 @@ if __name__ == "__main__":
     )
 
     # df_windows_descriptive.to_csv(Path(downloads_folder,r"df_windows_descriptive.csv"), index=False)
-    df_windows_descriptive = pd.read_csv(Path(downloads_folder,r"df_windows_descriptive.csv"))
+    # df_windows_descriptive = pd.read_csv(Path(downloads_folder,r"df_windows_descriptive.csv"))
     
     ### Sample the dataset (either to fraction of the tracks)
     non_feature_cols = [
@@ -119,7 +119,6 @@ if __name__ == "__main__":
         "window_end_position_t",
         "window_length_frames",
     ]
-    
     
     df_analysis = df_windows_descriptive.copy()
     
@@ -138,47 +137,99 @@ if __name__ == "__main__":
         threshold=0.95
     )
     print(f"Dropped {len(dropped)} features.")
-    descriptive_feature_cols = list(set(descriptive_feature_cols) - set(dropped))
+    descriptive_feature_cols = [c for c in descriptive_feature_cols if c not in dropped]
     
+    df_analysis[descriptive_feature_cols] = StandardScaler().fit_transform(df_analysis[descriptive_feature_cols])
     
     # --- 3) Subset windows (custom) ---
     chosen_intervals = 25
-    df_analysis_subset = subset_windowed_tracks(
+    df_leiden_subset = subset_windowed_tracks(
         df_windowed=df_analysis,
         step_size=chosen_intervals,
     )
     
     adata_full = df_to_adata(df_analysis, descriptive_feature_cols, obs_cols=non_feature_cols)
-    adata_sub  = df_to_adata(df_analysis_subset, descriptive_feature_cols, obs_cols=non_feature_cols)
+    adata_sub  = df_to_adata(df_leiden_subset, descriptive_feature_cols, obs_cols=non_feature_cols)
+
+    # sc.pp.scale(adata_full, zero_center=True, max_value=None)
+    # scaled_subset_X = adata_full[adata_sub.obs_names, adata_sub.var_names].X
+    # adata_sub.X = scaled_subset_X.copy()
     
-    sc.pp.scale(adata_full, zero_center=True, max_value=None) #, max_value=10)
-    adata_sub.X = adata_full.X[df_analysis_subset.index.values, :]
-    
+    """
+    LEIDEN CLUSTERING
+    """
     pca_var=0.95
-    sc.pp.pca(adata_sub)
+    # sc.pp.pca(adata_sub, n_comps=None, )
+    sc.pp.pca(adata_sub, n_comps=None, svd_solver='full', random_state=seed)
+
     var_ratio = adata_sub.uns["pca"]["variance_ratio"]
     n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var) + 1)
     adata_sub.obsm["X_pca"] = adata_sub.obsm["X_pca"][:, :n_pcs]
     
     sc.pp.neighbors(
         adata_sub,
-        n_neighbors=100,
+        n_neighbors=80,
         metric="cosine",
         method="umap",
+        knn=True,
         use_rep="X_pca",
     )
     
-    sc.tl.leiden(
-        adata_sub,
-        resolution=0.35,
-        random_state=seed,
-        key_added="ClusterID",
-    )
+    adata_sub = run_leiden_clustering(
+        adata_sub, 
+        resolution="auto", 
+        stability_resolutions=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0), # Gives 0.5 as result
+        key_added="ClusterID"
+        )
+
+    # adata_sub = run_leiden_clustering(
+    #     adata_sub, 
+    #     resolution=0.3, 
+    #     key_added="ClusterID"
+    #     )
+    
+    # sc.tl.leiden(
+    #     adata_sub,
+    #     resolution=0.2,
+    #     random_state=seed,
+    #     key_added="ClusterID",
+    # )
     
     sc.tl.umap(
         adata_sub,
         min_dist=0.1,
         random_state=seed,
+    )
+    
+    sc.pl.umap(adata_sub, color="ClusterID", size=6)
+    
+    feature_dict = {
+        f: [c for c in descriptive_feature_cols if c.startswith(f + "_")]
+        for f in features
+    }
+    
+    sc.tl.dendrogram(adata_sub, groupby="ClusterID")
+    sc.pl.heatmap(
+        adata_sub,
+        var_names=feature_dict,
+        var_group_labels=list(feature_dict.keys()),
+        groupby="ClusterID",
+        standard_scale="var",
+        figsize=(8.27, 11.69),
+        swap_axes=True,
+        dendrogram=True,
+        show_gene_labels=True,
+    )
+    
+    sc.pl.matrixplot(
+        adata_sub,
+        var_names=feature_dict,                 # dict: {group_label: [genes...]}
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="ClusterID",
+        standard_scale="var",
+        figsize=(8.27, 11.69),
+        swap_axes=True,
+        dendrogram=True
     )
     
     sc.tl.ingest(
@@ -194,69 +245,407 @@ if __name__ == "__main__":
         cols_from_obs=["ClusterID"],
     )
     
-    df_analysis_subset = adata_add_back_to_df(
-        df_analysis_subset, adata_sub,
+    df_leiden_subset = adata_add_back_to_df(
+        df_leiden_subset, adata_sub,
         cols_from_obs=["ClusterID"],
     )
     
     ###### ANALYSIS VALUES
-    plot_number_per_clusters(df_analysis, cluster_col="ClusterID")
-    plot_per_cluster_proportions(df_analysis)
+    plot_number_per_clusters(df_leiden_subset, cluster_col="ClusterID")
+    plot_per_cluster_proportions(df_leiden_subset)
     
-    sc.pl.umap(adata_sub, color="ClusterID")
-    
-    plt.figure(figsize=(6,5))
-    ax = sns.scatterplot(
-    data=df_analysis, x="UMAP1", y="UMAP2",
-    hue="cluster_label_leiden", palette="tab20",
-    s=2, alpha=0.3, edgecolor=None  
-    )
-    # bigger legend dots without changing plot dots
-    leg = ax.legend(
-        bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.,
-        markerscale=6,  # <-- enlarge legend markers
-        scatterpoints=1 # keep one dot per legend entry
-    )
-    plt.title("UMAP colored by Leiden clusters (−1 = noise)")
-    plt.tight_layout()
-    
-    
-    #######################################
-    ####### HMM STATE CLASSIFICATION ######
-    #######################################
-    
-    # Fraction of tracks
-    df_analysis_subset, sampled_keys = subset_full_tracks(
-        df=df_analysis,
-        fraction=0.3,
+
+    """
+    HMM STATE CLASSIFICATION (on windowed data)
+    """
+    df_hmm_descriptive = df_analysis.copy()
+    # scaled_X = adata_full[:, descriptive_feature_cols].X.toarray()
+    # df_analysis_hmm.loc[:, descriptive_feature_cols] = scaled_X
+
+    df_hmm_descriptive, sampled_keys = subset_full_tracks(
+        df=df_hmm_descriptive,
+        fraction=0.2,
         random_state=seed,
         id_cols=["sample_name", "TrackID"],
         return_selected_keys=True
     )
     
-    df_analysis_subset, hmm_model, selection_df = run_hmm_state_classification(
-        df_features=df_analysis_subset,
+    # df_hmm_descriptive, hmm_model, selection_df = run_hmm_state_classification(
+    #     df_features=df_hmm_descriptive,
+    #     feature_cols=descriptive_feature_cols,
+    #     k_min = 3,
+    #     k_max = 15,
+    #     n_states="auto", #10 came out of it
+    #     out_col_name="hmm_state"
+    # )
+    
+    
+    df_hmm_descriptive, hmm_model_descriptive, selection_df = run_hmm_state_classification(
+        df_features=df_hmm_descriptive,
         feature_cols=descriptive_feature_cols,
-        n_states="auto"
+        n_states=12, #6 came out of it
+        out_col_name="hmm_state",
+        random_state=seed  
     )
     
     # Apply HMM to full dataset
     df_analysis, _, _ = run_hmm_state_classification(
         df_features=df_analysis,
         feature_cols=descriptive_feature_cols,
-        model=hmm_model
+        model=hmm_model_descriptive,
+        out_col_name="hmm_state"
     )
     
+    df_hmm_descriptive["hmm_state"] =  df_hmm_descriptive["hmm_state"].astype(str).astype("category")
+    df_analysis["hmm_state"] =  df_analysis["hmm_state"].astype(str).astype("category")
+    
+    merge_pandas_cols_into_obs_anndata(
+        cols=["hmm_state"],
+        adata=adata_sub,
+        df_analysis=df_analysis,
+        on=["sample_name", "TrackID", "position_t"],    
+    )
+   
+    merge_pandas_cols_into_obs_anndata(
+        cols=["hmm_state"],
+        adata=adata_full,
+        df_analysis=df_analysis,
+        on=["sample_name", "TrackID", "position_t"],    
+    )
+    
+     # hmm_lookup = df_analysis[["sample_name", "TrackID", "position_t"] + ["hmm_state"]].copy()
+    # obs_df = adata_full.obs.reset_index().rename(columns={"index": "_obs_index"})
+    # obs_df = obs_df.drop(columns=["hmm_state"], errors="ignore")
+    # obs_merged = obs_df.merge(hmm_lookup, on=["sample_name", "TrackID", "position_t"], how="left")
+    # adata_full.obs["hmm_state"] = (
+    #     obs_merged
+    #     .set_index("_obs_index")
+    #     .loc[adata_full.obs.index, "hmm_state"]
+    #     .astype(str)
+    #     .astype("category")
+    # )
+    
+    # hmm_lookup = df_analysis_hmm[["sample_name", "TrackID", "position_t"] + ["hmm_state"]].copy()
+
+    sc.pl.umap(adata_sub, color="hmm_state", size=6)
+    
+    feature_dict = {
+        f: [c for c in descriptive_feature_cols if c.startswith(f + "_")]
+        for f in features
+    }
+    
+    sc.tl.dendrogram(adata_sub, groupby="hmm_state")
+    sc.pl.heatmap(
+        adata_sub,
+        var_names=feature_dict,
+        var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state",
+        standard_scale="var",
+        figsize=(8.27, 11.69),
+        swap_axes=True,
+        dendrogram=True,
+        show_gene_labels=True
+    )
+    
+    sc.pl.matrixplot(
+        adata_sub,
+        var_names=feature_dict,                 # dict: {group_label: [genes...]}
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state",
+        standard_scale="var",
+        figsize=(8.27, 11.69),
+        swap_axes=True,
+        dendrogram=True
+    )
+    
+    plot_number_per_clusters(df_hmm_descriptive, cluster_col="hmm_state")
+    plot_hmm_transition_matrix(hmm_model_descriptive)
+   
+    
+    """
+    ################################################
+    HMM STATE CLASSIFICATION (on raw timepoint data)
+    ################################################
+    """
+    
+    df_tracks = df_positions[["sample_name", "TrackID", "position_t"]+features].copy()
+    df_tracks[features]=df_tracks[features].astype(float)
+    df_tracks.loc[:, features] = StandardScaler().fit_transform(df_tracks.loc[:, features])
+    
+    df_hmm_raw = subset_full_tracks(
+        df=df_tracks,
+        id_cols=["sample_name", "TrackID"],
+        sampled_keys=sampled_keys
+    )
+    
+    df_hmm_raw, hmm_model_raw, selection_df = run_hmm_state_classification(
+        df_features=df_hmm_raw,
+        feature_cols=features,
+        k_min = 3,
+        k_max = 15,
+        n_states="auto", #6 came out of it
+        # n_states=10,
+        out_col_name="hmm_state_instant",
+        random_state=seed  
+    )
+     
+    df_hmm_raw, hmm_model_raw, selection_df = run_hmm_state_classification(
+        df_features=df_hmm_raw,
+        feature_cols=features,
+        # k_min = 2,
+        # k_max = 12,
+        # n_states="auto" #6 came out of it
+        n_states=12,
+        out_col_name="hmm_state_instant",
+        random_state=seed  
+    )
+    
+    # Apply HMM to full dataset
+    df_tracks, _, _ = run_hmm_state_classification(
+        df_features=df_tracks,
+        feature_cols=features,
+        model=hmm_model_raw,
+        out_col_name="hmm_state_instant"
+    )
+    
+    df_hmm_raw["hmm_state_instant"] =  df_hmm_raw["hmm_state_instant"].astype(str).astype("category")
+    df_tracks["hmm_state_instant"] =  df_tracks["hmm_state_instant"].astype(str).astype("category")
+    
+    merge_pandas_cols_into_obs_anndata(
+        cols=["hmm_state_instant"],
+        adata=adata_sub,
+        df_analysis=df_tracks,
+        on=["sample_name", "TrackID", "position_t"],    
+    )
+   
+    merge_pandas_cols_into_obs_anndata(
+        cols=["hmm_state_instant"],
+        adata=adata_full,
+        df_analysis=df_tracks,
+        on=["sample_name", "TrackID", "position_t"],    
+    )
+    
+    sc.pl.umap(adata_sub, color="hmm_state_instant", size=6)
+
+    adata_sub_hmm_raw = df_to_adata(
+        df_hmm_raw, features, obs_cols=["sample_name", "TrackID", "position_t", "hmm_state_instant"]
+    )
+    
+    feature_dict = {
+        f: [c for c in descriptive_feature_cols if c.startswith(f + "_")]
+        for f in features
+    }
+    
+    sc.tl.dendrogram(adata_sub_hmm_raw, groupby="hmm_state_instant")
+    sc.pl.heatmap(
+        adata_sub_hmm_raw,
+        var_names=features,
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state_instant",
+        standard_scale="var",
+        figsize=(8.27, 11.69),
+        swap_axes=True,
+        dendrogram=True,
+        show_gene_labels=True
+    )
+    
+    sc.pl.matrixplot(
+        adata_sub_hmm_raw,
+        var_names=features,                 # dict: {group_label: [genes...]}
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state_instant",
+        standard_scale="var",
+        figsize=(8.27, 11.69),
+        swap_axes=True,
+        dendrogram=True
+    )
+    
+    #### PROJECT ON DESCRIPTIVE DATA
+    sc.tl.dendrogram(adata_sub, groupby="hmm_state_instant")
+    sc.pl.heatmap(
+        adata_sub,
+        var_names=descriptive_feature_cols,
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state_instant",
+        standard_scale="var",
+        figsize=(11.69, 8.27),
+        swap_axes=True,
+        dendrogram=True,
+        show_gene_labels=True
+    )
+    
+    sc.pl.matrixplot(
+        adata_sub,
+        var_names=descriptive_feature_cols,                 # dict: {group_label: [genes...]}
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state_instant",
+        standard_scale="var",
+        figsize=(8.27, 11.69),
+        swap_axes=True,
+        dendrogram=True
+    )
+      
+    plot_number_per_clusters(df_hmm_raw, cluster_col="hmm_state_instant")
+    plot_hmm_transition_matrix(hmm_model_raw)
+    
+    
+    """
+    ################################################
+    HSMM STATE CLASSIFICATION (on raw timepoint data)
+    ################################################
+    """
+    
+    df_tracks = df_positions[["sample_name", "TrackID", "position_t"]+features].copy()
+    df_tracks[features]=df_tracks[features].astype(float)
+    df_tracks.loc[:, features] = StandardScaler().fit_transform(df_tracks.loc[:, features])
+    
+    df_hsmm_raw = subset_full_tracks(
+        df=df_tracks,
+        id_cols=["sample_name", "TrackID"],
+        sampled_keys=sampled_keys
+    )
+    
+    df_hsmm_raw, hsmm_model_raw, selection_df = run_hsmm_state_classification(
+        df_features=df_hsmm_raw,
+        feature_cols=features,
+        k_min = 3,
+        k_max = 15,
+        n_states="auto", #6 came out of it
+        # n_states=10,
+        out_col_name="hsmm_state_instant",
+        random_state=seed  
+    )
+     
+    df_hsmm_raw, hsmm_model_raw, selection_df = run_hsmm_state_classification(
+        df_features=df_hsmm_raw,
+        feature_cols=features,
+        # k_min = 2,
+        # k_max = 12,
+        # n_states="auto" #6 came out of it
+        n_states=6,
+        out_col_name="hsmm_state_instant",
+        random_state=seed  
+    )
+    
+    # Apply HMM to full dataset
+    df_tracks, _, _ = run_hsmm_state_classification(
+        df_features=df_tracks,
+        feature_cols=features,
+        model=hsmm_model_raw,
+        out_col_name="hmm_state_instant"
+    )
+    
+    df_hmm_raw["hmm_state_instant"] =  df_hmm_raw["hmm_state_instant"].astype(str).astype("category")
+    df_tracks["hmm_state_instant"] =  df_tracks["hmm_state_instant"].astype(str).astype("category")
+    
+    merge_pandas_cols_into_obs_anndata(
+        cols=["hmm_state_instant"],
+        adata=adata_sub,
+        df_analysis=df_tracks,
+        on=["sample_name", "TrackID", "position_t"],    
+    )
+   
+    merge_pandas_cols_into_obs_anndata(
+        cols=["hmm_state_instant"],
+        adata=adata_full,
+        df_analysis=df_tracks,
+        on=["sample_name", "TrackID", "position_t"],    
+    )
+    
+    sc.pl.umap(adata_sub, color="hmm_state_instant", size=6)
+
+    adata_sub_hmm_raw = df_to_adata(
+        df_hmm_raw, features, obs_cols=["sample_name", "TrackID", "position_t", "hmm_state_instant"]
+    )
+    
+    feature_dict = {
+        f: [c for c in descriptive_feature_cols if c.startswith(f + "_")]
+        for f in features
+    }
+    
+    sc.tl.dendrogram(adata_sub_hmm_raw, groupby="hmm_state_instant")
+    sc.pl.heatmap(
+        adata_sub_hmm_raw,
+        var_names=features,
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state_instant",
+        standard_scale="var",
+        figsize=(8.27, 11.69),
+        swap_axes=True,
+        dendrogram=True,
+        show_gene_labels=True
+    )
+    
+    sc.pl.matrixplot(
+        adata_sub_hmm_raw,
+        var_names=features,                 # dict: {group_label: [genes...]}
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state_instant",
+        standard_scale="var",
+        figsize=(8.27, 11.69),
+        swap_axes=True,
+        dendrogram=True
+    )
+    
+    #### PROJECT ON DESCRIPTIVE DATA
+    sc.tl.dendrogram(adata_sub, groupby="hmm_state_instant")
+    sc.pl.heatmap(
+        adata_sub,
+        var_names=descriptive_feature_cols,
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state_instant",
+        standard_scale="var",
+        figsize=(11.69, 8.27),
+        swap_axes=True,
+        dendrogram=True,
+        show_gene_labels=True
+    )
+    
+    sc.pl.matrixplot(
+        adata_sub,
+        var_names=descriptive_feature_cols,                 # dict: {group_label: [genes...]}
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state_instant",
+        standard_scale="var",
+        figsize=(8.27, 11.69),
+        swap_axes=True,
+        dendrogram=True
+    )
+      
+    plot_number_per_clusters(df_hmm_raw, cluster_col="hmm_state_instant")
+    plot_hmm_transition_matrix(hmm_model_raw)
     
     
     
+    # Contingency table
+    pd.crosstab(df['ClusterID'], df['hmm_state'], normalize='index')
     
     
+    adata_full.write("/Users/s.deblank-3/Downloads/adata_full.h5ad") 
+    adata_sub.write("/Users/s.deblank-3/Downloads/adata_sub.h5ad") 
+    
+    # adata_full.write("/Users/s.deblank-3/Downloads/adata_full.h5ad") 
+    # adata_sub.write("/Users/s.deblank-3/Downloads/adata_sub.h5ad") 
+    
+    adata = sc.read_h5ad("my_data.h5ad")
+    
+    adata.write_zarr("my_data.zarr")
+    adata = ad.read_zarr("my_data.zarr")
     
     
+    plot_cluster_feature_heatmap(
+        df_analysis_subset,
+        feature_cols=descriptive_feature_cols,
+        cluster_col="ClusterID",
+        # figsize=(8.27, 11.69),
+    )
     
-    
-    
+    plot_feature_cluster_heatmap(
+        df_analysis_subset,
+        feature_cols=descriptive_feature_cols,
+        cluster_col="ClusterID",
+        figsize=(8.27, 11.69),
+    )
 
     # ---------- 1) PCA & UMAP quick looks ----------
     plt.figure(figsize=(12,5))
@@ -327,8 +716,8 @@ if __name__ == "__main__":
 
     create_fulltrack_cluster_videos(
         examples_per_cluster=3,
-        clusters=[0],  
-        df_windows=df_analysis,
+        clusters=[1],  
+        df_windows=df_analysis_subset,
         df_positions=df_positions,
         output_folder=output_dir,  # folder containing images/<sample>/<sample>.zarr
         out_dir=downloads_folder,
@@ -387,6 +776,23 @@ if __name__ == "__main__":
     df_analysis_subset["cluster_label_leiden"] = labels_leiden
     df_analysis_subset["ClusterID"] = labels_leiden
     df_analysis_subset["ClusterID"].value_counts()
+    
+    plt.figure(figsize=(6,5))
+    ax = sns.scatterplot(
+    data=df_analysis_subset, x="UMAP1", y="UMAP2",
+    hue="cluster_label_leiden", palette="tab20",
+    s=5, alpha=0.3, edgecolor=None  
+    )
+    # bigger legend dots without changing plot dots
+    leg = ax.legend(
+        bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.,
+        markerscale=6,  # <-- enlarge legend markers
+        scatterpoints=1 # keep one dot per legend entry
+    )
+    plt.title("UMAP colored by Leiden clusters (−1 = noise)")
+    plt.tight_layout()
+    
+    
     
     
     ############
