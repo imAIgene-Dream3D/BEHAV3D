@@ -563,7 +563,7 @@ def run_active_killing_analysis(
         )
         
         if save_results:
-            results_dir = output_dir / "analysis" / "active_killing"
+            results_dir = output_dir / "analysis" / immune_cell_type / "active_killing"
             results_dir.mkdir(parents=True, exist_ok=True)
             advanced_features_path = results_dir / f"BEHAV3D_{immune_cell_type}_advanced_track_features.csv"
             df_advanced.to_csv(advanced_features_path, index=False)
@@ -627,7 +627,7 @@ def run_active_killing_analysis(
     
     # Save results
     if save_results:
-        results_dir = output_dir / "analysis" / "active_killing"
+        results_dir = output_dir / "analysis" / immune_cell_type / "active_killing"
         results_dir.mkdir(parents=True, exist_ok=True)
         
         if not df_killing_per_tp.empty:
