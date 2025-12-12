@@ -223,7 +223,8 @@ def filter_organoid_tracks(
     max_track_length=None,
     min_size=None,
     time_type="frames",
-    cell_type="organoid"
+    cell_type="organoid",
+    df_input_path=None  # Optional: path to input CSV (e.g., advanced features CSV)
     ):
     """
     This code filters tracks based on supplied parameters in the config.yml
@@ -235,6 +236,12 @@ def filter_organoid_tracks(
     
     Additonally, all tracks are cut down to:
     - Maximum track length (tcell_max_track_length)
+    
+    Parameters
+    ----------
+    df_input_path : Path or str, optional
+        Path to input CSV file. If provided, reads from this file instead of the default
+        combined_track_features.csv. Useful for reading advanced features CSV with active killing data.
     
     Output:
     - A .csv file containing filtered tracks from all experiments
@@ -265,7 +272,19 @@ def filter_organoid_tracks(
     if not qc_outdir.exists():
         qc_outdir.mkdir(parents=True)
     
-    df_all_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+    # Use provided input path or default to combined_track_features.csv
+    if df_input_path is not None:
+        df_all_tracks_path = Path(df_input_path)
+        print(f"  Using input file: {df_all_tracks_path.name}")
+    else:
+        df_all_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+    
+    if not df_all_tracks_path.exists():
+        raise FileNotFoundError(
+            f"Track features file not found: {df_all_tracks_path}\n"
+            f"Please run Feature Extraction for {cell_type} first."
+        )
+    
     df_all_tracks = pd.read_csv(df_all_tracks_path)
     
     # Dynamically detect *_line_condition columns from metadata

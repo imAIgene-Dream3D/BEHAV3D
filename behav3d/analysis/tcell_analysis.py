@@ -158,7 +158,8 @@ def filter_cell_tracks(
     filter_t0_dead=True,
     cell_type="tcell",
     time_type="frames", #can also be "relative_time"
-    plot_results=True
+    plot_results=True,
+    df_input_path=None  # Optional: path to input CSV (e.g., advanced features CSV)
     ):
     """
     This code filters tracks based on supplied parameters in the config.yml
@@ -170,6 +171,12 @@ def filter_cell_tracks(
     
     Additonally, all tracks are cut down to:
     - Maximum track length (max_track_length)
+    
+    Parameters
+    ----------
+    df_input_path : Path or str, optional
+        Path to input CSV file. If provided, reads from this file instead of the default
+        combined_track_features.csv. Useful for reading advanced features CSV with active killing data.
     
     Output:
     - A .csv file containing filtered tracks from all experiments
@@ -200,7 +207,19 @@ def filter_cell_tracks(
     if not qc_outdir.exists():
         qc_outdir.mkdir(parents=True)
     
-    df_all_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+    # Use provided input path or default to combined_track_features.csv
+    if df_input_path is not None:
+        df_all_tracks_path = Path(df_input_path)
+        print(f"  Using input file: {df_all_tracks_path.name}")
+    else:
+        df_all_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+    
+    if not df_all_tracks_path.exists():
+        raise FileNotFoundError(
+            f"Track features file not found: {df_all_tracks_path}\n"
+            f"Please run Feature Extraction for {cell_type} first."
+        )
+    
     df_all_tracks = pd.read_csv(df_all_tracks_path)
     
     df_all_tracks['sample_name'] = df_all_tracks['sample_name'].astype(str)
@@ -240,9 +259,13 @@ def filter_cell_tracks(
         # Don't subtract 1 for real time units (hours)
     else:  # frames
         time_column="position_t"
-        exp_duration = exp_duration-1
-        min_track_length = min_track_length-1
-        max_track_length = max_track_length-1
+        # Subtract 1 from frame-based values (only if they are not None)
+        if exp_duration is not None:
+            exp_duration = exp_duration - 1
+        if min_track_length is not None:
+            min_track_length = min_track_length - 1
+        if max_track_length is not None:
+            max_track_length = max_track_length - 1
     
     df_all_tracks_filt = df_all_tracks_filt.sort_values(group_cols + [time_column]).reset_index(drop=True)
 
@@ -373,25 +396,39 @@ def calculate_dtw(
     nr_tracks=len(df_tracks[["sample_name", "TrackID"]].drop_duplicates())
     nr_timepoints=len(df_tracks["relative_time"].unique())
     nr_features=len(features)
-
-    # dtw_input_tracks = np.empty((nr_tracks, nr_timepoints, nr_features),dtype=np.double)
     
+    # Check for NaN in selected features and warn user
+    nan_counts = df_tracks[features].isna().sum()
+    features_with_nan = nan_counts[nan_counts > 0]
+    if len(features_with_nan) > 0:
+        print(f"  ⚠️ Warning: Found NaN values in selected features:")
+        for feat, count in features_with_nan.items():
+            print(f"     - {feat}: {count} NaN values")
+        print(f"  → Filling NaN with 0 for DTW calculation")
+    
+    # Fill NaN values with 0 for DTW calculation
+    df_tracks_filled = df_tracks.copy()
+    df_tracks_filled[features] = df_tracks_filled[features].fillna(0)
+
     dtw_input_tracks=[]
     dtw_rownames=[]
-    unique_tracks = df_tracks.groupby(['TrackID', 'sample_name'])
+    unique_tracks = df_tracks_filled.groupby(['TrackID', 'sample_name'])
     for (TrackID, sample_name), group in unique_tracks:
         track_features = group[features].to_numpy().astype(np.double)
         dtw_rownames.append(f"{TrackID}--{sample_name}")
-        # dtw_track = {
-        #     "TrackID": TrackID,
-        #     "sample_name": sample_name,
-        #     "dtw_input": track_features
-        # }
-        # dtw_track = pd.DataFrame(dtw_track)
         dtw_input_tracks.append(track_features)
     
     dtw_distance_matrix = dtw_ndim.distance_matrix_fast(dtw_input_tracks)
     dtw_distance_matrix = pd.DataFrame(dtw_distance_matrix, index=dtw_rownames, columns=dtw_rownames)
+    
+    # Check for NaN in resulting distance matrix
+    nan_in_matrix = dtw_distance_matrix.isna().sum().sum()
+    if nan_in_matrix > 0:
+        print(f"  ⚠️ Warning: DTW distance matrix contains {nan_in_matrix} NaN values")
+        print(f"  → Filling with maximum distance value")
+        max_val = dtw_distance_matrix.max().max()
+        dtw_distance_matrix = dtw_distance_matrix.fillna(max_val if not pd.isna(max_val) else 0)
+    
     return(dtw_distance_matrix)
 
 def rolling_classification(
@@ -581,6 +618,15 @@ def fit_umap(
         assert config is not None, "Provide config or both umap_n_neighbors and umap_minimal_distance"
         umap_n_neighbors = config['umap_n_neighbors']
         umap_minimal_distance = config["umap_minimal_distance"]
+    
+    # Final safety check for NaN values in the distance matrix
+    dtw_matrix_values = dtw_distance_matrix.values.copy()
+    if np.isnan(dtw_matrix_values).any():
+        nan_count = np.isnan(dtw_matrix_values).sum()
+        print(f"  ⚠️ Warning: Distance matrix still contains {nan_count} NaN values")
+        print(f"  → Replacing with maximum finite value")
+        max_val = np.nanmax(dtw_matrix_values)
+        dtw_matrix_values = np.nan_to_num(dtw_matrix_values, nan=max_val if not np.isnan(max_val) else 0)
         
     umap_model = umap.UMAP(
         n_components=2, 
@@ -590,7 +636,7 @@ def fit_umap(
         random_state=random_state,
         metric="precomputed", 
         )
-    umap_embedding = umap_model.fit_transform(dtw_distance_matrix.values)
+    umap_embedding = umap_model.fit_transform(dtw_matrix_values)
     umap_embedding = pd.DataFrame(umap_embedding, columns=['UMAP1', 'UMAP2'])
     umap_embedding[['TrackID', 'sample_name']] = pd.DataFrame(
         [string.split('--') for string in dtw_distance_matrix.index]
