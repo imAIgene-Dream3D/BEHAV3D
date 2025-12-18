@@ -3956,7 +3956,7 @@ class ActiveKillingPanel:
                 print(f"✅ Active Killing Analysis complete!")
                 
                 if save:
-                    results_dir = Path(self.output_dir, "analysis", self.cell_type, "active_killing")
+                    results_dir = Path(self.output_dir, "analysis", immune_cell, "active_killing")
                     print(f"   Results saved to: {results_dir}")
                 
             except Exception:
@@ -5448,10 +5448,6 @@ class InteractionAnalysisPanel:
                     dead_threshold=dead_threshold,
                     results_dir=results_dir
                 )
-                
-                print()
-                print(f"✅ Interaction Analysis complete!")
-                print(f"   Results saved to: {results_dir}")
                 
             except Exception:
                 print("❌ Error during Interaction Analysis:")
