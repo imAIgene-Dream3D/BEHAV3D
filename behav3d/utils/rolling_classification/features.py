@@ -284,23 +284,27 @@ def compute_window_features(window_dataframe, column_name, time_column="position
     features[f"{column_name}_mean_value"] = compute_mean_value(signal_values)
 
     if signal_type != "binary":
+        features[f"{column_name}_median_value"] = compute_median_value(signal_values)
         features[f"{column_name}_value_range"] = compute_value_range(signal_values)
         features[f"{column_name}_standard_deviation"] = compute_standard_deviation(signal_values)
         features[f"{column_name}_minimum_value"] = compute_minimum_value(signal_values)
         features[f"{column_name}_maximum_value"] = compute_maximum_value(signal_values)
-        features[f"{column_name}_median_value"] = compute_median_value(signal_values)
-
         features[f"{column_name}_interquartile_range"] = compute_interquartile_range(signal_values)
         features[f"{column_name}_median_absolute_deviation"] = compute_median_absolute_deviation(signal_values)
 
         for q in [0.1, 0.25, 0.75, 0.9]:
             features[f"{column_name}_quantile_{int(q*100)}percent"] = compute_quantile(signal_values, q)
 
+    # 1 is postive slope, 0 is no slope, -1 is decreasing slope
     features[f"{column_name}_linear_trend_slope_per_time_unit"] = compute_linear_trend_slope(
         signal_values, time_values
     )
+    
+    # lag1_autocorrelation gives how similar a value is to itself a step later
+    # 1 is smooth curve, 0 is pure noise (current value gives no information on next value), -1 is up/down pattern
     features[f"{column_name}_lag1_autocorrelation"] = compute_lag1_autocorrelation(signal_values)
 
+    # This gives the actual mean value of the differences in value between one point to the next
     if signal_type != "binary":
         features[f"{column_name}_mean_absolute_first_difference"] = compute_mean_absolute_first_difference(signal_values)
 
@@ -313,9 +317,9 @@ def compute_window_features(window_dataframe, column_name, time_column="position
         binary_signal = convert_to_binary(signal_values)
         features[f"{column_name}_transition_rate"] = compute_binary_transition_rate(binary_signal)
         features[f"{column_name}_longest_true_length"] = compute_longest_true_run_length(binary_signal)
-        features[f"{column_name}_average_true_length"] = compute_average_true_run_length(binary_signal)
+        features[f"{column_name}_mean_true_length"] = compute_average_true_run_length(binary_signal)
         features[f"{column_name}_longest_false_length"] = compute_longest_true_run_length(~binary_signal)
-        features[f"{column_name}_average_false_length"] = compute_average_true_run_length(~binary_signal)
+        features[f"{column_name}_mean_false_length"] = compute_average_true_run_length(~binary_signal)
 
     if signal_type == "count":
         finite = signal_values[np.isfinite(signal_values)]
@@ -333,7 +337,7 @@ def compute_window_features(window_dataframe, column_name, time_column="position
     return features
 
 
-def _process_track_worker(
+def _create_descriptive_track_worker(
     group_df, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types
 ):
     group_df = group_df.reset_index(drop=True)
@@ -517,7 +521,7 @@ def create_descriptive_track_dataset(
     if n_jobs is None or n_jobs != 1:
         with ProcessPoolExecutor(max_workers=n_jobs) as ex:
             futures = ex.map(
-                _process_track_worker,
+                _create_descriptive_track_worker,
                 groups,
                 [columns_to_summarize] * total_groups,
                 [window_size] * total_groups,
@@ -532,7 +536,7 @@ def create_descriptive_track_dataset(
                     output_rows.extend(rows)
     else:
         for g in tqdm(groups, total=total_groups):
-            rows = _process_track_worker(
+            rows = _create_descriptive_track_worker(
                 g, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types
             )
             if rows:

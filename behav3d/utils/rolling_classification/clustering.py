@@ -189,6 +189,58 @@ def _leiden_stability_search(
 
     return best_labels, float(best_res), summary
 
+def merge_small_clusters(
+    adata,
+    key="clusters_leiden",
+    min_size=200,
+    use_rep="X_pca",  # or "X" or "X_umap" depending on what you trust
+):
+    labels = adata.obs[key].astype("category")
+    counts = labels.value_counts()
+
+    small_clusters = counts[counts < min_size].index.tolist()
+    if len(small_clusters) == 0:
+        print("No small clusters to merge.")
+        return
+
+    X = adata.obsm[use_rep] if use_rep in adata.obsm else adata.X
+
+    # compute centroids for all clusters
+    centroids = {}
+    for cl in labels.cat.categories:
+        idx = (labels == cl).to_numpy()
+        centroids[cl] = np.asarray(X[idx].mean(axis=0)).ravel()
+
+    centroids = pd.DataFrame(centroids).T  # (n_clusters, n_features)
+
+    # for each small cluster, find the closest *larger* cluster
+    new_labels = labels.copy()
+    for cl in small_clusters:
+        cl_size = counts[cl]
+        cl_centroid = centroids.loc[cl].to_numpy()
+
+        # candidate target clusters: not the same and >= min_size
+        big_clusters = [
+            c for c, s in counts.items()
+            if (c != cl) and (s >= min_size)
+        ]
+        if len(big_clusters) == 0:
+            print(f"Cluster {cl} is small but there is no larger cluster to merge into.")
+            continue
+
+        big_centroids = centroids.loc[big_clusters].to_numpy()
+        dists = np.linalg.norm(big_centroids - cl_centroid, axis=1)
+        target = big_clusters[int(np.argmin(dists))]
+
+        print(f"Merging small cluster {cl} (n={cl_size}) into {target} (n={counts[target]}).")
+        new_labels[new_labels == cl] = target
+
+    # re-categorize to keep it tidy
+    new_labels = new_labels.astype("category").cat.remove_unused_categories()
+    adata.obs[key] = new_labels
+    
+    return adata
+
 def run_hmm_state_classification(
     df_features: pd.DataFrame,
     feature_cols: list[str],
@@ -461,7 +513,8 @@ def run_sticky_hmm_state_classification(
             verbose=verbose,
             params=params,
             init_params=init_params,
-            transmat_prior=sticky_prior,  # matrix-valued sticky Dirichlet prior
+            transmat_prior=sticky_prior,
+            min_covar=1e-3# matrix-valued sticky Dirichlet prior
         )
         # Provide an explicitly sticky starting point
         m.startprob_ = np.full(K, 1.0 / K)
@@ -538,3 +591,290 @@ def run_sticky_hmm_state_classification(
         validate="many_to_one",
     )
     return df_out, model, selection_df
+
+def compute_cluster_transition_matrix(
+    adata,
+    cluster_key: str,
+    id_cols=["sample_name", "TrackID"],
+    time_key="position_t",
+    normalize: bool = True,
+    plot: bool = False,
+    ax: plt.Axes = None,
+):
+    """
+    Compute an HMM-style transition matrix between cluster states
+    from tracked objects over time.
+
+    Parameters
+    ----------
+    adata : anndata.AnnData
+        AnnData object containing tracking and clustering info in .obs.
+    cluster_key : str
+        Column in adata.obs with cluster labels (e.g. 'ClusterID', 'leiden').
+    track_key : str
+        Column in adata.obs identifying each track/object (e.g. 'track_id').
+    time_key : str
+        Column in adata.obs giving time or frame index (must be sortable).
+    normalize : bool, default True
+        If True, return row-normalized probabilities (HMM-style).
+        If False, returns raw transition counts.
+    plot : bool, default False
+        If True, plot the (normalized) transition matrix as a heatmap.
+    ax : matplotlib.axes.Axes, optional
+        Axis to plot on. If None and plot=True, a new figure/axis is created.
+
+    Returns
+    -------
+    transition_counts : pandas.DataFrame
+        Matrix of transition counts, shape (n_states, n_states).
+        Rows = current state, columns = next state.
+    transition_probs : pandas.DataFrame
+        Row-normalized transition matrix (P(next | current)).
+        If normalize=False, this is still returned but will match counts
+        except for rows with sum>0.
+    """
+    df = adata.obs[id_cols+[cluster_key, time_key]].copy()
+    df = df.sort_values(id_cols+[time_key])
+
+    # Next state within each track
+    df["next_state"] = df.groupby(id_cols)[cluster_key].shift(-1)
+
+    # Drop last timepoint of each track (no "next" state)
+    transitions = df.dropna(subset=["next_state"]).copy()
+
+    # Build transition counts
+    transition_counts = pd.crosstab(
+        transitions[cluster_key],
+        transitions["next_state"]
+    )
+
+    # Ensure all states present on both axes
+    states = sorted(df[cluster_key].unique())
+    transition_counts = transition_counts.reindex(
+        index=states, columns=states, fill_value=0
+    )
+
+    # Row-normalize to probabilities
+    row_sums = transition_counts.sum(axis=1)
+    transition_probs = transition_counts.div(
+        row_sums.replace(0, np.nan), axis=0
+    )
+
+    if plot:
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(6, 5))
+
+        data_to_plot = transition_probs if normalize else transition_counts
+
+        im = ax.imshow(data_to_plot.values, aspect="auto")
+        ax.set_xticks(np.arange(len(states)))
+        ax.set_yticks(np.arange(len(states)))
+        ax.set_xticklabels(states, rotation=90)
+        ax.set_yticklabels(states)
+
+        plt.colorbar(im, ax=ax, label="P(next | current)" if normalize else "Count")
+        ax.set_xlabel("Next state")
+        ax.set_ylabel("Current state")
+        ax.set_title("Cluster transition matrix")
+        plt.tight_layout()
+
+    return transition_counts, transition_probs
+
+def filter_short_state_runs(
+    adata,
+    cluster_key: str,
+    id_cols = ["sample_name", "TrackID"],
+    time_key: str = "position_t",
+    length_removed: int = 1,
+    new_key: str | None = None,
+    inplace: bool = False,
+):
+    """
+    Filter short runs of states along tracks by replacing them with neighboring states.
+
+    For each track (defined by id_cols), sorted by time_key:
+      - Find runs of consecutive identical states in `cluster_key`
+      - Any run with length <= length_removed is replaced:
+          * If both previous and next runs exist:
+              - If prev_state == next_state: use that state
+              - Else: use prev_state  (e.g. 1112333 -> 1111333)
+          * If only previous exists      : use prev_state
+          * If only next exists          : use next_state
+          * If no neighbors (only run)   : keep as is
+
+    Examples (with length_removed=1)
+    --------------------------------
+    111121111  ->  111111111
+    1112333    ->  1111333
+
+    Parameters
+    ----------
+    adata : anndata.AnnData
+        AnnData object containing tracking and clustering info in .obs.
+    cluster_key : str
+        Column in adata.obs with state/cluster labels (e.g. 'ClusterID', 'leiden').
+    id_cols : list of str, default ['sample_name', 'TrackID']
+        Columns that together define a track.
+    time_key : str, default 'position_t'
+        Column giving time/frame index (must be sortable).
+    length_removed : int, default 1
+        Maximum length of a run to be considered "short" and replaced.
+    new_key : str or None, default None
+        If not None and inplace=False, store filtered states in this new column
+        of adata.obs.
+    inplace : bool, default False
+        If True, overwrite adata.obs[cluster_key] with the filtered states.
+        If False, returns the filtered Series (and optionally writes to new_key).
+
+    Returns
+    -------
+    filtered_states : pandas.Series
+        The filtered states, indexed like adata.obs.
+    """
+    df = adata.obs[id_cols + [cluster_key, time_key]].copy()
+    df = df.sort_values(id_cols + [time_key])
+
+    filtered = df[cluster_key].copy()
+
+    # Process each track separately
+    for _, sub in df.groupby(id_cols, sort=False):
+        idx = sub.index.values
+        states = sub[cluster_key].to_numpy()
+
+        if len(states) == 0:
+            continue
+
+        # Identify runs of identical states
+        run_id = np.zeros(len(states), dtype=int)
+        current_run = 0
+        for i in range(1, len(states)):
+            if states[i] != states[i - 1]:
+                current_run += 1
+            run_id[i] = current_run
+        n_runs = current_run + 1
+
+        new_states = states.copy()
+
+        for r in range(n_runs):
+            mask = (run_id == r)
+            run_len = mask.sum()
+            if run_len > length_removed:
+                # keep as is
+                continue
+
+            # Determine neighboring states
+            prev_state = states[run_id == (r - 1)][-1] if r > 0 else None
+            next_state = states[run_id == (r + 1)][0] if r < n_runs - 1 else None
+
+            # Decide replacement
+            if prev_state is None and next_state is None:
+                # Only run in the track → keep as is
+                replacement = states[mask][0]
+            elif prev_state is None:
+                # At the start: use next
+                replacement = next_state
+            elif next_state is None:
+                # At the end: use prev
+                replacement = prev_state
+            else:
+                # In the middle, both neighbors exist
+                if prev_state == next_state:
+                    replacement = prev_state
+                else:
+                    # Your rule: "if bordered by different numbers take the state before"
+                    replacement = prev_state
+
+            new_states[mask] = replacement
+
+        filtered.loc[idx] = new_states
+
+    if new_key is not None:
+        adata.obs[new_key] = filtered
+    else:
+        adata.obs[cluster_key] = filtered
+
+    return adata
+
+def condense_state_runs(
+    adata,
+    cluster_key: str,
+    id_cols=["sample_name", "TrackID"],
+    time_key: str = "position_t",
+):
+    """
+    Collapse consecutive identical states within each track into runs.
+
+    Example:
+        For a given track:
+            t:   0  1  2  3  4  5
+            s:   1  1  1  2  2  1
+        becomes runs:
+            run 1: state=1, start_t=0, end_t=2, length=3
+            run 2: state=2, start_t=3, end_t=4, length=2
+            run 3: state=1, start_t=5, end_t=5, length=1
+
+    Parameters
+    ----------
+    adata : anndata.AnnData
+        AnnData with tracking and clustering info in .obs.
+    cluster_key : str
+        Column in adata.obs with state/cluster labels.
+    id_cols : list of str, optional
+        Columns that together define a track (e.g. ['sample_name', 'TrackID']).
+        If None, defaults to ['TrackID'].
+    time_key : str, default 'position_t'
+        Column giving time/frame index (must be sortable).
+
+    Returns
+    -------
+    runs_df : pandas.DataFrame
+        One row per run, with columns:
+            - all id_cols
+            - cluster_key (state of the run)
+            - 'run_start_time', 'run_end_time', 'run_length'
+            - 'run_index' (order of the run within each track)
+    """
+
+    df = adata.obs[id_cols + [cluster_key, time_key]].copy()
+    df = df.sort_values(id_cols + [time_key])
+
+    runs_list = []
+
+    for keys, sub in df.groupby(id_cols, sort=False):
+        sub = sub.sort_values(time_key)
+
+        # Identify where state changes
+        # run_id increases whenever cluster changes
+        run_id = (sub[cluster_key] != sub[cluster_key].shift()).cumsum()
+        sub = sub.assign(_run_id=run_id)
+
+        # Aggregate per run
+        agg = sub.groupby("_run_id").agg(
+            {
+                cluster_key: "first",
+                time_key: ["min", "max", "count"],
+            }
+        )
+
+        # Flatten columns
+        agg.columns = [
+            "state",
+            "run_start_time",
+            "run_end_time",
+            "run_length",
+        ]
+
+        # Add id_cols back & run index
+        for col, val in zip(id_cols, keys if isinstance(keys, tuple) else (keys,)):
+            agg[col] = val
+
+        agg["run_index"] = np.arange(len(agg))
+
+        runs_list.append(agg.reset_index(drop=True))
+
+    runs_df = pd.concat(runs_list, axis=0, ignore_index=True)
+
+    # Rename 'state' back to cluster_key so we can reuse easily
+    runs_df = runs_df.rename(columns={"state": cluster_key})
+
+    return runs_df
