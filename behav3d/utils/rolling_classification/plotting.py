@@ -1227,3 +1227,292 @@ def plot_clustering_feature_heatmap(
 
     if plot_results:
         print(f"Saved PDF to: {outpath}")
+
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Wedge, PathPatch, Polygon
+from matplotlib.path import Path
+import matplotlib.cm as cm
+
+def plot_directional_chord(
+    M,
+    labels=None,
+    ax=None,
+    *,
+    sort_labels=True,
+    pad=0.02,                 # gap between outer arcs (radians)
+    start_angle=np.pi / 2,    # where label 1 starts (12 o'clock)
+    r_outer=1.00,
+    r_inner=0.78,
+    ribbon_alpha=0.65,
+    arc_width=0.16,
+    min_value=0.0,            # hide ribbons below this
+    cmap_name="tab20",
+    arrow_size=0.03,          # relative to radius
+    arrow_at=0.93,            # where along ribbon centerline the arrow sits (0..1 toward target)
+    figsize=(7, 7),
+):
+    """
+    Draw a chord-like circular plot with *directional* transitions.
+
+    Parameters
+    ----------
+    M : (n,n) array-like OR pandas.DataFrame
+        Transition matrix where M[i,j] is flow from i -> j.
+    labels : list[str] | None
+        Node labels (if M is not a DataFrame).
+    ax : matplotlib axis | None
+        Provide an axis to draw on; otherwise creates a new figure/axis.
+    sort_labels : bool
+        If True, sorts labels; if False preserves input order.
+    pad, start_angle : float
+        Arc layout controls in radians.
+    r_outer, r_inner : float
+        Outer radius and inner radius where ribbons attach.
+    ribbon_alpha : float
+        Ribbon transparency.
+    arc_width : float
+        Thickness of the outer arcs.
+    min_value : float
+        Minimum flow to draw a ribbon.
+    cmap_name : str
+        Colormap used for node colors.
+    arrow_size : float
+        Arrow triangle size (in radius units).
+    arrow_at : float
+        Position of arrow along centerline (0 source -> 1 target).
+    figsize : tuple
+        Figure size if ax is None.
+
+    Returns
+    -------
+    ax : matplotlib axis
+    """
+
+    # ---- load / normalize input
+    if isinstance(M, pd.DataFrame):
+        df = M.copy()
+        if labels is None:
+            labels = list(df.index)
+        M = df.values.astype(float)
+    else:
+        M = np.asarray(M, dtype=float)
+        if labels is None:
+            labels = [str(i) for i in range(M.shape[0])]
+
+    n = M.shape[0]
+    if M.shape[1] != n:
+        raise ValueError("M must be square (n x n).")
+
+    # optional sorting (keeps matrix aligned)
+    if sort_labels:
+        order = np.argsort(np.array(labels, dtype=str))
+        labels = [labels[i] for i in order]
+        M = M[np.ix_(order, order)]
+
+    # remove diagonal for chord rendering (optional; comment out if you want self-loops)
+    np.fill_diagonal(M, 0.0)
+
+    outflow = M.sum(axis=1)
+    inflow = M.sum(axis=0)
+    node_weight = outflow + inflow  # used to size outer arcs
+    total = node_weight.sum()
+    if total <= 0:
+        raise ValueError("Matrix has no positive flow to plot.")
+
+    # ---- axis setup
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize, subplot_kw=dict(aspect="equal"))
+    ax.set_xlim(-1.15, 1.15)
+    ax.set_ylim(-1.15, 1.15)
+    ax.axis("off")
+
+    # ---- color mapping
+    cmap = cm.get_cmap(cmap_name, n)
+    node_color = [cmap(i) for i in range(n)]
+
+    # ---- allocate outer arc spans for each node
+    full = 2 * np.pi
+    usable = full - n * pad
+    spans = usable * (node_weight / total)
+
+    node_arc = []  # [(a0,a1)]
+    ang = start_angle
+    for i in range(n):
+        a0 = ang
+        a1 = ang - spans[i]
+        node_arc.append((a0, a1))
+        ang = a1 - pad
+
+    # helper: angle to xy on circle
+    def pol2xy(r, theta):
+        return np.array([r * np.cos(theta), r * np.sin(theta)])
+
+    # ---- draw outer arcs + labels
+    for i, (a0, a1) in enumerate(node_arc):
+        theta1 = np.degrees(a1)
+        theta2 = np.degrees(a0)
+        w = Wedge(
+            (0, 0),
+            r_outer,
+            theta1,
+            theta2,
+            width=arc_width,
+            facecolor=node_color[i],
+            edgecolor="white",
+            lw=1.2,
+            alpha=0.95,
+        )
+        ax.add_patch(w)
+
+        # label
+        am = (a0 + a1) / 2
+        p = pol2xy(r_outer + 0.08, am)
+        rot = np.degrees(am)
+        # keep text upright-ish
+        if rot < -90 or rot > 90:
+            rot += 180
+            ha = "right"
+        else:
+            ha = "left"
+        ax.text(
+            p[0],
+            p[1],
+            labels[i],
+            rotation=rot,
+            rotation_mode="anchor",
+            ha=ha,
+            va="center",
+            fontsize=10,
+        )
+
+    # ---- allocate sub-intervals on each node for outgoing ribbons
+    # For node i, split its arc by outgoing magnitudes M[i,j]
+    out_sub = [[None] * n for _ in range(n)]  # (s0,s1) angles for each i->j on source arc
+    for i in range(n):
+        a0, a1 = node_arc[i]
+        span = a0 - a1
+        if outflow[i] <= 0:
+            continue
+        cursor = a0
+        for j in range(n):
+            v = M[i, j]
+            if v <= 0:
+                continue
+            d = span * (v / outflow[i])
+            s0 = cursor
+            s1 = cursor - d
+            out_sub[i][j] = (s0, s1)
+            cursor = s1
+
+    # For target placement: also split each node by incoming so ribbons land with less overlap
+    in_sub = [[None] * n for _ in range(n)]  # (t0,t1) angles for each i->j on target arc
+    for j in range(n):
+        a0, a1 = node_arc[j]
+        span = a0 - a1
+        if inflow[j] <= 0:
+            continue
+        cursor = a0
+        for i in range(n):
+            v = M[i, j]
+            if v <= 0:
+                continue
+            d = span * (v / inflow[j])
+            t0 = cursor
+            t1 = cursor - d
+            in_sub[i][j] = (t0, t1)
+            cursor = t1
+
+    # ---- ribbon builder (a curved "band" using two Bezier curves)
+    def add_ribbon(i, j, s0, s1, t0, t1, value):
+        # edge points on inner radius
+        p_s0 = pol2xy(r_inner, s0)
+        p_s1 = pol2xy(r_inner, s1)
+        p_t0 = pol2xy(r_inner, t0)
+        p_t1 = pol2xy(r_inner, t1)
+
+        # control points pull toward center to create chord-like curvature
+        c_scale = 0.60
+        c1 = pol2xy(r_inner * c_scale, (s0 + t0) / 2)
+        c2 = pol2xy(r_inner * c_scale, (s1 + t1) / 2)
+
+        verts = [
+            p_s0,
+            c1,
+            p_t0,
+            p_t1,
+            c2,
+            p_s1,
+            p_s0,
+        ]
+        codes = [
+            Path.MOVETO,
+            Path.CURVE3,
+            Path.CURVE3,
+            Path.LINETO,
+            Path.CURVE3,
+            Path.CURVE3,
+            Path.CLOSEPOLY,
+        ]
+        patch = PathPatch(
+            Path(verts, codes),
+            facecolor=node_color[i],     # color by source
+            edgecolor="none",
+            alpha=ribbon_alpha,
+            zorder=2,
+        )
+        ax.add_patch(patch)
+
+        # ---- direction arrow (triangle) on the ribbon centerline toward target
+        sm = (s0 + s1) / 2
+        tm = (t0 + t1) / 2
+
+        # sample a quadratic-ish center curve using two control points
+        # (simple interpolation in Cartesian space)
+        ps = pol2xy(r_inner * 0.99, sm)
+        pt = pol2xy(r_inner * 0.99, tm)
+        cc = pol2xy(r_inner * 0.55, (sm + tm) / 2)
+
+        def bezier2(a, b, c, u):
+            return (1 - u) ** 2 * a + 2 * (1 - u) * u * b + u**2 * c
+
+        u = arrow_at
+        p = bezier2(ps, cc, pt, u)
+        p2 = bezier2(ps, cc, pt, min(1.0, u + 0.01))
+        v = p2 - p
+        nv = np.linalg.norm(v)
+        if nv == 0:
+            return
+        v = v / nv
+        # perpendicular
+        w = np.array([-v[1], v[0]])
+
+        L = arrow_size
+        tri = np.vstack(
+            [
+                p + v * L * 1.4,
+                p - v * L * 0.8 + w * L * 0.8,
+                p - v * L * 0.8 - w * L * 0.8,
+            ]
+        )
+        ax.add_patch(
+            Polygon(tri, closed=True, facecolor="black", edgecolor="none", alpha=0.55, zorder=3)
+        )
+
+    # ---- draw ribbons (iterate in descending value so thick ones go below)
+    edges = []
+    for i in range(n):
+        for j in range(n):
+            v = M[i, j]
+            if v > min_value and out_sub[i][j] and in_sub[i][j]:
+                edges.append((v, i, j, out_sub[i][j], in_sub[i][j]))
+    edges.sort(reverse=True, key=lambda x: x[0])
+
+    for v, i, j, (s0, s1), (t0, t1) in edges:
+        add_ribbon(i, j, s0, s1, t0, t1, v)
+
+    return ax

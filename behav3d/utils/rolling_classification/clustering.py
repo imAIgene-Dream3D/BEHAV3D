@@ -51,6 +51,8 @@ def run_leiden_clustering(
     X,
     n_neighbors=30,
     metric="euclidean",
+    method="umap",
+    use_rep="X_pca",
     resolution=1.0,
     random_state=0,
     stability_resolutions=(0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0),
@@ -85,8 +87,10 @@ def run_leiden_clustering(
         adata,
         n_neighbors=n_neighbors,
         metric=metric,
-        method="umap",
+        method=method,
         knn=True,
+        use_rep=use_rep,
+        random_state=random_state
     )
 
     if resolution in ("auto", None):
@@ -595,15 +599,15 @@ def run_sticky_hmm_state_classification(
 def compute_cluster_transition_matrix(
     adata,
     cluster_key: str,
-    id_cols=["sample_name", "TrackID"],
+    id_cols=("sample_name", "TrackID"),
     time_key="position_t",
     normalize: bool = True,
     plot: bool = False,
     ax: plt.Axes = None,
+    only_transitions: bool = False,
 ):
     """
-    Compute an HMM-style transition matrix between cluster states
-    from tracked objects over time.
+    Compute a transition matrix between cluster states from tracked objects over time.
 
     Parameters
     ----------
@@ -611,17 +615,22 @@ def compute_cluster_transition_matrix(
         AnnData object containing tracking and clustering info in .obs.
     cluster_key : str
         Column in adata.obs with cluster labels (e.g. 'ClusterID', 'leiden').
-    track_key : str
-        Column in adata.obs identifying each track/object (e.g. 'track_id').
-    time_key : str
+    id_cols : sequence of str, default ("sample_name", "TrackID")
+        Columns in adata.obs that together identify each track/object.
+    time_key : str, default "position_t"
         Column in adata.obs giving time or frame index (must be sortable).
     normalize : bool, default True
         If True, return row-normalized probabilities (HMM-style).
         If False, returns raw transition counts.
     plot : bool, default False
-        If True, plot the (normalized) transition matrix as a heatmap.
+        If True, plot the transition matrix as a heatmap.
     ax : matplotlib.axes.Axes, optional
         Axis to plot on. If None and plot=True, a new figure/axis is created.
+    only_transitions : bool, default False
+        If True, remove self-transitions (diagonal) from the *returned* matrices
+        by setting diagonal counts to 0 and re-normalizing across off-diagonal
+        entries (so rows sum to 1 when there is at least one off-diagonal transition).
+        Also makes the diagonal appear empty in the plot.
 
     Returns
     -------
@@ -629,15 +638,14 @@ def compute_cluster_transition_matrix(
         Matrix of transition counts, shape (n_states, n_states).
         Rows = current state, columns = next state.
     transition_probs : pandas.DataFrame
-        Row-normalized transition matrix (P(next | current)).
-        If normalize=False, this is still returned but will match counts
-        except for rows with sum>0.
+        Row-normalized transition matrix.
+        If only_transitions=True, this is P(next | current, next != current).
     """
-    df = adata.obs[id_cols+[cluster_key, time_key]].copy()
-    df = df.sort_values(id_cols+[time_key])
+    df = adata.obs[list(id_cols) + [cluster_key, time_key]].copy()
+    df = df.sort_values(list(id_cols) + [time_key])
 
     # Next state within each track
-    df["next_state"] = df.groupby(id_cols)[cluster_key].shift(-1)
+    df["next_state"] = df.groupby(list(id_cols))[cluster_key].shift(-1)
 
     # Drop last timepoint of each track (no "next" state)
     transitions = df.dropna(subset=["next_state"]).copy()
@@ -654,19 +662,37 @@ def compute_cluster_transition_matrix(
         index=states, columns=states, fill_value=0
     )
 
+    # Optionally remove self-transitions in the returned matrices
+    if only_transitions:
+        np.fill_diagonal(transition_counts.values, 0)
+
     # Row-normalize to probabilities
     row_sums = transition_counts.sum(axis=1)
-    transition_probs = transition_counts.div(
-        row_sums.replace(0, np.nan), axis=0
-    )
+    transition_probs = transition_counts.div(row_sums.replace(0, np.nan), axis=0)
 
     if plot:
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 5))
 
         data_to_plot = transition_probs if normalize else transition_counts
+        plot_arr = data_to_plot.to_numpy(dtype=float, copy=True)
 
-        im = ax.imshow(data_to_plot.values, aspect="auto")
+        # Make diagonal appear empty ONLY when only_transitions=True
+        if only_transitions:
+            diag_mask = np.eye(plot_arr.shape[0], dtype=bool)
+            plot_arr = np.ma.array(plot_arr, mask=diag_mask)
+
+        imshow_kwargs = {}
+        if normalize:  # probability heatmap
+            imshow_kwargs.update(dict(vmin=0.0, vmax=1.0))
+            
+        im = ax.imshow(plot_arr, aspect="auto", **imshow_kwargs)
+
+        # Make masked values transparent (so diagonal looks empty)
+        if only_transitions:
+            cmap = im.get_cmap()
+            cmap.set_bad(alpha=0)
+
         ax.set_xticks(np.arange(len(states)))
         ax.set_yticks(np.arange(len(states)))
         ax.set_xticklabels(states, rotation=90)
@@ -683,116 +709,76 @@ def compute_cluster_transition_matrix(
 def filter_short_state_runs(
     adata,
     cluster_key: str,
-    id_cols = ["sample_name", "TrackID"],
+    id_cols=("sample_name", "TrackID"),
     time_key: str = "position_t",
     length_removed: int = 1,
     new_key: str | None = None,
     inplace: bool = False,
 ):
     """
-    Filter short runs of states along tracks by replacing them with neighboring states.
-
-    For each track (defined by id_cols), sorted by time_key:
-      - Find runs of consecutive identical states in `cluster_key`
-      - Any run with length <= length_removed is replaced:
-          * If both previous and next runs exist:
-              - If prev_state == next_state: use that state
-              - Else: use prev_state  (e.g. 1112333 -> 1111333)
-          * If only previous exists      : use prev_state
-          * If only next exists          : use next_state
-          * If no neighbors (only run)   : keep as is
-
-    Examples (with length_removed=1)
-    --------------------------------
-    111121111  ->  111111111
-    1112333    ->  1111333
-
-    Parameters
-    ----------
-    adata : anndata.AnnData
-        AnnData object containing tracking and clustering info in .obs.
-    cluster_key : str
-        Column in adata.obs with state/cluster labels (e.g. 'ClusterID', 'leiden').
-    id_cols : list of str, default ['sample_name', 'TrackID']
-        Columns that together define a track.
-    time_key : str, default 'position_t'
-        Column giving time/frame index (must be sortable).
-    length_removed : int, default 1
-        Maximum length of a run to be considered "short" and replaced.
-    new_key : str or None, default None
-        If not None and inplace=False, store filtered states in this new column
-        of adata.obs.
-    inplace : bool, default False
-        If True, overwrite adata.obs[cluster_key] with the filtered states.
-        If False, returns the filtered Series (and optionally writes to new_key).
-
-    Returns
-    -------
-    filtered_states : pandas.Series
-        The filtered states, indexed like adata.obs.
+    Progressive + ordered smoothing:
+      - For each track, for k = 1..length_removed:
+          scan left-to-right;
+          whenever you see a run of length == k, replace it immediately,
+          then step back and re-check (so merges change what comes next).
     """
-    df = adata.obs[id_cols + [cluster_key, time_key]].copy()
-    df = df.sort_values(id_cols + [time_key])
+    df = adata.obs[list(id_cols) + [cluster_key, time_key]].copy()
+    df = df.sort_values(list(id_cols) + [time_key])
 
-    filtered = df[cluster_key].copy()
+    out = df[cluster_key].copy()
 
-    # Process each track separately
-    for _, sub in df.groupby(id_cols, sort=False):
-        idx = sub.index.values
-        states = sub[cluster_key].to_numpy()
+    def _smooth_exact_k_in_order(states: np.ndarray, k: int) -> np.ndarray:
+        """Scan left-to-right; replace runs of exact length k immediately; re-check after each change."""
+        n = len(states)
+        if n == 0:
+            return states
 
-        if len(states) == 0:
-            continue
+        i = 0
+        while i < n:
+            # find run [i:j)
+            j = i + 1
+            while j < n and states[j] == states[i]:
+                j += 1
+            run_len = j - i
 
-        # Identify runs of identical states
-        run_id = np.zeros(len(states), dtype=int)
-        current_run = 0
-        for i in range(1, len(states)):
-            if states[i] != states[i - 1]:
-                current_run += 1
-            run_id[i] = current_run
-        n_runs = current_run + 1
+            if run_len == k:
+                prev_state = states[i - 1] if i > 0 else None
+                next_state = states[j] if j < n else None
 
-        new_states = states.copy()
-
-        for r in range(n_runs):
-            mask = (run_id == r)
-            run_len = mask.sum()
-            if run_len > length_removed:
-                # keep as is
-                continue
-
-            # Determine neighboring states
-            prev_state = states[run_id == (r - 1)][-1] if r > 0 else None
-            next_state = states[run_id == (r + 1)][0] if r < n_runs - 1 else None
-
-            # Decide replacement
-            if prev_state is None and next_state is None:
-                # Only run in the track → keep as is
-                replacement = states[mask][0]
-            elif prev_state is None:
-                # At the start: use next
-                replacement = next_state
-            elif next_state is None:
-                # At the end: use prev
-                replacement = prev_state
-            else:
-                # In the middle, both neighbors exist
-                if prev_state == next_state:
-                    replacement = prev_state
+                if prev_state is None and next_state is None:
+                    replacement = states[i]          # only run
+                elif prev_state is None:
+                    replacement = next_state         # start
+                elif next_state is None:
+                    replacement = prev_state         # end
                 else:
-                    # Your rule: "if bordered by different numbers take the state before"
-                    replacement = prev_state
+                    # your rule: if neighbors differ, take previous
+                    replacement = prev_state if prev_state != next_state else prev_state
 
-            new_states[mask] = replacement
+                if replacement != states[i]:
+                    states[i:j] = replacement
+                    # step back to re-check merges around the edit
+                    i = max(0, i - 1)
+                    continue  # re-evaluate from (possibly) merged region
 
-        filtered.loc[idx] = new_states
+            # move to next run
+            i = j
 
+        return states
+
+    for _, sub in df.groupby(list(id_cols), sort=False):
+        idx = sub.index.to_numpy()
+        states = sub[cluster_key].to_numpy().copy()
+
+        for k in range(1, length_removed + 1):
+            states = _smooth_exact_k_in_order(states, k)
+
+        out.loc[idx] = states
+        
     if new_key is not None:
-        adata.obs[new_key] = filtered
+        adata.obs[new_key] = out
     else:
-        adata.obs[cluster_key] = filtered
-
+        adata.obs[cluster_key] = out
     return adata
 
 def condense_state_runs(

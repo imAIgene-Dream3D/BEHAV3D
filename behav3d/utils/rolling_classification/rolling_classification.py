@@ -35,8 +35,8 @@ random.seed(seed)
 np.random.seed(seed)
 
 if __name__ == "__main__":
-    ssd_dir = r"/Volumes/T7_Sam/"
-    # ssd_dir = r"F:/"
+    # ssd_dir = r"/Volumes/T7_Sam/"
+    ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
     
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
@@ -46,8 +46,8 @@ if __name__ == "__main__":
     # metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/CombinedAnalysis_AmberMacrophage/metadata.csv")
 
 
-    # downloads_folder = r"C:/Users/Samde/Downloads"
-    downloads_folder = "/Users/s.deblank-3/Downloads"
+    # outfolder = r"C:/Users/Samde/Downloads"
+    outfolder = Path(ssd_dir, r"BHVD_BEHAV3D\BEHAV3D_python\rolling_classification")
     # output_dir = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
     # metadata_csv_path = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
 
@@ -74,13 +74,13 @@ if __name__ == "__main__":
     groupby=["sample_name", "TrackID"]
     features=[
         "percentage_dead_mask",
-        "mean_dead_dye",
+        # "mean_dead_dye",
         # "nr_dead_mask_pixels",
         "organoid_contact_pixels",
         "tcell_contact_pixels",
         # "mean_square_displacement",
         "speed",
-        "directional_persistence",
+        # "directional_persistence",
         "volume",
         "extent",
         "elongation",
@@ -98,8 +98,8 @@ if __name__ == "__main__":
         id_cols = ["sample_name", "TrackID"],
     )
 
-    # df_windows_descriptive.to_csv(Path(downloads_folder,r"df_windows_descriptive.csv"), index=False)
-    # df_windows_descriptive = pd.read_csv(Path(downloads_folder,r"df_windows_descriptive.csv"))
+    # df_windows_descriptive.to_csv(Path(outfolder,r"df_windows_descriptive.csv"), index=False)
+    # df_windows_descriptive = pd.read_csv(Path(outfolder,r"df_windows_descriptive.csv"))
     
     ### Sample the dataset (either to fraction of the tracks)
     non_feature_cols = [
@@ -128,16 +128,19 @@ if __name__ == "__main__":
         feature_cols=descriptive_feature_cols,
         threshold=0.95
     )
-    print(f"Dropped {len(dropped)} features.")
+    print(f"Dropped {len(dropped)} highly correlated features.")
     descriptive_feature_cols = [c for c in descriptive_feature_cols if c not in dropped]
     
+    
+    ### Remove features with no variance
     selector = VarianceThreshold(threshold=1e-4)
     selector.fit(df_analysis[descriptive_feature_cols])
 
     keep_mask = selector.get_support()
     kept_features = df_analysis[descriptive_feature_cols].columns[keep_mask].tolist()
     dropped_low_var = df_analysis[descriptive_feature_cols].columns[~keep_mask].tolist()
-
+    print(f"Dropped {len(dropped_low_var)} low-variance features.")
+    
     scaler = StandardScaler().fit(df_analysis[descriptive_feature_cols])
     df_analysis[descriptive_feature_cols] = scaler.transform(df_analysis[descriptive_feature_cols])
     
@@ -177,24 +180,25 @@ if __name__ == "__main__":
     # sc.pp.pca(adata_sub, n_comps=None, )
     sc.pp.pca(
         adata_sub, 
-        n_comps=None, 
+        zero_center=True,
+        n_comps=len(descriptive_feature_cols), 
         svd_solver='full', 
-        random_state=seed
+        random_state=seed,
         )
 
     var_ratio = adata_sub.uns["pca"]["variance_ratio"]
     n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var) + 1)
     adata_sub.obsm["X_pca"] = adata_sub.obsm["X_pca"][:, :n_pcs]
     
-    sc.pp.neighbors(
-        adata_sub,
-        n_neighbors=80,
-        metric="cosine",
-        method="umap",
-        knn=True,
-        use_rep="X_pca",
-        random_state=seed
-    )
+    # sc.pp.neighbors(
+    #     adata_sub,
+    #     n_neighbors=80,
+    #     metric="cosine",
+    #     method="umap",
+    #     knn=True,
+    #     use_rep="X_pca",
+    #     random_state=seed
+    # )
     
     # adata_sub = run_leiden_clustering(
     #     adata_sub, 
@@ -206,10 +210,15 @@ if __name__ == "__main__":
 
     adata_sub = run_leiden_clustering(
         adata_sub, 
+        n_neighbors=50,
         resolution=0.35, 
+        metric="euclidean",
+        method="umap",
+        use_rep="X_pca",
         key_added="ClusterID",
         random_state=seed
         )
+    
     adata_sub = merge_small_clusters(
         adata_sub,
         key="ClusterID",
@@ -275,9 +284,35 @@ if __name__ == "__main__":
         id_cols = ["sample_name", "TrackID"],
         time_key = "position_t",
         length_removed = 1,
-        new_key = "ClusterID_filt"
+        new_key = "ClusterID_filt1"
     )
     
+    adata_full = filter_short_state_runs(
+        adata_full,
+        cluster_key="ClusterID",
+        id_cols = ["sample_name", "TrackID"],
+        time_key = "position_t",
+        length_removed = 2,
+        new_key = "ClusterID_filt2"
+    )
+    
+    adata_full = filter_short_state_runs(
+        adata_full,
+        cluster_key="ClusterID",
+        id_cols = ["sample_name", "TrackID"],
+        time_key = "position_t",
+        length_removed = 3,
+        new_key = "ClusterID_filt3"
+    )
+    
+    adata_full = filter_short_state_runs(
+        adata_full,
+        cluster_key="ClusterID",
+        id_cols = ["sample_name", "TrackID"],
+        time_key = "position_t",
+        length_removed = 5,
+        new_key = "ClusterID_filt5"
+    )
     
     
     # write results back
@@ -295,19 +330,33 @@ if __name__ == "__main__":
     plot_number_per_clusters(df_leiden_subset, cluster_col="ClusterID")
     plot_per_cluster_proportions(df_leiden_subset)
     
-    compute_cluster_transition_matrix(
-        adata=adata_sub,
-        cluster_key="ClusterID",
-        id_cols = ["sample_name", "TrackID"],
-        plot=True
-    )
-    
+
     compute_cluster_transition_matrix(
         adata=adata_full,
         cluster_key="ClusterID",
         id_cols = ["sample_name", "TrackID"],
         plot=True
     )
+    
+    _,transmat = compute_cluster_transition_matrix(
+        adata=adata_full,
+        cluster_key="ClusterID_filt",
+        id_cols = ["sample_name", "TrackID"],
+        only_transitions=False,
+        plot=True
+    )
+    
+    transmat_nr,transmat = compute_cluster_transition_matrix(
+        adata=adata_full,
+        cluster_key="ClusterID_filt5",
+        id_cols = ["sample_name", "TrackID"],
+        only_transitions=True,
+        plot=True
+    )
+    
+    probs_offdiag = transmat.copy()
+    np.fill_diagonal(probs_offdiag.values, 0)
+    probs_offdiag = probs_offdiag.div(probs_offdiag.sum(axis=1).replace(0, np.nan), axis=0)
     
     """
     ################################################
@@ -375,13 +424,15 @@ if __name__ == "__main__":
     
     sc.pl.umap(adata_sub, color="hmm_state", size=2)
 
-    compute_cluster_transition_matrix(
-            adata=adata_full,
-            cluster_key="ClusterID",
-            id_cols = ["sample_name", "TrackID"],
-            plot=True
-        )
-
+    adata_full = filter_short_state_runs(
+        adata_full,
+        cluster_key="hmm_state",
+        id_cols = ["sample_name", "TrackID"],
+        time_key = "position_t",
+        length_removed = 1,
+        new_key = "hmm_state_filt"
+    )
+ 
     compute_cluster_transition_matrix(
         adata=adata_full,
         cluster_key="hmm_state",
@@ -389,8 +440,49 @@ if __name__ == "__main__":
         plot=True
     )
     
+    compute_cluster_transition_matrix(
+        adata=adata_full,
+        cluster_key="hmm_state",
+        id_cols = ["sample_name", "TrackID"],
+        only_transitions=True,
+        plot=True
+    )
+    
+    _,mat = compute_cluster_transition_matrix(
+        adata=adata_full,
+        cluster_key="hmm_state_filt",
+        id_cols = ["sample_name", "TrackID"],
+        only_transitions=True,
+        plot=True
+    )
+    
     plot_hmm_transition_matrix(hmm_model_descriptive)
 
+    #### PROJECT ON DESCRIPTIVE DATA
+    sc.tl.dendrogram(adata_sub, groupby="hmm_state")
+    sc.pl.heatmap(
+        adata_sub,
+        var_names=descriptive_feature_cols,
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state",
+        standard_scale="var",
+        figsize=(40, 20),
+        swap_axes=True,
+        dendrogram=True,
+        show_gene_labels=True
+    )
+    
+    sc.pl.matrixplot(
+        adata_sub,
+        var_names=descriptive_feature_cols,                 # dict: {group_label: [genes...]}
+        # var_group_labels=list(feature_dict.keys()),
+        groupby="hmm_state",
+        standard_scale="var",
+        figsize=(20, 20),
+        swap_axes=True,
+        dendrogram=True
+    )
+    
     """
     ################################################
     sticky HMM STATE CLASSIFICATION (on raw timepoint data)
@@ -471,7 +563,7 @@ if __name__ == "__main__":
         adata_sub,
         var_names=descriptive_feature_cols,
         # var_group_labels=list(feature_dict.keys()),
-        groupby="hmm_state",
+        groupby="hmm_state_raw",
         standard_scale="var",
         figsize=(40, 20),
         swap_axes=True,
@@ -483,7 +575,7 @@ if __name__ == "__main__":
         adata_sub,
         var_names=descriptive_feature_cols,                 # dict: {group_label: [genes...]}
         # var_group_labels=list(feature_dict.keys()),
-        groupby="hmm_state",
+        groupby="hmm_state_raw",
         standard_scale="var",
         figsize=(20, 20),
         swap_axes=True,
@@ -505,8 +597,8 @@ if __name__ == "__main__":
     adata_full.write(r"C:\Users\Samde/Downloads/adata_full.h5ad") 
     adata_sub.write(r"C:\Users\Samde/Downloads/adata_sub.h5ad")
     
-    adata = sc.read_h5ad(Path(downloads_folder,"adata_full.h5ad"))
-    adata_sub = sc.read_h5ad(Path(downloads_folder,"adata_sub.h5ad"))
+    adata = sc.read_h5ad(Path(outfolder,"adata_full.h5ad"))
+    adata_sub = sc.read_h5ad(Path(outfolder,"adata_sub.h5ad"))
     adata.write_zarr("my_data.zarr")
     
     
@@ -528,8 +620,8 @@ if __name__ == "__main__":
     import scanpy as sc
     from pathlib import Path
     
-    downloads_folder = r"C:/Users/Samde/Downloads"
-    adata = sc.read_h5ad(Path(downloads_folder,"adata_cluster_from_1.h5ad"))
+    outfolder = r"C:/Users/Samde/Downloads"
+    adata = sc.read_h5ad(Path(outfolder,"adata_cluster_from_1.h5ad"))
     
     adata.obs["ClusterID"]=adata.obs["ClusterID"].astype(np.int64)+1
     adata.obs["hmm_state_raw"]=adata.obs["hmm_state_raw"].astype(np.int64)+1
@@ -538,9 +630,9 @@ if __name__ == "__main__":
     img = load_zarr(r"F:\BHVD_BEHAV3D\BEHAV3D_python\runs\ROCHE\images\ROCHE_JM1_Exp042-8_Img02_10T_HER2I\ROCHE_JM1_Exp042-8_Img02_10T_HER2I_tcell_tracked.zarr")
     raw = load_zarr(r"F:\BHVD_BEHAV3D\BEHAV3D_python\runs\ROCHE\images\ROCHE_JM1_Exp042-8_Img02_10T_HER2I\ROCHE_JM1_Exp042-8_Img02_10T_HER2I.zarr")
     
-    hmm_descr_path = Path(downloads_folder, "hmm_descr_state_overlay.zarr")
-    hmm_instant_path=Path(downloads_folder, "hmm_raw_state_overlay.zarr")
-    leiden_path = Path(downloads_folder, "leiden_overlay.zarr")
+    hmm_descr_path = Path(outfolder, "hmm_descr_state_overlay.zarr")
+    hmm_instant_path=Path(outfolder, "hmm_raw_state_overlay.zarr")
+    leiden_path = Path(outfolder, "leiden_overlay.zarr")
     
     hmm_instant_img = relabel_from_adata(
         img,
@@ -642,7 +734,7 @@ if __name__ == "__main__":
         df_analysis,
         df_positions,
         output_folder= output_dir,
-        out_dir = downloads_folder,
+        out_dir = outfolder,
         # normalize_per_channel: bool = False,
         fps = 6,
         # dpi: int = 200,
@@ -659,7 +751,7 @@ if __name__ == "__main__":
         df_analysis,
         df_positions,
         output_folder=output_dir,
-        out_dir=downloads_folder,
+        out_dir=outfolder,
         examples_per_cluster=3,   # 1 example per cluster per row
         fps=6,
         margin = (20, 20, 20),
@@ -676,7 +768,7 @@ if __name__ == "__main__":
         df_windows=df_analysis_subset,
         df_positions=df_positions,
         output_folder=output_dir,  # folder containing images/<sample>/<sample>.zarr
-        out_dir=downloads_folder,
+        out_dir=outfolder,
         # clusters=None,                # or e.g. [0, 1, 2]
         fps=6,
         margin=20,

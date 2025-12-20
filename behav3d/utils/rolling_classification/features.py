@@ -336,7 +336,6 @@ def compute_window_features(window_dataframe, column_name, time_column="position
 
     return features
 
-
 def _create_descriptive_track_worker(
     group_df, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types
 ):
@@ -674,3 +673,11 @@ def drop_highly_correlated_features(
     ).reset_index(drop=True)
 
     return df, dropped, report
+
+ ### Remove features with no variance
+    selector = VarianceThreshold(threshold=1e-4)
+    selector.fit(df_analysis[descriptive_feature_cols])
+
+    keep_mask = selector.get_support()
+    kept_features = df_analysis[descriptive_feature_cols].columns[keep_mask].tolist()
+    dropped_low_var = df_analysis[descriptive_feature_cols].columns[~keep_mask].tolist()
