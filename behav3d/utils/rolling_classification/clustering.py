@@ -8,6 +8,7 @@ from itertools import combinations
 from hmmlearn.hmm import GaussianHMM
 
 import matplotlib.pyplot as plt
+from behav3d.utils.rolling_classification import *
 
 def compare_cluster_distribution(df, col_a, col_b):
     counts = pd.crosstab(df[col_a], df[col_b])
@@ -864,3 +865,385 @@ def condense_state_runs(
     runs_df = runs_df.rename(columns={"state": cluster_key})
 
     return runs_df
+
+
+def rle_encode(states):
+    """Return list of (state, run_length)."""
+    if len(states) == 0:
+        return []
+    runs = []
+    cur = states[0]
+    length = 1
+    for s in states[1:]:
+        if s == cur:
+            length += 1
+        else:
+            runs.append((cur, length))
+            cur = s
+            length = 1
+    runs.append((cur, length))
+    return runs
+
+
+# ----------------------------
+# Feature builders (RETURN feats + list_of_columns_for_this_block)
+# ----------------------------
+def fractions_from_runs(runs, states):
+    total = sum(l for _, l in runs) if runs else 0
+    cols = [f"overall_fraction_{s}" for s in states]
+    out = {c: 0.0 for c in cols}
+    if total == 0:
+        return out, cols
+    for s, l in runs:
+        out[f"overall_fraction_{s}"] += l / total
+    return out, cols
+
+
+def bout_stats_from_runs(runs, states):
+    lengths = {s: [] for s in states}
+    for s, l in runs:
+        lengths[s].append(l)
+
+    total_bouts = len(runs)
+    track_length = sum(l for _, l in runs)
+
+    cols = []
+    for s in states:
+        cols.extend([f"bouts_nr_{s}", f"bouts_mean_length_{s}", f"bouts_max_length_{s}"])
+
+    if total_bouts == 0 or track_length == 0:
+        return {c: 0.0 for c in cols}, cols
+
+    out = {}
+    for s in states:
+        arr = np.asarray(lengths[s], dtype=float)
+        out[f"bouts_nr_{s}"] = float(arr.size) / float(total_bouts)
+        out[f"bouts_mean_length_{s}"] = float(arr.mean()) / float(track_length) if arr.size else 0.0
+        out[f"bouts_max_length_{s}"] = float(arr.max()) / float(track_length) if arr.size else 0.0
+
+    return out, cols
+
+
+def transition_probs_from_runs(runs, state_to_idx, states):
+    K = len(states)
+    M = np.zeros((K, K), dtype=float)
+    labels = [s for s, _ in runs]
+    if len(labels) < 2:
+        return M  # all zeros
+    for a, b in zip(labels[:-1], labels[1:]):
+        if a in state_to_idx and b in state_to_idx:
+            M[state_to_idx[a], state_to_idx[b]] += 1.0
+    row_sums = M.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    return M / row_sums
+
+
+def ngram_counts_from_runs(runs, n=3, weight="count"):
+    labels = [s for s, _ in runs]
+    lens = [l for _, l in runs]
+    out = {}
+    if len(labels) < n:
+        return out
+    for i in range(len(labels) - n + 1):
+        g = tuple(labels[i : i + n])
+        w = float(lens[i]) if weight == "duration" else 1.0
+        out[g] = out.get(g, 0.0) + w
+    return out
+
+
+def l2_normalize_block(df: pd.DataFrame, cols: list[str]) -> None:
+    """Row-wise L2 normalize selected columns. Leaves all-zero rows unchanged."""
+    if not cols:
+        return
+    X = df[cols].to_numpy(dtype=float, copy=True)
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    df.loc[:, cols] = X / norms
+    return df
+
+
+def l2_normalize_all(df: pd.DataFrame) -> None:
+    """Row-wise L2 normalize all columns. Leaves all-zero rows unchanged."""
+    if df.shape[1] == 0:
+        return
+    X = df.to_numpy(dtype=float, copy=True)
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    df.loc[:, :] = X / norms
+    return(df)
+
+def l2_normalize_features_blocks(
+    df,
+    blocks
+    ):
+    df_norm = df.copy()
+    for block in blocks:
+        df_norm = l2_normalize_block(df_norm, block)
+
+    df_norm=l2_normalize_all(df_norm)
+    return df_norm
+
+ 
+def extract_descibing_track_state_features(
+    adata,
+    group_col=("sample_name", "TrackID"),
+    time_col="position_t",
+    state_col="ClusterID",
+    use_fractions=True,
+    use_bout_stats=True,
+    use_transitions=True,
+    use_bigrams=True,
+    use_trigrams=True,
+    ngram_weight="count",
+):
+    """
+    Track-level feature extraction -> returns (track_adata, blocks)
+
+    track_adata.X        = features (n_tracks x n_features)
+    track_adata.obs      = per-track metadata (sample_name, TrackID, position_t_min/max, n_timepoints)
+    track_adata.var_names= feature names
+    """
+
+    group_col = list(group_col) if isinstance(group_col, (list, tuple)) else [group_col]
+
+    obs = adata.obs[group_col + [time_col, state_col]].copy()
+    obs = obs.sort_values(group_col + [time_col])
+
+    # Stable state universe
+    states = pd.Index(obs[state_col].astype("category").cat.categories).tolist()
+    state_to_idx = {s: i for i, s in enumerate(states)}
+
+    # Use observed=True to avoid unobserved categorical groups exploding results
+    gb = obs.groupby(group_col, sort=False, observed=True)
+
+    # Collect runs + n-gram vocab
+    runs_by_track = []
+    bigram_set, trigram_set = set(), set()
+
+    for tid, df_t in gb:
+        seq = df_t[state_col].tolist()
+        runs = rle_encode(seq)  # <-- your RLE function
+
+        runs_by_track.append((tid, runs))
+
+        if use_bigrams:
+            bigram_set |= set(ngram_counts_from_runs(runs, n=2, weight=ngram_weight).keys())
+        if use_trigrams:
+            trigram_set |= set(ngram_counts_from_runs(runs, n=3, weight=ngram_weight).keys())
+
+    bigram_list = sorted(bigram_set)
+    trigram_list = sorted(trigram_set)
+
+    def bg_col(g): return f"bigram_{g[0]}>{g[1]}"
+    def tg_col(g): return f"trigram_{g[0]}>{g[1]}>{g[2]}"
+
+    # Track block columns explicitly while building features
+    fraction_cols = []
+    bout_cols = []
+    transition_cols = []
+    bigram_cols = [bg_col(g) for g in bigram_list] if use_bigrams else []
+    trigram_cols = [tg_col(g) for g in trigram_list] if use_trigrams else []
+
+    rows = []
+    id_rows = []
+
+    for tid, runs in runs_by_track:
+        # tid is scalar if len(group_col)==1, else tuple
+        if len(group_col) == 1:
+            id_rows.append([tid])
+        else:
+            id_rows.append(list(tid))
+
+        feats = {}
+
+        if use_fractions:
+            f, fcols = fractions_from_runs(runs, states)
+            feats.update(f)
+            if not fraction_cols:
+                fraction_cols = fcols
+
+        if use_bout_stats:
+            b, bcols = bout_stats_from_runs(runs, states)
+            feats.update(b)
+            if not bout_cols:
+                bout_cols = bcols
+
+        if use_transitions:
+            T = transition_probs_from_runs(runs, state_to_idx, states)
+            if not transition_cols:
+                transition_cols = [f"transitions_{a}>{b}" for a in states for b in states]
+            for a in states:
+                ia = state_to_idx[a]
+                for b in states:
+                    ib = state_to_idx[b]
+                    feats[f"transitions_{a}>{b}"] = float(T[ia, ib])
+
+        if use_bigrams:
+            bg = ngram_counts_from_runs(runs, n=2, weight=ngram_weight)
+            total = sum(bg.values()) or 1.0
+            for g in bigram_list:
+                feats[bg_col(g)] = bg.get(g, 0.0) / total
+
+        if use_trigrams:
+            tg = ngram_counts_from_runs(runs, n=3, weight=ngram_weight)
+            total = sum(tg.values()) or 1.0
+            for g in trigram_list:
+                feats[tg_col(g)] = tg.get(g, 0.0) / total
+
+        rows.append(feats)
+
+    # Features
+    df_feat = pd.DataFrame(rows).fillna(0.0)
+
+    # IDs in the exact same order as df_feat rows
+    df_ids = pd.DataFrame(id_rows, columns=group_col)
+
+    # Time summaries (also observed=True to avoid unobserved category combos)
+    df_time = (
+        obs.groupby(group_col, sort=False, observed=True)[time_col]
+           .agg(position_t_min="min", position_t_max="max", n_timepoints="size")
+           .reset_index()
+    )
+
+    # Build obs table in the same row order as features
+    df_meta = df_ids.merge(df_time, on=group_col, how="left")
+
+    # Combine for conversion using your helper
+    df_out = pd.concat([df_meta.reset_index(drop=True), df_feat.reset_index(drop=True)], axis=1)
+
+    blocks = [fraction_cols, bout_cols, transition_cols, bigram_cols, trigram_cols]
+
+    feature_cols = df_feat.columns.tolist()
+    obs_cols = df_meta.columns.tolist()
+
+    track_adata = df_to_adata(df_out, feature_cols=feature_cols, obs_cols=obs_cols)
+
+    # Optional bookkeeping
+    track_adata.uns["feature_blocks"] = {
+        name: cols for name, cols in zip(
+            ["fractions", "bout_stats", "transitions", "bigrams", "trigrams"], blocks
+        ) if cols
+    }
+    track_adata.uns["feature_params"] = {
+        "group_col": group_col,
+        "time_col": time_col,
+        "state_col": state_col,
+        "ngram_weight": ngram_weight,
+        "use_fractions": use_fractions,
+        "use_bout_stats": use_bout_stats,
+        "use_transitions": use_transitions,
+        "use_bigrams": use_bigrams,
+        "use_trigrams": use_trigrams,
+    }
+
+    return track_adata, blocks
+
+
+def subset_full_adata_from_summary(
+    adata_full,
+    adata_tracks,
+    n_tracks: int | None = None,
+    cluster_key: str = "ClusterID",   
+    n_tracks_per_cluster = None,
+    sample_key: str = "sample_name",
+    track_key: str = "TrackID",
+    time_key: str = "position_t",
+    tmin_key: str = "position_t_min",
+    tmax_key: str = "position_t_max",
+    seed: int = 0,
+    query: str | None = None, 
+):
+    """
+    Subset a per-timepoint AnnData (adata_full) using a per-track summary AnnData (adata_tracks).
+
+    Keeps rows in adata_full.obs that:
+      - match (sample_key, track_key) present in chosen summary tracks
+      - and have time_key within [tmin_key, tmax_key] from adata_tracks.obs for that track.
+
+    Track selection
+    ---------------
+    - If n_tracks_per_cluster is provided:
+        * sample up to N tracks *within each cluster* from adata_tracks.obs[cluster_key]
+        * if n_tracks_per_cluster is an int: use the same N for every cluster
+        * if it's a dict: use per-cluster values (clusters not in dict -> 0)
+      In this mode, `n_tracks` is ignored.
+    - If n_tracks is provided: 
+        * sample n_tracks total across all tracks.
+    - Else: keep all tracks (after optional query).
+
+
+    Returns
+    -------
+    adata_sub : AnnData
+    chosen : pd.DataFrame
+        The chosen track windows (+ cluster column if present/used).
+    """
+
+    # --- tracks table (optionally filtered)
+    base_cols = [sample_key, track_key, tmin_key, tmax_key]
+    need_cluster = n_tracks_per_cluster is not None
+    if need_cluster and cluster_key not in adata_tracks.obs.columns:
+        raise ValueError(f"cluster_key='{cluster_key}' not found in adata_tracks.obs")
+
+    cols = base_cols + ([cluster_key] if need_cluster and cluster_key not in base_cols else [])
+    tracks_df = adata_tracks.obs[cols].copy()
+
+    if query is not None:
+        tracks_df = adata_tracks.obs.query(query)[cols].copy()
+
+    tracks_df = tracks_df.reset_index(drop=True)
+
+    if len(tracks_df) == 0:
+        raise ValueError("No tracks available after applying query/filtering.")
+
+    rng = np.random.default_rng(seed)
+
+    # --- choose which tracks
+    if n_tracks_per_cluster is not None:
+        # normalize to dict: cluster -> n
+        if isinstance(n_tracks_per_cluster, dict):
+            n_map = dict(n_tracks_per_cluster)
+            default_n = 0
+        else:
+            default_n = int(n_tracks_per_cluster)
+            n_map = {}
+
+        chosen_parts = []
+        # observed=True avoids unobserved categorical groups exploding
+        for cl, df_cl in tracks_df.groupby(cluster_key, sort=False, observed=True):
+            n_cl = n_map.get(cl, default_n)
+            if n_cl <= 0 or len(df_cl) == 0:
+                continue
+            k = min(n_cl, len(df_cl))
+            idx = rng.choice(len(df_cl), size=k, replace=False)
+            chosen_parts.append(df_cl.iloc[idx])
+
+        chosen = pd.concat(chosen_parts, axis=0, ignore_index=True) if chosen_parts else tracks_df.iloc[0:0].copy()
+
+        if len(chosen) == 0:
+            raise ValueError("No tracks selected with n_tracks_per_cluster (check cluster values / mapping).")
+    elif n_tracks is not None:
+        # Sample n_tracks total
+        n = min(int(n_tracks), len(tracks_df))
+        chosen = tracks_df.iloc[rng.choice(len(tracks_df), size=n, replace=False)].copy()
+    else:
+        chosen = tracks_df
+      
+    chosen = chosen.reset_index(drop=True)
+
+    # --- build mask by merging timepoints with chosen windows
+    obs_full = adata_full.obs[[sample_key, track_key, time_key]].copy()
+
+    tmp = obs_full.reset_index(drop=False).merge(
+        chosen[base_cols],  # only need keys + windows for filtering
+        on=[sample_key, track_key],
+        how="inner",
+    )
+
+    in_win = (tmp[time_key] >= tmp[tmin_key]) & (tmp[time_key] <= tmp[tmax_key])
+
+    # IMPORTANT: subset by integer row positions to be robust even if obs index has duplicates
+    kept_rowpos = tmp.loc[in_win].index.to_numpy()
+    adata_sub = adata_full[kept_rowpos, :].copy()
+
+    return adata_sub, chosen

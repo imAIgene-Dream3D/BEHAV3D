@@ -81,11 +81,11 @@ if __name__ == "__main__":
         # "mean_square_displacement",
         "speed",
         # "directional_persistence",
-        "volume",
-        "extent",
-        "elongation",
-        "sphericity",
-        "solidity",
+        # "volume",
+        # "extent",
+        # "elongation",
+        # "sphericity",
+        # "solidity",
     ]
 
     # df_tracks = df_positions[["sample_name", "TrackID", "position_t"]+features]
@@ -99,7 +99,7 @@ if __name__ == "__main__":
     )
 
     # df_windows_descriptive.to_csv(Path(outfolder,r"df_windows_descriptive.csv"), index=False)
-    # df_windows_descriptive = pd.read_csv(Path(outfolder,r"df_windows_descriptive.csv"))
+    df_windows_descriptive = pd.read_csv(Path(outfolder,r"df_windows_descriptive.csv"))
     
     ### Sample the dataset (either to fraction of the tracks)
     non_feature_cols = [
@@ -123,13 +123,13 @@ if __name__ == "__main__":
     df_analysis = df_analysis.dropna(subset=descriptive_feature_cols)
     
     ### Reduce redundancy of similar features
-    df_analysis, dropped, report = drop_highly_correlated_features(
-        df=df_analysis,
-        feature_cols=descriptive_feature_cols,
-        threshold=0.95
-    )
-    print(f"Dropped {len(dropped)} highly correlated features.")
-    descriptive_feature_cols = [c for c in descriptive_feature_cols if c not in dropped]
+    # df_analysis, dropped, report = drop_highly_correlated_features(
+    #     df=df_analysis,
+    #     feature_cols=descriptive_feature_cols,
+    #     threshold=0.95
+    # )
+    # print(f"Dropped {len(dropped)} highly correlated features.")
+    # descriptive_feature_cols = [c for c in descriptive_feature_cols if c not in dropped]
     
     
     ### Remove features with no variance
@@ -140,6 +140,7 @@ if __name__ == "__main__":
     kept_features = df_analysis[descriptive_feature_cols].columns[keep_mask].tolist()
     dropped_low_var = df_analysis[descriptive_feature_cols].columns[~keep_mask].tolist()
     print(f"Dropped {len(dropped_low_var)} low-variance features.")
+    descriptive_feature_cols = [c for c in descriptive_feature_cols if c not in dropped_low_var]
     
     scaler = StandardScaler().fit(df_analysis[descriptive_feature_cols])
     df_analysis[descriptive_feature_cols] = scaler.transform(df_analysis[descriptive_feature_cols])
@@ -190,16 +191,6 @@ if __name__ == "__main__":
     n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var) + 1)
     adata_sub.obsm["X_pca"] = adata_sub.obsm["X_pca"][:, :n_pcs]
     
-    # sc.pp.neighbors(
-    #     adata_sub,
-    #     n_neighbors=80,
-    #     metric="cosine",
-    #     method="umap",
-    #     knn=True,
-    #     use_rep="X_pca",
-    #     random_state=seed
-    # )
-    
     # adata_sub = run_leiden_clustering(
     #     adata_sub, 
     #     resolution="auto", 
@@ -225,13 +216,7 @@ if __name__ == "__main__":
         min_size=500,
         use_rep="X_pca",  # or "X" or "X_umap" depending on what you trust
     )
-    # sc.tl.leiden(
-    #     adata_sub,
-    #     resolution=0.2,
-    #     random_state=seed,
-    #     key_added="ClusterID",
-    # )
-    
+
     sc.tl.umap(
         adata_sub,
         min_dist=0.1,
@@ -255,7 +240,7 @@ if __name__ == "__main__":
         var_group_rotation=0,
         groupby="ClusterID",
         standard_scale="var",
-        figsize=(20, 15),
+        figsize=(25, 20),
         swap_axes=True,
         dendrogram=True,
         show_gene_labels=True,
@@ -266,7 +251,7 @@ if __name__ == "__main__":
         var_names=feature_dict,    
         groupby="ClusterID",
         standard_scale="var",
-        figsize=(15, 15),
+        figsize=(20, 20),
         swap_axes=True,
         dendrogram=True
     )
@@ -277,6 +262,9 @@ if __name__ == "__main__":
         obs="ClusterID",
         embedding_method="umap"  # also transfers UMAP coords into adata_full.obsm["X_umap"]
     )
+    
+    adata_full.write(Path(outfolder, "adata_full.h5ad"), compression="gzip") 
+    adata_sub.write(Path(outfolder, "adata_sub.h5ad")) 
     
     adata_full = filter_short_state_runs(
         adata_full,
@@ -340,7 +328,7 @@ if __name__ == "__main__":
     
     _,transmat = compute_cluster_transition_matrix(
         adata=adata_full,
-        cluster_key="ClusterID_filt",
+        cluster_key="ClusterID",
         id_cols = ["sample_name", "TrackID"],
         only_transitions=False,
         plot=True
@@ -348,15 +336,22 @@ if __name__ == "__main__":
     
     transmat_nr,transmat = compute_cluster_transition_matrix(
         adata=adata_full,
-        cluster_key="ClusterID_filt5",
+        cluster_key="ClusterID",
         id_cols = ["sample_name", "TrackID"],
         only_transitions=True,
         plot=True
     )
     
-    probs_offdiag = transmat.copy()
-    np.fill_diagonal(probs_offdiag.values, 0)
-    probs_offdiag = probs_offdiag.div(probs_offdiag.sum(axis=1).replace(0, np.nan), axis=0)
+    plot_exemplar_track_bars(
+        adata_full,
+        n_tracks=50,
+        track_key="TrackID",
+        time_key="position_t",
+        state_key="ClusterID",
+        seed=seed,
+        cmap_name="tab20",
+        ax=None,
+    )
     
     """
     ################################################
