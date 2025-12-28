@@ -1,3 +1,5 @@
+import numpy as np
+
 def filter_and_truncate_tracks(
     adata,
     groupby_cols = ["sample_name", "TrackID"],  # <-- composite track identity

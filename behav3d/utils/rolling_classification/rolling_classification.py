@@ -98,8 +98,8 @@ if __name__ == "__main__":
         id_cols = ["sample_name", "TrackID"],
     )
 
-    # df_windows_descriptive.to_csv(Path(outfolder,r"df_windows_descriptive.csv"), index=False)
-    df_windows_descriptive = pd.read_csv(Path(outfolder,r"df_windows_descriptive.csv"))
+    df_windows_descriptive.to_csv(Path(outfolder,r"df_windows_descriptive.csv"), index=False)
+    # df_windows_descriptive = pd.read_csv(Path(outfolder,r"df_windows_descriptive.csv"))
     
     ### Sample the dataset (either to fraction of the tracks)
     non_feature_cols = [
@@ -177,19 +177,26 @@ if __name__ == "__main__":
     """
     LEIDEN CLUSTERING
     """
-    pca_var=0.95
-    # sc.pp.pca(adata_sub, n_comps=None, )
-    sc.pp.pca(
-        adata_sub, 
-        zero_center=True,
-        n_comps=len(descriptive_feature_cols), 
+    adata_sub = run_pca(
+        adata_sub,
+        pca_var=0.95,
+        ncomps=len(descriptive_feature_cols),
         svd_solver='full', 
-        random_state=seed,
-        )
+        random_state=seed
+    )
+    # pca_var=0.95
+    # # sc.pp.pca(adata_sub, n_comps=None, )
+    # sc.pp.pca(
+    #     adata_sub, 
+    #     zero_center=True,
+    #     n_comps=len(descriptive_feature_cols), 
+    #     svd_solver='full', 
+    #     random_state=seed,
+    #     )
 
-    var_ratio = adata_sub.uns["pca"]["variance_ratio"]
-    n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var) + 1)
-    adata_sub.obsm["X_pca"] = adata_sub.obsm["X_pca"][:, :n_pcs]
+    # var_ratio = adata_sub.uns["pca"]["variance_ratio"]
+    # n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var) + 1)
+    # adata_sub.obsm["X_pca"] = adata_sub.obsm["X_pca"][:, :n_pcs]
     
     # adata_sub = run_leiden_clustering(
     #     adata_sub, 
@@ -202,7 +209,7 @@ if __name__ == "__main__":
     adata_sub = run_leiden_clustering(
         adata_sub, 
         n_neighbors=50,
-        resolution=0.35, 
+        resolution=0.25, 
         metric="euclidean",
         method="umap",
         use_rep="X_pca",
@@ -263,9 +270,6 @@ if __name__ == "__main__":
         embedding_method="umap"  # also transfers UMAP coords into adata_full.obsm["X_umap"]
     )
     
-    adata_full.write(Path(outfolder, "adata_full.h5ad"), compression="gzip") 
-    adata_sub.write(Path(outfolder, "adata_sub.h5ad")) 
-    
     adata_full = filter_short_state_runs(
         adata_full,
         cluster_key="ClusterID",
@@ -302,6 +306,8 @@ if __name__ == "__main__":
         new_key = "ClusterID_filt5"
     )
     
+    adata_full.write(Path(outfolder, "adata_full.h5ad"), compression="gzip") 
+    adata_sub.write(Path(outfolder, "adata_sub.h5ad")) 
     
     # write results back
     df_analysis = adata_add_back_to_df(

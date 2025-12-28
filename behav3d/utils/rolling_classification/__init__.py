@@ -140,6 +140,19 @@ def adata_add_back_to_df(df, adata, cols_from_obs, prefix=None):
         df[newc] = adata.obs[c].to_numpy()
     return df
 
+def adata_to_df(adata, layer=None, dense=True, obs_cols=None, prefix=None):
+    X = adata.X if layer is None else adata.layers[layer]
+
+    feature_cols = adata.var_names.to_list()
+    if prefix:
+        feature_cols = [f"{prefix}{c}" for c in feature_cols]
+
+    out = pd.DataFrame(X, columns=feature_cols, index=adata.obs_names)
+
+    if obs_cols is not None:
+        out = pd.concat([adata.obs[obs_cols].copy(), out], axis=1)
+    return out
+
 def merge_pandas_cols_into_obs_anndata(
     cols,
     adata,

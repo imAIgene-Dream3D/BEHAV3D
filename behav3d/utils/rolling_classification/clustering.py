@@ -10,6 +10,26 @@ from hmmlearn.hmm import GaussianHMM
 import matplotlib.pyplot as plt
 from behav3d.utils.rolling_classification import *
 
+def run_pca(
+    adata, 
+    ncomps=50, 
+    pca_var=0.95, 
+    svd_solver="full",
+    zero_center=True,
+    random_state=None
+    ):
+    sc.pp.pca(
+        adata,
+        zero_center=zero_center,
+        n_comps=ncomps,
+        svd_solver=svd_solver,
+        random_state=random_state,
+    )
+    var_ratio = adata.uns["pca"]["variance_ratio"]
+    n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var) + 1)
+    adata.obsm["X_pca"] = adata.obsm["X_pca"][:, :n_pcs]
+    return adata
+
 def compare_cluster_distribution(df, col_a, col_b):
     counts = pd.crosstab(df[col_a], df[col_b])
     props = counts.div(counts.sum(axis=1), axis=0)
@@ -206,7 +226,7 @@ def merge_small_clusters(
     small_clusters = counts[counts < min_size].index.tolist()
     if len(small_clusters) == 0:
         print("No small clusters to merge.")
-        return
+        return adata
 
     X = adata.obsm[use_rep] if use_rep in adata.obsm else adata.X
 
@@ -884,10 +904,6 @@ def rle_encode(states):
     runs.append((cur, length))
     return runs
 
-
-# ----------------------------
-# Feature builders (RETURN feats + list_of_columns_for_this_block)
-# ----------------------------
 def fractions_from_runs(runs, states):
     total = sum(l for _, l in runs) if runs else 0
     cols = [f"overall_fraction_{s}" for s in states]
@@ -897,7 +913,6 @@ def fractions_from_runs(runs, states):
     for s, l in runs:
         out[f"overall_fraction_{s}"] += l / total
     return out, cols
-
 
 def bout_stats_from_runs(runs, states):
     lengths = {s: [] for s in states}
@@ -923,7 +938,6 @@ def bout_stats_from_runs(runs, states):
 
     return out, cols
 
-
 def transition_probs_from_runs(runs, state_to_idx, states):
     K = len(states)
     M = np.zeros((K, K), dtype=float)
@@ -937,7 +951,6 @@ def transition_probs_from_runs(runs, state_to_idx, states):
     row_sums[row_sums == 0] = 1.0
     return M / row_sums
 
-
 def ngram_counts_from_runs(runs, n=3, weight="count"):
     labels = [s for s, _ in runs]
     lens = [l for _, l in runs]
@@ -950,39 +963,35 @@ def ngram_counts_from_runs(runs, n=3, weight="count"):
         out[g] = out.get(g, 0.0) + w
     return out
 
-
-def l2_normalize_block(df: pd.DataFrame, cols: list[str]) -> None:
+def l2_normalize_block(adata, cols, layer=None):
     """Row-wise L2 normalize selected columns. Leaves all-zero rows unchanged."""
-    if not cols:
-        return
-    X = df[cols].to_numpy(dtype=float, copy=True)
+    adata_norm = adata.copy()
+    if layer is not None:
+        X = adata_norm[:, cols].layers[layer]
+    else:
+        X = adata_norm[:, cols].X
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
-    df.loc[:, cols] = X / norms
-    return df
+    adata_norm[:, cols] = X / norms
+    return adata_norm
 
-
-def l2_normalize_all(df: pd.DataFrame) -> None:
+def l2_normalize_all(adata):
     """Row-wise L2 normalize all columns. Leaves all-zero rows unchanged."""
-    if df.shape[1] == 0:
-        return
-    X = df.to_numpy(dtype=float, copy=True)
+   
+    X = adata.X.copy()
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
-    df.loc[:, :] = X / norms
-    return(df)
+    adata.X = X / norms
+    return(adata)
 
 def l2_normalize_features_blocks(
-    df,
-    blocks
+    adata,
+    blocks,
+    layer=None
     ):
-    df_norm = df.copy()
     for block in blocks:
-        df_norm = l2_normalize_block(df_norm, block)
-
-    df_norm=l2_normalize_all(df_norm)
-    return df_norm
-
+        adata = l2_normalize_block(adata, block, layer=layer)
+    return adata
  
 def extract_descibing_track_state_features(
     adata,
@@ -1138,7 +1147,6 @@ def extract_descibing_track_state_features(
 
     return track_adata, blocks
 
-
 def subset_full_adata_from_summary(
     adata_full,
     adata_tracks,
@@ -1150,7 +1158,7 @@ def subset_full_adata_from_summary(
     time_key: str = "position_t",
     tmin_key: str = "position_t_min",
     tmax_key: str = "position_t_max",
-    seed: int = 0,
+    random_state: int = 0,
     query: str | None = None, 
 ):
     """
@@ -1196,7 +1204,7 @@ def subset_full_adata_from_summary(
     if len(tracks_df) == 0:
         raise ValueError("No tracks available after applying query/filtering.")
 
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(random_state)
 
     # --- choose which tracks
     if n_tracks_per_cluster is not None:

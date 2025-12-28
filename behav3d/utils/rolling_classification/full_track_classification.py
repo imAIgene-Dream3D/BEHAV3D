@@ -30,6 +30,18 @@ from behav3d.utils.rolling_classification.clustering import *
 from behav3d.utils.rolling_classification.plotting import *
 from behav3d.utils.rolling_classification.videos import *
 
+import numpy as np
+#%matplotlib inline
+
+seed = 123
+random.seed(seed)
+np.random.seed(seed)
+
+ssd_dir = r"F:/"
+ssd_dir = Path(ssd_dir)
+outfolder = Path(ssd_dir, r"BHVD_BEHAV3D\BEHAV3D_python\rolling_classification")
+adata_full = sc.read_h5ad(Path(outfolder,"adata_full.h5ad"))
+
 min_length = 100
 max_length = 100
 adata_filt = filter_and_truncate_tracks(
@@ -40,16 +52,43 @@ adata_filt = filter_and_truncate_tracks(
     max_length=max_length
 )
 
-
-test,blocks = extract_descibing_track_state_features(
-    adata_filt
+state_col = 'ClusterID'
+test, blocks = extract_descibing_track_state_features(
+    adata_filt,
+    state_col=state_col
 )
 
-test = run_leiden_clustering(
-    test, 
-    n_neighbors=50,
-    resolution=0.2, 
-    metric="cosine",
+"""
+Add L2 normalization??
+"""
+test_norm = l2_normalize_features_blocks(test, blocks=blocks)
+
+to_run = test_norm
+to_run = run_pca(
+    to_run,
+    ncomps=len(to_run.var_names),
+    pca_var=0.95, 
+    seed=None
+    )
+
+
+# to_run = run_leiden_clustering(
+#     to_run, 
+#     n_neighbors=50,
+#     resolution=0.2, 
+#     metric="cosine",
+#     method="umap",
+#     use_rep="X_pca",
+#     key_added="ClusterID",
+#     random_state=seed
+#     )
+
+
+to_run = run_leiden_clustering(
+    to_run, 
+    n_neighbors=30,
+    resolution=0.4, 
+    # metric="cosine",
     method="umap",
     use_rep="X",
     key_added="ClusterID",
@@ -57,17 +96,18 @@ test = run_leiden_clustering(
     )
 
 sc.tl.umap(
-    test,
+    to_run,
     min_dist=0.1,
     random_state=seed,
 )
 
-sc.pl.umap(test, color="ClusterID", size=6, alpha=0.5)
+sc.pl.umap(to_run, color="ClusterID", size=4, alpha=0.5)
 
-sc.tl.dendrogram(test, groupby="ClusterID")
+
+sc.tl.dendrogram(to_run, groupby="ClusterID")
 sc.pl.heatmap(
-    test,
-    var_names=test.var_names,
+    to_run,
+    var_names=to_run.var_names,
     # var_group_labels=list(feature_dict.keys()),
     # var_group_rotation=0,
     groupby="ClusterID",
@@ -79,8 +119,8 @@ sc.pl.heatmap(
 )
 
 sc.pl.matrixplot(
-    test,
-    var_names=test.var_names,    
+    to_run,
+    var_names=to_run.var_names,    
     groupby="ClusterID",
     standard_scale="var",
     figsize=(20, 20),
@@ -88,9 +128,16 @@ sc.pl.matrixplot(
     dendrogram=True
 )
 
+plot_exemplar_tracks_by_cluster(
+    adata_filt,
+    to_run,
+    n_per_cluster=5,
+    state_key="ClusterID",
+)
 
 plot_exemplar_tracks_by_cluster(
     adata_filt,
-    test,
-    n_per_cluster=20
+    to_run,
+    n_per_cluster=5,
+    state_key="ClusterID_filt5",
 )
