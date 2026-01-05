@@ -30,13 +30,14 @@ from behav3d.utils.rolling_classification.plotting import *
 from behav3d.utils.rolling_classification.videos import *
 # %matplotlib inline
 
+import time
 seed = 123
 random.seed(seed)
 np.random.seed(seed)
 
-if __name__ == "__main__":
-    # ssd_dir = r"/Volumes/T7_Sam/"
-    ssd_dir = r"F:/"
+def test():
+    ssd_dir = r"/Volumes/T7_Sam/"
+    # ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
     
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
@@ -47,7 +48,7 @@ if __name__ == "__main__":
 
 
     # outfolder = r"C:/Users/Samde/Downloads"
-    outfolder = Path(ssd_dir, r"BHVD_BEHAV3D\BEHAV3D_python\rolling_classification")
+    outfolder = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
     # output_dir = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE"
     # metadata_csv_path = r"F:/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv"
 
@@ -93,13 +94,13 @@ if __name__ == "__main__":
         df_tracks=df_positions,
         columns_to_summarize=features,
         window_size = window_size,
-        step_size = 1,
+        subsample_step_size = 1,
         time_col = "position_t",
         id_cols = ["sample_name", "TrackID"],
     )
 
-    df_windows_descriptive.to_csv(Path(outfolder,r"df_windows_descriptive.csv"), index=False)
-    # df_windows_descriptive = pd.read_csv(Path(outfolder,r"df_windows_descriptive.csv"))
+    # df_windows_descriptive.to_csv(Path(outfolder,r"df_windows_descriptive.csv"), index=False)
+    df_windows_descriptive = pd.read_csv(Path(outfolder,r"df_windows_descriptive.csv"))
     
     ### Sample the dataset (either to fraction of the tracks)
     non_feature_cols = [
@@ -122,7 +123,7 @@ if __name__ == "__main__":
     ]
     df_analysis = df_analysis.dropna(subset=descriptive_feature_cols)
     
-    ### Reduce redundancy of similar features
+    ## Reduce redundancy of similar features
     # df_analysis, dropped, report = drop_highly_correlated_features(
     #     df=df_analysis,
     #     feature_cols=descriptive_feature_cols,
@@ -140,22 +141,21 @@ if __name__ == "__main__":
     kept_features = df_analysis[descriptive_feature_cols].columns[keep_mask].tolist()
     dropped_low_var = df_analysis[descriptive_feature_cols].columns[~keep_mask].tolist()
     print(f"Dropped {len(dropped_low_var)} low-variance features.")
-    descriptive_feature_cols = [c for c in descriptive_feature_cols if c not in dropped_low_var]
     
-    scaler = StandardScaler().fit(df_analysis[descriptive_feature_cols])
-    df_analysis[descriptive_feature_cols] = scaler.transform(df_analysis[descriptive_feature_cols])
+    scaler = StandardScaler().fit(df_analysis[kept_features])
+    df_analysis[kept_features] = scaler.transform(df_analysis[kept_features])
     
-    adata_full = df_to_adata(df_analysis, descriptive_feature_cols, obs_cols=non_feature_cols)
+    adata_full = df_to_adata(df_analysis, kept_features, obs_cols=non_feature_cols)
     adata_full.uns["preprocessing"] = {
-        "kept_features": list(descriptive_feature_cols),
+        "kept_features": list(kept_features),
         "scaler": {
             "mean": scaler.mean_.astype(float),
             "scale": scaler.scale_.astype(float),
         }}
 
-    # df_analysis[descriptive_feature_cols] = scaler.fit_transform(df_analysis[descriptive_feature_cols])
+    # df_analysis[kept_features] = scaler.fit_transform(df_analysis[kept_features])
     # --- 3) Subset windows (custom) ---
-    chosen_intervals = 30
+    chosen_intervals = 10
     # chosen_intervals = window_size
     df_leiden_subset = subset_windowed_tracks(
         df_windowed=df_analysis,
@@ -163,28 +163,26 @@ if __name__ == "__main__":
     )
     
     
-    adata_sub  = df_to_adata(df_leiden_subset, descriptive_feature_cols, obs_cols=non_feature_cols)
+    adata_sub  = df_to_adata(df_leiden_subset, kept_features, obs_cols=non_feature_cols)
     adata_sub.uns["preprocessing"] = {
-        "kept_features": list(descriptive_feature_cols),
+        "kept_features": list(kept_features),
         "scaler": {
             "mean": scaler.mean_.astype(float),
             "scale": scaler.scale_.astype(float),
         }}
-    # sc.pp.scale(adata_full, zero_center=True, max_value=None)
-    # scaled_subset_X = adata_full[adata_sub.obs_names, adata_sub.var_names].X
-    # adata_sub.X = scaled_subset_X.copy()
+    
     
     """
     LEIDEN CLUSTERING
     """
     adata_sub = run_pca(
         adata_sub,
-        pca_var=0.95,
-        ncomps=len(descriptive_feature_cols),
+        pca_var_selection=0.95,
+        ncomps=len(kept_features),
         svd_solver='full', 
         random_state=seed
     )
-    # pca_var=0.95
+    # pca_var_selection=0.95
     # # sc.pp.pca(adata_sub, n_comps=None, )
     # sc.pp.pca(
     #     adata_sub, 
@@ -195,12 +193,12 @@ if __name__ == "__main__":
     #     )
 
     # var_ratio = adata_sub.uns["pca"]["variance_ratio"]
-    # n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var) + 1)
+    # n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var_selection) + 1)
     # adata_sub.obsm["X_pca"] = adata_sub.obsm["X_pca"][:, :n_pcs]
     
     # adata_sub = run_leiden_clustering(
     #     adata_sub, 
-    #     resolution="auto", 
+    #     leiden_resolution="auto", 
     #     stability_resolutions=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0), # Gives 0.5 as result
     #     key_added="ClusterID",
     #     random_state=seed
@@ -209,7 +207,7 @@ if __name__ == "__main__":
     adata_sub = run_leiden_clustering(
         adata_sub, 
         n_neighbors=50,
-        resolution=0.25, 
+        leiden_resolution=0.2, 
         metric="euclidean",
         method="umap",
         use_rep="X_pca",
@@ -232,12 +230,20 @@ if __name__ == "__main__":
     
     sc.pl.umap(adata_sub, color="ClusterID", size=2, alpha=0.5)
     
+    sc.tl.rank_genes_groups(
+    adata_sub,
+    groupby="ClusterID",      # <-- your cluster column
+    method="wilcoxon",     # robust choice
+    use_raw=False
+    )
+    sc.pl.rank_genes_groups(adata_sub, n_genes=15, sharey=False)
+
     feature_dict = {
-        f: [c for c in descriptive_feature_cols if c.startswith(f + "_")]
+        f: [c for c in kept_features if c.startswith(f + "_")]
         for f in features
     }
     known_prefixes = tuple(f + "_" for f in features)
-    feature_dict["other"] = [c for c in descriptive_feature_cols if not c.startswith(known_prefixes)]
+    feature_dict["other"] = [c for c in kept_features if not c.startswith(known_prefixes)]
     
     sc.tl.dendrogram(adata_sub, groupby="ClusterID")
     sc.pl.heatmap(
@@ -789,7 +795,7 @@ if __name__ == "__main__":
     # chosen_intervals = 25
     # df_analysis_subset = subset_windowed_tracks(
     #     df_windowed=df_analysis,
-    #     step_size=chosen_intervals,
+    #     subsample_step_size=chosen_intervals,
     # )
     
    
@@ -819,7 +825,7 @@ if __name__ == "__main__":
         X=X_pca,                # or umap_embedding, or X_scaled
         n_neighbors=80,
         metric="cosine",
-        resolution=0.35,
+        leiden_resolution=0.35,
         random_state=seed,
     )
     df_analysis_subset["cluster_label_leiden"] = labels_leiden

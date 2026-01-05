@@ -43,6 +43,9 @@ from collections import defaultdict
 from pathlib import Path
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import TwoSlopeNorm
+from matplotlib.patches import Patch
+from matplotlib import colormaps
+
 from behav3d.utils.fileio import load_zarr
 from behav3d.utils.preprocessing import calc_z_projection
 
@@ -708,6 +711,76 @@ def plot_number_per_clusters(
     else:
         return ax
      
+def plot_top_ranking_features(
+    adata,
+    groupby="ClusterID",
+    n_genes=15,
+    method="wilcoxon",
+):
+    # Run differential expression per group
+    sc.tl.rank_genes_groups(
+        adata,
+        groupby=groupby,
+        method=method,
+    )
+
+    # Get group names from the rank_genes_groups result
+    groups = adata.uns[key]["names"].dtype.names
+    n_groups = len(groups)
+
+    # Define a roughly square grid layout
+    n_cols = math.ceil(np.sqrt(n_groups))
+    n_rows = math.ceil(n_groups / n_cols)
+
+    # Create figure and axes grid
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.5 * n_cols, 5 * n_rows),
+        squeeze=False,
+    )
+
+    # Plot top-ranked genes for each group
+    for ax, group in zip(axes.flat, groups):
+        df = sc.get.rank_genes_groups_df(adata, group=group, key=key).copy()
+
+        # Rank genes by absolute score
+        df["abs_score"] = df["scores"].abs()
+        top = df.sort_values("abs_score", ascending=False).head(n_genes).iloc[::-1]
+
+        # Horizontal bar plot of scores
+        ax.barh(top["names"], top["scores"])
+        ax.axvline(0, linewidth=0.8)
+
+        ax.set_title(f"Cluster {group}")
+        ax.set_xlabel("score")
+
+        # Color gene labels by score direction
+        for label, score in zip(ax.get_yticklabels(), top["scores"]):
+            label.set_color("blue" if score > 0 else "red")
+
+    # Disable unused axes
+    for ax in axes.flat[len(groups):]:
+        ax.axis("off")
+
+    # Add shared legend for score direction
+    legend_elements = [
+        Line2D([0], [0], color="blue", lw=2, label="Present / high"),
+        Line2D([0], [0], color="red", lw=2, label="Absent / low"),
+    ]
+
+    fig.legend(
+        handles=legend_elements,
+        loc="lower center",
+        ncol=2,
+        frameon=False,
+    )
+
+    # Adjust layout to make room for legend
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
+    plt.show()
+     
+     
 def create_max_projection_cutout(
     df_window,
     df_positions,
@@ -1365,8 +1438,6 @@ def plot_tracks_bars_on_ax(
       - default: 100
       - if timepoints look discrete and track is short: rel_max = (n_timepoints - 1)
     """
-    import matplotlib.cm as cm
-
     key_cols = [sample_key, track_key]
 
     obs = adata_full.obs[[sample_key, track_key, time_key, state_key]].copy()
@@ -1422,7 +1493,9 @@ def plot_tracks_bars_on_ax(
 
     # state colors
     states = pd.Categorical(obs[state_key]).categories
-    cmap = cm.get_cmap(cmap_name, max(1, len(states)))
+    # cmap = cm.get_cmap(cmap_name, max(1, len(states)))
+    cmap = colormaps.get_cmap(cmap_name).resampled(max(1, len(states)))
+
     color_map = {st: cmap(i) for i, st in enumerate(states)}
 
     tracks = chosen_df[key_cols].drop_duplicates().reset_index(drop=True)
@@ -1481,31 +1554,20 @@ def plot_exemplar_tracks_by_cluster(
     sample_key="sample_name",
     track_key="TrackID",
     time_key="position_t",
-    state_key="ClusterID",         # state on full adata bars
-    cluster_key="ClusterID",       # cluster label in adata_tracks.obs used to group “boxes”
+    state_key="ClusterID",
+    cluster_key="ClusterID",
     tmin_key="position_t_min",
     tmax_key="position_t_max",
-     x_mode="relative", 
+    x_mode="relative",
     seed=0,
-    query=None,                   # optional filter on adata_tracks.obs BEFORE sampling
+    query=None,
     cmap_name="tab20",
-    max_cols=2,                   # grid layout
+    max_cols=2,
+    legend=True,
+    legend_loc="center left",
+    legend_bbox_to_anchor=(1.01, 0.5),
+    legend_ncol=1,
 ):
-    """
-    Overarching plotting function:
-      1) From adata_tracks (summary), sample n_per_cluster tracks PER cluster_key.
-      2) For each cluster, plot those sampled tracks as bars (from adata_full) in its own subplot "box".
-
-    Requirements
-    ------------
-    adata_tracks.obs must contain: sample_key, track_key, tmin_key, tmax_key, cluster_key
-    adata_full.obs must contain:   sample_key, track_key, time_key, state_key
-
-    Returns
-    -------
-    fig, axes, chosen
-      chosen is the sampled summary table (includes cluster_key)
-    """
     rng = np.random.default_rng(seed)
 
     needed = {sample_key, track_key, tmin_key, tmax_key, cluster_key}
@@ -1513,21 +1575,20 @@ def plot_exemplar_tracks_by_cluster(
     if missing:
         raise ValueError(f"adata_tracks.obs missing required columns: {missing}")
 
-    # ---- 1) Build the sampling frame
     tracks_df = adata_tracks.obs[[sample_key, track_key, tmin_key, tmax_key, cluster_key]].copy()
     if query is not None:
-        tracks_df = adata_tracks.obs.query(query)[[sample_key, track_key, tmin_key, tmax_key, cluster_key]].copy()
+        tracks_df = adata_tracks.obs.query(query)[
+            [sample_key, track_key, tmin_key, tmax_key, cluster_key]
+        ].copy()
 
     if len(tracks_df) == 0:
         raise ValueError("No tracks left after applying `query` (if any).")
 
-    # If duplicates per (sample,track,cluster) exist, collapse windows safely
     tracks_df = (
         tracks_df.groupby([cluster_key, sample_key, track_key], observed=True, as_index=False)
                  .agg(**{tmin_key: (tmin_key, "min"), tmax_key: (tmax_key, "max")})
     )
 
-    # ---- 2) Sample n_per_cluster per cluster
     chosen_parts = []
     for cl, df_cl in tracks_df.groupby(cluster_key, sort=False, observed=True):
         k = min(int(n_per_cluster), len(df_cl))
@@ -1541,22 +1602,60 @@ def plot_exemplar_tracks_by_cluster(
 
     chosen = pd.concat(chosen_parts, axis=0, ignore_index=True)
 
-    # ---- 3) Create subplot grid (one box per cluster)
     clusters = list(chosen[cluster_key].dropna().unique())
     n_clusters = len(clusters)
-    ncols = min(max_cols, n_clusters)
-    nrows = int(np.ceil(n_clusters / ncols))
+    ncols = min(max_cols, n_clusters) if n_clusters > 0 else 1
+    nrows = int(np.ceil(n_clusters / ncols)) if n_clusters > 0 else 1
 
-    # height scales with tracks per cluster
-    fig_h = sum(0.45 * min(n_per_cluster, (chosen[chosen[cluster_key] == cl].shape[0])) + 2 for cl in clusters)
+    fig_h = (
+        sum(
+            0.45 * min(n_per_cluster, (chosen[chosen[cluster_key] == cl].shape[0])) + 2
+            for cl in clusters
+        )
+        if clusters
+        else 4
+    )
     fig_w = 14 * ncols
-    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(fig_w, max(4, fig_h / max(1, ncols))), squeeze=False)
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        figsize=(fig_w, max(4, fig_h / max(1, ncols))),
+        squeeze=False,
+    )
 
-    # ---- 4) Plot each cluster into its own axis
+    legend_handles = None
+    if legend:
+        if state_key not in adata_full.obs.columns:
+            raise ValueError(
+                f"adata_full.obs missing required column for legend/state coloring: {state_key}"
+            )
+
+        states_series = adata_full.obs[state_key].dropna()
+
+        if pd.api.types.is_categorical_dtype(states_series):
+            state_values = list(states_series.cat.categories)
+        else:
+            uniq = pd.unique(states_series)
+            try:
+                state_values = sorted(uniq)
+            except Exception:
+                state_values = list(uniq)
+
+        cmap = colormaps.get_cmap(cmap_name).resampled(max(1, len(state_values)))
+
+        legend_handles = [
+            Patch(facecolor=cmap(i), edgecolor="k", label=str(v))
+            for i, v in enumerate(state_values)
+        ]
+
     for i, cl in enumerate(clusters):
         r, c = divmod(i, ncols)
         ax = axes[r, c]
-        df_cl = chosen.loc[chosen[cluster_key] == cl, [sample_key, track_key, tmin_key, tmax_key]].copy()
+        df_cl = chosen.loc[
+            chosen[cluster_key] == cl,
+            [sample_key, track_key, tmin_key, tmax_key],
+        ].copy()
+
         plot_tracks_bars_on_ax(
             adata_full=adata_full,
             chosen_df=df_cl,
@@ -1569,15 +1668,26 @@ def plot_exemplar_tracks_by_cluster(
             tmax_key=tmax_key,
             cmap_name=cmap_name,
             title=f"{cluster_key} = {cl} (n={len(df_cl)})",
-            x_mode=x_mode
+            x_mode=x_mode,
         )
 
-    # Turn off any unused axes
     for j in range(n_clusters, nrows * ncols):
         r, c = divmod(j, ncols)
         axes[r, c].axis("off")
 
-    fig.tight_layout()
+    if legend and legend_handles:
+        fig.legend(
+            handles=legend_handles,
+            title=state_key,
+            loc=legend_loc,
+            bbox_to_anchor=legend_bbox_to_anchor,
+            frameon=False,
+            ncol=legend_ncol,
+        )
+        fig.tight_layout(rect=(0, 0, 0.85, 1))
+    else:
+        fig.tight_layout()
+
     return fig, axes, chosen
 
 import numpy as np
