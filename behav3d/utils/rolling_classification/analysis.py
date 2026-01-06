@@ -198,7 +198,7 @@ def run_rolling_window_analysis(
     if leiden_resolution is None or leiden_resolution == "auto":
         adata_sub = run_leiden_clustering(
             adata_sub,
-            leiden_resolution="auto",
+            resolution="auto",
             stability_resolutions=leiden_stability_resolutions,
             key_added="ClusterID",
             random_state=seed,
@@ -207,7 +207,7 @@ def run_rolling_window_analysis(
         adata_sub = run_leiden_clustering(
             adata_sub,
             n_neighbors=n_neighbors,
-            leiden_resolution=leiden_resolution,
+            resolution=leiden_resolution,
             metric="euclidean",
             method="umap",
             use_rep="X_pca",

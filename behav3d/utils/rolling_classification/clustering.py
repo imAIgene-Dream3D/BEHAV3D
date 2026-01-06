@@ -13,7 +13,7 @@ from behav3d.utils.rolling_classification import *
 def run_pca(
     adata, 
     ncomps=50, 
-    pca_var=0.95, 
+    pca_var_selection=0.95, 
     svd_solver="full",
     zero_center=True,
     random_state=None
@@ -26,7 +26,7 @@ def run_pca(
         random_state=random_state,
     )
     var_ratio = adata.uns["pca"]["variance_ratio"]
-    n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var) + 1)
+    n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var_selection) + 1)
     adata.obsm["X_pca"] = adata.obsm["X_pca"][:, :n_pcs]
     return adata
 
