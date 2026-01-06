@@ -37,7 +37,7 @@ np.random.seed(seed)
 
 def test():
     ssd_dir = r"/Volumes/T7_Sam/"
-    # ssd_dir = r"F:/"
+    ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
     
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
@@ -132,7 +132,7 @@ def test():
     # print(f"Dropped {len(dropped)} highly correlated features.")
     # descriptive_feature_cols = [c for c in descriptive_feature_cols if c not in dropped]
     
-    
+    kept_features = descriptive_feature_cols.copy()
     ### Remove features with no variance
     selector = VarianceThreshold(threshold=1e-4)
     selector.fit(df_analysis[descriptive_feature_cols])
@@ -229,6 +229,12 @@ def test():
     )
     
     sc.pl.umap(adata_sub, color="ClusterID", size=2, alpha=0.5)
+    
+    plot_top_ranking_features(
+        adata_sub,
+        groupby="ClusterID",
+        n_features=10,
+    )
     
     sc.tl.rank_genes_groups(
     adata_sub,
@@ -604,7 +610,7 @@ def test():
     adata_full.write(r"C:\Users\Samde/Downloads/adata_full.h5ad") 
     adata_sub.write(r"C:\Users\Samde/Downloads/adata_sub.h5ad")
     
-    adata = sc.read_h5ad(Path(outfolder,"adata_full.h5ad"))
+    adata_full = sc.read_h5ad(Path(outfolder,"adata_full.h5ad"))
     adata_sub = sc.read_h5ad(Path(outfolder,"adata_sub.h5ad"))
     adata.write_zarr("my_data.zarr")
     

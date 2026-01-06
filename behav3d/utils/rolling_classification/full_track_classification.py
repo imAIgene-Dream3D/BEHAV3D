@@ -37,11 +37,25 @@ seed = 12345
 random.seed(seed)
 np.random.seed(seed)
 
-ssd_dir = r"/Volumes/T7_Sam/"
-# ssd_dir = r"F:/"
+# ssd_dir = r"/Volumes/T7_Sam/"
+ssd_dir = r"F:/"
 ssd_dir = Path(ssd_dir)
 outfolder = Path(ssd_dir, "BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
 adata_full = sc.read_h5ad(Path(outfolder,"adata_full.h5ad"))
+
+mapping =  {
+        "1": "Dead",
+        "2": "T cell interaction",
+        "3": "Interacting Scanners",
+        "4": "Organoid + T cell aggregation",
+        "5": "Static",
+        "6": "Non-interacting Movers",
+        "7": "Organoid interaction",
+    }
+adata_full = relabel_cluster_ids(
+    adata_full,
+    mapping
+)
 
 min_length = 100
 max_length = 100
@@ -108,7 +122,7 @@ to_run = run_pca(
 to_run = run_leiden_clustering(
     to_run, 
     n_neighbors=30,
-    resolution=0.2, 
+    resolution=0.4, 
     # metric="cosine",
     method="umap",
     use_rep="X",
@@ -122,7 +136,7 @@ sc.tl.umap(
     random_state=seed,
 )
 
-sc.pl.umap(to_run, color="ClusterID", size=1, alpha=0.5)
+sc.pl.umap(to_run, color="ClusterID", size=4, alpha=0.5)
 
 
 sc.tl.dendrogram(to_run, groupby="ClusterID")
@@ -170,3 +184,9 @@ sc.tl.rank_genes_groups(
     use_raw=False
 )
 sc.pl.rank_genes_groups(to_run, n_genes=15)
+
+plot_top_ranking_features(
+    to_run,
+    groupby="ClusterID",
+    n_features=10
+)
