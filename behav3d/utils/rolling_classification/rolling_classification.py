@@ -69,7 +69,7 @@ def test():
     # window_size=100
     # chosen_intervals = 50
 
-    window_size = 10
+    
     # window_size = None
 
     groupby=["sample_name", "TrackID"]
@@ -89,15 +89,27 @@ def test():
         # "solidity",
     ]
 
+    window_size = 10
     # df_tracks = df_positions[["sample_name", "TrackID", "position_t"]+features]
     df_windows_descriptive = create_descriptive_track_dataset(
         df_tracks=df_positions,
         columns_to_summarize=features,
         window_size = window_size,
-        subsample_step_size = 1,
+        step_size = 1,
         time_col = "position_t",
         id_cols = ["sample_name", "TrackID"],
     )
+    
+    # window_size = 5
+    # df_windows_small_descriptive = create_descriptive_track_dataset(
+    #     df_tracks=df_positions,
+    #     columns_to_summarize=features,
+    #     window_size = window_size,
+    #     step_size = 1,
+    #     time_col = "position_t",
+    #     id_cols = ["sample_name", "TrackID"],
+    #     features_to_compute=["mean", "median", "net_displacement", "straightness"]
+    # )
 
     # df_windows_descriptive.to_csv(Path(outfolder,r"df_windows_descriptive.csv"), index=False)
     df_windows_descriptive = pd.read_csv(Path(outfolder,r"df_windows_descriptive.csv"))
@@ -373,78 +385,141 @@ def test():
     
     """
     ################################################
-    HMM STATE CLASSIFICATION (on descriptive data)
+    HMM STATE CLASSIFICATION (on short mean data)
     ################################################
     """
     
+    window_size = 5
+    df_windows_small_descriptive = create_descriptive_track_dataset(
+        df_tracks=df_positions,
+        columns_to_summarize=features,
+        window_size = window_size,
+        step_size = 1,
+        time_col = "position_t",
+        id_cols = ["sample_name", "TrackID"],
+        features_to_compute=["mean", "median", "net_displacement", "straightness"]
+    )
+
+    # df_windows_descriptive.to_csv(Path(outfolder,r"df_windows_descriptive.csv"), index=False)
+    # df_windows_descriptive = pd.read_csv(Path(outfolder,r"df_windows_descriptive.csv"))
     
-    df_hmm_descriptive = df_analysis.copy()
+    ### Sample the dataset (either to fraction of the tracks)
+    non_feature_cols = [
+        "sample_name",
+        "TrackID",
+        "sub_TrackID",
+        "position_t",
+        "window_start_position_t",
+        "window_end_position_t",
+        "window_length_frames",
+    ]
+    
+    df_hmm_descriptive = df_windows_small_descriptive.copy()
+    
+    # Drop anything that ends with "_signal_type" or other metadata
+    hmm_feature_cols = [
+        col for col in df_hmm_descriptive.columns
+        if (col not in non_feature_cols)
+        and (not col.endswith("_signal_type"))
+    ]
+    # df_hmm_descriptive = df_analysis.copy()
     # scaled_X = adata_full[:, descriptive_feature_cols].X.toarray()
     # df_analysis_hmm.loc[:, descriptive_feature_cols] = scaled_X
-
-    df_hmm_descriptive, sampled_keys = subset_full_tracks(
+    df_hmm_descriptive = df_hmm_descriptive.dropna(subset=hmm_feature_cols)
+    scaler = StandardScaler().fit(df_hmm_descriptive[hmm_feature_cols])
+    df_hmm_descriptive[hmm_feature_cols] = scaler.transform(df_hmm_descriptive[hmm_feature_cols])
+    
+    df_hmm_sub, sampled_keys = subset_full_tracks(
         df=df_hmm_descriptive,
-        fraction=0.5,
+        fraction=1.0,
         random_state=seed,
         id_cols=["sample_name", "TrackID"],
         return_selected_keys=True
     )
     
-    # df_hmm_descriptive, hmm_model, selection_df = run_hmm_state_classification(
-    #     df_features=df_hmm_descriptive,
-    #     feature_cols=descriptive_feature_cols,
-    #     k_min = 3,
-    #     k_max = 15,
-    #     n_states="auto", #10 came out of it
-    #     out_col_name="hmm_state"
-    # )
-    
-    
-    df_hmm_descriptive, hmm_model_descriptive, selection_df = run_sticky_hmm_state_classification(
-        df_features=df_hmm_descriptive,
-        feature_cols=descriptive_feature_cols,
-        n_states=8, #6 came out of it
+    df_hmm_sub, hmm_model, selection_df = run_sticky_hmm_state_classification(
+        df_features=df_hmm_sub,
+        feature_cols=hmm_feature_cols,
+        k_min = 3,
+        k_max = 10,
         covariance_type="diag",
         stickiness_kappa=4,
+        n_states="auto", #10 came out of it
         out_col_name="hmm_state",
         random_state=seed  
     )
     
+    df_hmm_sub, hmm_model, selection_df = run_sticky_hmm_state_classification(
+        df_features=df_hmm_sub,
+        feature_cols=hmm_feature_cols,
+        # k_min = 3,
+        # k_max = 10,
+        covariance_type="diag",
+        stickiness_kappa=4,
+        n_states=7, #10 came out of it
+        out_col_name="hmm_state",
+        random_state=seed  
+    )
+    
+  
+    # df_hmm_descriptive, hmm_model_descriptive, selection_df = run_sticky_hmm_state_classification(
+    #     df_features=df_hmm_descriptive,
+    #     feature_cols=hmm_feature_cols,
+    #     n_states=8, #6 came out of it
+    #     covariance_type="diag",
+    #     stickiness_kappa=4,
+    #     out_col_name="hmm_state",
+    #     random_state=seed  
+    # )
+    
     # Apply HMM to full dataset
-    df_analysis, _, _ = run_sticky_hmm_state_classification(
-        df_features=df_analysis,
-        feature_cols=descriptive_feature_cols,
-        model=hmm_model_descriptive,
+    df_hmm_full, _, _ = run_sticky_hmm_state_classification(
+        df_features=df_hmm_descriptive,
+        feature_cols=hmm_feature_cols,
+        model=hmm_model,
         out_col_name="hmm_state"
     )
      
-    df_hmm_descriptive["hmm_state"] =  df_hmm_descriptive["hmm_state"].astype(str).astype("category")
-    df_analysis["hmm_state"] =  df_analysis["hmm_state"].astype(str).astype("category")
+    df_hmm_full["hmm_state"] =  df_hmm_full["hmm_state"].astype(str).astype("category")
+    df_hmm_sub["hmm_state"] =  df_hmm_sub["hmm_state"].astype(str).astype("category")
+    
+    adata_hmm_sub  = df_to_adata(df_hmm_sub, hmm_feature_cols, obs_cols=non_feature_cols+["hmm_state"])
+    adata_hmm_full  = df_to_adata(df_hmm_full, hmm_feature_cols, obs_cols=non_feature_cols+["hmm_state"])
+    # adata_sub  = df_to_adata(df_leiden_subset, kept_features, obs_cols=non_feature_cols)
+    
+    plot_hmm_top_ranking_features(
+        df_hmm_full,
+        hmm_feature_cols,
+        hmm_model,
+        out_col="hmm_state",
+        n_features=15,
+        rank_by="abs"
+    )
     
     merge_pandas_cols_into_obs_anndata(
         cols=["hmm_state"],
         adata=adata_sub,
-        df_analysis=df_analysis,
+        df_analysis=df_hmm_full,
         on=["sample_name", "TrackID", "position_t"],    
     )
    
     merge_pandas_cols_into_obs_anndata(
         cols=["hmm_state"],
         adata=adata_full,
-        df_analysis=df_analysis,
+        df_analysis=df_hmm_full,
         on=["sample_name", "TrackID", "position_t"],    
     )
     
-    sc.pl.umap(adata_sub, color="hmm_state", size=2)
+    sc.pl.umap(adata_hmm_sub, color="hmm_state", size=2)
 
-    adata_full = filter_short_state_runs(
-        adata_full,
-        cluster_key="hmm_state",
-        id_cols = ["sample_name", "TrackID"],
-        time_key = "position_t",
-        length_removed = 1,
-        new_key = "hmm_state_filt"
-    )
+    # adata_full = filter_short_state_runs(
+    #     adata_full,
+    #     cluster_key="hmm_state",
+    #     id_cols = ["sample_name", "TrackID"],
+    #     time_key = "position_t",
+    #     length_removed = 1,
+    #     new_key = "hmm_state_filt"
+    # )
  
     compute_cluster_transition_matrix(
         adata=adata_full,
@@ -472,10 +547,10 @@ def test():
     plot_hmm_transition_matrix(hmm_model_descriptive)
 
     #### PROJECT ON DESCRIPTIVE DATA
-    sc.tl.dendrogram(adata_sub, groupby="hmm_state")
+    sc.tl.dendrogram(adata_hmm_sub, groupby="hmm_state")
     sc.pl.heatmap(
-        adata_sub,
-        var_names=descriptive_feature_cols,
+        adata_hmm_sub,
+        var_names=hmm_feature_cols,
         # var_group_labels=list(feature_dict.keys()),
         groupby="hmm_state",
         standard_scale="var",
@@ -486,8 +561,8 @@ def test():
     )
     
     sc.pl.matrixplot(
-        adata_sub,
-        var_names=descriptive_feature_cols,                 # dict: {group_label: [genes...]}
+        adata_hmm_sub,
+        var_names=hmm_feature_cols,                 # dict: {group_label: [genes...]}
         # var_group_labels=list(feature_dict.keys()),
         groupby="hmm_state",
         standard_scale="var",
@@ -495,6 +570,10 @@ def test():
         swap_axes=True,
         dendrogram=True
     )
+    
+    
+    
+    
     
     """
     ################################################

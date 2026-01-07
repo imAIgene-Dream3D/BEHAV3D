@@ -225,7 +225,46 @@ def compute_fraction_near_bounds(signal_values: np.ndarray, lower_bound=0.0, upp
         float(np.mean(signal_values[valid] >= upper_cutoff))
     )
 
-def _compute_motion_features_from_xyz(px, py, pz):
+ALL_WINDOW_FEATURES = {
+    # metadata-ish
+    "signal_type",
+    
+    #Basic motion 
+    "summed_displacement",
+    "net_displacement",
+    "straightness",
+    "directional_persistence",
+    "median_turning_angle",
+    "fraction_reversed_movement",
+    "mean_square_displacement",
+        
+    # basic stats
+    "mean",
+    "median",
+    "range",
+    "std",
+    "min",
+    "max",
+    "iqr",
+    "mad",
+    "quantiles",  # includes the q list
+
+    # dynamics
+    "trend",
+    "lag1_autocorr",
+    "mean_abs_first_diff",
+
+    # bounded
+    "fraction_near_bounds",
+
+    # binary
+    "binary_runs",
+
+    # count
+    "count_dispersion",
+}
+
+def _compute_motion_features_from_xyz(px, py, pz, features_to_compute=ALL_WINDOW_FEATURES):
     coords = np.column_stack([px, py, pz]).astype(float, copy=False)
     coords_rel = coords - coords[0]  # now coords_rel[0] == (0,0,0)
 
@@ -265,7 +304,7 @@ def _compute_motion_features_from_xyz(px, py, pz):
         median_turn = 0.0
         frac_reversed = 0.0
 
-    return {
+    motion_features={
         "summed_displacement": path_length,
         "net_displacement": net_disp,
         "straightness": straightness,
@@ -275,7 +314,27 @@ def _compute_motion_features_from_xyz(px, py, pz):
         "mean_square_displacement": mean_square_displacement,
     }
     
-def compute_window_features(window_dataframe, column_name, time_column="position_t", signal_types=None):
+    motion_features = {k: v for k, v in motion_features.items() if k in features_to_compute}
+    return motion_features
+
+def compute_window_features(
+    window_dataframe,
+    column_name,
+    time_column="position_t",
+    signal_types=None,
+    quantiles=(0.1, 0.25, 0.75, 0.9), 
+    features_to_compute=ALL_WINDOW_FEATURES,
+):
+    """
+    features_to_compute:
+        - None => compute everything (backwards compatible)
+        - Iterable[str] => compute only those features (e.g. {"mean", "trend"})
+    """
+    requested = set(features_to_compute)
+    unknown = requested - ALL_WINDOW_FEATURES
+    if unknown:
+        raise ValueError(f"Unknown features_to_compute: {sorted(unknown)}")
+
     if time_column in window_dataframe.columns:
         time_values = window_dataframe[time_column].to_numpy(float, copy=False)
     else:
@@ -285,41 +344,54 @@ def compute_window_features(window_dataframe, column_name, time_column="position
     signal_type = signal_types.get(column_name, "continuous") if signal_types is not None else "continuous"
 
     features = {}
-    features[f"{column_name}_inferred_signal_type"] = signal_type
 
-    features[f"{column_name}_mean_value"] = compute_mean_value(signal_values)
+    if "signal_type" in requested:
+        features[f"{column_name}_inferred_signal_type"] = signal_type
 
+    if "mean" in requested:
+        features[f"{column_name}_mean_value"] = compute_mean_value(signal_values)
+
+    # Non-binary statistics
     if signal_type != "binary":
-        features[f"{column_name}_median_value"] = compute_median_value(signal_values)
-        features[f"{column_name}_value_range"] = compute_value_range(signal_values)
-        features[f"{column_name}_standard_deviation"] = compute_standard_deviation(signal_values)
-        features[f"{column_name}_minimum_value"] = compute_minimum_value(signal_values)
-        features[f"{column_name}_maximum_value"] = compute_maximum_value(signal_values)
-        features[f"{column_name}_interquartile_range"] = compute_interquartile_range(signal_values)
-        features[f"{column_name}_median_absolute_deviation"] = compute_median_absolute_deviation(signal_values)
+        if "median" in requested:
+            features[f"{column_name}_median_value"] = compute_median_value(signal_values)
+        if "range" in requested:
+            features[f"{column_name}_value_range"] = compute_value_range(signal_values)
+        if "std" in requested:
+            features[f"{column_name}_standard_deviation"] = compute_standard_deviation(signal_values)
+        if "min" in requested:
+            features[f"{column_name}_minimum_value"] = compute_minimum_value(signal_values)
+        if "max" in requested:
+            features[f"{column_name}_maximum_value"] = compute_maximum_value(signal_values)
+        if "iqr" in requested:
+            features[f"{column_name}_interquartile_range"] = compute_interquartile_range(signal_values)
+        if "mad" in requested:
+            features[f"{column_name}_median_absolute_deviation"] = compute_median_absolute_deviation(signal_values)
 
-        for q in [0.1, 0.25, 0.75, 0.9]:
-            features[f"{column_name}_quantile_{int(q*100)}percent"] = compute_quantile(signal_values, q)
+        if "quantiles" in requested:
+            for q in quantiles:
+                features[f"{column_name}_quantile_{int(q*100)}percent"] = compute_quantile(signal_values, q)
 
-    # 1 is postive slope, 0 is no slope, -1 is decreasing slope
-    features[f"{column_name}_linear_trend_slope_per_time_unit"] = compute_linear_trend_slope(
-        signal_values, time_values
-    )
-    
-    # lag1_autocorrelation gives how similar a value is to itself a step later
-    # 1 is smooth curve, 0 is pure noise (current value gives no information on next value), -1 is up/down pattern
-    features[f"{column_name}_lag1_autocorrelation"] = compute_lag1_autocorrelation(signal_values)
+    # Dynamics (can apply to binary too, but your old code computed trend + autocorr always)
+    if "trend" in requested:
+        features[f"{column_name}_linear_trend_slope_per_time_unit"] = compute_linear_trend_slope(
+            signal_values, time_values
+        )
 
-    # This gives the actual mean value of the differences in value between one point to the next
-    if signal_type != "binary":
+    if "lag1_autocorr" in requested:
+        features[f"{column_name}_lag1_autocorrelation"] = compute_lag1_autocorrelation(signal_values)
+
+    if signal_type != "binary" and "mean_abs_first_diff" in requested:
         features[f"{column_name}_mean_absolute_first_difference"] = compute_mean_absolute_first_difference(signal_values)
 
-    if signal_type == "bounded":
+    # bounded-only
+    if signal_type == "bounded" and "fraction_near_bounds" in requested:
         low_frac, high_frac = compute_fraction_near_bounds(signal_values)
         features[f"{column_name}_fraction_near_lower_bound"] = low_frac
         features[f"{column_name}_fraction_near_upper_bound"] = high_frac
 
-    if signal_type == "binary":
+    # binary-only
+    if signal_type == "binary" and "binary_runs" in requested:
         binary_signal = convert_to_binary(signal_values)
         features[f"{column_name}_transition_rate"] = compute_binary_transition_rate(binary_signal)
         features[f"{column_name}_longest_true_length"] = compute_longest_true_run_length(binary_signal)
@@ -327,7 +399,8 @@ def compute_window_features(window_dataframe, column_name, time_column="position
         features[f"{column_name}_longest_false_length"] = compute_longest_true_run_length(~binary_signal)
         features[f"{column_name}_mean_false_length"] = compute_average_true_run_length(~binary_signal)
 
-    if signal_type == "count":
+    # count-only
+    if signal_type == "count" and "count_dispersion" in requested:
         finite = signal_values[np.isfinite(signal_values)]
         if finite.size:
             mean_val = np.mean(finite)
@@ -343,7 +416,14 @@ def compute_window_features(window_dataframe, column_name, time_column="position
     return features
 
 def _create_descriptive_track_worker(
-    group_df, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types
+    group_df, 
+    columns_to_summarize, 
+    window_size, 
+    step_size, 
+    time_col, 
+    id_cols, 
+    signal_types,
+    features_to_compute=ALL_WINDOW_FEATURES
 ):
     group_df = group_df.reset_index(drop=True)
     n = len(group_df)
@@ -383,7 +463,12 @@ def _create_descriptive_track_worker(
             "window_length_frames": n,
         }
 
-        base.update(_compute_motion_features_from_xyz(px_all, py_all, pz_all))
+        base.update(_compute_motion_features_from_xyz(
+            px_all, 
+            py_all, 
+            pz_all, 
+            features_to_compute=features_to_compute)
+            )
 
         for col in columns_to_summarize:
             stype = signal_types.get(col, "continuous")
@@ -398,6 +483,7 @@ def _create_descriptive_track_worker(
                     col,
                     time_column=time_col,
                     signal_types={col: stype},
+                    features_to_compute=features_to_compute
                 )
             )
 
@@ -456,6 +542,7 @@ def _create_descriptive_track_worker(
                 px_all[start_idx:end_idx + 1],
                 py_all[start_idx:end_idx + 1],
                 pz_all[start_idx:end_idx + 1],
+                features_to_compute=features_to_compute
             )
         )
 
@@ -476,6 +563,7 @@ def _create_descriptive_track_worker(
                     col,
                     time_column=time_col,
                     signal_types={col: stype},
+                    features_to_compute=features_to_compute
                 )
             )
 
@@ -510,8 +598,9 @@ def create_descriptive_track_dataset(
     time_col="position_t",
     id_cols=["sample_name", "TrackID"],
     signal_types=None,
-    n_jobs=None,      # None => os.cpu_count()
-    chunksize=8,      # tune if many small tracks
+    n_jobs=None,
+    chunksize=8,
+    features_to_compute=ALL_WINDOW_FEATURES
 ):
     df_sorted = df_tracks.sort_values(id_cols + [time_col], kind="mergesort")
 
@@ -534,6 +623,7 @@ def create_descriptive_track_dataset(
                 [time_col] * total_groups,
                 [id_cols] * total_groups,
                 [signal_types] * total_groups,
+                [features_to_compute] * total_groups,
                 chunksize=chunksize,
             )
             for rows in tqdm(futures, total=total_groups):
@@ -542,7 +632,7 @@ def create_descriptive_track_dataset(
     else:
         for g in tqdm(groups, total=total_groups):
             rows = _create_descriptive_track_worker(
-                g, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types
+                g, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types, features_to_compute
             )
             if rows:
                 output_rows.extend(rows)

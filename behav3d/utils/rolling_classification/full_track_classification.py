@@ -54,7 +54,23 @@ mapping =  {
     }
 adata_full = relabel_cluster_ids(
     adata_full,
-    mapping
+    mapping,
+    cluster_key="ClusterID",
+)
+
+mapping =  {
+        "1": "Dead",
+        "2": "Static",
+        "3": "Scanner",
+        "4": "Organoid contact",
+        "5": "T cell interaction",
+        "6": "Organoid + T cell aggregation",
+        "7": "Scanner",
+    }
+adata_hmm_full = relabel_cluster_ids(
+    adata_hmm_full,
+    mapping,
+    cluster_key="hmm_state",
 )
 
 min_length = 100
@@ -67,7 +83,7 @@ adata_filt = filter_and_truncate_tracks(
     max_length=max_length,
 )
 
-state_col = 'ClusterID'
+state_col = 'hmm_state'
 # state_col = 'ClusterID_filt5'
 test, blocks = extract_descibing_track_state_features(
     adata_filt,
@@ -122,7 +138,7 @@ to_run = run_pca(
 to_run = run_leiden_clustering(
     to_run, 
     n_neighbors=30,
-    resolution=0.4, 
+    resolution=0.2, 
     # metric="cosine",
     method="umap",
     use_rep="X",
@@ -167,7 +183,7 @@ plot_exemplar_tracks_by_cluster(
     adata_filt,
     to_run,
     n_per_cluster=10,
-    state_key="ClusterID",
+    state_key="hmm_state",
 )
 
 plot_exemplar_tracks_by_cluster(

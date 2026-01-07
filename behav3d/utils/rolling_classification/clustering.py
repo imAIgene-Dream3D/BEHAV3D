@@ -430,12 +430,10 @@ def run_sticky_hmm_state_classification(
     model=None,
     id_cols: list[str] = ["sample_name", "TrackID"],
     time_col: str = "position_t",
-
     # n_states can be int OR "auto"
     n_states: int | str = "auto",
     k_min: int = 1,
     k_max: int = 8,
-
     covariance_type: str = "full",
     n_iter: int = 200,
     tol: float = 1e-3,
@@ -443,16 +441,16 @@ def run_sticky_hmm_state_classification(
     verbose: bool = False,
     error_on_nans: bool = True,
     out_col_name: str = "hmm_state",
-
     # --- sticky HMM knobs ---
-    stickiness_kappa: float = 8,   # extra prior mass on self transitions (diagonal)
+    stickiness_kappa: float = 8.0,     # extra prior mass on self transitions (diagonal)
     transmat_alpha: float = 1.0,       # base prior mass everywhere
+    min_covar: float = 1e-3,           # covariance floor for numerical stability
 ):
     """
     Fit a *sticky* Gaussian HMM to track time series and assign a hidden state
     to each timepoint.
 
-    Stickiness is implemented by a Dirichlet prior on each transition row:
+    Stickiness is implemented via a Dirichlet prior on each transition row:
       prior_ij = alpha  (i != j)
       prior_ii = alpha + kappa
 
@@ -489,6 +487,9 @@ def run_sticky_hmm_state_classification(
         return X_all, lengths, df_sorted
 
     def _num_params(K: int, D: int, cov_type: str):
+        # startprob_ is FIXED => do not count (K-1)
+        # transmat_ is learned => count K*(K-1) free params (row-normalized)
+        # emissions: means + covars
         if cov_type == "full":
             cov_params = K * (D * (D + 1) / 2)
         elif cov_type == "diag":
@@ -499,7 +500,9 @@ def run_sticky_hmm_state_classification(
             cov_params = (D * (D + 1) / 2)
         else:
             raise ValueError(f"Unknown covariance_type: {cov_type}")
-        return (K - 1) + K * (K - 1) + K * D + cov_params
+        trans_params = K * (K - 1)
+        mean_params = K * D
+        return trans_params + mean_params + cov_params
 
     def _bic(model: GaussianHMM, X: np.ndarray, lengths: list[int]):
         logL = model.score(X, lengths=lengths)
@@ -523,17 +526,13 @@ def run_sticky_hmm_state_classification(
         return tm
 
     def _build_model(K: int):
-        """
-        Build a GaussianHMM with sticky transition prior.
-        Uses transmat_prior if available; otherwise, falls back to post-fit smoothing.
-        """
         sticky_prior = _make_sticky_prior(K, transmat_alpha, stickiness_kappa)
         sticky_init = _make_sticky_init_transmat(K, transmat_alpha, stickiness_kappa)
 
-        # In hmmlearn, init_params controls what gets (re)initialized before fit.
-        # We set transmat_ ourselves, so exclude 't' from init_params.
-        init_params = "smc"  # exclude 't'
-        params = "stmc"
+        # We set startprob_ and transmat_ ourselves -> exclude 's' and 't' from init_params.
+        # We do NOT want to train startprob_ -> exclude 's' from params.
+        init_params = "mc"
+        params = "tmc"  # learn transmat + emissions, keep startprob_ fixed
 
         m = GaussianHMM(
             n_components=K,
@@ -544,29 +543,16 @@ def run_sticky_hmm_state_classification(
             verbose=verbose,
             params=params,
             init_params=init_params,
-            transmat_prior=sticky_prior,
-            min_covar=1e-3# matrix-valued sticky Dirichlet prior
+            transmat_prior=sticky_prior,  # matrix-valued Dirichlet prior (sticky)
+            min_covar=min_covar,
         )
-        # Provide an explicitly sticky starting point
-        m.startprob_ = np.full(K, 1.0 / K)
+
+        # Fixed uniform initial state distribution (not trained, not overwritten)
+        m.startprob_ = np.full(K, 1.0 / K, dtype=float)
+
+        # Sticky starting point for transitions (not overwritten)
         m.transmat_ = sticky_init
-        return m, True  # True => has transmat_prior support
-
-    def _apply_postfit_sticky_smoothing(model: GaussianHMM, K: int):
-        """
-        Fallback if transmat_prior isn't supported:
-        After fitting, bias the learned transmat_ toward self transitions and renormalize.
-        This is not as principled as a true sticky prior during EM, but is often useful.
-        """
-        tm = model.transmat_.copy()
-        tm = np.maximum(tm, 1e-15)
-
-        # Add pseudo-count style mass then renormalize row-wise
-        add = np.full((K, K), float(transmat_alpha))
-        np.fill_diagonal(add, float(transmat_alpha) + float(stickiness_kappa))
-        tm = tm + add
-        tm = tm / tm.sum(axis=1, keepdims=True)
-        model.transmat_ = tm
+        return m
 
     X_all, lengths, df_sorted = _prep_X_and_lengths(df_features)
     selection_df = None
@@ -582,11 +568,8 @@ def run_sticky_hmm_state_classification(
             best_k, best_bic, best_model = None, np.inf, None
 
             for k in range(k_min, k_max + 1):
-                m, has_prior = _build_model(k)
+                m = _build_model(k)
                 m.fit(X_all, lengths=lengths)
-
-                if not has_prior:
-                    _apply_postfit_sticky_smoothing(m, k)
 
                 bic_k = _bic(m, X_all, lengths)
                 logL_k = m.score(X_all, lengths=lengths)
@@ -600,10 +583,8 @@ def run_sticky_hmm_state_classification(
 
         else:
             K = int(n_states)
-            model, has_prior = _build_model(K)
+            model = _build_model(K)
             model.fit(X_all, lengths=lengths)
-            if not has_prior:
-                _apply_postfit_sticky_smoothing(model, K)
 
     # ---------- decode ----------
     states_all = model.predict(X_all, lengths=lengths) + 1  # 1-based states
@@ -621,6 +602,7 @@ def run_sticky_hmm_state_classification(
         sort=False,
         validate="many_to_one",
     )
+
     return df_out, model, selection_df
 
 def compute_cluster_transition_matrix(
@@ -1005,7 +987,6 @@ def relabel_cluster_ids(
     adata,
     mapping,
     cluster_key="ClusterID",
-    original_key="ClusterID_original",
     new_key=None,
     keep_unmapped=True,
     unmapped_label="unlabeled",
@@ -1014,6 +995,7 @@ def relabel_cluster_ids(
     if cluster_key not in adata.obs.columns:
         raise ValueError(f"{cluster_key} not found in adata.obs")
 
+    original_key=f"{cluster_key}_original",
     if (original_key in adata.obs.columns) and (not overwrite_original):
         raise ValueError(f"{original_key} already exists")
 
