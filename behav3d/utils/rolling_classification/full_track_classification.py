@@ -58,6 +58,7 @@ adata_full = relabel_cluster_ids(
     cluster_key="ClusterID",
 )
 
+#HMM STATE MAPPING
 mapping =  {
         "1": "Dead",
         "2": "Static",
@@ -67,8 +68,8 @@ mapping =  {
         "6": "Organoid + T cell aggregation",
         "7": "Scanner",
     }
-adata_hmm_full = relabel_cluster_ids(
-    adata_hmm_full,
+adata_full = relabel_cluster_ids(
+    adata_full,
     mapping,
     cluster_key="hmm_state",
 )
@@ -83,7 +84,7 @@ adata_filt = filter_and_truncate_tracks(
     max_length=max_length,
 )
 
-state_col = 'hmm_state'
+state_col = 'ClusterID'
 # state_col = 'ClusterID_filt5'
 test, blocks = extract_descibing_track_state_features(
     adata_filt,
@@ -183,7 +184,7 @@ plot_exemplar_tracks_by_cluster(
     adata_filt,
     to_run,
     n_per_cluster=10,
-    state_key="hmm_state",
+    state_key="ClusterID",
 )
 
 plot_exemplar_tracks_by_cluster(
