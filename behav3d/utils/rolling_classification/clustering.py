@@ -995,7 +995,7 @@ def relabel_cluster_ids(
     if cluster_key not in adata.obs.columns:
         raise ValueError(f"{cluster_key} not found in adata.obs")
 
-    original_key=f"{cluster_key}_original",
+    original_key=f"{cluster_key}_original"
     if (original_key in adata.obs.columns) and (not overwrite_original):
         raise ValueError(f"{original_key} already exists")
 
