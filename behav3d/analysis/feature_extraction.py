@@ -286,7 +286,16 @@ def run_feature_extraction(
                     if pd.notna(sample_metadata[col]):
                         other_segments_paths[other_type] = sample_metadata[col]
 
-        dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+        # Old: Construct dead_mask_path from output directory (kept for reference)
+        # dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+        
+        # New: Read dead_mask_path from metadata (if it exists)
+        dead_mask_path = None
+        if 'dead_mask_path' in sample_metadata.index and pd.notna(sample_metadata['dead_mask_path']):
+            dead_mask_path = Path(sample_metadata['dead_mask_path'])
+            if not dead_mask_path.exists():
+                print(f"⚠️ Warning: dead_mask_path in metadata does not exist: {dead_mask_path}")
+                dead_mask_path = None
         
         print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
         current_cell_segments_path, raw_image_path = convert_input_files_to_zarr(
@@ -474,8 +483,10 @@ def calculate_image_based_track_features(
     segments = load_image(current_cell_segments_path)
     segments_path = current_cell_segments_path
     
-    # Load dead mask
-    dead_mask = load_image(dead_mask_path)
+    # Load dead mask (only if path is provided)
+    dead_mask = None
+    if dead_mask_path is not None:
+        dead_mask = load_image(dead_mask_path)
     
     # Load all organoid types' segments (for contact calculation)
     organoid_segments_dict = {}
@@ -572,7 +583,7 @@ def calculate_image_based_track_features(
         print(f"{get_current_time()} - Skipping intensity features as not requested in features_choice")
     
     if "death" in features_choice:
-        if dead_channel is not None and pd.notna(dead_channel):
+        if dead_channel is not None and pd.notna(dead_channel) and dead_mask is not None:
             print(f"{get_current_time()} - Calculating number of dead mask pixels...")
             if df_dead_mask_outpath.exists() and not overwrite:
                 print("Dead mask calculation .csv already exists. Loading in dead mask calculation information...")
@@ -586,7 +597,10 @@ def calculate_image_based_track_features(
                     df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
             df_tracks = pd.merge(df_tracks, df_dead_mask, how="left")
         else:
-            print(f"{get_current_time()} - Skipping death mask calculations: no dead_channel specified in metadata")
+            if dead_mask is None and dead_channel is not None:
+                print(f"{get_current_time()} - Skipping death mask calculations: dead_mask_path not found in metadata or file doesn't exist")
+            else:
+                print(f"{get_current_time()} - Skipping death mask calculations: no dead_channel specified in metadata")
     else:
         print(f"{get_current_time()} - Skipping dead mask calculations as not requested in features_choice")
         
@@ -840,7 +854,18 @@ def interpolate_missing_positions(
     
     # Auto-detect contact columns if not specified
     if cols_to_copy is None:
-        cols_to_copy = ["sample_name", "TrackID", "distance_unit", "time_unit", "orientation_vector"]
+        cols_to_copy = ["sample_name", "TrackID", "distance_unit", "time_unit", "orientation_vector", "principal_axes"]
+        
+        # Add metadata string columns that should be forward-filled, not interpolated
+        for col in df_tracks.columns:
+            # Add line_condition columns (organoid1_line_condition, tcell_line_condition, etc.)
+            if col.endswith('_line_condition'):
+                if col not in cols_to_copy:
+                    cols_to_copy.append(col)
+            # Add well and exp_nr columns
+            if col in ['well', 'exp_nr']:
+                if col not in cols_to_copy:
+                    cols_to_copy.append(col)
         
         # Add all dynamically-generated contact columns
         for col in df_tracks.columns:
