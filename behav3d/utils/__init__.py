@@ -86,6 +86,22 @@ def has_dead_channel(metadata):
     # Check if any row has a non-null dead_channel value
     return metadata['dead_channel'].notna().any()
 
+def has_dead_mask(metadata):
+    """
+    Check if dead_mask_path column exists and has non-null, non-empty values in metadata.
+    Returns True if dead mask path is present, False otherwise.
+    """
+    if metadata is None:
+        return False
+    
+    if 'dead_mask_path' not in metadata.columns:
+        return False
+    
+    # Check if any row has a non-null AND non-empty dead_mask_path value
+    # (empty strings '' are not NaN but should be treated as missing)
+    mask_values = metadata['dead_mask_path'].fillna('')
+    return (mask_values.str.strip() != '').any()
+
 def load_behav3d_metadata(
     metadata_path
     ):
@@ -99,6 +115,7 @@ def load_behav3d_metadata(
         "exp_nr": "Int64",
         "well": str,
         "dead_channel": "Int64",
+        "dead_mask_path": str,
         "pixel_distance_xy": float,
         "pixel_distance_z": float,
         "distance_unit": str,
@@ -146,7 +163,6 @@ def check_behav3d_metadata(
         "distance_unit", 
         "time_interval", 
         "time_unit",
-        "dimension_order", 
         "raw_image_path",
     ]
     
@@ -191,11 +207,63 @@ def check_behav3d_metadata(
         missing_string = '\n'.join(missing_columns)
         raise AssertionError(f"Not all required columns are present in the metadata .csv file\n{missing_string}")
     
-    # Check that non-path columns are filled
+    # Check that non-path columns are filled - collect ALL missing columns
     columns_to_check = [col for col in required_columns if col not in path_columns]
+    missing_fields = []
+    
     for col in columns_to_check:
-        if metadata[col].isna().any():
-            raise AssertionError(f"Column '{col}' has missing values. All required fields must be filled.")
+        # Check for NaN, empty string, or literal 'nan' string
+        is_missing = (
+            metadata[col].isna() | 
+            (metadata[col].astype(str).str.strip() == '') |
+            (metadata[col].astype(str).str.strip().str.lower() == 'nan')
+        )
+        if is_missing.any():
+            # Get row indices where values are missing
+            missing_indices = metadata[is_missing].index.tolist()
+            # Try to get sample names, fall back to row numbers if sample_name is NaN/empty
+            missing_identifiers = []
+            for idx in missing_indices:
+                sample_name = metadata.loc[idx, 'sample_name']
+                # Check for NaN, empty string, or literal 'nan' string
+                if pd.notna(sample_name) and str(sample_name).strip() and str(sample_name).strip().lower() != 'nan':
+                    missing_identifiers.append(str(sample_name))
+                else:
+                    missing_identifiers.append(f"Row {idx + 1}")
+            missing_fields.append((col, missing_identifiers))
+    
+    # Check channel columns: if they exist, they must be filled (REQUIRED)
+    channel_cols = [col for col in metadata.columns if re.match(r'^channel_\d+_label$', col)]
+    for col in channel_cols:
+        # Check for NaN, empty string, or literal 'nan' string
+        is_missing = (
+            metadata[col].isna() | 
+            (metadata[col].astype(str).str.strip() == '') |
+            (metadata[col].astype(str).str.strip().str.lower() == 'nan')
+        )
+        if is_missing.any():
+            missing_indices = metadata[is_missing].index.tolist()
+            missing_identifiers = []
+            for idx in missing_indices:
+                sample_name = metadata.loc[idx, 'sample_name']
+                # Check for NaN, empty string, or literal 'nan' string
+                if pd.notna(sample_name) and str(sample_name).strip() and str(sample_name).strip().lower() != 'nan':
+                    missing_identifiers.append(str(sample_name))
+                else:
+                    missing_identifiers.append(f"Row {idx + 1}")
+            missing_fields.append((col, missing_identifiers))
+    
+    # If there are missing fields, raise error with ALL of them (BLOCKING)
+    if missing_fields:
+        error_lines = ["⚠️ The following required fields have missing values:\n"]
+        for col, identifiers in missing_fields:
+            ids_str = ', '.join(identifiers[:3])
+            if len(identifiers) > 3:
+                ids_str += f" (+{len(identifiers) - 3} more)"
+            error_lines.append(f"  • {col}: missing in [{ids_str}]")
+        error_lines.append("\nPlease fill in all required fields for all samples.")
+        raise AssertionError('\n'.join(error_lines))
+    
     
     # Validate paths per row
     ok = True
@@ -210,6 +278,31 @@ def check_behav3d_metadata(
         # Check raw image exists
         assert Path(sample_metadata["raw_image_path"]).exists(), \
             f"The raw_image_path supplied for 'row {rowidx+1}: {sample_name}' does not exist"
+        
+        # Check dead_mask_path (required if dead_channel is set)
+        has_dead_channel = (
+            'dead_channel' in sample_metadata.index and 
+            pd.notna(sample_metadata['dead_channel']) and
+            str(sample_metadata['dead_channel']).strip() and
+            str(sample_metadata['dead_channel']).strip().lower() != 'nan'
+        )
+        
+        if 'dead_mask_path' in sample_metadata.index:
+            dead_mask_val = sample_metadata['dead_mask_path']
+            # Check if it's a valid non-empty value (not NaN, not empty string, not 'nan' string)
+            is_valid_value = (
+                pd.notna(dead_mask_val) and 
+                str(dead_mask_val).strip() and 
+                str(dead_mask_val).strip().lower() != 'nan'
+            )
+            if is_valid_value:
+                if not Path(dead_mask_val).exists():
+                    print(f"!!! dead_mask_path '{dead_mask_val}' does not exist. Please run segmentation below.")
+                    ok = False
+            elif has_dead_channel:
+                # dead_channel is set but dead_mask_path is missing
+                print(f"!!! No dead mask image. Please run segmentation below.")
+                ok = False
         
         # Check each cell type's paths
         for prefix_type, display_type in all_cell_types:
