@@ -1,25 +1,15 @@
 import numpy as np
 import pandas as pd
-from typing import Optional, Tuple, Dict, Literal, List, Iterable
 from pandas.api.types import is_numeric_dtype
-
-from tqdm import tqdm
-
-import numpy as np
-
-import numpy as np
-import pandas as pd
-
-from concurrent.futures import ProcessPoolExecutor
-from tqdm import tqdm
 from sklearn.feature_selection import VarianceThreshold
-
 
 from behav3d.utils.rolling_classification import *
 
 """
 Full track features based on states
 """
+
+
 def rle_encode(states):
     """Return list of (state, run_length)."""
     if len(states) == 0:
@@ -37,6 +27,7 @@ def rle_encode(states):
     runs.append((cur, length))
     return runs
 
+
 def fractions_from_runs(runs, states):
     total = sum(l for _, l in runs) if runs else 0
     cols = [f"overall_fraction_{s}" for s in states]
@@ -46,6 +37,7 @@ def fractions_from_runs(runs, states):
     for s, l in runs:
         out[f"overall_fraction_{s}"] += l / total
     return out, cols
+
 
 def bout_stats_from_runs(runs, states):
     lengths = {s: [] for s in states}
@@ -71,6 +63,7 @@ def bout_stats_from_runs(runs, states):
 
     return out, cols
 
+
 def transition_probs_from_runs(runs, state_to_idx, states):
     K = len(states)
     M = np.zeros((K, K), dtype=float)
@@ -84,6 +77,7 @@ def transition_probs_from_runs(runs, state_to_idx, states):
     row_sums[row_sums == 0] = 1.0
     return M / row_sums
 
+
 def ngram_counts_from_runs(runs, n=3, weight="count"):
     labels = [s for s, _ in runs]
     lens = [l for _, l in runs]
@@ -95,6 +89,7 @@ def ngram_counts_from_runs(runs, n=3, weight="count"):
         w = float(lens[i]) if weight == "duration" else 1.0
         out[g] = out.get(g, 0.0) + w
     return out
+
 
 def extract_descibing_track_state_features(
     adata,
@@ -146,8 +141,11 @@ def extract_descibing_track_state_features(
     bigram_list = sorted(bigram_set)
     trigram_list = sorted(trigram_set)
 
-    def bg_col(g): return f"bigram_{g[0]}>{g[1]}"
-    def tg_col(g): return f"trigram_{g[0]}>{g[1]}>{g[2]}"
+    def bg_col(g):
+        return f"bigram_{g[0]}>{g[1]}"
+
+    def tg_col(g):
+        return f"trigram_{g[0]}>{g[1]}>{g[2]}"
 
     # Track block columns explicitly while building features
     fraction_cols = []
@@ -213,8 +211,8 @@ def extract_descibing_track_state_features(
     # Time summaries (also observed=True to avoid unobserved category combos)
     df_time = (
         obs.groupby(group_col, sort=False, observed=True)[time_col]
-           .agg(position_t_min="min", position_t_max="max", n_timepoints="size")
-           .reset_index()
+        .agg(position_t_min="min", position_t_max="max", n_timepoints="size")
+        .reset_index()
     )
 
     # Build obs table in the same row order as features
@@ -232,9 +230,9 @@ def extract_descibing_track_state_features(
 
     # Optional bookkeeping
     track_adata.uns["feature_blocks"] = {
-        name: cols for name, cols in zip(
-            ["fractions", "bout_stats", "transitions", "bigrams", "trigrams"], blocks
-        ) if cols
+        name: cols
+        for name, cols in zip(["fractions", "bout_stats", "transitions", "bigrams", "trigrams"], blocks)
+        if cols
     }
     track_adata.uns["feature_params"] = {
         "group_col": group_col,
@@ -252,15 +250,11 @@ def extract_descibing_track_state_features(
 
 
 """
-Accessory feautre selection or scaling methods
+Accessory feature selection or scaling methods
 """
 
-def scale_feature_blocks(
-    adata,
-    blocks,
-    layer=None,
-    mode="sqrt"  # "sqrt" or "linear"
-):
+
+def scale_feature_blocks(adata, blocks, layer=None, mode="sqrt"):  # "sqrt" or "linear"
     for block in blocks:
         d = len(block)
         if d == 0:
@@ -280,6 +274,7 @@ def scale_feature_blocks(
 
     return adata
 
+
 def l2_normalize_block(adata, cols, layer=None):
     """Row-wise L2 normalize selected columns. Leaves all-zero rows unchanged."""
     adata_norm = adata.copy()
@@ -292,33 +287,31 @@ def l2_normalize_block(adata, cols, layer=None):
     adata_norm[:, cols] = X / norms
     return adata_norm
 
+
 def l2_normalize_all(adata):
     """Row-wise L2 normalize all columns. Leaves all-zero rows unchanged."""
-   
     X = adata.X.copy()
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     adata.X = X / norms
-    return(adata)
+    return adata
 
-def l2_normalize_features_blocks(
-    adata,
-    blocks,
-    layer=None
-    ):
+
+def l2_normalize_features_blocks(adata, blocks, layer=None):
     for block in blocks:
         adata = l2_normalize_block(adata, block, layer=layer)
     return adata
- 
+
+
 def drop_highly_correlated_features(
     data,
-    feature_cols: list,
-    threshold: float = 0.98,
-    prefer_keep: list | None = None,
-    also_drop_constant: bool = True,
-    redundancy_tolerance_abs: float = 0.02,       # apply prefer_keep only if |Δredundancy| <= this
-    redundancy_tolerance_rel: float = 0.05,
-) -> tuple[object, list, pd.DataFrame]:
+    feature_cols,
+    threshold=0.98,
+    prefer_keep=None,
+    also_drop_constant=True,
+    redundancy_tolerance_abs=0.02,  # apply prefer_keep only if |Δredundancy| <= this
+    redundancy_tolerance_rel=0.05,
+):
     """
     Remove one feature from any pair with |corr| > threshold.
 
@@ -354,19 +347,21 @@ def drop_highly_correlated_features(
 
     # Replace infs and optionally drop constants
     X = X.replace([np.inf, -np.inf], np.nan)
-    dropped: list[str] = []
-    decisions: list[dict] = []
+    dropped = []
+    decisions = []
 
     if also_drop_constant and X.shape[1] > 0:
         nunique = X.nunique(dropna=True)
         const_cols = nunique[nunique <= 1].index.tolist()
         for c in const_cols:
-            decisions.append({
-                "kept_feature": None,
-                "dropped_feature": c,
-                "abs_correlation": np.nan,
-                "reason": "constant_or_single_value"
-            })
+            decisions.append(
+                {
+                    "kept_feature": None,
+                    "dropped_feature": c,
+                    "abs_correlation": np.nan,
+                    "reason": "constant_or_single_value",
+                }
+            )
         if const_cols:
             X = X.drop(columns=const_cols)
             dropped.extend(const_cols)
@@ -376,9 +371,8 @@ def drop_highly_correlated_features(
         if is_adata:
             keep_vars = [v for v in data.var_names if v not in set(dropped)]
             return data[:, keep_vars].copy(), dropped, report
-        else:
-            reduced_df = data.drop(columns=[c for c in dropped if c in data.columns])
-            return reduced_df, dropped, report
+        reduced_df = data.drop(columns=[c for c in dropped if c in data.columns])
+        return reduced_df, dropped, report
 
     # Impute NaNs so corr works
     X_impute = X.fillna(X.mean(numeric_only=True))
@@ -425,38 +419,34 @@ def drop_highly_correlated_features(
                 reason = "more_redundant"
 
             to_drop.add(loser)
-            decisions.append({
-                "kept_feature": kept,
-                "dropped_feature": loser,
-                "abs_correlation": corr_val,
-                "reason": reason,
-                "col_redundancy": float(col_redund),
-                "partner_redundancy": float(part_redund),
-                "redundancy_diff": float(diff),
-            })
+            decisions.append(
+                {
+                    "kept_feature": kept,
+                    "dropped_feature": loser,
+                    "abs_correlation": corr_val,
+                    "reason": reason,
+                    "col_redundancy": float(col_redund),
+                    "partner_redundancy": float(part_redund),
+                    "redundancy_diff": float(diff),
+                }
+            )
 
     dropped.extend(sorted(to_drop))
 
     report = pd.DataFrame(decisions, columns=["kept_feature", "dropped_feature", "abs_correlation", "reason"])
-    report = report.sort_values(
-        by=["reason", "abs_correlation"],
-        ascending=[True, False],
-        na_position="last"
-    ).reset_index(drop=True)
+    report = report.sort_values(by=["reason", "abs_correlation"], ascending=[True, False], na_position="last").reset_index(
+        drop=True
+    )
 
     if is_adata:
         keep_vars = [v for v in data.var_names if v not in set(dropped)]
         return data[:, keep_vars].copy(), dropped, report
-    else:
-        reduced_df = data.drop(columns=[c for c in dropped if c in data.columns])
-        return reduced_df, dropped, report
+
+    reduced_df = data.drop(columns=[c for c in dropped if c in data.columns])
+    return reduced_df, dropped, report
 
 
-def drop_low_variance_features(
-    data,
-    feature_cols: list[str],
-    low_var_threshold= 1e-4,
-) -> tuple[object, list[str], list[str]]:
+def drop_low_variance_features(data, feature_cols, low_var_threshold=1e-4):
     """
     Drop low-variance features using sklearn VarianceThreshold.
 
@@ -491,150 +481,6 @@ def drop_low_variance_features(
     if is_adata:
         keep_vars = [v for v in data.var_names if v not in set(dropped_low_var)]
         return data[:, keep_vars].copy(), kept_features, dropped_low_var
-    else:
-        reduced_df = data.drop(columns=dropped_low_var)
-        return reduced_df, kept_features, dropped_low_var
-    
-# def drop_highly_correlated_features(
-#     df: pd.DataFrame,
-#     feature_cols: list,
-#     threshold: float = 0.98,
-#     prefer_keep: list | None = None,
-#     also_drop_constant: bool = True,
-#     redundancy_tolerance_abs: float = 0.02,       # apply prefer_keep only if |Δredundancy| <= this
-#     redundancy_tolerance_rel: float = 0.05,
-# ) -> tuple[pd.DataFrame, list, pd.DataFrame]:
-#     """
-#     Remove one feature from any pair with |corr| > threshold.
-#     Returns:
-#       X_reduced : DataFrame of remaining features
-#       dropped   : list of dropped feature names
-#       report    : DataFrame logging each decision: kept, dropped, correlation, reason
-#     """
-#     # prefer_keep = set(prefer_keep or [])
-#     prefer_keep = [f for f in feature_cols if "median" in f]
-#     prefer_keep += [f for f in feature_cols if "mean" in f]
-#     # Work on a numeric-only copy (keep order)
-#     X = df[feature_cols].copy()
-#     # Cast non-numeric to numeric where possible, otherwise drop
-#     cols_ok = [c for c in X.columns if is_numeric_dtype(X[c])]
-#     X = X[cols_ok]
 
-#     # Replace infs and optionally drop constants
-#     X = X.replace([np.inf, -np.inf], np.nan)
-#     dropped: list[str] = []
-#     decisions: list[dict] = []
-
-#     if also_drop_constant:
-#         nunique = X.nunique(dropna=True)
-#         const_cols = nunique[nunique <= 1].index.tolist()
-#         for c in const_cols:
-#             decisions.append({
-#                 "kept_feature": None,
-#                 "dropped_feature": c,
-#                 "abs_correlation": np.nan,
-#                 "reason": "constant_or_single_value"
-#             })
-#         if const_cols:
-#             X = X.drop(columns=const_cols)
-#             dropped.extend(const_cols)
-
-#     if X.shape[1] <= 1:
-#         report = pd.DataFrame(decisions, columns=["kept_feature","dropped_feature","abs_correlation","reason"])
-#         return X, dropped, report
-
-#     # Impute NaNs (mean) so corr works; PCA later will use its own scaling
-#     X_impute = X.fillna(X.mean(numeric_only=True))
-
-#     # Absolute correlation matrix and its upper triangle
-#     corr = X_impute.corr().abs()
-#     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-
-#     to_drop = set()
-
-#     # Greedy pass over pairs above threshold
-#     for col in upper.columns:
-#         partners = upper.index[upper[col] > threshold].tolist()
-#         for partner in partners:
-#             if col in to_drop or partner in to_drop:
-#                 continue
-
-#             corr_val = float(upper.loc[partner, col])
-
-#             # compute redundancies (mean abs corr to others)
-#             col_redund    = corr[col].drop(index=[col]).mean()
-#             part_redund   = corr[partner].drop(index=[partner]).mean()
-#             diff = abs(col_redund - part_redund)
-#             rel_ok = diff <= redundancy_tolerance_rel * max(col_redund, part_redund, 1e-12)
-#             abs_ok = diff <= redundancy_tolerance_abs
-
-#             if abs_ok or rel_ok:
-#                 # tie → apply prefer_keep if it singles out one; else fall back to redundancy anyway
-#                 if (col in prefer_keep) ^ (partner in prefer_keep):
-#                     kept  = col if col in prefer_keep else partner
-#                     loser = partner if col in prefer_keep else col
-#                     reason = "prefer_keep_tie"
-#                 else:
-#                     # tie but no clear preference → arbitrarily drop the slightly more redundant (or lexical tiebreak)
-#                     if col_redund >= part_redund:
-#                         kept, loser = partner, col
-#                     else:
-#                         kept, loser = col, partner
-#                     reason = "more_redundant"
-#             else:
-#                 # not a tie → drop the more redundant one (ignore prefer_keep)
-#                 if col_redund >= part_redund:
-#                     kept, loser = partner, col
-#                 else:
-#                     kept, loser = col, partner
-#                 reason = "more_redundant"
-
-#             to_drop.add(loser)
-#             decisions.append({
-#                 "kept_feature": kept,
-#                 "dropped_feature": loser,
-#                 "abs_correlation": corr_val,
-#                 "reason": reason,
-#                 "col_redundancy": float(col_redund),
-#                 "partner_redundancy": float(part_redund),
-#                 "redundancy_diff": float(diff),
-#             })
-
-#     if to_drop:
-#         df = df.drop(columns=list(to_drop))
-#         dropped.extend(list(to_drop))
-
-#     report = pd.DataFrame(decisions, columns=["kept_feature","dropped_feature","abs_correlation","reason"])
-#     # Sort report: constants first, then by correlation desc
-#     report = report.sort_values(
-#         by=["reason", "abs_correlation"],
-#         ascending=[True, False],
-#         na_position="last"
-#     ).reset_index(drop=True)
-
-#     return df, dropped, report
-
-# def drop_low_variance_features(
-#     df: pd.DataFrame,
-#     feature_cols: list[str],
-#     low_var_threshold: float,
-# ) -> tuple[pd.DataFrame, list[str], list[str]]:
-#     """
-#     Drop low-variance features using sklearn VarianceThreshold.
-
-#     Returns:
-#       df_reduced        : df with low-variance features removed
-#       kept_features     : list of kept feature names
-#       dropped_low_var   : list of dropped feature names
-#     """
-#     selector = VarianceThreshold(threshold=low_var_threshold)
-#     selector.fit(df[feature_cols])
-
-#     keep_mask = selector.get_support()
-#     kept_features = df[feature_cols].columns[keep_mask].tolist()
-#     dropped_low_var = df[feature_cols].columns[~keep_mask].tolist()
-
-#     df_reduced = df.drop(columns=dropped_low_var)
-
-#     return df_reduced, kept_features, dropped_low_var
-
+    reduced_df = data.drop(columns=dropped_low_var)
+    return reduced_df, kept_features, dropped_low_var

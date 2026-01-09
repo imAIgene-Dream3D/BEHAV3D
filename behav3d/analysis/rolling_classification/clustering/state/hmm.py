@@ -2,54 +2,60 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from hmmlearn.hmm import GaussianHMM
+
+
 def run_hmm_state_classification(
-    df_features: pd.DataFrame,
-    feature_cols: list[str],
+    df_features,
+    feature_cols,
     model=None,
-    id_cols: list[str] = ["sample_name", "TrackID"],
-    time_col: str = "position_t",
-
-    # n_states can be int OR "auto"
-    n_states: int | str = "auto",
-    k_min: int = 1,
-    k_max: int = 8,
-
-    covariance_type: str = "full",
-    n_iter: int = 200,
-    tol: float = 1e-3,
-    random_state: int = 0,
-    verbose: bool = False,
-    # If you *really* want to allow NaNs through, set this False
-    error_on_nans: bool = True,
-    out_col_name: str = "hmm_state",
+    id_cols=("sample_name", "TrackID"),
+    time_col="position_t",
+    n_states="auto",
+    k_min=1,
+    k_max=8,
+    covariance_type="full",
+    n_iter=200,
+    tol=1e-3,
+    random_state=0,
+    verbose=False,
+    error_on_nans=True,
+    out_col_name="hmm_state",
+    # --- sticky knobs (optional) ---
+    sticky=False,
+    stickiness_kappa=8.0,
+    transmat_alpha=1.0,
+    min_covar=1e-3,
 ):
     """
-    Fit an HMM to track time series and assign a hidden state to each timepoint.
+    Fit a (Gaussian) HMM to track time series and assign a hidden state to each timepoint.
+
     If n_states="auto", choose number of states via BIC sweep from k_min..k_max.
+
+    If sticky=True, apply a "sticky" Dirichlet prior to the transition matrix:
+      prior_ij = alpha         (i != j)
+      prior_ii = alpha + kappa (diagonal)
 
     Returns
     -------
     (df_with_states, fitted_model, selection_df)
-        df_with_states is df_features plus a column "hmm_state".
+        df_with_states is df_features plus a column out_col_name.
         fitted_model is the chosen global model.
-        selection_df is a DataFrame with columns ["k","bic","logL"] if auto,
-        otherwise None.
+        selection_df is a DataFrame with columns ["k","bic","logL"] if auto, otherwise None.
     """
 
-    def _prep_X_and_lengths(df: pd.DataFrame):
-        req = set(id_cols + [time_col] + feature_cols)
+    def _prep_X_and_lengths(df):
+        req = set(list(id_cols) + [time_col] + list(feature_cols))
         missing = req - set(df.columns)
         if missing:
             raise ValueError(f"df_features missing columns: {missing}")
 
-        df_sorted = df.sort_values(id_cols + [time_col], kind="mergesort").copy()
+        df_sorted = df.sort_values(list(id_cols) + [time_col], kind="mergesort").copy()
 
-        # Build concatenated observation matrix + lengths for HMM
         sequences = []
         lengths = []
-
-        for _, g in df_sorted.groupby(id_cols, sort=False):
-            X = g[feature_cols].to_numpy(dtype=float)
+        for _, g in df_sorted.groupby(list(id_cols), sort=False):
+            X = g[list(feature_cols)].to_numpy(dtype=float)
 
             if error_on_nans and np.isnan(X).any():
                 raise ValueError(
@@ -60,10 +66,14 @@ def run_hmm_state_classification(
             sequences.append(X)
             lengths.append(len(g))
 
-        X_all = np.vstack(sequences)
+        X_all = np.vstack(sequences) if sequences else np.empty((0, len(feature_cols)), dtype=float)
         return X_all, lengths, df_sorted
 
-    def _num_params(K: int, D: int, cov_type: str):
+    def _num_params(K, D, cov_type, count_startprob=True):
+        # startprob_ params: (K-1) if learned, else 0
+        # transmat_ free params: K*(K-1) (row-normalized)
+        # means: K*D
+        # covars: depends on type
         if cov_type == "full":
             cov_params = K * (D * (D + 1) / 2)
         elif cov_type == "diag":
@@ -74,174 +84,20 @@ def run_hmm_state_classification(
             cov_params = (D * (D + 1) / 2)
         else:
             raise ValueError(f"Unknown covariance_type: {cov_type}")
-        return (K - 1) + K * (K - 1) + K * D + cov_params
 
-    def _bic(model: GaussianHMM, X: np.ndarray, lengths: list[int]):
-        logL = model.score(X, lengths=lengths)
-        N, D = X.shape
-        K = model.n_components
-        p = _num_params(K, D, model.covariance_type)
-        return -2 * logL + p * np.log(N)
-
-    X_all, lengths, df_sorted = _prep_X_and_lengths(df_features)
-
-    selection_df = None
-
-    if model is None:
-        # ---------- choose K ----------
-        if isinstance(n_states, str):
-            if n_states.lower() != "auto":
-                raise ValueError("n_states must be int or 'auto'")
-            if k_max < k_min:
-                raise ValueError("k_max must be >= k_min")
-
-            rows = []
-            best_k, best_bic, best_model = None, np.inf, None
-
-            init_params = "stmc"  # exclude 't'
-            params = "stmc"
-        
-            for k in range(k_min, k_max + 1):
-                m = GaussianHMM(
-                    n_components=k,
-                    covariance_type=covariance_type,
-                    n_iter=n_iter,
-                    tol=tol,
-                    random_state=random_state,
-                    verbose=verbose,
-                    params=params,
-                    init_params=init_params,
-                )
-
-                m.fit(X_all, lengths=lengths)
-                bic_k = _bic(m, X_all, lengths)
-                logL_k = m.score(X_all, lengths=lengths)
-                rows.append({"k": k, "bic": bic_k, "logL": logL_k})
-
-                if bic_k < best_bic:
-                    best_k, best_bic, best_model = k, bic_k, m
-
-            model = best_model
-            selection_df = pd.DataFrame(rows)
-
-        else:
-            model = GaussianHMM(
-                n_components=int(n_states),
-                covariance_type=covariance_type,
-                n_iter=n_iter,
-                tol=tol,
-                random_state=random_state,
-                verbose=verbose,
-            )
-            model.fit(X_all, lengths=lengths)
-            
-    # ---------- decode ----------
-    states_all = model.predict(X_all, lengths=lengths)
-    # Make HMM state start from 1, instead of 0
-    states_all = states_all + 1
-    out = df_sorted.copy()
-    out[out_col_name] = states_all
-
-    state_map = out[id_cols + [time_col, out_col_name]]
-
-    df_features_clean = df_features.drop(columns=[out_col_name], errors="ignore")
-    df_out = df_features_clean.merge(
-        state_map,
-        on=id_cols + [time_col],
-        how="left",
-        sort=False,
-        validate="many_to_one",
-    )
-    return df_out, model, selection_df
-
-def run_sticky_hmm_state_classification(
-    df_features: pd.DataFrame,
-    feature_cols: list[str],
-    model=None,
-    id_cols: list[str] = ["sample_name", "TrackID"],
-    time_col: str = "position_t",
-    # n_states can be int OR "auto"
-    n_states: int | str = "auto",
-    k_min: int = 1,
-    k_max: int = 8,
-    covariance_type: str = "full",
-    n_iter: int = 200,
-    tol: float = 1e-3,
-    random_state: int = 0,
-    verbose: bool = False,
-    error_on_nans: bool = True,
-    out_col_name: str = "hmm_state",
-    # --- sticky HMM knobs ---
-    stickiness_kappa: float = 8.0,     # extra prior mass on self transitions (diagonal)
-    transmat_alpha: float = 1.0,       # base prior mass everywhere
-    min_covar: float = 1e-3,           # covariance floor for numerical stability
-):
-    """
-    Fit a *sticky* Gaussian HMM to track time series and assign a hidden state
-    to each timepoint.
-
-    Stickiness is implemented via a Dirichlet prior on each transition row:
-      prior_ij = alpha  (i != j)
-      prior_ii = alpha + kappa
-
-    If n_states="auto", choose number of states via BIC sweep from k_min..k_max.
-
-    Returns
-    -------
-    (df_with_states, fitted_model, selection_df)
-    """
-
-    def _prep_X_and_lengths(df: pd.DataFrame):
-        req = set(id_cols + [time_col] + feature_cols)
-        missing = req - set(df.columns)
-        if missing:
-            raise ValueError(f"df_features missing columns: {missing}")
-
-        df_sorted = df.sort_values(id_cols + [time_col], kind="mergesort").copy()
-
-        sequences = []
-        lengths = []
-        for _, g in df_sorted.groupby(id_cols, sort=False):
-            X = g[feature_cols].to_numpy(dtype=float)
-
-            if error_on_nans and np.isnan(X).any():
-                raise ValueError(
-                    "NaNs found in feature matrix. "
-                    "Please interpolate/impute before calling run_sticky_hmm_state_classification."
-                )
-
-            sequences.append(X)
-            lengths.append(len(g))
-
-        X_all = np.vstack(sequences)
-        return X_all, lengths, df_sorted
-
-    def _num_params(K: int, D: int, cov_type: str):
-        # startprob_ is FIXED => do not count (K-1)
-        # transmat_ is learned => count K*(K-1) free params (row-normalized)
-        # emissions: means + covars
-        if cov_type == "full":
-            cov_params = K * (D * (D + 1) / 2)
-        elif cov_type == "diag":
-            cov_params = K * D
-        elif cov_type == "spherical":
-            cov_params = K
-        elif cov_type == "tied":
-            cov_params = (D * (D + 1) / 2)
-        else:
-            raise ValueError(f"Unknown covariance_type: {cov_type}")
+        start_params = (K - 1) if count_startprob else 0
         trans_params = K * (K - 1)
         mean_params = K * D
-        return trans_params + mean_params + cov_params
+        return start_params + trans_params + mean_params + cov_params
 
-    def _bic(model: GaussianHMM, X: np.ndarray, lengths: list[int]):
-        logL = model.score(X, lengths=lengths)
+    def _bic(m, X, lengths_, count_startprob=True):
+        logL = m.score(X, lengths=lengths_)
         N, D = X.shape
-        K = model.n_components
-        p = _num_params(K, D, model.covariance_type)
+        K = m.n_components
+        p = _num_params(K, D, m.covariance_type, count_startprob=count_startprob)
         return -2 * logL + p * np.log(N)
 
-    def _make_sticky_prior(K: int, alpha: float, kappa: float) -> np.ndarray:
+    def _make_sticky_prior(K, alpha, kappa):
         if alpha <= 0:
             raise ValueError("transmat_alpha must be > 0 for a valid Dirichlet prior.")
         if kappa < 0:
@@ -250,41 +106,66 @@ def run_sticky_hmm_state_classification(
         np.fill_diagonal(prior, float(alpha) + float(kappa))
         return prior
 
-    def _make_sticky_init_transmat(K: int, alpha: float, kappa: float) -> np.ndarray:
+    def _make_sticky_init_transmat(K, alpha, kappa):
         prior = _make_sticky_prior(K, alpha, kappa)
-        tm = prior / prior.sum(axis=1, keepdims=True)
-        return tm
+        return prior / prior.sum(axis=1, keepdims=True)
 
-    def _build_model(K: int):
-        sticky_prior = _make_sticky_prior(K, transmat_alpha, stickiness_kappa)
-        sticky_init = _make_sticky_init_transmat(K, transmat_alpha, stickiness_kappa)
+    def _build_model(K):
+        if sticky:
+            sticky_prior = _make_sticky_prior(K, transmat_alpha, stickiness_kappa)
+            sticky_init = _make_sticky_init_transmat(K, transmat_alpha, stickiness_kappa)
 
-        # We set startprob_ and transmat_ ourselves -> exclude 's' and 't' from init_params.
-        # We do NOT want to train startprob_ -> exclude 's' from params.
-        init_params = "mc"
-        params = "tmc"  # learn transmat + emissions, keep startprob_ fixed
+            # We set startprob_ and transmat_ ourselves -> exclude 's' and 't' from init_params.
+            # We do NOT want to train startprob_ -> exclude 's' from params.
+            init_params = "mc"
+            params = "tmc"
 
-        m = GaussianHMM(
+            m = GaussianHMM(
+                n_components=K,
+                covariance_type=covariance_type,
+                n_iter=n_iter,
+                tol=tol,
+                random_state=random_state,
+                verbose=verbose,
+                params=params,
+                init_params=init_params,
+                transmat_prior=sticky_prior,
+                min_covar=min_covar,
+            )
+
+            # Fixed uniform initial state distribution
+            m.startprob_ = np.full(K, 1.0 / K, dtype=float)
+
+            # Sticky starting point for transitions
+            m.transmat_ = sticky_init
+            return m
+
+        # non-sticky
+        return GaussianHMM(
             n_components=K,
             covariance_type=covariance_type,
             n_iter=n_iter,
             tol=tol,
             random_state=random_state,
             verbose=verbose,
-            params=params,
-            init_params=init_params,
-            transmat_prior=sticky_prior,  # matrix-valued Dirichlet prior (sticky)
-            min_covar=min_covar,
         )
 
-        # Fixed uniform initial state distribution (not trained, not overwritten)
-        m.startprob_ = np.full(K, 1.0 / K, dtype=float)
-
-        # Sticky starting point for transitions (not overwritten)
-        m.transmat_ = sticky_init
-        return m
-
     X_all, lengths, df_sorted = _prep_X_and_lengths(df_features)
+
+    if X_all.shape[0] == 0:
+        out = df_sorted.copy()
+        out[out_col_name] = np.nan
+        selection_df = None
+        df_features_clean = df_features.drop(columns=[out_col_name], errors="ignore")
+        df_out = df_features_clean.merge(
+            out[list(id_cols) + [time_col, out_col_name]],
+            on=list(id_cols) + [time_col],
+            how="left",
+            sort=False,
+            validate="many_to_one",
+        )
+        return df_out, model, selection_df
+
     selection_df = None
 
     if model is None:
@@ -295,45 +176,95 @@ def run_sticky_hmm_state_classification(
                 raise ValueError("k_max must be >= k_min")
 
             rows = []
-            best_k, best_bic, best_model = None, np.inf, None
+            best_bic = np.inf
+            best_model = None
 
-            for k in range(k_min, k_max + 1):
+            for k in range(int(k_min), int(k_max) + 1):
                 m = _build_model(k)
                 m.fit(X_all, lengths=lengths)
 
-                bic_k = _bic(m, X_all, lengths)
+                # if sticky=True and startprob fixed, don't count startprob params in BIC
+                count_startprob = not sticky
+                bic_k = _bic(m, X_all, lengths, count_startprob=count_startprob)
                 logL_k = m.score(X_all, lengths=lengths)
+
                 rows.append({"k": k, "bic": bic_k, "logL": logL_k})
 
                 if bic_k < best_bic:
-                    best_k, best_bic, best_model = k, bic_k, m
+                    best_bic = bic_k
+                    best_model = m
 
             model = best_model
             selection_df = pd.DataFrame(rows)
-
         else:
-            K = int(n_states)
-            model = _build_model(K)
+            model = _build_model(int(n_states))
             model.fit(X_all, lengths=lengths)
 
     # ---------- decode ----------
-    states_all = model.predict(X_all, lengths=lengths) + 1  # 1-based states
-
+    states_all = model.predict(X_all, lengths=lengths) + 1  # 1-based
     out = df_sorted.copy()
     out[out_col_name] = states_all
 
-    state_map = out[id_cols + [time_col, out_col_name]]
-
+    state_map = out[list(id_cols) + [time_col, out_col_name]]
     df_features_clean = df_features.drop(columns=[out_col_name], errors="ignore")
+
     df_out = df_features_clean.merge(
         state_map,
-        on=id_cols + [time_col],
+        on=list(id_cols) + [time_col],
         how="left",
         sort=False,
         validate="many_to_one",
     )
-
     return df_out, model, selection_df
+
+
+def run_sticky_hmm_state_classification(
+    df_features,
+    feature_cols,
+    model=None,
+    id_cols=("sample_name", "TrackID"),
+    time_col="position_t",
+    n_states="auto",
+    k_min=1,
+    k_max=8,
+    covariance_type="full",
+    n_iter=200,
+    tol=1e-3,
+    random_state=0,
+    verbose=False,
+    error_on_nans=True,
+    out_col_name="hmm_state",
+    # sticky defaults
+    stickiness_kappa=8.0,
+    transmat_alpha=1.0,
+    min_covar=1e-3,
+):
+    """
+    Convenience wrapper around run_hmm_state_classification with sticky=True and
+    default sticky hyperparameters.
+    """
+    return run_hmm_state_classification(
+        df_features=df_features,
+        feature_cols=feature_cols,
+        model=model,
+        id_cols=id_cols,
+        time_col=time_col,
+        n_states=n_states,
+        k_min=k_min,
+        k_max=k_max,
+        covariance_type=covariance_type,
+        n_iter=n_iter,
+        tol=tol,
+        random_state=random_state,
+        verbose=verbose,
+        error_on_nans=error_on_nans,
+        out_col_name=out_col_name,
+        sticky=True,
+        stickiness_kappa=stickiness_kappa,
+        transmat_alpha=transmat_alpha,
+        min_covar=min_covar,
+    )
+
 
 def hmm_emission_distance_symmetric_kl(model, eps=1e-6):
     K, D = model.means_.shape
@@ -356,7 +287,9 @@ def hmm_emission_distance_symmetric_kl(model, eps=1e-6):
         sign0, logdet0 = np.linalg.slogdet(S0)
         sign1, logdet1 = np.linalg.slogdet(S1)
         if sign0 <= 0 or sign1 <= 0:
-            raise ValueError("Non-positive definite covariance encountered. Increase min_covar/eps or use diag.")
+            raise ValueError(
+                "Non-positive definite covariance encountered. Increase min_covar/eps or use diag."
+            )
         term_logdet = (logdet1 - logdet0)
         return 0.5 * (term_trace + term_quad - D + term_logdet)
 
@@ -370,6 +303,7 @@ def hmm_emission_distance_symmetric_kl(model, eps=1e-6):
             dist[j, i] = d
 
     return pd.DataFrame(dist, index=np.arange(1, K + 1), columns=np.arange(1, K + 1))
+
 
 def plot_state_distance_heatmap(dist_df, title="State distance (symmetric KL)", cmap="viridis"):
     M = dist_df.to_numpy(float)
@@ -393,6 +327,7 @@ def plot_state_distance_heatmap(dist_df, title="State distance (symmetric KL)", 
     plt.tight_layout()
     plt.show()
 
+
 def merge_close_states_by_distance(
     df_out,
     dist_df,
@@ -404,7 +339,6 @@ def merge_close_states_by_distance(
     states = dist_df.index.to_list()
     K = len(states)
     idx = {s: i for i, s in enumerate(states)}
-
     parent = list(range(K))
 
     def find(a):

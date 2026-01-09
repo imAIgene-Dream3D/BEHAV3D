@@ -1,3 +1,6 @@
+import numpy as np
+import pandas as pd
+
 def relabel_cluster_ids(
     adata,
     mapping,

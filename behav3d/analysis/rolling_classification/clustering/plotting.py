@@ -1,71 +1,19 @@
-import numpy as np
-import pandas as pd
-from typing import Optional, Tuple, Dict, Literal, List, Iterable
-from pandas.api.types import is_numeric_dtype
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-
 import math
+from pathlib import Path  # only needed if you pass Path objects as outpath
 
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
-from dtaidistance import dtw, dtw_ndim
-import seaborn as sns
-from sklearn.cluster import KMeans, HDBSCAN, AgglomerativeClustering
-import umap
-from tqdm import tqdm
-
-from sklearn.metrics import adjusted_rand_score
-from sklearn.cluster import AgglomerativeClustering
-from itertools import combinations
-
-import numpy as np
-from scipy import sparse
-from scipy.cluster.hierarchy import linkage, leaves_list
-from scipy.spatial.distance import pdist
-import igraph as ig
-import leidenalg as la
-
-from typing import Dict, Iterable, Optional
 import numpy as np
 import pandas as pd
-import seaborn as sns
+
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
-
-from scipy.spatial.distance import pdist, squareform
-from scipy.cluster.hierarchy import linkage, leaves_list
-from scipy import sparse
-
-import scanpy
-
-from collections import defaultdict
-from pathlib import Path
-from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.colors import TwoSlopeNorm
-from matplotlib.patches import Patch
-from matplotlib import colormaps
 from matplotlib.lines import Line2D
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.gridspec import GridSpec
 
-from behav3d.utils.fileio import load_zarr
-from behav3d.utils.preprocessing import calc_z_projection
-
-import imageio_ffmpeg as iioff
-
-from pathlib import Path
-from typing import Tuple, Optional, List, Dict
-
-import numpy as np
-import pandas as pd
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-import imageio
-import imageio_ffmpeg
+import seaborn as sns
 import scanpy as sc
+
+from pandas.api.types import is_numeric_dtype
+from sklearn.preprocessing import MinMaxScaler
 
 
 def plot_per_cluster_proportions(

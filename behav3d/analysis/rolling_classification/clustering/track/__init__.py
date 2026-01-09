@@ -1,8 +1,12 @@
+import numpy as np
+import pandas as pd
+
+
 def condense_state_runs(
     adata,
-    cluster_key: str,
+    cluster_key,
     id_cols=["sample_name", "TrackID"],
-    time_key: str = "position_t",
+    time_key="position_t",
 ):
     """
     Collapse consecutive identical states within each track into runs.
@@ -47,7 +51,6 @@ def condense_state_runs(
         sub = sub.sort_values(time_key)
 
         # Identify where state changes
-        # run_id increases whenever cluster changes
         run_id = (sub[cluster_key] != sub[cluster_key].shift()).cumsum()
         sub = sub.assign(_run_id=run_id)
 
@@ -67,19 +70,21 @@ def condense_state_runs(
             "run_length",
         ]
 
-        # Add id_cols back & run index
-        for col, val in zip(id_cols, keys if isinstance(keys, tuple) else (keys,)):
+        # Add id columns back
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        for col, val in zip(id_cols, keys):
             agg[col] = val
 
+        # Run order within track
         agg["run_index"] = np.arange(len(agg))
 
         runs_list.append(agg.reset_index(drop=True))
 
     runs_df = pd.concat(runs_list, axis=0, ignore_index=True)
 
-    # Rename 'state' back to cluster_key so we can reuse easily
+    # Rename 'state' back to cluster_key
     runs_df = runs_df.rename(columns={"state": cluster_key})
 
     return runs_df
-
-

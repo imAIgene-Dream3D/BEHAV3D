@@ -1,130 +1,104 @@
 import numpy as np
 import pandas as pd
-from typing import Optional, Tuple, Dict, Literal, List, Iterable
-from pandas.api.types import is_numeric_dtype
-
-from tqdm import tqdm
-
-import numpy as np
-
-import numpy as np
-import pandas as pd
 
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
-from sklearn.feature_selection import VarianceThreshold
-
-
-from behav3d.utils.rolling_classification import *
-
-SignalType = Literal["binary", "count", "bounded", "continuous"]
 
 """
 Modules for single timepoint feature extraction based on raw features over time windows.
 """
-def is_nonneg_int_like(values: np.ndarray) -> bool:
+
+def is_nonneg_int_like(values):
     vals = values[np.isfinite(values)]
     if vals.size == 0:
         return False
     return np.all(vals >= 0) and np.allclose(vals, np.round(vals))
 
-def infer_signal_types(
-    df_tracks: pd.DataFrame,
-    columns: list,
-    *,
-    treat_01_as_bounded_if_other_values_exist: bool = True,
-) -> Tuple[Dict[str, SignalType], Dict[str, Tuple[float, float]]]:
+def infer_signal_types(df_tracks, columns, treat_01_as_bounded_if_other_values_exist=True):
     """
     Inspect the entire df_tracks once and decide signal type per column.
-    Returns (signal_type_map, bounds_map).
-    Rules (global across ALL rows):
-      - 'binary'  : finite unique ⊆ {0,1}. If treat_01_as_bounded_if_other_values_exist=True
-                    and there exist any values strictly between 0 and 1 globally, prefer 'bounded'.
-      - 'bounded' : all finite within [0,1] (up to tiny tolerance) or explicitly chosen as above.
-      - 'count'   : all finite are non-negative integer-like.
-      - 'continuous': otherwise.
-    Also returns bounds_map: for bounded columns (or ones within [0,1]) -> (0,1),
-    else (global_min, global_max) for reference.
+    Returns signal_type_map.
+
+    Rules (global across ALL rows, per-column):
+      - 'binary'     : finite unique ⊆ {0,1}
+      - 'bounded'    : all finite within [0,1] (up to tiny tolerance)
+      - 'count'      : all finite are non-negative integer-like
+      - 'continuous' : otherwise
     """
-    signal_type_map: Dict[str, SignalType] = {}
-    bounds_map: Dict[str, Tuple[float, float]] = {}
+    signal_type_map = {}
     tol = 1e-8
 
     for col in columns:
-        data = pd.to_numeric(df_tracks[col], errors="coerce").to_numpy(float)
+        data = pd.to_numeric(df_tracks[col], errors="coerce").to_numpy(dtype=float)
         finite = data[np.isfinite(data)]
-        global_min = float(np.nanmin(finite)) if finite.size else np.nan
-        global_max = float(np.nanmax(finite)) if finite.size else np.nan
         unique = np.unique(finite) if finite.size else np.array([])
 
-        # detect global properties
         only_01 = unique.size > 0 and np.all(np.isin(unique, [0.0, 1.0]))
-        any_between_01 = unique.size > 0 and (np.nanmin(unique) < 0 - tol or np.nanmax(unique) > 1 + tol or
-                                              np.any((unique > 0 + tol) & (unique < 1 - tol)))
         within_01 = unique.size > 0 and (np.nanmin(unique) >= 0 - tol) and (np.nanmax(unique) <= 1 + tol)
 
-        if only_01 and treat_01_as_bounded_if_other_values_exist and any_between_01:
-            # e.g., some windows 0/1, but globally we also see values in (0,1) → call it bounded globally
-            signal_type = "bounded"
-            bounds = (0.0, 1.0)
-        elif only_01:
+        if only_01:
             signal_type = "binary"
-            bounds = (0.0, 1.0)
         elif within_01:
             signal_type = "bounded"
-            bounds = (0.0, 1.0)
         elif is_nonneg_int_like(finite):
             signal_type = "count"
-            bounds = (global_min, global_max)
         else:
             signal_type = "continuous"
-            bounds = (global_min, global_max)
 
         signal_type_map[col] = signal_type
-        bounds_map[col] = bounds
 
-    return signal_type_map#, bounds_map
+    return signal_type_map
 
-def compute_mean_value(signal_values: np.ndarray) -> float:
+
+def compute_mean_value(signal_values):
     """Return the arithmetic mean of the signal, ignoring NaN values."""
     return float(np.nanmean(signal_values))
 
-def compute_median_value(signal_values: np.ndarray) -> float:
+
+def compute_median_value(signal_values):
     """Return the median (50th percentile) of the signal."""
     return float(np.nanmedian(signal_values))
 
-def compute_standard_deviation(signal_values: np.ndarray) -> float:
+
+def compute_standard_deviation(signal_values):
     """Return the standard deviation of the signal, measuring spread around the mean."""
     return float(np.nanstd(signal_values))
 
-def compute_minimum_value(signal_values: np.ndarray) -> float:
+
+def compute_minimum_value(signal_values):
     """Return the smallest value observed in the signal."""
     return float(np.nanmin(signal_values))
 
-def compute_maximum_value(signal_values: np.ndarray) -> float:
+
+def compute_maximum_value(signal_values):
     """Return the largest value observed in the signal."""
     return float(np.nanmax(signal_values))
 
-def compute_value_range(signal_values: np.ndarray) -> float:
+
+def compute_value_range(signal_values):
     """Return the range of the signal: (max − min)."""
     return compute_maximum_value(signal_values) - compute_minimum_value(signal_values)
 
-def compute_quantile(signal_values: np.ndarray, quantile_level: float) -> float:
+
+def compute_quantile(signal_values, quantile_level):
     """Return a specific quantile (e.g., 0.1 = 10th percentile)."""
     return float(np.nanpercentile(signal_values, quantile_level * 100))
 
-def compute_interquartile_range(signal_values: np.ndarray) -> float:
+
+def compute_interquartile_range(signal_values):
     """Return the interquartile range (IQR = Q75 − Q25)."""
     q25, q75 = np.nanpercentile(signal_values, [25, 75])
     return float(q75 - q25)
 
-def compute_median_absolute_deviation(signal_values: np.ndarray) -> float:
+
+def compute_median_absolute_deviation(signal_values):
     """Return the median absolute deviation (MAD) of the signal."""
     median_value = np.nanmedian(signal_values)
     absolute_deviation = np.abs(signal_values - median_value)
     return float(np.nanmedian(absolute_deviation))
 
-def compute_linear_trend_slope(signal_values: np.ndarray, time_values: Optional[np.ndarray]) -> float:
+
+def compute_linear_trend_slope(signal_values, time_values=None):
     """
     Fit a least-squares line to signal vs. time and return the slope.
     Positive = increasing trend; negative = decreasing.
@@ -133,103 +107,128 @@ def compute_linear_trend_slope(signal_values: np.ndarray, time_values: Optional[
     if signal_values.size < 2 or np.all(np.isnan(signal_values)):
         return np.nan
 
-    valid_mask = ~np.isnan(signal_values)
-    signal_values = signal_values[valid_mask]
+    valid_mask = np.isfinite(signal_values)
+    y = signal_values[valid_mask]
+    if y.size < 2:
+        return np.nan
+
     if time_values is not None:
-        time_vector = np.asarray(time_values, dtype=float)[valid_mask]
+        t = np.asarray(time_values, dtype=float)[valid_mask]
     else:
-        time_vector = np.arange(signal_values.size, dtype=float)
+        t = np.arange(y.size, dtype=float)
 
-    time_vector_centered = time_vector - np.nanmean(time_vector)
-    numerator = np.dot(time_vector_centered, signal_values - np.nanmean(signal_values))
-    denominator = np.dot(time_vector_centered, time_vector_centered)
-    return float(numerator / denominator) if denominator > 0 else np.nan
+    t_centered = t - np.nanmean(t)
+    y_centered = y - np.nanmean(y)
+    denom = np.dot(t_centered, t_centered)
+    return float(np.dot(t_centered, y_centered) / denom) if denom > 0 else np.nan
 
-def compute_lag1_autocorrelation(signal_values: np.ndarray) -> float:
+
+def compute_lag1_autocorrelation(signal_values):
     """
     Compute lag-1 autocorrelation (similarity between consecutive values).
     High → smooth signal, low → noisy, negative → oscillating.
     """
     signal_values = np.asarray(signal_values, dtype=float)
-    valid_mask = ~np.isnan(signal_values)
-    signal_values = signal_values[valid_mask]
-    if signal_values.size < 2:
+    valid_mask = np.isfinite(signal_values)
+    x = signal_values[valid_mask]
+    if x.size < 2:
         return np.nan
-    centered = signal_values - np.mean(signal_values)
+    centered = x - np.mean(x)
     numerator = np.dot(centered[:-1], centered[1:])
     denominator = np.dot(centered, centered)
     return float(numerator / (denominator + 1e-12))
 
-def compute_mean_absolute_first_difference(signal_values: np.ndarray) -> float:
+
+def compute_mean_absolute_first_difference(signal_values):
     """Return the average absolute change between consecutive values."""
-    if len(signal_values) < 2:
+    signal_values = np.asarray(signal_values, dtype=float)
+    if signal_values.size < 2:
         return np.nan
     return float(np.nanmean(np.abs(np.diff(signal_values))))
 
-def check_if_nonnegative_integer_like(signal_values: np.ndarray) -> bool:
-    """Return True if all finite values are non-negative and integer-like."""
-    finite_values = np.asarray(signal_values)[np.isfinite(signal_values)]
-    return finite_values.size > 0 and np.all(finite_values >= 0) and np.allclose(finite_values, np.round(finite_values))
 
-def convert_to_binary(signal_values: np.ndarray) -> np.ndarray:
-    """Convert a numeric signal to binary (0/1) using a threshold."""
-    return np.asarray(signal_values, dtype=bool)
+def convert_to_binary(signal_values, threshold=0.0):
+    """
+    Convert a numeric signal to a binary float array {0.0, 1.0} while preserving NaNs.
+    """
+    x = np.asarray(signal_values, dtype=float)
+    out = (x > threshold).astype(float)
+    out[np.isnan(x)] = np.nan
+    return out
 
-def compute_binary_transition_rate(binary_signal: np.ndarray) -> float:
+
+def compute_binary_transition_rate(binary_signal):
     """Return the proportion of time steps where the binary signal switches between 0 and 1."""
-    valid = ~np.isnan(binary_signal)
-    binary_signal = binary_signal[valid]
-    return np.nan if binary_signal.size < 2 else float(np.mean(np.diff(binary_signal) != 0))
+    b = np.asarray(binary_signal, dtype=float)
+    valid = np.isfinite(b)
+    b = b[valid]
+    if b.size < 2:
+        return np.nan
+    return float(np.mean(np.diff(b) != 0))
 
-def compute_longest_true_run_length(binary_signal: np.ndarray) -> float:
+
+def compute_longest_true_run_length(binary_signal):
     """Return the longest consecutive run of 1s in the binary signal."""
-    valid = ~np.isnan(binary_signal)
-    binary_signal = binary_signal[valid].astype(int)
+    b = np.asarray(binary_signal, dtype=float)
+    valid = np.isfinite(b)
+    b = b[valid].astype(int)
+
+    if b.size == 0:
+        return np.nan
+
     best = cur = 0
-    for v in binary_signal:
+    for v in b:
         if v == 1:
             cur += 1
             best = max(best, cur)
         else:
             cur = 0
-    return float(best) if binary_signal.size else np.nan
+    return float(best)
 
-def compute_average_true_run_length(binary_signal: np.ndarray) -> float:
+
+def compute_average_true_run_length(binary_signal):
     """
     Compute the average length of contiguous True runs in a binary signal.
-    Returns NaN if there are no True runs.
+    Returns 0 if there are no True runs.
     """
-    if binary_signal.size == 0:
+    b = np.asarray(binary_signal, dtype=float)
+    valid = np.isfinite(b)
+    b = b[valid].astype(int)
+
+    if b.size == 0:
         return np.nan
 
-    binary_signal = np.asarray(binary_signal, dtype=bool)
-    diff = np.diff(np.concatenate(([0], binary_signal.view(np.int8), [0])))
+    # find runs of 1s
+    diff = np.diff(np.concatenate(([0], b, [0])))
     starts = np.where(diff == 1)[0]
     ends = np.where(diff == -1)[0]
 
     if starts.size == 0:
-        return 0
+        return 0.0
 
     run_lengths = ends - starts
     return float(np.mean(run_lengths)) if run_lengths.size else np.nan
 
-def compute_fraction_near_bounds(signal_values: np.ndarray, lower_bound=0.0, upper_bound=1.0, margin_fraction=0.05) -> Tuple[float, float]:
+
+def compute_fraction_near_bounds(signal_values, lower_bound=0.0, upper_bound=1.0, margin_fraction=0.05):
     """Return the fractions of values near the lower and upper bounds of a bounded signal."""
-    valid = np.isfinite(signal_values)
+    x = np.asarray(signal_values, dtype=float)
+    valid = np.isfinite(x)
     if not np.any(valid):
         return np.nan, np.nan
+
     lower_cutoff = lower_bound + margin_fraction * (upper_bound - lower_bound)
     upper_cutoff = upper_bound - margin_fraction * (upper_bound - lower_bound)
-    return (
-        float(np.mean(signal_values[valid] <= lower_cutoff)),
-        float(np.mean(signal_values[valid] >= upper_cutoff))
-    )
+
+    xv = x[valid]
+    return float(np.mean(xv <= lower_cutoff)), float(np.mean(xv >= upper_cutoff))
+
 
 ALL_WINDOW_FEATURES = {
     # metadata-ish
     "signal_type",
-    
-    #Basic motion 
+
+    # Basic motion
     "summed_displacement",
     "net_displacement",
     "straightness",
@@ -237,7 +236,7 @@ ALL_WINDOW_FEATURES = {
     "median_turning_angle",
     "fraction_reversed_movement",
     "mean_square_displacement",
-        
+
     # basic stats
     "mean",
     "median",
@@ -247,7 +246,7 @@ ALL_WINDOW_FEATURES = {
     "max",
     "iqr",
     "mad",
-    "quantiles",  # includes the q list
+    "quantiles",
 
     # dynamics
     "trend",
@@ -264,11 +263,12 @@ ALL_WINDOW_FEATURES = {
     "count_dispersion",
 }
 
+
 def _compute_motion_features_from_xyz(px, py, pz, features_to_compute=ALL_WINDOW_FEATURES):
     coords = np.column_stack([px, py, pz]).astype(float, copy=False)
-    coords_rel = coords - coords[0]  # now coords_rel[0] == (0,0,0)
+    coords_rel = coords - coords[0]  # coords_rel[0] == (0,0,0)
 
-    sq_disp_from_origin = np.sum(coords_rel**2, axis=1)  # ||r(t)-r(0)||^2
+    sq_disp_from_origin = np.sum(coords_rel**2, axis=1)
     mean_square_displacement = float(np.nanmean(sq_disp_from_origin)) if sq_disp_from_origin.size else 0.0
 
     steps = np.diff(coords_rel, axis=0)
@@ -304,7 +304,7 @@ def _compute_motion_features_from_xyz(px, py, pz, features_to_compute=ALL_WINDOW
         median_turn = 0.0
         frac_reversed = 0.0
 
-    motion_features={
+    motion_features = {
         "summed_displacement": path_length,
         "net_displacement": net_disp,
         "straightness": straightness,
@@ -313,22 +313,21 @@ def _compute_motion_features_from_xyz(px, py, pz, features_to_compute=ALL_WINDOW
         "fraction_reversed_movement": frac_reversed,
         "mean_square_displacement": mean_square_displacement,
     }
-    
-    motion_features = {k: v for k, v in motion_features.items() if k in features_to_compute}
-    return motion_features
+
+    return {k: v for k, v in motion_features.items() if k in features_to_compute}
+
 
 def compute_window_features(
     window_dataframe,
     column_name,
     time_column="position_t",
     signal_types=None,
-    quantiles=(0.1, 0.25, 0.75, 0.9), 
+    quantiles=(0.1, 0.25, 0.75, 0.9),
     features_to_compute=ALL_WINDOW_FEATURES,
 ):
     """
     features_to_compute:
-        - None => compute everything (backwards compatible)
-        - Iterable[str] => compute only those features (e.g. {"mean", "trend"})
+        - Iterable[str] => compute only those features
     """
     requested = set(features_to_compute)
     unknown = requested - ALL_WINDOW_FEATURES
@@ -370,9 +369,9 @@ def compute_window_features(
 
         if "quantiles" in requested:
             for q in quantiles:
-                features[f"{column_name}_quantile_{int(q*100)}percent"] = compute_quantile(signal_values, q)
+                features[f"{column_name}_quantile_{int(q * 100)}percent"] = compute_quantile(signal_values, q)
 
-    # Dynamics (can apply to binary too, but your old code computed trend + autocorr always)
+    # Dynamics
     if "trend" in requested:
         features[f"{column_name}_linear_trend_slope_per_time_unit"] = compute_linear_trend_slope(
             signal_values, time_values
@@ -392,12 +391,15 @@ def compute_window_features(
 
     # binary-only
     if signal_type == "binary" and "binary_runs" in requested:
-        binary_signal = convert_to_binary(signal_values)
+        binary_signal = convert_to_binary(signal_values, threshold=0.0)
         features[f"{column_name}_transition_rate"] = compute_binary_transition_rate(binary_signal)
         features[f"{column_name}_longest_true_length"] = compute_longest_true_run_length(binary_signal)
         features[f"{column_name}_mean_true_length"] = compute_average_true_run_length(binary_signal)
-        features[f"{column_name}_longest_false_length"] = compute_longest_true_run_length(~binary_signal)
-        features[f"{column_name}_mean_false_length"] = compute_average_true_run_length(~binary_signal)
+
+        inv = 1.0 - binary_signal
+        inv[np.isnan(binary_signal)] = np.nan
+        features[f"{column_name}_longest_false_length"] = compute_longest_true_run_length(inv)
+        features[f"{column_name}_mean_false_length"] = compute_average_true_run_length(inv)
 
     # count-only
     if signal_type == "count" and "count_dispersion" in requested:
@@ -415,15 +417,16 @@ def compute_window_features(
 
     return features
 
+
 def _create_descriptive_track_worker(
-    group_df, 
-    columns_to_summarize, 
-    window_size, 
-    step_size, 
-    time_col, 
-    id_cols, 
+    group_df,
+    columns_to_summarize,
+    window_size,
+    step_size,
+    time_col,
+    id_cols,
     signal_types,
-    features_to_compute=ALL_WINDOW_FEATURES
+    features_to_compute=ALL_WINDOW_FEATURES,
 ):
     group_df = group_df.reset_index(drop=True)
     n = len(group_df)
@@ -445,7 +448,7 @@ def _create_descriptive_track_worker(
     out_rows = []
 
     # ---------------------------
-    # full-track mode (unchanged)
+    # full-track mode
     # ---------------------------
     if window_size is None:
         start_t = float(t_all[0]) if t_all is not None else 0.0
@@ -457,25 +460,27 @@ def _create_descriptive_track_worker(
             id_cols[0]: sample_val,
             id_cols[1]: track_id_val,
             "sub_TrackID": sub_track_id,
-            time_col: np.nan,  # <-- no single center timepoint in full-track mode
+            time_col: np.nan,
             f"window_start_{time_col}": start_t,
             f"window_end_{time_col}": end_t,
             "window_length_frames": n,
         }
 
-        base.update(_compute_motion_features_from_xyz(
-            px_all, 
-            py_all, 
-            pz_all, 
-            features_to_compute=features_to_compute)
+        base.update(
+            _compute_motion_features_from_xyz(
+                px_all,
+                py_all,
+                pz_all,
+                features_to_compute=features_to_compute,
             )
+        )
 
         for col in columns_to_summarize:
             stype = signal_types.get(col, "continuous")
             df_for_feat = (
                 pd.DataFrame({col: sig_arrays[col], time_col: t_all})
-                if t_all is not None else
-                pd.DataFrame({col: sig_arrays[col]})
+                if t_all is not None
+                else pd.DataFrame({col: sig_arrays[col]})
             )
             base.update(
                 compute_window_features(
@@ -483,7 +488,7 @@ def _create_descriptive_track_worker(
                     col,
                     time_column=time_col,
                     signal_types={col: stype},
-                    features_to_compute=features_to_compute
+                    features_to_compute=features_to_compute,
                 )
             )
 
@@ -501,8 +506,6 @@ def _create_descriptive_track_worker(
 
     for end_idx in range(0, n, stride):
         start_idx = end_idx - window_size + 1
-
-        # current/end timepoint
         end_t = float(t_all[end_idx]) if t_all is not None else float(end_idx)
 
         # Not enough history: emit NaNs for all features
@@ -511,14 +514,13 @@ def _create_descriptive_track_worker(
                 id_cols[0]: sample_val,
                 id_cols[1]: track_id_val,
                 "sub_TrackID": f"{int(track_id_val)}_tNaN-t{int(end_t)}",
-                time_col: end_t,  # <-- keep center timepoint for merging
+                time_col: end_t,
                 f"window_start_{time_col}": np.nan,
                 f"window_end_{time_col}": end_t,
                 "window_length_frames": np.nan,
             }
             if nan_feature_template is not None:
                 row.update(nan_feature_template)
-
             out_rows.append(row)
             continue
 
@@ -530,7 +532,7 @@ def _create_descriptive_track_worker(
             id_cols[0]: sample_val,
             id_cols[1]: track_id_val,
             "sub_TrackID": sub_track_id,
-            time_col: end_t,  # <-- center/endpoint timepoint for merging
+            time_col: end_t,
             f"window_start_{time_col}": start_t,
             f"window_end_{time_col}": end_t,
             "window_length_frames": window_size,
@@ -539,20 +541,20 @@ def _create_descriptive_track_worker(
         # motion features for trailing window
         row.update(
             _compute_motion_features_from_xyz(
-                px_all[start_idx:end_idx + 1],
-                py_all[start_idx:end_idx + 1],
-                pz_all[start_idx:end_idx + 1],
-                features_to_compute=features_to_compute
+                px_all[start_idx : end_idx + 1],
+                py_all[start_idx : end_idx + 1],
+                pz_all[start_idx : end_idx + 1],
+                features_to_compute=features_to_compute,
             )
         )
 
         # per-column signal features over trailing window
         for col in columns_to_summarize:
             stype = signal_types.get(col, "continuous")
-            sig_win = sig_arrays[col][start_idx:end_idx + 1]
+            sig_win = sig_arrays[col][start_idx : end_idx + 1]
 
             if t_all is not None:
-                t_win = t_all[start_idx:end_idx + 1]
+                t_win = t_all[start_idx : end_idx + 1]
                 wdf = pd.DataFrame({col: sig_win, time_col: t_win})
             else:
                 wdf = pd.DataFrame({col: sig_win})
@@ -563,19 +565,24 @@ def _create_descriptive_track_worker(
                     col,
                     time_column=time_col,
                     signal_types={col: stype},
-                    features_to_compute=features_to_compute
+                    features_to_compute=features_to_compute,
                 )
             )
 
         # Build a NaN template based on first valid window
         if nan_feature_template is None:
             nan_feature_template = {
-                k: np.nan for k in row.keys()
-                if k not in [
-                    id_cols[0], id_cols[1], "sub_TrackID",
+                k: np.nan
+                for k in row.keys()
+                if k
+                not in [
+                    id_cols[0],
+                    id_cols[1],
+                    "sub_TrackID",
                     time_col,
-                    f"window_start_{time_col}", f"window_end_{time_col}",
-                    "window_length_frames"
+                    f"window_start_{time_col}",
+                    f"window_end_{time_col}",
+                    "window_length_frames",
                 ]
             }
 
@@ -590,24 +597,25 @@ def _create_descriptive_track_worker(
 
     return out_rows
 
+
 def create_descriptive_track_dataset(
     df_tracks,
     columns_to_summarize,
     window_size=None,
     step_size=None,
     time_col="position_t",
-    id_cols=["sample_name", "TrackID"],
+    id_cols=("sample_name", "TrackID"),
     signal_types=None,
     n_jobs=None,
     chunksize=8,
-    features_to_compute=ALL_WINDOW_FEATURES
+    features_to_compute=ALL_WINDOW_FEATURES,
 ):
-    df_sorted = df_tracks.sort_values(id_cols + [time_col], kind="mergesort")
+    df_sorted = df_tracks.sort_values(list(id_cols) + [time_col], kind="mergesort")
 
     if signal_types is None:
         signal_types = infer_signal_types(df_sorted, columns=columns_to_summarize)
 
-    groups = [g for _, g in df_sorted.groupby(id_cols, sort=False)]
+    groups = [g for _, g in df_sorted.groupby(list(id_cols), sort=False)]
     total_groups = len(groups)
 
     output_rows = []
@@ -621,7 +629,7 @@ def create_descriptive_track_dataset(
                 [window_size] * total_groups,
                 [step_size] * total_groups,
                 [time_col] * total_groups,
-                [id_cols] * total_groups,
+                [list(id_cols)] * total_groups,
                 [signal_types] * total_groups,
                 [features_to_compute] * total_groups,
                 chunksize=chunksize,
@@ -632,7 +640,14 @@ def create_descriptive_track_dataset(
     else:
         for g in tqdm(groups, total=total_groups):
             rows = _create_descriptive_track_worker(
-                g, columns_to_summarize, window_size, step_size, time_col, id_cols, signal_types, features_to_compute
+                g,
+                columns_to_summarize,
+                window_size,
+                step_size,
+                time_col,
+                list(id_cols),
+                signal_types,
+                features_to_compute,
             )
             if rows:
                 output_rows.extend(rows)
@@ -641,10 +656,13 @@ def create_descriptive_track_dataset(
 
     if not result.empty:
         front_cols = [
-            id_cols[0], id_cols[1], "sub_TrackID",
-            time_col,  # <-- endpoint timepoint for merging
-            f"window_start_{time_col}", f"window_end_{time_col}",
-            "window_length_frames"
+            id_cols[0],
+            id_cols[1],
+            "sub_TrackID",
+            time_col,
+            f"window_start_{time_col}",
+            f"window_end_{time_col}",
+            "window_length_frames",
         ]
         other_cols = [c for c in result.columns if c not in front_cols]
         result = result[front_cols + other_cols]

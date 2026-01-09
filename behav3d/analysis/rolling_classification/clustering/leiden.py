@@ -1,3 +1,11 @@
+import numpy as np
+import pandas as pd
+
+import scanpy  # used as scanpy.pp.*, scanpy.tl.*, scanpy.AnnData
+
+from itertools import combinations
+from sklearn.metrics import adjusted_rand_score
+
 def run_pca(
     adata, 
     ncomps=50, 

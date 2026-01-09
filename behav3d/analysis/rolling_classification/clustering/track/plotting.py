@@ -1,3 +1,10 @@
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from matplotlib import colormaps
+
 def plot_tracks_bars_on_ax(
     adata_full,
     chosen_df,
