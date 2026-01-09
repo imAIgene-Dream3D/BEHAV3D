@@ -1,9 +1,11 @@
 # behav3d_widgets.py
 import random
+import re
 
 import ipywidgets as widgets
 from ipyfilechooser import FileChooser
 from IPython.display import display, clear_output
+from behav3d.utils import detect_organoid_types_from_metadata, detect_immune_cell_types_from_metadata, detect_other_cell_types_from_metadata
 from behav3d.utils import load_behav3d_metadata, check_behav3d_metadata, expand_column_patterns
 from behav3d.preprocessing import convert_input_files_to_zarr
 import builtins
@@ -21,8 +23,6 @@ from behav3d.preprocessing.tracking import visualize_tracks
 from behav3d.preprocessing.tracking.laptracking import run_laptracking
 from behav3d.preprocessing.tracking.trackpy_tracking import run_trackpy_tracking_generic
 from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
-
-
 import json
 from copy import deepcopy
 import yaml
@@ -598,6 +598,10 @@ class MetadataBuilder(widgets.VBox):
         self.immune_names = []
         self.other_names = []
         
+        # Channel names configuration
+        self.include_channels = False
+        self.n_channels = 0
+        
         # Sample data storage
         self.sample_forms = []
         
@@ -677,7 +681,6 @@ class MetadataBuilder(widgets.VBox):
     
     def _populate_from_dataframe(self, df):
         """Populate the form from an existing DataFrame"""
-        from behav3d.utils import detect_organoid_types_from_metadata, detect_immune_cell_types_from_metadata, detect_other_cell_types_from_metadata
         
         # Store loaded dataframe for re-population
         self.loaded_df = df.copy()
@@ -694,6 +697,15 @@ class MetadataBuilder(widgets.VBox):
         self.immune_names = immune_types
         self.other_names = other_types
         
+        # Detect channel columns (pattern: channel_N_label)
+        channel_cols = [col for col in df.columns if re.match(r'^channel_\d+_label$', col)]
+        if channel_cols:
+            self.include_channels = True
+            self.n_channels = len(channel_cols)
+        else:
+            self.include_channels = False
+            self.n_channels = 0
+        
         # Set number of samples
         self.n_samples_input.value = len(df)
         
@@ -708,6 +720,11 @@ class MetadataBuilder(widgets.VBox):
                 break
             
             form = self.sample_forms[idx]
+            
+            # Channel name fields
+            for field_name, widget in form['channels'].items():
+                if field_name in row and pd.notna(row[field_name]):
+                    widget.value = str(row[field_name]).strip()
             
             # Basic fields
             for field_name, widget in form['basic'].items():
@@ -755,11 +772,14 @@ class MetadataBuilder(widgets.VBox):
                     if col_name in row and pd.notna(row[col_name]) and path_field in fields_dict:
                         fields_dict[path_field].value = str(row[col_name]).strip()
             
-            # Dead channel
+            # Dead channel (including mask_path)
             if 'dead_channel' in row and pd.notna(row['dead_channel']) and str(row['dead_channel']).strip() != '':
                 try:
                     form['dead_channel']['enabled'].value = True
                     form['dead_channel']['number'].value = int(row['dead_channel'])
+                    # Load dead_mask_path if present
+                    if 'dead_mask_path' in row and pd.notna(row['dead_mask_path']) and 'mask_path' in form['dead_channel']:
+                        form['dead_channel']['mask_path'].value = str(row['dead_mask_path']).strip()
                 except (ValueError, TypeError):
                     # If conversion fails, leave dead channel disabled
                     form['dead_channel']['enabled'].value = False
@@ -790,6 +810,25 @@ class MetadataBuilder(widgets.VBox):
             style={'description_width': '120px'}
         )
         
+        # Include channels section
+        channels_label = widgets.HTML('<h4>Channel Names</h4>')
+        self.include_channels_checkbox = widgets.Checkbox(
+            description='Include channels?',
+            value=self.include_channels,
+            style={'description_width': '120px'}
+        )
+        self.n_channels_input = widgets.IntText(
+            value=self.n_channels if self.n_channels > 0 else 1,
+            description='Number of channels:',
+            style={'description_width': '140px'}
+        )
+        
+        # Toggle visibility of channel count based on checkbox
+        def _toggle_channels_input(change):
+            self.n_channels_input.layout.display = None if change['new'] else 'none'
+        self.include_channels_checkbox.observe(_toggle_channels_input, names='value')
+        _toggle_channels_input({'new': self.include_channels_checkbox.value})
+        
         btn_confirm = widgets.Button(description='Next: Name Cell Types', button_style='success')
         btn_confirm.on_click(self._show_cell_type_naming)
         
@@ -800,6 +839,9 @@ class MetadataBuilder(widgets.VBox):
             self.n_immune_input,
             other_label,
             self.n_other_input,
+            channels_label,
+            self.include_channels_checkbox,
+            self.n_channels_input,
             btn_confirm
         ]
     
@@ -808,6 +850,10 @@ class MetadataBuilder(widgets.VBox):
         self.n_organoid_types = self.n_organoid_input.value
         self.n_immune_types = self.n_immune_input.value
         self.n_other_types = self.n_other_input.value
+        
+        # Capture channel configuration
+        self.include_channels = self.include_channels_checkbox.value
+        self.n_channels = self.n_channels_input.value if self.include_channels else 0
         
         naming_widgets = []
         self.organoid_name_inputs = []
@@ -920,6 +966,11 @@ class MetadataBuilder(widgets.VBox):
         for i in range(1, len(self.sample_forms)):
             target_form = self.sample_forms[i]
             
+            # Copy channel fields
+            for field_name, src_widget in source_form['channels'].items():
+                if field_name in target_form['channels']:
+                    target_form['channels'][field_name].value = src_widget.value
+            
             # Copy basic fields (except sample_name)
             for field_name, src_widget in source_form['basic'].items():
                 if field_name != 'sample_name':
@@ -930,8 +981,10 @@ class MetadataBuilder(widgets.VBox):
                 for field_name, src_widget in source_form['cell_types'][cell_type].items():
                     target_form['cell_types'][cell_type][field_name].value = src_widget.value
             
-            # Copy dead channel
+            # Copy dead channel (including mask_path)
             target_form['dead_channel']['enabled'].value = source_form['dead_channel']['enabled'].value
+            if 'mask_path' in source_form['dead_channel'] and 'mask_path' in target_form['dead_channel']:
+                target_form['dead_channel']['mask_path'].value = source_form['dead_channel']['mask_path'].value
             target_form['dead_channel']['number'].value = source_form['dead_channel']['number'].value
         
         with self.save_output:
@@ -944,6 +997,7 @@ class MetadataBuilder(widgets.VBox):
             'basic': {},
             'cell_types': {},
             'dead_channel': {},
+            'channels': {},  # For channel name fields
             'widget': None
         }
         
@@ -1020,19 +1074,28 @@ class MetadataBuilder(widgets.VBox):
             description='Include dead channel',
             value=True
         )
+        dead_mask_path = widgets.Text(
+            description='Dead mask path:',
+            placeholder='Optional - path to dead cell mask',
+            style={'description_width': '130px'},
+            layout=widgets.Layout(width='600px')
+        )
         dead_number = widgets.IntText(
             description='Dead channel #:',
             value=0,
             style={'description_width': '120px'}
         )
         
-        # Toggle visibility
+        # Toggle visibility - show/hide both mask path and channel number
         def _toggle_dead(change):
-            dead_number.layout.display = None if change['new'] else 'none'
+            display_val = None if change['new'] else 'none'
+            dead_mask_path.layout.display = display_val
+            dead_number.layout.display = display_val
         dead_enabled.observe(_toggle_dead, names='value')
         _toggle_dead({'new': dead_enabled.value})
         
         form_data['dead_channel']['enabled'] = dead_enabled
+        form_data['dead_channel']['mask_path'] = dead_mask_path
         form_data['dead_channel']['number'] = dead_number
         
         # Cell type sections
@@ -1164,8 +1227,21 @@ class MetadataBuilder(widgets.VBox):
                 fields['tracks_csv_path']
             ])
         
-        # Assemble form
-        form_widget = widgets.VBox([
+        # Channel label fields (if include_channels is enabled)
+        channel_widgets = []
+        if self.include_channels and self.n_channels > 0:
+            for i in range(self.n_channels):
+                channel_field = widgets.Text(
+                    description=f'Channel {i+1} label:',
+                    placeholder=f'e.g., Tcell, Organoid',
+                    style={'description_width': '130px'},
+                    layout=widgets.Layout(width='400px')
+                )
+                form_data['channels'][f'channel_{i+1}_label'] = channel_field
+                channel_widgets.append(channel_field)
+        
+        # Assemble form - Basic Information includes channel labels
+        form_children = [
             header,
             widgets.HTML('<h5>Basic Information</h5>'),
             form_data['basic']['sample_name'],
@@ -1173,6 +1249,15 @@ class MetadataBuilder(widgets.VBox):
             form_data['basic']['well'],
             form_data['basic']['raw_image_path'],
             form_data['basic']['dimension_order'],
+        ]
+        
+        # Add channel label fields inside Basic Information section
+        if channel_widgets:
+            form_children.append(widgets.HTML('<b>Channel Labels:</b>'))
+            form_children.extend(channel_widgets)
+        
+        # Continue with rest of the form
+        form_children.extend([
             widgets.HTML('<h5>Imaging Parameters</h5>'),
             form_data['basic']['pixel_distance_xy'],
             form_data['basic']['pixel_distance_z'],
@@ -1181,11 +1266,14 @@ class MetadataBuilder(widgets.VBox):
             form_data['basic']['time_unit'],
             dead_channel_label,
             dead_enabled,
+            dead_mask_path,
             dead_number,
             widgets.HTML('<h5>Cell Type Configuration</h5>'),
             *cell_type_widgets,
             widgets.HTML('<hr>')
         ])
+        
+        form_widget = widgets.VBox(form_children)
         
         form_data['widget'] = form_widget
         return form_data
@@ -1210,15 +1298,21 @@ class MetadataBuilder(widgets.VBox):
         for form in self.sample_forms:
             row = {}
             
+            # Channel names (if any)
+            for field_name, widget in form['channels'].items():
+                row[field_name] = widget.value.strip()
+            
             # Basic fields (includes dimension_order now)
             for field_name, widget in form['basic'].items():
                 row[field_name] = widget.value
             
-            # Dead channel
+            # Dead channel (including mask_path) - only add columns if enabled
+            # If disabled, columns won't exist and pipeline interprets as "no death channel"
             if form['dead_channel']['enabled'].value:
+                if 'mask_path' in form['dead_channel']:
+                    row['dead_mask_path'] = form['dead_channel']['mask_path'].value.strip()
                 row['dead_channel'] = form['dead_channel']['number'].value
-            else:
-                row['dead_channel'] = ''
+            # Note: If disabled, we do NOT create these columns at all
             
             # Cell types with line_condition merging and prefixes
             for cell_type, fields in form['cell_types'].items():
@@ -4668,6 +4762,48 @@ class MotileCellAnalysisPanel:
                          layout=widgets.Layout(flex_flow="row wrap", gap="12px"))
         ])
         
+        # ---- Cluster percentage grouping selector ----
+        self.groupby_title = widgets.HTML(
+            '<div style="font-size:20px;font-weight:700;">Cluster % grid grouping:</div>'
+        )
+        self.groupby_description = widgets.HTML(
+            '<div style="font-size:12px;color:#666;margin-bottom:8px;">'
+            f'Select columns to group by in cluster percentage plots. '
+            f'Rows will always be {self.cell_type}_line_condition values. '
+            f'If none selected, only per-sample plots are generated.</div>'
+        )
+        
+        # Build list of eligible columns for grouping
+        # Eligible: exp_nr and all *_line_condition EXCEPT this cell type's own (EXCLUDE 'well')
+        this_line_col = f"{self.cell_type}_line_condition"
+        metadata = self.metadata_loader.metadata
+        eligible_cols = []
+        if metadata is not None:
+            for col in metadata.columns:
+                if col == 'exp_nr':  # 'well' is now excluded
+                    eligible_cols.append(col)
+                elif col.endswith('_line_condition') and col != this_line_col:
+                    eligible_cols.append(col)
+        
+        # Get saved selection from config
+        saved_groupby = list(self._panel_cfg.get("cluster_percentage_group_by", []))
+        # Filter to only include columns that still exist
+        saved_groupby = [c for c in saved_groupby if c in eligible_cols]
+        
+        self.groupby_selector = widgets.SelectMultiple(
+            options=eligible_cols,
+            value=saved_groupby,
+            description="Group by:",
+            style={"description_width": "80px"},
+            layout=widgets.Layout(width="400px", height="100px")
+        )
+        
+        self.groupby_box = widgets.VBox([
+            self.groupby_title,
+            self.groupby_description,
+            self.groupby_selector
+        ])
+        
         # ---- Run button ----
         self.btn_run = widgets.Button(
             description=f"Run {self.cell_type} analysis",
@@ -4696,6 +4832,8 @@ class MotileCellAnalysisPanel:
             self.normalize_section,
             widgets.HTML("<hr>"),
             self.umap_box,
+            widgets.HTML("<hr>"),
+            self.groupby_box,
             widgets.HTML("<hr>"),
             self.run_row,
             self.out_run,
@@ -4845,7 +4983,7 @@ class MotileCellAnalysisPanel:
         lock_widgets = [self.seed_widget, self.btn_select_all, self.btn_clear_all,
                   self.umap_distance_widget, self.umap_neighbors_widget,
                   self.num_clusters_widget, self.norm_select_all_btn,
-                  self.norm_clear_all_btn, self.btn_run]
+                  self.norm_clear_all_btn, self.groupby_selector, self.btn_run]
         
         for w in lock_widgets:
             w.disabled = locked
@@ -4865,6 +5003,9 @@ class MotileCellAnalysisPanel:
                 umap_n_neighbors = int(self.umap_neighbors_widget.value)
                 nr_of_clusters = int(self.num_clusters_widget.value)
                 
+                # Get cluster percentage grouping columns
+                cluster_percentage_group_by = list(self.groupby_selector.value)
+                
                 # Get selected features (patterns)
                 dtw_patterns = self._selected_features()
                 if not dtw_patterns:
@@ -4883,6 +5024,7 @@ class MotileCellAnalysisPanel:
                 self._panel_cfg["umap_min_dist"] = umap_min_dist
                 self._panel_cfg["umap_n_neighbors"] = umap_n_neighbors
                 self._panel_cfg["nr_of_clusters"] = nr_of_clusters
+                self._panel_cfg["cluster_percentage_group_by"] = cluster_percentage_group_by
                 self._panel_cfg["dtw_features_input"] = dtw_patterns
                 self._panel_cfg["dtw_feature_groups_enabled"] = {
                     g: row["group_cb"].value for g, row in self._group_rows.items()
@@ -4902,6 +5044,7 @@ class MotileCellAnalysisPanel:
                 print(f"  seed = {seed}")
                 print(f"  UMAP: n_neighbors={umap_n_neighbors}, min_dist={umap_min_dist}")
                 print(f"  clusters = {nr_of_clusters}")
+                print(f"  cluster_percentage_group_by = {cluster_percentage_group_by}")
                 print(f"  columns_to_use [{len(columns_to_use)}]: {columns_to_use}")
                 print(f"  columns_to_normalize [{len(columns_to_normalize)}]: {columns_to_normalize}")
                 
@@ -4961,6 +5104,7 @@ class MotileCellAnalysisPanel:
                     umap_minimal_distance=umap_min_dist,
                     umap_n_neighbors=umap_n_neighbors,
                     nr_of_clusters=nr_of_clusters,
+                    cluster_percentage_group_by=cluster_percentage_group_by,
                     plot_results=True,
                     seed=seed
                 )
@@ -5122,7 +5266,8 @@ class DeathDynamicsPanel:
                     dead_perc_threshold=dead_perc_threshold,
                     output_dir=self.output_dir,
                     df_tracks_path=None,
-                    org_type=self.cell_type
+                    org_type=self.cell_type,
+                    metadata=self.metadata_loader.metadata  # Pass metadata so it can find dead_mask_path
                 )
                 
                 print(f"✅ {self.cell_type} death dynamics complete!")
@@ -5719,10 +5864,38 @@ class BackprojectionPanel:
         preset_time = list(self._cfg.get("columns_input_time", self._cfg.get("columns_input", [])))
         preset_set = set(preset_time)
 
+        # Load actual columns from CSV to expand patterns
+        cell_type = self._celltype_map[self.celltype_dd.value]
+        feature_outdir = Path(self.output_dir, "analysis", cell_type, "track_features")
+        csv_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+        avail_cols = []
+        if csv_path.exists():
+            try:
+                avail_cols = pd.read_csv(csv_path, nrows=1).columns.tolist()
+            except Exception:
+                avail_cols = []
+
         rows = {}
         boxes = []
         for group_name, feats in self._base_groups.items():
-            child_cbs = [widgets.Checkbox(value=(f in preset_set), description=f, indent=True) for f in feats]
+            # Expand patterns against available columns
+            expanded_feats = []
+            for f in feats:
+                if any(ch in f for ch in "*?["):
+                    matches = [c for c in avail_cols if fnmatch.fnmatchcase(str(c), f)]
+                    expanded_feats.extend(matches if matches else [])
+                else:
+                    if f in avail_cols or not avail_cols:
+                        expanded_feats.append(f)
+            
+            # De-duplicate while preserving order
+            seen = set()
+            expanded_feats = [x for x in expanded_feats if not (x in seen or seen.add(x))]
+            
+            if not expanded_feats:
+                continue  # Skip empty groups
+                
+            child_cbs = [widgets.Checkbox(value=(f in preset_set), description=f, indent=True) for f in expanded_feats]
             gcb = widgets.Checkbox(value=all(cb.value for cb in child_cbs), indent=False)
             glabel = widgets.HTML(f"<b>{group_name}</b>")
             header = widgets.HBox([gcb, glabel])
@@ -5779,9 +5952,10 @@ class BackprojectionPanel:
             except Exception:
                 cols = []
 
-        # Prepare target patterns per group: add mean_ if not already present
+        # Prepare target patterns per group: ALWAYS add mean_ prefix
+        # The summarized CSV has mean_ prefix on ALL columns (e.g., mean_intensity_ch1 becomes mean_mean_intensity_ch1)
         def to_mean_pattern(name: str) -> str:
-            return name if str(name).startswith("mean_") else ("mean_" + str(name))
+            return "mean_" + str(name)
 
         group_to_columns = {}
         for gname, base_feats in self._base_groups.items():
