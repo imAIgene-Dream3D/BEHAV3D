@@ -690,6 +690,14 @@ def calculate_active_contact_features(df_tracks, cell_type):
     contact_col = f'{cell_type}_contact'
     active_contact_col = f'active_{cell_type}_contact'
     
+    # Check if mean_speed column exists (requires movement features to be calculated first)
+    if 'mean_speed' not in df_tracks.columns:
+        print(f"{get_current_time()} - Warning: 'mean_speed' column not found. Skipping active contact calculation.")
+        print(f"    Make sure 'movement' is included in features_choice to enable active contact detection.")
+        # Set all active contacts to False since we can't determine activity without speed
+        df_tracks[active_contact_col] = False
+        return df_tracks
+    
     print(f"{get_current_time()} - Determining active contact of {cell_type}")
 
     # --- Step 1: Explode touching cells column ---
@@ -880,6 +888,10 @@ def interpolate_missing_positions(
         # Select all columns that are not in cols_to_copy
         cols_to_interpolate = df_tracks.columns.difference(cols_to_copy).tolist()
         cols_to_interpolate = [col for col in cols_to_interpolate if col not in col_to_none]
+    
+    # Filter to only numeric columns - np.interp cannot handle object/string dtypes
+    numeric_cols = df_tracks.select_dtypes(include=[np.number]).columns.tolist()
+    cols_to_interpolate = [col for col in cols_to_interpolate if col in numeric_cols]
      
     grouped_df = df_tracks.groupby('TrackID')
     def interpolate_group(group, cols_to_interpolate, cols_to_copy):

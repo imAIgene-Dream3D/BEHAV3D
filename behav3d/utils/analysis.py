@@ -42,11 +42,18 @@ def summarize_track_features(
     config=None,
     output_dir=None,
     imaris=False,
-    cell_type="tcell"
+    cell_type="tcell",
+    df_input_path=None  # Optional: path to filtered CSV (e.g., advanced features filtered)
     ):
     """
     This code calculates summarized features (e.g. mean speed of the whole track) 
     for each TrackID for every experiment specified in the provided metadata.csv
+    
+    Parameters
+    ----------
+    df_input_path : Path or str, optional
+        Path to filtered CSV file. If provided, reads from this file instead of the default
+        combined_track_features_filtered.csv. Useful for summarizing advanced features with active killing data.
     
     Output:
     - A .csv file containing all tracks from all experiments with their track-summarized features
@@ -76,7 +83,19 @@ def summarize_track_features(
     if not qc_outdir.exists():
         qc_outdir.mkdir(parents=True)
 
-    df_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
+    # Use provided input path or default to filtered CSV
+    if df_input_path is not None:
+        df_tracks_path = Path(df_input_path)
+        print(f"  Using input file: {df_tracks_path.name}")
+    else:
+        df_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
+    
+    if not df_tracks_path.exists():
+        raise FileNotFoundError(
+            f"Filtered track features file not found: {df_tracks_path}\n"
+            f"Please run Track Filtering for {cell_type} first."
+        )
+    
     df_tracks = pd.read_csv(df_tracks_path)
     # Calculate mean values of track features over the whole track
     grouped_df_tracks=df_tracks.groupby(['sample_name','TrackID'])

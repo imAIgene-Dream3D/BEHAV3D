@@ -148,6 +148,14 @@ behav3d_calculated_features = {
         "touching_*",
         "active_*_contact",
     ],
+    "active_killing": [
+        # Active killing features from advanced_feature_extraction
+        # Only available if Active Killing Analysis has been run
+        # Global features (across all target types):
+        "is_active_killing",           # Boolean: True if this timepoint is active killing
+        "killing_efficiency",          # Ratio of actual vs expected background death
+        # Note: death_signal_increase_*tp excluded from DTW - not suitable for time-series comparison
+    ],
 }
 # ===============================
 # JSON CONFIG (loader + defaults)
@@ -376,6 +384,13 @@ _DEFAULT_CONFIG = {
         },
         "columns_input": [],         # patterns selected in the UI (e.g., "mean_intensity_*")
         "columns_resolved": [],      # expanded exact column names (filled at run)
+    },
+    "active_killing": {
+        "observation_window": 5,
+        "death_signal_column": "mean_dead_dye",
+        "killing_threshold_multiplier": 1.5,
+        "min_contact_duration": 1,
+        "save_results": True,
     }
 }
 
@@ -3689,12 +3704,369 @@ class FeatureExtractionPanel:
             except Exception:
                 import traceback; traceback.print_exc()
             finally:
+
+
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
+
+
+class ActiveKillingPanel:
+    """
+    Advanced feature extraction panel for Active Killing Analysis.
+    
+    Detects functional immune cell killing events by analyzing death signal 
+    changes after cell-cell contact. Analyzes killing against ALL organoid
+    types automatically detected from metadata.
+    """
+    
+    def __init__(self, metadata_loader):
+        """
+        Parameters
+        ----------
+        metadata_loader : MetadataLoader
+            Metadata loader instance with loaded metadata
+        """
+        self.metadata_loader = metadata_loader
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+        
+        # Detect all cell types from metadata
+        from behav3d.utils import (
+            detect_immune_cell_types_from_metadata,
+            detect_organoid_types_from_metadata,
+            detect_other_cell_types_from_metadata
+        )
+        
+        md = self.metadata_loader.metadata
+        if md is None:
+            raise RuntimeError("metadata_loader.metadata must be loaded before creating ActiveKillingPanel.")
+        
+        self.immune_types = detect_immune_cell_types_from_metadata(md)
+        self.organoid_types = detect_organoid_types_from_metadata(md)
+        self.other_types = detect_other_cell_types_from_metadata(md)
+        
+        # Potential immune cells (attackers): immune + other
+        self.potential_immune = self.immune_types + self.other_types
+        # All target types (organoids) will be analyzed automatically
+        self.target_types = self.organoid_types
+        
+        # Load config
+        params = dict(self.metadata_loader.behav3d_parameters or {})
+        params.setdefault("active_killing", deepcopy(_DEFAULT_CONFIG.get("active_killing", {})))
+        self._params = params
+        self._cfg = self._params["active_killing"]
+        
+        # ---- Section Title ----
+        self.section_title = widgets.HTML(
+            '<div style="font-size:22px;font-weight:700;">Active Killing Analysis</div>'
+        )
+        
+        self.description = widgets.HTML(
+            '<div style="color:#555;font-size:13px;margin-bottom:10px;">'
+            'Detects functional killing events by analyzing death signal changes after immune-target contact.<br>'
+            '<b>Targets:</b> All organoid types will be analyzed automatically.'
+            '</div>'
+        )
+        
+        # ---- Cell Type Selection ----
+        # Immune cell dropdown
+        immune_options = self.potential_immune if self.potential_immune else ["(none detected)"]
+        self.immune_dd = widgets.Dropdown(
+            options=immune_options,
+            value=immune_options[0] if immune_options else None,
+            description="Immune cell:",
+            style={'description_width': '120px'},
+            layout=widgets.Layout(width="280px")
+        )
+        
+        # Show detected target types (read-only info)
+        target_info = ", ".join(self.target_types) if self.target_types else "(none detected)"
+        self.target_info_html = widgets.HTML(
+            f'<div style="padding:5px;background:#f0f0f0;border-radius:4px;">'
+            f'<b>Target cell types:</b> {target_info}</div>'
+        )
+        
+        self.cell_selection_row = widgets.VBox([
+            self.immune_dd,
+            self.target_info_html
+        ], layout=widgets.Layout(gap="10px"))
+        
+        # ---- Parameters ----
+        self.observation_window = widgets.IntText(
+            description="Observation window:",
+            value=int(self._cfg.get("observation_window", 5)),
+            style={'description_width': '150px'},
+            layout=widgets.Layout(width="220px")
+        )
+        self.observation_window_label = widgets.HTML(
+            '<span style="color:#666;font-size:12px;">timepoints after contact</span>'
+        )
+        
+        # Death signal column dropdown
+        death_signal_options = ["mean_dead_dye", "percentage_dead_mask", "nr_dead_mask_pixels"]
+        self.death_signal_dd = widgets.Dropdown(
+            options=death_signal_options,
+            value=self._cfg.get("death_signal_column", "mean_dead_dye"),
+            description="Death signal:",
+            style={'description_width': '150px'},
+            layout=widgets.Layout(width="300px")
+        )
+        
+        self.killing_threshold = widgets.FloatText(
+            description="Killing threshold:",
+            value=float(self._cfg.get("killing_threshold_multiplier", 1.5)),
+            style={'description_width': '150px'},
+            layout=widgets.Layout(width="220px")
+        )
+        self.killing_threshold_label = widgets.HTML(
+            '<span style="color:#666;font-size:12px;">× background rate</span>'
+        )
+        
+        self.min_contact_duration = widgets.IntText(
+            description="Min contact duration:",
+            value=int(self._cfg.get("min_contact_duration", 1)),
+            style={'description_width': '150px'},
+            layout=widgets.Layout(width="220px")
+        )
+        self.min_contact_duration_label = widgets.HTML(
+            '<span style="color:#666;font-size:12px;">timepoints</span>'
+        )
+        
+        self.save_results = widgets.Checkbox(
+            description="Save results to CSV",
+            value=bool(self._cfg.get("save_results", True)),
+            indent=False
+        )
+        
+        # Parameter rows
+        self.param_row1 = widgets.HBox([
+            self.observation_window, self.observation_window_label,
+            widgets.HTML("&nbsp;&nbsp;&nbsp;"),
+            self.killing_threshold, self.killing_threshold_label
+        ], layout=widgets.Layout(align_items="center"))
+        
+        self.param_row2 = widgets.HBox([
+            self.min_contact_duration, self.min_contact_duration_label,
+            widgets.HTML("&nbsp;&nbsp;&nbsp;"),
+            self.death_signal_dd
+        ], layout=widgets.Layout(align_items="center"))
+        
+        # ---- Run Button ----
+        self.btn_run = widgets.Button(
+            description="Run Active Killing Analysis",
+            button_style="danger",
+            icon="bolt",
+            layout=widgets.Layout(width="260px")
+        )
+        self.btn_run.on_click(self._on_run_clicked)
+        
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
+        
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_html, self.save_results],
+            layout=widgets.Layout(align_items="center", gap="15px")
+        )
+        
+        # ---- Output ----
+        self.out = widgets.Output()
+        
+        # ---- Validation message ----
+        self.validation_html = widgets.HTML("")
+        self._validate_inputs()
+        
+        # Observe changes to update validation
+        self.immune_dd.observe(lambda _: self._validate_inputs(), names="value")
+        
+        # ---- Build UI ----
+        self.ui = widgets.VBox([
+            self.section_title,
+            self.description,
+            widgets.HTML("<b>Cell Type Selection</b>"),
+            self.cell_selection_row,
+            self.validation_html,
+            widgets.HTML("<hr>"),
+            widgets.HTML("<b>Analysis Parameters</b>"),
+            self.param_row1,
+            self.param_row2,
+            widgets.HTML("<hr>"),
+            self.run_row,
+            self.out
+        ])
+    
+    def _validate_inputs(self):
+        """Validate that required track files exist"""
+        immune = self.immune_dd.value
+        
+        messages = []
+        valid = True
+        
+        if immune == "(none detected)":
+            messages.append("⚠️ No immune cell types detected in metadata")
+            valid = False
+        
+        if not self.target_types:
+            messages.append("⚠️ No organoid types detected in metadata")
+            valid = False
+        
+        if valid:
+            # Check if immune track feature files exist
+            immune_path = Path(self.output_dir, "analysis", immune, "track_features",
+                              f"BEHAV3D_{immune}_combined_track_features_filtered.csv")
+            
+            if not immune_path.exists():
+                alt_path = immune_path.with_name(f"BEHAV3D_{immune}_combined_track_features.csv")
+                if not alt_path.exists():
+                    messages.append(f"⚠️ {immune} track features not found. Run feature extraction first.")
+                    valid = False
+                else:
+                    immune_path = alt_path
+            
+            # Check at least one target has tracks and contact columns exist
+            targets_found = []
+            for target in self.target_types:
+                target_path = Path(self.output_dir, "analysis", target, "track_features",
+                                  f"BEHAV3D_{target}_combined_track_features_filtered.csv")
+                if not target_path.exists():
+                    target_path = target_path.with_name(f"BEHAV3D_{target}_combined_track_features.csv")
+                
+                if target_path.exists():
+                    targets_found.append(target)
+            
+            if not targets_found:
+                messages.append(f"⚠️ No target track features found. Run feature extraction first.")
+                valid = False
+            
+            # Check contact columns exist for at least one target
+            if valid and immune_path.exists():
+                try:
+                    df_sample = pd.read_csv(immune_path, nrows=1)
+                    contacts_found = []
+                    for target in targets_found:
+                        contact_col = f"{target}_contact"
+                        if contact_col in df_sample.columns:
+                            contacts_found.append(target)
+                    
+                    if not contacts_found:
+                        messages.append(f"⚠️ No contact columns found in {immune} tracks. "
+                                       f"Ensure contact features were calculated.")
+                        valid = False
+                except Exception:
+                    pass
+        
+        if valid:
+            self.validation_html.value = '<span style="color:green;">✓ Ready to run</span>'
+        else:
+            self.validation_html.value = '<br>'.join([f'<span style="color:#c00;">{m}</span>' for m in messages])
+        
+        self.btn_run.disabled = not valid
+        return valid
+    
+    def _persist_params(self):
+        """Save parameters to config file"""
+        self._cfg["observation_window"] = int(self.observation_window.value)
+        self._cfg["death_signal_column"] = str(self.death_signal_dd.value)
+        self._cfg["killing_threshold_multiplier"] = float(self.killing_threshold.value)
+        self._cfg["min_contact_duration"] = int(self.min_contact_duration.value)
+        self._cfg["save_results"] = bool(self.save_results.value)
+        self._cfg["last_immune_cell"] = str(self.immune_dd.value)
+        # Target types are now auto-detected, no need to save
+        
+        self._params["active_killing"] = self._cfg
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(self._params, f, sort_keys=False)
+    
+    def _lock(self, locked):
+        """Lock/unlock controls"""
+        for w in [self.immune_dd, self.observation_window,
+                  self.death_signal_dd, self.killing_threshold, 
+                  self.min_contact_duration, self.save_results, self.btn_run]:
+            w.disabled = locked
+    
+    def _on_run_clicked(self, *_):
+        """Run active killing analysis for all organoid types"""
+        self._lock(True)
+        self.spinner_html.layout.display = None
+        self.out.clear_output()
+        
+        with self.out:
+            try:
+                self._persist_params()
+                
+                immune_cell = str(self.immune_dd.value)
+                observation_window = int(self.observation_window.value)
+                death_signal = str(self.death_signal_dd.value)
+                threshold_mult = float(self.killing_threshold.value)
+                min_contact = int(self.min_contact_duration.value)
+                save = bool(self.save_results.value)
+                
+                print(f"▶️ Running Active Killing Analysis...")
+                print(f"  Immune cell type: {immune_cell}")
+                print(f"  Target cell types: {', '.join(self.target_types)}")
+                print(f"  Observation window: {observation_window} timepoints")
+                print(f"  Death signal column: {death_signal}")
+                print(f"  Killing threshold: {threshold_mult}× background")
+                print(f"  Min contact duration: {min_contact} timepoints")
+                print(f"  Save results: {save}")
+                print()
+                
+                # Import and run the analysis
+                from behav3d.analysis.advanced_feature_extraction import run_active_killing_analysis
+                
+                # Run analysis for all target types (None triggers auto-detection)
+                df_killing_events, df_summary, stats = run_active_killing_analysis(
+                    metadata=self.metadata_loader.metadata,
+                    output_dir=self.output_dir,
+                    immune_cell_type=immune_cell,
+                    target_cell_types=None,  # Auto-detect all organoid types
+                    observation_window=observation_window,
+                    death_signal_column=death_signal,
+                    min_contact_duration=min_contact,
+                    killing_threshold_multiplier=threshold_mult,
+                    save_results=save
+                )
+                
+                print()
+                print("=" * 60)
+                print("RESULTS SUMMARY")
+                print("=" * 60)
+                print(f"Total qualifying contact events: {stats.get('total_contact_events', 0)}")
+                print(f"Total contact timepoints analyzed: {stats.get('total_contact_timepoints', 0)}")
+                print(f"Active killing timepoints: {stats.get('total_active_killing_timepoints', 0)}")
+                print(f"Overall killing rate: {stats.get('overall_killing_rate', 0):.1%}")
+                print()
+                
+                # Show per-sample background rates if available
+                if 'background_death_rates' in stats:
+                    print("Per-sample background death rates:")
+                    for sample_name, rate in stats['background_death_rates'].items():
+                        print(f"  {sample_name}: {rate:.6f} per timepoint")
+                    print()
+                
+                if not df_summary.empty:
+                    print("Per-sample and target type summary:")
+                    display(df_summary)
+                
+                print()
+                print(f"✅ Active Killing Analysis complete!")
+                
+                if save:
+                    results_dir = Path(self.output_dir, "analysis", immune_cell, "active_killing")
+                    print(f"   Results saved to: {results_dir}")
+                
+            except Exception:
+                print("❌ Error during Active Killing Analysis:")
+                traceback.print_exc()
+            finally:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
 
 class TrackFilterPanel:
     """
     Generic track filtering panel that works for ANY cell type.
+    
+    If Active Killing Analysis was run, this panel will automatically use the advanced
+    features CSV which includes killing data. The filtered output will be saved to the
+    active_killing folder to preserve the killing features for downstream analysis.
     """
     
     def __init__(self, metadata_loader, cell_type):
@@ -3708,9 +4080,18 @@ class TrackFilterPanel:
         """
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
         
         # Use unified category detection
         self.category = detect_cell_type_category(self.cell_type, metadata_loader.metadata)
+        
+        # Check if advanced features exist (Active Killing Analysis was run)
+        active_killing_dir = Path(self.output_dir, "analysis", self.cell_type, "active_killing")
+        self._advanced_features_path = Path(active_killing_dir, f"BEHAV3D_{self.cell_type}_advanced_track_features.csv")
+        self._use_advanced_features = self._advanced_features_path.exists()
+        
+        if self._use_advanced_features:
+            print(f"[TrackFilterPanel] Advanced features FOUND for {self.cell_type} - will include active killing data")
         
         # Load/init config
         params = self.metadata_loader.behav3d_parameters
@@ -3974,6 +4355,12 @@ class TrackFilterPanel:
                 elif self.has_dead:
                     print(f"  filter_t0_dead = {filter_t0_dead}")
                 
+                # Determine input path: use advanced features if available
+                df_input_path = None
+                if self._use_advanced_features:
+                    df_input_path = str(self._advanced_features_path)
+                    print(f"  Using ADVANCED features with active killing data")
+                
                 # Call adapted filter function (organoid or tcell)
                 if self.category == "organoid":
                     self._filter_tracks(
@@ -3984,7 +4371,8 @@ class TrackFilterPanel:
                         max_track_length=max_track_length,
                         min_size=min_size_t1,
                         time_type=time_type,
-                        cell_type=self.cell_type
+                        cell_type=self.cell_type,
+                        df_input_path=df_input_path
                     )
                     
                     # Summarize tracks after filtering (needed for behavioral analysis)
@@ -4003,7 +4391,8 @@ class TrackFilterPanel:
                         filter_t0_dead=filter_t0_dead,
                         cell_type=self.cell_type,
                         time_type=time_type,
-                        plot_results=plot_results
+                        plot_results=plot_results,
+                        df_input_path=df_input_path
                     )
                 
                 # Summarize tracks after filtering (needed for behavioral analysis)
@@ -4062,23 +4451,44 @@ class MotileCellAnalysisPanel:
         
         # Load a sample of the data to get actual column names
         feature_outdir = Path(self.output_dir, "analysis", self.cell_type, "track_features")
+        active_killing_dir = Path(self.output_dir, "analysis", self.cell_type, "active_killing")
+        
         df_tracks_path_filt = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
         df_tracks_path_unfilt = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features.csv")
+        # Check for advanced track features (with active killing data)
+        df_advanced_path = Path(active_killing_dir, f"BEHAV3D_{self.cell_type}_advanced_track_features.csv")
         
         actual_columns = []
-        # Try filtered first, then unfiltered as fallback
-        for df_tracks_path in [df_tracks_path_filt, df_tracks_path_unfilt]:
-            if df_tracks_path.exists():
-                try:
-                    # Read just the first row to get column names
-                    import pandas as pd
-                    df_sample = pd.read_csv(df_tracks_path, nrows=0)
-                    actual_columns = list(df_sample.columns)
-                    print(f"[MotileCellAnalysisPanel] Loaded {len(actual_columns)} columns from {df_tracks_path.name} for {self.cell_type}")
-                    break  # Stop after first successful load
-                except Exception as e:
-                    print(f"[MotileCellAnalysisPanel] Failed to load {df_tracks_path.name}: {e}")
-                    pass
+        self._use_advanced_features = False
+        self._advanced_features_path = None
+        
+        # First, check if advanced track features exist (has active killing data)
+        if df_advanced_path.exists():
+            try:
+                import pandas as pd
+                df_sample = pd.read_csv(df_advanced_path, nrows=0)
+                actual_columns = list(df_sample.columns)
+                self._use_advanced_features = True
+                self._advanced_features_path = df_advanced_path
+                print(f"[MotileCellAnalysisPanel] Using ADVANCED features ({len(actual_columns)} columns) from {df_advanced_path.name} for {self.cell_type}")
+            except Exception as e:
+                print(f"[MotileCellAnalysisPanel] Failed to load advanced features: {e}")
+        
+        # Fallback to regular track features if no advanced features
+        if not actual_columns:
+            # Try filtered first, then unfiltered as fallback
+            for df_tracks_path in [df_tracks_path_filt, df_tracks_path_unfilt]:
+                if df_tracks_path.exists():
+                    try:
+                        # Read just the first row to get column names
+                        import pandas as pd
+                        df_sample = pd.read_csv(df_tracks_path, nrows=0)
+                        actual_columns = list(df_sample.columns)
+                        print(f"[MotileCellAnalysisPanel] Loaded {len(actual_columns)} columns from {df_tracks_path.name} for {self.cell_type}")
+                        break  # Stop after first successful load
+                    except Exception as e:
+                        print(f"[MotileCellAnalysisPanel] Failed to load {df_tracks_path.name}: {e}")
+                        pass
         
         if not actual_columns:
             print(f"[MotileCellAnalysisPanel] WARNING: No CSV found for {self.cell_type} - using template features only")
@@ -4096,6 +4506,18 @@ class MotileCellAnalysisPanel:
                 del groups["death"]
             if "intensity" in groups:
                 groups["intensity"] = [f for f in groups["intensity"] if f != "mean_dead_dye"]
+        
+        # Check if active killing features exist (only present if Active Killing Analysis was run)
+        has_active_killing = False
+        if actual_columns:
+            killing_cols = {'is_active_killing', 'killing_efficiency', 'n_killing_events_total'}
+            has_active_killing = bool(killing_cols.intersection(set(actual_columns)))
+        
+        if not has_active_killing:
+            if "active_killing" in groups:
+                del groups["active_killing"]
+        else:
+            print(f"[MotileCellAnalysisPanel] Active killing features found for {self.cell_type}")
         
         # Expand wildcards in feature groups to show actual columns
         if actual_columns:
@@ -4523,6 +4945,11 @@ class MotileCellAnalysisPanel:
     
     def _expand_patterns(self, patterns):
         """Expand wildcard patterns using actual CSV columns"""
+        # Use advanced features path if available (has active killing columns)
+        if self._use_advanced_features and self._advanced_features_path and self._advanced_features_path.exists():
+            df = pd.read_csv(self._advanced_features_path, nrows=1)
+            return self._expand_column_patterns(patterns, df.columns.tolist())
+        
         # Load a sample CSV to get column names
         metadata = self.metadata_loader.metadata
         if metadata is None or len(metadata) == 0:
@@ -4625,10 +5052,53 @@ class MotileCellAnalysisPanel:
                 import random
                 random.seed(seed)
                 
+                # Determine which CSV to use for DTW analysis
+                feature_outdir = Path(self.output_dir, "analysis", self.cell_type, "track_features")
+                active_killing_dir = Path(self.output_dir, "analysis", self.cell_type, "active_killing")
+                
+                filtered_csv_path = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
+                summarized_csv_path = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_summarized.csv")
+                advanced_csv_path = Path(active_killing_dir, f"BEHAV3D_{self.cell_type}_advanced_track_features.csv")
+                
+                # ENFORCE: Summarized CSV is REQUIRED for DTW analysis (clustering needs it)
+                if not summarized_csv_path.exists():
+                    print(f"❌ ERROR: Summarized track features not found!")
+                    print(f"   Expected: {summarized_csv_path}")
+                    print(f"")
+                    print(f"   ⚠️ You MUST run 'Filter {self.cell_type} tracks & summarize' before running behavioral analysis.")
+                    print(f"   The summarization step is required for clustering.")
+                    return
+                
+                # ENFORCE: Filtered CSV is REQUIRED (unfiltered tracks cause issues with DTW)
+                if not filtered_csv_path.exists():
+                    print(f"❌ ERROR: Filtered track features not found!")
+                    print(f"   Expected: {filtered_csv_path}")
+                    print(f"")
+                    print(f"   ⚠️ You MUST run 'Filter {self.cell_type} tracks & summarize' before running behavioral analysis.")
+                    print(f"   Filtering ensures tracks have equal lengths for Dynamic Time Warping.")
+                    return
+                
+                df_tracks_path = filtered_csv_path
+                
+                # Check if filtered CSV has active killing columns
+                if self._use_advanced_features and self._advanced_features_path:
+                    try:
+                        df_check = pd.read_csv(filtered_csv_path, nrows=0)
+                        if 'is_active_killing' in df_check.columns or 'killing_efficiency' in df_check.columns:
+                            print(f"  Using filtered track features WITH active killing data")
+                        else:
+                            print(f"  ⚠️ Note: Active killing features exist but filtering was run before Active Killing Analysis.")
+                            print(f"     To include killing features in DTW, re-run 'Filter {self.cell_type} tracks & summarize'.")
+                    except Exception:
+                        pass
+                else:
+                    print(f"  Using filtered track features")
+                
                 # Call adapted tcell_analysis with cell_type parameter
                 self.df_tracks_clustered = run_tcell_analysis(
                     cell_type=self.cell_type,
                     output_dir=self.output_dir,
+                    df_tracks_path=df_tracks_path,
                     columns_to_use=columns_to_use,
                     columns_to_normalize=columns_to_normalize,
                     umap_minimal_distance=umap_min_dist,
@@ -4721,7 +5191,13 @@ class DeathDynamicsPanel:
         self.dead_perc_threshold = widgets.FloatText(
             description="Dead % threshold",
             value=float(self._panel_cfg.get("dead_perc_threshold", 0.02)),
-            style={'description_width': '160px'}
+            style={'description_width': '160px'},
+            layout=widgets.Layout(width="220px")
+        )
+        self.dead_threshold_help = widgets.HTML(
+            '<div style="font-size:12px;color:#666;margin-left:10px;">'
+            '(percentage_dead_mask threshold to classify as dead)'
+            '</div>'
         )
         
         # ---- Run button ----
@@ -4745,7 +5221,7 @@ class DeathDynamicsPanel:
         # ---- UI ----
         self.ui = widgets.VBox([
             self.section_title,
-            self.dead_perc_threshold,
+            widgets.HBox([self.dead_perc_threshold, self.dead_threshold_help], layout=widgets.Layout(align_items="center")),
             widgets.HTML("<hr>"),
             self.run_row,
             self.out_run,
@@ -4809,6 +5285,343 @@ class DeathDynamicsPanel:
             finally:
                 self.spinner_html.layout.display = "none"
                 self._lock(False)
+
+class InteractionAnalysisPanel:
+    """
+    Interaction analysis panel for organoids.
+    
+    Analyzes interactions from the organoid's point of view:
+    - Cumulative interactions over time with selected cell types
+    - Comparison between organoids that survive vs die
+    - Per-sample breakdowns
+    
+    Outputs PDF plots to analysis/{organoid_type}/interaction_analysis/
+    Each selected cell type gets its own separate PDF with statistics.
+    
+    Note: Uses death classification from Step 3 (Death Dynamics) if available.
+    """
+    
+    def __init__(self, metadata_loader, cell_type):
+        """
+        Parameters
+        ----------
+        metadata_loader : object
+            Metadata loader instance
+        cell_type : str
+            Name of the organoid cell type (e.g., "organoid")
+        """
+        from behav3d.utils import (
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata
+        )
+        
+        self.metadata_loader = metadata_loader
+        self.cell_type = str(cell_type).strip()
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+        
+        # Detect available cell types for interaction analysis
+        md = self.metadata_loader.metadata
+        self.immune_types = detect_immune_cell_types_from_metadata(md)
+        self.other_types = detect_other_cell_types_from_metadata(md)
+        self.available_cell_types = self.immune_types + self.other_types
+        
+        # Path to filtered data
+        feature_outdir = Path(self.output_dir, "analysis", self.cell_type, "track_features")
+        self.df_tracks_path = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
+        
+        # Load death threshold from config (saved by Step 3: Death Dynamics)
+        self._load_death_threshold_from_config()
+        
+        # ---- Title ----
+        self.section_title = widgets.HTML(
+            f'<div style="font-size:22px;font-weight:700;">{self.cell_type} Interaction Analysis</div>'
+        )
+        
+        # ---- Status message (will be updated dynamically) ----
+        self.status_html = widgets.HTML(value="")
+        
+        # ---- Refresh button to check for new files ----
+        self.btn_refresh = widgets.Button(
+            description="🔄 Refresh",
+            button_style="info",
+            layout=widgets.Layout(width="100px")
+        )
+        self.btn_refresh.on_click(self._on_refresh_clicked)
+        
+        # ---- Cell type selector ----
+        self.cell_type_selector_label = widgets.HTML(
+            '<div style="font-weight:600;margin-bottom:5px;">Select cell types to analyze interactions with:</div>'
+        )
+        
+        # Container for dynamically updated checkboxes
+        self.cell_type_box = widgets.VBox([])
+        self.cell_type_checkboxes = {}
+        
+        # ---- Death threshold info ----
+        self.death_info_html = widgets.HTML(value="")
+        
+        # ---- Run button ----
+        self.btn_run = widgets.Button(
+            description=f"Run Interaction Analysis",
+            button_style="warning",
+            layout=widgets.Layout(width="250px")
+        )
+        self.btn_run.on_click(self._on_run_clicked)
+        
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
+        
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_html],
+            layout=widgets.Layout(align_items="center", gap="10px")
+        )
+        
+        self.out_run = widgets.Output()
+        
+        # ---- Output info ----
+        self.output_info = widgets.HTML(
+            '<div style="font-size:12px;color:#666;margin-top:10px;">'
+            '<b>Generates for each selected cell type:</b><br>'
+            '• PDF with all plots (cumulative overall, per-sample, alive vs dead overall, alive vs dead per-sample)<br>'
+            '• CSV with summary statistics per sample'
+            '</div>'
+        )
+        
+        # ---- UI ----
+        self.ui = widgets.VBox([
+            self.section_title,
+            widgets.HBox([self.status_html, self.btn_refresh], layout=widgets.Layout(align_items="center", gap="10px")),
+            self.cell_type_selector_label,
+            self.cell_type_box,
+            self.death_info_html,
+            self.output_info,
+            widgets.HTML("<hr>"),
+            self.run_row,
+            self.out_run,
+        ])
+        
+        # Initial refresh to populate available cell types
+        self._refresh_data_status()
+    
+    def _load_death_threshold_from_config(self):
+        """Load death threshold from Step 3's config if available"""
+        self.dead_threshold = 0.02  # Default
+        self.death_dynamics_ran = False
+        
+        try:
+            params = dict(self.metadata_loader.behav3d_parameters or {})
+            death_cfg = params.get("death_dynamics", {}).get(self.cell_type, {})
+            if "dead_perc_threshold" in death_cfg:
+                self.dead_threshold = float(death_cfg["dead_perc_threshold"])
+                self.death_dynamics_ran = True
+        except Exception:
+            pass
+    
+    def _refresh_data_status(self):
+        """
+        Check for available filtered data and update the UI accordingly.
+        This can be called at any time to refresh after Step 1 completes.
+        """
+        import pandas as pd
+        
+        # Reload death threshold from config
+        self._load_death_threshold_from_config()
+        
+        self.has_data = self.df_tracks_path.exists()
+        self.has_contact_columns = False
+        self.contact_cell_types = []
+        self.has_dead_column = False
+        
+        if self.has_data:
+            try:
+                df_sample = pd.read_csv(self.df_tracks_path, nrows=0)
+                # Find which cell types have contact columns
+                for ct in self.available_cell_types:
+                    if f"{ct}_contact" in df_sample.columns:
+                        self.contact_cell_types.append(ct)
+                self.has_contact_columns = len(self.contact_cell_types) > 0
+                
+                # Check for death data
+                self.has_dead_column = "dead" in df_sample.columns or "percentage_dead_mask" in df_sample.columns
+            except Exception:
+                pass
+        
+        # Update status message
+        if not self.has_data:
+            self.status_html.value = (
+                '<div style="color:#b00;font-size:14px;padding:10px;background:#fee;border:1px solid #fcc;border-radius:4px;">'
+                '<b>⚠️ Waiting for filtered data</b><br>'
+                f'No filtered track features found for {self.cell_type}.<br>'
+                'Run Step 1 (Track Filtering) first, then click Refresh.'
+                '</div>'
+            )
+            self._set_controls_enabled(False)
+        elif not self.has_contact_columns:
+            self.status_html.value = (
+                '<div style="color:#b00;font-size:14px;padding:10px;background:#fee;border:1px solid #fcc;border-radius:4px;">'
+                '<b>⚠️ No Contact Data Found</b><br>'
+                f'No contact columns found for {self.cell_type}.<br>'
+                'Ensure contact features were calculated during feature extraction.'
+                '</div>'
+            )
+            self._set_controls_enabled(False)
+        else:
+            self.status_html.value = (
+                '<div style="color:#080;font-size:14px;padding:10px;background:#efe;border:1px solid #cfc;border-radius:4px;">'
+                f'<b>✅ Ready</b> - Filtered data found for {self.cell_type}<br>'
+                f'Available contact types: {", ".join(self.contact_cell_types)}'
+                '</div>'
+            )
+            self._set_controls_enabled(True)
+            self._update_cell_type_checkboxes()
+        
+        # Update death info message
+        self._update_death_info()
+    
+    def _update_death_info(self):
+        """Update the death threshold info display"""
+        if self.has_dead_column:
+            if self.death_dynamics_ran:
+                self.death_info_html.value = (
+                    '<div style="font-size:13px;padding:8px;background:#e3f2fd;border:1px solid #90caf9;border-radius:4px;margin-top:10px;">'
+                    f'<b>📊 Death classification:</b> Using threshold from Step 3 (Dead % threshold = {self.dead_threshold})'
+                    '</div>'
+                )
+            else:
+                self.death_info_html.value = (
+                    '<div style="font-size:13px;padding:8px;background:#fff3e0;border:1px solid #ffcc80;border-radius:4px;margin-top:10px;">'
+                    f'<b>⚠️ Step 3 not run:</b> Will calculate death using default threshold ({self.dead_threshold})<br>'
+                    '<i>Tip: Run Step 3 (Death Dynamics) first for consistent death classification.</i>'
+                    '</div>'
+                )
+        else:
+            self.death_info_html.value = (
+                '<div style="font-size:13px;padding:8px;background:#fce4ec;border:1px solid #f48fb1;border-radius:4px;margin-top:10px;">'
+                '<b>ℹ️ No death data:</b> Alive vs Dead plots will be skipped.'
+                '</div>'
+            )
+    
+    def _update_cell_type_checkboxes(self):
+        """Update the cell type checkboxes based on available contact columns"""
+        self.cell_type_checkboxes = {}
+        checkbox_widgets = []
+        
+        for ct in self.contact_cell_types:
+            category = "immune" if ct in self.immune_types else "other"
+            cb = widgets.Checkbox(
+                value=True,
+                description=f"{ct} ({category})",
+                indent=False,
+                layout=widgets.Layout(width="200px")
+            )
+            self.cell_type_checkboxes[ct] = cb
+            checkbox_widgets.append(cb)
+        
+        self.cell_type_box.children = checkbox_widgets
+    
+    def _set_controls_enabled(self, enabled: bool):
+        """Enable or disable all controls"""
+        self.btn_run.disabled = not enabled
+    
+    def _on_refresh_clicked(self, *_):
+        """Handle refresh button click"""
+        with self.out_run:
+            print("🔄 Refreshing data status...")
+        self._refresh_data_status()
+        with self.out_run:
+            if self.has_data and self.has_contact_columns:
+                print("   ✅ Data found! Ready to run.")
+            else:
+                print("   ⚠️ Data not yet available.")
+    
+    def _lock(self, locked):
+        """Lock/unlock all controls during processing"""
+        self.btn_run.disabled = locked
+        self.btn_refresh.disabled = locked
+        for cb in self.cell_type_checkboxes.values():
+            cb.disabled = locked
+    
+    def _on_run_clicked(self, *_):
+        """Run interaction analysis when button clicked"""
+        import traceback
+        
+        # First refresh to ensure we have latest data
+        self._refresh_data_status()
+        
+        if not self.has_data or not self.has_contact_columns:
+            with self.out_run:
+                print("❌ Cannot run - no valid data found. Please run Step 1 (Track Filtering) first.")
+            return
+        
+        self._lock(True)
+        self.out_run.clear_output()
+        self.spinner_html.layout.display = None
+        
+        with self.out_run:
+            try:
+                # Get selected cell types
+                selected_cell_types = [
+                    ct for ct, cb in self.cell_type_checkboxes.items() if cb.value
+                ]
+                
+                if not selected_cell_types:
+                    print("❌ Please select at least one cell type to analyze.")
+                    return
+                
+                # Use the threshold from Step 3 (Death Dynamics)
+                dead_threshold = self.dead_threshold
+                
+                print(f"▶️ Running {self.cell_type} Interaction Analysis...")
+                print(f"   Analyzing interactions with: {', '.join(selected_cell_types)}")
+                if self.has_dead_column:
+                    if self.death_dynamics_ran:
+                        print(f"   Using death threshold from Step 3: {dead_threshold}")
+                    else:
+                        print(f"   Using default death threshold: {dead_threshold}")
+                else:
+                    print(f"   No death data - skipping alive vs dead comparisons")
+                print()
+                
+                # Create output directory
+                results_dir = Path(self.output_dir, "analysis", self.cell_type, "interaction_analysis")
+                results_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Run the analysis - generates SEPARATE PDF per cell type
+                # All plots are generated (no selection needed)
+                self._run_interaction_analysis(
+                    selected_cell_types=selected_cell_types,
+                    dead_threshold=dead_threshold,
+                    results_dir=results_dir
+                )
+                
+            except Exception:
+                print("❌ Error during Interaction Analysis:")
+                traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
+    
+    def _run_interaction_analysis(
+        self,
+        selected_cell_types: list,
+        dead_threshold: float,
+        results_dir: Path
+    ):
+        """
+        Run the interaction analysis using the analysis module.
+        Thin wrapper that calls behav3d.analysis.interaction_analysis.run_interaction_analysis()
+        """
+        from behav3d.analysis.interaction_analysis import run_interaction_analysis
+        
+        run_interaction_analysis(
+            output_dir=self.output_dir,
+            cell_type=self.cell_type,
+            interacting_cell_types=selected_cell_types,
+            dead_threshold=dead_threshold,
+            df_tracks_path=str(self.df_tracks_path),
+            show_plots=True,
+        )
+
 
 class BackprojectionPanel:
     def __init__(self, metadata_loader, cell_type=None):
