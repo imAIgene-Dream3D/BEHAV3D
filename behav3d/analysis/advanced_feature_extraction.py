@@ -40,7 +40,6 @@ Key concepts:
 - active_killing_rate: Proportion of contact timepoints with active killing
 """
 
-import numpy as np
 import pandas as pd
 from pathlib import Path
 import time
@@ -708,8 +707,12 @@ def create_advanced_features_csv(
         print("No killing events to merge - returning original features with zero killing columns")
         return df
     
-    # Create a lookup key for merging
-    df["_merge_key"] = df["sample_name"].astype(str) + "_" + df["TrackID"].astype(str) + "_" + df["position_t"].astype(str)
+    # Create a lookup key for merging (vectorized approach)
+    df["_merge_key"] = (
+        df["sample_name"].astype(str) + "_" + 
+        df["TrackID"].astype(str) + "_" + 
+        df["position_t"].astype(str)
+    )
     
     df_killing_per_timepoint = df_killing_per_timepoint.copy()
     df_killing_per_timepoint["_merge_key"] = (
@@ -718,26 +721,27 @@ def create_advanced_features_csv(
         df_killing_per_timepoint["position_t"].astype(str)
     )
     
-    # Create lookup dictionary for fast assignment
-    killing_lookup = df_killing_per_timepoint.set_index("_merge_key")[
-        ["is_active_killing", "killing_efficiency", "death_signal_increase"]
-    ].to_dict("index")
+    # Handle potential duplicates (same immune cell, same timepoint, multiple contact events)
+    # Keep last to match original loop behavior which would overwrite with later values
+    df_killing_deduped = df_killing_per_timepoint.drop_duplicates(
+        subset=["_merge_key"], keep="last"
+    )
     
-    # Assign values from killing analysis
-    for key, values in killing_lookup.items():
-        mask = df["_merge_key"] == key
-        if mask.any():
-            df.loc[mask, "is_active_killing"] = values["is_active_killing"]
-            df.loc[mask, "killing_efficiency"] = values["killing_efficiency"]
-            df.loc[mask, f"death_signal_increase{window_suffix}"] = values["death_signal_increase"]
+    # Create indexed Series for vectorized lookup
+    killing_indexed = df_killing_deduped.set_index("_merge_key")[
+        ["is_active_killing", "killing_efficiency", "death_signal_increase"]
+    ]
+    
+    # Vectorized assignment using reindex - matches df's merge keys to killing data
+    matched_values = killing_indexed.reindex(df["_merge_key"])
+    
+    # Update columns - use where/fillna to preserve defaults for non-matches
+    df["is_active_killing"] = matched_values["is_active_killing"].fillna(False).astype(bool).values
+    df["killing_efficiency"] = matched_values["killing_efficiency"].fillna(0.0).values
+    df[f"death_signal_increase{window_suffix}"] = matched_values["death_signal_increase"].fillna(0.0).values
     
     # Clean up merge key
     df.drop(columns=["_merge_key"], inplace=True)
-    
-    # Ensure no NAs in killing columns - fill any remaining with defaults
-    df["is_active_killing"] = df["is_active_killing"].fillna(False).astype(bool)
-    df["killing_efficiency"] = df["killing_efficiency"].fillna(0.0)
-    df[f"death_signal_increase{window_suffix}"] = df[f"death_signal_increase{window_suffix}"].fillna(0.0)
     
     return df
 

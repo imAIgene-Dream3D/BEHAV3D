@@ -1504,13 +1504,13 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
                     output_dir=metadata_loader.output_dir
                 )
             except Exception:
-                import traceback; traceback.print_exc()
+                traceback.print_exc()
             finally:
                 metadata_loader.metadata = result
                 try:
                     metadata_loader.metadata.to_csv(metadata_loader.metadata_csv_path, index=False)
                 except Exception:
-                    import traceback; traceback.print_exc()
+                    traceback.print_exc()
                 print("Done ✅")
                 btn.disabled = False
                 spinner.layout.display = "none"  # hide spinner
@@ -2148,11 +2148,11 @@ class SignalUnmixingPanel:
                         self.metadata_loader.metadata = new_md
                         new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
                 except Exception:
-                    import traceback; traceback.print_exc()
+                    traceback.print_exc()
 
                 print("✅ Unmixing finished.", flush=True)
             except Exception:
-                import traceback; traceback.print_exc()
+                traceback.print_exc()
             finally:
                 self.spinner_unmix.layout.display = "none"
                 self._lock(False)
@@ -2300,7 +2300,7 @@ class SignalUnmixingPanel:
                             self.metadata_loader.metadata = metadata
                             metadata.to_csv(self.metadata_loader.metadata_csv_path, index=False)
                     except Exception:
-                        import traceback; traceback.print_exc()
+                        traceback.print_exc()
 
                 print(f"✅ Saved updated metadata")
             except Exception as e:
@@ -2778,7 +2778,7 @@ class PixelClassifierPanel:
                     print("✅ Training UI opened in Napari (use 'Close viewer' to close).", flush=True)
 
             except Exception:
-                import traceback; traceback.print_exc()
+                traceback.print_exc()
                 self.spinner_train.layout.display = "none"
                 self.close_button.layout.display = "none"
             finally:
@@ -2906,11 +2906,11 @@ class PixelClassifierPanel:
                         self.metadata_loader.metadata = new_md
                         new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
                 except Exception:
-                    import traceback; traceback.print_exc()
+                    traceback.print_exc()
 
                 print("✅ Apply finished.", flush=True)
             except Exception:
-                import traceback; traceback.print_exc()
+                traceback.print_exc()
             finally:
                 self.spinner_apply.layout.display = "none"
                 self._lock(False)
@@ -3310,7 +3310,7 @@ class TrackingPanel:
                 print("✅ Tracking finished.", flush=True)
 
             except Exception:
-                import traceback; traceback.print_exc()
+                traceback.print_exc()
             finally:
                 self.spinner_run.layout.display = "none"  # hide spinner
                 self._lock(False)
@@ -3702,7 +3702,7 @@ class FeatureExtractionPanel:
                 )
                 print("✅ Feature extraction finished.", flush=True)
             except Exception:
-                import traceback; traceback.print_exc()
+                traceback.print_exc()
             finally:
 
 
@@ -4405,7 +4405,6 @@ class TrackFilterPanel:
                 print(f"✅ {self.cell_type} filtering complete!")
                 
             except Exception:
-                import traceback
                 print(f"❌ Error while filtering {self.cell_type} tracks:")
                 traceback.print_exc()
             finally:
@@ -5058,7 +5057,6 @@ class MotileCellAnalysisPanel:
                 
                 filtered_csv_path = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
                 summarized_csv_path = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_summarized.csv")
-                advanced_csv_path = Path(active_killing_dir, f"BEHAV3D_{self.cell_type}_advanced_track_features.csv")
                 
                 # ENFORCE: Summarized CSV is REQUIRED for DTW analysis (clustering needs it)
                 if not summarized_csv_path.exists():
@@ -5118,7 +5116,6 @@ class MotileCellAnalysisPanel:
                 print(f"✅ {self.cell_type} analysis complete!")
                 
             except Exception:
-                import traceback
                 print(f"❌ Error while running {self.cell_type} analysis:")
                 traceback.print_exc()
             finally:
@@ -5279,7 +5276,6 @@ class DeathDynamicsPanel:
                     pass
                 
             except Exception:
-                import traceback
                 print(f"❌ Error while running {self.cell_type} death dynamics:")
                 traceback.print_exc()
             finally:
@@ -5543,7 +5539,6 @@ class InteractionAnalysisPanel:
     
     def _on_run_clicked(self, *_):
         """Run interaction analysis when button clicked"""
-        import traceback
         
         # First refresh to ensure we have latest data
         self._refresh_data_status()
@@ -6210,7 +6205,7 @@ class BackprojectionPanel:
                 print("✅ Backprojection finished (napari was launched inside the function).")
 
             except Exception:
-                import traceback; traceback.print_exc()
+                traceback.print_exc()
             finally:
                 try:
                     if patched:

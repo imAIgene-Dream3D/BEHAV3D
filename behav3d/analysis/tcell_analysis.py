@@ -48,6 +48,59 @@ import yaml
 import time
 import seaborn as sns
 # df_tracks=df_tracks[df_tracks["relative_time"]<=30]
+
+
+def _handle_nan_in_distance_matrix(distance_matrix, context="distance matrix"):
+    """
+    Handle NaN values in a distance matrix by replacing with maximum finite value.
+    
+    Parameters
+    ----------
+    distance_matrix : pd.DataFrame or np.ndarray
+        The distance matrix to check and fix
+    context : str
+        Description of where this matrix comes from (for logging)
+        
+    Returns
+    -------
+    pd.DataFrame or np.ndarray
+        The distance matrix with NaN values replaced
+        
+    Notes
+    -----
+    If all values are NaN, falls back to 0 and logs a serious data quality warning.
+    """
+    is_dataframe = isinstance(distance_matrix, pd.DataFrame)
+    
+    if is_dataframe:
+        nan_count = distance_matrix.isna().sum().sum()
+        if nan_count == 0:
+            return distance_matrix
+        
+        print(f"  ⚠️ Warning: {context} contains {nan_count} NaN values")
+        print(f"  → Replacing with maximum finite value")
+        
+        max_val = distance_matrix.max().max()
+        if pd.isna(max_val):
+            print(f"  ⚠️ Warning: All values in {context} are NaN.")
+            print("     → Falling back to 0 for all distances. Please check input data and DTW configuration.")
+            return distance_matrix.fillna(0)
+        return distance_matrix.fillna(max_val)
+    else:
+        # numpy array
+        if not np.isnan(distance_matrix).any():
+            return distance_matrix
+        
+        nan_count = np.isnan(distance_matrix).sum()
+        print(f"  ⚠️ Warning: {context} contains {nan_count} NaN values")
+        print(f"  → Replacing with maximum finite value")
+        
+        max_val = np.nanmax(distance_matrix)
+        if np.isnan(max_val):
+            print(f"  ⚠️ Warning: All values in {context} are NaN.")
+            print("     → Falling back to 0 for all distances. Please check input data and DTW configuration.")
+            return np.nan_to_num(distance_matrix, nan=0)
+        return np.nan_to_num(distance_matrix, nan=max_val)
     
 def run_tcell_analysis(
     config=None,
@@ -423,13 +476,10 @@ def calculate_dtw(
     dtw_distance_matrix = dtw_ndim.distance_matrix_fast(dtw_input_tracks)
     dtw_distance_matrix = pd.DataFrame(dtw_distance_matrix, index=dtw_rownames, columns=dtw_rownames)
     
-    # Check for NaN in resulting distance matrix
-    nan_in_matrix = dtw_distance_matrix.isna().sum().sum()
-    if nan_in_matrix > 0:
-        print(f"  ⚠️ Warning: DTW distance matrix contains {nan_in_matrix} NaN values")
-        print(f"  → Filling with maximum distance value")
-        max_val = dtw_distance_matrix.max().max()
-        dtw_distance_matrix = dtw_distance_matrix.fillna(max_val if not pd.isna(max_val) else 0)
+    # Check and handle NaN values in the distance matrix
+    dtw_distance_matrix = _handle_nan_in_distance_matrix(
+        dtw_distance_matrix, context="DTW distance matrix"
+    )
     
     return(dtw_distance_matrix)
 
@@ -623,12 +673,9 @@ def fit_umap(
     
     # Final safety check for NaN values in the distance matrix
     dtw_matrix_values = dtw_distance_matrix.values.copy()
-    if np.isnan(dtw_matrix_values).any():
-        nan_count = np.isnan(dtw_matrix_values).sum()
-        print(f"  ⚠️ Warning: Distance matrix still contains {nan_count} NaN values")
-        print(f"  → Replacing with maximum finite value")
-        max_val = np.nanmax(dtw_matrix_values)
-        dtw_matrix_values = np.nan_to_num(dtw_matrix_values, nan=max_val if not np.isnan(max_val) else 0)
+    dtw_matrix_values = _handle_nan_in_distance_matrix(
+        dtw_matrix_values, context="distance matrix (pre-UMAP)"
+    )
         
     umap_model = umap.UMAP(
         n_components=2, 
