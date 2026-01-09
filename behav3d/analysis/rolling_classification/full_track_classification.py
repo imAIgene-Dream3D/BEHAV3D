@@ -24,11 +24,11 @@ import seaborn as sns
 # import hdbscan
 
 from behav3d.utils.rolling_classification import *
-from behav3d.utils.rolling_classification.features import *
+from behav3d.utils.rolling_classification.clustering.state.features import *
 from behav3d.utils.rolling_classification.filtering import *
 from behav3d.utils.rolling_classification.clustering import *
-from behav3d.utils.rolling_classification.plotting import *
-from behav3d.utils.rolling_classification.videos import *
+from behav3d.utils.rolling_classification.clustering.plotting import *
+from behav3d.utils.rolling_classification.clustering.state.videos import *
 
 import numpy as np
 #%matplotlib inline
@@ -37,8 +37,8 @@ seed = 12345
 random.seed(seed)
 np.random.seed(seed)
 
-# ssd_dir = r"/Volumes/T7_Sam/"
-ssd_dir = r"F:/"
+ssd_dir = r"/Volumes/T7_Sam/"
+# ssd_dir = r"F:/"
 ssd_dir = Path(ssd_dir)
 outfolder = Path(ssd_dir, "BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
 adata_full = sc.read_h5ad(Path(outfolder,"adata_full.h5ad"))

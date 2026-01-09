@@ -88,6 +88,244 @@ def stratified_pick_examples(
     return pd.concat(selections, ignore_index=True)
 
 
+def create_max_projection_cutout(
+    df_window,
+    df_positions,
+    output_folder,
+    margin = 10,
+    pmin = 0,
+    pmax = 99.99,
+    mask_margin = False
+    ):
+    
+    sample_name = df_window["sample_name"]
+    start_t = int(df_window["window_start_position_t"])
+    end_t = int(df_window["window_end_position_t"])
+    
+    df_track = df_positions[
+        (df_positions["sample_name"] == sample_name) &
+        (df_positions["TrackID"] == df_window["TrackID"])
+    ]
+    
+    zarr_path = Path(output_folder, "images", sample_name, f"{sample_name}.zarr")
+    zarr = load_zarr(zarr_path)
+    T, C, Z, Y, X = zarr.shape
+    
+    p_img = np.asarray(zarr[-1])
+    percentiles = {}
+    for c in range(C):
+        ch = p_img[c]
+        lo = np.percentile(ch, pmin)
+        hi = np.percentile(ch, pmax)
+
+        if hi <= lo:
+            hi = lo + 1e-6  # avoid div0
+        percentiles[c] = (float(lo), float(hi))
+    
+    if mask_margin:
+        masked = np.zeros_like(zarr)
+        for t in range(start_t, end_t+1):
+            df_track_t = df_track[df_track["position_t"] == t]
+            pos_x = int(df_track_t["pixel_position_x"].values[0])
+            pos_y = int(df_track_t["pixel_position_y"].values[0])
+            pos_z = int(df_track_t["pixel_position_z"].values[0])
+            
+            x0 = max(0, pos_x - margin)
+            x1 = min(X, pos_x + margin + 1)
+            y0 = max(0, pos_y - margin)
+            y1 = min(Y, pos_y + margin + 1)
+            z0 = max(0, pos_z - margin)
+            z1 = min(Z, pos_z + margin + 1)
+            
+            masked[t, :, z0:z1, y0:y1, x0:x1] = zarr[t, :, z0:z1, y0:y1, x0:x1]
+    else:  
+        masked = zarr 
+    
+    z_min = int(df_track["pixel_position_z"].min())
+    z_max = int(df_track["pixel_position_z"].max())
+    y_min = int(df_track["pixel_position_y"].min())
+    y_max = int(df_track["pixel_position_y"].max())
+    x_min = int(df_track["pixel_position_x"].min())
+    x_max = int(df_track["pixel_position_x"].max())
+    
+    z_min = max(0, int(z_min - margin))
+    y_min = max(0, int(y_min - margin))
+    x_min = max(0, int(x_min - margin))
+
+    z_max = min(Z - 1, int(z_max + margin))
+    y_max = min(Y - 1, int(y_max + margin))
+    x_max = min(X - 1, int(x_max + margin))
+    
+    cropped_img = masked[
+        start_t:end_t,
+        :,
+        z_min:z_max,
+        y_min:y_max,
+        x_min:x_max
+        ]
+    
+    cropped_img = np.asarray(cropped_img)
+    xy_proj = calc_z_projection(cropped_img, z_axis=-3, projection='max')
+    xz_proj = calc_z_projection(cropped_img, z_axis=-2, projection='max')
+    yz_proj = calc_z_projection(cropped_img, z_axis=-1, projection='max')
+    
+    xy_proj_rgb = colorize_channels_to_rgb(xy_proj, percentiles=percentiles)
+    xz_proj_rgb = colorize_channels_to_rgb(xz_proj, percentiles=percentiles)
+    yz_proj_rgb = colorize_channels_to_rgb(yz_proj, percentiles=percentiles)
+    
+    return(xy_proj_rgb, xz_proj_rgb, yz_proj_rgb)
+
+def create_fulltrack_max_projection_stacks_with_track(
+    df_window,
+    df_positions,
+    output_folder,
+    margin=10,
+    pmin=0,
+    pmax=99,
+    mask_margin=False,
+    normalize_per_channel=True,
+):
+    """
+      * crops a fixed box that covers the *full track* (min/max over time + margin)
+      * computes per-time max-projection stacks (XY, XZ, YZ)
+      * returns 2D track coordinates in crop space for each projection so that
+        we can overlay the track on top of the max-projection videos.
+    """
+    sample_name = df_window["sample_name"]
+    start_t = int(df_window["window_start_position_t"])
+    end_t = int(df_window["window_end_position_t"])
+
+    # track over all times (we'll index into it per t)
+    df_track = df_positions[
+        (df_positions["sample_name"] == sample_name)
+        & (df_positions["TrackID"].astype(int) == int(df_window["TrackID"]))
+    ]
+
+    zarr_path = Path(output_folder, "images", sample_name, f"{sample_name}.zarr")
+    zarr = load_zarr(zarr_path)  # (T, C, Z, Y, X)
+    T, C, Z, Y, X = zarr.shape
+
+    # Normalize per channel from last timepoint like in create_max_projection_cutout
+    if normalize_per_channel:
+        p_img = np.asarray(zarr[-1])
+        percentiles = {}
+        for c in range(C):
+            ch = p_img[c]
+            lo = np.percentile(ch, pmin)
+            hi = np.percentile(ch, pmax)
+            hi_floor = 30000
+            hi = max(hi, hi_floor)
+            # hi = np.percentile(ch, pmax)
+            if hi <= lo:
+                hi = lo + 1e-6
+            percentiles[c] = (float(lo), float(hi))
+    else:
+        percentiles = None
+
+    # Optionally mask outside a small margin around the track before cropping
+    if mask_margin:
+        masked = np.zeros_like(zarr)
+        for t in range(start_t, end_t + 1):
+            df_track_t = df_track[df_track["position_t"] == t]
+            if len(df_track_t) == 0:
+                continue
+            pos_x = int(df_track_t["pixel_position_x"].values[0])
+            pos_y = int(df_track_t["pixel_position_y"].values[0])
+            pos_z = int(df_track_t["pixel_position_z"].values[0])
+
+            x0 = max(0, pos_x - margin)
+            x1 = min(X, pos_x + margin + 1)
+            y0 = max(0, pos_y - margin)
+            y1 = min(Y, pos_y + margin + 1)
+            z0 = max(0, pos_z - margin)
+            z1 = min(Z, pos_z + margin + 1)
+
+            masked[t, :, z0:z1, y0:y1, x0:x1] = zarr[t, :, z0:z1, y0:y1, x0:x1]
+    else:
+        masked = zarr
+
+        # Compute bounding box of the track *within the current time window*
+    df_track_window = df_track[
+        (df_track["position_t"] >= start_t) & (df_track["position_t"] <= end_t)
+    ]
+    if len(df_track_window) == 0:
+        # Fallback: use the full track if, for some reason, there are no
+        # detections inside the window.
+        df_bbox = df_track
+    else:
+        df_bbox = df_track_window
+        
+    z_min = int(df_bbox["pixel_position_z"].min())
+    z_max = int(df_bbox["pixel_position_z"].max())
+    y_min = int(df_bbox["pixel_position_y"].min())
+    y_max = int(df_bbox["pixel_position_y"].max())
+    x_min = int(df_bbox["pixel_position_x"].min())
+    x_max = int(df_bbox["pixel_position_x"].max())
+
+    # lower bounds: inclusive
+    z_min = max(0, int(z_min - margin))
+    y_min = max(0, int(y_min - margin))
+    x_min = max(0, int(x_min - margin))
+
+    # upper bounds: make them *exclusive* and clip to array size
+    z_max = min(Z, int(z_max + margin + 1))
+    y_max = min(Y, int(y_max + margin + 1))
+    x_max = min(X, int(x_max + margin + 1))
+
+    # Crop volumes over the time window, fixed spatial box
+# Crop volumes over the time window, fixed spatial box
+    cropped_img = masked[
+        start_t : end_t + 1,
+        :,
+        z_min:z_max,
+        y_min:y_max,
+        x_min:x_max,
+    ]
+    cropped_img = np.asarray(cropped_img)
+    # Shapes now: (T_window, C, Zc, Yc, Xc)
+    T_window = cropped_img.shape[0]
+
+    # Max-projections per time point
+    xy_proj = calc_z_projection(cropped_img, z_axis=-3, projection="max")  # (T_w, C, Yc, Xc)
+    xz_proj = calc_z_projection(cropped_img, z_axis=-2, projection="max")  # (T_w, C, Zc, Xc)
+    yz_proj = calc_z_projection(cropped_img, z_axis=-1, projection="max")  # (T_w, C, Zc, Yc)
+
+    xy_proj_rgb = colorize_channels_to_rgb(xy_proj, percentiles=percentiles)
+    xz_proj_rgb = colorize_channels_to_rgb(xz_proj, percentiles=percentiles)
+    yz_proj_rgb = colorize_channels_to_rgb(yz_proj, percentiles=percentiles)
+
+    # Build track coords in crop-space for each timepoint
+    track_xy = np.full((T_window, 2), np.nan, dtype=float)
+    track_xz = np.full((T_window, 2), np.nan, dtype=float)
+    track_yz = np.full((T_window, 2), np.nan, dtype=float)
+
+    for idx, t in enumerate(range(start_t, end_t + 1)):
+        df_t = df_track[df_track["position_t"] == t]
+        if len(df_t) == 0:
+            continue
+        pos_x = float(df_t["pixel_position_x"].values[0])
+        pos_y = float(df_t["pixel_position_y"].values[0])
+        pos_z = float(df_t["pixel_position_z"].values[0])
+
+        # local coords within the cropped box
+        x_local = pos_x - x_min
+        y_local = pos_y - y_min
+        z_local = pos_z - z_min
+
+        # XY projection: axes (Y, X)
+        track_xy[idx, 0] = x_local
+        track_xy[idx, 1] = y_local
+
+        # XZ projection: axes (Z, X)
+        track_xz[idx, 0] = x_local
+        track_xz[idx, 1] = z_local
+
+        # YZ projection: axes (Z, Y)
+        track_yz[idx, 0] = y_local
+        track_yz[idx, 1] = z_local
+
+    return xy_proj_rgb, xz_proj_rgb, yz_proj_rgb, track_xy, track_xz, track_yz
+
 def _pca_project_xyz(xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     PCA over 3D points (N,3). Returns (proj_2d, mean, components_3x3).

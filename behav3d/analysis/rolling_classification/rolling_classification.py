@@ -24,10 +24,10 @@ import seaborn as sns
 # import hdbscan
 
 from behav3d.utils.rolling_classification import *
-from behav3d.utils.rolling_classification.features import *
+from behav3d.utils.rolling_classification.clustering.state.features import *
 from behav3d.utils.rolling_classification.clustering import *
-from behav3d.utils.rolling_classification.plotting import *
-from behav3d.utils.rolling_classification.videos import *
+from behav3d.utils.rolling_classification.clustering.plotting import *
+from behav3d.utils.rolling_classification.clustering.state.videos import *
 # %matplotlib inline
 
 import time
