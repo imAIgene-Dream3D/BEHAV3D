@@ -286,7 +286,16 @@ def run_feature_extraction(
                     if pd.notna(sample_metadata[col]):
                         other_segments_paths[other_type] = sample_metadata[col]
 
-        dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+        # Old: Construct dead_mask_path from output directory (kept for reference)
+        # dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+        
+        # New: Read dead_mask_path from metadata (if it exists)
+        dead_mask_path = None
+        if 'dead_mask_path' in sample_metadata.index and pd.notna(sample_metadata['dead_mask_path']):
+            dead_mask_path = Path(sample_metadata['dead_mask_path'])
+            if not dead_mask_path.exists():
+                print(f"⚠️ Warning: dead_mask_path in metadata does not exist: {dead_mask_path}")
+                dead_mask_path = None
         
         print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
         current_cell_segments_path, raw_image_path = convert_input_files_to_zarr(
@@ -474,8 +483,10 @@ def calculate_image_based_track_features(
     segments = load_image(current_cell_segments_path)
     segments_path = current_cell_segments_path
     
-    # Load dead mask
-    dead_mask = load_image(dead_mask_path)
+    # Load dead mask (only if path is provided)
+    dead_mask = None
+    if dead_mask_path is not None:
+        dead_mask = load_image(dead_mask_path)
     
     # Load all organoid types' segments (for contact calculation)
     organoid_segments_dict = {}
@@ -572,7 +583,7 @@ def calculate_image_based_track_features(
         print(f"{get_current_time()} - Skipping intensity features as not requested in features_choice")
     
     if "death" in features_choice:
-        if dead_channel is not None and pd.notna(dead_channel):
+        if dead_channel is not None and pd.notna(dead_channel) and dead_mask is not None:
             print(f"{get_current_time()} - Calculating number of dead mask pixels...")
             if df_dead_mask_outpath.exists() and not overwrite:
                 print("Dead mask calculation .csv already exists. Loading in dead mask calculation information...")
@@ -586,7 +597,10 @@ def calculate_image_based_track_features(
                     df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
             df_tracks = pd.merge(df_tracks, df_dead_mask, how="left")
         else:
-            print(f"{get_current_time()} - Skipping death mask calculations: no dead_channel specified in metadata")
+            if dead_mask is None and dead_channel is not None:
+                print(f"{get_current_time()} - Skipping death mask calculations: dead_mask_path not found in metadata or file doesn't exist")
+            else:
+                print(f"{get_current_time()} - Skipping death mask calculations: no dead_channel specified in metadata")
     else:
         print(f"{get_current_time()} - Skipping dead mask calculations as not requested in features_choice")
         
@@ -675,6 +689,14 @@ def calculate_active_contact_features(df_tracks, cell_type):
     touching_col = f'touching_{cell_type}s'
     contact_col = f'{cell_type}_contact'
     active_contact_col = f'active_{cell_type}_contact'
+    
+    # Check if mean_speed column exists (requires movement features to be calculated first)
+    if 'mean_speed' not in df_tracks.columns:
+        print(f"{get_current_time()} - Warning: 'mean_speed' column not found. Skipping active contact calculation.")
+        print(f"    Make sure 'movement' is included in features_choice to enable active contact detection.")
+        # Set all active contacts to False since we can't determine activity without speed
+        df_tracks[active_contact_col] = False
+        return df_tracks
     
     print(f"{get_current_time()} - Determining active contact of {cell_type}")
 
@@ -842,6 +864,17 @@ def interpolate_missing_positions(
     if cols_to_copy is None:
         cols_to_copy = ["sample_name", "TrackID", "distance_unit", "time_unit", "orientation_vector", "principal_axes"]
         
+        # Add metadata string columns that should be forward-filled, not interpolated
+        for col in df_tracks.columns:
+            # Add line_condition columns (organoid1_line_condition, tcell_line_condition, etc.)
+            if col.endswith('_line_condition'):
+                if col not in cols_to_copy:
+                    cols_to_copy.append(col)
+            # Add well and exp_nr columns
+            if col in ['well', 'exp_nr']:
+                if col not in cols_to_copy:
+                    cols_to_copy.append(col)
+        
         # Add all dynamically-generated contact columns
         for col in df_tracks.columns:
             if (col.endswith('_contact') or 
@@ -855,6 +888,10 @@ def interpolate_missing_positions(
         # Select all columns that are not in cols_to_copy
         cols_to_interpolate = df_tracks.columns.difference(cols_to_copy).tolist()
         cols_to_interpolate = [col for col in cols_to_interpolate if col not in col_to_none]
+    
+    # Filter to only numeric columns - np.interp cannot handle object/string dtypes
+    numeric_cols = df_tracks.select_dtypes(include=[np.number]).columns.tolist()
+    cols_to_interpolate = [col for col in cols_to_interpolate if col in numeric_cols]
      
     grouped_df = df_tracks.groupby('TrackID')
     def interpolate_group(group, cols_to_interpolate, cols_to_copy):
