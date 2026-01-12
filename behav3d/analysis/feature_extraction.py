@@ -929,16 +929,12 @@ def interpolate_missing_positions(
 def calculate_movement_features(
     df_tracks, 
     time_interval,
-    rolling_meanspeed_window=10
+    rolling_meanspeed_window=5
     ):
     """
     Calculates various movement features for each timepoint of a track
     """
-    ## Convert the coordinates to time series
-    
-    #TODO Angleness/directionality: How much does it move in a single direction
-    # Calculate by calcualting standard deviation of angle changes ?
-    
+
     def calculate_displacement(track_coordinates):
         """calculate the displacement per timepoint compared to previous timepoint"""
         track_relative_pos = np.diff(track_coordinates,axis=0,prepend=track_coordinates[[0]])
@@ -956,6 +952,28 @@ def calculate_movement_features(
             msd_values[i] = np.mean(squared_displacements)
         return msd_values
     
+    def calculate_directional_persistence(track_coordinates, eps=1e-12):
+        """
+        Calculate directional persistence per timepoint compared to previous timepoint
+        """
+        steps = np.diff(track_coordinates, axis=0, prepend=track_coordinates[[0]])
+        step_norms = np.apply_along_axis(np.linalg.norm, 1, steps)
+
+        N = len(track_coordinates)
+        persistence = np.zeros(N, dtype=float)
+
+        # persistence needs previous step, so start at t=2
+        for t in range(2, N):
+            a = steps[t-1]
+            b = steps[t]
+            denom = step_norms[t-1] * step_norms[t]
+            if denom > eps:
+                persistence[t] = np.dot(a, b) / denom
+            else:
+                persistence[t] = 0.0
+        persistence = np.clip(persistence, -1.0, 1.0)
+        return persistence
+    
     ## split by unique trackID2 and process
     df_tracks_processed = []
     for track in df_tracks['TrackID'].unique():
@@ -969,14 +987,17 @@ def calculate_movement_features(
         displacement_from_origin = calculate_displacement_from_origin(track_array_rel)
         cumulative_displacement = np.cumsum(displacement, axis = 0)
         mean_square_displacement=compute_MSD(track_array_rel)
+        directional_persistence = calculate_directional_persistence(track_array_rel)
 
         # combine
         df_computed = pd.DataFrame({
             'displacement': displacement, 
             'cumulative_displacement': cumulative_displacement, 
             'displacement_from_origin': displacement_from_origin, 
-            'mean_square_displacement':mean_square_displacement
+            'mean_square_displacement':mean_square_displacement,
+            'directional_persistence':directional_persistence
             })
+        
         df_result= pd.concat([df_track_pos,df_computed], axis=1)
         df_result = pd.concat([df_result, df_track[["position_t", "SegmentID", "TrackID"]]], axis=1)
 
@@ -1582,7 +1603,7 @@ def _calculate_morphology_single_timepoint(args):
         properties["axis3_length"] = axis_length_c_list
         properties["oblateness"] = oblateness_list
         properties["prolateness"] = prolateness_list
-        properties["principal_axes"] = principal_axes_list  # columns: a,b,c
+        # properties["principal_axes"] = principal_axes_list  # columns: a,b,c
 
     # ---- FIXED ORIENTATION COMPUTATION (O(R) instead of O(R^2)) ----
     tensor_columns = [f"inertia_tensor-{i}-{j}" for i in range(3) for j in range(3)]
