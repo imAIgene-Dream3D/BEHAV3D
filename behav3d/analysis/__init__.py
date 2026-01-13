@@ -20,6 +20,12 @@ from .organoid_analysis import (
     run_organoid_analysis
 )
 
+# Import interaction analysis (organoid POV: cumulative contacts, survival comparison)
+from .interaction_analysis import (
+    run_interaction_analysis,
+    calculate_interaction_stats
+)
+
 def summarize_track_features(
     config=None,
     output_dir=None,

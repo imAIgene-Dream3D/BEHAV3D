@@ -39,7 +39,51 @@ import gc
 
 ## TODO create a function for BEHAV3D notebook
 
+def calculate_image_features(
+    image,
+    intensity=True,
+    edges=True,
+    texture=False,
+    # sigma_min=sigma_min,
+    sigma_max=16,
+    channel_axis=0,
+    ):
+    """
+    Calculate multiscale basic features for a given image.
+    Possible to save as a joblib and load later
+    """
+    img = np.asarray(image)
+    orig_shape = img.shape
+    ndim = img.ndim
+    
+    # Identify spatial axes (everything except channel_axis)
+    if channel_axis is None:
+        spatial_axes = list(range(ndim))
+    else:
+        spatial_axes = [ax for ax in range(ndim) if ax != channel_axis]
+    
+    # If image is 2D, squeeze pseudo-3D-axis
+    squeeze_axes = [ax for ax in spatial_axes if orig_shape[ax] == 1]
+    if squeeze_axes:
+        img_squeezed = np.squeeze(img, axis=tuple(squeeze_axes))
+    else:
+        img_squeezed = img
+        
+    feats = features_func(
+        img_squeezed,
+        intensity=intensity,
+        edges=edges,
+        texture=texture,
+        channel_axis=channel_axis,
+        sigma_max=sigma_max,
+        )
+    
+    n_features = feats.shape[-1]
+    orig_spatial_shape = [orig_shape[ax] for ax in spatial_axes]
+    feats_restored = feats.reshape((*orig_spatial_shape, n_features))
+    return feats_restored
 
+sigma_min = 1
 sigma_max = 16
 features_func = partial(
         feature.multiscale_basic_features,
@@ -394,8 +438,8 @@ def train_pixel_classifier(
         Dynamic segmentation function that handles different cell types.
         EDT thresholds are passed as kwargs
         """
-        print("✅ segment_and_update() called!")  # Debug
-        print(f"Received EDT thresholds: {edt_thresholds}")  # Debug
+        print("segment_and_update() called!")
+        print(f"Received EDT thresholds: {edt_thresholds}")
         start_time = time.time()
         log("###### Running Segmentation\n")
         log(f"EDT Thresholds: {edt_thresholds}\n")
@@ -404,7 +448,7 @@ def train_pixel_classifier(
         # Access the label layer and feature image
         image_data = all_images  # Use the original all_images data
         
-        # === Save user labels for all cell types ===
+        # Save user labels for all cell types
         cell_type_labels = {}  # Store {cell_type: label_data}
         
         # Save death labels (only if present)
@@ -459,7 +503,7 @@ def train_pixel_classifier(
             clf = future.fit_segmenter(selected_labels, selected_features, clf)
             return clf
         
-        # === Train classifiers for all cell types ===
+        # Train classifiers for all cell types
         classifiers = {}  # Store {cell_type: classifier}
         clf_death = None  # Initialize to None
         
@@ -487,7 +531,7 @@ def train_pixel_classifier(
                 QApplication.processEvents()
         
         
-        # === Apply classifiers to predict pixels ===
+        # Apply classifiers to predict pixels
         pred_masks = {}  # Store {cell_type: predicted_mask}
         
         # Define prediction paths
@@ -509,8 +553,14 @@ def train_pixel_classifier(
             if has_death:
                 log("\n### Predicting Death Pixels")
                 QApplication.processEvents()
+                log("   Starting apply_classifier for death...")
+                QApplication.processEvents()
                 pred_death_mask = apply_classifier(clf_death, features_outpath, pred_death_labels_outpath, n_workers=n_workers)
+                log("    Death prediction finished!")
+                QApplication.processEvents()
                 viewer.layers["Pixel Classification (Dead)"].data = pred_death_mask
+                log("    Death layer updated!")
+                QApplication.processEvents()
             else:
                 log("\n### Skipping death prediction (no dead channel)")
                 QApplication.processEvents()
@@ -541,7 +591,7 @@ def train_pixel_classifier(
                 viewer.layers[f"Pixel Classification ({cell_type.capitalize()})"].data = pred_mask
                 pred_masks[cell_type] = pred_mask
             
-        # === Segment instances for all cell types ===
+        # Segment instances for all cell types
         log("\n### Segment Cell Instances")
         QApplication.processEvents()
         
@@ -554,37 +604,61 @@ def train_pixel_classifier(
             QApplication.processEvents()
             
             pred_mask = pred_masks[cell_type]
+            n_timepoints = pred_mask.shape[0]
+            log(f"   Processing {n_timepoints} timepoints...")
+            log(f"   Mask shape: {pred_mask.shape}")
+            QApplication.processEvents()
             
             # Segment each timepoint
             segmented_timepoints = []
-            for t_idx in range(pred_mask.shape[0]):
+            for t_idx in range(n_timepoints):
+                log(f"   [T{t_idx+1}] Loading mask...")
+                QApplication.processEvents()
                 mask_t = pred_mask[t_idx]
                 # Remove background (label 1), keep only foreground (label 2)
                 mask_t = (mask_t == 2).astype(np.uint8)
+                fg_pixels = mask_t.sum()
+                log(f"   [T{t_idx+1}] Foreground pixels: {fg_pixels}")
+                QApplication.processEvents()
                 
                 # Apply watershed segmentation with EDT
-                if mask_t.sum() > 0:
+                if fg_pixels > 0:
+                    log(f"   [T{t_idx+1}] Computing EDT...")
+                    QApplication.processEvents()
                     # Distance transform
                     distance = ndimage.distance_transform_edt(mask_t)
+                    log(f"   [T{t_idx+1}] Finding local maxima...")
+                    QApplication.processEvents()
                     # Find peaks above threshold
                     local_max = distance > edt_threshold
-                    markers = label(local_max)
+                    log(f"   [T{t_idx+1}] Labeling markers (local_max pixels: {local_max.sum()})...")
+                    QApplication.processEvents()
+                    markers, num_markers = ndimage.label(local_max)
+                    log(f"   [T{t_idx+1}] Found {num_markers} markers")
+                    log(f"   [T{t_idx+1}] Running watershed...")
+                    QApplication.processEvents()
                     # Watershed
                     segmented = watershed(-distance, markers, mask=mask_t)
+                    log(f"   [T{t_idx+1}] Done!")
+                    QApplication.processEvents()
                 else:
                     segmented = np.zeros_like(mask_t, dtype=np.int32)
+                    log(f"   [T{t_idx+1}] Empty mask, skipped")
+                    QApplication.processEvents()
                 
                 segmented_timepoints.append(segmented)
             
             full_seg = np.stack(segmented_timepoints, axis=0)
             segmented_cells[cell_type] = full_seg
+            log(f"   {cell_type.capitalize()} segmentation complete!")
+            QApplication.processEvents()
             viewer.layers[f"{cell_type.capitalize()} Segments"].data = full_seg
-            
+        
         # Save images
-            image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
-            save_as_zarr(image_data, image_outpath)
-            
-            log(f"\n###### DONE time elapsed: {time.time() - start_time:.2f} s")
+        image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
+        save_as_zarr(image_data, image_outpath)
+        
+        log(f"\n###### DONE time elapsed: {time.time() - start_time:.2f} s")
     
     def save_pixel_classification(log=print):
         """Save all user-provided labels for all cell types"""
@@ -603,7 +677,7 @@ def train_pixel_classifier(
             save_as_zarr(label_layer.data, labels_outpath)
             log(f"Saved {cell_type} labels to: {labels_outpath}")
         
-        log("✅ All user labels saved!")
+        log("All user labels saved!")
             
     # Create Napari viewer
     viewer = napari.Viewer()
@@ -620,11 +694,11 @@ def train_pixel_classifier(
         channel_data = all_images[ch]  # Shape: (time, z, y, x)
         
         # Flatten and filter out zero pixels
-        flat_vals = channel_data.reshape(-1)
+        flat_vals = np.asarray(channel_data).reshape(-1)
         nonzero_vals = flat_vals[flat_vals > 0]
 
         if nonzero_vals.size > 0:
-            channel_percentile = float(np.percentile(nonzero_vals, 99))
+            channel_percentile = float(np.percentile(nonzero_vals, 99.8))
             contrast_limits = (0, channel_percentile)
         else:
             print(f"⚠️ Channel {ch} appears empty. Using fallback contrast limits.")
@@ -642,9 +716,9 @@ def train_pixel_classifier(
             colormap=channel_colors[ch] if ch < len(channel_colors) else 'gray',
             blending='additive'  # This allows channels to blend together
         )
-        img_layer.contrast_limits_range = (0, channel_data.max())
+        img_layer.contrast_limits_range = (0, float(channel_data.max()))
 
-    # ==== DYNAMIC LAYER CREATION FOR ALL CELL TYPES ====
+    # DYNAMIC LAYER CREATION FOR ALL CELL TYPES
     # Create user label layers and predicted label layers for each detected cell type
     user_layers = {}
     pixelclass_layers = {}
@@ -1258,6 +1332,12 @@ def run_pixel_classifier_segmentation(
             
             path_col = f'{prefix}_{cell_type}_segments_image_path'
             metadata.at[idx, path_col] = str(segments_outpaths[cell_type])
+        
+        # Update dead_mask_path in metadata if death channel is present AND column exists
+        if has_death and 'dead_mask_path' in metadata.columns and death_mask_outpath.exists():
+            metadata['dead_mask_path'] = metadata['dead_mask_path'].astype('object')
+            metadata.at[idx, 'dead_mask_path'] = str(death_mask_outpath)
+            print(f"  Updated dead_mask_path: {death_mask_outpath}")
         
         print(f"  Sample {sample_name} completed in {time.time() - start_time:.1f}s")
     

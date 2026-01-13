@@ -286,7 +286,16 @@ def run_feature_extraction(
                     if pd.notna(sample_metadata[col]):
                         other_segments_paths[other_type] = sample_metadata[col]
 
-        dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+        # Old: Construct dead_mask_path from output directory (kept for reference)
+        # dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+        
+        # New: Read dead_mask_path from metadata (if it exists)
+        dead_mask_path = None
+        if 'dead_mask_path' in sample_metadata.index and pd.notna(sample_metadata['dead_mask_path']):
+            dead_mask_path = Path(sample_metadata['dead_mask_path'])
+            if not dead_mask_path.exists():
+                print(f"⚠️ Warning: dead_mask_path in metadata does not exist: {dead_mask_path}")
+                dead_mask_path = None
         
         print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
         current_cell_segments_path, raw_image_path = convert_input_files_to_zarr(
@@ -474,8 +483,10 @@ def calculate_image_based_track_features(
     segments = load_image(current_cell_segments_path)
     segments_path = current_cell_segments_path
     
-    # Load dead mask
-    dead_mask = load_image(dead_mask_path)
+    # Load dead mask (only if path is provided)
+    dead_mask = None
+    if dead_mask_path is not None:
+        dead_mask = load_image(dead_mask_path)
     
     # Load all organoid types' segments (for contact calculation)
     organoid_segments_dict = {}
@@ -505,6 +516,11 @@ def calculate_image_based_track_features(
             "equivalent_diameter": float,
             "major_axis_length": float,
             "minor_axis_length": float,
+            "axis1_length": float,
+            "axis2_length": float,
+            "axis3_length": float,
+            "oblateness": float,
+            "prolateness": float,
             "surface_area": float,
             "sphericity": float,
             "convex_volume": float,
@@ -567,7 +583,7 @@ def calculate_image_based_track_features(
         print(f"{get_current_time()} - Skipping intensity features as not requested in features_choice")
     
     if "death" in features_choice:
-        if dead_channel is not None and pd.notna(dead_channel):
+        if dead_channel is not None and pd.notna(dead_channel) and dead_mask is not None:
             print(f"{get_current_time()} - Calculating number of dead mask pixels...")
             if df_dead_mask_outpath.exists() and not overwrite:
                 print("Dead mask calculation .csv already exists. Loading in dead mask calculation information...")
@@ -581,7 +597,10 @@ def calculate_image_based_track_features(
                     df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
             df_tracks = pd.merge(df_tracks, df_dead_mask, how="left")
         else:
-            print(f"{get_current_time()} - Skipping death mask calculations: no dead_channel specified in metadata")
+            if dead_mask is None and dead_channel is not None:
+                print(f"{get_current_time()} - Skipping death mask calculations: dead_mask_path not found in metadata or file doesn't exist")
+            else:
+                print(f"{get_current_time()} - Skipping death mask calculations: no dead_channel specified in metadata")
     else:
         print(f"{get_current_time()} - Skipping dead mask calculations as not requested in features_choice")
         
@@ -670,6 +689,14 @@ def calculate_active_contact_features(df_tracks, cell_type):
     touching_col = f'touching_{cell_type}s'
     contact_col = f'{cell_type}_contact'
     active_contact_col = f'active_{cell_type}_contact'
+    
+    # Check if mean_speed column exists (requires movement features to be calculated first)
+    if 'mean_speed' not in df_tracks.columns:
+        print(f"{get_current_time()} - Warning: 'mean_speed' column not found. Skipping active contact calculation.")
+        print(f"    Make sure 'movement' is included in features_choice to enable active contact detection.")
+        # Set all active contacts to False since we can't determine activity without speed
+        df_tracks[active_contact_col] = False
+        return df_tracks
     
     print(f"{get_current_time()} - Determining active contact of {cell_type}")
 
@@ -835,7 +862,18 @@ def interpolate_missing_positions(
     
     # Auto-detect contact columns if not specified
     if cols_to_copy is None:
-        cols_to_copy = ["sample_name", "TrackID", "distance_unit", "time_unit", "orientation_vector"]
+        cols_to_copy = ["sample_name", "TrackID", "distance_unit", "time_unit", "orientation_vector", "principal_axes"]
+        
+        # Add metadata string columns that should be forward-filled, not interpolated
+        for col in df_tracks.columns:
+            # Add line_condition columns (organoid1_line_condition, tcell_line_condition, etc.)
+            if col.endswith('_line_condition'):
+                if col not in cols_to_copy:
+                    cols_to_copy.append(col)
+            # Add well and exp_nr columns
+            if col in ['well', 'exp_nr']:
+                if col not in cols_to_copy:
+                    cols_to_copy.append(col)
         
         # Add all dynamically-generated contact columns
         for col in df_tracks.columns:
@@ -850,6 +888,10 @@ def interpolate_missing_positions(
         # Select all columns that are not in cols_to_copy
         cols_to_interpolate = df_tracks.columns.difference(cols_to_copy).tolist()
         cols_to_interpolate = [col for col in cols_to_interpolate if col not in col_to_none]
+    
+    # Filter to only numeric columns - np.interp cannot handle object/string dtypes
+    numeric_cols = df_tracks.select_dtypes(include=[np.number]).columns.tolist()
+    cols_to_interpolate = [col for col in cols_to_interpolate if col in numeric_cols]
      
     grouped_df = df_tracks.groupby('TrackID')
     def interpolate_group(group, cols_to_interpolate, cols_to_copy):
@@ -887,16 +929,12 @@ def interpolate_missing_positions(
 def calculate_movement_features(
     df_tracks, 
     time_interval,
-    rolling_meanspeed_window=10
+    rolling_meanspeed_window=5
     ):
     """
     Calculates various movement features for each timepoint of a track
     """
-    ## Convert the coordinates to time series
-    
-    #TODO Angleness/directionality: How much does it move in a single direction
-    # Calculate by calcualting standard deviation of angle changes ?
-    
+
     def calculate_displacement(track_coordinates):
         """calculate the displacement per timepoint compared to previous timepoint"""
         track_relative_pos = np.diff(track_coordinates,axis=0,prepend=track_coordinates[[0]])
@@ -914,6 +952,28 @@ def calculate_movement_features(
             msd_values[i] = np.mean(squared_displacements)
         return msd_values
     
+    def calculate_directional_persistence(track_coordinates, eps=1e-12):
+        """
+        Calculate directional persistence per timepoint compared to previous timepoint
+        """
+        steps = np.diff(track_coordinates, axis=0, prepend=track_coordinates[[0]])
+        step_norms = np.apply_along_axis(np.linalg.norm, 1, steps)
+
+        N = len(track_coordinates)
+        persistence = np.zeros(N, dtype=float)
+
+        # persistence needs previous step, so start at t=2
+        for t in range(2, N):
+            a = steps[t-1]
+            b = steps[t]
+            denom = step_norms[t-1] * step_norms[t]
+            if denom > eps:
+                persistence[t] = np.dot(a, b) / denom
+            else:
+                persistence[t] = 0.0
+        persistence = np.clip(persistence, -1.0, 1.0)
+        return persistence
+    
     ## split by unique trackID2 and process
     df_tracks_processed = []
     for track in df_tracks['TrackID'].unique():
@@ -927,14 +987,17 @@ def calculate_movement_features(
         displacement_from_origin = calculate_displacement_from_origin(track_array_rel)
         cumulative_displacement = np.cumsum(displacement, axis = 0)
         mean_square_displacement=compute_MSD(track_array_rel)
+        directional_persistence = calculate_directional_persistence(track_array_rel)
 
         # combine
         df_computed = pd.DataFrame({
             'displacement': displacement, 
             'cumulative_displacement': cumulative_displacement, 
             'displacement_from_origin': displacement_from_origin, 
-            'mean_square_displacement':mean_square_displacement
+            'mean_square_displacement':mean_square_displacement,
+            'directional_persistence':directional_persistence
             })
+        
         df_result= pd.concat([df_track_pos,df_computed], axis=1)
         df_result = pd.concat([df_result, df_track[["position_t", "SegmentID", "TrackID"]]], axis=1)
 
@@ -1376,7 +1439,28 @@ def calculate_basic_morphology(segments_path, voxel_spacing=(1.0, 1.0, 1.0), n_w
     return pd.concat(results, ignore_index=True)
 
 def _calculate_morphology_single_timepoint(args):
-    """Helper function to compute morphology features for a single timepoint """
+    """
+    Function to compute morphology features for a single timepoint 
+    
+    Features calculated:
+    - volume
+    - bbox_volume
+    - extent
+    - solidity
+    - equivalent_diameter
+    - major_axis_length
+    - minor_axis_length
+    - elongation
+    - surface_area
+    - sphericity
+    - convex_volume
+    - orientation_vector
+    - oblateness
+    - axis_length_a
+    - axis_length_b
+    - axis_length_c
+    
+    """
     t, segments_path, voxel_spacing = args
     segments = load_image(segments_path)
     stack = np.asarray(segments[t])
@@ -1418,6 +1502,14 @@ def _calculate_morphology_single_timepoint(args):
         sphericities = []
         convex_volumes = []
 
+        # NEW: principal-axis lengths & ellipticity (3D)
+        axis_length_a_list = []
+        axis_length_b_list = []
+        axis_length_c_list = []
+        oblateness_list = []
+        prolateness_list = []
+        principal_axes_list = []  # each entry is 3x3, columns are unit vectors for a,b,c
+
         for region_label in properties["TrackID"]:
             mask = (stack == region_label)
             coords = np.argwhere(mask)
@@ -1453,6 +1545,50 @@ def _calculate_morphology_single_timepoint(args):
 
             convex_volumes.append(convex_volume)
 
+            if coords.shape[0] >= 3:
+                try:
+                    pts = coords.astype(float) * np.array(voxel_spacing, dtype=float)  # (N,3)
+                    center = pts.mean(axis=0, keepdims=True)
+                    X = pts - center
+
+                    # SVD gives principal directions; Vt rows are unit vectors
+                    U, S, Vt = np.linalg.svd(X, full_matrices=False)
+                    V = Vt.T  # (3,3) columns are principal directions
+
+                    # Project onto principal directions and get extent along each
+                    proj = X @ V  # (N,3)
+                    lengths = np.ptp(proj, axis=0)  # full lengths along each axis (a',b',c')
+
+                    # Order by descending length: a >= b >= c
+                    order = np.argsort(lengths)[::-1]
+                    a, b, c = lengths[order]
+                    V_sorted = V[:, order]  # columns aligned with (a,b,c)
+
+                    # Oblate and prolate ellipticity
+                    e_ob = 1 - (c / a) if a > 0 else np.nan
+                    e_pro = 1 - (b / a) if a > 0 else np.nan
+                    
+                    axis_length_a_list.append(a)
+                    axis_length_b_list.append(b)
+                    axis_length_c_list.append(c)
+                    oblateness_list.append(e_ob)
+                    prolateness_list.append(e_pro)
+                    principal_axes_list.append(V_sorted.tolist())
+                except Exception:
+                    axis_length_a_list.append(np.nan)
+                    axis_length_b_list.append(np.nan)
+                    axis_length_c_list.append(np.nan)
+                    oblateness_list.append(np.nan)
+                    prolateness_list.append(np.nan)
+                    principal_axes_list.append([[np.nan, np.nan, np.nan]] * 3)
+            else:
+                axis_length_a_list.append(np.nan)
+                axis_length_b_list.append(np.nan)
+                axis_length_c_list.append(np.nan)
+                oblateness_list.append(np.nan)
+                principal_axes_list.append([[np.nan, np.nan, np.nan]] * 3)
+            # ----------------------------------------------------------------
+
         properties["surface_area"] = surface_areas
         properties["sphericity"] = sphericities
         properties["convex_volume"] = convex_volumes
@@ -1460,6 +1596,14 @@ def _calculate_morphology_single_timepoint(args):
         # Guard against divide-by-zero in solidity calculation
         with np.errstate(divide='ignore', invalid='ignore'):
             properties["solidity"] = properties["volume"] / properties["convex_volume"]
+            properties["surfrace_to_volume_ratio"] = properties["surface_area"] / properties["volume"]
+        # Attach NEW principal-axis results
+        properties["axis1_length"] = axis_length_a_list
+        properties["axis2_length"] = axis_length_b_list
+        properties["axis3_length"] = axis_length_c_list
+        properties["oblateness"] = oblateness_list
+        properties["prolateness"] = prolateness_list
+        # properties["principal_axes"] = principal_axes_list  # columns: a,b,c
 
     # ---- FIXED ORIENTATION COMPUTATION (O(R) instead of O(R^2)) ----
     tensor_columns = [f"inertia_tensor-{i}-{j}" for i in range(3) for j in range(3)]

@@ -23,8 +23,9 @@ def run_organoid_analysis(
     dead_perc_threshold,
     config=None,
     output_dir=None,
+    metadata=None,
     df_tracks_path=None,
-    org_type="organoid",  # This parameter already supports custom cell types!
+    org_type="organoid",
     # df_tracks_summarized_path=None,
     ):
     print(f"--------------- Performing {org_type} Death Dynamics analysis ---------------")
@@ -61,6 +62,23 @@ def run_organoid_analysis(
     df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
     df_tracks["TrackID"] = df_tracks["TrackID"].astype(str)
     
+    # Check if dead channel data exists in tracks
+    dead_columns = ["nr_dead_mask_pixels", "percentage_dead_mask", "mean_dead_dye"]
+    has_dead_data = all(col in df_tracks.columns for col in dead_columns)
+    
+    if not has_dead_data:
+        print(f"\n⚠️  WARNING: Dead channel data not found in features.")
+        print(f"   Missing columns: {[col for col in dead_columns if col not in df_tracks.columns]}")
+        print(f"   To run death dynamics analysis, enable dead_channel in MetadataBuilder before running feature extraction.")
+        print(f"   Skipping death dynamics analysis.\n")
+        
+        # Cannot run death dynamics analysis without dead channel data
+        end_time = time.time()
+        h,m,s = format_time(start_time, end_time)
+        print(f"### DONE (no death data) - elapsed time: {h}:{m:02}:{s:02}\n")
+        return
+    
+    # death analysis (only runs if has_dead_data)
     df_tracks["smoothed_nr_dead_mask_pixels"] = smooth_value_over_time(
             df_tracks, 
             column="nr_dead_mask_pixels", 
@@ -194,7 +212,39 @@ def run_organoid_analysis(
     
         raw_img_path = Path(img_outdir, f"{sample_name}.zarr")
         organoid_seg_path = Path(img_outdir, f"{sample_name}_{org_type}_tracked.zarr")
-        dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+        
+        # Get dead_mask_path from metadata
+        # only runs if has_dead_data=True, so dead_channel must exist
+        dead_mask_path = None
+        
+        if metadata is not None:
+            sample_metadata = metadata[metadata['sample_name'] == sample_name]
+            if not sample_metadata.empty:
+                # dead_mask_path directly from metadata
+                if 'dead_mask_path' in sample_metadata.columns:
+                    mask_path_val = sample_metadata['dead_mask_path'].values[0]
+                    if pd.notna(mask_path_val) and str(mask_path_val).strip():
+                        dead_mask_path = Path(mask_path_val)
+                        if dead_mask_path.exists():
+                            print(f"  Using dead_mask_path from metadata: {dead_mask_path}")
+                        else:
+                            print(f"  ⚠️  dead_mask_path in metadata does not exist: {dead_mask_path}")
+                            dead_mask_path = None
+        
+        # Fallback: construct path if not found in metadata
+        if dead_mask_path is None:
+            fallback_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+            if fallback_path.exists():
+                dead_mask_path = fallback_path
+                print(f"  Using fallback dead_mask_path: {dead_mask_path}")
+            else:
+                print(f"  ⚠️  Fallback dead_mask_path does not exist: {fallback_path}")
+        
+        # Skip PDF plotting if dead_mask_path is still None
+        if dead_mask_path is None:
+            print(f"  ⚠️  Skipping PDF generation for {sample_name} - no dead_mask_path available")
+            print(f"      (has_dead_channel={has_dead_channel}, metadata columns: {list(sample_metadata.columns) if metadata is not None and not sample_metadata.empty else 'N/A'})")
+            continue
 
         ### Plot analysis results per sample
         print(f"- Writing analysis pdf to {sample_pdf_outpath}")
@@ -223,7 +273,8 @@ def filter_organoid_tracks(
     max_track_length=None,
     min_size=None,
     time_type="frames",
-    cell_type="organoid"
+    cell_type="organoid",
+    df_input_path=None  # Optional: path to input CSV (e.g., advanced features CSV)
     ):
     """
     This code filters tracks based on supplied parameters in the config.yml
@@ -235,6 +286,12 @@ def filter_organoid_tracks(
     
     Additonally, all tracks are cut down to:
     - Maximum track length (tcell_max_track_length)
+    
+    Parameters
+    ----------
+    df_input_path : Path or str, optional
+        Path to input CSV file. If provided, reads from this file instead of the default
+        combined_track_features.csv. Useful for reading advanced features CSV with active killing data.
     
     Output:
     - A .csv file containing filtered tracks from all experiments
@@ -265,7 +322,19 @@ def filter_organoid_tracks(
     if not qc_outdir.exists():
         qc_outdir.mkdir(parents=True)
     
-    df_all_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+    # Use provided input path or default to combined_track_features.csv
+    if df_input_path is not None:
+        df_all_tracks_path = Path(df_input_path)
+        print(f"  Using input file: {df_all_tracks_path.name}")
+    else:
+        df_all_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+    
+    if not df_all_tracks_path.exists():
+        raise FileNotFoundError(
+            f"Track features file not found: {df_all_tracks_path}\n"
+            f"Please run Feature Extraction for {cell_type} first."
+        )
+    
     df_all_tracks = pd.read_csv(df_all_tracks_path)
     
     # Dynamically detect *_line_condition columns from metadata
