@@ -1,4 +1,4 @@
-from behav3d.utils import load_behav3d_metadata, check_behav3d_metadata
+from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
 
 import pandas as pd
 from pathlib import Path
@@ -23,14 +23,14 @@ from pathlib import Path
 import seaborn as sns
 # import hdbscan
 
-from behav3d.analysis.rolling_classification import *
-from behav3d.analysis.rolling_classification.clustering.state.calculate_descriptive_features import *
-from behav3d.analysis.rolling_classification.clustering import *
-from behav3d.analysis.rolling_classification.clustering.leiden import *
-from behav3d.analysis.rolling_classification.clustering.state.filtering import *
-from behav3d.analysis.rolling_classification.clustering.state.plotting import *
-from behav3d.analysis.rolling_classification.clustering.plotting import *
-from behav3d.analysis.rolling_classification.clustering.state.videos import *
+from behav3d.analysis.classification import *
+from behav3d.features.window_descriptive_features import *
+from behav3d.analysis.classification.clustering import *
+from behav3d.analysis.classification.clustering.leiden import *
+from behav3d.analysis.classification.clustering.state.filtering import *
+from behav3d.analysis.classification.clustering.state.plotting import *
+from behav3d.analysis.classification.clustering.plotting import *
+from behav3d.analysis.classification.clustering.state.videos import *
 # %matplotlib inline
 
 import time
@@ -711,7 +711,7 @@ def test():
     
     
     
-    from behav3d.utils.fileio import load_image, load_zarr, save_as_zarr, append_to_zarr
+    from behav3d.io.images import load_image, load_zarr, save_as_zarr, append_to_zarr
     import scanpy as sc
     from pathlib import Path
     

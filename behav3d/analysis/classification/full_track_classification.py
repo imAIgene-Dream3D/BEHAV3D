@@ -1,4 +1,4 @@
-from behav3d.utils import load_behav3d_metadata, check_behav3d_metadata
+from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
 
 import pandas as pd
 from pathlib import Path
@@ -23,12 +23,12 @@ from pathlib import Path
 import seaborn as sns
 # import hdbscan
 
-from behav3d.utils.rolling_classification import *
-from behav3d.utils.rolling_classification.clustering.state.features import *
-from behav3d.utils.rolling_classification.filtering import *
-from behav3d.utils.rolling_classification.clustering import *
-from behav3d.utils.rolling_classification.clustering.plotting import *
-from behav3d.utils.rolling_classification.clustering.state.videos import *
+from behav3d.analysis.classification import *
+from behav3d.analysis.classification.clustering.state.features import *
+from behav3d.analysis.classification.filtering import *
+from behav3d.analysis.classification.clustering import *
+from behav3d.analysis.classification.clustering.plotting import *
+from behav3d.analysis.classification.clustering.state.videos import *
 
 import numpy as np
 #%matplotlib inline

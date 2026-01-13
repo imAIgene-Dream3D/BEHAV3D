@@ -4,11 +4,11 @@ import time
 import pandas as pd
 import numpy as np
 
-from behav3d.utils import format_time
-from behav3d.utils.analysis import smooth_value_over_time
-from behav3d.utils.filtering import plot_filter_count, filter_by_full_duration, filter_minimal_track_length, trim_to_maximal_track_length
-from behav3d.utils.preprocessing import calc_z_projection
-from behav3d.utils.fileio import load_image
+from behav3d.core.utils import format_time
+from behav3d.analysis import smooth_value_over_time
+from behav3d.preprocessing.filtering import plot_filter_count, filter_by_full_duration, filter_minimal_track_length, trim_to_maximal_track_length
+from behav3d.preprocessing import calc_z_projection
+from behav3d.io.images import load_image
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages

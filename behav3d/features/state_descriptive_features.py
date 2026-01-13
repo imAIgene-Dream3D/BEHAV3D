@@ -3,10 +3,10 @@ import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from sklearn.feature_selection import VarianceThreshold
 
-from behav3d.utils.rolling_classification import *
+from behav3d.analysis.classification import *
 
 """
-Full track features based on states
+Full track features based on states per timepoint
 """
 
 

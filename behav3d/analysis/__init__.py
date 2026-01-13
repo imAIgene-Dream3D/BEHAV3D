@@ -2,29 +2,29 @@ from pathlib import Path
 import time
 import pandas as pd
 import numpy as np
-from behav3d.utils import format_time
+from behav3d.core.utils import format_time
 
-# Import cell behavioral analysis functions
-from .tcell_analysis import (
-    filter_cell_tracks,
-    run_tcell_analysis,
-    normalize_track_features,
-    calculate_dtw,
-    fit_umap,
-    cluster_umap
-)
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.gridspec import GridSpec
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-# Import death dynamics from organoid_analysis (for or_ category only when dead channel present)
-from .organoid_analysis import (
-    filter_organoid_tracks,
-    run_organoid_analysis
-)
+def smooth_value_over_time(
+    df, 
+    column, 
+    rolling_meanspeed_window, 
+    min_periods=1,
+    groupby=["TrackID", "sample_name"]
+    ):
+    smoothed_column = df.groupby(groupby)[column].transform(
+        lambda x: x.rolling(
+            window=rolling_meanspeed_window, 
+            min_periods=min_periods
+        ).mean()
+    )
+    return smoothed_column
 
-# Import interaction analysis (organoid POV: cumulative contacts, survival comparison)
-from .interaction_analysis import (
-    run_interaction_analysis,
-    calculate_interaction_stats
-)
+
 
 def summarize_track_features(
     config=None,

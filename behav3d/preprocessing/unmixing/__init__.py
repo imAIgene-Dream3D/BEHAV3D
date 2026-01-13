@@ -1,7 +1,7 @@
 from pathlib import Path
 import napari
 import numpy as np
-from behav3d.utils.fileio import load_zarr
+from behav3d.io.images import load_zarr
 import pandas as pd
 
 def visualize_unmix( 

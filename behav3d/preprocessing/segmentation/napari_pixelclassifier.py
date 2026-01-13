@@ -22,9 +22,9 @@ from sklearn.ensemble import RandomForestClassifier
 from scipy import ndimage
 from scipy.ndimage import binary_fill_holes, find_objects
 
-from behav3d.utils.preprocessing import open_mask, dilate_mask, zeropad_image_to_match_shape
-from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt, segment_2d_filter
-from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr, get_image_shape
+from behav3d.preprocessing.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, segment_2d_filter
+from behav3d.preprocessing import open_mask, dilate_mask, calculate_edt, zeropad_image_to_match_shape
+from behav3d.io.images import load_image, get_image_shape, load_zarr, save_as_zarr, append_to_zarr
 
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -272,7 +272,7 @@ def train_pixel_classifier(
         n_workers = 1
     
     # Detect cell types from metadata if not provided
-    from behav3d.utils import (
+    from behav3d.core.metadata import (
         detect_organoid_types_from_metadata,
         detect_immune_cell_types_from_metadata,
         detect_other_cell_types_from_metadata,
@@ -1109,7 +1109,7 @@ def run_pixel_classifier_segmentation(
         n_workers = 1
     
     # Detect cell types from metadata
-    from behav3d.utils import (
+    from behav3d.core.metadata import (
         detect_organoid_types_from_metadata,
         detect_immune_cell_types_from_metadata,
         detect_other_cell_types_from_metadata,

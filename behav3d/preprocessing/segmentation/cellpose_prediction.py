@@ -27,9 +27,9 @@ import numpy as np
 import torch
 import pandas as pd
 
-from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr
+from behav3d.io.images import load_image, load_zarr, save_as_zarr, append_to_zarr
 from skimage.filters import threshold_otsu
-from behav3d.utils.segmentation import segment_2d_filter# Cellpose import is relatively expensive  only load when we actually need it.
+from behav3d.preprocessing.segmentation import segment_2d_filter# Cellpose import is relatively expensive  only load when we actually need it.
 try:
     from cellpose import models  # noqa: WPS433 (allow external import)
 except ImportError as err:  # pragma: no cover  handled at runtime
@@ -310,7 +310,7 @@ def run_otsu_threshold_segmentation_from_zarr(
     from pathlib import Path
     import numpy as np
     from skimage.filters import threshold_otsu
-    from behav3d.utils.fileio import load_image, save_as_zarr
+    from behav3d.fileio import load_image, save_as_zarr
 
     output_dir = Path(output_dir)
 
@@ -366,7 +366,7 @@ def visualize_cellpose_sample(
     import napari
     import numpy as np
     from pathlib import Path
-    from behav3d.utils.fileio import load_zarr as _lz
+    from behav3d.fileio import load_zarr as _lz
 
     print(f"Sample selected: {sample_name}")
     print(f"Timepoint range: {timepoint_range}")

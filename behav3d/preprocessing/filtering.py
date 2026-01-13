@@ -16,7 +16,6 @@ def filter_by_full_duration(df: pd.DataFrame,
         df=df.drop(df[df[time_column]>exp_duration].index)
     return df
 
-
 def filter_minimal_track_length(
     df,
     min_track_length=None,

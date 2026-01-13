@@ -164,8 +164,8 @@ import seaborn as sns
 import ast
 import math
 import time
-from behav3d.utils import get_current_time, format_time, convert_time, convert_distance
-from behav3d.utils.fileio import load_image, convert_input_files_to_zarr
+from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
+from behav3d.io.images import load_image, convert_input_files_to_zarr
 from tqdm import tqdm
 from datetime import datetime
 

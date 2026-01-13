@@ -6,11 +6,12 @@ import numpy as np
 from scipy.ndimage import binary_fill_holes
 from skimage.segmentation import watershed, relabel_sequential
 from skimage.measure import label
-from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt
-from behav3d.utils.preprocessing import filter_median, sauvola_thresholding, dilate_mask, open_mask 
+from behav3d.preprocessing import calculate_edt, filter_median, sauvola_thresholding, dilate_mask, open_mask
+from behav3d.preprocessing.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments
 from pathlib import Path
 import torch
-from behav3d.utils.fileio import load_image, save_as_zarr, load_zarr, get_filepath_stem
+from behav3d.preprocessing.segmentation import unet_segmentation
+from behav3d.io.images import load_image, save_as_zarr, load_zarr, get_filepath_stem
 import zarr
 import dask.array as da
 from tqdm import tqdm

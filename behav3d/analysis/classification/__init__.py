@@ -38,8 +38,8 @@ from collections import defaultdict
 from pathlib import Path
 from matplotlib.backends.backend_pdf import PdfPages
 
-from behav3d.utils.fileio import load_zarr
-from behav3d.utils.preprocessing import calc_z_projection
+from behav3d.io.images import load_zarr
+from behav3d.preprocessing import calc_z_projection
 
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm

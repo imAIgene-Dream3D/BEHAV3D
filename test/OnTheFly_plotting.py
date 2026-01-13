@@ -1,6 +1,6 @@
 
 from behav3d.utils import load_behav3d_metadata, check_behav3d_metadata
-from behav3d.utils.fileio import load_image
+from behav3d.fileio import load_image
 from behav3d.utils.preprocessing import calc_z_projection
 from scipy.ndimage import center_of_mass
 import numpy as np

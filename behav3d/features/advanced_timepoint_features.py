@@ -45,7 +45,7 @@ from pathlib import Path
 import time
 from typing import Optional, List, Tuple, Dict, Union
 
-from behav3d.utils import get_current_time, format_time
+from behav3d.core.utils import get_current_time, format_time
 
 
 def calculate_background_death_rate(
@@ -475,7 +475,7 @@ def run_active_killing_analysis(
     stats : dict
         Overall statistics
     """
-    from behav3d.utils import detect_organoid_types_from_metadata
+    from behav3d.core.metadata import detect_organoid_types_from_metadata
     
     print(f"--------------- Running Active Killing Analysis ---------------")
     print(f"Immune cell type: {immune_cell_type}")

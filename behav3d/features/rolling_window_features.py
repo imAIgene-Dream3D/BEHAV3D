@@ -14,6 +14,7 @@ def is_nonneg_int_like(values):
         return False
     return np.all(vals >= 0) and np.allclose(vals, np.round(vals))
 
+
 def infer_signal_types(df_tracks, columns, treat_01_as_bounded_if_other_values_exist=True):
     """
     Inspect the entire df_tracks once and decide signal type per column.

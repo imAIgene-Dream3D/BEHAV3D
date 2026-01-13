@@ -10,8 +10,8 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 import imageio
 
-from behav3d.utils.fileio import load_zarr
-from behav3d.utils.preprocessing import calc_z_projection
+from behav3d.io.images import load_zarr
+from behav3d.preprocessing import calc_z_projection
 
 def stratified_pick_examples(df_windows, X, seed=0):
     """
