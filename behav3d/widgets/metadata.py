@@ -1,4 +1,5 @@
 import ipywidgets as widgets
+from IPython.display import display, clear_output
 from pathlib import Path
 import pandas as pd
 import re
@@ -12,6 +13,16 @@ from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata
+)
+
+from traitlets import Bool
+from copy import deepcopy
+import yaml
+from behav3d.widgets.utils import (
+    _DEFAULT_CONFIG,
+    CONFIG,
+     _load_config,
+     _cfg_get
 )
 
 class MetadataBuilder(widgets.VBox):
@@ -717,7 +728,7 @@ class MetadataBuilder(widgets.VBox):
             self.save_output.clear_output()
             print(f'Metadata saved to: {csv_path}')
             print(f'{len(df)} samples, {len(df.columns)} columns')
-            widgets.display(df)
+            display(df)
 
 
 class MetadataLoader(widgets.VBox):
@@ -726,6 +737,9 @@ class MetadataLoader(widgets.VBox):
     After clicking the button, `value` holds the loaded pandas DataFrame,
     and `path` holds the CSV path. Works without globals; read .value later.
     """
+    _busy = Bool(default_value=False).tag(sync=False)
+    _handler_bound = Bool(default_value=False).tag(sync=False)
+    
     def __init__(
         self,
         metadata_path_picker,
@@ -735,53 +749,90 @@ class MetadataLoader(widgets.VBox):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.metadata_path_picker = metadata_path_picker
-        self.output_dir_picker = output_dir_picker
+        self.metadata = None
+        self.output_dir = None
+        self.metadata_csv_path = None
+
         self.func = func
+        self.file_picker = metadata_path_picker
+        self.output_dir_picker = output_dir_picker
+
+        # initialize pickers with JSON defaults if empty
+        try:
+            if hasattr(self.file_picker, "value") and not self.file_picker.value:
+                self.file_picker.value = _cfg_get(CONFIG, "paths.metadata_csv", "") or ""
+        except Exception:
+            pass
+        try:
+            if hasattr(self.output_dir_picker, "value") and not self.output_dir_picker.value:
+                self.output_dir_picker.value = _cfg_get(CONFIG, "paths.output_dir", "") or ""
+        except Exception:
+            pass
         
-        self.btn_load = widgets.Button(
-            description=button_description,
-            button_style="primary",
-            icon="upload",
-            layout=widgets.Layout(width="200px")
-        )
+        self.button = widgets.Button(description=button_description, button_style='success', layout=widgets.Layout(
+        width="fit-content",   # size to content
+        flex="0 0 auto"        # don't stretch in HBox/VBox
+    ))
         self.out = widgets.Output()
-        self.btn_load.on_click(self._on_click)
-        
-        self.value = None
-        self.path = None
-        self.behav3d_parameters = _load_config()
-        self.output_dir = self.output_dir_picker.value if self.output_dir_picker else ""
-        
-        self.children = [self.btn_load, self.out]
+
+        self._click_handler = self._on_click
+        self.button.on_click(self._click_handler)
+        # Build UI (file_picker may be None initially)
+        children = []
+        if self.output_dir_picker is not None:
+            children.append(self.output_dir_picker)
+        if self.file_picker is not None:
+            children.append(self.file_picker)  
+        children += [self.button, self.out]
+        self.children = tuple(children)
 
     def set_file_picker(self, file_picker: widgets.Widget):
-        self.metadata_path_picker = file_picker
+        """Attach/replace the file picker widget (must have a `.value` path)."""
+        self.file_picker = file_picker
 
-    def load(self, path=None):
+    def load(self, path = None):
+        """Programmatic load (same as clicking the button)."""
         if path is None:
-            path = self.metadata_path_picker.value
-        
-        if not path or not Path(path).exists():
-            with self.out:
-                print(f"❌ Error: Metadata file does not exist: {path}")
-            return
-        
-        try:
-            df = load_behav3d_metadata(path)
-            with self.out:
-                self.out.clear_output()
-                check_behav3d_metadata(df, func=self.func)
-            
-            self.value = df
-            self.path = path
-            self.output_dir = self.output_dir_picker.value if self.output_dir_picker else str(Path(path).parent)
-            
-        except Exception as e:
-            with self.out:
-                print(f"❌ Error loading metadata: {e}")
-                import traceback
-                traceback.print_exc()
+            if self.file_picker is None:
+                raise ValueError("No file_picker attached and no path provided.")
+            path = self.file_picker.value
 
+        with self.out:
+            clear_output(wait=True)
+            if not path or not str(path).lower().endswith(".csv"):
+                print("Please choose a .csv file.")
+                return
+
+            self.metadata = load_behav3d_metadata(path)
+            self.output_dir = self.output_dir_picker.value if self.output_dir_picker is not None else ""
+            self.metadata_csv_path = str(path)
+            
+            self.behav3d_parameters_path = Path(self.output_dir, "behav3d_parameters.yml")
+            
+            if self.behav3d_parameters_path.exists():
+                self.behav3d_parameters = _load_config(path = self.behav3d_parameters_path)
+            else:
+                self.behav3d_parameters = deepcopy(_DEFAULT_CONFIG)
+                
+            self.behav3d_parameters["paths"]["metadata_csv"] = str(self.metadata_csv_path)
+            self.behav3d_parameters["paths"]["output_dir"]   = str(self.output_dir)
+            yaml.safe_dump(self.behav3d_parameters, self.behav3d_parameters_path.open("w"), sort_keys=False)
+            
+            check_behav3d_metadata(self.metadata, self.func)
+            print("✅ Checks passed!")
+            display(self.metadata)
+
+            
+    # Button handler
     def _on_click(self, _):
+        if self._busy:
+            return  # re-entrancy guard prevents double execution
+        self._busy = True
         self.load()
+        # try:
+        #     self.load()
+        # except Exception as e:
+        #     with self.out:
+        #         print(f"❌ Error: {e}")
+        # finally:
+        self._busy = False

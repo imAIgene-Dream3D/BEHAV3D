@@ -307,6 +307,8 @@ def _cfg_get(cfg: dict, dotted_key: str, default=None):
         cur = cur[part]
     return cur
 
+CONFIG = _load_config()
+
 def _mk_timepoint_range(use_all: bool, start: int, end: int):
     if use_all:
         return None

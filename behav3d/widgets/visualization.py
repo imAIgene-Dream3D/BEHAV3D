@@ -37,7 +37,7 @@ class BackprojectionPanel:
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
 
         from behav3d.io.images import load_image, load_zarr, save_as_zarr
-        from behav3d.metadata import (
+        from behav3d.core.metadata import (
             detect_immune_cell_types_from_metadata,
             detect_organoid_types_from_metadata,
             detect_other_cell_types_from_metadata,
