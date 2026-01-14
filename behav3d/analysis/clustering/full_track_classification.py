@@ -21,7 +21,7 @@ from behav3d.features.state_descriptive_features import (
     l2_normalize_features_blocks,
     drop_highly_correlated_features
 )
-from behav3d.analysis.classification.filtering import filter_and_truncate_tracks
+from behav3d.analysis.filtering import filter_and_truncate_tracks_anndata
 from behav3d.analysis.classification.clustering.general.leiden import run_pca, run_leiden_clustering
 from behav3d.analysis.classification.clustering.track.visualization.plots.exemplar_track_per_cluster import plot_exemplar_tracks_by_cluster
 from behav3d.analysis.classification.clustering.general.visualization.plots import plot_top_ranking_features
@@ -72,7 +72,7 @@ adata_full = relabel_cluster_ids(
 
 min_length = 100
 max_length = 100
-adata_filt = filter_and_truncate_tracks(
+adata_filt = filter_and_truncate_tracks_anndata(
     adata_full,
     groupby_cols=["sample_name", "TrackID"],   # <-- set to your actual column
     time_col="position_t",      # <-- set to your actual column (e.g., "t", "time", "frame"); or None

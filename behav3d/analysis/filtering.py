@@ -115,6 +115,53 @@ def plot_filter_count(
             plt.close(fig)
 
 
+def filter_and_truncate_tracks_anndata(
+    adata,
+    groupby_cols = ["sample_name", "TrackID"],  # <-- composite track identity
+    time_col: str = "position_t",                                  # <-- time/frame column
+    min_length: int = 10,                                   # x
+    max_length: int = 200                                   # y
+):
+    missing = [k for k in groupby_cols if k not in adata.obs.columns]
+    if missing:
+        raise KeyError(f"Missing groupby_cols in adata.obs: {missing}")
+
+    if time_col not in adata.obs.columns:
+        raise KeyError(f"'{time_col}' not found in adata.obs. Set time_col to your time column.")
+
+    obs = adata.obs.copy()
+
+    # --- 1) Filter groups with too few positions ---
+    # size per group (composite track key)
+    group_sizes = obs.groupby(list(groupby_cols), observed=True).size()
+    keep_groups = group_sizes[group_sizes >= min_length].index
+
+    # fast membership test: join on multi-index
+    obs["_keep"] = obs.set_index(list(groupby_cols)).index.isin(keep_groups)
+    obs = obs.loc[obs["_keep"]].copy()
+
+    # --- 2) Keep last max_length per group by time ordering ---
+    # stable tie-breaker (in case time_col has ties)
+    obs["_orig_idx"] = np.arange(len(obs))
+    obs = obs.sort_values(list(groupby_cols) + [time_col, "_orig_idx"])
+
+    # rank within group
+    obs["_rank"] = obs.groupby(list(groupby_cols), observed=True).cumcount()
+    sizes = obs.groupby(list(groupby_cols), observed=True)["_rank"].transform("max") + 1
+    obs = obs.loc[obs["_rank"] >= (sizes - max_length)]
+
+    # subset AnnData with rows in this exact order
+    idx = obs.index
+    adata_out = adata[idx].copy()
+
+    # cleanup helper cols if they persisted into adata_out.obs
+    for col in ["_keep", "_orig_idx", "_rank"]:
+        if col in adata_out.obs.columns:
+            adata_out.obs.drop(columns=[col], inplace=True)
+
+    return adata_out
+
+
 def filter_tracks(
     metadata,
     output_dir=None,
@@ -336,7 +383,68 @@ def filter_tracks(
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
     return(df_all_tracks_filt)
 
+def subset_selection_of_tracks(
+    df: pd.DataFrame,
+    fraction: float = 0.1,
+    id_cols: list[str] = ["sample_name", "TrackID"],
+    random_state: int = 0,
+    return_selected_keys: bool = False,
+    sampled_keys=None,
+):
+    """
+    Randomly subsample a fraction of unique tracks defined by id_cols,
+    then return df restricted to those full tracks.
 
+    If `selected_keys` is provided (a DataFrame containing columns `id_cols`),
+    no random sampling is done; instead, df is restricted to the tracks
+    matching those keys. This is useful for reproducing an earlier selection.
+    """
+    track_keys = df[id_cols].drop_duplicates()
+
+    if sampled_keys is None:
+        sampled_keys = track_keys.sample(frac=fraction, random_state=random_state)
+    else:
+        sampled_keys = sampled_keys[id_cols].drop_duplicates()
+
+    mask = (
+        df[id_cols]
+        .merge(sampled_keys, on=id_cols, how="left", indicator=True)["_merge"]
+        .eq("both")
+    ).to_numpy()
+    df_sub = df.loc[mask]
+
+    if return_selected_keys:
+        return df_sub, sampled_keys
+    else:
+        return df_sub
+
+def subset_timepoints_from_tracks(
+    df_windowed, 
+    step_size, 
+    time_col="position_t",
+    id_cols=("sample_name", "TrackID"), 
+    keep="first"
+    ):
+    
+    df_windowed = df_windowed.dropna()
+    step_size = max(int(step_size), 1)
+    if step_size == 1:
+        return df_windowed
+
+    # ensure stable order within each track
+    dfw = df_windowed.sort_values(list(id_cols) + [time_col], kind="mergesort").copy()
+
+    if keep == "first":
+        rank = dfw.groupby(list(id_cols), sort=False).cumcount()
+        mask = (rank % step_size) == 0
+    elif keep == "last":
+        rank_from_end = dfw.groupby(list(id_cols), sort=False).cumcount(ascending=False)
+        mask = (rank_from_end % step_size) == 0
+    else:
+        raise ValueError("keep must be 'first' or 'last'")
+
+    return dfw.loc[mask]
+    
 def plot_dead_dye_distribution(
     df_tracks,
     outpath,

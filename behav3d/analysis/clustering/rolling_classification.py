@@ -17,10 +17,11 @@ from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
 from behav3d.core.anndata import df_to_adata, adata_add_back_to_df, merge_pandas_cols_into_obs_anndata
 from behav3d.analysis.classification import (
     select_nonbinary_columnnames, 
-    subset_full_tracks, 
-    subset_windowed_tracks,
     relabel_cluster_ids
 )
+
+from behav3d.analysis.filtering import subset_timepoints_from_tracks, subset_selection_of_tracks
+
 from behav3d.features.rolling_window_features import create_descriptive_track_dataset, infer_signal_types
 from behav3d.features.state_descriptive_features import drop_highly_correlated_features
 from behav3d.analysis.classification.clustering.general.leiden import (
@@ -185,7 +186,7 @@ def test():
     # --- 3) Subset windows (custom) ---
     chosen_intervals = 10
     # chosen_intervals = window_size
-    df_leiden_subset = subset_windowed_tracks(
+    df_leiden_subset = subset_timepoints_from_tracks(
         df_windowed=df_analysis,
         step_size=chosen_intervals,
     )
@@ -445,7 +446,7 @@ def test():
     scaler = StandardScaler().fit(df_hmm_descriptive[hmm_feature_cols])
     df_hmm_descriptive[hmm_feature_cols] = scaler.transform(df_hmm_descriptive[hmm_feature_cols])
     
-    df_hmm_sub, sampled_keys = subset_full_tracks(
+    df_hmm_sub, sampled_keys = subset_selection_of_tracks(
         df=df_hmm_descriptive,
         fraction=1.0,
         random_state=seed,
@@ -607,7 +608,7 @@ def test():
     
     df_tracks.loc[:, nonbinary_cols] = StandardScaler().fit_transform(df_tracks.loc[:, nonbinary_cols])
     
-    df_sticky_hmm_raw = subset_full_tracks(
+    df_sticky_hmm_raw = subset_selection_of_tracks(
         df=df_tracks,
         id_cols=["sample_name", "TrackID"],
         sampled_keys=sampled_keys
@@ -894,7 +895,7 @@ def test():
     df_analysis[descriptive_feature_cols] = StandardScaler().fit_transform(df_analysis[descriptive_feature_cols])
     # Windows
     # chosen_intervals = 25
-    # df_analysis_subset = subset_windowed_tracks(
+    # df_analysis_subset = subset_timepoints_from_tracks(
     #     df_windowed=df_analysis,
     #     subsample_step_size=chosen_intervals,
     # )
@@ -1101,7 +1102,7 @@ def test():
     
     df_tracks.loc[:, nonbinary_cols] = StandardScaler().fit_transform(df_tracks.loc[:, nonbinary_cols])
     
-    df_hmm_raw, sampled_keys = subset_full_tracks(
+    df_hmm_raw, sampled_keys = subset_selection_of_tracks(
         df=df_tracks,
         id_cols=["sample_name", "TrackID"],
         return_selected_keys=True
@@ -1263,7 +1264,7 @@ def test():
     # scaled_X = adata_full[:, descriptive_feature_cols].X.toarray()
     # df_analysis_hmm.loc[:, descriptive_feature_cols] = scaled_X
 
-    df_hmm_descriptive, sampled_keys = subset_full_tracks(
+    df_hmm_descriptive, sampled_keys = subset_selection_of_tracks(
         df=df_hmm_descriptive,
         fraction=0.2,
         random_state=seed,

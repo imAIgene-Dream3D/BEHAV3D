@@ -21,7 +21,7 @@ from behav3d.features.state_descriptive_features import (
     drop_highly_correlated_features,
     drop_low_variance_features
 )
-from behav3d.analysis.classification.filtering import filter_and_truncate_tracks
+from behav3d.analysis.classification.filtering import filter_and_truncate_tracks_anndata
 from behav3d.analysis.classification.clustering.general.leiden import (
     run_pca, 
     run_leiden_clustering
@@ -109,7 +109,7 @@ def run_state_based_analysis(
     adata_full = sc.read_h5ad(adata_full_path)
 
     # --------- Filter + truncate tracks ----------
-    adata_filt = filter_and_truncate_tracks(
+    adata_filt = filter_and_truncate_tracks_anndata(
         adata_full,
         groupby_cols=list(groupby_cols),
         time_col=time_col,

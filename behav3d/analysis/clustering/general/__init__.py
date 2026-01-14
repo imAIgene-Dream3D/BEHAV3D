@@ -1,5 +1,22 @@
 import numpy as np
 import pandas as pd
+import scanpy as sc
+
+def select_nonbinary_columnnames(df: pd.DataFrame, cols: list[str], tol: float = 1e-9):
+    binary, continuous = [], []
+    for c in cols:
+        s = df[c].dropna().astype(float)
+        if s.empty:
+            continuous.append(c)
+            continue
+        u = np.unique(s.values)
+        # binary if all unique values are (approximately) 0 or 1
+        if np.all(np.isclose(u, 0.0, atol=tol) | np.isclose(u, 1.0, atol=tol)):
+            binary.append(c)
+        else:
+            continuous.append(c)
+    return continuous
+
 
 def relabel_cluster_ids(
     adata,

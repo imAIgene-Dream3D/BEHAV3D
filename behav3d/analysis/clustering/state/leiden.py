@@ -20,6 +20,8 @@ from behav3d.features.state_descriptive_features import (
     drop_highly_correlated_features, 
     drop_low_variance_features
 )
+
+from behav3d.analysis.filtering import subset_timepoints_from_tracks
 from behav3d.analysis.classification.clustering.general.leiden import (
     run_pca, 
     run_leiden_clustering, 
@@ -184,7 +186,7 @@ def run_rolling_window_analysis(
 
     # --- Subset windows for clustering ---
     df_analysis = df_windows_descriptive.copy()
-    df_subset = subset_windowed_tracks(
+    df_subset = subset_timepoints_from_tracks(
         df_windowed=df_analysis,
         step_size=chosen_intervals,
     )
