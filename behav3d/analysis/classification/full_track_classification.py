@@ -1,34 +1,30 @@
-from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
-
-import pandas as pd
 from pathlib import Path
-
-import pandas as pd
+import random
 import numpy as np
-
-import umap
-
+import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-import random
+import seaborn as sns
+import umap
+import scanpy as sc
 
 from sklearn.cluster import KMeans, HDBSCAN
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.feature_selection import VarianceThreshold
 
-
-from pathlib import Path
-
-import seaborn as sns
-# import hdbscan
-
-from behav3d.analysis.classification import *
-from behav3d.analysis.classification.clustering.state.features import *
-from behav3d.analysis.classification.filtering import *
-from behav3d.analysis.classification.clustering import *
-from behav3d.analysis.classification.clustering.plotting import *
-from behav3d.analysis.classification.clustering.state.visualization.videos.track_max_projection import *
+from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
+from behav3d.analysis.classification import relabel_cluster_ids
+from behav3d.features.state_descriptive_features import (
+    extract_descibing_track_state_features, 
+    scale_feature_blocks, 
+    l2_normalize_features_blocks,
+    drop_highly_correlated_features
+)
+from behav3d.analysis.classification.filtering import filter_and_truncate_tracks
+from behav3d.analysis.classification.clustering.general.leiden import run_pca, run_leiden_clustering
+from behav3d.analysis.classification.clustering.track.visualization.plots.exemplar_track_per_cluster import plot_exemplar_tracks_by_cluster
+from behav3d.analysis.classification.clustering.general.visualization.plots import plot_top_ranking_features
 
 import numpy as np
 #%matplotlib inline

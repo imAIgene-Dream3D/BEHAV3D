@@ -4,13 +4,6 @@ import numpy as np
 from behav3d.io.images import load_zarr
 import pandas as pd
 
-from tifffile import imread, imwrite
-from skimage.measure import regionprops_table
-import pandas as pd
-import numpy as np
-from pathlib import Path
-import math
-from behav3d.io.images import load_image, save_as_zarr, append_to_zarr
 import shutil
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor

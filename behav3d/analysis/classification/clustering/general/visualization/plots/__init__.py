@@ -1,19 +1,18 @@
 import math
-from pathlib import Path  # only needed if you pass Path objects as outpath
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.gridspec import GridSpec
-
 import seaborn as sns
 import scanpy as sc
 
 from pandas.api.types import is_numeric_dtype
 from sklearn.preprocessing import MinMaxScaler
+from behav3d.analysis.filtering import round_legend_ticks
 
 
 def plot_per_cluster_proportions(

@@ -1,6 +1,5 @@
 import warnings
 from collections import defaultdict
-
 import numpy as np
 from skimage.measure import label
 

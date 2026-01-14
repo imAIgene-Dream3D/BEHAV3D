@@ -10,7 +10,6 @@ from behav3d.preprocessing import calculate_edt, filter_median, sauvola_threshol
 from behav3d.preprocessing.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments
 from pathlib import Path
 import torch
-from behav3d.preprocessing.segmentation import unet_segmentation
 from behav3d.io.images import load_image, save_as_zarr, load_zarr, get_filepath_stem
 import zarr
 import dask.array as da

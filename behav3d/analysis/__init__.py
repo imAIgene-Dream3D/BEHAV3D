@@ -4,11 +4,6 @@ import pandas as pd
 import numpy as np
 from behav3d.core.utils import format_time
 
-from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.gridspec import GridSpec
-import matplotlib.pyplot as plt
-import seaborn as sns
-
 def smooth_value_over_time(
     df, 
     column, 

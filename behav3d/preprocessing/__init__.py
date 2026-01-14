@@ -1,10 +1,8 @@
 import time
-from behav3d.io.images import convert_file_to_zarr, get_image_shape
+import warnings
 from pathlib import Path
 import numpy as np
-
 from scipy.ndimage import distance_transform_edt
-
 from skimage.draw import ellipsoid
 from skimage.filters import median, threshold_sauvola
 from skimage.morphology import (
@@ -14,6 +12,8 @@ from skimage.morphology import (
     binary_opening,
     disk,
 )
+from behav3d.io.images import convert_file_to_zarr, get_image_shape
+from behav3d.core.utils import rel_elsize
 
 def calculate_edt(image, use_dims=3, elsize=None):
     """
@@ -156,35 +156,6 @@ def filter_median(image, use_dimensions=3, radius=None, filter_shape=None, elsiz
         k = expand_selem(k, img_dim)
     # print(f"Performing median smoothing with a ellipsoid of shape {k.shape}")
     data_smooth = median(image=image, footprint=k)
-    return(data_smooth)
-
-def filter_mean(image, use_dimensions=3, radius=None, filter_shape=None, elsize=None):
-    """
-    Perform mean filtering for each pixel/voxel in the image based on a certain shape and radius
-    """
-    assert radius is not None or filter_shape is not None, "Supply either 'radius' or 'filter_shape'"
-    img_dim = image.ndim
-    if elsize is None:
-        elsize = [1]*img_dim
-    elsize=rel_elsize(elsize)
-    
-    def expand_selem(selem, dims):
-        while selem.ndim != dims:
-            selem = np.expand_dims(selem, axis=0)
-        return(selem)
-    
-    if use_dimensions == 2:
-        k = disk(radius)
-    elif use_dimensions == 3:
-        if filter_shape is None and radius:
-            filter_shape=[radius]*3
-        k = draw_ellipsoid(shape=filter_shape)
-    # !!!! Change shape here!!!
-    while k.ndim < image.ndim:
-        k = expand_selem(k, img_dim)
-    print(f"Performing median smoothing with a ellipsoid of shape {k.shape}")
-    
-    data_smooth = skmean(image=image, footprint=k)
     return(data_smooth)
 
 def sauvola_thresholding(

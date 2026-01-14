@@ -19,6 +19,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
+from behav3d.analysis import smooth_value_over_time
+
 
 def run_interaction_analysis(
     output_dir: str,
@@ -58,7 +60,7 @@ def run_interaction_analysis(
             }
         }
     """
-    from behav3d.analysis import smooth_value_over_time
+    
     
     print(f"--------------- Performing {cell_type} Interaction Analysis ---------------")
     start_time = time.time()
@@ -179,7 +181,7 @@ def _process_death_classification(df: pd.DataFrame, dead_threshold: float):
     tuple
         (df with death columns, has_dead_column: bool)
     """
-    from behav3d.analysis import smooth_value_over_time
+    
     
     has_dead_column = "dead" in df.columns
     has_percentage_dead = "percentage_dead_mask" in df.columns

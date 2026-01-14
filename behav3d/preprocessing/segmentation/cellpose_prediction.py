@@ -6,7 +6,7 @@ into a re-usable function that can be imported and called from notebooks (e.g.
 `run_behav3d.ipynb`).
 
 The function
-1. Loads the image (OME-Tiff, regular Tiff, or Zarr) using `behav3d.utils.fileio`.
+1. Loads the image (OME-Tiff, regular Tiff, or Zarr) using `behav3d.io.images`.
 2. If the input is a Tiff, it is automatically converted to Zarr (chunked per
    time point) next to the original file so that subsequent calls can re-use
    the Zarr version directly.
@@ -310,7 +310,7 @@ def run_otsu_threshold_segmentation_from_zarr(
     from pathlib import Path
     import numpy as np
     from skimage.filters import threshold_otsu
-    from behav3d.fileio import load_image, save_as_zarr
+    from behav3d.io.images import load_image, save_as_zarr
 
     output_dir = Path(output_dir)
 
@@ -366,7 +366,7 @@ def visualize_cellpose_sample(
     import napari
     import numpy as np
     from pathlib import Path
-    from behav3d.fileio import load_zarr as _lz
+    from behav3d.io.images import load_zarr as _lz
 
     print(f"Sample selected: {sample_name}")
     print(f"Timepoint range: {timepoint_range}")

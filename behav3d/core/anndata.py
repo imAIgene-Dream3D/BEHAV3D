@@ -1,52 +1,37 @@
-
-import numpy as np
-import pandas as pd
-from typing import Optional, Tuple, Dict, Literal, List, Iterable
-from pandas.api.types import is_numeric_dtype
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-
 import math
+from typing import Optional, Tuple, Dict, Literal, List, Iterable
+from pathlib import Path
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
-import seaborn as sns
-from sklearn.cluster import KMeans, HDBSCAN, AgglomerativeClustering
-import umap
-from tqdm import tqdm
-
-from sklearn.cluster import AgglomerativeClustering
-
-import numpy as np
-from scipy import sparse
-import igraph as ig
-import leidenalg as la
-
-from typing import Dict, Iterable, Optional
 import numpy as np
 import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
-
+from pandas.api.types import is_numeric_dtype
+from scipy import sparse
 from scipy.spatial.distance import pdist, squareform
 from scipy.cluster.hierarchy import linkage, leaves_list
-from scipy import sparse
 
-import scanpy
-
-from collections import defaultdict
-from pathlib import Path
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_pdf import PdfPages
+import seaborn as sns
+
+import scanpy as sc
+import umap
+import igraph as ig
+import leidenalg as la
+from tqdm import tqdm
+import imageio_ffmpeg as iioff
+
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.cluster import KMeans, HDBSCAN, AgglomerativeClustering
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.impute import SimpleImputer
 
 from behav3d.io.images import load_zarr
 from behav3d.preprocessing import calc_z_projection
 
-from concurrent.futures import ProcessPoolExecutor
-from tqdm import tqdm
-import imageio_ffmpeg as iioff
-
-from sklearn.impute import SimpleImputer
-import scanpy as sc
 
 def relabel_img_from_adata(
     label_image: np.ndarray,

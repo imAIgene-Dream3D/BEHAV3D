@@ -1,3 +1,8 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+
 def plot_exemplar_track_bars(
     adata,
     n_tracks=10,

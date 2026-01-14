@@ -1,36 +1,49 @@
-from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
-
-import pandas as pd
-from pathlib import Path
-
-import pandas as pd
+import time
+import random
 import numpy as np
-
-import umap
-
+import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-import random
+import seaborn as sns
+import umap
+import scanpy as sc
 
 from sklearn.cluster import KMeans, HDBSCAN
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.feature_selection import VarianceThreshold
 
-
-from pathlib import Path
-
-import seaborn as sns
-# import hdbscan
-
-from behav3d.analysis.classification import *
-from behav3d.features.window_descriptive_features import *
-from behav3d.analysis.classification.clustering import *
-from behav3d.analysis.classification.clustering.general.leiden import *
-from behav3d.analysis.classification.clustering.state.filtering import *
-from behav3d.analysis.classification.clustering.state.plotting import *
-from behav3d.analysis.classification.clustering.plotting import *
-from behav3d.analysis.classification.clustering.state.visualization.videos.track_max_projection import *
+from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
+from behav3d.core.anndata import df_to_adata, adata_add_back_to_df, merge_pandas_cols_into_obs_anndata
+from behav3d.analysis.classification import (
+    select_nonbinary_columnnames, 
+    subset_full_tracks, 
+    subset_windowed_tracks,
+    relabel_cluster_ids
+)
+from behav3d.features.rolling_window_features import create_descriptive_track_dataset, infer_signal_types
+from behav3d.features.state_descriptive_features import drop_highly_correlated_features
+from behav3d.analysis.classification.clustering.general.leiden import (
+    run_pca, 
+    run_leiden_clustering, 
+    merge_small_clusters
+)
+from behav3d.analysis.classification.clustering.state.filtering import filter_short_state_runs
+from behav3d.analysis.classification.clustering.state.visualization.plots.clustering import (
+    plot_number_per_clusters,
+    plot_exemplar_track_bars
+)
+from behav3d.analysis.classification.clustering.general.visualization.plots import (
+    plot_per_cluster_proportions, 
+    plot_top_ranking_features
+)
+from behav3d.analysis.classification.clustering.state.hmm import (
+    run_sticky_hmm_state_classification,
+    plot_hmm_top_ranking_features,
+    plot_hmm_transition_matrix
+)
+from behav3d.analysis.classification.clustering.state.visualization.plots.state_transitions import compute_cluster_transition_matrix
+# from behav3d.analysis.classification.clustering.state.visualization.videos.track_max_projection import *
 # %matplotlib inline
 
 import time

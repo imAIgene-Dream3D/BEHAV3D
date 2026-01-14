@@ -3,7 +3,7 @@ import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from sklearn.feature_selection import VarianceThreshold
 
-from behav3d.analysis.classification import *
+from behav3d.core.anndata import df_to_adata
 
 """
 Full track features based on states per timepoint

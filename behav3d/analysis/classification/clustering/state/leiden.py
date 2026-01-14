@@ -1,33 +1,38 @@
-from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
-
-import pandas as pd
-from pathlib import Path
-
-import pandas as pd
+import time
+import random
 import numpy as np
-
-import umap
-
+import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-import random
+import seaborn as sns
+import umap
+import scanpy as sc
 
 from sklearn.cluster import KMeans, HDBSCAN
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.feature_selection import VarianceThreshold
 
-
-from pathlib import Path
-
-import seaborn as sns
-# import hdbscan
-
-from behav3d.analysis.classification import *
-from behav3d.analysis.classification.clustering.state.features import *
-from behav3d.analysis.classification.clustering import *
-from behav3d.analysis.classification.clustering.plotting import *
-from behav3d.analysis.classification.clustering.state.visualization.videos.track_max_projection import *
+from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
+from behav3d.core.anndata import df_to_adata
+from behav3d.features.rolling_window_features import create_descriptive_track_dataset
+from behav3d.features.state_descriptive_features import (
+    drop_highly_correlated_features, 
+    drop_low_variance_features
+)
+from behav3d.analysis.classification.clustering.general.leiden import (
+    run_pca, 
+    run_leiden_clustering, 
+    merge_small_clusters
+)
+from behav3d.analysis.classification.clustering.state.filtering import filter_short_state_runs
+from behav3d.analysis.classification.clustering.state.visualization.plots.clustering import (
+    plot_exemplar_track_bars
+)
+from behav3d.analysis.classification.clustering.state.visualization.plots.state_transitions import (
+    compute_cluster_transition_matrix
+)
+# from behav3d.analysis.classification.clustering.state.visualization.videos.track_max_projection import *
 # %matplotlib inline
 
 import time

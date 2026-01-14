@@ -1,8 +1,8 @@
 from pathlib import Path
 import napari
 import numpy as np
-from behav3d.io.images import load_zarr
 import pandas as pd
+from behav3d.io.images import load_zarr
 
 def visualize_unmix( 
                     metadata_row: pd.Series, 
