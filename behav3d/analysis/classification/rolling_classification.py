@@ -26,11 +26,11 @@ import seaborn as sns
 from behav3d.analysis.classification import *
 from behav3d.features.window_descriptive_features import *
 from behav3d.analysis.classification.clustering import *
-from behav3d.analysis.classification.clustering.leiden import *
+from behav3d.analysis.classification.clustering.general.leiden import *
 from behav3d.analysis.classification.clustering.state.filtering import *
 from behav3d.analysis.classification.clustering.state.plotting import *
 from behav3d.analysis.classification.clustering.plotting import *
-from behav3d.analysis.classification.clustering.state.videos import *
+from behav3d.analysis.classification.clustering.state.visualization.videos.track_max_projection import *
 # %matplotlib inline
 
 import time
@@ -729,7 +729,7 @@ def test():
     hmm_instant_path=Path(outfolder, "hmm_raw_state_overlay.zarr")
     leiden_path = Path(outfolder, "leiden_overlay.zarr")
     
-    hmm_instant_img = relabel_from_adata(
+    hmm_instant_img = relabel_img_from_adata(
         img,
         adata,
         obs_col="hmm_state",
@@ -737,7 +737,7 @@ def test():
     )
     save_as_zarr(hmm_instant_img, hmm_instant_path)
 
-    hmm_desc_img = relabel_from_adata(
+    hmm_desc_img = relabel_img_from_adata(
         img,
         adata,
         obs_col="hmm_state_raw",
@@ -745,7 +745,7 @@ def test():
     )
     save_as_zarr(hmm_desc_img, hmm_descr_path)
 
-    leiden_img = relabel_from_adata(
+    leiden_img = relabel_img_from_adata(
         img,
         adata,
         obs_col="ClusterID",

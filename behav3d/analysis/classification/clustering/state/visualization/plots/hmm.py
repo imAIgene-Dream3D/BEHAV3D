@@ -201,4 +201,24 @@ def plot_hmm_top_ranking_features(
     plt.tight_layout(rect=[0, 0.05, 1, 1])
     plt.show()
  
- 
+def plot_state_distance_heatmap(dist_df, title="State distance (symmetric KL)", cmap="viridis"):
+    M = dist_df.to_numpy(float)
+    fig, ax = plt.subplots(figsize=(0.65 * len(dist_df) + 3, 0.6 * len(dist_df) + 2.5))
+    im = ax.imshow(M, aspect="auto", interpolation="nearest", cmap=cmap)
+
+    ax.set_title(title)
+    ax.set_xlabel("State")
+    ax.set_ylabel("State")
+
+    ax.set_xticks(np.arange(len(dist_df)))
+    ax.set_yticks(np.arange(len(dist_df)))
+    ax.set_xticklabels(dist_df.columns.tolist())
+    ax.set_yticklabels(dist_df.index.tolist())
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("distance")
+
+    plt.tight_layout()
+    plt.show()

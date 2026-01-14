@@ -27,7 +27,7 @@ from behav3d.analysis.classification import *
 from behav3d.analysis.classification.clustering.state.features import *
 from behav3d.analysis.classification.clustering import *
 from behav3d.analysis.classification.clustering.plotting import *
-from behav3d.analysis.classification.clustering.state.videos import *
+from behav3d.analysis.classification.clustering.state.visualization.videos.track_max_projection import *
 # %matplotlib inline
 
 import time

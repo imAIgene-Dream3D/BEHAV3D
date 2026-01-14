@@ -25,7 +25,6 @@ def smooth_value_over_time(
     return smoothed_column
 
 
-
 def summarize_track_features(
     config=None,
     output_dir=None,

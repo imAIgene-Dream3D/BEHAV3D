@@ -43,7 +43,7 @@ from sklearn.decomposition import PCA
 
 from pathlib import Path
 from behav3d.core.utils import format_time, expand_column_patterns
-from behav3d.preprocessing.filtering import plot_filter_count, filter_by_full_duration, filter_minimal_track_length, trim_to_maximal_track_length
+from behav3d.analysis.filtering import plot_filter_count, filter_by_full_duration, filter_minimal_track_length, trim_to_maximal_track_length
 import yaml
 import time
 import seaborn as sns

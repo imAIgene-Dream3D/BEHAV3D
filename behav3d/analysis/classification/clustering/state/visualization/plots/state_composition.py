@@ -166,20 +166,20 @@ def plot_state_composition_over_time(
     return data, fig, ax
 
 
-df_fig, fig, ax = plot_state_composition_over_time(
-    adata_full, 
-    time_col="position_t", 
-    state_col="ClusterID", 
-    relative=False
-    )
+# df_fig, fig, ax = plot_state_composition_over_time(
+#     adata_full, 
+#     time_col="position_t", 
+#     state_col="ClusterID", 
+#     relative=False
+#     )
 
-df_fig, fig, axes= plot_state_composition_over_time(
-    adata_full, 
-    time_col="position_t", 
-    state_col="ClusterID", 
-    relative=True,
-    group_by_sample=True
-    )
+# df_fig, fig, axes= plot_state_composition_over_time(
+#     adata_full, 
+#     time_col="position_t", 
+#     state_col="ClusterID", 
+#     relative=True,
+#     group_by_sample=True
+#     )
 
-fig, axes = plot_state_composition_over_time(adata, group_by_sample=True, relative=True)
-plt.show()
+# fig, axes = plot_state_composition_over_time(adata, group_by_sample=True, relative=True)
+# plt.show()

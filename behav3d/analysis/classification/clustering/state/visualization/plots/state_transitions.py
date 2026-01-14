@@ -4,6 +4,10 @@ import plotly.graph_objects as go
 import hashlib
 import re
 
+# -----------------------------
+# Plot timepoint>timepoint state transition matrix
+# -----------------------------
+
 def compute_cluster_transition_matrix(
     adata,
     cluster_key: str,
@@ -113,7 +117,6 @@ def compute_cluster_transition_matrix(
         plt.tight_layout()
 
     return transition_counts, transition_probs
- 
  
 ##########################################################
 # N-gram calculations to describe state behavioral transition
