@@ -1,61 +1,98 @@
 # BEHAV3D
 
+A Python package for analyzing cell behavior in fluorescent 3D imaging.
+
 ## Installation
 
-**Step 0** If required, install [miniforge](https://github.com/conda-forge/miniforge) or [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
+### Quick Install (Recommended)
 
-https://github.com/conda-forge/miniforge/releases/latest/
-https://conda-forge.org/download/
+The easiest way to install BEHAV3D is using our automated installer that handles everything:
 
+**Windows:**
+1. Download this repository (Code > Download ZIP) and extract it
+2. Double-click `install_behav3d.bat`
+3. Follow the prompts
 
-
- - Mamba is a faster version of conda but both work the same
- - On Windows, isntallation with the mamba .exe might be blocked. If so, open a command terminal (cmd.exe) and run:
+**macOS / Linux:**
+```bash
+cd /path/to/BEHAV3D
+chmod +x install_behav3d.sh
+./install_behav3d.sh
 ```
-start /wait "" Miniforge3-Windows-x86_64.exe /InstallationType=JustMe /RegisterPython=0 /S /D=%UserProfile%\Miniforge3
-```
 
-**Step 1** Open a miniforge terminal or conda terminal by typing *miniforge* in your application search tab
+The installer will automatically:
+- ✅ Install Miniforge (conda) if not found
+- ✅ Detect your GPU (NVIDIA CUDA / Apple Silicon MPS / CPU-only)
+- ✅ Create the conda environment with all dependencies
+- ✅ Install PyTorch with the appropriate backend
+- ✅ Install Cellpose for cell segmentation
 
-**Step 2** Download the BEHAV3D repository from this github page, by clicking *Code* > *Download zip*. Unzip the file and place its content to a folder that from now on we call BEHAV3D reposotory.
+### Manual Installation
 
-**Step 3** Adapt location of this directory to your own one as indicated below and paste the following in the terminal to navigate to the BEHAV3D repository
-```
-cd <path/to/this/behav3/repository>
-```
-**Step 4**
-This creates a python environment and installes required packages
-Use the code below [env_mac.yml](./env_mac.yml) or [env_windows.yml](./env_windows.yml) dependent on what operating system you are on
+If you prefer manual installation:
 
-You might get asked to confirm changes in the terminal, so just type Y for *yes*
+**Step 1: Install Miniforge/Conda**
 
-*Mac install*:
-In the terminal copy paste and enter the following:
+If you don't have conda installed, download [Miniforge](https://github.com/conda-forge/miniforge/releases/latest/) (recommended) or [Miniconda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html).
 
-```
-mamba env create --file env_mac.yml
-mamba activate behav3d
+**Step 2: Create the environment**
+
+```bash
+cd /path/to/BEHAV3D
+
+# Create environment from yml file
+conda env create -f environment.yml
+conda activate behav3d
+
+# Install PyTorch (choose ONE based on your system):
+
+# CPU only (all platforms):
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# CUDA 12.1 (Windows/Linux with NVIDIA GPU):
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# macOS (includes MPS for Apple Silicon):
+pip install torch torchvision torchaudio
+
+# Install Cellpose
+pip install cellpose>=3.0
+
+# Install BEHAV3D package
 pip install -e .
+
+# Register Jupyter kernel
 python -m ipykernel install --user --name=behav3d --display-name "behav3d"
 ```
 
-*Windows install*
-In the terminal copy paste and enter the following:
+### Installation Options
+
+```bash
+# Check system info before installing
+python install_behav3d.py --check
+
+# Force CPU-only installation (even if GPU detected)
+python install_behav3d.py --cpu-only
+
+# Only install PyTorch/Cellpose (if environment already exists)
+python install_behav3d.py --pytorch-only
 ```
-mamba env create --file env_windows.yml
-mamba activate behav3d
-pip install -e .
-python -m ipykernel install --user --name=behav3d --display-name "behav3d"
+
+## How to Run
+
+BEHAV3D is run through Jupyter notebooks. We recommend using **Visual Studio Code**:
+
+1. Install [VS Code](https://code.visualstudio.com/Download)
+2. Install the Python and Jupyter extensions
+3. Open the BEHAV3D folder
+4. Open `notebooks/run_behav3d.ipynb`
+5. Select kernel: Python Environments > behav3d
+
+Alternatively, run in a web browser:
+```bash
+conda activate behav3d
+jupyter notebook notebooks/run_behav3d.ipynb
 ```
-
-## How to run
-
-BEHAV3D is run through a ipython notebook, in for example:
-
-- Visual Code with an ipython extension (Recommended). Install VisualCode from here https://code.visualstudio.com/Download. Once installed open the program and go to extensions and install the ipython extension. Once this is done you can go to *select kernel* > *python* > *behav3d*     
-  Open the following file that is in your BEHAV3D repository : [run_behav3d.ipynb](./notebooks/run_behav3d.ipynb) (BEHAV3D/notebooks/run_behav3d.ipynb)
-
-- Ipython notebook in a web browser
 
 ### Required files
 

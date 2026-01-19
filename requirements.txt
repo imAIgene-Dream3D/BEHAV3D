@@ -1,0 +1,126 @@
+# =============================================================================
+# BEHAV3D Requirements File (pip)
+# =============================================================================
+# Python version: 3.12 (recommended)
+# 
+# RECOMMENDED: Use the install script instead for automatic GPU detection:
+#   Windows: double-click install_behav3d.bat
+#   macOS/Linux: ./install_behav3d.sh
+#
+# Or use conda:
+#   conda env create -f environment.yml
+#   conda activate behav3d
+#   python install_behav3d.py --pytorch-only
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Core Scientific Computing
+# -----------------------------------------------------------------------------
+numpy>=2.0
+pandas>=2.0
+scipy>=1.14
+dask>=2024.0
+
+# -----------------------------------------------------------------------------
+# Visualization
+# -----------------------------------------------------------------------------
+matplotlib>=3.9
+seaborn>=0.13
+plotly>=5.0
+
+# -----------------------------------------------------------------------------
+# Image Processing & File I/O
+# -----------------------------------------------------------------------------
+scikit-image>=0.24
+tifffile>=2024.0
+imageio>=2.30
+imageio-ffmpeg>=0.5.1
+Pillow>=10.0
+aicspylibczi>=3.1
+zarr>=2.16
+h5py>=3.10
+
+# -----------------------------------------------------------------------------
+# Deep Learning & Segmentation
+# -----------------------------------------------------------------------------
+# NOTE: PyTorch must be installed FIRST with appropriate CUDA version!
+# See installation commands below or use install_behav3d.py
+torchsummary>=1.5.1
+cellpose==3.1.1.2
+
+# -----------------------------------------------------------------------------
+# Tracking
+# -----------------------------------------------------------------------------
+laptrack>=0.17
+trackpy>=0.6
+
+# -----------------------------------------------------------------------------
+# Machine Learning & Clustering
+# -----------------------------------------------------------------------------
+scikit-learn>=1.5
+umap-learn>=0.5
+hmmlearn>=0.3
+dtaidistance>=2.3
+
+# -----------------------------------------------------------------------------
+# Graph Analysis & Single-Cell
+# -----------------------------------------------------------------------------
+igraph>=0.11
+leidenalg>=0.10
+scanpy>=1.10
+
+# -----------------------------------------------------------------------------
+# GUI & Visualization Tools
+# -----------------------------------------------------------------------------
+napari>=0.5
+napari-console>=0.1
+napari-svg>=0.2
+magicgui>=0.8
+qtpy>=2.4
+PyQt5>=5.15
+ipywidgets>=8.1
+ipyfilechooser>=0.6
+traitlets>=5.14
+pyopengl>=3.1
+vispy>=0.14
+
+# -----------------------------------------------------------------------------
+# Jupyter / IPython
+# -----------------------------------------------------------------------------
+IPython>=8.0
+ipykernel>=6.0
+jupyter_client>=8.0
+jupyterlab_widgets>=3.0
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+tqdm>=4.60
+PyYAML>=6.0
+joblib>=1.3
+psutil>=5.9
+networkx>=3.0
+numba>=0.58
+numcodecs>=0.12
+
+# -----------------------------------------------------------------------------
+# Build & Packaging
+# -----------------------------------------------------------------------------
+setuptools>=70.0
+wheel>=0.40
+
+
+# =============================================================================
+# PYTORCH INSTALLATION (do this BEFORE pip install -r requirements.txt)
+# =============================================================================
+#
+# CPU only (all platforms):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+#
+# CUDA 12.1 (Windows/Linux with NVIDIA GPU):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# macOS (MPS acceleration for Apple Silicon):
+#   pip install torch torchvision torchaudio
+#
+# =============================================================================
