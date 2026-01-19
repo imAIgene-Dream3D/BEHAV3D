@@ -385,15 +385,43 @@ def install_cellpose(conda_path, gpu_info, force_cpu=False):
 # BEHAV3D PACKAGE INSTALLATION
 # =============================================================================
 
+def find_project_root():
+    """Find the BEHAV3D project root directory (where setup.py is located)."""
+    script_dir = Path(__file__).parent.resolve()
+    
+    # Check if setup.py is in the same directory (old structure)
+    if (script_dir / "setup.py").exists():
+        return script_dir
+    
+    # Check parent directory (new structure with installation/ subfolder)
+    parent_dir = script_dir.parent
+    if (parent_dir / "setup.py").exists():
+        return parent_dir
+    
+    # Check grandparent (in case of deeper nesting)
+    grandparent_dir = parent_dir.parent
+    if (grandparent_dir / "setup.py").exists():
+        return grandparent_dir
+    
+    # Fallback to script directory
+    print_warning(f"Could not find setup.py. Using script directory: {script_dir}")
+    return script_dir
+
 def install_behav3d_package(conda_path):
     """Install BEHAV3D package in development mode."""
     print_step("Installing BEHAV3D package...")
     
     run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
-    script_dir = Path(__file__).parent
+    project_root = find_project_root()
+    
+    # Verify setup.py exists
+    if not (project_root / "setup.py").exists():
+        print_warning(f"setup.py not found in {project_root}")
+        print_info("Skipping BEHAV3D package installation.")
+        return False
     
     try:
-        cmd = f'{run_prefix} pip install -e "{script_dir}"'
+        cmd = f'{run_prefix} pip install -e "{project_root}"'
         print_info(f"Running: {cmd}")
         run_command(cmd)
         print_success("BEHAV3D package installed successfully")
