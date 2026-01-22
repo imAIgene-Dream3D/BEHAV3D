@@ -1,7 +1,7 @@
-from behav3d.utils.fileio import load_image, append_to_zarr, save_as_zarr
-from behav3d.utils.preprocessing import dilate_mask
-from behav3d.utils.segmentation import segment_size_filter
-from behav3d.utils.tracking import convert_tracked_image_to_csv
+from behav3d.io.images import load_image, append_to_zarr, save_as_zarr
+from behav3d.preprocessing import dilate_mask
+from behav3d.preprocessing.segmentation import segment_size_filter
+from behav3d.preprocessing.tracking import convert_tracked_image_to_csv
 import pandas as pd
 
 from skimage.segmentation import watershed

@@ -4,8 +4,8 @@ import pandas as pd
 import shutil
 from skimage.measure import regionprops, regionprops_table
 from scipy.ndimage import distance_transform_edt
-from behav3d.utils.fileio import load_image, save_as_zarr
-from behav3d.utils.tracking import convert_segments_to_tracks
+from behav3d.io.images import load_image, save_as_zarr
+from behav3d.preprocessing.tracking import convert_segments_to_tracks
 from typing import Optional, Tuple, Sequence
 
 try:

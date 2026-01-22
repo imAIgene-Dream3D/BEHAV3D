@@ -19,9 +19,9 @@ from sklearn.ensemble import RandomForestClassifier
 # from napari_apoc import PixelClassifier  # Commented out - use scikit-learn instead
 from scipy.ndimage import binary_fill_holes, find_objects
 
-from behav3d.utils.preprocessing import open_mask, dilate_mask
-from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt, segment_2d_filter
-from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr
+from behav3d.preprocessing.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, segment_2d_filter
+from behav3d.preprocessing import open_mask, dilate_mask, calculate_edt
+from behav3d.io.images import save_as_zarr, load_zarr, load_image, append_to_zarr
 
 from tqdm import tqdm
 

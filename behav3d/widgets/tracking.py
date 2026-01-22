@@ -1,0 +1,306 @@
+import ipywidgets as widgets
+from pathlib import Path
+import pandas as pd
+import traceback
+import yaml
+from copy import deepcopy
+from .utils import (
+    _cfg_get, 
+    spinning_loader,
+    detect_cell_type_category
+)
+from behav3d.preprocessing.tracking.laptracking import run_laptracking
+from behav3d.preprocessing.tracking.trackpy_tracking import run_trackpy_tracking_generic
+from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
+from behav3d.preprocessing.tracking import visualize_tracks
+
+class TrackingPanel:
+    """
+    Minimal UI for tracking (LAP, TrackPy, or Propagation) for any cell type.
+    - Automatically detects cell type category (organoid/immune/other)
+    - Loads appropriate default configuration based on category
+    - Uses metadata_loader.output_dir and metadata_loader.metadata_csv_path directly
+    - Updates metadata_loader.metadata and always saves CSV
+    - cell_type is supplied in __init__
+    """
+    def __init__(self, metadata_loader, cell_type):
+        self.metadata_loader = metadata_loader
+        self.cell_type = str(cell_type).strip()
+
+        self._detect_all_cell_types()
+        self._detect_category()
+        self._ensure_cfg_skeleton()
+        
+        params = dict(self.metadata_loader.behav3d_parameters or {})
+        tcfg = self._get_config_for_cell_type(params)
+
+        self.method = widgets.Dropdown(
+            description="Tracking method",
+            options=[("LAP (laptrack)", "lap"),
+                     ("TrackPy", "trackpy"),
+                     ("Propagation", "propagation")],
+            value=str(tcfg.get("method", "lap")),
+            style={'description_width': '160px'}
+        )
+
+        self.overwrite = widgets.Checkbox(
+            description="Overwrite existing",
+            value=bool(tcfg.get("overwrite", False))
+        )
+
+        lap = tcfg.get("lap", {})
+        self.track_cost_dist = widgets.IntText(
+            description="Track cost (px)",
+            value=int(lap.get("track_cost_px", 45)),
+            style={'description_width':'160px'}
+        )
+        self.gap_cost_dist = widgets.IntText(
+            description="Gap close cost (px)",
+            value=int(lap.get("gap_close_cost_px", 60)),
+            style={'description_width':'160px'}
+        )
+        self.gap_max_frames = widgets.IntText(
+            description="Gap close max frames",
+            value=int(lap.get("gap_close_max_frames", 3)),
+            style={'description_width':'160px'}
+        )
+        self.merging_cost_dist = widgets.IntText(
+            description="Merging cost (px)",
+            value=int(lap.get("merging_cost_px", 0)),
+            style={'description_width':'160px'}
+        )
+        self.splitting_cost_dist = widgets.IntText(
+            description="Splitting cost (px)",
+            value=int(lap.get("splitting_cost_px", 0)),
+            style={'description_width':'160px'}
+        )
+        self.lap_params = widgets.VBox([
+            widgets.HTML("<b>LAP parameters</b>"),
+            self.track_cost_dist, self.gap_cost_dist, self.gap_max_frames,
+            self.merging_cost_dist, self.splitting_cost_dist
+        ])
+
+        tpy = tcfg.get("trackpy", {})
+        self.tp_search_range = widgets.IntText(
+            description="Search range (px)",
+            value=int(tpy.get("search_range_px", 31)),
+            style={'description_width':'160px'}
+        )
+        self.tp_memory = widgets.IntText(
+            description="Memory (frames)",
+            value=int(tpy.get("memory_frames", 2)),
+            style={'description_width':'160px'}
+        )
+        self.tp_adaptive_stop = widgets.FloatText(
+            description="Adaptive stop",
+            value=float(tpy.get("adaptive_stop", 10.0)),
+            style={'description_width':'160px'}
+        )
+        self.tp_adaptive_step = widgets.FloatText(
+            description="Adaptive step",
+            value=float(tpy.get("adaptive_step", 0.95)),
+            style={'description_width':'160px'}
+        )
+        self.tp_params = widgets.VBox([
+            widgets.HTML("<b>TrackPy parameters</b>"),
+            self.tp_search_range, self.tp_memory, self.tp_adaptive_stop, self.tp_adaptive_step
+        ])
+
+        self.prop_params = widgets.VBox([
+            widgets.HTML("<b>Propagation tracking</b>"),
+            widgets.HTML("<i>No tunable parameters.</i>")
+        ])
+
+        self.param_container = widgets.VBox()
+        self.method.observe(self._toggle_param_groups, names='value')
+        self._toggle_param_groups()
+
+        self.btn_run = widgets.Button(
+            description=f"Run {cell_type} tracking",
+            button_style="success",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
+        self.spinner_run = widgets.HTML(value=spinning_loader)
+        self.spinner_run.layout.display = "none"
+        self.run_row = widgets.HBox(
+            [self.btn_run, self.spinner_run],
+            layout=widgets.Layout(align_items="center", gap="8px")
+        )
+
+        self.btn_run.on_click(self._on_run_clicked)
+        self.out = widgets.Output()
+
+        self.ui = widgets.VBox([
+            widgets.HTML(f"<b>{cell_type} Tracking</b>"),
+            self.method,
+            widgets.HBox([self.overwrite]),
+            self.param_container,
+            self.run_row,
+            widgets.HTML("<hr>"),
+            self.out
+        ])
+
+    def display(self):
+        widgets.display(self.ui)
+
+    def _detect_all_cell_types(self):
+        from behav3d.io.images import load_image, load_zarr, save_as_zarr
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata
+        )
+        metadata = self.metadata_loader.metadata
+        if metadata is None: raise ValueError("Metadata not loaded.")
+        self.organoid_types = detect_organoid_types_from_metadata(metadata)
+        self.immune_types = detect_immune_cell_types_from_metadata(metadata)
+        self.other_types = detect_other_cell_types_from_metadata(metadata)
+
+    def _detect_category(self):
+        self.category = detect_cell_type_category(self.cell_type, self.metadata_loader.metadata)
+    
+    def _get_config_for_cell_type(self, params):
+        tracking_cfg = params.get("tracking", {})
+        if self.cell_type in tracking_cfg: return tracking_cfg[self.cell_type]
+        if self.category == 'organoid': return tracking_cfg.get('organoid', {})
+        if self.category == 'immune': return tracking_cfg.get('immune', {})
+        return tracking_cfg.get('other', {})
+
+    def _toggle_param_groups(self, change=None):
+        if self.method.value == "lap": self.param_container.children = (self.lap_params,)
+        elif self.method.value == "trackpy": self.param_container.children = (self.tp_params,)
+        else: self.param_container.children = (self.prop_params,)
+
+    def _lock(self, state: bool):
+        for w in [self.method, self.overwrite, self.track_cost_dist, self.gap_cost_dist, self.gap_max_frames,
+                  self.merging_cost_dist, self.splitting_cost_dist, self.tp_search_range, self.tp_memory,
+                  self.tp_adaptive_stop, self.tp_adaptive_step, self.btn_run]:
+            if hasattr(w, "disabled"): w.disabled = state
+
+    def _force_commit_pending_changes(self):
+        try:
+            from IPython.display import Javascript, display
+            widgets.display(Javascript("document.activeElement && document.activeElement.blur();"))
+            import time as _t; _t.sleep(0.08)
+        except Exception: pass
+
+    def _ensure_cfg_skeleton(self):
+        p = dict(self.metadata_loader.behav3d_parameters or {})
+        p.setdefault("tracking", {})
+        p["tracking"].setdefault("immune", {"method": "trackpy", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 45, "gap_close_max_frames": 5, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 31, "memory_frames": 5, "adaptive_stop": 5.0, "adaptive_step": 0.95}})
+        p["tracking"].setdefault("other", {"method": "trackpy", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 45, "gap_close_max_frames": 5, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 31, "memory_frames": 5, "adaptive_stop": 5.0, "adaptive_step": 0.95}})
+        p["tracking"].setdefault("organoid", {"method": "propagation", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 80, "gap_close_max_frames": 3, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 35, "memory_frames": 2, "adaptive_stop": 10.0, "adaptive_step": 0.95}})
+        self.metadata_loader.behav3d_parameters = p
+
+    def _persist_params(self):
+        self._ensure_cfg_skeleton()
+        params = dict(self.metadata_loader.behav3d_parameters or {})
+        prof = params["tracking"].setdefault(self.cell_type, {"lap": {}, "trackpy": {}})
+        prof["method"] = str(self.method.value)
+        prof["overwrite"] = bool(self.overwrite.value)
+        prof["lap"].update({"track_cost_px": int(self.track_cost_dist.value), "gap_close_cost_px": int(self.gap_cost_dist.value), "gap_close_max_frames": int(self.gap_max_frames.value), "merging_cost_px": int(self.merging_cost_dist.value), "splitting_cost_px": int(self.splitting_cost_dist.value)})
+        prof["trackpy"].update({"search_range_px": int(self.tp_search_range.value), "memory_frames": int(self.tp_memory.value), "adaptive_stop": float(self.tp_adaptive_stop.value), "adaptive_step": float(self.tp_adaptive_step.value)})
+        self.metadata_loader.behav3d_parameters = params
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(params, f, sort_keys=False)
+
+    def _on_run_clicked(self, _):
+        self._lock(True)
+        self.spinner_run.layout.display = None
+        with self.out:
+            self.out.clear_output()
+            try:
+                self._force_commit_pending_changes()
+                self._persist_params()
+                out_dir = Path(self.metadata_loader.output_dir).expanduser()
+                out_dir.mkdir(parents=True, exist_ok=True)
+                csv_path = Path(self.metadata_loader.metadata_csv_path).expanduser()
+
+                method = self.method.value
+                if method == "lap":
+                    tc, gc, mc, sc = int(self.track_cost_dist.value)**2, int(self.gap_cost_dist.value)**2, int(self.merging_cost_dist.value), int(self.splitting_cost_dist.value)
+                    new_md = run_laptracking(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, track_cost_cutoff=tc, gap_closing_cost_cutoff=gc, gap_closing_max_frame_count=int(self.gap_max_frames.value), merging_cost_cutoff=(mc**2 if mc>0 else False), splitting_cost_cutoff=(sc**2 if sc>0 else False), overwrite=bool(self.overwrite.value))
+                elif method == "trackpy":
+                    new_md = run_trackpy_tracking_generic(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, overwrite=bool(self.overwrite.value), search_range=int(self.tp_search_range.value), memory=int(self.tp_memory.value), adaptive_stop=float(self.tp_adaptive_stop.value), adaptive_step=float(self.tp_adaptive_step.value))
+                else:
+                    new_md = run_propagation_tracking(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, overwrite=bool(self.overwrite.value))
+
+                self.metadata_loader.metadata = new_md
+                new_md.to_csv(csv_path, sep=",", index=False)
+                print("✅ Tracking finished.")
+            except Exception: traceback.print_exc()
+            finally:
+                self.spinner_run.layout.display = "none"
+                self._lock(False)
+
+class TrackingVisualizationPanel:
+    def __init__(self, metadata_loader, default_time_range=None, channel_colors=None):
+        self.metadata_loader = metadata_loader
+        self.channel_colors = tuple(channel_colors or _cfg_get(self.metadata_loader.behav3d_parameters, "tracking_visualization.channel_colors", ["cyan", "yellow", "red", "green", "magenta", "blue"]))
+        self._viewer = None
+        self._status = widgets.HTML("<b>Waiting for user to load metadata…</b>")
+        self._refresh_btn = widgets.Button(description="Refresh", tooltip="Build/Update selector from metadata_loader.metadata")
+        self._refresh_btn.on_click(self._on_refresh_clicked)
+        self.sample_dropdown = widgets.Dropdown(options=[], value=None, description="Sample:", layout=widgets.Layout(width="350px"), disabled=True)
+        self.use_range = widgets.Checkbox(description="Use custom time range", value=bool(_cfg_get(self.metadata_loader.behav3d_parameters, "tracking_visualization.use_range", False)), indent=False)
+
+        if isinstance(default_time_range, (tuple, list)) and len(default_time_range) == 2:
+            _start_default, _end_default = map(int, default_time_range)
+        else:
+            _start_default = int(_cfg_get(self.metadata_loader.behav3d_parameters, "tracking_visualization.start_t", 0))
+            _end_default   = int(_cfg_get(self.metadata_loader.behav3d_parameters, "tracking_visualization.end_t", 0))
+
+        self.start_t = widgets.IntText(description="Start T:", value=_start_default, layout=widgets.Layout(width="180px"))
+        self.end_t   = widgets.IntText(description="End T:", value=_end_default, layout=widgets.Layout(width="180px"))
+        self.range_box = widgets.HBox([self.start_t, self.end_t])
+        self.range_box.layout.display = "flex" if self.use_range.value else "none"
+        self.use_range.observe(lambda ch: setattr(self.range_box.layout, 'display', 'flex' if ch['new'] else 'none'), names="value")
+
+        self.open_button = widgets.Button(description="Visualize segmentation and tracking results", button_style="primary", tooltip="Launch Napari for the selected sample", icon="eye", layout=widgets.Layout(width="300px"), disabled=True)
+        self.close_button = widgets.Button(description="Close viewer", button_style="danger", icon="stop", tooltip="Close the active Napari viewer", layout=widgets.Layout(width="200px", display="none"))
+        self.msg = widgets.Output()
+        self.open_button.on_click(self._on_open_clicked)
+        self.close_button.on_click(self._on_close_clicked)
+        self._panel = widgets.VBox([widgets.HBox([self._status, self._refresh_btn]), self.sample_dropdown, self.use_range, self.range_box, widgets.HBox([self.open_button, self.close_button]), self.msg])
+        self._maybe_build_from_loader()
+
+    def display(self):
+        widgets.display(self._panel)
+
+    def get_selected_row(self) -> pd.Series:
+        name = self.sample_dropdown.value
+        df = self.metadata_loader.metadata
+        return df[df["sample_name"].astype(str) == str(name)].iloc[0]
+
+    def open_viewer(self):
+        row = self.get_selected_row()
+        time_range = (int(self.start_t.value), int(self.end_t.value)) if self.use_range.value else None
+        with self.msg:
+            self.msg.clear_output()
+            try:
+                self._viewer = visualize_tracks(metadata_row=row, timepoint_range=time_range, channel_colors=self.channel_colors)
+            except Exception as e: print(f"Error: {e}")
+            self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
+
+    def _maybe_build_from_loader(self):
+        df = getattr(self.metadata_loader, "metadata", None)
+        if isinstance(df, pd.DataFrame) and not df.empty and ("sample_name" in df.columns):
+            sample_names = df["sample_name"].astype(str).unique().tolist()
+            desired = _cfg_get(self.metadata_loader.behav3d_parameters, "tracking_visualization.sample_name", None)
+            self.sample_dropdown.options = sample_names
+            self.sample_dropdown.value = desired if (desired in sample_names) else sample_names[0]
+            self.sample_dropdown.disabled = False
+            self.open_button.disabled = False
+            self._status.value = "<span style='color:green'>Metadata loaded ✅</span>"
+        else:
+            self._status.value = "<b>Waiting for user to load metadata…</b>"
+            self.sample_dropdown.disabled = True
+            self.open_button.disabled = True
+
+    def _on_open_clicked(self, _): self.open_viewer()
+    def _on_close_clicked(self, _):
+        with self.msg:
+            try:
+                if self._viewer: self._viewer.close(); self._viewer = None
+            finally: self.close_button.layout.display = "none"
+    def _on_refresh_clicked(self, _):
+        with self.msg: self.msg.clear_output(); self._maybe_build_from_loader()
