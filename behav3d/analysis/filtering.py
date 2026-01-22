@@ -7,6 +7,7 @@ import pandas as pd
 from pathlib import Path
 import time
 from behav3d.core.utils import format_time
+import numpy as np
 
 def filter_by_full_duration(df: pd.DataFrame,
                             exp_duration=None,

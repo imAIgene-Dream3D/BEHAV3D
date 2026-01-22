@@ -14,17 +14,19 @@ from sklearn.decomposition import PCA
 from sklearn.feature_selection import VarianceThreshold
 
 from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
-from behav3d.analysis.classification import relabel_cluster_ids
+
 from behav3d.features.state_descriptive_features import (
     extract_descibing_track_state_features, 
     scale_feature_blocks, 
     l2_normalize_features_blocks,
     drop_highly_correlated_features
 )
+
+from behav3d.analysis.clustering.general import relabel_cluster_ids
 from behav3d.analysis.filtering import filter_and_truncate_tracks_anndata
-from behav3d.analysis.classification.clustering.general.leiden import run_pca, run_leiden_clustering
-from behav3d.analysis.classification.clustering.track.visualization.plots.exemplar_track_per_cluster import plot_exemplar_tracks_by_cluster
-from behav3d.analysis.classification.clustering.general.visualization.plots import plot_top_ranking_features
+from behav3d.analysis.clustering.general.leiden import run_pca, run_leiden_clustering
+from behav3d.analysis.clustering.track.visualization.plots.exemplar_track_per_cluster import plot_exemplar_tracks_by_cluster
+from behav3d.analysis.clustering.general.visualization.plots import plot_top_ranking_features
 
 import numpy as np
 #%matplotlib inline
@@ -37,7 +39,7 @@ ssd_dir = r"/Volumes/T7_Sam/"
 # ssd_dir = r"F:/"
 ssd_dir = Path(ssd_dir)
 outfolder = Path(ssd_dir, "BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
-adata_full = sc.read_h5ad(Path(outfolder,"adata_full.h5ad"))
+adata_full = sc.read_h5ad(Path(outfolder,"adata_hmm_full.h5ad"))
 
 mapping =  {
         "1": "Dead",
@@ -203,3 +205,67 @@ plot_top_ranking_features(
     groupby="ClusterID",
     n_features=10
 )
+
+
+"""
+Plot sankey plot from one state to another
+"""
+df_paths = paths_between_states(
+    adata_full,
+    start_state="Static",
+    end_state="Organoid contact",
+    state_col="ClusterID",
+    collapse_bouts=True,
+    mode="next_end",
+)
+
+plot_paths_by_count(
+    df_paths,
+    top_n=25,
+    min_count=1,
+    title="Most common paths from state 1 to state 5",
+)
+
+colors = [
+    "#d62728",
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
+]
+
+fig = plot_sankey_diagram_between_states(
+    df_paths,
+    state_colors=colors,
+    min_count=100,
+)
+fig.write_image(
+    "/Users/s.deblank-3/Downloads/newplot.pdf",
+    width=1400,
+    height=700,
+    scale=2,
+)
+fig.show()
+
+"""
+Plot state composition over time
+"""
+df_fig, fig, ax = plot_state_composition_over_time(
+    adata_full, 
+    time_col="position_t", 
+    state_col="ClusterID", 
+    relative=False
+    )
+
+df_fig, fig, axes= plot_state_composition_over_time(
+    adata_full, 
+    time_col="position_t", 
+    state_col="ClusterID", 
+    relative=True,
+    group_by_sample=True
+    )

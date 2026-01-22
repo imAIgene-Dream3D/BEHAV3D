@@ -1,13 +1,16 @@
 from pathlib import Path
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
+import shutil
+
 import napari
 import numpy as np
-from behav3d.io.images import load_zarr
 import pandas as pd
-
-import shutil
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor
-import multiprocessing
+
+from skimage.measure import regionprops_table
+
+from behav3d.io.images import save_as_zarr, load_image, load_zarr
 
 def convert_segments_to_tracks(
     df_tracks,

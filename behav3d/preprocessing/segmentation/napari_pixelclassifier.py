@@ -618,6 +618,17 @@ def train_pixel_classifier(
                 log(f"\n### Predicting {cell_type.capitalize()} Pixels")
                 QApplication.processEvents()
                 pred_mask = apply_classifier(classifiers[cell_type], features_outpath, pred_labels_paths[cell_type], n_workers=n_workers)
+                
+                if cell_type in organoid_types:
+                    opening_nr_pixels = 3
+                elif cell_type in immune_types:
+                    opening_nr_pixels = 0
+                else:
+                    opening_nr_pixels = 0
+                
+                # Postprocess mask
+                pred_mask = postprocess_mask(pred_mask, fill_holes=True, opening_nr_pixels=opening_nr_pixels)
+
                 pred_masks[cell_type] = pred_mask
                 viewer.layers[f"Pixel Classification ({cell_type.capitalize()})"].data = pred_mask
         

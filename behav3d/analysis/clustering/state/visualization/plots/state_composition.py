@@ -7,7 +7,7 @@ def plot_state_composition_over_time(
     adata,
     *,
     time_col: str = "position_t",
-    state_col: str = "hmm_state",
+    state_col: str = "ClusterID",
     sample_col: str = "sample_name",
     relative: bool = True,
     group_by_sample: bool = False,
