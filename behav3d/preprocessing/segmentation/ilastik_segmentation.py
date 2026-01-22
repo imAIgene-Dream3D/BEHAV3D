@@ -26,7 +26,7 @@ from tifffile import imread, imwrite
 import numpy as np
 import pandas as pd
 import time
-from behav3d.utils import format_time
+from behav3d.core.utils import format_time
 
 def run_ilastik_segmentation(
     metadata, 
@@ -42,29 +42,22 @@ def run_ilastik_segmentation(
     verbose=False
     ):
     
-    assert config is not None or all(
-        [output_dir,
-         ilastik_path, 
-         ilastik_pix_clas_model, 
-         ilastik_org_seg_model, 
-         ilastik_tcell_seg_model,
-         ilastik_org_postproc_model,
-         ilastik_tcell_postproc_model
-         is not None]
-    ), "Either 'config' or 'output_dir, ilastik_path, ilastik_pix_clas_model, ilastik_org_seg_model, ilastik_tcell_seg_model, ilastik_org_postproc_model and ilastik_tcell_postproc_model' parameters must be supplied"
-    
-    if not all([
+    args_list = [
         output_dir,
-        ilastik_path, 
-        ilastik_pix_clas_model, 
-        ilastik_org_seg_model, 
+        ilastik_path,
+        ilastik_pix_clas_model,
+        ilastik_org_seg_model,
         ilastik_tcell_seg_model,
         ilastik_org_postproc_model,
         ilastik_tcell_postproc_model
-        is not None]
-        ):
+    ]
+    
+    assert config is not None or all(x is not None for x in args_list), \
+        "Either 'config' or all individual ilastik paths must be supplied"
+    
+    if any(x is None for x in args_list):
         output_dir = config['output_dir']
-        metadata = pd.read_csv(config["metadata_csv_path"])
+        # metadata = pd.read_csv(config["metadata_csv_path"]) # Already passed in
         ilastik_path = config['ilastik_path']
         ilastik_pix_clas_model = config['ilastik_pixel_classifier_model']
         ilastik_org_seg_model = config['ilastik_organoid_segmentation_model']

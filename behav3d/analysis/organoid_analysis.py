@@ -4,11 +4,18 @@ import time
 import pandas as pd
 import numpy as np
 
-from behav3d.utils import format_time
-from behav3d.utils.analysis import smooth_value_over_time
-from behav3d.utils.filtering import plot_filter_count, filter_by_full_duration, filter_minimal_track_length, trim_to_maximal_track_length
-from behav3d.utils.preprocessing import calc_z_projection
-from behav3d.utils.fileio import load_image
+from behav3d.core.utils import format_time
+from behav3d.analysis import smooth_value_over_time
+from behav3d.analysis.filtering import (
+    plot_filter_count, 
+    filter_by_full_duration, 
+    filter_minimal_track_length, 
+    trim_to_maximal_track_length,
+    plot_touching_nontouching_distribution,
+    plot_dead_dye_distribution
+)
+from behav3d.preprocessing import calc_z_projection
+from behav3d.io.images import load_image
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
@@ -424,7 +431,6 @@ def filter_organoid_tracks(
     )
     
     # Plot touching distributions for all contact types (same as immune/other cells)
-    from behav3d.analysis.tcell_analysis import plot_touching_nontouching_distribution
     contact_columns = [col for col in df_all_tracks_filt.columns if col.endswith('_contact') and not col.startswith('active_')]
     for contact_col in contact_columns:
         target_type = contact_col.replace('_contact', '')
@@ -440,7 +446,6 @@ def filter_organoid_tracks(
     
     # Plot dead dye distribution if dead channel exists
     if "mean_dead_dye" in df_all_tracks_filt.columns:
-        from behav3d.analysis.tcell_analysis import plot_dead_dye_distribution
         
         # Plot distribution at all timepoints
         plot_dead_dye_distr_outpath = Path(qc_outdir, f"BEHAV3D_dead_dye_distribution.pdf")

@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from behav3d.utils.fileio import load_image
+from behav3d.fileio import load_image
 import napari
 
 cell_type = 'organoid'

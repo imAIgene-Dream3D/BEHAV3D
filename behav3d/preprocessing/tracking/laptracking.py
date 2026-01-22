@@ -4,8 +4,8 @@ from pathlib import Path
 from skimage.measure import regionprops_table
 from laptrack import LapTrack
 from tqdm import tqdm
-from behav3d.utils.fileio import load_image, append_to_zarr, get_filepath_stem
-from behav3d.utils.tracking import convert_segments_to_tracks
+from behav3d.io.images import load_image, append_to_zarr, get_filepath_stem
+from behav3d.preprocessing.tracking import convert_segments_to_tracks
 
 def laptrack_image(
     segments=None,

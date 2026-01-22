@@ -22,9 +22,9 @@ from sklearn.ensemble import RandomForestClassifier
 from scipy import ndimage
 from scipy.ndimage import binary_fill_holes, find_objects
 
-from behav3d.utils.preprocessing import open_mask, dilate_mask, zeropad_image_to_match_shape
-from behav3d.utils.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, calculate_edt, segment_2d_filter
-from behav3d.utils.fileio import save_as_zarr, load_zarr, load_image, append_to_zarr, get_image_shape
+from behav3d.preprocessing.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, segment_2d_filter
+from behav3d.preprocessing import open_mask, dilate_mask, calculate_edt, zeropad_image_to_match_shape
+from behav3d.io.images import load_image, get_image_shape, load_zarr, save_as_zarr, append_to_zarr
 
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -107,8 +107,82 @@ def postprocess_mask(mask, fill_holes=True, opening_nr_pixels=1):
         mask = open_mask(mask)
     return(mask)
 
+def refine_segments(
+    segments: np.ndarray,
+    edt: np.ndarray,
+    mask: np.ndarray,
+    thr: float,
+    segment_size_min: int,
+    n_workers: int | None = 1,
+    out_dtype=np.uint16,
+):
+    """
+    One refinement pass:
+      - relabel segments sequentially (so find_objects indices match label ids)
+      - for each label, run refine_segment(local_mask, local_edt, thr, ...)
+      - stitch refined local labels into a global label image with unique IDs
 
-def refine_segment(args):
+    Returns:
+      new_segments (same shape as mask)
+    """
+    # Make labels contiguous so: slices[i] corresponds to label (i+1)
+    segments, _, _ = relabel_sequential(segments)
+
+    slices = find_objects(segments)
+    args_list = []
+
+    for i, slc in enumerate(slices):
+        if slc is None:
+            continue
+
+        label_id = i + 1
+        local_mask = (segments[slc] == label_id)
+        if not np.any(local_mask):
+            continue
+
+        local_edt = edt[slc]
+        minc = [s.start for s in slc]
+        args_list.append((local_mask, local_edt, thr, segment_size_min, minc))
+
+    if n_workers is None:
+        n_workers = multiprocessing.cpu_count()
+
+    if len(args_list) == 0:
+        return np.zeros_like(mask, dtype=out_dtype)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        results = list(executor.map(_refine_segment, args_list))
+
+    new_segments = np.zeros_like(mask, dtype=np.uint32)  # safer while assembling
+    current_label = 0
+
+    for local_segment, minc in results:
+        z0, y0, x0 = minc
+
+        nonzero = local_segment > 0
+        if not np.any(nonzero):
+            continue
+
+        local_segment = local_segment.astype(np.uint32, copy=False)
+        local_max = int(local_segment.max())
+
+        local_segment[nonzero] += current_label
+
+        zz, yy, xx = np.where(nonzero)
+        new_segments[z0 + zz, y0 + yy, x0 + xx] = local_segment[nonzero]
+
+        current_label += local_max
+
+    if out_dtype is not None:
+        if np.iinfo(out_dtype).max < new_segments.max():
+            raise ValueError(
+                f"Label overflow: max label {new_segments.max()} exceeds dtype {out_dtype}"
+            )
+        new_segments = new_segments.astype(out_dtype, copy=False)
+
+    return new_segments
+
+def _refine_segment(args):
     """Refine a single segment by reapplying EDT-based splitting."""
     # start_time = time.time()
     # label_id, segment_mask, full_edt, edt_threshold, segment_size_min = args
@@ -124,6 +198,11 @@ def refine_segment(args):
     new_seg = watershed(-local_edt, markers=local_seeds, mask=local_mask)
     # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
     new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
+    
+    # If EDT threshold is too high and all segments were removed, use original segment
+    if np.max(new_seg) == 0:
+        return (local_mask.astype(np.int32), tuple(minc))
+    
     # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
     new_seg = watershed(-local_edt, markers=new_seg, mask=local_mask)
     # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
@@ -131,73 +210,42 @@ def refine_segment(args):
     # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
     return (new_seg, tuple(minc))
 
-def segment_mask(mask, edt_thr=1.5, edt_thr_refined=[2, 2.5, 3], segment_size_min=15, use_dims=3, n_workers=1):
-    offset = 1
-    start_time = time.time()
-    # Step 1: Initial segmentation
+def segment_mask(mask, edt_thr=1.5, edt_thr_refined=None, segment_size_min=15, use_dims=3, n_workers=1):
     edt = calculate_edt(mask, use_dims=use_dims)
-    seeds = label(edt >= edt_thr)
-    segments = watershed(-edt, markers = seeds, mask=mask)
-    seeds2 = label(mask * (segments==0))
-    seeds2[seeds2!=0] += seeds.max()
-    # Relabel last segments to keep unique labels
-    segments[segments==0]=seeds2[segments==0]
-    segments = segment_size_filter(segments, size_min=segment_size_min)
-    segments = watershed(-edt, markers = segments, mask=mask)
-    # segments, _, _ = relabel_sequential(segments, offset)
-    
-    # If edt_thr_refined ois not list, turn into list
-    if not isinstance(edt_thr_refined, list):
-        if edt_thr_refined is not None:
-            edt_thr_refined = [edt_thr_refined]
-        
+
+    # Normalize refined thresholds
+    if edt_thr_refined is not None and not isinstance(edt_thr_refined, list):
+        edt_thr_refined = [edt_thr_refined]
+
+    # Start from connected components as initial segments
+    segments = label(mask)
+
+    # Pass 1: use edt_thr
+    segments = refine_segments(
+        segments=segments,
+        edt=edt,
+        mask=mask,
+        thr=edt_thr,
+        segment_size_min=segment_size_min,
+        n_workers=n_workers,
+        out_dtype=np.uint16,
+    )
+
+    # Pass 2..N: refined thresholds
     if edt_thr_refined is not None:
         for thr in edt_thr_refined:
-            # Step 2: Prepare for per-label refinement
-            start_time = time.time()
-            unique_labels = np.unique(segments)
-            unique_labels = unique_labels[unique_labels != 0]  # Exclude background
-            args_list = []
-    
-            slices = find_objects(segments)
-            for i, slc in enumerate(slices):
-                label_id = i + 1  # Because label 0 is background and ignored
-
-                if slc is None:
-                    continue  # This label is not present
-
-                local_mask = segments[slc] == label_id
-                local_edt = edt[slc]
-                minc = [s.start for s in slc]
-
-                args_list.append((local_mask, local_edt, thr, segment_size_min, minc))
-
-            if n_workers is None:
-                n_workers = multiprocessing.cpu_count()
-
-            results = []
-            with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                results += list(executor.map(refine_segment, args_list))
-           
-            current_label = 0
-            segments = np.zeros_like(mask, dtype=np.uint16)
-            for result in results:
-                local_segment, minc = result
-                z0, y0, x0 = minc
-                z1, y1, x1 = z0 + local_segment.shape[0], y0 + local_segment.shape[1], x0 + local_segment.shape[2]
-
-                # Assign to global array with label offset
-                nonzero_mask = local_segment > 0
-                local_segment[nonzero_mask] += current_label
-                segments[z0:z1, y0:y1, x0:x1][nonzero_mask] = local_segment[nonzero_mask]
-
-                current_label = segments.max() + 1  # Update for next segment
-    else:
-        segments, _, _ = relabel_sequential(segments, offset)
-        
-    # FIlter out 2D segments
+            segments = refine_segments(
+                segments=segments,
+                edt=edt,
+                mask=mask,
+                thr=thr,
+                segment_size_min=segment_size_min,
+                n_workers=n_workers,
+                out_dtype=np.uint16,
+            )
+    segments = segment_size_filter(segments, size_min=segment_size_min)
     segments = segment_2d_filter(segments)
-    return(segments)
+    return segments
 
 
 def _apply_classifier(args):
@@ -272,7 +320,7 @@ def train_pixel_classifier(
         n_workers = 1
     
     # Detect cell types from metadata if not provided
-    from behav3d.utils import (
+    from behav3d.core.metadata import (
         detect_organoid_types_from_metadata,
         detect_immune_cell_types_from_metadata,
         detect_other_cell_types_from_metadata,
@@ -570,6 +618,17 @@ def train_pixel_classifier(
                 log(f"\n### Predicting {cell_type.capitalize()} Pixels")
                 QApplication.processEvents()
                 pred_mask = apply_classifier(classifiers[cell_type], features_outpath, pred_labels_paths[cell_type], n_workers=n_workers)
+                
+                if cell_type in organoid_types:
+                    opening_nr_pixels = 3
+                elif cell_type in immune_types:
+                    opening_nr_pixels = 0
+                else:
+                    opening_nr_pixels = 0
+                
+                # Postprocess mask
+                pred_mask = postprocess_mask(pred_mask, fill_holes=True, opening_nr_pixels=opening_nr_pixels)
+
                 pred_masks[cell_type] = pred_mask
                 viewer.layers[f"Pixel Classification ({cell_type.capitalize()})"].data = pred_mask
         
@@ -597,67 +656,72 @@ def train_pixel_classifier(
         
         # Segment each cell type using EDT watershed
         segmented_cells = {}  # Store {cell_type: segmented_mask}
-        
         for cell_type in all_cell_types:
             edt_threshold = edt_thresholds.get(cell_type, 1.0)  # Default if not specified
             log(f"\n### Segmenting {cell_type.capitalize()} (EDT threshold={edt_threshold})")
             QApplication.processEvents()
-            
+
             pred_mask = pred_masks[cell_type]
             n_timepoints = pred_mask.shape[0]
             log(f"   Processing {n_timepoints} timepoints...")
             log(f"   Mask shape: {pred_mask.shape}")
             QApplication.processEvents()
-            
-            # Segment each timepoint
+
             segmented_timepoints = []
             for t_idx in range(n_timepoints):
                 log(f"   [T{t_idx+1}] Loading mask...")
                 QApplication.processEvents()
+
                 mask_t = pred_mask[t_idx]
                 # Remove background (label 1), keep only foreground (label 2)
-                mask_t = (mask_t == 2).astype(np.uint8)
-                fg_pixels = mask_t.sum()
+                mask_t = (mask_t == 2)  # bool mask is fine
+                fg_pixels = int(mask_t.sum())
                 log(f"   [T{t_idx+1}] Foreground pixels: {fg_pixels}")
                 QApplication.processEvents()
-                
-                # Apply watershed segmentation with EDT
-                if fg_pixels > 0:
-                    log(f"   [T{t_idx+1}] Computing EDT...")
-                    QApplication.processEvents()
-                    # Distance transform
-                    distance = ndimage.distance_transform_edt(mask_t)
-                    log(f"   [T{t_idx+1}] Finding local maxima...")
-                    QApplication.processEvents()
-                    # Find peaks above threshold
-                    local_max = distance > edt_threshold
-                    log(f"   [T{t_idx+1}] Labeling markers (local_max pixels: {local_max.sum()})...")
-                    QApplication.processEvents()
-                    markers, num_markers = ndimage.label(local_max)
-                    log(f"   [T{t_idx+1}] Found {num_markers} markers")
-                    log(f"   [T{t_idx+1}] Running watershed...")
-                    QApplication.processEvents()
-                    # Watershed
-                    segmented = watershed(-distance, markers, mask=mask_t)
-                    log(f"   [T{t_idx+1}] Done!")
-                    QApplication.processEvents()
-                else:
-                    segmented = np.zeros_like(mask_t, dtype=np.int32)
+
+                if fg_pixels == 0:
+                    segmented = np.zeros_like(mask_t, dtype=np.uint16)
                     log(f"   [T{t_idx+1}] Empty mask, skipped")
                     QApplication.processEvents()
-                
+                else:
+                    # Use your unified pipeline (EDT + refine passes)
+                    log(f"   [T{t_idx+1}] Segmenting via segment_mask()...")
+                    QApplication.processEvents()
+
+                    # Determine segment size based on cell type category
+                    if cell_type in organoid_types:
+                        segment_size_min = 1000
+                    elif cell_type in immune_types:
+                        segment_size_min = 10
+                    else:
+                        segment_size_min = 10
+
+                    segmented = segment_mask(
+                        mask=mask_t,
+                        edt_thr=edt_threshold,          # first pass threshold
+                        edt_thr_refined=None,           # or e.g. [edt_threshold + 0.5, edt_threshold + 1.0]
+                        segment_size_min=segment_size_min,            # keep your default or set per cell type
+                        use_dims=2,                     # IMPORTANT: 2D frames (change to 3 for 3D)
+                        n_workers=1,                    # or whatever you want
+                    )
+
+                    segmented = segmented.astype(np.uint16, copy=False)
+                    log(f"   [T{t_idx+1}] Done! labels={int(segmented.max())}")
+                    QApplication.processEvents()
+
                 segmented_timepoints.append(segmented)
-            
+
             full_seg = np.stack(segmented_timepoints, axis=0)
             segmented_cells[cell_type] = full_seg
             log(f"   {cell_type.capitalize()} segmentation complete!")
             QApplication.processEvents()
+
             viewer.layers[f"{cell_type.capitalize()} Segments"].data = full_seg
-        
+
         # Save images
         image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
         save_as_zarr(image_data, image_outpath)
-        
+
         log(f"\n###### DONE time elapsed: {time.time() - start_time:.2f} s")
     
     def save_pixel_classification(log=print):
@@ -1109,7 +1173,7 @@ def run_pixel_classifier_segmentation(
         n_workers = 1
     
     # Detect cell types from metadata
-    from behav3d.utils import (
+    from behav3d.core.metadata import (
         detect_organoid_types_from_metadata,
         detect_immune_cell_types_from_metadata,
         detect_other_cell_types_from_metadata,

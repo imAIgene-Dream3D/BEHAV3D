@@ -5,10 +5,16 @@ from pathlib import Path
 import yaml
 import time
 import argparse
-from behav3d.utils import format_time
-from behav3d.utils.fileio import get_filepath_stem, load_image, load_zarr, save_as_zarr
 from tqdm import tqdm
 import dask.array as da
+
+from behav3d.core.utils import format_time
+from behav3d.io.images import get_filepath_stem, load_image, load_zarr, save_as_zarr
+from behav3d.core.metadata import (
+    detect_immune_cell_types_from_metadata,
+    detect_organoid_types_from_metadata,
+    detect_other_cell_types_from_metadata
+)
 
 
 def backproject_mean_features_behav3d(
@@ -345,11 +351,7 @@ def _find_track_image_column(df_sample, cell_type):
 
 def _load_other_cell_tracks(trackid_data, metadata, df_sample, cell_type, raw_img):
     """Load tracks from other cell types for visualization context."""
-    from behav3d.utils import (
-        detect_immune_cell_types_from_metadata,
-        detect_organoid_types_from_metadata,
-        detect_other_cell_types_from_metadata
-    )
+    
     
     all_cell_types = (detect_immune_cell_types_from_metadata(metadata) + 
                       detect_organoid_types_from_metadata(metadata) + 

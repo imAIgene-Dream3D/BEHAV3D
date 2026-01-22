@@ -42,8 +42,16 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.decomposition import PCA
 
 from pathlib import Path
-from behav3d.utils import format_time, expand_column_patterns
-from behav3d.utils.filtering import plot_filter_count, filter_by_full_duration, filter_minimal_track_length, trim_to_maximal_track_length
+from behav3d.core.utils import format_time, expand_column_patterns
+from behav3d.analysis.filtering import (
+    plot_filter_count, 
+    filter_by_full_duration, 
+    filter_minimal_track_length, 
+    trim_to_maximal_track_length,
+    plot_dead_dye_distribution,
+    plot_touching_nontouching_distribution,
+    round_legend_ticks
+)
 import yaml
 import time
 import seaborn as sns
@@ -1673,161 +1681,7 @@ def plot_clustering_feature_heatmap(
 #             pdf.savefig(fig, dpi=600)
 #             plt.close(fig)
 
-def plot_dead_dye_distribution(
-    df_tracks,
-    outpath,
-    nr_cols=3,
-    rows_per_page = 3,
-    figsize=(8.27, 11.69),
-    plot_results=True
-    ):
-    """
-    Create a violin plot with an underlying scatterplot that provides an
-    overview of the mean dead dye intensity per segment at the first timepoint
-    in each experiment
-    """
-    sample_names = df_tracks["sample_name"].unique()
-    n_plots = len(sample_names)
-    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
-    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
-    
-    with PdfPages(outpath) as pdf:
-        # df_time1 = df_tracks[df_tracks["relative_time"]==1]
-        plot_idx = 0  # Track which plot we are adding
-        for page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
-            gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.3, hspace=0.1)
-            remaining_axes = [
-                fig.add_subplot(gs[i, j]) 
-                for i in range(rows_per_page)
-                for j in range(nr_cols)
-                ]
 
-            for ax in remaining_axes:
-                if plot_idx >= n_plots:
-                    ax.remove()  # Remove empty axes
-                    continue
-                
-                sample = sample_names[plot_idx]
-                df_subset = df_tracks[(df_tracks["sample_name"] == sample)]
-
-                # Violin plot
-                sns.violinplot(
-                    data=df_subset, 
-                    # x='sample_name', 
-                    y='mean_dead_dye', 
-                    dodge=False, 
-                    inner=None,
-                    ax=ax
-                    )
-
-                # Jitter plot (scatter over the violin)
-                sns.stripplot(
-                    data=df_subset, 
-                    # x='sample_name', 
-                    y='mean_dead_dye', 
-                    color='black', 
-                    alpha=0.5, 
-                    jitter=True,
-                    ax=ax
-                    )
-                ax.set_title(sample, fontsize=10, loc='center')
-                ax.set_xticks([])
-                ax.set_xticklabels([])
-                ax.set_xlabel("")
-                ax.set_ylabel("Mean Dead Dye")
-                ax.grid(True, linestyle="--", alpha=0.7)
-                sns.despine()
-                plot_idx += 1
-                
-            # plt.show(fig)
-            fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
-            pdf.savefig(fig, bbox_inches='tight', dpi=600)
-            plt.close(fig)
-        
-def plot_touching_nontouching_distribution(
-    df_tracks,
-    outpath,
-    contact_column='organoid_contact',
-    nr_cols=3,
-    rows_per_page = 3,
-    figsize=(8.27, 11.69),
-    plot_results=True
-    ):
-    """
-    Create a barplot that provides an overview of how many cells make contact with
-    other organoids/cells
-    """
-    
-    sample_names = df_tracks["sample_name"].unique()
-    n_plots = len(sample_names)
-    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
-    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
-        
-    with PdfPages(outpath) as pdf:
-        # organoid_lines = df_tracks["organoid_line"].unique()
-        plot_idx = 0  # Track which plot we are adding
-        for page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
-            gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.5, hspace=0.3)
-
-            remaining_axes = [
-                fig.add_subplot(gs[i, j]) 
-                for i in range(rows_per_page)
-                for j in range(nr_cols)
-                ]
-
-            for ax in remaining_axes:
-                if plot_idx >= n_plots:
-                    ax.remove()  # Remove empty axes
-                    continue
-                
-                sample = sample_names[plot_idx]
-                df_subset = df_tracks[(df_tracks["sample_name"] == sample)].copy()
-
-                # Convert contact to binary: ANY value > 0 means touching (1), else not touching (0)
-                # This handles both boolean (True/False) and numeric contact columns
-                df_subset['contact_binary'] = (df_subset[contact_column].astype(float) > 0).astype(int)
-                
-                # Count touching vs not touching
-                touching_counts = df_subset['contact_binary'].value_counts().reindex([0, 1], fill_value=0)
-                
-                # Create bar chart with exactly 2 bars
-                bars = ax.bar([0, 1], [touching_counts[0], touching_counts[1]], 
-                              color='steelblue', width=0.6, edgecolor='black', linewidth=1)
-                
-                ax.set_xlabel('Touching', fontsize=9)
-                ax.set_ylabel('Count', fontsize=9)
-                ax.set_xticks([0, 1])
-                ax.set_xticklabels(['No', 'Yes'])
-                ax.set_title(f"{sample}", fontsize=10)
-                ax.set_xlim(-0.5, 1.5)
-                
-                # Force integer y-axis
-                ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-                
-                plot_idx += 1
-            # Add a global title (dynamic based on contact_column)
-            target_type = contact_column.replace('_contact', '').replace('_', ' ').title()
-            fig.suptitle(f"Touching vs. Non-touching {target_type}", fontsize=14, fontweight="bold")
-
-            # Adjust layout and save
-            # plt.tight_layout(rect=[0, 0, 1, 0.96])
-            fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
-            # plt.show(fig)
-            pdf.savefig(fig, bbox_inches='tight', dpi=600)
-            plt.close(fig)
-            # plt.savefig("output.pdf", bbox_inches='tight', dpi=600)
-
-def round_legend_ticks(value):
-    if value <= 1.0:
-        # return np.ceil(value * 10) / 10
-        return 1.0
-    elif value <= 100:
-        return np.ceil(value / 10) * 10
-    elif value <= 10000:
-        return np.ceil(value / 500) * 500
-    return value
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
