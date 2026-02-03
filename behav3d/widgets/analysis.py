@@ -301,6 +301,12 @@ class ActiveKillingPanel:
         self.death_signal_dd = widgets.Dropdown(options=["mean_dead_dye", "percentage_dead_mask", "nr_dead_mask_pixels"], value=self._cfg.get("death_signal_column", "mean_dead_dye"), description="Death signal:", style={'description_width': '150px'}, layout=widgets.Layout(width="300px"))
         self.killing_threshold = widgets.FloatText(description="Killing threshold:", value=float(self._cfg.get("killing_threshold_multiplier", 1.5)), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"))
         self.min_contact_duration = widgets.IntText(description="Min contact duration:", value=int(self._cfg.get("min_contact_duration", 1)), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"))
+        
+        # Absolute threshold option
+        self.use_absolute_threshold = widgets.Checkbox(description="Use absolute threshold", value=bool(self._cfg.get("use_absolute_threshold", False)), indent=False, layout=widgets.Layout(width="200px"))
+        self.absolute_threshold = widgets.FloatText(description="Absolute threshold:", value=float(self._cfg.get("absolute_killing_threshold", 0.0) or 0.0), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"), disabled=not self._cfg.get("use_absolute_threshold", False))
+        self.use_absolute_threshold.observe(self._on_absolute_threshold_toggle, names="value")
+        
         self.save_results = widgets.Checkbox(description="Save results to CSV", value=bool(self._cfg.get("save_results", True)), indent=False)
         
         self.btn_run = widgets.Button(description="Run Active Killing Analysis", button_style="danger", icon="bolt", layout=widgets.Layout(width="260px"))
@@ -318,6 +324,7 @@ class ActiveKillingPanel:
             self.immune_dd, self.target_info_html, self.validation_html, widgets.HTML("<hr>"),
             widgets.HBox([self.observation_window, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints after contact</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.killing_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">× background rate</span>')], layout=widgets.Layout(align_items="center")),
             widgets.HBox([self.min_contact_duration, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.death_signal_dd], layout=widgets.Layout(align_items="center")),
+            widgets.HBox([self.use_absolute_threshold, self.absolute_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">death signal increase (bypasses multiplier)</span>')], layout=widgets.Layout(align_items="center")),
             widgets.HTML("<hr>"),
             widgets.HBox([self.btn_run, self.spinner_html, self.save_results], layout=widgets.Layout(align_items="center", gap="15px")),
             self.out
@@ -336,13 +343,45 @@ class ActiveKillingPanel:
         self.validation_html.value = '<span style="color:green;">✓ Ready</span>' if valid else '<br>'.join([f'<span style="color:#c00;">{m}</span>' for m in messages])
         self.btn_run.disabled = not valid
 
+    def _on_absolute_threshold_toggle(self, change):
+        """Enable/disable absolute threshold input based on checkbox."""
+        self.absolute_threshold.disabled = not change["new"]
+        # Disable multiplier display hint when using absolute
+        if change["new"]:
+            self.killing_threshold.disabled = True
+        else:
+            self.killing_threshold.disabled = False
+
     def _on_run_clicked(self, *_):
         self.btn_run.disabled = True; self.spinner_html.layout.display = None; self.out.clear_output()
         with self.out:
             try:
-                self._cfg.update({"observation_window": int(self.observation_window.value), "death_signal_column": str(self.death_signal_dd.value), "killing_threshold_multiplier": float(self.killing_threshold.value), "min_contact_duration": int(self.min_contact_duration.value), "save_results": bool(self.save_results.value), "last_immune_cell": str(self.immune_dd.value)})
+                # Determine absolute threshold value
+                absolute_killing_threshold = float(self.absolute_threshold.value) if self.use_absolute_threshold.value else None
+                
+                self._cfg.update({
+                    "observation_window": int(self.observation_window.value),
+                    "death_signal_column": str(self.death_signal_dd.value),
+                    "killing_threshold_multiplier": float(self.killing_threshold.value),
+                    "min_contact_duration": int(self.min_contact_duration.value),
+                    "use_absolute_threshold": bool(self.use_absolute_threshold.value),
+                    "absolute_killing_threshold": absolute_killing_threshold,
+                    "save_results": bool(self.save_results.value),
+                    "last_immune_cell": str(self.immune_dd.value)
+                })
                 with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
-                run_active_killing_analysis(metadata=self.metadata_loader.metadata, output_dir=self.output_dir, immune_cell_type=str(self.immune_dd.value), target_cell_types=None, observation_window=int(self.observation_window.value), death_signal_column=str(self.death_signal_dd.value), min_contact_duration=int(self.min_contact_duration.value), killing_threshold_multiplier=float(self.killing_threshold.value), save_results=bool(self.save_results.value))
+                run_active_killing_analysis(
+                    metadata=self.metadata_loader.metadata,
+                    output_dir=self.output_dir,
+                    immune_cell_type=str(self.immune_dd.value),
+                    target_cell_types=None,
+                    observation_window=int(self.observation_window.value),
+                    death_signal_column=str(self.death_signal_dd.value),
+                    min_contact_duration=int(self.min_contact_duration.value),
+                    killing_threshold_multiplier=float(self.killing_threshold.value),
+                    absolute_killing_threshold=absolute_killing_threshold,
+                    save_results=bool(self.save_results.value)
+                )
                 print(f"✅ Killing analysis finished.")
             except Exception: traceback.print_exc()
             finally: self.spinner_html.layout.display = "none"; self.btn_run.disabled = False

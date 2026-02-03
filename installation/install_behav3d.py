@@ -365,21 +365,23 @@ def install_pytorch(conda_path, gpu_info, force_cpu=False):
 
 def install_cellpose(conda_path, gpu_info, force_cpu=False):
     """Install Cellpose with appropriate backend."""
-    print_step("Installing Cellpose...")
+    print_step("Installing Cellpose with GUI support...")
     
     run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
     
     try:
         # Cellpose automatically uses GPU if PyTorch has CUDA support
+        # Install with [gui] extra for pyqtgraph and other GUI dependencies
         # Pin to specific version for compatibility
-        cmd = f'{run_prefix} pip install cellpose==3.1.1.2'
+        cmd = f'{run_prefix} pip install "cellpose[gui]==3.1.1.2"'
         print_info(f"Running: {cmd}")
         run_command(cmd)
-        print_success("Cellpose installed successfully")
+        print_success("Cellpose installed successfully (with GUI)")
         return True
     except subprocess.CalledProcessError as e:
         print_error(f"Failed to install Cellpose: {e}")
         return False
+
 
 # =============================================================================
 # BEHAV3D PACKAGE INSTALLATION
@@ -606,13 +608,25 @@ Examples:
                 print_error("Failed to create conda environment.")
                 return 1
     
-    # Install PyTorch
+    # Install nomkl to prevent OpenMP conflicts between conda MKL and PyTorch
+    # This must be done BEFORE installing PyTorch
+    print_header("OPENMP CONFLICT PREVENTION")
+    print_step("Installing nomkl to prevent MKL/OpenMP conflicts...")
+    try:
+        cmd = f'"{conda_path}" install -n {ENV_NAME} nomkl -y'
+        run_command(cmd)
+        print_success("nomkl installed - OpenMP conflicts prevented")
+    except:
+        print_warning("Could not install nomkl - you may see OpenMP warnings")
+    
+    # Install PyTorch FIRST with correct backend (CUDA/MPS/CPU)
+    # This ensures Cellpose uses the existing PyTorch instead of installing CPU version
     print_header("PYTORCH INSTALLATION")
     if not install_pytorch(conda_path, gpu_info, force_cpu=args.cpu_only):
         print_error("Failed to install PyTorch.")
         return 1
     
-    # Install Cellpose
+    # Install Cellpose (will use existing PyTorch)
     print_header("CELLPOSE INSTALLATION")
     if not install_cellpose(conda_path, gpu_info, force_cpu=args.cpu_only):
         print_error("Failed to install Cellpose.")
