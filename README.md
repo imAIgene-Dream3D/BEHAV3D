@@ -44,25 +44,37 @@ cd /path/to/BEHAV3D
 conda env create -f environment.yml
 conda activate behav3d
 
-# Install PyTorch (choose ONE based on your system):
-
-# CPU only (all platforms):
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-
-# CUDA 12.1 (Windows/Linux with NVIDIA GPU):
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# macOS (includes MPS for Apple Silicon):
-pip install torch torchvision torchaudio
-
 # Install Cellpose
 pip install cellpose>=3.0
+
+# Install PyTorch (choose ONE based on your system):
+
+# First remove any preexisting pytorch installations:
+conda remove pytorch torchvision torchaudio
+
+# CPU only (all platforms):
+conda install pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1 -c pytorch
+
+# CUDA 12.1 (Windows/Linux with NVIDIA GPU):
+conda install pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia
 
 # Install BEHAV3D package
 pip install -e .
 
 # Register Jupyter kernel
 python -m ipykernel install --user --name=behav3d --display-name "behav3d"
+```
+
+***If pytorch installation is not working or you run into errors (OpenMP related), try this:***
+
+**Option 1:** Install nomkl **before** installing pytorch (avoids conflicts with OpenMP)
+```
+conda install nomkl
+```
+**Option 2:** Remove cellpose and re-install it with conda:
+```
+pip uninstall cellpose -y
+conda install -c conda-forge cellpose
 ```
 
 ### Installation Options
