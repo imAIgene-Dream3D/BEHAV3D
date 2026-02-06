@@ -17,6 +17,146 @@ from behav3d.core.metadata import (
 )
 
 
+def _load_active_killing_data(
+    output_dir: str,
+    cell_type: str,
+    sample_name: str,
+    track_img: np.ndarray,
+    raw_img_shape: tuple
+) -> dict:
+    """
+    Load active killing data and create a time-varying labels layer.
+    
+    Returns a dict with:
+    - 'Active_Killing': labels layer showing cells only when actively killing
+    - 'Killing_Efficiency': image layer with killing efficiency values
+    
+    The labels layer will show:
+    - TrackID for cells that are actively killing at that timepoint
+    - 0 for all other pixels
+    
+    Parameters
+    ----------
+    output_dir : str
+        BEHAV3D output directory
+    cell_type : str
+        Cell type (e.g., 'tcell')
+    sample_name : str
+        Sample name to filter data
+    track_img : np.ndarray
+        Track image (t, z, y, x) with TrackIDs
+    raw_img_shape : tuple
+        Shape of raw image for tiling
+        
+    Returns
+    -------
+    dict
+        Dictionary with 'Active_Killing' and optionally 'Killing_Efficiency' layers
+    """
+    active_killing_outdir = Path(output_dir, "analysis", cell_type, "active_killing")
+    advanced_features_path = active_killing_outdir / f"BEHAV3D_{cell_type}_advanced_track_features.csv"
+    
+    result = {}
+    
+    if not advanced_features_path.exists():
+        print(f"  Active killing data not found at {advanced_features_path}")
+        return result
+    
+    print(f"  Loading active killing data from {advanced_features_path}")
+    df_active_killing = pd.read_csv(advanced_features_path)
+    df_active_killing = df_active_killing[df_active_killing["sample_name"] == sample_name]
+    
+    if df_active_killing.empty:
+        print(f"  No active killing data found for sample {sample_name}")
+        return result
+    
+    # Check if we have the required columns
+    if "is_active_killing" not in df_active_killing.columns:
+        print(f"  'is_active_killing' column not found in advanced features")
+        return result
+    
+    # Get the timepoints where killing is active
+    killing_timepoints = df_active_killing[df_active_killing["is_active_killing"] == True]
+    n_killing_events = len(killing_timepoints)
+    n_killing_tracks = killing_timepoints["TrackID"].nunique() if n_killing_events > 0 else 0
+    print(f"  Found {n_killing_events} active killing timepoints across {n_killing_tracks} tracks")
+    
+    if n_killing_events == 0:
+        return result
+    
+    # Create time-varying active killing mask
+    # track_img shape: (t, 1, z, y, x) after expand_dims or (t, z, y, x) before
+    if track_img.ndim == 5:
+        t_dim, _, z_dim, y_dim, x_dim = track_img.shape
+    else:
+        t_dim, z_dim, y_dim, x_dim = track_img.shape
+    
+    # Initialize arrays for active killing labels and efficiency
+    active_killing_labels = np.zeros((t_dim, 1, z_dim, y_dim, x_dim), dtype=np.uint16)
+    killing_efficiency_img = np.zeros((t_dim, 1, z_dim, y_dim, x_dim), dtype=np.float32)
+    
+    # For each timepoint, mask only the tracks that are actively killing
+    # Get efficiency column (could be killing_efficiency or we calculate from threshold)
+    efficiency_col = "killing_efficiency" if "killing_efficiency" in df_active_killing.columns else None
+    
+    # Create lookup: (TrackID, position_t) -> (is_killing, efficiency)
+    killing_lookup = {}
+    for _, row in killing_timepoints.iterrows():
+        track_id = int(row["TrackID"])
+        t = int(row["position_t"])
+        efficiency = float(row[efficiency_col]) if efficiency_col else 1.0
+        killing_lookup[(track_id, t)] = efficiency
+    
+    # Process each timepoint
+    print(f"  Creating active killing visualization...")
+    track_img_np = np.asarray(track_img)
+    if track_img_np.ndim == 4:
+        track_img_np = np.expand_dims(track_img_np, axis=1)
+    
+    unique_timepoints = killing_timepoints["position_t"].unique()
+    for t in tqdm(unique_timepoints, desc="  Processing timepoints"):
+        t = int(t)
+        if t >= t_dim:
+            continue
+        
+        # Get tracks that are actively killing at this timepoint
+        killing_tracks_at_t = killing_timepoints[killing_timepoints["position_t"] == t]
+        
+        for _, row in killing_tracks_at_t.iterrows():
+            track_id = int(row["TrackID"])
+            efficiency = killing_lookup.get((track_id, t), 1.0)
+            
+            # Create mask for this track at this timepoint
+            track_mask = track_img_np[t] == track_id
+            
+            # Set the active killing labels (use TrackID for identification on hover)
+            active_killing_labels[t][track_mask] = track_id
+            
+            # Set the killing efficiency value
+            killing_efficiency_img[t][track_mask] = efficiency
+    
+    # Convert to dask arrays and tile for channel dimension if needed
+    n_channels = raw_img_shape[-4]
+    active_killing_labels = da.from_array(active_killing_labels)
+    active_killing_labels = da.tile(active_killing_labels, (1, n_channels, 1, 1, 1))
+    
+    killing_efficiency_img = da.from_array(killing_efficiency_img)
+    killing_efficiency_img = da.tile(killing_efficiency_img, (1, n_channels, 1, 1, 1))
+    
+    result["Active_Killing"] = {
+        "img": active_killing_labels,
+        "type": "label"
+    }
+    
+    result["Killing_Efficiency"] = {
+        "img": killing_efficiency_img,
+        "type": "image"
+    }
+    
+    print(f"  Active killing layer created successfully")
+    return result
+
+
 def backproject_mean_features_behav3d(
     metadata,
     sample_name,
@@ -155,7 +295,16 @@ def backproject_mean_features_behav3d(
     trackid_data[f"filtered_{cell_type}_TrackID"]["img"] = da.tile(
         trackid_data[f"filtered_{cell_type}_TrackID"]["img"], (1, raw_img.shape[-4], 1, 1, 1))
     
-    backproject_data = {**trackid_data, **backprojected_cols}
+    # Load active killing data if available (for immune cell types)
+    active_killing_data = _load_active_killing_data(
+        output_dir=output_dir,
+        cell_type=cell_type,
+        sample_name=sample_name,
+        track_img=filt_track_img,
+        raw_img_shape=raw_img.shape
+    )
+    
+    backproject_data = {**trackid_data, **backprojected_cols, **active_killing_data}
     visualize_data = {**raw_img_data, **backproject_data}
     
     print("- Visualizing backprojection in napari")
@@ -319,7 +468,16 @@ def backproject_time_features_behav3d(
     trackid_data[f"filtered_{cell_type}_TrackID"]["img"] = da.tile(
         trackid_data[f"filtered_{cell_type}_TrackID"]["img"], (1, raw_img.shape[-4], 1, 1, 1))
     
-    backproject_data = {**trackid_data, **backprojected_cols}
+    # Load active killing data if available (for immune cell types)
+    active_killing_data = _load_active_killing_data(
+        output_dir=output_dir,
+        cell_type=cell_type,
+        sample_name=sample_name,
+        track_img=filt_track_img,
+        raw_img_shape=raw_img.shape
+    )
+    
+    backproject_data = {**trackid_data, **backprojected_cols, **active_killing_data}
     visualize_data = {**raw_img_data, **backproject_data}
     
     print("- Visualizing backprojection in napari")
@@ -507,6 +665,10 @@ def view_napari(
     """
     Visualize backprojection in napari.
     Like original: single tracks layer with color_by='ClusterID'.
+    
+    Special handling for Active_Killing layer:
+    - Shows as bright red outlines when cells are actively killing
+    - Hover shows TrackID (which can be cross-referenced with Killing_Efficiency)
     """
     
     viewer = napari.Viewer()
@@ -514,7 +676,49 @@ def view_napari(
     # Add all image/label layers
     for k, v in backproject_data.items():
         v["img"] = np.transpose(v["img"], (1, 0, 2, 3, 4))
-        if v["type"] == "label" or v["type"] == "segment":
+        
+        if k == "Active_Killing":
+            # Special handling for Active Killing layer
+            # Use red color and show as visible by default with contour mode
+            layer = viewer.add_labels(
+                v["img"], 
+                name=k, 
+                scale=elsize,
+                opacity=0.7
+            )
+            # Set contour display to show outlines
+            layer.contour = 2
+            layer.visible = True  # Show by default
+            print(f"  ✨ Active Killing layer added - hover to see TrackID of killing cells")
+            
+        elif k == "Killing_Efficiency":
+            # Special handling for Killing Efficiency layer
+            # Use hot colormap (red-yellow) for killing intensity
+            img_data = v["img"]
+            if hasattr(img_data, 'compute'):
+                img_np = np.asarray(img_data)
+            else:
+                img_np = img_data
+            valid_vals = img_np[(img_np != 0) & np.isfinite(img_np)]
+            if valid_vals.size > 0:
+                vmin = 0
+                vmax = np.percentile(valid_vals, 98)
+                if vmax <= vmin:
+                    vmax = vmin + 1
+            else:
+                vmin, vmax = 0, 1
+            layer = viewer.add_image(
+                v["img"], 
+                name=k, 
+                scale=elsize, 
+                colormap='hot',
+                contrast_limits=[float(vmin), float(vmax)],
+                opacity=0.8
+            )
+            layer.visible = False  # Hidden by default, user can enable
+            print(f"  📊 Killing Efficiency layer added - shows intensity of killing events")
+            
+        elif v["type"] == "label" or v["type"] == "segment":
             # Labels layer (like original) - hover shows the value directly
             viewer.add_labels(v["img"], name=k, scale=elsize)
         else:

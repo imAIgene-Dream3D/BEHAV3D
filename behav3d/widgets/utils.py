@@ -239,6 +239,8 @@ _DEFAULT_CONFIG = {
         "death_signal_column": "mean_dead_dye",
         "killing_threshold_multiplier": 1.5,
         "min_contact_duration": 1,
+        "use_absolute_threshold": False,
+        "absolute_killing_threshold": None,
         "save_results": True,
     }
 }
