@@ -46,6 +46,12 @@ _DEFAULT_CONFIG = {
         "tp_start": 0,
         "tp_end": 0,
     },
+    "cellpose": {
+        "number_of_channels": 0,
+        "labels_mode": "same_for_all",  # "same_for_all" or "per_sample"
+        "channel_labels": {},  # {0: "organoid1", 1: "tcell", ...}
+        "per_sample_channel_labels": {},  # {sample_name: {0: "organoid1", ...}, ...}
+    },
     "tracking": {
         "immune": {
             "method": "trackpy",

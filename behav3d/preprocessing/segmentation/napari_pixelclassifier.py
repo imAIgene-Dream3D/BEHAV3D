@@ -9,7 +9,7 @@ import shutil
 import napari
 from magicgui import magicgui
 from magicgui.widgets import PushButton, FloatSlider
-from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout, QApplication, QLabel
+from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout, QApplication, QLabel, QCheckBox
 
 from aicspylibczi import CziFile
 
@@ -38,7 +38,7 @@ import dask.array as da
 import gc
 
 ## TODO create a function for BEHAV3D notebook
-
+'''
 def calculate_image_features(
     image,
     intensity=True,
@@ -82,7 +82,7 @@ def calculate_image_features(
     orig_spatial_shape = [orig_shape[ax] for ax in spatial_axes]
     feats_restored = feats.reshape((*orig_spatial_shape, n_features))
     return feats_restored
-
+'''
 sigma_min = 1
 sigma_max = 16
 features_func = partial(
@@ -96,16 +96,47 @@ features_func = partial(
     )
 
 def postprocess_mask(mask, fill_holes=True, opening_nr_pixels=1):
+    """
+    Postprocess a binary mask by filling holes and/or applying opening.
+    
+    Parameters
+    ----------
+    mask : np.ndarray
+        Binary mask (bool or 0/1). Can be 2D (Y, X), 3D (Z, Y, X), or 4D (T, Z, Y, X)
+    fill_holes : bool
+        Whether to fill holes in the mask
+    opening_nr_pixels : int
+        Number of pixels for morphological opening (0 to disable)
+    
+    Returns
+    -------
+    np.ndarray
+        Postprocessed binary mask (same shape and dtype as input)
+    """
+    mask = mask.astype(bool)  # Ensure binary
+    
     if fill_holes:  
-        # mask = binary_fill_holes(mask)
-        # Assume `mask` is a 3D binary array: (Z, Y, X)
-        filled_mask = np.zeros_like(mask)
-        for i in range(mask.shape[0]):
-            filled_mask[i] = binary_fill_holes(mask[i])
-        mask = filled_mask
-    if opening_nr_pixels>0 and opening_nr_pixels is not None:
-        mask = open_mask(mask)
-    return(mask)
+        # Handle different dimensionalities
+        if mask.ndim == 2:  # (Y, X)
+            mask = binary_fill_holes(mask)
+        elif mask.ndim == 3:  # (Z, Y, X)
+            filled_mask = np.zeros_like(mask)
+            for i in range(mask.shape[0]):
+                filled_mask[i] = binary_fill_holes(mask[i])
+            mask = filled_mask
+        elif mask.ndim == 4:  # (T, Z, Y, X)
+            filled_mask = np.zeros_like(mask)
+            for t in range(mask.shape[0]):
+                for z in range(mask.shape[1]):
+                    filled_mask[t, z] = binary_fill_holes(mask[t, z])
+            mask = filled_mask
+        else:
+            raise ValueError(f"Unsupported mask dimensionality: {mask.ndim}D")
+    
+    if opening_nr_pixels > 0 and opening_nr_pixels is not None:
+        mask = open_mask(mask, nr_pixels=opening_nr_pixels)
+    
+    return mask.astype(bool)
 
 def refine_segments(
     segments: np.ndarray,
@@ -290,6 +321,8 @@ def train_pixel_classifier(
     organoid_types=None,
     immune_types=None,
     other_types=None,
+    initial_params=None,
+    on_params_changed=None,
     ):
     """
     Train a pixel classifier for segmentation with support for multiple cell types.
@@ -480,42 +513,115 @@ def train_pixel_classifier(
         only_segment=False,
         n_workers: int = 16,
         log=print,
-        **edt_thresholds  # Dynamic EDT thresholds for each cell type
+        **kwargs  # Dynamic parameters: edt_thresholds, segment_size_mins, opening_nr_pixels, fill_holes
         ):
         """
         Dynamic segmentation function that handles different cell types.
-        EDT thresholds are passed as kwargs
+        Parameters are passed as kwargs with prefixes:
+        - {cell_type}_edt_threshold: EDT threshold for segmentation
+        - {cell_type}_segment_size_min: Minimum segment size
+        - {cell_type}_opening_nr_pixels: Mask opening pixels
+        - {cell_type}_fill_holes: Whether to fill holes (bool)
         """
         print("segment_and_update() called!")
+        
+        # Parse kwargs into separate dictionaries
+        edt_thresholds = {}
+        segment_size_mins = {}
+        opening_nr_pixels_dict = {}
+        fill_holes_dict = {}
+        
+        # Define suffixes for parameter parsing
+        SUFFIX_EDT = '_edt_threshold'
+        SUFFIX_SIZE = '_segment_size_min'
+        SUFFIX_OPENING = '_opening_nr_pixels'
+        SUFFIX_FILLHOLES = '_fill_holes'
+        
+        for key, value in kwargs.items():
+            if key.endswith(SUFFIX_EDT):
+                cell_type = key[:-len(SUFFIX_EDT)]
+                edt_thresholds[cell_type] = value
+            elif key.endswith(SUFFIX_SIZE):
+                cell_type = key[:-len(SUFFIX_SIZE)]
+                segment_size_mins[cell_type] = value
+            elif key.endswith(SUFFIX_OPENING):
+                cell_type = key[:-len(SUFFIX_OPENING)]
+                opening_nr_pixels_dict[cell_type] = value
+            elif key.endswith(SUFFIX_FILLHOLES):
+                cell_type = key[:-len(SUFFIX_FILLHOLES)]
+                fill_holes_dict[cell_type] = value
+        
         print(f"Received EDT thresholds: {edt_thresholds}")
+        print(f"Received segment size mins: {segment_size_mins}")
+        print(f"Received opening pixels: {opening_nr_pixels_dict}")
+        print(f"Received fill holes: {fill_holes_dict}")
+        
         start_time = time.time()
         log("###### Running Segmentation\n")
         log(f"EDT Thresholds: {edt_thresholds}\n")
+        log(f"Segment Size Mins: {segment_size_mins}\n")
+        log(f"Opening Pixels: {opening_nr_pixels_dict}\n")
+        log(f"Fill Holes: {fill_holes_dict}\n")
+        log(f"only_segment = {only_segment}\n")
+        log(f"all_cell_types = {all_cell_types}\n")
         QApplication.processEvents()
         
         # Access the label layer and feature image
         image_data = all_images  # Use the original all_images data
+        log(f"image_data shape: {image_data.shape if hasattr(image_data, 'shape') else 'N/A'}\n")
+        log(f"all_features shape: {all_features.shape if hasattr(all_features, 'shape') else 'N/A'}\n")
+        QApplication.processEvents()
         
         # Save user labels for all cell types
         cell_type_labels = {}  # Store {cell_type: label_data}
         
         # Save death labels (only if present)
         if has_death:
+            log("Saving death labels...\n")
+            QApplication.processEvents()
             dead_label_layer = viewer.layers['User Provided Labels (Dead)']
             dead_label_data = dead_label_layer.data
             dead_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserDeadLabels.zarr')
+            # Remove existing zarr to avoid ContainsArrayError
+            if dead_labels_outpath.exists():
+                shutil.rmtree(dead_labels_outpath)
             save_as_zarr(dead_label_data, dead_labels_outpath)
-            log("Saved death labels")
+            log("Saved death labels\n")
+            QApplication.processEvents()
         
-        # Save dynamic cell type labels
+        # Save dynamic cell type labels and apply postprocessing for training
         for cell_type in all_cell_types:
             layer_name = f'User Provided Labels ({cell_type.capitalize()})'
             label_layer = viewer.layers[layer_name]
-            label_data = label_layer.data
+            label_data = label_layer.data.copy()
+            
+            # Apply postprocessing to user labels before training
+            # Extract foreground mask (label 2) for postprocessing
+            # Get postprocessing parameters for this cell type
+            opening_nr_pixels = opening_nr_pixels_dict.get(cell_type, 
+                (3 if cell_type in organoid_types else 0))
+            fill_holes = fill_holes_dict.get(cell_type, True)
+            
+            # Extract foreground mask and postprocess
+            fg_mask = (label_data == 2).astype(bool)
+            if np.any(fg_mask):
+                processed_fg = postprocess_mask(
+                    fg_mask, 
+                    fill_holes=fill_holes, 
+                    opening_nr_pixels=int(opening_nr_pixels)
+                )
+                # Reconstruct labels: background=1, foreground=2
+                label_data = np.where(processed_fg, 2, 
+                                     np.where(label_data == 1, 1, 0)).astype(label_data.dtype)
+            
             labels_outpath = Path(pixel_class_outdir, f'PixelClassifier_User{cell_type.capitalize()}Labels.zarr')
+            # Remove existing zarr to avoid ContainsArrayError
+            if labels_outpath.exists():
+                shutil.rmtree(labels_outpath)
             save_as_zarr(label_data, labels_outpath)
             cell_type_labels[cell_type] = label_data
-            log(f"Saved {cell_type} labels")
+            log(f"Saved {cell_type} labels (postprocessed for training)\n")
+            QApplication.processEvents()
 
 
         def train_classifier(user_labels, features):
@@ -554,6 +660,9 @@ def train_pixel_classifier(
         # Train classifiers for all cell types
         classifiers = {}  # Store {cell_type: classifier}
         clf_death = None  # Initialize to None
+        
+        log(f"\n--- Starting classifier training (only_segment={only_segment}) ---\n")
+        QApplication.processEvents()
         
         if not only_segment:
             # Train death classifier (only if death channel is present)
@@ -619,15 +728,18 @@ def train_pixel_classifier(
                 QApplication.processEvents()
                 pred_mask = apply_classifier(classifiers[cell_type], features_outpath, pred_labels_paths[cell_type], n_workers=n_workers)
                 
-                if cell_type in organoid_types:
-                    opening_nr_pixels = 3
-                elif cell_type in immune_types:
-                    opening_nr_pixels = 0
-                else:
-                    opening_nr_pixels = 0
+                # Get postprocessing parameters for this cell type
+                opening_nr_pixels = opening_nr_pixels_dict.get(cell_type, 
+                    (3 if cell_type in organoid_types else 0))
+                fill_holes = fill_holes_dict.get(cell_type, True)
                 
-                # Postprocess mask
-                pred_mask = postprocess_mask(pred_mask, fill_holes=True, opening_nr_pixels=opening_nr_pixels)
+                # Convert label mask to binary for postprocessing
+                # pred_mask has labels: 0=background, 1=background_label, 2=foreground
+                # Extract foreground mask (label 2) and postprocess
+                fg_mask = (pred_mask == 2).astype(bool)
+                processed_fg = postprocess_mask(fg_mask, fill_holes=fill_holes, opening_nr_pixels=int(opening_nr_pixels))
+                # Reconstruct labels: keep background labels (1) and update foreground (2)
+                pred_mask = np.where(processed_fg, 2, np.where(pred_mask == 1, 1, 0)).astype(pred_mask.dtype)
 
                 pred_masks[cell_type] = pred_mask
                 viewer.layers[f"Pixel Classification ({cell_type.capitalize()})"].data = pred_mask
@@ -657,8 +769,12 @@ def train_pixel_classifier(
         # Segment each cell type using EDT watershed
         segmented_cells = {}  # Store {cell_type: segmented_mask}
         for cell_type in all_cell_types:
-            edt_threshold = edt_thresholds.get(cell_type, 1.0)  # Default if not specified
-            log(f"\n### Segmenting {cell_type.capitalize()} (EDT threshold={edt_threshold})")
+            edt_threshold = edt_thresholds.get(cell_type, 
+                (12.0 if cell_type in organoid_types else (2.5 if cell_type in immune_types else 1.0)))
+            segment_size_min = segment_size_mins.get(cell_type,
+                (1000 if cell_type in organoid_types else (10 if cell_type in immune_types else 10)))
+            
+            log(f"\n### Segmenting {cell_type.capitalize()} (EDT threshold={edt_threshold}, min_size={segment_size_min})")
             QApplication.processEvents()
 
             pred_mask = pred_masks[cell_type]
@@ -688,19 +804,11 @@ def train_pixel_classifier(
                     log(f"   [T{t_idx+1}] Segmenting via segment_mask()...")
                     QApplication.processEvents()
 
-                    # Determine segment size based on cell type category
-                    if cell_type in organoid_types:
-                        segment_size_min = 1000
-                    elif cell_type in immune_types:
-                        segment_size_min = 10
-                    else:
-                        segment_size_min = 10
-
                     segmented = segment_mask(
                         mask=mask_t,
                         edt_thr=edt_threshold,          # first pass threshold
                         edt_thr_refined=None,           # or e.g. [edt_threshold + 0.5, edt_threshold + 1.0]
-                        segment_size_min=segment_size_min,            # keep your default or set per cell type
+                        segment_size_min=segment_size_min,
                         use_dims=2,                     # IMPORTANT: 2D frames (change to 3 for 3D)
                         n_workers=1,                    # or whatever you want
                     )
@@ -720,6 +828,9 @@ def train_pixel_classifier(
 
         # Save images
         image_outpath = Path(pixel_class_outdir, 'PixelClassifier_Images.zarr')
+        # Remove existing zarr to avoid ContainsArrayError
+        if image_outpath.exists():
+            shutil.rmtree(image_outpath)
         save_as_zarr(image_data, image_outpath)
 
         log(f"\n###### DONE time elapsed: {time.time() - start_time:.2f} s")
@@ -730,6 +841,9 @@ def train_pixel_classifier(
         if has_death:
             dead_label_layer = viewer.layers['User Provided Labels (Dead)']
             dead_labels_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserDeadLabels.zarr')
+            # Remove existing zarr to avoid ContainsArrayError
+            if dead_labels_outpath.exists():
+                shutil.rmtree(dead_labels_outpath)
             save_as_zarr(dead_label_layer.data, dead_labels_outpath)
             log(f"Saved death labels to: {dead_labels_outpath}")
         
@@ -738,6 +852,9 @@ def train_pixel_classifier(
             layer_name = f'User Provided Labels ({cell_type.capitalize()})'
             label_layer = viewer.layers[layer_name]
             labels_outpath = Path(pixel_class_outdir, f'PixelClassifier_User{cell_type.capitalize()}Labels.zarr')
+            # Remove existing zarr to avoid ContainsArrayError
+            if labels_outpath.exists():
+                shutil.rmtree(labels_outpath)
             save_as_zarr(label_layer.data, labels_outpath)
             log(f"Saved {cell_type} labels to: {labels_outpath}")
         
@@ -770,8 +887,6 @@ def train_pixel_classifier(
         
         # Add channel as separate layer with color
         channel_name = f"Channel {ch+1}"
-        if ch < len(channel_colors):
-            channel_name = f"Channel {ch+1} ({channel_colors[ch]})"
         
         img_layer = viewer.add_image(
             channel_data, 
@@ -859,101 +974,154 @@ def train_pixel_classifier(
                 auto_call=False
     )
     
-    # Create dynamic sliders for organoid types
-    organoid_sliders = {}
+    # Create dynamic sliders for all cell types (organoids, immune, other)
+    # Store sliders in dictionaries organized by parameter type
+    edt_sliders = {}
+    segment_size_sliders = {}
+    opening_sliders = {}
+    fill_holes_checkboxes = {}
+    
+    # Helper function to add sliders for a cell type
+    def add_cell_type_sliders(cell_type, category):
+        """Add all parameter sliders for a given cell type"""
+        # Default values based on category
+        if category == 'organoid':
+            default_edt = 12.0
+            default_segment_size = 1000
+            default_opening = 3
+            default_fill_holes = True
+        elif category == 'immune':
+            default_edt = 2.5
+            default_segment_size = 10
+            default_opening = 0
+            default_fill_holes = True
+        else:  # other
+            default_edt = 1.0
+            default_segment_size = 10
+            default_opening = 0
+            default_fill_holes = True
+        
+        # Override defaults with initial_params if provided
+        if initial_params is not None:
+            default_edt = initial_params.get(f"{cell_type}_edt_threshold", default_edt)
+            default_segment_size = initial_params.get(f"{cell_type}_segment_size_min", default_segment_size)
+            default_opening = initial_params.get(f"{cell_type}_opening_nr_pixels", default_opening)
+            default_fill_holes = initial_params.get(f"{cell_type}_fill_holes", default_fill_holes)
+        
+        # EDT threshold slider
+        label = QLabel(f"{cell_type} EDT threshold")
+        gui.native.layout().addWidget(label)
+        edt_slider = FloatSlider(
+            value=default_edt,
+            min=0.5,
+            max=20.0,
+            step=0.5,
+            name=f"{cell_type}_edt_threshold"
+        )
+        edt_sliders[cell_type] = edt_slider
+        gui.native.layout().addWidget(edt_slider.native)
+        
+        # Segment size min slider
+        label = QLabel(f"{cell_type} min segment size")
+        gui.native.layout().addWidget(label)
+        segment_size_slider = FloatSlider(
+            value=float(default_segment_size),
+            min=1.0,
+            max=5000.0,
+            step=10.0,
+            name=f"{cell_type}_segment_size_min"
+        )
+        segment_size_sliders[cell_type] = segment_size_slider
+        gui.native.layout().addWidget(segment_size_slider.native)
+        
+        # Opening pixels slider
+        label = QLabel(f"{cell_type} opening pixels")
+        gui.native.layout().addWidget(label)
+        opening_slider = FloatSlider(
+            value=float(default_opening),
+            min=0.0,
+            max=10.0,
+            step=1.0,
+            name=f"{cell_type}_opening_nr_pixels"
+        )
+        opening_sliders[cell_type] = opening_slider
+        gui.native.layout().addWidget(opening_slider.native)
+        
+        # Fill holes checkbox
+        fill_holes_cb = QCheckBox(f"{cell_type} fill holes")
+        fill_holes_cb.setChecked(default_fill_holes)
+        fill_holes_cb.setObjectName(f"{cell_type}_fill_holes")
+        fill_holes_checkboxes[cell_type] = fill_holes_cb
+        gui.native.layout().addWidget(fill_holes_cb)
+    
+    # Add sliders for all cell types
     for organoid_type in organoid_types:
-        # Create a label for the slider
-        label = QLabel(f"{organoid_type} edt threshold")
-        gui.native.layout().addWidget(label)
-        
-        # Create the slider (use organoid parameters)
-        slider = FloatSlider(
-            value=12.0,  # Default organoid threshold
-            min=0.5,
-            max=20.0,
-            step=0.5,
-            name=f"{organoid_type}_edt_threshold"
-        )
-        organoid_sliders[organoid_type] = slider
-        # Add slider to gui layout
-        gui.native.layout().addWidget(slider.native)
+        add_cell_type_sliders(organoid_type, 'organoid')
     
-    # Create dynamic sliders for immune cell types
-    immune_sliders = {}
     for immune_type in immune_types:
-        # Create a label for the slider
-        label = QLabel(f"{immune_type} edt threshold")
-        gui.native.layout().addWidget(label)
-        
-        # Create the slider (use immune cell parameters)
-        slider = FloatSlider(
-            value=2.5,  # Default immune cell threshold
-            min=0.5,
-            max=15.0,
-            step=0.5,
-            name=f"{immune_type}_edt_threshold"
-        )
-        immune_sliders[immune_type] = slider
-        # Add slider to gui layout
-        gui.native.layout().addWidget(slider.native)
+        add_cell_type_sliders(immune_type, 'immune')
     
-    # Create dynamic sliders for other cell types
-    other_sliders = {}
     for other_type in other_types:
-        # Create a label for the slider
-        label = QLabel(f"{other_type} edt threshold")
-        gui.native.layout().addWidget(label)
-        
-        # Create the slider (use default parameters for other types)
-        slider = FloatSlider(
-            value=1.0,  # Default "other" threshold
-            min=0.5,
-            max=20.0,
-            step=0.5,
-            name=f"{other_type}_edt_threshold"
-        )
-        other_sliders[other_type] = slider
-        # Add slider to gui layout
-        gui.native.layout().addWidget(slider.native)
+        add_cell_type_sliders(other_type, 'other')
     
-    # Override the call behavior to include all thresholds
+    # Override the call behavior to include all parameters
     def custom_call(*args, **kwargs):
-        """Custom call function that collects EDT thresholds from all sliders"""
+        """Custom call function that collects all parameters from sliders"""
         print("Custom call function triggered")  # Debug
         
-        # Get all EDT thresholds from sliders
-        all_edt_thresholds = {}
-        all_edt_thresholds.update({org_type: slider.value for org_type, slider in organoid_sliders.items()})
-        all_edt_thresholds.update({immune_type: slider.value for immune_type, slider in immune_sliders.items()})
-        all_edt_thresholds.update({other_type: slider.value for other_type, slider in other_sliders.items()})
+        # Collect all parameters
+        all_params = {}
         
-        print(f"Collected EDT thresholds: {all_edt_thresholds}")  # Debug
+        # EDT thresholds
+        for cell_type, slider in edt_sliders.items():
+            all_params[f"{cell_type}_edt_threshold"] = slider.value
         
-        # Call with all thresholds as kwargs
-        return segment_and_update(
-            pixel_class_outdir=pixel_class_outdir,
-            only_segment=gui.only_segment.value,
-            n_workers=n_workers,
-            log=log_output.appendPlainText,
-            **all_edt_thresholds
-        )
+        # Segment size mins
+        for cell_type, slider in segment_size_sliders.items():
+            all_params[f"{cell_type}_segment_size_min"] = int(slider.value)
+        
+        # Opening pixels
+        for cell_type, slider in opening_sliders.items():
+            all_params[f"{cell_type}_opening_nr_pixels"] = int(slider.value)
+        
+        # Fill holes
+        for cell_type, checkbox in fill_holes_checkboxes.items():
+            all_params[f"{cell_type}_fill_holes"] = checkbox.isChecked()
+        
+        print(f"Collected parameters: {all_params}")  # Debug
+        
+        # Save parameters via callback if provided
+        if on_params_changed is not None:
+            try:
+                on_params_changed(all_params)
+                print("Parameters saved via callback")
+            except Exception as e:
+                print(f"Warning: Could not save parameters via callback: {e}")
+        
+        # Call with all parameters as kwargs, with error handling
+        try:
+            return segment_and_update(
+                pixel_class_outdir=pixel_class_outdir,
+                only_segment=gui.only_segment.value,
+                n_workers=n_workers,
+                log=log_output.appendPlainText,
+                **all_params
+            )
+        except Exception as e:
+            import traceback
+            error_msg = f"\nERROR: {str(e)}\n{traceback.format_exc()}"
+            print(error_msg)
+            log_output.appendPlainText(error_msg)
+            raise
     
     # Replace default call button behavior with custom function
-    # First, disconnect all existing connections
-    try:
-        gui.called.disconnect()
-    except (TypeError, RuntimeError):
-        # No connections exist yet
-        pass
-    
-    # Connect our custom call function
-    gui.called.connect(custom_call)
-    
-    # Also ensure the button directly triggers our function
+    # Disconnect existing connections to avoid double-calling
     try:
         gui.call_button.clicked.disconnect()
     except (TypeError, RuntimeError):
-        pass
+        pass  # No connections exist yet
+    
+    # Connect ONLY the button click to our custom function (not gui.called to avoid double execution)
     gui.call_button.clicked.connect(lambda: custom_call())
     
     viewer.window.add_dock_widget(gui)
@@ -968,82 +1136,6 @@ def train_pixel_classifier(
 
     napari.run()
 
-# def apply_pixel_classifier(
-#     classifier,
-#     img,
-#     t
-#     ):
-#     clf_path, path, outpath, idx = args
-#     clf = joblib.load(clf_path)
-#     features = np.asarray(load_image(path, mode="r")[idx])
-#     prediction = zarr.open(outpath, mode="r+")
-#     prediction[idx] = future.predict_segmenter(features, clf)
-'''def _run_single_timepoint_segmentation(
-    t_img,
-    clf_org,
-    clf_org_2,
-    clf_tcell,
-    clf_death,
-    organoid_edt_threshold=6,
-    organoid_min_size=1000,
-    only_segment=False,
-    tcell_mask=None,
-    organoid_mask=None,
-    organoid_mask_2=None,
-    ):
-    if only_segment:
-        assert tcell_mask is not None, "tcell_segments must be provided when only_segment is True"
-        assert organoid_mask is not None, "organoid_segments must be provided when only_segment is True"
-        if clf_org_2 is not None:
-            assert organoid_mask_2 is not None, "organoid_segments_2 must be provided when only_segment is True and clf_org_2 is not None"
-        death_mask=None
-    else:
-        features = features_func(t_img)
-        # result = future.predict_segmenter(features, clf)
-            
-        # print("\n### Predicting Organoid Pixels")
-        organoid_mask = future.predict_segmenter(features, clf_org)
-        organoid_mask[organoid_mask>0] -= 1
-
-        if clf_org_2 is not None:
-            organoid_mask_2 = future.predict_segmenter(features, clf_org_2)
-            organoid_mask_2[organoid_mask_2>0] -= 1
-        
-        # print("\n### Predicting T-cell Pixels")
-        tcell_mask = future.predict_segmenter(features, clf_tcell)
-        tcell_mask[tcell_mask>0] -= 1
-        
-        # print("\n### Predicting Death Pixels")
-        death_mask = future.predict_segmenter(features, clf_death)
-        death_mask[death_mask>0] -= 1
-    
-    
-    # print("\n### Segmenting Organoids and T-cells")
-    if clf_org_2 is not None:
-        two_org_types = True
-        seg_organoid, seg_organoid_2, seg_tcell = segment_tcell_and_organoid(
-            args = (organoid_mask, organoid_mask_2, tcell_mask, organoid_edt_threshold, two_org_types)
-        )
-        # return(seg_organoid, seg_organoid_2, seg_tcell, pred_death_mask)
-    else:
-        two_org_types = False
-        seg_organoid, seg_tcell = segment_tcell_and_organoid(
-            args = (organoid_mask, tcell_mask, organoid_edt_threshold, two_org_types),  
-        )
-        
-        # return(seg_organoid, seg_tcell, pred_death_mask, pred_org_mask, pred_tcell_mask)
-    return_dict = {
-        "segments_organoid": seg_organoid,
-        "segments_tcell": seg_tcell,
-        "death_mask": death_mask,
-        "mask_tcell": tcell_mask,
-        "mask_organoid": organoid_mask
-    }
-    
-    if two_org_types:
-        return_dict["segments_organoid_2"] = seg_organoid_2
-    
-    return return_dict'''
 
 def _process_single_timepoint(args):
     """
@@ -1053,7 +1145,8 @@ def _process_single_timepoint(args):
     ----------
     args : tuple
         (t, t_img, classifiers, clf_death, all_cell_types, organoid_types, immune_types, 
-         other_types, all_edt_thresholds, only_segment, loaded_masks, has_death)
+         other_types, all_edt_thresholds, all_segment_size_mins, all_opening_nr_pixels,
+         all_fill_holes, only_segment, loaded_masks, has_death)
     
     Returns
     -------
@@ -1061,7 +1154,8 @@ def _process_single_timepoint(args):
         Contains masks and segments for all cell types at this timepoint
     """
     (t, t_img, classifiers, clf_death, all_cell_types, organoid_types, immune_types, 
-     other_types, all_edt_thresholds, only_segment, loaded_masks, has_death) = args
+     other_types, all_edt_thresholds, all_segment_size_mins, all_opening_nr_pixels,
+     all_fill_holes, only_segment, loaded_masks, has_death) = args
     
     result = {
         'timepoint': t,
@@ -1080,8 +1174,19 @@ def _process_single_timepoint(args):
         for cell_type in all_cell_types:
             # Predict pixels using classifier
             pred_mask = future.predict_segmenter(features, classifiers[cell_type])
-            # Convert to binary mask (label 2 = foreground, label 1 = background)
+            # Convert to binary mask: label 1 = background -> 0, label 2 = foreground -> 1
             pred_mask[pred_mask > 0] -= 1  # Convert 1->0 (bg), 2->1 (fg)
+            
+            # Apply postprocessing
+            opening_nr_pixels = all_opening_nr_pixels.get(cell_type, 0)
+            fill_holes = all_fill_holes.get(cell_type, True)
+            
+            # Extract foreground mask (now label 1 after subtraction) for postprocessing
+            fg_mask = (pred_mask == 1).astype(bool)
+            processed_fg = postprocess_mask(fg_mask, fill_holes=fill_holes, opening_nr_pixels=int(opening_nr_pixels))
+            # Reconstruct binary mask: 0=background, 1=foreground
+            pred_mask = processed_fg.astype(pred_mask.dtype)
+            
             result['masks'][cell_type] = pred_mask
         
         # Apply death classifier (only if present)
@@ -1093,6 +1198,7 @@ def _process_single_timepoint(args):
     # Segment each cell type
     for cell_type in all_cell_types:
         edt_threshold = all_edt_thresholds.get(cell_type, 1.0)
+        segment_size_min = all_segment_size_mins.get(cell_type, 10)
         
         if only_segment and cell_type in loaded_masks:
             mask = np.asarray(loaded_masks[cell_type][t])
@@ -1100,14 +1206,6 @@ def _process_single_timepoint(args):
             mask = result['masks'][cell_type]
         else:
             continue
-        
-        # Determine segment size based on cell type category
-        if cell_type in organoid_types:
-            segment_size_min = 1000
-        elif cell_type in immune_types:
-            segment_size_min = 10
-        else:
-            segment_size_min = 10
         
         # Segment the mask
         seg = segment_mask(
@@ -1128,6 +1226,15 @@ def run_pixel_classifier_segmentation(
     organoid_edt_thresholds=None,  # Dict: {organoid_type: threshold}
     immune_edt_thresholds=None,    # Dict: {immune_type: threshold}
     other_edt_thresholds=None,      # Dict: {other_type: threshold}
+    organoid_segment_size_mins=None,  # Dict: {organoid_type: min_size}
+    immune_segment_size_mins=None,    # Dict: {immune_type: min_size}
+    other_segment_size_mins=None,      # Dict: {other_type: min_size}
+    organoid_opening_nr_pixels=None,   # Dict: {organoid_type: pixels}
+    immune_opening_nr_pixels=None,     # Dict: {immune_type: pixels}
+    other_opening_nr_pixels=None,      # Dict: {other_type: pixels}
+    organoid_fill_holes=None,          # Dict: {organoid_type: bool}
+    immune_fill_holes=None,            # Dict: {immune_type: bool}
+    other_fill_holes=None,             # Dict: {other_type: bool}
     timepoint_range=None,
     clf_organoid_paths=None,        # Dict: {organoid_type: path}
     clf_immune_paths=None,          # Dict: {immune_type: path}
@@ -1136,12 +1243,6 @@ def run_pixel_classifier_segmentation(
     only_segment=False,
     overwrite_existing=False,
     n_workers=4,
-    # deprecated
-    #corganoid_edt_threshold=None,
-    #clf_org_path=None,
-    #clf_org2_path=None,
-    #clf_tcell_path=None,
-    #two_org_types=False,
     ):
 
     """
@@ -1190,7 +1291,7 @@ def run_pixel_classifier_segmentation(
     print(f"Detected cell types: organoids={organoid_types}, immune={immune_types}, other={other_types}")
     print(f"Dead channel: {has_death}")
     
-    # Initialize threshold dictionaries with defaults if not provided
+    # Initialize parameter dictionaries with defaults if not provided
     if organoid_edt_thresholds is None:
         organoid_edt_thresholds = {ct: 12.0 for ct in organoid_types}
     if immune_edt_thresholds is None:
@@ -1198,8 +1299,32 @@ def run_pixel_classifier_segmentation(
     if other_edt_thresholds is None:
         other_edt_thresholds = {ct: 1.0 for ct in other_types}
     
-    # Combine all thresholds
+    if organoid_segment_size_mins is None:
+        organoid_segment_size_mins = {ct: 1000 for ct in organoid_types}
+    if immune_segment_size_mins is None:
+        immune_segment_size_mins = {ct: 10 for ct in immune_types}
+    if other_segment_size_mins is None:
+        other_segment_size_mins = {ct: 10 for ct in other_types}
+    
+    if organoid_opening_nr_pixels is None:
+        organoid_opening_nr_pixels = {ct: 3 for ct in organoid_types}
+    if immune_opening_nr_pixels is None:
+        immune_opening_nr_pixels = {ct: 0 for ct in immune_types}
+    if other_opening_nr_pixels is None:
+        other_opening_nr_pixels = {ct: 0 for ct in other_types}
+    
+    if organoid_fill_holes is None:
+        organoid_fill_holes = {ct: True for ct in organoid_types}
+    if immune_fill_holes is None:
+        immune_fill_holes = {ct: True for ct in immune_types}
+    if other_fill_holes is None:
+        other_fill_holes = {ct: True for ct in other_types}
+    
+    # Combine all parameters
     all_edt_thresholds = {**organoid_edt_thresholds, **immune_edt_thresholds, **other_edt_thresholds}
+    all_segment_size_mins = {**organoid_segment_size_mins, **immune_segment_size_mins, **other_segment_size_mins}
+    all_opening_nr_pixels = {**organoid_opening_nr_pixels, **immune_opening_nr_pixels, **other_opening_nr_pixels}
+    all_fill_holes = {**organoid_fill_holes, **immune_fill_holes, **other_fill_holes}
     
     # Setup classifier directory
     pixelclass_dir = Path(output_dir, "images", "PixelClassification")
@@ -1342,7 +1467,8 @@ def run_pixel_classifier_segmentation(
             # Prepare arguments for parallel processing
             args_list = [
                 (t, img[t], classifiers, clf_death, all_cell_types, organoid_types, 
-                 immune_types, other_types, all_edt_thresholds, only_segment, 
+                 immune_types, other_types, all_edt_thresholds, all_segment_size_mins,
+                 all_opening_nr_pixels, all_fill_holes, only_segment, 
                  loaded_masks, has_death)
                 for t in timepoint_indices
             ]

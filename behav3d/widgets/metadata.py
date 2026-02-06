@@ -31,7 +31,7 @@ class MetadataBuilder(widgets.VBox):
     Supports:
     - Dynamic number of samples
     - Organoid, immune, and other cell type populations
-    - Dead channel only (yes/no toggle)
+    - Dead channel configuration (global setting)
     - Fill-down from sample 1
     - Load existing CSV for editing
     """
@@ -47,9 +47,8 @@ class MetadataBuilder(widgets.VBox):
         self.immune_names = []
         self.other_names = []
         
-        # Channel names configuration
-        self.include_channels = False
-        self.n_channels = 0
+        # Dead channel configuration
+        self.include_dead_channel = False
         
         # Sample data storage
         self.sample_forms = []
@@ -136,13 +135,11 @@ class MetadataBuilder(widgets.VBox):
         self.immune_names = immune_types
         self.other_names = other_types
         
-        channel_cols = [col for col in df.columns if re.match(r'^channel_\d+_label$', col)]
-        if channel_cols:
-            self.include_channels = True
-            self.n_channels = len(channel_cols)
+        # Check for dead channel
+        if 'dead_channel' in df.columns and df['dead_channel'].notna().any():
+            self.include_dead_channel = True
         else:
-            self.include_channels = False
-            self.n_channels = 0
+            self.include_dead_channel = False
         
         self.n_samples_input.value = len(df)
         self._build_data_entry_form()
@@ -154,10 +151,6 @@ class MetadataBuilder(widgets.VBox):
                 break
             
             form = self.sample_forms[idx]
-            
-            for field_name, widget in form['channels'].items():
-                if field_name in row and pd.notna(row[field_name]):
-                    widget.value = str(row[field_name]).strip()
             
             for field_name, widget in form['basic'].items():
                 if field_name in row and pd.notna(row[field_name]):
@@ -197,14 +190,15 @@ class MetadataBuilder(widgets.VBox):
                     if col_name in row and pd.notna(row[col_name]) and path_field in fields_dict:
                         fields_dict[path_field].value = str(row[col_name]).strip()
             
-            if 'dead_channel' in row and pd.notna(row['dead_channel']) and str(row['dead_channel']).strip() != '':
-                try:
-                    form['dead_channel']['enabled'].value = True
-                    form['dead_channel']['number'].value = int(row['dead_channel'])
-                    if 'dead_mask_path' in row and pd.notna(row['dead_mask_path']) and 'mask_path' in form['dead_channel']:
-                        form['dead_channel']['mask_path'].value = str(row['dead_mask_path']).strip()
-                except (ValueError, TypeError):
-                    form['dead_channel']['enabled'].value = False
+            # Populate dead channel fields
+            if self.include_dead_channel:
+                if 'dead_channel' in row and pd.notna(row['dead_channel']) and str(row['dead_channel']).strip() != '':
+                    try:
+                        form['dead_channel']['number'].value = int(row['dead_channel'])
+                    except (ValueError, TypeError):
+                        pass
+                if 'dead_mask_path' in row and pd.notna(row['dead_mask_path']) and 'mask_path' in form['dead_channel']:
+                    form['dead_channel']['mask_path'].value = str(row['dead_mask_path']).strip()
     
     def _on_configure_populations(self, btn):
         """Show population configuration UI"""
@@ -229,22 +223,13 @@ class MetadataBuilder(widgets.VBox):
             style={'description_width': '120px'}
         )
         
-        channels_label = widgets.HTML('<h4>Channel Names</h4>')
-        self.include_channels_checkbox = widgets.Checkbox(
-            description='Include channels?',
-            value=self.include_channels,
-            style={'description_width': '120px'}
+        # Dead channel checkbox (moved here from sample form)
+        dead_label = widgets.HTML('<h4>Dead Channel</h4>')
+        self.include_dead_checkbox = widgets.Checkbox(
+            description='Include dead channel?',
+            value=self.include_dead_channel,
+            style={'description_width': '150px'}
         )
-        self.n_channels_input = widgets.IntText(
-            value=self.n_channels if self.n_channels > 0 else 1,
-            description='Number of channels:',
-            style={'description_width': '140px'}
-        )
-        
-        def _toggle_channels_input(change):
-            self.n_channels_input.layout.display = None if change['new'] else 'none'
-        self.include_channels_checkbox.observe(_toggle_channels_input, names='value')
-        _toggle_channels_input({'new': self.include_channels_checkbox.value})
         
         btn_confirm = widgets.Button(description='Next: Name Cell Types', button_style='success')
         btn_confirm.on_click(self._show_cell_type_naming)
@@ -256,9 +241,8 @@ class MetadataBuilder(widgets.VBox):
             self.n_immune_input,
             other_label,
             self.n_other_input,
-            channels_label,
-            self.include_channels_checkbox,
-            self.n_channels_input,
+            dead_label,
+            self.include_dead_checkbox,
             btn_confirm
         ]
     
@@ -268,8 +252,7 @@ class MetadataBuilder(widgets.VBox):
         self.n_immune_types = self.n_immune_input.value
         self.n_other_types = self.n_other_input.value
         
-        self.include_channels = self.include_channels_checkbox.value
-        self.n_channels = self.n_channels_input.value if self.include_channels else 0
+        self.include_dead_channel = self.include_dead_checkbox.value
         
         naming_widgets = []
         self.organoid_name_inputs = []
@@ -292,11 +275,11 @@ class MetadataBuilder(widgets.VBox):
         if self.n_immune_types > 0:
             naming_widgets.append(widgets.HTML('<h4>Name Your Immune Cell Types</h4>'))
             for i in range(self.n_immune_types):
-                default = self.immune_names[i] if i < len(self.immune_names) else f'immune{i+1}'
+                default = self.immune_names[i] if i < len(self.immune_names) else f'tcell{i+1}' if i == 0 else f'immune{i+1}'
                 w = widgets.Text(
                     value=default,
                     description=f'Immune {i+1}:',
-                    placeholder='e.g., tcells, nk',
+                    placeholder='e.g., tcell, nk, macro',
                     style={'description_width': '100px'}
                 )
                 self.immune_name_inputs.append(w)
@@ -309,7 +292,7 @@ class MetadataBuilder(widgets.VBox):
                 w = widgets.Text(
                     value=default,
                     description=f'Other {i+1}:',
-                    placeholder='e.g., tumorcells, fibroblast',
+                    placeholder='e.g., tumor, fibroblast',
                     style={'description_width': '100px'}
                 )
                 self.other_name_inputs.append(w)
@@ -334,7 +317,7 @@ class MetadataBuilder(widgets.VBox):
         n_samples = self.n_samples_input.value
         self.sample_forms = []
         
-        form_widgets = [widgets.HTML('<h3> Sample Data Entry</h3>')]
+        form_widgets = [widgets.HTML('<h3>Sample Data Entry</h3>')]
         
         btn_fill_down = widgets.Button(
             description='Fill All from Sample 1',
@@ -375,22 +358,21 @@ class MetadataBuilder(widgets.VBox):
         for i in range(1, len(self.sample_forms)):
             target_form = self.sample_forms[i]
             
-            for field_name, src_widget in source_form['channels'].items():
-                if field_name in target_form['channels']:
-                    target_form['channels'][field_name].value = src_widget.value
-            
+            # Copy basic fields (except sample_name)
             for field_name, src_widget in source_form['basic'].items():
                 if field_name != 'sample_name':
                     target_form['basic'][field_name].value = src_widget.value
             
+            # Copy cell type fields
             for cell_type in source_form['cell_types']:
                 for field_name, src_widget in source_form['cell_types'][cell_type].items():
                     target_form['cell_types'][cell_type][field_name].value = src_widget.value
             
-            target_form['dead_channel']['enabled'].value = source_form['dead_channel']['enabled'].value
-            if 'mask_path' in source_form['dead_channel'] and 'mask_path' in target_form['dead_channel']:
-                target_form['dead_channel']['mask_path'].value = source_form['dead_channel']['mask_path'].value
-            target_form['dead_channel']['number'].value = source_form['dead_channel']['number'].value
+            # Copy dead channel fields
+            if self.include_dead_channel:
+                if 'mask_path' in source_form['dead_channel'] and 'mask_path' in target_form['dead_channel']:
+                    target_form['dead_channel']['mask_path'].value = source_form['dead_channel']['mask_path'].value
+                target_form['dead_channel']['number'].value = source_form['dead_channel']['number'].value
         
         with self.save_output:
             self.save_output.clear_output()
@@ -402,12 +384,12 @@ class MetadataBuilder(widgets.VBox):
             'basic': {},
             'cell_types': {},
             'dead_channel': {},
-            'channels': {},
             'widget': None
         }
         
         header = widgets.HTML(f'<h4 style="background:#e1f5fe;padding:8px;">Sample {sample_idx + 1}</h4>')
         
+        # Basic information widgets
         form_data['basic']['sample_name'] = widgets.Text(
             description='Sample name*:',
             placeholder='e.g., Sample001',
@@ -429,7 +411,7 @@ class MetadataBuilder(widgets.VBox):
         
         form_data['basic']['raw_image_path'] = widgets.Text(
             description='Raw image path*:',
-            placeholder='/path/to/image.czi',
+            placeholder='/path/to/image.czi/.ims/.lif/.liff/.tiff/.zarr',
             style={'description_width': '150px'},
             layout=widgets.Layout(width='600px')
         )
@@ -440,6 +422,7 @@ class MetadataBuilder(widgets.VBox):
             style={'description_width': '150px'}
         )
         
+        # Imaging parameters
         form_data['basic']['pixel_distance_xy'] = widgets.FloatText(
             description='Pixel xy (μm)*:',
             value=0.5,
@@ -470,34 +453,32 @@ class MetadataBuilder(widgets.VBox):
             style={'description_width': '150px'}
         )
         
-        dead_channel_label = widgets.HTML('<h5>Dead Channel</h5>')
-        dead_enabled = widgets.Checkbox(
-            description='Include dead channel',
-            value=True
-        )
-        dead_mask_path = widgets.Text(
-            description='Dead mask path:',
-            placeholder='Optional - path to dead cell mask',
-            style={'description_width': '130px'},
-            layout=widgets.Layout(width='600px')
-        )
-        dead_number = widgets.IntText(
-            description='Dead channel #:',
-            value=0,
-            style={'description_width': '120px'}
-        )
+        # Dead channel widgets
+        dead_channel_widgets = []
+        dead_number = None
+        if self.include_dead_channel:
+            dead_channel_label = widgets.HTML('<h5>Dead Channel Configuration</h5>')
+            
+            dead_mask_path = widgets.Text(
+                description='Dead mask path:',
+                placeholder='Optional - path to dead cell mask (filled by pipeline)',
+                style={'description_width': '130px'},
+                layout=widgets.Layout(width='600px')
+            )
+            
+            # Dead channel number - IntText
+            dead_number = widgets.IntText(
+                description='Dead channel:',
+                value=0,
+                style={'description_width': '120px'}
+            )
+            
+            form_data['dead_channel']['mask_path'] = dead_mask_path
+            form_data['dead_channel']['number'] = dead_number
+            
+            dead_channel_widgets = [dead_channel_label, dead_mask_path, dead_number]
         
-        def _toggle_dead(change):
-            display_val = None if change['new'] else 'none'
-            dead_mask_path.layout.display = display_val
-            dead_number.layout.display = display_val
-        dead_enabled.observe(_toggle_dead, names='value')
-        _toggle_dead({'new': dead_enabled.value})
-        
-        form_data['dead_channel']['enabled'] = dead_enabled
-        form_data['dead_channel']['mask_path'] = dead_mask_path
-        form_data['dead_channel']['number'] = dead_number
-        
+        # Cell type configuration widgets
         cell_type_widgets = []
         
         for org_name in self.organoid_names:
@@ -620,18 +601,7 @@ class MetadataBuilder(widgets.VBox):
                 fields['tracks_csv_path']
             ])
         
-        channel_widgets = []
-        if self.include_channels and self.n_channels > 0:
-            for i in range(self.n_channels):
-                channel_field = widgets.Text(
-                    description=f'Channel {i+1} label:',
-                    placeholder=f'e.g., Tcell, Organoid',
-                    style={'description_width': '130px'},
-                    layout=widgets.Layout(width='400px')
-                )
-                form_data['channels'][f'channel_{i+1}_label'] = channel_field
-                channel_widgets.append(channel_field)
-        
+        # Build form layout
         form_children = [
             header,
             widgets.HTML('<h5>Basic Information</h5>'),
@@ -640,27 +610,21 @@ class MetadataBuilder(widgets.VBox):
             form_data['basic']['well'],
             form_data['basic']['raw_image_path'],
             form_data['basic']['dimension_order'],
-        ]
-        
-        if channel_widgets:
-            form_children.append(widgets.HTML('<b>Channel Labels:</b>'))
-            form_children.extend(channel_widgets)
-        
-        form_children.extend([
             widgets.HTML('<h5>Imaging Parameters</h5>'),
             form_data['basic']['pixel_distance_xy'],
             form_data['basic']['pixel_distance_z'],
             form_data['basic']['distance_unit'],
             form_data['basic']['time_interval'],
             form_data['basic']['time_unit'],
-            dead_channel_label,
-            dead_enabled,
-            dead_mask_path,
-            dead_number,
-            widgets.HTML('<h5>Cell Type Configuration</h5>'),
-            *cell_type_widgets,
-            widgets.HTML('<hr>')
-        ])
+        ]
+                
+        # Add dead channel configuration
+        form_children.extend(dead_channel_widgets)
+        
+        # Add cell type configuration
+        form_children.append(widgets.HTML('<h5>Cell Type Configuration</h5>'))
+        form_children.extend(cell_type_widgets)
+        form_children.append(widgets.HTML('<hr>'))
         
         form_widget = widgets.VBox(form_children)
         form_data['widget'] = form_widget
@@ -684,14 +648,18 @@ class MetadataBuilder(widgets.VBox):
         rows = []
         for form in self.sample_forms:
             row = {}
-            for field_name, widget in form['channels'].items():
-                row[field_name] = widget.value.strip()
+                        
+            # Save basic fields
             for field_name, widget in form['basic'].items():
                 row[field_name] = widget.value
-            if form['dead_channel']['enabled'].value:
+            
+            # Save dead channel fields (only if dead channel is included)
+            if self.include_dead_channel:
                 if 'mask_path' in form['dead_channel']:
                     row['dead_mask_path'] = form['dead_channel']['mask_path'].value.strip()
                 row['dead_channel'] = form['dead_channel']['number'].value
+            
+            # Save cell type fields
             for cell_type, fields in form['cell_types'].items():
                 if cell_type in self.organoid_names:
                     prefix = 'or'
@@ -721,13 +689,60 @@ class MetadataBuilder(widgets.VBox):
             rows.append(row)
         
         df = pd.DataFrame(rows)
+        
+        # Reorder columns in the desired order
+        ordered_columns = []
+        
+        # 1. Basic columns first
+        basic_order = ['sample_name', 'exp_nr', 'well', 'raw_image_path', 'dimension_order',
+                       'pixel_distance_xy', 'pixel_distance_z', 'distance_unit', 
+                       'time_interval', 'time_unit']
+        for col in basic_order:
+            if col in df.columns:
+                ordered_columns.append(col)
+        
+        # 2. Dead channel columns (if included)
+        if self.include_dead_channel:
+            if 'dead_mask_path' in df.columns:
+                ordered_columns.append('dead_mask_path')
+            if 'dead_channel' in df.columns:
+                ordered_columns.append('dead_channel')
+        
+        # 4. Cell type columns: or_* then im_* then ot_*
+        for org_name in self.organoid_names:
+            for suffix in ['_line_condition', '_segments_image_path', '_tracks_image_path', '_tracks_csv_path']:
+                col = f'or_{org_name}{suffix}'
+                if col in df.columns:
+                    ordered_columns.append(col)
+        
+        for immune_name in self.immune_names:
+            for suffix in ['_line_condition', '_segments_image_path', '_tracks_image_path', '_tracks_csv_path']:
+                col = f'im_{immune_name}{suffix}'
+                if col in df.columns:
+                    ordered_columns.append(col)
+        
+        for other_name in self.other_names:
+            for suffix in ['_line_condition', '_segments_image_path', '_tracks_image_path', '_tracks_csv_path']:
+                col = f'ot_{other_name}{suffix}'
+                if col in df.columns:
+                    ordered_columns.append(col)
+        
+        # Add any remaining columns not in the ordered list
+        for col in df.columns:
+            if col not in ordered_columns:
+                ordered_columns.append(col)
+        
+        df = df[ordered_columns]
+        
         csv_path = output_dir / 'metadata.csv'
         df.to_csv(csv_path, index=False)
         
         with self.save_output:
             self.save_output.clear_output()
-            print(f'Metadata saved to: {csv_path}')
+            print(f'✅ Metadata saved to: {csv_path}')
             print(f'{len(df)} samples, {len(df.columns)} columns')
+            if self.include_dead_channel:
+                print(f'Dead channel: column "dead_channel" and "dead_mask_path" included')
             display(df)
 
 
