@@ -1,0 +1,203 @@
+from pathlib import Path
+import numpy as np
+
+# pip install readlif
+from readlif.reader import LifFile
+
+
+def _load_liff_raw(path):
+    """
+    Internal helper: open a .lif file and return (array, dims_string).
+    
+    Uses readlif.reader.LifFile to read Leica LIF files.
+    Returns array in (T, C, Z, Y, X) order.
+    """
+    path = Path(path)
+    lf = LifFile(str(path))
+    
+    # Get the first image series (LIF files can contain multiple series)
+    if len(lf.image_list) == 0:
+        raise ValueError(f"No images found in LIF file: {path}")
+    
+    # Get first image series
+    img_series = lf.get_image(0)
+    
+    # Get dimensions from the image series
+    n_channels = img_series.channels
+    n_z = img_series.nz if hasattr(img_series, 'nz') else (img_series.dims.z if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'z') else 1)
+    n_t = img_series.nt if hasattr(img_series, 'nt') else 1
+    height = img_series.dims.y if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'y') else img_series.dims[1]
+    width = img_series.dims.x if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'x') else img_series.dims[0]
+    
+    # Build array by iterating through all frames
+    # readlif returns frames as PIL images or numpy arrays
+    frames = []
+    for t in range(n_t):
+        time_frames = []
+        for z in range(n_z):
+            channel_frames = []
+            for c in range(n_channels):
+                try:
+                    frame = img_series.get_frame(z=z, t=t, c=c)
+                except TypeError:
+                    # Some versions use different parameter names
+                    frame = img_series.get_frame(z=z, t=t, channel=c)
+                channel_frames.append(np.asarray(frame))
+            time_frames.append(np.stack(channel_frames, axis=0))  # Stack channels: (C, Y, X)
+        frames.append(np.stack(time_frames, axis=0))  # Stack Z: (Z, C, Y, X)
+    
+    arr = np.stack(frames, axis=0)  # Stack T: (T, Z, C, Y, X)
+    
+    # Reorder from (T, Z, C, Y, X) to (T, C, Z, Y, X)
+    arr = np.transpose(arr, axes=(0, 2, 1, 3, 4))
+    
+    dims = "TCZYX"
+    return arr, dims
+
+
+def load_liff(path):
+    """
+    Load a .lif/.liff file and return data as (T, C, Z, Y, X).
+    
+    Any missing axes are added as singleton dimensions (size 1),
+    so that the returned array always has 5 dimensions.
+    """
+    arr, dims = _load_liff_raw(path)
+    
+    # Ensure we have all 5 axes T,C,Z,Y,X present in dims
+    wanted = "TCZYX"
+    for ax in wanted:
+        if ax not in dims:
+            arr = np.expand_dims(arr, axis=0)
+            dims = ax + dims
+    
+    # Build a mapping from axis label -> index in current array
+    axis_map = {ax: i for i, ax in enumerate(dims)}
+    
+    # Reorder to (T, C, Z, Y, X)
+    order = [axis_map[ax] for ax in wanted]
+    arr = np.transpose(arr, axes=order)
+    
+    return arr
+
+
+def get_liff_shape(path, take_dims="TCZYX"):
+    """
+    Return the shape of a .lif/.liff file for the requested axes (default: TCZYX).
+    
+    Gets shape without loading the full image data into memory.
+    """
+    path = Path(path)
+    lf = LifFile(str(path))
+    
+    if len(lf.image_list) == 0:
+        return [1] * len(take_dims)
+    
+    img_series = lf.get_image(0)
+    
+    # Extract dimensions
+    n_channels = img_series.channels
+    n_z = img_series.nz if hasattr(img_series, 'nz') else (img_series.dims.z if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'z') else 1)
+    n_t = img_series.nt if hasattr(img_series, 'nt') else 1
+    height = img_series.dims.y if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'y') else img_series.dims[1]
+    width = img_series.dims.x if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'x') else img_series.dims[0]
+    
+    size_by_dim = {
+        'T': n_t,
+        'C': n_channels,
+        'Z': n_z,
+        'Y': height,
+        'X': width
+    }
+    
+    out_shape = [int(size_by_dim.get(ax, 1)) for ax in take_dims]
+    return out_shape
+
+
+def load_liff_metadata(path):
+    """
+    Load metadata from a .lif/.liff file (pixel sizes, time interval, etc).
+    
+    Returns a dict with keys: elsize_x, elsize_y, elsize_z, time_interval
+    (in micrometers and seconds, respectively).
+    """
+    path = Path(path)
+    lf = LifFile(str(path))
+    
+    metadata = {}
+    
+    if len(lf.image_list) == 0:
+        return {
+            'elsize_x': None,
+            'elsize_y': None,
+            'elsize_z': None,
+            'time_interval': None
+        }
+    
+    img_series = lf.get_image(0)
+    
+    # Try to extract pixel sizes from scale attributes
+    # readlif may expose these as scale_x, scale_y, scale_z (in meters) or similar
+    if hasattr(img_series, 'scale'):
+        scale = img_series.scale
+        if isinstance(scale, (list, tuple)) and len(scale) >= 3:
+            # Convert from meters to micrometers
+            metadata['elsize_x'] = float(scale[0]) * 1e6 if scale[0] else None
+            metadata['elsize_y'] = float(scale[1]) * 1e6 if scale[1] else None
+            metadata['elsize_z'] = float(scale[2]) * 1e6 if scale[2] else None
+    
+    # Try individual scale attributes
+    for attr, key, factor in [
+        ('scale_x', 'elsize_x', 1e6),  # meters to µm
+        ('scale_y', 'elsize_y', 1e6),
+        ('scale_z', 'elsize_z', 1e6),
+        ('scale_t', 'time_interval', 1),  # already in seconds
+    ]:
+        if key not in metadata and hasattr(img_series, attr):
+            val = getattr(img_series, attr)
+            if val is not None and val != 0:
+                metadata[key] = float(val) * factor
+    
+    # Try info dict if available
+    if hasattr(img_series, 'info') and isinstance(img_series.info, dict):
+        info = img_series.info
+        for src_key, dst_key in [
+            ('scale_x', 'elsize_x'),
+            ('scale_y', 'elsize_y'),
+            ('scale_z', 'elsize_z'),
+        ]:
+            if dst_key not in metadata and src_key in info:
+                val = info[src_key]
+                if val is not None and val != 0:
+                    metadata[dst_key] = float(val) * 1e6
+    
+    # Set defaults for missing values (user can override in CSV)
+    metadata.setdefault('elsize_x', None)
+    metadata.setdefault('elsize_y', None)
+    metadata.setdefault('elsize_z', None)
+    metadata.setdefault('time_interval', None)
+    
+    return metadata
+
+
+def load_elsizes_liff(path):
+    """
+    Load element sizes (pixel distances) from a .lif/.liff file.
+    
+    Returns a dict with keys: x, y, z (in micrometers), t (time interval), 
+    elsize_unit, time_interval_unit.
+    
+    Note: If metadata cannot be extracted from the file, values will be None
+    and should be specified manually in the metadata CSV.
+    """
+    metadata = load_liff_metadata(path)
+    
+    elsizes = {
+        "x": metadata.get('elsize_x'),
+        "y": metadata.get('elsize_y'),
+        "z": metadata.get('elsize_z'),
+        "elsize_unit": "µm",
+        "t": metadata.get('time_interval'),
+        "time_interval_unit": "s"
+    }
+    return elsizes
