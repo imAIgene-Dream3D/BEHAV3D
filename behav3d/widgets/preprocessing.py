@@ -10,8 +10,8 @@ from .utils import (
 )
 from behav3d.preprocessing import convert_input_files_to_zarr
 from behav3d.io.images import load_image, get_image_shape, get_image_dimension_order
-from behav3d.preprocessing.unmixing import visualize_unmix
-from behav3d.preprocessing.unmixing.signal_unmixing import signal_unmixing
+#from behav3d.preprocessing.unmixing import visualize_unmix
+#from behav3d.preprocessing.unmixing.signal_unmixing import signal_unmixing
 
 def convert_zarr_button(metadata_loader, dim_order_widget):
     btn = widgets.Button(

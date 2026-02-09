@@ -301,12 +301,8 @@ def apply_classifier(classifier, features_outpath, pred_labels_outpath, n_worker
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         test+=list(tqdm(executor.map(_apply_classifier, args_list), total=len(args_list)))
     
-    pixel_class = load_image(pred_labels_outpath)
-    pixel_class[pixel_class==1] = 0
-    # pixel_class[pixel_class>0] -= 1
-    # pixel_class = pixel_class.compute()
-    pixel_class = np.asarray(pixel_class)
-
+    pixel_class = np.asarray(load_image(pred_labels_outpath))
+    
     return pixel_class
         
 def train_pixel_classifier(
@@ -750,16 +746,12 @@ def train_pixel_classifier(
                 log("\n### Loading Death Prediction Mask")
                 QApplication.processEvents()
                 pred_death_mask = viewer.layers["Pixel Classification (Dead)"].data
-                pred_death_mask[pred_death_mask==1] = 0
-                viewer.layers["Pixel Classification (Dead)"].data = pred_death_mask
             
             # Load predictions for all cell types
             for cell_type in all_cell_types:
                 log(f"\n### Loading {cell_type.capitalize()} Prediction Mask")
                 QApplication.processEvents()
                 pred_mask = viewer.layers[f"Pixel Classification ({cell_type.capitalize()})"].data
-                pred_mask[pred_mask==1] = 0
-                viewer.layers[f"Pixel Classification ({cell_type.capitalize()})"].data = pred_mask
                 pred_masks[cell_type] = pred_mask
             
         # Segment instances for all cell types
@@ -1134,8 +1126,8 @@ def train_pixel_classifier(
     save_button.clicked.connect(save_function)
     gui.native.layout().addWidget(save_button.native)
 
-    napari.run()
-
+    #napari.run()
+    return viewer
 
 def _process_single_timepoint(args):
     """
