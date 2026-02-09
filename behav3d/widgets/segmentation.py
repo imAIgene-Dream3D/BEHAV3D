@@ -488,7 +488,10 @@ class PixelClassifierPanel:
                 if self._viewer is not None:
                     self._viewer.close()
                     self._viewer = None
-            finally: self.close_button.layout.display = "none"
+            finally:
+                self.close_button.layout.display = "none"
+                self.out.clear_output()
+                print("✅ Training finished.")
 
     def _on_apply_clicked(self, _, only_segment=False):
         self._lock(True)
