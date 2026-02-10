@@ -19,7 +19,8 @@ from behav3d.analysis.tcell_analysis import (
 )
 from behav3d.analysis.organoid_analysis import (
     filter_organoid_tracks,
-    run_organoid_analysis
+    run_organoid_analysis,
+    plot_multi_organoid_death_dynamics
 )
 from behav3d.analysis import summarize_track_features
 from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
@@ -427,6 +428,84 @@ class DeathDynamicsPanel:
                 print(f"✅ {self.cell_type} death dynamics complete!")
             except Exception: traceback.print_exc()
             finally: self.spinner_html.layout.display = "none"; self.btn_run.disabled = False
+
+
+class MultiOrganoidDeathDynamicsPanel:
+    """
+    Combined death dynamics comparison panel for multiple organoid types.
+    Shows all organoid types together on the same plot for easy comparison.
+    Only appears when 2+ organoid types are detected.
+    """
+    def __init__(self, metadata_loader, organoid_types):
+        self.metadata_loader = metadata_loader
+        self.organoid_types = organoid_types  # List of organoid type names
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+        
+        # Check which organoid types have death dynamics data available
+        self.available_data = {}
+        for org_type in self.organoid_types:
+            csv_path = Path(self.output_dir, "analysis", org_type, "results", f"combined_general_{org_type}_dynamics_analysis.csv")
+            if csv_path.exists():
+                self.available_data[org_type] = csv_path
+        
+        self.btn_refresh = widgets.Button(description="🔄 Refresh", button_style="info", layout=widgets.Layout(width="100px"))
+        self.btn_refresh.on_click(self._on_refresh_clicked)
+        self.btn_run = widgets.Button(description="Generate Comparison Plot", button_style="warning", layout=widgets.Layout(width="250px"))
+        self.btn_run.on_click(self._on_run_clicked)
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
+        self.status_html = widgets.HTML("")
+        self.out = widgets.Output()
+        
+        self._refresh_status()
+        
+        self.ui = widgets.VBox([
+            widgets.HTML('<b>Multi-Organoid Death Dynamics Comparison</b>'),
+            widgets.HTML('<div style="font-size:12px;color:#666;">Compare death dynamics across all organoid types on the same plot.</div>'),
+            widgets.HBox([self.status_html, self.btn_refresh], layout=widgets.Layout(align_items="center", gap="10px")),
+            widgets.HTML("<hr>"),
+            widgets.HBox([self.btn_run, self.spinner_html]),
+            self.out
+        ])
+    
+    def _refresh_status(self):
+        """Check which organoid types have death dynamics data available."""
+        self.available_data = {}
+        for org_type in self.organoid_types:
+            csv_path = Path(self.output_dir, "analysis", org_type, "results", f"combined_general_{org_type}_dynamics_analysis.csv")
+            if csv_path.exists():
+                self.available_data[org_type] = csv_path
+        
+        if len(self.available_data) < 2:
+            missing = [ot for ot in self.organoid_types if ot not in self.available_data]
+            self.status_html.value = f'<div style="color:#b00;">⚠️ Waiting for death dynamics data from: {", ".join(missing)}</div>'
+            self.btn_run.disabled = True
+        else:
+            self.status_html.value = f'<div style="color:#080;">✅ Ready: {", ".join(self.available_data.keys())}</div>'
+            self.btn_run.disabled = False
+    
+    def _on_refresh_clicked(self, *_):
+        self._refresh_status()
+    
+    def _on_run_clicked(self, *_):
+        self.btn_run.disabled = True
+        self.spinner_html.layout.display = None
+        self.out.clear_output()
+        
+        with self.out:
+            try:
+                # Call the analysis function from organoid_analysis module
+                plot_multi_organoid_death_dynamics(
+                    output_dir=self.output_dir,
+                    organoid_types=self.organoid_types
+                )
+                print("✅ Multi-organoid comparison complete!")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self.btn_run.disabled = False
+
 
 class InteractionAnalysisPanel:
     """
