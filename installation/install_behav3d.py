@@ -4,7 +4,7 @@ BEHAV3D Installer Script
 ========================
 
 This script handles the complete installation of BEHAV3D, including:
-1. Installing Miniconda/Miniforge if conda is not found
+1. Installing Micromamba if conda is not found (lightweight conda alternative)
 2. Detecting CUDA/GPU availability
 3. Creating the conda environment with appropriate PyTorch version
 4. Installing Cellpose with or without GPU support
@@ -45,6 +45,13 @@ MINIFORGE_URLS = {
     "Windows": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Windows-x86_64.exe",
     "Darwin": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-{arch}.sh",
     "Linux": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh",
+}
+
+# Micromamba download URLs (lightweight, standalone conda alternative)
+MICROMAMBA_URLS = {
+    "Windows": "https://micro.mamba.pm/api/micromamba/win-64/latest",
+    "Darwin": "https://micro.mamba.pm/api/micromamba/osx-{arch}/latest",
+    "Linux": "https://micro.mamba.pm/api/micromamba/linux-64/latest",
 }
 
 # =============================================================================
@@ -112,26 +119,38 @@ def run_command(cmd, shell=True, capture=False, check=True):
 # =============================================================================
 
 def find_conda():
-    """Find conda executable."""
-    # Check common locations
-    conda_names = ['conda', 'mamba']
+    """Find conda-compatible package manager (prefers mamba > micromamba > conda)."""
+    # Check PATH - prefer mamba (faster) over conda
+    conda_names = ['mamba', 'micromamba', 'conda']
     
     for name in conda_names:
         path = shutil.which(name)
         if path:
             return path
     
-    # Check common installation paths
+    # Check common installation paths (mamba/miniforge first, then conda)
     home = Path.home()
     common_paths = [
-        home / "miniconda3" / "condabin" / "conda",
+        # Miniforge/Mambaforge include mamba by default
+        home / "miniforge3" / "condabin" / "mamba",
+        home / "mambaforge" / "condabin" / "mamba",
+        # Micromamba
+        home / "micromamba" / "micromamba",
+        home / "micromamba" / "bin" / "micromamba",
+        # Fall back to conda
         home / "miniforge3" / "condabin" / "conda",
-        home / "anaconda3" / "condabin" / "conda",
         home / "mambaforge" / "condabin" / "conda",
-        Path("C:/Users") / os.environ.get("USERNAME", "") / "miniconda3" / "condabin" / "conda.bat",
+        home / "miniconda3" / "condabin" / "conda",
+        home / "anaconda3" / "condabin" / "conda",
+        # Windows-specific paths (mamba first, then conda)
+        Path("C:/Users") / os.environ.get("USERNAME", "") / "miniforge3" / "condabin" / "mamba.bat",
+        Path("C:/Users") / os.environ.get("USERNAME", "") / "mambaforge" / "condabin" / "mamba.bat",
+        Path("C:/Users") / os.environ.get("USERNAME", "") / "micromamba" / "micromamba.exe",
         Path("C:/Users") / os.environ.get("USERNAME", "") / "miniforge3" / "condabin" / "conda.bat",
-        Path("C:/ProgramData/miniconda3/condabin/conda.bat"),
+        Path("C:/Users") / os.environ.get("USERNAME", "") / "miniconda3" / "condabin" / "conda.bat",
+        Path("C:/ProgramData/miniforge3/condabin/mamba.bat"),
         Path("C:/ProgramData/miniforge3/condabin/conda.bat"),
+        Path("C:/ProgramData/miniconda3/condabin/conda.bat"),
     ]
     
     for p in common_paths:
@@ -194,6 +213,61 @@ def install_miniforge():
         else:
             print_error("Installation failed - conda not found after install")
             return None
+
+def install_micromamba():
+    """Download and install Micromamba (lightweight conda alternative)."""
+    print_step("Installing Micromamba (lightweight conda alternative)...")
+    
+    system = get_platform()
+    arch = get_architecture()
+    
+    if system == "Darwin":
+        url = MICROMAMBA_URLS[system].format(arch=arch)
+    else:
+        url = MICROMAMBA_URLS[system]
+    
+    # Download micromamba
+    print_info(f"Downloading from: {url}")
+    
+    install_path = Path.home() / "micromamba"
+    install_path.mkdir(exist_ok=True)
+    
+    if system == "Windows":
+        micromamba_exe = install_path / "micromamba.exe"
+    else:
+        micromamba_exe = install_path / "bin" / "micromamba"
+        (install_path / "bin").mkdir(exist_ok=True)
+    
+    try:
+        urllib.request.urlretrieve(url, micromamba_exe)
+        
+        if system != "Windows":
+            os.chmod(micromamba_exe, 0o755)
+        
+        print_success(f"Micromamba installed at: {micromamba_exe}")
+        
+        # Initialize micromamba
+        print_step("Initializing micromamba...")
+        
+        # Set the root prefix
+        root_prefix = install_path / "envs"
+        root_prefix.mkdir(exist_ok=True)
+        
+        if system == "Windows":
+            # Set environment variables for Windows
+            run_command(f'setx MAMBA_ROOT_PREFIX "{root_prefix}"', check=False)
+            run_command(f'"{micromamba_exe}" shell init -s powershell -p "{root_prefix}"', check=False)
+        else:
+            # Initialize for bash/zsh
+            run_command(f'"{micromamba_exe}" shell init -s bash -p "{root_prefix}"', check=False)
+            run_command(f'"{micromamba_exe}" shell init -s zsh -p "{root_prefix}"', check=False)
+        
+        print_success("Micromamba initialized")
+        return str(micromamba_exe)
+        
+    except Exception as e:
+        print_error(f"Failed to install micromamba: {e}")
+        return None
 
 # =============================================================================
 # GPU/CUDA DETECTION
@@ -274,10 +348,30 @@ def get_gpu_info():
 # ENVIRONMENT CREATION
 # =============================================================================
 
+def get_package_manager():
+    """Get the best available package manager (prefers mamba > micromamba > conda)."""
+    # Check for mamba first (fastest)
+    mamba_path = shutil.which("mamba")
+    if mamba_path:
+        return mamba_path
+    
+    # Check for micromamba
+    micromamba_path = shutil.which("micromamba")
+    if micromamba_path:
+        return micromamba_path
+    
+    # Fall back to conda
+    conda_path = find_conda()
+    return conda_path if conda_path else None
+
 def check_env_exists(conda_path, env_name):
     """Check if conda environment exists."""
     try:
-        result = run_command(f'"{conda_path}" env list', capture=True)
+        # Use best available package manager
+        pkg_mgr = get_package_manager()
+        if not pkg_mgr:
+            pkg_mgr = conda_path
+        result = run_command(f'"{pkg_mgr}" env list', capture=True)
         return env_name in result
     except:
         return False
@@ -294,12 +388,16 @@ def create_conda_environment(conda_path, env_file="environment.yml"):
         return False
     
     try:
-        # Check if mamba is available (faster)
-        mamba_path = shutil.which("mamba")
-        installer = mamba_path if mamba_path else conda_path
+        # Use best available package manager
+        pkg_mgr = get_package_manager()
+        if not pkg_mgr:
+            pkg_mgr = conda_path
+        
+        installer_name = Path(pkg_mgr).stem
+        print_info(f"Using {installer_name} for environment creation")
         
         # Use -n flag to override the name in the YAML file
-        cmd = f'"{installer}" env create -f "{env_path}" -n {ENV_NAME} -y'
+        cmd = f'"{pkg_mgr}" env create -f "{env_path}" -n {ENV_NAME} -y'
         print_info(f"Running: {cmd}")
         run_command(cmd)
         print_success(f"Environment '{ENV_NAME}' created successfully")
@@ -310,11 +408,11 @@ def create_conda_environment(conda_path, env_file="environment.yml"):
 
 def get_conda_run_prefix(conda_path, env_name):
     """Get the command prefix to run commands in conda environment."""
-    system = get_platform()
-    if system == "Windows":
-        return f'"{conda_path}" run -n {env_name}'
-    else:
-        return f'"{conda_path}" run -n {env_name}'
+    # Use best available package manager
+    pkg_mgr = get_package_manager()
+    if not pkg_mgr:
+        pkg_mgr = conda_path
+    return f'"{pkg_mgr}" run -n {env_name}'
 
 # =============================================================================
 # PYTORCH INSTALLATION
@@ -538,21 +636,29 @@ Examples:
     conda_path = find_conda()
     
     if conda_path:
-        print_success(f"Conda found: {conda_path}")
+        pkg_name = Path(conda_path).stem
+        print_success(f"Package manager found: {pkg_name} ({conda_path})")
+        
+        # Check if mamba is available (preferred for speed)
+        mamba_path = shutil.which("mamba")
+        if mamba_path and "mamba" not in conda_path.lower():
+            print_info(f"Mamba detected - will use mamba for faster operations")
+        elif "micromamba" in conda_path.lower():
+            print_info(f"Using micromamba (lightweight conda alternative)")
     else:
         print_warning("Conda not found on system")
-        response = input("\nWould you like to install Miniforge (recommended conda distribution)? [Y/n]: ")
+        response = input("\nWould you like to install Micromamba (lightweight conda alternative)? [Y/n]: ")
         if response.lower() != 'n':
-            conda_path = install_miniforge()
+            conda_path = install_micromamba()
             if not conda_path:
-                print_error("Failed to install Miniforge. Please install manually.")
-                print_info("Visit: https://github.com/conda-forge/miniforge")
+                print_error("Failed to install Micromamba. Please install manually.")
+                print_info("Visit: https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html")
                 return 1
             print_warning("Please restart your terminal and run this script again.")
-            print_info("The conda installation needs a shell restart to take effect.")
+            print_info("The micromamba installation needs a shell restart to take effect.")
             return 0
         else:
-            print_error("Conda is required for BEHAV3D installation.")
+            print_error("Conda/Micromamba is required for BEHAV3D installation.")
             return 1
     
     # Check if environment exists
@@ -574,7 +680,10 @@ Examples:
             if args.reinstall:
                 # --reinstall flag: remove and recreate without prompting
                 print_step(f"Removing existing environment (--reinstall flag)...")
-                run_command(f'"{conda_path}" env remove -n {ENV_NAME} -y')
+                pkg_mgr = get_package_manager()
+                if not pkg_mgr:
+                    pkg_mgr = conda_path
+                run_command(f'"{pkg_mgr}" env remove -n {ENV_NAME} -y')
                 env_exists = False
             elif args.keep_existing:
                 # --keep-existing flag: skip recreation without prompting
@@ -592,7 +701,10 @@ Examples:
                 
                 if response == '1':
                     print_step(f"Removing existing environment...")
-                    run_command(f'"{conda_path}" env remove -n {ENV_NAME} -y')
+                    pkg_mgr = get_package_manager()
+                    if not pkg_mgr:
+                        pkg_mgr = conda_path
+                    run_command(f'"{pkg_mgr}" env remove -n {ENV_NAME} -y')
                     env_exists = False
                 elif response == '2':
                     print_info("Keeping existing environment. Will update PyTorch/Cellpose.")
@@ -610,10 +722,23 @@ Examples:
     
     # Install nomkl to prevent OpenMP conflicts between conda MKL and PyTorch
     # This must be done BEFORE installing PyTorch
+    # First, switch igraph's BLAS dependency from MKL to OpenBLAS to avoid conflict:
+    #   igraph requires blas==2.305 mkl, but nomkl requires blas * openblas
     print_header("OPENMP CONFLICT PREVENTION")
-    print_step("Installing nomkl to prevent MKL/OpenMP conflicts...")
     try:
-        cmd = f'"{conda_path}" install -n {ENV_NAME} nomkl -y'
+        pkg_mgr = get_package_manager()
+        if not pkg_mgr:
+            pkg_mgr = conda_path
+        
+        # Step 1: Switch BLAS backend to openblas (resolves igraph/nomkl conflict)
+        print_step("Switching BLAS backend to OpenBLAS (fixes igraph/nomkl conflict)...")
+        cmd = f'"{pkg_mgr}" install -n {ENV_NAME} -c conda-forge igraph "blas=*=openblas" -y'
+        run_command(cmd)
+        print_success("BLAS backend switched to OpenBLAS")
+        
+        # Step 2: Install nomkl (now compatible since BLAS is openblas)
+        print_step("Installing nomkl to prevent MKL/OpenMP conflicts...")
+        cmd = f'"{pkg_mgr}" install -n {ENV_NAME} nomkl -y'
         run_command(cmd)
         print_success("nomkl installed - OpenMP conflicts prevented")
     except:
