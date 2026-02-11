@@ -104,7 +104,7 @@ If the automatic installer doesn't work, you can install manually:
 mamba env create -f environment.yml
 
 # Activate environment
-conda activate behav3d
+mamba activate behav3d
 
 # Install PyTorch with CUDA support (if GPU available)
 python install_behav3d.py --pytorch-only
@@ -158,7 +158,7 @@ Use one of these options:
 
 ### Import Errors After Installation
 ```bash
-conda activate behav3d
+mamba activate behav3d
 pip install --upgrade behav3d
 ```
 

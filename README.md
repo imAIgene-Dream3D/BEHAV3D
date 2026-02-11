@@ -44,7 +44,7 @@ cd /path/to/BEHAV3D
 
 # Create environment from yml file
 mamba env create -f environment.yml
-conda activate behav3d
+mamba activate behav3d
 
 # Install Cellpose
 pip install cellpose>=3.0
@@ -107,7 +107,7 @@ BEHAV3D is run through Jupyter notebooks. We recommend using **Visual Studio Cod
 
 Alternatively, run in a web browser:
 ```bash
-conda activate behav3d
+mamba activate behav3d
 jupyter notebook notebooks/run_behav3d.ipynb
 ```
 
