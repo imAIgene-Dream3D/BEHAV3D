@@ -152,6 +152,16 @@ conda activate behav3d
 pip install --upgrade behav3d
 ```
 
+### OpenMP/MKL Conflicts (nomkl fails to install)
+If you see `LibMambaUnsatisfiableError` when installing `nomkl` (because `igraph` requires `blas==mkl`):
+```bash
+# Switch BLAS backend to openblas first
+conda install -c conda-forge igraph "blas=*=openblas"
+# Then install nomkl
+conda install nomkl
+```
+The automated installer handles this automatically.
+
 ## 📞 Support
 
 If you encounter issues:

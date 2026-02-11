@@ -69,6 +69,9 @@ python -m ipykernel install --user --name=behav3d --display-name "behav3d"
 
 **Option 1:** Install nomkl **before** installing pytorch (avoids conflicts with OpenMP)
 ```
+# First switch BLAS backend to openblas (fixes igraph/nomkl conflict)
+conda install -c conda-forge igraph "blas=*=openblas"
+# Then install nomkl
 conda install nomkl
 ```
 **Option 2:** Remove cellpose and re-install it with conda:
