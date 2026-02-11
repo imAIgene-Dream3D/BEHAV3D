@@ -391,16 +391,19 @@ def compute_window_features(
         features[f"{column_name}_fraction_near_upper_bound"] = high_frac
 
     # binary-only
-    if signal_type == "binary" and "binary_runs" in requested:
+    if signal_type == "binary":
         binary_signal = convert_to_binary(signal_values, threshold=0.0)
-        features[f"{column_name}_transition_rate"] = compute_binary_transition_rate(binary_signal)
-        features[f"{column_name}_longest_true_length"] = compute_longest_true_run_length(binary_signal)
-        features[f"{column_name}_mean_true_length"] = compute_average_true_run_length(binary_signal)
+        if "transition_rate" in requested:
+            features[f"{column_name}_transition_rate"] = compute_binary_transition_rate(binary_signal)
+        
+        if "binary_runs" in requested:
+            features[f"{column_name}_longest_true_length"] = compute_longest_true_run_length(binary_signal)
+            features[f"{column_name}_mean_true_length"] = compute_average_true_run_length(binary_signal)
 
-        inv = 1.0 - binary_signal
-        inv[np.isnan(binary_signal)] = np.nan
-        features[f"{column_name}_longest_false_length"] = compute_longest_true_run_length(inv)
-        features[f"{column_name}_mean_false_length"] = compute_average_true_run_length(inv)
+            inv = 1.0 - binary_signal
+            inv[np.isnan(binary_signal)] = np.nan
+            features[f"{column_name}_longest_false_length"] = compute_longest_true_run_length(inv)
+            features[f"{column_name}_mean_false_length"] = compute_average_true_run_length(inv)
 
     # count-only
     if signal_type == "count" and "count_dispersion" in requested:
@@ -428,6 +431,7 @@ def _create_descriptive_track_worker(
     id_cols,
     signal_types,
     features_to_compute=ALL_WINDOW_FEATURES,
+    only_nonbinary=False,
 ):
     group_df = group_df.reset_index(drop=True)
     n = len(group_df)
@@ -445,6 +449,14 @@ def _create_descriptive_track_worker(
     pz_all = group_df["position_z"].to_numpy(float, copy=False)
 
     sig_arrays = {col: group_df[col].to_numpy(float, copy=False) for col in columns_to_summarize}
+    
+    # Separate binary and non-binary columns if only_nonbinary is True
+    if only_nonbinary:
+        binary_cols = [col for col in columns_to_summarize if signal_types.get(col, "continuous") == "binary"]
+        nonbinary_cols = [col for col in columns_to_summarize if signal_types.get(col, "continuous") != "binary"]
+    else:
+        binary_cols = []
+        nonbinary_cols = columns_to_summarize
 
     out_rows = []
 
@@ -476,7 +488,8 @@ def _create_descriptive_track_worker(
             )
         )
 
-        for col in columns_to_summarize:
+        # Compute window features for non-binary columns
+        for col in nonbinary_cols:
             stype = signal_types.get(col, "continuous")
             df_for_feat = (
                 pd.DataFrame({col: sig_arrays[col], time_col: t_all})
@@ -492,6 +505,11 @@ def _create_descriptive_track_worker(
                     features_to_compute=features_to_compute,
                 )
             )
+        
+        # For binary columns, just add the last value (or mean for full track)
+        for col in binary_cols:
+            # For full track mode, we'll use the mean as a summary
+            base[f"{col}_value"] = float(np.nanmean(sig_arrays[col]))
 
         out_rows.append(base)
         return out_rows
@@ -549,8 +567,8 @@ def _create_descriptive_track_worker(
             )
         )
 
-        # per-column signal features over trailing window
-        for col in columns_to_summarize:
+        # per-column signal features over trailing window (non-binary only)
+        for col in nonbinary_cols:
             stype = signal_types.get(col, "continuous")
             sig_win = sig_arrays[col][start_idx : end_idx + 1]
 
@@ -569,6 +587,10 @@ def _create_descriptive_track_worker(
                     features_to_compute=features_to_compute,
                 )
             )
+        
+        # For binary columns, just add the value at the current timepoint (end_idx)
+        for col in binary_cols:
+            row[f"{col}_value"] = float(sig_arrays[col][end_idx])
 
         # Build a NaN template based on first valid window
         if nan_feature_template is None:
@@ -610,6 +632,7 @@ def create_descriptive_track_dataset(
     n_jobs=None,
     chunksize=8,
     features_to_compute=ALL_WINDOW_FEATURES,
+    only_nonbinary=False,
 ):
     df_sorted = df_tracks.sort_values(list(id_cols) + [time_col], kind="mergesort")
 
@@ -633,6 +656,7 @@ def create_descriptive_track_dataset(
                 [list(id_cols)] * total_groups,
                 [signal_types] * total_groups,
                 [features_to_compute] * total_groups,
+                [only_nonbinary] * total_groups,
                 chunksize=chunksize,
             )
             for rows in tqdm(futures, total=total_groups):
@@ -649,6 +673,7 @@ def create_descriptive_track_dataset(
                 list(id_cols),
                 signal_types,
                 features_to_compute,
+                only_nonbinary,
             )
             if rows:
                 output_rows.extend(rows)

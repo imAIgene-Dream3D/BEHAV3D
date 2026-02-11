@@ -363,8 +363,11 @@ class DeathDynamicsPanel:
             try: self.has_death_features = bool({'mean_dead_dye', 'percentage_dead_mask', 'nr_dead_mask_pixels'}.intersection(set(pd.read_csv(p, nrows=0).columns)))
             except Exception: pass
         
-        params = dict(self.metadata_loader.behav3d_parameters or {})
-        cfg = params.setdefault("death_dynamics", {}).setdefault(self.cell_type, deepcopy(_DEFAULT_CONFIG.get("death_dynamics", {}).get("organoid", {})))
+        # Initialize death_dynamics structure in the actual parameters dictionary
+        cfg = self.metadata_loader.behav3d_parameters.setdefault("death_dynamics", {}).setdefault(
+            self.cell_type, 
+            deepcopy(_DEFAULT_CONFIG.get("death_dynamics", {}).get("organoid", {}))
+        )
         
         self.dead_perc_threshold = widgets.FloatText(description="Dead % threshold", value=float(cfg.get("dead_perc_threshold", 0.02)), style={'description_width': '160px'}, layout=widgets.Layout(width="220px"))
         self.btn_run = widgets.Button(description=f"Run {cell_type} death dynamics", button_style="warning", layout=widgets.Layout(width="300px"))

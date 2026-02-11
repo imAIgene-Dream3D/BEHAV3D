@@ -234,6 +234,17 @@ _DEFAULT_CONFIG = {
         "killing_threshold_multiplier": 1.5,
         "min_contact_duration": 1,
         "save_results": True,
+    },
+    "death_dynamics": {
+        "organoid": {
+            "dead_perc_threshold": 0.02
+        },
+        "immune": {
+            "dead_perc_threshold": 0.25
+        },
+        "other": {
+            "dead_perc_threshold": 0.10
+        }
     }
 }
 

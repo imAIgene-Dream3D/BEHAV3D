@@ -15,7 +15,7 @@ from sklearn.feature_selection import VarianceThreshold
 
 from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
 from behav3d.core.anndata import df_to_adata, adata_add_back_to_df, merge_pandas_cols_into_obs_anndata
-from behav3d.analysis.classification import (
+from behav3d.analysis.clustering.general import (
     select_nonbinary_columnnames, 
     relabel_cluster_ids
 )
@@ -24,26 +24,30 @@ from behav3d.analysis.filtering import subset_timepoints_from_tracks, subset_sel
 
 from behav3d.features.rolling_window_features import create_descriptive_track_dataset, infer_signal_types
 from behav3d.features.state_descriptive_features import drop_highly_correlated_features
-from behav3d.analysis.classification.clustering.general.leiden import (
+from behav3d.analysis.clustering.general.leiden import (
     run_pca, 
     run_leiden_clustering, 
     merge_small_clusters
 )
-from behav3d.analysis.classification.clustering.state.filtering import filter_short_state_runs
-from behav3d.analysis.classification.clustering.state.visualization.plots.clustering import (
-    plot_number_per_clusters,
+from behav3d.analysis.clustering.state.filtering import filter_short_state_runs
+
+from behav3d.analysis.clustering.state.visualization.plots.clustering import (
     plot_exemplar_track_bars
-)
-from behav3d.analysis.classification.clustering.general.visualization.plots import (
+)   
+from behav3d.analysis.clustering.general.visualization.plots import (
     plot_per_cluster_proportions, 
-    plot_top_ranking_features
+    plot_top_ranking_features,
+    plot_number_per_clusters
 )
-from behav3d.analysis.classification.clustering.state.hmm import (
-    run_sticky_hmm_state_classification,
-    plot_hmm_top_ranking_features,
-    plot_hmm_transition_matrix
+from behav3d.analysis.clustering.state.hmm import (
+    run_sticky_hmm_state_classification
 )
-from behav3d.analysis.classification.clustering.state.visualization.plots.state_transitions import compute_cluster_transition_matrix
+
+from behav3d.analysis.clustering.state.visualization.plots.hmm import (
+    plot_hmm_top_ranking_features
+)
+
+from behav3d.analysis.clustering.state.visualization.plots.state_transitions import compute_cluster_transition_matrix
 # from behav3d.analysis.classification.clustering.state.visualization.videos.track_max_projection import *
 # %matplotlib inline
 
