@@ -276,10 +276,14 @@ def cluster_group(
     df_group,
     feature_cols,
     non_feature_cols,
+    min_silhouette=0.5,
+    max_davies_bouldin=1,
     n_neighbors=15,
     resolution=0.2,
-    min_cluster_size=100,
+    min_cluster_size=None,
     pca_var_selection=0.95,
+    outfolder=None,
+    group_name=None,
     random_state=123
 ):
     """
@@ -315,18 +319,18 @@ def cluster_group(
     if len(df_clean) < 50:  # Skip if too few samples
         return None
     
-    # Scale features
-    scaler = StandardScaler()
-    df_clean[feature_cols] = scaler.fit_transform(df_clean[feature_cols])
+    # Scale features - ALREADY DONE GLOBALLY
+    # scaler = StandardScaler()
+    # df_clean[feature_cols] = scaler.fit_transform(df_clean[feature_cols])
     
     # Create AnnData object
     adata = df_to_adata(df_clean, feature_cols, obs_cols=non_feature_cols)
     adata.uns["preprocessing"] = {
         "kept_features": list(feature_cols),
-        "scaler": {
-            "mean": scaler.mean_.astype(float),
-            "scale": scaler.scale_.astype(float),
-        }
+        # "scaler": {
+        #     "mean": scaler.mean_.astype(float),
+        #     "scale": scaler.scale_.astype(float),
+        # }
     }
     
     # Run PCA
@@ -338,62 +342,107 @@ def cluster_group(
         random_state=random_state
     )
     
+    # Run initial UMAP (needed for visualization of all K steps)
+    # We do this BEFORE K-means loop so all plots are on the same embedding
+    sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=random_state)
+    sc.tl.umap(adata, min_dist=0.1, random_state=random_state)
     
-    # Run Leiden clustering
-    adata = run_leiden_clustering(
-        adata, 
-        n_neighbors=n_neighbors,
-        resolution=resolution, 
-        metric="euclidean",
-        method="umap",
-        use_rep="X_pca",
-        key_added="ClusterID",
-        random_state=random_state
-    )
-    
-    # Merge small clusters
-    adata = merge_small_clusters(
-        adata,
-        key="ClusterID",
-        min_size=min_cluster_size,
-        use_rep="X_pca",
-    )
-    
-    # Validate clustering: only keep multiple clusters if there's clear evidence
-    # Use PCA representation for validation
+    # Recursive K-means Clustering
+    print("    Running recursive K-means clustering...")
     X_pca = adata.obsm["X_pca"]
-    labels = adata.obs["ClusterID"].values
     
-    is_valid, metrics = validate_clustering(
-        X_pca, 
-        labels,
-        min_silhouette=0.3,  # Require reasonable cluster separation
-        max_davies_bouldin=1.5  # Require good cluster compactness
-    )
+    best_k = 1
+    best_labels = np.zeros(len(df_clean), dtype=int)
+    best_metrics = {"n_clusters": 1, "silhouette": -1, "davies_bouldin": np.inf}
     
+    # Try increasing k from 2 up to max_k
+    max_k = 15
     
-    # Format metrics for display
-    sil_str = f"{metrics['silhouette']:.3f}" if metrics['silhouette'] is not None else 'N/A'
-    db_str = f"{metrics['davies_bouldin']:.3f}" if metrics['davies_bouldin'] is not None else 'N/A'
+    # Store results for PDF generation
+    k_results = []
     
-    print(f"    Clustering validation: n_clusters={metrics['n_clusters']}, "
-          f"silhouette={sil_str}, davies_bouldin={db_str}")
+    for k in range(2, max_k + 1):
+        kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
+        labels = kmeans.fit_predict(X_pca)
+        
+        # Validate
+        is_valid, metrics = validate_clustering(
+            X_pca, 
+            labels,
+            min_silhouette=min_silhouette,
+            max_davies_bouldin=max_davies_bouldin
+        )
+        
+        sil_str = f"{metrics['silhouette']:.3f}" if metrics['silhouette'] is not None else 'N/A'
+        db_str = f"{metrics['davies_bouldin']:.3f}" if metrics['davies_bouldin'] is not None else 'N/A'
+        status_str = 'Valid' if is_valid else 'Invalid'
+        print(f"      k={k}: silhouette={sil_str}, db={db_str} -> {status_str}")
+        
+        # Store for plotting (even invalid ones)
+        # Add labels to adata temporarily for plotting
+        col_name = f"kmeans_{k}"
+        adata.obs[col_name] = labels.astype(str)
+        k_results.append({
+            "k": k,
+            "col": col_name,
+            "valid": is_valid,
+            "metrics": metrics
+        })
+        
+        if is_valid:
+            best_k = k
+            best_labels = labels
+            best_metrics = metrics
+        else:
+            # If validation fails, stop and use the last valid k
+            print(f"      Validation failed at k={k}. Stopping and using k={best_k}.")
+            # We break but still want to plot this failed step as requested
+            break
+            
+    # Assign best labels
+    adata.obs["ClusterID"] = best_labels.astype(str)
     
-    if not is_valid and metrics['n_clusters'] > 1:
-        print("    ⚠ Clustering validation FAILED - collapsing to single cluster")
-        print("      (No clear evidence for distinct subclusters)")
-        # Collapse all to a single cluster
-        adata.obs["ClusterID"] = "0"
-    else:
-        print(f"    ✓ Clustering validation PASSED - keeping {metrics['n_clusters']} cluster(s)")
+    # Validate final result
+    print(f"    ✓ Final selection: {best_metrics['n_clusters']} cluster(s)")
     
-    # Compute UMAP
-    sc.tl.umap(
-        adata,
-        min_dist=0.1,
-        random_state=random_state,
-    )
-    
+    # Generate PDF of all steps if outfolder is provided
+    if outfolder is not None and group_name is not None:
+        try:
+            pdf_path = outfolder / f"recursive_kmeans_steps_{group_name}.pdf"
+            with PdfPages(pdf_path) as pdf:
+                # Plot each step we computed
+                for res in k_results:
+                    k = res['k']
+                    col = res['col']
+                    valid = res['valid']
+                    met = res['metrics']
+                    
+                    fig, ax = plt.subplots(figsize=(6, 5))
+                    
+                    # Plot UMAP
+                    sc.pl.umap(
+                        adata, 
+                        color=col, 
+                        ax=ax, 
+                        show=False, 
+                        title=f"k={k} ({'VALID' if valid else 'INVALID'})\nSil={met['silhouette']:.3f}, DB={met['davies_bouldin']:.3f}",
+                        legend_loc="on data",
+                        legend_fontsize=8
+                    )
+                    
+                    pdf.savefig(fig, bbox_inches='tight')
+                    plt.close(fig)
+                    
+            print(f"    Saved recursive steps PDF to {pdf_path}")
+            
+            # Clean up temporary columns
+            for res in k_results:
+                if res['col'] in adata.obs.columns:
+                    del adata.obs[res['col']]
+                    
+        except Exception as e:
+            print(f"    Error saving PDF: {e}")
+            
     return adata
 
 
@@ -484,7 +533,7 @@ def run_state_classification(
     min_spacing=None,
     n_neighbors=15,
     resolution=0.2,
-    min_cluster_size=100,
+    min_cluster_size=None,
     pca_var_selection=0.95,
     outfolder=None,
     random_state=123
@@ -538,8 +587,8 @@ def run_state_classification(
         "percentage_dead_mask",
         # "mean_dead_dye",
         # "nr_dead_mask_pixels",
-        "organoid_contact_pixels",
-        "tcell_contact_pixels",
+        # "organoid_contact_pixels",
+        # "tcell_contact_pixels",
         # "mean_square_displacement",
         "speed",
         # "directional_persistence",
@@ -599,6 +648,7 @@ def run_state_classification(
     )
     
     # Drop NaN values
+    df_analysis = df_windows_descriptive.copy()
     df_analysis = df_windows_descriptive.dropna(subset=descriptive_feature_cols).copy()
     
     # Reduce redundancy of similar features
@@ -620,6 +670,11 @@ def run_state_classification(
     dropped_low_var = df_analysis[descriptive_feature_cols].columns[~keep_mask].tolist()
     print(f"Dropped {len(dropped_low_var)} low-variance features.")
     
+    # Scale features globally (on the full dataset) before splitting
+    print("Scaling features globally...")
+    scaler = StandardScaler()
+    df_analysis[kept_features] = scaler.fit_transform(df_analysis[kept_features])
+    
     # Create groups based on binary features BEFORE subsampling
     # This allows us to subsample each group independently
     print("Creating binary feature groups...")
@@ -633,6 +688,7 @@ def run_state_classification(
     group_results = {}
     for group_name, mask in groups.items():
         print(f"\nProcessing group: {group_name}")
+
         df_group_full = df_analysis[mask].copy()
         
         if len(df_group_full) < 50:
@@ -673,6 +729,8 @@ def run_state_classification(
             resolution=resolution,
             min_cluster_size=min_cluster_size,
             pca_var_selection=pca_var_selection,
+            outfolder=Path(outfolder) if outfolder else None,
+            group_name=group_name,
             random_state=random_state
         )
         
