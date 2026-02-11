@@ -31,9 +31,11 @@ The installer will automatically:
 
 If you prefer manual installation:
 
-**Step 1: Install Miniforge/Conda**
+**Step 1: Install Miniforge**
 
-If you don't have conda installed, download [Miniforge](https://github.com/conda-forge/miniforge/releases/latest/) (recommended) or [Miniconda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html).
+If you don't have conda/mamba installed, download [Miniforge](https://github.com/conda-forge/miniforge/releases/latest/) (recommended, includes `mamba`) or [Miniconda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html).
+
+> **Note:** We recommend using `mamba` instead of `conda` for faster dependency resolution. Miniforge includes `mamba` by default. All `mamba` commands below can be replaced with `conda` if using Miniconda/Anaconda.
 
 **Step 2: Create the environment**
 
@@ -41,7 +43,7 @@ If you don't have conda installed, download [Miniforge](https://github.com/conda
 cd /path/to/BEHAV3D
 
 # Create environment from yml file
-conda env create -f environment.yml
+mamba env create -f environment.yml
 conda activate behav3d
 
 # Install Cellpose
@@ -50,13 +52,13 @@ pip install cellpose>=3.0
 # Install PyTorch (choose ONE based on your system):
 
 # First remove any preexisting pytorch installations:
-conda remove pytorch torchvision torchaudio
+mamba remove pytorch torchvision torchaudio
 
 # CPU only (all platforms):
-conda install pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1 -c pytorch
+mamba install pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1 -c pytorch
 
 # CUDA 12.1 (Windows/Linux with NVIDIA GPU):
-conda install pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia
+mamba install pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia
 
 # Install BEHAV3D package
 pip install -e .
@@ -70,14 +72,14 @@ python -m ipykernel install --user --name=behav3d --display-name "behav3d"
 **Option 1:** Install nomkl **before** installing pytorch (avoids conflicts with OpenMP)
 ```
 # First switch BLAS backend to openblas (fixes igraph/nomkl conflict)
-conda install -c conda-forge igraph "blas=*=openblas"
+mamba install -c conda-forge igraph "blas=*=openblas"
 # Then install nomkl
-conda install nomkl
+mamba install nomkl
 ```
 **Option 2:** Remove cellpose and re-install it with conda:
 ```
 pip uninstall cellpose -y
-conda install -c conda-forge cellpose
+mamba install -c conda-forge cellpose
 ```
 
 ### Installation Options

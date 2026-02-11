@@ -119,29 +119,38 @@ def run_command(cmd, shell=True, capture=False, check=True):
 # =============================================================================
 
 def find_conda():
-    """Find conda executable."""
-    # Check common locations
-    conda_names = ['conda', 'mamba', 'micromamba']
+    """Find conda-compatible package manager (prefers mamba > micromamba > conda)."""
+    # Check PATH - prefer mamba (faster) over conda
+    conda_names = ['mamba', 'micromamba', 'conda']
     
     for name in conda_names:
         path = shutil.which(name)
         if path:
             return path
     
-    # Check common installation paths
+    # Check common installation paths (mamba/miniforge first, then conda)
     home = Path.home()
     common_paths = [
-        home / "miniconda3" / "condabin" / "conda",
-        home / "miniforge3" / "condabin" / "conda",
-        home / "anaconda3" / "condabin" / "conda",
-        home / "mambaforge" / "condabin" / "conda",
+        # Miniforge/Mambaforge include mamba by default
+        home / "miniforge3" / "condabin" / "mamba",
+        home / "mambaforge" / "condabin" / "mamba",
+        # Micromamba
         home / "micromamba" / "micromamba",
         home / "micromamba" / "bin" / "micromamba",
-        Path("C:/Users") / os.environ.get("USERNAME", "") / "miniconda3" / "condabin" / "conda.bat",
-        Path("C:/Users") / os.environ.get("USERNAME", "") / "miniforge3" / "condabin" / "conda.bat",
+        # Fall back to conda
+        home / "miniforge3" / "condabin" / "conda",
+        home / "mambaforge" / "condabin" / "conda",
+        home / "miniconda3" / "condabin" / "conda",
+        home / "anaconda3" / "condabin" / "conda",
+        # Windows-specific paths (mamba first, then conda)
+        Path("C:/Users") / os.environ.get("USERNAME", "") / "miniforge3" / "condabin" / "mamba.bat",
+        Path("C:/Users") / os.environ.get("USERNAME", "") / "mambaforge" / "condabin" / "mamba.bat",
         Path("C:/Users") / os.environ.get("USERNAME", "") / "micromamba" / "micromamba.exe",
-        Path("C:/ProgramData/miniconda3/condabin/conda.bat"),
+        Path("C:/Users") / os.environ.get("USERNAME", "") / "miniforge3" / "condabin" / "conda.bat",
+        Path("C:/Users") / os.environ.get("USERNAME", "") / "miniconda3" / "condabin" / "conda.bat",
+        Path("C:/ProgramData/miniforge3/condabin/mamba.bat"),
         Path("C:/ProgramData/miniforge3/condabin/conda.bat"),
+        Path("C:/ProgramData/miniconda3/condabin/conda.bat"),
     ]
     
     for p in common_paths:
