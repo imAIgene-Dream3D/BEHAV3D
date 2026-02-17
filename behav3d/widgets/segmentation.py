@@ -1,6 +1,8 @@
 import ipywidgets as widgets
+from IPython.display import display
 from pathlib import Path
 import os
+import pandas as pd
 import yaml
 import traceback
 from functools import partial
@@ -15,6 +17,14 @@ from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
     run_pixel_classifier_segmentation
 )
 import napari
+from ipyfilechooser import FileChooser
+from behav3d.preprocessing.segmentation.cellpose_prediction import (
+    run_cellpose_and_sync_metadata,
+    run_otsu_threshold_segmentation_from_zarr,
+    run_otsu_and_sync_metadata
+)
+from behav3d.core.metadata import has_dead_channel
+
 
 class PixelClassifierPanel:
     def __init__(self, metadata_loader):
@@ -478,7 +488,7 @@ class PixelClassifierPanel:
                 self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
                 if self._viewer is None:
                     self.out.clear_output()
-                    print("✅ Training finished.")
+                    print("Training finished.")
             except Exception: traceback.print_exc()
             finally: self._lock(False)
 
@@ -491,7 +501,7 @@ class PixelClassifierPanel:
             finally:
                 self.close_button.layout.display = "none"
                 self.out.clear_output()
-                print("✅ Training finished.")
+                print("Training finished.")
 
     def _on_apply_clicked(self, _, only_segment=False):
         self._lock(True)
@@ -535,7 +545,7 @@ class PixelClassifierPanel:
                 if new_md is not None:
                     self.metadata_loader.metadata = new_md
                     new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
-                print("✅ Apply finished.")
+                print("Apply finished.")
             except Exception: traceback.print_exc()
             finally:
                 self.spinner_apply.layout.display = "none"
@@ -804,3 +814,232 @@ class CellposeChannelConfigPanel:
         else:
             per_sample = cellpose_cfg.get("per_sample_channel_labels", {})
             return per_sample.get(sample_name, cellpose_cfg.get("channel_labels", {}))
+
+
+class CellposeInferencePanel:
+    """Widget panel for Cellpose model loading and inference."""
+    
+    def __init__(self, metadata_loader, category='organoid'):
+        self.metadata_loader = metadata_loader
+        self.category = category  # 'organoid' or 'immune'
+        self._detect_cell_types()
+        
+        # Model Selection
+        self.model_path_text = widgets.Text(
+            value='',
+            placeholder='Type path or click Browse...',
+            description=f'{category.capitalize()} model:',
+            style={'description_width': 'initial'},
+            layout=widgets.Layout(width='70%')
+        )
+
+        self.browse_btn = widgets.Button(
+            description='Browse…',
+            icon='folder-open',
+            layout=widgets.Layout(width='100px')
+        )
+        self.browse_btn.on_click(self._on_browse_clicked)
+        self.browse_output = widgets.Output()
+
+        self.load_btn = widgets.Button(
+            description=f"Load {category.capitalize()} Model", 
+            button_style='info', 
+            layout={'width': 'max-content'}
+        )
+        self.load_btn.on_click(self._on_load_clicked)
+        
+        # Inference
+        self.label_selector = widgets.Dropdown(
+            description='Cell type to segment:',
+            style={'description_width': 'initial'},
+            layout={'width': 'max-content'},
+        )
+        self._update_label_options()
+
+        self.apply_btn = widgets.Button(
+            description=f"Apply {category.capitalize()} Segmentation", 
+            button_style='success', 
+            layout={'width': 'max-content'}
+        )
+        self.apply_btn.on_click(self._on_apply_clicked)
+        
+        self.out = widgets.Output()
+        
+        # State variables
+        self.pretrained_model_dir = None
+        self.channel_order = []
+        self.available_labels = []
+
+        # Build UI
+        parts = [
+            widgets.HBox([self.model_path_text, self.browse_btn]),
+            self.browse_output,
+            self.load_btn,
+            widgets.HTML("<hr>"),
+            self.label_selector,
+            self.apply_btn,
+            self.out
+        ]
+        
+        self.ui = widgets.VBox(parts, layout=widgets.Layout(grid_gap='10px'))
+
+    def _detect_cell_types(self):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel
+        )
+        metadata = self.metadata_loader.metadata
+        self.organoid_types = detect_organoid_types_from_metadata(metadata)
+        self.immune_types = detect_immune_cell_types_from_metadata(metadata)
+        self.other_types = detect_other_cell_types_from_metadata(metadata)
+        self.has_death = has_dead_channel(metadata)
+        
+        if self.category == 'organoid':
+            self.cell_types = self.organoid_types
+        else:
+            self.cell_types = self.immune_types + self.other_types
+
+    def _update_label_options(self):
+        if self.cell_types:
+            self.label_selector.options = self.cell_types
+            self.label_selector.value = self.cell_types[0]
+        else:
+            self.label_selector.options = ["None detected"]
+
+    def _on_browse_clicked(self, b):
+        with self.browse_output:
+            self.browse_output.clear_output()
+            fc = FileChooser('.', select_default=True, show_only_dirs=False)
+            def on_select(chooser):
+                if chooser.selected:
+                    self.model_path_text.value = str(chooser.selected)
+                self.browse_output.clear_output()
+            fc.register_callback(on_select)
+            widgets.display(fc)
+
+    def _on_load_clicked(self, b):
+        self.pretrained_model_dir = self.model_path_text.value
+        if not self.pretrained_model_dir:
+            with self.out:
+                self.out.clear_output()
+                print("Error: Please select a model path first.")
+            return
+
+        # Extract channel order from model name
+        try:
+            self.channel_order = self.pretrained_model_dir.split(os.path.sep)[-1].split('__')[-1].split('_')
+            self.channel_order = [ch.split('-')[-1] for ch in self.channel_order]
+        except:
+            self.channel_order = ["Unknown"]
+
+        # Get labels from config
+        self.available_labels = []
+        config_path = getattr(self.metadata_loader, 'behav3d_parameters_path', None)
+        if config_path and config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f) or {}
+                cellpose_cfg = config.get("cellpose", {})
+                mode = cellpose_cfg.get("labels_mode", "same_for_all")
+                if mode == "same_for_all":
+                    self.available_labels = list(cellpose_cfg.get("channel_labels", {}).values())
+                else:
+                    labels_set = set()
+                    for sl in cellpose_cfg.get("per_sample_channel_labels", {}).values():
+                        labels_set.update(sl.values())
+                    self.available_labels = sorted(list(labels_set))
+            except: pass
+        
+        self.available_labels = [l for l in self.available_labels if l and l != 'dead']
+
+        with self.out:
+            self.out.clear_output()
+            print(f"Loaded {self.category.capitalize()} model")
+            print(f"   Channels detected: {self.channel_order}")
+            print(f"   Cell types: {self.cell_types}")
+
+    def _on_apply_clicked(self, b):
+        if not self.pretrained_model_dir:
+            with self.out:
+                print("Error: Load a model first.")
+            return
+            
+        label = self.label_selector.value
+        with self.out:
+            self.out.clear_output()
+            try:
+                # updates memory and saves CSV
+                _, summary = run_cellpose_and_sync_metadata(
+                    output_dir=self.metadata_loader.output_dir,
+                    metadata_loader=self.metadata_loader,
+                    pretrained_model_dir=self.pretrained_model_dir,
+                    input_channels=[label], # assign to ch0
+                    label_name=label,
+                    timepoint_range= None
+                )
+                
+                # summary
+                n_proc = len(summary['processed'])
+                n_skip = len(summary['skipped'])
+                if n_skip > 0:
+                    print(f"Cellpose segmentation finished: {n_proc} processed, {n_skip} skipped.")
+                    print(f"Skipped samples: {', '.join(summary['skipped'])}")
+                else:
+                    print(f"Cellpose segmentation finished for all {n_proc} samples.")
+                print("Metadata updated.")
+            except Exception:
+                traceback.print_exc()
+
+    def display(self):
+        display(self.ui)
+
+
+class DeadMaskPanel:
+    """Widget panel for Run Dead Mask (Otsu) segmentation."""
+
+    def __init__(self, metadata_loader):
+        self.metadata_loader = metadata_loader
+        self.has_death = has_dead_channel(metadata_loader.metadata)
+        
+        self.btn = widgets.Button(
+            description="Run Dead Mask (Otsu)", 
+            button_style='warning', 
+            layout={'width': 'max-content'},
+            disabled=not self.has_death
+        )
+        self.btn.on_click(self._on_clicked)
+        self.out = widgets.Output()
+        
+        if not self.has_death:
+            with self.out:
+                print("No dead channel detected in metadata.")
+
+        self.ui = widgets.VBox([self.btn, self.out])
+
+    def _on_clicked(self, b):
+        with self.out:
+            self.out.clear_output()
+            print("Starting Dead Mask (Otsu) segmentation...")
+            try:
+                _, summary = run_otsu_and_sync_metadata(
+                    output_dir=self.metadata_loader.output_dir,
+                    metadata_loader=self.metadata_loader,
+                    mask_suffix="_mask_dead",
+                    timepoint_range=None
+                )
+                # summary
+                n_proc = len(summary['processed'])
+                n_skip = len(summary['skipped'])
+                if n_skip > 0:
+                    print(f"Dead mask segmentation finished: {n_proc} processed, {n_skip} skipped.")
+                    print(f"Skipped samples: {', '.join(summary['skipped'])}")
+                else:
+                    print(f"Dead mask segmentation finished for all {n_proc} samples.")
+                print("Metadata updated.")
+            except Exception:
+                traceback.print_exc()
+
+    def display(self):
+        display(self.ui)
