@@ -779,4 +779,181 @@ def plot_general_organoid_analysis(
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
+
+def plot_multi_organoid_death_dynamics(
+    output_dir,
+    organoid_types,
+    figsize=(12, 10)
+    ):
+    """
+    Generate comparison plots for death dynamics across multiple organoid types.
     
+    Parameters
+    ----------
+    output_dir : str or Path
+        Base output directory containing analysis results
+    organoid_types : list
+        List of organoid type names (e.g., ['organoid1', 'organoid2'])
+    figsize : tuple
+        Figure size for plots
+    
+    Returns
+    -------
+    Path or None
+        Path to generated PDF, or None if insufficient data
+    """
+    print(f"--------------- Multi-Organoid Death Dynamics Comparison ---------------")
+    
+    output_dir = Path(output_dir)
+    
+    # Check which organoid types have death dynamics data available
+    available_data = {}
+    for org_type in organoid_types:
+        csv_path = Path(output_dir, "analysis", org_type, "results", f"combined_general_{org_type}_dynamics_analysis.csv")
+        if csv_path.exists():
+            available_data[org_type] = csv_path
+            print(f"Found data for {org_type}")
+        else:
+            print(f"Missing data for {org_type}: {csv_path}")
+    
+    if len(available_data) < 2:
+        print(f"\n⚠️ Need at least 2 organoid types with death dynamics data.")
+        print(f"   Available: {list(available_data.keys())}")
+        print(f"   Run death dynamics analysis for each organoid type first.")
+        return None
+    
+    # Load and combine data from all organoid types
+    all_data = []
+    for org_type, csv_path in available_data.items():
+        df = pd.read_csv(csv_path)
+        df["organoid_type"] = org_type
+        all_data.append(df)
+    
+    df_combined = pd.concat(all_data, ignore_index=True)
+    
+    # Create a combined label for each sample + organoid_type combination
+    df_combined["sample_organoid"] = df_combined["sample_name"] + "_" + df_combined["organoid_type"]
+    
+    # Create output directory
+    results_outdir = Path(output_dir, "analysis", "multi_organoid_comparison")
+    results_outdir.mkdir(parents=True, exist_ok=True)
+    
+    # Save combined data
+    combined_csv_path = results_outdir / "combined_multi_organoid_death_dynamics.csv"
+    df_combined.to_csv(combined_csv_path, index=False)
+    print(f"\nCombined data saved to: {combined_csv_path}")
+    
+    # Generate plots
+    pdf_path = results_outdir / "multi_organoid_death_dynamics_comparison.pdf"
+    
+    # Get unique combinations for color palette
+    unique_combinations = df_combined["sample_organoid"].unique()
+    n_combinations = len(unique_combinations)
+    
+    # Generate enough distinct colors
+    if n_combinations <= 10:
+        colors = sns.color_palette("tab10", n_combinations)
+    elif n_combinations <= 20:
+        colors = sns.color_palette("tab20", n_combinations)
+    else:
+        # For many combinations, use a continuous colormap
+        colors = sns.color_palette("husl", n_combinations)
+    
+    color_map = dict(zip(unique_combinations, colors))
+    
+    with PdfPages(pdf_path) as pdf:
+        # ======== Plot 1: Line plot - Percentage Dead per sample + organoid_type ========
+        fig1, ax1 = plt.subplots(1, 1, figsize=figsize)
+        
+        sns.lineplot(
+            data=df_combined,
+            x='position_t',
+            y='percentage_dead',
+            hue='sample_organoid',
+            ax=ax1,
+            linewidth=2,
+            palette=color_map
+        )
+        
+        ax1.grid(True, linestyle=':', linewidth=1, alpha=0.5)
+        ax1.set_ylim(0, 1.05)
+        ax1.set_xlim(0)
+        ax1.set_xlabel('Timepoint')
+        ax1.set_ylabel('')
+        ax1.set_title('Percentage of Dead Multi-Organoids')
+        
+        # Format y-axis as percentage
+       #ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x*100:.0f}%'))
+        
+        ax1.legend(
+            bbox_to_anchor=(1.02, 1),
+            loc='upper left',
+            borderaxespad=0,
+            prop={'size': 7},
+            title='Sample Name'
+        )
+        
+        plt.tight_layout()
+        plt.show()
+        pdf.savefig(fig1, bbox_inches='tight')
+        plt.close(fig1)
+        
+        # ======== Plot 2: Bar plot - End state per sample + organoid_type ========
+        fig2, ax2 = plt.subplots(1, 1, figsize=figsize)
+        
+        # Get final timepoint for each sample and organoid type
+        idx = df_combined.groupby(["sample_organoid"])["position_t"].idxmax()
+        df_end = df_combined.loc[idx, ["organoid_type", "sample_name", "sample_organoid", 
+                                        "percentage_dead", "percentage_alive", "percentage_disappeared"]].copy()
+        
+        # Sort by sample_name then organoid_type for consistent ordering
+        df_end = df_end.sort_values(["sample_name", "organoid_type"]).reset_index(drop=True)
+        
+        # Create x-axis labels: "organoid_type_sample_name"
+        df_end["bar_label"] = df_end["organoid_type"] + "_" + df_end["sample_name"]
+        
+        x = np.arange(len(df_end))
+        width = 0.6
+        
+        # Stacked bar: Alive (bottom), Dead (middle), Disappeared (top)
+        bars_alive = ax2.bar(x, df_end["percentage_alive"], width, 
+                             label="percentage_alive", color="#6699CC", zorder=2)
+        bars_dead = ax2.bar(x, df_end["percentage_dead"], width, 
+                            bottom=df_end["percentage_alive"], 
+                            label="percentage_dead", color="#CC6666", zorder=2)
+        bars_disappeared = ax2.bar(x, df_end["percentage_disappeared"], width, 
+                                   bottom=df_end["percentage_alive"] + df_end["percentage_dead"], 
+                                   label="percentage_disappeared", color="#898989", zorder=2)
+        
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(df_end["bar_label"], rotation=45, ha='right', fontsize=8)
+        ax2.grid(True, linestyle=':', linewidth=1, alpha=0.5, zorder=1)
+        ax2.set_ylim(0, 1.05)
+        ax2.set_xlabel('Organoid Name and Sample Name')
+        ax2.set_ylabel('')
+        ax2.set_title('Percentage of Multiple Organoids States at End of Experiment')
+        
+        # Format y-axis as percentage
+        #x2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x*100:.0f}%'))
+        
+        # Legend with correct order: disappeared, alive, dead (matching single organoid plot)
+        handles, labels = ax2.get_legend_handles_labels()
+        order = [2, 0, 1]  # disappeared, alive, dead
+        ax2.legend(
+            [handles[i] for i in order],
+            [labels[i] for i in order],
+            bbox_to_anchor=(1.02, 1), 
+            loc='upper left', 
+            borderaxespad=0, 
+            prop={'size': 8}
+        )
+        
+        plt.tight_layout()
+        plt.show()
+        pdf.savefig(fig2, bbox_inches='tight')
+        plt.close(fig2)
+    
+    print(f"PDF saved to: {pdf_path}")
+    print(f"### DONE\n")
+    
+    return pdf_path
