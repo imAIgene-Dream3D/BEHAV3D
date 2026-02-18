@@ -1177,13 +1177,14 @@ def _resolve_track_image_column(df_sample_meta, track_image_col=None):
 def open_cluster_backprojection_napari(
     adata,
     metadata,
+    outfolder=None,
     sample_name=None,
     cluster_col="ClusterID",
     sample_col="sample_name",
     trackid_col="TrackID",
     time_col="position_t",
     raw_image_col="raw_image_path",
-    track_image_col=None,
+    track_image_col="tcell_tracks_image_path",
     track_channel=0,
     show_trackid_layer=True,
     show_cluster_mapping_widget=True,
@@ -2027,7 +2028,7 @@ def test():
         plot_top_ranking_features(
             adata_merged,
             groupby="ClusterID",
-            n_features=10,
+            n_features=20,
         )
         plt.suptitle("Merged - Top Ranking Features", y=1.02)
         plt.tight_layout()
@@ -2036,14 +2037,22 @@ def test():
         plot_number_per_clusters(adata_merged.obs, cluster_col="ClusterID")
         plt.title("Merged - Cluster Sizes")
         plt.show()
+    open_cluster_backprojection_napari(
+        adata_merged,
+        metadata,
+        track_image_col="tcell_tracks_image_path",
+        sample_name="ROCHE_JM1_Exp042-9_Img04_10T_HER2-I"
+    )
 
 
 if __name__ == "__main__":
     
     ssd_dir = r"/Volumes/T7_Sam/"
+    ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
     metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv")
+    metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata_home.csv")
     outfolder = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
     metadata = load_behav3d_metadata(metadata_csv_path)
     analysis_outdir = Path(output_dir, "analysis", "tcell")
@@ -2067,8 +2076,6 @@ if __name__ == "__main__":
         # "mean_square_displacement",
         "speed",
         # "directional_persistence",
-        "volume",
-        "surface_area",
         "extent",
         "elongation",
         "sphericity",
@@ -2095,7 +2102,7 @@ if __name__ == "__main__":
     leiden_subsample_tries = 20
     lower_quantile_cap = None      # e.g. 0.01
     upper_quantile_cap = 0.99      # e.g. None to disable upper capping
-    outfolder = Path("/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
+    outfolder = Path(ssd_dir, "/BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
     random_state = 123
 
     pass

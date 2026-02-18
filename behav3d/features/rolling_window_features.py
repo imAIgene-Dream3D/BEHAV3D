@@ -1,7 +1,9 @@
 import numpy as np
 import pandas as pd
+import os
 
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from tqdm import tqdm
 
 """
@@ -694,23 +696,49 @@ def create_descriptive_track_dataset(
 
     output_rows = []
 
-    if n_jobs is None or n_jobs != 1:
-        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
-            futures = ex.map(
-                _create_descriptive_track_worker,
-                groups,
-                [columns_to_summarize] * total_groups,
-                [window_size] * total_groups,
-                [step_size] * total_groups,
-                [time_col] * total_groups,
-                [list(id_cols)] * total_groups,
-                [signal_types] * total_groups,
-                [features_to_compute] * total_groups,
-                [only_nonbinary] * total_groups,
-                [incomplete_window_policy] * total_groups,
-                chunksize=chunksize,
-            )
-            for rows in tqdm(futures, total=total_groups):
+    # n_jobs=None means "auto": use all available CPU cores.
+    # Keep a robust fallback to serial if the process pool breaks.
+    resolved_n_jobs = os.cpu_count() if n_jobs is None else n_jobs
+    if resolved_n_jobs is None:
+        resolved_n_jobs = 1
+    resolved_n_jobs = int(resolved_n_jobs)
+    use_parallel = resolved_n_jobs != 1
+
+    if use_parallel:
+        try:
+            with ProcessPoolExecutor(max_workers=resolved_n_jobs) as ex:
+                futures = ex.map(
+                    _create_descriptive_track_worker,
+                    groups,
+                    [columns_to_summarize] * total_groups,
+                    [window_size] * total_groups,
+                    [step_size] * total_groups,
+                    [time_col] * total_groups,
+                    [list(id_cols)] * total_groups,
+                    [signal_types] * total_groups,
+                    [features_to_compute] * total_groups,
+                    [only_nonbinary] * total_groups,
+                    [incomplete_window_policy] * total_groups,
+                    chunksize=chunksize,
+                )
+                for rows in tqdm(futures, total=total_groups):
+                    if rows:
+                        output_rows.extend(rows)
+        except BrokenProcessPool:
+            # Recover from abrupt worker exits by retrying deterministically in-process.
+            for g in tqdm(groups, total=total_groups):
+                rows = _create_descriptive_track_worker(
+                    g,
+                    columns_to_summarize,
+                    window_size,
+                    step_size,
+                    time_col,
+                    list(id_cols),
+                    signal_types,
+                    features_to_compute,
+                    only_nonbinary,
+                    incomplete_window_policy,
+                )
                 if rows:
                     output_rows.extend(rows)
     else:
