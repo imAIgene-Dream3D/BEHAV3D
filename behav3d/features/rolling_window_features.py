@@ -265,8 +265,51 @@ ALL_WINDOW_FEATURES = {
 }
 
 
+_MOTION_FEATURE_KEYS = {
+    "summed_displacement",
+    "net_displacement",
+    "straightness",
+    "directional_persistence",
+    "median_turning_angle",
+    "fraction_reversed_movement",
+    "mean_square_displacement",
+}
+
+
+def _needs_min_two_timepoints(feature_key: str) -> bool:
+    """Heuristic for features that are undefined/unstable for 1-frame windows."""
+    if feature_key in _MOTION_FEATURE_KEYS:
+        return True
+    min2_suffixes = (
+        "_linear_trend_slope_per_time_unit",
+        "_lag1_autocorrelation",
+        "_mean_absolute_first_difference",
+        "_transition_rate",
+        "_longest_true_length",
+        "_mean_true_length",
+        "_longest_false_length",
+        "_mean_false_length",
+    )
+    return feature_key.endswith(min2_suffixes)
+
+
 def _compute_motion_features_from_xyz(px, py, pz, features_to_compute=ALL_WINDOW_FEATURES):
     coords = np.column_stack([px, py, pz]).astype(float, copy=False)
+    # Drop invalid coordinate rows so motion features can still be computed
+    # from the valid part of the window.
+    valid = np.all(np.isfinite(coords), axis=1)
+    coords = coords[valid]
+    if coords.shape[0] == 0:
+        motion_features = {
+            "summed_displacement": 0.0,
+            "net_displacement": 0.0,
+            "straightness": 0.0,
+            "directional_persistence": 0.0,
+            "median_turning_angle": 0.0,
+            "fraction_reversed_movement": 0.0,
+            "mean_square_displacement": 0.0,
+        }
+        return {k: v for k, v in motion_features.items() if k in features_to_compute}
     coords_rel = coords - coords[0]  # coords_rel[0] == (0,0,0)
 
     sq_disp_from_origin = np.sum(coords_rel**2, axis=1)
@@ -274,7 +317,7 @@ def _compute_motion_features_from_xyz(px, py, pz, features_to_compute=ALL_WINDOW
 
     steps = np.diff(coords_rel, axis=0)
     if steps.size == 0:
-        return {
+        motion_features = {
             "summed_displacement": 0.0,
             "net_displacement": 0.0,
             "straightness": 0.0,
@@ -283,6 +326,7 @@ def _compute_motion_features_from_xyz(px, py, pz, features_to_compute=ALL_WINDOW
             "fraction_reversed_movement": 0.0,
             "mean_square_displacement": mean_square_displacement,
         }
+        return {k: v for k, v in motion_features.items() if k in features_to_compute}
 
     step_len = np.linalg.norm(steps, axis=1)
     path_length = float(np.nansum(step_len))
@@ -432,6 +476,7 @@ def _create_descriptive_track_worker(
     signal_types,
     features_to_compute=ALL_WINDOW_FEATURES,
     only_nonbinary=False,
+    incomplete_window_policy="drop",
 ):
     group_df = group_df.reset_index(drop=True)
     n = len(group_df)
@@ -521,14 +566,19 @@ def _create_descriptive_track_worker(
     stride = step_size if step_size is not None else 1
     stride = max(int(stride), 1)
 
-    nan_feature_template = None
+    policy = str(incomplete_window_policy).lower()
+    if policy not in {"drop", "partial", "as_far_as_possible"}:
+        raise ValueError(
+            "incomplete_window_policy must be one of: "
+            "'drop', 'partial' (alias: 'as_far_as_possible')."
+        )
 
     for end_idx in range(0, n, stride):
         start_idx = end_idx - window_size + 1
         end_t = float(t_all[end_idx]) if t_all is not None else float(end_idx)
 
-        # Not enough history: emit NaNs for all features
-        if start_idx < 0:
+        if start_idx < 0 and policy == "drop":
+            # Not enough history in strict mode: emit NaN window entry.
             row = {
                 id_cols[0]: sample_val,
                 id_cols[1]: track_id_val,
@@ -538,10 +588,12 @@ def _create_descriptive_track_worker(
                 f"window_end_{time_col}": end_t,
                 "window_length_frames": np.nan,
             }
-            if nan_feature_template is not None:
-                row.update(nan_feature_template)
             out_rows.append(row)
             continue
+
+        # Partial mode: use as much history as available.
+        if start_idx < 0 and policy in {"partial", "as_far_as_possible"}:
+            start_idx = 0
 
         # Valid trailing window
         start_t = float(t_all[start_idx]) if t_all is not None else float(start_idx)
@@ -554,7 +606,7 @@ def _create_descriptive_track_worker(
             time_col: end_t,
             f"window_start_{time_col}": start_t,
             f"window_end_{time_col}": end_t,
-            "window_length_frames": window_size,
+            "window_length_frames": int(end_idx - start_idx + 1),
         }
 
         # motion features for trailing window
@@ -592,31 +644,28 @@ def _create_descriptive_track_worker(
         for col in binary_cols:
             row[f"{col}_value"] = float(sig_arrays[col][end_idx])
 
-        # Build a NaN template based on first valid window
-        if nan_feature_template is None:
-            nan_feature_template = {
-                k: np.nan
-                for k in row.keys()
-                if k
-                not in [
-                    id_cols[0],
-                    id_cols[1],
-                    "sub_TrackID",
-                    time_col,
-                    f"window_start_{time_col}",
-                    f"window_end_{time_col}",
-                    "window_length_frames",
-                ]
-            }
-
         out_rows.append(row)
 
-    # Backfill NaN feature keys for any early rows created before template existed
-    if nan_feature_template is not None:
-        for r in out_rows:
-            for k in nan_feature_template.keys():
-                if k not in r:
-                    r[k] = np.nan
+    # In partial mode, first row can be t0-t0 (window length 1). For features that
+    # need at least 2 timepoints, copy values from the next available row.
+    if policy in {"partial", "as_far_as_possible"} and len(out_rows) >= 2:
+        first = out_rows[0]
+        second = out_rows[1]
+        if int(first.get("window_length_frames", 0)) <= 1:
+            protected = {
+                id_cols[0],
+                id_cols[1],
+                "sub_TrackID",
+                time_col,
+                f"window_start_{time_col}",
+                f"window_end_{time_col}",
+                "window_length_frames",
+            }
+            for k in list(first.keys()):
+                if k in protected:
+                    continue
+                if _needs_min_two_timepoints(k) and (k in second):
+                    first[k] = second[k]
 
     return out_rows
 
@@ -633,6 +682,7 @@ def create_descriptive_track_dataset(
     chunksize=8,
     features_to_compute=ALL_WINDOW_FEATURES,
     only_nonbinary=False,
+    incomplete_window_policy="drop",
 ):
     df_sorted = df_tracks.sort_values(list(id_cols) + [time_col], kind="mergesort")
 
@@ -657,6 +707,7 @@ def create_descriptive_track_dataset(
                 [signal_types] * total_groups,
                 [features_to_compute] * total_groups,
                 [only_nonbinary] * total_groups,
+                [incomplete_window_policy] * total_groups,
                 chunksize=chunksize,
             )
             for rows in tqdm(futures, total=total_groups):
@@ -674,6 +725,7 @@ def create_descriptive_track_dataset(
                 signal_types,
                 features_to_compute,
                 only_nonbinary,
+                incomplete_window_policy,
             )
             if rows:
                 output_rows.extend(rows)

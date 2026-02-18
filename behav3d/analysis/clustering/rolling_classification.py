@@ -52,6 +52,7 @@ from behav3d.analysis.clustering.state.visualization.plots.state_transitions imp
 # %matplotlib inline
 
 import time
+from pathlib import Path
 seed = 123
 random.seed(seed)
 np.random.seed(seed)
