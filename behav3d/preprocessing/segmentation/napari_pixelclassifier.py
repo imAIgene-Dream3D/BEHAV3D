@@ -1235,6 +1235,7 @@ def run_pixel_classifier_segmentation(
     only_segment=False,
     overwrite_existing=False,
     n_workers=4,
+    log_callback=print,
     ):
 
     """
@@ -1253,16 +1254,21 @@ def run_pixel_classifier_segmentation(
     n_workers : int
         Number of parallel workers for timepoint processing (default: 4)
         Will be capped at available CPU count to prevent overloading
+    log_callback : callable
+        Function to handle log messages (default: print)
     """
     
+    # Use log_callback instead of print
+    log = log_callback
+
     # Validate and cap n_workers to available CPU count
     max_workers = multiprocessing.cpu_count()
     if n_workers > max_workers:
         safe_workers = max(1, max_workers // 2)
-        print(f"⚠️ Requested {n_workers} workers but only {max_workers} CPUs available. Using {safe_workers} workers (half of available) for system stability.")
+        log(f"⚠️ Requested {n_workers} workers but only {max_workers} CPUs available. Using {safe_workers} workers (half of available) for system stability.")
         n_workers = safe_workers
     elif n_workers < 1:
-        print(f"⚠️ Invalid n_workers={n_workers}. Using 1 worker (sequential).")
+        log(f"⚠️ Invalid n_workers={n_workers}. Using 1 worker (sequential).")
         n_workers = 1
     
     # Detect cell types from metadata
@@ -1280,8 +1286,8 @@ def run_pixel_classifier_segmentation(
     
     all_cell_types = organoid_types + immune_types + other_types
     
-    print(f"Detected cell types: organoids={organoid_types}, immune={immune_types}, other={other_types}")
-    print(f"Dead channel: {has_death}")
+    log(f"Detected cell types: organoids={organoid_types}, immune={immune_types}, other={other_types}")
+    log(f"Dead channel: {has_death}")
     
     # Initialize parameter dictionaries with defaults if not provided
     if organoid_edt_thresholds is None:
@@ -1366,11 +1372,11 @@ def run_pixel_classifier_segmentation(
             shutil.copy(clf_death_path, death_clf_default)
         if death_clf_default.exists():
             clf_death = joblib.load(death_clf_default)
-            print(f"Loaded death classifier from: {death_clf_default}")
+            log(f"Loaded death classifier from: {death_clf_default}")
         else:
-            print(f"⚠️ Warning: Death channel detected but classifier not found at: {death_clf_default}")
+            log(f"⚠️ Warning: Death channel detected but classifier not found at: {death_clf_default}")
     else:
-        print("Skipping death classifier (no dead channel)")
+        log("Skipping death classifier (no dead channel)")
     
     # Ensure all segment path columns exist with correct dtype (object/string)
     for cell_type in all_cell_types:
@@ -1391,7 +1397,7 @@ def run_pixel_classifier_segmentation(
     
     # Process each sample
     for idx, sample in metadata.iterrows():
-        print(f"Processing sample: {sample['sample_name']}") 
+        log(f"Processing sample: {sample['sample_name']}") 
         start_time = time.time()
         sample_name = sample['sample_name']
         
@@ -1416,13 +1422,13 @@ def run_pixel_classifier_segmentation(
             img = load_image(raw_image_path)
             save_as_zarr(img, raw_image_zarr)
         img = load_image(raw_image_zarr)
-        print(f"  Image shape: {img.shape}")
+        log(f"  Image shape: {img.shape}")
         
         # Check if already segmented
         all_segments_exist = all(p.exists() for p in segments_outpaths.values())
         
         if all_segments_exist and not overwrite_existing and not only_segment:
-            print("  Already segmented, skipping")
+            log("  Already segmented, skipping")
         else:   
             # Remove existing outputs if overwriting
             for cell_type, seg_path in segments_outpaths.items():
@@ -1436,7 +1442,7 @@ def run_pixel_classifier_segmentation(
                     if mask_path.exists():
                         loaded_masks[cell_type] = load_image(mask_path)
                     else:
-                        print(f"  Warning: Mask not found for {cell_type}: {mask_path}")
+                        log(f"  Warning: Mask not found for {cell_type}: {mask_path}")
             else:
                 # Remove mask files if not in only_segment mode
                 if death_mask_outpath.exists():
@@ -1451,10 +1457,10 @@ def run_pixel_classifier_segmentation(
                 start_t = max(0, min(start_t, img.shape[0]-1))
                 end_t = max(start_t, min(end_t, img.shape[0]-1))
                 timepoint_indices = list(range(start_t, end_t + 1))
-                print(f"  Processing timepoints: {start_t} to {end_t} (total: {len(timepoint_indices)})")
+                log(f"  Processing timepoints: {start_t} to {end_t} (total: {len(timepoint_indices)})")
             else:
                 timepoint_indices = list(range(img.shape[0]))
-                print(f"  Processing all timepoints: 0 to {img.shape[0]-1}")
+                log(f"  Processing all timepoints: 0 to {img.shape[0]-1}")
             
             # Prepare arguments for parallel processing
             args_list = [
@@ -1466,7 +1472,7 @@ def run_pixel_classifier_segmentation(
             ]
             
             # Process timepoints in parallel
-            print(f"  Using {n_workers} parallel workers")
+            log(f"  Using {n_workers} parallel workers")
             with ThreadPoolExecutor(max_workers=n_workers) as executor:
                 results = list(tqdm(
                     executor.map(_process_single_timepoint, args_list),
@@ -1519,8 +1525,8 @@ def run_pixel_classifier_segmentation(
         if has_death and 'dead_mask_path' in metadata.columns and death_mask_outpath.exists():
             metadata['dead_mask_path'] = metadata['dead_mask_path'].astype('object')
             metadata.at[idx, 'dead_mask_path'] = str(death_mask_outpath)
-            print(f"  Updated dead_mask_path: {death_mask_outpath}")
+            log(f"  Updated dead_mask_path: {death_mask_outpath}")
         
-        print(f"  Sample {sample_name} completed in {time.time() - start_time:.1f}s")
+        log(f"  Sample {sample_name} completed in {time.time() - start_time:.1f}s")
     
     return metadata
