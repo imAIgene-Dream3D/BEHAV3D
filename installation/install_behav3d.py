@@ -771,18 +771,34 @@ Examples:
     print_header("INSTALLATION COMPLETE")
     print_success("BEHAV3D has been installed successfully!")
     print()
-    print("To activate the environment:")
-    if get_platform() == "Windows":
-        print(f"  conda activate {ENV_NAME}")
+    # Ask user if they want to run the BEHAV3D notebook now
+    try:
+        response = input("\nWould you like to open the BEHAV3D notebook now? [1] Yes  [2] No: ").strip()
+    except EOFError:
+        response = "2"
+    if response == "1" or response.lower() == "yes":
+        # Try to open the notebook directly
+        print_info("Attempting to launch the BEHAV3D notebook...")
+        notebooks_path = os.path.join(find_project_root(), "notebooks", "run_behav3d.ipynb")
+        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+        # Use jupyter notebook command to open the notebook
+        try:
+            cmd = f'{run_prefix} jupyter notebook "{notebooks_path}"'
+            print_info(f"Running: {cmd}")
+            run_command(cmd)
+        except Exception as e:
+            print_warning(f"Could not open notebook automatically: {e}")
+            print("You can open it manually as described below.")
     else:
-        print(f"  conda activate {ENV_NAME}")
+        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+        notebooks_path = os.path.join(find_project_root(), "notebooks", "run_behav3d.ipynb")
+        cmd = f'{run_prefix} jupyter notebook "{notebooks_path}"'
+
+        print("\nStart using BEHAV3D!")
+        print()
+        print("To run the Jupyter notebook, open a Command Line Interface (CMD/Terminal) and run this code:")
+        print(cmd)
     print()
-    print("To start using BEHAV3D:")
-    print("  1. Activate the environment")
-    print("  2. Navigate to the notebooks folder")
-    print("  3. Run: jupyter notebook")
-    print()
-    
     return 0
 
 if __name__ == "__main__":

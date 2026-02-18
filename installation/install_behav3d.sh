@@ -90,12 +90,3 @@ if [ $exit_code -ne 0 ]; then
 fi
 
 echo ""
-echo "============================================================"
-echo "              Installation Complete!"
-echo "============================================================"
-echo ""
-echo "To use BEHAV3D:"
-echo "  1. Open a new terminal"
-echo "  2. Run: conda activate $ENV_NAME"
-echo "  3. Navigate to the notebooks folder and run Jupyter"
-echo ""

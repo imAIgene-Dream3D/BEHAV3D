@@ -243,12 +243,5 @@ fi
 # =============================================================================
 
 echo ""
-print_header "Installation Complete!"
-
-echo "To use BEHAV3D:"
-echo "  1. Open a new Terminal window"
-echo "  2. Run: conda activate $ENV_NAME"
-echo "  3. Navigate to the notebooks folder and run Jupyter"
-echo ""
 echo "Press any key to close..."
 read -n 1
