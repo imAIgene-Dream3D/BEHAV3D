@@ -184,11 +184,15 @@ def run_propagation_tracking(
         if segments_col is not None and segments_col.startswith(('or_', 'im_', 'ot_')):
             # Use the same prefix as the segments column
             prefix = segments_col.split('_')[0]
-            metadata.at[idx, f"{prefix}_{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
-            metadata.at[idx, f"{prefix}_{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
-        else:
-            # Fallback to old non-prefixed format
-            metadata.at[idx, f"{cell_type}_tracks_image_path"] = str(tracked_img_outpath)
-            metadata.at[idx, f"{cell_type}_tracks_csv_path"] = str(tracked_csv_outpath)
+            img_col = f"{prefix}_{cell_type}_tracks_image_path"
+            csv_col = f"{prefix}_{cell_type}_tracks_csv_path"
+        
+        # Ensure columns are object dtype
+        for col in [img_col, csv_col]:
+            if col not in metadata.columns or metadata[col].dtype != object:
+                metadata[col] = metadata.get(col, pd.Series(dtype=object)).astype(object)
+        
+        metadata.at[idx, img_col] = str(tracked_img_outpath)
+        metadata.at[idx, csv_col] = str(tracked_csv_outpath)
         
     return metadata

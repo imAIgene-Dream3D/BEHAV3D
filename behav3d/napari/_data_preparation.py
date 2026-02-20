@@ -160,6 +160,7 @@ class DataPreparationTab(QWidget):
         self._build_output_dir_section()
         self._build_metadata_builder_section()
         self._build_metadata_loader_section()
+        self._build_metadata_overview_section()
         self._build_dim_order_section()
         self._build_zarr_section()
 
@@ -488,6 +489,8 @@ class DataPreparationTab(QWidget):
         df = pd.DataFrame(rows)
         csv_path = Path(out_dir) / "metadata.csv"
         df.to_csv(csv_path, index=False)
+        self.metadata = df
+        self._populate_metadata_overview()
         self._log(f"✅ Metadata saved to {csv_path}  ({len(df)} samples, {len(df.columns)} columns)")
 
     # ══════════════════════════════════════════════════════════════════════
@@ -565,7 +568,8 @@ class DataPreparationTab(QWidget):
             self.metadata_info_label.setText("  |  ".join(info_parts))
             self._log(f"✅ Metadata loaded from {csv_path}")
 
-            # Populate dim-order table
+            # Populate overview and dim-order table
+            self._populate_metadata_overview()
             self._populate_dim_order_table()
 
             # Emit signal for other tabs
@@ -576,10 +580,47 @@ class DataPreparationTab(QWidget):
             self._log(f"❌ Error loading metadata: {e}")
 
     # ══════════════════════════════════════════════════════════════════════
-    # Section 4 – Dimension Order Table
+    # Section 4 – Metadata Overview
+    # ══════════════════════════════════════════════════════════════════════
+    def _build_metadata_overview_section(self):
+        grp = QGroupBox("4 · Metadata Overview")
+        lay = QVBoxLayout(grp)
+
+        self.metadata_table = QTableWidget(0, 0)
+        self.metadata_table.setAlternatingRowColors(True)
+        # Fix for white-on-white text in some themes
+        self.metadata_table.setStyleSheet("QTableWidget { alternate-background-color: #333; }")
+        self.metadata_table.setMaximumHeight(250)
+        lay.addWidget(self.metadata_table)
+
+        self._layout.addWidget(grp)
+
+    def _populate_metadata_overview(self):
+        if self.metadata is None or self.metadata.empty:
+            self.metadata_table.setRowCount(0)
+            self.metadata_table.setColumnCount(0)
+            return
+
+        # Show first 10 rows for overview
+        df_preview = self.metadata.head(10)
+        self.metadata_table.setRowCount(len(df_preview))
+        self.metadata_table.setColumnCount(len(df_preview.columns))
+        self.metadata_table.setHorizontalHeaderLabels(df_preview.columns)
+
+        for i in range(len(df_preview)):
+            for j in range(len(df_preview.columns)):
+                val = df_preview.iloc[i, j]
+                item = QTableWidgetItem(str(val) if pd.notna(val) else "")
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.metadata_table.setItem(i, j, item)
+
+        self.metadata_table.resizeColumnsToContents()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Section 5 – Dimension Order Table
     # ══════════════════════════════════════════════════════════════════════
     def _build_dim_order_section(self):
-        grp = QGroupBox("4 · Dimension Order")
+        grp = QGroupBox("5 · Dimension Order")
         lay = QVBoxLayout(grp)
 
         self.dim_table = QTableWidget(0, 3)
@@ -683,10 +724,10 @@ class DataPreparationTab(QWidget):
         self._log(f"✅ Dimension orders saved to {csv_path}")
 
     # ══════════════════════════════════════════════════════════════════════
-    # Section 5 – Convert to Zarr
+    # Section 6 – Convert to Zarr
     # ══════════════════════════════════════════════════════════════════════
     def _build_zarr_section(self):
-        grp = QGroupBox("5 · Convert to Zarr")
+        grp = QGroupBox("6 · Convert to Zarr")
         lay = QVBoxLayout(grp)
 
         self.zarr_btn = QPushButton("Convert All Images to Zarr")

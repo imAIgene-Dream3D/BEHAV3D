@@ -1424,11 +1424,26 @@ def run_pixel_classifier_segmentation(
         img = load_image(raw_image_zarr)
         log(f"  Image shape: {img.shape}")
         
-        # Check if already segmented
-        all_segments_exist = all(p.exists() for p in segments_outpaths.values())
-        
-        if all_segments_exist and not overwrite_existing and not only_segment:
-            log("  Already segmented, skipping")
+        # Check if already segmented (Check metadata AND disk)
+        skip_sample = False
+        if not overwrite_existing and not only_segment:
+            # 1. Check metadata for existing paths
+            for cell_type in all_cell_types:
+                prefix = 'or' if cell_type in organoid_types else ('im' if cell_type in immune_types else 'ot')
+                path_col = f'{prefix}_{cell_type}_segments_image_path'
+                existing_path = sample.get(path_col)
+                if pd.notna(existing_path) and str(existing_path).strip():
+                    if Path(str(existing_path)).exists():
+                        skip_sample = True
+                        break
+            
+            # 2. Check calculated output paths for safety
+            if not skip_sample and all(p.exists() for p in segments_outpaths.values()):
+                skip_sample = True
+
+        if skip_sample:
+            log(f"  Sample {sample_name} already segmented. Skipping (Overwrite existing unchecked).")
+            continue
         else:   
             # Remove existing outputs if overwriting
             for cell_type, seg_path in segments_outpaths.items():
@@ -1520,6 +1535,7 @@ def run_pixel_classifier_segmentation(
             
             path_col = f'{prefix}_{cell_type}_segments_image_path'
             metadata.at[idx, path_col] = str(segments_outpaths[cell_type])
+            log(f"  Saved {cell_type} segments: {segments_outpaths[cell_type]}")
         
         # Update dead_mask_path in metadata if death channel is present AND column exists
         if has_death and 'dead_mask_path' in metadata.columns and death_mask_outpath.exists():

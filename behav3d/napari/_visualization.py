@@ -16,7 +16,8 @@ from pathlib import Path
 import dask.array as da
 import numpy as np
 import pandas as pd
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QPropertyAnimation, QEasingCurve, Property, QRect, QPoint
+from qtpy.QtGui import QPainter, QColor
 from qtpy.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -27,6 +28,8 @@ from qtpy.QtWidgets import (
     QPushButton,
     QCheckBox,
     QTextEdit,
+    QAbstractButton,
+    QSizePolicy,
 )
 
 from behav3d.core.metadata import (
@@ -36,13 +39,84 @@ from behav3d.core.metadata import (
 )
 
 # Channel colormaps (cycled if there are many channels)
-_CHANNEL_COLORS = ["cyan", "yellow", "magenta", "green", "red", "blue"]
+_CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
 # Label colormaps per cell-type category
 _LABEL_CMAP = {
     "or": "viridis",
     "im": "inferno",
     "ot": "plasma",
 }
+# ----------------------------------------------------------------------
+# Custom Toggle Switch (QSwitch)
+# ----------------------------------------------------------------------
+class QSwitch(QAbstractButton):
+    """Modern toggle switch widget."""
+    def __init__(self, parent=None, track_radius=10, thumb_radius=8):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        
+        self._track_radius = track_radius
+        self._thumb_radius = thumb_radius
+        
+        self._margin = 3
+        self._base_width = 40
+        self._base_height = 22
+        
+        # Position of the thumb (0 to 1 float)
+        self._offset = 0.0
+        self._animation = QPropertyAnimation(self, b"offset", self)
+        self._animation.setDuration(150)
+        self._animation.setEasingCurve(QEasingCurve.InOutSine)
+        
+        self.setFixedSize(self._base_width, self._base_height)
+
+    @Property(float)
+    def offset(self):
+        return self._offset
+
+    @offset.setter
+    def offset(self, pos):
+        self._offset = pos
+        self.update()
+
+    def sizeHint(self):
+        return self.size()
+
+    def nextCheckState(self):
+        super().nextCheckState()
+        start = self._offset
+        end = 1.0 if self.isChecked() else 0.0
+        self._animation.stop()
+        self._animation.setStartValue(start)
+        self._animation.setEndValue(end)
+        self._animation.start()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        
+        # Draw background track
+        if self.isChecked():
+            # Green for ON
+            p.setBrush(QColor("#4CAF50"))
+        else:
+            # Grey for OFF
+            p.setBrush(QColor("#CCCCCC"))
+            
+        p.drawRoundedRect(0, 0, self.width(), self.height(), self._track_radius, self._track_radius)
+        
+        # Draw thumb
+        p.setBrush(QColor("white"))
+        thumb_x = self._margin + self._offset * (self.width() - 2 * self._thumb_radius - 2 * self._margin)
+        p.drawEllipse(int(thumb_x), self._margin, 2 * self._thumb_radius, 2 * self._thumb_radius)
+
+    def setChecked(self, checked: bool):
+        super().setChecked(checked)
+        self._offset = 1.0 if checked else 0.0
+        self.update()
+
 
 
 class VisualizationTab(QWidget):
@@ -84,7 +158,7 @@ class VisualizationTab(QWidget):
         # Options
         self.clear_layers_cb = QCheckBox("Clear existing layers before loading")
         self.clear_layers_cb.setChecked(True)
-        sel_lay.addWidget(self.clear_layers_cb)
+        # sel_lay.addWidget(self.clear_layers_cb) # Removed as it does not make sense right now
 
         btn_load = QPushButton("Load Dataset into Napari")
         btn_load.setStyleSheet(
@@ -94,6 +168,34 @@ class VisualizationTab(QWidget):
         sel_lay.addWidget(btn_load)
 
         layout.addWidget(sel_grp)
+
+        # Visibility Toggles
+        vis_grp = QGroupBox("Visibility Toggles")
+        vis_lay = QHBoxLayout(vis_grp)
+        
+        def make_switch(label, group_type):
+            container = QHBoxLayout()
+            container.addWidget(QLabel(label))
+            sw = QSwitch()
+            sw.setChecked(True)
+            sw.clicked.connect(lambda: self._on_toggle_layer_group(sw.isChecked(), group_type))
+            container.addWidget(sw)
+            return container, sw
+
+        lay_raw, self.toggle_raw = make_switch("Raw:", "raw")
+        lay_seg, self.toggle_seg = make_switch("Segments:", "segments")
+        lay_tseg, self.toggle_track_seg = make_switch("Tracked Segments:", "tracked_segments")
+        lay_tracks, self.toggle_tracks = make_switch("Tracks:", "tracks")
+        
+        # Hide tracks by default
+        self.toggle_tracks.setChecked(False)
+
+        vis_lay.addLayout(lay_raw)
+        vis_lay.addLayout(lay_seg)
+        vis_lay.addLayout(lay_tseg)
+        vis_lay.addLayout(lay_tracks)
+        
+        layout.addWidget(vis_grp)
 
         # Info panel
         self.info_label = QLabel("Load metadata in the Data Preparation tab first.")
@@ -144,8 +246,14 @@ class VisualizationTab(QWidget):
             return
         row = row.iloc[0]
 
-        if self.clear_layers_cb.isChecked():
-            self.viewer.layers.clear()
+        # Reset toggles to default before loading
+        self.toggle_raw.setChecked(True)
+        self.toggle_seg.setChecked(True)
+        self.toggle_track_seg.setChecked(True)
+        self.toggle_tracks.setChecked(False) # Tracks are hidden by default
+
+        # if self.clear_layers_cb.isChecked():
+        self.viewer.layers.clear()
 
         output_dir = self.data_prep.output_dir or ""
 
@@ -155,7 +263,10 @@ class VisualizationTab(QWidget):
         # ---- 2. Segments -------------------------------------------------
         self._load_segments(sample_name, row)
 
-        # ---- 3. Tracks ---------------------------------------------------
+        # ---- 3. Tracked Segments -----------------------------------------
+        self._load_tracked_segments(sample_name, row)
+
+        # ---- 4. Tracks ---------------------------------------------------
         self._load_tracks(sample_name, row)
 
         self.info_label.setText(f"✅  Loaded dataset for '{sample_name}'")
@@ -237,7 +348,7 @@ class VisualizationTab(QWidget):
                 name=layer_name,
                 colormap=color,
                 blending="additive",
-                visible=(c == 0),  # only first channel visible by default
+                visible=True,
             )
             self._log(f"    + Image layer: {layer_name}  ({color})")
 
@@ -252,16 +363,25 @@ class VisualizationTab(QWidget):
 
         for ct_name, prefix in ct_map.items():
             seg_col = f"{prefix}_{ct_name}_segments_image_path"
-            seg_path = str(row.get(seg_col, "")).strip()
-            if not seg_path or not Path(seg_path).exists():
-                # Also try .zarr version in output dir
+            seg_path_val = row.get(seg_col)
+            
+            # Robust check for missing values (NaN or empty)
+            if pd.isna(seg_path_val) or not str(seg_path_val).strip():
+                self._log(f"    - Skipping {ct_name} segments: Path not defined in metadata")
+                continue
+            
+            seg_path = str(seg_path_val).strip()
+            if not Path(seg_path).exists():
+                # Also try .zarr version in output dir as a fallback
                 if self.data_prep.output_dir:
-                    zarr_guess = Path(self.data_prep.output_dir, f"{Path(seg_path).stem}.zarr") if seg_path else None
-                    if zarr_guess and zarr_guess.exists():
+                    zarr_guess = Path(self.data_prep.output_dir, f"{Path(seg_path).stem}.zarr")
+                    if zarr_guess.exists():
                         seg_path = str(zarr_guess)
                     else:
+                        self._log(f"    - Skipping {ct_name} segments: File not found ({seg_path})")
                         continue
                 else:
+                    self._log(f"    - Skipping {ct_name} segments: File not found ({seg_path})")
                     continue
 
             try:
@@ -278,7 +398,7 @@ class VisualizationTab(QWidget):
                 self.viewer.add_labels(
                     seg_data,
                     name=layer_name,
-                    visible=False,
+                    visible=True,
                 )
                 self._log(f"    + Labels layer: {layer_name}")
             except Exception as e:
@@ -293,23 +413,31 @@ class VisualizationTab(QWidget):
 
         for ct_name, prefix in ct_map.items():
             csv_col = f"{prefix}_{ct_name}_tracks_csv_path"
-            csv_path_str = str(row.get(csv_col, "")).strip()
-            if not csv_path_str or not Path(csv_path_str).exists():
+            csv_path_val = row.get(csv_col)
+            
+            # Robust check for missing values (NaN or empty)
+            if pd.isna(csv_path_val) or not str(csv_path_val).strip():
+                self._log(f"    - Skipping {ct_name} tracks: Path not defined in metadata")
+                continue
+
+            csv_path_str = str(csv_path_val).strip()
+            if not Path(csv_path_str).exists():
+                self._log(f"    - Skipping {ct_name} tracks: File not found ({csv_path_str})")
                 continue
 
             try:
                 tracks_df = pd.read_csv(csv_path_str)
 
                 # Expect columns: track_id, t, z, y, x (at minimum)
-                required = {"track_id", "t", "y", "x"}
+                required = {"TrackID", "position_t", "pixel_position_y", "pixel_position_x"}
                 if not required.issubset(set(tracks_df.columns)):
                     self._log(f"    ⚠️ Tracks CSV for {ct_name} missing columns {required - set(tracks_df.columns)}")
                     continue
 
-                if "z" in tracks_df.columns:
-                    track_data = tracks_df[["track_id", "t", "z", "y", "x"]].values
+                if "pixel_position_z" in tracks_df.columns:
+                    track_data = tracks_df[["TrackID", "position_t", "pixel_position_z", "pixel_position_y", "pixel_position_x"]].values
                 else:
-                    track_data = tracks_df[["track_id", "t", "y", "x"]].values
+                    track_data = tracks_df[["TrackID", "position_t", "pixel_position_y", "pixel_position_x"]].values
 
                 layer_name = f"{sample_name} – {ct_name} tracks"
                 self.viewer.add_tracks(
@@ -320,6 +448,85 @@ class VisualizationTab(QWidget):
                 self._log(f"    + Tracks layer: {layer_name}")
             except Exception as e:
                 self._log(f"    ⚠️ Could not load tracks for {ct_name}: {e}")
+
+    # ------------------------------------------------------------------
+    # Tracked Segment loader
+    # ------------------------------------------------------------------
+    def _load_tracked_segments(self, sample_name: str, row: pd.Series):
+        """Load tracked segments (labeled images with track IDs)."""
+        from behav3d.io.formats.zarr import load_zarr
+        
+        ct_map = self._detect_cell_type_columns(row)
+
+        for ct_name, prefix in ct_map.items():
+            track_seg_col = f"{prefix}_{ct_name}_tracks_image_path"
+            track_seg_path_val = row.get(track_seg_col)
+            
+            if pd.isna(track_seg_path_val) or not str(track_seg_path_val).strip():
+                continue
+                
+            track_seg_path = str(track_seg_path_val).strip()
+            if not Path(track_seg_path).exists():
+                continue
+
+            try:
+                track_seg_p = Path(track_seg_path)
+                if track_seg_p.suffix == ".zarr":
+                    seg_data = load_zarr(track_seg_p)
+                else:
+                    from behav3d.io.images import load_image
+                    seg_data = load_image(track_seg_p)
+                    if not isinstance(seg_data, da.Array):
+                        seg_data = da.from_array(seg_data, chunks=(1,) + seg_data.shape[1:])
+
+                layer_name = f"{sample_name} – {ct_name} tracked segments"
+                self.viewer.add_labels(
+                    seg_data,
+                    name=layer_name,
+                    visible=True,
+                )
+                self._log(f"    + Tracked Labels layer: {layer_name}")
+                
+                # If we have tracked segments, hide the regular segments
+                reg_seg_layer_name = f"{sample_name} – {ct_name} segments"
+                if reg_seg_layer_name in self.viewer.layers:
+                    self.viewer.layers[reg_seg_layer_name].visible = False
+                    self._log(f"    - Hiding regular segments for {ct_name}")
+                    # Update toggle state to reflect that some segments are hidden
+                    # Note: This affects ALL segments if multiple cell types exist, 
+                    # but usually it's consistent.
+                    self.toggle_seg.setChecked(False)
+
+            except Exception as e:
+                self._log(f"    ⚠️ Could not load tracked segments for {ct_name}: {e}")
+
+    def _on_toggle_layer_group(self, state, group_type):
+        """Batch show/hide layers based on their name suffix/pattern."""
+        visible = bool(state)
+        
+        for layer in self.viewer.layers:
+            name = layer.name
+            match = False
+            
+            if group_type == "raw":
+                # Raw images usually: "sample_name – Ch0"
+                if " – Ch" in name:
+                    match = True
+            elif group_type == "segments":
+                # Segments usually: "sample_name – celltype segments"
+                if name.endswith(" segments") and not name.endswith(" tracked segments"):
+                    match = True
+            elif group_type == "tracked_segments":
+                # Tracked segments: "sample_name – celltype tracked segments"
+                if name.endswith(" tracked segments"):
+                    match = True
+            elif group_type == "tracks":
+                # Tracks: "sample_name – celltype tracks"
+                if name.endswith(" tracks"):
+                    match = True
+                    
+            if match:
+                layer.visible = visible
 
     # ------------------------------------------------------------------
     # Detect cell-type columns from metadata row

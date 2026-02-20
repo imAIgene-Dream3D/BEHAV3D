@@ -40,11 +40,16 @@ class TrackingTab(_StubTab):
         super().__init__("Tracking", parent)
 
 
-class SingleCellAnalysisTab(_StubTab):
+class FeatureExtractionTab(_StubTab):
     def __init__(self, parent=None):
-        super().__init__("Single-Cell Analysis", parent)
+        super().__init__("Feature Extraction", parent)
 
 
-class ApplicationTab(_StubTab):
+class FilteringTab(_StubTab):
     def __init__(self, parent=None):
-        super().__init__("Application", parent)
+        super().__init__("Filtering", parent)
+
+
+class AnalysisTab(_StubTab):
+    def __init__(self, parent=None):
+        super().__init__("Analysis", parent)

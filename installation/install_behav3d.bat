@@ -209,14 +209,5 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
-echo ============================================================
-echo              Installation Complete!
-echo ============================================================
-echo.
-echo To use BEHAV3D:
-echo   1. Open a new Miniforge Prompt (search "Miniforge" in Start menu)
-echo   2. Run: conda activate %ENV_NAME%
-echo   3. Navigate to the notebooks folder and run Jupyter
-echo.
 echo Press any key to close this window...
 pause >nul

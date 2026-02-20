@@ -27,3 +27,6 @@ if errorlevel 1 (
         )
     )
 )
+
+:: Keep window open if there was an error or if run via double-click
+if errorlevel 1 pause

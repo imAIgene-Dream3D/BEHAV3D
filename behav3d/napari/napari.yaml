@@ -1,6 +1,6 @@
 name: behav3d
 display_name: BEHAV3D
-contributions: imAIgenelab - Dream3D lab
+contributions:
   commands:
     - id: behav3d.make_behav3d_widget
       python_name: behav3d.napari._widget:BEHAV3DWidget

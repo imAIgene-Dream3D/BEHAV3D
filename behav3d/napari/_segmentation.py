@@ -98,6 +98,12 @@ class SegmentationTab(QWidget):
         layout.addWidget(QLabel("Log"))
         layout.addWidget(self.log)
 
+    def _on_metadata_updated(self):
+        """Trigger updates in sub-widgets."""
+        self.pixel_classifier_page._on_metadata_updated()
+        # self.cellpose_page._on_metadata_updated()
+        # self.import_page._on_metadata_updated()
+
     def _log(self, msg):
         import datetime
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -105,7 +111,48 @@ class SegmentationTab(QWidget):
         self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def _on_method_changed(self, index):
+        # If switching away from Pixel Classifier (index 0), check session
+        current_idx = self.param_stack.currentIndex()
+        if current_idx == 0 and self.pixel_classifier_page.is_session_active:
+            from qtpy.QtWidgets import QMessageBox
+            res = QMessageBox.question(
+                self, 
+                "Switch Method?", 
+                "A segmentation session is active. Switching methods will clear the viewer and reset your unsaved labeling session. \n\nDo you want to proceed?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if res == QMessageBox.No:
+                # Revert combo box index
+                self.method_combo.blockSignals(True)
+                self.method_combo.setCurrentIndex(current_idx)
+                self.method_combo.blockSignals(False)
+                return
+            else:
+                self.cleanup_session()
+
         self.param_stack.setCurrentIndex(index)
+
+    def request_tab_exit(self):
+        """Called by the main widget when the user tries to leave this tab."""
+        # 1. Pixel Classifier Page
+        if self.pixel_classifier_page.is_session_active:
+            from qtpy.QtWidgets import QMessageBox
+            res = QMessageBox.question(
+                self, 
+                "Leave Segmentation Tab?", 
+                "A segmentation session is active. Switching tabs will clear the viewer and reset your unsaved labeling session. \n\nDo you want to leave?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if res == QMessageBox.No:
+                return False
+            else:
+                self.cleanup_session()
+                return True
+        return True
+
+    def cleanup_session(self):
+        """Clear viewer and reset tab state."""
+        self.pixel_classifier_page.reset_ui()
 
 def _cfg_get(cfg: dict, dotted_key: str, default=None):
     """Get a value from a nested dict using dotted key notation."""
@@ -127,6 +174,7 @@ class PixelClassifierWidget(QWidget):
         self._init_ui()
         self.all_images = None
         self.all_features = None
+        self.is_session_active = False
 
     def _detect_cell_types(self):
         from behav3d.core.metadata import (
@@ -197,7 +245,7 @@ class PixelClassifierWidget(QWidget):
         self.spin_workers.setMaximumWidth(70)
         train_form.addRow("Workers:", self.spin_workers)
         
-        self.btn_load_training = QPushButton("Load Training Data")
+        self.btn_load_training = QPushButton("Generate Training Data")
         self.btn_load_training.setToolTip("Clears viewer and loads selected timepoints for labeling")
         self.btn_load_training.setStyleSheet("background-color: #007bff; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
         self.btn_load_training.clicked.connect(self._on_load_training_clicked)
@@ -207,6 +255,16 @@ class PixelClassifierWidget(QWidget):
         self.btn_save_labels.setStyleSheet("background-color: #fd7e14; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
         self.btn_save_labels.clicked.connect(self._save_user_labels)
         
+        self.btn_clear_layer = QPushButton("Clear Layer")
+        self.btn_clear_layer.setToolTip("Erase painted labels in the currently selected user label layer")
+        self.btn_clear_layer.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
+        self.btn_clear_layer.clicked.connect(self._clear_selected_user_labels)
+        
+        self.btn_clear_all = QPushButton("Clear All")
+        self.btn_clear_all.setToolTip("Erase painted labels from ALL user label layers")
+        self.btn_clear_all.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
+        self.btn_clear_all.clicked.connect(self._clear_all_user_labels)
+        
         self.btn_train_update = QPushButton("Train Classifier")
         self.btn_train_update.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
         self.btn_train_update.clicked.connect(self._on_train_clicked)
@@ -214,19 +272,63 @@ class PixelClassifierWidget(QWidget):
         train_btn_row = QHBoxLayout()
         train_btn_row.setSpacing(4)
         train_btn_row.addWidget(self.btn_save_labels)
+        train_btn_row.addWidget(self.btn_clear_layer)
+        train_btn_row.addWidget(self.btn_clear_all)
         train_btn_row.addWidget(self.btn_train_update)
         
         train_layout = QVBoxLayout()
         train_layout.addLayout(train_form)
         train_layout.addWidget(self.btn_load_training)
+
+        # Instructional label for labeling
+        self.instruction_label = QLabel("Select a 'User Provided Labels ...' layer and annotate your ground truth data in the left panel")
+        self.instruction_label.setWordWrap(True)
+        self.instruction_label.setStyleSheet("color: white; font-style: italic; margin-top: 4px;")
+        self.instruction_label.setVisible(False)
+        train_layout.addWidget(self.instruction_label)
+
+        # Legend for labels
+        legend_layout = QHBoxLayout()
+        legend_layout.setContentsMargins(6, 4, 6, 4)
+        
+        def create_legend_item(text, color_hex):
+            item = QHBoxLayout()
+            box = QLabel()
+            box.setFixedSize(12, 12)
+            box.setStyleSheet(f"background-color: {color_hex}; border: 1px solid #555;")
+            label = QLabel(text)
+            label.setStyleSheet("font-size: 10px; font-weight: bold;")
+            item.addWidget(box)
+            item.addWidget(label)
+            return item
+
+        legend_layout.addLayout(create_legend_item("0: Eraser", "none"))
+        legend_layout.addLayout(create_legend_item("1: Background", "#8b3a26")) # Red
+        legend_layout.addLayout(create_legend_item("2: Foreground", "#00ffff")) # Cyan
+        legend_layout.addStretch()
+        
+        self.legend_widget = QWidget()
+        self.legend_widget.setLayout(legend_layout)
+        self.legend_widget.setVisible(False) # Hide until data loaded
+        train_layout.addWidget(self.legend_widget)
+
+        # Add training related buttons
         train_layout.addLayout(train_btn_row)
+
+        # Hide action buttons until training data is loaded
+        self.btn_save_labels.setVisible(False)
+        self.btn_clear_layer.setVisible(False)
+        self.btn_clear_all.setVisible(False)
+        self.btn_train_update.setVisible(False)
+        self.legend_widget.setVisible(False)
+        self.instruction_label.setVisible(False)
         
         train_group.setLayout(train_layout)
         
         content_layout.addWidget(train_group)
 
         # Segmentation Parameters (Dynamic)
-        self.param_group = QGroupBox("2. Segmentation Parameters")
+        self.param_group = QGroupBox("2. Fine-tune Segmentation Parameters (Optional)")
         self.param_layout = QVBoxLayout()
         self.param_group.setLayout(self.param_layout)
 
@@ -247,10 +349,6 @@ class PixelClassifierWidget(QWidget):
         seg_form.setSpacing(4)
         seg_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         
-        self.check_overwrite = QCheckBox("Overwrite existing")
-        self.check_overwrite.setChecked(bool(pc.get("overwrite_existing", False)))
-        seg_form.addRow(self.check_overwrite)
-
         self.check_process_all = QCheckBox("All timepoints")
         self.check_process_all.setChecked(bool(pc.get("use_all_timepoints", True)))
         self.check_process_all.toggled.connect(self._on_process_all_toggled)
@@ -299,7 +397,7 @@ class PixelClassifierWidget(QWidget):
         while self.param_layout.count():
             item = self.param_layout.takeAt(0)
             widget = item.widget()
-            if widget:
+            if widget and widget is not self.btn_resegment:
                 widget.deleteLater()
         
         self.param_widgets = {}
@@ -377,7 +475,6 @@ class PixelClassifierWidget(QWidget):
         pc["use_all_timepoints"] = bool(self.check_process_all.isChecked())
         pc["tp_start"] = int(self.spin_t_start.value())
         pc["tp_end"] = int(self.spin_t_end.value())
-        pc["overwrite_existing"] = bool(self.check_overwrite.isChecked())
 
         # Save per-cell-type parameters
         for cell_type in self.all_cell_types:
@@ -435,6 +532,93 @@ class PixelClassifierWidget(QWidget):
         else:
             self.log("All user labels saved.")
 
+    def reset_ui(self):
+        """Hide action buttons and clear session data."""
+        self.btn_save_labels.setVisible(False)
+        self.btn_clear_layer.setVisible(False)
+        self.btn_clear_all.setVisible(False)
+        self.btn_train_update.setVisible(False)
+        self.legend_widget.setVisible(False)
+        self.instruction_label.setVisible(False)
+        
+        self.all_images = None
+        self.all_features = None
+        self.is_session_active = False
+        
+        # Clear specific layers related to segmentation/labeling if they exist
+        layers_to_remove = [l for l in self.viewer.layers if 'User Provided Labels' in l.name or 'Pixel Classification' in l.name or 'Channel' in l.name or 'Segments' in l.name]
+        for l in layers_to_remove:
+            self.viewer.layers.remove(l)
+        
+        self.log("Segmentation session reset.")
+
+    def _configure_user_label_layer(self, layer):
+        """Configure a user label layer for simplified pixel classifier usage.
+        
+        - Additive blending
+        - Labels restricted to 0 (Eraser), 1 (Background), 2 (Foreground)
+        - Default selected label = 1 (Background)
+        - Custom colors: 1=blue (background), 2=red (foreground)
+        """
+        import numpy as np
+
+        # Additive blending
+        layer.blending = "additive"
+
+        # Custom color map: 0=transparent, 1=red (bg), 2=cyan (fg)
+        layer.color = {
+            0: (0, 0, 0, 0),       # Eraser / transparent
+            1: (1.0, 0.2, 0.2, 1), # Background – red
+            2: (0.0, 1.0, 1.0, 1), # Foreground – cyan
+        }
+
+        # Default selected label
+        layer.selected_label = 1
+
+        # Clamp selected_label to 0–2 whenever user changes it
+        def _clamp_label(event):
+            if layer.selected_label > 2:
+                layer.selected_label = 2
+        layer.events.selected_label.connect(_clamp_label)
+
+    def _clear_selected_user_labels(self):
+        """Zero out the currently selected user label layer."""
+        import numpy as np
+        import napari
+
+        active = self.viewer.layers.selection.active
+        if active is None or not isinstance(active, napari.layers.Labels):
+            self.log("Please select a User Provided Labels layer first.")
+            return
+        if not active.name.startswith("User Provided Labels"):
+            self.log(f"'{active.name}' is not a user label layer — select a 'User Provided Labels' layer.")
+            return
+
+        active.data = np.zeros_like(active.data)
+        active.refresh()
+        self.log(f"Cleared labels in '{active.name}'.")
+
+    def _clear_all_user_labels(self):
+        """Zero out every 'User Provided Labels' layer (keeps layers alive)."""
+        import numpy as np
+        from qtpy.QtWidgets import QMessageBox
+
+        reply = QMessageBox.question(
+            self, "Clear All Labels",
+            "This will erase ALL painted labels in every user label layer.\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        cleared = 0
+        for layer in self.viewer.layers:
+            if layer.name.startswith("User Provided Labels"):
+                layer.data = np.zeros_like(layer.data)
+                layer.refresh()
+                cleared += 1
+        self.log(f"Cleared labels in {cleared} layer(s).")
+
     def _on_process_all_toggled(self, checked):
         self.spin_t_start.setEnabled(not checked)
         self.spin_t_end.setEnabled(not checked)
@@ -443,8 +627,16 @@ class PixelClassifierWidget(QWidget):
         self.log("Starting batch segmentation...")
         self._persist_params()
         try:
-            # Get parameters
-            overwrite = self.check_overwrite.isChecked()
+            from qtpy.QtWidgets import QMessageBox
+
+            # Ask user about overwriting
+            overwrite_msg = "Do you want to overwrite existing segmentation results for the selected timepoints?"
+            reply = QMessageBox.question(
+                self, "Overwrite Existing Results?",
+                overwrite_msg,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            overwrite = (reply == QMessageBox.Yes)
             
             # Timepoint range
             if self.check_process_all.isChecked():
@@ -473,7 +665,12 @@ class PixelClassifierWidget(QWidget):
                     opn = int(w['opening'].value())
                     fh  = bool(w['fill_holes'].isChecked())
                 else:
-                    edt, sz, opn, fh = 2.5, 10, 0, True
+                    if cell_type in self.organoid_types:
+                        edt, sz, opn, fh = 12.0, 1000, 3, True
+                    elif cell_type in self.immune_types:
+                        edt, sz, opn, fh = 2.5, 10, 0, True
+                    else:
+                        edt, sz, opn, fh = 1.0, 10, 0, True
 
                 if cell_type in self.organoid_types:
                     org_edt[cell_type] = edt; org_size[cell_type] = sz
@@ -485,8 +682,30 @@ class PixelClassifierWidget(QWidget):
                     oth_edt[cell_type] = edt; oth_size[cell_type] = sz
                     oth_open[cell_type] = opn; oth_fill[cell_type] = fh
 
+            # Collect classifier paths
+            output_dir = Path(self.metadata_loader.output_dir)
+            pixel_class_outdir = output_dir / "images" / "PixelClassification"
+            
+            clf_organoid_paths = {}
+            clf_immune_paths = {}
+            clf_other_paths = {}
+            clf_death_path = None
+            
+            def get_clf_path(target):
+                 p = pixel_class_outdir / f'PixelClassifier_{target.capitalize()}.joblib'
+                 return p if p.exists() else None
+
+            for ct in self.organoid_types:
+                clf_organoid_paths[ct] = get_clf_path(ct)
+            for ct in self.immune_types:
+                clf_immune_paths[ct] = get_clf_path(ct)
+            for ct in self.other_types:
+                clf_other_paths[ct] = get_clf_path(ct)
+            if self.has_death:
+                clf_death_path = get_clf_path('Dead')
+
             # Call the segmentation function
-            run_pixel_classifier_segmentation(
+            updated_metadata = run_pixel_classifier_segmentation(
                 metadata=self.metadata_loader.metadata,
                 output_dir=self.metadata_loader.output_dir,
                 organoid_edt_thresholds=org_edt or None,
@@ -501,13 +720,58 @@ class PixelClassifierWidget(QWidget):
                 organoid_fill_holes=org_fill or None,
                 immune_fill_holes=imm_fill or None,
                 other_fill_holes=oth_fill or None,
-                only_segment=True,
+                only_segment=False,
                 n_workers=self.spin_workers.value(),
                 log_callback=self.log,
                 overwrite_existing=overwrite,
                 timepoint_range=timepoint_range,
+                clf_organoid_paths=clf_organoid_paths,
+                clf_immune_paths=clf_immune_paths,
+                clf_other_paths=clf_other_paths,
+                clf_death_path=clf_death_path
             )
+            # Update metadata in loader
+            self.metadata_loader.metadata = updated_metadata
+            
+            # Save updated metadata CSV to disk
+            csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
+            if csv_path:
+                try:
+                    updated_metadata.to_csv(csv_path, index=False)
+                    # self.log(f"  Metadata CSV updated at: {csv_path}")
+                except Exception as e:
+                    self.log(f"  Warning: Could not save metadata CSV: {e}")
+
             self.log("Batch segmentation finished successfully!")
+
+            # Prompt the user if they want to visualize results
+            from qtpy.QtWidgets import QMessageBox
+            res = QMessageBox.question(
+                self,
+                "Segmentation Finished",
+                "Batch segmentation finished successfully! \n\nDo you want to switch to the Visualization Tab and see the segments?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if res == QMessageBox.Yes:
+                # Trigger switch to visualization tab and load first sample
+                parent = self.parent()
+                while parent and not hasattr(parent, 'tabs'):
+                    parent = parent.parent()
+                
+                if parent and hasattr(parent, 'tabs'):
+                    # Switch to visualization tab (index 1)
+                    parent.tabs.setCurrentIndex(1)
+                    # Load first sample
+                    if hasattr(parent, 'visualization_tab'):
+                        self.log("  Loading first sample in Visualization Tab...")
+                        parent.visualization_tab.sample_combo.setCurrentIndex(0)
+                        parent.visualization_tab._on_load_dataset()
+                        
+                        # Ensure all 'Segments' layers are visible
+                        for layer in self.viewer.layers:
+                            if "Segments" in layer.name:
+                                layer.visible = True
 
         except Exception as e:
             traceback.print_exc()
@@ -517,7 +781,6 @@ class PixelClassifierWidget(QWidget):
         try:
             self.log("Loading training data...")
             self._persist_params()
-            self.viewer.layers.clear()
             
             if not self.metadata_loader.metadata_loaded:
                 self.log("Metadata not loaded!")
@@ -533,25 +796,43 @@ class PixelClassifierWidget(QWidget):
             metadata = self.metadata_loader.metadata
             examples_per_sample = self.spin_examples.value()
             
-            # --- CACHING: Check if cached data can be reused ---
+            # --- CACHING: Check if cached data exists ---
             pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
             saved_examples = pc.get("examples_per_sample", None)
-            can_reuse_cache = (
-                features_outpath.exists()
-                and image_outpath.exists()
-                and saved_examples == examples_per_sample
-            )
+            exists = features_outpath.exists() and image_outpath.exists()
             
-            if can_reuse_cache:
+            load_existing = False
+            if exists:
+                from qtpy.QtWidgets import QMessageBox
+                msg = f"Pre-existing training data found with {saved_examples} Examples/sample.\n\nDo you want to generate NEW training data (overwriting) or LOAD the already saved data?"
+                box = QMessageBox(self)
+                box.setWindowTitle("Training Data Detected")
+                box.setText(msg)
+                btn_generate = box.addButton("Generate New", QMessageBox.AcceptRole)
+                btn_load = box.addButton("Load Existing", QMessageBox.YesRole)
+                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+                box.exec_()
+                
+                if box.clickedButton() == btn_cancel:
+                    self.log("Action cancelled.")
+                    return
+                elif box.clickedButton() == btn_load:
+                    load_existing = True
+
+            self.viewer.layers.clear() # Clear after prompting, to avoid removing if cancel
+
+            if load_existing:
                 # --- FAST PATH: load from cached zarr files ---
-                self.log("Loading cached images and features from disk (same examples_per_sample)...")
+                self.log(f"Loading cached images and features from disk ({saved_examples} examples/sample)...")
                 stacked_images = np.asarray(load_image(image_outpath))
                 stacked_features = np.asarray(load_image(features_outpath))
                 self.log(f"  Cached images shape: {stacked_images.shape}")
                 self.log(f"  Cached features shape: {stacked_features.shape}")
             else:
                 # --- SLOW PATH: regenerate images and features ---
-                if can_reuse_cache is False and saved_examples is not None and saved_examples != examples_per_sample:
+                if exists and not load_existing:
+                     self.log("Generating new training data (overwriting)...")
+                elif saved_examples is not None and saved_examples != examples_per_sample:
                     self.log(f"examples_per_sample changed ({saved_examples} → {examples_per_sample}), regenerating...")
                 else:
                     self.log("No cached data found, generating images and features...")
@@ -615,9 +896,22 @@ class PixelClassifierWidget(QWidget):
                 
                 self.log(f"Max shape for padding: {max_shape}")
                 
-                # Remove old cached files before regenerating
-                if image_outpath.exists(): shutil.rmtree(image_outpath)
-                if features_outpath.exists(): shutil.rmtree(features_outpath)
+                # Remove old cached files, labels, and predictions before regenerating
+                self.log("Cleaning up old training files, labels and predictions...")
+                to_delete = [
+                    image_outpath, 
+                    features_outpath,
+                    pixel_class_outdir / 'PixelClassifier_UserDeadLabels.zarr',
+                    pixel_class_outdir / 'PixelClassifier_Death_PredictedLabels.zarr'
+                ]
+                for ct in self.all_cell_types:
+                    to_delete.append(pixel_class_outdir / f'PixelClassifier_User{ct.capitalize()}Labels.zarr')
+                    to_delete.append(pixel_class_outdir / f'PixelClassifier_{ct.capitalize()}_PredictedLabels.zarr')
+                
+                for p in to_delete:
+                    if p.exists():
+                        if p.is_dir(): shutil.rmtree(p)
+                        else: p.unlink()
                 
                 self.log("Calculating features (this may take a while)...")
                 
@@ -676,7 +970,8 @@ class PixelClassifierWidget(QWidget):
                     channel_data,
                     name=f"Channel {ch+1}",
                     colormap=channel_colors[ch % len(channel_colors)],
-                    blending='additive'
+                    blending='additive',
+                    visible=True,
                 )
                 try:
                     flat = channel_data.flatten()
@@ -689,7 +984,20 @@ class PixelClassifierWidget(QWidget):
             
             # Create label layer dimensions
             dims = stacked_images.shape  # (T, C, Z, Y, X)
-            label_dims = (dims[0], dims[2], dims[3], dims[4])  # (T, Z, Y, X)
+            self.log(f"  Images shape: {dims}")
+            
+            # label_dims should be (T, Z, Y, X)
+            # If dims is 5D: (T, C, Z, Y, X)
+            if len(dims) == 5:
+                label_dims = (dims[0], dims[2], dims[3], dims[4])
+            elif len(dims) == 4:
+                # Assuming (T, C, Y, X)
+                label_dims = (dims[0], 1, dims[2], dims[3])
+                self.log("  Warning: 4D images detected, assuming (T, C, Y, X)")
+            else:
+                label_dims = dims # fallback
+            
+            self.log(f"  Labels shape: {label_dims}")
             
             # --- Reload existing user labels and predictions from disk ---
             # 1. User Provided Labels
@@ -698,22 +1006,31 @@ class PixelClassifierWidget(QWidget):
                 if dead_labels_path.exists():
                     self.log("  Loading existing dead labels from disk...")
                     dead_labels = np.asarray(load_zarr(dead_labels_path))
+                    if dead_labels.shape != label_dims:
+                        self.log(f"  Warning: Dead labels shape mismatch {dead_labels.shape} vs {label_dims}. Resizing...")
+                        # Simple zero-pad or crop could be here, but we'll just use zeros if wrong
+                        dead_labels = np.zeros(label_dims, dtype=np.uint16)
                 else:
                     dead_labels = np.zeros(label_dims, dtype=np.uint16)
-                self.viewer.add_labels(dead_labels, name='User Provided Labels (Dead)', opacity=0.3)
+                layer = self.viewer.add_labels(dead_labels, name='User Provided Labels (Dead)', opacity=0.3)
+                self._configure_user_label_layer(layer)
 
             for cell_type in self.all_cell_types:
                 user_label_path = pixel_class_outdir / f'PixelClassifier_User{cell_type.capitalize()}Labels.zarr'
                 if user_label_path.exists():
                     self.log(f"  Loading existing {cell_type} user labels from disk...")
                     user_labels = np.asarray(load_zarr(user_label_path))
+                    if user_labels.shape != label_dims:
+                         self.log(f"  Warning: {cell_type} user labels shape mismatch {user_labels.shape} vs {label_dims}. Using zeros.")
+                         user_labels = np.zeros(label_dims, dtype=np.uint16)
                 else:
                     user_labels = np.zeros(label_dims, dtype=np.uint16)
-                self.viewer.add_labels(
+                layer = self.viewer.add_labels(
                     user_labels,
                     name=f'User Provided Labels ({cell_type.capitalize()})',
                     opacity=0.3
                 )
+                self._configure_user_label_layer(layer)
 
             # 2. Pixel Classification predictions
             if self.has_death:
@@ -721,6 +1038,9 @@ class PixelClassifierWidget(QWidget):
                 if pred_death_path.exists():
                     self.log("  Loading existing dead predictions from disk...")
                     pred_dead = np.asarray(load_zarr(pred_death_path))
+                    if pred_dead.shape != label_dims:
+                         self.log(f"  Warning: Dead prediction shape mismatch {pred_dead.shape} vs {label_dims}. Using zeros.")
+                         pred_dead = np.zeros(label_dims, dtype=np.uint16)
                 else:
                     pred_dead = np.zeros(label_dims, dtype=np.uint16)
                 self.viewer.add_labels(pred_dead, name='Pixel Classification (Dead)', opacity=0.3, visible=False)
@@ -730,6 +1050,9 @@ class PixelClassifierWidget(QWidget):
                 if pred_label_path.exists():
                     self.log(f"  Loading existing {cell_type} predictions from disk...")
                     pred_data = np.asarray(load_zarr(pred_label_path))
+                    if pred_data.shape != label_dims:
+                        self.log(f"  Warning: {cell_type} prediction shape mismatch {pred_data.shape} vs {label_dims}. Using zeros.")
+                        pred_data = np.zeros(label_dims, dtype=np.uint16)
                 else:
                     pred_data = np.zeros(label_dims, dtype=np.uint16)
                 self.viewer.add_labels(
@@ -749,6 +1072,15 @@ class PixelClassifierWidget(QWidget):
                 )
 
             self.log("Training data loaded successfully!")
+
+            # Show action buttons now that data is loaded
+            self.btn_save_labels.setVisible(True)
+            self.btn_clear_layer.setVisible(True)
+            self.btn_clear_all.setVisible(True)
+            self.btn_train_update.setVisible(True)
+            self.legend_widget.setVisible(True)
+            self.instruction_label.setVisible(True)
+            self.is_session_active = True
             
         except Exception as e:
             traceback.print_exc()
@@ -1081,6 +1413,8 @@ class PixelClassifierWidget(QWidget):
                 
                 if seg_layer_name in self.viewer.layers:
                     layer = self.viewer.layers[seg_layer_name]
+                    self.viewer.layers[seg_layer_name].visible = True
+
                     # Check shape
                     if layer.data.shape != pred_data.shape:
                         self.log(f"  Warning: Shape mismatch for {seg_layer_name}. Re-initializing layer data.")
@@ -1108,150 +1442,7 @@ class PixelClassifierWidget(QWidget):
             traceback.print_exc()
             self.log(f"Error resegmenting: {e}")
 
-    def _save_user_labels(self):
-        """Save all user-provided label layers to zarr on disk."""
-        if not self.metadata_loader.output_dir:
-            self.log("Cannot save labels: no output directory set.")
-            return
 
-        output_dir = Path(self.metadata_loader.output_dir)
-        pixel_class_outdir = output_dir / "images" / "PixelClassification"
-        pixel_class_outdir.mkdir(parents=True, exist_ok=True)
-
-        saved_any = False
-
-        if self.has_death:
-            layer_name = 'User Provided Labels (Dead)'
-            if layer_name in self.viewer.layers:
-                outpath = pixel_class_outdir / 'PixelClassifier_UserDeadLabels.zarr'
-                if outpath.exists():
-                    shutil.rmtree(outpath)
-                save_as_zarr(self.viewer.layers[layer_name].data, outpath)
-                self.log(f"Saved Dead labels to {outpath.name}")
-                saved_any = True
-
-        for cell_type in self.all_cell_types:
-            layer_name = f'User Provided Labels ({cell_type.capitalize()})'
-            if layer_name in self.viewer.layers:
-                outpath = pixel_class_outdir / f'PixelClassifier_User{cell_type.capitalize()}Labels.zarr'
-                if outpath.exists():
-                    shutil.rmtree(outpath)
-                save_as_zarr(self.viewer.layers[layer_name].data, outpath)
-                self.log(f"Saved {cell_type} labels to {outpath.name}")
-                saved_any = True
-
-        if not saved_any:
-            self.log("No user label layers found in viewer to save.")
-        else:
-            self.log("All user labels saved.")
-
-    def _on_process_all_toggled(self, checked):
-        self.spin_t_start.setEnabled(not checked)
-        self.spin_t_end.setEnabled(not checked)
-
-    def _on_run_segmentation_clicked(self):
-        self.log("Starting batch segmentation...")
-        self._persist_params()
-        try:
-            # Get parameters
-            overwrite = self.check_overwrite.isChecked()
-            
-            # Timepoint range
-            if self.check_process_all.isChecked():
-                timepoint_range = None
-                self.log("Processing ALL timepoints.")
-            else:
-                t_start = self.spin_t_start.value()
-                t_end = self.spin_t_end.value()
-                if t_start > t_end:
-                    self.log("Error: Start timepoint must be <= End timepoint.")
-                    return
-                timepoint_range = (t_start, t_end)
-                self.log(f"Processing timepoints: {t_start} - {t_end}")
-            
-            # Get cell types and parameters
-            targets = []
-            if self.has_death:
-                targets.append('Dead')
-            targets.extend([t.capitalize() for t in self.all_cell_types])
-            
-            # Extract segmentation parameters for each cell type
-            segmentation_params = {}
-            for target in targets:
-                cell_type_key = target.lower()
-                params = {}
-                if cell_type_key == 'dead':
-                    # Use defaults for dead channel if not in UI
-                    params['edt_threshold'] = 2.5
-                    params['segment_size_min'] = 10
-                    params['opening_nr_pixels'] = 0
-                    params['fill_holes'] = True
-                else:
-                    if cell_type_key in self.param_widgets:
-                        widgets = self.param_widgets[cell_type_key]
-                        params['edt_threshold'] = widgets['edt'].value()
-                        params['segment_size_min'] = widgets['min_size'].value()
-                        params['opening_nr_pixels'] = widgets['opening'].value()
-                        params['fill_holes'] = widgets['fill_holes'].isChecked()
-                    else:
-                        self.log(f"Warning: No parameters found for {target}. Using defaults.")
-                        params['edt_threshold'] = 2.5
-                        params['segment_size_min'] = 10
-                        params['opening_nr_pixels'] = 0
-                        params['fill_holes'] = True
-                segmentation_params[target] = params
-
-            # Prepare kwargs for segment_and_update
-            kwargs = {}
-            for target, params in segmentation_params.items():
-                for key, value in params.items():
-                    kwargs[f'{target.lower()}_{key}'] = value
-                    
-            # Collect classifier paths
-            output_dir = Path(self.metadata_loader.output_dir)
-            pixel_class_outdir = output_dir / "images" / "PixelClassification"
-            
-            clf_organoid_paths = {}
-            clf_immune_paths = {}
-            clf_other_paths = {}
-            clf_death_path = None
-            
-            # Helper to check clf exists
-            def get_clf_path(target):
-                 p = pixel_class_outdir / f'PixelClassifier_{target.capitalize()}.joblib'
-                 return p if p.exists() else None
-
-            for ct in self.organoid_types:
-                clf_organoid_paths[ct] = get_clf_path(ct)
-            for ct in self.immune_types:
-                clf_immune_paths[ct] = get_clf_path(ct)
-            for ct in self.other_types:
-                clf_other_paths[ct] = get_clf_path(ct)
-            if self.has_death:
-                clf_death_path = get_clf_path('Dead')
-
-            # Call the segmentation function
-            updated_metadata = run_pixel_classifier_segmentation(
-                metadata=self.metadata_loader.metadata,
-                output_dir=self.metadata_loader.output_dir,
-                only_segment=False,  # False means Predict + Segment
-                n_workers=self.spin_workers.value(),
-                log_callback=self.log, # Pass the logger callback
-                overwrite_existing=overwrite,
-                timepoint_range=timepoint_range,
-                clf_organoid_paths=clf_organoid_paths,
-                clf_immune_paths=clf_immune_paths,
-                clf_other_paths=clf_other_paths,
-                clf_death_path=clf_death_path,
-                **kwargs
-            )
-            # Update metadata in loader
-            self.metadata_loader.metadata = updated_metadata
-            self.log("Batch segmentation finished successfully!")
-
-        except Exception as e:
-            traceback.print_exc()
-            self.log(f"Error during batch segmentation: {e}")
 
 
 class CellposeWidget(QWidget):

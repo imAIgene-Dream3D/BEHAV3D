@@ -70,11 +70,11 @@ def run_launcher():
         input("Press Enter to close...")
         sys.exit(1)
 
-    # Build the command: "<pkg_manager>" run -n <env_name> python <this_script> --internal
+    # Build the command: "<pkg_manager>" run --no-capture-output -n <env_name> python <this_script> --internal
     # We use __file__ to refer to this same script
     script_path = script_dir / "launch_napari.py"
     
-    cmd = f'"{pkg_manager}" run -n {env_name} python "{script_path}" --internal'
+    cmd = f'"{pkg_manager}" run --no-capture-output -n {env_name} python "{script_path}" --internal'
     print(f"Launching napari in '{env_name}' environment...")
     print(f"  Command: {cmd}")
     print()
