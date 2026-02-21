@@ -2048,11 +2048,11 @@ def test():
 if __name__ == "__main__":
     
     ssd_dir = r"/Volumes/T7_Sam/"
-    ssd_dir = r"F:/"
+    # ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
     metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv")
-    metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata_home.csv")
+    # metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata_home.csv")
     outfolder = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
     metadata = load_behav3d_metadata(metadata_csv_path)
     analysis_outdir = Path(output_dir, "analysis", "tcell")
@@ -2102,8 +2102,9 @@ if __name__ == "__main__":
     leiden_subsample_tries = 20
     lower_quantile_cap = None      # e.g. 0.01
     upper_quantile_cap = 0.99      # e.g. None to disable upper capping
-    outfolder = Path(ssd_dir, "/BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
+    outfolder = Path(ssd_dir, "BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
     random_state = 123
 
     pass
     # test()
+    # adata_merged = sc.read_h5ad("/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/rolling_classification/adata_merged_group_clusters.h5ad")
