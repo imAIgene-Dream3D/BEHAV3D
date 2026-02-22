@@ -807,9 +807,6 @@ def cluster_group(
     if len(df_clean) < 50:  # Skip if too few samples
         return None
     
-    # Scale features - ALREADY DONE GLOBALLY
-    # scaler = StandardScaler()
-    # df_clean[feature_cols] = scaler.fit_transform(df_clean[feature_cols])
     
     # Create AnnData object
     adata = df_to_adata(df_clean, feature_cols, obs_cols=non_feature_cols)
@@ -1466,6 +1463,9 @@ def _prepare_state_classification_dataset(
     outfolder=None,
     scale_features=True,
     incomplete_window_policy="drop",
+    prepared_dataset_cache_path=None,
+    reuse_prepared_dataset=True,
+    save_prepared_dataset=True,
 ):
     """Shared preprocessing for state classification and full-dataset inference."""
     groupby = ["sample_name", "TrackID"]
@@ -1479,101 +1479,146 @@ def _prepare_state_classification_dataset(
         "window_length_frames",
     ]
 
-    print("Creating descriptive track dataset...")
-    df_windows_descriptive = create_descriptive_track_dataset(
-        df_tracks=df_positions,
-        columns_to_summarize=features,
-        window_size=window_size,
-        step_size=1,
-        time_col="position_t",
-        id_cols=groupby,
-        features_to_compute=descriptive_features,
-        only_nonbinary=True,
-        incomplete_window_policy=incomplete_window_policy,
-    )
+    if prepared_dataset_cache_path is None and outfolder is not None:
+        prepared_dataset_cache_path = Path(outfolder) / "state_classification_prepared_windows.csv"
+    elif prepared_dataset_cache_path is not None:
+        prepared_dataset_cache_path = Path(prepared_dataset_cache_path)
+        if prepared_dataset_cache_path.suffix.lower() != ".csv":
+            prepared_dataset_cache_path = prepared_dataset_cache_path.with_suffix(".csv")
 
-    descriptive_feature_cols = [
-        col for col in df_windows_descriptive.columns
-        if (col not in non_feature_cols)
-        and (not col.endswith("_signal_type"))
-    ]
+    loaded_from_cache = False
+    if (
+        reuse_prepared_dataset
+        and prepared_dataset_cache_path is not None
+        and prepared_dataset_cache_path.exists()
+    ):
+        try:
+            df_analysis = pd.read_csv(prepared_dataset_cache_path)
+            binary_cols_to_merge = [col for col in binary_features_to_group if col in df_analysis.columns]
+            descriptive_feature_cols = [
+                col for col in df_analysis.columns
+                if (col not in non_feature_cols)
+                and (not col.endswith("_signal_type"))
+            ]
+            binary_prefixes = tuple(f"{c}_" for c in binary_cols_to_merge)
+            kept_features = [
+                c for c in descriptive_feature_cols
+                if (c not in binary_cols_to_merge)
+                and (not c.startswith(binary_prefixes))
+            ]
+            df_windows_descriptive = df_analysis.copy()
+            loaded_from_cache = True
+            print(f"Loaded prepared window dataset from cache: {prepared_dataset_cache_path}")
+        except Exception as exc:
+            print(f"Could not load prepared dataset cache ({exc}); recomputing windows.")
 
-    binary_cols_to_merge = [col for col in binary_features_to_group if col in df_positions.columns]
-    merge_cols = ["sample_name", "TrackID", "position_t"]
-    df_binary = df_positions[merge_cols + binary_cols_to_merge].copy()
-
-    df_analysis = df_windows_descriptive.merge(
-        df_binary,
-        on=merge_cols,
-        how="left",
-        suffixes=("", "_orig"),
-    )
-    policy = str(incomplete_window_policy).lower()
-    if policy == "drop":
-        df_analysis = df_analysis.dropna(subset=descriptive_feature_cols).copy()
-    elif policy in {"partial", "as_far_as_possible"}:
-        df_analysis = df_analysis.copy()
-    else:
-        raise ValueError(
-            "incomplete_window_policy must be one of: "
-            "'drop', 'partial' (alias: 'as_far_as_possible')."
+    if not loaded_from_cache:
+        print("Creating descriptive track dataset...")
+        df_windows_descriptive = create_descriptive_track_dataset(
+            df_tracks=df_positions,
+            columns_to_summarize=features,
+            window_size=window_size,
+            step_size=1,
+            time_col="position_t",
+            id_cols=groupby,
+            features_to_compute=descriptive_features,
+            only_nonbinary=True,
+            incomplete_window_policy=incomplete_window_policy,
         )
 
-    # Drop descriptive feature columns that are entirely empty.
-    empty_descriptive_cols = [
-        c for c in descriptive_feature_cols
-        if c in df_analysis.columns and df_analysis[c].isna().all()
-    ]
-    if len(empty_descriptive_cols) > 0:
-        print(f"Dropping {len(empty_descriptive_cols)} empty descriptive columns.")
-        df_analysis = df_analysis.drop(columns=empty_descriptive_cols, errors="ignore")
-        df_windows_descriptive = df_windows_descriptive.drop(columns=empty_descriptive_cols, errors="ignore")
-        descriptive_feature_cols = [c for c in descriptive_feature_cols if c not in empty_descriptive_cols]
+        descriptive_feature_cols = [
+            col for col in df_windows_descriptive.columns
+            if (col not in non_feature_cols)
+            and (not col.endswith("_signal_type"))
+        ]
 
-    binary_prefixes = tuple(f"{c}_" for c in binary_cols_to_merge)
-    kept_features = [
-        c for c in descriptive_feature_cols
-        if (c not in binary_cols_to_merge)
-        and (not c.startswith(binary_prefixes))
-    ]
-    if len(kept_features) != len(descriptive_feature_cols):
-        removed = sorted(set(descriptive_feature_cols) - set(kept_features))
-        print(f"Excluded binary-derived grouping features from clustering feature set: {removed}")
+        binary_cols_to_merge = [col for col in binary_features_to_group if col in df_positions.columns]
+        merge_cols = ["sample_name", "TrackID", "position_t"]
+        df_binary = df_positions[merge_cols + binary_cols_to_merge].copy()
 
-    if len(kept_features) > 0:
-        if lower_quantile_cap is not None or upper_quantile_cap is not None:
-            if outfolder is not None:
-                outfolder = Path(outfolder)
-                outfolder.mkdir(parents=True, exist_ok=True)
-                capping_pdf_path = outfolder / "feature_distributions_quantile_capping_comparison.pdf"
-                print("Plotting feature distributions before and after quantile capping...")
-                with PdfPages(capping_pdf_path) as pdf:
-                    plot_feature_distributions_to_pdf(
-                        df=df_analysis,
-                        feature_cols=kept_features,
-                        pdf=pdf,
-                        title_prefix="Before Quantile Capping",
-                    )
+        df_analysis = df_windows_descriptive.merge(
+            df_binary,
+            on=merge_cols,
+            how="left",
+            suffixes=("", "_orig"),
+        )
+        policy = str(incomplete_window_policy).lower()
+        if policy == "drop":
+            df_analysis = df_analysis.dropna(subset=descriptive_feature_cols).copy()
+        elif policy in {"partial", "as_far_as_possible"}:
+            df_analysis = df_analysis.copy()
+        else:
+            raise ValueError(
+                "incomplete_window_policy must be one of: "
+                "'drop', 'partial' (alias: 'as_far_as_possible')."
+            )
+
+        # Drop descriptive feature columns that are entirely empty.
+        empty_descriptive_cols = [
+            c for c in descriptive_feature_cols
+            if c in df_analysis.columns and df_analysis[c].isna().all()
+        ]
+        if len(empty_descriptive_cols) > 0:
+            print(f"Dropping {len(empty_descriptive_cols)} empty descriptive columns.")
+            df_analysis = df_analysis.drop(columns=empty_descriptive_cols, errors="ignore")
+            df_windows_descriptive = df_windows_descriptive.drop(columns=empty_descriptive_cols, errors="ignore")
+            descriptive_feature_cols = [c for c in descriptive_feature_cols if c not in empty_descriptive_cols]
+
+        binary_prefixes = tuple(f"{c}_" for c in binary_cols_to_merge)
+        kept_features = [
+            c for c in descriptive_feature_cols
+            if (c not in binary_cols_to_merge)
+            and (not c.startswith(binary_prefixes))
+        ]
+        if len(kept_features) != len(descriptive_feature_cols):
+            removed = sorted(set(descriptive_feature_cols) - set(kept_features))
+            print(f"Excluded binary-derived grouping features from clustering feature set: {removed}")
+
+        if len(kept_features) > 0:
+            if lower_quantile_cap is not None or upper_quantile_cap is not None:
+                if outfolder is not None:
+                    outfolder = Path(outfolder)
+                    outfolder.mkdir(parents=True, exist_ok=True)
+                    capping_pdf_path = outfolder / "feature_distributions_quantile_capping_comparison.pdf"
+                    print("Plotting feature distributions before and after quantile capping...")
+                    with PdfPages(capping_pdf_path) as pdf:
+                        plot_feature_distributions_to_pdf(
+                            df=df_analysis,
+                            feature_cols=kept_features,
+                            pdf=pdf,
+                            title_prefix="Before Quantile Capping",
+                        )
+                        df_analysis = cap_values_to_quantile(
+                            df_analysis,
+                            kept_features,
+                            lower_quantile=lower_quantile_cap,
+                            upper_quantile=upper_quantile_cap,
+                        )
+                        plot_feature_distributions_to_pdf(
+                            df=df_analysis,
+                            feature_cols=kept_features,
+                            pdf=pdf,
+                            title_prefix="After Quantile Capping",
+                        )
+                    print(f"Saved quantile capping comparison to {capping_pdf_path}")
+                else:
                     df_analysis = cap_values_to_quantile(
                         df_analysis,
                         kept_features,
                         lower_quantile=lower_quantile_cap,
                         upper_quantile=upper_quantile_cap,
                     )
-                    plot_feature_distributions_to_pdf(
-                        df=df_analysis,
-                        feature_cols=kept_features,
-                        pdf=pdf,
-                        title_prefix="After Quantile Capping",
-                    )
-                print(f"Saved quantile capping comparison to {capping_pdf_path}")
-            else:
-                df_analysis = cap_values_to_quantile(
-                    df_analysis,
-                    kept_features,
-                    lower_quantile=lower_quantile_cap,
-                    upper_quantile=upper_quantile_cap,
-                )
+
+        if (
+            save_prepared_dataset
+            and prepared_dataset_cache_path is not None
+        ):
+            try:
+                prepared_dataset_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                df_analysis.to_csv(prepared_dataset_cache_path, index=False)
+                print(f"Saved prepared window dataset cache: {prepared_dataset_cache_path}")
+            except Exception as exc:
+                print(f"Warning: failed to save prepared dataset cache ({exc}).")
 
     scaler = None
     if scale_features and len(kept_features) > 0:
@@ -1681,6 +1726,9 @@ def apply_trained_state_clustering_to_full_dataset(
     descriptive_features=["mean", "median", "std", "net_displacement", "straightness", "mean_square_displacement"],
     cluster_col="ClusterID",
     incomplete_window_policy="drop",
+    prepared_dataset_cache_path=None,
+    reuse_prepared_dataset=True,
+    save_prepared_dataset=True,
 ):
     """
     Apply trained per-group clustering models to the full (non-subsampled) dataset.
@@ -1723,6 +1771,9 @@ def apply_trained_state_clustering_to_full_dataset(
         outfolder=None,
         scale_features=True,
         incomplete_window_policy=incomplete_window_policy,
+        prepared_dataset_cache_path=prepared_dataset_cache_path,
+        reuse_prepared_dataset=reuse_prepared_dataset,
+        save_prepared_dataset=save_prepared_dataset,
     )
     adata_full = _infer_full_dataset_from_group_models(
         df_analysis=prepared["df_analysis"],
@@ -1761,6 +1812,9 @@ def run_state_classification(
     incomplete_window_policy="drop",
     outfolder=None,
     random_state=123,
+    prepared_dataset_cache_path=None,
+    reuse_prepared_dataset=True,
+    save_prepared_dataset=True,
 ):
     """
     Main function to run state classification grouped by binary features.
@@ -1829,6 +1883,9 @@ def run_state_classification(
         outfolder=outfolder,
         scale_features=True,
         incomplete_window_policy=incomplete_window_policy,
+        prepared_dataset_cache_path=prepared_dataset_cache_path,
+        reuse_prepared_dataset=reuse_prepared_dataset,
+        save_prepared_dataset=save_prepared_dataset,
     )
     df_windows_descriptive = prepared["df_windows_descriptive"]
     df_analysis = prepared["df_analysis"]
@@ -2047,8 +2104,8 @@ def test():
 
 if __name__ == "__main__":
     
-    ssd_dir = r"/Volumes/T7_Sam/"
-    # ssd_dir = r"F:/"
+    # ssd_dir = r"/Volumes/T7_Sam/"
+    ssd_dir = r"F:/"
     ssd_dir = Path(ssd_dir)
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
     metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv")
@@ -2088,9 +2145,10 @@ if __name__ == "__main__":
 
     groupby = ["sample_name", "TrackID"]
     descriptive_features = ["mean", "median", "std", "net_displacement", "straightness", "mean_square_displacement"]
-    max_samples = 20000      # or None
+    # max_samples = 20000      # or None
+    max_samples=None
     min_spacing = 10          # or None for auto
-    n_neighbors = 30
+    n_neighbors = 60
     resolution = 0.2         # currently not used in leiden search path
     min_cluster_size = None  # currently unused
     pca_var_selection = 0.95
@@ -2104,7 +2162,8 @@ if __name__ == "__main__":
     upper_quantile_cap = 0.99      # e.g. None to disable upper capping
     outfolder = Path(ssd_dir, "BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
     random_state = 123
-
+    reuse_prepared_dataset=True
+    save_prepared_dataset=True
     pass
     # test()
     # adata_merged = sc.read_h5ad("/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/rolling_classification/adata_merged_group_clusters.h5ad")

@@ -228,8 +228,8 @@ if __name__ == "__main__":
     """
     df_paths = paths_between_states(
         adata_full,
-        start_state="Static",
-        end_state="Organoid contact",
+        start_state="round_static",
+        end_state="organoid_contact",
         state_col="ClusterID",
         collapse_bouts=True,
         mode="next_end",
@@ -261,7 +261,7 @@ if __name__ == "__main__":
         min_count=100,
     )
     fig.write_image(
-        "/Users/s.deblank-3/Downloads/newplot.pdf",
+        r"C:/Users/Samde/Downloads/newplot.pdf",
         width=1400,
         height=700,
         scale=2,

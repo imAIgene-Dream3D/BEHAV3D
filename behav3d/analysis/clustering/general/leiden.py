@@ -23,7 +23,23 @@ def run_pca(
     )
     var_ratio = adata.uns["pca"]["variance_ratio"]
     n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var_selection) + 1)
+    
+    # truncate X_pca
     adata.obsm["X_pca"] = adata.obsm["X_pca"][:, :n_pcs]
+    
+    # truncate loadings so projection/ingest is consistent
+    if "PCs" in adata.varm:
+        adata.varm["PCs"] = adata.varm["PCs"][:, :n_pcs]
+
+    # truncate PCA metadata arrays to match
+    if "variance" in adata.uns["pca"]:
+        adata.uns["pca"]["variance"] = adata.uns["pca"]["variance"][:n_pcs]
+    adata.uns["pca"]["variance_ratio"] = adata.uns["pca"]["variance_ratio"][:n_pcs]
+
+    # keep params consistent (optional but nice)
+    if "params" in adata.uns["pca"]:
+        adata.uns["pca"]["params"]["n_comps"] = n_pcs
+        
     return adata
 
 def run_leiden_clustering(
