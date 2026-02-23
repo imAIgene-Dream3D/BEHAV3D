@@ -76,8 +76,18 @@ python install_behav3d.py --reinstall
 ## 📋 Requirements
 
 - **Python**: 3.12 (recommended)
-- **Conda/Miniforge**: Recommended for environment management
+- **Miniforge** (recommended, includes `mamba`) or Conda/Miniconda
 - **CUDA**: 12.1+ (optional, for GPU acceleration)
+
+### Package Manager Priority
+
+The installer automatically detects and prefers the fastest available package manager:
+
+1. **mamba** (fastest — included with Miniforge/Mambaforge)
+2. **micromamba** (lightweight standalone alternative)
+3. **conda** (fallback)
+
+> All `mamba` commands can be replaced with `conda` if using Miniconda/Anaconda.
 
 ### Supported Platforms
 - ✅ Windows 10/11 (x64)
@@ -88,13 +98,13 @@ python install_behav3d.py --reinstall
 
 If the automatic installer doesn't work, you can install manually:
 
-### Using Conda (Recommended)
+### Using Mamba/Conda (Recommended)
 ```bash
-# Create environment from file
-conda env create -f environment.yml
+# Create environment from file (use mamba for speed, or conda)
+mamba env create -f environment.yml
 
 # Activate environment
-conda activate behav3d
+mamba activate behav3d
 
 # Install PyTorch with CUDA support (if GPU available)
 python install_behav3d.py --pytorch-only
@@ -148,9 +158,19 @@ Use one of these options:
 
 ### Import Errors After Installation
 ```bash
-conda activate behav3d
+mamba activate behav3d
 pip install --upgrade behav3d
 ```
+
+### OpenMP/MKL Conflicts (nomkl fails to install)
+If you see `LibMambaUnsatisfiableError` when installing `nomkl` (because `igraph` requires `blas==mkl`):
+```bash
+# Switch BLAS backend to openblas first
+mamba install -c conda-forge igraph "blas=*=openblas"
+# Then install nomkl
+mamba install nomkl
+```
+The automated installer handles this automatically.
 
 ## 📞 Support
 
