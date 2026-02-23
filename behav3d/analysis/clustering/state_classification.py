@@ -1,188 +1,69 @@
-import time
-import random
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from pandas.api.types import is_numeric_dtype
+import json
 from matplotlib.backends.backend_pdf import PdfPages
-import seaborn as sns
-import umap
-import scanpy as sc
-
-from sklearn.cluster import KMeans, HDBSCAN
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
-from sklearn.decomposition import PCA
-from sklearn.feature_selection import VarianceThreshold
-
-from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
-from behav3d.core.anndata import (
-    df_to_adata,
-    adata_add_back_to_df,
-    merge_pandas_cols_into_obs_anndata,
-    relabel_img_from_adata,
-)
-from behav3d.io.images import load_image
-from behav3d.analysis.clustering.general import (
-    select_nonbinary_columnnames, 
-    relabel_cluster_ids
-)
-
-from behav3d.analysis.filtering import subset_timepoints_from_tracks, subset_selection_of_tracks
-
-from behav3d.features.rolling_window_features import create_descriptive_track_dataset, infer_signal_types
-from behav3d.features.state_descriptive_features import drop_highly_correlated_features
-from behav3d.analysis.clustering.general.leiden import (
-    run_pca, 
-    run_leiden_clustering, 
-    merge_small_clusters
-)
-from behav3d.analysis.clustering.state.filtering import filter_short_state_runs
-
-from behav3d.analysis.clustering.state.visualization.plots.clustering import (
-    plot_exemplar_track_bars
-)   
-from behav3d.analysis.clustering.general.visualization.plots import (
-    plot_per_cluster_proportions, 
-    plot_top_ranking_features,
-    plot_number_per_clusters
-)
 
 from pathlib import Path
+import pickle
 
-seed = 123
-random.seed(seed)
-np.random.seed(seed)
+import scanpy as sc
+from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score
+from sklearn.preprocessing import StandardScaler
+
+from behav3d.core.anndata import df_to_adata
+from behav3d.features.rolling_window_features import create_descriptive_track_dataset
+from behav3d.analysis.clustering.general.leiden import run_pca, run_leiden_clustering
 
 A4_PORTRAIT = (8.27, 11.69)
 A4_LANDSCAPE = (11.69, 8.27)
 
 
-def _a4_size(orientation="auto", width=None, height=None):
-    """Return A4 size in inches, with optional auto orientation from width/height."""
-    if orientation == "portrait":
-        return A4_PORTRAIT
-    if orientation == "landscape":
-        return A4_LANDSCAPE
-    if width is not None and height is not None and width > height:
-        return A4_LANDSCAPE
-    return A4_PORTRAIT
+def _binary_col_to_group_name(col: str) -> str:
+    name = str(col)
+    name = name.replace("_pixels", "")
+    name = name.replace("_value", "")
+    return name
 
 
-def save_pdf_page_a4(pdf, fig, orientation="auto"):
-    """Save a matplotlib figure to PDF with A4 page size."""
-    width, height = fig.get_size_inches()
-    fig.set_size_inches(*_a4_size(orientation=orientation, width=width, height=height), forward=True)
-    pdf.savefig(fig, bbox_inches="tight")
+def _assign_binary_group_labels(df: pd.DataFrame, binary_cols: list[str]) -> pd.Series:
+    """Build a single categorical group label from binary indicator columns."""
+    if len(binary_cols) == 0:
+        return pd.Series(["no_contact"] * len(df), index=df.index, dtype="object")
+
+    labels = []
+    for _, row in df[binary_cols].iterrows():
+        active = []
+        for col in binary_cols:
+            val = row[col]
+            if pd.notna(val) and float(val) == 1.0:
+                active.append(_binary_col_to_group_name(col))
+        if len(active) == 0:
+            labels.append("no_contact")
+        elif len(active) == 1:
+            labels.append(active[0])
+        else:
+            labels.append("_and_".join(active))
+    return pd.Series(labels, index=df.index, dtype="object")
 
 
-def save_figure_a4(fig, path, orientation="auto", dpi=300):
-    """Save a standalone figure to an A4-sized PDF/image."""
-    width, height = fig.get_size_inches()
-    fig.set_size_inches(*_a4_size(orientation=orientation, width=width, height=height), forward=True)
-    fig.savefig(path, bbox_inches="tight", dpi=dpi)
-
-
-def _minmax_scale_columns(df):
-    """Approximate scanpy standard_scale='var' on a cluster x feature matrix."""
-    if df is None or df.empty:
-        return df
-    scaled = df.copy().astype(float)
-    col_min = scaled.min(axis=0)
-    col_max = scaled.max(axis=0)
-    denom = (col_max - col_min).replace(0, 1.0)
-    return (scaled - col_min) / denom
-
-
-def identify_binary_features(df, feature_cols):
-    """
-    Identify which features are binary (only contain 0 and 1 values).
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Input dataframe
-    feature_cols : list
-        List of feature column names to check
-        
-    Returns
-    -------
-    binary_features : list
-        List of binary feature names
-    nonbinary_features : list
-        List of non-binary feature names
-    """
-    binary_features = []
-    nonbinary_features = []
-    
-    for col in feature_cols:
-        if col in df.columns:
-            unique_vals = df[col].dropna().unique()
-            # Check if only contains 0 and 1
-            if set(unique_vals).issubset({0, 1, 0.0, 1.0}):
-                binary_features.append(col)
-            else:
-                nonbinary_features.append(col)
-    
-    return binary_features, nonbinary_features
-
-
-def create_binary_groups(df, binary_features):
-    """
-    Create groups based on combinations of binary features.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Input dataframe
-    binary_features : list
-        List of binary feature column names
-        
-    Returns
-    -------
-    groups : dict
-        Dictionary mapping group names to boolean masks
-    """
-    from itertools import combinations
-    
-    groups = {}
-    
-    if len(binary_features) == 0:
-        return groups
-    
-    # Create individual groups for each binary feature (only that feature is 1)
-    for feature in binary_features:
-        # Create mask where ONLY this feature is 1 and all others are 0
-        mask = df[feature] == 1
-        for other_feature in binary_features:
-            if other_feature != feature:
-                mask &= (df[other_feature] == 0)
-        
-        group_name = f"{feature}_only"
-        groups[group_name] = mask
-    
-    # Create combination groups (2 or more features are 1)
-    for r in range(2, len(binary_features) + 1):
-        for combo in combinations(binary_features, r):
-            # All features in combo must be 1
-            mask = pd.Series(True, index=df.index)
-            for feature in combo:
-                mask &= (df[feature] == 1)
-            
-            # All features NOT in combo must be 0
-            for feature in binary_features:
-                if feature not in combo:
-                    mask &= (df[feature] == 0)
-            
-            # Create readable group name
-            combo_name = "_and_".join(combo)
-            groups[combo_name] = mask
-    
-    # Create a "none" group (all binary features are 0)
-    none_mask = pd.Series(True, index=df.index)
-    for feature in binary_features:
-        none_mask &= (df[feature] == 0)
-    groups["no_contact"] = none_mask
-    
-    return groups
+def _add_clean_binary_annotation_columns(df: pd.DataFrame, binary_cols: list[str]) -> pd.DataFrame:
+    """Add user-facing binary annotation columns (e.g. organoid_contact) to obs."""
+    out = df.copy()
+    for col in binary_cols:
+        if col not in out.columns:
+            continue
+        clean_name = _binary_col_to_group_name(col)
+        if clean_name == col or clean_name in out.columns:
+            continue
+        vals = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+        out[clean_name] = (vals > 0).astype(np.int8)
+    return out
 
 
 def subsample_with_temporal_spacing(
@@ -191,1265 +72,73 @@ def subsample_with_temporal_spacing(
     time_col="position_t",
     min_spacing=5,
     max_samples=None,
-    random_state=123
+    random_state=123,
 ):
-    """
-    Subsample timepoints with minimum temporal spacing to reduce autocorrelation.
-    
-    This helps prevent consecutive timepoints from the same track clustering together
-    purely due to temporal proximity rather than biological state.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Input dataframe
-    id_cols : list
-        Columns identifying unique tracks
-    time_col : str
-        Time column name
-    min_spacing : int
-        Minimum number of timepoints between selected samples from the same track
-    max_samples : int, optional
-        Maximum total number of samples after temporal-spacing subsampling.
-        If provided and exceeded, samples are randomly downsampled to this size.
-    random_state : int
-        Random seed
-        
-    Returns
-    -------
-    df_subsampled : pd.DataFrame
-        Subsampled dataframe with temporal spacing
-    """
+    """Subsample rows with temporal spacing per track."""
     if id_cols is None:
         id_cols = ["sample_name", "TrackID"]
-    
+
     np.random.seed(random_state)
-    
     subsampled_rows = []
-    
+
     for _, track_df in df.groupby(id_cols):
         track_df = track_df.sort_values(time_col).reset_index(drop=True)
         n = len(track_df)
-        
         if n == 0:
             continue
-        
-        # Start with a random offset
         start_idx = np.random.randint(0, min(min_spacing, n))
         selected_indices = []
-        
         idx = start_idx
         while idx < n:
             selected_indices.append(idx)
             idx += min_spacing
-            
         subsampled_rows.append(track_df.iloc[selected_indices])
-    
+
     if len(subsampled_rows) == 0:
-        return df.iloc[:0].copy()  # Return empty dataframe with same columns
+        return df.iloc[:0].copy()
 
     df_subsampled = pd.concat(subsampled_rows, ignore_index=True)
-
-    # Optional global cap after full per-track temporal-spacing subsampling
     if max_samples is not None and len(df_subsampled) > max_samples:
         df_subsampled = df_subsampled.sample(n=max_samples, random_state=random_state).reset_index(drop=True)
-
     return df_subsampled
 
 
-
-
-def validate_clustering(X, labels, min_silhouette=0.3, max_davies_bouldin=1.5):
-    """
-    Validate whether clustering results show clear evidence of distinct subclusters.
-    
-    Uses silhouette score and Davies-Bouldin index to assess cluster quality.
-    Only returns True if there's strong evidence for multiple distinct clusters.
-    
-    Parameters
-    ----------
-    X : np.ndarray
-        Feature matrix (n_samples, n_features)
-    labels : np.ndarray
-        Cluster labels
-    min_silhouette : float
-        Minimum silhouette score to accept clustering (higher = better separation)
-        Range: [-1, 1], where >0.3 indicates reasonable structure
-    max_davies_bouldin : float
-        Maximum Davies-Bouldin index to accept clustering (lower = better separation)
-        Range: [0, inf], where <1.5 indicates good separation
-        
-    Returns
-    -------
-    is_valid : bool
-        True if clustering shows clear evidence of distinct subclusters
-    metrics : dict
-        Dictionary containing validation metrics
-    """
-    from sklearn.metrics import silhouette_score, davies_bouldin_score
-    
-    unique_labels = np.unique(labels)
-    n_clusters = len(unique_labels)
-    
-    # If only one cluster, no subclusters exist
-    if n_clusters <= 1:
-        return False, {"n_clusters": n_clusters, "silhouette": None, "davies_bouldin": None}
-    
-    # Calculate silhouette score (higher is better, range [-1, 1])
-    # >0.7: strong structure, 0.5-0.7: reasonable, 0.25-0.5: weak, <0.25: no structure
-    try:
-        silhouette = silhouette_score(X, labels)
-    except:
-        silhouette = -1.0
-    
-    # Calculate Davies-Bouldin index (lower is better, range [0, inf])
-    # <1.0: excellent, 1.0-1.5: good, >1.5: poor separation
-    try:
-        davies_bouldin = davies_bouldin_score(X, labels)
-    except:
-        davies_bouldin = float('inf')
-    
-    metrics = {
-        "n_clusters": n_clusters,
-        "silhouette": silhouette,
-        "davies_bouldin": davies_bouldin
-    }
-    
-    # Require BOTH good silhouette AND good Davies-Bouldin for validation
-    is_valid = (silhouette >= min_silhouette) and (davies_bouldin <= max_davies_bouldin)
-    
-    return is_valid, metrics
-
-
-def build_cluster_feature_correlation(feature_df, labels):
-    """
-    Build a cluster-vs-cluster correlation matrix from cluster mean feature profiles.
-
-    Parameters
-    ----------
-    feature_df : pd.DataFrame
-        Feature matrix used for clustering/evaluation
-    labels : array-like
-        Cluster labels per row in feature_df
-
-    Returns
-    -------
-    corr : pd.DataFrame or None
-        Correlation matrix between clusters based on mean feature vectors.
-        Returns None when fewer than 2 clusters are present.
-    """
-    tmp = feature_df.copy()
-    tmp["_cluster_tmp"] = pd.Categorical(labels)
-    centroids = tmp.groupby("_cluster_tmp", observed=False).mean(numeric_only=True)
-    if centroids.shape[0] < 2:
-        return None
-    return centroids.T.corr()
-
-
-def build_cluster_feature_matrix(feature_df, labels):
-    """
-    Build a cluster-by-feature mean matrix for heatmap plotting.
-    """
-    tmp = feature_df.copy()
-    numeric_tmp = tmp.select_dtypes(include=[np.number]).copy()
-    if numeric_tmp.shape[1] == 0:
-        numeric_tmp = tmp.apply(pd.to_numeric, errors="coerce")
-        numeric_tmp = numeric_tmp.dropna(axis=1, how="all")
-    if numeric_tmp.shape[1] == 0:
-        return None
-    numeric_tmp["_cluster_tmp"] = pd.Categorical(labels.astype(str))
-    centroids = numeric_tmp.groupby("_cluster_tmp", observed=False).mean(numeric_only=True)
-    if centroids.shape[0] < 1 or centroids.shape[1] < 1:
-        return None
-    return centroids
-
-
-def plot_cluster_feature_correlation(
-    corr,
-    title,
-    pdf=None,
-    figsize=(6, 5),
-):
-    """
-    Plot a cluster-vs-cluster feature-profile correlation matrix.
-    If pdf is provided, writes directly to that PDF.
-    """
-    if corr is None:
-        return
-
-    fig, ax = plt.subplots(figsize=figsize)
-    sns.heatmap(
-        corr,
-        vmin=-1,
-        vmax=1,
-        cmap="coolwarm",
-        annot=True,
-        fmt=".2f",
-        square=True,
-        cbar_kws={"label": "Correlation"},
-        ax=ax,
-    )
-    ax.set_title(title)
-    plt.tight_layout()
-    if pdf is not None:
-        save_pdf_page_a4(pdf, fig, orientation="portrait")
-        plt.close(fig)
-    return fig
-
-
-def plot_cluster_feature_heatmap(pdf, adata, cluster_col, title):
-    """
-    Plot Scanpy heatmap (with dendrogram) without grouped feature labels.
-    """
-    if adata is None or adata.n_obs == 0 or adata.n_vars == 0:
-        return
-
-    sc.tl.dendrogram(adata, groupby=cluster_col)
-    sc.pl.heatmap(
-        adata,
-        var_names=list(adata.var_names),
-        groupby=cluster_col,
-        standard_scale="var",
-        figsize=A4_LANDSCAPE,
-        swap_axes=True,
-        dendrogram=True,
-        show_gene_labels=True,
-        show=False,
-    )
-    fig = plt.gcf()
-    fig.suptitle(title, y=0.995)
-    save_pdf_page_a4(pdf, fig, orientation="landscape")
-    plt.close(fig)
-
-
-def plot_scanpy_heatmap_page(pdf, adata, cluster_col, title):
-    """
-    Save a native Scanpy heatmap as its own A4 PDF page (vector quality).
-    """
-    if adata is None or adata.n_obs == 0 or adata.n_vars == 0:
-        return
-
-    cluster_values = adata.obs[cluster_col].astype(str)
-    n_clusters = cluster_values.nunique()
-    use_dendrogram = n_clusters > 1
-
-    if use_dendrogram:
-        try:
-            sc.tl.dendrogram(adata, groupby=cluster_col)
-        except Exception as exc:
-            print(f"Warning: dendrogram failed for {cluster_col} ({exc}). Plotting heatmap without dendrogram.")
-            use_dendrogram = False
-
-    sc.pl.heatmap(
-        adata,
-        var_names=list(adata.var_names),
-        groupby=cluster_col,
-        standard_scale="var",
-        figsize=A4_LANDSCAPE,
-        swap_axes=True,
-        dendrogram=use_dendrogram,
-        show_gene_labels=True,
-        show=False,
-    )
-    fig = plt.gcf()
-    fig.suptitle(title, y=0.995)
-    save_pdf_page_a4(pdf, fig, orientation="landscape")
-    plt.close(fig)
-
-
-def plot_result_summary_page(pdf, adata, cluster_col, corr, feature_matrix, title, selected=False):
-    """
-    One A4 page per tested setting with UMAP + correlation.
-    """
-    fig, (ax_umap, ax_corr) = plt.subplots(1, 2, figsize=A4_LANDSCAPE, gridspec_kw={"width_ratios": [1.0, 1.0]})
-
-    # Panel 1: UMAP
-    sc.pl.umap(
-        adata,
-        color=cluster_col,
-        ax=ax_umap,
-        show=False,
-        title="UMAP",
-        legend_loc="on data",
-        legend_fontsize=7,
-    )
-    ax_umap.set_aspect("equal", adjustable="box")
-
-    # Panel 2: Cluster correlation
-    if corr is not None and not corr.empty:
-        sns.heatmap(
-            corr,
-            vmin=-1,
-            vmax=1,
-            cmap="coolwarm",
-            annot=True,
-            fmt=".2f",
-            square=True,
-            cbar_kws={"label": "Correlation"},
-            ax=ax_corr,
-        )
-        ax_corr.set_title("Cluster Correlation")
-    else:
-        ax_corr.text(0.5, 0.5, "No correlation matrix", ha="center", va="center", transform=ax_corr.transAxes)
-        ax_corr.set_axis_off()
-
-    page_title = title + (" [SELECTED]" if selected else "")
-    fig.suptitle(page_title, fontsize=12, fontweight="bold", y=0.995)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    save_pdf_page_a4(pdf, fig, orientation="landscape")
-    plt.close(fig)
-
-
-def _plot_method_umap(pdf, adata, col, title, selected=False):
-    fig, ax = plt.subplots(figsize=A4_PORTRAIT)
-    sc.pl.umap(
-        adata,
-        color=col,
-        ax=ax,
-        show=False,
-        title=title,
-        legend_loc="on data",
-        legend_fontsize=8,
-    )
-    ax.set_aspect("equal", adjustable="box")
-    if selected:
-        ax.set_title(ax.get_title(), color="red", fontweight="bold")
-    save_pdf_page_a4(pdf, fig, orientation="portrait")
-    plt.close(fig)
-
-
-def run_kmeans_search(
-    adata,
-    X_pca,
-    X_umap,
-    feature_df,
-    min_silhouette,
-    max_davies_bouldin,
-    random_state,
-):
-    print("    Iterative KMeans search (k=1..8) on X_pca, validated on X_umap...")
-    results = []
-    for k in range(1, 9):
-        if k == 1:
-            labels = np.zeros(X_umap.shape[0], dtype=int)
-            inertia = np.nan
-        else:
-            kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
-            labels = kmeans.fit_predict(X_umap)
-            inertia = float(kmeans.inertia_)
-
-        is_valid, metrics = validate_clustering(
-            X_umap,
-            labels,
-            min_silhouette=min_silhouette,
-            max_davies_bouldin=max_davies_bouldin
-        )
-        col_name = f"kmeans_{k}"
-        adata.obs[col_name] = pd.Categorical(labels.astype(str))
-        corr = build_cluster_feature_correlation(feature_df, labels.astype(str))
-        feature_matrix = build_cluster_feature_matrix(feature_df, labels)
-        results.append({
-            "param_name": "k",
-            "param_value": k,
-            "col": col_name,
-            "labels": labels,
-            "metrics": metrics,
-            "valid": is_valid,
-            "inertia": inertia,
-            "corr": corr,
-            "feature_matrix": feature_matrix,
-        })
-
-        sil_str = "N/A" if metrics["silhouette"] is None else f"{metrics['silhouette']:.3f}"
-        db_str = "N/A" if metrics["davies_bouldin"] is None else f"{metrics['davies_bouldin']:.3f}"
-        print(f"      k={k}: n_clusters={metrics['n_clusters']}, silhouette={sil_str}, db={db_str}, valid={is_valid}")
-
-    scored = [r for r in results if r["metrics"]["silhouette"] is not None]
-    if len(scored) == 0:
-        best_result = results[0]
-        print("    No valid multi-cluster solution found, defaulting to first tested setting.")
-    else:
-        best_result = max(scored, key=lambda r: r["metrics"]["silhouette"])
-    return results, best_result
-
-
-def run_leiden_search(
-    adata,
-    feature_df,
-    resolutions,
-    n_stability_repeats,
-    n_subsample_repeats,
-    random_state,
-):
-    print("    Leiden auto-selection + diagnostics over tested resolutions...")
-    auto_col = "leiden_auto_selection_tmp"
-    adata = run_leiden_clustering(
-        adata,
-        n_neighbors=None,
-        resolution="auto",
-        stability_resolutions=tuple(float(r) for r in resolutions),
-        n_stability_repeats=n_stability_repeats,
-        n_subsample_repeats=n_subsample_repeats,
-        metric="euclidean",
-        method="umap",
-        use_rep="X_pca",
-        key_added=auto_col,
-        random_state=random_state,
-    )
-    best_res_auto = float(adata.uns.get("leiden_stability_best_res", resolutions[0]))
-    labels_by_resolution = adata.uns.get("leiden_stability_labels_by_resolution", {})
-    print(f"    Auto-selected Leiden resolution from stability search: {best_res_auto}")
-
-    results = []
-    for res in resolutions:
-        col_name = f"leiden_{str(res).replace('.', '_')}"
-        labels = None
-        for key_str, key_labels in labels_by_resolution.items():
-            if np.isclose(float(key_str), float(res)):
-                labels = np.asarray(key_labels).astype(int)
-                break
-        if labels is None:
-            raise ValueError(
-                f"Leiden labels for resolution={res} not found in stability search output. "
-                "Expected cached labels in adata.uns['leiden_stability_labels_by_resolution']."
-            )
-
-        adata.obs[col_name] = pd.Categorical((labels + 1).astype(str))
-        metrics = {
-            "n_clusters": int(len(np.unique(labels))),
-            "silhouette": None,
-            "davies_bouldin": None,
-        }
-        corr = build_cluster_feature_correlation(feature_df, labels.astype(str))
-        feature_matrix = build_cluster_feature_matrix(feature_df, labels)
-        results.append({
-            "param_name": "resolution",
-            "param_value": float(res),
-            "col": col_name,
-            "labels": labels,
-            "metrics": metrics,
-            "valid": None,
-            "inertia": np.nan,
-            "corr": corr,
-            "feature_matrix": feature_matrix,
-        })
-        print(f"      res={res}: n_clusters={metrics['n_clusters']}")
-
-    best_result = None
-    for res_data in results:
-        if np.isclose(float(res_data["param_value"]), best_res_auto):
-            best_result = res_data
-            break
-    if best_result is None:
-        best_result = results[0]
-        print("    Warning: auto-selected resolution not found in diagnostics list; used first tested resolution.")
-
-    return results, best_result
-
-
-def plot_kmeans_diagnostics(pdf, adata, results, best_result, min_silhouette, max_davies_bouldin):
-    x = [r["param_value"] for r in results]
-    sils = [np.nan if r["metrics"]["silhouette"] is None else r["metrics"]["silhouette"] for r in results]
-    dbs = [np.nan if r["metrics"]["davies_bouldin"] is None else r["metrics"]["davies_bouldin"] for r in results]
-
-    fig_metrics, axes = plt.subplots(1, 2, figsize=A4_LANDSCAPE)
-    axes[0].plot(x, sils, "o-", color="tab:green")
-    axes[0].set_title("Silhouette over search")
-    axes[0].set_xlabel(best_result["param_name"])
-    axes[0].set_ylabel("Silhouette score")
-    axes[0].axvline(best_result["param_value"], color="red", linestyle="--", linewidth=1)
-    axes[0].axhline(min_silhouette, color="black", linestyle=":", linewidth=1)
-
-    axes[1].plot(x, dbs, "o-", color="tab:red")
-    axes[1].set_title("Davies-Bouldin over search")
-    axes[1].set_xlabel(best_result["param_name"])
-    axes[1].set_ylabel("Davies-Bouldin index")
-    axes[1].axvline(best_result["param_value"], color="red", linestyle="--", linewidth=1)
-    axes[1].axhline(max_davies_bouldin, color="black", linestyle=":", linewidth=1)
-    plt.tight_layout()
-    save_pdf_page_a4(pdf, fig_metrics, orientation="landscape")
-    plt.close(fig_metrics)
-
-    for res in results:
-        selected = np.isclose(float(res["param_value"]), float(best_result["param_value"]))
-        title = (
-            f"k={res['param_value']} | "
-            f"Sil={res['metrics']['silhouette'] if res['metrics']['silhouette'] is not None else 'N/A'} | "
-            f"DB={res['metrics']['davies_bouldin'] if res['metrics']['davies_bouldin'] is not None else 'N/A'}"
-        )
-        plot_result_summary_page(
-            pdf=pdf,
-            adata=adata,
-            cluster_col=res["col"],
-            corr=res.get("corr"),
-            feature_matrix=res.get("feature_matrix"),
-            title=title,
-            selected=selected,
-        )
-        plot_scanpy_heatmap_page(
-            pdf=pdf,
-            adata=adata,
-            cluster_col=res["col"],
-            title=f"Scanpy Heatmap (k={res['param_value']})",
-        )
-
-
-def plot_leiden_diagnostics(pdf, adata, results, best_result):
-    stability_summary = adata.uns.get("leiden_stability_summary", None)
-    if stability_summary is not None and len(stability_summary) > 0:
-        tested_resolutions = sorted({float(r["param_value"]) for r in results})
-        fig_ari, ax_ari = plt.subplots(figsize=A4_LANDSCAPE)
-        ax_ari.plot(
-            stability_summary["resolution"],
-            stability_summary["mean_ari"],
-            "o-",
-            color="tab:blue",
-            label="Seed mean ARI",
-        )
-        if "std_ari" in stability_summary.columns:
-            ax_ari.fill_between(
-                stability_summary["resolution"],
-                stability_summary["mean_ari"] - stability_summary["std_ari"],
-                stability_summary["mean_ari"] + stability_summary["std_ari"],
-                color="tab:blue",
-                alpha=0.2,
-            )
-        if "mean_ari_subsample" in stability_summary.columns:
-            ax_ari.plot(
-                stability_summary["resolution"],
-                stability_summary["mean_ari_subsample"],
-                "o-",
-                color="tab:orange",
-                label="Subsample mean ARI",
-            )
-        ax_ari.axvline(best_result["param_value"], color="red", linestyle="--", linewidth=1)
-        ax_ari.set_title("Leiden Stability ARI over Resolution")
-        ax_ari.set_xlabel("Resolution")
-        ax_ari.set_ylabel("ARI")
-        # Force x-axis to show the exact tested resolutions (e.g., includes 0.05)
-        ax_ari.set_xticks(tested_resolutions)
-        ax_ari.set_xlim(min(tested_resolutions) - 0.005, max(tested_resolutions) + 0.005)
-        ax_ari.legend()
-        plt.tight_layout()
-        save_pdf_page_a4(pdf, fig_ari, orientation="landscape")
-        plt.close(fig_ari)
-
-    for res in results:
-        selected = np.isclose(float(res["param_value"]), float(best_result["param_value"]))
-        title = (
-            f"resolution={res['param_value']} | "
-            f"n_clusters={res['metrics']['n_clusters']}"
-        )
-        plot_result_summary_page(
-            pdf=pdf,
-            adata=adata,
-            cluster_col=res["col"],
-            corr=res.get("corr"),
-            feature_matrix=res.get("feature_matrix"),
-            title=title,
-            selected=selected,
-        )
-        plot_scanpy_heatmap_page(
-            pdf=pdf,
-            adata=adata,
-            cluster_col=res["col"],
-            title=f"Scanpy Heatmap (resolution={res['param_value']})",
-        )
-
-
-def cluster_group(
-    df_group,
-    feature_cols,
-    non_feature_cols,
-    min_silhouette=0.3,
-    max_davies_bouldin=1.5,
-    n_neighbors=30,
-    resolution="auto",
-    pca_var_selection=0.95,
-    outfolder=None,
-    group_name=None,
-    clustering_method="kmeans",
-    resolutions=(0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5),
-    leiden_seed_tries=10,
-    leiden_subsample_tries=10,
-    random_state=123
-):
-    """
-    Perform clustering on a single group of data.
-    
-    Parameters
-    ----------
-    df_group : pd.DataFrame
-        Subset of data for this group
-    feature_cols : list
-        Feature columns to use for clustering
-    non_feature_cols : list
-        Non-feature columns (metadata)
-    n_neighbors : int
-        Number of neighbors for Leiden clustering
-    resolution : float
-        Resolution parameter for Leiden clustering
-    min_cluster_size : int
-        Minimum cluster size for merging small clusters
-    pca_var_selection : float
-        Variance threshold for PCA
-    random_state : int
-        Random seed
-        
-    Returns
-    -------
-    adata : AnnData
-        AnnData object with clustering results
-    """
-    # Drop NaN values
-    df_clean = df_group.dropna(subset=feature_cols).copy()
-    
-    if len(df_clean) < 50:  # Skip if too few samples
-        return None
-    
-    
-    # Create AnnData object
-    adata = df_to_adata(df_clean, feature_cols, obs_cols=non_feature_cols)
-    adata.uns["preprocessing"] = {
-        "kept_features": list(feature_cols),
-        # "scaler": {
-        #     "mean": scaler.mean_.astype(float),
-        #     "scale": scaler.scale_.astype(float),
-        # }
-    }
-    
-    # Run PCA
-    adata = run_pca(
-        adata,
-        pca_var_selection=pca_var_selection,
-        ncomps=min(len(feature_cols), len(df_clean) - 1),
-        svd_solver='full', 
-        random_state=random_state
-    )
-
-    # Build shared UMAP embedding used for validation and visualization
-    sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=random_state)
-    sc.tl.umap(adata, min_dist=0.1, random_state=random_state)
-    X_pca = adata.obsm["X_pca"]
-    X_umap = adata.obsm["X_umap"]
-    feature_df = df_clean[feature_cols].reset_index(drop=True)
-
-    method = clustering_method.lower()
-    if method == "kmeans":
-        results, best_result = run_kmeans_search(
-            adata=adata,
-            X_pca=X_pca,
-            X_umap=X_umap,
-            feature_df=feature_df,
-            min_silhouette=min_silhouette,
-            max_davies_bouldin=max_davies_bouldin,
-            random_state=random_state,
-        )
-    elif method == "leiden":
-        if resolution == "auto":
-            results, best_result = run_leiden_search(
-                adata=adata,
-                feature_df=feature_df,
-                resolutions=resolutions,
-                n_stability_repeats=leiden_seed_tries,
-                n_subsample_repeats=leiden_subsample_tries,
-                random_state=random_state,
-            )
-        else:
-            fixed_res = float(resolution)
-            col_name = f"leiden_{str(fixed_res)}"
-            adata = run_leiden_clustering(
-                adata,
-                n_neighbors=None,
-                resolution=fixed_res,
-                metric="euclidean",
-                method="umap",
-                use_rep="X_pca",
-                key_added=col_name,
-                random_state=random_state,
-            )
-            labels = adata.obs[col_name].astype("category").cat.codes.to_numpy()
-            metrics = {
-                "n_clusters": int(len(np.unique(labels))),
-                "silhouette": None,
-                "davies_bouldin": None,
-            }
-            results = [{
-                "param_name": "resolution",
-                "param_value": fixed_res,
-                "col": col_name,
-                "labels": labels,
-                "metrics": metrics,
-                "valid": None,
-                "inertia": np.nan,
-                "corr": build_cluster_feature_correlation(feature_df, labels.astype(str)),
-                "feature_matrix": build_cluster_feature_matrix(feature_df, labels),
-            }]
-            best_result = results[0]
-            print(f"    Fixed Leiden resolution={fixed_res}: n_clusters={metrics['n_clusters']}")
-    else:
-        raise ValueError(f"Unknown clustering_method '{clustering_method}'. Use 'kmeans' or 'leiden'.")
-
-    adata.obs["ClusterID"] = pd.Categorical(adata.obs[best_result["col"]].astype(str))
-    if method == "kmeans":
-        best_sil = best_result["metrics"]["silhouette"]
-        best_db = best_result["metrics"]["davies_bouldin"]
-        print(
-            f"    ✓ Final selection: {best_result['param_name']}={best_result['param_value']} "
-            f"(Sil={best_sil if best_sil is not None else 'N/A'}, DB={best_db if best_db is not None else 'N/A'})"
-        )
-    else:
-        print(
-            f"    ✓ Final selection: {best_result['param_name']}={best_result['param_value']} "
-            f"(n_clusters={best_result['metrics']['n_clusters']})"
-        )
-
-    # Save per-group diagnostics
-    if outfolder is not None and group_name is not None:
-        outfolder = Path(outfolder)
-        outfolder.mkdir(parents=True, exist_ok=True)
-        if method == "leiden":
-            stability_summary = adata.uns.get("leiden_stability_summary", None)
-            if stability_summary is not None and len(stability_summary) > 0:
-                csv_path = outfolder / f"recursive_leiden_stability_summary_{group_name}.csv"
-                stability_summary.to_csv(csv_path, index=False)
-                print(f"Saved Leiden stability summary CSV to {csv_path}")
-        pdf_path = outfolder / f"recursive_{clustering_method}_steps_{group_name}.pdf"
-        with PdfPages(pdf_path) as pdf:
-            if method == "leiden":
-                plot_leiden_diagnostics(
-                    pdf=pdf,
-                    adata=adata,
-                    results=results,
-                    best_result=best_result,
-                )
-            else:
-                plot_kmeans_diagnostics(
-                    pdf=pdf,
-                    adata=adata,
-                    results=results,
-                    best_result=best_result,
-                    min_silhouette=min_silhouette,
-                    max_davies_bouldin=max_davies_bouldin,
-                )
-
-    # Clean temporary clustering columns
-    for res in results:
-        if res["col"] in adata.obs.columns and res["col"] != "ClusterID":
-            del adata.obs[res["col"]]
-    if "leiden_auto_selection_tmp" in adata.obs.columns:
-        del adata.obs["leiden_auto_selection_tmp"]
-
-    return adata
-
-
-def plot_group_umaps(group_results, ncols=3, figsize_per_plot=(5, 5)):
-    """
-    Plot UMAP results for all groups in a grid.
-    
-    Parameters
-    ----------
-    group_results : dict
-        Dictionary mapping group names to AnnData objects
-    ncols : int
-        Number of columns in the grid
-    figsize_per_plot : tuple
-        Size of each subplot (width, height)
-        
-    Returns
-    -------
-    fig : matplotlib.figure.Figure
-        The figure object
-    """
-    n_groups = len(group_results)
-    nrows = int(np.ceil(n_groups / ncols))
-    
-    fig, axes = plt.subplots(
-        nrows, ncols, 
-        figsize=(figsize_per_plot[0] * ncols, figsize_per_plot[1] * nrows)
-    )
-    
-    # Flatten axes for easier iteration
-    if n_groups == 1:
-        axes = [axes]
-    else:
-        axes = axes.flatten()
-    
-    for idx, (group_name, adata) in enumerate(group_results.items()):
-        ax = axes[idx]
-        
-        if adata is None:
-            ax.text(0.5, 0.5, f"{group_name}\n(insufficient data)", 
-                   ha='center', va='center', transform=ax.transAxes)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            continue
-        
-        # Get UMAP coordinates
-        umap_coords = adata.obsm["X_umap"]
-        cluster_labels = adata.obs["ClusterID"].astype(str)
-        
-        # Plot
-        scatter = ax.scatter(
-            umap_coords[:, 0], 
-            umap_coords[:, 1],
-            c=cluster_labels.astype('category').cat.codes,
-            cmap='tab20',
-            s=2,
-            alpha=0.5
-        )
-        
-        ax.set_title(f"{group_name}\n(n={len(adata)})", fontsize=10, fontweight='bold')
-        ax.set_xlabel("UMAP1")
-        ax.set_ylabel("UMAP2")
-        ax.set_aspect("equal", adjustable="box")
-        
-        # Add legend
-        unique_clusters = cluster_labels.unique()
-        if len(unique_clusters) <= 20:  # Only show legend if not too many clusters
-            handles = [plt.Line2D([0], [0], marker='o', color='w', 
-                                markerfacecolor=plt.cm.tab20(i % 20), 
-                                markersize=8, label=cluster)
-                      for i, cluster in enumerate(sorted(unique_clusters))]
-            ax.legend(handles=handles, loc='best', fontsize=6, 
-                     title='Cluster', title_fontsize=7, framealpha=0.8)
-    
-    # Hide unused subplots
-    for idx in range(n_groups, len(axes)):
-        axes[idx].axis('off')
-    
-    plt.tight_layout()
-    return fig
-
-
-
-def plot_feature_distributions_to_pdf(df, feature_cols, pdf, title_prefix="Feature Distributions"):
-    """
-    Plot feature distributions and append the figure as one page in a PDF.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Input dataframe.
-    feature_cols : list
-        Feature columns to plot.
-    pdf : matplotlib.backends.backend_pdf.PdfPages
-        Open PDF writer where the page should be saved.
-    title_prefix : str
-        Title suffix to annotate plot context.
-    """
-    if len(feature_cols) == 0:
-        return
-
-    n_cols = 3
-    n_rows = 4
-    plots_per_page = n_cols * n_rows
-
-    for start in range(0, len(feature_cols), plots_per_page):
-        chunk = feature_cols[start:start + plots_per_page]
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=A4_PORTRAIT)
-        axes = np.array(axes).flatten()
-
-        for i, feature in enumerate(chunk):
-            sns.violinplot(y=df[feature], ax=axes[i])
-            axes[i].set_title(f"{feature}\n({title_prefix})", fontsize=9)
-
-        for i in range(len(chunk), len(axes)):
-            axes[i].axis("off")
-
-        fig.tight_layout()
-        save_pdf_page_a4(pdf, fig, orientation="portrait")
-        plt.close(fig)
-
-
-def cap_values_to_quantile(df, features, lower_quantile=None, upper_quantile=0.99):
-    """
-    Cap features to the specified quantiles.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Input dataframe
-    features : list
-        List of feature columns to cap
-    lower_quantile : float
-        Lower quantile threshold (0 to 1). Values below this will be set to the quantile value.
-        If None, no lower capping is performed.
-    upper_quantile : float
-        Upper quantile threshold (0 to 1). Values above this will be set to the quantile value.
-        If None, no upper capping is performed.
-        
-    Returns
-    -------
-    df_capped : pd.DataFrame
-        Dataframe with capped values
-    """
+def cap_values_to_quantile(df, features, lower_quantile=None, upper_quantile=0.99, return_limits=False):
+    """Cap numeric feature values to requested quantiles."""
     if lower_quantile is None and upper_quantile is None:
+        if return_limits:
+            return df, {}
         return df
-        
+
     df_capped = df.copy()
-    
-    if lower_quantile is not None:
-        print(f"Capping features to {lower_quantile*100}th lower quantile...")
-    if upper_quantile is not None:
-        print(f"Capping features to {upper_quantile*100}th upper quantile...")
-    
-    skipped_non_numeric = []
-    skipped_boolean = []
+    cap_limits = {}
 
     for feature in features:
-        if feature in df_capped.columns:
-            col = df_capped[feature]
-
-            # Quantile interpolation on boolean data fails in newer numpy/pandas.
-            # Binary/boolean features should not be outlier-capped.
-            if pd.api.types.is_bool_dtype(col):
-                skipped_boolean.append(feature)
-                continue
-
-            # Ensure numeric dtype for quantile computation.
-            series = pd.to_numeric(col, errors="coerce").dropna()
-            if len(series) > 0:
-                lower_limit = None
-                upper_limit = None
-                
-                if lower_quantile is not None:
-                    lower_limit = series.quantile(lower_quantile)
-                    
-                if upper_quantile is not None:
-                    upper_limit = series.quantile(upper_quantile)
-                
-                # Clip values using numeric representation to avoid dtype issues.
-                numeric_col = pd.to_numeric(df_capped[feature], errors="coerce")
-                df_capped[feature] = numeric_col.clip(lower=lower_limit, upper=upper_limit)
-            else:
-                skipped_non_numeric.append(feature)
-
-    if skipped_boolean:
-        print(f"Skipped boolean features for quantile capping: {len(skipped_boolean)}")
-    if skipped_non_numeric:
-        print(f"Skipped non-numeric features for quantile capping: {len(skipped_non_numeric)}")
-            
-    return df_capped
-
-
-def _to_tczyx(arr, name="image"):
-    """Coerce image-like array to TCZYX shape."""
-    if arr.ndim == 5:
-        return arr
-    if arr.ndim == 4:
-        # Assume TZYX
-        return np.expand_dims(arr, axis=1)
-    if arr.ndim == 3:
-        # Assume ZYX
-        return np.expand_dims(np.expand_dims(arr, axis=0), axis=1)
-    raise ValueError(f"{name} must be 3D/4D/5D. Got shape={getattr(arr, 'shape', None)}")
-
-
-def _resolve_track_image_column(df_sample_meta, track_image_col=None):
-    """Resolve which metadata column contains tracked-label image path."""
-    if track_image_col is not None:
-        if track_image_col not in df_sample_meta.columns:
-            raise ValueError(f"track_image_col '{track_image_col}' not found in metadata columns.")
-        return track_image_col
-
-    candidates = [
-        c for c in df_sample_meta.columns
-        if c.endswith("_tracks_image_path")
-    ]
-    candidates = [c for c in candidates if pd.notna(df_sample_meta.iloc[0][c])]
-    if len(candidates) == 0:
-        raise ValueError(
-            "Could not auto-detect track image column. "
-            "Pass track_image_col explicitly (e.g. 'tcell_tracks_image_path')."
-        )
-    if len(candidates) > 1:
-        raise ValueError(
-            f"Multiple track image path columns found: {candidates}. "
-            "Pass track_image_col explicitly."
-        )
-    return candidates[0]
-
-
-def open_cluster_backprojection_napari(
-    adata,
-    metadata,
-    outfolder=None,
-    sample_name=None,
-    cluster_col="ClusterID",
-    sample_col="sample_name",
-    trackid_col="TrackID",
-    time_col="position_t",
-    raw_image_col="raw_image_path",
-    track_image_col="tcell_tracks_image_path",
-    track_channel=0,
-    show_trackid_layer=True,
-    show_cluster_mapping_widget=True,
-    fill_missing_timepoints_per_track=True,
-):
-    """
-    Open napari with raw channels split into separate layers and ClusterID overlay labels.
-
-    Cluster labels are mapped per voxel using (sample_name, TrackID, position_t) from adata.obs.
-    """
-    try:
-        import napari
-    except ImportError as exc:
-        raise ImportError("napari is required for visualization. Install with `pip install napari`.") from exc
-
-    if isinstance(metadata, (str, Path)):
-        metadata = load_behav3d_metadata(metadata)
-    if not isinstance(metadata, pd.DataFrame):
-        raise TypeError("metadata must be a pandas DataFrame or path to metadata csv.")
-
-    if sample_col not in adata.obs.columns:
-        raise ValueError(f"adata.obs is missing required sample column '{sample_col}'.")
-    if cluster_col not in adata.obs.columns:
-        raise ValueError(f"adata.obs is missing required cluster column '{cluster_col}'.")
-    if trackid_col not in adata.obs.columns:
-        raise ValueError(f"adata.obs is missing required trackid column '{trackid_col}'.")
-    if time_col not in adata.obs.columns:
-        raise ValueError(f"adata.obs is missing required time column '{time_col}'.")
-
-    adata_samples = pd.Series(adata.obs[sample_col].astype(str).unique()).sort_values().tolist()
-    if sample_name is None:
-        if len(adata_samples) == 0:
-            raise ValueError("No sample_name values found in adata.obs.")
-        sample_name = adata_samples[0]
-        print(f"sample_name not provided. Using first sample: {sample_name}")
-    sample_name = str(sample_name)
-
-    if sample_name not in adata_samples:
-        raise ValueError(f"sample_name '{sample_name}' not found in adata.obs[{sample_col}].")
-
-    if "sample_name" not in metadata.columns:
-        raise ValueError("metadata must contain 'sample_name' column.")
-    df_sample_meta = metadata[metadata["sample_name"].astype(str) == sample_name]
-    if df_sample_meta.empty:
-        raise ValueError(f"sample_name '{sample_name}' not found in metadata.")
-    df_sample_meta = df_sample_meta.iloc[[0]].copy()
-
-    if raw_image_col not in df_sample_meta.columns:
-        raise ValueError(f"raw_image_col '{raw_image_col}' not found in metadata.")
-
-    track_image_col = _resolve_track_image_column(df_sample_meta, track_image_col=track_image_col)
-
-    raw_img_path = Path(df_sample_meta.iloc[0][raw_image_col])
-    track_img_path = Path(df_sample_meta.iloc[0][track_image_col])
-
-    raw = _to_tczyx(load_image(raw_img_path), name="raw image")
-    track = _to_tczyx(load_image(track_img_path), name="track image")
-
-    if track.shape[1] <= track_channel:
-        raise ValueError(
-            f"track_channel={track_channel} out of bounds for track image with {track.shape[1]} channels."
-        )
-
-    track_tzyx = track[:, track_channel, ...]
-
-    # relabel_img_from_adata currently expects numeric labels.
-    # If cluster labels are strings (e.g. "no_contact_1"), encode to ints for display.
-    overlay_obs_col = cluster_col
-    cluster_id_mapping = None
-    if not pd.api.types.is_numeric_dtype(adata.obs[cluster_col]):
-        overlay_obs_col = f"__{cluster_col}_napari_codes__"
-        adata = adata.copy()
-        cluster_values = adata.obs[cluster_col].astype(str)
-        categories = sorted(cluster_values.dropna().unique().tolist())
-        cluster_id_mapping = {cat: i + 1 for i, cat in enumerate(categories)}
-        adata.obs[overlay_obs_col] = cluster_values.map(cluster_id_mapping).astype(np.int64)
-
-    # Align adata time values to image frame index if needed.
-    adata = adata.copy()
-    sample_mask = adata.obs[sample_col].astype(str) == str(sample_name)
-    sample_times = pd.to_numeric(adata.obs.loc[sample_mask, time_col], errors="coerce").dropna().astype(int)
-    n_frames = int(track_tzyx.shape[0])
-    if len(sample_times) > 0:
-        unique_times = np.sort(sample_times.unique())
-        expected = np.arange(n_frames)
-        if not (len(unique_times) > 0 and np.array_equal(unique_times, expected)):
-            if np.array_equal(unique_times, np.arange(1, n_frames + 1)):
-                # Common case: timepoints are 1..T instead of 0..T-1
-                adata.obs.loc[sample_mask, time_col] = (
-                    pd.to_numeric(adata.obs.loc[sample_mask, time_col], errors="coerce") - 1
-                )
-                print("Adjusted time index from 1..T to 0..T-1 for backprojection.")
-            elif len(unique_times) <= n_frames:
-                # Robust fallback: map sorted unique time values to sequential frame indices.
-                tmap = {t: i for i, t in enumerate(unique_times)}
-                mapped = pd.to_numeric(adata.obs.loc[sample_mask, time_col], errors="coerce").map(tmap)
-                adata.obs.loc[sample_mask, time_col] = mapped
-                print(
-                    "Mapped non-sequential time values to frame indices for backprojection "
-                    f"(unique_timepoints={len(unique_times)}, n_frames={n_frames})."
-                )
-
-    # Quick diagnostics for TrackID overlap.
-    img_track_ids = np.unique(track_tzyx.astype(np.int64))
-    if hasattr(img_track_ids, "compute"):
-        img_track_ids = img_track_ids.compute()
-    img_track_ids = np.asarray(img_track_ids)
-    img_track_ids = set(img_track_ids[img_track_ids > 0].tolist())
-    obs_track_ids = pd.to_numeric(adata.obs.loc[sample_mask, trackid_col], errors="coerce").dropna().astype(int)
-    obs_track_ids = set(obs_track_ids.tolist())
-    overlap = len(img_track_ids.intersection(obs_track_ids))
-    if overlap == 0:
-        print(
-            "Warning: no TrackID overlap between image labels and adata obs for this sample. "
-            "Overlay will be empty."
-        )
-
-    # Build overlay via explicit (time, TrackID) mapping so we can optionally fill
-    # missing timepoints per track before rasterization.
-    df_overlay = adata.obs[[sample_col, trackid_col, time_col, overlay_obs_col]].copy()
-    df_overlay = df_overlay[df_overlay[sample_col].astype(str) == str(sample_name)].copy()
-    df_overlay[trackid_col] = pd.to_numeric(df_overlay[trackid_col], errors="coerce").astype("Int64")
-    df_overlay[time_col] = pd.to_numeric(df_overlay[time_col], errors="coerce").astype("Int64")
-    df_overlay[overlay_obs_col] = pd.to_numeric(df_overlay[overlay_obs_col], errors="coerce").astype("Int64")
-    df_overlay = df_overlay.dropna(subset=[trackid_col, time_col, overlay_obs_col]).copy()
-    df_overlay[trackid_col] = df_overlay[trackid_col].astype(np.int64)
-    df_overlay[time_col] = df_overlay[time_col].astype(np.int64)
-    df_overlay[overlay_obs_col] = df_overlay[overlay_obs_col].astype(np.int64)
-
-    if fill_missing_timepoints_per_track and len(df_overlay) > 0:
-        frames = np.arange(n_frames, dtype=np.int64)
-        filled_parts = []
-        for tid, g in df_overlay.groupby(trackid_col):
-            g = g[[time_col, overlay_obs_col]].drop_duplicates(subset=[time_col], keep="last").set_index(time_col).sort_index()
-            g = g.reindex(frames)
-            g[overlay_obs_col] = g[overlay_obs_col].ffill().bfill()
-            g = g.dropna(subset=[overlay_obs_col])
-            if len(g) == 0:
-                continue
-            g = g.reset_index().rename(columns={"index": time_col})
-            g[trackid_col] = int(tid)
-            filled_parts.append(g[[trackid_col, time_col, overlay_obs_col]])
-        if len(filled_parts) > 0:
-            df_overlay = pd.concat(filled_parts, ignore_index=True)
-
-    overlay_by_time = {}
-    for t, g in df_overlay.groupby(time_col, observed=False):
-        overlay_by_time[int(t)] = (
-            g[trackid_col].to_numpy(dtype=np.int64),
-            g[overlay_obs_col].to_numpy(dtype=np.int64),
-        )
-
-    labels_cluster = np.zeros(track_tzyx.shape, dtype=np.int32)
-    for t in range(n_frames):
-        labels_t = track_tzyx[t]
-        if hasattr(labels_t, "compute"):
-            labels_t = labels_t.compute()
-        labels_t = np.asarray(labels_t, dtype=np.int64)
-        max_label_t = int(labels_t.max()) if labels_t.size else 0
-        if max_label_t <= 0:
+        if feature not in df_capped.columns:
             continue
-        lut = np.zeros(max_label_t + 1, dtype=np.int32)
-        tids_vals = overlay_by_time.get(t, None)
-        if tids_vals is not None:
-            tids, vals = tids_vals
-            valid = (tids >= 0) & (tids <= max_label_t)
-            if np.any(valid):
-                lut[tids[valid]] = vals[valid].astype(np.int32)
-        labels_cluster[t] = lut[labels_t]
+        col = df_capped[feature]
+        if pd.api.types.is_bool_dtype(col):
+            if return_limits:
+                cap_limits[feature] = {"lower": None, "upper": None}
+            continue
+        series = pd.to_numeric(col, errors="coerce").dropna()
+        if len(series) == 0:
+            if return_limits:
+                cap_limits[feature] = {"lower": None, "upper": None}
+            continue
+        lower_limit = series.quantile(lower_quantile) if lower_quantile is not None else None
+        upper_limit = series.quantile(upper_quantile) if upper_quantile is not None else None
+        numeric_col = pd.to_numeric(df_capped[feature], errors="coerce")
+        df_capped[feature] = numeric_col.clip(lower=lower_limit, upper=upper_limit)
+        if return_limits:
+            cap_limits[feature] = {
+                "lower": None if lower_limit is None else float(lower_limit),
+                "upper": None if upper_limit is None else float(upper_limit),
+            }
 
-    scale_tzyx = None
-    if all(c in df_sample_meta.columns for c in ["pixel_distance_z", "pixel_distance_xy"]):
-        z = float(df_sample_meta.iloc[0]["pixel_distance_z"])
-        xy = float(df_sample_meta.iloc[0]["pixel_distance_xy"])
-        scale_tzyx = (1.0, z, xy, xy)
-
-    viewer = napari.Viewer(title=f"Cluster backprojection: {sample_name}")
-
-    for c in range(raw.shape[1]):
-        viewer.add_image(
-            raw[:, c, ...],
-            name=f"raw_ch{c}",
-            scale=scale_tzyx,
-            blending="additive",
-        )
-
-    if show_trackid_layer:
-        viewer.add_labels(
-            track_tzyx.astype(np.int32),
-            name="TrackID",
-            scale=scale_tzyx,
-            opacity=0.25,
-        )
-
-    viewer.add_labels(
-        labels_cluster.astype(np.int32),
-        name=f"{cluster_col}_overlay",
-        scale=scale_tzyx,
-        opacity=0.5,
-    )
-
-    if cluster_id_mapping is not None:
-        viewer.layers[f"{cluster_col}_overlay"].metadata["cluster_id_mapping"] = cluster_id_mapping
-        print(
-            f"Encoded non-numeric '{cluster_col}' for napari overlay. "
-            f"Mapping stored in layer metadata under 'cluster_id_mapping'."
-        )
-        if show_cluster_mapping_widget:
-            try:
-                from qtpy.QtWidgets import QWidget, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem
-
-                mapping_widget = QWidget()
-                layout = QVBoxLayout(mapping_widget)
-                layout.addWidget(QLabel(f"{cluster_col} mapping"))
-
-                table = QTableWidget(len(cluster_id_mapping), 2)
-                table.setHorizontalHeaderLabels(["Code", "Cluster Name"])
-                table.verticalHeader().setVisible(False)
-
-                for row, (name, code) in enumerate(sorted(cluster_id_mapping.items(), key=lambda x: x[1])):
-                    table.setItem(row, 0, QTableWidgetItem(str(code)))
-                    table.setItem(row, 1, QTableWidgetItem(str(name)))
-
-                table.resizeColumnsToContents()
-                layout.addWidget(table)
-                viewer.window.add_dock_widget(mapping_widget, area="right", name=f"{cluster_col} Mapping")
-            except Exception as exc:
-                print(f"Could not create napari mapping widget ({exc}).")
-
-    return viewer
-
-
-def _group_to_cluster_prefix(group_name: str) -> str:
-    """Convert internal group name to a compact ClusterID prefix."""
-    prefix = str(group_name)
-    prefix = prefix.replace("_pixels", "")
-    prefix = prefix.replace("_only", "")
-    prefix = prefix.replace("_and_", "_")
-    prefix = prefix.strip("_")
-    if prefix == "":
-        prefix = "group"
-    return prefix
-
-
-def _resolve_group_leiden_resolution(resolution, group_name):
-    """
-    Resolve Leiden resolution setting for one group.
-
-    Supported values for `resolution`:
-    - "auto"
-    - float/int
-    - dict[group_name_or_prefix -> float]
-    """
-    if isinstance(resolution, dict):
-        if group_name in resolution:
-            return resolution[group_name]
-        group_prefix = _group_to_cluster_prefix(group_name)
-        if group_prefix in resolution:
-            return resolution[group_prefix]
-        for k, v in resolution.items():
-            k = str(k)
-            if group_name.startswith(k) or group_prefix.startswith(k):
-                return v
-        raise ValueError(
-            f"Missing Leiden resolution for group '{group_name}'. "
-            f"Provided keys: {list(resolution.keys())}"
-        )
-    return resolution
+    if return_limits:
+        return df_capped, cap_limits
+    return df_capped
 
 
 def _prepare_state_classification_dataset(
@@ -1457,17 +146,17 @@ def _prepare_state_classification_dataset(
     features,
     binary_features_to_group,
     window_size=5,
-    descriptive_features=["mean", "median", "std", "net_displacement", "straightness", "mean_square_displacement"],
+    descriptive_features=("mean", "median", "std", "net_displacement", "straightness", "mean_square_displacement"),
     lower_quantile_cap=None,
     upper_quantile_cap=0.99,
     outfolder=None,
-    scale_features=True,
+    scale_features=False,
     incomplete_window_policy="drop",
-    prepared_dataset_cache_path=None,
     reuse_prepared_dataset=True,
     save_prepared_dataset=True,
+    prepared_dataset_cache_path=None,
 ):
-    """Shared preprocessing for state classification and full-dataset inference."""
+    """Create the windowed descriptive dataset used for clustering/classification."""
     groupby = ["sample_name", "TrackID"]
     non_feature_cols = [
         "sample_name",
@@ -1483,37 +172,27 @@ def _prepare_state_classification_dataset(
         prepared_dataset_cache_path = Path(outfolder) / "state_classification_prepared_windows.csv"
     elif prepared_dataset_cache_path is not None:
         prepared_dataset_cache_path = Path(prepared_dataset_cache_path)
-        if prepared_dataset_cache_path.suffix.lower() != ".csv":
-            prepared_dataset_cache_path = prepared_dataset_cache_path.with_suffix(".csv")
 
+    quantile_limits_cache_path = None
+    if prepared_dataset_cache_path is not None:
+        quantile_limits_cache_path = prepared_dataset_cache_path.with_name(
+            prepared_dataset_cache_path.stem + "_quantile_cap_limits.json"
+        )
+
+    quantile_cap_limits = {}
     loaded_from_cache = False
-    if (
-        reuse_prepared_dataset
-        and prepared_dataset_cache_path is not None
-        and prepared_dataset_cache_path.exists()
-    ):
+    if reuse_prepared_dataset and prepared_dataset_cache_path is not None and prepared_dataset_cache_path.exists():
         try:
             df_analysis = pd.read_csv(prepared_dataset_cache_path)
-            binary_cols_to_merge = [col for col in binary_features_to_group if col in df_analysis.columns]
-            descriptive_feature_cols = [
-                col for col in df_analysis.columns
-                if (col not in non_feature_cols)
-                and (not col.endswith("_signal_type"))
-            ]
-            binary_prefixes = tuple(f"{c}_" for c in binary_cols_to_merge)
-            kept_features = [
-                c for c in descriptive_feature_cols
-                if (c not in binary_cols_to_merge)
-                and (not c.startswith(binary_prefixes))
-            ]
-            df_windows_descriptive = df_analysis.copy()
+            if quantile_limits_cache_path is not None and quantile_limits_cache_path.exists():
+                with open(quantile_limits_cache_path, "r") as f:
+                    quantile_cap_limits = json.load(f)
             loaded_from_cache = True
             print(f"Loaded prepared window dataset from cache: {prepared_dataset_cache_path}")
         except Exception as exc:
             print(f"Could not load prepared dataset cache ({exc}); recomputing windows.")
 
     if not loaded_from_cache:
-        print("Creating descriptive track dataset...")
         df_windows_descriptive = create_descriptive_track_dataset(
             df_tracks=df_positions,
             columns_to_summarize=features,
@@ -1521,274 +200,1234 @@ def _prepare_state_classification_dataset(
             step_size=1,
             time_col="position_t",
             id_cols=groupby,
-            features_to_compute=descriptive_features,
+            features_to_compute=list(descriptive_features),
             only_nonbinary=True,
             incomplete_window_policy=incomplete_window_policy,
         )
 
         descriptive_feature_cols = [
             col for col in df_windows_descriptive.columns
-            if (col not in non_feature_cols)
-            and (not col.endswith("_signal_type"))
+            if (col not in non_feature_cols) and (not col.endswith("_signal_type"))
         ]
 
         binary_cols_to_merge = [col for col in binary_features_to_group if col in df_positions.columns]
         merge_cols = ["sample_name", "TrackID", "position_t"]
         df_binary = df_positions[merge_cols + binary_cols_to_merge].copy()
 
-        df_analysis = df_windows_descriptive.merge(
-            df_binary,
-            on=merge_cols,
-            how="left",
-            suffixes=("", "_orig"),
-        )
-        policy = str(incomplete_window_policy).lower()
-        if policy == "drop":
+        df_analysis = df_windows_descriptive.merge(df_binary, on=merge_cols, how="left", suffixes=("", "_orig"))
+        if str(incomplete_window_policy).lower() == "drop":
             df_analysis = df_analysis.dropna(subset=descriptive_feature_cols).copy()
-        elif policy in {"partial", "as_far_as_possible"}:
-            df_analysis = df_analysis.copy()
-        else:
-            raise ValueError(
-                "incomplete_window_policy must be one of: "
-                "'drop', 'partial' (alias: 'as_far_as_possible')."
-            )
 
-        # Drop descriptive feature columns that are entirely empty.
-        empty_descriptive_cols = [
-            c for c in descriptive_feature_cols
-            if c in df_analysis.columns and df_analysis[c].isna().all()
-        ]
+        empty_descriptive_cols = [c for c in descriptive_feature_cols if c in df_analysis.columns and df_analysis[c].isna().all()]
         if len(empty_descriptive_cols) > 0:
-            print(f"Dropping {len(empty_descriptive_cols)} empty descriptive columns.")
             df_analysis = df_analysis.drop(columns=empty_descriptive_cols, errors="ignore")
-            df_windows_descriptive = df_windows_descriptive.drop(columns=empty_descriptive_cols, errors="ignore")
             descriptive_feature_cols = [c for c in descriptive_feature_cols if c not in empty_descriptive_cols]
 
         binary_prefixes = tuple(f"{c}_" for c in binary_cols_to_merge)
         kept_features = [
             c for c in descriptive_feature_cols
-            if (c not in binary_cols_to_merge)
-            and (not c.startswith(binary_prefixes))
+            if (c not in binary_cols_to_merge) and (not c.startswith(binary_prefixes))
         ]
-        if len(kept_features) != len(descriptive_feature_cols):
-            removed = sorted(set(descriptive_feature_cols) - set(kept_features))
-            print(f"Excluded binary-derived grouping features from clustering feature set: {removed}")
 
-        if len(kept_features) > 0:
-            if lower_quantile_cap is not None or upper_quantile_cap is not None:
-                if outfolder is not None:
-                    outfolder = Path(outfolder)
-                    outfolder.mkdir(parents=True, exist_ok=True)
-                    capping_pdf_path = outfolder / "feature_distributions_quantile_capping_comparison.pdf"
-                    print("Plotting feature distributions before and after quantile capping...")
-                    with PdfPages(capping_pdf_path) as pdf:
-                        plot_feature_distributions_to_pdf(
-                            df=df_analysis,
-                            feature_cols=kept_features,
-                            pdf=pdf,
-                            title_prefix="Before Quantile Capping",
-                        )
-                        df_analysis = cap_values_to_quantile(
-                            df_analysis,
-                            kept_features,
-                            lower_quantile=lower_quantile_cap,
-                            upper_quantile=upper_quantile_cap,
-                        )
-                        plot_feature_distributions_to_pdf(
-                            df=df_analysis,
-                            feature_cols=kept_features,
-                            pdf=pdf,
-                            title_prefix="After Quantile Capping",
-                        )
-                    print(f"Saved quantile capping comparison to {capping_pdf_path}")
-                else:
-                    df_analysis = cap_values_to_quantile(
-                        df_analysis,
-                        kept_features,
-                        lower_quantile=lower_quantile_cap,
-                        upper_quantile=upper_quantile_cap,
-                    )
+        if len(kept_features) > 0 and (lower_quantile_cap is not None or upper_quantile_cap is not None):
+            df_analysis, quantile_cap_limits = cap_values_to_quantile(
+                df_analysis,
+                kept_features,
+                lower_quantile=lower_quantile_cap,
+                upper_quantile=upper_quantile_cap,
+                return_limits=True,
+            )
 
-        if (
-            save_prepared_dataset
-            and prepared_dataset_cache_path is not None
-        ):
-            try:
-                prepared_dataset_cache_path.parent.mkdir(parents=True, exist_ok=True)
-                df_analysis.to_csv(prepared_dataset_cache_path, index=False)
-                print(f"Saved prepared window dataset cache: {prepared_dataset_cache_path}")
-            except Exception as exc:
-                print(f"Warning: failed to save prepared dataset cache ({exc}).")
+        if save_prepared_dataset and prepared_dataset_cache_path is not None:
+            prepared_dataset_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            df_analysis.to_csv(prepared_dataset_cache_path, index=False)
+            if quantile_limits_cache_path is not None and len(quantile_cap_limits) > 0:
+                with open(quantile_limits_cache_path, "w") as f:
+                    json.dump(quantile_cap_limits, f, indent=2)
+    else:
+        binary_cols_to_merge = [col for col in binary_features_to_group if col in df_analysis.columns]
+        descriptive_feature_cols = [
+            col for col in df_analysis.columns
+            if (col not in non_feature_cols) and (not col.endswith("_signal_type"))
+        ]
+        binary_prefixes = tuple(f"{c}_" for c in binary_cols_to_merge)
+        kept_features = [
+            c for c in descriptive_feature_cols
+            if (c not in binary_cols_to_merge) and (not c.startswith(binary_prefixes))
+        ]
 
     scaler = None
     if scale_features and len(kept_features) > 0:
-        print("Scaling features globally...")
         scaler = StandardScaler().fit(df_analysis[kept_features])
         df_analysis[kept_features] = scaler.transform(df_analysis[kept_features])
 
     return {
-        "df_windows_descriptive": df_windows_descriptive,
+        "df_windows_descriptive": df_analysis.copy(),
         "df_analysis": df_analysis,
         "kept_features": kept_features,
         "non_feature_cols": non_feature_cols,
         "binary_cols_to_merge": binary_cols_to_merge,
         "scaler": scaler,
+        "quantile_cap_limits": quantile_cap_limits,
+        "lower_quantile_cap": lower_quantile_cap,
+        "upper_quantile_cap": upper_quantile_cap,
+        "quantile_limits_cache_path": None if quantile_limits_cache_path is None else str(quantile_limits_cache_path),
     }
 
 
-def _infer_full_dataset_from_group_models(
-    df_analysis,
-    group_reference_adatas,
-    binary_cols_to_merge,
+def cluster_group(
+    df_group,
+    feature_cols,
     non_feature_cols,
-    cluster_col="ClusterID",
+    n_neighbors=60,
+    resolution="auto",
+    pca_var_selection=0.95,
+    clustering_method="leiden",
+    random_state=123,
+    outfolder=None,
+    group_name="all_data",
+    save_diagnostics=True,
+    **kwargs,
 ):
-    """Infer per-timepoint cluster labels on full dataset using trained per-group references."""
-    if not isinstance(group_reference_adatas, dict) or len(group_reference_adatas) == 0:
-        raise ValueError("group_reference_adatas must be a non-empty dict of {group_name: adata_or_path}.")
+    """Cluster one dataframe group; Leiden is default and recommended."""
+    df_clean = df_group.dropna(subset=feature_cols).copy()
+    if len(df_clean) < 50:
+        return None
 
-    ref_models = {}
-    common_feature_order = None
-    for group_name, ref in group_reference_adatas.items():
-        if ref is None:
-            continue
-        ref_adata = sc.read_h5ad(ref) if isinstance(ref, (str, Path)) else ref
-        if ref_adata is None or ref_adata.n_obs == 0:
-            continue
-        if cluster_col not in ref_adata.obs.columns:
-            raise ValueError(f"Reference model '{group_name}' is missing '{cluster_col}' in obs.")
-        feature_order = list(ref_adata.var_names)
-        if common_feature_order is None:
-            common_feature_order = feature_order
-        elif feature_order != common_feature_order:
-            raise ValueError(
-                "All reference group models must share identical feature columns/order "
-                "to build one merged full AnnData."
+    adata = df_to_adata(df_clean, feature_cols, obs_cols=non_feature_cols)
+    adata = run_pca(
+        adata,
+        pca_var_selection=pca_var_selection,
+        ncomps=min(len(feature_cols), len(df_clean) - 1),
+        svd_solver="full",
+        random_state=random_state,
+    )
+
+    sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=random_state)
+    sc.tl.umap(adata, min_dist=0.1,random_state=random_state)
+        
+    method = str(clustering_method).lower()
+    if method == "leiden":
+        adata = run_leiden_clustering(
+            adata,
+            n_neighbors=n_neighbors,
+            resolution=resolution,
+            use_rep="X_pca",
+            metric="euclidean",
+            method="umap",
+            key_added="ClusterID",
+            random_state=random_state,
+        )
+        adata.obs["ClusterID"] = adata.obs["ClusterID"].astype("category")
+    elif method == "kmeans":
+        k = int(resolution) if isinstance(resolution, (int, float)) and float(resolution) >= 2 else 5
+        labels = KMeans(n_clusters=k, random_state=random_state, n_init="auto").fit_predict(adata.obsm["X_pca"])
+        adata.obs["ClusterID"] = pd.Categorical(pd.Series(labels.astype(str), index=adata.obs.index))
+    else:
+        raise ValueError("clustering_method must be one of: 'leiden', 'kmeans'.")
+
+    # Save clustering diagnostics immediately after this clustering run (old-style flow).
+    if save_diagnostics and outfolder is not None:
+        prefix = f"state_classification".replace(" ", "_")
+        diagnostics_pdf = Path(outfolder) / f"{prefix}_diagnostics.pdf"
+        plot_clustering_diagnostics_pdf(
+            adata=adata,
+            cluster_col="ClusterID",
+            feature_cols=feature_cols,
+            pdf_path=diagnostics_pdf,
+            title=f"{group_name} | {clustering_method} (resolution={resolution})",
+        )
+    return adata
+
+
+def build_cluster_feature_correlation(feature_df, labels):
+    """Build cluster-vs-cluster correlation matrix from mean feature profiles."""
+    tmp = feature_df.copy()
+    tmp["_cluster_tmp"] = pd.Categorical(np.asarray(labels).astype(str))
+    centroids = tmp.groupby("_cluster_tmp", observed=False).mean(numeric_only=True)
+    if centroids.shape[0] < 2:
+        return None
+    return centroids.T.corr()
+
+
+def _save_pdf_page_a4(pdf, fig, orientation="portrait"):
+    fig.set_size_inches(*(A4_PORTRAIT if orientation == "portrait" else A4_LANDSCAPE), forward=True)
+    pdf.savefig(fig, bbox_inches="tight")
+
+
+def plot_clustering_diagnostics_pdf(
+    adata,
+    cluster_col,
+    feature_cols,
+    pdf_path,
+    title="Clustering diagnostics",
+):
+    """
+    Old-style diagnostics:
+    1) Scanpy UMAP + cluster correlation matrix
+    2) Separate Scanpy heatmap page
+    """
+    if adata is None or adata.n_obs == 0:
+        return
+    if cluster_col not in adata.obs.columns:
+        return
+
+    ad = adata.copy()
+    ad = _ensure_umap(ad, n_neighbors=30, random_state=123)
+
+    pdf_path = Path(pdf_path)
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with PdfPages(pdf_path) as pdf:
+        fig, (ax_umap, ax_corr) = plt.subplots(
+            1, 2, figsize=A4_LANDSCAPE, gridspec_kw={"width_ratios": [1.25, 0.75]}
+        )
+        sc.pl.umap(
+            ad,
+            color=cluster_col,
+            ax=ax_umap,
+            show=False,
+            title="UMAP",
+            legend_loc="on data",
+            legend_fontsize=7,
+        )
+        ax_umap.set_aspect("equal", adjustable="box")
+
+        # Correlation matrix on same page using explicit axis.  
+        sc.pl.correlation_matrix(
+            ad,
+            groupby=cluster_col,
+            show_correlation_numbers=True,
+            ax=ax_corr,
+            show=False,
+        )
+        ax_corr.set_title("Cluster correlations", fontsize=10)
+
+        fig.suptitle(f"{title} | UMAP + Correlation", fontsize=12, fontweight="bold", y=0.995)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        umap_bbox = ax_umap.get_position().frozen()
+
+        # Keep UMAP unchanged; only move/shrink correlation panel.
+        bbox = ax_corr.get_position()
+        extra_gap = 0.03
+        new_x = min(0.98 - bbox.width, bbox.x0 + extra_gap)
+        height_shrink = 0.5
+        new_h = bbox.height * height_shrink
+        ax_corr.set_position([new_x, bbox.y0 + (bbox.height - new_h) / 2, bbox.width, new_h])
+        ax_umap.set_position(umap_bbox)
+
+        _save_pdf_page_a4(pdf, fig, orientation="landscape")
+        plt.close(fig)
+
+        use_dendrogram = ad.obs[cluster_col].astype(str).nunique() > 1
+        if use_dendrogram:
+            try:
+                sc.tl.dendrogram(ad, groupby=cluster_col)
+            except Exception:
+                use_dendrogram = False
+
+        try:
+            sc.pl.heatmap(
+                ad,
+                var_names=list(feature_cols),
+                groupby=cluster_col,
+                standard_scale="var",
+                figsize=A4_LANDSCAPE,
+                swap_axes=True,
+                dendrogram=use_dendrogram,
+                show_gene_labels=True,
+                show=False,
             )
-        ref_models[group_name] = ref_adata
-
-    if len(ref_models) == 0:
-        raise ValueError("No usable reference group models provided.")
-
-    missing_features = [c for c in common_feature_order if c not in df_analysis.columns]
-    if missing_features:
-        raise ValueError(f"Full dataset is missing required model features: {missing_features[:10]}")
-
-    groups = create_binary_groups(df_analysis, binary_cols_to_merge)
-    df_out = df_analysis.copy()
-    df_out["ClusterID"] = "unassigned"
-    df_out["ClusterGroup"] = "unassigned"
-
-    for group_name, mask in groups.items():
-        if group_name not in ref_models:
-            continue
-        ref_adata = ref_models[group_name]
-        idx = df_out.index[mask]
-        if len(idx) == 0:
-            continue
-
-        df_group = df_out.loc[idx].copy()
-        feature_order = list(ref_adata.var_names)
-
-        scaler_meta = ref_adata.uns.get("preprocessing", {}).get("scaler", None)
-        if scaler_meta is not None:
-            means = np.asarray(scaler_meta["mean"], dtype=float)
-            scales = np.asarray(scaler_meta["scale"], dtype=float)
-            if len(means) != len(feature_order) or len(scales) != len(feature_order):
-                raise ValueError(f"Scaler metadata shape mismatch for group '{group_name}'.")
-            X = df_group[feature_order].to_numpy(dtype=float)
-            df_group.loc[:, feature_order] = (X - means) / scales
-
-        obs_cols = [c for c in non_feature_cols if c in df_group.columns] + [
-            c for c in binary_cols_to_merge if c in df_group.columns
-        ]
-        adata_query = df_to_adata(df_group, feature_order, obs_cols=obs_cols)
-        sc.tl.ingest(adata_query, ref_adata, obs=cluster_col, embedding_method="umap")
-
-        prefix = _group_to_cluster_prefix(group_name)
-        assigned = adata_query.obs[cluster_col].astype(str).map(lambda x: f"{prefix}_{x}")
-        df_out.loc[idx, "ClusterID"] = assigned.to_numpy()
-        df_out.loc[idx, "ClusterGroup"] = group_name
-
-    merged_obs_cols = [c for c in df_out.columns if c not in common_feature_order]
-    adata_full = df_to_adata(df_out, common_feature_order, obs_cols=merged_obs_cols)
-    adata_full.obs["ClusterID"] = adata_full.obs["ClusterID"].astype("category")
-    adata_full.obs["ClusterGroup"] = adata_full.obs["ClusterGroup"].astype("category")
-    return adata_full
+        except TypeError:
+            # Compatibility fallback for older scanpy signatures.
+            sc.pl.heatmap(
+                ad,
+                var_names=list(feature_cols),
+                groupby=cluster_col,
+                standard_scale="var",
+                figsize=A4_LANDSCAPE,
+                swap_axes=True,
+                show_gene_labels=True,
+                show=False,
+            )
+        fig_hm = plt.gcf()
+        fig_hm.suptitle(f"{title} | Heatmap", y=0.995)
+        _save_pdf_page_a4(pdf, fig_hm, orientation="landscape")
+        plt.close(fig_hm)
 
 
-def apply_trained_state_clustering_to_full_dataset(
-    df_positions,
-    group_reference_adatas,
-    features,
-    binary_features_to_group,
-    window_size=5,
-    descriptive_features=["mean", "median", "std", "net_displacement", "straightness", "mean_square_displacement"],
-    cluster_col="ClusterID",
-    incomplete_window_policy="drop",
-    prepared_dataset_cache_path=None,
-    reuse_prepared_dataset=True,
-    save_prepared_dataset=True,
+def _ensure_umap(adata, n_neighbors=30, random_state=123):
+    """Ensure AnnData has a UMAP embedding for plotting."""
+    if "X_umap" in adata.obsm:
+        return adata
+    if "X_pca" in adata.obsm:
+        sc.pp.neighbors(adata, n_neighbors=int(n_neighbors), use_rep="X_pca", random_state=int(random_state))
+    else:
+        sc.pp.neighbors(adata, n_neighbors=int(n_neighbors), random_state=int(random_state))
+    sc.tl.umap(adata, random_state=int(random_state))
+    return adata
+
+def check_model_clusterid_consistency(
+    model_adata,
+    adata_full,
+    model_cluster_col="ClusterID",
+    full_cluster_col="ClusterID",
+    key_cols=("sample_name", "TrackID", "position_t"),
+    max_examples=10,
 ):
     """
-    Apply trained per-group clustering models to the full (non-subsampled) dataset.
+    Check whether model rows keep the same cluster label after label transfer into full data.
 
-    Parameters
-    ----------
-    df_positions : pd.DataFrame
-        Full positions dataframe.
-    group_reference_adatas : dict
-        Mapping {group_name: AnnData or .h5ad path}. Each reference adata must contain
-        trained cluster labels in `cluster_col`.
-    features : list
-        Base columns to summarize in rolling windows (same as training).
-    binary_features_to_group : list
-        Binary columns used for grouping.
-    window_size : int
-        Rolling window size (must match training).
-    descriptive_features : list
-        Descriptive summary features (must match training).
-    cluster_col : str
-        Cluster label column in reference adatas.
-    incomplete_window_policy : str
-        How to handle timepoints without a full descriptive window:
-        - "drop": remove those timepoints
-        - "partial": keep and fill from neighboring valid rows per track
-
-    Returns
-    -------
-    adata_full : AnnData
-        Full dataset with inferred ClusterID per timepoint.
+    Matching priority:
+    1) key-based join on key_cols
+    2) obs_names intersection (fallback only if keys are unavailable)
     """
+    if model_cluster_col not in model_adata.obs.columns:
+        raise ValueError(f"Missing '{model_cluster_col}' in model_adata.obs.")
+    if full_cluster_col not in adata_full.obs.columns:
+        raise ValueError(f"Missing '{full_cluster_col}' in adata_full.obs.")
+
+    model_obs = model_adata.obs.copy()
+    full_obs = adata_full.obs.copy()
+    model_obs["_cluster_model"] = model_obs[model_cluster_col].astype(str)
+    full_obs["_cluster_full"] = full_obs[full_cluster_col].astype(str)
+
+    missing_model_keys = [c for c in key_cols if c not in model_obs.columns]
+    missing_full_keys = [c for c in key_cols if c not in full_obs.columns]
+    keys_available = len(missing_model_keys) == 0 and len(missing_full_keys) == 0
+    used_match_mode = "key_cols" if keys_available else "obs_names"
+
+    if keys_available:
+        keys = list(key_cols)
+        model_cmp = model_obs[keys + ["_cluster_model"]].copy()
+        full_cmp = full_obs[keys + ["_cluster_full"]].copy()
+        for c in keys:
+            model_cmp[c] = model_cmp[c].astype(str)
+            full_cmp[c] = full_cmp[c].astype(str)
+
+        model_dups = int(model_cmp.duplicated(subset=keys, keep=False).sum())
+        full_dups = int(full_cmp.duplicated(subset=keys, keep=False).sum())
+        if model_dups > 0 or full_dups > 0:
+            raise ValueError(
+                f"Cannot do one-to-one comparison: duplicate key rows found "
+                f"(model duplicates={model_dups}, full duplicates={full_dups}) for key_cols={keys}."
+            )
+
+        merged = model_cmp.merge(full_cmp, on=keys, how="left", validate="one_to_one")
+    else:
+        overlap = model_obs.index.intersection(full_obs.index)
+        if len(overlap) == 0:
+            raise ValueError(
+                "Cannot compare labels: no shared obs_names and key columns are missing for key-based matching. "
+                f"missing in model_adata: {missing_model_keys}; missing in adata_full: {missing_full_keys}"
+            )
+        merged = pd.DataFrame(
+            {
+                "_cluster_model": model_obs.loc[overlap, "_cluster_model"].to_numpy(),
+                "_cluster_full": full_obs.loc[overlap, "_cluster_full"].to_numpy(),
+            },
+            index=overlap,
+        ).reset_index(drop=False).rename(columns={"index": "_row_id"})
+
+    merged["_match"] = merged["_cluster_model"] == merged["_cluster_full"]
+    missing_in_full = int(merged["_cluster_full"].isna().sum())
+    n_total = int(len(merged))
+    n_match = int(merged["_match"].sum())
+    n_mismatch = int((~merged["_match"] & merged["_cluster_full"].notna()).sum())
+
+    summary = {
+        "match_mode": used_match_mode,
+        "n_model_rows_checked": n_total,
+        "n_matching_clusterid": n_match,
+        "n_mismatched_clusterid": n_mismatch,
+        "n_missing_rows_in_adata_full": missing_in_full,
+        "match_rate": float(n_match / n_total) if n_total > 0 else np.nan,
+    }
+
+    print(
+        "ClusterID consistency check "
+        f"(mode={summary['match_mode']}): "
+        f"checked={summary['n_model_rows_checked']}, "
+        f"matches={summary['n_matching_clusterid']}, "
+        f"mismatches={summary['n_mismatched_clusterid']}, "
+        f"missing_in_full={summary['n_missing_rows_in_adata_full']}"
+    )
+    if n_mismatch > 0:
+        cols = [c for c in merged.columns if c not in {"_match"}]
+        print("First mismatches:")
+        print(merged.loc[(~merged["_match"]) & merged["_cluster_full"].notna(), cols].head(max_examples))
+
+    return summary, merged
+
+
+def _to_numpy_2d(X):
+    """Convert dense/sparse matrix-like data to a 2D numpy array."""
+    if hasattr(X, "toarray"):
+        return X.toarray()
+    return np.asarray(X)
+
+
+def build_state_preprocessing_artifact(
+    *,
+    kept_features,
+    scaler,
+    lower_quantile_cap=None,
+    upper_quantile_cap=None,
+    quantile_cap_limits=None,
+):
+    """Build serializable preprocessing metadata for reproducible inference."""
+    artifact = {
+        "continuous_feature_cols": list(kept_features),
+        "zscore": None,
+        "quantile_capping": {
+            "lower_quantile": lower_quantile_cap,
+            "upper_quantile": upper_quantile_cap,
+            "feature_limits": dict(quantile_cap_limits or {}),
+        },
+    }
+    if scaler is not None:
+        artifact["zscore"] = {
+            "mean": np.asarray(scaler.mean_, dtype=float),
+            "scale": np.asarray(scaler.scale_, dtype=float),
+        }
+    return artifact
+
+
+def _apply_preprocessing_to_continuous_matrix(X, preprocessing_artifact, feature_cols):
+    """Apply saved quantile caps and z-normalization to a continuous feature frame."""
+    out = np.asarray(X, dtype=float).copy()
+    feature_cols = list(feature_cols)
+    qmeta = (preprocessing_artifact or {}).get("quantile_capping", {})
+    limits = qmeta.get("feature_limits", {}) if isinstance(qmeta, dict) else {}
+    if isinstance(limits, dict) and len(limits) > 0:
+        for i, feat in enumerate(feature_cols):
+            lim = limits.get(feat, None)
+            if lim is None:
+                continue
+            lower = lim.get("lower", None)
+            upper = lim.get("upper", None)
+            out[:, i] = np.clip(out[:, i], a_min=lower, a_max=upper)
+
+    zmeta = (preprocessing_artifact or {}).get("zscore", None)
+    if zmeta is not None:
+        mean = np.asarray(zmeta["mean"], dtype=float)
+        scale = np.asarray(zmeta["scale"], dtype=float)
+        if out.shape[1] != len(mean) or out.shape[1] != len(scale):
+            raise ValueError(
+                "Preprocessing zscore parameter size mismatch: "
+                f"n_features={out.shape[1]}, len(mean)={len(mean)}, len(scale)={len(scale)}"
+            )
+        out = (out - mean) / scale
+    return out
+
+
+def load_state_classifier_artifact(path):
+    """Load a saved state classification v2 classifier artifact pickle."""
+    with open(path, "rb") as f:
+        artifact = pickle.load(f)
+    if not isinstance(artifact, dict) or "classifier" not in artifact:
+        raise ValueError("Invalid classifier artifact: expected dict with key 'classifier'.")
+    return artifact
+
+
+def _require_columns(df, required_cols, context):
+    missing = [c for c in required_cols if c not in df.columns]
+    if len(missing) > 0:
+        raise ValueError(
+            f"Missing required columns for {context}: {missing}. "
+            f"Available columns include: {list(df.columns[:20])}"
+        )
+
+
+def apply_classifier(
+    df_positions,
+    classifier_artifact_or_path,
+    output_col="ClusterID_pred",
+    confidence_col="ClusterID_confidence",
+    outfolder=None,
+):
+    """
+    Apply a saved classifier artifact to raw position data.
+
+    This function:
+    1) loads saved windowing/preprocessing/classifier metadata
+    2) recreates the windowed descriptive dataset with the same parameters
+    3) applies saved preprocessing + classifier
+    4) returns predicted AnnData
+    """
+    artifact = (
+        load_state_classifier_artifact(classifier_artifact_or_path)
+        if isinstance(classifier_artifact_or_path, (str, Path))
+        else classifier_artifact_or_path
+    )
+    if not isinstance(artifact, dict) or "classifier" not in artifact:
+        raise ValueError("classifier_artifact_or_path must be a valid classifier artifact or path to one.")
+
+    windowing = artifact.get("windowing", None)
+    if not isinstance(windowing, dict):
+        raise ValueError(
+            "Classifier artifact is missing 'windowing' settings. "
+            "Re-train/save with updated run_state_classification to enable auto window reconstruction."
+        )
+
+    required_window_keys = [
+        "features",
+        "binary_features_to_group",
+        "window_size",
+        "descriptive_features",
+        "incomplete_window_policy",
+    ]
+    missing_window_keys = [k for k in required_window_keys if k not in windowing]
+    if len(missing_window_keys) > 0:
+        raise ValueError(f"Classifier artifact windowing settings are incomplete: missing {missing_window_keys}")
+
+    _require_columns(
+        df_positions,
+        ["sample_name", "TrackID", "position_t"] + list(windowing["features"]),
+        context="windowed dataset creation",
+    )
+
     prepared = _prepare_state_classification_dataset(
         df_positions=df_positions,
-        features=features,
-        binary_features_to_group=binary_features_to_group,
-        window_size=window_size,
-        descriptive_features=descriptive_features,
-        lower_quantile_cap=None,
-        upper_quantile_cap=None,
-        outfolder=None,
-        scale_features=True,
-        incomplete_window_policy=incomplete_window_policy,
-        prepared_dataset_cache_path=prepared_dataset_cache_path,
-        reuse_prepared_dataset=reuse_prepared_dataset,
-        save_prepared_dataset=save_prepared_dataset,
+        features=list(windowing["features"]),
+        binary_features_to_group=list(windowing["binary_features_to_group"]),
+        window_size=int(windowing["window_size"]),
+        descriptive_features=list(windowing["descriptive_features"]),
+        lower_quantile_cap=windowing.get("lower_quantile_cap", None),
+        upper_quantile_cap=windowing.get("upper_quantile_cap", None),
+        outfolder=outfolder,
+        scale_features=False,
+        incomplete_window_policy=str(windowing.get("incomplete_window_policy", "drop")),
+        reuse_prepared_dataset=False,
+        save_prepared_dataset=False,
     )
-    adata_full = _infer_full_dataset_from_group_models(
-        df_analysis=prepared["df_analysis"],
-        group_reference_adatas=group_reference_adatas,
-        binary_cols_to_merge=prepared["binary_cols_to_merge"],
-        non_feature_cols=prepared["non_feature_cols"],
-        cluster_col=cluster_col,
-    )
-    adata_full.uns["inference"] = {
+
+    df_analysis = prepared["df_analysis"]
+    non_feature_cols = prepared["non_feature_cols"]
+    binary_cols_to_merge = prepared["binary_cols_to_merge"]
+
+    if "continuous_feature_cols" in artifact:
+        # Full-label classifier artifact path.
+        cont_cols = list(artifact["continuous_feature_cols"])
+    else:
+        # Label-transfer classifier artifact path.
+        cont_cols = list(artifact.get("feature_cols", []))
+    if len(cont_cols) == 0:
+        raise ValueError("Classifier artifact has no stored feature columns ('continuous_feature_cols'/'feature_cols').")
+
+    missing_cont = [c for c in cont_cols if c not in df_analysis.columns]
+    if len(missing_cont) > 0:
+        raise ValueError(
+            "Prepared dataset is missing required classifier features: "
+            f"{missing_cont[:20]}"
+        )
+
+    obs_cols = [c for c in non_feature_cols if c in df_analysis.columns] + [
+        c for c in binary_cols_to_merge if c in df_analysis.columns
+    ]
+    adata_query = df_to_adata(df_analysis, cont_cols, obs_cols=obs_cols)
+
+    if "continuous_feature_cols" in artifact:
+        predict_clusterids_with_full_classifier(
+            adata=adata_query,
+            classifier_artifact=artifact,
+            output_col=output_col,
+            confidence_col=confidence_col,
+            inplace=True,
+        )
+    else:
+        predict_clusterids_with_classifier(
+            adata=adata_query,
+            classifier=artifact,
+            feature_cols=cont_cols,
+            output_col=output_col,
+            confidence_col=confidence_col,
+            inplace=True,
+        )
+
+    return adata_query
+
+
+def train_clusterid_classifier_from_model_adata(
+    model_adata,
+    cluster_col="ClusterID",
+    classifier_backend="random_forest",
+    classifier_kwargs=None,
+    random_state=123,
+):
+    """Train a supervised classifier on model_adata features -> cluster labels."""
+    if cluster_col not in model_adata.obs.columns:
+        raise ValueError(f"Missing '{cluster_col}' in model_adata.obs.")
+
+    feature_cols = list(model_adata.var_names)
+    X_train = _to_numpy_2d(model_adata[:, feature_cols].X)
+    y_train = model_adata.obs[cluster_col].astype(str).to_numpy()
+    if len(y_train) == 0:
+        raise ValueError("No rows in model_adata to train classifier.")
+
+    backend = str(classifier_backend).lower()
+    params = dict(classifier_kwargs) if classifier_kwargs is not None else {}
+
+    if backend in {"random_forest", "rf", "randomforest", "randomforestclassifier"}:
+        default_params = {
+            "n_estimators": 300,
+            "min_samples_leaf": 2,
+            "n_jobs": -1,
+            "random_state": int(random_state),
+        }
+        default_params.update(params)
+        clf = RandomForestClassifier(**default_params)
+        backend_name = "random_forest"
+    elif backend in {"logistic_regression", "logreg", "lr"}:
+        default_params = {
+            "max_iter": 1000,
+            "multi_class": "auto",
+            "random_state": int(random_state),
+        }
+        default_params.update(params)
+        clf = LogisticRegression(**default_params)
+        backend_name = "logistic_regression"
+    else:
+        raise ValueError(
+            "Unknown classifier_backend. Use one of: "
+            "'random_forest', 'logistic_regression'."
+        )
+
+    clf.fit(X_train, y_train)
+    train_acc = float((clf.predict(X_train) == y_train).mean())
+    fit_info = {
+        "backend": backend_name,
         "cluster_col": cluster_col,
-        "model_groups": sorted([k for k, v in group_reference_adatas.items() if v is not None]),
-        "window_size": int(window_size),
-        "descriptive_features": list(descriptive_features),
+        "n_train_rows": int(X_train.shape[0]),
+        "n_features": int(X_train.shape[1]),
+        "classes": [str(c) for c in getattr(clf, "classes_", [])],
+        "train_accuracy": train_acc,
+        "params": {k: repr(v) for k, v in clf.get_params().items()},
     }
-    return adata_full
+    print(
+        "Trained cluster classifier "
+        f"(backend={backend_name}, rows={fit_info['n_train_rows']}, "
+        f"features={fit_info['n_features']}, train_acc={train_acc:.4f})"
+    )
+    return clf, fit_info
+
+
+def predict_clusterids_with_classifier(
+    adata,
+    classifier,
+    feature_cols=None,
+    output_col="ClusterID",
+    confidence_col=None,
+    inplace=True,
+):
+    """Predict cluster labels for an AnnData object using a trained classifier or artifact."""
+    target = adata if inplace else adata.copy()
+    clf = classifier
+    preprocessing_artifact = None
+    if isinstance(classifier, dict) and "classifier" in classifier:
+        clf = classifier["classifier"]
+        preprocessing_artifact = classifier.get("preprocessing", None)
+
+    cols = list(target.var_names) if feature_cols is None else list(feature_cols)
+
+    missing = [c for c in cols if c not in target.var_names]
+    if len(missing) > 0:
+        raise ValueError(f"adata is missing classifier feature columns: {missing[:10]}")
+
+    X_query = _to_numpy_2d(target[:, cols].X)
+    if preprocessing_artifact is not None:
+        X_query = _apply_preprocessing_to_continuous_matrix(
+            X_query,
+            preprocessing_artifact=preprocessing_artifact,
+            feature_cols=cols,
+        )
+    pred = clf.predict(X_query)
+    target.obs[output_col] = pd.Categorical(pd.Series(pred, index=target.obs.index).astype(str))
+
+    if confidence_col is not None and hasattr(clf, "predict_proba"):
+        proba = clf.predict_proba(X_query)
+        target.obs[confidence_col] = pd.Series(proba.max(axis=1), index=target.obs.index, dtype=float)
+
+    return target
+
+
+def _mixed_label_sort_key(x):
+    s = str(x)
+    return (0, int(s)) if s.isdigit() else (1, s)
+
+
+def evaluate_classifier_predictions(
+    y_true,
+    y_pred,
+    outfolder=None,
+    filename_prefix="classifier_qc",
+    row_normalized_decimals=5,
+):
+    """Evaluate predicted labels and optionally save confusion/report artifacts."""
+    y_true = np.asarray(y_true).astype(str)
+    y_pred = np.asarray(y_pred).astype(str)
+    label_set = pd.Index(np.concatenate([y_true, y_pred])).unique().tolist()
+    labels = sorted([str(x) for x in label_set], key=_mixed_label_sort_key)
+
+    cm_counts = confusion_matrix(y_true, y_pred, labels=labels)
+    cm_true_norm = confusion_matrix(y_true, y_pred, labels=labels, normalize="true")
+    report_dict = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
+
+    summary = {
+        "n_rows": int(len(y_true)),
+        "n_classes": int(len(labels)),
+        "classes": [str(c) for c in labels],
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "artifacts": {},
+    }
+
+    if outfolder is not None:
+        outfolder = Path(outfolder)
+        outfolder.mkdir(parents=True, exist_ok=True)
+
+        cm_counts_df = pd.DataFrame(cm_counts, index=labels, columns=labels)
+        cm_norm_df = pd.DataFrame(cm_true_norm, index=labels, columns=labels)
+        report_df = pd.DataFrame(report_dict).T
+
+        cm_counts_csv = outfolder / f"{filename_prefix}_confusion_counts.csv"
+        cm_norm_csv = outfolder / f"{filename_prefix}_confusion_true_normalized.csv"
+        report_csv = outfolder / f"{filename_prefix}_classification_report.csv"
+        cm_pdf = outfolder / f"{filename_prefix}_confusion_matrices.pdf"
+
+        cm_counts_df.to_csv(cm_counts_csv)
+        cm_norm_df.to_csv(cm_norm_csv)
+        report_df.to_csv(report_csv)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
+
+        im0 = axes[0].imshow(cm_counts, cmap="Blues", aspect="auto")
+        axes[0].set_title("Confusion Matrix (Counts)")
+        axes[0].set_xlabel("Predicted label")
+        axes[0].set_ylabel("True label")
+        axes[0].set_xticks(np.arange(len(labels)))
+        axes[0].set_yticks(np.arange(len(labels)))
+        axes[0].set_xticklabels(labels, rotation=90)
+        axes[0].set_yticklabels(labels)
+        fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+        im1 = axes[1].imshow(cm_true_norm, cmap="Blues", aspect="auto", vmin=0.0, vmax=1.0)
+        axes[1].set_title("Confusion Matrix (Row-normalized)")
+        axes[1].set_xlabel("Predicted label")
+        axes[1].set_ylabel("True label")
+        axes[1].set_xticks(np.arange(len(labels)))
+        axes[1].set_yticks(np.arange(len(labels)))
+        axes[1].set_xticklabels(labels, rotation=90)
+        axes[1].set_yticklabels(labels)
+        fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+        if len(labels) <= 20:
+            for i in range(len(labels)):
+                for j in range(len(labels)):
+                    axes[0].text(j, i, str(int(cm_counts[i, j])), ha="center", va="center", fontsize=7, color="black")
+                    axes[1].text(
+                        j,
+                        i,
+                        f"{cm_true_norm[i, j]:.{int(row_normalized_decimals)}f}",
+                        ha="center",
+                        va="center",
+                        fontsize=7,
+                        color="black",
+                    )
+
+        fig.suptitle("Classifier QC", fontsize=12)
+        fig.savefig(cm_pdf, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+        summary["artifacts"] = {
+            "confusion_counts_csv": str(cm_counts_csv),
+            "confusion_true_normalized_csv": str(cm_norm_csv),
+            "classification_report_csv": str(report_csv),
+            "confusion_matrices_pdf": str(cm_pdf),
+        }
+
+    return summary
+
+
+def evaluate_clusterid_classifier_on_model_adata(
+    model_adata,
+    classifier,
+    cluster_col="ClusterID",
+    outfolder=None,
+    filename_prefix="state_classification_classifier_qc",
+    row_normalized_decimals=5,
+):
+    """Evaluate classifier quality on model_adata and optionally save QC outputs."""
+    if cluster_col not in model_adata.obs.columns:
+        raise ValueError(f"Missing '{cluster_col}' in model_adata.obs.")
+
+    feature_cols = list(model_adata.var_names)
+    X_eval = _to_numpy_2d(model_adata[:, feature_cols].X)
+    y_true = model_adata.obs[cluster_col].astype(str).to_numpy()
+    y_pred = np.asarray(classifier.predict(X_eval)).astype(str)
+
+    summary = evaluate_classifier_predictions(
+        y_true=y_true,
+        y_pred=y_pred,
+        outfolder=outfolder,
+        filename_prefix=filename_prefix,
+        row_normalized_decimals=row_normalized_decimals,
+    )
+
+    print(
+        "Classifier QC on model data: "
+        f"n={summary['n_rows']}, classes={summary['n_classes']}, "
+        f"accuracy={summary['accuracy']:.4f}, balanced_accuracy={summary['balanced_accuracy']:.4f}"
+    )
+
+    return summary
+
+
+def _resolve_binary_classifier_feature_cols(adata, binary_cols_to_merge):
+    """Resolve binary classifier features strictly from supplied binary columns."""
+    cols = []
+    for col in list(binary_cols_to_merge):
+        clean_col = _binary_col_to_group_name(col)
+        if clean_col in adata.obs.columns:
+            cols.append(clean_col)
+        elif col in adata.obs.columns:
+            cols.append(col)
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(cols))
+
+
+def _build_binary_feature_dataframe(
+    obs_df,
+    binary_feature_cols,
+    expected_expanded_cols=None,
+):
+    """Build numeric binary/group feature frame with one-hot encoding for categoricals."""
+    pieces = []
+    for col in list(binary_feature_cols):
+        if col not in obs_df.columns:
+            raise ValueError(f"Missing binary/group feature column in adata.obs: '{col}'")
+        s = obs_df[col]
+        if is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
+            piece = pd.DataFrame(
+                {col: pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float)},
+                index=obs_df.index,
+            )
+        else:
+            piece = pd.get_dummies(
+                s.astype("string").fillna("missing"),
+                prefix=str(col),
+                dtype=float,
+            )
+            piece.index = obs_df.index
+        pieces.append(piece)
+
+    if len(pieces) == 0:
+        out = pd.DataFrame(index=obs_df.index)
+    else:
+        out = pd.concat(pieces, axis=1)
+
+    if expected_expanded_cols is not None:
+        expected = list(expected_expanded_cols)
+        out = out.reindex(columns=expected, fill_value=0.0)
+    return out
+
+
+def _build_classifier_matrix_from_adata(
+    adata,
+    continuous_feature_cols,
+    binary_feature_cols,
+    binary_expanded_feature_cols=None,
+    return_binary_feature_names=False,
+):
+    """Build a numeric feature matrix from adata.X (continuous) and obs (binary)."""
+    cont_cols = list(continuous_feature_cols)
+    bin_cols = list(binary_feature_cols)
+
+    missing_cont = [c for c in cont_cols if c not in adata.var_names]
+    if len(missing_cont) > 0:
+        raise ValueError(f"Missing continuous feature columns in adata.var_names: {missing_cont[:10]}")
+
+    X_cont = _to_numpy_2d(adata[:, cont_cols].X).astype(float, copy=False)
+    if len(bin_cols) == 0:
+        if return_binary_feature_names:
+            return X_cont, []
+        return X_cont
+
+    bin_df = _build_binary_feature_dataframe(
+        obs_df=adata.obs,
+        binary_feature_cols=bin_cols,
+        expected_expanded_cols=binary_expanded_feature_cols,
+    )
+    X_bin = bin_df.to_numpy(dtype=float)
+    X = np.hstack([X_cont, X_bin])
+    if return_binary_feature_names:
+        return X, list(bin_df.columns)
+    return X
+
+
+def train_full_clusterid_classifier_from_adata(
+    adata,
+    target_col="ClusterID",
+    binary_feature_cols=None,
+    preprocessing_artifact=None,
+    classifier_kwargs=None,
+    random_state=123,
+):
+    """
+    Train final random-forest classifier using continuous + binary features.
+
+    Returns classifier artifact and fit metadata.
+    """
+    if target_col not in adata.obs.columns:
+        raise ValueError(f"Missing target column '{target_col}' in adata.obs.")
+
+    continuous_feature_cols = list(adata.var_names)
+    binary_cols = [] if binary_feature_cols is None else list(binary_feature_cols)
+    X_train, expanded_binary_cols = _build_classifier_matrix_from_adata(
+        adata=adata,
+        continuous_feature_cols=continuous_feature_cols,
+        binary_feature_cols=binary_cols,
+        return_binary_feature_names=True,
+    )
+    y_train = adata.obs[target_col].astype(str).to_numpy()
+    if len(y_train) == 0:
+        raise ValueError("No rows available to train full ClusterID classifier.")
+
+    params = {
+        "n_estimators": 500,
+        "min_samples_leaf": 2,
+        "n_jobs": -1,
+        "random_state": int(random_state),
+    }
+    if classifier_kwargs is not None:
+        params.update(dict(classifier_kwargs))
+
+    clf = RandomForestClassifier(**params)
+    clf.fit(X_train, y_train)
+    y_pred_train = clf.predict(X_train)
+    train_acc = float((y_pred_train == y_train).mean())
+
+    artifact = {
+        "classifier": clf,
+        "continuous_feature_cols": list(continuous_feature_cols),
+        "binary_feature_cols": list(binary_cols),
+        "binary_expanded_feature_cols": list(expanded_binary_cols),
+        "target_col": str(target_col),
+        "preprocessing": preprocessing_artifact,
+    }
+    fit_info = {
+        "backend": "random_forest",
+        "target_col": str(target_col),
+        "continuous_feature_cols": list(continuous_feature_cols),
+        "binary_feature_cols": list(binary_cols),
+        "n_train_rows": int(X_train.shape[0]),
+        "n_features_total": int(X_train.shape[1]),
+        "n_features_continuous": int(len(continuous_feature_cols)),
+        "n_features_binary": int(len(binary_cols)),
+        "n_features_binary_expanded": int(len(expanded_binary_cols)),
+        "classes": [str(c) for c in getattr(clf, "classes_", [])],
+        "train_accuracy": train_acc,
+        "params": {k: repr(v) for k, v in clf.get_params().items()},
+    }
+    print(
+        "Trained full ClusterID classifier "
+        f"(rows={fit_info['n_train_rows']}, total_features={fit_info['n_features_total']}, "
+        f"train_acc={train_acc:.4f})"
+    )
+    return artifact, fit_info
+
+
+def predict_clusterids_with_full_classifier(
+    adata,
+    classifier_artifact,
+    output_col="ClusterID_pred",
+    confidence_col=None,
+    inplace=True,
+):
+    """Apply a trained full ClusterID classifier artifact to an AnnData object."""
+    target = adata if inplace else adata.copy()
+    clf = classifier_artifact["classifier"]
+    cont_cols = classifier_artifact["continuous_feature_cols"]
+    bin_cols = classifier_artifact.get("binary_feature_cols", [])
+    bin_expanded_cols = classifier_artifact.get("binary_expanded_feature_cols", None)
+    preprocessing_artifact = classifier_artifact.get("preprocessing", None)
+
+    # Ensure continuous features use identical capping/z-normalization as training.
+    X_cont = _to_numpy_2d(target[:, cont_cols].X).astype(float, copy=False)
+    if preprocessing_artifact is not None:
+        X_cont = _apply_preprocessing_to_continuous_matrix(
+            X_cont,
+            preprocessing_artifact=preprocessing_artifact,
+            feature_cols=cont_cols,
+        )
+
+    if len(bin_cols) == 0:
+        X_query = X_cont
+    else:
+        bin_df = _build_binary_feature_dataframe(
+            obs_df=target.obs,
+            binary_feature_cols=bin_cols,
+            expected_expanded_cols=bin_expanded_cols,
+        )
+        X_query = np.hstack([X_cont, bin_df.to_numpy(dtype=float)])
+    pred = np.asarray(clf.predict(X_query)).astype(str)
+    target.obs[output_col] = pd.Categorical(pd.Series(pred, index=target.obs.index).astype(str))
+
+    if confidence_col is not None and hasattr(clf, "predict_proba"):
+        proba = clf.predict_proba(X_query)
+        target.obs[confidence_col] = pd.Series(proba.max(axis=1), index=target.obs.index, dtype=float)
+
+    return target
+
+
+def plot_binary_group_behavioral_cluster_grid(
+    adata,
+    binary_group_col="binary_group",
+    behavioral_cluster_col="behavioral_clusterid",
+    ncols=1,
+    figsize_per_plot=(10.0, 1.8),
+    csv_path=None,
+    pdf_path=None,
+    return_csv=True,
+):
+    """
+    Plot one horizontal stacked bar per binary group, showing proportions of behavioral clusters.
+    """
+    obs = adata.obs.copy()
+    if binary_group_col not in obs.columns:
+        raise ValueError(f"Missing '{binary_group_col}' in adata.obs.")
+    if behavioral_cluster_col not in obs.columns:
+        raise ValueError(f"Missing '{behavioral_cluster_col}' in adata.obs.")
+
+    plot_df = obs[[binary_group_col, behavioral_cluster_col]].copy()
+    plot_df[binary_group_col] = plot_df[binary_group_col].astype("string").fillna("unassigned")
+    plot_df[behavioral_cluster_col] = plot_df[behavioral_cluster_col].astype("string").fillna("unassigned")
+
+    # Keep all behavioral clusters present in the dataset (even if concentrated in
+    # one binary group), so no cluster silently disappears in the grid.
+    cluster_counts = plot_df[behavioral_cluster_col].value_counts(dropna=False)
+    all_clusters = cluster_counts.index.tolist()
+
+    ctab = pd.crosstab(
+        plot_df[binary_group_col],
+        plot_df[behavioral_cluster_col],
+        normalize="index",
+        dropna=False,
+    ).reindex(columns=all_clusters, fill_value=0.0)
+
+    def _sort_key(x):
+        s = str(x)
+        return (0, int(s)) if s.isdigit() else (1, s)
+
+    group_names = sorted(ctab.index.tolist(), key=_sort_key)
+    cluster_names = sorted(ctab.columns.tolist(), key=_sort_key)
+
+    n_groups = len(group_names)
+    if n_groups == 0:
+        raise ValueError("No groups available for plotting.")
+
+    nrows = int(np.ceil(n_groups / ncols))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(figsize_per_plot[0] * ncols, figsize_per_plot[1] * nrows),
+        squeeze=False,
+    )
+    axes = axes.flatten()
+
+    # Build a larger distinct palette by combining qualitative colormaps.
+    palette = []
+    for cmap_name in ("tab20", "tab20b", "tab20c"):
+        cmap = plt.get_cmap(cmap_name)
+        palette.extend([cmap(i) for i in range(cmap.N)])
+    if len(cluster_names) > len(palette):
+        cmap = plt.get_cmap("hsv")
+        palette.extend([cmap(i / max(len(cluster_names), 1)) for i in range(len(cluster_names) - len(palette))])
+    colors = {cl: palette[i] for i, cl in enumerate(cluster_names)}
+
+    for i, grp in enumerate(group_names):
+        ax = axes[i]
+        left = 0.0
+        for cl in cluster_names:
+            val = float(ctab.loc[grp, cl])
+            if val <= 0:
+                continue
+            ax.barh([0], [val], left=left, color=colors[cl], height=0.92, edgecolor="none", linewidth=0.0)
+            left += val
+        ax.set_xlim(0, 1)
+        ax.set_ylim(-0.7, 0.7)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.grid(False)
+        ax.text(
+            -0.01,
+            0.5,
+            str(grp),
+            transform=ax.transAxes,
+            ha="right",
+            va="center",
+            fontsize=10,
+        )
+        grp_n = int((plot_df[binary_group_col] == grp).sum())
+        ax.set_title(f"n={grp_n}", fontsize=9, loc="right")
+
+    for j in range(n_groups, len(axes)):
+        axes[j].axis("off")
+
+    handles = [
+        plt.Line2D([0], [0], marker="s", linestyle="none", color=colors[cl], label=str(cl), markersize=7)
+        for cl in cluster_names
+    ]
+    fig.legend(
+        handles=handles,
+        labels=[str(c) for c in cluster_names],
+        title="behavioral_clusterid",
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        borderaxespad=0.0,
+    )
+    fig.suptitle("Behavioral Cluster Composition per Binary Group", fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0, 0, 0.82, 0.97])
+
+    # Diagnostic print to quickly verify cluster presence in plotting table.
+    if "5" in ctab.columns:
+        by_group = (ctab["5"] * 100.0).round(3)
+        print(f"Cluster 5 total n={int(cluster_counts.get('5', 0))}; per-group proportions (%):")
+        print(by_group[by_group > 0].sort_values(ascending=False))
+
+    if csv_path is None and pdf_path is not None:
+        csv_path = Path(pdf_path).with_suffix(".csv")
+    if csv_path is not None:
+        ctab.to_csv(csv_path)
+    if pdf_path is not None:
+        fig.savefig(pdf_path, dpi=300, bbox_inches="tight")
+
+    if return_csv:
+        return fig, ctab
+    return fig
+
+
+def plot_behavioral_cluster_binary_group_grid(
+    adata,
+    binary_group_col="binary_group",
+    behavioral_cluster_col="behavioral_clusterid",
+    ncols=1,
+    figsize_per_plot=(10.0, 1.8),
+    csv_path=None,
+    pdf_path=None,
+    return_csv=True,
+):
+    """
+    Plot one horizontal stacked bar per behavioral cluster, showing proportions of binary groups.
+    """
+    obs = adata.obs.copy()
+    if binary_group_col not in obs.columns:
+        raise ValueError(f"Missing '{binary_group_col}' in adata.obs.")
+    if behavioral_cluster_col not in obs.columns:
+        raise ValueError(f"Missing '{behavioral_cluster_col}' in adata.obs.")
+
+    plot_df = obs[[binary_group_col, behavioral_cluster_col]].copy()
+    plot_df[binary_group_col] = plot_df[binary_group_col].astype("string").fillna("unassigned")
+    plot_df[behavioral_cluster_col] = plot_df[behavioral_cluster_col].astype("string").fillna("unassigned")
+
+    # Keep all binary groups present in the dataset so no group disappears.
+    group_counts = plot_df[binary_group_col].value_counts(dropna=False)
+    all_groups = group_counts.index.tolist()
+
+    ctab = pd.crosstab(
+        plot_df[behavioral_cluster_col],
+        plot_df[binary_group_col],
+        normalize="index",
+        dropna=False,
+    ).reindex(columns=all_groups, fill_value=0.0)
+
+    def _sort_key(x):
+        s = str(x)
+        return (0, int(s)) if s.isdigit() else (1, s)
+
+    cluster_names = sorted(ctab.index.tolist(), key=_sort_key)
+    group_names = sorted(ctab.columns.tolist(), key=_sort_key)
+
+    n_clusters = len(cluster_names)
+    if n_clusters == 0:
+        raise ValueError("No behavioral clusters available for plotting.")
+
+    nrows = int(np.ceil(n_clusters / ncols))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(figsize_per_plot[0] * ncols, figsize_per_plot[1] * nrows),
+        squeeze=False,
+    )
+    axes = axes.flatten()
+
+    palette = []
+    for cmap_name in ("tab20", "tab20b", "tab20c"):
+        cmap = plt.get_cmap(cmap_name)
+        palette.extend([cmap(i) for i in range(cmap.N)])
+    if len(group_names) > len(palette):
+        cmap = plt.get_cmap("hsv")
+        palette.extend([cmap(i / max(len(group_names), 1)) for i in range(len(group_names) - len(palette))])
+    colors = {grp: palette[i] for i, grp in enumerate(group_names)}
+
+    for i, cl in enumerate(cluster_names):
+        ax = axes[i]
+        left = 0.0
+        for grp in group_names:
+            val = float(ctab.loc[cl, grp])
+            if val <= 0:
+                continue
+            ax.barh([0], [val], left=left, color=colors[grp], height=0.92, edgecolor="none", linewidth=0.0)
+            left += val
+        ax.set_xlim(0, 1)
+        ax.set_ylim(-0.7, 0.7)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.grid(False)
+        ax.text(
+            -0.01,
+            0.5,
+            str(cl),
+            transform=ax.transAxes,
+            ha="right",
+            va="center",
+            fontsize=10,
+        )
+        cl_n = int((plot_df[behavioral_cluster_col] == cl).sum())
+        ax.set_title(f"n={cl_n}", fontsize=9, loc="right")
+
+    for j in range(n_clusters, len(axes)):
+        axes[j].axis("off")
+
+    handles = [
+        plt.Line2D([0], [0], marker="s", linestyle="none", color=colors[grp], label=str(grp), markersize=7)
+        for grp in group_names
+    ]
+    fig.legend(
+        handles=handles,
+        labels=[str(g) for g in group_names],
+        title="binary_group",
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        borderaxespad=0.0,
+    )
+    fig.suptitle("Binary Group Composition per Behavioral Cluster", fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0, 0, 0.82, 0.97])
+
+    if csv_path is None and pdf_path is not None:
+        csv_path = Path(pdf_path).with_suffix(".csv")
+    if csv_path is not None:
+        ctab.to_csv(csv_path)
+    if pdf_path is not None:
+        fig.savefig(pdf_path, dpi=300, bbox_inches="tight")
+
+    if return_csv:
+        return fig, ctab
+    return fig
 
 
 def run_state_classification(
@@ -1796,14 +1435,13 @@ def run_state_classification(
     features,
     binary_features_to_group,
     window_size=5,
-    chosen_intervals=10,
     max_samples=None,
     min_spacing=None,
-    n_neighbors=15,
+    n_neighbors=60,
     resolution="auto",
-    descriptive_features=["mean", "median", "std", "net_displacement", "straightness", "mean_square_displacement"],
+    descriptive_features=("mean", "median", "std", "net_displacement", "straightness", "mean_square_displacement"),
     pca_var_selection=0.95,
-    clustering_method="kmeans",
+    clustering_method="leiden",
     resolutions=(0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5),
     leiden_seed_tries=10,
     leiden_subsample_tries=10,
@@ -1812,300 +1450,332 @@ def run_state_classification(
     incomplete_window_policy="drop",
     outfolder=None,
     random_state=123,
-    prepared_dataset_cache_path=None,
     reuse_prepared_dataset=True,
     save_prepared_dataset=True,
+    label_transfer_method="classifier",
+    classifier_backend="random_forest",
+    classifier_kwargs=None,
+    classifier_confidence_col="ClusterID_confidence",
+    save_label_classifier=True,
+    train_full_label_classifier=True,
+    full_classifier_kwargs=None,
+    full_classifier_confidence_col="ClusterID_full_classifier_confidence",
+    save_full_label_classifier=True,
+    return_artifacts=False,
 ):
     """
-    Main function to run state classification grouped by binary features.
-    
-    Parameters
-    ----------
-    df_positions : pd.DataFrame
-        Input dataframe with track positions and features
-    features : list
-        List of all feature column names
-    binary_features_to_group : list
-        List of binary feature names to use for grouping
-    window_size : int
-        Window size for rolling features
-    chosen_intervals : int
-        Interval for subsampling timepoints (deprecated, kept for compatibility)
-    max_samples : int, optional
-        Maximum total samples per group after temporal-spacing subsampling.
-        If None, no global cap is applied.
-    min_spacing : int, optional
-        Minimum temporal spacing between samples from the same track.
-        If None, will be automatically estimated based on group size.
-    n_neighbors : int
-        Number of neighbors for Leiden clustering
-    resolution : str | float | dict
-        Leiden resolution mode:
-        - "auto": use stability auto-tuning across `resolutions`
-        - float/int: fixed resolution for all groups
-        - dict: per-group fixed resolution (keys can be full group names or prefixes)
-    pca_var_selection : float
-        Variance threshold for PCA
-    clustering_method : str
-        Method to use: "kmeans" or "leiden"
-    resolutions : tuple
-        Resolutions to test if using Leiden
-    leiden_seed_tries : int
-        Number of random-seed repeats for Leiden stability scan.
-    leiden_subsample_tries : int
-        Number of subsample repeats for Leiden stability scan.
-    lower_quantile_cap : float, optional
-        Lower quantile to cap features at (default None).
-    upper_quantile_cap : float, optional
-        Upper quantile to cap features at (default 0.99).
-    incomplete_window_policy : str
-        How to handle timepoints without a full descriptive window:
-        - "drop": remove those timepoints
-        - "partial": keep and fill from neighboring valid rows per track
-    outfolder : Path or str
-        Output folder for saving results
-    random_state : int
-        Random seed
-    Returns
-    -------
-    adata_merged : AnnData
-        Merged full AnnData with prefixed ClusterID labels across binary groups.
+    State classification:
+    - cluster all continuous descriptive data jointly (single global model)
+    - annotate binary contact info and combined ClusterID afterwards
+    - transfer model labels to full dataset via `ingest` or a supervised classifier
+    - optionally train final RF on continuous + binary features to predict final labels
     """
-    
     prepared = _prepare_state_classification_dataset(
         df_positions=df_positions,
         features=features,
         binary_features_to_group=binary_features_to_group,
         window_size=window_size,
-        descriptive_features=descriptive_features,
+        descriptive_features=list(descriptive_features),
         lower_quantile_cap=lower_quantile_cap,
         upper_quantile_cap=upper_quantile_cap,
         outfolder=outfolder,
-        scale_features=True,
+        scale_features=False,
         incomplete_window_policy=incomplete_window_policy,
-        prepared_dataset_cache_path=prepared_dataset_cache_path,
         reuse_prepared_dataset=reuse_prepared_dataset,
         save_prepared_dataset=save_prepared_dataset,
     )
-    df_windows_descriptive = prepared["df_windows_descriptive"]
     df_analysis = prepared["df_analysis"]
     kept_features = prepared["kept_features"]
     non_feature_cols = prepared["non_feature_cols"]
     binary_cols_to_merge = prepared["binary_cols_to_merge"]
-    
-    print("Creating binary feature groups...")
-    groups = create_binary_groups(df_analysis, binary_cols_to_merge)
-    
-    print(f"Found {len(groups)} groups (before subsampling):")
-    for group_name, mask in groups.items():
-        print(f"  - {group_name}: {mask.sum()} samples")
-    
-    # Cluster each group with per-group subsampling
-    group_results = {}
-    for group_name, mask in groups.items():
-        print(f"\nProcessing group: {group_name}")
+    quantile_cap_limits = prepared.get("quantile_cap_limits", {})
 
-        df_group_full = df_analysis[mask].copy()
-        
-        if len(df_group_full) < 50:
-            print(f"  Skipping {group_name}: insufficient data ({len(df_group_full)} samples)")
-            group_results[group_name] = None
-            continue
-        
-        # Per-group temporal subsampling to reduce autocorrelation
-        # Only calculate estimated spacing if not provided by user
-        if min_spacing is None:
-            target_samples = max(500, len(df_group_full) // 20)  # At least 500 or 5% of data
-            spacing_to_use = max(1, len(df_group_full) // target_samples // 10)  # Rough estimate
-        else:
-            spacing_to_use = min_spacing
-        
-        print(f"  Subsampling with temporal spacing (min_spacing={spacing_to_use})...")
-        df_group = subsample_with_temporal_spacing(
-            df_group_full,
-            id_cols=["sample_name", "TrackID"],
-            time_col="position_t",
-            min_spacing=spacing_to_use,
-            max_samples=max_samples,
-            random_state=random_state
-        )
-        
-        print(f"  After subsampling: {len(df_group)} samples")
-        
-        if len(df_group) < 50:
-            print(f"  Skipping {group_name}: insufficient data after subsampling ({len(df_group)} samples)")
-            group_results[group_name] = None
-            continue
-        
-        # Fit preprocessing on the subset used for clustering, then apply
-        # that learned transform to define the per-group cluster model.
-        scaler_group = None
-        df_group_train = df_group.copy()
-        if len(kept_features) > 0:
-            scaler_group = StandardScaler().fit(df_group_train[kept_features])
-            df_group_train[kept_features] = scaler_group.transform(df_group_train[kept_features])
-        
-        adata = cluster_group(
-            df_group=df_group_train,
-            feature_cols=kept_features,
-            non_feature_cols=non_feature_cols,
-            n_neighbors=n_neighbors,
-            resolution=_resolve_group_leiden_resolution(resolution, group_name),
-            pca_var_selection=pca_var_selection,
-            clustering_method=clustering_method,
-            resolutions=resolutions,
-            leiden_seed_tries=leiden_seed_tries,
-            leiden_subsample_tries=leiden_subsample_tries,
-            outfolder=Path(outfolder) if outfolder else None,
-            group_name=group_name,
-            random_state=random_state
-        )
-        
-        group_results[group_name] = adata
-        
-        if adata is not None:
-            if "preprocessing" not in adata.uns:
-                adata.uns["preprocessing"] = {}
-            adata.uns["preprocessing"]["kept_features"] = list(kept_features)
-            if scaler_group is not None:
-                adata.uns["preprocessing"]["scaler"] = {
-                    "mean": scaler_group.mean_.astype(float),
-                    "scale": scaler_group.scale_.astype(float),
-                }
+    scaler = None
+    df_scaled = df_analysis.copy()
+    if len(kept_features) > 0:
+        scaler = StandardScaler().fit(df_scaled[kept_features])
+        df_scaled[kept_features] = scaler.transform(df_scaled[kept_features])
 
-            n_clusters = len(adata.obs["ClusterID"].unique())
-            print(f"  Found {n_clusters} clusters")
-    
-    # Plot results
-    print("\nPlotting UMAP grid...")
-    fig = plot_group_umaps(group_results, ncols=3)
-    
-    trained_models = {k: v for k, v in group_results.items() if v is not None}
-    if len(trained_models) > 0:
-        adata_merged = _infer_full_dataset_from_group_models(
-            df_analysis=df_analysis,
-            group_reference_adatas=trained_models,
-            binary_cols_to_merge=binary_cols_to_merge,
-            non_feature_cols=non_feature_cols,
-            cluster_col="ClusterID",
-        )
-        adata_merged.uns["inference"] = {
-            "cluster_col": "ClusterID",
-            "model_groups": sorted(list(trained_models.keys())),
-            "window_size": int(window_size),
-            "descriptive_features": list(descriptive_features),
-        }
-        print(f"Inferred full dataset labels: n_obs={adata_merged.n_obs}, n_vars={adata_merged.n_vars}")
+    preprocessing_artifact = build_state_preprocessing_artifact(
+        kept_features=kept_features,
+        scaler=scaler,
+        lower_quantile_cap=prepared.get("lower_quantile_cap", lower_quantile_cap),
+        upper_quantile_cap=prepared.get("upper_quantile_cap", upper_quantile_cap),
+        quantile_cap_limits=quantile_cap_limits,
+    )
+    windowing_artifact = {
+        "features": list(features),
+        "binary_features_to_group": list(binary_features_to_group),
+        "window_size": int(window_size),
+        "descriptive_features": list(descriptive_features),
+        "incomplete_window_policy": str(incomplete_window_policy),
+        "lower_quantile_cap": prepared.get("lower_quantile_cap", lower_quantile_cap),
+        "upper_quantile_cap": prepared.get("upper_quantile_cap", upper_quantile_cap),
+    }
+
+
+    if len(df_scaled) < 50:
+        raise ValueError("Insufficient rows in full descriptive dataset for clustering.")
+
+    if min_spacing is None:
+        target_samples = max(500, len(df_scaled) // 20)
+        spacing_to_use = max(1, len(df_scaled) // target_samples // 10)
     else:
-        print("No groups produced cluster results; returning empty merged AnnData.")
-        empty_df = df_analysis.iloc[:0].copy()
-        if "ClusterID" not in empty_df.columns:
-            empty_df["ClusterID"] = pd.Series(dtype="object")
-        if "ClusterGroup" not in empty_df.columns:
-            empty_df["ClusterGroup"] = pd.Series(dtype="object")
-        merged_obs_cols = [c for c in empty_df.columns if c not in kept_features]
-        adata_merged = df_to_adata(empty_df, kept_features, obs_cols=merged_obs_cols)
+        spacing_to_use = int(min_spacing)
+
+    df_train = subsample_with_temporal_spacing(
+        df_scaled,
+        id_cols=["sample_name", "TrackID"],
+        time_col="position_t",
+        min_spacing=spacing_to_use,
+        max_samples=max_samples,
+        random_state=random_state,
+    )
+    
+    print(f"Subsampled {len(df_train)} rows for clustering (spacing={spacing_to_use}).")
+    if len(df_train) < 50:
+        raise ValueError("Insufficient rows after global subsampling for clustering.")
+
+    model_adata = cluster_group(
+        df_group=df_train,
+        feature_cols=kept_features,
+        non_feature_cols=non_feature_cols,
+        n_neighbors=n_neighbors,
+        resolution=resolution,
+        pca_var_selection=pca_var_selection,
+        outfolder=Path(outfolder) if outfolder else None,
+        group_name="all_data",
+        clustering_method=clustering_method,
+        resolutions=resolutions,
+        leiden_seed_tries=leiden_seed_tries,
+        leiden_subsample_tries=leiden_subsample_tries,
+        random_state=random_state,
+    )
+    if model_adata is None:
+        raise RuntimeError("Global clustering model could not be fit.")
+
+    if "preprocessing" not in model_adata.uns:
+        model_adata.uns["preprocessing"] = {}
+    model_adata.uns["preprocessing"]["kept_features"] = list(kept_features)
+    model_adata.uns["preprocessing"]["quantile_capping"] = preprocessing_artifact.get("quantile_capping", {})
+    if scaler is not None:
+        model_adata.uns["preprocessing"]["scaler"] = {
+            "mean": scaler.mean_.astype(float),
+            "scale": scaler.scale_.astype(float),
+        }
+
+    # Inference to full dataset
+    # df_full = df_analysis.copy()
+    # if scaler is not None:
+    #     x = df_full[kept_features].to_numpy(dtype=float)
+    #     df_full.loc[:, kept_features] = (x - scaler.mean_) / scaler.scale_
+
+    obs_cols = [c for c in non_feature_cols if c in df_scaled.columns] + [c for c in binary_cols_to_merge if c in df_scaled.columns]
+    adata_full = df_to_adata(df_scaled, kept_features, obs_cols=obs_cols)
+    adata_full = adata_full[:, model_adata.var_names].copy()
+    transfer_mode = str(label_transfer_method).lower()
+    label_classifier = None
+    label_classifier_artifact = None
+    classifier_fit_info = None
+    classifier_qc_model_data = None
+    classifier_model_path = None
+    if transfer_mode == "ingest":
+        sc.tl.ingest(adata_full, model_adata, obs="ClusterID")
+    elif transfer_mode == "classifier":
+        label_classifier, classifier_fit_info = train_clusterid_classifier_from_model_adata(
+            model_adata=model_adata,
+            cluster_col="ClusterID",
+            classifier_backend=classifier_backend,
+            classifier_kwargs=classifier_kwargs,
+            random_state=random_state,
+        )
+        label_classifier_artifact = {
+            "classifier": label_classifier,
+            "backend": str(classifier_backend),
+            "feature_cols": list(model_adata.var_names),
+            "cluster_col": "ClusterID",
+            "preprocessing": preprocessing_artifact,
+            "windowing": windowing_artifact,
+        }
+        predict_clusterids_with_classifier(
+            adata=adata_full,
+            classifier=label_classifier_artifact,
+            feature_cols=list(model_adata.var_names),
+            output_col="ClusterID",
+            confidence_col=classifier_confidence_col,
+            inplace=True,
+        )
+        classifier_qc_model_data = evaluate_clusterid_classifier_on_model_adata(
+            model_adata=model_adata,
+            classifier=label_classifier,
+            cluster_col="ClusterID",
+            outfolder=(Path(outfolder) if outfolder is not None else None),
+            filename_prefix=f"state_classification_classifier_qc_{classifier_backend}",
+        )
+    else:
+        raise ValueError("label_transfer_method must be one of: 'ingest', 'classifier'.")
+
+    cluster_check_summary, _ = check_model_clusterid_consistency(
+        model_adata=model_adata,
+        adata_full=adata_full,
+        model_cluster_col="ClusterID",
+        full_cluster_col="ClusterID",
+        key_cols=("sample_name", "TrackID", "position_t"),
+    )
+    
+    adata_full.obs = _add_clean_binary_annotation_columns(adata_full.obs, binary_cols_to_merge)
+    adata_full.obs["behavioral_clusterid"] = adata_full.obs["ClusterID"].astype(str)
+    adata_full.obs["binary_group"] = _assign_binary_group_labels(adata_full.obs, binary_cols_to_merge).astype("category")
+    adata_full.obs["ClusterID"] = (
+        adata_full.obs["binary_group"].astype(str) + "_" + adata_full.obs["behavioral_clusterid"].astype(str)
+    ).astype("category")
+    adata_full.obs["behavioral_clusterid"] = adata_full.obs["behavioral_clusterid"].astype("category")
+
+    adata_full.uns["state_classification"] = {
+        "window_size": int(window_size),
+        "features": list(features),
+        "descriptive_features": list(descriptive_features),
+        "binary_features_to_group": list(binary_cols_to_merge),
+        "clustering_method": clustering_method,
+        "resolution": resolution,
+        "n_neighbors": int(n_neighbors),
+        "label_transfer_method": transfer_mode,
+        "classifier_backend": str(classifier_backend) if transfer_mode == "classifier" else None,
+        "classifier_fit_info": classifier_fit_info,
+        "classifier_qc_model_data": classifier_qc_model_data,
+        "classifier_confidence_col": classifier_confidence_col if transfer_mode == "classifier" else None,
+        "classifier_model_path": None,
+        "preprocessing_artifact": preprocessing_artifact,
+        "windowing_artifact": windowing_artifact,
+        "full_classifier_fit_info": None,
+        "full_classifier_qc_model_data": None,
+        "full_classifier_prediction_col": "ClusterID_full_classifier" if train_full_label_classifier else None,
+        "full_classifier_confidence_col": full_classifier_confidence_col if train_full_label_classifier else None,
+        "full_classifier_model_path": None,
+        "model_vs_full_clusterid_check": cluster_check_summary,
+    }
+
+    full_label_classifier_artifact = None
+    full_classifier_fit_info = None
+    full_classifier_qc_model_data = None
+    full_classifier_model_path = None
+    if train_full_label_classifier:
+        full_label_classifier_artifact, full_classifier_fit_info = train_full_clusterid_classifier_from_adata(
+            adata=adata_full,
+            target_col="ClusterID",
+            binary_feature_cols=binary_features_to_group,
+            preprocessing_artifact=preprocessing_artifact,
+            classifier_kwargs=full_classifier_kwargs,
+            random_state=random_state,
+        )
+        full_label_classifier_artifact["windowing"] = dict(windowing_artifact)
+
+        predict_clusterids_with_full_classifier(
+            adata=adata_full,
+            classifier_artifact=full_label_classifier_artifact,
+            output_col="ClusterID_full_classifier",
+            confidence_col=full_classifier_confidence_col,
+            inplace=True,
+        )
+        y_full_true = adata_full.obs["ClusterID"].astype(str).to_numpy()
+        y_full_pred = adata_full.obs["ClusterID_full_classifier"].astype(str).to_numpy()
+        full_classifier_qc_model_data = evaluate_classifier_predictions(
+            y_true=y_full_true,
+            y_pred=y_full_pred,
+            outfolder=(Path(outfolder) if outfolder is not None else None),
+            filename_prefix="state_classification_full_classifier_qc_random_forest",
+        )
+        if outfolder is not None:
+            outdir = Path(outfolder)
+            full_feature_names = list(full_label_classifier_artifact.get("continuous_feature_cols", [])) + list(
+                full_label_classifier_artifact.get("binary_expanded_feature_cols", [])
+            )
+            X_full_eval = _build_classifier_matrix_from_adata(
+                adata=adata_full,
+                continuous_feature_cols=full_label_classifier_artifact.get("continuous_feature_cols", []),
+                binary_feature_cols=full_label_classifier_artifact.get("binary_feature_cols", []),
+                binary_expanded_feature_cols=full_label_classifier_artifact.get("binary_expanded_feature_cols", []),
+            )
+            
+        print(
+            "Full classifier QC on adata_full labels: "
+            f"n={full_classifier_qc_model_data['n_rows']}, "
+            f"accuracy={full_classifier_qc_model_data['accuracy']:.4f}, "
+            f"balanced_accuracy={full_classifier_qc_model_data['balanced_accuracy']:.4f}"
+        )
+        adata_full.uns["state_classification"]["full_classifier_fit_info"] = full_classifier_fit_info
+        adata_full.uns["state_classification"]["full_classifier_qc_model_data"] = full_classifier_qc_model_data
 
     if outfolder is not None:
         outfolder = Path(outfolder)
-        outfolder.mkdir(parents=True, exist_ok=True)
-        
-        # Save figure
-        fig_path = outfolder / "state_classification_umap_grid.pdf"
-        save_figure_a4(fig, fig_path, orientation="auto", dpi=300)
-        print(f"Saved UMAP grid to {fig_path}")
-        
-        # Save individual group results
-        for group_name, adata in group_results.items():
-            if adata is not None:
-                group_path = outfolder / f"adata_{group_name}.h5ad"
-                adata.write(group_path, compression="gzip")
-                print(f"Saved {group_name} results to {group_path}")
-        if adata_merged is not None:
-            merged_path = outfolder / "adata_merged_group_clusters.h5ad"
-            adata_merged.write(merged_path, compression="gzip")
-            print(f"Saved merged full results to {merged_path}")
-    
-    plt.show()
-    return adata_merged
+        outfolder.mkdir(parents=False, exist_ok=True)
 
+        if transfer_mode == "classifier" and save_label_classifier and label_classifier_artifact is not None:
+            classifier_model_path = outfolder / f"state_classification_label_classifier_{classifier_backend}.pkl"
+            with open(classifier_model_path, "wb") as f:
+                pickle.dump(label_classifier_artifact, f)
+            adata_full.uns["state_classification"]["classifier_model_path"] = str(classifier_model_path)
+        if train_full_label_classifier and save_full_label_classifier and full_label_classifier_artifact is not None:
+            full_classifier_model_path = outfolder / "state_classification_full_label_classifier_random_forest.pkl"
+            with open(full_classifier_model_path, "wb") as f:
+                pickle.dump(full_label_classifier_artifact, f)
+            adata_full.uns["state_classification"]["full_classifier_model_path"] = str(full_classifier_model_path)
 
-def test():
-    """
-    Test function demonstrating usage of state_classification.
-    """
-    # Example paths (modify as needed)
-    ssd_dir = Path("/Users/s.deblank-3/Downloads/BHVD_SB1_Exp003_62T_lowTcellDensity/behav3d")
-    metadata_csv_path = ssd_dir / "metadata.csv"
-    
-    outfolder = ssd_dir / "state_classification"
-    outfolder.mkdir(parents=True, exist_ok=True)
-    
-    # Load metadata
-    metadata = load_behav3d_metadata(metadata_csv_path)
-    
-    # Load track features
-    analysis_outdir = ssd_dir / "analysis" / "tcell"
-    feature_outdir = analysis_outdir / "track_features"
-    df_tracks_path = feature_outdir / "BEHAV3D_tcell_combined_track_features.csv"
-    
-    df_positions = pd.read_csv(df_tracks_path)
-    df_positions = df_positions.sort_values(by=["sample_name", "TrackID", "position_t"])
-    
-    # Define features
-    features = [
-        "percentage_dead_mask",
-        "organoid_contact_pixels",
-        "tcell_contact_pixels",
-        "speed",
-    ]
-    
-    # Define binary features to use for grouping
-    binary_features_to_group = [
-        "organoid_contact",
-        "tcell_contact",
-    ]
-    
-    # Run state classification
-    adata_merged = run_state_classification(
-        df_positions=df_positions,
-        features=features,
-        binary_features_to_group=binary_features_to_group,
-        window_size=5,
-        chosen_intervals=10,
-        n_neighbors=15,
-        resolution=0.2,
-        pca_var_selection=0.95,
-        outfolder=outfolder,
-        random_state=seed
-    )
-    
-    # Additional analysis for merged output
-    if adata_merged is not None and adata_merged.n_obs > 0:
-        plot_top_ranking_features(
-            adata_merged,
-            groupby="ClusterID",
-            n_features=20,
+        # Persist exact per-feature quantile cap values used during training.
+        qcap = preprocessing_artifact.get("quantile_capping", {})
+        feature_limits = qcap.get("feature_limits", {}) if isinstance(qcap, dict) else {}
+        if len(feature_limits) > 0:
+            qcap_json_path = outfolder / "state_classification_quantile_cap_limits.json"
+            with open(qcap_json_path, "w") as f:
+                json.dump(feature_limits, f, indent=2)
+            qcap_df = pd.DataFrame.from_dict(feature_limits, orient="index")
+            qcap_df.index.name = "feature"
+            qcap_df.to_csv(outfolder / "state_classification_quantile_cap_limits.csv")
+            adata_full.uns["state_classification"]["quantile_cap_limits_json"] = str(qcap_json_path)
+
+        adata_full.write(outfolder / "adata_state_classification_full.h5ad", compression="gzip")
+        model_adata.write(outfolder / "adata_state_classification_model.h5ad", compression="gzip")
+
+        pdf1 = outfolder / "state_classification_binary_group_cluster_proportions.pdf"
+        fig, _ = plot_binary_group_behavioral_cluster_grid(
+            adata_full,
+            pdf_path=pdf1,
+            return_csv=True,
         )
-        plt.suptitle("Merged - Top Ranking Features", y=1.02)
-        plt.tight_layout()
-        plt.show()
+        plt.close(fig)
+        pdf2 = outfolder / "state_classification_cluster_binary_group_proportions.pdf"
+        fig2, _ = plot_behavioral_cluster_binary_group_grid(
+            adata_full,
+            pdf_path=pdf2,
+            return_csv=True,
+        )
+        plt.close(fig2)
 
-        plot_number_per_clusters(adata_merged.obs, cluster_col="ClusterID")
-        plt.title("Merged - Cluster Sizes")
-        plt.show()
-    open_cluster_backprojection_napari(
-        adata_merged,
-        metadata,
-        track_image_col="tcell_tracks_image_path",
-        sample_name="ROCHE_JM1_Exp042-9_Img04_10T_HER2-I"
-    )
+    if return_artifacts:
+        return {
+            "adata_full": adata_full,
+            "model_adata": model_adata,
+            "label_classifier": label_classifier,
+            "label_classifier_artifact": label_classifier_artifact,
+            "classifier_fit_info": classifier_fit_info,
+            "classifier_qc_model_data": classifier_qc_model_data,
+            "full_label_classifier_artifact": full_label_classifier_artifact,
+            "full_classifier_fit_info": full_classifier_fit_info,
+            "full_classifier_qc_model_data": full_classifier_qc_model_data,
+            "cluster_check_summary": cluster_check_summary,
+        }
+
+    return adata_full
 
 
 if __name__ == "__main__":
-    
-    # ssd_dir = r"/Volumes/T7_Sam/"
-    ssd_dir = r"F:/"
+    """
+    Return lightweight defaults for quick test runs.
+
+    This helper is optional and not used by the normal pipeline.
+    """
+    from behav3d.core.metadata import load_behav3d_metadata
+    ssd_dir = r"/Volumes/T7_Sam/"
     ssd_dir = Path(ssd_dir)
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
     metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv")
@@ -2117,13 +1787,13 @@ if __name__ == "__main__":
     df_tracks_path = Path(feature_outdir, f"BEHAV3D_tcell_combined_track_features_filtered.csv")
     df_positions = pd.read_csv(df_tracks_path)
     df_positions=df_positions.sort_values(by=["sample_name", "TrackID", "position_t"])
+    outfolder = Path("/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/rolling_classification/clustering_then_binary_assignment")
     
-    binary_features_to_group = [
-        "organoid_contact_pixels",
-        "tcell_contact_pixels",
-    ]
-
-    # Create descriptive features per window
+    window_size = 5
+    max_samples = None
+    min_spacing = 10
+    n_neighbors = 60
+    resolution = 0.15
     features=[
         "percentage_dead_mask",
         # "mean_dead_dye",
@@ -2141,29 +1811,33 @@ if __name__ == "__main__":
         # "prolateness"
         # "surface_to_volume_ratio"
     ]
-    window_size=5
-
-    groupby = ["sample_name", "TrackID"]
-    descriptive_features = ["mean", "median", "std", "net_displacement", "straightness", "mean_square_displacement"]
-    # max_samples = 20000      # or None
-    max_samples=None
-    min_spacing = 10          # or None for auto
-    n_neighbors = 60
-    resolution = 0.2         # currently not used in leiden search path
-    min_cluster_size = None  # currently unused
+    
+    # Define binary features to use for grouping
+    binary_features_to_group = [
+        "organoid_contact",
+        "tcell_contact",
+    ]
+    
+    descriptive_features = (
+        "mean",
+        "median",
+        "std",
+        "net_displacement",
+        "straightness",
+        "mean_square_displacement",
+    )
     pca_var_selection = 0.95
-    clustering_method = "leiden"   # or "leiden"
-    incomplete_window_policy="partial"
-    clustering_method
-    resolutions = (0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5)
-    leiden_seed_tries = 20
-    leiden_subsample_tries = 20
-    lower_quantile_cap = None      # e.g. 0.01
-    upper_quantile_cap = 0.99      # e.g. None to disable upper capping
-    outfolder = Path(ssd_dir, "BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
+    clustering_method = "leiden"
+    resolutions = 0.15
+    leiden_seed_tries = 10
+    leiden_subsample_tries = 10
+    lower_quantile_cap = None
+    upper_quantile_cap = 0.99
+    incomplete_window_policy = "drop"
     random_state = 123
-    reuse_prepared_dataset=True
-    save_prepared_dataset=True
-    pass
-    # test()
-    # adata_merged = sc.read_h5ad("/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/rolling_classification/adata_merged_group_clusters.h5ad")
+    reuse_prepared_dataset = True
+    save_prepared_dataset = True
+    label_transfer_method = "classifier"
+    classifier_backend = "random_forest"
+    train_full_label_classifier = True
+    
