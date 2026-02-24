@@ -4,6 +4,10 @@ import os
 import yaml
 import traceback
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from io import BytesIO
+from PIL import Image as PILImage, ImageDraw, ImageFont
 from copy import deepcopy
 from .utils import (
     _cfg_get, 
@@ -12,6 +16,8 @@ from .utils import (
     _DEFAULT_CONFIG
 )
 from behav3d.core.utils import expand_column_patterns
+from behav3d.io.formats.zarr import load_zarr
+from behav3d.io.images import load_image
 from behav3d.features.timepoint_features import run_feature_extraction
 from behav3d.analysis.tcell_analysis import (
     filter_cell_tracks,
@@ -272,6 +278,7 @@ class ActiveKillingPanel:
     def __init__(self, metadata_loader):
         self.metadata_loader = metadata_loader
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+        self.killing_results = None
         
         from behav3d.core.metadata import (
             detect_immune_cell_types_from_metadata,
@@ -309,12 +316,29 @@ class ActiveKillingPanel:
         self.use_absolute_threshold.observe(self._on_absolute_threshold_toggle, names="value")
         
         self.save_results = widgets.Checkbox(description="Save results to CSV", value=bool(self._cfg.get("save_results", True)), indent=False)
+        self.gallery_item_count = widgets.IntText(description="Gallery items:", value=5, style={'description_width': '100px'}, layout=widgets.Layout(width="180px"))
         
         self.btn_run = widgets.Button(description="Run Active Killing Analysis", button_style="danger", icon="bolt", layout=widgets.Layout(width="260px"))
         self.btn_run.on_click(self._on_run_clicked)
+        
+        self.btn_show_results = widgets.Button(description="Display Existing Results", button_style="success", icon="eye", layout=widgets.Layout(width="260px"))
+        self.btn_show_results.on_click(lambda _: self._update_gallery_from_file(self._existing_results_path))
+        self.btn_show_results.layout.display = "none"
+        self._existing_results_path = None
+        
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
+        
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
+        
         self.out = widgets.Output()
+        self.insights_out = widgets.Output()
+        self.gallery_out = widgets.Output()
+        
+        self.insights_accordion = widgets.Accordion(children=[widgets.VBox([self.insights_out, self.gallery_out])], selected_index=None)
+        self.insights_accordion.set_title(0, "Active Killing Insights & Gallery")
+        self.insights_accordion.layout.display = "none"
         self.validation_html = widgets.HTML("")
         self._validate_inputs()
         self.immune_dd.observe(lambda _: self._validate_inputs(), names="value")
@@ -327,9 +351,14 @@ class ActiveKillingPanel:
             widgets.HBox([self.min_contact_duration, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.death_signal_dd], layout=widgets.Layout(align_items="center")),
             widgets.HBox([self.use_absolute_threshold, self.absolute_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">death signal increase (bypasses multiplier)</span>')], layout=widgets.Layout(align_items="center")),
             widgets.HTML("<hr>"),
-            widgets.HBox([self.btn_run, self.spinner_html, self.save_results], layout=widgets.Layout(align_items="center", gap="15px")),
+            widgets.HBox([self.btn_run, self.spinner_html, self.save_results, self.gallery_item_count], layout=widgets.Layout(align_items="center", gap="15px")),
+            self.btn_show_results,
+            self.insights_accordion,
             self.out
         ])
+        
+        # Check if results already exist to enable visualize button
+        self._check_existing_results()
     
     def _validate_inputs(self):
         immune = self.immune_dd.value
@@ -353,39 +382,526 @@ class ActiveKillingPanel:
         else:
             self.killing_threshold.disabled = False
 
+    def _check_existing_results(self):
+        """Check if analysis results already exist to enable the display button."""
+        immune = self.immune_dd.value
+        if immune == "(none detected)": return
+        
+        results_dir = Path(self.output_dir, "analysis", immune, "active_killing")
+        advanced_path = results_dir / f"BEHAV3D_{immune}_advanced_track_features.csv"
+        if advanced_path.exists():
+            self._existing_results_path = advanced_path
+            self.btn_show_results.layout.display = None
+        else:
+            self.btn_show_results.layout.display = "none"
+
+    def _update_gallery_from_file(self, advanced_path):
+        """Load results from CSV and display gallery."""
+        self.gallery_out.clear_output()
+        with self.gallery_out:
+            display(widgets.HTML('<b style="color:#007bff;">⏳ Loading gallery insights...</b>'))
+            try:
+                df_killing = pd.read_csv(advanced_path)
+                # Normalize columns immediately
+                if "TrackID" in df_killing.columns and "immune_track_id" not in df_killing.columns:
+                    df_killing["immune_track_id"] = df_killing["TrackID"]
+                
+                self.killing_results = df_killing # Store for fallback
+                
+                # Coordinate normalization
+                coord_map = {"centroid-0": "position_z", "centroid-1": "position_y", "centroid-2": "position_x"}
+                for old_col, new_col in coord_map.items():
+                    if old_col in df_killing.columns and new_col not in df_killing.columns:
+                        df_killing[new_col] = df_killing[old_col]
+                
+                # Ensure visibility
+                self.insights_accordion.layout.display = None
+                self.insights_accordion.selected_index = 0
+                
+                self._display_insights(df_killing)
+                self._display_gallery(df_killing)
+            except Exception:
+                traceback.print_exc()
+
     def _on_run_clicked(self, *_):
-        self.btn_run.disabled = True; self.spinner_html.layout.display = None; self.out.clear_output()
+        self.btn_run.disabled = True
+        self.spinner_html.layout.display = None
+        self.out.clear_output()
+        self.insights_out.clear_output()
+        self.gallery_out.clear_output()
+        self.insights_accordion.selected_index = None # Collapse accordion
+        self.insights_accordion.layout.display = "none"
+        
+        immune = self.immune_dd.value
+        if immune == "(none detected)":
+            with self.out: print("Please select an immune cell type.")
+            self.btn_run.disabled = False
+            self.spinner_html.layout.display = "none"
+            return
+
         with self.out:
             try:
-                # Determine absolute threshold value
-                absolute_killing_threshold = float(self.absolute_threshold.value) if self.use_absolute_threshold.value else None
+                print(f"Starting Active Killing Analysis for {immune}...")
                 
-                self._cfg.update({
-                    "observation_window": int(self.observation_window.value),
-                    "death_signal_column": str(self.death_signal_dd.value),
-                    "killing_threshold_multiplier": float(self.killing_threshold.value),
-                    "min_contact_duration": int(self.min_contact_duration.value),
-                    "use_absolute_threshold": bool(self.use_absolute_threshold.value),
-                    "absolute_killing_threshold": absolute_killing_threshold,
-                    "save_results": bool(self.save_results.value),
-                    "last_immune_cell": str(self.immune_dd.value)
-                })
-                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
-                run_active_killing_analysis(
+                # Save current parameters
+                self._cfg["observation_window"] = self.observation_window.value
+                self._cfg["death_signal_column"] = self.death_signal_dd.value
+                self._cfg["killing_threshold_multiplier"] = self.killing_threshold.value
+                self._cfg["min_contact_duration"] = self.min_contact_duration.value
+                self._cfg["use_absolute_threshold"] = self.use_absolute_threshold.value
+                self._cfg["absolute_killing_threshold"] = self.absolute_threshold.value
+                self._cfg["save_results"] = self.save_results.value
+                
+                # Ensure the 'active_killing' key exists in behav3d_parameters
+                if "active_killing" not in self.metadata_loader.behav3d_parameters:
+                    self.metadata_loader.behav3d_parameters["active_killing"] = {}
+                self.metadata_loader.behav3d_parameters["active_killing"].update(self._cfg)
+                
+                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+                    yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
+                
+                # Run analysis
+                results_dir = Path(self.output_dir, "analysis", immune, "active_killing")
+                results_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Determine absolute threshold value
+                abs_thresh = float(self.absolute_threshold.value) if self.use_absolute_threshold.value else None
+                
+                df_killing, _, _ = run_active_killing_analysis(
                     metadata=self.metadata_loader.metadata,
                     output_dir=self.output_dir,
-                    immune_cell_type=str(self.immune_dd.value),
-                    target_cell_types=None,
-                    observation_window=int(self.observation_window.value),
-                    death_signal_column=str(self.death_signal_dd.value),
-                    min_contact_duration=int(self.min_contact_duration.value),
+                    immune_cell_type=immune,
+                    target_cell_types=self.target_types,
+                    observation_window=self.observation_window.value,
+                    death_signal_column=self.death_signal_dd.value,
                     killing_threshold_multiplier=float(self.killing_threshold.value),
-                    absolute_killing_threshold=absolute_killing_threshold,
+                    min_contact_duration=int(self.min_contact_duration.value),
+                    absolute_killing_threshold=abs_thresh,
                     save_results=bool(self.save_results.value)
                 )
-                print(f"✅ Killing analysis finished.")
-            except Exception: traceback.print_exc()
-            finally: self.spinner_html.layout.display = "none"; self.btn_run.disabled = False
+                
+                print("✅ Active Killing Analysis complete! Loading gallery...")
+                # Use the automated loader to ensure enriched columns (coordinates) are present
+                results_dir = Path(self.output_dir, "analysis", immune, "active_killing")
+                advanced_path = results_dir / f"BEHAV3D_{immune}_advanced_track_features.csv"
+                
+                if advanced_path.exists():
+                    self._update_gallery_from_file(advanced_path)
+                else:
+                    # Fallback if file wasn't created for some reason
+                    self.killing_results = df_killing
+                    self.insights_accordion.layout.display = None
+                    self.insights_accordion.selected_index = 0
+                    self._display_insights(df_killing)
+                    self._display_gallery(df_killing)
+
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self.btn_run.disabled = False
+
+    def _display_insights(self, df_killing):
+        """Display graphical insights in the accordion."""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        self.insights_out.clear_output()
+        if df_killing.empty: return
+        
+        # Normalize columns: enriched CSV uses TrackID, analysis uses immune_track_id
+        if "TrackID" in df_killing.columns and "immune_track_id" not in df_killing.columns:
+            df_killing["immune_track_id"] = df_killing["TrackID"]
+        
+        with self.insights_out:
+            # Create a 2x2 grid for advanced kinetics
+            fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+            axes = axes.flatten()
+            
+            df_active = df_killing[df_killing["is_active_killing"]].copy()
+            
+            # 1. Efficiency Distribution
+            sns.histplot(df_active["killing_efficiency"], kde=True, ax=axes[0], color='red')
+            axes[0].set_title("1. Killing Efficiency Distribution", fontsize=14, fontweight='bold')
+            axes[0].set_xlabel("Efficiency Score")
+            
+            # 2. Smoothed Killing Trend (Kinetics)
+            temp_counts = df_active.groupby("position_t").size()
+            if not temp_counts.empty:
+                # Reindex to include all timepoints for a smooth line
+                max_t = int(df_killing["position_t"].max())
+                full_t = pd.Series(0, index=range(max_t + 1))
+                full_t.update(temp_counts)
+                
+                # Rolling mean for smoothing
+                window = max(5, max_t // 20)
+                smoothed = full_t.rolling(window=window, center=True).mean()
+                
+                axes[1].plot(full_t.index, full_t.values, color='darkred', alpha=0.2, label='Raw Counts')
+                axes[1].plot(smoothed.index, smoothed.values, color='red', linewidth=2, label='Kinetics Trend')
+                axes[1].fill_between(smoothed.index, 0, smoothed.values, color='red', alpha=0.1)
+                axes[1].set_title("2. Killing Intensity (Smoothed)", fontsize=14, fontweight='bold')
+                axes[1].set_xlabel("Timepoint")
+                axes[1].set_ylabel("Events / Timepoint")
+                axes[1].legend()
+            
+            # 3. Cumulative Killing Curve
+            if not temp_counts.empty:
+                cumulative = full_t.cumsum()
+                axes[2].plot(cumulative.index, cumulative.values, color='darkblue', linewidth=3)
+                axes[2].fill_between(cumulative.index, 0, cumulative.values, color='blue', alpha=0.1)
+                axes[2].set_title("3. Cumulative Killing Progress", fontsize=14, fontweight='bold')
+                axes[2].set_xlabel("Timepoint")
+                axes[2].set_ylabel("Cumulative Sum of Active Killing Events")
+                axes[2].grid(True, linestyle='--', alpha=0.6)
+            
+            # 4. Serial Killer Raster Plot
+            if not df_active.empty:
+                # Assign a numeric Y-index for each unique T-cell for the raster
+                df_active['hitter_label'] = df_active['sample_name'] + "_" + df_active['immune_track_id'].astype(str)
+                hitters = df_active.groupby('hitter_label').size().sort_values(ascending=False)
+                hitter_map = {name: i for i, name in enumerate(hitters.index)}
+                df_active['y_idx'] = df_active['hitter_label'].map(hitter_map)
+                
+                scatter = axes[3].scatter(df_active["position_t"], df_active["y_idx"], 
+                                          c=df_active["killing_efficiency"], cmap='YlOrRd', 
+                                          s=50, edgecolors='black', alpha=0.8)
+                axes[3].set_title("4. Killing Event Raster (By T-cell)", fontsize=14, fontweight='bold')
+                axes[3].set_xlabel("Timepoint")
+                
+                # Invert Y so rank 0 (top hitter) is at top
+                axes[3].invert_yaxis()
+                
+                # Add TrackID labels to Y-axis
+                if len(hitters) <= 25:
+                    axes[3].set_yticks(range(len(hitters)))
+                    axes[3].set_yticklabels([str(n).split("_")[-1] for n in hitters.index], fontsize=8)
+                    axes[3].set_ylabel("T-cell TrackID (Ranked)")
+                else:
+                    # Just label top 15 if too many
+                    axes[3].set_yticks(range(15))
+                    axes[3].set_yticklabels([str(n).split("_")[-1] for n in hitters.index[:15]], fontsize=8)
+                    axes[3].set_ylabel("T-cell TrackID (Top 15 shown, ranked)")
+                
+                plt.colorbar(scatter, ax=axes[3], label='Efficiency')
+            
+            plt.tight_layout()
+            
+            # Save the plot
+            plot_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", "plots")
+            plot_dir.mkdir(parents=True, exist_ok=True)
+            plot_path = plot_dir / f"killing_kinetics_summary_{self.immune_dd.value}.png"
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            
+            plt.show()
+            
+            display(widgets.HTML(f"<div style='color:green;font-size:12px;margin-top:-10px;'>📊 <b>Kinetics Summary saved to:</b> <br><small>{plot_path.relative_to(Path(self.output_dir))}</small></div>"))
+            
+            # Summary Table
+            n_items = int(self.gallery_item_count.value)
+            top_hitters = df_killing[df_killing["is_active_killing"]].groupby(["sample_name", "immune_track_id"]).size().sort_values(ascending=False).head(n_items)
+            if not top_hitters.empty:
+                display(widgets.HTML("<b>Top Killing T cells (by events/timepoints):</b>"))
+                display(top_hitters.to_frame("Count"))
+
+    def _display_gallery(self, df_killing):
+        """Display the Active Killing Events Gallery."""
+        n_items = int(self.gallery_item_count.value)
+        
+        # No 'with self.gallery_out' here, it's called from a context that already has it
+        display(widgets.HTML(f'<hr><b style="font-size:16px;">Top {n_items} Active Killing Events Gallery</b>'))
+        display(widgets.HTML('<p style="font-size:12px;color:#666;">Showing Maximum Intensity Projections (MIP) using raw image data.<br>'
+                             '<b>Legend:</b> <span style="color:#666;">Grayscale (Raw Structure)</span>, '
+                             '<span style="color:red;">Translucent Red (Dead Mask)</span>, '
+                             '<span style="color:purple;">Translucent Purple (ACTIVE T-cell)</span></p>'))
+        display(widgets.HTML(f'<div style="font-size:11px;color:#888;margin-bottom:10px;">Showing top event for each of the top {n_items} most active killers. Highlights are translucent for visual clarity.</div>'))
+        
+        df_active = df_killing[df_killing["is_active_killing"]].copy()
+        if not df_active.empty:
+            # Find unique killers
+            all_killers = df_active.groupby(["sample_name", "immune_track_id"]).size().sort_values(ascending=False)
+            max_available = len(all_killers)
+            
+            if n_items > max_available:
+                display(widgets.HTML(f'<b style="color:orange;">⚠️ Warning: Only {max_available} active killers found. Limiting gallery to {max_available} items.</b>'))
+                n_items = max_available
+            
+            # Find top hitters
+            top_hitters_idx = all_killers.head(n_items).index
+            
+            top_events_list = []
+            for sample, tid in top_hitters_idx:
+                df_hitter = df_active[(df_active["sample_name"] == sample) & (df_active["immune_track_id"] == tid)]
+                # Find best event for this hitter (highest efficiency)
+                best_event = df_hitter.sort_values("killing_efficiency", ascending=False).head(1)
+                top_events_list.append(best_event)
+            
+            if top_events_list:
+                top_events = pd.concat(top_events_list)
+            else:
+                top_events = pd.DataFrame()
+            
+            gallery_items = []
+            for i, (_, event) in enumerate(top_events.iterrows()):
+                display(widgets.HTML(f"<i>📸 Processing event {i+1}/{len(top_events)}...</i>"))
+                item = self._generate_killing_gallery_item(event, df_killing)
+                if item: gallery_items.append(item)
+            
+            if gallery_items:
+                # Clear the processing messages before showing gallery
+                self.gallery_out.clear_output()
+                display(widgets.HTML('<hr><b style="font-size:16px;">Top 5 Active Killing Events Gallery</b>'))
+                display(widgets.HTML('<p style="font-size:12px;color:#666;">Showing Maximum Intensity Projections (MIP) using raw image data.<br>'
+                                     '<b>Legend:</b> <span style="color:#666;">Grayscale (Raw Structure)</span>, '
+                                     '<span style="color:red;">Translucent Red (Dead Mask)</span>, '
+                                     '<span style="color:purple;">Translucent Purple (ACTIVE T-cell)</span></p>'))
+                display(widgets.VBox(gallery_items))
+            else:
+                md_path = getattr(self.metadata_loader, 'metadata_csv_path', "(unknown path)")
+                display(widgets.HTML(f"<i>⚠️ Could not generate gallery. Ensure Zarr files exist and are accessible. Check the metadata here {md_path}</i>"))
+        else:
+            display(widgets.HTML("<i>No active killing events found to display in gallery.</i>"))
+
+    def _generate_killing_gallery_item(self, event_row, df_killing=None):
+        """Generate a widget representing one killing event with images."""
+        try:
+            # Redundant imports removed as they are at the top
+            sample_name = event_row["sample_name"]
+            t_id = int(event_row["immune_track_id"])
+            o_id = int(event_row["targeted_track_id"]) if pd.notna(event_row["targeted_track_id"]) else -1
+            t_start = int(event_row["position_t"])
+            observation_window = int(self.observation_window.value)
+            t_end = t_start + (2 * observation_window) # Extend window for context
+            
+            # Metadata lookup
+            md_match = self.metadata_loader.metadata[self.metadata_loader.metadata["sample_name"] == sample_name]
+            if md_match.empty:
+                print(f"  ❌ Sample '{sample_name}' not found in metadata.")
+                return None
+            md_row = md_match.iloc[0]
+            
+            # Paths - Robust column lookup (handles im_ and or_ prefixes)
+            def get_col_path(suffix):
+                cols = [c for c in self.metadata_loader.metadata.columns if c.endswith(suffix)]
+                if not cols: return None
+                val = md_row[cols[0]]
+                if pd.isna(val) or str(val).strip() == "": return None
+                return Path(val)
+
+            immune_tracks_path = get_col_path(f"{self.immune_dd.value}_tracks_image_path")
+            if immune_tracks_path is None:
+                print(f"  ❌ Metadata column not found for: {self.immune_dd.value}_tracks_image_path")
+                return None
+            if not immune_tracks_path.exists():
+                print(f"  ❌ Immune tracks file not found at: {immune_tracks_path}")
+                return None
+            
+            # Auto-detect organoid type
+            org_type = "organoid"
+            for ct in self.metadata_loader.metadata.columns:
+                if "_tracks_image_path" in ct and f"im_{self.immune_dd.value}" not in ct and f"_{self.immune_dd.value}" not in ct:
+                    org_type = ct.replace("_tracks_image_path", "").replace("or_", "")
+                    break
+            
+            raw_img_path = get_col_path("raw_image_path")
+            if raw_img_path is None:
+                 raw_img_path = get_col_path("image_path") # Typical fallback
+
+            org_tracks_path = get_col_path(f"{org_type}_tracks_image_path")
+            if org_tracks_path is None:
+                print(f"  ❌ Metadata column not found for: {org_type}_tracks_image_path")
+                return None
+            if not org_tracks_path.exists():
+                print(f"  ❌ Target tracks file not found at: {org_tracks_path}")
+                return None
+                
+            dead_mask_path = Path(self.output_dir, "images", sample_name, f"{sample_name}_mask_dead.zarr")
+            
+            # Helper to get MIP crop
+            def get_mip_crop(t, track_id, organoid_id, center_coords=None):
+                try:
+                    res_xy = float(md_row.get("pixel_distance_xy", 1.0))
+                    res_z = float(md_row.get("pixel_distance_z", 1.0))
+                    
+                    # Determine coordinates: Use provided center or look up from data
+                    if center_coords is not None:
+                        cz, cy, cx = center_coords
+                    else:
+                        # Try to get coordinates from provided dataframe first
+                        row_t = pd.DataFrame()
+                        if df_killing is not None:
+                            row_t = df_killing[(df_killing["sample_name"] == sample_name) & 
+                                               (df_killing["immune_track_id"] == track_id) & 
+                                               (df_killing["position_t"] == t)]
+                        if row_t.empty:
+                            # Fallback to self.killing_results
+                            if hasattr(self, "killing_results") and self.killing_results is not None:
+                                 row_t = self.killing_results[(self.killing_results["sample_name"] == sample_name) & 
+                                                        (self.killing_results["immune_track_id"] == track_id) & 
+                                                        (self.killing_results["position_t"] == t)]
+                        
+                        if row_t.empty: return None
+                        cz = int(row_t["position_z"].iloc[0] / res_z)
+                        cy = int(row_t["position_y"].iloc[0] / res_xy)
+                        cx = int(row_t["position_x"].iloc[0] / res_xy)
+                    
+                    win = 60 # Slightly larger window for raw data
+                    
+                    def load_tp(path, timepoint):
+                        if not path or not path.exists(): return None
+                        try:
+                            if str(path).endswith(".zarr") or str(path).endswith(".zarr.zip"):
+                                img = load_zarr(path)
+                                if timepoint >= img.shape[0]: return None
+                                return img[timepoint]
+                            img = load_image(path)
+                            if timepoint >= img.shape[0]: return None
+                            return img[timepoint]
+                        except: return None
+
+                    def get_crop(img):
+                        if img is None: return None
+                        try:
+                            if img.ndim == 4: # C,Z,Y,X
+                                c, z, y, x = img.shape
+                                y1, y2 = max(0, cy-win), min(y, cy+win)
+                                x1, x2 = max(0, cx-win), min(x, cx+win)
+                                return img[:, :, y1:y2, x1:x2]
+                            else: # Z,Y,X
+                                z, y, x = img.shape
+                                y1, y2 = max(0, cy-win), min(y, cy+win)
+                                x1, x2 = max(0, cx-win), min(x, cx+win)
+                                return img[:, y1:y2, x1:x2]
+                        except: return None
+
+                    # Load raw data and masks
+                    raw_tp = load_tp(raw_img_path, t)
+                    m_t_full = load_tp(immune_tracks_path, t)
+                    m_d_full = load_tp(dead_mask_path, t)
+
+                    c_raw = get_crop(raw_tp)
+                    c_mt = get_crop(m_t_full)
+                    c_md = get_crop(m_d_full)
+
+                    if c_raw is None: return None
+                    
+                    # Ensure numpy arrays for computation
+                    if c_mt is not None:
+                        if hasattr(c_mt, 'compute'): c_mt = c_mt.compute()
+                        c_mt = np.asarray(c_mt)
+                    if c_raw is not None:
+                        if hasattr(c_raw, 'compute'): c_raw = c_raw.compute()
+                        c_raw = np.asarray(c_raw)
+                    if c_md is not None:
+                        if hasattr(c_md, 'compute'): c_md = c_md.compute()
+                        c_md = np.asarray(c_md)
+
+                    # 1. Grayscale Base (all channels)
+                    if c_raw is not None and c_raw.ndim == 4:
+                        raw_gray = np.max(c_raw, axis=0) # Z,Y,X
+                        mip_gray = np.max(raw_gray, axis=0).astype(np.float32)
+                        p1, p99 = np.percentile(mip_gray, [1, 99])
+                        mip_gray = np.clip((mip_gray - p1) / (p99 - p1 + 1e-10), 0, 1)
+                    else:
+                        mip_gray = np.zeros(c_raw.shape[1:] if c_raw is not None else (120, 120), dtype=np.float32)
+
+                    # 2. Tracks & Color Blending
+                    mip_dead = np.max(c_md > 0, axis=0) if c_md is not None else np.zeros_like(mip_gray)
+                    mip_active = np.max(c_mt == track_id, axis=0) if c_mt is not None else np.zeros_like(mip_gray)
+
+                    rgb = np.zeros((mip_gray.shape[0], mip_gray.shape[1], 3), dtype=np.float32)
+                    rgb[:, :, 0] = mip_gray; rgb[:, :, 1] = mip_gray; rgb[:, :, 2] = mip_gray
+                    
+                    alpha_red = 0.3
+                    alpha_purple = 0.5
+                    
+                    rgb[mip_dead > 0, 0] = rgb[mip_dead > 0, 0] * (1-alpha_red) + 1.0 * alpha_red
+                    rgb[mip_dead > 0, 1] = rgb[mip_dead > 0, 1] * (1-alpha_red)
+                    rgb[mip_dead > 0, 2] = rgb[mip_dead > 0, 2] * (1-alpha_red)
+                    
+                    rgb[mip_active > 0, 0] = rgb[mip_active > 0, 0] * (1-alpha_purple) + 1.0 * alpha_purple
+                    rgb[mip_active > 0, 1] = rgb[mip_active > 0, 1] * (1-alpha_purple)
+                    rgb[mip_active > 0, 2] = rgb[mip_active > 0, 2] * (1-alpha_purple) + 1.0 * alpha_purple
+                    
+                    return np.clip(rgb * 255, 0, 255).astype(np.uint8)
+                except: return None
+
+            # Max time calculation
+            if "timelapse_duration" in md_row:
+                max_t = int(md_row["timelapse_duration"]) - 1
+            elif df_killing is not None:
+                max_t = int(df_killing[df_killing["sample_name"] == sample_name]["position_t"].max())
+            else:
+                max_t = t_end  # Fallback
+            
+            # Determine fixed center coordinates at event start
+            res_xy = float(md_row.get("pixel_distance_xy", 1.0))
+            res_z = float(md_row.get("pixel_distance_z", 1.0))
+            fixed_coords = (
+                int(event_row["position_z"] / res_z),
+                int(event_row["position_y"] / res_xy),
+                int(event_row["position_x"] / res_xy)
+            )
+
+            frames = []
+            for t in range(t_start, min(t_end + 1, max_t + 1)):
+                img = get_mip_crop(t, t_id, o_id, center_coords=fixed_coords)
+                if img is not None:
+                    pil_img = PILImage.fromarray(img)
+                    draw = ImageDraw.Draw(pil_img)
+                    text = f"T={t}"
+                    # Simple text overlay at top-right
+                    # Using default font and drawing a small shadow for visibility
+                    w, h = pil_img.size
+                    pos = (w - 50, 5) 
+                    draw.text((pos[0]+1, pos[1]+1), text, fill="black") # shadow
+                    draw.text(pos, text, fill="white")
+                    frames.append(pil_img)
+            
+            if not frames:
+                return None
+            
+            # Save GIF to output directory
+            gallery_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", "gallery")
+            gallery_dir.mkdir(parents=True, exist_ok=True)
+            gif_name = f"killing_event_{sample_name}_T{t_id}_start{t_start}.gif"
+            gif_path = gallery_dir / gif_name
+            
+            # Save with Pillow
+            frames[0].save(
+                gif_path,
+                save_all=True,
+                append_images=frames[1:],
+                duration=200, # 200ms per frame
+                loop=0
+            )
+            
+            with open(gif_path, "rb") as f:
+                gif_data = f.read()
+                
+            img_widget = widgets.Image(value=gif_data, format='gif')
+            
+            killing_window_end = min(t_start + observation_window, max_t)
+            viz_window_end = min(t_end, max_t)
+            
+            info_html = widgets.HTML(f"""
+                <div style='border: 1px solid #ddd; padding: 10px; margin-bottom: 5px; background: #f9f9f9; width: 600px;'>
+                    <b>Event Details:</b> Sample: {sample_name} | T-cell ID: {t_id} | Target ID: {o_id if o_id != -1 else 'N/A'}<br>
+                    <b>Efficiency:</b> {event_row['killing_efficiency']:.2f}<br>
+                    <div style='font-size: 11px; color: #444; margin-top: 5px;'>
+                        <b>🧪 Killing Window:</b> T={t_start} to T={killing_window_end} (Analysis period)<br>
+                        <b>🎬 Visualization Window:</b> T={t_start} to T={viz_window_end} (Forensic context)
+                    </div>
+                    <small style='color: #666;'>Saved to: {gif_path.relative_to(Path(self.output_dir))}</small>
+                </div>
+            """)
+            return widgets.VBox([info_html, img_widget])
+            
+        except Exception as e:
+            with self.gallery_out:
+                print(f"  ❌ Error generating gallery item for {sample_name}:")
+                traceback.print_exc()
+            return None
 
 class DeathDynamicsPanel:
     """

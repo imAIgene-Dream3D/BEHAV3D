@@ -79,9 +79,13 @@ class BackprojectionPanel:
         self.mode_tb = widgets.ToggleButtons(options=list(self._mode_map.keys()), value="Mean features" if self._cfg.get("mode") == "mean" else "Time features", description="Mode")
         
         self.save_cb = widgets.Checkbox(description="Save .zarr to disk", value=bool(self._cfg.get("save", False)))
-        self.status_html = widgets.HTML("")
-        self.refresh_btn = widgets.Button(description="Refresh", icon="refresh")
+        self.refresh_btn = widgets.Button(description="Refresh Features", icon="refresh", layout=widgets.Layout(width="150px"))
         self.refresh_btn.on_click(self._on_refresh_clicked)
+        
+        # Feature Selection Dropdown
+        self.feature_dd = widgets.Dropdown(description="Feature:", options=["Behavioral States Only"], value="Behavioral States Only", layout=widgets.Layout(width="360px"), style={'description_width': '100px'})
+        
+        self.status_html = widgets.HTML("<i>Loading available features...</i>")
         
         self.selection_container = widgets.VBox([])
         self._mean_group_rows = {}
@@ -100,13 +104,14 @@ class BackprojectionPanel:
         
         self.ui = widgets.VBox([
             widgets.HTML('<div style="font-size:22px;font-weight:700;">Backprojection</div>'),
-            self.sample_dd, self.celltype_dd, self.mode_tb, self.save_cb,
+            widgets.HTML('<div style="color:#666;font-size:12px;margin-bottom:10px;">Visualize behavioral states and individual features in Napari.</div>'),
+            self.sample_dd, self.celltype_dd, self.mode_tb, self.feature_dd, self.save_cb,
             widgets.HBox([self.status_html, self.refresh_btn]),
-            self.selection_container,
+            # self.selection_container is now less critical as we use the dropdown
             widgets.HBox([self.btn_run, self.spinner_html]),
             self.out
         ])
-        self._swap_ui()
+        self._on_celltype_changed()
 
     def _default_backproj_config(self, cell_type):
         return {"cell_type": cell_type, "mode": "mean", "save": False, "columns_input_time": [], "columns_input_mean": []}
@@ -123,16 +128,64 @@ class BackprojectionPanel:
         m = self._mode_map[self.mode_tb.value]
         self.selection_container.children = [self._time_selection_box] if m == "time" else [widgets.HTML("<i>Mean selection placeholder</i>")]
 
-    def _on_celltype_changed(self): self._rebuild_mean_selection_from_file()
-    def _on_refresh_clicked(self, *_): self._rebuild_mean_selection_from_file()
+    def _on_celltype_changed(self):
+        self._update_available_features()
+
+    def _update_available_features(self):
+        """Populate the dropdown with available numeric features."""
+        ct = self._celltype_map[self.celltype_dd.value]
+        fdir = Path(self.output_dir, "analysis", ct, "track_features")
+        
+        # Check for filtered features first, then advanced
+        p_filtered = fdir / f"BEHAV3D_{ct}_combined_track_features_filtered.csv"
+        p_advanced = Path(self.output_dir, "analysis", ct, "active_killing", f"BEHAV3D_{ct}_advanced_track_features.csv")
+        
+        available_cols = []
+        if p_advanced.exists():
+            try: available_cols = pd.read_csv(p_advanced, nrows=0).columns.tolist()
+            except Exception: pass
+        elif p_filtered.exists():
+            try: available_cols = pd.read_csv(p_filtered, nrows=0).columns.tolist()
+            except Exception: pass
+        
+        if not available_cols:
+            self.feature_dd.options = ["Behavioral States Only"]
+            self.status_html.value = '<span style="color:#c00;">⚠️ No features found. Run extraction first.</span>'
+            return
+
+        # Filter numeric and exclude boilerplate
+        exclude = ["TrackID", "sample_name", "position_t", "position_x", "position_y", "position_z", "ClusterID", "UMAP1", "UMAP2"]
+        numeric_features = [c for c in available_cols if c not in exclude]
+        
+        # Sort and add default
+        self.feature_dd.options = ["Behavioral States (Clusters)"] + sorted(numeric_features)
+        self.status_html.value = f'<span style="color:green;">✓ Found {len(numeric_features)} features</span>'
+
+    def _on_refresh_clicked(self, *_):
+        self._update_available_features()
 
     def _on_run_clicked(self, *_):
-        self.btn_run.disabled = True; self.spinner_html.layout.display = None
+        self.btn_run.disabled = True; self.spinner_html.layout.display = None; self.out.clear_output()
         with self.out:
             try:
                 m = self._mode_map[self.mode_tb.value]
+                ct = self._celltype_map[self.celltype_dd.value]
+                
+                # Collect columns: Behavioral States (ClusterID) + Selected Feature
+                cols = ["ClusterID"]
+                selected = self.feature_dd.value
+                if selected != "Behavioral States (Clusters)":
+                    cols.append(selected)
+                
                 fn = backproject_mean_features_behav3d if m == "mean" else backproject_time_features_behav3d
-                fn(metadata=self.metadata_loader.metadata, sample_name=self.sample_dd.value, output_dir=self.output_dir, cell_type=self._celltype_map[self.celltype_dd.value], columns=[], save=bool(self.save_cb.value))
+                fn(
+                    metadata=self.metadata_loader.metadata, 
+                    sample_name=self.sample_dd.value, 
+                    output_dir=self.output_dir, 
+                    cell_type=ct, 
+                    columns=cols, 
+                    save=bool(self.save_cb.value)
+                )
                 print("✅ Backprojection finished.")
             except Exception: traceback.print_exc()
             finally: self.spinner_html.layout.display = "none"; self.btn_run.disabled = False
