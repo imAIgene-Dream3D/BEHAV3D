@@ -79,12 +79,12 @@ class BackprojectionPanel:
         self.mode_tb = widgets.ToggleButtons(options=list(self._mode_map.keys()), value="Mean features" if self._cfg.get("mode") == "mean" else "Time features", description="Mode")
         
         self.save_cb = widgets.Checkbox(description="Save .zarr to disk", value=bool(self._cfg.get("save", False)))
-        self.behavior_cb = widgets.Checkbox(description="Include Behavioral States (Clusters)", value=True)
+        self.behavior_cb = widgets.Checkbox(description="Include Behavioral States (Clusters)", value=True, style={'description_width': 'initial'})
         self.refresh_btn = widgets.Button(description="Refresh Features", icon="refresh", layout=widgets.Layout(width="150px"))
         self.refresh_btn.on_click(self._on_refresh_clicked)
         
         # Feature Selection Dropdown
-        self.feature_dd = widgets.Dropdown(description="Other Feature:", options=["(none)"], value="(none)", layout=widgets.Layout(width="360px"), style={'description_width': '100px'})
+        self.feature_dd = widgets.Dropdown(description="Feature:", options=["(none)"], value="(none)", layout=widgets.Layout(width="360px"), style={'description_width': '100px'})
         
         self.status_html = widgets.HTML("<i>Loading available features...</i>")
         
