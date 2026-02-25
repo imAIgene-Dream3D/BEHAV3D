@@ -1982,12 +1982,6 @@ def train_state_classifiers(
     Stage 2: train intrinsic/full classifiers on model_adata with optional holdout validation.
 
     Mutates model_adata in-place by adding/updating model_adata.uns["classification"].
-
-    Returns:
-        dict: {
-            "full_classifier_path": str | None,
-            "partial_classifier_path": str | None,
-        }
     """
     if isinstance(model_adata, dict):
         raise ValueError(
@@ -2576,10 +2570,30 @@ def train_state_classifiers(
             f"intrinsic_clusters={n_intrinsic}, full_behavioral_clusters={n_full}, "
             f"saved_artifact={None if apply_artifact_path is None else str(apply_artifact_path)}"
         )
-    return {
-        "full_classifier_path": None if full_classifier_model_path is None else str(full_classifier_model_path),
-        "partial_classifier_path": None if classifier_model_path is None else str(classifier_model_path),
-    }
+    return
+    # return {
+    #     "adata_full": None,
+    #     "model_adata": model_adata,
+    #     "label_classifier": label_classifier,
+    #     "label_classifier_artifact": label_classifier_artifact,
+    #     "label_classifier_artifact_full_data": label_classifier_artifact_full_data,
+    #     "label_classifier_artifact_train_split": label_classifier_artifact_train_split,
+    #     "classifier_fit_info": classifier_fit_info,
+    #     "classifier_fit_info_train_split": classifier_fit_info_train_split,
+    #     "classifier_qc_model_data": classifier_qc_model_data,
+    #     "full_label_classifier_artifact": full_label_classifier_artifact,
+    #     "full_label_classifier_artifact_full_data": full_label_classifier_artifact_full_data,
+    #     "full_label_classifier_artifact_train_split": full_label_classifier_artifact_train_split,
+    #     "full_classifier_fit_info": full_classifier_fit_info,
+    #     "full_classifier_fit_info_train_split": full_classifier_fit_info_train_split,
+    #     "full_classifier_qc_model_data": full_classifier_qc_model_data,
+    #     "intrinsic_validation": intrinsic_validation,
+    #     "full_validation": full_validation,
+    #     "cluster_check_summary": None,
+    #     "classifier_model_path": None if classifier_model_path is None else str(classifier_model_path),
+    #     "full_classifier_model_path": None if full_classifier_model_path is None else str(full_classifier_model_path),
+    #     "apply_artifact_path": None if apply_artifact_path is None else str(apply_artifact_path),
+    # }
 
 
 def apply_state_classifiers_to_full_dataset(
@@ -2589,55 +2603,42 @@ def apply_state_classifiers_to_full_dataset(
     full_label_classifier_artifact=None,
     outfolder=None,
     continuous_output_col="intrinsic_behavioral_cluster",
+    continuous_confidence_col="intrinsic_behavioral_cluster_confidence",
     full_output_col="full_behavioral_cluster",
+    full_confidence_col="full_behavioral_cluster_confidence",
     continuous_model_variant="full_data",
     full_model_variant="full_data",
     combine_binary_with_continuous=True,
     verbose=True,
 ):
-    """Apply trained stage-2 classifier artifacts to the full dataset.
-
-    Confidence columns are always derived as `<output_col>_confidence`.
-    """
+    """Apply trained stage-2 classifier artifacts to the full dataset."""
     if not (hasattr(model_adata, "uns") and hasattr(model_adata, "var_names")):
         raise ValueError("model_adata must be an AnnData-like object with .uns and .var_names.")
 
     class_meta = model_adata.uns.get("classification", {}) if isinstance(model_adata.uns, dict) else {}
     clust_meta = model_adata.uns.get("clustering", {}) if isinstance(model_adata.uns, dict) else {}
-    continuous_confidence_col = f"{str(continuous_output_col)}_confidence"
-    full_confidence_col = f"{str(full_output_col)}_confidence"
-
-    def _coerce_classifier_artifact(artifact_input, artifact_name):
-        if artifact_input is None:
-            return None
-        if isinstance(artifact_input, (str, Path)):
-            return load_state_classifier_artifact(artifact_input)
-        if isinstance(artifact_input, dict) and "classifier" in artifact_input:
-            return artifact_input
-        raise ValueError(
-            f"{artifact_name} must be a classifier artifact dict or a path to a pickled classifier artifact, "
-            f"got {type(artifact_input)}."
-        )
 
     def _resolve_artifact_variant(artifact_input, variant_name, artifact_name):
         if artifact_input is None:
             return None
-        if isinstance(artifact_input, (str, Path)):
-            return _coerce_classifier_artifact(artifact_input, artifact_name)
         if isinstance(artifact_input, dict) and "classifier" in artifact_input:
             return artifact_input
         if isinstance(artifact_input, dict):
             available = sorted([str(k) for k, v in artifact_input.items() if v is not None])
             if variant_name in artifact_input and artifact_input[variant_name] is not None:
                 candidate = artifact_input[variant_name]
-                return _coerce_classifier_artifact(candidate, f"{artifact_name} variant '{variant_name}'")
+                if isinstance(candidate, dict) and "classifier" in candidate:
+                    return candidate
+                raise ValueError(
+                    f"Invalid {artifact_name} variant '{variant_name}': expected classifier artifact dict."
+                )
             raise ValueError(
                 f"Requested {artifact_name} variant '{variant_name}' not available. "
                 f"Available variants: {available}"
             )
         raise ValueError(
-            f"{artifact_name} must be a classifier artifact dict, a path, or a variant dict "
-            f"(keys: 'full_data'/'train_split' with artifact/path values), got {type(artifact_input)}."
+            f"{artifact_name} must be a classifier artifact dict or variant dict "
+            f"(keys: 'full_data'/'train_split'), got {type(artifact_input)}."
         )
 
     def _load_artifact_variant_from_meta(paths_key, fallback_key, variant_name, artifact_name):
@@ -2868,7 +2869,7 @@ def test_pipeline():
         cluster_key="full_behavioral_cluster",
     )
     
-    classifier_paths = train_state_classifiers(
+    train_state_classifiers(
         model_adata=model_adata,
         outfolder=outfolder,
         label_transfer_method="classifier",
@@ -2888,16 +2889,16 @@ def test_pipeline():
     
     adata_full = apply_state_classifiers_to_full_dataset(
         df_positions=df_positions,
-        model_adata=model_adata,
-        label_classifier_artifact=classifier_paths.get("partial_classifier_path", None),
+        model_adata=stage2_artifacts["model_adata"],
+        label_classifier_artifact=stage2_artifacts.get("label_classifier_artifact", None),
         full_label_classifier_artifact=(
-            classifier_paths.get("full_classifier_path", None)
-            if train_full_label_classifier
-            else None
+            stage2_artifacts.get("full_label_classifier_artifact", None) if train_full_label_classifier else None
         ),
         outfolder=outfolder,
         continuous_output_col="intrinsic_behavioral_cluster",
+        continuous_confidence_col=classifier_confidence_col,
         full_output_col="full_behavioral_cluster",
+        full_confidence_col=full_classifier_confidence_col,
         combine_binary_with_continuous=True,
         verbose=verbose,
     )
