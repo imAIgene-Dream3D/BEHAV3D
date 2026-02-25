@@ -316,7 +316,7 @@ class ActiveKillingPanel:
         self.use_absolute_threshold.observe(self._on_absolute_threshold_toggle, names="value")
         
         self.save_results = widgets.Checkbox(description="Save results to CSV", value=bool(self._cfg.get("save_results", True)), indent=False)
-        self.gallery_item_count = widgets.IntText(description="Gallery items:", value=5, style={'description_width': '100px'}, layout=widgets.Layout(width="180px"))
+        self.gallery_item_count = widgets.IntText(description="Immune cells in gallery:", value=5, style={'description_width': '180px'}, layout=widgets.Layout(width="280px"))
         
         self.btn_run = widgets.Button(description="Run Active Killing Analysis", button_style="danger", icon="bolt", layout=widgets.Layout(width="260px"))
         self.btn_run.on_click(self._on_run_clicked)
@@ -351,7 +351,7 @@ class ActiveKillingPanel:
             widgets.HBox([self.min_contact_duration, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.death_signal_dd], layout=widgets.Layout(align_items="center")),
             widgets.HBox([self.use_absolute_threshold, self.absolute_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">death signal increase (bypasses multiplier)</span>')], layout=widgets.Layout(align_items="center")),
             widgets.HTML("<hr>"),
-            widgets.HBox([self.btn_run, self.spinner_html, self.save_results, self.gallery_item_count], layout=widgets.Layout(align_items="center", gap="15px")),
+            widgets.HBox([self.btn_run, self.spinner_html, self.save_results, self.gallery_item_count, widgets.HTML('<span style="color:#666;font-size:12px;">x sample</span>')], layout=widgets.Layout(align_items="center", gap="15px")),
             self.btn_show_results,
             self.insights_accordion,
             self.out
@@ -514,151 +514,153 @@ class ActiveKillingPanel:
             df_killing["immune_track_id"] = df_killing["TrackID"]
         
         with self.insights_out:
-            # Create a 2x2 grid for advanced kinetics
-            fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-            axes = axes.flatten()
-            
+            # 1. Per-sample kinetics (4 plots each)
+            samples = df_killing["sample_name"].unique()
+            for sample_name in samples:
+                df_sample_all = df_killing[df_killing["sample_name"] == sample_name]
+                df_sample_active = df_sample_all[df_sample_all["is_active_killing"]].copy()
+                
+                display(widgets.HTML(f"<h3 style='margin-bottom:5px;'>Sample: {sample_name}</h3>"))
+                
+                fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+                axes = axes.flatten()
+                
+                # Plot 1: Efficiency Distribution (Per Sample)
+                if not df_sample_active.empty:
+                    sns.histplot(df_sample_active["killing_efficiency"], kde=True, ax=axes[0], color='red')
+                axes[0].set_title("1. Killing Efficiency Distribution", fontsize=14, fontweight='bold')
+                axes[0].set_xlabel("Efficiency Score (signal increase / expected background)")
+                axes[0].set_ylabel("Active Killing Events")
+                
+                # Plot 2: Smoothed Kinetics
+                temp_counts = df_sample_active.groupby("position_t").size()
+                if not temp_counts.empty:
+                    max_t = int(df_sample_all["position_t"].max())
+                    full_t = pd.Series(0, index=range(max_t + 1))
+                    full_t.update(temp_counts)
+                    window = max(5, max_t // 20)
+                    smoothed = full_t.rolling(window=window, center=True).mean()
+                    
+                    axes[1].plot(full_t.index, full_t.values, color='darkred', alpha=0.2, label='Raw Counts')
+                    axes[1].plot(smoothed.index, smoothed.values, color='red', linewidth=2, label='Kinetics Trend')
+                    axes[1].fill_between(smoothed.index, 0, smoothed.values, color='red', alpha=0.1)
+                    axes[1].set_title("2. Killing Intensity (Smoothed)", fontsize=14, fontweight='bold')
+                    axes[1].set_xlabel("Timepoint")
+                    axes[1].set_ylabel("Events / Timepoint")
+                    axes[1].legend()
+
+                # Plot 3: Cumulative Progress
+                if not temp_counts.empty:
+                    cumulative = full_t.cumsum()
+                    axes[2].plot(cumulative.index, cumulative.values, color='darkblue', linewidth=3)
+                    axes[2].fill_between(cumulative.index, 0, cumulative.values, color='blue', alpha=0.1)
+                    axes[2].set_title("3. Cumulative Killing Progress", fontsize=14, fontweight='bold')
+                    axes[2].set_xlabel("Timepoint")
+                    axes[2].set_ylabel("Cumulative Sum of Active Killing Events")
+                    axes[2].grid(True, linestyle='--', alpha=0.6)
+
+                # Plot 4: Raster
+                if not df_sample_active.empty:
+                    df_sample_active['hitter_label'] = df_sample_active['immune_track_id'].astype(str)
+                    hitters = df_sample_active.groupby('hitter_label').size().sort_values(ascending=False)
+                    hitter_map = {name: i for i, name in enumerate(hitters.index)}
+                    df_sample_active['y_idx'] = df_sample_active['hitter_label'].map(hitter_map)
+                    
+                    scatter = axes[3].scatter(df_sample_active["position_t"], df_sample_active["y_idx"], 
+                                              c=df_sample_active["killing_efficiency"], cmap='YlOrRd', 
+                                              s=50, edgecolors='black', alpha=0.8)
+                    axes[3].set_title("4. Killing Event Raster (By T-cell)", fontsize=14, fontweight='bold')
+                    axes[3].set_xlabel("Timepoint")
+                    axes[3].invert_yaxis()
+                    
+                    if len(hitters) <= 25:
+                        axes[3].set_yticks(range(len(hitters)))
+                        axes[3].set_yticklabels([str(n) for n in hitters.index], fontsize=8)
+                        axes[3].set_ylabel("T-cell TrackID (Ranked)")
+                    else:
+                        axes[3].set_yticks(range(15))
+                        axes[3].set_yticklabels([str(n) for n in hitters.index[:15]], fontsize=8)
+                        axes[3].set_ylabel("T-cell TrackID (Top 15 shown, ranked)")
+                    plt.colorbar(scatter, ax=axes[3], label='Efficiency')
+
+                plt.tight_layout()
+                
+                # Save per-sample plot
+                sample_plot_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", "plots", sample_name)
+                sample_plot_dir.mkdir(parents=True, exist_ok=True)
+                plot_path = sample_plot_dir / f"killing_kinetics_summary_{sample_name}.png"
+                plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+                plt.show()
+                display(widgets.HTML(f"<div style='color:green;font-size:11px;margin-top:-10px;margin-bottom:20px;'>📊 <b>Kinetics saved to:</b> {plot_path.relative_to(Path(self.output_dir))}</div>"))
+
+            # 2. Combined Killing Efficiency Distribution (ONLY that plot)
             df_active = df_killing[df_killing["is_active_killing"]].copy()
-            
-            # 1. Efficiency Distribution
-            sns.histplot(df_active["killing_efficiency"], kde=True, ax=axes[0], color='red')
-            axes[0].set_title("1. Killing Efficiency Distribution", fontsize=14, fontweight='bold')
-            axes[0].set_xlabel("Efficiency Score")
-            
-            # 2. Smoothed Killing Trend (Kinetics)
-            temp_counts = df_active.groupby("position_t").size()
-            if not temp_counts.empty:
-                # Reindex to include all timepoints for a smooth line
-                max_t = int(df_killing["position_t"].max())
-                full_t = pd.Series(0, index=range(max_t + 1))
-                full_t.update(temp_counts)
-                
-                # Rolling mean for smoothing
-                window = max(5, max_t // 20)
-                smoothed = full_t.rolling(window=window, center=True).mean()
-                
-                axes[1].plot(full_t.index, full_t.values, color='darkred', alpha=0.2, label='Raw Counts')
-                axes[1].plot(smoothed.index, smoothed.values, color='red', linewidth=2, label='Kinetics Trend')
-                axes[1].fill_between(smoothed.index, 0, smoothed.values, color='red', alpha=0.1)
-                axes[1].set_title("2. Killing Intensity (Smoothed)", fontsize=14, fontweight='bold')
-                axes[1].set_xlabel("Timepoint")
-                axes[1].set_ylabel("Events / Timepoint")
-                axes[1].legend()
-            
-            # 3. Cumulative Killing Curve
-            if not temp_counts.empty:
-                cumulative = full_t.cumsum()
-                axes[2].plot(cumulative.index, cumulative.values, color='darkblue', linewidth=3)
-                axes[2].fill_between(cumulative.index, 0, cumulative.values, color='blue', alpha=0.1)
-                axes[2].set_title("3. Cumulative Killing Progress", fontsize=14, fontweight='bold')
-                axes[2].set_xlabel("Timepoint")
-                axes[2].set_ylabel("Cumulative Sum of Active Killing Events")
-                axes[2].grid(True, linestyle='--', alpha=0.6)
-            
-            # 4. Serial Killer Raster Plot
             if not df_active.empty:
-                # Assign a numeric Y-index for each unique T-cell for the raster
-                df_active['hitter_label'] = df_active['sample_name'] + "_" + df_active['immune_track_id'].astype(str)
-                hitters = df_active.groupby('hitter_label').size().sort_values(ascending=False)
-                hitter_map = {name: i for i, name in enumerate(hitters.index)}
-                df_active['y_idx'] = df_active['hitter_label'].map(hitter_map)
+                display(widgets.HTML("<hr><h3 style='margin-bottom:5px;'>Combined Samples</h3>"))
+                fig, ax = plt.subplots(figsize=(10, 6))
+                sns.histplot(df_active["killing_efficiency"], kde=True, ax=ax, color='purple')
+                ax.set_title("Combined Killing Efficiency Distribution", fontsize=16, fontweight='bold')
+                ax.set_xlabel("Efficiency Score (signal increase / expected background)")
+                ax.set_ylabel("Active Killing Events")
                 
-                scatter = axes[3].scatter(df_active["position_t"], df_active["y_idx"], 
-                                          c=df_active["killing_efficiency"], cmap='YlOrRd', 
-                                          s=50, edgecolors='black', alpha=0.8)
-                axes[3].set_title("4. Killing Event Raster (By T-cell)", fontsize=14, fontweight='bold')
-                axes[3].set_xlabel("Timepoint")
-                
-                # Invert Y so rank 0 (top hitter) is at top
-                axes[3].invert_yaxis()
-                
-                # Add TrackID labels to Y-axis
-                if len(hitters) <= 25:
-                    axes[3].set_yticks(range(len(hitters)))
-                    axes[3].set_yticklabels([str(n).split("_")[-1] for n in hitters.index], fontsize=8)
-                    axes[3].set_ylabel("T-cell TrackID (Ranked)")
-                else:
-                    # Just label top 15 if too many
-                    axes[3].set_yticks(range(15))
-                    axes[3].set_yticklabels([str(n).split("_")[-1] for n in hitters.index[:15]], fontsize=8)
-                    axes[3].set_ylabel("T-cell TrackID (Top 15 shown, ranked)")
-                
-                plt.colorbar(scatter, ax=axes[3], label='Efficiency')
-            
-            plt.tight_layout()
-            
-            # Save the plot
-            plot_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", "plots")
-            plot_dir.mkdir(parents=True, exist_ok=True)
-            plot_path = plot_dir / f"killing_kinetics_summary_{self.immune_dd.value}.png"
-            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-            
-            plt.show()
-            
-            display(widgets.HTML(f"<div style='color:green;font-size:12px;margin-top:-10px;'>📊 <b>Kinetics Summary saved to:</b> <br><small>{plot_path.relative_to(Path(self.output_dir))}</small></div>"))
-            
+                # Save combined plot
+                combined_plot_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", "plots")
+                combined_plot_dir.mkdir(parents=True, exist_ok=True)
+                combined_path = combined_plot_dir / "combined_killing_efficiency_distribution.png"
+                plt.savefig(combined_path, dpi=150, bbox_inches='tight')
+                plt.show()
+                display(widgets.HTML(f"<div style='color:green;font-size:11px;margin-top:-10px;'>📊 <b>Combined distribution saved to:</b> {combined_path.relative_to(Path(self.output_dir))}</div>"))
+
             # Summary Table
             n_items = int(self.gallery_item_count.value)
             top_hitters = df_killing[df_killing["is_active_killing"]].groupby(["sample_name", "immune_track_id"]).size().sort_values(ascending=False).head(n_items)
             if not top_hitters.empty:
-                display(widgets.HTML("<b>Top Killing T cells (by events/timepoints):</b>"))
+                display(widgets.HTML("<br><b>Top Killing T cells across all samples (by events):</b>"))
                 display(top_hitters.to_frame("Count"))
 
     def _display_gallery(self, df_killing):
-        """Display the Active Killing Events Gallery."""
-        n_items = int(self.gallery_item_count.value)
+        """Display the Active Killing Events Gallery organized by sample."""
+        n_items_per_sample = int(self.gallery_item_count.value)
         
-        # No 'with self.gallery_out' here, it's called from a context that already has it
-        display(widgets.HTML(f'<hr><b style="font-size:16px;">Top {n_items} Active Killing Events Gallery</b>'))
+        display(widgets.HTML(f'<hr><b style="font-size:18px;">Active Killing Events Gallery (Top {n_items_per_sample} per sample)</b>'))
         display(widgets.HTML('<p style="font-size:12px;color:#666;">Showing Maximum Intensity Projections (MIP) using raw image data.<br>'
                              '<b>Legend:</b> <span style="color:#666;">Grayscale (Raw Structure)</span>, '
                              '<span style="color:red;">Translucent Red (Dead Mask)</span>, '
                              '<span style="color:purple;">Translucent Purple (ACTIVE T-cell)</span></p>'))
-        display(widgets.HTML(f'<div style="font-size:11px;color:#888;margin-bottom:10px;">Showing top event for each of the top {n_items} most active killers. Highlights are translucent for visual clarity.</div>'))
         
         df_active = df_killing[df_killing["is_active_killing"]].copy()
         if not df_active.empty:
-            # Find unique killers
-            all_killers = df_active.groupby(["sample_name", "immune_track_id"]).size().sort_values(ascending=False)
-            max_available = len(all_killers)
+            samples = df_active["sample_name"].unique()
             
-            if n_items > max_available:
-                display(widgets.HTML(f'<b style="color:orange;">⚠️ Warning: Only {max_available} active killers found. Limiting gallery to {max_available} items.</b>'))
-                n_items = max_available
-            
-            # Find top hitters
-            top_hitters_idx = all_killers.head(n_items).index
-            
-            top_events_list = []
-            for sample, tid in top_hitters_idx:
-                df_hitter = df_active[(df_active["sample_name"] == sample) & (df_active["immune_track_id"] == tid)]
-                # Find best event for this hitter (highest efficiency)
-                best_event = df_hitter.sort_values("killing_efficiency", ascending=False).head(1)
-                top_events_list.append(best_event)
-            
-            if top_events_list:
-                top_events = pd.concat(top_events_list)
-            else:
-                top_events = pd.DataFrame()
-            
-            gallery_items = []
-            for i, (_, event) in enumerate(top_events.iterrows()):
-                display(widgets.HTML(f"<i>📸 Processing event {i+1}/{len(top_events)}...</i>"))
-                item = self._generate_killing_gallery_item(event, df_killing)
-                if item: gallery_items.append(item)
-            
-            if gallery_items:
-                # Clear the processing messages before showing gallery
-                self.gallery_out.clear_output()
-                display(widgets.HTML('<hr><b style="font-size:16px;">Top 5 Active Killing Events Gallery</b>'))
-                display(widgets.HTML('<p style="font-size:12px;color:#666;">Showing Maximum Intensity Projections (MIP) using raw image data.<br>'
-                                     '<b>Legend:</b> <span style="color:#666;">Grayscale (Raw Structure)</span>, '
-                                     '<span style="color:red;">Translucent Red (Dead Mask)</span>, '
-                                     '<span style="color:purple;">Translucent Purple (ACTIVE T-cell)</span></p>'))
-                display(widgets.VBox(gallery_items))
-            else:
-                md_path = getattr(self.metadata_loader, 'metadata_csv_path', "(unknown path)")
-                display(widgets.HTML(f"<i>⚠️ Could not generate gallery. Ensure Zarr files exist and are accessible. Check the metadata here {md_path}</i>"))
+            for sample_name in samples:
+                display(widgets.HTML(f"<h3 style='margin-top:20px;background:#f0faf0;padding:5px;border-left:5px solid #28a745;'>Sample: {sample_name}</h3>"))
+                
+                df_sample = df_active[df_active["sample_name"] == sample_name].copy()
+                all_killers = df_sample.groupby("immune_track_id").size().sort_values(ascending=False)
+                max_available = len(all_killers)
+                
+                current_n = min(n_items_per_sample, max_available)
+                if n_items_per_sample > max_available:
+                     display(widgets.HTML(f'<small style="color:orange;">Only {max_available} active killers found in this sample.</small>'))
+                
+                top_hitters_idx = all_killers.head(current_n).index
+                
+                gallery_items = []
+                for tid in top_hitters_idx:
+                    df_hitter = df_sample[df_sample["immune_track_id"] == tid]
+                    best_event = df_hitter.sort_values("killing_efficiency", ascending=False).iloc[0]
+                    
+                    display(widgets.HTML(f"<i>📸 Processing T-cell {tid}...</i>"))
+                    item = self._generate_killing_gallery_item(best_event, df_killing)
+                    if item: gallery_items.append(item)
+                
+                if gallery_items:
+                    # No easy way to clear previous "Processing" messages without clearing everything, 
+                    # but we can wrap them in a VBox to show them all at once at the end of sample processing.
+                    # Or just display them. Let's just display them.
+                    display(widgets.VBox(gallery_items))
+                else:
+                    display(widgets.HTML("<i>Could not generate gallery items for this sample.</i>"))
         else:
             display(widgets.HTML("<i>No active killing events found to display in gallery.</i>"))
 
@@ -862,7 +864,7 @@ class ActiveKillingPanel:
                 return None
             
             # Save GIF to output directory
-            gallery_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", "gallery")
+            gallery_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", "gallery", sample_name)
             gallery_dir.mkdir(parents=True, exist_ok=True)
             gif_name = f"killing_event_{sample_name}_T{t_id}_start{t_start}.gif"
             gif_path = gallery_dir / gif_name
