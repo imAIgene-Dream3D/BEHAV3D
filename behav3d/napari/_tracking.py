@@ -16,6 +16,8 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtCore import Qt
 
+from behav3d.napari._widgets import make_help_row
+
 
 def _cfg_get(cfg: dict, dotted_key: str, default=None):
     cur = cfg
@@ -97,33 +99,65 @@ class CellTypeTrackingPanel(QWidget):
         self.lap_track_cost.setRange(1, 999)
         self.lap_track_cost.setValue(int(lap_cfg.get("track_cost_px", 45)))
         self.lap_track_cost.setMaximumWidth(80)
-        lap_form.addRow("Track cost (px):", self.lap_track_cost)
+        lap_form.addRow("Track cost (px):", make_help_row(
+            self.lap_track_cost,
+            "Track Cost (pixels)",
+            "Maximum pixel distance a cell can travel between two "
+            "consecutive frames to be linked as the same track.\n\n"
+            "Increase if cells move fast; decrease to avoid false links."
+        ))
 
         self.lap_gap_cost = QSpinBox()
         self.lap_gap_cost.setRange(1, 999)
         self.lap_gap_cost.setValue(int(lap_cfg.get("gap_close_cost_px", 60)))
         self.lap_gap_cost.setMaximumWidth(80)
-        lap_form.addRow("Gap close cost (px):", self.lap_gap_cost)
+        lap_form.addRow("Gap close cost (px):", make_help_row(
+            self.lap_gap_cost,
+            "Gap Closing Cost (pixels)",
+            "Maximum distance (in pixels) allowed when reconnecting a "
+            "track that was temporarily lost for one or more frames.\n\n"
+            "Should be >= Track cost. Increase if cells disappear "
+            "briefly due to segmentation gaps."
+        ))
 
         self.lap_gap_frames = QSpinBox()
         self.lap_gap_frames.setRange(0, 100)
         self.lap_gap_frames.setValue(int(lap_cfg.get("gap_close_max_frames", 3)))
         self.lap_gap_frames.setMaximumWidth(60)
-        lap_form.addRow("Gap close max frames:", self.lap_gap_frames)
+        lap_form.addRow("Gap close max frames:", make_help_row(
+            self.lap_gap_frames,
+            "Gap Closing Max Frames",
+            "Maximum number of consecutive frames a cell can be missing "
+            "before the gap is too large to close.\n\n"
+            "Higher values recover longer disappearances but may "
+            "introduce false links."
+        ))
 
         self.lap_merge_cost = QSpinBox()
         self.lap_merge_cost.setRange(0, 999)
         self.lap_merge_cost.setValue(int(lap_cfg.get("merging_cost_px", 0)))
         self.lap_merge_cost.setMaximumWidth(80)
-        self.lap_merge_cost.setToolTip("0 = disabled")
-        lap_form.addRow("Merging cost (px):", self.lap_merge_cost)
+        lap_form.addRow("Merging cost (px):", make_help_row(
+            self.lap_merge_cost,
+            "Merging Cost (pixels)",
+            "Maximum distance for detecting merge events, where two "
+            "tracks combine into one object.\n\n"
+            "Set to 0 to disable merging detection.\n"
+            "Useful when cells fuse or cluster together."
+        ))
 
         self.lap_split_cost = QSpinBox()
         self.lap_split_cost.setRange(0, 999)
         self.lap_split_cost.setValue(int(lap_cfg.get("splitting_cost_px", 0)))
         self.lap_split_cost.setMaximumWidth(80)
-        self.lap_split_cost.setToolTip("0 = disabled")
-        lap_form.addRow("Splitting cost (px):", self.lap_split_cost)
+        lap_form.addRow("Splitting cost (px):", make_help_row(
+            self.lap_split_cost,
+            "Splitting Cost (pixels)",
+            "Maximum distance for detecting split events, where one "
+            "object divides into two tracks.\n\n"
+            "Set to 0 to disable splitting detection.\n"
+            "Useful for cell division or organoid fragmentation."
+        ))
 
         self.param_stack.addWidget(lap_page)
 
@@ -139,20 +173,38 @@ class CellTypeTrackingPanel(QWidget):
         self.tp_search_range.setRange(1, 999)
         self.tp_search_range.setValue(int(tp_cfg.get("search_range_px", 31)))
         self.tp_search_range.setMaximumWidth(80)
-        tp_form.addRow("Search range (px):", self.tp_search_range)
+        tp_form.addRow("Search range (px):", make_help_row(
+            self.tp_search_range,
+            "Search Range (pixels)",
+            "Maximum pixel distance to look for a cell in the next frame.\n\n"
+            "Should be large enough to cover the fastest-moving cells."
+        ))
 
         self.tp_memory = QSpinBox()
         self.tp_memory.setRange(0, 100)
         self.tp_memory.setValue(int(tp_cfg.get("memory_frames", 2)))
         self.tp_memory.setMaximumWidth(60)
-        tp_form.addRow("Memory (frames):", self.tp_memory)
+        tp_form.addRow("Memory (frames):", make_help_row(
+            self.tp_memory,
+            "Memory (frames)",
+            "Number of frames a cell can disappear and still be "
+            "reconnected to its previous track.\n\n"
+            "Similar to 'gap closing' in LAP."
+        ))
 
         self.tp_adaptive_stop = QDoubleSpinBox()
         self.tp_adaptive_stop.setRange(0.0, 100.0)
         self.tp_adaptive_stop.setSingleStep(0.5)
         self.tp_adaptive_stop.setValue(float(tp_cfg.get("adaptive_stop", 10.0)))
         self.tp_adaptive_stop.setMaximumWidth(80)
-        tp_form.addRow("Adaptive stop:", self.tp_adaptive_stop)
+        tp_form.addRow("Adaptive stop:", make_help_row(
+            self.tp_adaptive_stop,
+            "Adaptive Stop",
+            "Factor that limits how much the search range can shrink "
+            "adaptively.\n\n"
+            "Higher = more conservative shrinking.\n"
+            "Leave at default unless tracking quality is poor."
+        ))
 
         self.tp_adaptive_step = QDoubleSpinBox()
         self.tp_adaptive_step.setRange(0.01, 1.0)
@@ -160,7 +212,15 @@ class CellTypeTrackingPanel(QWidget):
         self.tp_adaptive_step.setDecimals(3)
         self.tp_adaptive_step.setValue(float(tp_cfg.get("adaptive_step", 0.95)))
         self.tp_adaptive_step.setMaximumWidth(80)
-        tp_form.addRow("Adaptive step:", self.tp_adaptive_step)
+        tp_form.addRow("Adaptive step:", make_help_row(
+            self.tp_adaptive_step,
+            "Adaptive Step",
+            "Multiplier applied to the search range at each iteration "
+            "of the adaptive search.\n\n"
+            "Values close to 1.0 = slow reduction.\n"
+            "Values close to 0.5 = aggressive reduction.\n\n"
+            "Default 0.95 works well in most cases."
+        ))
 
         self.param_stack.addWidget(tp_page)
 

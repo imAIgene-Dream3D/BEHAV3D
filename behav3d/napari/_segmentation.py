@@ -1,5 +1,6 @@
 ﻿
 import napari
+from behav3d.napari._widgets import HelpButton, make_help_row
 import yaml
 from magicgui.widgets import create_widget
 from qtpy.QtWidgets import (
@@ -54,8 +55,26 @@ class SegmentationTab(QWidget):
         self._init_ui()
 
     def _init_ui(self):
-        layout = QVBoxLayout()
-        self.setLayout(layout)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.stack = QStackedWidget()
+        self.main_layout.addWidget(self.stack)
+
+        # -- Page 0: Placeholder --
+        self.placeholder_page = QWidget()
+        place_lay = QVBoxLayout(self.placeholder_page)
+        self.placeholder_label = QLabel("Load metadata in the Data Preparation tab to see segmentation options.")
+        self.placeholder_label.setAlignment(Qt.AlignCenter)
+        self.placeholder_label.setStyleSheet("color: #888; font-style: italic; font-size: 14px; padding: 20px;")
+        place_lay.addWidget(self.placeholder_label)
+        self.stack.addWidget(self.placeholder_page)
+
+        # -- Page 1: Main Content --
+        self.main_content = QWidget()
+        layout = QVBoxLayout(self.main_content)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
 
         # Method Selection
         method_group = QGroupBox("Segmentation Method")
@@ -98,9 +117,27 @@ class SegmentationTab(QWidget):
         layout.addWidget(QLabel("Log"))
         layout.addWidget(self.log)
 
+        self.stack.addWidget(self.main_content)
+        
+        # Connect to metadata signal
+        if hasattr(self.metadata_loader, "metadata_loaded"):
+            self.metadata_loader.metadata_loaded.connect(self._on_metadata_loaded)
+            
+        # Initial state
+        if self.metadata_loader.metadata is not None:
+            self.stack.setCurrentIndex(1)
+        else:
+            self.stack.setCurrentIndex(0)
+
+    def _on_metadata_loaded(self, metadata):
+        """Metadata signal received: show options and refresh sub-widgets."""
+        self.stack.setCurrentIndex(1)
+        self._on_metadata_updated()
+
     def _on_metadata_updated(self):
         """Trigger updates in sub-widgets."""
-        self.pixel_classifier_page._on_metadata_updated()
+        if hasattr(self, 'pixel_classifier_page'):
+            self.pixel_classifier_page._on_metadata_updated()
         # self.cellpose_page._on_metadata_updated()
         # self.import_page._on_metadata_updated()
 
@@ -233,7 +270,13 @@ class PixelClassifierWidget(QWidget):
         self.spin_examples.setValue(int(pc.get("examples_per_sample", 3)))
         self.spin_examples.setRange(1, 10)
         self.spin_examples.setMaximumWidth(70)
-        train_form.addRow("Examples/sample:", self.spin_examples)
+        train_form.addRow("Examples/sample:", make_help_row(
+            self.spin_examples,
+            "Examples per Sample",
+            "Number of timepoints randomly sampled from each dataset "
+            "for training the pixel classifier.\n\n"
+            "More examples → better generalization but slower training."
+        ))
         
         self.check_sample_specific = QCheckBox("Per-sample classifier")
         self.check_sample_specific.setChecked(bool(pc.get("sample_specific_classifier", False)))
@@ -243,7 +286,13 @@ class PixelClassifierWidget(QWidget):
         self.spin_workers.setValue(int(pc.get("workers", os.cpu_count() or 4)))
         self.spin_workers.setRange(1, 128)
         self.spin_workers.setMaximumWidth(70)
-        train_form.addRow("Workers:", self.spin_workers)
+        train_form.addRow("Workers:", make_help_row(
+            self.spin_workers,
+            "Workers",
+            "Number of parallel CPU threads used during batch segmentation.\n\n"
+            "Higher values speed up processing but use more memory. "
+            "A good default is the number of CPU cores on your machine."
+        ))
         
         self.btn_load_training = QPushButton("Generate Training Data")
         self.btn_load_training.setToolTip("Clears viewer and loads selected timepoints for labeling")
@@ -435,27 +484,57 @@ class PixelClassifierWidget(QWidget):
             w_edt.setSingleStep(0.5)
             w_edt.setValue(float(saved_edt))
             w_edt.setMaximumWidth(70)
-            ct_form.addRow("EDT:", w_edt)
-            
+            ct_form.addRow("EDT:", make_help_row(
+                w_edt,
+                "EDT (Distance Transform Threshold)",
+                "Controls sensitivity for separating touching objects.\n\n"
+                "Lower values → more sensitive, splits objects more aggressively.\n"
+                "Higher values → less splitting, objects stay merged.\n\n"
+                "Typical values:\n"
+                "  • Organoids: 8–15\n"
+                "  • Immune cells: 1.5–4.0"
+            ))
+
             w_size = QSpinBox()
             w_size.setRange(1, 100000)
             w_size.setValue(int(saved_size))
             w_size.setMaximumWidth(80)
-            ct_form.addRow("Min size:", w_size)
-            
+            ct_form.addRow("Min size:", make_help_row(
+                w_size,
+                "Minimum Object Size (pixels)",
+                "Minimum volume (in pixels) for a segmented object to be kept.\n\n"
+                "Objects smaller than this are removed as noise.\n\n"
+                "Typical values:\n"
+                "  • Organoids: 500–2000\n"
+                "  • Immune cells: 5–50"
+            ))
+
             w_open = QSpinBox()
             w_open.setRange(0, 10)
             w_open.setValue(int(saved_open))
             w_open.setMaximumWidth(60)
-            ct_form.addRow("Opening:", w_open)
-            
+            ct_form.addRow("Opening:", make_help_row(
+                w_open,
+                "Morphological Opening (pixels)",
+                "Radius of morphological opening applied to the mask.\n\n"
+                "Smooths edges and removes small protrusions/noise.\n"
+                "0 = no opening applied.\n\n"
+                "Increase for smoother boundaries; keep low for small objects."
+            ))
+
             w_fill = QCheckBox("Fill holes")
             w_fill.setChecked(bool(saved_fill))
-            ct_form.addRow(w_fill)
-            
+            ct_form.addRow(make_help_row(
+                w_fill,
+                "Fill Holes",
+                "When checked, internal gaps or holes within segmented "
+                "objects are automatically filled.\n\n"
+                "Recommended ON for most use cases."
+            ))
+
             ct_group.setLayout(ct_form)
             self.param_layout.addWidget(ct_group)
-            
+
             self.param_widgets[cell_type] = {
                 'edt': w_edt,
                 'min_size': w_size,
@@ -624,6 +703,10 @@ class PixelClassifierWidget(QWidget):
         self.spin_t_end.setEnabled(not checked)
 
     def _on_run_segmentation_clicked(self):
+        if self.metadata_loader.metadata is None:
+            self.log("⚠️ Cannot run segmentation: No metadata loaded.")
+            return
+
         self.log("Starting batch segmentation...")
         self._persist_params()
         try:
@@ -779,6 +862,10 @@ class PixelClassifierWidget(QWidget):
 
     def _on_load_training_clicked(self):
         try:
+            if self.metadata_loader.metadata is None:
+                self.log("⚠️ Cannot generate training data: No metadata loaded.")
+                return
+
             self.log("Loading training data...")
             self._persist_params()
             

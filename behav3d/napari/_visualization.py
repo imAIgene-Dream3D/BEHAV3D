@@ -28,6 +28,7 @@ from qtpy.QtWidgets import (
     QPushButton,
     QCheckBox,
     QTextEdit,
+    QStackedWidget,
     QAbstractButton,
     QSizePolicy,
 )
@@ -141,8 +142,27 @@ class VisualizationTab(QWidget):
         self._metadata: pd.DataFrame | None = None
 
         # ------- Build UI -------
-        layout = QVBoxLayout(self)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.stack = QStackedWidget()
+        self.main_layout.addWidget(self.stack)
+
+        # -- Page 0: Placeholder --
+        self.placeholder_page = QWidget()
+        place_lay = QVBoxLayout(self.placeholder_page)
+        self.placeholder_label = QLabel("Load metadata in the Data Preparation tab to see visualization options.")
+        self.placeholder_label.setAlignment(Qt.AlignCenter)
+        self.placeholder_label.setStyleSheet("color: #888; font-style: italic; font-size: 14px; padding: 20px;")
+        place_lay.addWidget(self.placeholder_label)
+        self.stack.addWidget(self.placeholder_page)
+
+        # -- Page 1: Main Content --
+        self.main_content = QWidget()
+        layout = QVBoxLayout(self.main_content)
         layout.setAlignment(Qt.AlignTop)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
 
         # Dataset selector
         sel_grp = QGroupBox("Dataset")
@@ -197,11 +217,6 @@ class VisualizationTab(QWidget):
         
         layout.addWidget(vis_grp)
 
-        # Info panel
-        self.info_label = QLabel("Load metadata in the Data Preparation tab first.")
-        self.info_label.setWordWrap(True)
-        layout.addWidget(self.info_label)
-
         # Log
         self.log = QTextEdit()
         self.log.setReadOnly(True)
@@ -209,6 +224,9 @@ class VisualizationTab(QWidget):
         self.log.setStyleSheet("font-family: monospace; font-size: 11px;")
         layout.addWidget(QLabel("Log"))
         layout.addWidget(self.log)
+
+        self.stack.addWidget(self.main_content)
+        self.stack.setCurrentIndex(0)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -225,15 +243,14 @@ class VisualizationTab(QWidget):
         samples = sorted(str(s) for s in metadata["sample_name"].unique())
         self.sample_combo.clear()
         self.sample_combo.addItems(samples)
-        self.info_label.setText(f"{len(samples)} sample(s) available.  Select one and click Load.")
         self._log(f"Metadata received — {len(samples)} sample(s)")
+        self.stack.setCurrentIndex(1)
 
     # ------------------------------------------------------------------
     # Load dataset into napari
     # ------------------------------------------------------------------
     def _on_load_dataset(self):
         if self._metadata is None:
-            self.info_label.setText("⚠️  No metadata loaded.")
             return
 
         sample_name = self.sample_combo.currentText()
@@ -242,7 +259,6 @@ class VisualizationTab(QWidget):
 
         row = self._metadata[self._metadata["sample_name"] == sample_name]
         if row.empty:
-            self.info_label.setText(f"⚠️  Sample '{sample_name}' not found in metadata.")
             return
         row = row.iloc[0]
 
@@ -268,8 +284,6 @@ class VisualizationTab(QWidget):
 
         # ---- 4. Tracks ---------------------------------------------------
         self._load_tracks(sample_name, row)
-
-        self.info_label.setText(f"✅  Loaded dataset for '{sample_name}'")
         self._log(f"✅ Dataset '{sample_name}' loaded into napari")
 
     # ------------------------------------------------------------------
