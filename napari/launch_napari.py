@@ -11,7 +11,9 @@ Usage:
     python launch_napari.py --internal  -> Payload mode (runs inside env)
 """
 import sys
+import os
 import argparse
+import platform
 from pathlib import Path
 
 # =============================================================================
@@ -42,6 +44,68 @@ def run_napari_payload():
 # =============================================================================
 # LAUNCHER MODE (Runs outside, orchestrates subprocess)
 # =============================================================================
+
+def _find_env_python(pkg_manager, env_name):
+    """Find the Python binary inside a conda/mamba/micromamba environment.
+    
+    For micromamba we avoid 'micromamba run' because it generates a wrapper
+    script that uses 'exec --', which fails on Ubuntu where /bin/sh is dash.
+    Instead, we locate the environment's Python binary directly.
+    """
+    pkg_path = Path(pkg_manager)
+    pkg_stem = pkg_path.stem.lower()  # e.g. 'micromamba', 'conda', 'mamba'
+    system = platform.system()
+    
+    # --- Strategy 1: resolve env prefix via '<pkg> env list --json' ---
+    try:
+        import subprocess, json
+        result = subprocess.run(
+            [str(pkg_path), "env", "list", "--json"],
+            capture_output=True, text=True, check=False
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            envs = data.get("envs", [])
+            for env_path_str in envs:
+                env_path = Path(env_path_str)
+                if env_path.name == env_name:
+                    if system == "Windows":
+                        py = env_path / "python.exe"
+                    else:
+                        py = env_path / "bin" / "python"
+                    if py.exists():
+                        return str(py)
+    except Exception:
+        pass
+    
+    # --- Strategy 2: common env locations ---
+    home = Path.home()
+    candidate_roots = []
+    
+    if "micromamba" in pkg_stem:
+        # micromamba default root prefix
+        candidate_roots.append(home / "micromamba" / "envs")
+        # MAMBA_ROOT_PREFIX env var
+        mamba_root = os.environ.get("MAMBA_ROOT_PREFIX")
+        if mamba_root:
+            candidate_roots.append(Path(mamba_root))
+    
+    # miniforge / mambaforge / miniconda / anaconda
+    for base in ["miniforge3", "mambaforge", "miniconda3", "anaconda3"]:
+        candidate_roots.append(home / base / "envs")
+    
+    for root in candidate_roots:
+        env_dir = root / env_name
+        if system == "Windows":
+            py = env_dir / "python.exe"
+        else:
+            py = env_dir / "bin" / "python"
+        if py.exists():
+            return str(py)
+    
+    return None
+
+
 def run_launcher():
     """Read config and spawn subprocess in the correct environment."""
     import json
@@ -70,18 +134,33 @@ def run_launcher():
         input("Press Enter to close...")
         sys.exit(1)
 
-    # Build the command: "<pkg_manager>" run --no-capture-output -n <env_name> python <this_script> --internal
-    # We use __file__ to refer to this same script
     script_path = script_dir / "launch_napari.py"
     
-    cmd = f'"{pkg_manager}" run --no-capture-output -n {env_name} python "{script_path}" --internal'
+    # ── Decide launch strategy ──
+    pkg_stem = Path(pkg_manager).stem.lower()
+    
+    # For micromamba: bypass 'micromamba run' (broken on Ubuntu/dash)
+    # and run the environment's Python directly.
+    # For conda/mamba: try direct Python first, fall back to 'conda run'.
+    env_python = _find_env_python(pkg_manager, env_name)
+    
+    if env_python:
+        # Direct invocation — most reliable across all platforms
+        cmd = [env_python, str(script_path), "--internal"]
+        cmd_display = f'"{env_python}" "{script_path}" --internal'
+        use_shell = False
+    else:
+        # Fall back to conda/mamba run (won't work for micromamba on Ubuntu)
+        cmd = f'"{pkg_manager}" run --no-capture-output -n {env_name} python "{script_path}" --internal'
+        cmd_display = cmd
+        use_shell = True
+    
     print(f"Launching napari in '{env_name}' environment...")
-    print(f"  Command: {cmd}")
+    print(f"  Command: {cmd_display}")
     print()
 
-    # On Windows, we need to handle signal differently often, but basic run is fine
     try:
-        subprocess.run(cmd, shell=True, check=True)
+        subprocess.run(cmd, shell=use_shell, check=True)
     except subprocess.CalledProcessError as e:
         print(f"\nERROR: napari exited with error code {e.returncode}")
         input("Press Enter to close...")

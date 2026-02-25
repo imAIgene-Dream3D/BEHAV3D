@@ -648,6 +648,55 @@ def save_env_config(conda_path):
     return config_path
 
 
+def _find_env_python(pkg_manager, env_name):
+    """Locate the Python binary inside a conda/mamba/micromamba environment.
+    
+    Avoids 'micromamba run' which generates a wrapper script using 'exec --'
+    that fails on Ubuntu where /bin/sh is dash.
+    """
+    pkg_path = Path(pkg_manager)
+    system = get_platform()
+    
+    # Strategy 1: query '<pkg> env list --json'
+    try:
+        result = subprocess.run(
+            [str(pkg_path), "env", "list", "--json"],
+            capture_output=True, text=True, check=False
+        )
+        if result.returncode == 0:
+            import json as _json
+            data = _json.loads(result.stdout)
+            for env_path_str in data.get("envs", []):
+                env_path = Path(env_path_str)
+                if env_path.name == env_name:
+                    py = env_path / ("python.exe" if system == "Windows" else "bin/python")
+                    if py.exists():
+                        return str(py)
+    except Exception:
+        pass
+    
+    # Strategy 2: well-known locations
+    home = Path.home()
+    candidate_roots = [
+        home / "micromamba" / "envs",
+        home / "miniforge3" / "envs",
+        home / "mambaforge" / "envs",
+        home / "miniconda3" / "envs",
+        home / "anaconda3" / "envs",
+    ]
+    mamba_root = os.environ.get("MAMBA_ROOT_PREFIX")
+    if mamba_root:
+        candidate_roots.insert(0, Path(mamba_root))
+    
+    for root in candidate_roots:
+        env_dir = root / env_name
+        py = env_dir / ("python.exe" if system == "Windows" else "bin/python")
+        if py.exists():
+            return str(py)
+    
+    return None
+
+
 def launch_napari(conda_path):
     """Launch napari with the BEHAV3D plugin."""
     project_root = find_project_root()
@@ -658,9 +707,15 @@ def launch_napari(conda_path):
         print_info("Falling back to standard napari launch...")
         cmd = f'{get_conda_run_prefix(conda_path, ENV_NAME)} napari'
     else:
-        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
-        # Use --internal to run the payload mode directly since we are already constructing the run command
-        cmd = f'{run_prefix} python "{script_path}" --internal'
+        # Try to use the environment's Python directly (avoids micromamba run issues)
+        env_python = _find_env_python(
+            get_package_manager() or conda_path, ENV_NAME
+        )
+        if env_python:
+            cmd = f'"{env_python}" "{script_path}" --internal'
+        else:
+            run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+            cmd = f'{run_prefix} python "{script_path}" --internal'
         
     print_info(f"Running: {cmd}")
     try:
