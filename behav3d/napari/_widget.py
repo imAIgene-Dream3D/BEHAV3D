@@ -55,8 +55,26 @@ class BEHAV3DWidget(QWidget):
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
     def _on_tab_changed(self, index):
-        """Intercept tab switches to handle exit warnings."""
-        # 2 is the index of the Segmentation Tab
+        """Intercept tab switches to handle exit warnings and missing output dir."""
+        # 1. Handle missing output directory (indices >= 2: Segmentation, Tracking, etc.)
+        if index >= 2:
+            has_metadata = self.data_prep_tab.metadata is not None
+            has_out_dir = bool(self.data_prep_tab.output_dir)
+            
+            if has_metadata and not has_out_dir:
+                from qtpy.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self, 
+                    "Output Directory Required",
+                    "No output directory has been established. Please go to the Data Preparation tab to define it."
+                )
+                # Switch back to last tab (likely Data Prep or Visualization)
+                self.tabs.blockSignals(True)
+                self.tabs.setCurrentIndex(self._last_tab_index)
+                self.tabs.blockSignals(False)
+                return
+
+        # 2. Handle exit logic (e.g. Segmentation Tab training session)
         if self._last_tab_index == 2:
             if hasattr(self, 'segmentation_tab'):
                 if not self.segmentation_tab.request_tab_exit():

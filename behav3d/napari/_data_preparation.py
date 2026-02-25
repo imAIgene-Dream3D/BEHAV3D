@@ -141,11 +141,13 @@ class DataPreparationTab(QWidget):
         self.output_dir: str = ""
         self.behav3d_parameters: dict = deepcopy(_DEFAULT_CONFIG)
         self._zarr_worker: _ZarrWorker | None = None
+        self._edit_mode: bool = False          # True when editing loaded metadata
+        self._loaded_csv_path: str = ""        # CSV path of last loaded metadata
 
         # Build UI --------------------------------------------------------
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         inner = QWidget()
         self._layout = QVBoxLayout(inner)
         self._layout.setContentsMargins(4, 4, 4, 4)
@@ -188,6 +190,7 @@ class DataPreparationTab(QWidget):
 
         self.output_dir_edit = QLineEdit()
         self.output_dir_edit.setPlaceholderText("Select output directory…")
+        self.output_dir_edit.editingFinished.connect(self._on_output_dir_edited)
         btn = QPushButton("Browse…")
         btn.clicked.connect(self._browse_output_dir)
         lay.addWidget(self.output_dir_edit, stretch=1)
@@ -200,14 +203,18 @@ class DataPreparationTab(QWidget):
             self.output_dir_edit.setText(d)
             self.output_dir = d
 
+    def _on_output_dir_edited(self):
+        self.output_dir = self.output_dir_edit.text().strip()
+
     # ══════════════════════════════════════════════════════════════════════
     # Section 2 – Metadata Builder
     # ══════════════════════════════════════════════════════════════════════
     def _build_metadata_builder_section(self):
-        grp = QGroupBox("2 · Metadata Builder")
-        grp.setCheckable(True)
-        grp.setChecked(False)  # collapsed by default
-        lay = QVBoxLayout(grp)
+        self.builder_grp = QGroupBox("2 · Metadata Builder")
+        self.builder_grp.setCheckable(True)
+        self.builder_grp.setChecked(False)  # collapsed by default
+        self.builder_grp.toggled.connect(self._on_builder_toggled)
+        lay = QVBoxLayout(self.builder_grp)
 
         # --- Number of samples ---
         row = QHBoxLayout()
@@ -246,18 +253,20 @@ class DataPreparationTab(QWidget):
         self.sample_form_container = QVBoxLayout()
         lay.addLayout(self.sample_form_container)
 
-        # --- Fill-down + Save ---
+        # --- Fill-down + Save (Horizontal Row) ---
         btns = QHBoxLayout()
         btn_fill = QPushButton("Fill All from Sample 1")
         btn_fill.clicked.connect(self._on_fill_down)
-        btn_save = QPushButton("Save Metadata CSV")
-        btn_save.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-        btn_save.clicked.connect(self._on_save_metadata)
+        
+        self.btn_save_metadata = QPushButton("Save Metadata CSV")
+        self.btn_save_metadata.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        self.btn_save_metadata.clicked.connect(self._on_save_metadata)
+        
         btns.addWidget(btn_fill)
-        btns.addWidget(btn_save)
+        btns.addWidget(self.btn_save_metadata)
         lay.addLayout(btns)
 
-        self._layout.addWidget(grp)
+        self._layout.addWidget(self.builder_grp)
 
         # Internal storage
         self._organoid_name_edits: list[QLineEdit] = []
@@ -435,11 +444,216 @@ class DataPreparationTab(QWidget):
         self._log("✅ Filled all samples from Sample 1")
 
     # --- Save metadata CSV ------------------------------------------------
-    def _on_save_metadata(self):
-        out_dir = self.output_dir_edit.text().strip()
-        if not out_dir or not Path(out_dir).exists():
-            QMessageBox.warning(self, "Error", "Please set a valid output directory first.")
+    def _on_builder_toggled(self, checked):
+        """Handle builder toggle — prompt if metadata is already loaded."""
+        if not checked:
+            self._reset_builder()
             return
+
+        if self.metadata is not None:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Metadata Builder")
+            msg.setText("Metadata is already loaded. Do you want to edit the current metadata or generate a new one?")
+            
+            # Custom buttons
+            btn_edit = msg.addButton("Edit Current", QMessageBox.AcceptRole)
+            btn_new = msg.addButton("Generate New", QMessageBox.DestructiveRole)
+            btn_cancel = msg.addButton("Cancel", QMessageBox.RejectRole)
+            
+            msg.exec_()
+            
+            clicked = msg.clickedButton()
+            if clicked == btn_cancel:
+                # Revert toggle
+                self.builder_grp.blockSignals(True)
+                self.builder_grp.setChecked(False)
+                self.builder_grp.blockSignals(False)
+                return
+            
+            if clicked == btn_edit:
+                self._enter_edit_mode()
+            else: # Generate New
+                self._reset_builder()
+
+    def _reset_builder(self):
+        """Reset the builder UI and internal state to blank."""
+        self._edit_mode = False
+        
+        # Reset spins without triggering configuration
+        for s in [self.n_samples_spin, self.n_organoid_spin, self.n_immune_spin, self.n_other_spin]:
+            s.blockSignals(True)
+            if s == self.n_samples_spin:
+                s.setValue(1)
+            else:
+                s.setValue(0)
+            s.blockSignals(False)
+
+        self.include_dead_cb.blockSignals(True)
+        self.include_dead_cb.setChecked(False)
+        self.include_dead_cb.blockSignals(False)
+
+        # Clear UI sections
+        self._clear_layout(self.cell_type_naming_container)
+        self._clear_layout(self.sample_form_container)
+
+        # Clear lists
+        self._organoid_name_edits = []
+        self._immune_name_edits = []
+        self._other_name_edits = []
+        self._sample_forms = []
+
+        # Reset button text/style based on current state
+        is_checked = self.builder_grp.isChecked()
+        if not is_checked and self.metadata is not None:
+            # Collapsed + Metadata loaded -> Yellow Edit
+            # NOTE: To keep the button active while the group is "collapsed", 
+            # we would technically need the group to be checked. 
+            # In standard Qt, an unchecked QGroupBox disables all children.
+            self.btn_save_metadata.setText("Edit Metadata CSV")
+            self.btn_save_metadata.setStyleSheet(
+                "background-color: #FFA726; color: white; font-weight: bold;"
+            )
+        elif is_checked and not self._edit_mode:
+            # Open + Not editing -> Green Save New
+            self.btn_save_metadata.setText("Save Metadata CSV")
+            self.btn_save_metadata.setStyleSheet(
+                "background-color: #4CAF50; color: white; font-weight: bold;"
+            )
+        elif self.metadata is not None and not is_checked:
+            # Fallback for yellow state
+            self.btn_save_metadata.setText("Edit Metadata CSV")
+            self.btn_save_metadata.setStyleSheet(
+                "background-color: #FFA726; color: white; font-weight: bold;"
+            )
+        else:
+            # Default Green Save
+            self.btn_save_metadata.setText("Save Metadata CSV")
+            self.btn_save_metadata.setStyleSheet(
+                "background-color: #4CAF50; color: white; font-weight: bold;"
+            )
+
+    def _enter_edit_mode(self):
+        """Populate builder from loaded metadata and switch to edit mode."""
+        self._edit_mode = True
+        self._populate_builder_from_metadata()
+        self.btn_save_metadata.setText("Save Changes")
+        self.btn_save_metadata.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-weight: bold;"
+        )
+
+    def _populate_builder_from_metadata(self):
+        """Fill the metadata builder forms from self.metadata."""
+        md = self.metadata
+        if md is None or md.empty:
+            return
+
+        org_types = detect_organoid_types_from_metadata(md)
+        imm_types = detect_immune_cell_types_from_metadata(md)
+        oth_types = detect_other_cell_types_from_metadata(md)
+        include_dead = "dead_channel" in md.columns
+
+        # Set spinners
+        self.n_samples_spin.setValue(len(md))
+        self.n_organoid_spin.setValue(len(org_types))
+        self.n_immune_spin.setValue(len(imm_types))
+        self.n_other_spin.setValue(len(oth_types))
+        self.include_dead_cb.setChecked(include_dead)
+
+        # Build cell type naming fields
+        self._on_configure_cell_types()
+
+        # Fill naming edits with detected names
+        for i, name in enumerate(org_types):
+            if i < len(self._organoid_name_edits):
+                self._organoid_name_edits[i].setText(name)
+        for i, name in enumerate(imm_types):
+            if i < len(self._immune_name_edits):
+                self._immune_name_edits[i].setText(name)
+        for i, name in enumerate(oth_types):
+            if i < len(self._other_name_edits):
+                self._other_name_edits[i].setText(name)
+
+        # Build sample forms
+        self._build_sample_forms()
+
+        # Populate each sample form from the DataFrame row
+        for row_idx, (_, row) in enumerate(md.iterrows()):
+            if row_idx >= len(self._sample_forms):
+                break
+            form = self._sample_forms[row_idx]
+
+            # Basic fields
+            for key, widget in form["basic"].items():
+                val = row.get(key)
+                if val is None or pd.isna(val):
+                    continue
+                if isinstance(widget, QLineEdit):
+                    widget.setText(str(val))
+                elif isinstance(widget, QSpinBox):
+                    widget.setValue(int(val))
+                elif isinstance(widget, QDoubleSpinBox):
+                    widget.setValue(float(val))
+
+            # Dead channel fields
+            if include_dead:
+                if "number" in form["dead_channel"] and "dead_channel" in row.index:
+                    dc_val = row.get("dead_channel")
+                    if pd.notna(dc_val):
+                        form["dead_channel"]["number"].setValue(int(dc_val))
+                if "mask_path" in form["dead_channel"] and "dead_mask_path" in row.index:
+                    dm_val = row.get("dead_mask_path")
+                    if pd.notna(dm_val):
+                        form["dead_channel"]["mask_path"].setText(str(dm_val))
+
+            # Cell type fields
+            all_ct = org_types + imm_types + oth_types
+            for ct_name in all_ct:
+                if ct_name not in form["cell_types"]:
+                    continue
+                if ct_name in org_types:
+                    pfx = "or"
+                elif ct_name in imm_types:
+                    pfx = "im"
+                else:
+                    pfx = "ot"
+
+                ct_fields = form["cell_types"][ct_name]
+
+                # line_condition → split into line + condition
+                lc_col = f"{pfx}_{ct_name}_line_condition"
+                lc_val = row.get(lc_col)
+                if pd.notna(lc_val) and str(lc_val).strip():
+                    parts = str(lc_val).split("_", 1)
+                    ct_fields["line"].setText(parts[0])
+                    if len(parts) > 1:
+                        ct_fields["condition"].setText(parts[1])
+
+                for fld in ("segments_image_path", "tracks_image_path", "tracks_csv_path"):
+                    col = f"{pfx}_{ct_name}_{fld}"
+                    v = row.get(col)
+                    if pd.notna(v) and str(v).strip():
+                        ct_fields[fld].setText(str(v))
+
+        self._log("📝 Metadata loaded into builder for editing.")
+
+    def _on_save_metadata(self):
+        # If button is in "Edit" state, open builder in edit mode instead of saving
+        if self.btn_save_metadata.text() == "Edit Metadata CSV":
+            self.builder_grp.blockSignals(True)
+            self.builder_grp.setChecked(True)
+            self.builder_grp.blockSignals(False)
+            self._enter_edit_mode()
+            return
+
+        # Determine save target
+        if self._edit_mode and self._loaded_csv_path:
+            csv_path = Path(self._loaded_csv_path)
+        else:
+            out_dir = self.output_dir_edit.text().strip()
+            if not out_dir or not Path(out_dir).exists():
+                QMessageBox.warning(self, "Error", "Please set a valid output directory first.")
+                return
+            csv_path = Path(out_dir) / "metadata.csv"
 
         org_names = [e.text().strip() for e in self._organoid_name_edits]
         imm_names = [e.text().strip() for e in self._immune_name_edits]
@@ -487,11 +701,44 @@ class DataPreparationTab(QWidget):
             rows.append(row)
 
         df = pd.DataFrame(rows)
-        csv_path = Path(out_dir) / "metadata.csv"
+
+        # Overwrite prompt
+        if csv_path.exists():
+            res = QMessageBox.question(
+                self, "Overwrite?",
+                f"A metadata file already exists:\n{csv_path}\n\nDo you want to overwrite it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if res != QMessageBox.Yes:
+                self._log("Save cancelled by user.")
+                return
+
         df.to_csv(csv_path, index=False)
         self.metadata = df
+        self._loaded_csv_path = str(csv_path)
         self._populate_metadata_overview()
         self._log(f"✅ Metadata saved to {csv_path}  ({len(df)} samples, {len(df.columns)} columns)")
+
+        # Update behav3d_parameters
+        self.behav3d_parameters["paths"]["metadata_csv"] = str(csv_path)
+
+        # If we were in edit mode, exit it and reset button
+        if self._edit_mode:
+            self._edit_mode = False
+            self.builder_grp.blockSignals(True)
+            self.builder_grp.setChecked(False)
+            self.builder_grp.blockSignals(False)
+            self._reset_builder()
+
+        # Reset button to "Edit" state since metadata is now loaded
+        self.btn_save_metadata.setText("Edit Metadata CSV")
+        self.btn_save_metadata.setStyleSheet(
+            "background-color: #FFA726; color: white; font-weight: bold;"
+        )
+
+        # Reload + emit so other tabs update
+        self.csv_path_edit.setText(str(csv_path))
+        self.metadata_loaded.emit(self.metadata)
 
     # ══════════════════════════════════════════════════════════════════════
     # Section 3 – Metadata Loader
@@ -567,6 +814,13 @@ class DataPreparationTab(QWidget):
                 info_parts.append(f"Other: {', '.join(oth)}")
             self.metadata_info_label.setText("  |  ".join(info_parts))
             self._log(f"✅ Metadata loaded from {csv_path}")
+            self._loaded_csv_path = csv_path
+
+            # Switch save button to "Edit Metadata CSV" (yellow)
+            self.btn_save_metadata.setText("Edit Metadata CSV")
+            self.btn_save_metadata.setStyleSheet(
+                "background-color: #FFA726; color: white; font-weight: bold;"
+            )
 
             # Populate overview and dim-order table
             self._populate_metadata_overview()
@@ -614,7 +868,7 @@ class DataPreparationTab(QWidget):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 self.metadata_table.setItem(i, j, item)
 
-        self.metadata_table.resizeColumnsToContents()
+        # self.metadata_table.resizeColumnsToContents()  # Removed to prevent excessive width
 
     # ══════════════════════════════════════════════════════════════════════
     # Section 5 – Dimension Order Table

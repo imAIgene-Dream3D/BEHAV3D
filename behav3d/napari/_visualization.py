@@ -180,6 +180,10 @@ class VisualizationTab(QWidget):
         self.clear_layers_cb.setChecked(True)
         # sel_lay.addWidget(self.clear_layers_cb) # Removed as it does not make sense right now
 
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet("color: #666; font-style: italic;")
+        sel_lay.addWidget(self.info_label)
+
         btn_load = QPushButton("Load Dataset into Napari")
         btn_load.setStyleSheet(
             "background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;"
@@ -243,6 +247,7 @@ class VisualizationTab(QWidget):
         samples = sorted(str(s) for s in metadata["sample_name"].unique())
         self.sample_combo.clear()
         self.sample_combo.addItems(samples)
+        self.info_label.setText(f"{len(samples)} sample(s) available.  Select one and click Load.")
         self._log(f"Metadata received — {len(samples)} sample(s)")
         self.stack.setCurrentIndex(1)
 
@@ -251,6 +256,7 @@ class VisualizationTab(QWidget):
     # ------------------------------------------------------------------
     def _on_load_dataset(self):
         if self._metadata is None:
+            self.info_label.setText("⚠️  No metadata loaded.")
             return
 
         sample_name = self.sample_combo.currentText()
@@ -259,6 +265,7 @@ class VisualizationTab(QWidget):
 
         row = self._metadata[self._metadata["sample_name"] == sample_name]
         if row.empty:
+            self.info_label.setText(f"⚠️  Sample '{sample_name}' not found in metadata.")
             return
         row = row.iloc[0]
 

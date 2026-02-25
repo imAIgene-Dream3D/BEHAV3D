@@ -99,7 +99,7 @@ class SegmentationTab(QWidget):
         self.param_stack.addWidget(self.cellpose_page)
 
         # 3. Import Page
-        self.import_page = ImportWidget(self.viewer, self.metadata_loader)
+        self.import_page = ImportWidget(self.viewer, self.metadata_loader, log_callback=self._log)
         self.param_stack.addWidget(self.import_page)
 
 
@@ -139,7 +139,7 @@ class SegmentationTab(QWidget):
         if hasattr(self, 'pixel_classifier_page'):
             self.pixel_classifier_page._on_metadata_updated()
         # self.cellpose_page._on_metadata_updated()
-        # self.import_page._on_metadata_updated()
+        self.import_page._on_metadata_updated()
 
     def _log(self, msg):
         import datetime
@@ -1546,14 +1546,428 @@ class CellposeWidget(QWidget):
         layout.addStretch()
 
 class ImportWidget(QWidget):
-    def __init__(self, viewer, metadata_loader):
+    """Widget to validate and import pre-existing segmentation files.
+    
+    Shows a per-sample, per-cell-type status table with conversion actions.
+    """
+
+    def __init__(self, viewer, metadata_loader, log_callback=None):
         super().__init__()
         self.viewer = viewer
         self.metadata_loader = metadata_loader
+        self.log = log_callback or print
+        self.organoid_types = []
+        self.immune_types = []
+        self.other_types = []
+        self.all_cell_types = []
         self._init_ui()
-    
+
+    # ── helpers ──────────────────────────────────────────────────────────
+    def _get_prefix(self, cell_type):
+        """Return the metadata column prefix for a cell type."""
+        if cell_type in self.organoid_types:
+            return "or"
+        if cell_type in self.immune_types:
+            return "im"
+        return "ot"
+
+    def _seg_col(self, cell_type):
+        """Full metadata column name for a cell type's segmentation path."""
+        return f"{self._get_prefix(cell_type)}_{cell_type}_segments_image_path"
+
+    def _expected_outpath(self, sample_name, cell_type):
+        """Where a converted zarr would be saved (matches batch segmentation)."""
+        out_dir = Path(self.metadata_loader.output_dir)
+        return out_dir / "images" / sample_name / f"{sample_name}_{cell_type}_segments.zarr"
+
+    # ── zarr validation ─────────────────────────────────────────────────
+    @staticmethod
+    def _check_zarr_structure(path):
+        """Check that a .zarr file matches the expected save_as_zarr structure.
+        
+        Expected: single root array (no sub-groups), chunks starting with (1, ...).
+        Returns (ok: bool, reason: str).
+        """
+        import zarr
+        try:
+            store = zarr.storage.LocalStore(str(path))
+            root = zarr.open(store, mode="r")
+            # Must be an array at root, not a group with children
+            if isinstance(root, zarr.Group):
+                # Check if group contains a single array
+                members = list(root.arrays())
+                if len(members) == 0:
+                    return False, "Zarr group contains no arrays"
+                return False, "Zarr contains sub-groups instead of a root array"
+            # root is zarr.Array
+            if root.chunks[0] != 1:
+                return False, f"First chunk dim is {root.chunks[0]}, expected 1"
+            return True, "OK"
+        except Exception as e:
+            return False, str(e)
+
+    # ── UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
+        if hasattr(self.metadata_loader, "metadata_loaded"):
+            self.metadata_loader.metadata_loaded.connect(self._on_metadata_updated)
+
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
-        layout.addWidget(QLabel("Import pre-existing segmentation labels (Coming Soon)"))
-        layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_content = QWidget()
+        self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_layout.setAlignment(Qt.AlignTop)
+        scroll.setWidget(self.scroll_content)
+        layout.addWidget(scroll)
+
+        # placeholder
+        self.placeholder = QLabel("Load metadata to see segmentation import status.")
+        self.placeholder.setStyleSheet("color:#888; font-style:italic; padding:20px;")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.scroll_layout.addWidget(self.placeholder)
+
+    def _on_metadata_updated(self, _metadata=None):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+        )
+        md = self.metadata_loader.metadata
+        if md is None:
+            return
+        self.organoid_types = detect_organoid_types_from_metadata(md)
+        self.immune_types = detect_immune_cell_types_from_metadata(md)
+        self.other_types = detect_other_cell_types_from_metadata(md)
+        self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
+        self._rebuild_table()
+
+    # ── table builder ───────────────────────────────────────────────────
+    def _rebuild_table(self):
+        """Clear and rebuild the entire status table."""
+        # clear old widgets
+        while self.scroll_layout.count():
+            item = self.scroll_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        md = self.metadata_loader.metadata
+        if md is None or md.empty:
+            lbl = QLabel("No metadata loaded.")
+            lbl.setStyleSheet("color:#888; font-style:italic; padding:20px;")
+            self.scroll_layout.addWidget(lbl)
+            return
+
+        for idx, row in md.iterrows():
+            sample_name = str(row.get("sample_name", f"Row {idx+1}"))
+            self._add_sample_section(sample_name, idx, row)
+
+        # Check if ANY button was added to the scroll layout
+        any_fixes_needed = False
+        for i in range(self.scroll_layout.count()):
+            w = self.scroll_layout.itemAt(i).widget()
+            if isinstance(w, QWidget):
+                # Look for buttons with specific text/tooltips
+                btns = w.findChildren(QPushButton)
+                for b in btns:
+                    if "Convert" in b.text() or "Fix" in b.text():
+                        any_fixes_needed = True
+                        break
+            if any_fixes_needed:
+                break
+
+        if any_fixes_needed:
+            # ── global Convert All button ──
+            btn_all = QPushButton("⚡  Convert / Fix All Samples")
+            btn_all.setStyleSheet(
+                "QPushButton{background:#1565C0;color:white;padding:8px 16px;"
+                "border-radius:4px;font-weight:bold;font-size:13px}"
+                "QPushButton:hover{background:#1976D2}"
+            )
+            btn_all.clicked.connect(self._convert_all)
+            self.scroll_layout.addWidget(btn_all)
+        else:
+            # All correct -> Show success message
+            success_msg = QLabel("✨ All available segmentation files are in the correct format.")
+            success_msg.setWordWrap(True)
+            success_msg.setAlignment(Qt.AlignCenter)
+            success_msg.setStyleSheet("color:#2E7D32; background:#E8F5E9; padding:12px; border-radius:8px; margin:5px; border:1px solid #C8E6C9; font-weight:bold;")
+            self.scroll_layout.addWidget(success_msg)
+
+        # ── General Instruction (ALWAYS visible at the bottom) ──
+        instr = QLabel(
+            "To add or change segmentation paths, go to the <b>Data Preparation</b> tab "
+            "and check the <b>Metadata Builder</b>."
+        )
+        instr.setWordWrap(True)
+        instr.setAlignment(Qt.AlignCenter)
+        instr.setStyleSheet("color:#555; background:#f9f9f9; padding:15px; border-radius:8px; margin:10px; border:1px solid #ddd;")
+        self.scroll_layout.addWidget(instr)
+
+        self.scroll_layout.addStretch()
+
+    def _add_sample_section(self, sample_name, row_idx, row):
+        """Add a grouped section for one sample."""
+        from functools import partial
+
+        # Sample header
+        header = QLabel(f"📁  {sample_name}")
+        header.setStyleSheet("font-weight:bold; font-size:13px; padding:6px 0 2px 0;")
+        self.scroll_layout.addWidget(header)
+
+        # Track whether ALL cell types have empty paths
+        all_empty = True
+
+        for ct in self.all_cell_types:
+            col = self._seg_col(ct)
+            raw_val = row.get(col) if col in row.index else None
+            has_value = raw_val is not None and pd.notna(raw_val) and str(raw_val).strip() not in ("", "nan")
+
+            if has_value:
+                all_empty = False
+
+            row_widget = QWidget()
+            row_lay = QHBoxLayout(row_widget)
+            row_lay.setContentsMargins(16, 2, 4, 2)
+            lbl = QLabel(f"{ct}:")
+            lbl.setFixedWidth(120)
+            row_lay.addWidget(lbl)
+
+            if not has_value:
+                status = QLabel("No segmentation available")
+                status.setStyleSheet("color:#999; font-style:italic;")
+                row_lay.addWidget(status)
+            else:
+                path_str = str(raw_val).strip().strip('"').strip("'")
+                file_path = Path(path_str)
+
+                if not file_path.exists():
+                    status = QLabel(f"⚠️  File not found")
+                    status.setToolTip(path_str)
+                    status.setStyleSheet("color:#E65100;")
+                    row_lay.addWidget(status)
+
+                elif file_path.suffix == ".zarr":
+                    ok, reason = self._check_zarr_structure(file_path)
+                    if ok:
+                        status = QLabel("✅  Ready for tracking")
+                        status.setStyleSheet("color:#2E7D32; font-weight:bold;")
+                        row_lay.addWidget(status)
+                    else:
+                        btn = QPushButton("🔄  Fix zarr format")
+                        btn.setToolTip(f"Issue: {reason}")
+                        btn.setStyleSheet(
+                            "QPushButton{background:#F57C00;color:white;padding:4px 10px;"
+                            "border-radius:3px}"
+                            "QPushButton:hover{background:#FB8C00}"
+                        )
+                        btn.clicked.connect(partial(self._convert_single, path_str, ct, sample_name, row_idx))
+                        row_lay.addWidget(btn)
+
+                elif file_path.suffix.lower() in (".tif", ".tiff"):
+                    btn = QPushButton("🔄  Convert TIFF → zarr")
+                    btn.setStyleSheet(
+                        "QPushButton{background:#1565C0;color:white;padding:4px 10px;"
+                        "border-radius:3px}"
+                        "QPushButton:hover{background:#1976D2}"
+                    )
+                    btn.clicked.connect(partial(self._convert_single, path_str, ct, sample_name, row_idx))
+                    row_lay.addWidget(btn)
+                else:
+                    status = QLabel(f"⚠️  Format not supported ({file_path.suffix})")
+                    status.setStyleSheet("color:#E65100;")
+                    row_lay.addWidget(status)
+
+            row_lay.addStretch()
+            self.scroll_layout.addWidget(row_widget)
+
+        # If ALL cell types empty → show combined message instead
+        if all_empty:
+            # remove the per-cell-type rows we just added (they all say "No segmentation")
+            # keep the header, remove the rest
+            items_to_remove = []
+            for i in range(self.scroll_layout.count() - 1, -1, -1):
+                item = self.scroll_layout.itemAt(i)
+                w = item.widget()
+                if w is header:
+                    break
+                items_to_remove.append(i)
+            for i in items_to_remove:
+                item = self.scroll_layout.takeAt(i)
+                if item.widget():
+                    item.widget().deleteLater()
+
+            msg = QLabel("  No segmentation data found for this sample.<br>  (Check the <b>Metadata Builder</b> in Data Prep if you have files to import)")
+            msg.setStyleSheet("color:#888; font-style:italic; padding:4px 16px;")
+            msg.setWordWrap(True)
+            self.scroll_layout.addWidget(msg)
+        else:
+            # Check if any "action" buttons were added for this sample
+            fixes_needed = False
+            # We look at the widgets added after the header
+            found_header = False
+            for i in range(self.scroll_layout.count()):
+                w = self.scroll_layout.itemAt(i).widget()
+                if not found_header:
+                    if w is header:
+                        found_header = True
+                    continue
+                # Now we are past the header
+                if isinstance(w, QWidget):
+                    if w.findChildren(QPushButton):
+                        fixes_needed = True
+                        break
+            
+            if fixes_needed:
+                # Per-sample Convert All button
+                btn = QPushButton(f"⚡  Convert / Fix all for {sample_name}")
+                btn.setStyleSheet(
+                    "QPushButton{background:#2E7D32;color:white;padding:5px 12px;"
+                    "border-radius:3px;font-size:12px}"
+                    "QPushButton:hover{background:#388E3C}"
+                )
+                btn.clicked.connect(partial(self._convert_sample, sample_name, row_idx))
+                wrap = QWidget()
+                wrap_lay = QHBoxLayout(wrap)
+                wrap_lay.setContentsMargins(16, 2, 4, 6)
+                wrap_lay.addWidget(btn)
+                wrap_lay.addStretch()
+                self.scroll_layout.addWidget(wrap)
+
+        # separator
+        sep = QWidget()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background:#ddd;")
+        self.scroll_layout.addWidget(sep)
+
+    # ── conversion logic ────────────────────────────────────────────────
+    def _convert_single(self, src_path_str, cell_type, sample_name, row_idx, 
+                        save_metadata=True, refresh_ui=True):
+        """Convert a single file (TIFF or bad zarr) and update metadata."""
+        from qtpy.QtWidgets import QMessageBox
+        src = Path(src_path_str)
+        dest = self._expected_outpath(sample_name, cell_type)
+
+        # Overwrite check
+        if dest.exists():
+            # If we are in a batch operation (save_metadata=False), we might want to skip prompt
+            # but for safety let's prompt or assume user already confirmed global action?
+            # Actually, per-file confirmation is safer unless we add "Apply to all".
+            res = QMessageBox.question(
+                self, "Overwrite?",
+                f"There is a pre-existing segmentation file:\n{dest}\n\nDo you want to overwrite it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if res != QMessageBox.Yes:
+                self.log(f"Skipped {cell_type} for {sample_name} (user declined overwrite)")
+                return False
+
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            self.log(f"Converting {src.name} → {dest.name} ...")
+            img = load_image(src)
+            if dest.exists():
+                import shutil
+                shutil.rmtree(dest)
+            save_as_zarr(img, dest)
+            self.log(f"✅  Saved: {dest}")
+
+            # Update metadata
+            md = self.metadata_loader.metadata
+            col = self._seg_col(cell_type)
+            if col not in md.columns:
+                md[col] = pd.NA
+            md[col] = md[col].astype("object")
+            md.at[row_idx, col] = str(dest)
+            
+            if save_metadata:
+                self._save_metadata(refresh_ui=refresh_ui)
+            return True
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.log(f"❌  Error converting {cell_type} for {sample_name}: {e}")
+            if refresh_ui: # Only show error dialog if not in background bulk operation
+                QMessageBox.warning(self, "Conversion Error", str(e))
+            return False
+
+    def _convert_sample(self, sample_name, row_idx, save_metadata=True, refresh_ui=True):
+        """Convert all actionable files for one sample."""
+        md = self.metadata_loader.metadata
+        row = md.iloc[row_idx]
+        converted_any = False
+
+        for ct in self.all_cell_types:
+            col = self._seg_col(ct)
+            raw_val = row.get(col) if col in row.index else None
+            has_value = raw_val is not None and pd.notna(raw_val) and str(raw_val).strip() not in ("", "nan")
+            if not has_value:
+                continue
+
+            path_str = str(raw_val).strip().strip('"').strip("'")
+            file_path = Path(path_str)
+
+            if not file_path.exists():
+                continue
+
+            needs_convert = False
+            if file_path.suffix.lower() in (".tif", ".tiff"):
+                needs_convert = True
+            elif file_path.suffix == ".zarr":
+                ok, _ = self._check_zarr_structure(file_path)
+                if not ok:
+                    needs_convert = True
+
+            if needs_convert:
+                # We pass refresh_ui=False here to prevent the table from being rebuilt 
+                # inside the loop, which causes the crash!
+                if self._convert_single(path_str, ct, sample_name, row_idx, 
+                                        save_metadata=False, refresh_ui=False):
+                    converted_any = True
+
+        if converted_any:
+            if save_metadata:
+                self._save_metadata(refresh_ui=refresh_ui)
+        elif refresh_ui:
+            self.log(f"No conversions needed for {sample_name}")
+        
+        return converted_any
+
+    def _convert_all(self):
+        """Convert all actionable files across all samples."""
+        md = self.metadata_loader.metadata
+        if md is None:
+            return
+        
+        converted_any = False
+        for idx, row in md.iterrows():
+            sample_name = str(row.get("sample_name", f"Row {idx+1}"))
+            # refresh_ui=False to avoid crash
+            if self._convert_sample(sample_name, idx, save_metadata=False, refresh_ui=False):
+                converted_any = True
+        
+        if converted_any:
+            self._save_metadata(refresh_ui=True)
+        else:
+            self.log("No conversions needed.")
+
+    def _save_metadata(self, show_popup=True, refresh_ui=True):
+        """Save metadata CSV to disk and show info popup."""
+        from qtpy.QtWidgets import QMessageBox
+        md = self.metadata_loader.metadata
+        csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv", "")
+        if not csv_path:
+            self.log("⚠️  Cannot save metadata: CSV path unknown")
+            return
+        md.to_csv(csv_path, index=False)
+        self.log(f"Metadata updated: {csv_path}")
+        if show_popup:
+            QMessageBox.information(self, "Metadata Updated",
+                                    f"The metadata CSV has been updated:\n{csv_path}")
+        if refresh_ui:
+            self._rebuild_table()
