@@ -45,14 +45,15 @@ ENV_NAME = DEFAULT_ENV_NAME
 MINIFORGE_URLS = {
     "Windows": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Windows-x86_64.exe",
     "Darwin": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-{arch}.sh",
-    "Linux": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh",
+    "Linux": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-{arch}.sh",
 }
 
 # Micromamba download URLs (lightweight, standalone conda alternative)
+# These return tar.bz2 archives containing bin/micromamba
 MICROMAMBA_URLS = {
     "Windows": "https://micro.mamba.pm/api/micromamba/win-64/latest",
     "Darwin": "https://micro.mamba.pm/api/micromamba/osx-{arch}/latest",
-    "Linux": "https://micro.mamba.pm/api/micromamba/linux-64/latest",
+    "Linux": "https://micro.mamba.pm/api/micromamba/linux-{arch}/latest",
 }
 
 # =============================================================================
@@ -100,6 +101,18 @@ def get_architecture():
     if machine in ('arm64', 'aarch64'):
         return 'arm64'
     return 'x86_64'
+
+def get_micromamba_arch():
+    """Get the architecture string used in micromamba download URLs.
+    
+    macOS uses osx-arm64, Linux uses linux-aarch64 for ARM.
+    """
+    machine = platform.machine().lower()
+    if machine in ('arm64', 'aarch64'):
+        if platform.system() == 'Darwin':
+            return 'arm64'   # osx-arm64
+        return 'aarch64'     # linux-aarch64
+    return '64'
 
 def run_command(cmd, shell=True, capture=False, check=True):
     """Run a shell command."""
@@ -169,6 +182,8 @@ def install_miniforge():
     
     if system == "Darwin":
         url = MINIFORGE_URLS[system].format(arch=arch)
+    elif system == "Linux":
+        url = MINIFORGE_URLS[system].format(arch=arch)
     else:
         url = MINIFORGE_URLS[system]
     
@@ -216,18 +231,26 @@ def install_miniforge():
             return None
 
 def install_micromamba():
-    """Download and install Micromamba (lightweight conda alternative)."""
+    """Download and install Micromamba (lightweight conda alternative).
+    
+    The micromamba API returns a tar.bz2 archive containing the binary at
+    bin/micromamba (Unix) or Library/bin/micromamba.exe (Windows).
+    """
+    import tarfile
+    
     print_step("Installing Micromamba (lightweight conda alternative)...")
     
     system = get_platform()
-    arch = get_architecture()
+    mm_arch = get_micromamba_arch()
     
+    # Build download URL with correct architecture
     if system == "Darwin":
-        url = MICROMAMBA_URLS[system].format(arch=arch)
+        url = MICROMAMBA_URLS[system].format(arch=mm_arch)
+    elif system == "Linux":
+        url = MICROMAMBA_URLS[system].format(arch=mm_arch)
     else:
         url = MICROMAMBA_URLS[system]
     
-    # Download micromamba
     print_info(f"Downloading from: {url}")
     
     install_path = Path.home() / "micromamba"
@@ -240,12 +263,41 @@ def install_micromamba():
         (install_path / "bin").mkdir(exist_ok=True)
     
     try:
-        urllib.request.urlretrieve(url, micromamba_exe)
+        # Download the tar.bz2 archive to a temporary file, then extract
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = Path(tmpdir) / "micromamba.tar.bz2"
+            urllib.request.urlretrieve(url, archive_path)
+            print_success("Download complete")
+            
+            # Extract the micromamba binary from the archive
+            print_step("Extracting micromamba binary...")
+            with tarfile.open(archive_path, "r:bz2") as tar:
+                if system == "Windows":
+                    # Windows binary is at Library/bin/micromamba.exe
+                    member_name = "Library/bin/micromamba.exe"
+                else:
+                    # Unix binary is at bin/micromamba
+                    member_name = "bin/micromamba"
+                
+                # Extract only the micromamba binary
+                member = tar.getmember(member_name)
+                # Extract to temp dir first, then move to final location
+                tar.extract(member, path=tmpdir)
+                extracted = Path(tmpdir) / member_name
+                
+                # Move to final install location
+                shutil.copy2(str(extracted), str(micromamba_exe))
         
         if system != "Windows":
             os.chmod(micromamba_exe, 0o755)
         
-        print_success(f"Micromamba installed at: {micromamba_exe}")
+        # Verify the binary works
+        print_step("Verifying micromamba binary...")
+        result = run_command(f'"{micromamba_exe}" --version', capture=True, check=False)
+        if result:
+            print_success(f"Micromamba {result} installed at: {micromamba_exe}")
+        else:
+            print_success(f"Micromamba installed at: {micromamba_exe}")
         
         # Initialize micromamba
         print_step("Initializing micromamba...")
