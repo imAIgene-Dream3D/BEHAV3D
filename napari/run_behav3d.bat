@@ -17,9 +17,9 @@ python "%~dp0launch_napari.py"
 if errorlevel 1 (
     echo.
     echo Trying alternative Python paths...
-    "%USERPROFILE%\miniforge3\python.exe" "%~dp0launch_napari.py" 2>nul
+    "%USERPROFILE%\miniforge3\python.exe" "%~dp0launch_napari.py"
     if errorlevel 1 (
-        "%USERPROFILE%\miniconda3\python.exe" "%~dp0launch_napari.py" 2>nul
+        "%USERPROFILE%\miniconda3\python.exe" "%~dp0launch_napari.py"
         if errorlevel 1 (
             echo.
             echo ERROR: Could not find Python. Please ensure Python is installed and on your PATH.

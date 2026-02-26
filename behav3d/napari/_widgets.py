@@ -13,15 +13,15 @@ class HelpButton(QPushButton):
         self._title = title
         self._description = description
 
-        self.setFixedSize(20, 20)
+        self.setFixedSize(15, 15)
         self.setCursor(Qt.WhatsThisCursor)
         self.setStyleSheet(
             "QPushButton {"
             "  background-color: #5a9bd5;"
             "  color: white;"
-            "  border-radius: 10px;"
+            "  border-radius: 7px;"
             "  font-weight: bold;"
-            "  font-size: 12px;"
+            "  font-size: 10px;"
             "  padding: 0px;"
             "}"
             "QPushButton:hover {"

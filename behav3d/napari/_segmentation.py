@@ -145,7 +145,9 @@ class SegmentationTab(QWidget):
         import datetime
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.log.append(f"[{timestamp}] {msg}")
-        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+        self.log.verticalScrollBar().setValue(
+            self.log.verticalScrollBar().maximum()
+        )
 
     def _on_method_changed(self, index):
         # If switching away from Pixel Classifier (index 0), check session
@@ -282,18 +284,6 @@ class PixelClassifierWidget(QWidget):
         self.check_sample_specific.setChecked(bool(pc.get("sample_specific_classifier", False)))
         train_form.addRow(self.check_sample_specific)
         
-        self.spin_workers = QSpinBox()
-        self.spin_workers.setValue(int(pc.get("workers", os.cpu_count() or 4)))
-        self.spin_workers.setRange(1, 128)
-        self.spin_workers.setMaximumWidth(70)
-        train_form.addRow("Workers:", make_help_row(
-            self.spin_workers,
-            "Workers",
-            "Number of parallel CPU threads used during batch segmentation.\n\n"
-            "Higher values speed up processing but use more memory. "
-            "A good default is the number of CPU cores on your machine."
-        ))
-        
         self.btn_load_training = QPushButton("Generate Training Data")
         self.btn_load_training.setToolTip("Clears viewer and loads selected timepoints for labeling")
         self.btn_load_training.setStyleSheet("background-color: #007bff; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
@@ -381,6 +371,24 @@ class PixelClassifierWidget(QWidget):
         self.param_layout = QVBoxLayout()
         self.param_group.setLayout(self.param_layout)
 
+        # Workers spinner (applies to batch segmentation)
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setValue(int(pc.get("workers", os.cpu_count() or 4)))
+        self.spin_workers.setRange(1, 128)
+        self.spin_workers.setMaximumWidth(70)
+        self.workers_form = QFormLayout()
+        self.workers_form.setContentsMargins(6, 6, 6, 6)
+        self.workers_form.setSpacing(4)
+        self.workers_form.addRow("Workers:", make_help_row(
+            self.spin_workers,
+            "Workers",
+            "Number of parallel CPU threads used during batch segmentation.\n\n"
+            "Higher values speed up processing but use more memory. "
+            "A good default is the number of CPU cores on your machine."
+        ))
+        self.param_layout.addLayout(self.workers_form)
+
         self.btn_resegment = QPushButton("Test Segmentation Parameters")
         self.btn_resegment.setToolTip("Re-runs segmentation on the current slice/time point using current parameters.")
         self.btn_resegment.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
@@ -442,12 +450,29 @@ class PixelClassifierWidget(QWidget):
         self._refresh_params_ui()
 
     def _refresh_params_ui(self):
-        # Clear existing
+        # Collect all items first, then process
+        items = []
         while self.param_layout.count():
-            item = self.param_layout.takeAt(0)
+            items.append(self.param_layout.takeAt(0))
+        
+        # Delete dynamic items, keep workers_form and btn_resegment
+        for item in items:
             widget = item.widget()
-            if widget and widget is not self.btn_resegment:
+            layout = item.layout()
+            if widget and widget is self.btn_resegment:
+                pass  # keep it
+            elif layout and layout is self.workers_form:
+                pass  # keep it
+            elif widget:
                 widget.deleteLater()
+            elif layout:
+                while layout.count():
+                    child = layout.takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
+        
+        # Re-add preserved items (workers first, resegment re-added at end)
+        self.param_layout.addLayout(self.workers_form)
         
         self.param_widgets = {}
 
