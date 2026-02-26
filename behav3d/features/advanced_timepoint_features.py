@@ -44,6 +44,7 @@ import pandas as pd
 from pathlib import Path
 import time
 from typing import Optional, List, Tuple, Dict, Union
+import numpy as np
 
 from behav3d.core.metadata import detect_organoid_types_from_metadata
 from behav3d.core.utils import get_current_time, format_time
@@ -342,6 +343,7 @@ def analyze_active_killing_per_timepoint(
         last_is_active = False
         last_efficiency = 0.0
         last_killing_threshold = 0.0
+        last_target_id = None
         
         for i, t in enumerate(contact_timepoints):
             observation_end_t = t + observation_window
@@ -384,12 +386,16 @@ def analyze_active_killing_per_timepoint(
                         after_window = after_window.iloc[[0]]
                     
                     death_after = after_window[death_signal_column].values[0]
-                    death_increases.append(death_after - death_at_t)
+                    death_increases.append((target_id_int, death_after - death_at_t))
                 
                 # Use max death increase across all touched targets
                 if death_increases:
-                    death_increase = max(death_increases)
+                    # Find which target had the max increase
+                    max_idx = np.argmax([d[1] for d in death_increases])
+                    target_id_max = death_increases[max_idx][0]
+                    death_increase = death_increases[max_idx][1]
                 else:
+                    target_id_max = None
                     death_increase = 0.0
                 
                 # Calculate killing threshold
@@ -411,12 +417,14 @@ def analyze_active_killing_per_timepoint(
                 last_is_active = is_active
                 last_efficiency = efficiency
                 last_killing_threshold = killing_threshold
+                last_target_id = target_id_max
             else:
                 # Cannot observe full window - forward-fill last known values
                 death_increase = last_death_increase
                 is_active = last_is_active
                 efficiency = last_efficiency
                 killing_threshold = last_killing_threshold
+                target_id_max = last_target_id
             
             killing_results.append({
                 "contact_event_id": event["contact_event_id"],
@@ -426,6 +434,7 @@ def analyze_active_killing_per_timepoint(
                 "death_signal_increase": death_increase,
                 "is_active_killing": is_active,
                 "killing_efficiency": efficiency,
+                "targeted_track_id": target_id_max if is_active else None,
                 "sample_background_rate": sample_bg_rate,
                 "killing_threshold_used": killing_threshold if can_observe else last_killing_threshold,
                 "observation_complete": can_observe,
@@ -642,6 +651,7 @@ def run_active_killing_analysis(
         "killing_threshold_multiplier": killing_threshold_multiplier,
         "absolute_killing_threshold": absolute_killing_threshold,
         "threshold_mode": "absolute" if absolute_killing_threshold is not None else "multiplier",
+        "targeted_organoids_tracked": True
     }
     
     print(f"{get_current_time()} - Active killing analysis complete:")
@@ -728,6 +738,8 @@ def create_advanced_features_csv(
     df["is_active_killing"] = False
     df["killing_efficiency"] = 0.0
     df[f"death_signal_increase{window_suffix}"] = 0.0
+    df["targeted_track_id"] = -1
+    df["contact_event_id"] = -1
     
     if df_killing_per_timepoint.empty:
         print("No killing events to merge - returning original features with zero killing columns")
@@ -755,7 +767,7 @@ def create_advanced_features_csv(
     
     # Create indexed Series for vectorized lookup
     killing_indexed = df_killing_deduped.set_index("_merge_key")[
-        ["is_active_killing", "killing_efficiency", "death_signal_increase"]
+        ["is_active_killing", "killing_efficiency", "death_signal_increase", "targeted_track_id", "contact_event_id"]
     ]
     
     # Vectorized assignment using reindex - matches df's merge keys to killing data
@@ -765,6 +777,8 @@ def create_advanced_features_csv(
     df["is_active_killing"] = matched_values["is_active_killing"].fillna(False).astype(bool).values
     df["killing_efficiency"] = matched_values["killing_efficiency"].fillna(0.0).values
     df[f"death_signal_increase{window_suffix}"] = matched_values["death_signal_increase"].fillna(0.0).values
+    df["targeted_track_id"] = matched_values["targeted_track_id"].fillna(-1).values
+    df["contact_event_id"] = matched_values["contact_event_id"].fillna(-1).astype(int).values
     
     # Clean up merge key
     df.drop(columns=["_merge_key"], inplace=True)
