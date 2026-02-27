@@ -3,6 +3,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pandas.api.types import is_numeric_dtype
 import json
+import copy
+import warnings
+import re
 from matplotlib.backends.backend_pdf import PdfPages
 
 from pathlib import Path
@@ -20,6 +23,9 @@ from behav3d.core.anndata import df_to_adata
 from behav3d.features.rolling_window_features import create_descriptive_track_dataset
 from behav3d.analysis.clustering.general import relabel_cluster_ids
 from behav3d.analysis.clustering.general.leiden import run_pca, run_leiden_clustering
+from behav3d.analysis.clustering.state.visualization.plots.state_composition import (
+    save_state_composition_report,
+)
 
 A4_PORTRAIT = (8.27, 11.69)
 A4_LANDSCAPE = (11.69, 8.27)
@@ -151,39 +157,77 @@ def build_identity_cluster_mapping(
 
 
 def subsample_with_temporal_spacing(
-    df,
+    data,
     id_cols=None,
     time_col="position_t",
     min_spacing=5,
     max_samples=None,
     random_state=123,
 ):
-    """Subsample rows with temporal spacing per track."""
+    """Subsample rows with temporal spacing per track for DataFrame or AnnData input."""
     if id_cols is None:
         id_cols = ["sample_name", "TrackID"]
 
-    np.random.seed(random_state)
-    subsampled_rows = []
+    rng = np.random.RandomState(random_state)
 
-    for _, track_df in df.groupby(id_cols):
+    if hasattr(data, "obs") and hasattr(data, "n_obs"):
+        obs = data.obs
+        missing_cols = [c for c in list(id_cols) + [time_col] if c not in obs.columns]
+        if len(missing_cols) > 0:
+            raise ValueError(
+                "AnnData input is missing required columns for temporal subsampling: "
+                f"{missing_cols}"
+            )
+
+        obs_work = obs[list(id_cols) + [time_col]].copy()
+        obs_work["_obs_idx"] = np.arange(data.n_obs, dtype=int)
+        selected_obs_idx = []
+
+        for _, track_obs in obs_work.groupby(id_cols, observed=False):
+            track_obs = track_obs.sort_values(time_col).reset_index(drop=True)
+            n = len(track_obs)
+            if n == 0:
+                continue
+            start_idx = int(rng.randint(0, min(int(min_spacing), n)))
+            local_selected = []
+            idx = start_idx
+            while idx < n:
+                local_selected.append(int(idx))
+                idx += int(min_spacing)
+            selected_obs_idx.extend(track_obs.iloc[local_selected]["_obs_idx"].tolist())
+
+        if len(selected_obs_idx) == 0:
+            subset_empty = data[:0].copy()
+            subset_empty.uns = copy.deepcopy(dict(getattr(data, "uns", {})))
+            return subset_empty
+
+        selected_obs_idx = np.asarray(selected_obs_idx, dtype=int)
+        if max_samples is not None and len(selected_obs_idx) > int(max_samples):
+            selected_obs_idx = rng.choice(selected_obs_idx, size=int(max_samples), replace=False)
+        subset = data[selected_obs_idx].copy()
+        subset.uns = copy.deepcopy(dict(getattr(data, "uns", {})))
+        return subset
+
+    subsampled_rows = []
+    for _, track_df in data.groupby(id_cols):
         track_df = track_df.sort_values(time_col).reset_index(drop=True)
         n = len(track_df)
         if n == 0:
             continue
-        start_idx = np.random.randint(0, min(min_spacing, n))
+        start_idx = int(rng.randint(0, min(int(min_spacing), n)))
         selected_indices = []
         idx = start_idx
         while idx < n:
-            selected_indices.append(idx)
-            idx += min_spacing
+            selected_indices.append(int(idx))
+            idx += int(min_spacing)
         subsampled_rows.append(track_df.iloc[selected_indices])
 
     if len(subsampled_rows) == 0:
-        return df.iloc[:0].copy()
+        return data.iloc[:0].copy()
 
     df_subsampled = pd.concat(subsampled_rows, ignore_index=True)
-    if max_samples is not None and len(df_subsampled) > max_samples:
-        df_subsampled = df_subsampled.sample(n=max_samples, random_state=random_state).reset_index(drop=True)
+    if max_samples is not None and len(df_subsampled) > int(max_samples):
+        df_subsampled = df_subsampled.sample(n=int(max_samples), random_state=random_state).reset_index(drop=True)
     return df_subsampled
 
 
@@ -238,15 +282,14 @@ def prepare_state_classification_dataset(
     scale_features=False,
     incomplete_window_policy="drop",
     reuse_prepared_dataset=True,
-    save_prepared_dataset=True,
-    prepared_dataset_cache_path=None,
+    save_prepared_dataset=False,
+    prepared_dataset_path=None,
     verbose=True,
 ):
     """Create the windowed descriptive dataset used for clustering/classification.
 
     Returns:
-        tuple[pd.DataFrame, dict]: (df_prepared, info)
-        where df_prepared is scaled if scale_features=True.
+        sc.AnnData: prepared dataset (scaled if scale_features=True).
     """
     groupby = ["sample_name", "TrackID"]
     non_feature_cols = [
@@ -259,36 +302,21 @@ def prepare_state_classification_dataset(
         "window_length_frames",
     ]
 
-    if prepared_dataset_cache_path is None and outfolder is not None:
-        prepared_dataset_cache_path = Path(outfolder) / "state_classification_prepared_windows.csv"
-    elif prepared_dataset_cache_path is not None:
-        prepared_dataset_cache_path = Path(prepared_dataset_cache_path)
-
-    quantile_limits_cache_path = None
-    prepared_info_cache_path = None
-    if prepared_dataset_cache_path is not None:
-        quantile_limits_cache_path = prepared_dataset_cache_path.with_name(
-            prepared_dataset_cache_path.stem + "_quantile_cap_limits.json"
-        )
-        prepared_info_cache_path = prepared_dataset_cache_path.with_name(
-            prepared_dataset_cache_path.stem + "_info.json"
-        )
+    if prepared_dataset_path is None and outfolder is not None:
+        prepared_dataset_path = Path(outfolder) / "state_classification_full.h5ad"
+    elif prepared_dataset_path is not None:
+        prepared_dataset_path = Path(prepared_dataset_path)
 
     quantile_cap_limits = {}
-    loaded_info = None
     loaded_from_cache = False
-    if reuse_prepared_dataset and prepared_dataset_cache_path is not None and prepared_dataset_cache_path.exists():
+    adata_prepared = None
+    cached_pre_meta = {}
+    if reuse_prepared_dataset and prepared_dataset_path is not None and prepared_dataset_path.exists():
         try:
-            df_prepared = pd.read_csv(prepared_dataset_cache_path)
-            if quantile_limits_cache_path is not None and quantile_limits_cache_path.exists():
-                with open(quantile_limits_cache_path, "r") as f:
-                    quantile_cap_limits = json.load(f)
-            if prepared_info_cache_path is not None and prepared_info_cache_path.exists():
-                with open(prepared_info_cache_path, "r") as f:
-                    loaded_info = json.load(f)
+            adata_prepared = sc.read_h5ad(prepared_dataset_path)
             loaded_from_cache = True
             if verbose:
-                print(f"Loaded prepared window dataset from cache: {prepared_dataset_cache_path}")
+                print(f"Loaded prepared window dataset from cache: {prepared_dataset_path}")
         except Exception as exc:
             if verbose:
                 print(f"Could not load prepared dataset cache ({exc}); recomputing windows.")
@@ -339,77 +367,66 @@ def prepare_state_classification_dataset(
                 return_limits=True,
             )
 
-        if save_prepared_dataset and prepared_dataset_cache_path is not None:
-            prepared_dataset_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            df_prepared.to_csv(prepared_dataset_cache_path, index=False)
-            if quantile_limits_cache_path is not None and len(quantile_cap_limits) > 0:
-                with open(quantile_limits_cache_path, "w") as f:
-                    json.dump(quantile_cap_limits, f, indent=2)
-            if prepared_info_cache_path is not None:
-                info_to_cache = {
-                    "kept_features": list(kept_features),
-                    "non_feature_cols": list(non_feature_cols),
-                    "binary_cols_to_merge": list(binary_cols_to_merge),
-                    "quantile_cap_limits": dict(quantile_cap_limits),
-                    "lower_quantile_cap": lower_quantile_cap,
-                    "upper_quantile_cap": upper_quantile_cap,
-                    "quantile_limits_cache_path": (
-                        None if quantile_limits_cache_path is None else str(quantile_limits_cache_path)
-                    ),
-                }
-                with open(prepared_info_cache_path, "w") as f:
-                    json.dump(info_to_cache, f, indent=2)
+        obs_cols = [c for c in non_feature_cols if c in df_prepared.columns] + [
+            c for c in binary_cols_to_merge if c in df_prepared.columns
+        ]
+        adata_prepared = df_to_adata(df_prepared, kept_features, obs_cols=obs_cols)
+
     else:
-        binary_cols_to_merge = [col for col in binary_features_to_group if col in df_prepared.columns]
-        descriptive_feature_cols = [
-            col for col in df_prepared.columns
-            if (col not in non_feature_cols) and (not col.endswith("_signal_type"))
-        ]
-        binary_prefixes = tuple(f"{c}_" for c in binary_cols_to_merge)
-        kept_features = [
-            c for c in descriptive_feature_cols
-            if (c not in binary_cols_to_merge) and (not c.startswith(binary_prefixes))
-        ]
-
-        if isinstance(loaded_info, dict):
-            cached_non_feature_cols = loaded_info.get("non_feature_cols", None)
-            if isinstance(cached_non_feature_cols, list) and len(cached_non_feature_cols) > 0:
-                non_feature_cols = [str(c) for c in cached_non_feature_cols]
-
-            cached_binary_cols = loaded_info.get("binary_cols_to_merge", None)
-            if isinstance(cached_binary_cols, list) and len(cached_binary_cols) > 0:
-                valid_binary_cols = [str(c) for c in cached_binary_cols if str(c) in df_prepared.columns]
-                if len(valid_binary_cols) > 0:
-                    binary_cols_to_merge = valid_binary_cols
-
-            cached_kept_features = loaded_info.get("kept_features", None)
+        binary_cols_to_merge = [col for col in binary_features_to_group if col in adata_prepared.obs.columns]
+        kept_features = [str(c) for c in list(adata_prepared.var_names)]
+        cached_pre_meta = (
+            adata_prepared.uns.get("preprocessing", {})
+            if (hasattr(adata_prepared, "uns") and isinstance(adata_prepared.uns, dict))
+            else {}
+        )
+        if isinstance(cached_pre_meta, dict):
+            cached_kept_features = cached_pre_meta.get("kept_features", None)
             if isinstance(cached_kept_features, list) and len(cached_kept_features) > 0:
-                valid_kept_features = [str(c) for c in cached_kept_features if str(c) in df_prepared.columns]
+                valid_kept_features = [str(c) for c in cached_kept_features if str(c) in adata_prepared.var_names]
                 if len(valid_kept_features) > 0:
                     kept_features = valid_kept_features
+                    adata_prepared = adata_prepared[:, kept_features].copy()
 
-            cached_qcap = loaded_info.get("quantile_cap_limits", None)
-            if isinstance(cached_qcap, dict) and len(quantile_cap_limits) == 0:
-                quantile_cap_limits = dict(cached_qcap)
-
-            if "lower_quantile_cap" in loaded_info:
-                lower_quantile_cap = loaded_info.get("lower_quantile_cap", None)
-            if "upper_quantile_cap" in loaded_info:
-                upper_quantile_cap = loaded_info.get("upper_quantile_cap", None)
+            qcap_meta = cached_pre_meta.get("quantile_capping", {})
+            if isinstance(qcap_meta, dict):
+                feature_limits = qcap_meta.get("feature_limits", None)
+                if isinstance(feature_limits, dict) and len(quantile_cap_limits) == 0:
+                    quantile_cap_limits = dict(feature_limits)
+                if "lower_quantile" in qcap_meta:
+                    lower_quantile_cap = qcap_meta.get("lower_quantile", None)
+                if "upper_quantile" in qcap_meta:
+                    upper_quantile_cap = qcap_meta.get("upper_quantile", None)
 
     scaler = None
     if scale_features and len(kept_features) > 0:
-        scaler = StandardScaler().fit(df_prepared[kept_features])
-        df_prepared[kept_features] = scaler.transform(df_prepared[kept_features])
+        cached_scaler_meta = (
+            cached_pre_meta.get("scaler", None)
+            if isinstance(cached_pre_meta, dict)
+            else None
+        )
+        if (
+            loaded_from_cache
+            and isinstance(cached_scaler_meta, dict)
+            and ("mean" in cached_scaler_meta)
+            and ("scale" in cached_scaler_meta)
+        ):
+            scaler = StandardScaler()
+            scaler.mean_ = np.asarray(cached_scaler_meta["mean"], dtype=float)
+            scaler.scale_ = np.asarray(cached_scaler_meta["scale"], dtype=float)
+        else:
+            X_prepared = _to_numpy_2d(adata_prepared[:, kept_features].X).astype(float, copy=False)
+            scaler = StandardScaler().fit(X_prepared)
+            scaled_prepared = scaler.transform(X_prepared)
+            X_all = _to_numpy_2d(adata_prepared.X).astype(float, copy=True)
+            feat_indices = adata_prepared.var_names.get_indexer(kept_features)
+            if np.any(feat_indices < 0):
+                missing = [kept_features[i] for i, idx in enumerate(feat_indices) if idx < 0]
+                raise ValueError(f"Missing kept_features in adata_prepared.var_names: {missing[:20]}")
+            X_all[:, feat_indices] = scaled_prepared
+            adata_prepared.X = X_all
 
-    preprocessing_artifact = build_state_preprocessing_artifact(
-        kept_features=kept_features,
-        scaler=scaler,
-        lower_quantile_cap=lower_quantile_cap,
-        upper_quantile_cap=upper_quantile_cap,
-        quantile_cap_limits=quantile_cap_limits,
-    )
-    windowing_artifact = {
+    windowing_params = {
         "features": list(features),
         "binary_features_to_group": list(binary_features_to_group),
         "window_size": int(window_size),
@@ -419,26 +436,107 @@ def prepare_state_classification_dataset(
         "lower_quantile_cap": lower_quantile_cap,
         "upper_quantile_cap": upper_quantile_cap,
     }
-
-    info = {
-        "kept_features": kept_features,
-        "non_feature_cols": non_feature_cols,
-        "binary_cols_to_merge": binary_cols_to_merge,
-        "scaler": scaler,
-        "preprocessing_artifact": preprocessing_artifact,
-        "windowing_artifact": windowing_artifact,
-        "quantile_cap_limits": quantile_cap_limits,
-        "lower_quantile_cap": lower_quantile_cap,
-        "upper_quantile_cap": upper_quantile_cap,
-        "quantile_limits_cache_path": None if quantile_limits_cache_path is None else str(quantile_limits_cache_path),
-        "prepared_info_cache_path": None if prepared_info_cache_path is None else str(prepared_info_cache_path),
+    quantile_capping_params = {
+        "lower_quantile": lower_quantile_cap,
+        "upper_quantile": upper_quantile_cap,
+        "feature_limits": dict(quantile_cap_limits or {}),
     }
-    return df_prepared, info
+
+    adata_prepared.uns["preprocessing"] = {
+        "kept_features": list(kept_features),
+        "non_feature_cols": list(non_feature_cols),
+        "binary_cols_to_merge": list(binary_cols_to_merge),
+        "quantile_capping": dict(quantile_capping_params),
+        "windowing": dict(windowing_params),
+        "features": list(windowing_params.get("features", [])),
+        "binary_features_to_group": list(windowing_params.get("binary_features_to_group", [])),
+        "window_size": int(windowing_params.get("window_size", 0)),
+        "descriptive_features": list(windowing_params.get("descriptive_features", [])),
+        "incomplete_window_policy": str(windowing_params.get("incomplete_window_policy", "drop")),
+        "lower_quantile_cap": windowing_params.get("lower_quantile_cap", None),
+        "upper_quantile_cap": windowing_params.get("upper_quantile_cap", None),
+    }
+    if scaler is not None:
+        adata_prepared.uns["preprocessing"]["scaler"] = {
+            "mean": scaler.mean_.astype(float),
+            "scale": scaler.scale_.astype(float),
+        }
+    adata_prepared.uns.pop("clustering", None)
+
+    if save_prepared_dataset and prepared_dataset_path is not None:
+        prepared_dataset_path.parent.mkdir(parents=True, exist_ok=True)
+        adata_prepared.write(prepared_dataset_path, compression="gzip")
+    return adata_prepared
 
 
 def _save_pdf_page_a4(pdf, fig, orientation="portrait"):
     fig.set_size_inches(*(A4_PORTRAIT if orientation == "portrait" else A4_LANDSCAPE), forward=True)
     pdf.savefig(fig, bbox_inches="tight")
+
+
+def _resolve_output_dir(output_dir):
+    """Resolve/create the pipeline output root directory."""
+    if output_dir is None:
+        raise ValueError(
+            "output_dir is required. Pass the root folder used by the state-classification pipeline."
+        )
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    return output_dir_path
+
+
+def _resolve_processing_outdir(output_dir):
+    """Return/create the shared processing output root under output_dir."""
+    output_dir_path = _resolve_output_dir(output_dir)
+    processing_outdir = output_dir_path / "processing"
+    processing_outdir.mkdir(parents=True, exist_ok=True)
+    return processing_outdir
+
+
+def _resolve_processing_subdir(output_dir, *parts):
+    """Return/create a subfolder under processing output root."""
+    processing_outdir = _resolve_processing_outdir(output_dir)
+    subdir = processing_outdir.joinpath(*parts)
+    subdir.mkdir(parents=True, exist_ok=True)
+    return subdir
+
+
+def _resolve_state_clustering_outdir(output_dir):
+    """Return/create clustering diagnostics/proportion folder under processing root."""
+    return _resolve_processing_subdir(output_dir, "state_clustering")
+
+
+def _resolve_state_stage_paths(output_dir):
+    """Build canonical state-classification artifact paths from output_dir."""
+    output_dir_path = _resolve_output_dir(output_dir)
+    processing_outdir = _resolve_processing_outdir(output_dir_path)
+    intrinsic_outdir = processing_outdir / "intrinsic_behavioral_classification"
+    full_outdir = processing_outdir / "full_behavioral_classification"
+    intrinsic_qc_outdir = intrinsic_outdir / "quality_control"
+    full_qc_outdir = full_outdir / "quality_control"
+
+    return {
+        "output_dir": output_dir_path,
+        "processing_outdir": processing_outdir,
+        "state_clustering_outdir": processing_outdir / "state_clustering",
+        "model_adata_path": processing_outdir / "state_classification_model.h5ad",
+        "prepared_full_adata_path": processing_outdir / "state_classification_full.h5ad",
+        "full_output_adata_path": processing_outdir / "state_classification_full.h5ad",
+        "intrinsic_outdir": intrinsic_outdir,
+        "full_outdir": full_outdir,
+        "intrinsic_qc_outdir": intrinsic_qc_outdir,
+        "full_qc_outdir": full_qc_outdir,
+        "intrinsic_classifier_default_path": intrinsic_outdir / "state_classifiction_random_forest.pkl",
+        "full_classifier_default_path": full_outdir / "state_classifiction_random_forest.pkl",
+        "state_composition_outdir": output_dir_path / "analysis" / "state_composition",
+    }
+
+
+def _sanitize_filename_token(value, fallback="value"):
+    """Sanitize a value for safe use in filenames."""
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
+    token = token.strip("._-")
+    return token if len(token) > 0 else str(fallback)
 
 
 def plot_clustering_diagnostics_pdf(
@@ -502,11 +600,16 @@ def plot_clustering_diagnostics_pdf(
         plt.close(fig)
 
         use_dendrogram = ad.obs[cluster_col].astype(str).nunique() > 1
+        dendrogram_key = f"dendrogram_{cluster_col}"
+        dendrogram_arg = False
         if use_dendrogram:
             try:
-                sc.tl.dendrogram(ad, groupby=cluster_col)
+                if dendrogram_key not in ad.uns:
+                    sc.tl.dendrogram(ad, groupby=cluster_col, key_added=dendrogram_key)
+                if dendrogram_key in ad.uns:
+                    dendrogram_arg = dendrogram_key
             except Exception:
-                use_dendrogram = False
+                dendrogram_arg = False
 
         sc.pl.heatmap(
             ad,
@@ -515,7 +618,7 @@ def plot_clustering_diagnostics_pdf(
             standard_scale="var",
             figsize=A4_LANDSCAPE,
             swap_axes=True,
-            dendrogram=use_dendrogram,
+            dendrogram=dendrogram_arg,
             show_gene_labels=True,
             show=False,
         )
@@ -526,14 +629,115 @@ def plot_clustering_diagnostics_pdf(
         plt.close(fig_hm)
 
 
+def _export_clustering_diagnostics_csvs(
+    adata,
+    cluster_col,
+    feature_cols,
+    outdir,
+    filename_prefix="state_classification_diagnostics",
+):
+    """Export CSV companions for clustering diagnostics panels."""
+    if adata is None or adata.n_obs == 0:
+        return {}
+    if cluster_col not in adata.obs.columns:
+        return {}
+
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    ad = adata.copy()
+    ad = _ensure_umap(ad, n_neighbors=30, random_state=123)
+
+    diagnostics_paths = {}
+
+    # UMAP panel source data.
+    umap = np.asarray(ad.obsm.get("X_umap", np.empty((ad.n_obs, 2))), dtype=float)
+    if umap.ndim != 2 or umap.shape[0] != ad.n_obs:
+        umap = np.zeros((ad.n_obs, 2), dtype=float)
+    if umap.shape[1] < 2:
+        umap = np.pad(umap, ((0, 0), (0, 2 - umap.shape[1])), mode="constant")
+    umap_df = pd.DataFrame(
+        {
+            "obs_index": ad.obs.index.astype(str),
+            "umap_1": umap[:, 0],
+            "umap_2": umap[:, 1],
+            "cluster_col": ad.obs[cluster_col].astype(str).to_numpy(),
+        }
+    )
+    for c in ["sample_name", "TrackID", "position_t"]:
+        if c in ad.obs.columns:
+            umap_df[c] = ad.obs[c].to_numpy()
+    umap_csv = outdir / f"{filename_prefix}_umap.csv"
+    umap_df.to_csv(umap_csv, index=False)
+    diagnostics_paths["umap_csv"] = str(umap_csv)
+
+    valid_features = [str(c) for c in list(feature_cols or []) if str(c) in ad.var_names]
+    cluster_order = sorted(ad.obs[cluster_col].astype(str).unique().tolist(), key=_mixed_label_sort_key)
+    if len(valid_features) == 0:
+        cluster_means = pd.DataFrame(index=cluster_order)
+    else:
+        X = _to_numpy_2d(ad[:, valid_features].X).astype(float, copy=False)
+        feature_df = pd.DataFrame(X, columns=valid_features, index=ad.obs.index)
+        feature_df["_cluster"] = ad.obs[cluster_col].astype(str).to_numpy()
+        cluster_means = feature_df.groupby("_cluster", observed=True)[valid_features].mean()
+        cluster_means = cluster_means.reindex(cluster_order)
+
+    # Correlation panel source data (cluster-by-cluster correlation).
+    if cluster_means.shape[0] > 0 and cluster_means.shape[1] > 0:
+        corr_df = cluster_means.T.corr()
+    else:
+        corr_df = pd.DataFrame(index=cluster_means.index, columns=cluster_means.index, dtype=float)
+    corr_csv = outdir / f"{filename_prefix}_cluster_correlation.csv"
+    corr_df.to_csv(corr_csv)
+    diagnostics_paths["cluster_correlation_csv"] = str(corr_csv)
+
+    # Heatmap panel source data (cluster x feature, standard_scale='var' equivalent).
+    heatmap_df = cluster_means.copy()
+    if heatmap_df.shape[1] > 0:
+        for col in heatmap_df.columns:
+            series = pd.to_numeric(heatmap_df[col], errors="coerce")
+            col_min = series.min()
+            col_max = series.max()
+            if pd.isna(col_min) or pd.isna(col_max) or float(col_max) == float(col_min):
+                heatmap_df[col] = 0.0
+            else:
+                heatmap_df[col] = (series - col_min) / (col_max - col_min)
+    heatmap_csv = outdir / f"{filename_prefix}_heatmap_matrix.csv"
+    heatmap_df.to_csv(heatmap_csv)
+    diagnostics_paths["heatmap_matrix_csv"] = str(heatmap_csv)
+
+    return diagnostics_paths
+
+
 def _ensure_umap(adata, n_neighbors=30, random_state=123):
     """Ensure AnnData has a UMAP embedding for plotting."""
     if "X_umap" in adata.obsm:
         return adata
-    if "X_pca" in adata.obsm:
-        sc.pp.neighbors(adata, n_neighbors=int(n_neighbors), use_rep="X_pca", random_state=int(random_state))
-    else:
-        sc.pp.neighbors(adata, n_neighbors=int(n_neighbors), random_state=int(random_state))
+
+    requested_n_neighbors = int(n_neighbors)
+    neighbors_meta = adata.uns.get("neighbors", {}) if isinstance(adata.uns, dict) else {}
+    params = neighbors_meta.get("params", {}) if isinstance(neighbors_meta, dict) else {}
+    existing_n_neighbors = params.get("n_neighbors", None)
+    conn_key = neighbors_meta.get("connectivities_key", "connectivities")
+    dist_key = neighbors_meta.get("distances_key", "distances")
+    has_graph = (conn_key in adata.obsp) and (dist_key in adata.obsp)
+
+    can_reuse_neighbors = False
+    try:
+        can_reuse_neighbors = has_graph and (int(existing_n_neighbors) == requested_n_neighbors)
+    except (TypeError, ValueError):
+        can_reuse_neighbors = False
+
+    if not can_reuse_neighbors:
+        if "X_pca" in adata.obsm:
+            sc.pp.neighbors(
+                adata,
+                n_neighbors=requested_n_neighbors,
+                use_rep="X_pca",
+                random_state=int(random_state),
+            )
+        else:
+            sc.pp.neighbors(adata, n_neighbors=requested_n_neighbors, random_state=int(random_state))
     sc.tl.umap(adata, random_state=int(random_state))
     return adata
 
@@ -640,34 +844,27 @@ def _to_numpy_2d(X):
     return np.asarray(X)
 
 
-def build_state_preprocessing_artifact(
-    *,
-    kept_features,
-    scaler,
-    lower_quantile_cap=None,
-    upper_quantile_cap=None,
-    quantile_cap_limits=None,
-):
-    """Build serializable preprocessing metadata for reproducible inference."""
-    artifact = {
-        "continuous_feature_cols": list(kept_features),
-        "zscore": None,
-        "quantile_capping": {
-            "lower_quantile": lower_quantile_cap,
-            "upper_quantile": upper_quantile_cap,
-            "feature_limits": dict(quantile_cap_limits or {}),
-        },
+def _coerce_scaler_params(preprocessing_params):
+    """Extract scaler params from preprocessing params; supports legacy 'zscore' key."""
+    if not isinstance(preprocessing_params, dict):
+        return None
+    scaler_meta = preprocessing_params.get("scaler", None)
+    if not isinstance(scaler_meta, dict):
+        scaler_meta = preprocessing_params.get("zscore", None)
+    if not isinstance(scaler_meta, dict):
+        return None
+    mean = scaler_meta.get("mean", None)
+    scale = scaler_meta.get("scale", None)
+    if mean is None or scale is None:
+        return None
+    return {
+        "mean": np.asarray(mean, dtype=float),
+        "scale": np.asarray(scale, dtype=float),
     }
-    if scaler is not None:
-        artifact["zscore"] = {
-            "mean": np.asarray(scaler.mean_, dtype=float),
-            "scale": np.asarray(scaler.scale_, dtype=float),
-        }
-    return artifact
 
 
-def _build_preprocessing_artifact_from_uns(preprocessing_meta, feature_cols=None):
-    """Reconstruct preprocessing artifact from model_adata.uns['preprocessing'] metadata."""
+def _build_preprocessing_params_from_uns(preprocessing_meta, feature_cols=None):
+    """Build reusable preprocessing parameter dict from adata.uns['preprocessing'] metadata."""
     if not isinstance(preprocessing_meta, dict):
         return None
 
@@ -676,27 +873,488 @@ def _build_preprocessing_artifact_from_uns(preprocessing_meta, feature_cols=None
         kept_features = []
     kept_features = [str(c) for c in kept_features]
 
-    artifact = {
-        "continuous_feature_cols": list(kept_features),
-        "zscore": None,
-        "quantile_capping": dict(preprocessing_meta.get("quantile_capping", {})),
-    }
+    qmeta = preprocessing_meta.get("quantile_capping", {})
+    if not isinstance(qmeta, dict):
+        qmeta = {}
+    feature_limits = qmeta.get("feature_limits", {})
+    if not isinstance(feature_limits, dict):
+        feature_limits = {}
 
-    scaler_meta = preprocessing_meta.get("scaler", None)
-    if isinstance(scaler_meta, dict) and ("mean" in scaler_meta) and ("scale" in scaler_meta):
-        artifact["zscore"] = {
-            "mean": np.asarray(scaler_meta["mean"], dtype=float),
-            "scale": np.asarray(scaler_meta["scale"], dtype=float),
+    params = {
+        "continuous_feature_cols": list(kept_features),
+        "quantile_capping": {
+            "lower_quantile": qmeta.get("lower_quantile", None),
+            "upper_quantile": qmeta.get("upper_quantile", None),
+            "feature_limits": dict(feature_limits),
+        },
+        "scaler": None,
+    }
+    scaler_params = _coerce_scaler_params(preprocessing_meta)
+    if scaler_params is not None:
+        params["scaler"] = scaler_params
+    return params
+
+
+def _normalize_preprocessing_params_for_compare(preprocessing_params, windowing_params, feature_cols):
+    """Normalize preprocessing + windowing params into deterministic compare payload."""
+    feature_cols = [str(c) for c in list(feature_cols or [])]
+    pre = preprocessing_params if isinstance(preprocessing_params, dict) else {}
+    window = windowing_params if isinstance(windowing_params, dict) else {}
+
+    qmeta = pre.get("quantile_capping", {})
+    qmeta = qmeta if isinstance(qmeta, dict) else {}
+    feature_limits = qmeta.get("feature_limits", {})
+    feature_limits = feature_limits if isinstance(feature_limits, dict) else {}
+    feature_limits_norm = {}
+    for feat in sorted([str(k) for k in feature_limits.keys()]):
+        lim = feature_limits.get(feat, {})
+        lim = lim if isinstance(lim, dict) else {}
+        lower = lim.get("lower", None)
+        upper = lim.get("upper", None)
+        feature_limits_norm[feat] = {
+            "lower": None if lower is None else float(lower),
+            "upper": None if upper is None else float(upper),
         }
 
-    return artifact
+    scaler_meta = _coerce_scaler_params(pre)
+    scaler_norm = None
+    if isinstance(scaler_meta, dict):
+        scaler_norm = {
+            "mean": np.asarray(scaler_meta.get("mean", []), dtype=float).tolist(),
+            "scale": np.asarray(scaler_meta.get("scale", []), dtype=float).tolist(),
+        }
+
+    windowing_keys = [
+        "features",
+        "binary_features_to_group",
+        "window_size",
+        "min_spacing",
+        "descriptive_features",
+        "incomplete_window_policy",
+        "lower_quantile_cap",
+        "upper_quantile_cap",
+    ]
+    windowing_norm = {}
+    for key in windowing_keys:
+        val = window.get(key, None)
+        if key in {"features", "binary_features_to_group", "descriptive_features"}:
+            windowing_norm[key] = [] if val is None else [str(x) for x in list(val)]
+        elif key in {"window_size", "min_spacing"}:
+            windowing_norm[key] = None if val is None else int(val)
+        elif key in {"lower_quantile_cap", "upper_quantile_cap"}:
+            windowing_norm[key] = None if val is None else float(val)
+        elif key == "incomplete_window_policy":
+            windowing_norm[key] = None if val is None else str(val)
+        else:
+            windowing_norm[key] = val
+
+    return {
+        "continuous_feature_cols": list(feature_cols),
+        "windowing": windowing_norm,
+        "quantile_capping": {
+            "lower_quantile": None if qmeta.get("lower_quantile", None) is None else float(qmeta.get("lower_quantile")),
+            "upper_quantile": None if qmeta.get("upper_quantile", None) is None else float(qmeta.get("upper_quantile")),
+            "feature_limits": feature_limits_norm,
+        },
+        "scaler": scaler_norm,
+    }
 
 
-def _apply_preprocessing_to_continuous_matrix(X, preprocessing_artifact, feature_cols):
-    """Apply saved quantile caps and z-normalization to a continuous feature frame."""
+def _build_classifier_preprocessing_compare_payload(classifier_artifact):
+    """Build normalized preprocessing/windowing compare payload from classifier metadata."""
+    if not isinstance(classifier_artifact, dict):
+        return None
+    feature_cols = classifier_artifact.get("continuous_feature_cols", None)
+    if feature_cols is None:
+        feature_cols = classifier_artifact.get("feature_cols", [])
+    preprocessing_params = classifier_artifact.get("preprocessing", None)
+    if not isinstance(preprocessing_params, dict):
+        preprocessing_params = {
+            "continuous_feature_cols": list(feature_cols),
+            "quantile_capping": {"lower_quantile": None, "upper_quantile": None, "feature_limits": {}},
+            "scaler": None,
+        }
+    payload_feature_cols = preprocessing_params.get("continuous_feature_cols", feature_cols)
+    windowing_params = classifier_artifact.get("windowing", {})
+    return _normalize_preprocessing_params_for_compare(
+        preprocessing_params=preprocessing_params,
+        windowing_params=windowing_params,
+        feature_cols=payload_feature_cols,
+    )
+
+
+def _build_adata_preprocessing_compare_payload(adata):
+    """Build normalized preprocessing/windowing compare payload from adata.uns."""
+    if not (hasattr(adata, "uns") and isinstance(adata.uns, dict)):
+        return None
+    pre_meta = adata.uns.get("preprocessing", {})
+    pre_meta = pre_meta if isinstance(pre_meta, dict) else {}
+    preprocessing_params = _build_preprocessing_params_from_uns(
+        pre_meta,
+        feature_cols=list(getattr(adata, "var_names", [])),
+    )
+    feature_cols = (
+        preprocessing_params.get("continuous_feature_cols", list(getattr(adata, "var_names", [])))
+        if isinstance(preprocessing_params, dict)
+        else list(getattr(adata, "var_names", []))
+    )
+    return _normalize_preprocessing_params_for_compare(
+        preprocessing_params=preprocessing_params,
+        windowing_params=pre_meta.get("windowing", {}),
+        feature_cols=feature_cols,
+    )
+
+
+def _compare_preprocessing_params(payload_a, payload_b, rtol=1e-8, atol=1e-12):
+    """Compare two normalized preprocessing/windowing payloads and return (is_match, reasons)."""
+    reasons = []
+    if not isinstance(payload_a, dict):
+        return False, ["left preprocessing payload is missing/invalid"]
+    if not isinstance(payload_b, dict):
+        return False, ["right preprocessing payload is missing/invalid"]
+
+    cols_a = list(payload_a.get("continuous_feature_cols", []))
+    cols_b = list(payload_b.get("continuous_feature_cols", []))
+    if cols_a != cols_b:
+        reasons.append("continuous_feature_cols mismatch")
+
+    win_a = payload_a.get("windowing", {})
+    win_b = payload_b.get("windowing", {})
+    for key in [
+        "features",
+        "binary_features_to_group",
+        "window_size",
+        "min_spacing",
+        "descriptive_features",
+        "incomplete_window_policy",
+        "lower_quantile_cap",
+        "upper_quantile_cap",
+    ]:
+        if win_a.get(key, None) != win_b.get(key, None):
+            reasons.append(f"windowing.{key} mismatch")
+
+    q_a = payload_a.get("quantile_capping", {})
+    q_b = payload_b.get("quantile_capping", {})
+    for key in ["lower_quantile", "upper_quantile"]:
+        va = q_a.get(key, None)
+        vb = q_b.get(key, None)
+        if va is None and vb is None:
+            continue
+        if (va is None) != (vb is None):
+            reasons.append(f"quantile_capping.{key} mismatch")
+            continue
+        if not np.isclose(float(va), float(vb), rtol=rtol, atol=atol):
+            reasons.append(f"quantile_capping.{key} mismatch")
+
+    fl_a = q_a.get("feature_limits", {})
+    fl_b = q_b.get("feature_limits", {})
+    feats_a = sorted([str(k) for k in fl_a.keys()])
+    feats_b = sorted([str(k) for k in fl_b.keys()])
+    if feats_a != feats_b:
+        reasons.append("quantile_capping.feature_limits keys mismatch")
+    else:
+        for feat in feats_a:
+            lim_a = fl_a.get(feat, {})
+            lim_b = fl_b.get(feat, {})
+            for bound in ["lower", "upper"]:
+                va = lim_a.get(bound, None)
+                vb = lim_b.get(bound, None)
+                if va is None and vb is None:
+                    continue
+                if (va is None) != (vb is None):
+                    reasons.append(f"feature_limits.{feat}.{bound} mismatch")
+                    continue
+                if not np.isclose(float(va), float(vb), rtol=rtol, atol=atol):
+                    reasons.append(f"feature_limits.{feat}.{bound} mismatch")
+
+    sc_a = payload_a.get("scaler", None)
+    sc_b = payload_b.get("scaler", None)
+    if (sc_a is None) != (sc_b is None):
+        reasons.append("scaler presence mismatch")
+    elif isinstance(sc_a, dict) and isinstance(sc_b, dict):
+        for key in ["mean", "scale"]:
+            arr_a = np.asarray(sc_a.get(key, []), dtype=float)
+            arr_b = np.asarray(sc_b.get(key, []), dtype=float)
+            if arr_a.shape != arr_b.shape:
+                reasons.append(f"scaler.{key} length mismatch")
+                continue
+            if not np.allclose(arr_a, arr_b, rtol=rtol, atol=atol):
+                reasons.append(f"scaler.{key} values mismatch")
+
+    return len(reasons) == 0, reasons
+
+
+def _matches_requested_preprocessing_in_adata(
+    adata,
+    *,
+    features,
+    binary_features_to_group,
+    window_size,
+    min_spacing,
+    descriptive_features,
+    incomplete_window_policy,
+    lower_quantile_cap,
+    upper_quantile_cap,
+    scale_features,
+):
+    """Check whether adata.uns preprocessing matches requested preprocessing settings.
+
+    Note:
+        `min_spacing` is intentionally excluded from preprocessing matching because it
+        belongs to model sampling stage, not full window preprocessing stage.
+    """
+    reasons = []
+    if not (hasattr(adata, "uns") and isinstance(adata.uns, dict)):
+        return False, ["adata.uns is missing/invalid"]
+    pre_meta = adata.uns.get("preprocessing", {})
+    if not isinstance(pre_meta, dict):
+        return False, ["adata.uns['preprocessing'] is missing/invalid"]
+
+    window = pre_meta.get("windowing", {})
+    if not isinstance(window, dict):
+        reasons.append("preprocessing.windowing missing/invalid")
+        window = {}
+    expected_window = {
+        "features": [str(x) for x in list(features)],
+        "binary_features_to_group": [str(x) for x in list(binary_features_to_group)],
+        "window_size": int(window_size),
+        "descriptive_features": [str(x) for x in list(descriptive_features)],
+        "incomplete_window_policy": str(incomplete_window_policy),
+        "lower_quantile_cap": None if lower_quantile_cap is None else float(lower_quantile_cap),
+        "upper_quantile_cap": None if upper_quantile_cap is None else float(upper_quantile_cap),
+    }
+    for key, expected_val in expected_window.items():
+        got = window.get(key, None)
+        if key in {"features", "binary_features_to_group", "descriptive_features"}:
+            got = [] if got is None else [str(x) for x in list(got)]
+        elif key in {"window_size"}:
+            got = None if got is None else int(got)
+        elif key in {"lower_quantile_cap", "upper_quantile_cap"}:
+            got = None if got is None else float(got)
+        elif key == "incomplete_window_policy":
+            got = None if got is None else str(got)
+        if got != expected_val:
+            reasons.append(f"windowing.{key} mismatch")
+
+    qmeta = pre_meta.get("quantile_capping", {})
+    if not isinstance(qmeta, dict):
+        reasons.append("preprocessing.quantile_capping missing/invalid")
+        qmeta = {}
+    got_lower = qmeta.get("lower_quantile", None)
+    got_upper = qmeta.get("upper_quantile", None)
+    got_lower = None if got_lower is None else float(got_lower)
+    got_upper = None if got_upper is None else float(got_upper)
+    exp_lower = None if lower_quantile_cap is None else float(lower_quantile_cap)
+    exp_upper = None if upper_quantile_cap is None else float(upper_quantile_cap)
+    if got_lower != exp_lower:
+        reasons.append("quantile_capping.lower_quantile mismatch")
+    if got_upper != exp_upper:
+        reasons.append("quantile_capping.upper_quantile mismatch")
+
+    scaler_meta = pre_meta.get("scaler", None)
+    has_scaler = isinstance(scaler_meta, dict) and ("mean" in scaler_meta) and ("scale" in scaler_meta)
+    if bool(scale_features) != bool(has_scaler):
+        reasons.append("scaler presence mismatch")
+
+    return len(reasons) == 0, reasons
+
+
+def _matches_model_sampling_cache(
+    adata,
+    *,
+    kept_features,
+    min_spacing_used,
+    max_samples,
+    random_state,
+    id_cols=("sample_name", "TrackID"),
+    time_col="position_t",
+    nan_policy="drop_any_nan_in_kept_features",
+):
+    """Check whether cached model adata matches sampling/cleaning stage settings."""
+    reasons = []
+    if not (hasattr(adata, "uns") and isinstance(adata.uns, dict)):
+        return False, ["model cache uns missing/invalid"]
+    pre_meta = adata.uns.get("preprocessing", {})
+    if not isinstance(pre_meta, dict):
+        return False, ["model cache preprocessing metadata missing/invalid"]
+    model_cache = pre_meta.get("model_cache", {})
+    if not isinstance(model_cache, dict):
+        return False, ["model cache metadata missing"]
+
+    features_meta = model_cache.get("features", {})
+    if isinstance(features_meta, dict):
+        kept_cached = features_meta.get("kept_features", [])
+    else:
+        kept_cached = features_meta
+    if kept_cached is None:
+        kept_cached = []
+    kept_cached = [str(x) for x in list(kept_cached)]
+
+    if kept_features is None:
+        kept_features = []
+    kept_expected = [str(x) for x in list(kept_features)]
+    if kept_cached != kept_expected:
+        reasons.append("model_cache.features.kept_features mismatch")
+    var_names = [str(x) for x in list(getattr(adata, "var_names", []))]
+    if var_names != kept_expected:
+        reasons.append("model cache var_names mismatch")
+
+    sampling_meta = model_cache.get("sampling", {})
+    sampling_meta = sampling_meta if isinstance(sampling_meta, dict) else {}
+    try:
+        got_spacing = int(sampling_meta.get("min_spacing_used", -1))
+    except Exception:
+        got_spacing = -1
+    if got_spacing != int(min_spacing_used):
+        reasons.append("model_cache.sampling.min_spacing_used mismatch")
+    got_max_samples = sampling_meta.get("max_samples", None)
+    got_max_samples = None if got_max_samples is None else int(got_max_samples)
+    exp_max_samples = None if max_samples is None else int(max_samples)
+    if got_max_samples != exp_max_samples:
+        reasons.append("model_cache.sampling.max_samples mismatch")
+    try:
+        got_random_state = int(sampling_meta.get("random_state", -1))
+    except Exception:
+        got_random_state = -1
+    if got_random_state != int(random_state):
+        reasons.append("model_cache.sampling.random_state mismatch")
+    if [str(x) for x in list(sampling_meta.get("id_cols", []))] != [str(x) for x in list(id_cols)]:
+        reasons.append("model_cache.sampling.id_cols mismatch")
+    if str(sampling_meta.get("time_col", "")) != str(time_col):
+        reasons.append("model_cache.sampling.time_col mismatch")
+
+    cleaning_meta = model_cache.get("cleaning", {})
+    cleaning_meta = cleaning_meta if isinstance(cleaning_meta, dict) else {}
+    if str(cleaning_meta.get("nan_policy", "")) != str(nan_policy):
+        reasons.append("model_cache.cleaning.nan_policy mismatch")
+
+    return len(reasons) == 0, reasons
+
+
+def _matches_cached_pca_stage(
+    adata,
+    *,
+    pca_var_selection,
+    svd_solver,
+    random_state,
+    ncomps_requested,
+):
+    """Check whether cached PCA output matches current PCA settings."""
+    reasons = []
+    if "X_pca" not in adata.obsm:
+        return False, ["X_pca missing"]
+    if not (hasattr(adata, "uns") and isinstance(adata.uns, dict)):
+        return False, ["uns missing/invalid"]
+    model_cache = (
+        adata.uns.get("preprocessing", {}).get("model_cache", {})
+        if isinstance(adata.uns.get("preprocessing", {}), dict)
+        else {}
+    )
+    pca_meta = model_cache.get("pca", {}) if isinstance(model_cache, dict) else {}
+    if not isinstance(pca_meta, dict):
+        return False, ["model_cache.pca missing"]
+
+    got_pca_var = pca_meta.get("pca_var_selection", np.nan)
+    if not np.isclose(float(got_pca_var), float(pca_var_selection), rtol=1e-8, atol=1e-12):
+        reasons.append("model_cache.pca.pca_var_selection mismatch")
+    if str(pca_meta.get("svd_solver", "")) != str(svd_solver):
+        reasons.append("model_cache.pca.svd_solver mismatch")
+    try:
+        got_random_state = int(pca_meta.get("random_state", -1))
+    except Exception:
+        got_random_state = -1
+    if got_random_state != int(random_state):
+        reasons.append("model_cache.pca.random_state mismatch")
+    try:
+        got_ncomps_requested = int(pca_meta.get("ncomps_requested", -1))
+    except Exception:
+        got_ncomps_requested = -1
+    if got_ncomps_requested != int(ncomps_requested):
+        reasons.append("model_cache.pca.ncomps_requested mismatch")
+    x_pca = adata.obsm.get("X_pca", None)
+    ncomps_effective = -1 if x_pca is None else int(x_pca.shape[1])
+    if int(pca_meta.get("ncomps_effective", -1)) != ncomps_effective:
+        reasons.append("model_cache.pca.ncomps_effective mismatch")
+
+    return len(reasons) == 0, reasons
+
+
+def _matches_cached_neighbors_stage(
+    adata,
+    *,
+    n_neighbors,
+    random_state,
+    use_rep="X_pca",
+):
+    """Check whether cached neighbors graph matches current neighbor settings."""
+    reasons = []
+    if not (hasattr(adata, "uns") and isinstance(adata.uns, dict)):
+        return False, ["uns missing/invalid"]
+    neighbors_uns = adata.uns.get("neighbors", {})
+    neighbors_uns = neighbors_uns if isinstance(neighbors_uns, dict) else {}
+    params = neighbors_uns.get("params", {})
+    params = params if isinstance(params, dict) else {}
+    conn_key = neighbors_uns.get("connectivities_key", "connectivities")
+    dist_key = neighbors_uns.get("distances_key", "distances")
+    has_graph = (conn_key in adata.obsp) and (dist_key in adata.obsp)
+    if not has_graph:
+        reasons.append("neighbors graph missing")
+    try:
+        if int(params.get("n_neighbors", -1)) != int(n_neighbors):
+            reasons.append("neighbors params.n_neighbors mismatch")
+    except Exception:
+        reasons.append("neighbors params.n_neighbors invalid")
+
+    model_cache = (
+        adata.uns.get("preprocessing", {}).get("model_cache", {})
+        if isinstance(adata.uns.get("preprocessing", {}), dict)
+        else {}
+    )
+    neighbors_meta = model_cache.get("neighbors", {}) if isinstance(model_cache, dict) else {}
+    if not isinstance(neighbors_meta, dict):
+        return False, reasons + ["model_cache.neighbors missing"]
+    if int(neighbors_meta.get("n_neighbors", -1)) != int(n_neighbors):
+        reasons.append("model_cache.neighbors.n_neighbors mismatch")
+    if int(neighbors_meta.get("random_state", -1)) != int(random_state):
+        reasons.append("model_cache.neighbors.random_state mismatch")
+    if str(neighbors_meta.get("use_rep", "")) != str(use_rep):
+        reasons.append("model_cache.neighbors.use_rep mismatch")
+
+    return len(reasons) == 0, reasons
+
+
+def _matches_cached_umap_stage(
+    adata,
+    *,
+    min_dist,
+    random_state,
+):
+    """Check whether cached UMAP embedding matches current UMAP settings."""
+    reasons = []
+    if "X_umap" not in adata.obsm:
+        return False, ["X_umap missing"]
+    if not (hasattr(adata, "uns") and isinstance(adata.uns, dict)):
+        return False, ["uns missing/invalid"]
+    model_cache = (
+        adata.uns.get("preprocessing", {}).get("model_cache", {})
+        if isinstance(adata.uns.get("preprocessing", {}), dict)
+        else {}
+    )
+    umap_meta = model_cache.get("umap", {}) if isinstance(model_cache, dict) else {}
+    if not isinstance(umap_meta, dict):
+        return False, ["model_cache.umap missing"]
+    if float(umap_meta.get("min_dist", np.nan)) != float(min_dist):
+        reasons.append("model_cache.umap.min_dist mismatch")
+    if int(umap_meta.get("random_state", -1)) != int(random_state):
+        reasons.append("model_cache.umap.random_state mismatch")
+    return len(reasons) == 0, reasons
+
+
+def _apply_preprocessing_to_continuous_matrix(X, preprocessing_params, feature_cols):
+    """Apply saved quantile caps and scaling to a continuous feature matrix."""
     out = np.asarray(X, dtype=float).copy()
     feature_cols = list(feature_cols)
-    qmeta = (preprocessing_artifact or {}).get("quantile_capping", {})
+    qmeta = (preprocessing_params or {}).get("quantile_capping", {})
     limits = qmeta.get("feature_limits", {}) if isinstance(qmeta, dict) else {}
     if isinstance(limits, dict) and len(limits) > 0:
         for i, feat in enumerate(feature_cols):
@@ -707,13 +1365,13 @@ def _apply_preprocessing_to_continuous_matrix(X, preprocessing_artifact, feature
             upper = lim.get("upper", None)
             out[:, i] = np.clip(out[:, i], a_min=lower, a_max=upper)
 
-    zmeta = (preprocessing_artifact or {}).get("zscore", None)
-    if zmeta is not None:
-        mean = np.asarray(zmeta["mean"], dtype=float)
-        scale = np.asarray(zmeta["scale"], dtype=float)
+    scaler_meta = _coerce_scaler_params(preprocessing_params)
+    if scaler_meta is not None:
+        mean = np.asarray(scaler_meta["mean"], dtype=float)
+        scale = np.asarray(scaler_meta["scale"], dtype=float)
         if out.shape[1] != len(mean) or out.shape[1] != len(scale):
             raise ValueError(
-                "Preprocessing zscore parameter size mismatch: "
+                "Preprocessing scaler parameter size mismatch: "
                 f"n_features={out.shape[1]}, len(mean)={len(mean)}, len(scale)={len(scale)}"
             )
         out = (out - mean) / scale
@@ -787,7 +1445,7 @@ def apply_classifier(
         context="windowed dataset creation",
     )
 
-    df_prepared, prepared_info = prepare_state_classification_dataset(
+    adata_prepared = prepare_state_classification_dataset(
         df_positions=df_positions,
         features=list(windowing["features"]),
         binary_features_to_group=list(windowing["binary_features_to_group"]),
@@ -803,9 +1461,29 @@ def apply_classifier(
         save_prepared_dataset=False,
         verbose=verbose,
     )
-
-    non_feature_cols = prepared_info["non_feature_cols"]
-    binary_cols_to_merge = prepared_info["binary_cols_to_merge"]
+    pre_meta = (
+        adata_prepared.uns.get("preprocessing", {})
+        if isinstance(getattr(adata_prepared, "uns", {}), dict)
+        else {}
+    )
+    default_non_feature_cols = [
+        "sample_name",
+        "TrackID",
+        "sub_TrackID",
+        "position_t",
+        "window_start_position_t",
+        "window_end_position_t",
+        "window_length_frames",
+    ]
+    non_feature_cols = pre_meta.get("non_feature_cols", default_non_feature_cols)
+    if not isinstance(non_feature_cols, list):
+        non_feature_cols = list(default_non_feature_cols)
+    binary_cols_to_merge = pre_meta.get("binary_cols_to_merge", None)
+    if not isinstance(binary_cols_to_merge, list):
+        binary_cols_to_merge = [
+            c for c in list(windowing.get("binary_features_to_group", []))
+            if c in adata_prepared.obs.columns
+        ]
 
     if "continuous_feature_cols" in artifact:
         # Full-label classifier artifact path.
@@ -816,17 +1494,18 @@ def apply_classifier(
     if len(cont_cols) == 0:
         raise ValueError("Classifier artifact has no stored feature columns ('continuous_feature_cols'/'feature_cols').")
 
-    missing_cont = [c for c in cont_cols if c not in df_prepared.columns]
+    missing_cont = [c for c in cont_cols if c not in adata_prepared.var_names]
     if len(missing_cont) > 0:
         raise ValueError(
             "Prepared dataset is missing required classifier features: "
             f"{missing_cont[:20]}"
         )
 
-    obs_cols = [c for c in non_feature_cols if c in df_prepared.columns] + [
-        c for c in binary_cols_to_merge if c in df_prepared.columns
+    obs_cols = [c for c in non_feature_cols if c in adata_prepared.obs.columns] + [
+        c for c in binary_cols_to_merge if c in adata_prepared.obs.columns
     ]
-    adata_query = df_to_adata(df_prepared, cont_cols, obs_cols=obs_cols)
+    adata_query = adata_prepared[:, cont_cols].copy()
+    adata_query.obs = adata_query.obs[obs_cols].copy()
 
     if "continuous_feature_cols" in artifact:
         predict_clusterids_with_full_classifier(
@@ -959,10 +1638,10 @@ def predict_clusterids_with_classifier(
     """Predict cluster labels for an AnnData object using a trained classifier or artifact."""
     target = adata if inplace else adata.copy()
     clf = classifier
-    preprocessing_artifact = None
+    preprocessing_params = None
     if isinstance(classifier, dict) and "classifier" in classifier:
         clf = classifier["classifier"]
-        preprocessing_artifact = classifier.get("preprocessing", None)
+        preprocessing_params = classifier.get("preprocessing", None)
 
     cols = list(target.var_names) if feature_cols is None else list(feature_cols)
 
@@ -971,10 +1650,10 @@ def predict_clusterids_with_classifier(
         raise ValueError(f"adata is missing classifier feature columns: {missing[:10]}")
 
     X_query = _to_numpy_2d(target[:, cols].X)
-    if apply_preprocessing and preprocessing_artifact is not None:
+    if apply_preprocessing and preprocessing_params is not None:
         X_query = _apply_preprocessing_to_continuous_matrix(
             X_query,
-            preprocessing_artifact=preprocessing_artifact,
+            preprocessing_params=preprocessing_params,
             feature_cols=cols,
         )
     pred = clf.predict(X_query)
@@ -1373,14 +2052,14 @@ def predict_clusterids_with_full_classifier(
     cont_cols = classifier_artifact["continuous_feature_cols"]
     bin_cols = classifier_artifact.get("binary_feature_cols", [])
     bin_expanded_cols = classifier_artifact.get("binary_expanded_feature_cols", None)
-    preprocessing_artifact = classifier_artifact.get("preprocessing", None)
+    preprocessing_params = classifier_artifact.get("preprocessing", None)
 
     # Ensure continuous features use identical capping/z-normalization as training.
     X_cont = _to_numpy_2d(target[:, cont_cols].X).astype(float, copy=False)
-    if apply_preprocessing and preprocessing_artifact is not None:
+    if apply_preprocessing and preprocessing_params is not None:
         X_cont = _apply_preprocessing_to_continuous_matrix(
             X_cont,
-            preprocessing_artifact=preprocessing_artifact,
+            preprocessing_params=preprocessing_params,
             feature_cols=cont_cols,
         )
 
@@ -1427,11 +2106,13 @@ def train_full_classifier_on_labeled_adata(
 
     This lets you run full-classifier training separately from the continuous-only stage.
     """
-    if preprocessing_artifact is None:
-        preprocessing_artifact = _build_preprocessing_artifact_from_uns(
+    preprocessing_params = preprocessing_artifact
+    if preprocessing_params is None:
+        preprocessing_params = _build_preprocessing_params_from_uns(
             adata.uns.get("preprocessing", {}) if isinstance(adata.uns, dict) else None,
             feature_cols=list(adata.var_names),
         )
+    windowing_params = windowing_artifact
     if binary_features_to_group is None:
         binary_features_to_group = []
         if isinstance(adata.uns, dict):
@@ -1443,7 +2124,7 @@ def train_full_classifier_on_labeled_adata(
         adata=adata,
         target_col="full_behavioral_cluster",
         binary_feature_cols=binary_features_to_group,
-        preprocessing_artifact=preprocessing_artifact,
+        preprocessing_artifact=preprocessing_params,
         random_state=random_state,
         n_estimators=n_estimators,
         min_samples_leaf=min_samples_leaf,
@@ -1454,8 +2135,8 @@ def train_full_classifier_on_labeled_adata(
         class_weight=class_weight,
         verbose=verbose,
     )
-    if windowing_artifact is not None:
-        full_label_classifier_artifact["windowing"] = dict(windowing_artifact)
+    if windowing_params is not None:
+        full_label_classifier_artifact["windowing"] = dict(windowing_params)
 
     predict_clusterids_with_full_classifier(
         adata=adata,
@@ -1749,6 +2430,7 @@ def run_state_clustering(
     df_positions,
     features,
     binary_features_to_group,
+    output_dir,
     window_size=5,
     min_spacing=None,
     max_samples=None,
@@ -1764,10 +2446,9 @@ def run_state_clustering(
     lower_quantile_cap=None,
     upper_quantile_cap=0.99,
     incomplete_window_policy="drop",
-    outfolder=None,
     random_state=123,
     reuse_prepared_dataset=True,
-    save_prepared_dataset=True,
+    # save_prepared_dataset=True,
     verbose=True,
 ):
     """Stage 1: prepare continuous features, fit clustering model, and return model_adata.
@@ -1775,99 +2456,266 @@ def run_state_clustering(
     Stage-1 metadata is stored in:
     - model_adata.uns["preprocessing"]
     - model_adata.uns["clustering"]
+    - model_adata.uns["preprocessing"]["prepared_adata_full_*"] cache metadata
     """
-    outfolder_path = None if outfolder is None else Path(outfolder)
+    stage_paths = _resolve_state_stage_paths(output_dir)
+    output_dir_path = stage_paths["output_dir"]
+    state_clustering_outdir = _resolve_state_clustering_outdir(output_dir_path)
+    prepared_adata_full_path = stage_paths["prepared_full_adata_path"]
+    prepared_adata_model_path = stage_paths["model_adata_path"]
 
     if verbose:
         print("# Preparing dataset for state classification and clustering (windowed feature extraction, quantile capping, scaling)...")
-    
-    df_prepared, prepared_info = prepare_state_classification_dataset(
-        df_positions=df_positions,
+
+    prepare_kwargs = {
+        "df_positions": df_positions,
+        "features": features,
+        "binary_features_to_group": binary_features_to_group,
+        "window_size": window_size,
+        "min_spacing": min_spacing,
+        "descriptive_features": list(descriptive_features),
+        "lower_quantile_cap": lower_quantile_cap,
+        "upper_quantile_cap": upper_quantile_cap,
+        "outfolder": output_dir_path,
+        "scale_features": True,
+        "incomplete_window_policy": incomplete_window_policy,
+        "reuse_prepared_dataset": reuse_prepared_dataset,
+        "prepared_dataset_path": prepared_adata_full_path,
+        "verbose": verbose,
+    }
+    adata_prepared = prepare_state_classification_dataset(**prepare_kwargs)
+
+    pre_match, pre_mismatch_reasons = _matches_requested_preprocessing_in_adata(
+        adata_prepared,
         features=features,
         binary_features_to_group=binary_features_to_group,
         window_size=window_size,
         min_spacing=min_spacing,
-        descriptive_features=list(descriptive_features),
+        descriptive_features=descriptive_features,
+        incomplete_window_policy=incomplete_window_policy,
         lower_quantile_cap=lower_quantile_cap,
         upper_quantile_cap=upper_quantile_cap,
-        outfolder=outfolder,
         scale_features=True,
-        incomplete_window_policy=incomplete_window_policy,
-        reuse_prepared_dataset=reuse_prepared_dataset,
-        save_prepared_dataset=save_prepared_dataset,
-        verbose=verbose,
     )
-    kept_features = list(prepared_info["kept_features"])
-    non_feature_cols = list(prepared_info["non_feature_cols"])
-    binary_cols_to_merge = list(prepared_info["binary_cols_to_merge"])
-    preprocessing_artifact = prepared_info["preprocessing_artifact"]
-    windowing_artifact = prepared_info["windowing_artifact"]
-    scaler = prepared_info.get("scaler", None)
+    if not pre_match:
+        if verbose:
+            print(
+                "Prepared full cache mismatch; recomputing full preprocessing from df_positions. "
+                f"reasons={pre_mismatch_reasons}"
+            )
+        prepare_kwargs["reuse_prepared_dataset"] = False
+        adata_prepared = prepare_state_classification_dataset(**prepare_kwargs)
+    
+    pre_meta = (
+        adata_prepared.uns.get("preprocessing", {})
+        if isinstance(getattr(adata_prepared, "uns", {}), dict)
+        else {}
+    )
+    kept_features = pre_meta.get("kept_features", list(adata_prepared.var_names))
+    if not isinstance(kept_features, list):
+        kept_features = list(adata_prepared.var_names)
+    kept_features = [str(c) for c in kept_features if str(c) in adata_prepared.var_names]
+    if len(kept_features) == 0:
+        kept_features = [str(c) for c in list(adata_prepared.var_names)]
 
-    if len(df_prepared) < 50:
+    default_non_feature_cols = [
+        "sample_name",
+        "TrackID",
+        "sub_TrackID",
+        "position_t",
+        "window_start_position_t",
+        "window_end_position_t",
+        "window_length_frames",
+    ]
+    non_feature_cols = pre_meta.get("non_feature_cols", default_non_feature_cols)
+    if not isinstance(non_feature_cols, list):
+        non_feature_cols = list(default_non_feature_cols)
+
+    binary_cols_to_merge = pre_meta.get("binary_cols_to_merge", None)
+    if not isinstance(binary_cols_to_merge, list):
+        binary_cols_to_merge = [c for c in list(binary_features_to_group) if c in adata_prepared.obs.columns]
+
+    if adata_prepared.n_obs < 50:
         raise ValueError("Insufficient rows in full descriptive dataset for clustering.")
     if verbose:
         print(
             "Prepared dataset: "
-            f"rows={len(df_prepared)}, continuous_features={len(kept_features)}, "
+            f"rows={adata_prepared.n_obs}, continuous_features={len(kept_features)}, "
             f"binary_group_features={len(binary_cols_to_merge)}"
         )
 
     if min_spacing is None:
-        spacing_to_use = window_size
+        spacing_to_use = int(window_size)
     else:
         spacing_to_use = int(min_spacing)
-    
-    if verbose:
-        print(
-            f"# Subsampling dataset for clustering with temporal spacing (min_spacing={spacing_to_use}, "
-            f"# max_samples={max_samples})..."
-        )
-    df_train = subsample_with_temporal_spacing(
-        df_prepared,
-        id_cols=["sample_name", "TrackID"],
-        time_col="position_t",
-        min_spacing=spacing_to_use,
-        max_samples=max_samples,
-        random_state=random_state,
-    )
-    if verbose:
-        print(f"Subsampled {len(df_train)} rows for clustering (spacing={spacing_to_use}).")
-    if len(df_train) < 50:
-        raise ValueError("Insufficient rows after global subsampling for clustering.")
+    sampling_id_cols = ["sample_name", "TrackID"]
+    sampling_time_col = "position_t"
+    nan_policy = "drop_any_nan_in_kept_features"
 
-    df_clean = df_train.dropna(subset=kept_features).copy()
-    if len(df_clean) < 50:
-        raise ValueError("Insufficient rows after dropping NaNs for PCA stage.")
-    if verbose and len(df_clean) != len(df_train):
-        print(f"Dropped NaNs for PCA input: kept {len(df_clean)} / {len(df_train)} rows.")
-    obs_cols = [c for c in non_feature_cols if c in df_clean.columns] + [
-        c for c in binary_cols_to_merge if c in df_clean.columns
-    ]
-    
-    model_adata = df_to_adata(df_clean, kept_features, obs_cols=obs_cols)
-    
-    if verbose:
-        print(
-            f"# Running PCA for dimensionality reduction before clustering (n_features={len(kept_features)}, "
-            f"# n_samples={len(df_clean)}, min_var_selection={pca_var_selection})..."
+    model_adata = None
+    if (
+        bool(reuse_prepared_dataset)
+        and prepared_adata_model_path is not None
+        and prepared_adata_model_path.exists()
+    ):
+        try:
+            cached_model_adata = sc.read_h5ad(prepared_adata_model_path)
+            pre_match_model, pre_reasons_model = _matches_requested_preprocessing_in_adata(
+                cached_model_adata,
+                features=features,
+                binary_features_to_group=binary_features_to_group,
+                window_size=window_size,
+                min_spacing=min_spacing,
+                descriptive_features=descriptive_features,
+                incomplete_window_policy=incomplete_window_policy,
+                lower_quantile_cap=lower_quantile_cap,
+                upper_quantile_cap=upper_quantile_cap,
+                scale_features=True,
+            )
+            sampling_match, sampling_reasons = _matches_model_sampling_cache(
+                cached_model_adata,
+                kept_features=kept_features,
+                min_spacing_used=spacing_to_use,
+                max_samples=max_samples,
+                random_state=random_state,
+                id_cols=sampling_id_cols,
+                time_col=sampling_time_col,
+                nan_policy=nan_policy,
+            )
+            if pre_match_model and sampling_match:
+                model_adata = cached_model_adata
+                if verbose:
+                    print(
+                        "reusing saved model adata and skipping subsampling/NaN-clean stage: "
+                        f"{prepared_adata_model_path}"
+                    )
+            elif verbose:
+                mismatch_reasons = []
+                if not pre_match_model:
+                    mismatch_reasons.extend([f"preprocessing: {r}" for r in pre_reasons_model])
+                if not sampling_match:
+                    mismatch_reasons.extend([f"sampling: {r}" for r in sampling_reasons])
+                print(
+                    "Cached model adata mismatch; rebuilding sampling/clean stage from prepared full data. "
+                    f"reasons={mismatch_reasons}"
+                )
+        except Exception as exc:
+            if verbose:
+                print(f"Could not load cached model adata ({exc}); rebuilding sampling/clean stage.")
+
+    subsampled_rows_for_log = None
+    if model_adata is None:
+        if verbose:
+            print(
+                f"# Subsampling dataset for clustering with temporal spacing (min_spacing={spacing_to_use}, "
+                f"# max_samples={max_samples})..."
+            )
+        adata_train = subsample_with_temporal_spacing(
+            adata_prepared,
+            id_cols=sampling_id_cols,
+            time_col=sampling_time_col,
+            min_spacing=spacing_to_use,
+            max_samples=max_samples,
+            random_state=random_state,
         )
         
-    model_adata = run_pca(
+        if adata_train.n_obs < 50:
+            raise ValueError("Insufficient rows after global subsampling for clustering.")
+        subsampled_rows_for_log = int(adata_train.n_obs)
+
+        X_train = _to_numpy_2d(adata_train[:, kept_features].X).astype(float, copy=False)
+        valid_mask = ~np.isnan(X_train).any(axis=1)
+        adata_clean = adata_train[valid_mask].copy()
+        if adata_clean.n_obs < 50:
+            raise ValueError("Insufficient rows after dropping NaNs for PCA stage.")
+        if verbose and adata_clean.n_obs != adata_train.n_obs:
+            print(f"Dropped NaNs for PCA input: kept {adata_clean.n_obs} / {adata_train.n_obs} rows.")
+        model_adata = adata_clean[:, kept_features].copy()
+    else:
+        if model_adata.n_obs < 50:
+            raise ValueError("Cached model dataset has insufficient rows for clustering.")
+        subsampled_rows_for_log = int(model_adata.n_obs)
+
+    ncomps_requested = min(len(kept_features), model_adata.n_obs - 1)
+    if ncomps_requested < 2:
+        raise ValueError("Insufficient rows/features to run PCA stage.")
+
+    if verbose:
+        print(f"Subsampled {subsampled_rows_for_log} rows for clustering (spacing={spacing_to_use}).")
+            
+    pca_recomputed = False
+    pca_match, pca_reasons = _matches_cached_pca_stage(
         model_adata,
         pca_var_selection=pca_var_selection,
-        ncomps=min(len(kept_features), len(df_clean) - 1),
         svd_solver="full",
         random_state=random_state,
+        ncomps_requested=ncomps_requested,
     )
-    
+    if pca_match:
+        if verbose:
+            print("reusing saved PCA stage (X_pca).")
+    else:
+        if verbose:
+            print(
+                f"# Running PCA for dimensionality reduction before clustering (n_features={len(kept_features)}, "
+                f"# n_samples={model_adata.n_obs}, min_var_selection={pca_var_selection}). "
+                f"reasons={pca_reasons}"
+            )
+        model_adata = run_pca(
+            model_adata,
+            pca_var_selection=pca_var_selection,
+            ncomps=ncomps_requested,
+            svd_solver="full",
+            random_state=random_state,
+        )
+        pca_recomputed = True
+
+    neighbors_match, neighbors_reasons = _matches_cached_neighbors_stage(
+        model_adata,
+        n_neighbors=n_neighbors,
+        random_state=random_state,
+        use_rep="X_pca",
+    )
+    if pca_recomputed:
+        neighbors_match = False
+        neighbors_reasons = list(neighbors_reasons) + ["upstream PCA recomputed"]
+    neighbors_recomputed = False
+    if neighbors_match:
+        if verbose:
+            print(f"reusing saved neighbors graph with n_neighbors={n_neighbors}.")
+    else:
+        if verbose:
+            print(
+                f"Recomputing neighbors graph (n_neighbors={n_neighbors}, use_rep='X_pca'). "
+                f"reasons={neighbors_reasons}"
+            )
+        sc.pp.neighbors(model_adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=random_state)
+        neighbors_recomputed = True
+
+    umap_match, umap_reasons = _matches_cached_umap_stage(
+        model_adata,
+        min_dist=min_dist,
+        random_state=random_state,
+    )
+    if pca_recomputed or neighbors_recomputed:
+        umap_match = False
+        umap_reasons = list(umap_reasons) + ["upstream representation/graph recomputed"]
+    if umap_match:
+        if verbose:
+            print(f"reusing saved UMAP embedding (min_dist={min_dist}).")
+    else:
+        if verbose:
+            print(
+                f"Recomputing UMAP embedding (min_dist={min_dist}, random_state={random_state}). "
+                f"reasons={umap_reasons}"
+            )
+        sc.tl.umap(model_adata, min_dist=min_dist, random_state=random_state)
+
     if verbose:
         print(
             f"# Running {clustering_method} clustering with n_neighbors={n_neighbors}, min_dist={min_dist}, "
             f"# resolution={resolution}..."
         )
-    sc.pp.neighbors(model_adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=random_state)
-    sc.tl.umap(model_adata, min_dist=min_dist, random_state=random_state)
 
     method = str(clustering_method).lower()
     if method == "leiden":
@@ -1913,8 +2761,10 @@ def run_state_clustering(
             f"model_rows={model_adata.n_obs}"
         )
 
-    if outfolder_path is not None:
-        diagnostics_pdf = Path(outfolder_path) / "state_classification_diagnostics.pdf"
+    diagnostics_csvs = {}
+    diagnostics_pdf = None
+    if state_clustering_outdir is not None:
+        diagnostics_pdf = state_clustering_outdir / "state_classification_diagnostics.pdf"
         plot_clustering_diagnostics_pdf(
             adata=model_adata,
             cluster_col="intrinsic_behavioral_cluster",
@@ -1922,26 +2772,73 @@ def run_state_clustering(
             pdf_path=diagnostics_pdf,
             title=f"all_data | {clustering_method} (resolution={resolution})",
         )
+        diagnostics_csvs = _export_clustering_diagnostics_csvs(
+            adata=model_adata,
+            cluster_col="intrinsic_behavioral_cluster",
+            feature_cols=kept_features,
+            outdir=state_clustering_outdir,
+            filename_prefix="state_classification_diagnostics",
+        )
+        if ("binary_group" in model_adata.obs.columns) and ("behavioral_clusterid" in model_adata.obs.columns):
+            pdf1 = state_clustering_outdir / "state_classification_binary_group_cluster_proportions.pdf"
+            fig1, _ = plot_binary_group_behavioral_cluster_grid(
+                model_adata,
+                pdf_path=pdf1,
+                return_csv=True,
+                verbose=verbose,
+            )
+            plt.close(fig1)
+            pdf2 = state_clustering_outdir / "state_classification_cluster_binary_group_proportions.pdf"
+            fig2, _ = plot_behavioral_cluster_binary_group_grid(
+                model_adata,
+                pdf_path=pdf2,
+                return_csv=True,
+            )
+            plt.close(fig2)
 
-    if "preprocessing" not in model_adata.uns:
-        model_adata.uns["preprocessing"] = {}
-    model_adata.uns["preprocessing"]["kept_features"] = list(kept_features)
-    model_adata.uns["preprocessing"]["quantile_capping"] = preprocessing_artifact.get("quantile_capping", {})
-    model_adata.uns["preprocessing"]["windowing"] = dict(windowing_artifact)
-    model_adata.uns["preprocessing"]["features"] = list(windowing_artifact.get("features", []))
-    model_adata.uns["preprocessing"]["binary_features_to_group"] = list(windowing_artifact.get("binary_features_to_group", []))
-    model_adata.uns["preprocessing"]["window_size"] = int(windowing_artifact.get("window_size", 0))
-    model_adata.uns["preprocessing"]["descriptive_features"] = list(windowing_artifact.get("descriptive_features", []))
-    model_adata.uns["preprocessing"]["incomplete_window_policy"] = str(
-        windowing_artifact.get("incomplete_window_policy", "drop")
+    ncomps_effective = (
+        int(model_adata.obsm["X_pca"].shape[1])
+        if ("X_pca" in model_adata.obsm and model_adata.obsm["X_pca"] is not None)
+        else 0
     )
-    model_adata.uns["preprocessing"]["lower_quantile_cap"] = windowing_artifact.get("lower_quantile_cap", None)
-    model_adata.uns["preprocessing"]["upper_quantile_cap"] = windowing_artifact.get("upper_quantile_cap", None)
-    if scaler is not None:
-        model_adata.uns["preprocessing"]["scaler"] = {
-            "mean": scaler.mean_.astype(float),
-            "scale": scaler.scale_.astype(float),
-        }
+    model_cache_meta = {
+        "sampling": {
+            "min_spacing_used": int(spacing_to_use),
+            "max_samples": None if max_samples is None else int(max_samples),
+            "random_state": int(random_state),
+            "time_col": str(sampling_time_col),
+            "id_cols": [str(c) for c in sampling_id_cols],
+        },
+        "cleaning": {
+            "nan_policy": str(nan_policy),
+        },
+        "features": {
+            "kept_features": [str(c) for c in kept_features],
+        },
+        "pca": {
+            "pca_var_selection": float(pca_var_selection),
+            "svd_solver": "full",
+            "random_state": int(random_state),
+            "ncomps_requested": int(ncomps_requested),
+            "ncomps_effective": int(ncomps_effective),
+        },
+        "neighbors": {
+            "n_neighbors": int(n_neighbors),
+            "use_rep": "X_pca",
+            "random_state": int(random_state),
+        },
+        "umap": {
+            "min_dist": float(min_dist),
+            "random_state": int(random_state),
+        },
+    }
+    model_preprocessing_meta = dict(adata_prepared.uns.get("preprocessing", {}))
+    model_preprocessing_meta["model_cache"] = dict(model_cache_meta)
+    model_preprocessing_meta.pop("prepared_adata_full_signature", None)
+    model_preprocessing_meta["prepared_adata_full_path"] = (
+        None if prepared_adata_full_path is None else str(prepared_adata_full_path)
+    )
+    model_adata.uns["preprocessing"] = model_preprocessing_meta
 
     model_adata.uns["clustering"] = {
         "clustering_method": clustering_method,
@@ -1950,7 +2847,20 @@ def run_state_clustering(
         "random_state": int(random_state),
         "non_feature_cols": list(non_feature_cols),
         "binary_cols_to_merge": list(binary_cols_to_merge),
+        "diagnostics_pdf": None if diagnostics_pdf is None else str(diagnostics_pdf),
+        "diagnostics_csvs": dict(diagnostics_csvs),
     }
+
+    model_adata.write(prepared_adata_model_path, compression="gzip")
+
+    prepared_adata_full = adata_prepared[:, kept_features].copy()
+    prepared_adata_full.uns["preprocessing"] = dict(adata_prepared.uns.get("preprocessing", {}))
+    prepared_adata_full.uns["preprocessing"].pop("prepared_adata_full_signature", None)
+    prepared_adata_full.uns["preprocessing"]["prepared_adata_full_path"] = str(prepared_adata_full_path)
+    prepared_adata_full.write(prepared_adata_full_path, compression="gzip")
+    if verbose:
+        print(f"Saved model-stage cache: {prepared_adata_model_path}")
+        print(f"Saved prepared full adata cache: {prepared_adata_full_path}")
     return model_adata
 
 
@@ -2014,8 +2924,8 @@ def train_state_classifiers(
             "Run run_state_clustering first."
         )
 
-    windowing_artifact = pre_meta.get("windowing", None)
-    if not isinstance(windowing_artifact, dict):
+    windowing_params = pre_meta.get("windowing", None)
+    if not isinstance(windowing_params, dict):
         raise ValueError("model_adata.uns['preprocessing']['windowing'] must be a dict.")
 
     transfer_mode = str(label_transfer_method).lower()
@@ -2031,12 +2941,12 @@ def train_state_classifiers(
     classifier_backend_name = "random_forest"
 
     cont_cols = list(model_adata.var_names)
-    preprocessing_artifact = _build_preprocessing_artifact_from_uns(
+    preprocessing_params = _build_preprocessing_params_from_uns(
         pre_meta,
         feature_cols=cont_cols,
     )
-    if preprocessing_artifact is not None and not isinstance(preprocessing_artifact, dict):
-        raise ValueError("model_adata.uns['preprocessing'] could not be converted to preprocessing artifact.")
+    if preprocessing_params is not None and not isinstance(preprocessing_params, dict):
+        raise ValueError("model_adata.uns['preprocessing'] could not be converted to preprocessing params.")
 
     required_clustering_keys = ["non_feature_cols", "binary_cols_to_merge", "resolution", "n_neighbors", "random_state"]
     missing_clustering_keys = [k for k in required_clustering_keys if k not in clust_meta]
@@ -2103,11 +3013,9 @@ def train_state_classifiers(
             f"{missing_binary_cols}. Re-run run_state_clustering so binary columns are in model_adata.obs."
         )
 
-    label_classifier = None  # canonical full-data intrinsic model
-    label_classifier_artifact = None  # canonical full-data intrinsic artifact
-    label_classifier_artifact_full_data = None
+    label_classifier = None  # canonical train-split intrinsic model
     label_classifier_artifact_train_split = None
-    classifier_fit_info = None  # canonical full-data fit info
+    classifier_fit_info = None  # canonical train-split fit info
     classifier_fit_info_train_split = None
     classifier_qc_model_data = None
     classifier_model_path = None
@@ -2123,20 +3031,27 @@ def train_state_classifiers(
         "holdout_artifacts": {},
     }
 
-    outfolder_path = None if outfolder is None else Path(outfolder)
+    outfolder_path = _resolve_processing_outdir(outfolder)
     intrinsic_outfolder = None
     full_outfolder = None
+    intrinsic_qc_outfolder = None
+    full_qc_outfolder = None
     if outfolder_path is not None:
-        outfolder_path.mkdir(parents=False, exist_ok=True)
+        outfolder_path.mkdir(parents=True, exist_ok=True)
         intrinsic_outfolder = outfolder_path / "intrinsic_behavioral_classification"
         full_outfolder = outfolder_path / "full_behavioral_classification"
         intrinsic_outfolder.mkdir(parents=True, exist_ok=True)
         full_outfolder.mkdir(parents=True, exist_ok=True)
+        intrinsic_qc_outfolder = intrinsic_outfolder / "quality_control"
+        full_qc_outfolder = full_outfolder / "quality_control"
+        intrinsic_qc_outfolder.mkdir(parents=True, exist_ok=True)
+        full_qc_outfolder.mkdir(parents=True, exist_ok=True)
 
     if train_continuous_classifier:
         X_intrinsic_all = _to_numpy_2d(model_adata[:, cont_cols].X).astype(float, copy=False)
         y_intrinsic_all = model_adata.obs["intrinsic_behavioral_cluster"].astype(str).to_numpy()
-
+        X_intrinsic_train = X_intrinsic_all
+        y_intrinsic_train = y_intrinsic_all
         if validation_mode == "holdout":
             if validation_stratify:
                 _validate_stratified_split_feasibility(
@@ -2153,59 +3068,15 @@ def train_state_classifiers(
             y_intrinsic_train = y_intrinsic_all[idx_train]
             X_intrinsic_test = X_intrinsic_all[idx_test]
             y_intrinsic_test = y_intrinsic_all[idx_test]
-
-            clf_intrinsic_train_split, fit_info_intrinsic_train_split = train_random_forest_classifier(
-                X_train=X_intrinsic_train,
-                y_train=y_intrinsic_train,
-                random_state=stage1_random_state,
-                n_estimators=classifier_n_estimators,
-                min_samples_leaf=classifier_min_samples_leaf,
-                n_jobs=classifier_n_jobs,
-                max_depth=classifier_max_depth,
-                min_samples_split=classifier_min_samples_split,
-                max_features=classifier_max_features,
-                class_weight=classifier_class_weight,
-            )
-            fit_info_intrinsic_train_split["cluster_col"] = "intrinsic_behavioral_cluster"
-            classifier_fit_info_train_split = fit_info_intrinsic_train_split
-
-            y_pred_intrinsic_train = np.asarray(
-                clf_intrinsic_train_split.predict(X_intrinsic_train)
-            ).astype(str)
-            y_pred_intrinsic_test = np.asarray(
-                clf_intrinsic_train_split.predict(X_intrinsic_test)
-            ).astype(str)
-            holdout_intrinsic_eval = _evaluate_holdout_predictions(
-                y_true=y_intrinsic_test,
-                y_pred=y_pred_intrinsic_test,
-                outfolder=intrinsic_outfolder,
-                filename_prefix=f"state_classification_intrinsic_classifier_holdout_qc_{classifier_backend_name}",
-            )
-
             intrinsic_validation["n_train"] = int(len(idx_train))
             intrinsic_validation["n_test"] = int(len(idx_test))
-            intrinsic_validation["train_metrics"] = _build_compact_metric_summary(
-                y_intrinsic_train, y_pred_intrinsic_train
-            )
-            intrinsic_validation["test_metrics"] = holdout_intrinsic_eval["metrics"]
-            intrinsic_validation["oob_score_train_split"] = float(
-                fit_info_intrinsic_train_split.get("oob_score", np.nan)
-            )
-            intrinsic_validation["holdout_artifacts"] = holdout_intrinsic_eval["artifacts"]
+        else:
+            intrinsic_validation["n_train"] = int(model_adata.n_obs)
+            intrinsic_validation["n_test"] = 0
 
-            label_classifier_artifact_train_split = {
-                "classifier": clf_intrinsic_train_split,
-                "backend": classifier_backend_name,
-                "feature_cols": cont_cols,
-                "cluster_col": "intrinsic_behavioral_cluster",
-                "preprocessing": preprocessing_artifact,
-                "windowing": windowing_artifact,
-            }
-
-        label_classifier, classifier_fit_info = train_clusterid_classifier_from_model_adata(
-            model_adata=model_adata,
-            cluster_col="intrinsic_behavioral_cluster",
-            classifier_backend=classifier_backend_name,
+        label_classifier, classifier_fit_info = train_random_forest_classifier(
+            X_train=X_intrinsic_train,
+            y_train=y_intrinsic_train,
             random_state=stage1_random_state,
             n_estimators=classifier_n_estimators,
             min_samples_leaf=classifier_min_samples_leaf,
@@ -2214,36 +3085,49 @@ def train_state_classifiers(
             min_samples_split=classifier_min_samples_split,
             max_features=classifier_max_features,
             class_weight=classifier_class_weight,
-            verbose=verbose,
         )
-        label_classifier_artifact_full_data = {
+        classifier_fit_info["cluster_col"] = "intrinsic_behavioral_cluster"
+        classifier_fit_info_train_split = classifier_fit_info
+
+        label_classifier_artifact_train_split = {
             "classifier": label_classifier,
             "backend": classifier_backend_name,
             "feature_cols": cont_cols,
             "cluster_col": "intrinsic_behavioral_cluster",
-            "preprocessing": preprocessing_artifact,
-            "windowing": windowing_artifact,
+            "preprocessing": preprocessing_params,
+            "windowing": windowing_params,
         }
-        label_classifier_artifact = label_classifier_artifact_full_data
+
+        y_pred_intrinsic_train = np.asarray(label_classifier.predict(X_intrinsic_train)).astype(str)
+        intrinsic_validation["train_metrics"] = _build_compact_metric_summary(
+            y_intrinsic_train, y_pred_intrinsic_train
+        )
+        intrinsic_validation["oob_score_train_split"] = float(
+            classifier_fit_info.get("oob_score", np.nan)
+        )
+
+        if validation_mode == "holdout":
+            y_pred_intrinsic_test = np.asarray(label_classifier.predict(X_intrinsic_test)).astype(str)
+            holdout_intrinsic_eval = _evaluate_holdout_predictions(
+                y_true=y_intrinsic_test,
+                y_pred=y_pred_intrinsic_test,
+                outfolder=intrinsic_qc_outfolder,
+                filename_prefix=f"state_classification_intrinsic_classifier_holdout_qc_{classifier_backend_name}",
+            )
+            intrinsic_validation["test_metrics"] = holdout_intrinsic_eval["metrics"]
+            intrinsic_validation["holdout_artifacts"] = holdout_intrinsic_eval["artifacts"]
+
         classifier_qc_model_data = evaluate_clusterid_classifier_on_model_adata(
             model_adata=model_adata,
             classifier=label_classifier,
             cluster_col="intrinsic_behavioral_cluster",
-            outfolder=intrinsic_outfolder,
+            outfolder=intrinsic_qc_outfolder,
             filename_prefix=f"state_classification_classifier_qc_{classifier_backend_name}",
             verbose=verbose,
         )
-        intrinsic_validation["oob_score_full_data"] = float(
-            classifier_fit_info.get("oob_score", np.nan)
+        intrinsic_validation["oob_score_full_data"] = (
+            intrinsic_validation["oob_score_train_split"] if validation_mode != "holdout" else None
         )
-        y_pred_intrinsic_full_data = np.asarray(label_classifier.predict(X_intrinsic_all)).astype(str)
-        if validation_mode == "oob_only":
-            intrinsic_validation["n_train"] = int(model_adata.n_obs)
-            intrinsic_validation["n_test"] = 0
-            intrinsic_validation["train_metrics"] = _build_compact_metric_summary(
-                y_intrinsic_all,
-                y_pred_intrinsic_full_data,
-            )
 
         if verbose and validation_mode == "holdout":
             tm = intrinsic_validation["train_metrics"] or {}
@@ -2255,8 +3139,7 @@ def train_state_classifiers(
                 f"test_acc={vm.get('accuracy', np.nan):.4f}, "
                 f"test_bal_acc={vm.get('balanced_accuracy', np.nan):.4f}, "
                 f"test_macro_f1={vm.get('macro_f1', np.nan):.4f}, "
-                f"oob_train_split={intrinsic_validation.get('oob_score_train_split', np.nan):.4f}, "
-                f"oob_full_data={intrinsic_validation.get('oob_score_full_data', np.nan):.4f}"
+                f"oob_train_split={intrinsic_validation.get('oob_score_train_split', np.nan):.4f}"
             )
         elif verbose:
             tm = intrinsic_validation["train_metrics"] or {}
@@ -2266,13 +3149,12 @@ def train_state_classifiers(
                 f"train_acc={tm.get('accuracy', np.nan):.4f}, "
                 f"train_bal_acc={tm.get('balanced_accuracy', np.nan):.4f}, "
                 f"train_macro_f1={tm.get('macro_f1', np.nan):.4f}, "
-                f"oob_full_data={intrinsic_validation.get('oob_score_full_data', np.nan):.4f}"
+                f"oob_train_split={intrinsic_validation.get('oob_score_train_split', np.nan):.4f}"
             )
 
-    full_label_classifier_artifact = None  # canonical full-data full-label artifact
-    full_label_classifier_artifact_full_data = None
+    full_label_classifier_artifact = None  # canonical train-split full-label artifact
     full_label_classifier_artifact_train_split = None
-    full_classifier_fit_info = None  # canonical full-data full fit info
+    full_classifier_fit_info = None  # canonical train-split full fit info
     full_classifier_fit_info_train_split = None
     full_classifier_qc_model_data = None
     full_classifier_model_path = None
@@ -2321,61 +3203,22 @@ def train_state_classifiers(
             )
             y_full_train = adata_train_split.obs["full_behavioral_cluster"].astype(str).to_numpy()
             y_full_test = adata_test_split.obs["full_behavioral_cluster"].astype(str).to_numpy()
-
-            clf_full_train_split, fit_info_full_train_split = train_random_forest_classifier(
-                X_train=X_full_train,
-                y_train=y_full_train,
-                random_state=stage1_random_state,
-                n_estimators=classifier_n_estimators,
-                min_samples_leaf=classifier_min_samples_leaf,
-                n_jobs=classifier_n_jobs,
-                max_depth=classifier_max_depth,
-                min_samples_split=classifier_min_samples_split,
-                max_features=classifier_max_features,
-                class_weight=classifier_class_weight,
-            )
-            fit_info_full_train_split["target_col"] = "full_behavioral_cluster"
-            fit_info_full_train_split["continuous_feature_cols"] = list(cont_cols)
-            fit_info_full_train_split["binary_feature_cols"] = list(binary_cols_to_merge)
-            fit_info_full_train_split["n_features_total"] = int(X_full_train.shape[1])
-            fit_info_full_train_split["n_features_continuous"] = int(len(cont_cols))
-            fit_info_full_train_split["n_features_binary"] = int(len(binary_cols_to_merge))
-            fit_info_full_train_split["n_features_binary_expanded"] = int(len(expanded_binary_train_cols))
-            full_classifier_fit_info_train_split = fit_info_full_train_split
-
-            y_pred_full_train = np.asarray(clf_full_train_split.predict(X_full_train)).astype(str)
-            y_pred_full_test = np.asarray(clf_full_train_split.predict(X_full_test)).astype(str)
-            holdout_full_eval = _evaluate_holdout_predictions(
-                y_true=y_full_test,
-                y_pred=y_pred_full_test,
-                outfolder=full_outfolder,
-                filename_prefix=f"state_classification_full_classifier_holdout_qc_{classifier_backend_name}",
-            )
-
             full_validation["n_train"] = int(len(idx_train))
             full_validation["n_test"] = int(len(idx_test))
-            full_validation["train_metrics"] = _build_compact_metric_summary(y_full_train, y_pred_full_train)
-            full_validation["test_metrics"] = holdout_full_eval["metrics"]
-            full_validation["oob_score_train_split"] = float(
-                fit_info_full_train_split.get("oob_score", np.nan)
+        else:
+            X_full_train, expanded_binary_train_cols = _build_classifier_matrix_from_adata(
+                adata=model_adata,
+                continuous_feature_cols=cont_cols,
+                binary_feature_cols=binary_cols_to_merge,
+                return_binary_feature_names=True,
             )
-            full_validation["holdout_artifacts"] = holdout_full_eval["artifacts"]
+            y_full_train = y_full_all
+            full_validation["n_train"] = int(model_adata.n_obs)
+            full_validation["n_test"] = 0
 
-            full_label_classifier_artifact_train_split = {
-                "classifier": clf_full_train_split,
-                "continuous_feature_cols": list(cont_cols),
-                "binary_feature_cols": list(binary_cols_to_merge),
-                "binary_expanded_feature_cols": list(expanded_binary_train_cols),
-                "target_col": "full_behavioral_cluster",
-                "preprocessing": preprocessing_artifact,
-                "windowing": dict(windowing_artifact),
-            }
-
-        full_label_classifier_artifact_full_data, full_classifier_fit_info = train_full_clusterid_classifier_from_adata(
-            adata=model_adata,
-            target_col="full_behavioral_cluster",
-            binary_feature_cols=binary_cols_to_merge,
-            preprocessing_artifact=preprocessing_artifact,
+        clf_full_train_split, fit_info_full_train_split = train_random_forest_classifier(
+            X_train=X_full_train,
+            y_train=y_full_train,
             random_state=stage1_random_state,
             n_estimators=classifier_n_estimators,
             min_samples_leaf=classifier_min_samples_leaf,
@@ -2384,39 +3227,66 @@ def train_state_classifiers(
             min_samples_split=classifier_min_samples_split,
             max_features=classifier_max_features,
             class_weight=classifier_class_weight,
-            verbose=verbose,
         )
-        full_label_classifier_artifact_full_data["windowing"] = dict(windowing_artifact)
-        full_label_classifier_artifact = full_label_classifier_artifact_full_data
+        fit_info_full_train_split["target_col"] = "full_behavioral_cluster"
+        fit_info_full_train_split["continuous_feature_cols"] = list(cont_cols)
+        fit_info_full_train_split["binary_feature_cols"] = list(binary_cols_to_merge)
+        fit_info_full_train_split["n_features_total"] = int(X_full_train.shape[1])
+        fit_info_full_train_split["n_features_continuous"] = int(len(cont_cols))
+        fit_info_full_train_split["n_features_binary"] = int(len(binary_cols_to_merge))
+        fit_info_full_train_split["n_features_binary_expanded"] = int(len(expanded_binary_train_cols))
+        full_classifier_fit_info_train_split = fit_info_full_train_split
+        full_classifier_fit_info = fit_info_full_train_split
+
+        full_label_classifier_artifact_train_split = {
+            "classifier": clf_full_train_split,
+            "continuous_feature_cols": list(cont_cols),
+            "binary_feature_cols": list(binary_cols_to_merge),
+            "binary_expanded_feature_cols": list(expanded_binary_train_cols),
+            "target_col": "full_behavioral_cluster",
+            "preprocessing": preprocessing_params,
+            "windowing": dict(windowing_params),
+        }
+        full_label_classifier_artifact = full_label_classifier_artifact_train_split
+
+        y_pred_full_train = np.asarray(clf_full_train_split.predict(X_full_train)).astype(str)
+        full_validation["train_metrics"] = _build_compact_metric_summary(y_full_train, y_pred_full_train)
+        full_validation["oob_score_train_split"] = float(
+            fit_info_full_train_split.get("oob_score", np.nan)
+        )
+
+        if validation_mode == "holdout":
+            y_pred_full_test = np.asarray(clf_full_train_split.predict(X_full_test)).astype(str)
+            holdout_full_eval = _evaluate_holdout_predictions(
+                y_true=y_full_test,
+                y_pred=y_pred_full_test,
+                outfolder=full_qc_outfolder,
+                filename_prefix=f"state_classification_full_classifier_holdout_qc_{classifier_backend_name}",
+            )
+            full_validation["test_metrics"] = holdout_full_eval["metrics"]
+            full_validation["holdout_artifacts"] = holdout_full_eval["artifacts"]
 
         X_full_all = _build_classifier_matrix_from_adata(
             adata=model_adata,
             continuous_feature_cols=cont_cols,
             binary_feature_cols=binary_cols_to_merge,
-            binary_expanded_feature_cols=full_label_classifier_artifact_full_data.get(
+            binary_expanded_feature_cols=full_label_classifier_artifact_train_split.get(
                 "binary_expanded_feature_cols", []
             ),
             return_binary_feature_names=False,
         )
         y_pred_full_all = np.asarray(
-            full_label_classifier_artifact_full_data["classifier"].predict(X_full_all)
+            full_label_classifier_artifact_train_split["classifier"].predict(X_full_all)
         ).astype(str)
         full_classifier_qc_model_data = evaluate_classifier_predictions(
             y_true=y_full_all,
             y_pred=y_pred_full_all,
-            outfolder=full_outfolder,
+            outfolder=full_qc_outfolder,
             filename_prefix="state_classification_full_classifier_qc_random_forest",
         )
-        full_validation["oob_score_full_data"] = float(
-            full_classifier_fit_info.get("oob_score", np.nan)
+        full_validation["oob_score_full_data"] = (
+            full_validation["oob_score_train_split"] if validation_mode != "holdout" else None
         )
-        if validation_mode == "oob_only":
-            full_validation["n_train"] = int(model_adata.n_obs)
-            full_validation["n_test"] = 0
-            full_validation["train_metrics"] = _build_compact_metric_summary(
-                y_full_all,
-                y_pred_full_all,
-            )
         if verbose:
             print(
                 "Full classifier QC on model labels: "
@@ -2434,8 +3304,7 @@ def train_state_classifiers(
                 f"test_acc={vm.get('accuracy', np.nan):.4f}, "
                 f"test_bal_acc={vm.get('balanced_accuracy', np.nan):.4f}, "
                 f"test_macro_f1={vm.get('macro_f1', np.nan):.4f}, "
-                f"oob_train_split={full_validation.get('oob_score_train_split', np.nan):.4f}, "
-                f"oob_full_data={full_validation.get('oob_score_full_data', np.nan):.4f}"
+                f"oob_train_split={full_validation.get('oob_score_train_split', np.nan):.4f}"
             )
         elif verbose:
             tm = full_validation["train_metrics"] or {}
@@ -2445,8 +3314,62 @@ def train_state_classifiers(
                 f"train_acc={tm.get('accuracy', np.nan):.4f}, "
                 f"train_bal_acc={tm.get('balanced_accuracy', np.nan):.4f}, "
                 f"train_macro_f1={tm.get('macro_f1', np.nan):.4f}, "
-                f"oob_full_data={full_validation.get('oob_score_full_data', np.nan):.4f}"
+                f"oob_train_split={full_validation.get('oob_score_train_split', np.nan):.4f}"
             )
+
+    intrinsic_metrics_csv = None
+    full_metrics_csv = None
+    if intrinsic_qc_outfolder is not None and train_continuous_classifier:
+        intrinsic_tm = intrinsic_validation.get("train_metrics") or {}
+        intrinsic_vm = intrinsic_validation.get("test_metrics") or {}
+        intrinsic_metrics_row = {
+            "mode": validation_mode,
+            "n_train": intrinsic_validation.get("n_train", 0),
+            "n_test": intrinsic_validation.get("n_test", 0),
+            "oob_score_train_split": intrinsic_validation.get("oob_score_train_split", np.nan),
+            "train_accuracy": intrinsic_tm.get("accuracy", np.nan),
+            "train_balanced_accuracy": intrinsic_tm.get("balanced_accuracy", np.nan),
+            "train_macro_f1": intrinsic_tm.get("macro_f1", np.nan),
+            "test_accuracy": intrinsic_vm.get("accuracy", np.nan),
+            "test_balanced_accuracy": intrinsic_vm.get("balanced_accuracy", np.nan),
+            "test_macro_f1": intrinsic_vm.get("macro_f1", np.nan),
+            "model_data_accuracy": (
+                None if classifier_qc_model_data is None else classifier_qc_model_data.get("accuracy", np.nan)
+            ),
+            "model_data_balanced_accuracy": (
+                None if classifier_qc_model_data is None else classifier_qc_model_data.get("balanced_accuracy", np.nan)
+            ),
+        }
+        intrinsic_metrics_csv = (
+            intrinsic_qc_outfolder / f"state_classification_intrinsic_classifier_metrics_{classifier_backend_name}.csv"
+        )
+        pd.DataFrame([intrinsic_metrics_row]).to_csv(intrinsic_metrics_csv, index=False)
+
+    if full_qc_outfolder is not None and train_full_classifier:
+        full_tm = full_validation.get("train_metrics") or {}
+        full_vm = full_validation.get("test_metrics") or {}
+        full_metrics_row = {
+            "mode": validation_mode,
+            "n_train": full_validation.get("n_train", 0),
+            "n_test": full_validation.get("n_test", 0),
+            "oob_score_train_split": full_validation.get("oob_score_train_split", np.nan),
+            "train_accuracy": full_tm.get("accuracy", np.nan),
+            "train_balanced_accuracy": full_tm.get("balanced_accuracy", np.nan),
+            "train_macro_f1": full_tm.get("macro_f1", np.nan),
+            "test_accuracy": full_vm.get("accuracy", np.nan),
+            "test_balanced_accuracy": full_vm.get("balanced_accuracy", np.nan),
+            "test_macro_f1": full_vm.get("macro_f1", np.nan),
+            "model_data_accuracy": (
+                None if full_classifier_qc_model_data is None else full_classifier_qc_model_data.get("accuracy", np.nan)
+            ),
+            "model_data_balanced_accuracy": (
+                None if full_classifier_qc_model_data is None else full_classifier_qc_model_data.get("balanced_accuracy", np.nan)
+            ),
+        }
+        full_metrics_csv = (
+            full_qc_outfolder / f"state_classification_full_classifier_metrics_{classifier_backend_name}.csv"
+        )
+        pd.DataFrame([full_metrics_row]).to_csv(full_metrics_csv, index=False)
 
     model_adata.uns["classification"] = {
         "label_transfer_method": transfer_mode,
@@ -2465,9 +3388,12 @@ def train_state_classifiers(
         "full_classifier_model_path": None,
         "full_classifier_model_paths": {},
         "model_vs_full_clusterid_check": None,
-        "apply_artifact_path": None,
         "intrinsic_artifacts_dir": None if intrinsic_outfolder is None else str(intrinsic_outfolder),
         "full_artifacts_dir": None if full_outfolder is None else str(full_outfolder),
+        "intrinsic_qc_dir": None if intrinsic_qc_outfolder is None else str(intrinsic_qc_outfolder),
+        "full_qc_dir": None if full_qc_outfolder is None else str(full_qc_outfolder),
+        "intrinsic_metrics_csv": None if intrinsic_metrics_csv is None else str(intrinsic_metrics_csv),
+        "full_metrics_csv": None if full_metrics_csv is None else str(full_metrics_csv),
         "validation_config": {
             "mode": validation_mode,
             "test_size": None if validation_mode == "oob_only" else float(validation_test_size),
@@ -2486,95 +3412,30 @@ def train_state_classifiers(
         )
         model_adata.uns["classification"]["full_classifier_qc_model_data"] = full_classifier_qc_model_data
 
-    apply_artifact_path = None
-
     if outfolder_path is not None:
-        if save_label_classifier and label_classifier_artifact_full_data is not None:
-            classifier_model_path = intrinsic_outfolder / (
-                f"state_classification_label_classifier_{classifier_backend_name}_full_data.pkl"
-            )
+        if save_label_classifier and label_classifier_artifact_train_split is not None:
+            classifier_model_path = intrinsic_outfolder / "state_classifiction_random_forest.pkl"
             with open(classifier_model_path, "wb") as f:
-                pickle.dump(label_classifier_artifact_full_data, f)
+                pickle.dump(label_classifier_artifact_train_split, f)
             model_adata.uns["classification"]["classifier_model_path"] = str(classifier_model_path)
-            classifier_model_paths["full_data"] = str(classifier_model_path)
-            if label_classifier_artifact_train_split is not None:
-                classifier_model_path_train_split = intrinsic_outfolder / (
-                    f"state_classification_label_classifier_{classifier_backend_name}_train_split.pkl"
-                )
-                with open(classifier_model_path_train_split, "wb") as f:
-                    pickle.dump(label_classifier_artifact_train_split, f)
-                classifier_model_paths["train_split"] = str(classifier_model_path_train_split)
+            classifier_model_paths["train_split"] = str(classifier_model_path)
             model_adata.uns["classification"]["classifier_model_paths"] = dict(classifier_model_paths)
 
-        if train_full_classifier and save_full_label_classifier and full_label_classifier_artifact_full_data is not None:
-            full_classifier_model_path = full_outfolder / "state_classification_full_label_classifier_random_forest_full_data.pkl"
+        if train_full_classifier and save_full_label_classifier and full_label_classifier_artifact_train_split is not None:
+            full_classifier_model_path = full_outfolder / "state_classifiction_random_forest.pkl"
             with open(full_classifier_model_path, "wb") as f:
-                pickle.dump(full_label_classifier_artifact_full_data, f)
+                pickle.dump(full_label_classifier_artifact_train_split, f)
             model_adata.uns["classification"]["full_classifier_model_path"] = str(full_classifier_model_path)
-            full_classifier_model_paths["full_data"] = str(full_classifier_model_path)
-            if full_label_classifier_artifact_train_split is not None:
-                full_classifier_model_path_train_split = (
-                    full_outfolder / "state_classification_full_label_classifier_random_forest_train_split.pkl"
-                )
-                with open(full_classifier_model_path_train_split, "wb") as f:
-                    pickle.dump(full_label_classifier_artifact_train_split, f)
-                full_classifier_model_paths["train_split"] = str(full_classifier_model_path_train_split)
+            full_classifier_model_paths["train_split"] = str(full_classifier_model_path)
             model_adata.uns["classification"]["full_classifier_model_paths"] = dict(full_classifier_model_paths)
 
-        apply_artifact_path = outfolder_path / "state_classification_apply_artifact.pkl"
-        apply_artifact = {
-            "schema_version": 1,
-            "label_transfer_method": transfer_mode,
-            "continuous_label_classifier_artifact": {
-                "full_data": label_classifier_artifact_full_data,
-                "train_split": label_classifier_artifact_train_split,
-            },
-            "full_label_classifier_artifact": {
-                "full_data": full_label_classifier_artifact_full_data,
-                "train_split": full_label_classifier_artifact_train_split,
-            },
-            "default_continuous_model_variant": "full_data",
-            "default_full_model_variant": "full_data",
-            "preprocessing": preprocessing_artifact,
-            "windowing": dict(windowing_artifact),
-            "clustering": {
-                "clustering_method": clustering_method,
-                "resolution": clustering_resolution,
-                "n_neighbors": clustering_n_neighbors,
-                "random_state": stage1_random_state,
-                "non_feature_cols": list(non_feature_cols),
-                "binary_cols_to_merge": list(binary_cols_to_merge),
-            },
-            "output_columns": {
-                "clusterid_output_col": "intrinsic_behavioral_cluster",
-                "clusterid_confidence_col": classifier_confidence_col,
-                "full_classifier_output_col": "full_behavioral_cluster",
-                "full_classifier_confidence_col": full_classifier_confidence_col,
-            },
-        }
-        with open(apply_artifact_path, "wb") as f:
-            pickle.dump(apply_artifact, f)
-        model_adata.uns["classification"]["apply_artifact_path"] = str(apply_artifact_path)
-
-        qcap = (preprocessing_artifact or {}).get("quantile_capping", {})
-        feature_limits = qcap.get("feature_limits", {}) if isinstance(qcap, dict) else {}
-        if len(feature_limits) > 0:
-            qcap_json_path = outfolder_path / "state_classification_quantile_cap_limits.json"
-            with open(qcap_json_path, "w") as f:
-                json.dump(feature_limits, f, indent=2)
-            qcap_df = pd.DataFrame.from_dict(feature_limits, orient="index")
-            qcap_df.index.name = "feature"
-            qcap_df.to_csv(outfolder_path / "state_classification_quantile_cap_limits.csv")
-            model_adata.uns["classification"]["quantile_cap_limits_json"] = str(qcap_json_path)
-
-        model_adata.write(outfolder_path / "adata_state_classification_model.h5ad", compression="gzip")
+        model_adata.write(outfolder_path / "state_classification_model.h5ad", compression="gzip")
     if verbose:
         n_intrinsic = int(model_adata.obs["intrinsic_behavioral_cluster"].astype(str).nunique())
         n_full = int(model_adata.obs["full_behavioral_cluster"].astype(str).nunique()) if "full_behavioral_cluster" in model_adata.obs.columns else 0
         print(
             "Completed stage-2 classifier training: "
-            f"intrinsic_clusters={n_intrinsic}, full_behavioral_clusters={n_full}, "
-            f"saved_artifact={None if apply_artifact_path is None else str(apply_artifact_path)}"
+            f"intrinsic_clusters={n_intrinsic}, full_behavioral_clusters={n_full}"
         )
     return {
         "full_classifier_path": None if full_classifier_model_path is None else str(full_classifier_model_path),
@@ -2705,24 +3566,95 @@ def apply_state_classifiers_to_full_dataset(
             f"full_variant={full_model_variant if full_label_classifier_selected is not None else None}"
         )
 
-    if label_classifier_selected is not None:
-        adata_full = apply_classifier(
-            df_positions=df_positions,
-            classifier_artifact_or_path=label_classifier_selected,
-            output_col=continuous_output_col,
-            confidence_col=continuous_confidence_col,
-            outfolder=outfolder,
-            verbose=verbose,
-        )
+    pre_meta = model_adata.uns.get("preprocessing", {}) if isinstance(model_adata.uns, dict) else {}
+    prepared_cache_path = None
+    prepared_cache_used = False
+    prepared_cache_mismatch_reasons = []
+    full_predicted_in_primary = False
+
+    reference_classifier_artifact = (
+        label_classifier_selected if label_classifier_selected is not None else full_label_classifier_selected
+    )
+    adata_full = None
+
+    cache_path_raw = pre_meta.get("prepared_adata_full_path", None) if isinstance(pre_meta, dict) else None
+    if cache_path_raw is not None and reference_classifier_artifact is not None:
+        prepared_cache_path = Path(cache_path_raw)
+        if prepared_cache_path.exists():
+            cached_adata = sc.read_h5ad(prepared_cache_path)
+            cache_payload = _build_adata_preprocessing_compare_payload(cached_adata)
+            classifier_payload = _build_classifier_preprocessing_compare_payload(reference_classifier_artifact)
+            is_match, mismatch_reasons = _compare_preprocessing_params(
+                cache_payload,
+                classifier_payload,
+                rtol=1e-8,
+                atol=1e-12,
+            )
+            if is_match:
+                adata_full = cached_adata
+                prepared_cache_used = True
+                if verbose:
+                    print(f"Using cached prepared full adata and skipping preprocessing: {prepared_cache_path}")
+            else:
+                prepared_cache_mismatch_reasons = list(mismatch_reasons)
+                err_msg = (
+                    "ERROR: cached prepared adata preprocessing mismatch; recomputing from df_positions. "
+                    f"reasons={prepared_cache_mismatch_reasons}"
+                )
+                warnings.warn(err_msg, RuntimeWarning)
+                if verbose:
+                    print(err_msg)
+        elif verbose:
+            print(f"Prepared adata cache path was set but file is missing; recomputing: {prepared_cache_path}")
+
+    if adata_full is None:
+        if label_classifier_selected is not None:
+            adata_full = apply_classifier(
+                df_positions=df_positions,
+                classifier_artifact_or_path=label_classifier_selected,
+                output_col=continuous_output_col,
+                confidence_col=continuous_confidence_col,
+                outfolder=outfolder,
+                verbose=verbose,
+            )
+        else:
+            adata_full = apply_classifier(
+                df_positions=df_positions,
+                classifier_artifact_or_path=full_label_classifier_selected,
+                output_col=full_output_col,
+                confidence_col=full_confidence_col,
+                outfolder=outfolder,
+                verbose=verbose,
+            )
+            full_predicted_in_primary = True
     else:
-        adata_full = apply_classifier(
-            df_positions=df_positions,
-            classifier_artifact_or_path=full_label_classifier_selected,
-            output_col=full_output_col,
-            confidence_col=full_confidence_col,
-            outfolder=outfolder,
-            verbose=verbose,
-        )
+        if label_classifier_selected is not None:
+            cont_cols = list(label_classifier_selected.get("feature_cols", []))
+            missing_cont = [c for c in cont_cols if c not in adata_full.var_names]
+            if len(missing_cont) > 0:
+                raise ValueError(
+                    "Cached prepared adata is missing intrinsic classifier features: "
+                    f"{missing_cont[:20]}"
+                )
+            predict_clusterids_with_classifier(
+                adata=adata_full,
+                classifier=label_classifier_selected,
+                feature_cols=cont_cols,
+                output_col=continuous_output_col,
+                confidence_col=continuous_confidence_col,
+                inplace=True,
+                apply_preprocessing=False,
+            )
+        elif full_label_classifier_selected is not None:
+            predict_clusterids_with_full_classifier(
+                adata=adata_full,
+                classifier_artifact=full_label_classifier_selected,
+                output_col=full_output_col,
+                confidence_col=full_confidence_col,
+                inplace=True,
+                apply_preprocessing=False,
+            )
+            full_predicted_in_primary = True
 
     binary_cols_to_merge = list(clust_meta.get("binary_cols_to_merge", []))
     if combine_binary_with_continuous and (label_classifier_selected is not None):
@@ -2734,7 +3666,7 @@ def apply_state_classifiers_to_full_dataset(
             intrinsic_col="intrinsic_behavioral_cluster",
         )
 
-    if full_label_classifier_selected is not None:
+    if full_label_classifier_selected is not None and (not full_predicted_in_primary):
         predict_clusterids_with_full_classifier(
             adata=adata_full,
             classifier_artifact=full_label_classifier_selected,
@@ -2745,7 +3677,6 @@ def apply_state_classifiers_to_full_dataset(
         )
 
     adata_full.uns["preprocessing"] = dict(model_adata.uns.get("preprocessing", {}))
-    adata_full.uns["clustering"] = dict(clust_meta)
     adata_full.uns["classification"] = dict(class_meta)
     adata_full.uns["classification"]["applied_continuous_output_col"] = str(continuous_output_col)
     adata_full.uns["classification"]["applied_continuous_model_variant"] = (
@@ -2757,28 +3688,93 @@ def apply_state_classifiers_to_full_dataset(
     adata_full.uns["classification"]["applied_full_model_variant"] = (
         None if full_label_classifier_selected is None else str(full_model_variant)
     )
+    adata_full.uns["classification"]["prepared_cache_used"] = bool(prepared_cache_used)
+    adata_full.uns["classification"]["prepared_cache_mismatch_reasons"] = list(prepared_cache_mismatch_reasons)
+    adata_full.uns["classification"]["prepared_cache_path"] = (
+        None if prepared_cache_path is None else str(prepared_cache_path)
+    )
+
+    state_composition_report_pdf = None
+    state_composition_report_pdfs = []
+    state_composition_report_auc_csv = None
+    state_composition_report_plot_csvs = []
+    state_composition_report_error = None
 
     if outfolder is not None:
         outfolder = Path(outfolder)
         outfolder.mkdir(parents=False, exist_ok=True)
-        adata_full.write(outfolder / "adata_state_classification_full.h5ad", compression="gzip")
 
-        if ("binary_group" in adata_full.obs.columns) and ("behavioral_clusterid" in adata_full.obs.columns):
-            pdf1 = outfolder / "state_classification_binary_group_cluster_proportions.pdf"
-            fig, _ = plot_binary_group_behavioral_cluster_grid(
-                adata_full,
-                pdf_path=pdf1,
-                return_csv=True,
-                verbose=verbose,
+        if full_output_col in adata_full.obs.columns:
+            report_dir = outfolder / "analysis" / "state_composition"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            report_token = _sanitize_filename_token(
+                full_output_col,
+                fallback="full_behavioral_cluster",
             )
-            plt.close(fig)
-            pdf2 = outfolder / "state_classification_cluster_binary_group_proportions.pdf"
-            fig2, _ = plot_behavioral_cluster_binary_group_grid(
-                adata_full,
-                pdf_path=pdf2,
-                return_csv=True,
+            report_pdf_path = report_dir / f"state_composition_report_{report_token}.pdf"
+            report_auc_csv_path = report_dir / f"state_composition_report_{report_token}.csv"
+            try:
+                report_out = save_state_composition_report(
+                    adata=adata_full,
+                    output_pdf_path=report_pdf_path,
+                    output_csv_path=report_auc_csv_path,
+                    time_col="position_t",
+                    state_col=str(full_output_col),
+                    sample_col="sample_name",
+                    include_pooled_summary=True,
+                    verbose=verbose,
+                )
+                pdf_paths = report_out.get("pdf_paths", {})
+                if isinstance(pdf_paths, dict) and len(pdf_paths) > 0:
+                    state_composition_report_pdfs = [str(v) for v in pdf_paths.values()]
+                    state_composition_report_pdf = str(
+                        pdf_paths.get(
+                            "stacked_by_sample",
+                            state_composition_report_pdfs[0],
+                        )
+                    )
+                else:
+                    state_composition_report_pdf = str(report_out.get("pdf_path", report_pdf_path))
+                    state_composition_report_pdfs = [state_composition_report_pdf]
+                state_composition_report_auc_csv = str(report_out.get("csv_path", report_auc_csv_path))
+                plot_csv_paths = report_out.get("plot_data_csv_paths", {})
+                if isinstance(plot_csv_paths, dict) and len(plot_csv_paths) > 0:
+                    state_composition_report_plot_csvs = [str(v) for v in plot_csv_paths.values()]
+                else:
+                    plot_csv_path = report_out.get("plot_data_csv_path", None)
+                    if plot_csv_path is not None:
+                        state_composition_report_plot_csvs = [str(plot_csv_path)]
+            except Exception as exc:
+                state_composition_report_error = str(exc)
+                warnings.warn(
+                    "Could not generate state composition report after classifier apply: "
+                    f"{exc}",
+                    RuntimeWarning,
+                )
+                if verbose:
+                    print(f"Skipping state composition report export due to error: {exc}")
+        else:
+            state_composition_report_error = (
+                "Could not generate state composition report: "
+                f"missing '{full_output_col}' in adata_full.obs."
             )
-            plt.close(fig2)
+            warnings.warn(state_composition_report_error, RuntimeWarning)
+
+        adata_full.uns["classification"]["state_composition_report_pdf"] = state_composition_report_pdf
+        adata_full.uns["classification"]["state_composition_report_pdfs"] = list(state_composition_report_pdfs)
+        adata_full.uns["classification"]["state_composition_report_auc_csv"] = state_composition_report_auc_csv
+        adata_full.uns["classification"]["state_composition_report_plot_csvs"] = list(
+            state_composition_report_plot_csvs
+        )
+        adata_full.uns["classification"]["state_composition_report_error"] = state_composition_report_error
+
+        adata_full.write(outfolder / "state_classification_full.h5ad", compression="gzip")
+    else:
+        adata_full.uns["classification"]["state_composition_report_pdf"] = None
+        adata_full.uns["classification"]["state_composition_report_pdfs"] = []
+        adata_full.uns["classification"]["state_composition_report_auc_csv"] = None
+        adata_full.uns["classification"]["state_composition_report_plot_csvs"] = []
+        adata_full.uns["classification"]["state_composition_report_error"] = None
 
     if verbose:
         n_rows = int(adata_full.n_obs)
@@ -2818,7 +3814,6 @@ def test_pipeline():
         incomplete_window_policy=incomplete_window_policy,
         random_state=random_state,
         reuse_prepared_dataset=reuse_prepared_dataset,
-        save_prepared_dataset=save_prepared_dataset,
         verbose=verbose,
     )
     
@@ -2827,10 +3822,10 @@ def test_pipeline():
     
     mapping = {
         1: "dead",
-        2: "plastic_scanner",
-        3: "round_scanner",
+        2: "static",
+        3: "plastic_scanner",
         4: "static",
-        5: "static",
+        5: "round_scanner",
     }
     rename_intrinsic_behavioral_clusters(
         adata=model_adata,
@@ -2889,12 +3884,8 @@ def test_pipeline():
     adata_full = apply_state_classifiers_to_full_dataset(
         df_positions=df_positions,
         model_adata=model_adata,
-        label_classifier_artifact=classifier_paths.get("partial_classifier_path", None),
-        full_label_classifier_artifact=(
-            classifier_paths.get("full_classifier_path", None)
-            if train_full_label_classifier
-            else None
-        ),
+        label_classifier_artifact=classifier_paths["partial_classifier_path"],
+        full_label_classifier_artifact=classifier_paths["full_classifier_path"],
         outfolder=outfolder,
         continuous_output_col="intrinsic_behavioral_cluster",
         full_output_col="full_behavioral_cluster",
@@ -2927,7 +3918,7 @@ if __name__ == "__main__":
     max_samples = None
     min_spacing = 10
     n_neighbors = 60
-    resolution = 0.15
+    resolution = 0.2
     features=[
         "percentage_dead_mask",
         # "mean_dead_dye",
@@ -2962,13 +3953,13 @@ if __name__ == "__main__":
     )
     pca_var_selection = 0.95
     clustering_method = "leiden"
-    resolutions = 0.15
+    resolutions = 0.2
     leiden_seed_tries = 10
     leiden_subsample_tries = 10
     lower_quantile_cap = None
     upper_quantile_cap = 0.99
     incomplete_window_policy = "drop"
-    random_state = 123
+    random_state = 12345
     reuse_prepared_dataset = True
     save_prepared_dataset = True
     label_transfer_method = "classifier"

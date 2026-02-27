@@ -31,9 +31,9 @@ from behav3d.analysis.classification.clustering.general.visualization.plots impo
 # %matplotlib inline
 
 import time
-seed = 123
-random.seed(seed)
-np.random.seed(seed)
+random_state = 123
+random.random_state(random_state)
+np.random.random_state(random_state)
 
 def run_state_based_analysis(
     output_dir,
@@ -41,7 +41,7 @@ def run_state_based_analysis(
     
     # Input
     adata_full_path=None,  # if None, will look under output_dir/analysis/<cell_type>/rolling_classification/adata_full.h5ad
-    state_col="ClusterID",
+    state_col="full_behavioral_cluster",
     groupby_cols=("sample_name", "TrackID"),
     time_col="position_t",
 
@@ -79,13 +79,13 @@ def run_state_based_analysis(
     # Exemplar track plotting
     plot_exemplars=True,
     n_per_cluster=10,
-    exemplar_state_keys=("ClusterID", "ClusterID_filt5"),
+    exemplar_state_keys=("full_behavioral_cluster"),
 
     # Saving
     save_outputs=True,
     output_subdir_name="state_feature_classification",
 
-    seed=123,
+    random_state=123,
 ):
     print("--------------- Performing state-based full track analysis ---------------")
     start_time = time.time()
@@ -159,10 +159,10 @@ def run_state_based_analysis(
         adata_state_features = run_pca(
             adata_state_features,
             ncomps=len(adata_state_features.var_names),
-            pca_var=pca_var_selection,  # matches your snippet signature
-            random_state=seed,
+            pca_var_selection=pca_var_selection,  # matches your snippet signature
+            random_state=random_state,
         )
-        leiden_use_rep="X_pca",
+        leiden_use_rep="X_pca"
 
     # --------- Leiden ----------
     # Your snippet uses use_rep="X" (not X_pca). Keep it configurable.
@@ -172,17 +172,17 @@ def run_state_based_analysis(
         method="umap",
         use_rep=leiden_use_rep,
         key_added="ClusterID",
-        random_state=seed,
+        random_state=random_state,
     )
 
     adata_state_features = run_leiden_clustering(
-        adata_state_features, 
-         n_neighbors=n_neighbors,
+            adata_state_features, 
+            n_neighbors=n_neighbors,
             resolution=leiden_resolution,
             method="umap",
             use_rep=leiden_use_rep,
             key_added="ClusterID",
-            random_state=seed,
+            random_state=random_state,
             metric=leiden_metric
         )
 
@@ -190,7 +190,7 @@ def run_state_based_analysis(
     sc.tl.umap(
         adata_state_features,
         min_dist=umap_min_dist,
-        random_state=seed,
+        random_state=random_state,
     )
 
     # --------- Plots ----------
@@ -228,7 +228,7 @@ def run_state_based_analysis(
             adata_filt,
             adata_state_features,
             n_per_cluster=n_per_cluster,
-            state_key="ClusterID",
+            state_key=state_col,
         )
         for k in exemplar_state_keys:
             if k in adata_filt.obs.columns:

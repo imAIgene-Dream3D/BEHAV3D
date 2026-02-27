@@ -414,6 +414,7 @@ def _add_row_title(row_img, title, fontsize=40):
     plt.close(fig)
     return buf
 
+
 def colorize_channels_to_rgb(
     img, 
     channel_axis=1, 
@@ -775,7 +776,6 @@ def create_cluster_videos(
     return results
 
 
-
 def create_cluster_overview_video(
     df_windows,
     df_positions,
@@ -892,7 +892,6 @@ def create_cluster_overview_video(
         writer.close()
 
     return str(video_path)
-
 
 
 def create_fulltrack_cluster_videos(

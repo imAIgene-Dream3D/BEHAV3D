@@ -111,7 +111,7 @@ def run_leiden_clustering(
                 "`adata.uns['neighbors']['params']['n_neighbors']`. "
                 "Provide n_neighbors explicitly or recompute neighbors with Scanpy."
             )
-        print(f"Using precomputed neighbors graph (n_neighbors={resolved_n_neighbors}).")
+        # print(f"Using precomputed neighbors graph (n_neighbors={resolved_n_neighbors}).")
     else:
         scanpy.pp.neighbors(
             adata,

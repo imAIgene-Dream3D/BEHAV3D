@@ -629,63 +629,65 @@ def plot_sankey_diagram_between_states(
     return fig
 
 
-# # -----------------------------
-# # Usage (same behavior as your script)
-# # -----------------------------
-# # compute 2-, 3-, and 4-grams
-# df_ngrams = all_ngrams(
-#     adata_full,
-#     n_values=(2, 3, 4),
-#     state_col="ClusterID",
-#     group_cols=("sample_name", "TrackID"),
-#     time_col="position_t",
-#     collapse_bouts=True,  # strongly recommended
-# )
+test():
+    # -----------------------------
+    # Usage (same behavior as your script)
+    # -----------------------------
+    # compute 2-, 3-, and 4-grams
+    cluster_column = "full_behavioral_cluster"  # matches your snippet; could also be "ClusterID"
+    df_ngrams = all_ngrams(
+        adata_full,
+        n_values=(2, 3, 4),
+        state_col=cluster_column,
+        group_cols=("sample_name", "TrackID"),
+        time_col="position_t",
+        collapse_bouts=True,  # strongly recommended
+    )
 
-# plot_top_ngrams(df_ngrams, n=3, top_n=30)
-# plot_top_ngrams_per_end_state(df_ngrams, n=4, top_n=10)
+    plot_top_ngrams(df_ngrams, n=3, top_n=30)
+    plot_top_ngrams_per_end_state(df_ngrams, n=4, top_n=10)
 
-# df_paths_1_5 = paths_between_states(
-#     adata_full,
-#     start_state="Static",
-#     end_state="Organoid contact",
-#     state_col="ClusterID",
-#     collapse_bouts=True,
-#     mode="next_end",
-# )
+    df_paths_1_5 = paths_between_states(
+        adata_full,
+        start_state="static",
+        end_state="organoid_contact",
+        state_col=cluster_column,
+        collapse_bouts=True,
+        mode="next_end",
+    )
 
-# plot_paths_by_count(
-#     df_paths_1_5,
-#     top_n=25,
-#     min_count=1,
-#     title="Most common paths from state 1 to state 5",
-# )
+    plot_paths_by_count(
+        df_paths_1_5,
+        top_n=25,
+        min_count=1,
+        title="Most common paths from state 1 to state 5",
+    )
 
-# colors = [
-#     "#d62728",
-#     "#1f77b4",
-#     "#ff7f0e",
-#     "#2ca02c",
-#     "#9467bd",
-#     "#8c564b",
-#     "#e377c2",
-#     "#7f7f7f",
-#     "#bcbd22",
-#     "#17becf",
-# ]
+    colors = [
+        "#d62728",
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
 
-# fig = plot_sankey_diagram_between_states(
-#     df_paths_1_5,
-#     state_colors=colors,
-#     min_count=100,
-# )
+    fig = plot_sankey_diagram_between_states(
+        df_paths_1_5,
+        state_colors=colors,
+        min_count=100,
+    )
 
-# # export + show
-# # (requires kaleido installed for write_image / to_image)
-# fig.write_image(
-#     "/Users/s.deblank-3/Downloads/newplot.pdf",
-#     width=1400,
-#     height=700,
-#     scale=2,
-# )
-# fig.show()
+    # export + show
+    # (requires kaleido installed for write_image / to_image)
+    fig.write_image(
+        "/Users/s.deblank-3/Downloads/newplot.pdf",
+        width=1400,
+        height=700,
+        scale=2,
+    )
+    fig.show()
