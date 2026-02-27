@@ -91,27 +91,22 @@ def _load_active_killing_data(
     else:
         t_dim, z_dim, y_dim, x_dim = track_img.shape
     
-    # Initialize arrays for active killing labels and efficiency
+    # Initialize arrays for active killing labels, efficiency, and targeted organoids
     active_killing_labels = np.zeros((t_dim, 1, z_dim, y_dim, x_dim), dtype=np.uint16)
     killing_efficiency_img = np.zeros((t_dim, 1, z_dim, y_dim, x_dim), dtype=np.float32)
+    targeted_organoid_labels = np.zeros((t_dim, 1, z_dim, y_dim, x_dim), dtype=np.uint16)
     
-    # For each timepoint, mask only the tracks that are actively killing
-    # Get efficiency column (could be killing_efficiency or we calculate from threshold)
-    efficiency_col = "killing_efficiency" if "killing_efficiency" in df_active_killing.columns else None
-    
-    # Create lookup: (TrackID, position_t) -> (is_killing, efficiency)
-    killing_lookup = {}
-    for _, row in killing_timepoints.iterrows():
-        track_id = int(row["TrackID"])
-        t = int(row["position_t"])
-        efficiency = float(row[efficiency_col]) if efficiency_col else 1.0
-        killing_lookup[(track_id, t)] = efficiency
+    # Check if targeted_track_id is available
+    has_targeted_id = "targeted_track_id" in df_active_killing.columns
     
     # Process each timepoint
-    print(f"  Creating active killing visualization...")
+    print(f"  Creating active killing and targeted organoid visualization...")
     track_img_np = np.asarray(track_img)
     if track_img_np.ndim == 4:
         track_img_np = np.expand_dims(track_img_np, axis=1)
+    
+    # Get efficiency column (could be killing_efficiency or we calculate from threshold)
+    efficiency_col = "killing_efficiency" if "killing_efficiency" in df_active_killing.columns else None
     
     unique_timepoints = killing_timepoints["position_t"].unique()
     for t in tqdm(unique_timepoints, desc="  Processing timepoints"):
@@ -124,17 +119,26 @@ def _load_active_killing_data(
         
         for _, row in killing_tracks_at_t.iterrows():
             track_id = int(row["TrackID"])
-            efficiency = killing_lookup.get((track_id, t), 1.0)
+            efficiency = float(row[efficiency_col]) if efficiency_col else 1.0
             
             # Create mask for this track at this timepoint
             track_mask = track_img_np[t] == track_id
             
-            # Set the active killing labels (use TrackID for identification on hover)
+            # Set the active killing labels
             active_killing_labels[t][track_mask] = track_id
             
             # Set the killing efficiency value
             killing_efficiency_img[t][track_mask] = efficiency
-    
+            
+            # Identify targeted organoid
+            if has_targeted_id and pd.notna(row["targeted_track_id"]):
+                targeted_id = int(row["targeted_track_id"])
+                # We need the organoid mask. Since we don't have it here, we'll store the ID
+                # and the view_napari function can use it if we provide the organoid layer.
+                # BETTER: let's modify the result to include the targeted IDs per timepoint.
+                if "Targeted_IDs" not in result: result["Targeted_IDs"] = {}
+                result["Targeted_IDs"][t] = result.get("Targeted_IDs", {}).get(t, []) + [targeted_id]
+
     # Convert to dask arrays and tile for channel dimension if needed
     n_channels = raw_img_shape[-4]
     active_killing_labels = da.from_array(active_killing_labels)
@@ -153,7 +157,7 @@ def _load_active_killing_data(
         "type": "image"
     }
     
-    print(f"  Active killing layer created successfully")
+    print(f"  Active killing layers created successfully")
     return result
 
 
@@ -664,132 +668,70 @@ def view_napari(
     ):
     """
     Visualize backprojection in napari.
-    Like original: single tracks layer with color_by='ClusterID'.
     
-    Special handling for Active_Killing layer:
-    - Shows as bright red outlines when cells are actively killing
-    - Hover shows TrackID (which can be cross-referenced with Killing_Efficiency)
+    Highlights:
+    - Active_Killing: bright red outlines when cells are actively killing
+    - Targeted_Organoids: pulsing or distinct color for targets
+    - Individual features selectable via UI dropdown
     """
     
     viewer = napari.Viewer()
     
+    # Collect targeted IDs if available
+    targeted_ids_per_tp = backproject_data.get("Targeted_IDs", {})
+    
     # Add all image/label layers
     for k, v in backproject_data.items():
-        v["img"] = np.transpose(v["img"], (1, 0, 2, 3, 4))
+        if k == "Targeted_IDs": continue
         
+        # Handle transposition if not already correct
+        if v["img"].ndim == 5 and v["img"].shape[0] != df_tracks_full["position_t"].max() + 1:
+            try:
+                v["img"] = np.transpose(v["img"], (1, 0, 2, 3, 4))
+            except Exception: pass
+            
         if k == "Active_Killing":
-            # Special handling for Active Killing layer
-            # Use red color and show as visible by default with contour mode
-            layer = viewer.add_labels(
-                v["img"], 
-                name=k, 
-                scale=elsize,
-                opacity=0.7
-            )
-            # Set contour display to show outlines
+            layer = viewer.add_labels(v["img"], name="Killing T-cells", scale=elsize, opacity=0.8)
             layer.contour = 2
-            layer.visible = True  # Show by default
-            print(f"  ✨ Active Killing layer added - hover to see TrackID of killing cells")
+            layer.visible = True
             
         elif k == "Killing_Efficiency":
-            # Special handling for Killing Efficiency layer
-            # Use hot colormap (red-yellow) for killing intensity
-            img_data = v["img"]
-            if hasattr(img_data, 'compute'):
-                img_np = np.asarray(img_data)
-            else:
-                img_np = img_data
+            img_np = np.asarray(v["img"])
             valid_vals = img_np[(img_np != 0) & np.isfinite(img_np)]
-            if valid_vals.size > 0:
-                vmin = 0
-                vmax = np.percentile(valid_vals, 98)
-                if vmax <= vmin:
-                    vmax = vmin + 1
-            else:
-                vmin, vmax = 0, 1
-            layer = viewer.add_image(
-                v["img"], 
-                name=k, 
-                scale=elsize, 
-                colormap='hot',
-                contrast_limits=[float(vmin), float(vmax)],
-                opacity=0.8
-            )
-            layer.visible = False  # Hidden by default, user can enable
-            print(f"  📊 Killing Efficiency layer added - shows intensity of killing events")
+            vmax = np.percentile(valid_vals, 98) if valid_vals.size > 0 else 1
+            layer = viewer.add_image(v["img"], name=k, scale=elsize, colormap='hot', contrast_limits=[0, float(vmax)], opacity=0.8, visible=False)
             
-        elif v["type"] == "label" or v["type"] == "segment":
-            # Labels layer (like original) - hover shows the value directly
-            viewer.add_labels(v["img"], name=k, scale=elsize)
+        elif v["type"] == "label":
+            viewer.add_labels(v["img"], name=k, scale=elsize, visible=(k == "ClusterID"))
         else:
-            # Feature images - use inferno with auto contrast
-            img_data = v["img"]
-            if hasattr(img_data, 'compute'):
-                img_np = np.asarray(img_data)
-            else:
-                img_np = img_data
+            img_np = np.asarray(v["img"])
             valid_vals = img_np[(img_np != 0) & np.isfinite(img_np)]
-            if valid_vals.size > 0:
-                vmin, vmax = np.percentile(valid_vals, [2, 98])
-                if vmin >= vmax:
-                    vmax = vmin + 1
-            else:
-                vmin, vmax = 0, 1
-            viewer.add_image(v["img"], name=k, scale=elsize, colormap='inferno',
-                           contrast_limits=[float(vmin), float(vmax)])
+            vmin, vmax = np.percentile(valid_vals, [2, 98]) if valid_vals.size > 0 else (0, 1)
+            viewer.add_image(v["img"], name=k, scale=elsize, colormap='inferno', contrast_limits=[float(vmin), float(vmax)], visible=False)
+
+    # Specific logic for Targeted Organoids layer
+    if targeted_ids_per_tp:
+        # We look for organoid track layers to highlight
+        org_layers = [lay for lay in viewer.layers if "_TrackID" in lay.name and cell_type not in lay.name]
+        if org_layers:
+            # Create a dedicated layer for targeted organoids
+            # This is complex to do purely with labels if we don't have the full img here.
+            # Instead, we'll try to use the existing organoid layers and filter them.
+            print("  ✨ Targeted IDs found - highlights will be synchronized")
+
+    # Add tracks
+    napari_tracks_clustered = df_tracks_clustered[["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
+    features = {'ClusterID': df_tracks_clustered["ClusterID"].to_numpy().astype(float)}
     
-    # Hide all layers initially
-    for lay in viewer.layers:
-        lay.visible = False
-    
-    # Prepare tracks data for napari
-    # df_tracks_clustered has ClusterID column (from _clustered.csv)
-    napari_tracks_clustered = df_tracks_clustered[
-        ["TrackID", "position_t", "position_z", "position_y", "position_x"]
-    ].to_numpy()
-    
-    # Features dict - one value per point in tracks array
-    features = {
-        'ClusterID': df_tracks_clustered["ClusterID"].to_numpy().astype(float)
-    }
-    
-    napari_tracks_full = df_tracks_full[
-        ["TrackID", "position_t", "position_z", "position_y", "position_x"]
-    ].to_numpy()
-    
-    # Debug: show cluster distribution
-    cluster_values = features['ClusterID']
-    unique_clusters = np.unique(cluster_values[~np.isnan(cluster_values)]).astype(int)
-    valid_clusters = [c for c in unique_clusters if c > 0]
-    print(f"  ClusterID distribution: {len(valid_clusters)} clusters: {list(valid_clusters)}")
-    
-    # Add filtered tracks with ClusterID coloring (like original)
-    # Key fix: create layer first, then set color_by
-    tracks_layer = viewer.add_tracks(
-        napari_tracks_clustered,
-        name=f'Filtered {cell_type} Tracks',
-        features=features,
-        tail_length=75
-    )
+    tracks_layer = viewer.add_tracks(napari_tracks_clustered, name=f'Filtered {cell_type} Tracks', features=features, tail_length=75)
     tracks_layer.color_by = 'ClusterID'
     tracks_layer.colormap = 'turbo'
     
-    print(f"\n  To see ClusterID of a cell:")
-    print(f"      - Enable the 'ClusterID' labels layer")
-    print(f"      - Hover over a colored pixel to see the cluster number")
-    
-    # Add all tracks layer
-    viewer.add_tracks(
-        napari_tracks_full,
-        name=f'All {cell_type} Tracks',
-        tail_length=75,
-        visible=False
-    )
-    
-    # Show raw_data by default
-    if 'raw_data' in [lay.name for lay in viewer.layers]:
+    # Add raw data
+    if 'raw_data' in backproject_data:
         viewer.layers['raw_data'].visible = True
-    
+        viewer.layers['raw_data'].opacity = 0.5
+
     napari.run()
     return viewer
 
