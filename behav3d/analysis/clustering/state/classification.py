@@ -6,6 +6,7 @@ import json
 import copy
 import warnings
 import re
+import time
 from matplotlib.backends.backend_pdf import PdfPages
 
 from pathlib import Path
@@ -303,7 +304,7 @@ def prepare_state_classification_dataset(
     ]
 
     if prepared_dataset_path is None and outfolder is not None:
-        prepared_dataset_path = Path(outfolder) / "state_classification_full.h5ad"
+        prepared_dataset_path = Path(outfolder) / "BEHAV3D_behavioral_states.h5ad"
     elif prepared_dataset_path is not None:
         prepared_dataset_path = Path(prepared_dataset_path)
 
@@ -371,6 +372,7 @@ def prepare_state_classification_dataset(
             c for c in binary_cols_to_merge if c in df_prepared.columns
         ]
         adata_prepared = df_to_adata(df_prepared, kept_features, obs_cols=obs_cols)
+        del df_windows_descriptive, df_binary, df_prepared
 
     else:
         binary_cols_to_merge = [col for col in binary_features_to_group if col in adata_prepared.obs.columns]
@@ -400,6 +402,18 @@ def prepare_state_classification_dataset(
 
     scaler = None
     if scale_features and len(kept_features) > 0:
+        duplicate_kept_features = []
+        _seen_kept_features = set()
+        for col in kept_features:
+            scol = str(col)
+            if scol in _seen_kept_features and scol not in duplicate_kept_features:
+                duplicate_kept_features.append(scol)
+            _seen_kept_features.add(scol)
+        if len(duplicate_kept_features) > 0:
+            raise ValueError(
+                "Duplicate kept_features are not supported for deterministic scaling/index assignment. "
+                f"Duplicates (first 20): {duplicate_kept_features[:20]}"
+            )
         cached_scaler_meta = (
             cached_pre_meta.get("scaler", None)
             if isinstance(cached_pre_meta, dict)
@@ -425,6 +439,7 @@ def prepare_state_classification_dataset(
                 raise ValueError(f"Missing kept_features in adata_prepared.var_names: {missing[:20]}")
             X_all[:, feat_indices] = scaled_prepared
             adata_prepared.X = X_all
+            del X_prepared, scaled_prepared, X_all
 
     windowing_params = {
         "features": list(features),
@@ -475,60 +490,106 @@ def _save_pdf_page_a4(pdf, fig, orientation="portrait"):
 
 
 def _resolve_output_dir(output_dir):
-    """Resolve/create the pipeline output root directory."""
+    """Resolve/create the global BEHAV3D output root directory."""
     if output_dir is None:
-        raise ValueError(
-            "output_dir is required. Pass the root folder used by the state-classification pipeline."
-        )
+        raise ValueError("output_dir is required.")
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
     return output_dir_path
 
 
-def _resolve_processing_outdir(output_dir):
-    """Return/create the shared processing output root under output_dir."""
-    output_dir_path = _resolve_output_dir(output_dir)
-    processing_outdir = output_dir_path / "processing"
+def _resolve_state_outdir(output_dir, cell_type):
+    """Return/create state-classification root: output_dir/analysis/<cell_type>/behavioral_states."""
+    if cell_type is None or len(str(cell_type).strip()) == 0:
+        raise ValueError("cell_type is required.")
+    root = _resolve_output_dir(output_dir)
+    state_outdir = root / "analysis" / str(cell_type) / "behavioral_states"
+    state_outdir.mkdir(parents=True, exist_ok=True)
+    return state_outdir
+
+
+def _resolve_analysis_paths(output_dir, cell_type):
+    """Resolve standard analysis folders and expected track-feature CSV inputs."""
+    if cell_type is None or len(str(cell_type).strip()) == 0:
+        raise ValueError("cell_type is required.")
+    root = _resolve_output_dir(output_dir)
+    analysis_outdir = root / "analysis" / str(cell_type)
+    feature_outdir = analysis_outdir / "track_features"
+    return {
+        "output_dir": root,
+        "analysis_outdir": analysis_outdir,
+        "feature_outdir": feature_outdir,
+        "filtered_tracks_csv": feature_outdir / f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv",
+        "combined_tracks_csv": feature_outdir / f"BEHAV3D_{cell_type}_combined_track_features.csv",
+    }
+
+
+def _resolve_positions_csv_path(output_dir, cell_type):
+    """Resolve the positions/features CSV from standard BEHAV3D analysis layout."""
+    analysis_paths = _resolve_analysis_paths(output_dir, cell_type)
+    filtered_path = analysis_paths["filtered_tracks_csv"]
+    combined_path = analysis_paths["combined_tracks_csv"]
+    if filtered_path.exists():
+        return filtered_path
+    if combined_path.exists():
+        return combined_path
+    raise FileNotFoundError(
+        "Could not find track-features CSV for state classification. "
+        f"Expected one of: '{filtered_path}' or '{combined_path}'. "
+        f"Run feature extraction for cell_type='{cell_type}' first, or place the CSV in "
+        "output_dir/analysis/<cell_type>/track_features."
+    )
+
+
+def _resolve_processing_outdir(base_outdir):
+    """Return/create processing output root under a stage root folder."""
+    if base_outdir is None:
+        raise ValueError("base_outdir is required to resolve processing output.")
+    processing_outdir = Path(base_outdir) / "processing"
     processing_outdir.mkdir(parents=True, exist_ok=True)
     return processing_outdir
 
 
-def _resolve_processing_subdir(output_dir, *parts):
+def _resolve_processing_subdir(base_outdir, *parts):
     """Return/create a subfolder under processing output root."""
-    processing_outdir = _resolve_processing_outdir(output_dir)
+    processing_outdir = _resolve_processing_outdir(base_outdir)
     subdir = processing_outdir.joinpath(*parts)
     subdir.mkdir(parents=True, exist_ok=True)
     return subdir
 
 
-def _resolve_state_clustering_outdir(output_dir):
+def _resolve_state_clustering_outdir(base_outdir):
     """Return/create clustering diagnostics/proportion folder under processing root."""
-    return _resolve_processing_subdir(output_dir, "state_clustering")
+    if base_outdir is None:
+        raise ValueError("base_outdir is required to resolve state clustering output.")
+    state_clustering_outdir = Path(base_outdir) / "state_clustering"
+    state_clustering_outdir.mkdir(parents=True, exist_ok=True)
+    return state_clustering_outdir
 
 
-def _resolve_state_stage_paths(output_dir):
-    """Build canonical state-classification artifact paths from output_dir."""
-    output_dir_path = _resolve_output_dir(output_dir)
-    processing_outdir = _resolve_processing_outdir(output_dir_path)
+def _resolve_state_stage_paths(output_dir, cell_type):
+    """Build canonical state-classification artifact paths from output_dir + cell_type."""
+    state_outdir = _resolve_state_outdir(output_dir, cell_type)
+    processing_outdir = _resolve_processing_outdir(state_outdir)
     intrinsic_outdir = processing_outdir / "intrinsic_behavioral_classification"
     full_outdir = processing_outdir / "full_behavioral_classification"
     intrinsic_qc_outdir = intrinsic_outdir / "quality_control"
     full_qc_outdir = full_outdir / "quality_control"
 
     return {
-        "output_dir": output_dir_path,
+        "state_outdir": state_outdir,
         "processing_outdir": processing_outdir,
         "state_clustering_outdir": processing_outdir / "state_clustering",
-        "model_adata_path": processing_outdir / "state_classification_model.h5ad",
-        "prepared_full_adata_path": processing_outdir / "state_classification_full.h5ad",
-        "full_output_adata_path": processing_outdir / "state_classification_full.h5ad",
+        "model_adata_path": processing_outdir / f"BEHAV3D_{cell_type}_behavioral_states_modeldata.h5ad",
+        "prepared_full_adata_path": state_outdir / f"BEHAV3D_{cell_type}_behavioral_states_prepared_full.h5ad",
+        "full_output_adata_path": state_outdir / f"BEHAV3D_{cell_type}_behavioral_states.h5ad",
         "intrinsic_outdir": intrinsic_outdir,
         "full_outdir": full_outdir,
         "intrinsic_qc_outdir": intrinsic_qc_outdir,
         "full_qc_outdir": full_qc_outdir,
-        "intrinsic_classifier_default_path": intrinsic_outdir / "state_classifiction_random_forest.pkl",
-        "full_classifier_default_path": full_outdir / "state_classifiction_random_forest.pkl",
-        "state_composition_outdir": output_dir_path / "analysis" / "state_composition",
+        "intrinsic_classifier_default_path": intrinsic_outdir / f"intrinsic_state_classification_random_forest_{cell_type}.pkl",
+        "full_classifier_default_path": full_outdir / f"state_classification_random_forest_{cell_type}.pkl",
+        "state_composition_outdir": state_outdir / "state_composition",
     }
 
 
@@ -552,8 +613,7 @@ def plot_clustering_diagnostics_pdf(
     if cluster_col not in adata.obs.columns:
         return
 
-    ad = adata.copy()
-    ad = _ensure_umap(ad, n_neighbors=30, random_state=123)
+    ad = _ensure_umap(adata, n_neighbors=30, random_state=123)
 
     pdf_path = Path(pdf_path)
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -634,7 +694,7 @@ def _export_clustering_diagnostics_csvs(
     cluster_col,
     feature_cols,
     outdir,
-    filename_prefix="state_classification_diagnostics",
+    filename_prefix="behavioral_states_diagnostics",
 ):
     """Export CSV companions for clustering diagnostics panels."""
     if adata is None or adata.n_obs == 0:
@@ -645,8 +705,7 @@ def _export_clustering_diagnostics_csvs(
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    ad = adata.copy()
-    ad = _ensure_umap(ad, n_neighbors=30, random_state=123)
+    ad = _ensure_umap(adata, n_neighbors=30, random_state=123)
 
     diagnostics_paths = {}
 
@@ -1350,9 +1409,16 @@ def _matches_cached_umap_stage(
     return len(reasons) == 0, reasons
 
 
-def _apply_preprocessing_to_continuous_matrix(X, preprocessing_params, feature_cols):
+def _apply_preprocessing_to_continuous_matrix(
+    X,
+    preprocessing_params,
+    feature_cols,
+    inplace=False,
+):
     """Apply saved quantile caps and scaling to a continuous feature matrix."""
-    out = np.asarray(X, dtype=float).copy()
+    out = np.asarray(X, dtype=float)
+    if not inplace:
+        out = out.copy()
     feature_cols = list(feature_cols)
     qmeta = (preprocessing_params or {}).get("quantile_capping", {})
     limits = qmeta.get("feature_limits", {}) if isinstance(qmeta, dict) else {}
@@ -1374,7 +1440,8 @@ def _apply_preprocessing_to_continuous_matrix(X, preprocessing_params, feature_c
                 "Preprocessing scaler parameter size mismatch: "
                 f"n_features={out.shape[1]}, len(mean)={len(mean)}, len(scale)={len(scale)}"
             )
-        out = (out - mean) / scale
+        out -= mean
+        out /= scale
     return out
 
 
@@ -1505,7 +1572,8 @@ def apply_classifier(
         c for c in binary_cols_to_merge if c in adata_prepared.obs.columns
     ]
     adata_query = adata_prepared[:, cont_cols].copy()
-    adata_query.obs = adata_query.obs[obs_cols].copy()
+    adata_query.obs = adata_query.obs[obs_cols]
+    del adata_prepared
 
     if "continuous_feature_cols" in artifact:
         predict_clusterids_with_full_classifier(
@@ -1649,12 +1717,16 @@ def predict_clusterids_with_classifier(
     if len(missing) > 0:
         raise ValueError(f"adata is missing classifier feature columns: {missing[:10]}")
 
-    X_query = _to_numpy_2d(target[:, cols].X)
+    if apply_preprocessing and preprocessing_params is not None:
+        X_query = _to_numpy_2d(target[:, cols].X).astype(float, copy=True)
+    else:
+        X_query = _to_numpy_2d(target[:, cols].X).astype(float, copy=False)
     if apply_preprocessing and preprocessing_params is not None:
         X_query = _apply_preprocessing_to_continuous_matrix(
             X_query,
             preprocessing_params=preprocessing_params,
             feature_cols=cols,
+            inplace=True,
         )
     pred = clf.predict(X_query)
     target.obs[output_col] = pd.Categorical(pd.Series(pred, index=target.obs.index).astype(str))
@@ -1853,7 +1925,7 @@ def evaluate_clusterid_classifier_on_model_adata(
     classifier,
     cluster_col="intrinsic_behavioral_cluster",
     outfolder=None,
-    filename_prefix="state_classification_classifier_qc",
+    filename_prefix="behavioral_states_classifier_qc",
     row_normalized_decimals=5,
     verbose=True,
 ):
@@ -1939,6 +2011,7 @@ def _build_classifier_matrix_from_adata(
     binary_feature_cols,
     binary_expanded_feature_cols=None,
     return_binary_feature_names=False,
+    row_indices=None,
 ):
     """Build a numeric feature matrix from adata.X (continuous) and obs (binary)."""
     cont_cols = list(continuous_feature_cols)
@@ -1948,14 +2021,25 @@ def _build_classifier_matrix_from_adata(
     if len(missing_cont) > 0:
         raise ValueError(f"Missing continuous feature columns in adata.var_names: {missing_cont[:10]}")
 
-    X_cont = _to_numpy_2d(adata[:, cont_cols].X).astype(float, copy=False)
+    if row_indices is None:
+        adata_cont = adata[:, cont_cols]
+        obs_df = adata.obs
+    else:
+        row_indices = np.asarray(row_indices)
+        adata_cont = adata[row_indices, cont_cols]
+        if np.issubdtype(row_indices.dtype, np.integer):
+            obs_df = adata.obs.iloc[row_indices]
+        else:
+            obs_df = adata.obs.loc[row_indices]
+
+    X_cont = _to_numpy_2d(adata_cont.X).astype(float, copy=False)
     if len(bin_cols) == 0:
         if return_binary_feature_names:
             return X_cont, []
         return X_cont
 
     bin_df = _build_binary_feature_dataframe(
-        obs_df=adata.obs,
+        obs_df=obs_df,
         binary_feature_cols=bin_cols,
         expected_expanded_cols=binary_expanded_feature_cols,
     )
@@ -2055,12 +2139,16 @@ def predict_clusterids_with_full_classifier(
     preprocessing_params = classifier_artifact.get("preprocessing", None)
 
     # Ensure continuous features use identical capping/z-normalization as training.
-    X_cont = _to_numpy_2d(target[:, cont_cols].X).astype(float, copy=False)
+    if apply_preprocessing and preprocessing_params is not None:
+        X_cont = _to_numpy_2d(target[:, cont_cols].X).astype(float, copy=True)
+    else:
+        X_cont = _to_numpy_2d(target[:, cont_cols].X).astype(float, copy=False)
     if apply_preprocessing and preprocessing_params is not None:
         X_cont = _apply_preprocessing_to_continuous_matrix(
             X_cont,
             preprocessing_params=preprocessing_params,
             feature_cols=cont_cols,
+            inplace=True,
         )
 
     if len(bin_cols) == 0:
@@ -2097,7 +2185,7 @@ def train_full_classifier_on_labeled_adata(
     output_col="full_behavioral_cluster",
     confidence_col="full_behavioral_cluster_confidence",
     outfolder=None,
-    qc_filename_prefix="state_classification_full_classifier_qc_random_forest",
+    qc_filename_prefix="behavioral_states_full_classifier_qc_random_forest",
     windowing_artifact=None,
     verbose=True,
 ):
@@ -2427,10 +2515,10 @@ def plot_behavioral_cluster_binary_group_grid(
 
 
 def run_state_clustering(
-    df_positions,
     features,
     binary_features_to_group,
     output_dir,
+    cell_type,
     window_size=5,
     min_spacing=None,
     max_samples=None,
@@ -2440,71 +2528,137 @@ def run_state_clustering(
     descriptive_features=("mean", "median", "std", "net_displacement", "straightness", "mean_square_displacement"),
     pca_var_selection=0.95,
     clustering_method="leiden",
-    resolutions=(0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5),
-    leiden_seed_tries=10,
-    leiden_subsample_tries=10,
     lower_quantile_cap=None,
     upper_quantile_cap=0.99,
     incomplete_window_policy="drop",
     random_state=123,
     reuse_prepared_dataset=True,
     # save_prepared_dataset=True,
+    df_positions=None,
     verbose=True,
 ):
-    """Stage 1: prepare continuous features, fit clustering model, and return model_adata.
+    """Stage 1: load/prepare positions, cluster, return model_adata.
 
     Stage-1 metadata is stored in:
     - model_adata.uns["preprocessing"]
     - model_adata.uns["clustering"]
     - model_adata.uns["preprocessing"]["prepared_adata_full_*"] cache metadata
     """
-    stage_paths = _resolve_state_stage_paths(output_dir)
-    output_dir_path = stage_paths["output_dir"]
-    state_clustering_outdir = _resolve_state_clustering_outdir(output_dir_path)
+    stage_paths = _resolve_state_stage_paths(output_dir, cell_type)
+    state_outdir = stage_paths["state_outdir"]
+    state_clustering_outdir = _resolve_state_clustering_outdir(stage_paths["processing_outdir"])
     prepared_adata_full_path = stage_paths["prepared_full_adata_path"]
     prepared_adata_model_path = stage_paths["model_adata_path"]
+    df_tracks_path = None
+    stage_prepare_started = time.perf_counter()
+    adata_prepared = None
+    prepared_cache_used = False
+    positions_loaded_from_csv = False
 
-    if verbose:
-        print("# Preparing dataset for state classification and clustering (windowed feature extraction, quantile capping, scaling)...")
+    def _load_positions_if_needed():
+        nonlocal df_positions, df_tracks_path, positions_loaded_from_csv
+        if df_positions is None:
+            df_tracks_path = _resolve_positions_csv_path(output_dir, cell_type)
+            df_positions = pd.read_csv(df_tracks_path)
+            positions_loaded_from_csv = True
+        _require_columns(
+            df_positions,
+            ["sample_name", "TrackID", "position_t"] + list(features),
+            context="state clustering input",
+        )
+        return df_positions
 
-    prepare_kwargs = {
-        "df_positions": df_positions,
-        "features": features,
-        "binary_features_to_group": binary_features_to_group,
-        "window_size": window_size,
-        "min_spacing": min_spacing,
-        "descriptive_features": list(descriptive_features),
-        "lower_quantile_cap": lower_quantile_cap,
-        "upper_quantile_cap": upper_quantile_cap,
-        "outfolder": output_dir_path,
-        "scale_features": True,
-        "incomplete_window_policy": incomplete_window_policy,
-        "reuse_prepared_dataset": reuse_prepared_dataset,
-        "prepared_dataset_path": prepared_adata_full_path,
-        "verbose": verbose,
-    }
-    adata_prepared = prepare_state_classification_dataset(**prepare_kwargs)
+    if (
+        bool(reuse_prepared_dataset)
+        and prepared_adata_full_path is not None
+        and prepared_adata_full_path.exists()
+    ):
+        try:
+            cached_prepared = sc.read_h5ad(prepared_adata_full_path)
+            pre_match_cached, pre_reasons_cached = _matches_requested_preprocessing_in_adata(
+                cached_prepared,
+                features=features,
+                binary_features_to_group=binary_features_to_group,
+                window_size=window_size,
+                min_spacing=min_spacing,
+                descriptive_features=descriptive_features,
+                incomplete_window_policy=incomplete_window_policy,
+                lower_quantile_cap=lower_quantile_cap,
+                upper_quantile_cap=upper_quantile_cap,
+                scale_features=True,
+            )
+            if pre_match_cached:
+                adata_prepared = cached_prepared
+                prepared_cache_used = True
+                if verbose:
+                    print(f"reusing prepared full adata cache: {prepared_adata_full_path}")
+            elif verbose:
+                print(
+                    "Prepared full cache mismatch; rebuilding from raw positions. "
+                    f"reasons={pre_reasons_cached}"
+                )
+        except Exception as exc:
+            if verbose:
+                print(f"Could not load prepared full cache ({exc}); rebuilding from raw positions.")
 
-    pre_match, pre_mismatch_reasons = _matches_requested_preprocessing_in_adata(
-        adata_prepared,
-        features=features,
-        binary_features_to_group=binary_features_to_group,
-        window_size=window_size,
-        min_spacing=min_spacing,
-        descriptive_features=descriptive_features,
-        incomplete_window_policy=incomplete_window_policy,
-        lower_quantile_cap=lower_quantile_cap,
-        upper_quantile_cap=upper_quantile_cap,
-        scale_features=True,
-    )
-    if not pre_match:
+    if adata_prepared is None:
+        _load_positions_if_needed()
         if verbose:
             print(
-                "Prepared full cache mismatch; recomputing full preprocessing from df_positions. "
-                f"reasons={pre_mismatch_reasons}"
+                "# Preparing dataset for state classification and clustering "
+                "(windowed feature extraction, quantile capping, scaling)..."
             )
-        prepare_kwargs["reuse_prepared_dataset"] = False
+            if positions_loaded_from_csv:
+                print(f"Using input track-features CSV: {df_tracks_path}")
+            else:
+                print("Using provided df_positions DataFrame input (caller-managed ordering).")
+
+        prepare_kwargs = {
+            "df_positions": df_positions,
+            "features": features,
+            "binary_features_to_group": binary_features_to_group,
+            "window_size": window_size,
+            "min_spacing": min_spacing,
+            "descriptive_features": list(descriptive_features),
+            "lower_quantile_cap": lower_quantile_cap,
+            "upper_quantile_cap": upper_quantile_cap,
+            "outfolder": state_outdir,
+            "scale_features": True,
+            "incomplete_window_policy": incomplete_window_policy,
+            "reuse_prepared_dataset": reuse_prepared_dataset,
+            "prepared_dataset_path": prepared_adata_full_path,
+            "verbose": verbose,
+        }
         adata_prepared = prepare_state_classification_dataset(**prepare_kwargs)
+
+        pre_match, pre_mismatch_reasons = _matches_requested_preprocessing_in_adata(
+            adata_prepared,
+            features=features,
+            binary_features_to_group=binary_features_to_group,
+            window_size=window_size,
+            min_spacing=min_spacing,
+            descriptive_features=descriptive_features,
+            incomplete_window_policy=incomplete_window_policy,
+            lower_quantile_cap=lower_quantile_cap,
+            upper_quantile_cap=upper_quantile_cap,
+            scale_features=True,
+        )
+        if not pre_match:
+            if verbose:
+                print(
+                    "Prepared full cache mismatch; recomputing full preprocessing from input track-features CSV. "
+                    f"reasons={pre_mismatch_reasons}"
+                )
+            prepare_kwargs["reuse_prepared_dataset"] = False
+            adata_prepared = prepare_state_classification_dataset(**prepare_kwargs)
+        del df_positions
+    elif verbose:
+        print(
+            "# Preparing dataset for state classification and clustering "
+            "(windowed feature extraction, quantile capping, scaling)..."
+        )
+    if verbose:
+        print(f"[timing] preprocessing prepare/reuse: {time.perf_counter() - stage_prepare_started:.2f}s")
     
     pre_meta = (
         adata_prepared.uns.get("preprocessing", {})
@@ -2534,6 +2688,11 @@ def run_state_clustering(
     binary_cols_to_merge = pre_meta.get("binary_cols_to_merge", None)
     if not isinstance(binary_cols_to_merge, list):
         binary_cols_to_merge = [c for c in list(binary_features_to_group) if c in adata_prepared.obs.columns]
+    prepared_preprocessing_meta = (
+        dict(adata_prepared.uns.get("preprocessing", {}))
+        if isinstance(getattr(adata_prepared, "uns", {}), dict)
+        else {}
+    )
 
     if adata_prepared.n_obs < 50:
         raise ValueError("Insufficient rows in full descriptive dataset for clustering.")
@@ -2552,7 +2711,9 @@ def run_state_clustering(
     sampling_time_col = "position_t"
     nan_policy = "drop_any_nan_in_kept_features"
 
+    stage_sampling_started = time.perf_counter()
     model_adata = None
+    model_cache_loaded = False
     if (
         bool(reuse_prepared_dataset)
         and prepared_adata_model_path is not None
@@ -2584,6 +2745,7 @@ def run_state_clustering(
             )
             if pre_match_model and sampling_match:
                 model_adata = cached_model_adata
+                model_cache_loaded = True
                 if verbose:
                     print(
                         "reusing saved model adata and skipping subsampling/NaN-clean stage: "
@@ -2604,6 +2766,7 @@ def run_state_clustering(
                 print(f"Could not load cached model adata ({exc}); rebuilding sampling/clean stage.")
 
     subsampled_rows_for_log = None
+    rows_after_nan_for_pca = None
     if model_adata is None:
         if verbose:
             print(
@@ -2625,41 +2788,79 @@ def run_state_clustering(
 
         X_train = _to_numpy_2d(adata_train[:, kept_features].X).astype(float, copy=False)
         valid_mask = ~np.isnan(X_train).any(axis=1)
-        adata_clean = adata_train[valid_mask].copy()
-        if adata_clean.n_obs < 50:
+        n_valid = int(valid_mask.sum())
+        if n_valid < 50:
             raise ValueError("Insufficient rows after dropping NaNs for PCA stage.")
-        if verbose and adata_clean.n_obs != adata_train.n_obs:
-            print(f"Dropped NaNs for PCA input: kept {adata_clean.n_obs} / {adata_train.n_obs} rows.")
-        model_adata = adata_clean[:, kept_features].copy()
+        rows_after_nan_for_pca = int(n_valid)
+        if verbose and n_valid != adata_train.n_obs:
+            print(f"Dropped NaNs for PCA input: kept {n_valid} / {adata_train.n_obs} rows.")
+        model_adata = adata_train[valid_mask, kept_features].copy()
+        del X_train, valid_mask, adata_train
     else:
         if model_adata.n_obs < 50:
             raise ValueError("Cached model dataset has insufficient rows for clustering.")
         subsampled_rows_for_log = int(model_adata.n_obs)
+        rows_after_nan_for_pca = int(model_adata.n_obs)
 
     ncomps_requested = min(len(kept_features), model_adata.n_obs - 1)
     if ncomps_requested < 2:
         raise ValueError("Insufficient rows/features to run PCA stage.")
 
     if verbose:
+        print(f"[timing] sampling + NaN cleanup: {time.perf_counter() - stage_sampling_started:.2f}s")
+
+    if verbose:
         print(f"Subsampled {subsampled_rows_for_log} rows for clustering (spacing={spacing_to_use}).")
-            
+
+    stage_pca_started = time.perf_counter()
     pca_recomputed = False
-    pca_match, pca_reasons = _matches_cached_pca_stage(
-        model_adata,
-        pca_var_selection=pca_var_selection,
-        svd_solver="full",
-        random_state=random_state,
-        ncomps_requested=ncomps_requested,
-    )
-    if pca_match:
-        if verbose:
-            print("reusing saved PCA stage (X_pca).")
+    neighbors_recomputed = False
+
+    pca_input_shape = (int(model_adata.n_obs), int(len(kept_features)))
+
+    if model_cache_loaded:
+        pca_match, pca_reasons = _matches_cached_pca_stage(
+            model_adata,
+            pca_var_selection=pca_var_selection,
+            svd_solver="full",
+            random_state=random_state,
+            ncomps_requested=ncomps_requested,
+        )
+        if pca_match:
+            if verbose:
+                print("reusing saved PCA stage (X_pca).")
+        else:
+            if verbose:
+                print(
+                    "PCA input diagnostics: "
+                    f"matrix_shape={pca_input_shape}, "
+                    f"kept_features={len(kept_features)}, "
+                    f"rows_after_nan={rows_after_nan_for_pca}"
+                )
+                print(
+                    f"# Running PCA for dimensionality reduction before clustering (n_features={len(kept_features)}, "
+                    f"# n_samples={model_adata.n_obs}, min_var_selection={pca_var_selection}). "
+                    f"reasons={pca_reasons}"
+                )
+            model_adata = run_pca(
+                model_adata,
+                pca_var_selection=pca_var_selection,
+                ncomps=ncomps_requested,
+                svd_solver="full",
+                random_state=random_state,
+            )
+            pca_recomputed = True
     else:
         if verbose:
             print(
+                "PCA input diagnostics: "
+                f"matrix_shape={pca_input_shape}, "
+                f"kept_features={len(kept_features)}, "
+                f"rows_after_nan={rows_after_nan_for_pca}"
+            )
+            print(
                 f"# Running PCA for dimensionality reduction before clustering (n_features={len(kept_features)}, "
-                f"# n_samples={model_adata.n_obs}, min_var_selection={pca_var_selection}). "
-                f"reasons={pca_reasons}"
+                f"# n_samples={model_adata.n_obs}, min_var_selection={pca_var_selection})."
             )
         model_adata = run_pca(
             model_adata,
@@ -2669,47 +2870,75 @@ def run_state_clustering(
             random_state=random_state,
         )
         pca_recomputed = True
+    if verbose:
+        print(f"[timing] PCA stage: {time.perf_counter() - stage_pca_started:.2f}s")
 
-    neighbors_match, neighbors_reasons = _matches_cached_neighbors_stage(
-        model_adata,
-        n_neighbors=n_neighbors,
-        random_state=random_state,
-        use_rep="X_pca",
-    )
-    if pca_recomputed:
-        neighbors_match = False
-        neighbors_reasons = list(neighbors_reasons) + ["upstream PCA recomputed"]
-    neighbors_recomputed = False
-    if neighbors_match:
-        if verbose:
-            print(f"reusing saved neighbors graph with n_neighbors={n_neighbors}.")
+    stage_neighbors_started = time.perf_counter()
+    if model_cache_loaded:
+        neighbors_match, neighbors_reasons = _matches_cached_neighbors_stage(
+            model_adata,
+            n_neighbors=n_neighbors,
+            random_state=random_state,
+            use_rep="X_pca",
+        )
+        if pca_recomputed:
+            neighbors_match = False
+            neighbors_reasons = list(neighbors_reasons) + ["upstream PCA recomputed"]
+        if neighbors_match:
+            if verbose:
+                print(f"reusing saved neighbors graph with n_neighbors={n_neighbors}.")
+        else:
+            if verbose:
+                print(
+                    f"Recomputing neighbors graph (n_neighbors={n_neighbors}, use_rep='X_pca'). "
+                    f"reasons={neighbors_reasons}"
+                )
+            sc.pp.neighbors(model_adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=random_state)
+            neighbors_recomputed = True
     else:
         if verbose:
-            print(
-                f"Recomputing neighbors graph (n_neighbors={n_neighbors}, use_rep='X_pca'). "
-                f"reasons={neighbors_reasons}"
-            )
+            print(f"Running neighbors graph (n_neighbors={n_neighbors}, use_rep='X_pca').")
         sc.pp.neighbors(model_adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=random_state)
         neighbors_recomputed = True
+    if verbose:
+        print(f"[timing] neighbors stage: {time.perf_counter() - stage_neighbors_started:.2f}s")
 
-    umap_match, umap_reasons = _matches_cached_umap_stage(
-        model_adata,
-        min_dist=min_dist,
-        random_state=random_state,
-    )
-    if pca_recomputed or neighbors_recomputed:
-        umap_match = False
-        umap_reasons = list(umap_reasons) + ["upstream representation/graph recomputed"]
-    if umap_match:
-        if verbose:
-            print(f"reusing saved UMAP embedding (min_dist={min_dist}).")
+    stage_umap_started = time.perf_counter()
+    if model_cache_loaded:
+        umap_match, umap_reasons = _matches_cached_umap_stage(
+            model_adata,
+            min_dist=min_dist,
+            random_state=random_state,
+        )
+        if pca_recomputed or neighbors_recomputed:
+            umap_match = False
+            umap_reasons = list(umap_reasons) + ["upstream representation/graph recomputed"]
+        if umap_match:
+            if verbose:
+                print(f"reusing saved UMAP embedding (min_dist={min_dist}).")
+        else:
+            if verbose:
+                print(
+                    f"Recomputing UMAP embedding (min_dist={min_dist}, random_state={random_state}). "
+                    f"reasons={umap_reasons}"
+                )
+            sc.tl.umap(
+                model_adata, 
+                min_dist=min_dist, 
+                random_state=random_state,
+                n_components=2
+                )
     else:
         if verbose:
-            print(
-                f"Recomputing UMAP embedding (min_dist={min_dist}, random_state={random_state}). "
-                f"reasons={umap_reasons}"
+            print(f"Running UMAP embedding (min_dist={min_dist}, random_state={random_state}).")
+        sc.tl.umap(
+            model_adata, 
+            min_dist=min_dist, 
+            random_state=random_state,
+            n_components=2
             )
-        sc.tl.umap(model_adata, min_dist=min_dist, random_state=random_state)
+    if verbose:
+        print(f"[timing] UMAP stage: {time.perf_counter() - stage_umap_started:.2f}s")
 
     if verbose:
         print(
@@ -2717,6 +2946,11 @@ def run_state_clustering(
             f"# resolution={resolution}..."
         )
 
+    stage_clustering_started = time.perf_counter()
+    if isinstance(resolution, (list, tuple, np.ndarray, pd.Series)):
+        stability_resolutions = [float(r) for r in list(resolution)]
+    else:
+        stability_resolutions = [float(resolution)]
     method = str(clustering_method).lower()
     if method == "leiden":
         if ("neighbors" not in model_adata.uns) or ("connectivities" not in model_adata.obsp):
@@ -2733,9 +2967,7 @@ def run_state_clustering(
             method="umap",
             key_added="intrinsic_behavioral_cluster",
             random_state=random_state,
-            stability_resolutions=resolutions,
-            n_stability_repeats=int(leiden_seed_tries),
-            n_subsample_repeats=int(leiden_subsample_tries),
+            stability_resolutions=stability_resolutions,
         )
         model_adata.obs["intrinsic_behavioral_cluster"] = model_adata.obs["intrinsic_behavioral_cluster"].astype("category")
     elif method == "kmeans":
@@ -2753,6 +2985,19 @@ def run_state_clustering(
         intrinsic_col="intrinsic_behavioral_cluster",
     )
     if verbose:
+        print(f"[timing] clustering stage: {time.perf_counter() - stage_clustering_started:.2f}s")
+
+    stage_prepared_write_started = time.perf_counter()
+    prepared_adata_full = adata_prepared[:, kept_features].copy()
+    prepared_adata_full.uns["preprocessing"] = dict(prepared_preprocessing_meta)
+    prepared_adata_full.uns["preprocessing"].pop("prepared_adata_full_signature", None)
+    prepared_adata_full.uns["preprocessing"]["prepared_adata_full_path"] = str(prepared_adata_full_path)
+    prepared_adata_full.write(prepared_adata_full_path, compression="gzip")
+    del prepared_adata_full, adata_prepared
+    if verbose:
+        print(f"[timing] cache write prepared_full_adata: {time.perf_counter() - stage_prepared_write_started:.2f}s")
+
+    if verbose:
         n_intrinsic = int(model_adata.obs["intrinsic_behavioral_cluster"].astype(str).nunique())
         n_full = int(model_adata.obs["full_behavioral_cluster"].astype(str).nunique())
         print(
@@ -2764,7 +3009,7 @@ def run_state_clustering(
     diagnostics_csvs = {}
     diagnostics_pdf = None
     if state_clustering_outdir is not None:
-        diagnostics_pdf = state_clustering_outdir / "state_classification_diagnostics.pdf"
+        diagnostics_pdf = state_clustering_outdir / "behavioral_clustering_diagnostics.pdf"
         plot_clustering_diagnostics_pdf(
             adata=model_adata,
             cluster_col="intrinsic_behavioral_cluster",
@@ -2777,10 +3022,10 @@ def run_state_clustering(
             cluster_col="intrinsic_behavioral_cluster",
             feature_cols=kept_features,
             outdir=state_clustering_outdir,
-            filename_prefix="state_classification_diagnostics",
+            filename_prefix="behavioral_clustering_diagnostics",
         )
         if ("binary_group" in model_adata.obs.columns) and ("behavioral_clusterid" in model_adata.obs.columns):
-            pdf1 = state_clustering_outdir / "state_classification_binary_group_cluster_proportions.pdf"
+            pdf1 = state_clustering_outdir / "behavioral_clustering_binary_group_cluster_proportions.pdf"
             fig1, _ = plot_binary_group_behavioral_cluster_grid(
                 model_adata,
                 pdf_path=pdf1,
@@ -2788,7 +3033,7 @@ def run_state_clustering(
                 verbose=verbose,
             )
             plt.close(fig1)
-            pdf2 = state_clustering_outdir / "state_classification_cluster_binary_group_proportions.pdf"
+            pdf2 = state_clustering_outdir / "behavioral_clustering_cluster_binary_group_proportions.pdf"
             fig2, _ = plot_behavioral_cluster_binary_group_grid(
                 model_adata,
                 pdf_path=pdf2,
@@ -2832,7 +3077,7 @@ def run_state_clustering(
             "random_state": int(random_state),
         },
     }
-    model_preprocessing_meta = dict(adata_prepared.uns.get("preprocessing", {}))
+    model_preprocessing_meta = dict(prepared_preprocessing_meta)
     model_preprocessing_meta["model_cache"] = dict(model_cache_meta)
     model_preprocessing_meta.pop("prepared_adata_full_signature", None)
     model_preprocessing_meta["prepared_adata_full_path"] = (
@@ -2851,22 +3096,19 @@ def run_state_clustering(
         "diagnostics_csvs": dict(diagnostics_csvs),
     }
 
+    stage_model_write_started = time.perf_counter()
     model_adata.write(prepared_adata_model_path, compression="gzip")
-
-    prepared_adata_full = adata_prepared[:, kept_features].copy()
-    prepared_adata_full.uns["preprocessing"] = dict(adata_prepared.uns.get("preprocessing", {}))
-    prepared_adata_full.uns["preprocessing"].pop("prepared_adata_full_signature", None)
-    prepared_adata_full.uns["preprocessing"]["prepared_adata_full_path"] = str(prepared_adata_full_path)
-    prepared_adata_full.write(prepared_adata_full_path, compression="gzip")
     if verbose:
+        print(f"[timing] cache write model_adata: {time.perf_counter() - stage_model_write_started:.2f}s")
         print(f"Saved model-stage cache: {prepared_adata_model_path}")
         print(f"Saved prepared full adata cache: {prepared_adata_full_path}")
     return model_adata
 
 
 def train_state_classifiers(
-    model_adata,
-    outfolder=None,
+    output_dir,
+    cell_type,
+    model_adata=None,
     label_transfer_method="classifier",
     classifier_backend="random_forest",
     classifier_n_estimators=300,
@@ -2889,7 +3131,7 @@ def train_state_classifiers(
     verbose=True,
 ):
     """
-    Stage 2: train intrinsic/full classifiers on model_adata with optional holdout validation.
+    Stage 2: train intrinsic/full classifiers using model_adata (auto-loaded from canonical path if needed).
 
     Mutates model_adata in-place by adding/updating model_adata.uns["classification"].
 
@@ -2899,6 +3141,20 @@ def train_state_classifiers(
             "partial_classifier_path": str | None,
         }
     """
+    stage_paths = _resolve_state_stage_paths(output_dir, cell_type)
+    state_outdir = stage_paths["state_outdir"]
+    model_adata_path = stage_paths["model_adata_path"]
+    if model_adata is None:
+        if not model_adata_path.exists():
+            raise FileNotFoundError(
+                "Could not load model_adata for classifier training. "
+                f"Expected '{model_adata_path}'. "
+                "Run run_state_clustering(...) first or pass model_adata explicitly."
+            )
+        model_adata = sc.read_h5ad(model_adata_path)
+        if verbose:
+            print(f"Loaded model_adata from: {model_adata_path}")
+
     if isinstance(model_adata, dict):
         raise ValueError(
             "train_state_classifiers now expects model_adata (AnnData), not a stage-1 artifact dict."
@@ -3031,21 +3287,16 @@ def train_state_classifiers(
         "holdout_artifacts": {},
     }
 
-    outfolder_path = _resolve_processing_outdir(outfolder)
-    intrinsic_outfolder = None
-    full_outfolder = None
-    intrinsic_qc_outfolder = None
-    full_qc_outfolder = None
-    if outfolder_path is not None:
-        outfolder_path.mkdir(parents=True, exist_ok=True)
-        intrinsic_outfolder = outfolder_path / "intrinsic_behavioral_classification"
-        full_outfolder = outfolder_path / "full_behavioral_classification"
-        intrinsic_outfolder.mkdir(parents=True, exist_ok=True)
-        full_outfolder.mkdir(parents=True, exist_ok=True)
-        intrinsic_qc_outfolder = intrinsic_outfolder / "quality_control"
-        full_qc_outfolder = full_outfolder / "quality_control"
-        intrinsic_qc_outfolder.mkdir(parents=True, exist_ok=True)
-        full_qc_outfolder.mkdir(parents=True, exist_ok=True)
+    outfolder_path = stage_paths["processing_outdir"]
+    outfolder_path.mkdir(parents=True, exist_ok=True)
+    intrinsic_outfolder = stage_paths["intrinsic_outdir"]
+    full_outfolder = stage_paths["full_outdir"]
+    intrinsic_qc_outfolder = stage_paths["intrinsic_qc_outdir"]
+    full_qc_outfolder = stage_paths["full_qc_outdir"]
+    intrinsic_outfolder.mkdir(parents=True, exist_ok=True)
+    full_outfolder.mkdir(parents=True, exist_ok=True)
+    intrinsic_qc_outfolder.mkdir(parents=True, exist_ok=True)
+    full_qc_outfolder.mkdir(parents=True, exist_ok=True)
 
     if train_continuous_classifier:
         X_intrinsic_all = _to_numpy_2d(model_adata[:, cont_cols].X).astype(float, copy=False)
@@ -3151,6 +3402,9 @@ def train_state_classifiers(
                 f"train_macro_f1={tm.get('macro_f1', np.nan):.4f}, "
                 f"oob_train_split={intrinsic_validation.get('oob_score_train_split', np.nan):.4f}"
             )
+        del X_intrinsic_all, y_intrinsic_all, X_intrinsic_train, y_intrinsic_train
+        if validation_mode == "holdout":
+            del X_intrinsic_test, y_intrinsic_test
 
     full_label_classifier_artifact = None  # canonical train-split full-label artifact
     full_label_classifier_artifact_train_split = None
@@ -3186,23 +3440,23 @@ def train_state_classifiers(
                 stratify=(y_full_all if validation_stratify else None),
             )
 
-            adata_train_split = model_adata[idx_train].copy()
-            adata_test_split = model_adata[idx_test].copy()
             X_full_train, expanded_binary_train_cols = _build_classifier_matrix_from_adata(
-                adata=adata_train_split,
+                adata=model_adata,
                 continuous_feature_cols=cont_cols,
                 binary_feature_cols=binary_cols_to_merge,
                 return_binary_feature_names=True,
+                row_indices=idx_train,
             )
             X_full_test = _build_classifier_matrix_from_adata(
-                adata=adata_test_split,
+                adata=model_adata,
                 continuous_feature_cols=cont_cols,
                 binary_feature_cols=binary_cols_to_merge,
                 binary_expanded_feature_cols=expanded_binary_train_cols,
                 return_binary_feature_names=False,
+                row_indices=idx_test,
             )
-            y_full_train = adata_train_split.obs["full_behavioral_cluster"].astype(str).to_numpy()
-            y_full_test = adata_test_split.obs["full_behavioral_cluster"].astype(str).to_numpy()
+            y_full_train = y_full_all[idx_train]
+            y_full_test = y_full_all[idx_test]
             full_validation["n_train"] = int(len(idx_train))
             full_validation["n_test"] = int(len(idx_test))
         else:
@@ -3266,15 +3520,18 @@ def train_state_classifiers(
             full_validation["test_metrics"] = holdout_full_eval["metrics"]
             full_validation["holdout_artifacts"] = holdout_full_eval["artifacts"]
 
-        X_full_all = _build_classifier_matrix_from_adata(
-            adata=model_adata,
-            continuous_feature_cols=cont_cols,
-            binary_feature_cols=binary_cols_to_merge,
-            binary_expanded_feature_cols=full_label_classifier_artifact_train_split.get(
-                "binary_expanded_feature_cols", []
-            ),
-            return_binary_feature_names=False,
-        )
+        if validation_mode == "holdout":
+            X_full_all = _build_classifier_matrix_from_adata(
+                adata=model_adata,
+                continuous_feature_cols=cont_cols,
+                binary_feature_cols=binary_cols_to_merge,
+                binary_expanded_feature_cols=full_label_classifier_artifact_train_split.get(
+                    "binary_expanded_feature_cols", []
+                ),
+                return_binary_feature_names=False,
+            )
+        else:
+            X_full_all = X_full_train
         y_pred_full_all = np.asarray(
             full_label_classifier_artifact_train_split["classifier"].predict(X_full_all)
         ).astype(str)
@@ -3316,6 +3573,9 @@ def train_state_classifiers(
                 f"train_macro_f1={tm.get('macro_f1', np.nan):.4f}, "
                 f"oob_train_split={full_validation.get('oob_score_train_split', np.nan):.4f}"
             )
+        del X_full_train, y_full_train, X_full_all, y_pred_full_train, y_pred_full_all
+        if validation_mode == "holdout":
+            del X_full_test, y_full_test, y_pred_full_test
 
     intrinsic_metrics_csv = None
     full_metrics_csv = None
@@ -3412,24 +3672,23 @@ def train_state_classifiers(
         )
         model_adata.uns["classification"]["full_classifier_qc_model_data"] = full_classifier_qc_model_data
 
-    if outfolder_path is not None:
-        if save_label_classifier and label_classifier_artifact_train_split is not None:
-            classifier_model_path = intrinsic_outfolder / "state_classifiction_random_forest.pkl"
-            with open(classifier_model_path, "wb") as f:
-                pickle.dump(label_classifier_artifact_train_split, f)
-            model_adata.uns["classification"]["classifier_model_path"] = str(classifier_model_path)
-            classifier_model_paths["train_split"] = str(classifier_model_path)
-            model_adata.uns["classification"]["classifier_model_paths"] = dict(classifier_model_paths)
+    if save_label_classifier and label_classifier_artifact_train_split is not None:
+        classifier_model_path = intrinsic_outfolder / "state_classifiction_random_forest.pkl"
+        with open(classifier_model_path, "wb") as f:
+            pickle.dump(label_classifier_artifact_train_split, f)
+        model_adata.uns["classification"]["classifier_model_path"] = str(classifier_model_path)
+        classifier_model_paths["train_split"] = str(classifier_model_path)
+        model_adata.uns["classification"]["classifier_model_paths"] = dict(classifier_model_paths)
 
-        if train_full_classifier and save_full_label_classifier and full_label_classifier_artifact_train_split is not None:
-            full_classifier_model_path = full_outfolder / "state_classifiction_random_forest.pkl"
-            with open(full_classifier_model_path, "wb") as f:
-                pickle.dump(full_label_classifier_artifact_train_split, f)
-            model_adata.uns["classification"]["full_classifier_model_path"] = str(full_classifier_model_path)
-            full_classifier_model_paths["train_split"] = str(full_classifier_model_path)
-            model_adata.uns["classification"]["full_classifier_model_paths"] = dict(full_classifier_model_paths)
+    if train_full_classifier and save_full_label_classifier and full_label_classifier_artifact_train_split is not None:
+        full_classifier_model_path = full_outfolder / "state_classifiction_random_forest.pkl"
+        with open(full_classifier_model_path, "wb") as f:
+            pickle.dump(full_label_classifier_artifact_train_split, f)
+        model_adata.uns["classification"]["full_classifier_model_path"] = str(full_classifier_model_path)
+        full_classifier_model_paths["train_split"] = str(full_classifier_model_path)
+        model_adata.uns["classification"]["full_classifier_model_paths"] = dict(full_classifier_model_paths)
 
-        model_adata.write(outfolder_path / "state_classification_model.h5ad", compression="gzip")
+    model_adata.write(stage_paths["model_adata_path"], compression="gzip")
     if verbose:
         n_intrinsic = int(model_adata.obs["intrinsic_behavioral_cluster"].astype(str).nunique())
         n_full = int(model_adata.obs["full_behavioral_cluster"].astype(str).nunique()) if "full_behavioral_cluster" in model_adata.obs.columns else 0
@@ -3444,11 +3703,11 @@ def train_state_classifiers(
 
 
 def apply_state_classifiers_to_full_dataset(
-    df_positions,
-    model_adata,
+    output_dir,
+    cell_type,
+    model_adata=None,
     label_classifier_artifact=None,
     full_label_classifier_artifact=None,
-    outfolder=None,
     continuous_output_col="intrinsic_behavioral_cluster",
     full_output_col="full_behavioral_cluster",
     continuous_model_variant="full_data",
@@ -3456,15 +3715,44 @@ def apply_state_classifiers_to_full_dataset(
     combine_binary_with_continuous=True,
     verbose=True,
 ):
-    """Apply trained stage-2 classifier artifacts to the full dataset.
+    """Apply trained stage-2 classifier artifacts to full dataset loaded from analysis track-features CSV.
 
     Confidence columns are always derived as `<output_col>_confidence`.
     """
+    stage_paths = _resolve_state_stage_paths(output_dir, cell_type)
+    state_outdir = stage_paths["state_outdir"]
+
+    if model_adata is None:
+        model_adata_path = stage_paths["model_adata_path"]
+        if not model_adata_path.exists():
+            raise FileNotFoundError(
+                "Could not load model_adata for classifier apply. "
+                f"Expected '{model_adata_path}'. "
+                "Run run_state_clustering(...) first or pass model_adata explicitly."
+            )
+        model_adata = sc.read_h5ad(model_adata_path)
+        if verbose:
+            print(f"Loaded model_adata from: {model_adata_path}")
+
     if not (hasattr(model_adata, "uns") and hasattr(model_adata, "var_names")):
         raise ValueError("model_adata must be an AnnData-like object with .uns and .var_names.")
 
-    class_meta = model_adata.uns.get("classification", {}) if isinstance(model_adata.uns, dict) else {}
-    clust_meta = model_adata.uns.get("clustering", {}) if isinstance(model_adata.uns, dict) else {}
+    class_meta = (
+        dict(model_adata.uns.get("classification", {}))
+        if isinstance(model_adata.uns, dict)
+        else {}
+    )
+    clust_meta = (
+        dict(model_adata.uns.get("clustering", {}))
+        if isinstance(model_adata.uns, dict)
+        else {}
+    )
+    pre_meta = (
+        dict(model_adata.uns.get("preprocessing", {}))
+        if isinstance(model_adata.uns, dict)
+        else {}
+    )
+    del model_adata
     continuous_confidence_col = f"{str(continuous_output_col)}_confidence"
     full_confidence_col = f"{str(full_output_col)}_confidence"
 
@@ -3508,13 +3796,27 @@ def apply_state_classifiers_to_full_dataset(
             available.extend([str(k) for k, v in paths.items() if v is not None])
             path = paths.get(variant_name, None)
             if path is not None:
-                return load_state_classifier_artifact(path), sorted(set(available))
+                try:
+                    return load_state_classifier_artifact(path), sorted(set(available))
+                except FileNotFoundError:
+                    warnings.warn(
+                        f"{artifact_name}: metadata path missing on disk for variant '{variant_name}': {path}. "
+                        "Trying fallback locations.",
+                        RuntimeWarning,
+                    )
 
         fallback_path = class_meta.get(fallback_key, None)
         if fallback_path is not None:
             available = sorted(set(available + ["full_data"]))
             if variant_name == "full_data":
-                return load_state_classifier_artifact(fallback_path), available
+                try:
+                    return load_state_classifier_artifact(fallback_path), available
+                except FileNotFoundError:
+                    warnings.warn(
+                        f"{artifact_name}: metadata fallback path missing on disk: {fallback_path}. "
+                        "Trying fallback locations.",
+                        RuntimeWarning,
+                    )
         return None, sorted(set(available))
 
     label_classifier_selected = _resolve_artifact_variant(
@@ -3531,6 +3833,16 @@ def apply_state_classifiers_to_full_dataset(
             variant_name=continuous_model_variant,
             artifact_name="continuous_label_classifier_artifact",
         )
+        if label_classifier_selected is None and stage_paths["intrinsic_classifier_default_path"].exists():
+            label_classifier_selected = load_state_classifier_artifact(stage_paths["intrinsic_classifier_default_path"])
+            available_continuous_variants = sorted(
+                set(list(available_continuous_variants) + ["full_data", "train_split"])
+            )
+            if verbose:
+                print(
+                    "Loaded intrinsic classifier artifact from default path: "
+                    f"{stage_paths['intrinsic_classifier_default_path']}"
+                )
     else:
         available_continuous_variants = [str(continuous_model_variant)]
 
@@ -3541,23 +3853,36 @@ def apply_state_classifiers_to_full_dataset(
             variant_name=full_model_variant,
             artifact_name="full_label_classifier_artifact",
         )
+        if full_label_classifier_selected is None and stage_paths["full_classifier_default_path"].exists():
+            full_label_classifier_selected = load_state_classifier_artifact(stage_paths["full_classifier_default_path"])
+            available_full_variants = sorted(set(list(available_full_variants) + ["full_data", "train_split"]))
+            if verbose:
+                print(
+                    "Loaded full classifier artifact from default path: "
+                    f"{stage_paths['full_classifier_default_path']}"
+                )
     else:
         available_full_variants = [str(full_model_variant)]
 
     if (label_classifier_selected is None) and (continuous_model_variant != "full_data"):
         raise ValueError(
             f"Requested continuous model variant '{continuous_model_variant}' not available. "
-            f"Available variants: {available_continuous_variants}"
+            f"Available variants: {available_continuous_variants}. "
+            f"Expected intrinsic classifier at '{stage_paths['intrinsic_classifier_default_path']}'."
         )
     if (full_label_classifier_selected is None) and (full_model_variant != "full_data"):
         raise ValueError(
             f"Requested full model variant '{full_model_variant}' not available. "
-            f"Available variants: {available_full_variants}"
+            f"Available variants: {available_full_variants}. "
+            f"Expected full classifier at '{stage_paths['full_classifier_default_path']}'."
         )
 
     if label_classifier_selected is None and full_label_classifier_selected is None:
-        raise ValueError(
-            "No classifier artifact provided. Supply label/full artifact or train with train_state_classifiers first."
+        raise FileNotFoundError(
+            "No classifier artifact could be resolved for apply stage. "
+            f"Expected intrinsic classifier at '{stage_paths['intrinsic_classifier_default_path']}' "
+            f"or full classifier at '{stage_paths['full_classifier_default_path']}'. "
+            "Run train_state_classifiers(...) first, or pass explicit classifier artifacts."
         )
     if verbose:
         print(
@@ -3566,7 +3891,6 @@ def apply_state_classifiers_to_full_dataset(
             f"full_variant={full_model_variant if full_label_classifier_selected is not None else None}"
         )
 
-    pre_meta = model_adata.uns.get("preprocessing", {}) if isinstance(model_adata.uns, dict) else {}
     prepared_cache_path = None
     prepared_cache_used = False
     prepared_cache_mismatch_reasons = []
@@ -3576,6 +3900,14 @@ def apply_state_classifiers_to_full_dataset(
         label_classifier_selected if label_classifier_selected is not None else full_label_classifier_selected
     )
     adata_full = None
+    positions_csv_path = _resolve_positions_csv_path(output_dir, cell_type)
+    df_positions = None
+
+    def _load_positions_if_needed():
+        nonlocal df_positions
+        if df_positions is None:
+            df_positions = pd.read_csv(positions_csv_path, low_memory=False)
+            df_positions = df_positions.sort_values(by=["sample_name", "TrackID", "position_t"])
 
     cache_path_raw = pre_meta.get("prepared_adata_full_path", None) if isinstance(pre_meta, dict) else None
     if cache_path_raw is not None and reference_classifier_artifact is not None:
@@ -3598,7 +3930,7 @@ def apply_state_classifiers_to_full_dataset(
             else:
                 prepared_cache_mismatch_reasons = list(mismatch_reasons)
                 err_msg = (
-                    "ERROR: cached prepared adata preprocessing mismatch; recomputing from df_positions. "
+                    "ERROR: cached prepared adata preprocessing mismatch; recomputing from input track-features CSV. "
                     f"reasons={prepared_cache_mismatch_reasons}"
                 )
                 warnings.warn(err_msg, RuntimeWarning)
@@ -3608,13 +3940,14 @@ def apply_state_classifiers_to_full_dataset(
             print(f"Prepared adata cache path was set but file is missing; recomputing: {prepared_cache_path}")
 
     if adata_full is None:
+        _load_positions_if_needed()
         if label_classifier_selected is not None:
             adata_full = apply_classifier(
                 df_positions=df_positions,
                 classifier_artifact_or_path=label_classifier_selected,
                 output_col=continuous_output_col,
                 confidence_col=continuous_confidence_col,
-                outfolder=outfolder,
+                outfolder=state_outdir,
                 verbose=verbose,
             )
         else:
@@ -3623,10 +3956,11 @@ def apply_state_classifiers_to_full_dataset(
                 classifier_artifact_or_path=full_label_classifier_selected,
                 output_col=full_output_col,
                 confidence_col=full_confidence_col,
-                outfolder=outfolder,
+                outfolder=state_outdir,
                 verbose=verbose,
             )
             full_predicted_in_primary = True
+        del df_positions
     else:
         if label_classifier_selected is not None:
             cont_cols = list(label_classifier_selected.get("feature_cols", []))
@@ -3688,11 +4022,6 @@ def apply_state_classifiers_to_full_dataset(
     adata_full.uns["classification"]["applied_full_model_variant"] = (
         None if full_label_classifier_selected is None else str(full_model_variant)
     )
-    adata_full.uns["classification"]["prepared_cache_used"] = bool(prepared_cache_used)
-    adata_full.uns["classification"]["prepared_cache_mismatch_reasons"] = list(prepared_cache_mismatch_reasons)
-    adata_full.uns["classification"]["prepared_cache_path"] = (
-        None if prepared_cache_path is None else str(prepared_cache_path)
-    )
 
     state_composition_report_pdf = None
     state_composition_report_pdfs = []
@@ -3700,81 +4029,71 @@ def apply_state_classifiers_to_full_dataset(
     state_composition_report_plot_csvs = []
     state_composition_report_error = None
 
-    if outfolder is not None:
-        outfolder = Path(outfolder)
-        outfolder.mkdir(parents=False, exist_ok=True)
-
-        if full_output_col in adata_full.obs.columns:
-            report_dir = outfolder / "analysis" / "state_composition"
-            report_dir.mkdir(parents=True, exist_ok=True)
-            report_token = _sanitize_filename_token(
-                full_output_col,
-                fallback="full_behavioral_cluster",
-            )
-            report_pdf_path = report_dir / f"state_composition_report_{report_token}.pdf"
-            report_auc_csv_path = report_dir / f"state_composition_report_{report_token}.csv"
-            try:
-                report_out = save_state_composition_report(
-                    adata=adata_full,
-                    output_pdf_path=report_pdf_path,
-                    output_csv_path=report_auc_csv_path,
-                    time_col="position_t",
-                    state_col=str(full_output_col),
-                    sample_col="sample_name",
-                    include_pooled_summary=True,
-                    verbose=verbose,
-                )
-                pdf_paths = report_out.get("pdf_paths", {})
-                if isinstance(pdf_paths, dict) and len(pdf_paths) > 0:
-                    state_composition_report_pdfs = [str(v) for v in pdf_paths.values()]
-                    state_composition_report_pdf = str(
-                        pdf_paths.get(
-                            "stacked_by_sample",
-                            state_composition_report_pdfs[0],
-                        )
-                    )
-                else:
-                    state_composition_report_pdf = str(report_out.get("pdf_path", report_pdf_path))
-                    state_composition_report_pdfs = [state_composition_report_pdf]
-                state_composition_report_auc_csv = str(report_out.get("csv_path", report_auc_csv_path))
-                plot_csv_paths = report_out.get("plot_data_csv_paths", {})
-                if isinstance(plot_csv_paths, dict) and len(plot_csv_paths) > 0:
-                    state_composition_report_plot_csvs = [str(v) for v in plot_csv_paths.values()]
-                else:
-                    plot_csv_path = report_out.get("plot_data_csv_path", None)
-                    if plot_csv_path is not None:
-                        state_composition_report_plot_csvs = [str(plot_csv_path)]
-            except Exception as exc:
-                state_composition_report_error = str(exc)
-                warnings.warn(
-                    "Could not generate state composition report after classifier apply: "
-                    f"{exc}",
-                    RuntimeWarning,
-                )
-                if verbose:
-                    print(f"Skipping state composition report export due to error: {exc}")
-        else:
-            state_composition_report_error = (
-                "Could not generate state composition report: "
-                f"missing '{full_output_col}' in adata_full.obs."
-            )
-            warnings.warn(state_composition_report_error, RuntimeWarning)
-
-        adata_full.uns["classification"]["state_composition_report_pdf"] = state_composition_report_pdf
-        adata_full.uns["classification"]["state_composition_report_pdfs"] = list(state_composition_report_pdfs)
-        adata_full.uns["classification"]["state_composition_report_auc_csv"] = state_composition_report_auc_csv
-        adata_full.uns["classification"]["state_composition_report_plot_csvs"] = list(
-            state_composition_report_plot_csvs
+    if full_output_col in adata_full.obs.columns:
+        report_dir = stage_paths["state_composition_outdir"]
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_token = _sanitize_filename_token(
+            full_output_col,
+            fallback="full_behavioral_cluster",
         )
-        adata_full.uns["classification"]["state_composition_report_error"] = state_composition_report_error
-
-        adata_full.write(outfolder / "state_classification_full.h5ad", compression="gzip")
+        report_pdf_path = report_dir / f"state_composition_report_{report_token}.pdf"
+        report_auc_csv_path = report_dir / f"state_composition_report_{report_token}.csv"
+        try:
+            report_out = save_state_composition_report(
+                adata=adata_full,
+                output_pdf_path=report_pdf_path,
+                output_csv_path=report_auc_csv_path,
+                time_col="position_t",
+                state_col=str(full_output_col),
+                sample_col="sample_name",
+                include_pooled_summary=True,
+                verbose=verbose,
+            )
+            pdf_paths = report_out.get("pdf_paths", {})
+            if isinstance(pdf_paths, dict) and len(pdf_paths) > 0:
+                state_composition_report_pdfs = [str(v) for v in pdf_paths.values()]
+                state_composition_report_pdf = str(
+                    pdf_paths.get(
+                        "stacked_by_sample",
+                        state_composition_report_pdfs[0],
+                    )
+                )
+            else:
+                state_composition_report_pdf = str(report_out.get("pdf_path", report_pdf_path))
+                state_composition_report_pdfs = [state_composition_report_pdf]
+            state_composition_report_auc_csv = str(report_out.get("csv_path", report_auc_csv_path))
+            plot_csv_paths = report_out.get("plot_data_csv_paths", {})
+            if isinstance(plot_csv_paths, dict) and len(plot_csv_paths) > 0:
+                state_composition_report_plot_csvs = [str(v) for v in plot_csv_paths.values()]
+            else:
+                plot_csv_path = report_out.get("plot_data_csv_path", None)
+                if plot_csv_path is not None:
+                    state_composition_report_plot_csvs = [str(plot_csv_path)]
+        except Exception as exc:
+            state_composition_report_error = str(exc)
+            warnings.warn(
+                "Could not generate state composition report after classifier apply: "
+                f"{exc}",
+                RuntimeWarning,
+            )
+            if verbose:
+                print(f"Skipping state composition report export due to error: {exc}")
     else:
-        adata_full.uns["classification"]["state_composition_report_pdf"] = None
-        adata_full.uns["classification"]["state_composition_report_pdfs"] = []
-        adata_full.uns["classification"]["state_composition_report_auc_csv"] = None
-        adata_full.uns["classification"]["state_composition_report_plot_csvs"] = []
-        adata_full.uns["classification"]["state_composition_report_error"] = None
+        state_composition_report_error = (
+            "Could not generate state composition report: "
+            f"missing '{full_output_col}' in adata_full.obs."
+        )
+        warnings.warn(state_composition_report_error, RuntimeWarning)
+
+    adata_full.uns["classification"]["state_composition_report_pdf"] = state_composition_report_pdf
+    adata_full.uns["classification"]["state_composition_report_pdfs"] = list(state_composition_report_pdfs)
+    adata_full.uns["classification"]["state_composition_report_auc_csv"] = state_composition_report_auc_csv
+    adata_full.uns["classification"]["state_composition_report_plot_csvs"] = list(
+        state_composition_report_plot_csvs
+    )
+    adata_full.uns["classification"]["state_composition_report_error"] = state_composition_report_error
+
+    adata_full.write(stage_paths["full_output_adata_path"], compression="gzip")
 
     if verbose:
         n_rows = int(adata_full.n_obs)
@@ -3794,10 +4113,10 @@ def apply_state_classifiers_to_full_dataset(
 
 def test_pipeline():
     model_adata = run_state_clustering(
-        df_positions,
-        features,
-        binary_features_to_group, 
-        outfolder=outfolder,
+        features=features,
+        binary_features_to_group=binary_features_to_group,
+        output_dir=output_dir,
+        cell_type=cell_type,
         window_size=window_size,
         max_samples=max_samples,
         min_spacing=min_spacing,
@@ -3806,9 +4125,6 @@ def test_pipeline():
         descriptive_features=descriptive_features,
         pca_var_selection=pca_var_selection,
         clustering_method=clustering_method,
-        resolutions=resolutions,
-        leiden_seed_tries=leiden_seed_tries,
-        leiden_subsample_tries=leiden_subsample_tries,
         lower_quantile_cap=lower_quantile_cap,
         upper_quantile_cap=upper_quantile_cap,
         incomplete_window_policy=incomplete_window_policy,
@@ -3864,8 +4180,9 @@ def test_pipeline():
     )
     
     classifier_paths = train_state_classifiers(
+        output_dir=output_dir,
+        cell_type=cell_type,
         model_adata=model_adata,
-        outfolder=outfolder,
         label_transfer_method="classifier",
         classifier_backend=classifier_backend,
         classifier_n_estimators=classifier_n_estimators,
@@ -3882,11 +4199,11 @@ def test_pipeline():
         )
     
     adata_full = apply_state_classifiers_to_full_dataset(
-        df_positions=df_positions,
+        output_dir=output_dir,
+        cell_type=cell_type,
         model_adata=model_adata,
         label_classifier_artifact=classifier_paths["partial_classifier_path"],
         full_label_classifier_artifact=classifier_paths["full_classifier_path"],
-        outfolder=outfolder,
         continuous_output_col="intrinsic_behavioral_cluster",
         full_output_col="full_behavioral_cluster",
         combine_binary_with_continuous=True,
@@ -3905,15 +4222,9 @@ if __name__ == "__main__":
     output_dir = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
     metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata.csv")
     # metadata_csv_path = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE/metadata_home.csv")
-    outfolder = Path(ssd_dir, r"BHVD_BEHAV3D/BEHAV3D_python/rolling_classification")
     metadata = load_behav3d_metadata(metadata_csv_path)
-    analysis_outdir = Path(output_dir, "analysis", "tcell")
-    feature_outdir = Path(analysis_outdir, "track_features")
-    df_tracks_path = Path(feature_outdir, f"BEHAV3D_tcell_combined_track_features_filtered.csv")
-    df_positions = pd.read_csv(df_tracks_path)
-    df_positions=df_positions.sort_values(by=["sample_name", "TrackID", "position_t"])
-    outfolder = Path("/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/rolling_classification/clustering_then_binary_assignment")
-    
+    output_dir = Path("/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/ROCHE")
+    cell_type = "tcell"
     window_size = 5
     max_samples = None
     min_spacing = 10
@@ -3954,8 +4265,6 @@ if __name__ == "__main__":
     pca_var_selection = 0.95
     clustering_method = "leiden"
     resolutions = 0.2
-    leiden_seed_tries = 10
-    leiden_subsample_tries = 10
     lower_quantile_cap = None
     upper_quantile_cap = 0.99
     incomplete_window_policy = "drop"
@@ -3963,7 +4272,7 @@ if __name__ == "__main__":
     reuse_prepared_dataset = True
     save_prepared_dataset = True
     label_transfer_method = "classifier"
-    
+    cell_type = "tcell"
     classifier_backend = "random_forest"
     classifier_n_estimators = 300
     classifier_min_samples_leaf = 2

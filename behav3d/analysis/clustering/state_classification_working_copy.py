@@ -5,6 +5,7 @@ from pandas.api.types import is_numeric_dtype
 import json
 import copy
 import warnings
+import time
 from matplotlib.backends.backend_pdf import PdfPages
 
 from pathlib import Path
@@ -2320,6 +2321,7 @@ def run_state_clustering(
         prepared_adata_full_path = outfolder_path / "state_classification_full.h5ad"
         prepared_adata_model_path = outfolder_path / "state_classification_model.h5ad"
 
+    stage_prepare_started = time.perf_counter()
     prepare_kwargs = {
         "df_positions": df_positions,
         "features": features,
@@ -2358,6 +2360,8 @@ def run_state_clustering(
             )
         prepare_kwargs["reuse_prepared_dataset"] = False
         adata_prepared = prepare_state_classification_dataset(**prepare_kwargs)
+    if verbose:
+        print(f"[timing] preprocessing prepare/reuse: {time.perf_counter() - stage_prepare_started:.2f}s")
     
     pre_meta = (
         adata_prepared.uns.get("preprocessing", {})
@@ -2405,6 +2409,7 @@ def run_state_clustering(
     sampling_time_col = "position_t"
     nan_policy = "drop_any_nan_in_kept_features"
 
+    stage_sampling_started = time.perf_counter()
     model_adata = None
     if (
         bool(reuse_prepared_dataset)
@@ -2456,6 +2461,7 @@ def run_state_clustering(
             if verbose:
                 print(f"Could not load cached model adata ({exc}); rebuilding sampling/clean stage.")
 
+    subsampled_rows_for_log = None
     if model_adata is None:
         if verbose:
             print(
@@ -2473,6 +2479,7 @@ def run_state_clustering(
         
         if adata_train.n_obs < 50:
             raise ValueError("Insufficient rows after global subsampling for clustering.")
+        subsampled_rows_for_log = int(adata_train.n_obs)
 
         X_train = _to_numpy_2d(adata_train[:, kept_features].X).astype(float, copy=False)
         valid_mask = ~np.isnan(X_train).any(axis=1)
@@ -2485,14 +2492,19 @@ def run_state_clustering(
     else:
         if model_adata.n_obs < 50:
             raise ValueError("Cached model dataset has insufficient rows for clustering.")
+        subsampled_rows_for_log = int(model_adata.n_obs)
 
     ncomps_requested = min(len(kept_features), model_adata.n_obs - 1)
     if ncomps_requested < 2:
         raise ValueError("Insufficient rows/features to run PCA stage.")
 
     if verbose:
-        print(f"Subsampled {adata_train.n_obs} rows for clustering (spacing={spacing_to_use}).")
-            
+        print(f"[timing] sampling + NaN cleanup: {time.perf_counter() - stage_sampling_started:.2f}s")
+
+    if verbose:
+        print(f"Subsampled {subsampled_rows_for_log} rows for clustering (spacing={spacing_to_use}).")
+
+    stage_pca_started = time.perf_counter()
     pca_recomputed = False
     pca_match, pca_reasons = _matches_cached_pca_stage(
         model_adata,
@@ -2510,7 +2522,7 @@ def run_state_clustering(
                 f"# Running PCA for dimensionality reduction before clustering (n_features={len(kept_features)}, "
                 f"# n_samples={model_adata.n_obs}, min_var_selection={pca_var_selection}). "
                 f"reasons={pca_reasons}"
-            )
+        )
         model_adata = run_pca(
             model_adata,
             pca_var_selection=pca_var_selection,
@@ -2519,7 +2531,12 @@ def run_state_clustering(
             random_state=random_state,
         )
         pca_recomputed = True
+    if verbose:
+        print(f"[timing] PCA stage: {time.perf_counter() - stage_pca_started:.2f}s")
 
+    print(f"PCA output n_comps={model_adata.obsm['X_pca'].shape[1]}")
+    
+    stage_neighbors_started = time.perf_counter()
     neighbors_match, neighbors_reasons = _matches_cached_neighbors_stage(
         model_adata,
         n_neighbors=n_neighbors,
@@ -2541,7 +2558,10 @@ def run_state_clustering(
             )
         sc.pp.neighbors(model_adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=random_state)
         neighbors_recomputed = True
+    if verbose:
+        print(f"[timing] neighbors stage: {time.perf_counter() - stage_neighbors_started:.2f}s")
 
+    stage_umap_started = time.perf_counter()
     umap_match, umap_reasons = _matches_cached_umap_stage(
         model_adata,
         min_dist=min_dist,
@@ -2560,6 +2580,8 @@ def run_state_clustering(
                 f"reasons={umap_reasons}"
             )
         sc.tl.umap(model_adata, min_dist=min_dist, random_state=random_state)
+    if verbose:
+        print(f"[timing] UMAP stage: {time.perf_counter() - stage_umap_started:.2f}s")
 
     if verbose:
         print(
@@ -2567,6 +2589,7 @@ def run_state_clustering(
             f"# resolution={resolution}..."
         )
 
+    stage_clustering_started = time.perf_counter()
     method = str(clustering_method).lower()
     if method == "leiden":
         if ("neighbors" not in model_adata.uns) or ("connectivities" not in model_adata.obsp):
@@ -2602,6 +2625,8 @@ def run_state_clustering(
         binary_cols_to_merge=binary_cols_to_merge,
         intrinsic_col="intrinsic_behavioral_cluster",
     )
+    if verbose:
+        print(f"[timing] clustering stage: {time.perf_counter() - stage_clustering_started:.2f}s")
     if verbose:
         n_intrinsic = int(model_adata.obs["intrinsic_behavioral_cluster"].astype(str).nunique())
         n_full = int(model_adata.obs["full_behavioral_cluster"].astype(str).nunique())
@@ -2675,13 +2700,19 @@ def run_state_clustering(
     }
 
     if outfolder_path is not None:
+        stage_model_write_started = time.perf_counter()
         model_adata.write(prepared_adata_model_path, compression="gzip")
+        if verbose:
+            print(f"[timing] cache write model_adata: {time.perf_counter() - stage_model_write_started:.2f}s")
 
+        stage_prepared_write_started = time.perf_counter()
         prepared_adata_full = adata_prepared[:, kept_features].copy()
         prepared_adata_full.uns["preprocessing"] = dict(adata_prepared.uns.get("preprocessing", {}))
         prepared_adata_full.uns["preprocessing"].pop("prepared_adata_full_signature", None)
         prepared_adata_full.uns["preprocessing"]["prepared_adata_full_path"] = str(prepared_adata_full_path)
         prepared_adata_full.write(prepared_adata_full_path, compression="gzip")
+        if verbose:
+            print(f"[timing] cache write prepared_full_adata: {time.perf_counter() - stage_prepared_write_started:.2f}s")
         if verbose:
             print(f"Saved model-stage cache: {prepared_adata_model_path}")
             print(f"Saved prepared full adata cache: {prepared_adata_full_path}")
