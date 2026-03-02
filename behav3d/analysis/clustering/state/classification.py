@@ -8,6 +8,7 @@ import warnings
 import re
 import time
 from matplotlib.backends.backend_pdf import PdfPages
+from dataclasses import asdict, dataclass
 
 from pathlib import Path
 import pickle
@@ -27,9 +28,17 @@ from behav3d.analysis.clustering.general.leiden import run_pca, run_leiden_clust
 from behav3d.analysis.clustering.state.visualization.plots.state_composition import (
     save_state_composition_report,
 )
+from behav3d.analysis.clustering.state.visualization.plots.state_transitions import (
+    save_state_transition_report,
+)
+from behav3d.analysis.clustering.state.visualization.backprojection import (
+    export_behavioral_state_backprojection_zarrs,
+    show_behavioral_state_backprojection,
+)
 
 A4_PORTRAIT = (8.27, 11.69)
 A4_LANDSCAPE = (11.69, 8.27)
+STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION = 1
 
 
 def _binary_col_to_group_name(col: str) -> str:
@@ -281,7 +290,7 @@ def prepare_state_classification_dataset(
     upper_quantile_cap=0.99,
     outfolder=None,
     scale_features=False,
-    incomplete_window_policy="drop",
+    incomplete_window_policy="partial",
     reuse_prepared_dataset=True,
     save_prepared_dataset=False,
     prepared_dataset_path=None,
@@ -467,7 +476,7 @@ def prepare_state_classification_dataset(
         "binary_features_to_group": list(windowing_params.get("binary_features_to_group", [])),
         "window_size": int(windowing_params.get("window_size", 0)),
         "descriptive_features": list(windowing_params.get("descriptive_features", [])),
-        "incomplete_window_policy": str(windowing_params.get("incomplete_window_policy", "drop")),
+        "incomplete_window_policy": str(windowing_params.get("incomplete_window_policy", None)),
         "lower_quantile_cap": windowing_params.get("lower_quantile_cap", None),
         "upper_quantile_cap": windowing_params.get("upper_quantile_cap", None),
     }
@@ -498,6 +507,29 @@ def _resolve_output_dir(output_dir):
     return output_dir_path
 
 
+@dataclass(frozen=True)
+class StatePaths:
+    output_dir: Path
+    analysis_outdir: Path
+    feature_outdir: Path
+    filtered_tracks_csv: Path
+    combined_tracks_csv: Path
+    state_outdir: Path
+    processing_outdir: Path
+    state_clustering_outdir: Path
+    model_adata_path: Path
+    prepared_full_adata_path: Path
+    full_output_adata_path: Path
+    intrinsic_outdir: Path
+    full_outdir: Path
+    intrinsic_qc_outdir: Path
+    full_qc_outdir: Path
+    intrinsic_classifier_default_path: Path
+    full_classifier_default_path: Path
+    state_composition_outdir: Path
+    state_transitions_outdir: Path
+
+
 def _resolve_state_outdir(output_dir, cell_type):
     """Return/create state-classification root: output_dir/analysis/<cell_type>/behavioral_states."""
     if cell_type is None or len(str(cell_type).strip()) == 0:
@@ -506,6 +538,47 @@ def _resolve_state_outdir(output_dir, cell_type):
     state_outdir = root / "analysis" / str(cell_type) / "behavioral_states"
     state_outdir.mkdir(parents=True, exist_ok=True)
     return state_outdir
+
+
+def _resolve_state_paths(output_dir, cell_type):
+    """Resolve canonical state-pipeline paths as a typed context."""
+    if cell_type is None or len(str(cell_type).strip()) == 0:
+        raise ValueError("cell_type is required.")
+    root = _resolve_output_dir(output_dir)
+    analysis_outdir = root / "analysis" / str(cell_type)
+    feature_outdir = analysis_outdir / "track_features"
+
+    state_outdir = root / "analysis" / str(cell_type) / "behavioral_states"
+    state_outdir.mkdir(parents=True, exist_ok=True)
+    processing_outdir = state_outdir / "processing"
+    processing_outdir.mkdir(parents=True, exist_ok=True)
+
+    intrinsic_outdir = processing_outdir / "intrinsic_behavioral_classification"
+    full_outdir = processing_outdir / "full_behavioral_classification"
+    intrinsic_qc_outdir = intrinsic_outdir / "quality_control"
+    full_qc_outdir = full_outdir / "quality_control"
+
+    return StatePaths(
+        output_dir=root,
+        analysis_outdir=analysis_outdir,
+        feature_outdir=feature_outdir,
+        filtered_tracks_csv=feature_outdir / f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv",
+        combined_tracks_csv=feature_outdir / f"BEHAV3D_{cell_type}_combined_track_features.csv",
+        state_outdir=state_outdir,
+        processing_outdir=processing_outdir,
+        state_clustering_outdir=processing_outdir / "state_clustering",
+        model_adata_path=processing_outdir / f"BEHAV3D_{cell_type}_behavioral_states_modeldata.h5ad",
+        prepared_full_adata_path=processing_outdir / f"BEHAV3D_{cell_type}_behavioral_states_prepared_full.h5ad",
+        full_output_adata_path=state_outdir / f"BEHAV3D_{cell_type}_behavioral_states.h5ad",
+        intrinsic_outdir=intrinsic_outdir,
+        full_outdir=full_outdir,
+        intrinsic_qc_outdir=intrinsic_qc_outdir,
+        full_qc_outdir=full_qc_outdir,
+        intrinsic_classifier_default_path=intrinsic_outdir / f"intrinsic_state_classification_random_forest_{cell_type}.pkl",
+        full_classifier_default_path=full_outdir / f"state_classification_random_forest_{cell_type}.pkl",
+        state_composition_outdir=state_outdir / "state_composition",
+        state_transitions_outdir=state_outdir / "state_transitions",
+    )
 
 
 def _resolve_analysis_paths(output_dir, cell_type):
@@ -524,11 +597,19 @@ def _resolve_analysis_paths(output_dir, cell_type):
     }
 
 
-def _resolve_positions_csv_path(output_dir, cell_type):
+def _resolve_legacy_prepared_full_adata_path(state_paths, cell_type):
+    return state_paths.state_outdir / f"BEHAV3D_{cell_type}_behavioral_states_prepared_full.h5ad"
+
+
+def _resolve_positions_csv_path(output_dir=None, cell_type=None, state_paths=None):
     """Resolve the positions/features CSV from standard BEHAV3D analysis layout."""
-    analysis_paths = _resolve_analysis_paths(output_dir, cell_type)
-    filtered_path = analysis_paths["filtered_tracks_csv"]
-    combined_path = analysis_paths["combined_tracks_csv"]
+    if state_paths is None:
+        analysis_paths = _resolve_analysis_paths(output_dir, cell_type)
+        filtered_path = analysis_paths["filtered_tracks_csv"]
+        combined_path = analysis_paths["combined_tracks_csv"]
+    else:
+        filtered_path = state_paths.filtered_tracks_csv
+        combined_path = state_paths.combined_tracks_csv
     if filtered_path.exists():
         return filtered_path
     if combined_path.exists():
@@ -568,29 +649,8 @@ def _resolve_state_clustering_outdir(base_outdir):
 
 
 def _resolve_state_stage_paths(output_dir, cell_type):
-    """Build canonical state-classification artifact paths from output_dir + cell_type."""
-    state_outdir = _resolve_state_outdir(output_dir, cell_type)
-    processing_outdir = _resolve_processing_outdir(state_outdir)
-    intrinsic_outdir = processing_outdir / "intrinsic_behavioral_classification"
-    full_outdir = processing_outdir / "full_behavioral_classification"
-    intrinsic_qc_outdir = intrinsic_outdir / "quality_control"
-    full_qc_outdir = full_outdir / "quality_control"
-
-    return {
-        "state_outdir": state_outdir,
-        "processing_outdir": processing_outdir,
-        "state_clustering_outdir": processing_outdir / "state_clustering",
-        "model_adata_path": processing_outdir / f"BEHAV3D_{cell_type}_behavioral_states_modeldata.h5ad",
-        "prepared_full_adata_path": state_outdir / f"BEHAV3D_{cell_type}_behavioral_states_prepared_full.h5ad",
-        "full_output_adata_path": state_outdir / f"BEHAV3D_{cell_type}_behavioral_states.h5ad",
-        "intrinsic_outdir": intrinsic_outdir,
-        "full_outdir": full_outdir,
-        "intrinsic_qc_outdir": intrinsic_qc_outdir,
-        "full_qc_outdir": full_qc_outdir,
-        "intrinsic_classifier_default_path": intrinsic_outdir / f"intrinsic_state_classification_random_forest_{cell_type}.pkl",
-        "full_classifier_default_path": full_outdir / f"state_classification_random_forest_{cell_type}.pkl",
-        "state_composition_outdir": state_outdir / "state_composition",
-    }
+    """Compatibility wrapper. Prefer `_resolve_state_paths(...)`."""
+    return asdict(_resolve_state_paths(output_dir, cell_type))
 
 
 def _sanitize_filename_token(value, fallback="value"):
@@ -1454,6 +1514,237 @@ def load_state_classifier_artifact(path):
     return artifact
 
 
+def _extract_pipeline_metadata_from_classifier_artifact(classifier_artifact, artifact_name):
+    """Return strict pipeline metadata payload from a classifier artifact."""
+    if not isinstance(classifier_artifact, dict) or "classifier" not in classifier_artifact:
+        raise ValueError(
+            f"{artifact_name} is not a valid classifier artifact dict."
+        )
+    pipeline_meta = classifier_artifact.get("pipeline_metadata", None)
+    if not isinstance(pipeline_meta, dict):
+        raise ValueError(
+            f"{artifact_name} is missing required 'pipeline_metadata'. "
+            "Re-train classifiers with the updated pipeline."
+        )
+
+    try:
+        schema_version = int(pipeline_meta.get("schema_version", -1))
+    except Exception as exc:
+        raise ValueError(
+            f"{artifact_name} has invalid pipeline_metadata.schema_version. "
+            "Re-train classifiers with the updated pipeline."
+        ) from exc
+    if schema_version != int(STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION):
+        raise ValueError(
+            f"{artifact_name} has unsupported pipeline_metadata schema_version={schema_version}; "
+            f"expected {STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION}. "
+            "Re-train classifiers with the updated pipeline."
+        )
+
+    pre_meta = pipeline_meta.get("preprocessing", None)
+    clust_meta = pipeline_meta.get("clustering", None)
+    class_meta = pipeline_meta.get("classification", None)
+    if not isinstance(pre_meta, dict):
+        raise ValueError(
+            f"{artifact_name} pipeline_metadata.preprocessing is missing/invalid. "
+            "Re-train classifiers with the updated pipeline."
+        )
+    if not isinstance(clust_meta, dict):
+        raise ValueError(
+            f"{artifact_name} pipeline_metadata.clustering is missing/invalid. "
+            "Re-train classifiers with the updated pipeline."
+        )
+    if not isinstance(class_meta, dict):
+        raise ValueError(
+            f"{artifact_name} pipeline_metadata.classification is missing/invalid. "
+            "Re-train classifiers with the updated pipeline."
+        )
+
+    return {
+        "schema_version": int(schema_version),
+        "preprocessing": copy.deepcopy(pre_meta),
+        "clustering": copy.deepcopy(clust_meta),
+        "classification": copy.deepcopy(class_meta),
+    }
+
+
+def _validate_classifier_artifact_metadata_consistency(
+    intrinsic_artifact,
+    full_artifact,
+):
+    """Validate strict metadata consistency when both intrinsic/full artifacts are provided."""
+    intrinsic_meta = _extract_pipeline_metadata_from_classifier_artifact(
+        intrinsic_artifact,
+        artifact_name="continuous_label_classifier_artifact",
+    )
+    full_meta = _extract_pipeline_metadata_from_classifier_artifact(
+        full_artifact,
+        artifact_name="full_label_classifier_artifact",
+    )
+
+    payload_intrinsic = _build_classifier_preprocessing_compare_payload(intrinsic_artifact)
+    payload_full = _build_classifier_preprocessing_compare_payload(full_artifact)
+    is_match, mismatch_reasons = _compare_preprocessing_params(
+        payload_intrinsic,
+        payload_full,
+        rtol=1e-8,
+        atol=1e-12,
+    )
+    if not is_match:
+        raise ValueError(
+            "Intrinsic and full classifier artifacts were trained with different preprocessing/windowing settings: "
+            f"{mismatch_reasons}. Re-train classifiers from the same model run."
+        )
+
+    intrinsic_bin_cols = intrinsic_meta["clustering"].get("binary_cols_to_merge", None)
+    full_bin_cols = full_meta["clustering"].get("binary_cols_to_merge", None)
+    if not isinstance(intrinsic_bin_cols, list):
+        raise ValueError(
+            "continuous_label_classifier_artifact pipeline_metadata.clustering.binary_cols_to_merge is missing/invalid. "
+            "Re-train classifiers with the updated pipeline."
+        )
+    if not isinstance(full_bin_cols, list):
+        raise ValueError(
+            "full_label_classifier_artifact pipeline_metadata.clustering.binary_cols_to_merge is missing/invalid. "
+            "Re-train classifiers with the updated pipeline."
+        )
+    intrinsic_bin_cols = [str(c) for c in intrinsic_bin_cols]
+    full_bin_cols = [str(c) for c in full_bin_cols]
+    if intrinsic_bin_cols != full_bin_cols:
+        raise ValueError(
+            "Intrinsic and full classifier artifacts have different binary_cols_to_merge metadata. "
+            f"intrinsic={intrinsic_bin_cols}, full={full_bin_cols}. "
+            "Re-train classifiers from the same model run."
+        )
+
+
+def _coerce_classifier_artifact_input(artifact_input, artifact_name):
+    if artifact_input is None:
+        return None
+    if isinstance(artifact_input, (str, Path)):
+        return load_state_classifier_artifact(artifact_input)
+    if isinstance(artifact_input, dict) and "classifier" in artifact_input:
+        return artifact_input
+    raise ValueError(
+        f"{artifact_name} must be a classifier artifact dict or a path to a pickled classifier artifact, "
+        f"got {type(artifact_input)}."
+    )
+
+
+def _resolve_classifier_artifact_variant_input(artifact_input, variant_name, artifact_name):
+    """Resolve explicit artifact input (path/artifact/variant-dict) into artifact + source metadata."""
+    if artifact_input is None:
+        return None, None, None
+    if isinstance(artifact_input, (str, Path)):
+        return (
+            _coerce_classifier_artifact_input(artifact_input, artifact_name),
+            "explicit_path",
+            str(Path(artifact_input)),
+        )
+    if isinstance(artifact_input, dict) and "classifier" in artifact_input:
+        return artifact_input, "explicit_artifact", None
+    if isinstance(artifact_input, dict):
+        available = sorted([str(k) for k, v in artifact_input.items() if v is not None])
+        if variant_name in artifact_input and artifact_input[variant_name] is not None:
+            candidate = artifact_input[variant_name]
+            source_path = str(Path(candidate)) if isinstance(candidate, (str, Path)) else None
+            return (
+                _coerce_classifier_artifact_input(candidate, f"{artifact_name} variant '{variant_name}'"),
+                "explicit_variant",
+                source_path,
+            )
+        raise ValueError(
+            f"Requested {artifact_name} variant '{variant_name}' not available. "
+            f"Available variants: {available}"
+        )
+    raise ValueError(
+        f"{artifact_name} must be a classifier artifact dict, a path, or a variant dict "
+        f"(keys: 'full_data'/'train_split' with artifact/path values), got {type(artifact_input)}."
+    )
+
+
+def _resolve_classifier_artifacts_with_defaults(
+    *,
+    label_classifier_artifact,
+    full_label_classifier_artifact,
+    continuous_model_variant,
+    full_model_variant,
+    state_paths,
+    verbose=True,
+):
+    """Resolve intrinsic/full artifacts via explicit input first, then canonical default paths."""
+
+    def _load_default_artifact_if_missing(current_artifact, default_path):
+        if current_artifact is not None:
+            return current_artifact, None, None
+        default_path = Path(default_path)
+        if default_path.exists():
+            loaded = load_state_classifier_artifact(default_path)
+            return loaded, "default_path", str(default_path)
+        return None, None, None
+
+    label_classifier_selected, label_source_type, label_source_path = _resolve_classifier_artifact_variant_input(
+        label_classifier_artifact,
+        continuous_model_variant,
+        "continuous_label_classifier_artifact",
+    )
+    full_label_classifier_selected, full_source_type, full_source_path = _resolve_classifier_artifact_variant_input(
+        full_label_classifier_artifact,
+        full_model_variant,
+        "full_label_classifier_artifact",
+    )
+
+    if label_classifier_selected is None:
+        label_classifier_selected, default_type, default_path = _load_default_artifact_if_missing(
+            label_classifier_selected,
+            state_paths.intrinsic_classifier_default_path,
+        )
+        if default_type is not None:
+            label_source_type = default_type
+            label_source_path = default_path
+            if verbose:
+                print(f"Using default intrinsic classifier path: {default_path}")
+        elif verbose:
+            print(
+                "No intrinsic classifier provided and default path not found: "
+                f"{state_paths.intrinsic_classifier_default_path}"
+            )
+
+    if full_label_classifier_selected is None:
+        full_label_classifier_selected, default_type, default_path = _load_default_artifact_if_missing(
+            full_label_classifier_selected,
+            state_paths.full_classifier_default_path,
+        )
+        if default_type is not None:
+            full_source_type = default_type
+            full_source_path = default_path
+            if verbose:
+                print(f"Using default full classifier path: {default_path}")
+        elif verbose:
+            print(
+                "No full classifier provided and default path not found: "
+                f"{state_paths.full_classifier_default_path}"
+            )
+
+    if label_classifier_selected is None and full_label_classifier_selected is None:
+        raise FileNotFoundError(
+            "No classifier artifact could be resolved for apply stage. "
+            f"Checked intrinsic default path='{state_paths.intrinsic_classifier_default_path}' "
+            f"and full default path='{state_paths.full_classifier_default_path}'. "
+            "Pass label_classifier_artifact and/or full_label_classifier_artifact, "
+            "or train/save classifiers first."
+        )
+
+    return {
+        "label_classifier_selected": label_classifier_selected,
+        "full_label_classifier_selected": full_label_classifier_selected,
+        "label_source_type": label_source_type,
+        "label_source_path": label_source_path,
+        "full_source_type": full_source_type,
+        "full_source_path": full_source_path,
+    }
+
+
 def _require_columns(df, required_cols, context):
     missing = [c for c in required_cols if c not in df.columns]
     if len(missing) > 0:
@@ -1523,7 +1814,7 @@ def apply_classifier(
         upper_quantile_cap=windowing.get("upper_quantile_cap", None),
         outfolder=outfolder,
         scale_features=False,
-        incomplete_window_policy=str(windowing.get("incomplete_window_policy", "drop")),
+        incomplete_window_policy=str(windowing.get("incomplete_window_policy", None)),
         reuse_prepared_dataset=False,
         save_prepared_dataset=False,
         verbose=verbose,
@@ -2530,11 +2821,12 @@ def run_state_clustering(
     clustering_method="leiden",
     lower_quantile_cap=None,
     upper_quantile_cap=0.99,
-    incomplete_window_policy="drop",
+    incomplete_window_policy="partial",
     random_state=123,
     reuse_prepared_dataset=True,
     # save_prepared_dataset=True,
     df_positions=None,
+    state_paths=None,
     verbose=True,
 ):
     """Stage 1: load/prepare positions, cluster, return model_adata.
@@ -2544,11 +2836,20 @@ def run_state_clustering(
     - model_adata.uns["clustering"]
     - model_adata.uns["preprocessing"]["prepared_adata_full_*"] cache metadata
     """
-    stage_paths = _resolve_state_stage_paths(output_dir, cell_type)
-    state_outdir = stage_paths["state_outdir"]
-    state_clustering_outdir = _resolve_state_clustering_outdir(stage_paths["processing_outdir"])
-    prepared_adata_full_path = stage_paths["prepared_full_adata_path"]
-    prepared_adata_model_path = stage_paths["model_adata_path"]
+    state_paths = state_paths or _resolve_state_paths(output_dir, cell_type)
+    state_outdir = state_paths.state_outdir
+    state_clustering_outdir = _resolve_state_clustering_outdir(state_paths.processing_outdir)
+    prepared_adata_full_path = state_paths.prepared_full_adata_path
+    legacy_prepared_adata_full_path = _resolve_legacy_prepared_full_adata_path(
+        state_paths=state_paths,
+        cell_type=cell_type,
+    )
+    prepared_adata_read_path = None
+    if prepared_adata_full_path is not None and prepared_adata_full_path.exists():
+        prepared_adata_read_path = prepared_adata_full_path
+    elif legacy_prepared_adata_full_path.exists():
+        prepared_adata_read_path = legacy_prepared_adata_full_path
+    prepared_adata_model_path = state_paths.model_adata_path
     df_tracks_path = None
     stage_prepare_started = time.perf_counter()
     adata_prepared = None
@@ -2558,7 +2859,7 @@ def run_state_clustering(
     def _load_positions_if_needed():
         nonlocal df_positions, df_tracks_path, positions_loaded_from_csv
         if df_positions is None:
-            df_tracks_path = _resolve_positions_csv_path(output_dir, cell_type)
+            df_tracks_path = _resolve_positions_csv_path(state_paths=state_paths)
             df_positions = pd.read_csv(df_tracks_path)
             positions_loaded_from_csv = True
         _require_columns(
@@ -2568,13 +2869,9 @@ def run_state_clustering(
         )
         return df_positions
 
-    if (
-        bool(reuse_prepared_dataset)
-        and prepared_adata_full_path is not None
-        and prepared_adata_full_path.exists()
-    ):
+    if bool(reuse_prepared_dataset) and prepared_adata_read_path is not None:
         try:
-            cached_prepared = sc.read_h5ad(prepared_adata_full_path)
+            cached_prepared = sc.read_h5ad(prepared_adata_read_path)
             pre_match_cached, pre_reasons_cached = _matches_requested_preprocessing_in_adata(
                 cached_prepared,
                 features=features,
@@ -2591,7 +2888,12 @@ def run_state_clustering(
                 adata_prepared = cached_prepared
                 prepared_cache_used = True
                 if verbose:
-                    print(f"reusing prepared full adata cache: {prepared_adata_full_path}")
+                    print(f"reusing prepared full adata cache: {prepared_adata_read_path}")
+                    if prepared_adata_read_path != prepared_adata_full_path:
+                        print(
+                            "Loaded legacy prepared cache path; future writes use: "
+                            f"{prepared_adata_full_path}"
+                        )
             elif verbose:
                 print(
                     "Prepared full cache mismatch; rebuilding from raw positions. "
@@ -3128,6 +3430,7 @@ def train_state_classifiers(
     validation_test_size=0.05,
     validation_random_state=None,
     validation_stratify=True,
+    state_paths=None,
     verbose=True,
 ):
     """
@@ -3141,9 +3444,8 @@ def train_state_classifiers(
             "partial_classifier_path": str | None,
         }
     """
-    stage_paths = _resolve_state_stage_paths(output_dir, cell_type)
-    state_outdir = stage_paths["state_outdir"]
-    model_adata_path = stage_paths["model_adata_path"]
+    state_paths = state_paths or _resolve_state_paths(output_dir, cell_type)
+    model_adata_path = state_paths.model_adata_path
     if model_adata is None:
         if not model_adata_path.exists():
             raise FileNotFoundError(
@@ -3287,12 +3589,12 @@ def train_state_classifiers(
         "holdout_artifacts": {},
     }
 
-    outfolder_path = stage_paths["processing_outdir"]
+    outfolder_path = state_paths.processing_outdir
     outfolder_path.mkdir(parents=True, exist_ok=True)
-    intrinsic_outfolder = stage_paths["intrinsic_outdir"]
-    full_outfolder = stage_paths["full_outdir"]
-    intrinsic_qc_outfolder = stage_paths["intrinsic_qc_outdir"]
-    full_qc_outfolder = stage_paths["full_qc_outdir"]
+    intrinsic_outfolder = state_paths.intrinsic_outdir
+    full_outfolder = state_paths.full_outdir
+    intrinsic_qc_outfolder = state_paths.intrinsic_qc_outdir
+    full_qc_outfolder = state_paths.full_qc_outdir
     intrinsic_outfolder.mkdir(parents=True, exist_ok=True)
     full_outfolder.mkdir(parents=True, exist_ok=True)
     intrinsic_qc_outfolder.mkdir(parents=True, exist_ok=True)
@@ -3672,23 +3974,44 @@ def train_state_classifiers(
         )
         model_adata.uns["classification"]["full_classifier_qc_model_data"] = full_classifier_qc_model_data
 
+    def _build_pipeline_metadata_payload():
+        return {
+            "schema_version": int(STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION),
+            "preprocessing": copy.deepcopy(dict(model_adata.uns.get("preprocessing", {}))),
+            "clustering": copy.deepcopy(dict(model_adata.uns.get("clustering", {}))),
+            "classification": copy.deepcopy(dict(model_adata.uns.get("classification", {}))),
+        }
+
+    if label_classifier_artifact_train_split is not None:
+        label_classifier_artifact_train_split["pipeline_metadata"] = _build_pipeline_metadata_payload()
+    if full_label_classifier_artifact_train_split is not None:
+        full_label_classifier_artifact_train_split["pipeline_metadata"] = _build_pipeline_metadata_payload()
+
     if save_label_classifier and label_classifier_artifact_train_split is not None:
-        classifier_model_path = intrinsic_outfolder / "state_classifiction_random_forest.pkl"
-        with open(classifier_model_path, "wb") as f:
-            pickle.dump(label_classifier_artifact_train_split, f)
+        classifier_model_path = state_paths.intrinsic_classifier_default_path
+        classifier_model_path.parent.mkdir(parents=True, exist_ok=True)
         model_adata.uns["classification"]["classifier_model_path"] = str(classifier_model_path)
         classifier_model_paths["train_split"] = str(classifier_model_path)
         model_adata.uns["classification"]["classifier_model_paths"] = dict(classifier_model_paths)
+        label_classifier_artifact_train_split["pipeline_metadata"] = _build_pipeline_metadata_payload()
+        with open(classifier_model_path, "wb") as f:
+            pickle.dump(label_classifier_artifact_train_split, f)
+        if verbose:
+            print(f"Saved intrinsic classifier artifact: {classifier_model_path}")
 
     if train_full_classifier and save_full_label_classifier and full_label_classifier_artifact_train_split is not None:
-        full_classifier_model_path = full_outfolder / "state_classifiction_random_forest.pkl"
-        with open(full_classifier_model_path, "wb") as f:
-            pickle.dump(full_label_classifier_artifact_train_split, f)
+        full_classifier_model_path = state_paths.full_classifier_default_path
+        full_classifier_model_path.parent.mkdir(parents=True, exist_ok=True)
         model_adata.uns["classification"]["full_classifier_model_path"] = str(full_classifier_model_path)
         full_classifier_model_paths["train_split"] = str(full_classifier_model_path)
         model_adata.uns["classification"]["full_classifier_model_paths"] = dict(full_classifier_model_paths)
+        full_label_classifier_artifact_train_split["pipeline_metadata"] = _build_pipeline_metadata_payload()
+        with open(full_classifier_model_path, "wb") as f:
+            pickle.dump(full_label_classifier_artifact_train_split, f)
+        if verbose:
+            print(f"Saved full classifier artifact: {full_classifier_model_path}")
 
-    model_adata.write(stage_paths["model_adata_path"], compression="gzip")
+    model_adata.write(state_paths.model_adata_path, compression="gzip")
     if verbose:
         n_intrinsic = int(model_adata.obs["intrinsic_behavioral_cluster"].astype(str).nunique())
         n_full = int(model_adata.obs["full_behavioral_cluster"].astype(str).nunique()) if "full_behavioral_cluster" in model_adata.obs.columns else 0
@@ -3705,7 +4028,6 @@ def train_state_classifiers(
 def apply_state_classifiers_to_full_dataset(
     output_dir,
     cell_type,
-    model_adata=None,
     label_classifier_artifact=None,
     full_label_classifier_artifact=None,
     continuous_output_col="intrinsic_behavioral_cluster",
@@ -3713,207 +4035,111 @@ def apply_state_classifiers_to_full_dataset(
     continuous_model_variant="full_data",
     full_model_variant="full_data",
     combine_binary_with_continuous=True,
+    export_state_transitions=True,
+    state_transitions_rows_per_page=3,
+    state_transitions_include_self_pairs=True,
+    state_transitions_min_count=100,
+    state_transitions_relative_count=0.0,
+    state_paths=None,
     verbose=True,
+    export_behavioral_state_images=False,
+    behavioral_state_image_col=None,
 ):
-    """Apply trained stage-2 classifier artifacts to full dataset loaded from analysis track-features CSV.
+    """Apply trained stage-2 classifier artifacts to full dataset from track-features CSV.
 
     Confidence columns are always derived as `<output_col>_confidence`.
+    If artifacts are omitted, canonical default classifier paths are probed.
     """
-    stage_paths = _resolve_state_stage_paths(output_dir, cell_type)
-    state_outdir = stage_paths["state_outdir"]
+    state_paths = state_paths or _resolve_state_paths(output_dir, cell_type)
+    state_outdir = state_paths.state_outdir
 
-    if model_adata is None:
-        model_adata_path = stage_paths["model_adata_path"]
-        if not model_adata_path.exists():
-            raise FileNotFoundError(
-                "Could not load model_adata for classifier apply. "
-                f"Expected '{model_adata_path}'. "
-                "Run run_state_clustering(...) first or pass model_adata explicitly."
-            )
-        model_adata = sc.read_h5ad(model_adata_path)
-        if verbose:
-            print(f"Loaded model_adata from: {model_adata_path}")
-
-    if not (hasattr(model_adata, "uns") and hasattr(model_adata, "var_names")):
-        raise ValueError("model_adata must be an AnnData-like object with .uns and .var_names.")
-
-    class_meta = (
-        dict(model_adata.uns.get("classification", {}))
-        if isinstance(model_adata.uns, dict)
-        else {}
-    )
-    clust_meta = (
-        dict(model_adata.uns.get("clustering", {}))
-        if isinstance(model_adata.uns, dict)
-        else {}
-    )
-    pre_meta = (
-        dict(model_adata.uns.get("preprocessing", {}))
-        if isinstance(model_adata.uns, dict)
-        else {}
-    )
-    del model_adata
     continuous_confidence_col = f"{str(continuous_output_col)}_confidence"
     full_confidence_col = f"{str(full_output_col)}_confidence"
 
-    def _coerce_classifier_artifact(artifact_input, artifact_name):
-        if artifact_input is None:
-            return None
-        if isinstance(artifact_input, (str, Path)):
-            return load_state_classifier_artifact(artifact_input)
-        if isinstance(artifact_input, dict) and "classifier" in artifact_input:
-            return artifact_input
-        raise ValueError(
-            f"{artifact_name} must be a classifier artifact dict or a path to a pickled classifier artifact, "
-            f"got {type(artifact_input)}."
-        )
-
-    def _resolve_artifact_variant(artifact_input, variant_name, artifact_name):
-        if artifact_input is None:
-            return None
-        if isinstance(artifact_input, (str, Path)):
-            return _coerce_classifier_artifact(artifact_input, artifact_name)
-        if isinstance(artifact_input, dict) and "classifier" in artifact_input:
-            return artifact_input
-        if isinstance(artifact_input, dict):
-            available = sorted([str(k) for k, v in artifact_input.items() if v is not None])
-            if variant_name in artifact_input and artifact_input[variant_name] is not None:
-                candidate = artifact_input[variant_name]
-                return _coerce_classifier_artifact(candidate, f"{artifact_name} variant '{variant_name}'")
-            raise ValueError(
-                f"Requested {artifact_name} variant '{variant_name}' not available. "
-                f"Available variants: {available}"
-            )
-        raise ValueError(
-            f"{artifact_name} must be a classifier artifact dict, a path, or a variant dict "
-            f"(keys: 'full_data'/'train_split' with artifact/path values), got {type(artifact_input)}."
-        )
-
-    def _load_artifact_variant_from_meta(paths_key, fallback_key, variant_name, artifact_name):
-        paths = class_meta.get(paths_key, None)
-        available = []
-        if isinstance(paths, dict):
-            available.extend([str(k) for k, v in paths.items() if v is not None])
-            path = paths.get(variant_name, None)
-            if path is not None:
-                try:
-                    return load_state_classifier_artifact(path), sorted(set(available))
-                except FileNotFoundError:
-                    warnings.warn(
-                        f"{artifact_name}: metadata path missing on disk for variant '{variant_name}': {path}. "
-                        "Trying fallback locations.",
-                        RuntimeWarning,
-                    )
-
-        fallback_path = class_meta.get(fallback_key, None)
-        if fallback_path is not None:
-            available = sorted(set(available + ["full_data"]))
-            if variant_name == "full_data":
-                try:
-                    return load_state_classifier_artifact(fallback_path), available
-                except FileNotFoundError:
-                    warnings.warn(
-                        f"{artifact_name}: metadata fallback path missing on disk: {fallback_path}. "
-                        "Trying fallback locations.",
-                        RuntimeWarning,
-                    )
-        return None, sorted(set(available))
-
-    label_classifier_selected = _resolve_artifact_variant(
-        label_classifier_artifact, continuous_model_variant, "continuous_label_classifier_artifact"
+    resolved_artifacts = _resolve_classifier_artifacts_with_defaults(
+        label_classifier_artifact=label_classifier_artifact,
+        full_label_classifier_artifact=full_label_classifier_artifact,
+        continuous_model_variant=continuous_model_variant,
+        full_model_variant=full_model_variant,
+        state_paths=state_paths,
+        verbose=verbose,
     )
-    full_label_classifier_selected = _resolve_artifact_variant(
-        full_label_classifier_artifact, full_model_variant, "full_label_classifier_artifact"
+    label_classifier_selected = resolved_artifacts["label_classifier_selected"]
+    full_label_classifier_selected = resolved_artifacts["full_label_classifier_selected"]
+    label_source_type = resolved_artifacts["label_source_type"]
+    label_source_path = resolved_artifacts["label_source_path"]
+    full_source_type = resolved_artifacts["full_source_type"]
+    full_source_path = resolved_artifacts["full_source_path"]
+
+    if (label_classifier_selected is not None) and (full_label_classifier_selected is not None):
+        _validate_classifier_artifact_metadata_consistency(
+            intrinsic_artifact=label_classifier_selected,
+            full_artifact=full_label_classifier_selected,
+        )
+
+    reference_classifier_artifact = (
+        label_classifier_selected if label_classifier_selected is not None else full_label_classifier_selected
     )
+    reference_artifact_name = (
+        "continuous_label_classifier_artifact"
+        if label_classifier_selected is not None
+        else "full_label_classifier_artifact"
+    )
+    reference_pipeline_meta = _extract_pipeline_metadata_from_classifier_artifact(
+        reference_classifier_artifact,
+        artifact_name=reference_artifact_name,
+    )
+    class_meta = dict(reference_pipeline_meta["classification"])
+    clust_meta = dict(reference_pipeline_meta["clustering"])
+    pre_meta = dict(reference_pipeline_meta["preprocessing"])
 
-    if label_classifier_selected is None:
-        label_classifier_selected, available_continuous_variants = _load_artifact_variant_from_meta(
-            paths_key="classifier_model_paths",
-            fallback_key="classifier_model_path",
-            variant_name=continuous_model_variant,
-            artifact_name="continuous_label_classifier_artifact",
-        )
-        if label_classifier_selected is None and stage_paths["intrinsic_classifier_default_path"].exists():
-            label_classifier_selected = load_state_classifier_artifact(stage_paths["intrinsic_classifier_default_path"])
-            available_continuous_variants = sorted(
-                set(list(available_continuous_variants) + ["full_data", "train_split"])
-            )
-            if verbose:
-                print(
-                    "Loaded intrinsic classifier artifact from default path: "
-                    f"{stage_paths['intrinsic_classifier_default_path']}"
-                )
-    else:
-        available_continuous_variants = [str(continuous_model_variant)]
-
-    if full_label_classifier_selected is None:
-        full_label_classifier_selected, available_full_variants = _load_artifact_variant_from_meta(
-            paths_key="full_classifier_model_paths",
-            fallback_key="full_classifier_model_path",
-            variant_name=full_model_variant,
-            artifact_name="full_label_classifier_artifact",
-        )
-        if full_label_classifier_selected is None and stage_paths["full_classifier_default_path"].exists():
-            full_label_classifier_selected = load_state_classifier_artifact(stage_paths["full_classifier_default_path"])
-            available_full_variants = sorted(set(list(available_full_variants) + ["full_data", "train_split"]))
-            if verbose:
-                print(
-                    "Loaded full classifier artifact from default path: "
-                    f"{stage_paths['full_classifier_default_path']}"
-                )
-    else:
-        available_full_variants = [str(full_model_variant)]
-
-    if (label_classifier_selected is None) and (continuous_model_variant != "full_data"):
-        raise ValueError(
-            f"Requested continuous model variant '{continuous_model_variant}' not available. "
-            f"Available variants: {available_continuous_variants}. "
-            f"Expected intrinsic classifier at '{stage_paths['intrinsic_classifier_default_path']}'."
-        )
-    if (full_label_classifier_selected is None) and (full_model_variant != "full_data"):
-        raise ValueError(
-            f"Requested full model variant '{full_model_variant}' not available. "
-            f"Available variants: {available_full_variants}. "
-            f"Expected full classifier at '{stage_paths['full_classifier_default_path']}'."
-        )
-
-    if label_classifier_selected is None and full_label_classifier_selected is None:
-        raise FileNotFoundError(
-            "No classifier artifact could be resolved for apply stage. "
-            f"Expected intrinsic classifier at '{stage_paths['intrinsic_classifier_default_path']}' "
-            f"or full classifier at '{stage_paths['full_classifier_default_path']}'. "
-            "Run train_state_classifiers(...) first, or pass explicit classifier artifacts."
-        )
     if verbose:
         print(
             "Applying classifiers to full dataset: "
             f"continuous_variant={continuous_model_variant if label_classifier_selected is not None else None}, "
             f"full_variant={full_model_variant if full_label_classifier_selected is not None else None}"
         )
+        print(
+            "Classifier source summary: "
+            f"intrinsic=({label_source_type}, {label_source_path}), "
+            f"full=({full_source_type}, {full_source_path})"
+        )
 
-    prepared_cache_path = None
-    prepared_cache_used = False
-    prepared_cache_mismatch_reasons = []
     full_predicted_in_primary = False
-
-    reference_classifier_artifact = (
-        label_classifier_selected if label_classifier_selected is not None else full_label_classifier_selected
-    )
     adata_full = None
-    positions_csv_path = _resolve_positions_csv_path(output_dir, cell_type)
+    positions_csv_path = None
     df_positions = None
 
     def _load_positions_if_needed():
-        nonlocal df_positions
+        nonlocal df_positions, positions_csv_path
         if df_positions is None:
+            if positions_csv_path is None:
+                positions_csv_path = _resolve_positions_csv_path(state_paths=state_paths)
             df_positions = pd.read_csv(positions_csv_path, low_memory=False)
             df_positions = df_positions.sort_values(by=["sample_name", "TrackID", "position_t"])
 
-    cache_path_raw = pre_meta.get("prepared_adata_full_path", None) if isinstance(pre_meta, dict) else None
-    if cache_path_raw is not None and reference_classifier_artifact is not None:
-        prepared_cache_path = Path(cache_path_raw)
-        if prepared_cache_path.exists():
-            cached_adata = sc.read_h5ad(prepared_cache_path)
+    binary_cols_to_merge = clust_meta.get("binary_cols_to_merge", None)
+    if not isinstance(binary_cols_to_merge, list):
+        raise ValueError(
+            "Classifier artifact pipeline metadata is missing 'clustering.binary_cols_to_merge'. "
+            "Re-train classifiers with the updated pipeline."
+        )
+    binary_cols_to_merge = [str(c) for c in list(binary_cols_to_merge)]
+
+    prepared_cache_path = state_paths.prepared_full_adata_path
+    legacy_prepared_cache_path = _resolve_legacy_prepared_full_adata_path(
+        state_paths=state_paths,
+        cell_type=cell_type,
+    )
+    prepared_cache_read_path = None
+    if prepared_cache_path is not None and prepared_cache_path.exists():
+        prepared_cache_read_path = prepared_cache_path
+    elif legacy_prepared_cache_path.exists():
+        prepared_cache_read_path = legacy_prepared_cache_path
+
+    if prepared_cache_read_path is not None:
+        cached_adata = sc.read_h5ad(prepared_cache_read_path)
+        try:
             cache_payload = _build_adata_preprocessing_compare_payload(cached_adata)
             classifier_payload = _build_classifier_preprocessing_compare_payload(reference_classifier_artifact)
             is_match, mismatch_reasons = _compare_preprocessing_params(
@@ -3924,20 +4150,36 @@ def apply_state_classifiers_to_full_dataset(
             )
             if is_match:
                 adata_full = cached_adata
-                prepared_cache_used = True
                 if verbose:
-                    print(f"Using cached prepared full adata and skipping preprocessing: {prepared_cache_path}")
+                    print(
+                        "Using cached prepared full adata and skipping preprocessing: "
+                        f"{prepared_cache_read_path}"
+                    )
+                    if prepared_cache_read_path != prepared_cache_path:
+                        print(
+                            "Loaded legacy prepared cache path; future writes use: "
+                            f"{prepared_cache_path}"
+                        )
             else:
-                prepared_cache_mismatch_reasons = list(mismatch_reasons)
                 err_msg = (
                     "ERROR: cached prepared adata preprocessing mismatch; recomputing from input track-features CSV. "
-                    f"reasons={prepared_cache_mismatch_reasons}"
+                    f"reasons={list(mismatch_reasons)}"
                 )
                 warnings.warn(err_msg, RuntimeWarning)
                 if verbose:
                     print(err_msg)
-        elif verbose:
-            print(f"Prepared adata cache path was set but file is missing; recomputing: {prepared_cache_path}")
+        except Exception as exc:
+            warnings.warn(
+                f"Could not validate cached prepared adata; recomputing from input track-features CSV ({exc}).",
+                RuntimeWarning,
+            )
+            if verbose:
+                print(f"Could not validate cached prepared adata; recomputing from CSV: {exc}")
+    elif verbose:
+        print(
+            "Prepared adata cache is missing; recomputing. "
+            f"expected_new='{prepared_cache_path}', checked_legacy='{legacy_prepared_cache_path}'"
+        )
 
     if adata_full is None:
         _load_positions_if_needed()
@@ -3963,7 +4205,12 @@ def apply_state_classifiers_to_full_dataset(
         del df_positions
     else:
         if label_classifier_selected is not None:
-            cont_cols = list(label_classifier_selected.get("feature_cols", []))
+            cont_cols = list(
+                label_classifier_selected.get(
+                    "feature_cols",
+                    label_classifier_selected.get("continuous_feature_cols", []),
+                )
+            )
             missing_cont = [c for c in cont_cols if c not in adata_full.var_names]
             if len(missing_cont) > 0:
                 raise ValueError(
@@ -3990,7 +4237,6 @@ def apply_state_classifiers_to_full_dataset(
             )
             full_predicted_in_primary = True
 
-    binary_cols_to_merge = list(clust_meta.get("binary_cols_to_merge", []))
     if combine_binary_with_continuous and (label_classifier_selected is not None):
         if continuous_output_col != "intrinsic_behavioral_cluster":
             adata_full.obs["intrinsic_behavioral_cluster"] = adata_full.obs[continuous_output_col].astype("category")
@@ -4010,7 +4256,7 @@ def apply_state_classifiers_to_full_dataset(
             apply_preprocessing=False,
         )
 
-    adata_full.uns["preprocessing"] = dict(model_adata.uns.get("preprocessing", {}))
+    adata_full.uns["preprocessing"] = dict(pre_meta)
     adata_full.uns["classification"] = dict(class_meta)
     adata_full.uns["classification"]["applied_continuous_output_col"] = str(continuous_output_col)
     adata_full.uns["classification"]["applied_continuous_model_variant"] = (
@@ -4030,7 +4276,7 @@ def apply_state_classifiers_to_full_dataset(
     state_composition_report_error = None
 
     if full_output_col in adata_full.obs.columns:
-        report_dir = stage_paths["state_composition_outdir"]
+        report_dir = state_paths.state_composition_outdir
         report_dir.mkdir(parents=True, exist_ok=True)
         report_token = _sanitize_filename_token(
             full_output_col,
@@ -4093,7 +4339,121 @@ def apply_state_classifiers_to_full_dataset(
     )
     adata_full.uns["classification"]["state_composition_report_error"] = state_composition_report_error
 
-    adata_full.write(stage_paths["full_output_adata_path"], compression="gzip")
+    state_transition_report_dir = None
+    state_transition_matrix_counts_csv = None
+    state_transition_matrix_probs_csv = None
+    state_transition_matrix_counts_no_self_csv = None
+    state_transition_matrix_probs_no_self_csv = None
+    state_transition_ngrams_all_csv = None
+    state_transition_ngrams_pooled_csv = None
+    state_transition_ngrams_per_end_csv = None
+    state_transition_ngrams_per_start_csv = None
+    state_transition_sankey_pdf = None
+    state_transition_sankey_html_dir = None
+    state_transition_report_error = None
+
+    if bool(export_state_transitions):
+        if full_output_col in adata_full.obs.columns:
+            try:
+                transitions_outdir = state_paths.state_transitions_outdir
+                transitions_outdir.mkdir(parents=True, exist_ok=True)
+                transition_out = save_state_transition_report(
+                    adata=adata_full,
+                    output_dir=transitions_outdir,
+                    state_col=str(full_output_col),
+                    id_cols=("sample_name", "TrackID"),
+                    time_col="position_t",
+                    include_self_pairs=bool(state_transitions_include_self_pairs),
+                    rows_per_page=max(1, int(state_transitions_rows_per_page)),
+                    sankey_min_count=int(state_transitions_min_count),
+                    sankey_relative_count=float(state_transitions_relative_count),
+                    verbose=verbose,
+                )
+                state_transition_report_dir = str(transition_out.get("output_dir", transitions_outdir))
+                state_transition_matrix_counts_csv = transition_out.get("transition_matrix_counts_csv", None)
+                state_transition_matrix_probs_csv = transition_out.get("transition_matrix_probs_csv", None)
+                state_transition_matrix_counts_no_self_csv = transition_out.get(
+                    "transition_matrix_counts_no_self_csv", None
+                )
+                state_transition_matrix_probs_no_self_csv = transition_out.get(
+                    "transition_matrix_probs_no_self_csv", None
+                )
+                state_transition_ngrams_all_csv = transition_out.get("transition_ngrams_all_csv", None)
+                state_transition_ngrams_pooled_csv = transition_out.get("transition_ngrams_pooled_csv", None)
+                state_transition_ngrams_per_end_csv = transition_out.get("transition_ngrams_per_end_csv", None)
+                state_transition_ngrams_per_start_csv = transition_out.get(
+                    "transition_ngrams_per_start_csv", None
+                )
+                state_transition_sankey_pdf = transition_out.get("sankey_pdf_path", None)
+                state_transition_sankey_html_dir = transition_out.get("sankey_html_dir", None)
+            except Exception as exc:
+                state_transition_report_error = str(exc)
+                warnings.warn(
+                    "Could not generate state transition report after classifier apply: "
+                    f"{exc}",
+                    RuntimeWarning,
+                )
+                if verbose:
+                    print(f"Skipping state transition report export due to error: {exc}")
+        else:
+            state_transition_report_error = (
+                "Could not generate state transition report: "
+                f"missing '{full_output_col}' in adata_full.obs."
+            )
+            warnings.warn(state_transition_report_error, RuntimeWarning)
+
+    adata_full.uns["classification"]["state_transition_report_dir"] = state_transition_report_dir
+    adata_full.uns["classification"]["state_transition_matrix_counts_csv"] = state_transition_matrix_counts_csv
+    adata_full.uns["classification"]["state_transition_matrix_probs_csv"] = state_transition_matrix_probs_csv
+    adata_full.uns["classification"]["state_transition_matrix_counts_no_self_csv"] = (
+        state_transition_matrix_counts_no_self_csv
+    )
+    adata_full.uns["classification"]["state_transition_matrix_probs_no_self_csv"] = (
+        state_transition_matrix_probs_no_self_csv
+    )
+    adata_full.uns["classification"]["state_transition_ngrams_all_csv"] = state_transition_ngrams_all_csv
+    adata_full.uns["classification"]["state_transition_ngrams_pooled_csv"] = (
+        state_transition_ngrams_pooled_csv
+    )
+    adata_full.uns["classification"]["state_transition_ngrams_per_end_csv"] = (
+        state_transition_ngrams_per_end_csv
+    )
+    adata_full.uns["classification"]["state_transition_ngrams_per_start_csv"] = (
+        state_transition_ngrams_per_start_csv
+    )
+    adata_full.uns["classification"]["state_transition_sankey_pdf"] = state_transition_sankey_pdf
+    adata_full.uns["classification"]["state_transition_sankey_html_dir"] = state_transition_sankey_html_dir
+    adata_full.uns["classification"]["state_transition_report_error"] = state_transition_report_error
+
+    behavioral_state_backprojection = {
+        "enabled": bool(export_behavioral_state_images),
+        "state_col": None,
+        "output_paths": {},
+        "skipped_samples": [],
+        "errors": [],
+    }
+    if bool(export_behavioral_state_images):
+        export_state_col = (
+            str(behavioral_state_image_col)
+            if behavioral_state_image_col is not None
+            else str(full_output_col)
+        )
+        behavioral_state_backprojection = export_behavioral_state_backprojection_zarrs(
+            adata=adata_full,
+            output_dir=state_paths.output_dir,
+            cell_type=cell_type,
+            state_col=export_state_col,
+            sample_col="sample_name",
+            track_col="TrackID",
+            time_col="position_t",
+            background_value=0,
+            verbose=verbose,
+        )
+        behavioral_state_backprojection["enabled"] = True
+        behavioral_state_backprojection["state_col"] = export_state_col
+    adata_full.uns["classification"]["behavioral_state_backprojection"] = behavioral_state_backprojection
+
+    adata_full.write(state_paths.full_output_adata_path, compression="gzip")
 
     if verbose:
         n_rows = int(adata_full.n_obs)
@@ -4177,6 +4537,8 @@ def test_pipeline():
         adata=model_adata,
         mapping=full_mapping,
         cluster_key="full_behavioral_cluster",
+        # Set overwrite_original=True to make reruns idempotent.
+        overwrite_original=True,
     )
     
     classifier_paths = train_state_classifiers(
@@ -4201,12 +4563,38 @@ def test_pipeline():
     adata_full = apply_state_classifiers_to_full_dataset(
         output_dir=output_dir,
         cell_type=cell_type,
-        model_adata=model_adata,
-        label_classifier_artifact=classifier_paths["partial_classifier_path"],
-        full_label_classifier_artifact=classifier_paths["full_classifier_path"],
+        # label_classifier_artifact=classifier_paths["partial_classifier_path"],
+        # full_label_classifier_artifact=classifier_paths["full_classifier_path"],
         continuous_output_col="intrinsic_behavioral_cluster",
         full_output_col="full_behavioral_cluster",
         combine_binary_with_continuous=True,
+        verbose=verbose,
+    )
+
+    if "sample_name" not in adata_full.obs.columns:
+        raise ValueError(
+            "test_pipeline requires 'sample_name' in adata_full.obs to visualize backprojection."
+        )
+    sample_names = (
+        pd.Series(adata_full.obs["sample_name"])
+        .dropna()
+        .astype("string")
+        .str.strip()
+    )
+    sample_names = sample_names[sample_names != ""]
+    unique_samples = sorted(sample_names.unique().tolist())
+    if len(unique_samples) == 0:
+        raise ValueError(
+            "test_pipeline could not resolve a sample_name from adata_full.obs for backprojection visualization."
+        )
+    selected_sample_name = "ROCHE_JM1_Exp042-8_Img03_10T_HER2II"
+    if verbose:
+        print(f"Opening behavioral-state backprojection viewer for sample '{selected_sample_name}'")
+    _viewer = show_behavioral_state_backprojection(
+        sample_name=selected_sample_name,
+        output_dir=output_dir,
+        cell_type=cell_type,
+        run=True,
         verbose=verbose,
     )
  
@@ -4267,7 +4655,7 @@ if __name__ == "__main__":
     resolutions = 0.2
     lower_quantile_cap = None
     upper_quantile_cap = 0.99
-    incomplete_window_policy = "drop"
+    incomplete_window_policy = "partial"
     random_state = 12345
     reuse_prepared_dataset = True
     save_prepared_dataset = True

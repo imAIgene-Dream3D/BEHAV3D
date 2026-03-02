@@ -575,30 +575,81 @@ def _create_descriptive_track_worker(
             "'drop', 'partial' (alias: 'as_far_as_possible')."
         )
 
+    idx_all = np.arange(n, dtype=int)
+    time_is_integer_like = False
+    track_min_t = None
+    if t_all is not None:
+        finite_t = t_all[np.isfinite(t_all)]
+        if finite_t.size > 0:
+            time_is_integer_like = bool(np.allclose(finite_t, np.round(finite_t)))
+            track_min_t = float(np.nanmin(finite_t))
+
     for end_idx in range(0, n, stride):
-        start_idx = end_idx - window_size + 1
         end_t = float(t_all[end_idx]) if t_all is not None else float(end_idx)
+        if t_all is None:
+            # Fallback for inputs without time column: keep row-based trailing windows.
+            start_idx = end_idx - window_size + 1
+            if start_idx < 0 and policy == "drop":
+                row = {
+                    id_cols[0]: sample_val,
+                    id_cols[1]: track_id_val,
+                    "sub_TrackID": f"{int(track_id_val)}_tNaN-t{int(end_t)}",
+                    time_col: end_t,
+                    f"window_start_{time_col}": np.nan,
+                    f"window_end_{time_col}": end_t,
+                    "window_length_frames": np.nan,
+                }
+                out_rows.append(row)
+                continue
+            if start_idx < 0 and policy in {"partial", "as_far_as_possible"}:
+                start_idx = 0
+            win_idx = idx_all[start_idx : end_idx + 1]
+        else:
+            # Timepoint-based trailing window: [t-window_size+1, t], clipped in partial mode.
+            target_start_t = float(end_t - int(window_size) + 1)
+            effective_start_t = (
+                max(float(track_min_t), float(target_start_t))
+                if track_min_t is not None
+                else float(target_start_t)
+            )
+            win_mask = (
+                (idx_all <= int(end_idx))
+                & np.isfinite(t_all)
+                & (t_all >= effective_start_t)
+                & (t_all <= float(end_t))
+            )
+            win_idx = np.where(win_mask)[0]
+            if win_idx.size == 0:
+                win_idx = np.asarray([int(end_idx)], dtype=int)
 
-        if start_idx < 0 and policy == "drop":
-            # Not enough history in strict mode: emit NaN window entry.
-            row = {
-                id_cols[0]: sample_val,
-                id_cols[1]: track_id_val,
-                "sub_TrackID": f"{int(track_id_val)}_tNaN-t{int(end_t)}",
-                time_col: end_t,
-                f"window_start_{time_col}": np.nan,
-                f"window_end_{time_col}": end_t,
-                "window_length_frames": np.nan,
-            }
-            out_rows.append(row)
-            continue
+            if policy == "drop":
+                has_full_history = False
+                if track_min_t is not None and np.isfinite(target_start_t) and float(target_start_t) >= float(track_min_t):
+                    if time_is_integer_like:
+                        expected = np.arange(
+                            int(np.round(target_start_t)),
+                            int(np.round(end_t)) + 1,
+                            dtype=int,
+                        )
+                        observed = np.unique(np.round(t_all[win_idx]).astype(int))
+                        has_full_history = bool(np.all(np.isin(expected, observed)))
+                    else:
+                        has_full_history = bool(len(win_idx) >= int(window_size))
 
-        # Partial mode: use as much history as available.
-        if start_idx < 0 and policy in {"partial", "as_far_as_possible"}:
-            start_idx = 0
+                if not has_full_history:
+                    row = {
+                        id_cols[0]: sample_val,
+                        id_cols[1]: track_id_val,
+                        "sub_TrackID": f"{int(track_id_val)}_tNaN-t{int(end_t)}",
+                        time_col: end_t,
+                        f"window_start_{time_col}": np.nan,
+                        f"window_end_{time_col}": end_t,
+                        "window_length_frames": np.nan,
+                    }
+                    out_rows.append(row)
+                    continue
 
-        # Valid trailing window
-        start_t = float(t_all[start_idx]) if t_all is not None else float(start_idx)
+        start_t = float(t_all[win_idx[0]]) if t_all is not None else float(win_idx[0])
         sub_track_id = f"{int(track_id_val)}_t{int(start_t)}-t{int(end_t)}"
 
         row = {
@@ -608,15 +659,15 @@ def _create_descriptive_track_worker(
             time_col: end_t,
             f"window_start_{time_col}": start_t,
             f"window_end_{time_col}": end_t,
-            "window_length_frames": int(end_idx - start_idx + 1),
+            "window_length_frames": int(len(win_idx)),
         }
 
         # motion features for trailing window
         row.update(
             _compute_motion_features_from_xyz(
-                px_all[start_idx : end_idx + 1],
-                py_all[start_idx : end_idx + 1],
-                pz_all[start_idx : end_idx + 1],
+                px_all[win_idx],
+                py_all[win_idx],
+                pz_all[win_idx],
                 features_to_compute=features_to_compute,
             )
         )
@@ -624,10 +675,10 @@ def _create_descriptive_track_worker(
         # per-column signal features over trailing window (non-binary only)
         for col in nonbinary_cols:
             stype = signal_types.get(col, "continuous")
-            sig_win = sig_arrays[col][start_idx : end_idx + 1]
+            sig_win = sig_arrays[col][win_idx]
 
             if t_all is not None:
-                t_win = t_all[start_idx : end_idx + 1]
+                t_win = t_all[win_idx]
                 wdf = pd.DataFrame({col: sig_win, time_col: t_win})
             else:
                 wdf = pd.DataFrame({col: sig_win})
@@ -648,12 +699,33 @@ def _create_descriptive_track_worker(
 
         out_rows.append(row)
 
-    # In partial mode, first row can be t0-t0 (window length 1). For features that
-    # need at least 2 timepoints, copy values from the next available row.
+    # In partial mode, first row can be single-frame. For features that need at least
+    # 2 timepoints, copy values from t+1 row if available, otherwise nearest later
+    # row with window_length_frames >= 2.
     if policy in {"partial", "as_far_as_possible"} and len(out_rows) >= 2:
         first = out_rows[0]
-        second = out_rows[1]
-        if int(first.get("window_length_frames", 0)) <= 1:
+        first_window_len = pd.to_numeric([first.get("window_length_frames", np.nan)], errors="coerce")[0]
+        if np.isfinite(first_window_len) and int(first_window_len) <= 1:
+            source_row = None
+            first_t = pd.to_numeric([first.get(time_col, np.nan)], errors="coerce")[0]
+            if np.isfinite(first_t):
+                target_t = float(first_t) + 1.0
+                for candidate in out_rows[1:]:
+                    cand_t = pd.to_numeric([candidate.get(time_col, np.nan)], errors="coerce")[0]
+                    cand_len = pd.to_numeric([candidate.get("window_length_frames", np.nan)], errors="coerce")[0]
+                    if np.isfinite(cand_t) and np.isfinite(cand_len):
+                        if int(cand_len) >= 2 and np.isclose(float(cand_t), float(target_t)):
+                            source_row = candidate
+                            break
+            if source_row is None:
+                for candidate in out_rows[1:]:
+                    cand_len = pd.to_numeric([candidate.get("window_length_frames", np.nan)], errors="coerce")[0]
+                    if np.isfinite(cand_len) and int(cand_len) >= 2:
+                        source_row = candidate
+                        break
+            if source_row is None:
+                return out_rows
+
             protected = {
                 id_cols[0],
                 id_cols[1],
@@ -666,8 +738,8 @@ def _create_descriptive_track_worker(
             for k in list(first.keys()):
                 if k in protected:
                     continue
-                if _needs_min_two_timepoints(k) and (k in second):
-                    first[k] = second[k]
+                if _needs_min_two_timepoints(k) and (k in source_row):
+                    first[k] = source_row[k]
 
     return out_rows
 

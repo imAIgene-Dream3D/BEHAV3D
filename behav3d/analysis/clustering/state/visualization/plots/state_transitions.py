@@ -4,6 +4,10 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import hashlib
 import re
+import warnings
+from io import BytesIO
+from pathlib import Path
+from matplotlib.backends.backend_pdf import PdfPages
 
 # -----------------------------
 # Plot timepoint>timepoint state transition matrix
@@ -165,7 +169,7 @@ def all_ngrams(
     # counters[n] is a plain dict: {ngram_tuple: count}
     counters = {n: {} for n in n_values}
 
-    for _, g in df.groupby(list(group_cols), sort=False):
+    for _, g in df.groupby(list(group_cols), sort=False, observed=False):
         seq = g["_state"].tolist()
         if collapse_bouts:
             seq = collapse_runs(seq)
@@ -192,11 +196,13 @@ def all_ngrams(
                 }
             )
 
-    out = (
-        pd.DataFrame(rows)
-        .sort_values(["n", "count"], ascending=[True, False], kind="stable")
-        .reset_index(drop=True)
-    )
+    if len(rows) == 0:
+        return pd.DataFrame(
+            columns=["n", "ngram", "ngram_str", "end_state", "count"]
+        )
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values(["n", "count"], ascending=[True, False], kind="stable").reset_index(drop=True)
     return out
 
 # Get top-N n-grams (of order n) that lead to end_state
@@ -297,7 +303,7 @@ def paths_between_states(
     # counter is a plain dict: {path_tuple: count}
     counter = {}
 
-    for _, g in df.groupby(list(group_cols), sort=False):
+    for _, g in df.groupby(list(group_cols), sort=False, observed=False):
         seq = g["_state"].tolist()
         if collapse_bouts:
             seq = collapse_runs(seq)
@@ -379,6 +385,36 @@ def plot_paths_by_count(
     plt.show()
 
 
+def _filter_paths_for_sankey(
+    df,
+    count_col="count",
+    min_count=0,
+    relative_count=0.0,
+):
+    """Filter paths by absolute and/or relative occurrence thresholds."""
+    if count_col not in df.columns:
+        raise KeyError(f"Missing '{count_col}' column in path table.")
+
+    work = df.copy()
+    work[count_col] = pd.to_numeric(work[count_col], errors="coerce").fillna(0.0)
+    work = work[work[count_col] > 0].copy()
+
+    min_count = float(min_count)
+    relative_count = float(relative_count)
+    if min_count < 0:
+        raise ValueError("min_count must be >= 0.")
+    if not (0.0 <= relative_count <= 1.0):
+        raise ValueError("relative_count must be in [0, 1].")
+
+    total_count = float(work[count_col].sum())
+    if min_count > 0:
+        work = work[work[count_col] >= min_count].copy()
+    if relative_count > 0 and total_count > 0:
+        work = work[(work[count_col] / total_count) >= relative_count].copy()
+
+    return work, total_count
+
+
 # Plot a Sankey diagram of paths between states, proportions of most common behavioral routes
 def plot_sankey_diagram_between_states(
     df,
@@ -392,10 +428,16 @@ def plot_sankey_diagram_between_states(
     show_node_labels=False,
     transparent_bg=True,
     font_size=25,
+    relative_count=0.0,
 ):
-    df = df[df[count_col] > min_count].copy()
+    df, _total_count = _filter_paths_for_sankey(
+        df,
+        count_col=count_col,
+        min_count=min_count,
+        relative_count=relative_count,
+    )
     if df.empty:
-        raise ValueError("No rows left after filtering by min_count")
+        raise ValueError("No rows left after filtering by min_count/relative_count")
 
     def stable_rgba(label, a=1.0):
         h = hashlib.md5(str(label).encode("utf-8")).hexdigest()
@@ -607,8 +649,18 @@ def plot_sankey_diagram_between_states(
     bg = "rgba(0,0,0,0)" if transparent_bg else "white"
     legend_bg = "rgba(0,0,0,0)" if transparent_bg else "rgba(255,255,255,0.8)"
 
+    threshold_text = []
+    if float(min_count) > 0:
+        threshold_text.append(f"count >= {min_count}")
+    if float(relative_count) > 0:
+        threshold_text.append(f"share >= {100.0 * float(relative_count):.1f}%")
+    if len(threshold_text) == 0:
+        threshold_suffix = "no path filter"
+    else:
+        threshold_suffix = ", ".join(threshold_text)
+
     fig.update_layout(
-        title_text=f"Right-aligned Sankey (count > {min_count})",
+        title_text=f"Right-aligned Sankey ({threshold_suffix})",
         font_size=font_size,
         margin=dict(l=20, r=220, t=50, b=20),
         legend=dict(
@@ -629,65 +681,602 @@ def plot_sankey_diagram_between_states(
     return fig
 
 
-test():
-    # -----------------------------
-    # Usage (same behavior as your script)
-    # -----------------------------
-    # compute 2-, 3-, and 4-grams
-    cluster_column = "full_behavioral_cluster"  # matches your snippet; could also be "ClusterID"
+def _natural_sort_key(value):
+    parts = re.split(r"(\d+)", str(value))
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+
+def _sanitize_filename_token(value, fallback="value"):
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
+    token = token.strip("._-")
+    return token if len(token) > 0 else str(fallback)
+
+
+def _plot_transition_heatmap_page(df_matrix, title, colorbar_label, normalized):
+    fig, ax = plt.subplots(figsize=(7.5, 6.0))
+    arr = df_matrix.to_numpy(dtype=float, copy=True)
+    if normalized:
+        im = ax.imshow(arr, aspect="auto", vmin=0.0, vmax=1.0)
+    else:
+        im = ax.imshow(arr, aspect="auto")
+
+    n_rows, n_cols = arr.shape
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_xticklabels([str(c) for c in df_matrix.columns], rotation=90)
+    ax.set_yticklabels([str(i) for i in df_matrix.index])
+    ax.set_xlabel("Next state")
+    ax.set_ylabel("Current state")
+    ax.set_title(str(title))
+    plt.colorbar(im, ax=ax, label=str(colorbar_label))
+    fig.tight_layout()
+    return fig
+
+
+def _plot_ngram_ranking_page(df_ranking, title, y_col="ngram_str", x_col="count"):
+    work = df_ranking.copy()
+    if len(work) == 0:
+        return None
+    work[x_col] = pd.to_numeric(work[x_col], errors="coerce").fillna(0.0)
+    work = work.sort_values(x_col, ascending=False, kind="stable")
+    if len(work) == 0:
+        return None
+
+    fig_h = max(4.0, min(18.0, 0.35 * float(len(work)) + 1.5))
+    fig, ax = plt.subplots(figsize=(11.0, fig_h))
+    labels = work[y_col].astype(str).tolist()[::-1]
+    values = work[x_col].astype(float).tolist()[::-1]
+    ax.barh(labels, values)
+    ax.set_xlabel("Count (pooled across tracks)")
+    ax.set_ylabel("N-gram")
+    ax.set_title(str(title))
+    fig.tight_layout()
+    return fig
+
+
+def _coerce_ngram_orders(ngram_orders):
+    if isinstance(ngram_orders, (int, np.integer)):
+        vals = [int(ngram_orders)]
+    else:
+        vals = [int(v) for v in list(ngram_orders)]
+    vals = sorted({int(v) for v in vals if int(v) >= 2})
+    if len(vals) == 0:
+        raise ValueError("ngram_orders must contain at least one integer >= 2.")
+    return tuple(vals)
+
+
+def _build_ngram_tables(
+    adata,
+    state_col,
+    id_cols,
+    time_col,
+    ngram_orders,
+    collapse_bouts,
+    ngram_min_count,
+    ngram_pooled_top_n,
+    ngram_per_state_top_n,
+):
     df_ngrams = all_ngrams(
-        adata_full,
-        n_values=(2, 3, 4),
-        state_col=cluster_column,
-        group_cols=("sample_name", "TrackID"),
-        time_col="position_t",
-        collapse_bouts=True,  # strongly recommended
+        adata_full=adata,
+        n_values=tuple(ngram_orders),
+        state_col=str(state_col),
+        group_cols=tuple(id_cols),
+        time_col=str(time_col),
+        collapse_bouts=bool(collapse_bouts),
+    ).copy()
+
+    if len(df_ngrams) == 0:
+        df_ngrams = pd.DataFrame(
+            columns=["n", "ngram", "ngram_str", "end_state", "count", "start_state"]
+        )
+        return df_ngrams, df_ngrams.copy(), df_ngrams.copy(), df_ngrams.copy()
+
+    df_ngrams["count"] = pd.to_numeric(df_ngrams["count"], errors="coerce").fillna(0).astype(int)
+    df_ngrams = df_ngrams[df_ngrams["count"] > 0].copy()
+    df_ngrams["start_state"] = df_ngrams["ngram"].apply(
+        lambda g: str(g[0]) if isinstance(g, tuple) and len(g) > 0 else ""
+    )
+    df_ngrams["end_state"] = df_ngrams["end_state"].astype(str)
+    df_ngrams["ngram_str"] = df_ngrams["ngram_str"].astype(str)
+
+    work = df_ngrams[df_ngrams["count"] >= int(ngram_min_count)].copy()
+
+    pooled_rows = []
+    for n in tuple(ngram_orders):
+        sub = work[work["n"] == int(n)].sort_values("count", ascending=False, kind="stable").head(int(ngram_pooled_top_n))
+        if len(sub) > 0:
+            sub = sub.copy()
+            sub["rank_scope"] = "pooled"
+            pooled_rows.append(sub)
+    pooled_df = pd.concat(pooled_rows, ignore_index=True) if len(pooled_rows) > 0 else work.iloc[0:0].copy()
+
+    per_end_rows = []
+    for n in tuple(ngram_orders):
+        sub_n = work[work["n"] == int(n)]
+        for end_state, g in sub_n.groupby("end_state", sort=False, observed=False):
+            g = g.sort_values("count", ascending=False, kind="stable").head(int(ngram_per_state_top_n))
+            if len(g) == 0:
+                continue
+            g = g.copy()
+            g["rank_scope"] = "per_end_state"
+            g["group_state"] = str(end_state)
+            per_end_rows.append(g)
+    per_end_df = pd.concat(per_end_rows, ignore_index=True) if len(per_end_rows) > 0 else work.iloc[0:0].copy()
+
+    per_start_rows = []
+    for n in tuple(ngram_orders):
+        sub_n = work[work["n"] == int(n)]
+        for start_state, g in sub_n.groupby("start_state", sort=False, observed=False):
+            g = g.sort_values("count", ascending=False, kind="stable").head(int(ngram_per_state_top_n))
+            if len(g) == 0:
+                continue
+            g = g.copy()
+            g["rank_scope"] = "per_start_state"
+            g["group_state"] = str(start_state)
+            per_start_rows.append(g)
+    per_start_df = pd.concat(per_start_rows, ignore_index=True) if len(per_start_rows) > 0 else work.iloc[0:0].copy()
+
+    return df_ngrams, pooled_df, per_end_df, per_start_df
+
+
+def save_state_transition_report(
+    adata,
+    output_dir,
+    *,
+    state_col="full_behavioral_cluster",
+    id_cols=("sample_name", "TrackID"),
+    time_col="position_t",
+    include_self_pairs=True,
+    rows_per_page=3,
+    sankey_min_count=100,
+    sankey_relative_count=0.0,
+    sankey_vector_export=True,
+    sankey_one_plot_per_page=True,
+    sankey_merge_backend="pypdf_optional",
+    sankey_mode="next_end",
+    collapse_bouts=True,
+    allow_revisit_end=False,
+    max_path_len=None,
+    include_no_self_matrices=True,
+    include_ngram_rankings=True,
+    ngram_orders=(2, 3),
+    ngram_pooled_top_n=30,
+    ngram_per_state_top_n=10,
+    ngram_include_per_end_state=True,
+    ngram_include_per_start_state=True,
+    ngram_min_count=1,
+    state_colors=None,
+    verbose=True,
+):
+    """Save transition matrix + all-pairs Sankey report for one state column."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    html_dir = output_dir / "sankey_html"
+
+    include_no_self_matrices = bool(include_no_self_matrices)
+    include_ngram_rankings = bool(include_ngram_rankings)
+    ngram_include_per_end_state = bool(ngram_include_per_end_state)
+    ngram_include_per_start_state = bool(ngram_include_per_start_state)
+    ngram_orders = _coerce_ngram_orders(ngram_orders)
+    ngram_pooled_top_n = max(1, int(ngram_pooled_top_n))
+    ngram_per_state_top_n = max(1, int(ngram_per_state_top_n))
+    ngram_min_count = max(1, int(ngram_min_count))
+
+    counts, probs = compute_cluster_transition_matrix(
+        adata,
+        cluster_key=str(state_col),
+        id_cols=tuple(id_cols),
+        time_key=str(time_col),
+        normalize=True,
+        plot=False,
+        only_transitions=False,
     )
 
-    plot_top_ngrams(df_ngrams, n=3, top_n=30)
-    plot_top_ngrams_per_end_state(df_ngrams, n=4, top_n=10)
+    matrix_counts_csv = output_dir / "transition_matrix_counts.csv"
+    matrix_probs_csv = output_dir / "transition_matrix_probs.csv"
+    matrix_counts_no_self_csv = output_dir / "transition_matrix_counts_no_self.csv"
+    matrix_probs_no_self_csv = output_dir / "transition_matrix_probs_no_self.csv"
+    matrix_heatmap_pdf = output_dir / "transition_matrix_heatmap.pdf"
+    counts.to_csv(matrix_counts_csv)
+    probs.to_csv(matrix_probs_csv)
 
-    df_paths_1_5 = paths_between_states(
-        adata_full,
-        start_state="static",
-        end_state="organoid_contact",
-        state_col=cluster_column,
-        collapse_bouts=True,
-        mode="next_end",
+    counts_no_self = None
+    probs_no_self = None
+    if include_no_self_matrices:
+        counts_no_self, probs_no_self = compute_cluster_transition_matrix(
+            adata,
+            cluster_key=str(state_col),
+            id_cols=tuple(id_cols),
+            time_key=str(time_col),
+            normalize=True,
+            plot=False,
+            only_transitions=True,
+        )
+        counts_no_self.to_csv(matrix_counts_no_self_csv)
+        probs_no_self.to_csv(matrix_probs_no_self_csv)
+
+    if str(state_col) not in adata.obs.columns:
+        raise KeyError(f"Missing state column '{state_col}' in adata.obs.")
+    states = (
+        pd.Series(adata.obs[str(state_col)])
+        .astype("string")
+        .dropna()
+        .astype(str)
+        .str.strip()
     )
+    states = sorted(states.unique().tolist(), key=_natural_sort_key)
 
-    plot_paths_by_count(
-        df_paths_1_5,
-        top_n=25,
-        min_count=1,
-        title="Most common paths from state 1 to state 5",
-    )
+    ngrams_all_csv = output_dir / "transition_ngrams_all.csv"
+    ngrams_pooled_csv = output_dir / "transition_ngrams_pooled.csv"
+    ngrams_per_end_csv = output_dir / "transition_ngrams_per_end.csv"
+    ngrams_per_start_csv = output_dir / "transition_ngrams_per_start.csv"
 
-    colors = [
-        "#d62728",
-        "#1f77b4",
-        "#ff7f0e",
-        "#2ca02c",
-        "#9467bd",
-        "#8c564b",
-        "#e377c2",
-        "#7f7f7f",
-        "#bcbd22",
-        "#17becf",
-    ]
+    df_ngrams = None
+    df_ngrams_pooled = None
+    df_ngrams_per_end = None
+    df_ngrams_per_start = None
+    if include_ngram_rankings:
+        df_ngrams, df_ngrams_pooled, df_ngrams_per_end, df_ngrams_per_start = _build_ngram_tables(
+            adata=adata,
+            state_col=state_col,
+            id_cols=id_cols,
+            time_col=time_col,
+            ngram_orders=ngram_orders,
+            collapse_bouts=collapse_bouts,
+            ngram_min_count=ngram_min_count,
+            ngram_pooled_top_n=ngram_pooled_top_n,
+            ngram_per_state_top_n=ngram_per_state_top_n,
+        )
+        df_ngrams.to_csv(ngrams_all_csv, index=False)
+        df_ngrams_pooled.to_csv(ngrams_pooled_csv, index=False)
+        df_ngrams_per_end.to_csv(ngrams_per_end_csv, index=False)
+        df_ngrams_per_start.to_csv(ngrams_per_start_csv, index=False)
 
-    fig = plot_sankey_diagram_between_states(
-        df_paths_1_5,
-        state_colors=colors,
-        min_count=100,
-    )
+    with PdfPages(matrix_heatmap_pdf) as pdf:
+        fig_counts = _plot_transition_heatmap_page(
+            counts,
+            title=f"Transition Counts ({state_col})",
+            colorbar_label="Count",
+            normalized=False,
+        )
+        pdf.savefig(fig_counts, bbox_inches="tight")
+        plt.close(fig_counts)
 
-    # export + show
-    # (requires kaleido installed for write_image / to_image)
-    fig.write_image(
-        "/Users/s.deblank-3/Downloads/newplot.pdf",
-        width=1400,
-        height=700,
-        scale=2,
-    )
-    fig.show()
+        fig_probs = _plot_transition_heatmap_page(
+            probs,
+            title=f"Transition Probabilities ({state_col})",
+            colorbar_label="P(next | current)",
+            normalized=True,
+        )
+        pdf.savefig(fig_probs, bbox_inches="tight")
+        plt.close(fig_probs)
+
+        if include_no_self_matrices and counts_no_self is not None and probs_no_self is not None:
+            fig_counts_no_self = _plot_transition_heatmap_page(
+                counts_no_self,
+                title=f"Transition Counts (self-transitions removed) ({state_col})",
+                colorbar_label="Count",
+                normalized=False,
+            )
+            pdf.savefig(fig_counts_no_self, bbox_inches="tight")
+            plt.close(fig_counts_no_self)
+
+            fig_probs_no_self = _plot_transition_heatmap_page(
+                probs_no_self,
+                title=f"Transition Probabilities (self-transitions removed) ({state_col})",
+                colorbar_label="P(next | current, next != current)",
+                normalized=True,
+            )
+            pdf.savefig(fig_probs_no_self, bbox_inches="tight")
+            plt.close(fig_probs_no_self)
+
+        if include_ngram_rankings and df_ngrams is not None:
+            for n in ngram_orders:
+                pooled_n = df_ngrams_pooled[df_ngrams_pooled["n"] == int(n)].copy()
+                fig = _plot_ngram_ranking_page(
+                    pooled_n,
+                    title=f"Top {ngram_pooled_top_n} {n}-grams (pooled)",
+                )
+                if fig is not None:
+                    pdf.savefig(fig, bbox_inches="tight")
+                    plt.close(fig)
+
+            if ngram_include_per_end_state:
+                end_states = sorted(
+                    df_ngrams_per_end.get("group_state", pd.Series([], dtype=str)).astype(str).unique().tolist(),
+                    key=_natural_sort_key,
+                )
+                for end_state in end_states:
+                    for n in ngram_orders:
+                        sub = df_ngrams_per_end[
+                            (df_ngrams_per_end["n"] == int(n))
+                            & (df_ngrams_per_end["group_state"].astype(str) == str(end_state))
+                        ].copy()
+                        fig = _plot_ngram_ranking_page(
+                            sub,
+                            title=f"Top {ngram_per_state_top_n} {n}-grams ending in {end_state}",
+                        )
+                        if fig is not None:
+                            pdf.savefig(fig, bbox_inches="tight")
+                            plt.close(fig)
+
+            if ngram_include_per_start_state:
+                start_states = sorted(
+                    df_ngrams_per_start.get("group_state", pd.Series([], dtype=str)).astype(str).unique().tolist(),
+                    key=_natural_sort_key,
+                )
+                for start_state in start_states:
+                    for n in ngram_orders:
+                        sub = df_ngrams_per_start[
+                            (df_ngrams_per_start["n"] == int(n))
+                            & (df_ngrams_per_start["group_state"].astype(str) == str(start_state))
+                        ].copy()
+                        fig = _plot_ngram_ranking_page(
+                            sub,
+                            title=f"Top {ngram_per_state_top_n} {n}-grams starting in {start_state}",
+                        )
+                        if fig is not None:
+                            pdf.savefig(fig, bbox_inches="tight")
+                            plt.close(fig)
+
+    rows_per_page = max(1, int(rows_per_page))
+    include_self_pairs = bool(include_self_pairs)
+    sankey_min_count = int(sankey_min_count)
+    sankey_relative_count = float(sankey_relative_count)
+    sankey_vector_export = bool(sankey_vector_export)
+    sankey_one_plot_per_page = bool(sankey_one_plot_per_page)
+    sankey_merge_backend = str(sankey_merge_backend).strip().lower()
+    if sankey_merge_backend not in {"pypdf_optional", "pypdf_required", "none"}:
+        raise ValueError("sankey_merge_backend must be one of: 'pypdf_optional', 'pypdf_required', 'none'.")
+    if not (0.0 <= sankey_relative_count <= 1.0):
+        raise ValueError("sankey_relative_count must be in [0, 1].")
+    if sankey_vector_export and (not sankey_one_plot_per_page) and verbose:
+        print("Sankey vector export uses one plot per page; ignoring sankey_one_plot_per_page=False.")
+
+    pair_rows = []
+    sankey_pdf_pages_dir = output_dir / "sankey_pdf_pages"
+    sankey_pdf_page_rows = []
+    sankey_png_rows = []
+    sankey_pdf_path = output_dir / "sankey_all_pairs.pdf"
+    kaleido_available = True
+    kaleido_warned = False
+
+    for start_state in states:
+        for end_state in states:
+            if (not include_self_pairs) and (str(start_state) == str(end_state)):
+                continue
+
+            row = {
+                "start_state": str(start_state),
+                "end_state": str(end_state),
+                "n_paths": 0,
+                "count_sum": 0,
+                "status": "no_paths",
+                "sankey_output_path": None,
+                "sankey_pdf_page": None,
+                "error": None,
+            }
+
+            df_paths = paths_between_states(
+                adata,
+                start_state=str(start_state),
+                end_state=str(end_state),
+                state_col=str(state_col),
+                group_cols=tuple(id_cols),
+                time_col=str(time_col),
+                collapse_bouts=bool(collapse_bouts),
+                mode=str(sankey_mode),
+                allow_revisit_end=bool(allow_revisit_end),
+                max_len=max_path_len,
+            )
+
+            if not df_paths.empty:
+                row["n_paths"] = int(len(df_paths))
+                row["count_sum"] = int(pd.to_numeric(df_paths["count"], errors="coerce").fillna(0).sum())
+
+            if len(df_paths) == 0:
+                pair_rows.append(row)
+                continue
+
+            df_paths_filtered, _total_count = _filter_paths_for_sankey(
+                df_paths,
+                count_col="count",
+                min_count=sankey_min_count,
+                relative_count=sankey_relative_count,
+            )
+            row["n_paths_filtered"] = int(len(df_paths_filtered))
+            row["count_sum_filtered"] = int(
+                pd.to_numeric(df_paths_filtered.get("count", pd.Series([], dtype=float)), errors="coerce")
+                .fillna(0)
+                .sum()
+            )
+            if len(df_paths_filtered) == 0:
+                row["status"] = "no_paths_after_filter"
+                pair_rows.append(row)
+                continue
+
+            try:
+                fig = plot_sankey_diagram_between_states(
+                    df_paths,
+                    state_colors=state_colors,
+                    min_count=sankey_min_count,
+                    relative_count=sankey_relative_count,
+                )
+            except Exception as exc:
+                row["status"] = "error"
+                row["error"] = str(exc)
+                pair_rows.append(row)
+                continue
+
+            if kaleido_available and sankey_vector_export:
+                try:
+                    sankey_pdf_pages_dir.mkdir(parents=True, exist_ok=True)
+                    page_filename = (
+                        "sankey_"
+                        + _sanitize_filename_token(start_state, "start")
+                        + "_to_"
+                        + _sanitize_filename_token(end_state, "end")
+                        + ".pdf"
+                    )
+                    page_path = sankey_pdf_pages_dir / page_filename
+                    fig.write_image(str(page_path), format="pdf", width=1400, height=700, scale=2)
+                    row["status"] = "pdf_unmerged"
+                    row["sankey_output_path"] = str(page_path)
+                    sankey_pdf_page_rows.append({"row": row, "pdf_path": page_path})
+                except Exception as exc:
+                    kaleido_available = False
+                    if not kaleido_warned:
+                        warnings.warn(
+                            "Static Plotly export unavailable for Sankey vector PDF; falling back to HTML files. "
+                            f"Details: {exc}",
+                            RuntimeWarning,
+                        )
+                        kaleido_warned = True
+
+            if kaleido_available and (not sankey_vector_export):
+                try:
+                    png_bytes = fig.to_image(format="png", width=1400, height=700, scale=2)
+                    row["status"] = "pdf_pending"
+                    sankey_png_rows.append({"row": row, "png_bytes": png_bytes})
+                except Exception as exc:
+                    kaleido_available = False
+                    if not kaleido_warned:
+                        warnings.warn(
+                            "Kaleido unavailable for Sankey PDF export; falling back to HTML files. "
+                            f"Details: {exc}",
+                            RuntimeWarning,
+                        )
+                        kaleido_warned = True
+
+            if not kaleido_available:
+                html_dir.mkdir(parents=True, exist_ok=True)
+                html_name = (
+                    "sankey_"
+                    + _sanitize_filename_token(start_state, "start")
+                    + "_to_"
+                    + _sanitize_filename_token(end_state, "end")
+                    + ".html"
+                )
+                html_path = html_dir / html_name
+                try:
+                    fig.write_html(str(html_path), include_plotlyjs="cdn", full_html=True)
+                    row["status"] = "html"
+                    row["sankey_output_path"] = str(html_path)
+                except Exception as exc:
+                    row["status"] = "error"
+                    row["error"] = str(exc)
+
+            pair_rows.append(row)
+
+    sankey_pdf_written = False
+    if sankey_vector_export and len(sankey_pdf_page_rows) > 0:
+        if sankey_merge_backend == "none":
+            sankey_pdf_written = False
+        else:
+            merger_cls = None
+            try:
+                from pypdf import PdfMerger as _PdfMerger
+                merger_cls = _PdfMerger
+            except Exception as exc:
+                if sankey_merge_backend == "pypdf_required":
+                    raise RuntimeError(
+                        "sankey_merge_backend='pypdf_required' but pypdf is not available."
+                    ) from exc
+                if not kaleido_warned:
+                    warnings.warn(
+                        "pypdf unavailable for merging Sankey vector pages; keeping per-pair PDF files only.",
+                        RuntimeWarning,
+                    )
+                    kaleido_warned = True
+                merger_cls = None
+
+            if merger_cls is not None:
+                merger = merger_cls()
+                for i, item in enumerate(sankey_pdf_page_rows):
+                    row = item["row"]
+                    page_path = item["pdf_path"]
+                    merger.append(str(page_path))
+                    row["status"] = "pdf"
+                    row["sankey_pdf_page"] = int(i) + 1
+                    row["sankey_output_path"] = str(sankey_pdf_path)
+                with open(sankey_pdf_path, "wb") as f:
+                    merger.write(f)
+                merger.close()
+                sankey_pdf_written = True
+
+    if (not sankey_vector_export) and len(sankey_png_rows) > 0:
+        with PdfPages(sankey_pdf_path) as pdf:
+            for i in range(0, len(sankey_png_rows), rows_per_page):
+                chunk = sankey_png_rows[i : i + rows_per_page]
+                n_chunk = len(chunk)
+                fig, axes = plt.subplots(n_chunk, 1, figsize=(11.69, 3.6 * n_chunk))
+                if n_chunk == 1:
+                    axes = [axes]
+
+                for j, item in enumerate(chunk):
+                    row = item["row"]
+                    page_number = int((i + j) // rows_per_page) + 1
+                    row["status"] = "pdf"
+                    row["sankey_pdf_page"] = page_number
+                    row["sankey_output_path"] = str(sankey_pdf_path)
+                    img = plt.imread(BytesIO(item["png_bytes"]), format="png")
+                    ax = axes[j]
+                    ax.imshow(img)
+                    ax.axis("off")
+                    ax.set_title(
+                        f"{row['start_state']} -> {row['end_state']} "
+                        f"(n_paths={row['n_paths']}, count_sum={row['count_sum']})",
+                        fontsize=10,
+                    )
+
+                fig.tight_layout()
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+        sankey_pdf_written = True
+
+    pair_index_df = pd.DataFrame(pair_rows)
+    pair_index_csv = output_dir / "sankey_pairs_index.csv"
+    pair_index_df.to_csv(pair_index_csv, index=False)
+
+    if verbose:
+        print(f"Saved transition matrix counts CSV: {matrix_counts_csv}")
+        print(f"Saved transition matrix probabilities CSV: {matrix_probs_csv}")
+        if include_no_self_matrices:
+            print(f"Saved no-self transition matrix counts CSV: {matrix_counts_no_self_csv}")
+            print(f"Saved no-self transition matrix probabilities CSV: {matrix_probs_no_self_csv}")
+        print(f"Saved transition matrix heatmap PDF: {matrix_heatmap_pdf}")
+        if include_ngram_rankings:
+            print(f"Saved transition n-grams CSV (all): {ngrams_all_csv}")
+            print(f"Saved transition n-grams CSV (pooled): {ngrams_pooled_csv}")
+            print(f"Saved transition n-grams CSV (per-end): {ngrams_per_end_csv}")
+            print(f"Saved transition n-grams CSV (per-start): {ngrams_per_start_csv}")
+        if sankey_pdf_written:
+            print(f"Saved Sankey all-pairs PDF: {sankey_pdf_path}")
+        elif html_dir.exists():
+            print(f"Saved Sankey HTML fallback directory: {html_dir}")
+        print(f"Saved Sankey pair index CSV: {pair_index_csv}")
+
+    return {
+        "output_dir": str(output_dir),
+        "state_col": str(state_col),
+        "states": list(states),
+        "sankey_min_count": int(sankey_min_count),
+        "sankey_relative_count": float(sankey_relative_count),
+        "transition_matrix_counts_csv": str(matrix_counts_csv),
+        "transition_matrix_probs_csv": str(matrix_probs_csv),
+        "transition_matrix_counts_no_self_csv": (
+            str(matrix_counts_no_self_csv) if include_no_self_matrices else None
+        ),
+        "transition_matrix_probs_no_self_csv": (
+            str(matrix_probs_no_self_csv) if include_no_self_matrices else None
+        ),
+        "transition_matrix_heatmap_pdf": str(matrix_heatmap_pdf),
+        "transition_ngrams_all_csv": (str(ngrams_all_csv) if include_ngram_rankings else None),
+        "transition_ngrams_pooled_csv": (str(ngrams_pooled_csv) if include_ngram_rankings else None),
+        "transition_ngrams_per_end_csv": (str(ngrams_per_end_csv) if include_ngram_rankings else None),
+        "transition_ngrams_per_start_csv": (str(ngrams_per_start_csv) if include_ngram_rankings else None),
+        "sankey_pairs_index_csv": str(pair_index_csv),
+        "sankey_pdf_path": (str(sankey_pdf_path) if sankey_pdf_written else None),
+        "sankey_pdf_pages_dir": (str(sankey_pdf_pages_dir) if sankey_pdf_pages_dir.exists() else None),
+        "sankey_html_dir": (str(html_dir) if html_dir.exists() else None),
+    }

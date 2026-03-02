@@ -3656,6 +3656,8 @@ def test_pipeline():
         adata=model_adata,
         mapping=full_mapping,
         cluster_key="full_behavioral_cluster",
+        # Set overwrite_original=True to make reruns idempotent.
+        overwrite_original=True,
     )
     
     classifier_paths = train_state_classifiers(
