@@ -489,14 +489,28 @@ class TrackingTab(QWidget):
         self.cell_tabs.setTabPosition(QTabWidget.West)
         layout.addWidget(self.cell_tabs)
 
-        # Global Run Button
+        # Global Run Button + Queue button
         self.btn_run_batch = QPushButton("Run Batch Tracking (All Cell Types)")
         self.btn_run_batch.setStyleSheet(
             "background-color: #007bff; color: white; font-weight: bold; "
             "border-radius: 4px; padding: 10px; font-size: 14px;"
         )
         self.btn_run_batch.clicked.connect(self._on_run_batch_clicked)
-        layout.addWidget(self.btn_run_batch)
+
+        self.btn_queue_track = QPushButton("+🛒")
+        self.btn_queue_track.setFixedSize(36, 32)
+        self.btn_queue_track.setToolTip("Add Batch Tracking to Processing Queue")
+        self.btn_queue_track.setStyleSheet(
+            "QPushButton { background: #1a1a2e; color: #ffc107; border: 1px solid #ffc107; "
+            "border-radius: 4px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
+        )
+
+        batch_btn_row = QHBoxLayout()
+        batch_btn_row.setSpacing(4)
+        batch_btn_row.addWidget(self.btn_run_batch, stretch=1)
+        batch_btn_row.addWidget(self.btn_queue_track)
+        layout.addLayout(batch_btn_row)
 
         # Log window
         self.log_box = QTextEdit()
@@ -586,7 +600,11 @@ class TrackingTab(QWidget):
             self.cell_tabs.addTab(panel, f"🟡 {ct.capitalize()}")
 
     def _on_run_batch_clicked(self):
-        """Sequential run for all configured cell type panels."""
+        self.run_batch_tracking(interactive=True)
+
+    def run_batch_tracking(self, interactive=True):
+        """Sequential run for all configured cell type panels.
+        When interactive=False, skips overwrite and visualization dialogs."""
         if not self.panels:
             self._log("No cell type panels to track.")
             return
@@ -602,7 +620,7 @@ class TrackingTab(QWidget):
                 existing_types.append(ct)
         
         overwrite = True
-        if existing_types:
+        if existing_types and interactive:
             from qtpy.QtWidgets import QMessageBox
             msg = f"Pre-existing tracking data found for: {', '.join(existing_types)}.\n\nDo you want to overwrite it?"
             res = QMessageBox.question(
@@ -624,16 +642,16 @@ class TrackingTab(QWidget):
             
             self._log("✅ Batch tracking finished.")
 
-            from qtpy.QtWidgets import QMessageBox
-            res = QMessageBox.question(
-                self, "Batch Tracking Finished",
-                "Successfully tracked all cell types! \n\nDo you want to switch to the Visualization Tab and see the tracks?",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if res == QMessageBox.Yes:
-                # Use the logic from any panel (they all have access to same parent/viewer)
-                first_panel = next(iter(self.panels.values()))
-                first_panel._switch_to_viz_and_show_tracks()
+            if interactive:
+                from qtpy.QtWidgets import QMessageBox
+                res = QMessageBox.question(
+                    self, "Batch Tracking Finished",
+                    "Successfully tracked all cell types! \n\nDo you want to switch to the Visualization Tab and see the tracks?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if res == QMessageBox.Yes:
+                    first_panel = next(iter(self.panels.values()))
+                    first_panel._switch_to_viz_and_show_tracks()
 
         except Exception as e:
             traceback.print_exc()

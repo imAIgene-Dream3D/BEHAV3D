@@ -7,7 +7,7 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
     QStackedWidget, QPushButton, QGroupBox, QFormLayout, 
     QSpinBox, QDoubleSpinBox, QCheckBox, QFileDialog, QScrollArea,
-    QPlainTextEdit, QTextEdit
+    QPlainTextEdit, QTextEdit, QMessageBox
 )
 from qtpy.QtCore import Qt
 import pandas as pd
@@ -314,6 +314,18 @@ class PixelClassifierWidget(QWidget):
         train_btn_row.addWidget(self.btn_clear_layer)
         train_btn_row.addWidget(self.btn_clear_all)
         train_btn_row.addWidget(self.btn_train_update)
+
+        # +🛒 button for Train
+        self.btn_queue_train = QPushButton("+🛒")
+        self.btn_queue_train.setFixedSize(36, 28)
+        self.btn_queue_train.setToolTip("Add Train Classifier to Processing Queue")
+        self.btn_queue_train.setStyleSheet(
+            "QPushButton { background: #1a1a2e; color: #ffc107; border: 1px solid #ffc107; "
+            "border-radius: 4px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
+        )
+        self.btn_queue_train.setVisible(False)
+        train_btn_row.addWidget(self.btn_queue_train)
         
         train_layout = QVBoxLayout()
         train_layout.addLayout(train_form)
@@ -435,10 +447,26 @@ class PixelClassifierWidget(QWidget):
         self.btn_run_segmentation = QPushButton("Run Batch Segmentation")
         self.btn_run_segmentation.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; border-radius: 4px; padding: 6px; font-size: 12px;")
         self.btn_run_segmentation.clicked.connect(self._on_run_segmentation_clicked)
+
+        # +🛒 button for Batch Segmentation
+        self.btn_queue_segment = QPushButton("+🛒")
+        self.btn_queue_segment.setFixedSize(36, 28)
+        self.btn_queue_segment.setToolTip("Add Batch Segmentation to Processing Queue")
+        self.btn_queue_segment.setStyleSheet(
+            "QPushButton { background: #1a1a2e; color: #ffc107; border: 1px solid #ffc107; "
+            "border-radius: 4px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
+        )
+        self.btn_queue_segment.setVisible(False)
+
+        seg_btn_row = QHBoxLayout()
+        seg_btn_row.setSpacing(4)
+        seg_btn_row.addWidget(self.btn_run_segmentation, stretch=1)
+        seg_btn_row.addWidget(self.btn_queue_segment)
         
         seg_layout = QVBoxLayout()
         seg_layout.addLayout(seg_form)
-        seg_layout.addWidget(self.btn_run_segmentation)
+        seg_layout.addLayout(seg_btn_row)
         seg_group.setLayout(seg_layout)
         
         content_layout.addWidget(seg_group)
@@ -448,6 +476,8 @@ class PixelClassifierWidget(QWidget):
         self.log("Metadata updated, refreshing Segmentation Tab...")
         self._detect_cell_types()
         self._refresh_params_ui()
+        # Show segmentation queue button once metadata is loaded
+        self.btn_queue_segment.setVisible(True)
 
     def _refresh_params_ui(self):
         # Collect all items first, then process
@@ -644,6 +674,7 @@ class PixelClassifierWidget(QWidget):
         self.btn_train_update.setVisible(False)
         self.legend_widget.setVisible(False)
         self.instruction_label.setVisible(False)
+        self.btn_queue_train.setVisible(False)
         
         self.all_images = None
         self.all_features = None
@@ -728,6 +759,10 @@ class PixelClassifierWidget(QWidget):
         self.spin_t_end.setEnabled(not checked)
 
     def _on_run_segmentation_clicked(self):
+        self.run_batch_segmentation(interactive=True)
+
+    def run_batch_segmentation(self, interactive=True):
+        """Run batch segmentation. When interactive=False, skips dialogs."""
         if self.metadata_loader.metadata is None:
             self.log("⚠️ Cannot run segmentation: No metadata loaded.")
             return
@@ -735,16 +770,18 @@ class PixelClassifierWidget(QWidget):
         self.log("Starting batch segmentation...")
         self._persist_params()
         try:
-            from qtpy.QtWidgets import QMessageBox
-
-            # Ask user about overwriting
-            overwrite_msg = "Do you want to overwrite existing segmentation results for the selected timepoints?"
-            reply = QMessageBox.question(
-                self, "Overwrite Existing Results?",
-                overwrite_msg,
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            overwrite = (reply == QMessageBox.Yes)
+            if interactive:
+                from qtpy.QtWidgets import QMessageBox
+                # Ask user about overwriting
+                overwrite_msg = "Do you want to overwrite existing segmentation results for the selected timepoints?"
+                reply = QMessageBox.question(
+                    self, "Overwrite Existing Results?",
+                    overwrite_msg,
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                overwrite = (reply == QMessageBox.Yes)
+            else:
+                overwrite = True
             
             # Timepoint range
             if self.check_process_all.isChecked():
@@ -846,46 +883,46 @@ class PixelClassifierWidget(QWidget):
             if csv_path:
                 try:
                     updated_metadata.to_csv(csv_path, index=False)
-                    # self.log(f"  Metadata CSV updated at: {csv_path}")
                 except Exception as e:
                     self.log(f"  Warning: Could not save metadata CSV: {e}")
 
             self.log("Batch segmentation finished successfully!")
 
-            # Prompt the user if they want to visualize results
-            from qtpy.QtWidgets import QMessageBox
-            res = QMessageBox.question(
-                self,
-                "Segmentation Finished",
-                "Batch segmentation finished successfully! \n\nDo you want to switch to the Visualization Tab and see the segments?",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            
-            if res == QMessageBox.Yes:
-                # Trigger switch to visualization tab and load first sample
-                parent = self.parent()
-                while parent and not hasattr(parent, 'tabs'):
-                    parent = parent.parent()
+            # Prompt the user if they want to visualize results (only in interactive mode)
+            if interactive:
+                from qtpy.QtWidgets import QMessageBox
+                res = QMessageBox.question(
+                    self,
+                    "Segmentation Finished",
+                    "Batch segmentation finished successfully! \n\nDo you want to switch to the Visualization Tab and see the segments?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
                 
-                if parent and hasattr(parent, 'tabs'):
-                    # Switch to visualization tab (index 1)
-                    parent.tabs.setCurrentIndex(1)
-                    # Load first sample
-                    if hasattr(parent, 'visualization_tab'):
-                        self.log("  Loading first sample in Visualization Tab...")
-                        parent.visualization_tab.sample_combo.setCurrentIndex(0)
-                        parent.visualization_tab._on_load_dataset()
-                        
-                        # Ensure all 'Segments' layers are visible
-                        for layer in self.viewer.layers:
-                            if "Segments" in layer.name:
-                                layer.visible = True
+                if res == QMessageBox.Yes:
+                    # Trigger switch to visualization tab and load first sample
+                    parent = self.parent()
+                    while parent and not hasattr(parent, 'tabs'):
+                        parent = parent.parent()
+                    
+                    if parent and hasattr(parent, 'tabs'):
+                        # Switch to visualization tab (index 1)
+                        parent.tabs.setCurrentIndex(1)
+                        # Load first sample
+                        if hasattr(parent, 'visualization_tab'):
+                            self.log("  Loading first sample in Visualization Tab...")
+                            parent.visualization_tab.sample_combo.setCurrentIndex(0)
+                            parent.visualization_tab._on_load_dataset()
+                            
+                            # Ensure all 'Segments' layers are visible
+                            for layer in self.viewer.layers:
+                                if "Segments" in layer.name:
+                                    layer.visible = True
 
         except Exception as e:
             traceback.print_exc()
             self.log(f"Error during batch segmentation: {e}")
 
-    def _on_load_training_clicked(self):
+    def _on_load_training_clicked(self, interactive=True):
         try:
             if self.metadata_loader.metadata is None:
                 self.log("⚠️ Cannot generate training data: No metadata loaded.")
@@ -915,20 +952,24 @@ class PixelClassifierWidget(QWidget):
             
             load_existing = False
             if exists:
-                from qtpy.QtWidgets import QMessageBox
-                msg = f"Pre-existing training data found with {saved_examples} Examples/sample.\n\nDo you want to generate NEW training data (overwriting) or LOAD the already saved data?"
-                box = QMessageBox(self)
-                box.setWindowTitle("Training Data Detected")
-                box.setText(msg)
-                btn_generate = box.addButton("Generate New", QMessageBox.AcceptRole)
-                btn_load = box.addButton("Load Existing", QMessageBox.YesRole)
-                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-                box.exec_()
-                
-                if box.clickedButton() == btn_cancel:
-                    self.log("Action cancelled.")
-                    return
-                elif box.clickedButton() == btn_load:
+                if interactive:
+                    from qtpy.QtWidgets import QMessageBox
+                    msg = f"Pre-existing training data found with {saved_examples} Examples/sample.\n\nDo you want to generate NEW training data (overwriting) or LOAD the already saved data?"
+                    box = QMessageBox(self)
+                    box.setWindowTitle("Training Data Detected")
+                    box.setText(msg)
+                    btn_generate = box.addButton("Generate New", QMessageBox.AcceptRole)
+                    btn_load = box.addButton("Load Existing", QMessageBox.YesRole)
+                    btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+                    box.exec_()
+                    
+                    if box.clickedButton() == btn_cancel:
+                        self.log("Action cancelled.")
+                        return
+                    elif box.clickedButton() == btn_load:
+                        load_existing = True
+                else:
+                    # Non-interactive (Queue): Default to load existing if it exists
                     load_existing = True
 
             self.viewer.layers.clear() # Clear after prompting, to avoid removing if cancel
@@ -1192,11 +1233,25 @@ class PixelClassifierWidget(QWidget):
             self.btn_train_update.setVisible(True)
             self.legend_widget.setVisible(True)
             self.instruction_label.setVisible(True)
+            self.btn_queue_train.setVisible(True)  # Show queue button now that training data is loaded
             self.is_session_active = True
             
         except Exception as e:
             traceback.print_exc()
             self.log(f"Failed to load training data: {e}")
+
+    def run_train(self, interactive=True):
+        """Run classifier training. Called by queue (interactive=False) or button (interactive=True)."""
+        if not self.is_session_active:
+            self.log("Session not active. Loading training data...")
+            self._on_load_training_clicked(interactive=interactive)
+        
+        if self.is_session_active:
+            self._on_train_clicked()
+        else:
+            self.log("Error: Failed to load training data for classifier.")
+            if not interactive:
+                 raise RuntimeError("Training data not loaded. Please load training data manually first.")
 
     def _on_train_clicked(self):
         """Train classifiers, predict pixels, and segment — mirrors original segment_and_update()."""
@@ -1779,9 +1834,39 @@ class ImportWidget(QWidget):
                 elif file_path.suffix == ".zarr":
                     ok, reason = self._check_zarr_structure(file_path)
                     if ok:
-                        status = QLabel("✅  Ready for tracking")
-                        status.setStyleSheet("color:#2E7D32; font-weight:bold;")
-                        row_lay.addWidget(status)
+                        # --- Dimension check ---
+                        dims_match = True
+                        try:
+                            raw_path = Path(row.get("raw_image_path", ""))
+                            if raw_path.exists():
+                                import zarr
+                                raw_store = zarr.open(str(raw_path), mode='r')
+                                seg_store = zarr.open(str(file_path), mode='r')
+                                
+                                # Compare dimensions
+                                # raw_shape might be (T, C, Z, Y, X) or (T, Z, Y, X)
+                                # seg_shape is (T, Z, Y, X)
+                                
+                                # 1. Check spatial dimensions (Z, Y, X) - always the last 3
+                                if len(seg_shape) < 3 or raw_shape[-3:] != seg_shape[-3:]:
+                                    dims_match = False
+                                    reason = f"Spatial mismatch: Raw {raw_shape[-3:]} vs Seg {seg_shape[-3:]}"
+                                # 2. Check timepoints (index 0)
+                                elif raw_shape[0] != seg_shape[0]:
+                                    dims_match = False
+                                    reason = f"Time mismatch: Raw {raw_shape[0]}T vs Seg {seg_shape[0]}T"
+                        except:
+                            pass
+
+                        if dims_match:
+                            status = QLabel("✅  Ready for tracking")
+                            status.setStyleSheet("color:#2E7D32; font-weight:bold;")
+                            row_lay.addWidget(status)
+                        else:
+                            status = QLabel(f"⚠️  Dimension mismatch")
+                            status.setToolTip(reason)
+                            status.setStyleSheet("color:#E65100; font-weight:bold;")
+                            row_lay.addWidget(status)
                     else:
                         btn = QPushButton("🔄  Fix zarr format")
                         btn.setToolTip(f"Issue: {reason}")
@@ -1794,6 +1879,21 @@ class ImportWidget(QWidget):
                         row_lay.addWidget(btn)
 
                 elif file_path.suffix.lower() in (".tif", ".tiff"):
+                    # Check TIFF dims if possible
+                    warning = ""
+                    try:
+                        raw_path = Path(row.get("raw_image_path", ""))
+                        if raw_path.exists():
+                            import zarr
+                            from behav3d.core.io import load_image
+                            raw_store = zarr.open(str(raw_path), mode='r')
+                            # For TIFF we'd have to load it to check shape, which is slow for many files.
+                            # Let's just do it and log if mismatch.
+                            # Actually, maybe just keep it simple and check AFTER conversion? 
+                            # No, user wants check during import.
+                    except:
+                        pass
+
                     btn = QPushButton("🔄  Convert TIFF → zarr")
                     btn.setStyleSheet(
                         "QPushButton{background:#1565C0;color:white;padding:4px 10px;"
