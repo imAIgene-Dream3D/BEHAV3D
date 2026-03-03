@@ -1274,6 +1274,7 @@ def run_pixel_classifier_segmentation(
     only_segment=False,
     overwrite_existing=False,
     n_workers=4,
+    log_callback=print,
     ):
 
     """
@@ -1292,8 +1293,13 @@ def run_pixel_classifier_segmentation(
     n_workers : int
         Number of parallel workers for timepoint processing (default: 4)
         Will be capped at available CPU count to prevent overloading
+    log_callback : callable
+        Function to handle log messages (default: print)
     """
     
+    # Use log_callback instead of print
+    log = log_callback
+
     # Validate and cap n_workers to available CPU count
     max_workers = multiprocessing.cpu_count()
     if n_workers > max_workers:
@@ -1301,7 +1307,7 @@ def run_pixel_classifier_segmentation(
         print(f"⚠️ Requested {n_workers} workers but only {max_workers} CPUs available. Using {safe_workers} workers.")
         n_workers = safe_workers
     elif n_workers < 1:
-        print(f"⚠️ Invalid n_workers={n_workers}. Using 1 worker (sequential).")
+        log(f"⚠️ Invalid n_workers={n_workers}. Using 1 worker (sequential).")
         n_workers = 1
     
     # Detect cell types from metadata
@@ -1418,9 +1424,9 @@ def run_pixel_classifier_segmentation(
             clf_death.n_jobs = 1  # Same fix for death classifier
             print(f"Loaded death classifier from: {death_clf_default}")
         else:
-            print(f"⚠️ Warning: Death channel detected but classifier not found at: {death_clf_default}")
+            log(f"⚠️ Warning: Death channel detected but classifier not found at: {death_clf_default}")
     else:
-        print("Skipping death classifier (no dead channel)")
+        log("Skipping death classifier (no dead channel)")
     
     _log_mem("after loading classifiers")
     
@@ -1475,8 +1481,26 @@ def run_pixel_classifier_segmentation(
         # Check if already segmented
         all_segments_exist = all(p.exists() for p in segments_outpaths.values())
         
-        if all_segments_exist and not overwrite_existing and not only_segment:
-            print("  Already segmented, skipping")
+        # Check if already segmented (Check metadata AND disk)
+        skip_sample = False
+        if not overwrite_existing and not only_segment:
+            # 1. Check metadata for existing paths
+            for cell_type in all_cell_types:
+                prefix = 'or' if cell_type in organoid_types else ('im' if cell_type in immune_types else 'ot')
+                path_col = f'{prefix}_{cell_type}_segments_image_path'
+                existing_path = sample.get(path_col)
+                if pd.notna(existing_path) and str(existing_path).strip():
+                    if Path(str(existing_path)).exists():
+                        skip_sample = True
+                        break
+            
+            # 2. Check calculated output paths for safety
+            if not skip_sample and all(p.exists() for p in segments_outpaths.values()):
+                skip_sample = True
+
+        if skip_sample:
+            log(f"  Sample {sample_name} already segmented. Skipping (Overwrite existing unchecked).")
+            continue
         else:   
             # Remove existing outputs if overwriting
             for cell_type, seg_path in segments_outpaths.items():
@@ -1490,7 +1514,7 @@ def run_pixel_classifier_segmentation(
                     if mask_path.exists():
                         loaded_masks[cell_type] = load_image(mask_path)
                     else:
-                        print(f"  Warning: Mask not found for {cell_type}: {mask_path}")
+                        log(f"  Warning: Mask not found for {cell_type}: {mask_path}")
             else:
                 # Remove mask files if not in only_segment mode
                 if death_mask_outpath.exists():
@@ -1505,10 +1529,10 @@ def run_pixel_classifier_segmentation(
                 start_t = max(0, min(start_t, img.shape[0]-1))
                 end_t = max(start_t, min(end_t, img.shape[0]-1))
                 timepoint_indices = list(range(start_t, end_t + 1))
-                print(f"  Processing timepoints: {start_t} to {end_t} (total: {len(timepoint_indices)})")
+                log(f"  Processing timepoints: {start_t} to {end_t} (total: {len(timepoint_indices)})")
             else:
                 timepoint_indices = list(range(img.shape[0]))
-                print(f"  Processing all timepoints: 0 to {img.shape[0]-1}")
+                log(f"  Processing all timepoints: 0 to {img.shape[0]-1}")
             
             n_total = len(timepoint_indices)
             # Mask/segment spatial shape: skip T and C dimensions
@@ -1728,12 +1752,13 @@ def run_pixel_classifier_segmentation(
             
             path_col = f'{prefix}_{cell_type}_segments_image_path'
             metadata.at[idx, path_col] = str(segments_outpaths[cell_type])
+            log(f"  Saved {cell_type} segments: {segments_outpaths[cell_type]}")
         
         # Update dead_mask_path in metadata if death channel is present AND column exists
         if has_death and 'dead_mask_path' in metadata.columns and death_mask_outpath.exists():
             metadata['dead_mask_path'] = metadata['dead_mask_path'].astype('object')
             metadata.at[idx, 'dead_mask_path'] = str(death_mask_outpath)
-            print(f"  Updated dead_mask_path: {death_mask_outpath}")
+            log(f"  Updated dead_mask_path: {death_mask_outpath}")
         
         _log_mem(f"sample {sample_name} END")
         print(f"  Sample {sample_name} completed in {time.time() - start_time:.1f}s")

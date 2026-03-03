@@ -400,8 +400,9 @@ def check_behav3d_metadata(
         sample_name = sample_metadata['sample_name']
         
         # Check raw image exists
-        assert Path(sample_metadata["raw_image_path"]).exists(), \
-            f"The raw_image_path supplied for 'row {rowidx+1}: {sample_name}' does not exist"
+        raw_path = str(sample_metadata["raw_image_path"]).strip().strip('"').strip("'")
+        assert Path(raw_path).exists(), \
+            f"The raw_image_path supplied for 'row {rowidx+1}: {sample_name}' does not exist: '{raw_path}'"
         
         # Check dead_mask_path (required if dead_channel is set)
         has_dead_channel_val = (
@@ -420,6 +421,8 @@ def check_behav3d_metadata(
                 str(dead_mask_val).strip().lower() != 'nan'
             )
             if is_valid_value:
+                # Add robustness: strip quotes
+                dead_mask_val = str(dead_mask_val).strip().strip('"').strip("'")
                 if not Path(dead_mask_val).exists():
                     print(f"!!! dead_mask_path '{dead_mask_val}' does not exist. Please run segmentation below.")
                     ok = False
@@ -436,24 +439,27 @@ def check_behav3d_metadata(
             
             # Check segments
             if not pd.isna(sample_metadata[segments_col]) and sample_metadata[segments_col]:
-                if not Path(sample_metadata[segments_col]).exists():
-                    print(f"⚠️ {segments_col} path does not exist")
+                p = str(sample_metadata[segments_col]).strip().strip('"').strip("'")
+                if not Path(p).exists():
+                    print(f"⚠️ {segments_col} path does not exist: '{p}'")
             else:
                 print(f"!!! No segmented {display_type} image. Please run segmentation below.")
                 ok = False
             
             # Check tracks image
             if not pd.isna(sample_metadata[tracks_img_col]) and sample_metadata[tracks_img_col]:
-                if not Path(sample_metadata[tracks_img_col]).exists():
-                    print(f"⚠️ {tracks_img_col} path does not exist")
+                p = str(sample_metadata[tracks_img_col]).strip().strip('"').strip("'")
+                if not Path(p).exists():
+                    print(f"⚠️ {tracks_img_col} path does not exist: '{p}'")
             else:
                 print(f"!!! No tracked {display_type} image. Please run tracking below.")
                 ok = False
             
             # Check tracks CSV
             if not pd.isna(sample_metadata[tracks_csv_col]) and sample_metadata[tracks_csv_col]:
-                if not Path(sample_metadata[tracks_csv_col]).exists():
-                    print(f"⚠️ {tracks_csv_col} path does not exist")
+                p = str(sample_metadata[tracks_csv_col]).strip().strip('"').strip("'")
+                if not Path(p).exists():
+                    print(f"⚠️ {tracks_csv_col} path does not exist: '{p}'")
             else:
                 print(f"!!! No tracked {display_type} CSV. Please run tracking below.")
                 ok = False
