@@ -656,12 +656,10 @@ def generalize_units_of_track_features(
     df_tracks["position_x"]=df_tracks["position_x"].apply(convert_distance, args=(distance_unit,))
     
     # Calculate relative time, where each track begins at timepoint 1
-    def calculate_relative_time(group):
-        min_position = group['position_t'].min()
-        group['relative_time'] = group['position_t'].sub(min_position).add(1)
-        return group
-
-    df_tracks = df_tracks.groupby('TrackID').apply(calculate_relative_time).reset_index(drop=True)
+    # Use transform so the TrackID column is preserved (groupby+apply+reset_index(drop=True)
+    # silently drops the TrackID column in newer pandas versions)
+    min_time_per_track = df_tracks.groupby('TrackID')['position_t'].transform('min')
+    df_tracks['relative_time'] = df_tracks['position_t'] - min_time_per_track + 1
 
     df_tracks["time"]=df_tracks["position_t"]*time_interval
     df_tracks["time"]=df_tracks["time"].apply(convert_time, args=(time_unit))
