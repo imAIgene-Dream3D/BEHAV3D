@@ -30,6 +30,7 @@ dependencies:
   - pandas>=2.0
   - scipy>=1.14
   - dask-core>=2024.0
+  - threadpoolctl
 
   # -------------------------------------------------------------------------
   # Visualization

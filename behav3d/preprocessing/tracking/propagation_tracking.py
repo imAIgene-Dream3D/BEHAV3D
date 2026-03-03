@@ -191,7 +191,7 @@ def run_propagation_tracking(
         for col in [img_col, csv_col]:
             if col not in metadata.columns or metadata[col].dtype != object:
                 metadata[col] = metadata.get(col, pd.Series(dtype=object)).astype(object)
-        
+                
         metadata.at[idx, img_col] = str(tracked_img_outpath)
         metadata.at[idx, csv_col] = str(tracked_csv_outpath)
         

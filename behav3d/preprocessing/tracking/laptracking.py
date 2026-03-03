@@ -189,12 +189,12 @@ def run_laptracking(
             prefix = segments_col.split('_')[0]
             img_col = f"{prefix}_{cell_type}_tracks_image_path"
             csv_col = f"{prefix}_{cell_type}_tracks_csv_path"
-        
+            
         # Ensure columns are object dtype
         for col in [img_col, csv_col]:
             if col not in metadata.columns or metadata[col].dtype != object:
                 metadata[col] = metadata.get(col, pd.Series(dtype=object)).astype(object)
-        
+                
         metadata.at[idx, img_col] = str(tracked_img_outpath)
         metadata.at[idx, csv_col] = str(tracked_csv_outpath)
         

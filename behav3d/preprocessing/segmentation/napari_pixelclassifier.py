@@ -27,7 +27,7 @@ from behav3d.preprocessing import open_mask, dilate_mask, calculate_edt, zeropad
 from behav3d.io.images import load_image, get_image_shape, load_zarr, save_as_zarr, append_to_zarr
 
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 import joblib
@@ -36,6 +36,28 @@ from functools import partial
 import zarr
 import dask.array as da
 import gc
+
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+try:
+    import threadpoolctl
+    _HAS_THREADPOOLCTL = True
+except ImportError:
+    _HAS_THREADPOOLCTL = False
+
+
+def _log_mem(tag, log_func=print):
+    """Log current process memory usage (RSS in MB)."""
+    if _HAS_PSUTIL:
+        proc = psutil.Process(os.getpid())
+        rss_mb = proc.memory_info().rss / (1024 * 1024)
+        log_func(f"[MEM] {tag}: {rss_mb:.0f} MB")
+    else:
+        log_func(f"[MEM] {tag}: psutil not installed, skipping memory log")
 
 ## TODO create a function for BEHAV3D notebook
 '''
@@ -296,10 +318,18 @@ def apply_classifier(classifier, features_outpath, pred_labels_outpath, n_worker
     shape = load_image(features_outpath).shape
     pred_labels = da.zeros(shape[:-1], chunks=(1,) + shape[1:-1], dtype='int16')
     save_as_zarr(pred_labels, pred_labels_outpath)
+
+    # Disable internal RF parallelism to prevent nested thread explosion
+    # (ThreadPoolExecutor already parallelizes across timepoints)
+    original_n_jobs = getattr(classifier, 'n_jobs', 1)
+    classifier.n_jobs = 1
+
     args_list = [(classifier, str(features_outpath), str(pred_labels_outpath), idx) for idx in range(pred_labels.shape[0])]
     test=[]
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         test+=list(tqdm(executor.map(_apply_classifier, args_list), total=len(args_list)))
+
+    classifier.n_jobs = original_n_jobs
     
     pixel_class = np.asarray(load_image(pred_labels_outpath))
     
@@ -553,6 +583,7 @@ def train_pixel_classifier(
         print(f"Received fill holes: {fill_holes_dict}")
         
         start_time = time.time()
+        _log_mem("segment_and_update START", log)
         log("###### Running Segmentation\n")
         log(f"EDT Thresholds: {edt_thresholds}\n")
         log(f"Segment Size Mins: {segment_size_mins}\n")
@@ -657,6 +688,7 @@ def train_pixel_classifier(
         classifiers = {}  # Store {cell_type: classifier}
         clf_death = None  # Initialize to None
         
+        _log_mem("before classifier training", log)
         log(f"\n--- Starting classifier training (only_segment={only_segment}) ---\n")
         QApplication.processEvents()
         
@@ -705,10 +737,12 @@ def train_pixel_classifier(
             # Predict death pixels (only if death channel is present)
             if has_death:
                 log("\n### Predicting Death Pixels")
+                _log_mem("before death prediction", log)
                 QApplication.processEvents()
                 log("   Starting apply_classifier for death...")
                 QApplication.processEvents()
                 pred_death_mask = apply_classifier(clf_death, features_outpath, pred_death_labels_outpath, n_workers=n_workers)
+                _log_mem("after death prediction", log)
                 log("    Death prediction finished!")
                 QApplication.processEvents()
                 viewer.layers["Pixel Classification (Dead)"].data = pred_death_mask
@@ -721,8 +755,10 @@ def train_pixel_classifier(
             # Predict pixels for all cell types
             for cell_type in all_cell_types:
                 log(f"\n### Predicting {cell_type.capitalize()} Pixels")
+                _log_mem(f"before {cell_type} prediction", log)
                 QApplication.processEvents()
                 pred_mask = apply_classifier(classifiers[cell_type], features_outpath, pred_labels_paths[cell_type], n_workers=n_workers)
+                _log_mem(f"after {cell_type} prediction", log)
                 
                 # Get postprocessing parameters for this cell type
                 opening_nr_pixels = opening_nr_pixels_dict.get(cell_type, 
@@ -755,6 +791,7 @@ def train_pixel_classifier(
                 pred_masks[cell_type] = pred_mask
             
         # Segment instances for all cell types
+        _log_mem("before segmentation", log)
         log("\n### Segment Cell Instances")
         QApplication.processEvents()
         
@@ -813,6 +850,7 @@ def train_pixel_classifier(
 
             full_seg = np.stack(segmented_timepoints, axis=0)
             segmented_cells[cell_type] = full_seg
+            _log_mem(f"after {cell_type} segmentation (all timepoints)", log)
             log(f"   {cell_type.capitalize()} segmentation complete!")
             QApplication.processEvents()
 
@@ -825,6 +863,7 @@ def train_pixel_classifier(
             shutil.rmtree(image_outpath)
         save_as_zarr(image_data, image_outpath)
 
+        _log_mem("segment_and_update END", log)
         log(f"\n###### DONE time elapsed: {time.time() - start_time:.2f} s")
     
     def save_pixel_classification(log=print):
@@ -1264,8 +1303,8 @@ def run_pixel_classifier_segmentation(
     # Validate and cap n_workers to available CPU count
     max_workers = multiprocessing.cpu_count()
     if n_workers > max_workers:
-        safe_workers = max(1, max_workers // 2)
-        log(f"⚠️ Requested {n_workers} workers but only {max_workers} CPUs available. Using {safe_workers} workers (half of available) for system stability.")
+        safe_workers = max_workers
+        print(f"⚠️ Requested {n_workers} workers but only {max_workers} CPUs available. Using {safe_workers} workers.")
         n_workers = safe_workers
     elif n_workers < 1:
         log(f"⚠️ Invalid n_workers={n_workers}. Using 1 worker (sequential).")
@@ -1286,8 +1325,9 @@ def run_pixel_classifier_segmentation(
     
     all_cell_types = organoid_types + immune_types + other_types
     
-    log(f"Detected cell types: organoids={organoid_types}, immune={immune_types}, other={other_types}")
-    log(f"Dead channel: {has_death}")
+    print(f"Detected cell types: organoids={organoid_types}, immune={immune_types}, other={other_types}")
+    print(f"Dead channel: {has_death}")
+    _log_mem("run_pixel_classifier_segmentation START")
     
     # Initialize parameter dictionaries with defaults if not provided
     if organoid_edt_thresholds is None:
@@ -1364,6 +1404,15 @@ def run_pixel_classifier_segmentation(
     for other_type in other_types:
         classifiers[other_type] = _load_classifier(other_type, other_clf_paths.get(other_type))
     
+    # MEJORA 1: clf.n_jobs=1 — prevent RF from spawning all cores per prediction
+    # The RF saved from napari has n_jobs=-1 (all system cores).
+    # Without this, each predict call launches N threads.
+    # With n_workers=4 workers × N threads = thread explosion → crash.
+    # With n_jobs=1: each worker uses exactly 1 core for RF. You control the total.
+    for clf in classifiers.values():
+        clf.n_jobs = 1
+    print("✓ Classifiers set to n_jobs=1 for stable parallel prediction")
+    
     # Load death classifier (only if death channel is present)
     clf_death = None
     if has_death:
@@ -1372,11 +1421,14 @@ def run_pixel_classifier_segmentation(
             shutil.copy(clf_death_path, death_clf_default)
         if death_clf_default.exists():
             clf_death = joblib.load(death_clf_default)
-            log(f"Loaded death classifier from: {death_clf_default}")
+            clf_death.n_jobs = 1  # Same fix for death classifier
+            print(f"Loaded death classifier from: {death_clf_default}")
         else:
             log(f"⚠️ Warning: Death channel detected but classifier not found at: {death_clf_default}")
     else:
         log("Skipping death classifier (no dead channel)")
+    
+    _log_mem("after loading classifiers")
     
     # Ensure all segment path columns exist with correct dtype (object/string)
     for cell_type in all_cell_types:
@@ -1397,7 +1449,8 @@ def run_pixel_classifier_segmentation(
     
     # Process each sample
     for idx, sample in metadata.iterrows():
-        log(f"Processing sample: {sample['sample_name']}") 
+        print(f"Processing sample: {sample['sample_name']}")
+        _log_mem(f"sample {sample['sample_name']} START")
         start_time = time.time()
         sample_name = sample['sample_name']
         
@@ -1422,7 +1475,11 @@ def run_pixel_classifier_segmentation(
             img = load_image(raw_image_path)
             save_as_zarr(img, raw_image_zarr)
         img = load_image(raw_image_zarr)
-        log(f"  Image shape: {img.shape}")
+        print(f"  Image shape: {img.shape}")
+        _log_mem(f"after loading image zarr handle")
+        
+        # Check if already segmented
+        all_segments_exist = all(p.exists() for p in segments_outpaths.values())
         
         # Check if already segmented (Check metadata AND disk)
         skip_sample = False
@@ -1477,49 +1534,209 @@ def run_pixel_classifier_segmentation(
                 timepoint_indices = list(range(img.shape[0]))
                 log(f"  Processing all timepoints: 0 to {img.shape[0]-1}")
             
-            # Prepare arguments for parallel processing
-            args_list = [
-                (t, img[t], classifiers, clf_death, all_cell_types, organoid_types, 
-                 immune_types, other_types, all_edt_thresholds, all_segment_size_mins,
-                 all_opening_nr_pixels, all_fill_holes, only_segment, 
-                 loaded_masks, has_death)
-                for t in timepoint_indices
-            ]
+            n_total = len(timepoint_indices)
+            # Mask/segment spatial shape: skip T and C dimensions
+            # features_func uses channel_axis=0, so predict_segmenter output is (Z, Y, X)
+            spatial_shape = tuple(img.shape[2:])  # (Z, Y, X), NOT (C, Z, Y, X)
             
-            # Process timepoints in parallel
-            log(f"  Using {n_workers} parallel workers")
-            with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                results = list(tqdm(
-                    executor.map(_process_single_timepoint, args_list),
-                    total=len(args_list),
-                    desc=f"  {sample_name}"
-                ))
+            # MEJORA 2: Dynamic RAM check — reduce workers if images are too large
+            # Compute real feature count from a tiny dummy array (microseconds, ~4 KB).
+            # This is just a measurement — no side effects on real data.
+            dummy = np.zeros((img.shape[1],) + (8, 8, 8), dtype=np.float32)
+            n_features = features_func(dummy).shape[-1]
+            del dummy
             
-            # Save results in timepoint order
-            for result in sorted(results, key=lambda x: x['timepoint']):
-                # Save masks
-                if not only_segment:
-                    for cell_type in all_cell_types:
-                        if cell_type in result['masks']:
-                            append_to_zarr(
-                                np.expand_dims(result['masks'][cell_type], axis=0),
-                                mask_outpaths[cell_type]
-                            )
-                    
-                    # Save death mask
-                    if result['death_mask'] is not None:
-                        append_to_zarr(
-                            np.expand_dims(result['death_mask'], axis=0),
-                            death_mask_outpath
-                        )
+            # Accurate memory estimate per worker:
+            # - features array: spatial_voxels × n_features × 8 bytes (float64)
+            # - raw timepoint held briefly: timepoint_bytes
+            # - intermediates (masks, segments): ~50% overhead
+            spatial_voxels = int(np.prod(spatial_shape))
+            features_bytes = spatial_voxels * n_features * 8  # float64
+            timepoint_bytes = int(np.prod(img.shape[1:])) * 2  # int16 = 2 bytes
+            estimated_memory_per_worker = int(features_bytes + timepoint_bytes)
+            print(f"  Feature probe: {n_features} features → {features_bytes/1e9:.2f} GB features array, "
+                  f"{estimated_memory_per_worker/1e9:.2f} GB/worker estimated")
+            
+            if _HAS_PSUTIL:
+                available_ram = psutil.virtual_memory().available
+                safe_workers = max(1, int(available_ram * 0.8 // estimated_memory_per_worker))
+                actual_workers = min(n_workers, safe_workers)
                 
-                # Save segments
+                if actual_workers < n_workers:
+                    print(
+                        f"⚠️ Large images ({timepoint_bytes/1e9:.2f} GB/timepoint, "
+                        f"~{estimated_memory_per_worker/1e9:.2f} GB/worker estimated). "
+                        f"Available RAM: {available_ram/1e9:.1f} GB. "
+                        f"Reducing workers {n_workers} → {actual_workers} to avoid crash."
+                    )
+                else:
+                    print(
+                        f"  Memory OK: {available_ram/1e9:.1f} GB available, "
+                        f"~{estimated_memory_per_worker/1e9:.2f} GB/worker → using {actual_workers} workers"
+                    )
+            else:
+                actual_workers = n_workers
+                print(f"  psutil not installed, skipping RAM check. Using {actual_workers} workers.")
+            
+            _log_mem(f"before processing loop ({n_total} timepoints, {actual_workers} workers)")
+            
+            # MEJORA 3: Pre-allocated zarrs with fixed size — thread-safe index writes
+            # Instead of append_to_zarr (which requires strict sequential order),
+            # create zarrs with final size and each worker writes zarr[t_i] = data.
+            # Two workers never touch the same index.
+            # Result is always zarr[0]=T0, zarr[1]=T1... regardless of completion order.
+            if not only_segment:
+                zarr_masks = {}
+                zarr_segs = {}
                 for cell_type in all_cell_types:
-                    if cell_type in result['segments']:
-                        append_to_zarr(
-                            np.expand_dims(result['segments'][cell_type], axis=0),
-                            segments_outpaths[cell_type]
+                    zarr_masks[cell_type] = zarr.open(
+                        str(mask_outpaths[cell_type]),
+                        mode="w",
+                        shape=(n_total,) + spatial_shape,
+                        chunks=(1,) + spatial_shape,
+                        dtype="int16",
+                    )
+                    zarr_segs[cell_type] = zarr.open(
+                        str(segments_outpaths[cell_type]),
+                        mode="w",
+                        shape=(n_total,) + spatial_shape,
+                        chunks=(1,) + spatial_shape,
+                        dtype="uint16",
+                    )
+                zarr_death = None
+                if has_death and clf_death is not None:
+                    zarr_death = zarr.open(
+                        str(death_mask_outpath),
+                        mode="w",
+                        shape=(n_total,) + spatial_shape,
+                        chunks=(1,) + spatial_shape,
+                        dtype="int16",
+                    )
+            else:
+                zarr_segs = {}
+                for cell_type in all_cell_types:
+                    zarr_segs[cell_type] = zarr.open(
+                        str(segments_outpaths[cell_type]),
+                        mode="w",
+                        shape=(n_total,) + spatial_shape,
+                        chunks=(1,) + spatial_shape,
+                        dtype="uint16",
+                    )
+                zarr_masks = None
+                zarr_death = None
+            
+            # -----------------------------------------------------------------
+            # Per-timepoint worker function
+            # -----------------------------------------------------------------
+            def process_timepoint(args):
+                t_i, t = args
+                t_start = time.time()
+                
+                # Read 1 timepoint from zarr (lazy read, materialized here)
+                t_img = np.asarray(img[t])
+                
+                if not only_segment:
+                    # MEJORA 4: threadpoolctl limits features_func to 1 internal thread
+                    # multiscale_basic_features (scikit-image) internally uses all cores.
+                    # Without control: 4 workers × 16 cores = 64 competing threads.
+                    # With limits=1: 4 workers × 1 thread = actual_workers cores total.
+                    if _HAS_THREADPOOLCTL:
+                        with threadpoolctl.threadpool_limits(limits=1):
+                            features = features_func(t_img)
+                    else:
+                        features = features_func(t_img)
+                    del t_img  # free immediately — features is all we need from here
+                    
+                    for cell_type in all_cell_types:
+                        # RF already has n_jobs=1 (Mejora 1) → 1 core per worker
+                        pred_mask = future.predict_segmenter(features, classifiers[cell_type])
+                        pred_mask[pred_mask > 0] -= 1
+                        
+                        opening_nr_pixels_val = all_opening_nr_pixels.get(cell_type, 0)
+                        fill_holes_val = all_fill_holes.get(cell_type, True)
+                        fg_mask = (pred_mask == 1).astype(bool)
+                        processed_fg = postprocess_mask(fg_mask, fill_holes=fill_holes_val, opening_nr_pixels=int(opening_nr_pixels_val))
+                        pred_mask = processed_fg.astype(np.int16)
+                        
+                        # Write mask by exact index (Mejora 3)
+                        # t_i=0 is always T0, t_i=1 is always T1, etc.
+                        zarr_masks[cell_type][t_i] = pred_mask
+                        
+                        edt_threshold = all_edt_thresholds.get(cell_type, 1.0)
+                        segment_size_min = all_segment_size_mins.get(cell_type, 10)
+                        seg = segment_mask(
+                            mask=pred_mask.astype(bool),
+                            edt_thr=edt_threshold,
+                            edt_thr_refined=[edt_threshold+0.5, edt_threshold+1.0, edt_threshold+1.5] if (cell_type in immune_types or cell_type in other_types) else None,
+                            segment_size_min=segment_size_min,
+                            use_dims=3
                         )
+                        
+                        zarr_segs[cell_type][t_i] = seg
+                        del pred_mask, fg_mask, processed_fg, seg
+                    
+                    # Death classifier
+                    if has_death and clf_death is not None and zarr_death is not None:
+                        death_mask = future.predict_segmenter(features, clf_death)
+                        death_mask[death_mask > 0] -= 1
+                        zarr_death[t_i] = death_mask
+                        del death_mask
+                    
+                    del features
+                else:
+                    # only_segment mode: read existing masks, segment, write
+                    for cell_type in all_cell_types:
+                        if cell_type not in loaded_masks:
+                            continue
+                        mask = np.asarray(loaded_masks[cell_type][t])
+                        
+                        edt_threshold = all_edt_thresholds.get(cell_type, 1.0)
+                        segment_size_min = all_segment_size_mins.get(cell_type, 10)
+                        seg = segment_mask(
+                            mask=mask,
+                            edt_thr=edt_threshold,
+                            edt_thr_refined=[edt_threshold+0.5, edt_threshold+1.0, edt_threshold+1.5] if (cell_type in immune_types or cell_type in other_types) else None,
+                            segment_size_min=segment_size_min,
+                            use_dims=3
+                        )
+                        
+                        zarr_segs[cell_type][t_i] = seg
+                        del mask, seg
+                    del t_img  # free in only_segment branch too
+                
+                gc.collect()
+                
+                t_elapsed = time.time() - t_start
+                if (t_i + 1) % 10 == 0 or t_i == 0 or (t_i + 1) == n_total:
+                    _log_mem(f"T{t} ({t_i+1}/{n_total}, {t_elapsed:.1f}s)")
+                
+                return t_i, t
+            
+            # MEJORA 5: ThreadPoolExecutor at timepoint level
+            # Instead of 1 sequential timepoint with N chaotic internal threads,
+            # actual_workers timepoints in parallel with 1 thread each.
+            # Speedup ≈ actual_workers×, stable on any machine.
+            print(f"  Starting parallel processing with {actual_workers} workers...")
+            args_list = list(enumerate(timepoint_indices))
+            
+            with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+                futures_map = {
+                    executor.submit(process_timepoint, args): args
+                    for args in args_list
+                }
+                completed = 0
+                for fut in tqdm(as_completed(futures_map), total=n_total, desc=f"  {sample_name}"):
+                    try:
+                        t_i, t = fut.result()
+                        completed += 1
+                        if completed % 10 == 0 or completed == 1 or completed == n_total:
+                            print(f"  Progress: {completed}/{n_total} timepoints completed")
+                    except Exception as e:
+                        args = futures_map[fut]
+                        print(f"  ❌ Error in timepoint {args}: {e}")
+                        raise
+            
+            print(f"  ✓ All {n_total} timepoints written successfully")
                 
         # Update metadata with segment paths (with prefixes)
         for cell_type in all_cell_types:
@@ -1543,6 +1760,8 @@ def run_pixel_classifier_segmentation(
             metadata.at[idx, 'dead_mask_path'] = str(death_mask_outpath)
             log(f"  Updated dead_mask_path: {death_mask_outpath}")
         
-        log(f"  Sample {sample_name} completed in {time.time() - start_time:.1f}s")
+        _log_mem(f"sample {sample_name} END")
+        print(f"  Sample {sample_name} completed in {time.time() - start_time:.1f}s")
     
+    _log_mem("run_pixel_classifier_segmentation END")
     return metadata

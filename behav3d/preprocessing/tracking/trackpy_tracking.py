@@ -319,12 +319,12 @@ def run_trackpy_tracking_generic(
             # Fallback to old non-prefixed format
             img_col = f"{cell_type}_tracks_image_path"
             csv_col = f"{cell_type}_tracks_csv_path"
-        
-        # Ensure columns are object dtype to avoid lossySetItemError
+            
+        # Ensure columns are object dtype to avoid LossySetitemError
         for col in [img_col, csv_col]:
             if col not in metadata.columns or metadata[col].dtype != object:
                 metadata[col] = metadata.get(col, pd.Series(dtype=object)).astype(object)
-        
+                
         metadata.at[idx, img_col] = str(tracked_img_outpath)
         metadata.at[idx, csv_col] = str(tracked_csv_outpath)
         
@@ -485,11 +485,11 @@ def run_trackpy_tracking_with_method(
             img_col = f"{prefix}_{cell_type}_tracks_image_path"
             csv_col = f"{prefix}_{cell_type}_tracks_csv_path"
         
-        # Ensure columns are object dtype to avoid lossySetItemError
+        # Ensure columns are object dtype
         for col in [img_col, csv_col]:
             if col not in metadata.columns or metadata[col].dtype != object:
                 metadata[col] = metadata.get(col, pd.Series(dtype=object)).astype(object)
-        
+                
         metadata.at[idx, img_col] = str(tracked_img_outpath)
         metadata.at[idx, csv_col] = str(tracked_csv_outpath)
 

@@ -300,6 +300,8 @@ def run_cellpose_segmentation(
         )
     
     print(f"Detected '{label_name}' as {category_name} type (prefix: {prefix}_, min_size: {min_size})")
+
+    summary = {"processed": [], "skipped": []}
     
     # Ensure the path column exists with correct dtype
     path_col = f'{prefix}_{label_name}_segments_image_path'
@@ -316,6 +318,11 @@ def run_cellpose_segmentation(
         raw_image_path = Path(sample['raw_image_path'])
         raw_image_zarr = Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
         
+        if not raw_image_zarr.exists():
+            print(f"  [SKIP] Zarr file missing for {sample_name}, run image preprocessing first.")
+            summary["skipped"].append(sample_name)
+            continue
+
         images = load_image(raw_image_zarr)
         
 
@@ -388,9 +395,42 @@ def run_cellpose_segmentation(
         print(f"  [SAVED] Segments at {masks_outpath}")
 
         metadata.at[idx, path_col] = str(masks_outpath)
+        summary["processed"].append(sample_name)
 
-    return metadata
+    return metadata, summary
 
+
+def run_cellpose_and_sync_metadata(
+    output_dir,
+    metadata_loader,
+    pretrained_model_dir,
+    input_channels,
+    label_name,
+    timepoint_range=None,
+    **cellpose_kwargs,
+):
+    """
+    Wrapper around run_cellpose_segmentation that automatically handles
+    metadata CSV reading, updating, and saving.
+    """
+    # 1. Run the segmentation
+    updated_metadata, summary = run_cellpose_segmentation(
+        output_dir=output_dir,
+        metadata=metadata_loader.metadata,
+        pretrained_model_dir=pretrained_model_dir,
+        input_channels=input_channels,
+        label_name=label_name,
+        timepoint_range=timepoint_range,
+        **cellpose_kwargs,
+    )
+
+    # 2. Update the in-memory metadata
+    metadata_loader.metadata = updated_metadata
+
+    # 3. Save
+    updated_metadata.to_csv(metadata_loader.metadata_csv_path, index=False)
+    
+    return updated_metadata, summary
 
 
 def run_otsu_threshold_segmentation_from_zarr(
@@ -422,7 +462,7 @@ def run_otsu_threshold_segmentation_from_zarr(
     # Check if dead channel exists in metadata
     if not has_dead_channel(metadata):
         print("[SKIP] No dead channel detected in metadata. Skipping dead mask segmentation.")
-        return metadata
+        return metadata, {"processed": [], "skipped": []}
     
     output_dir = Path(output_dir)
     
@@ -442,6 +482,8 @@ def run_otsu_threshold_segmentation_from_zarr(
     if 'dead_mask_path' not in metadata.columns:
         metadata['dead_mask_path'] = pd.NA
     metadata['dead_mask_path'] = metadata['dead_mask_path'].astype('object')
+
+    summary = {"processed": [], "skipped": []}
 
     for idx, sample in metadata.iterrows():
         sample_name = sample['sample_name']
@@ -469,6 +511,7 @@ def run_otsu_threshold_segmentation_from_zarr(
         if death_channel is None:
             print(f"[SKIP] No 'dead' channel label found in config for {sample_name}")
             print(f"       Please configure 'dead' label in the 'Configure Channel Labels' panel.")
+            summary["skipped"].append(sample_name)
             continue
         
         mask_dir = output_dir / "images" / sample_name
@@ -477,6 +520,7 @@ def run_otsu_threshold_segmentation_from_zarr(
         raw_image_zarr = mask_dir / f"{sample_name}.zarr"
         if not raw_image_zarr.exists():
             print(f"[SKIP] Zarr file missing for {sample_name}, run image preprocessing first.")
+            summary["skipped"].append(sample_name)
             continue
 
         masks_outpath = mask_dir / f"{sample_name}{mask_suffix}.zarr"
@@ -510,8 +554,35 @@ def run_otsu_threshold_segmentation_from_zarr(
         
         # Update metadata with the path
         metadata.at[idx, 'dead_mask_path'] = str(masks_outpath)
+        summary["processed"].append(sample_name)
     
-    return metadata
+    return metadata, summary
+
+def run_otsu_and_sync_metadata(
+    output_dir,
+    metadata_loader,
+    mask_suffix="_mask_dead",
+    timepoint_range=None,
+):
+    """
+    Wrapper around run_otsu_threshold_segmentation_from_zarr that automatically handles
+    metadata CSV reading, updating, and saving.
+    """
+    # 1. Run the segmentation (The Worker)
+    updated_metadata, summary = run_otsu_threshold_segmentation_from_zarr(
+        output_dir=output_dir,
+        metadata=metadata_loader.metadata,
+        mask_suffix=mask_suffix,
+        timepoint_range=timepoint_range,
+    )
+
+    # 2. Update the in-memory metadata
+    metadata_loader.metadata = updated_metadata
+
+    # 3. Save
+    updated_metadata.to_csv(metadata_loader.metadata_csv_path, index=False)
+    
+    return updated_metadata, summary
 
 # -----------------------------------------------------------------------------
 # 3. Quick visualization helper (Napari)
