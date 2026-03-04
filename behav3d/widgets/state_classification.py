@@ -99,23 +99,7 @@ class StateClassificationPanel:
         self._build_backprojection_section()
         self._build_train_section()
 
-        self.steps = widgets.Accordion(
-            children=[
-                self.clustering_section,
-                self.rename_intrinsic_section,
-                self.rename_full_section,
-                self.train_section,
-                self.apply_section,
-                self.backprojection_section,
-            ],
-            selected_index=None,
-        )
-        self.steps.set_title(0, "Intrinsic state clustering")
-        self.steps.set_title(1, "Rename Intrinsic")
-        self.steps.set_title(2, "Rename Full Mapping")
-        self.steps.set_title(3, "Train classification")
-        self.steps.set_title(4, "Apply classification")
-        self.steps.set_title(5, "Backprojection")
+        self._build_steps()
 
         self.ui = widgets.VBox(
             [
@@ -135,6 +119,33 @@ class StateClassificationPanel:
         self.apply_full_pkl_picker.text.observe(self._on_apply_path_changed, names="value")
         self.apply_intrinsic_pkl_picker.text.observe(self._on_apply_path_changed, names="value")
         self._refresh_context()
+
+    def _build_steps(self):
+        step_defs = [
+            ("Intrinsic state clustering", self.clustering_section),
+            ("Rename Intrinsic", self.rename_intrinsic_section),
+            ("Rename Full Mapping", self.rename_full_section),
+            ("Train classification", self.train_section),
+            ("Apply classification", self.apply_section),
+            ("Backprojection", self.backprojection_section),
+        ]
+        self._step_accordions = []
+        for title, section in step_defs:
+            acc = widgets.Accordion(children=[section], selected_index=None)
+            acc.set_title(0, title)
+            self._step_accordions.append(acc)
+        self.steps = widgets.VBox(self._step_accordions)
+
+    def _collapse_all_steps(self):
+        for acc in self._step_accordions:
+            acc.selected_index = None
+
+    def _open_step(self, index):
+        if index is None:
+            return
+        if index < 0 or index >= len(self._step_accordions):
+            return
+        self._step_accordions[index].selected_index = 0
 
     def _build_apply_section(self):
         self.apply_full_pkl_picker = PathPicker(
@@ -1243,7 +1254,7 @@ class StateClassificationPanel:
         self._refresh_backprojection_samples()
         self._rebuild_intrinsic_rename_rows()
         self._rebuild_full_rename_rows()
-        self.steps.selected_index = None
+        self._collapse_all_steps()
         self._refresh_enablement()
 
     def _on_refresh_clicked(self, _):
@@ -1387,7 +1398,7 @@ class StateClassificationPanel:
                 self._rebuild_intrinsic_rename_rows()
                 self._rebuild_full_rename_rows()
                 # Keep compact behavior: open rename-intrinsic section next.
-                self.steps.selected_index = 1
+                self._open_step(1)
             except Exception:
                 traceback.print_exc()
             finally:
@@ -1416,7 +1427,7 @@ class StateClassificationPanel:
                 self._rebuild_full_rename_rows()
                 print(f"Intrinsic clusters renamed and persisted to {self._model_adata_path()}")
                 # Open full mapping next.
-                self.steps.selected_index = 2
+                self._open_step(2)
             except Exception:
                 traceback.print_exc()
             finally:

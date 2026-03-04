@@ -161,19 +161,28 @@ def plot_exemplar_tracks_by_cluster(
     if missing:
         raise ValueError(f"adata_tracks.obs missing required columns: {missing}")
 
-    tracks_df = adata_tracks.obs[[sample_key, track_key, tmin_key, tmax_key, cluster_key]].copy()
-    if query is not None:
+    full_tracks_df = adata_tracks.obs[[sample_key, track_key, tmin_key, tmax_key, cluster_key]].copy()
+    grouped_full = (
+        full_tracks_df.groupby([cluster_key, sample_key, track_key], observed=True, as_index=False)
+        .agg(**{tmin_key: (tmin_key, "min"), tmax_key: (tmax_key, "max")})
+    )
+    if len(grouped_full) == 0:
+        raise ValueError("No tracks available in adata_tracks.obs.")
+
+    cluster_total_counts = grouped_full.groupby(cluster_key, observed=True).size().to_dict()
+
+    if query is None:
+        tracks_df = grouped_full
+    else:
         tracks_df = adata_tracks.obs.query(query)[
             [sample_key, track_key, tmin_key, tmax_key, cluster_key]
         ].copy()
-
-    if len(tracks_df) == 0:
-        raise ValueError("No tracks left after applying `query` (if any).")
-
-    tracks_df = (
-        tracks_df.groupby([cluster_key, sample_key, track_key], observed=True, as_index=False)
-                 .agg(**{tmin_key: (tmin_key, "min"), tmax_key: (tmax_key, "max")})
-    )
+        if len(tracks_df) == 0:
+            raise ValueError("No tracks left after applying `query` (if any).")
+        tracks_df = (
+            tracks_df.groupby([cluster_key, sample_key, track_key], observed=True, as_index=False)
+            .agg(**{tmin_key: (tmin_key, "min"), tmax_key: (tmax_key, "max")})
+        )
 
     chosen_parts = []
     for cl, df_cl in tracks_df.groupby(cluster_key, sort=False, observed=True):
@@ -253,7 +262,7 @@ def plot_exemplar_tracks_by_cluster(
             tmin_key=tmin_key,
             tmax_key=tmax_key,
             cmap_name=cmap_name,
-            title=f"{cluster_key} = {cl} (n={len(df_cl)})",
+            title=f"{cluster_key} = {cl} (N_total={cluster_total_counts.get(cl, 0)})",
             x_mode=x_mode,
         )
 
