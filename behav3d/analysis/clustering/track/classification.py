@@ -42,7 +42,12 @@ from behav3d.analysis.clustering.general.leiden import (
 from behav3d.analysis.clustering.state.visualization.backprojection import (
     export_behavioral_state_backprojection_zarrs,
 )
-from behav3d.analysis.clustering.track.visualization.plots.exemplar_track_per_cluster import plot_exemplar_tracks_by_cluster
+from behav3d.analysis.clustering.track.visualization.plots.exemplar_track_per_cluster import (
+    plot_exemplar_tracks_by_cluster,
+    save_exemplar_statebar_track_pdf_per_cluster,
+    save_exemplar_statebar_backprojection_video_per_cluster,
+    select_exemplar_tracks_by_cluster,
+)
 from behav3d.analysis.clustering.general.visualization.plots import plot_top_ranking_features
 # %matplotlib inline
 
@@ -75,6 +80,172 @@ def _resolve_track_paths(output_dir, cell_type, output_subdir_name="behavioral_t
         "analysis_outdir": analysis_outdir,
         "state_outdir": state_outdir,
         "outfolder": outfolder,
+    }
+
+
+def _resolve_track_positions_csv_path(output_dir, cell_type):
+    """Resolve canonical track-features CSV path used for coordinate enrichment."""
+    root = _resolve_output_dir(output_dir)
+    analysis_outdir = root / "analysis" / str(cell_type)
+    feature_outdir = analysis_outdir / "track_features"
+    filtered_path = feature_outdir / f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv"
+    combined_path = feature_outdir / f"BEHAV3D_{cell_type}_combined_track_features.csv"
+    if filtered_path.exists():
+        return filtered_path
+    if combined_path.exists():
+        return combined_path
+    raise FileNotFoundError(
+        "Could not find track-features CSV required for exemplar coordinate enrichment. "
+        f"Expected one of: '{filtered_path}' or '{combined_path}'."
+    )
+
+
+def _merge_coordinate_columns_into_obs(
+    adata,
+    positions_csv_path,
+    sample_col="sample_name",
+    track_col="TrackID",
+    time_col="position_t",
+):
+    """
+    Merge missing coordinate columns from positions CSV into adata.obs by
+    (sample_name, TrackID, position_t).
+    """
+    key_cols = [str(sample_col), str(track_col), str(time_col)]
+    missing_keys_obs = [c for c in key_cols if c not in adata.obs.columns]
+    if len(missing_keys_obs) > 0:
+        raise ValueError(
+            f"Cannot enrich coordinates: adata.obs missing merge key columns {missing_keys_obs}."
+        )
+
+    df_pos = pd.read_csv(Path(positions_csv_path), low_memory=False)
+    missing_keys_pos = [c for c in key_cols if c not in df_pos.columns]
+    if len(missing_keys_pos) > 0:
+        raise ValueError(
+            "Cannot enrich coordinates: positions CSV missing merge key columns "
+            f"{missing_keys_pos}. csv='{positions_csv_path}'"
+        )
+
+    candidate_coord_cols = [
+        "pixel_position_x",
+        "pixel_position_y",
+        "pixel_position_z",
+        "position_x",
+        "position_y",
+        "position_z",
+    ]
+    coord_cols_present = [c for c in candidate_coord_cols if c in df_pos.columns]
+    if len(coord_cols_present) == 0:
+        raise ValueError(
+            "Cannot enrich coordinates: positions CSV has none of the expected coordinate columns "
+            "['pixel_position_x','pixel_position_y','pixel_position_z','position_x','position_y','position_z']. "
+            f"csv='{positions_csv_path}'"
+        )
+
+    missing_coord_cols_in_obs = [c for c in coord_cols_present if c not in adata.obs.columns]
+    if len(missing_coord_cols_in_obs) == 0:
+        return {
+            "csv_path": str(positions_csv_path),
+            "added_columns": [],
+        }
+
+    merge_key_cols = ["__k_sample", "__k_track", "__k_time"]
+    obs = adata.obs.copy()
+    obs["__k_sample"] = obs[str(sample_col)].astype("string")
+    obs["__k_track"] = obs[str(track_col)].astype("string")
+    obs["__k_time"] = pd.to_numeric(obs[str(time_col)], errors="coerce")
+
+    pos = df_pos[key_cols + coord_cols_present].copy()
+    pos["__k_sample"] = pos[str(sample_col)].astype("string")
+    pos["__k_track"] = pos[str(track_col)].astype("string")
+    pos["__k_time"] = pd.to_numeric(pos[str(time_col)], errors="coerce")
+
+    pos = pos.dropna(subset=merge_key_cols)
+    pos = (
+        pos[merge_key_cols + coord_cols_present]
+        .groupby(merge_key_cols, as_index=False, observed=False)
+        .first()
+    )
+
+    obs["__orig_order"] = np.arange(len(obs), dtype=int)
+    merged = obs.merge(
+        pos[merge_key_cols + missing_coord_cols_in_obs],
+        on=merge_key_cols,
+        how="left",
+        sort=False,
+    )
+    merged = merged.sort_values("__orig_order")
+    merged.index = adata.obs.index
+
+    drop_cols = ["__k_sample", "__k_track", "__k_time", "__orig_order"]
+    merged = merged.drop(columns=[c for c in drop_cols if c in merged.columns])
+    adata.obs = merged
+
+    return {
+        "csv_path": str(positions_csv_path),
+        "added_columns": [str(c) for c in missing_coord_cols_in_obs],
+    }
+
+
+def _ensure_exemplar_coordinate_columns(
+    adata,
+    *,
+    output_dir,
+    cell_type,
+    require_pixel_for_video=False,
+):
+    """
+    Ensure exemplar plotting prerequisites:
+      - PDF trajectory panel: either position_* or pixel_position_* triplet.
+      - Video panel: pixel_position_* triplet.
+    """
+    pos_triplet = ["position_x", "position_y", "position_z"]
+    pix_triplet = ["pixel_position_x", "pixel_position_y", "pixel_position_z"]
+
+    has_pos = all(c in adata.obs.columns for c in pos_triplet)
+    has_pix = all(c in adata.obs.columns for c in pix_triplet)
+
+    needs_enrichment = (not has_pos and not has_pix) or (bool(require_pixel_for_video) and not has_pix)
+    merge_info = {"csv_path": None, "added_columns": []}
+    if needs_enrichment:
+        csv_path = _resolve_track_positions_csv_path(output_dir=output_dir, cell_type=cell_type)
+        merge_info = _merge_coordinate_columns_into_obs(
+            adata=adata,
+            positions_csv_path=csv_path,
+            sample_col="sample_name",
+            track_col="TrackID",
+            time_col="position_t",
+        )
+
+    has_pos = all(c in adata.obs.columns for c in pos_triplet)
+    has_pix = all(c in adata.obs.columns for c in pix_triplet)
+
+    missing_pos = [c for c in pos_triplet if c not in adata.obs.columns]
+    missing_pix = [c for c in pix_triplet if c not in adata.obs.columns]
+
+    if not (has_pos or has_pix):
+        raise ValueError(
+            "Exemplar PDF export requires either coordinate triplet "
+            "['position_x','position_y','position_z'] or "
+            "['pixel_position_x','pixel_position_y','pixel_position_z'] in adata.obs. "
+            f"Missing position triplet columns: {missing_pos}; missing pixel triplet columns: {missing_pix}. "
+            f"Enrichment csv={merge_info.get('csv_path')}."
+        )
+    if bool(require_pixel_for_video) and (not has_pix):
+        missing_pixel = [c for c in pix_triplet if c not in adata.obs.columns]
+        raise ValueError(
+            "Exemplar backprojection video export requires pixel coordinates "
+            "['pixel_position_x','pixel_position_y','pixel_position_z'] in adata.obs. "
+            "PDF export can still run with either position_* or pixel_position_* coordinates. "
+            f"Missing pixel columns: {missing_pixel}. Enrichment csv={merge_info.get('csv_path')}."
+        )
+
+    return {
+        "enriched": bool(needs_enrichment),
+        "csv_path": merge_info.get("csv_path"),
+        "added_columns": list(merge_info.get("added_columns", [])),
+        "has_position_triplet": bool(has_pos),
+        "has_pixel_triplet": bool(has_pix),
     }
 
 
@@ -799,6 +970,16 @@ def apply_track_classifier_to_subtracks(
     output_col="ClusterID",
     confidence_col=None,
     output_subdir_name="behavioral_tracks",
+    plot_exemplars=True,
+    plot_exemplar_backprojection_videos=True,
+    n_per_cluster=10,
+    plot_dpi=300,
+    exemplar_video_fps=6,
+    exemplar_video_dpi=180,
+    exemplar_video_margin=20,
+    exemplar_video_pmin=0.0,
+    exemplar_video_pmax=99.99,
+    exemplar_video_track_color="#63ff33",
     save_outputs=True,
     save_as_model=True,
     random_state=123,
@@ -865,6 +1046,121 @@ def apply_track_classifier_to_subtracks(
         inplace=True,
     )
 
+    exemplar_statebar_track_pdf_by_cluster = {}
+    exemplar_statebar_backprojection_video_by_cluster = {}
+    exemplar_selection_csv = None
+    exemplar_render_config = {
+        "stage": "after_classification",
+        "cluster_key": str(output_col),
+        "state_key": str(state_col),
+        "n_per_cluster": int(n_per_cluster),
+        "plot_exemplars": bool(plot_exemplars),
+        "plot_exemplar_backprojection_videos": bool(plot_exemplar_backprojection_videos),
+        "plot_dpi": int(plot_dpi),
+        "video_fps": int(exemplar_video_fps),
+        "video_dpi": int(exemplar_video_dpi),
+        "video_margin": int(exemplar_video_margin),
+        "video_pmin": float(exemplar_video_pmin),
+        "video_pmax": float(exemplar_video_pmax),
+        "video_track_color": str(exemplar_video_track_color),
+        "coordinate_enrichment": None,
+    }
+
+    if bool(plot_exemplars):
+        class_outdir = outfolder / "classification"
+        class_outdir.mkdir(parents=True, exist_ok=True)
+
+        adata_plot = filter_and_truncate_tracks_anndata(
+            adata_full,
+            groupby_cols=[str(c) for c in list(groupby_cols)],
+            time_col=str(time_col),
+            min_length=int(min_length),
+            max_length=int(max_length),
+        )
+        coord_enrichment_pdf = _ensure_exemplar_coordinate_columns(
+            adata=adata_plot,
+            output_dir=output_dir,
+            cell_type=cell_type,
+            require_pixel_for_video=False,
+        )
+        exemplar_render_config["coordinate_enrichment"] = dict(coord_enrichment_pdf)
+
+        chosen_exemplars, _ = select_exemplar_tracks_by_cluster(
+            adata_tracks=adata_tracks,
+            n_per_cluster=int(n_per_cluster),
+            sample_key="sample_name",
+            track_key="TrackID",
+            cluster_key=str(output_col),
+            tmin_key="position_t_min",
+            tmax_key="position_t_max",
+            seed=int(random_state),
+            query=None,
+        )
+
+        exemplar_selection_csv = class_outdir / (
+            f"exemplar_selection_cluster_{_sanitize_filename_token(output_col, fallback='cluster')}_"
+            f"state_{_sanitize_filename_token(state_col, fallback='state')}_classified.csv"
+        )
+        chosen_exemplars.to_csv(exemplar_selection_csv, index=False)
+
+        per_cluster_pdf_out = save_exemplar_statebar_track_pdf_per_cluster(
+            adata_full=adata_plot,
+            out_dir=class_outdir,
+            chosen_df=chosen_exemplars,
+            adata_tracks=None,
+            n_per_cluster=int(n_per_cluster),
+            sample_key="sample_name",
+            track_key="TrackID",
+            time_key=str(time_col),
+            state_key=str(state_col),
+            cluster_key=str(output_col),
+            tmin_key="position_t_min",
+            tmax_key="position_t_max",
+            rows_per_page=6,
+            plot_dpi=int(plot_dpi),
+            seed=int(random_state),
+            cmap_name="tab20",
+        )
+        exemplar_statebar_track_pdf_by_cluster = dict(
+            per_cluster_pdf_out.get("pdf_paths_by_cluster", {})
+        )
+
+        if bool(plot_exemplar_backprojection_videos):
+            coord_enrichment_video = _ensure_exemplar_coordinate_columns(
+                adata=adata_plot,
+                output_dir=output_dir,
+                cell_type=cell_type,
+                require_pixel_for_video=True,
+            )
+            exemplar_render_config["coordinate_enrichment_video"] = dict(coord_enrichment_video)
+            per_cluster_video_out = save_exemplar_statebar_backprojection_video_per_cluster(
+                adata_full=adata_plot,
+                output_dir=output_dir,
+                out_dir=class_outdir,
+                chosen_df=chosen_exemplars,
+                adata_tracks=None,
+                n_per_cluster=int(n_per_cluster),
+                sample_key="sample_name",
+                track_key="TrackID",
+                time_key=str(time_col),
+                state_key=str(state_col),
+                cluster_key=str(output_col),
+                tmin_key="position_t_min",
+                tmax_key="position_t_max",
+                fps=int(exemplar_video_fps),
+                dpi=int(exemplar_video_dpi),
+                margin=int(exemplar_video_margin),
+                pmin=float(exemplar_video_pmin),
+                pmax=float(exemplar_video_pmax),
+                track_color=str(exemplar_video_track_color),
+                coordinate_source_hint=coord_enrichment_video.get("csv_path"),
+                seed=int(random_state),
+                cmap_name="tab20",
+            )
+            exemplar_statebar_backprojection_video_by_cluster = dict(
+                per_cluster_video_out.get("video_paths_by_cluster", {})
+            )
+
     output_path = None
     if bool(save_outputs):
         if bool(save_as_model):
@@ -872,9 +1168,6 @@ def apply_track_classifier_to_subtracks(
         else:
             output_path = outfolder / f"BEHAV3D_{_sanitize_filename_token(cell_type, fallback='cell')}_behavioral_trajectories_predicted.h5ad"
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        adata_tracks.write(output_path, compression="gzip")
-        if verbose:
-            print(f"Saved classifier-applied subtracks adata: {output_path}")
 
     adata_tracks.uns.setdefault("classification", {})
     adata_tracks.uns["classification"].update(
@@ -893,8 +1186,21 @@ def apply_track_classifier_to_subtracks(
             ),
             "applied_on_adata_full_path": str(adata_full_path),
             "saved_output_path": None if output_path is None else str(output_path),
+            "exemplar_render_stage": "after_classification",
+            "exemplar_statebar_track_pdf_by_cluster": dict(exemplar_statebar_track_pdf_by_cluster),
+            "exemplar_statebar_backprojection_video_by_cluster": dict(
+                exemplar_statebar_backprojection_video_by_cluster
+            ),
+            "exemplar_selection_csv": (
+                None if exemplar_selection_csv is None else str(exemplar_selection_csv)
+            ),
+            "exemplar_render_config": dict(exemplar_render_config),
         }
     )
+    if bool(save_outputs) and output_path is not None:
+        adata_tracks.write(output_path, compression="gzip")
+        if verbose:
+            print(f"Saved classifier-applied subtracks adata: {output_path}")
     return {
         "adata_tracks": adata_tracks,
         "output_path": None if output_path is None else str(output_path),
@@ -1300,6 +1606,13 @@ def run_state_based_analysis(
     plot_exemplars=True,
     n_per_cluster=10,
     exemplar_state_keys=("full_behavioral_cluster",),
+    plot_exemplar_backprojection_videos=True,
+    exemplar_video_fps=6,
+    exemplar_video_dpi=180,
+    exemplar_video_margin=20,
+    exemplar_video_pmin=0.0,
+    exemplar_video_pmax=99.99,
+    exemplar_video_track_color="#63ff33",
 
     # Saving
     save_outputs=True,
@@ -1484,11 +1797,32 @@ def run_state_based_analysis(
             )
             print(f"Saved clustering diagnostics PDF: {report_paths['diagnostics_pdf']}")
 
+    exemplar_statebar_track_pdf_by_cluster = {}
+    exemplar_statebar_backprojection_video_by_cluster = {}
+    exemplar_selection_csv = None
+    exemplar_render_config = {
+        "stage": "after_clustering",
+        "cluster_key": str(cluster_key),
+        "state_key": str(state_col),
+        "n_per_cluster": int(n_per_cluster),
+        "autosave_plots": bool(autosave_plots),
+        "plot_exemplars": bool(plot_exemplars),
+        "plot_exemplar_backprojection_videos": bool(plot_exemplar_backprojection_videos),
+        "plot_dpi": int(plot_dpi),
+        "video_fps": int(exemplar_video_fps),
+        "video_dpi": int(exemplar_video_dpi),
+        "video_margin": int(exemplar_video_margin),
+        "video_pmin": float(exemplar_video_pmin),
+        "video_pmax": float(exemplar_video_pmax),
+        "video_track_color": str(exemplar_video_track_color),
+        "coordinate_enrichment": None,
+    }
+
     # --------- Exemplar tracks by cluster ----------
     if plot_exemplars:
         # This assumes plot_exemplar_tracks_by_cluster signature: (adata_tracks, adata_clusters, n_per_cluster, state_key)
         # where `adata_clusters` contains the clustering in .obs[cluster_key].
-        fig_exemplar, _, _ = plot_exemplar_tracks_by_cluster(
+        fig_exemplar, _, chosen_exemplars = plot_exemplar_tracks_by_cluster(
             adata_filt,
             adata_state_features,
             n_per_cluster=n_per_cluster,
@@ -1505,7 +1839,94 @@ def run_state_based_analysis(
                 _apply_best_pdf_orientation(fig_exemplar, default_orientation="landscape")
                 pdf.savefig(fig_exemplar, dpi=int(plot_dpi), bbox_inches="tight")
             print(f"Saved exemplar PDF: {exemplar_path}")
+
+            coord_enrichment_pdf = _ensure_exemplar_coordinate_columns(
+                adata=adata_filt,
+                output_dir=output_dir,
+                cell_type=cell_type,
+                require_pixel_for_video=False,
+            )
+            exemplar_render_config["coordinate_enrichment"] = dict(coord_enrichment_pdf)
+
+            exemplar_selection_csv = clustering_outfolder / (
+                f"exemplar_selection_cluster_{_sanitize_filename_token(cluster_key, fallback='cluster')}_"
+                f"state_{_sanitize_filename_token(state_col, fallback='state')}_clustering.csv"
+            )
+            chosen_exemplars.to_csv(exemplar_selection_csv, index=False)
+
+            per_cluster_pdf_out = save_exemplar_statebar_track_pdf_per_cluster(
+                adata_full=adata_filt,
+                out_dir=clustering_outfolder,
+                chosen_df=chosen_exemplars,
+                adata_tracks=None,
+                n_per_cluster=int(n_per_cluster),
+                sample_key="sample_name",
+                track_key="TrackID",
+                time_key=str(time_col),
+                state_key=str(state_col),
+                cluster_key=str(cluster_key),
+                tmin_key="position_t_min",
+                tmax_key="position_t_max",
+                rows_per_page=6,
+                plot_dpi=int(plot_dpi),
+                seed=int(random_state),
+                cmap_name="tab20",
+            )
+            exemplar_statebar_track_pdf_by_cluster = dict(
+                per_cluster_pdf_out.get("pdf_paths_by_cluster", {})
+            )
+
+            if bool(plot_exemplar_backprojection_videos):
+                coord_enrichment_video = _ensure_exemplar_coordinate_columns(
+                    adata=adata_filt,
+                    output_dir=output_dir,
+                    cell_type=cell_type,
+                    require_pixel_for_video=True,
+                )
+                exemplar_render_config["coordinate_enrichment_video"] = dict(coord_enrichment_video)
+                per_cluster_video_out = save_exemplar_statebar_backprojection_video_per_cluster(
+                    adata_full=adata_filt,
+                    output_dir=output_dir,
+                    out_dir=clustering_outfolder,
+                    chosen_df=chosen_exemplars,
+                    adata_tracks=None,
+                    n_per_cluster=int(n_per_cluster),
+                    sample_key="sample_name",
+                    track_key="TrackID",
+                    time_key=str(time_col),
+                    state_key=str(state_col),
+                    cluster_key=str(cluster_key),
+                    tmin_key="position_t_min",
+                    tmax_key="position_t_max",
+                    fps=int(exemplar_video_fps),
+                    dpi=int(exemplar_video_dpi),
+                    margin=int(exemplar_video_margin),
+                    pmin=float(exemplar_video_pmin),
+                    pmax=float(exemplar_video_pmax),
+                    track_color=str(exemplar_video_track_color),
+                    coordinate_source_hint=coord_enrichment_video.get("csv_path"),
+                    seed=int(random_state),
+                    cmap_name="tab20",
+                )
+                exemplar_statebar_backprojection_video_by_cluster = dict(
+                    per_cluster_video_out.get("video_paths_by_cluster", {})
+                )
         plt.close(fig_exemplar)
+
+    adata_state_features.uns.setdefault("visualization", {})
+    adata_state_features.uns["visualization"].update(
+        {
+            "exemplar_render_stage": "after_clustering",
+            "exemplar_statebar_track_pdf_by_cluster": dict(exemplar_statebar_track_pdf_by_cluster),
+            "exemplar_statebar_backprojection_video_by_cluster": dict(
+                exemplar_statebar_backprojection_video_by_cluster
+            ),
+            "exemplar_selection_csv": (
+                None if exemplar_selection_csv is None else str(exemplar_selection_csv)
+            ),
+            "exemplar_render_config": dict(exemplar_render_config),
+        }
+    )
 
 
     # --------- Save outputs ----------

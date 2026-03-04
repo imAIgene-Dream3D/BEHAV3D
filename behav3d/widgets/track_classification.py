@@ -1187,6 +1187,7 @@ class TrackClassificationPanel:
                     output_col=self._fixed_cluster_key(),
                     confidence_col=f"{self._fixed_cluster_key()}_confidence",
                     output_subdir_name="behavioral_tracks",
+                    n_per_cluster=int(self.n_per_cluster.value),
                     save_outputs=True,
                     save_as_model=True,
                     random_state=int(self.random_state.value),
