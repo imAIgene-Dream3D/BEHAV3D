@@ -6,6 +6,7 @@ import traceback
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 from io import BytesIO
 from PIL import Image as PILImage, ImageDraw, ImageFont
 from copy import deepcopy
@@ -26,8 +27,11 @@ from behav3d.analysis.tcell_analysis import (
 from behav3d.analysis.organoid_analysis import (
     filter_organoid_tracks,
     run_organoid_analysis,
-    plot_multi_organoid_death_dynamics
+    plot_multi_organoid_death_dynamics,
+    run_organoid_morphology_dead_analysis
 )
+
+from behav3d.io.images import load_zarr
 from behav3d.analysis import summarize_track_features
 from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
 from behav3d.analysis.interaction_analysis import run_interaction_analysis
@@ -905,6 +909,226 @@ class ActiveKillingPanel:
                 traceback.print_exc()
             return None
 
+
+class DeathThresholdPreview:
+    """
+    Interactive visual preview for tuning the organoid death threshold.
+    """
+    def __init__(self, metadata_loader, cell_type):
+        self.metadata_loader = metadata_loader
+        self.cell_type = str(cell_type).strip()
+        self.output_dir = Path(self.metadata_loader.output_dir).expanduser()
+        
+        # Paths
+        feature_outdir = self.output_dir / "analysis" / self.cell_type / "track_features"
+        #self.df_tracks_path = feature_outdir / f"BEHAV3D_{self.cell_type}_combined_track_features.csv"
+        self.df_tracks_path = feature_outdir / f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv"
+
+        #if not self.df_tracks_path.exists():
+            #self.df_tracks_path = feature_outdir / f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv"
+
+        if not self.df_tracks_path.exists():
+            self.df_tracks = None
+        else:
+            self.df_tracks = pd.read_csv(self.df_tracks_path)
+            self.df_tracks['TrackID'] = self.df_tracks['TrackID'].astype(str)
+
+        self.samples = self.metadata_loader.metadata['sample_name'].tolist()
+        
+        # UI Elements
+        self.sample_dd = widgets.Dropdown(options=self.samples, description="Sample:", layout={'width': '250px'})
+        self.time_slider = widgets.IntSlider(description="Time:", continuous_update=False, layout={'width': '400px'})
+        #self.threshold_slider = widgets.FloatSlider(value=0.02, min=0, max=0.5, step=0.005, description="Threshold:", continuous_update=False, layout={'width': '400px'})
+        self.threshold_input = widgets.BoundedFloatText(
+            value=0.02, min=0, max=1, step=0.0005,
+            description="Threshold:", style={'description_width': 'initial'},
+            layout={'width': '120px'}
+            )
+        self.org_ch_input = widgets.IntText(value=0, description=f"{self.cell_type} Channel:", style={'description_width': 'initial'}, layout={'width': '200px'})
+        self.dead_ch_input = widgets.IntText(value=1, description="Dead Channel:", style={'description_width': 'initial'}, layout={'width': '200px'})
+
+        self.out = widgets.Output(layout={'overflow': 'visible', 'height': 'auto'})
+        
+        # Observers
+        self.sample_dd.observe(self._on_sample_change, names='value')
+        self.time_slider.observe(self._update, names='value')
+        self.threshold_input.observe(self._update, names='value')
+        self.org_ch_input.observe(self._update, names='value')
+        self.dead_ch_input.observe(self._update, names='value')
+
+        self.ui = widgets.VBox([
+            widgets.HTML(f"<b>Visual Threshold Preview</b> <i>(Max Intensity Projection)</i>"),
+            widgets.HBox([self.sample_dd, self.threshold_input]),
+            widgets.HBox([
+                widgets.HTML("<b>Channels: </b>"),
+                self.org_ch_input,
+                self.dead_ch_input,
+                widgets.HTML("<i>(Indices starting at 0)</i>")
+            ]),
+            self.time_slider,
+            self.out,
+        ])
+
+        # Initial Load
+        if self.samples:
+            self._on_sample_change({'new': self.samples[0]})
+
+    def _on_sample_change(self, change):
+        sample = change['new']
+        row = self.metadata_loader.metadata[self.metadata_loader.metadata['sample_name'] == sample].iloc[0]
+        
+        sample_dir = self.output_dir / "images" / sample
+        self.raw_path = sample_dir / f"{sample}.zarr"
+        
+        # Segmentation/tracked image path from metadata
+        self.label_path = None
+        for prefix in ['or', 'im', 'ot']:
+            col = f"{prefix}_{self.cell_type}_tracks_image_path"
+            if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                p = Path(row[col])
+                if p.exists():
+                    self.label_path = p
+                    break
+        
+        # Fallback:tracked.zarr
+        if self.label_path is None or not self.label_path.exists():
+            tracked_fallback = sample_dir / f"{sample}_{self.cell_type}_tracked.zarr"
+            #segments_fallback = sample_dir / f"{sample}_{self.cell_type}_segments.zarr"
+            if tracked_fallback.exists():
+                self.label_path = tracked_fallback
+            #elif segments_fallback.exists():
+            #    self.label_path = segments_fallback
+            else:
+                self.label_path = tracked_fallback  # will fail with informative error
+            
+        self.dead_mask_path = sample_dir / f"{sample}_mask_dead.zarr"
+        if 'dead_mask_path' in row and pd.notna(row['dead_mask_path']):
+            dp = Path(row['dead_mask_path'])
+            if dp.exists():
+                self.dead_mask_path = dp
+        
+        try:
+            raw = load_zarr(self.raw_path)
+            # T, C, Z, Y, X or T, Z, Y, X
+            self.time_slider.max = raw.shape[0] - 1
+            self.time_slider.value = raw.shape[0] // 2
+        except: pass
+        
+        self._update(None)
+
+    @staticmethod
+    def _contrast_limits(img):
+        """Compute display vmin/vmax using 1st–99th percentile of non-zero pixels."""
+        pos = img[img > 0]
+        if pos.size == 0:
+            return 0, max(1, img.max())
+        return float(np.percentile(pos, 1)), float(np.percentile(pos, 99))
+
+    def _update(self, _):
+        sample = self.sample_dd.value
+        t = self.time_slider.value
+        thr = self.threshold_input.value
+        
+        self.out.clear_output(wait=False)
+        with self.out:
+            try:
+                org_ch = self.org_ch_input.value
+                dead_ch = self.dead_ch_input.value
+
+                # Load Z stacks and apply Maximum Intensity Projection per channel
+                raw_zarr = load_zarr(self.raw_path)
+                has_channels = (raw_zarr.ndim == 5)
+                if has_channels:
+                    n_channels = raw_zarr.shape[1]
+                    if org_ch >= n_channels:
+                        print(f"{self.cell_type} Channel {org_ch} out of range (0–{n_channels-1}). Select a valid channel.")
+                        return
+                    if dead_ch >= n_channels:
+                        print(f"Dead Channel {dead_ch} out of range (0–{n_channels-1}). Select a valid channel.")
+                        return
+                    raw_img = np.asarray(raw_zarr[t, org_ch]).max(axis=0)
+                    dead_raw = np.asarray(raw_zarr[t, dead_ch]).max(axis=0)
+                else:
+                    raw_img = np.asarray(raw_zarr[t]).max(axis=0)
+                    dead_raw = raw_img
+
+                # Segmentation: first-nonzero projection (avoids label mixing from MIP)
+                label_zarr = load_zarr(self.label_path)
+                label_vol = np.asarray(label_zarr[t])
+                if label_vol.ndim == 3:
+                    first_nz_idx = np.argmax(label_vol > 0, axis=0)
+                    label_img = np.take_along_axis(label_vol, first_nz_idx[np.newaxis], axis=0)[0]
+                else:
+                    label_img = label_vol
+
+                # Dead mask: MIP over Z (binary OR: correct for 0/1 masks)
+                dead_mask_zarr = load_zarr(self.dead_mask_path)
+                dead_vol = np.asarray(dead_mask_zarr[t])
+                dead_mask = dead_vol.max(axis=0) if dead_vol.ndim == 3 else dead_vol
+
+                # Classification image (red=dead, green=alive, gray=unknown)
+                class_img = np.zeros((*label_img.shape, 3), dtype=float)
+                if self.df_tracks is not None:
+                    df_t = self.df_tracks[(self.df_tracks['sample_name'] == sample) & (self.df_tracks['position_t'] == t)]
+                    for label_id in np.unique(label_img):
+                        if label_id == 0: continue
+                        row = df_t[df_t['TrackID'] == str(label_id)]
+                        if not row.empty:
+                            perc = row['percentage_dead_mask'].values[0]
+                            color = [1, 0, 0] if perc >= thr else [0, 1, 0]
+                            class_img[label_img == label_id] = color
+                        else:
+                            class_img[label_img == label_id] = [0.5, 0.5, 0.5]
+
+                # Contrast limits
+                vmin_r, vmax_r = self._contrast_limits(raw_img)
+                vmin_d, vmax_d = self._contrast_limits(dead_raw)
+
+                # Masks for overlay
+                seg_display = np.ma.masked_where(label_img == 0, label_img)
+                dead_mask_overlay = np.ma.masked_where(dead_mask == 0, dead_mask)
+                red_cmap = ListedColormap(['#FF2020'])
+
+                #fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+                fig, axes = plt.subplots(1, 5, figsize=(30, 6), dpi=150)
+                # 1) Raw Organoid
+                axes[0].imshow(raw_img, cmap='gray', vmin=vmin_r, vmax=vmax_r)
+                axes[0].set_title(f"Raw {self.cell_type} (Ch {org_ch})")
+                # 2) Segmentation
+                axes[1].imshow(np.zeros_like(label_img), cmap='gray', vmin=0, vmax=1)
+                axes[1].imshow(seg_display, cmap='nipy_spectral', interpolation='nearest')
+                axes[1].set_title(f"Segments ({Path(self.label_path).stem})")
+                # 3) Raw Dead channel
+                axes[2].imshow(dead_raw, cmap='gray', vmin=vmin_d, vmax=vmax_d)
+                axes[2].set_title(f"Raw Dead (Ch {dead_ch})")
+                # 4) Dead mask (red) on raw organoid
+                axes[3].imshow(raw_img, cmap='gray', vmin=vmin_r, vmax=vmax_r)
+                axes[3].imshow(dead_mask_overlay, cmap=red_cmap, alpha=0.55)
+                axes[3].set_title(f"Dead Mask on {self.cell_type}")
+                # 5) Classification
+                axes[4].imshow(class_img)
+                axes[4].set_title(f"Classification (Thr: {thr:.3f})\nRed=Dead, Green=Alive")
+                for ax in axes: ax.axis('off')
+                plt.tight_layout()
+                plt.show()
+                
+                ch_note = f"Raw: {raw_zarr.shape} ({n_channels} ch)" if has_channels else f"Raw: {raw_zarr.shape} (no channel dim)"
+                info_html = f"""
+                <div style='padding: 5px; border: 1px solid #ccc; background-color: #f9f9f9; font-size: 12px;'>
+                    <b>Legend:</b>
+                    <span style='color: green;'>●</span> Alive |
+                    <span style='color: red;'>●</span> Dead |
+                    <span style='color: gray;'>●</span> Track missing/filtered |
+                </div>
+                """
+                display(widgets.HTML(info_html))
+                
+                if self.df_tracks is None:
+                    print("Please run Feature Extraction and track filtering first.")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                print(f"Preview unavailable: {e}")
+
 class DeathDynamicsPanel:
     """
     Death dynamics analysis panel (organoid-specific).
@@ -923,25 +1147,53 @@ class DeathDynamicsPanel:
         
         params = dict(self.metadata_loader.behav3d_parameters or {})
         cfg = params.setdefault("death_dynamics", {}).setdefault(self.cell_type, deepcopy(_DEFAULT_CONFIG.get("death_dynamics", {}).get("organoid", {})))
+        self._params = params
+        self._panel_cfg = cfg
+        self.metadata_loader.behav3d_parameters = self._params
         
         self.dead_perc_threshold = widgets.FloatText(description="Dead % threshold", value=float(cfg.get("dead_perc_threshold", 0.02)), style={'description_width': '160px'}, layout=widgets.Layout(width="220px"))
         self.btn_run = widgets.Button(description=f"Run {cell_type} death dynamics", button_style="warning", layout=widgets.Layout(width="300px"))
         self.btn_run.on_click(self._on_run_clicked)
+        
+        self.btn_preview = widgets.ToggleButton(description="Preview Threshold", button_style="info", layout=widgets.Layout(width="200px"))
+        self.btn_preview.observe(self._on_preview_toggled, names='value')
+        self.preview_container = widgets.VBox([])
+
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
         self.out = widgets.Output()
         
         if not self.has_death_features:
-            self.ui = widgets.VBox([widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'), widgets.HTML('<div style="color:#b00;">⚠️ No death features found.</div>')])
+            self.ui = widgets.VBox([widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'), widgets.HTML('<div style="color:#b00;">No death features found. Run feature extraction first.</div>')])
         else:
-            self.ui = widgets.VBox([widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'), widgets.HBox([self.dead_perc_threshold, widgets.HTML('<div style="font-size:12px;color:#666;">(threshold for classification)</div>')], layout=widgets.Layout(align_items="center")), widgets.HTML("<hr>"), widgets.HBox([self.btn_run, self.spinner_html]), self.out])
+            self.ui = widgets.VBox([
+                widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'), 
+                self.btn_preview,
+                self.preview_container,
+                widgets.HTML("<hr>"),
+                widgets.HBox([self.dead_perc_threshold, widgets.HTML('<div style="font-size:12px;color:#666;">(Adjust value manually or use preview slider)</div>')], layout=widgets.Layout(align_items="center")),
+                widgets.HBox([self.btn_run, self.spinner_html]), 
+                self.out
+            ])
+
+    def _on_preview_toggled(self, change):
+        if change['new']:
+            try:
+                preview = DeathThresholdPreview(self.metadata_loader, self.cell_type)
+                widgets.jslink((self.dead_perc_threshold, 'value'), (preview.threshold_input, 'value'))
+                self.preview_container.children = [preview.ui]
+            except Exception as e:
+                with self.out: print(f"Error launching preview: {e}")
+        else:
+            self.preview_container.children = []
 
     def _on_run_clicked(self, *_):
         self.btn_run.disabled = True; self.spinner_html.layout.display = None; self.out.clear_output()
         with self.out:
             try:
-                self.metadata_loader.behav3d_parameters["death_dynamics"][self.cell_type]["dead_perc_threshold"] = float(self.dead_perc_threshold.value)
-                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
+                self._panel_cfg["dead_perc_threshold"] = float(self.dead_perc_threshold.value)
+                self.metadata_loader.behav3d_parameters = self._params
+                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self._params, f, sort_keys=False)
                 run_organoid_analysis(dead_perc_threshold=float(self.dead_perc_threshold.value), output_dir=self.output_dir, df_tracks_path=None, org_type=self.cell_type, metadata=self.metadata_loader.metadata)
                 print(f"✅ {self.cell_type} death dynamics complete!")
             except Exception: traceback.print_exc()
@@ -996,10 +1248,10 @@ class MultiOrganoidDeathDynamicsPanel:
         
         if len(self.available_data) < 2:
             missing = [ot for ot in self.organoid_types if ot not in self.available_data]
-            self.status_html.value = f'<div style="color:#b00;">⚠️ Waiting for death dynamics data from: {", ".join(missing)}</div>'
+            self.status_html.value = f'<div style="color:#b00;">Waiting for death dynamics data from: {", ".join(missing)}</div>'
             self.btn_run.disabled = True
         else:
-            self.status_html.value = f'<div style="color:#080;">✅ Ready: {", ".join(self.available_data.keys())}</div>'
+            self.status_html.value = f'<div style="color:#080;">Ready: {", ".join(self.available_data.keys())}</div>'
             self.btn_run.disabled = False
     
     def _on_refresh_clicked(self, *_):
@@ -1023,6 +1275,174 @@ class MultiOrganoidDeathDynamicsPanel:
             finally:
                 self.spinner_html.layout.display = "none"
                 self.btn_run.disabled = False
+
+
+class MultiOrganoidMorphologyDeathPanel:
+    """
+    Morphology vs Death analysis for all organoid types combined.
+    """
+    def __init__(self, metadata_loader, organoid_types):
+        self.metadata_loader = metadata_loader
+        self.organoid_types = organoid_types
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+
+        params = dict(self.metadata_loader.behav3d_parameters or {})
+        cfg = params.setdefault("morpho_dead", {})
+
+        self.window_start = widgets.IntText(
+            description="Window Start (t >= N)",
+            value=int(cfg.get("window_start", 0)),
+            style={'description_width': '180px'},
+            layout=widgets.Layout(width="260px")
+        )
+        self.window_end = widgets.IntText(
+            description="Window End (t <= N)",
+            value=int(cfg.get("window_end", 5)),
+            style={'description_width': '180px'},
+            layout=widgets.Layout(width="260px")
+        )
+        self.umap_n_neighbors = widgets.IntText(
+            description="UMAP neighbors",
+            value=int(cfg.get("umap_n_neighbors", 15)),
+            style={'description_width': '180px'},
+            layout=widgets.Layout(width="260px")
+        )
+        self.umap_n_neighbors.tooltip = "Number of local neighbors used for UMAP manifold construction. Controls local vs global structure."
+        
+        self.umap_min_dist = widgets.FloatText(
+            description="UMAP min_dist",
+            value=float(cfg.get("umap_min_dist", 0.1)),
+            style={'description_width': '180px'},
+            layout=widgets.Layout(width="260px")
+        )
+        self.umap_min_dist.tooltip = "Minimum distance between points in UMAP embedding. Controls how tightly points are packed."
+        
+        self.umap_spread = widgets.FloatText(
+            description="UMAP spread",
+            value=float(cfg.get("umap_spread", 1.0)),
+            style={'description_width': '180px'},
+            layout=widgets.Layout(width="260px")
+        )
+        self.umap_spread.tooltip = "The effective scale of embedded points."
+        
+        self.distance_metric = widgets.Text(
+            value=cfg.get("distance_metric", "euclidean"),
+            description="UMAP metric",
+            placeholder="euclidean",
+            style={'description_width': '180px'},
+            layout=widgets.Layout(width="260px")
+        )
+        self.distance_metric.tooltip = "Distance metric for UMAP. See umap-learn docs for full options."
+                
+        self.leiden_resolution = widgets.FloatText(
+            description="Leiden resolution",
+            value=float(cfg.get("leiden_resolution", 1.0)),
+            style={'description_width': '180px'},
+            layout=widgets.Layout(width="260px")
+        )
+        self.leiden_resolution.tooltip = "Controls cluster granularity. Higher values lead to more clusters."
+
+        self.status_html = widgets.HTML("")
+        self.btn_refresh = widgets.Button(description="Refresh", button_style="info", layout=widgets.Layout(width="100px"))
+        self.btn_refresh.on_click(self._on_refresh_clicked)
+        self.btn_run = widgets.Button(description="Run Initial Morphology vs Death", button_style="warning", layout=widgets.Layout(width="280px"))
+        self.btn_run.on_click(self._on_run_clicked)
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
+        self.out = widgets.Output()
+
+        self._refresh_status()
+
+        self.ui = widgets.VBox([
+            widgets.HTML('<b>Initial Morphology Related to Death</b>'),
+            widgets.HTML('<div style="font-size:12px;color:#666;">Uses baseline morphology averaged over the selected window, excludes organoids dead in that window, and labels dead if any death occurs after.</div>'),
+            widgets.HTML('<div style="font-size:12px;color:#666;">Features: 4 key morphology descriptors (volume, sphericity, solidity, surface-to-volume ratio).</div>'),
+            widgets.HBox([self.status_html, self.btn_refresh], layout=widgets.Layout(align_items="center", gap="10px")),
+            widgets.HTML("<hr>"),
+            widgets.HBox([self.window_start, self.window_end], layout=widgets.Layout(gap="12px")),
+            widgets.HBox([self.umap_n_neighbors, self.umap_min_dist], layout=widgets.Layout(gap="12px")),
+            widgets.HBox([self.distance_metric, self.leiden_resolution], layout=widgets.Layout(gap="12px")),
+            widgets.HTML("<hr>"),
+            widgets.HBox([self.btn_run, self.spinner_html]),
+            self.out
+        ])
+
+        # Check for organoid presence to show/hide the entire panel
+        md = self.metadata_loader.metadata
+        has_organoids = any(col.startswith('or_') for col in md.columns)
+        if not has_organoids:
+            self.ui.layout.display = "none"
+
+    def _refresh_status(self):
+        self.available_data = {}
+        missing = []
+        for org_type in self.organoid_types:
+            csv_path = Path(self.output_dir, "analysis", org_type, "track_features", f"BEHAV3D_{org_type}_combined_track_features_filtered.csv")
+            if csv_path.exists():
+                self.available_data[org_type] = csv_path
+            else:
+                missing.append(org_type)
+
+        if not self.available_data:
+            self.status_html.value = '<div style="color:#b00;">No organoid track features found. Run track filtering first.</div>'
+            self.btn_run.disabled = True
+        elif missing:
+            self.status_html.value = (
+                f'<div style="color:#b80;">Missing data for: {", ".join(missing)}. '
+                f'Will run with available: {", ".join(self.available_data.keys())}</div>'
+            )
+            self.btn_run.disabled = False
+        else:
+            self.status_html.value = f'<div style="color:#080;">Ready: {", ".join(self.available_data.keys())}</div>'
+            self.btn_run.disabled = False
+
+    def _on_refresh_clicked(self, *_):
+        self._refresh_status()
+
+    def _persist_params(self):
+        params = self.metadata_loader.behav3d_parameters
+        cfg = params.setdefault("morpho_dead", {})
+        cfg.update({
+            "window_start": int(self.window_start.value),
+            "window_end": int(self.window_end.value),
+            "umap_n_neighbors": int(self.umap_n_neighbors.value),
+            "umap_min_dist": float(self.umap_min_dist.value),
+            #"umap_spread": float(self.umap_spread.value),
+            "distance_metric": str(self.distance_metric.value).strip() or "euclidean",
+            "leiden_resolution": float(self.leiden_resolution.value),
+        })
+        if hasattr(self.metadata_loader, "behav3d_parameters_path"):
+            yaml.safe_dump(
+                params,
+                self.metadata_loader.behav3d_parameters_path.open("w"),
+                sort_keys=False
+            )
+
+    def _on_run_clicked(self, *_):
+        self.btn_run.disabled = True
+        self.spinner_html.layout.display = None
+        self.out.clear_output()
+        with self.out:
+            try:
+                self._persist_params()
+                run_organoid_morphology_dead_analysis(
+                    output_dir=self.output_dir,
+                    organoid_types=self.organoid_types,
+                    initial_window=(int(self.window_start.value), int(self.window_end.value)),
+                    umap_n_neighbors=int(self.umap_n_neighbors.value),
+                    umap_min_dist=float(self.umap_min_dist.value),
+                    #umap_spread=float(self.umap_spread.value),
+                    distance_metric=str(self.distance_metric.value).strip() or "euclidean",
+                    leiden_resolution=float(self.leiden_resolution.value),
+                    metadata=self.metadata_loader.metadata,
+                )
+                print("Initial morphology vs death analysis complete!")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self.btn_run.disabled = False
+
 
 
 class InteractionAnalysisPanel:
