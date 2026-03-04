@@ -310,7 +310,7 @@ class ActiveKillingPanel:
         self.target_info_html = widgets.HTML(f'<div style="padding:5px;background:#f0f0f0;border-radius:4px;"><b>Target cell types:</b> {target_info}</div>')
         
         self.observation_window = widgets.IntText(description="Observation window:", value=int(self._cfg.get("observation_window", 5)), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"))
-        self.death_signal_dd = widgets.Dropdown(options=["mean_dead_dye", "percentage_dead_mask", "nr_dead_mask_pixels"], value=self._cfg.get("death_signal_column", "mean_dead_dye"), description="Death signal:", style={'description_width': '150px'}, layout=widgets.Layout(width="300px"))
+        self.death_signal_dd = widgets.Dropdown(options=["percentage_dead_mask", "mean_dead_dye", "nr_dead_mask_pixels"], value=self._cfg.get("death_signal_column", "percentage_dead_mask"), description="Death signal:", style={'description_width': '150px'}, layout=widgets.Layout(width="300px"))
         self.killing_threshold = widgets.FloatText(description="Killing threshold:", value=float(self._cfg.get("killing_threshold_multiplier", 1.5)), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"))
         self.min_contact_duration = widgets.IntText(description="Min contact duration:", value=int(self._cfg.get("min_contact_duration", 1)), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"))
         
@@ -535,6 +535,7 @@ class ActiveKillingPanel:
                 axes[0].set_title("1. Killing Efficiency Distribution", fontsize=14, fontweight='bold')
                 axes[0].set_xlabel("Efficiency Score (signal increase / expected background)")
                 axes[0].set_ylabel("Active Killing Events")
+                axes[0].set_xlim(left=0, right=10)
                 
                 # Plot 2: Smoothed Kinetics
                 temp_counts = df_sample_active.groupby("position_t").size()
@@ -563,29 +564,21 @@ class ActiveKillingPanel:
                     axes[2].set_ylabel("Cumulative Sum of Active Killing Events")
                     axes[2].grid(True, linestyle='--', alpha=0.6)
 
-                # Plot 4: Raster
+                # Plot 4: Distribution of active killing events per cell
                 if not df_sample_active.empty:
-                    df_sample_active['hitter_label'] = df_sample_active['immune_track_id'].astype(str)
-                    hitters = df_sample_active.groupby('hitter_label').size().sort_values(ascending=False)
-                    hitter_map = {name: i for i, name in enumerate(hitters.index)}
-                    df_sample_active['y_idx'] = df_sample_active['hitter_label'].map(hitter_map)
-                    
-                    scatter = axes[3].scatter(df_sample_active["position_t"], df_sample_active["y_idx"], 
-                                              c=df_sample_active["killing_efficiency"], cmap='YlOrRd', 
-                                              s=50, edgecolors='black', alpha=0.8)
-                    axes[3].set_title("4. Killing Event Raster (By T-cell)", fontsize=14, fontweight='bold')
-                    axes[3].set_xlabel("Timepoint")
-                    axes[3].invert_yaxis()
-                    
-                    if len(hitters) <= 25:
-                        axes[3].set_yticks(range(len(hitters)))
-                        axes[3].set_yticklabels([str(n) for n in hitters.index], fontsize=8)
-                        axes[3].set_ylabel("T-cell TrackID (Ranked)")
-                    else:
-                        axes[3].set_yticks(range(15))
-                        axes[3].set_yticklabels([str(n) for n in hitters.index[:15]], fontsize=8)
-                        axes[3].set_ylabel("T-cell TrackID (Top 15 shown, ranked)")
-                    plt.colorbar(scatter, ax=axes[3], label='Efficiency')
+                    events_per_cell = df_sample_active.groupby("immune_track_id").size()
+                    max_events = int(events_per_cell.max())
+                    counts_per_bin = events_per_cell.value_counts().reindex(range(1, max_events + 1), fill_value=0)
+                    axes[3].bar(counts_per_bin.index, counts_per_bin.values, color='red', edgecolor='black', alpha=0.8)
+                    axes[3].set_xticks(range(1, max_events + 1))
+                    axes[3].set_title("4. Distribution of Killing Events per Cell", fontsize=14, fontweight='bold')
+                    axes[3].set_xlabel("Number of Active Killing Events")
+                    axes[3].set_ylabel("Number of Cells")
+                    axes[3].grid(True, axis='y', linestyle='--', alpha=0.6)
+                else:
+                    axes[3].set_title("4. Distribution of Killing Events per Cell", fontsize=14, fontweight='bold')
+                    axes[3].set_xlabel("Number of Active Killing Events")
+                    axes[3].set_ylabel("Number of Cells")
 
                 plt.tight_layout()
                 
