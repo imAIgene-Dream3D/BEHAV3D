@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 import numpy as np
 import pandas as pd
 import shutil
@@ -16,6 +17,20 @@ except ImportError:
         "Install via: pip install trackpy"
     )
 tp.quiet()
+
+# ---------------------------------------------------------------------------
+# Raise TrackPy's subnet size limit from the default (30) to 300.
+# Dense datasets (e.g. 100×100 µm FOV) can generate subnets with >30 points,
+# causing SubnetOversizeException.  300 is a reasonable trade-off between
+# allowing real-world data and avoiding factorial-time blowup.
+# ---------------------------------------------------------------------------
+_BEHAV3D_MAX_SUB_NET_SIZE = 300
+try:
+    import trackpy.linking as _tpl
+    _ORIGINAL_MAX = getattr(_tpl.Linker, 'MAX_SUB_NET_SIZE', 30)
+    _tpl.Linker.MAX_SUB_NET_SIZE = _BEHAV3D_MAX_SUB_NET_SIZE
+except Exception:
+    _ORIGINAL_MAX = 30
 
 def mask_from_one_hot_encoding_3D(one_hot):
     mask = np.zeros((one_hot.shape[1:]), dtype='int')
@@ -162,6 +177,7 @@ def run_trackpy_tracking_generic(
     adaptive_stop=10.0,
     adaptive_step=0.95,
     return_trackimg=True,
+    log_callback=None,
     **kwargs
 ):
     """Run trackpy tracking on any cell type.
@@ -248,8 +264,14 @@ def run_trackpy_tracking_generic(
             # Tracking
             from trackpy.linking.utils import SubnetOversizeException
 
+            if _BEHAV3D_MAX_SUB_NET_SIZE != _ORIGINAL_MAX:
+                _msg = (f"[TrackPy] MAX_SUB_NET_SIZE raised from {_ORIGINAL_MAX} "
+                        f"to {_BEHAV3D_MAX_SUB_NET_SIZE}. Large subnets may be slow.")
+                print(_msg, file=sys.stderr)
+                if log_callback:
+                    log_callback(f"⚠️ {_msg}")
+
             try:
-                # print("Trying fast Numba-based linking...")
                 df_tracks = tp.link(
                     df_centroids,
                     search_range=search_range,
@@ -258,12 +280,13 @@ def run_trackpy_tracking_generic(
                     adaptive_step=adaptive_step,
                     pos_columns=['position_z', 'position_y', 'position_x'],
                     t_column='position_t',
-                    # link_strategy='recursive'
-                    # use_numba=True  # default, but explicit here
                 )
             except SubnetOversizeException as e:
-                print(f"Numba linking failed due to large subnet: {e}")
-                print("Falling back to slower non-Numba linking...")
+                _warn = (f"[WARNING] Numba linking hit subnet limit: {e}\n"
+                         f"Falling back to recursive (slower) linking strategy...")
+                print(_warn, file=sys.stderr)
+                if log_callback:
+                    log_callback(f"⚠️ {_warn}")
 
                 df_tracks = tp.link(
                     df_centroids,

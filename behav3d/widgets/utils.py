@@ -115,21 +115,18 @@ _DEFAULT_CONFIG = {
     },
     "features": {
         "immune": {
-            "dead_mask_percentage_threshold": 0.25,
             "features_choice": ["movement", "intensity", "contact", "death"],
             "contact_threshold": 0,
             "n_workers": 16,
             "overwrite": False
         },
         "organoid": {
-            "dead_mask_percentage_threshold": 0.02,
             "features_choice": ["intensity", "death", "morphology"],
             "contact_threshold": 0,
             "n_workers": 8,
             "overwrite": False
         },
         "other": {
-            "dead_mask_percentage_threshold": 0.10,
             "features_choice": ["movement", "intensity", "contact"],
             "contact_threshold": 0,
             "n_workers": 8,
@@ -144,8 +141,6 @@ _DEFAULT_CONFIG = {
             "min_track_length_enabled": True,
             "max_track_length": 999999,
             "max_track_length_enabled": True,
-            "filter_t0_dead": True,
-            "filter_t0_dead_enabled": True,
         },
         "organoid": {
             "exp_duration_enabled": False,
@@ -154,8 +149,6 @@ _DEFAULT_CONFIG = {
             "min_track_length": 50,
             "max_track_length_enabled": False,
             "max_track_length": 999999,
-            "filter_t0_dead": True,
-            "filter_t0_dead_enabled": True,
         },
         "other": {
             "exp_duration": 24.0,
@@ -164,8 +157,6 @@ _DEFAULT_CONFIG = {
             "min_track_length_enabled": True,
             "max_track_length": 999999,
             "max_track_length_enabled": True,
-            "filter_t0_dead": False,
-            "filter_t0_dead_enabled": False
         }
     },
     "analysis": {
@@ -200,7 +191,6 @@ _DEFAULT_CONFIG = {
             'dtw_features_input': [],
             "dtw_features_resolved": [],
             'z_normalize': {},
-            "dead_perc_threshold": 0.02
         },
         "other": {
             "seed": 42,
@@ -217,7 +207,6 @@ _DEFAULT_CONFIG = {
             'dtw_features_input': [],
             "dtw_features_resolved": [],
             'z_normalize': {},
-            "dead_perc_threshold": 0.10
         }
     },
     "backprojection": {

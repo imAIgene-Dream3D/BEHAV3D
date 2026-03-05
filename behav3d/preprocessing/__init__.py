@@ -284,6 +284,8 @@ def calc_z_projection(im, z_axis=-3, projection='max'):
 def convert_input_files_to_zarr(
     output_dir,
     metadata,
+    t_start=None,
+    t_end=None,
     ):
     
     for idx, sample in metadata.iterrows():
@@ -297,7 +299,9 @@ def convert_input_files_to_zarr(
         convert_file_to_zarr(
             path=raw_image_path, 
             outpath=raw_image_zarr, 
-            overwrite=False
+            overwrite=False,
+            t_start=t_start,
+            t_end=t_end,
         )
                 
         metadata.at[idx, "raw_image_path"] = str(raw_image_zarr)

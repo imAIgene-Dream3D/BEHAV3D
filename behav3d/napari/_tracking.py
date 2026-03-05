@@ -69,18 +69,19 @@ class CellTypeTrackingPanel(QWidget):
 
         # ── Method selector ──────────────────────────────────────────
         method_group = QGroupBox("Tracking Method")
-        method_form = QFormLayout(method_group)
-        method_form.setContentsMargins(6, 4, 6, 4)
-        method_form.setSpacing(3)
-
+        method_layout = QHBoxLayout()
+        method_layout.setContentsMargins(6, 4, 6, 4)
         self.combo_method = QComboBox()
-        self.combo_method.addItems(["LAP (laptrack)", "TrackPy", "Propagation"])
+        self.combo_method.addItems([
+            "LAP (laptrack)", "TrackPy", "Propagation",
+            "btrack (Bayesian)", "Import tracking",
+        ])
         saved_method = tcfg.get("method", def_method)
-        idx_map = {"lap": 0, "trackpy": 1, "propagation": 2}
+        idx_map = {"lap": 0, "trackpy": 1, "propagation": 2, "btrack": 3, "import": 4}
         self.combo_method.setCurrentIndex(idx_map.get(saved_method, 0))
-        method_form.addRow("Method:", self.combo_method)
-
-        method_form.addRow("Method:", self.combo_method)
+        method_layout.addWidget(QLabel("Method:"))
+        method_layout.addWidget(self.combo_method)
+        method_group.setLayout(method_layout)
 
         layout.addWidget(method_group)
 
@@ -94,7 +95,7 @@ class CellTypeTrackingPanel(QWidget):
         lap_form = QFormLayout(lap_page)
         lap_form.setContentsMargins(6, 4, 6, 4)
         lap_form.setSpacing(3)
-        lap_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        lap_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
 
         self.lap_track_cost = QSpinBox()
         self.lap_track_cost.setRange(1, 999)
@@ -168,7 +169,7 @@ class CellTypeTrackingPanel(QWidget):
         tp_form = QFormLayout(tp_page)
         tp_form.setContentsMargins(6, 4, 6, 4)
         tp_form.setSpacing(3)
-        tp_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        tp_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
 
         self.tp_search_range = QSpinBox()
         self.tp_search_range.setRange(1, 999)
@@ -228,13 +229,40 @@ class CellTypeTrackingPanel(QWidget):
         # Page 2 — Propagation params (Simplified)
         prop_page = QWidget()
         prop_lay = QVBoxLayout(prop_page)
-        prop_notice = QLabel("No tunable parameters for Propagation tracking method.")
+        prop_notice = QLabel("No tunable parameters for\nPropagation tracking method.")
+        prop_notice.setWordWrap(True)
         prop_notice.setAlignment(Qt.AlignCenter)
         prop_notice.setStyleSheet("color: #666; font-style: italic; padding: 10px;")
         prop_lay.addWidget(prop_notice)
         prop_lay.addStretch()
 
         self.param_stack.addWidget(prop_page)
+
+        # Page 3 — btrack (Coming soon)
+        btrack_page = QWidget()
+        btrack_lay = QVBoxLayout(btrack_page)
+        btrack_notice = QLabel(
+            "btrack (Bayesian tracking) will be\navailable in a future release."
+        )
+        btrack_notice.setWordWrap(True)
+        btrack_notice.setAlignment(Qt.AlignCenter)
+        btrack_notice.setStyleSheet("color: #999; font-style: italic; padding: 10px;")
+        btrack_lay.addWidget(btrack_notice)
+        btrack_lay.addStretch()
+        self.param_stack.addWidget(btrack_page)
+
+        # Page 4 — Import tracking (Coming soon)
+        import_page = QWidget()
+        import_lay = QVBoxLayout(import_page)
+        import_notice = QLabel(
+            "Import tracking will be\navailable in a future release."
+        )
+        import_notice.setWordWrap(True)
+        import_notice.setAlignment(Qt.AlignCenter)
+        import_notice.setStyleSheet("color: #999; font-style: italic; padding: 10px;")
+        import_lay.addWidget(import_notice)
+        import_lay.addStretch()
+        self.param_stack.addWidget(import_page)
 
         # Set active page
         self.param_stack.setCurrentIndex(self.combo_method.currentIndex())
@@ -243,9 +271,9 @@ class CellTypeTrackingPanel(QWidget):
         # ── Apply settings buttons ──────────────────────────────────
         cat_label = self.category.capitalize() + "s" if self.category != "other" else "Other types"
         sync_row = QHBoxLayout()
-        self.btn_apply_cat = QPushButton(f"Apply settings to all {cat_label}")
+        self.btn_apply_cat = QPushButton(f"Apply to all {cat_label}")
         self.btn_apply_cat.clicked.connect(lambda: self._apply_to_others(category_only=True))
-        self.btn_apply_all = QPushButton("Apply settings to all")
+        self.btn_apply_all = QPushButton("Apply to all")
         self.btn_apply_all.clicked.connect(lambda: self._apply_to_others(category_only=False))
         
         sync_row.addWidget(self.btn_apply_cat)
@@ -261,13 +289,26 @@ class CellTypeTrackingPanel(QWidget):
         self.btn_run.clicked.connect(self._on_run_clicked)
         layout.addWidget(self.btn_run)
 
+        # Disable run button for coming-soon methods
+        def _on_method_idx_changed(idx):
+            is_coming_soon = idx >= 3
+            self.btn_run.setEnabled(not is_coming_soon)
+            if is_coming_soon:
+                self.btn_run.setToolTip("This tracking method is not yet available.")
+            else:
+                self.btn_run.setToolTip("")
+        self.combo_method.currentIndexChanged.connect(_on_method_idx_changed)
+        _on_method_idx_changed(self.combo_method.currentIndex())
+
         layout.addStretch()
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
     def _get_method_key(self):
-        return ["lap", "trackpy", "propagation"][self.combo_method.currentIndex()]
+        return ["lap", "trackpy", "propagation", "btrack", "import"][
+            self.combo_method.currentIndex()
+        ]
 
     def _collect_params(self) -> dict:
         """Collect current widget values into a dict."""
@@ -439,13 +480,19 @@ class CellTypeTrackingPanel(QWidget):
         if existing:
             from qtpy.QtWidgets import QMessageBox
             details = "\n".join(f"  \u2022 {w}" for w in existing)
-            res = QMessageBox.warning(
-                self, "Overwrite Existing Tracking?",
+            box = QMessageBox(self)
+            box.setWindowTitle("Overwrite Existing Tracking?")
+            box.setText(
                 f"The following tracking data already exists:\n\n{details}\n\n"
-                "Do you want to overwrite it?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                "What do you want to do?"
             )
-            if res != QMessageBox.Yes:
+            btn_overwrite = box.addButton("Overwrite", QMessageBox.DestructiveRole)
+            btn_skip = box.addButton("Skip", QMessageBox.AcceptRole)
+            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_cancel)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked != btn_overwrite:
                 self.log(f"Tracking for {self.cell_type} cancelled.")
                 return
             overwrite = True
@@ -514,9 +561,18 @@ class TrackingTab(QWidget):
 
     # ------------------------------------------------------------------
     def _init_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
+        scroll.setWidget(content)
 
         # Sub-tab widget (West position = left tabs)
         self.cell_tabs = QTabWidget()
@@ -546,6 +602,10 @@ class TrackingTab(QWidget):
         batch_btn_row.addWidget(self.btn_queue_track)
         layout.addLayout(batch_btn_row)
 
+        # Hidden until metadata is loaded
+        self.btn_run_batch.setVisible(False)
+        self.btn_queue_track.setVisible(False)
+
         # Log window
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -557,6 +617,7 @@ class TrackingTab(QWidget):
         # Placeholder when no metadata
         self._placeholder = QLabel("Load metadata in the Data Preparation tab to see tracking options.")
         self._placeholder.setAlignment(Qt.AlignCenter)
+        self._placeholder.setWordWrap(True)
         self._placeholder.setStyleSheet("color: #888; font-style: italic;")
         self.cell_tabs.addTab(self._placeholder, "—")
 
@@ -598,7 +659,12 @@ class TrackingTab(QWidget):
 
         if not all_types:
             self.cell_tabs.addTab(self._placeholder, "—")
+            self.btn_run_batch.setVisible(False)
+            self.btn_queue_track.setVisible(False)
             return
+
+        self.btn_run_batch.setVisible(True)
+        self.btn_queue_track.setVisible(True)
 
         for ct in org:
             panel = CellTypeTrackingPanel(
@@ -636,7 +702,7 @@ class TrackingTab(QWidget):
     def _on_run_batch_clicked(self):
         self.run_batch_tracking(interactive=True)
 
-    def run_batch_tracking(self, interactive=True):
+    def run_batch_tracking(self, interactive=True, skip_existing=False):
         """Sequential run for all configured cell type panels.
         When interactive=False, skips overwrite and visualization dialogs."""
         if not self.panels:
@@ -653,6 +719,7 @@ class TrackingTab(QWidget):
         # Check for existing tracking data across all cell types
         all_cts = list(self.panels.keys())
         existing = []
+        existing_cts = set()
         out_dir = Path(self.metadata_loader.output_dir)
         md = self.metadata_loader.metadata
         for ct in all_cts:
@@ -662,21 +729,30 @@ class TrackingTab(QWidget):
                 csv_dir = out_dir / "trackdata" / sn / ct
                 if zarr_path.exists() or (csv_dir.exists() and list(csv_dir.glob("*.csv"))):
                     existing.append(f"{ct} tracking data for {sn}")
+                    existing_cts.add(ct)
 
-        overwrite = True
+        skip_existing_flag = skip_existing
+        overwrite = not skip_existing
         if existing and interactive:
             from qtpy.QtWidgets import QMessageBox
             details = "\n".join(f"  \u2022 {w}" for w in existing)
-            res = QMessageBox.warning(
-                self, "Overwrite Existing Tracking?",
+            box = QMessageBox(self)
+            box.setWindowTitle("Overwrite Existing Tracking?")
+            box.setText(
                 f"The following tracking data already exists:\n\n{details}\n\n"
-                "Do you want to overwrite it?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                "What do you want to do?"
             )
-            if res != QMessageBox.Yes:
+            btn_overwrite = box.addButton("Overwrite All", QMessageBox.DestructiveRole)
+            btn_skip = box.addButton("Skip Existing", QMessageBox.AcceptRole)
+            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_cancel)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == btn_cancel:
                 self._log("Batch tracking cancelled by user.")
                 return
-            overwrite = True
+            skip_existing_flag = (clicked == btn_skip)
+            overwrite = not skip_existing_flag
 
         # Persist all panel params before starting so config is saved even if an error occurs
         for ct, panel in self.panels.items():
@@ -684,6 +760,9 @@ class TrackingTab(QWidget):
 
         try:
             for i, (ct, panel) in enumerate(self.panels.items(), 1):
+                if skip_existing_flag and ct in existing_cts:
+                    self._log(f"--- [{i}/{total}] Skipping {ct} (existing data) ---")
+                    continue
                 print(f"\n\u25b6 [{i}/{total}] Tracking {ct}...", file=sys.stderr)
                 self._log(f"--- [{i}/{total}] Tracking {ct} ---")
                 panel._run_tracking_for(ct, overwrite=overwrite)

@@ -170,6 +170,26 @@ from tqdm import tqdm
 from datetime import datetime
 
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+
+
+def _run_parallel_with_fallback(fn, args_list, n_workers):
+    """
+    Run fn over args_list using ProcessPoolExecutor with n_workers.
+    If a BrokenProcessPool error occurs (e.g. Windows out-of-virtual-memory),
+    raise a RuntimeError so that batch/queue processing can stop and
+    inform the user to lower the number of workers.
+    """
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            return list(tqdm(ex.map(fn, args_list), total=len(args_list)))
+    except BrokenProcessPool:
+        raise RuntimeError(
+            f"Worker processes crashed while using {n_workers} workers "
+            f"(likely out of memory). Please lower the number of workers "
+            f"and try again."
+        )
+
 
 def run_feature_extraction(
     metadata, 
@@ -1083,7 +1103,18 @@ def _calculate_contact_single_timepoint(args):
         contact_threshold,
         calculate_from
     ) = args
-    
+
+    # Validate element sizes before any division
+    for name, value in [("element_size_x (pixel_distance_xy)", element_size_x),
+                        ("element_size_y (pixel_distance_xy)", element_size_y),
+                        ("element_size_z (pixel_distance_z)",  element_size_z)]:
+        if value == 0 or value is None:
+            raise ValueError(
+                f"Element size '{name}' is {value!r}. "
+                "Check that 'pixel_distance_xy' and 'pixel_distance_z' are set correctly "
+                "in the metadata for all samples."
+            )
+
     # Load current cell type's segments for this timepoint
     current_segments = np.asarray(load_image(current_cell_segments_path)[t])
     
@@ -1258,8 +1289,7 @@ def calculate_contact_features(
     ]
 
     if n_workers > 1:
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            results = list(tqdm(executor.map(_calculate_contact_single_timepoint, args_list), total=len(args_list)))
+        results = _run_parallel_with_fallback(_calculate_contact_single_timepoint, args_list, n_workers)
     else:
         results = [_calculate_contact_single_timepoint(args) for args in tqdm(args_list)]
 
@@ -1414,14 +1444,7 @@ def calculate_basic_morphology(segments_path, voxel_spacing=(1.0, 1.0, 1.0), n_w
 
     args_list = [(t, segments_path, voxel_volume) for t in range(timepoints)]
     if n_workers and n_workers > 1:
-        with ProcessPoolExecutor(max_workers=int(n_workers)) as ex:
-            results = list(
-                tqdm(
-                    ex.map(_basic_counts_single_timepoint, args_list),
-                    total=len(args_list),
-                    # desc="Fast morphology (nr_pixels & volume)",
-                )
-            )
+        results = _run_parallel_with_fallback(_basic_counts_single_timepoint, args_list, int(n_workers))
     else:
         results = [
             _basic_counts_single_timepoint(args)
@@ -1642,10 +1665,9 @@ def calculate_morphology_features(segments_path, voxel_spacing=(1.0, 1.0, 1.0), 
     timepoints = segments.shape[0]
     args_list = [(t, segments_path, voxel_spacing) for t in range(timepoints)]
     if n_workers > 1:
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            results = list(tqdm(executor.map(_calculate_morphology_single_timepoint, args_list), total=len(args_list)))
+        results = _run_parallel_with_fallback(_calculate_morphology_single_timepoint, args_list, n_workers)
     else:
-        results = [_calculate_morphology_single_timepoint(args) for args in tqdm(args_list) ]
+        results = [_calculate_morphology_single_timepoint(args) for args in tqdm(args_list)]
 
     return pd.concat(results, ignore_index=True)
 

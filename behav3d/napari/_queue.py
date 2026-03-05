@@ -16,7 +16,7 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QFrame, QSizePolicy, QMessageBox, QScrollArea,
 )
-from qtpy.QtCore import Qt, Signal, QObject, QTimer
+from qtpy.QtCore import Qt, Signal, Slot, QObject, QTimer
 from qtpy.QtGui import QFont
 
 
@@ -28,6 +28,8 @@ class StepType(Enum):
     TRAIN = "train"
     SEGMENT = "segment"
     TRACK = "track"
+    FEATURE_EXTRACT = "feature_extract"
+    FILTER = "filter"
 
     @property
     def label(self):
@@ -35,11 +37,19 @@ class StepType(Enum):
             StepType.TRAIN: "🧠 Train Classifier",
             StepType.SEGMENT: "🦠 Batch Segmentation",
             StepType.TRACK: "📍 Batch Tracking",
+            StepType.FEATURE_EXTRACT: "🧪 Feature Extraction",
+            StepType.FILTER: "🧹 Filtering",
         }[self]
 
     @property
     def order(self):
-        return {StepType.TRAIN: 0, StepType.SEGMENT: 1, StepType.TRACK: 2}[self]
+        return {
+            StepType.TRAIN: 0,
+            StepType.SEGMENT: 1,
+            StepType.TRACK: 2,
+            StepType.FEATURE_EXTRACT: 3,
+            StepType.FILTER: 4,
+        }[self]
 
 
 class StepStatus(Enum):
@@ -137,13 +147,17 @@ class ProcessingQueuePanel(QWidget):
     PRESETS = {
         "Train + Segment + Track": [StepType.TRAIN, StepType.SEGMENT, StepType.TRACK],
         "Segment + Track": [StepType.SEGMENT, StepType.TRACK],
+        "Segment → Filter": [StepType.SEGMENT, StepType.TRACK, StepType.FEATURE_EXTRACT, StepType.FILTER],
     }
 
-    def __init__(self, segmentation_tab, tracking_tab, metadata_loader, parent=None):
+    def __init__(self, segmentation_tab, tracking_tab, metadata_loader,
+                 feature_extraction_tab=None, filtering_tab=None, parent=None):
         super().__init__(parent)
         self.segmentation_tab = segmentation_tab
         self.tracking_tab = tracking_tab
         self.metadata_loader = metadata_loader
+        self.feature_extraction_tab = feature_extraction_tab
+        self.filtering_tab = filtering_tab
 
         self._steps: List[QueueStep] = []
         self._step_rows: List[QueueStepRow] = []
@@ -273,25 +287,80 @@ class ProcessingQueuePanel(QWidget):
 
     # ── Adding / Removing steps ────────────────────────────────────────
 
+    @Slot(object)
     def add_step(self, step_type: StepType):
-        """Add a step to the queue (maintains order, avoids duplicates)."""
-        if self._is_running:
-            return
-        # No duplicates
+        """Add a step to the queue, with conditional dependency prompting."""
         if any(s.step_type == step_type for s in self._steps):
+            # Already in queue
             return
+
+        from qtpy.QtWidgets import QMessageBox
+
+        # Dependency chain logic
+        added_already = [s.step_type for s in self._steps]
+        
+        # 1. TRACK needs SEGMENT
+        if step_type == StepType.TRACK and StepType.SEGMENT not in added_already:
+            missing = self._check_input_data_missing(StepType.TRACK)
+            if missing:
+                res = QMessageBox.question(
+                    self, "Missing Segmentation Data",
+                    "Segmentation data is missing for some samples/cell types.\n\n"
+                    "Would you like to add Batch Segmentation to the pipeline?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if res == QMessageBox.Yes:
+                    self.add_step(StepType.SEGMENT)
+                else:
+                    return # Cancel adding Track
+
+        # 2. FEATURE_EXTRACT needs TRACK
+        elif step_type == StepType.FEATURE_EXTRACT and StepType.TRACK not in added_already:
+            missing = self._check_input_data_missing(StepType.FEATURE_EXTRACT)
+            if missing:
+                res = QMessageBox.question(
+                    self, "Missing Tracking Data",
+                    "Tracking data is missing for some samples/cell types.\n\n"
+                    "Would you like to add Batch Tracking to the pipeline?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if res == QMessageBox.Yes:
+                    self.add_step(StepType.TRACK)
+                else:
+                    return # Cancel adding Feature Extract
+
+        # 3. FILTER needs FEATURE_EXTRACT
+        elif step_type == StepType.FILTER and StepType.FEATURE_EXTRACT not in added_already:
+            missing = self._check_input_data_missing(StepType.FILTER)
+            if missing:
+                res = QMessageBox.question(
+                    self, "Missing Feature Data",
+                    "Feature extraction data is missing for some cell types.\n\n"
+                    "Would you like to add Feature Extraction to the pipeline?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if res == QMessageBox.Yes:
+                    self.add_step(StepType.FEATURE_EXTRACT)
+                else:
+                    return # Cancel adding Filter
+
+        # Finally add the requested step
         step = QueueStep(step_type=step_type)
         self._steps.append(step)
-        # Train requires Segment — auto-add it
+        
+        # Train still auto-adds Segment (as per existing logic, likely desired)
         if step_type == StepType.TRAIN:
             if not any(s.step_type == StepType.SEGMENT for s in self._steps):
                 self._steps.append(QueueStep(step_type=StepType.SEGMENT))
+
         self._steps.sort(key=lambda s: s.step_type.order)
         self._rebuild_list()
+        
         # Auto-expand when adding
         if not self.body.isVisible():
             self._toggle_body()
-        # Reset preset combo to custom if it doesn't match
+
+        # Reset preset combo to custom (0)
         self.preset_combo.blockSignals(True)
         self.preset_combo.setCurrentIndex(0)
         self.preset_combo.blockSignals(False)
@@ -378,6 +447,63 @@ class ProcessingQueuePanel(QWidget):
 
     # ── Pre-run validation ─────────────────────────────────────────────
 
+    def _check_input_data_missing(self, step_type: StepType) -> bool:
+        """Check if input data required for a step is missing."""
+        md = self.metadata_loader.metadata
+        if md is None:
+            return True
+        out_dir = Path(self.metadata_loader.output_dir)
+
+        if step_type == StepType.TRACK:
+            # Requires segmented zarrs for all types & samples
+            all_cts = []
+            if self.tracking_tab:
+                all_cts = list(self.tracking_tab.panels.keys())
+            if not all_cts:
+                return False # No types configured yet
+            
+            for ct in all_cts:
+                for _, sample in md.iterrows():
+                    sn = sample.get("sample_name", "unknown")
+                    seg_zarr = out_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
+                    if not seg_zarr.exists():
+                        return True
+            return False
+
+        elif step_type == StepType.FEATURE_EXTRACT:
+            # Requires tracked zarrs/csvs
+            all_cts = []
+            if self.feature_extraction_tab:
+                all_cts = list(self.feature_extraction_tab.panels.keys())
+            if not all_cts:
+                return False
+                
+            for ct in all_cts:
+                for _, sample in md.iterrows():
+                    sn = sample.get("sample_name", "unknown")
+                    track_zarr = out_dir / "images" / sn / f"{sn}_{ct}_tracked.zarr"
+                    # Also check csv dir
+                    csv_dir = out_dir / "trackdata" / sn / ct
+                    if not track_zarr.exists() and not (csv_dir.exists() and list(csv_dir.glob("*.csv"))):
+                        return True
+            return False
+
+        elif step_type == StepType.FILTER:
+            # Requires combined feature CSV
+            all_cts = []
+            if self.filtering_tab:
+                all_cts = list(self.filtering_tab.panels.keys())
+            if not all_cts:
+                return False
+                
+            for ct in all_cts:
+                feat_csv = out_dir / "analysis" / ct / "track_features" / f"BEHAV3D_{ct}_combined_track_features.csv"
+                if not feat_csv.exists():
+                    return True
+            return False
+
+        return False
+
     def _check_existing_data(self) -> List[str]:
         """Return list of descriptions of data that will be overwritten."""
         warnings = []
@@ -389,7 +515,6 @@ class ProcessingQueuePanel(QWidget):
 
         for step in self._steps:
             if step.step_type == StepType.TRAIN:
-                # Check for existing .joblib classifiers
                 if pc_dir.exists():
                     jobllibs = list(pc_dir.glob("PixelClassifier_*.joblib"))
                     if jobllibs:
@@ -397,7 +522,6 @@ class ProcessingQueuePanel(QWidget):
                         warnings.append(f"Trained classifiers: {names}")
 
             elif step.step_type == StepType.SEGMENT:
-                # Check for existing segment zarrs
                 for _, sample in md.iterrows():
                     sn = sample.get("sample_name", "unknown")
                     sample_img_dir = out_dir / "images" / sn
@@ -408,7 +532,6 @@ class ProcessingQueuePanel(QWidget):
                             break
 
             elif step.step_type == StepType.TRACK:
-                # Check for existing track files
                 for _, sample in md.iterrows():
                     sn = sample.get("sample_name", "unknown")
                     sample_img_dir = out_dir / "images" / sn
@@ -416,6 +539,24 @@ class ProcessingQueuePanel(QWidget):
                         track_files = list(sample_img_dir.glob("*_tracked.zarr"))
                         if track_files:
                             warnings.append(f"Tracking data for {sn}")
+                            break
+
+            elif step.step_type == StepType.FEATURE_EXTRACT:
+                analysis_dir = out_dir / "analysis"
+                if analysis_dir.exists():
+                    for ct_dir in analysis_dir.iterdir():
+                        feat_csv = ct_dir / "track_features" / f"BEHAV3D_{ct_dir.name}_combined_track_features.csv"
+                        if feat_csv.exists():
+                            warnings.append(f"Feature data for {ct_dir.name}")
+                            break
+
+            elif step.step_type == StepType.FILTER:
+                analysis_dir = out_dir / "analysis"
+                if analysis_dir.exists():
+                    for ct_dir in analysis_dir.iterdir():
+                        filt_csv = ct_dir / "track_features" / f"BEHAV3D_{ct_dir.name}_filtered_track_features.csv"
+                        if filt_csv.exists():
+                            warnings.append(f"Filtered data for {ct_dir.name}")
                             break
 
         return warnings
@@ -433,16 +574,24 @@ class ProcessingQueuePanel(QWidget):
 
         # Pre-run overwrite check
         existing = self._check_existing_data()
+        skip_existing = False
         if existing:
             details = "\n".join(f"  • {w}" for w in existing)
-            res = QMessageBox.warning(
-                self, "Overwrite Existing Data?",
-                f"The following data will be overwritten:\n\n{details}\n\n"
-                "Do you want to continue?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            box = QMessageBox(self)
+            box.setWindowTitle("Overwrite Existing Data?")
+            box.setText(
+                f"The following data already exists:\n\n{details}\n\n"
+                "What do you want to do?"
             )
-            if res != QMessageBox.Yes:
+            btn_overwrite = box.addButton("Overwrite All", QMessageBox.DestructiveRole)
+            btn_skip = box.addButton("Skip Existing", QMessageBox.AcceptRole)
+            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_cancel)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == btn_cancel:
                 return
+            skip_existing = (clicked == btn_skip)
 
         # ── Execute ──
         self._is_running = True
@@ -470,7 +619,7 @@ class ProcessingQueuePanel(QWidget):
             print(f"\n▶ [{i+1}/{len(self._steps)}] {step.step_type.label}...", file=sys.stderr)
 
             try:
-                self._execute_step(step)
+                self._execute_step(step, skip_existing=skip_existing)
                 step.elapsed = time.time() - step_start
                 step.status = StepStatus.DONE
                 print(f"✅ {step.step_type.label} completed in {step.elapsed:.1f}s", file=sys.stderr)
@@ -506,20 +655,23 @@ class ProcessingQueuePanel(QWidget):
         self.preset_combo.setEnabled(True)
         self.queue_finished.emit()
 
-    def _execute_step(self, step: QueueStep):
+    def _execute_step(self, step: QueueStep, skip_existing: bool = False):
         """Run a single step, calling the backend directly."""
         if step.step_type == StepType.TRAIN:
             self._run_train()
         elif step.step_type == StepType.SEGMENT:
-            self._run_segment()
+            self._run_segment(skip_existing=skip_existing)
         elif step.step_type == StepType.TRACK:
-            self._run_track()
+            self._run_track(skip_existing=skip_existing)
+        elif step.step_type == StepType.FEATURE_EXTRACT:
+            self._run_feature_extract(skip_existing=skip_existing)
+        elif step.step_type == StepType.FILTER:
+            self._run_filter(skip_existing=skip_existing)
 
     # ── Step runners (non-interactive) ─────────────────────────────────
 
     def _run_train(self):
         """Run classifier training (non-interactive)."""
-        # Switch to segmentation tab first (important for internal widget state)
         parent = self.parent()
         while parent and not hasattr(parent, 'tabs'):
             parent = parent.parent()
@@ -529,11 +681,25 @@ class ProcessingQueuePanel(QWidget):
         pc_widget = self.segmentation_tab.pixel_classifier_page
         pc_widget.run_train(interactive=False)
 
-    def _run_segment(self):
+    def _run_segment(self, skip_existing: bool = False):
         """Run batch segmentation (non-interactive)."""
         pc_widget = self.segmentation_tab.pixel_classifier_page
-        pc_widget.run_batch_segmentation(interactive=False)
+        pc_widget.run_batch_segmentation(interactive=False, skip_existing=skip_existing)
 
-    def _run_track(self):
+    def _run_track(self, skip_existing: bool = False):
         """Run batch tracking (non-interactive)."""
-        self.tracking_tab.run_batch_tracking(interactive=False)
+        self.tracking_tab.run_batch_tracking(interactive=False, skip_existing=skip_existing)
+
+    def _run_feature_extract(self, skip_existing: bool = False):
+        """Run batch feature extraction (non-interactive)."""
+        if self.feature_extraction_tab is not None:
+            self.feature_extraction_tab.run_batch_feature_extraction(interactive=False, skip_existing=skip_existing)
+        else:
+            raise RuntimeError("Feature Extraction tab not wired to queue.")
+
+    def _run_filter(self, skip_existing: bool = False):
+        """Run batch filtering (non-interactive)."""
+        if self.filtering_tab is not None:
+            self.filtering_tab.run_batch_filtering(interactive=False, skip_existing=skip_existing)
+        else:
+            raise RuntimeError("Filtering tab not wired to queue.")

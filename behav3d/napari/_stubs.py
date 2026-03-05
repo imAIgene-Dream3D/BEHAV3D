@@ -30,26 +30,7 @@ class _StubTab(QWidget):
         layout.addWidget(sub)
 
 
-class SegmentationTab(_StubTab):
-    def __init__(self, parent=None):
-        super().__init__("Segmentation", parent)
-
-
-class TrackingTab(_StubTab):
-    def __init__(self, parent=None):
-        super().__init__("Tracking", parent)
-
-
-class FeatureExtractionTab(_StubTab):
-    def __init__(self, parent=None):
-        super().__init__("Feature Extraction", parent)
-
-
-class FilteringTab(_StubTab):
-    def __init__(self, parent=None):
-        super().__init__("Filtering", parent)
-
-
 class AnalysisTab(_StubTab):
     def __init__(self, parent=None):
         super().__init__("Analysis", parent)
+

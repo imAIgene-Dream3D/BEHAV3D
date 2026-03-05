@@ -170,6 +170,7 @@ def filter_tracks(
     min_track_length=None,
     max_track_length=None,
     filter_t0_dead=True,
+    min_size=None,
     cell_type="tcell",
     time_type="frames", #can also be "relative_time"
     plot_results=True,
@@ -284,6 +285,26 @@ def filter_tracks(
         df_all_tracks_filt, 
         col_name="nr_tracks_exp_duration", 
         df_track_counts=df_track_counts
+        )
+
+    # Filter out tracks whose volume at t=1 is below min_size
+    if min_size is not None and "volume" in df_all_tracks_filt.columns:
+        t1_small = df_all_tracks_filt[
+            (df_all_tracks_filt["relative_time"] == 1) &
+            (df_all_tracks_filt["volume"] < min_size)
+        ][["TrackID", "sample_name"]]
+        before = df_all_tracks_filt[["TrackID", "sample_name"]].drop_duplicates().shape[0]
+        df_all_tracks_filt = df_all_tracks_filt[
+            ~df_all_tracks_filt.set_index(["TrackID", "sample_name"]).index.isin(
+                t1_small.set_index(["TrackID", "sample_name"]).index
+            )
+        ]
+        after = df_all_tracks_filt[["TrackID", "sample_name"]].drop_duplicates().shape[0]
+        print(f"  Filtered by min size ({min_size}): {before} → {after} tracks")
+        df_track_counts = count_tracks(
+            df_all_tracks_filt,
+            col_name="nr_tracks_min_size",
+            df_track_counts=df_track_counts
         )
 
     # Filtering out tracks under specific track length

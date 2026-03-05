@@ -105,10 +105,13 @@ class _ZarrWorker(QThread):
     progress = Signal(str)
     finished = Signal(bool, str)  # (success, message)
 
-    def __init__(self, output_dir: str, metadata: pd.DataFrame, parent=None):
+    def __init__(self, output_dir: str, metadata: pd.DataFrame,
+                 t_start: int = None, t_end: int = None, parent=None):
         super().__init__(parent)
         self.output_dir = output_dir
         self.metadata = metadata
+        self.t_start = t_start
+        self.t_end = t_end
 
     def run(self):
         try:
@@ -118,6 +121,8 @@ class _ZarrWorker(QThread):
             convert_input_files_to_zarr(
                 output_dir=self.output_dir,
                 metadata=self.metadata,
+                t_start=self.t_start,
+                t_end=self.t_end,
             )
             self.finished.emit(True, "✅ Zarr conversion complete!")
         except Exception:
@@ -984,6 +989,37 @@ class DataPreparationTab(QWidget):
         grp = QGroupBox("6 · Convert to Zarr")
         lay = QVBoxLayout(grp)
 
+        # Timepoint clipping
+        self.zarr_clip_check = QCheckBox("Clip timepoints (select range)")
+        self.zarr_clip_check.setChecked(False)
+        lay.addWidget(self.zarr_clip_check)
+
+        clip_row = QHBoxLayout()
+        clip_row.setContentsMargins(20, 0, 0, 0)
+        clip_row.setSpacing(4)
+        clip_row.addWidget(QLabel("Start:"))
+        self.zarr_t_start = QSpinBox()
+        self.zarr_t_start.setRange(0, 99999)
+        self.zarr_t_start.setValue(0)
+        self.zarr_t_start.setMaximumWidth(80)
+        self.zarr_t_start.setEnabled(False)
+        clip_row.addWidget(self.zarr_t_start)
+        clip_row.addWidget(QLabel("End:"))
+        self.zarr_t_end = QSpinBox()
+        self.zarr_t_end.setRange(0, 99999)
+        self.zarr_t_end.setValue(0)
+        self.zarr_t_end.setMaximumWidth(80)
+        self.zarr_t_end.setEnabled(False)
+        clip_row.addWidget(self.zarr_t_end)
+        clip_row.addStretch()
+        lay.addLayout(clip_row)
+
+        def _toggle_clip(state):
+            enabled = self.zarr_clip_check.isChecked()
+            self.zarr_t_start.setEnabled(enabled)
+            self.zarr_t_end.setEnabled(enabled)
+        self.zarr_clip_check.stateChanged.connect(_toggle_clip)
+
         self.zarr_btn = QPushButton("Convert All Images to Zarr")
         self.zarr_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
         self.zarr_btn.clicked.connect(self._on_convert_zarr)
@@ -1007,11 +1043,25 @@ class DataPreparationTab(QWidget):
         # Save dim orders first
         self._save_dim_order()
 
+        # Gather clipping params
+        t_start = None
+        t_end = None
+        if self.zarr_clip_check.isChecked():
+            t_start = int(self.zarr_t_start.value())
+            t_end = int(self.zarr_t_end.value())
+            if t_end <= t_start:
+                QMessageBox.warning(self, "Error",
+                    f"End timepoint ({t_end}) must be greater than start ({t_start}).")
+                return
+
         self.zarr_btn.setEnabled(False)
         self.zarr_status.setText("⏳ Converting…")
         self._log("Starting zarr conversion…")
 
-        self._zarr_worker = _ZarrWorker(out_dir, self.metadata.copy(), parent=self)
+        self._zarr_worker = _ZarrWorker(
+            out_dir, self.metadata.copy(),
+            t_start=t_start, t_end=t_end, parent=self
+        )
         self._zarr_worker.progress.connect(lambda msg: self._log(msg))
         self._zarr_worker.finished.connect(self._on_zarr_done)
         self._zarr_worker.start()

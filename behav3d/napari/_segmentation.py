@@ -284,9 +284,7 @@ class PixelClassifierWidget(QWidget):
             "More examples → better generalization but slower training."
         ))
         
-        self.check_sample_specific = QCheckBox("Per-sample classifier")
-        self.check_sample_specific.setChecked(bool(pc.get("sample_specific_classifier", False)))
-        train_form.addRow(self.check_sample_specific)
+
         
         self.btn_load_training = QPushButton("Generate Training Data")
         self.btn_load_training.setToolTip("Clears viewer and loads selected timepoints for labeling")
@@ -389,10 +387,14 @@ class PixelClassifierWidget(QWidget):
 
         # Workers spinner (applies to batch segmentation)
         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+        n_cores = os.cpu_count() or 4
+        max_allowed = max(1, n_cores - 1)
         self.spin_workers = QSpinBox()
-        self.spin_workers.setValue(int(pc.get("workers", os.cpu_count() or 4)))
-        self.spin_workers.setRange(1, 128)
+        default_workers = min(int(pc.get("workers", n_cores)), max_allowed)
+        self.spin_workers.setValue(default_workers)
+        self.spin_workers.setRange(1, max_allowed)
         self.spin_workers.setMaximumWidth(70)
+        self.spin_workers.valueChanged.connect(self._on_workers_changed)
         self.workers_form = QFormLayout()
         self.workers_form.setContentsMargins(6, 6, 6, 6)
         self.workers_form.setSpacing(4)
@@ -609,7 +611,7 @@ class PixelClassifierWidget(QWidget):
         """Save all segmentation widget values to behav3d_parameters.yml."""
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
         pc["examples_per_sample"] = int(self.spin_examples.value())
-        pc["sample_specific_classifier"] = bool(self.check_sample_specific.isChecked())
+
         pc["workers"] = int(self.spin_workers.value())
         pc["use_all_timepoints"] = bool(self.check_process_all.isChecked())
         pc["tp_start"] = int(self.spin_t_start.value())
@@ -763,10 +765,21 @@ class PixelClassifierWidget(QWidget):
         self.spin_t_start.setEnabled(not checked)
         self.spin_t_end.setEnabled(not checked)
 
+    def _on_workers_changed(self, value):
+        import os
+        n_cores = os.cpu_count() or 4
+        max_allowed = max(1, n_cores - 1)
+        if value > max_allowed:
+            self.spin_workers.setValue(max_allowed)
+            self.log(
+                f"⚠️ Workers capped to {max_allowed} (system has {n_cores} cores). "
+                f"Using all cores can freeze the system."
+            )
+
     def _on_run_segmentation_clicked(self):
         self.run_batch_segmentation(interactive=True)
 
-    def run_batch_segmentation(self, interactive=True):
+    def run_batch_segmentation(self, interactive=True, skip_existing=False):
         """Run batch segmentation. When interactive=False, skips dialogs."""
         if self.metadata_loader.metadata is None:
             self.log("⚠️ Cannot run segmentation: No metadata loaded.")
@@ -777,16 +790,21 @@ class PixelClassifierWidget(QWidget):
         try:
             if interactive:
                 from qtpy.QtWidgets import QMessageBox
-                # Ask user about overwriting
-                overwrite_msg = "Do you want to overwrite existing segmentation results for the selected timepoints?"
-                reply = QMessageBox.question(
-                    self, "Overwrite Existing Results?",
-                    overwrite_msg,
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-                )
-                overwrite = (reply == QMessageBox.Yes)
+                box = QMessageBox(self)
+                box.setWindowTitle("Existing Segmentation Results")
+                box.setText("Segmentation results may already exist for some timepoints.\n\nWhat do you want to do?")
+                btn_overwrite = box.addButton("Overwrite All", QMessageBox.DestructiveRole)
+                btn_skip = box.addButton("Skip Existing", QMessageBox.AcceptRole)
+                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+                box.setDefaultButton(btn_cancel)
+                box.exec_()
+                clicked = box.clickedButton()
+                if clicked == btn_cancel:
+                    self.log("Segmentation cancelled.")
+                    return
+                overwrite = (clicked == btn_overwrite)
             else:
-                overwrite = True
+                overwrite = not skip_existing
             
             # Timepoint range
             if self.check_process_all.isChecked():

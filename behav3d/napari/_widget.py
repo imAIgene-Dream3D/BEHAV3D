@@ -2,8 +2,8 @@
 BEHAV3D napari plugin – main dock widget.
 Provides a QTabWidget with tabs for the full BEHAV3D pipeline.
 """
-from qtpy.QtWidgets import QWidget, QVBoxLayout, QTabWidget, QScrollArea
-from qtpy.QtCore import Qt
+from qtpy.QtWidgets import QWidget, QVBoxLayout, QTabWidget
+from qtpy.QtCore import Qt, QSize
 import napari
 
 
@@ -13,25 +13,16 @@ class BEHAV3DWidget(QWidget):
     def __init__(self, napari_viewer: "napari.Viewer", parent=None):
         super().__init__(parent)
         self.viewer = napari_viewer
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(300)
 
-        # --- Outer layout with scroll area --------------------------------
+        # --- Outer layout -------------------------------------------------
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        outer_layout.addWidget(scroll)
-
-        # --- Inner content widget -----------------------------------------
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(4, 4, 4, 4)
-        scroll.setWidget(content)
+        outer_layout.setSpacing(0)
+        layout = outer_layout
 
         self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        layout.addWidget(self.tabs, stretch=1)
 
         # --- Tab 1: Data Preparation (metadata + dim order + zarr) --------
         from behav3d.napari._data_preparation import DataPreparationTab
@@ -53,14 +44,22 @@ class BEHAV3DWidget(QWidget):
         self.tracking_tab = TrackingTab(viewer=self.viewer, metadata_loader=self.data_prep_tab)
         self.tabs.addTab(self.tracking_tab, "📍 Tracking")
 
-        # --- Tab 5–7: Additional Steps (Stubs) ---------------------------
-        from behav3d.napari._stubs import (
-            FeatureExtractionTab,
-            FilteringTab,
-            AnalysisTab
+        # --- Tab 5: Feature Extraction ------------------------------------
+        from behav3d.napari._feature_extraction import FeatureExtractionTab
+        self.feature_extraction_tab = FeatureExtractionTab(
+            viewer=self.viewer, metadata_loader=self.data_prep_tab, parent=self
         )
-        self.tabs.addTab(FeatureExtractionTab(parent=self), "🧪 Feature Extraction")
-        self.tabs.addTab(FilteringTab(parent=self), "🧹 Filtering")
+        self.tabs.addTab(self.feature_extraction_tab, "🧪 Feature Extraction")
+
+        # --- Tab 6: Filtering ---------------------------------------------
+        from behav3d.napari._filtering import FilteringTab
+        self.filtering_tab = FilteringTab(
+            viewer=self.viewer, metadata_loader=self.data_prep_tab, parent=self
+        )
+        self.tabs.addTab(self.filtering_tab, "🧹 Filtering")
+
+        # --- Tab 7: Analysis (Stub) ---------------------------------------
+        from behav3d.napari._stubs import AnalysisTab
         self.tabs.addTab(AnalysisTab(parent=self), "📊 Analysis")
 
         # --- Processing Queue (collapsible bottom panel) ------------------
@@ -69,6 +68,8 @@ class BEHAV3DWidget(QWidget):
             segmentation_tab=self.segmentation_tab,
             tracking_tab=self.tracking_tab,
             metadata_loader=self.data_prep_tab,
+            feature_extraction_tab=self.feature_extraction_tab,
+            filtering_tab=self.filtering_tab,
         )
         layout.addWidget(self.queue_panel)
 
@@ -82,6 +83,12 @@ class BEHAV3DWidget(QWidget):
         )
         self.tracking_tab.btn_queue_track.clicked.connect(
             lambda: self.queue_panel.add_step(StepType.TRACK)
+        )
+        self.feature_extraction_tab.btn_queue_feature.clicked.connect(
+            lambda: self.queue_panel.add_step(StepType.FEATURE_EXTRACT)
+        )
+        self.filtering_tab.btn_queue_filter.clicked.connect(
+            lambda: self.queue_panel.add_step(StepType.FILTER)
         )
 
         # --- Tab Switch Logic ---------------------------------------------
@@ -119,3 +126,6 @@ class BEHAV3DWidget(QWidget):
                     return
 
         self._last_tab_index = index
+
+    def sizeHint(self):
+        return QSize(440, 650)
