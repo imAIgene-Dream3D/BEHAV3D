@@ -310,14 +310,21 @@ def run_trackpy_tracking_generic(
             print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
         
         # Update metadata with prefixed column names
-        prefix = segments_col.split('_')[0]
-        img_col = f"{prefix}_{cell_type}_tracks_image_path"
-        csv_col = f"{prefix}_{cell_type}_tracks_csv_path"
-        # Ensure columns are object dtype to avoid FutureWarning
-        if img_col not in metadata.columns or metadata[img_col].dtype != object:
-            metadata[img_col] = metadata.get(img_col, pd.Series(dtype=object)).astype(object)
-        if csv_col not in metadata.columns or metadata[csv_col].dtype != object:
-            metadata[csv_col] = metadata.get(csv_col, pd.Series(dtype=object)).astype(object)
+        if segments_col is not None and segments_col.startswith(('or_', 'im_', 'ot_')):
+            # Use the same prefix as the segments column
+            prefix = segments_col.split('_')[0]
+            img_col = f"{prefix}_{cell_type}_tracks_image_path"
+            csv_col = f"{prefix}_{cell_type}_tracks_csv_path"
+        else:
+            # Fallback to old non-prefixed format
+            img_col = f"{cell_type}_tracks_image_path"
+            csv_col = f"{cell_type}_tracks_csv_path"
+            
+        # Ensure columns are object dtype to avoid LossySetitemError
+        for col in [img_col, csv_col]:
+            if col not in metadata.columns or metadata[col].dtype != object:
+                metadata[col] = metadata.get(col, pd.Series(dtype=object)).astype(object)
+                
         metadata.at[idx, img_col] = str(tracked_img_outpath)
         metadata.at[idx, csv_col] = str(tracked_csv_outpath)
         
@@ -472,14 +479,17 @@ def run_trackpy_tracking_with_method(
             print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
 
         # Update metadata with prefixed column names
-        prefix = segments_col.split('_')[0]
-        img_col = f"{prefix}_{cell_type}_tracks_image_path"
-        csv_col = f"{prefix}_{cell_type}_tracks_csv_path"
-        # Ensure columns are object dtype to avoid FutureWarning
-        if img_col not in metadata.columns or metadata[img_col].dtype != object:
-            metadata[img_col] = metadata.get(img_col, pd.Series(dtype=object)).astype(object)
-        if csv_col not in metadata.columns or metadata[csv_col].dtype != object:
-            metadata[csv_col] = metadata.get(csv_col, pd.Series(dtype=object)).astype(object)
+        if segments_col is not None and segments_col.startswith(('or_', 'im_', 'ot_')):
+            # Use the same prefix as the segments column
+            prefix = segments_col.split('_')[0]
+            img_col = f"{prefix}_{cell_type}_tracks_image_path"
+            csv_col = f"{prefix}_{cell_type}_tracks_csv_path"
+        
+        # Ensure columns are object dtype
+        for col in [img_col, csv_col]:
+            if col not in metadata.columns or metadata[col].dtype != object:
+                metadata[col] = metadata.get(col, pd.Series(dtype=object)).astype(object)
+                
         metadata.at[idx, img_col] = str(tracked_img_outpath)
         metadata.at[idx, csv_col] = str(tracked_csv_outpath)
 

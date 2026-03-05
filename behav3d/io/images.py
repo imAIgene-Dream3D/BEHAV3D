@@ -5,6 +5,7 @@ from .formats.h5 import load_h5
 from .formats.ims import load_ims, load_ims_metadata
 from .formats.zarr import load_zarr, save_as_zarr, append_to_zarr
 from .formats.tiff import load_tiff
+from .formats.liff import load_liff, get_liff_shape, load_liff_metadata, load_elsizes_liff
 
 def get_filepath_stem(path):
     path=Path(path)
@@ -38,6 +39,8 @@ def load_image(path, axis_order="TCZYX", group=None, mode="r", **kwargs):
         img = load_zarr(path, group=group, mode=mode)
     elif path.suffix==".tif" or path.suffix==".tiff":
         img = load_tiff(path)
+    elif path.suffix==".lif" or path.suffix==".liff":
+        img = load_liff(path)
     else:
         raise ValueError(f"Unsupported file format: {path.suffix}")
     
@@ -60,6 +63,8 @@ def load_image_metadata(path):
         pass
     elif path.suffix==".tif" or path.suffix==".tiff":
         pass
+    elif path.suffix==".lif" or path.suffix==".liff":
+        metadata = load_liff_metadata(path)
     else:
         raise ValueError(f"Unsupported file format: {path.suffix}")
     return(metadata)
@@ -137,7 +142,9 @@ def load_elsizes(path):
     elif path.suffix==".zarr" or str(path).endswith(".zarr.zip"):
         pass
     elif path.suffix==".tif" or path.suffix==".tiff":
-       pass
+        pass
+    elif path.suffix==".lif" or path.suffix==".liff":
+        elsizes = load_elsizes_liff(path)
     else:
         raise ValueError(f"Unsupported file format: {path.suffix}")
     
@@ -153,6 +160,8 @@ def get_image_shape(path):
         shape = img.shape
     elif path.suffix == ".czi":
         shape = get_czi_shape(path)
+    elif path.suffix==".lif" or path.suffix==".liff":
+        shape = get_liff_shape(path)
     shape = tuple(shape)
     return shape
 
@@ -165,6 +174,9 @@ def get_image_dimension_order(path):
         from aicspylibczi import CziFile
         czifile = CziFile(path)
         dim_order = czifile.dims[-5:]
+    elif path.suffix==".lif" or path.suffix==".liff":
+        # readlif doesn't expose dims directly; assume standard TCZYX
+        dim_order = "TCZYX"
     else:
         dim_order = "TCZYX"
     return dim_order

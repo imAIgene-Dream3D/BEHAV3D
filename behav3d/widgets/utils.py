@@ -46,6 +46,12 @@ _DEFAULT_CONFIG = {
         "tp_start": 0,
         "tp_end": 0,
     },
+    "cellpose": {
+        "number_of_channels": 0,
+        "labels_mode": "same_for_all",  # "same_for_all" or "per_sample"
+        "channel_labels": {},  # {0: "organoid1", 1: "tcell", ...}
+        "per_sample_channel_labels": {},  # {sample_name: {0: "organoid1", ...}, ...}
+    },
     "tracking": {
         "immune": {
             "method": "trackpy",
@@ -230,9 +236,11 @@ _DEFAULT_CONFIG = {
     },
     "active_killing": {
         "observation_window": 5,
-        "death_signal_column": "mean_dead_dye",
+        "death_signal_column": "percentage_dead_mask",
         "killing_threshold_multiplier": 1.5,
         "min_contact_duration": 1,
+        "use_absolute_threshold": False,
+        "absolute_killing_threshold": None,
         "save_results": True,
     },
     "death_dynamics": {

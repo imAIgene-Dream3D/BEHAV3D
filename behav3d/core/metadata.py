@@ -107,6 +107,7 @@ def load_behav3d_metadata(
         "sample_name": str,
         "exp_nr": "Int64",
         "well": str,
+        "number_of_channels": "Int64",
         "dead_channel": "Int64",
         "dead_mask_path": str,
         "pixel_distance_xy": float,
@@ -225,26 +226,156 @@ def check_behav3d_metadata(
                     missing_identifiers.append(f"Row {idx + 1}")
             missing_fields.append((col, missing_identifiers))
     
-    # Check channel columns: if they exist, they must be filled (REQUIRED)
-    channel_cols = [col for col in metadata.columns if re.match(r'^channel_\d+_label$', col)]
-    for col in channel_cols:
-        # Check for NaN, empty string, or literal 'nan' string
-        is_missing = (
-            metadata[col].isna() | 
-            (metadata[col].astype(str).str.strip() == '') |
-            (metadata[col].astype(str).str.strip().str.lower() == 'nan')
+    # Check channel columns: if number_of_channels is set, validate channel columns
+    # 0-indexed format
+    channel_cols = sorted([col for col in metadata.columns if re.match(r'^channel\d+$', col)],
+                          key=lambda x: int(re.match(r'^channel(\d+)$', x).group(1)))
+    
+    # Collect all channel-related errors to show them all at once
+    channel_errors = []
+    
+    # If number_of_channels exists, validate it
+    if 'number_of_channels' in metadata.columns:
+        # 1. Check that number_of_channels is not empty in any row
+        n_channels_missing = (
+            metadata['number_of_channels'].isna() | 
+            (metadata['number_of_channels'].astype(str).str.strip() == '') |
+            (metadata['number_of_channels'].astype(str).str.strip().str.lower() == 'nan')
         )
-        if is_missing.any():
-            missing_indices = metadata[is_missing].index.tolist()
+        if n_channels_missing.any():
+            missing_indices = metadata[n_channels_missing].index.tolist()
             missing_identifiers = []
             for idx in missing_indices:
                 sample_name = metadata.loc[idx, 'sample_name']
-                # Check for NaN, empty string, or literal 'nan' string
                 if pd.notna(sample_name) and str(sample_name).strip() and str(sample_name).strip().lower() != 'nan':
                     missing_identifiers.append(str(sample_name))
                 else:
                     missing_identifiers.append(f"Row {idx + 1}")
-            missing_fields.append((col, missing_identifiers))
+            channel_errors.append(
+                f"• number_of_channels is missing or empty in: {', '.join(missing_identifiers)}"
+            )
+        
+        # Only continue with other checks if number_of_channels is filled in all rows
+        if not n_channels_missing.any():
+            # 2. Check that number_of_channels is the same in all rows
+            n_channels_values = metadata['number_of_channels'].astype(int).unique()
+            if len(n_channels_values) > 1:
+                channel_errors.append(
+                    f"• Different rows have different number_of_channels values: {list(n_channels_values)}. All rows must have the same value."
+                )
+            
+            n_channels = int(n_channels_values[0])
+            
+            # Build list of valid channel labels from detected cell types FIRST
+            # to calculate expected number of channels
+            valid_channel_labels = set()
+            valid_channel_labels.update(organoid_types)  # e.g., "organoid1", "organoid2"
+            valid_channel_labels.update(immune_types)    # e.g., "tcell", "macro"
+            valid_channel_labels.update(other_types)     # e.g., "tumor1"
+            
+            # Check if dead_channel is used (add "dead" to valid labels if any row has dead_channel set)
+            has_dead_in_metadata = (
+                'dead_channel' in metadata.columns and
+                metadata['dead_channel'].notna().any() and
+                (metadata['dead_channel'].astype(str).str.strip() != '').any() and
+                (metadata['dead_channel'].astype(str).str.strip().str.lower() != 'nan').any()
+            )
+            if has_dead_in_metadata:
+                valid_channel_labels.add('dead')
+            
+            # Calculate expected number of channels based on cell types
+            expected_n_channels = len(valid_channel_labels)
+            expected_channel_cols = [f'channel{i}' for i in range(expected_n_channels)]
+            
+            # 3. Check that number_of_channels matches expected (based on cell types)
+            if n_channels != expected_n_channels:
+                cell_types_breakdown = []
+                if organoid_types:
+                    cell_types_breakdown.append(f"{len(organoid_types)} organoid(s): {sorted(organoid_types)}")
+                if immune_types:
+                    cell_types_breakdown.append(f"{len(immune_types)} immune(s): {sorted(immune_types)}")
+                if other_types:
+                    cell_types_breakdown.append(f"{len(other_types)} other(s): {sorted(other_types)}")
+                if has_dead_in_metadata:
+                    cell_types_breakdown.append("1 dead channel")
+                channel_errors.append(
+                    f"• number_of_channels is {n_channels} but should be {expected_n_channels} based on cell types defined. "
+                    f"Cell types: {', '.join(cell_types_breakdown)}"
+                )
+            
+            # 4. Check that number of channel columns matches expected
+            if len(channel_cols) != expected_n_channels:
+                channel_errors.append(
+                    f"• Found {len(channel_cols)} channel columns but expected {expected_n_channels}. "
+                    f"Expected columns: {expected_channel_cols}, Found: {channel_cols}"
+                )
+            
+            # Check that channel columns are named correctly (channel0, channel1, ..., channel{n-1})
+            if channel_cols != expected_channel_cols and len(channel_cols) == expected_n_channels:
+                channel_errors.append(
+                    f"• Channel columns do not match expected format. Expected: {expected_channel_cols}, Found: {channel_cols}"
+                )
+            
+            # 4. PER-ROW VALIDATION: Check that labels in each row match the cell type names
+            # Labels can be in different order per row, but must match the valid cell types
+            for rowidx, sample_metadata in metadata.iterrows():
+                sample_name = sample_metadata.get('sample_name', f'Row {rowidx + 1}')
+                
+                # Get all channel labels for this row (can be in any order)
+                row_channel_labels = []
+                missing_channel_labels = []
+                for ch_col in channel_cols:
+                    ch_label = sample_metadata.get(ch_col)
+                    is_missing = (
+                        pd.isna(ch_label) or
+                        str(ch_label).strip() == '' or
+                        str(ch_label).strip().lower() == 'nan'
+                    )
+                    if is_missing:
+                        missing_channel_labels.append(ch_col)
+                    else:
+                        row_channel_labels.append(str(ch_label).strip())
+                
+                # Check that all channel labels are filled
+                if missing_channel_labels:
+                    channel_errors.append(
+                        f"• Sample '{sample_name}' (Row {rowidx + 1}): Missing channel labels in {missing_channel_labels}"
+                    )
+                    continue  # Skip further checks for this row if labels are missing
+                
+                # Check that all labels match the valid cell type names
+                invalid_labels = [ch_label for ch_label in row_channel_labels if ch_label not in valid_channel_labels]
+                if invalid_labels:
+                    channel_errors.append(
+                        f"• Sample '{sample_name}' (Row {rowidx + 1}): Invalid channel labels {invalid_labels}. "
+                        f"Valid options: {sorted(valid_channel_labels)}"
+                    )
+                
+                # Check that all required cell types are present in the labels
+                present_labels = set(row_channel_labels)
+                missing_types = valid_channel_labels - present_labels
+                if missing_types and not invalid_labels:  # Only report if no invalid labels (to avoid duplicate info)
+                    channel_errors.append(
+                        f"• Sample '{sample_name}' (Row {rowidx + 1}): Missing required cell types {sorted(missing_types)}. "
+                        f"Present labels: {sorted(present_labels)}"
+                    )
+    
+    # Raise all channel errors at once if any
+    if channel_errors:
+        # Check for dead channel presence for the error message
+        has_dead_for_msg = (
+            'dead_channel' in metadata.columns and
+            metadata['dead_channel'].notna().any() and
+            (metadata['dead_channel'].astype(str).str.strip() != '').any() and
+            (metadata['dead_channel'].astype(str).str.strip().str.lower() != 'nan').any()
+        )
+        error_msg = "Channel configuration errors:\n" + "\n".join(channel_errors)
+        error_msg += f"\n\nValid cell type labels based on metadata columns:\n"
+        error_msg += f"  Organoid types (or_*): {sorted(organoid_types) if organoid_types else 'None'}\n"
+        error_msg += f"  Immune types (im_*): {sorted(immune_types) if immune_types else 'None'}\n"
+        error_msg += f"  Other types (ot_*): {sorted(other_types) if other_types else 'None'}\n"
+        error_msg += f"  Dead channel: {'dead' if has_dead_for_msg else 'N/A'}"
+        raise AssertionError(error_msg)
     
     # If there are missing fields, raise error with ALL of them (BLOCKING)
     if missing_fields:

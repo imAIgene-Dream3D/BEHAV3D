@@ -1,6 +1,8 @@
 import ipywidgets as widgets
+from IPython.display import display
 from pathlib import Path
 import os
+import pandas as pd
 import yaml
 import traceback
 from functools import partial
@@ -15,6 +17,14 @@ from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
     run_pixel_classifier_segmentation
 )
 import napari
+from ipyfilechooser import FileChooser
+from behav3d.preprocessing.segmentation.cellpose_prediction import (
+    run_cellpose_and_sync_metadata,
+    run_otsu_threshold_segmentation_from_zarr,
+    run_otsu_and_sync_metadata
+)
+from behav3d.core.metadata import has_dead_channel
+
 
 class PixelClassifierPanel:
     def __init__(self, metadata_loader):
@@ -45,7 +55,7 @@ class PixelClassifierPanel:
 
         self.manual_clf_paths = widgets.Checkbox(
             description="Manually supply classifiers",
-            value=bool(pc.get("manual_clf_paths", False)),
+            value=False,  # Always start unchecked, user must opt-in
             indent=False
         )
 
@@ -85,6 +95,7 @@ class PixelClassifierPanel:
 
         self.edt_thresholds = {}
         self._create_edt_threshold_inputs()
+        self._create_postprocessing_inputs()
         self.use_all_timepoints = widgets.Checkbox(
             description="Process ALL timepoints",
             value=bool(pc.get("use_all_timepoints", True))
@@ -155,19 +166,45 @@ class PixelClassifierPanel:
                 self._apply_dir_to_clf_paths(newd)
         self.clf_dir.text.observe(_dir_changed, names='value')
 
-        threshold_widgets = [widgets.HTML("<b>EDT Thresholds per cell type</b>")]
+        # Build segmentation parameter widgets organized by cell type
+        segmentation_widgets = [widgets.HTML("<b>Segmentation parameters per cell type</b>")]
+        
         if self.organoid_types:
-            threshold_widgets.append(widgets.HTML("<i>Organoids:</i>"))
+            segmentation_widgets.append(widgets.HTML("<i>Organoids:</i>"))
             for org_type in self.organoid_types:
-                if org_type in self.edt_thresholds: threshold_widgets.append(self.edt_thresholds[org_type])
+                if org_type in self.edt_thresholds:
+                    segmentation_widgets.append(widgets.HBox([
+                        self.edt_thresholds[org_type],
+                        self.segment_size_mins[org_type],
+                    ]))
+                    segmentation_widgets.append(widgets.HBox([
+                        self.opening_nr_pixels[org_type],
+                        self.fill_holes[org_type],
+                    ]))
         if self.immune_types:
-            threshold_widgets.append(widgets.HTML("<i>Immune cells:</i>"))
+            segmentation_widgets.append(widgets.HTML("<i>Immune cells:</i>"))
             for immune_type in self.immune_types:
-                if immune_type in self.edt_thresholds: threshold_widgets.append(self.edt_thresholds[immune_type])
+                if immune_type in self.edt_thresholds:
+                    segmentation_widgets.append(widgets.HBox([
+                        self.edt_thresholds[immune_type],
+                        self.segment_size_mins[immune_type],
+                    ]))
+                    segmentation_widgets.append(widgets.HBox([
+                        self.opening_nr_pixels[immune_type],
+                        self.fill_holes[immune_type],
+                    ]))
         if self.other_types:
-            threshold_widgets.append(widgets.HTML("<i>Other cells:</i>"))
+            segmentation_widgets.append(widgets.HTML("<i>Other cells:</i>"))
             for other_type in self.other_types:
-                if other_type in self.edt_thresholds: threshold_widgets.append(self.edt_thresholds[other_type])
+                if other_type in self.edt_thresholds:
+                    segmentation_widgets.append(widgets.HBox([
+                        self.edt_thresholds[other_type],
+                        self.segment_size_mins[other_type],
+                    ]))
+                    segmentation_widgets.append(widgets.HBox([
+                        self.opening_nr_pixels[other_type],
+                        self.fill_holes[other_type],
+                    ]))
 
         self.ui = widgets.VBox([
             widgets.VBox([
@@ -181,7 +218,7 @@ class PixelClassifierPanel:
                 widgets.HTML("<b>Apply segmentation</b>"),
                 self.manual_clf_paths,
                 self.clf_paths_box,
-                *threshold_widgets,
+                *segmentation_widgets,
                 self.overwrite_existing,
                 widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end]),
                 self.apply_row,
@@ -231,6 +268,53 @@ class PixelClassifierPanel:
                 style={'description_width': '160px'},
             )
     
+    def _create_postprocessing_inputs(self):
+        """Create inputs for segment_size_min, opening_nr_pixels, fill_holes per cell type"""
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+        
+        self.segment_size_mins = {}
+        self.opening_nr_pixels = {}
+        self.fill_holes = {}
+        
+        for cell_type in self.all_cell_types:
+            # Defaults based on cell type category
+            if cell_type in self.organoid_types:
+                default_size = 1000
+                default_opening = 3
+                default_fill = True
+            elif cell_type in self.immune_types:
+                default_size = 10
+                default_opening = 0
+                default_fill = True
+            else:
+                default_size = 10
+                default_opening = 0
+                default_fill = True
+            
+            # Segment size min
+            saved_size = pc.get(f"{cell_type}_segment_size_min", default_size)
+            self.segment_size_mins[cell_type] = widgets.IntText(
+                description=f"{cell_type.capitalize()} min size:",
+                value=int(saved_size),
+                style={'description_width': '160px'},
+            )
+            
+            # Opening nr pixels
+            saved_opening = pc.get(f"{cell_type}_opening_nr_pixels", default_opening)
+            self.opening_nr_pixels[cell_type] = widgets.IntText(
+                description=f"{cell_type.capitalize()} opening px:",
+                value=int(saved_opening),
+                style={'description_width': '160px'},
+            )
+            
+            # Fill holes
+            saved_fill = pc.get(f"{cell_type}_fill_holes", default_fill)
+            self.fill_holes[cell_type] = widgets.Checkbox(
+                description=f"{cell_type.capitalize()} fill holes",
+                value=bool(saved_fill),
+                indent=False,
+            )
+    
     def _persist_params(self):
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
         pc["examples_per_sample"] = int(self.examples_per_sample.value)
@@ -244,6 +328,14 @@ class PixelClassifierPanel:
         
         for cell_type, threshold_widget in self.edt_thresholds.items():
             pc[f"{cell_type}_edt_threshold"] = float(threshold_widget.value)
+        
+        for cell_type in self.all_cell_types:
+            if cell_type in self.segment_size_mins:
+                pc[f"{cell_type}_segment_size_min"] = int(self.segment_size_mins[cell_type].value)
+            if cell_type in self.opening_nr_pixels:
+                pc[f"{cell_type}_opening_nr_pixels"] = int(self.opening_nr_pixels[cell_type].value)
+            if cell_type in self.fill_holes:
+                pc[f"{cell_type}_fill_holes"] = bool(self.fill_holes[cell_type].value)
         
         if self.manual_clf_paths.value:
             pc["clf_dir"] = str(self.clf_dir.value or "")
@@ -319,6 +411,9 @@ class PixelClassifierPanel:
             self.manual_clf_paths, self.overwrite_existing,
         ]
         to_lock.extend(self.edt_thresholds.values())
+        to_lock.extend(self.segment_size_mins.values())
+        to_lock.extend(self.opening_nr_pixels.values())
+        to_lock.extend(self.fill_holes.values())
         for w in to_lock: w.disabled = state
         try:
             self.clf_dir.text.disabled = state
@@ -331,6 +426,35 @@ class PixelClassifierPanel:
                 picker.btn.disabled = state
         except Exception: pass
 
+    def _get_current_params(self):
+        """Collect current parameter values from widgets into a dict"""
+        params = {}
+        for cell_type in self.all_cell_types:
+            if cell_type in self.edt_thresholds:
+                params[f"{cell_type}_edt_threshold"] = float(self.edt_thresholds[cell_type].value)
+            if cell_type in self.segment_size_mins:
+                params[f"{cell_type}_segment_size_min"] = int(self.segment_size_mins[cell_type].value)
+            if cell_type in self.opening_nr_pixels:
+                params[f"{cell_type}_opening_nr_pixels"] = int(self.opening_nr_pixels[cell_type].value)
+            if cell_type in self.fill_holes:
+                params[f"{cell_type}_fill_holes"] = bool(self.fill_holes[cell_type].value)
+        return params
+    
+    def _update_widgets_from_params(self, params):
+        """Update widget values from a params dict and persist to config"""
+        for cell_type in self.all_cell_types:
+            if f"{cell_type}_edt_threshold" in params and cell_type in self.edt_thresholds:
+                self.edt_thresholds[cell_type].value = float(params[f"{cell_type}_edt_threshold"])
+            if f"{cell_type}_segment_size_min" in params and cell_type in self.segment_size_mins:
+                self.segment_size_mins[cell_type].value = int(params[f"{cell_type}_segment_size_min"])
+            if f"{cell_type}_opening_nr_pixels" in params and cell_type in self.opening_nr_pixels:
+                self.opening_nr_pixels[cell_type].value = int(params[f"{cell_type}_opening_nr_pixels"])
+            if f"{cell_type}_fill_holes" in params and cell_type in self.fill_holes:
+                self.fill_holes[cell_type].value = bool(params[f"{cell_type}_fill_holes"])
+        # Persist updated values to config file
+        self._persist_params()
+        print("Parameters updated from training and saved to config")
+    
     def _on_train_clicked(self, _):
         with self.out:
             self.out.clear_output()
@@ -340,6 +464,13 @@ class PixelClassifierPanel:
                 odir.mkdir(parents=True, exist_ok=True)
                 self._lock(True)
                 self.spinner_train.layout.display = None
+                
+                # Collect initial parameters from widget
+                initial_params = self._get_current_params()
+                
+                print("Starting pixel classifier training...")
+                print("Napari viewer will open. Close it when done labeling.")
+                
                 ret = train_pixel_classifier(
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
@@ -349,11 +480,15 @@ class PixelClassifierPanel:
                     organoid_types=self.organoid_types,
                     immune_types=self.immune_types,
                     other_types=self.other_types,
+                    initial_params=initial_params,
+                    on_params_changed=self._update_widgets_from_params,
                 )
                 self._viewer = ret if (ret is not None and hasattr(ret, "close")) else None
                 self.spinner_train.layout.display = "none"
                 self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
-                if self._viewer is None: print("✅ Training finished.")
+                if self._viewer is None:
+                    self.out.clear_output()
+                    print("Training finished.")
             except Exception: traceback.print_exc()
             finally: self._lock(False)
 
@@ -363,7 +498,10 @@ class PixelClassifierPanel:
                 if self._viewer is not None:
                     self._viewer.close()
                     self._viewer = None
-            finally: self.close_button.layout.display = "none"
+            finally:
+                self.close_button.layout.display = "none"
+                self.out.clear_output()
+                print("Training finished.")
 
     def _on_apply_clicked(self, _, only_segment=False):
         self._lock(True)
@@ -386,6 +524,15 @@ class PixelClassifierPanel:
                     organoid_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.organoid_types if ct in self.edt_thresholds},
                     immune_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.immune_types if ct in self.edt_thresholds},
                     other_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.other_types if ct in self.edt_thresholds},
+                    organoid_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.organoid_types if ct in self.segment_size_mins},
+                    immune_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.immune_types if ct in self.segment_size_mins},
+                    other_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.other_types if ct in self.segment_size_mins},
+                    organoid_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.organoid_types if ct in self.opening_nr_pixels},
+                    immune_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.immune_types if ct in self.opening_nr_pixels},
+                    other_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.other_types if ct in self.opening_nr_pixels},
+                    organoid_fill_holes={ct: bool(self.fill_holes[ct].value) for ct in self.organoid_types if ct in self.fill_holes},
+                    immune_fill_holes={ct: bool(self.fill_holes[ct].value) for ct in self.immune_types if ct in self.fill_holes},
+                    other_fill_holes={ct: bool(self.fill_holes[ct].value) for ct in self.other_types if ct in self.fill_holes},
                     timepoint_range=tpr,
                     clf_organoid_paths=clf_organoid_paths,
                     clf_immune_paths=clf_immune_paths,
@@ -398,8 +545,501 @@ class PixelClassifierPanel:
                 if new_md is not None:
                     self.metadata_loader.metadata = new_md
                     new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
-                print("✅ Apply finished.")
+                print("Apply finished.")
             except Exception: traceback.print_exc()
             finally:
                 self.spinner_apply.layout.display = "none"
                 self._lock(False)
+class CellposeChannelConfigPanel:
+    """Panel for configuring channel labels for Cellpose segmentation.
+    
+    This panel calculates the number of channels from metadata cell types
+    and allows users to configure channel labels either:
+    - Same for all samples (global configuration)
+    - Per-sample configuration
+    
+    Channel labels are saved to the config file under the 'cellpose' section.
+    """
+    
+    def __init__(self, metadata_loader):
+        self.metadata_loader = metadata_loader
+        self._detect_cell_types()
+        self._calculate_number_of_channels()
+        
+        # Load saved config
+        cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {})
+        
+        # Display calculated number of channels
+        self.n_channels_display = widgets.HTML(
+            value=f"<b>Number of channels:</b> {self.n_channels} "
+                  f"(Organoids: {len(self.organoid_types)}, "
+                  f"Immune: {len(self.immune_types)}, "
+                  f"Other: {len(self.other_types)}"
+                  f"{', Dead: 1' if self.has_death else ''})"
+        )
+        
+        # Mode selection: same for all vs per-sample
+        saved_mode = cellpose_cfg.get("labels_mode", "same_for_all")
+        self.labels_mode = widgets.RadioButtons(
+            options=[
+                ('Same labels for all samples', 'same_for_all'),
+                ('Configure labels per sample', 'per_sample')
+            ],
+            value=saved_mode,
+            description='Configuration mode:',
+            style={'description_width': '140px'}
+        )
+        
+        # Container for dynamic channel label UI
+        self.channel_config_container = widgets.VBox()
+        
+        # Save button
+        self.btn_save = widgets.Button(
+            description='Save Channel Configuration',
+            button_style='success',
+            icon='save'
+        )
+        self.btn_save.on_click(self._on_save)
+        
+        # Output for status messages
+        self.out = widgets.Output()
+        
+        # Setup observers
+        self.labels_mode.observe(self._on_mode_change, names='value')
+        
+        # Build initial UI
+        self._build_channel_config_ui()
+        
+        # Main UI
+        self.ui = widgets.VBox([
+            widgets.HTML('<h3>Cellpose Channel Configuration</h3>'),
+            self.n_channels_display,
+            widgets.HTML('<hr>'),
+            self.labels_mode,
+            self.channel_config_container,
+            self.btn_save,
+            self.out
+        ])
+    
+    def _detect_cell_types(self):
+        """Detect cell types from metadata"""
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel
+        )
+        metadata = self.metadata_loader.metadata
+        self.organoid_types = detect_organoid_types_from_metadata(metadata)
+        self.immune_types = detect_immune_cell_types_from_metadata(metadata)
+        self.other_types = detect_other_cell_types_from_metadata(metadata)
+        self.has_death = has_dead_channel(metadata)
+        self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
+    
+    def _calculate_number_of_channels(self):
+        """Calculate total number of channels from cell types"""
+        self.n_channels = len(self.organoid_types) + len(self.immune_types) + len(self.other_types)
+        if self.has_death:
+            self.n_channels += 1
+    
+    def _get_channel_options(self):
+        """Get available channel label options"""
+        options = list(self.organoid_types) + list(self.immune_types) + list(self.other_types)
+        if self.has_death:
+            options.append('dead')
+        return options
+    
+    def _get_sample_names(self):
+        """Get list of sample names from metadata"""
+        return list(self.metadata_loader.metadata['sample_name'].unique())
+    
+    def _on_mode_change(self, change):
+        """Handle mode change between same_for_all and per_sample"""
+        self._build_channel_config_ui()
+    
+    def _build_channel_config_ui(self):
+        """Build the channel configuration UI based on current mode"""
+        cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {})
+        mode = self.labels_mode.value
+        
+        self.channel_dropdowns = {}
+        children = []
+        
+        if self.n_channels == 0:
+            children.append(widgets.HTML('<p style="color: orange;">No channels detected. Please check your metadata configuration.</p>'))
+            self.channel_config_container.children = children
+            return
+        
+        channel_options = self._get_channel_options()
+        
+        if mode == 'same_for_all':
+            children.append(widgets.HTML('<h4>Set channel labels (applies to all samples)</h4>'))
+            
+            # Load saved global channel labels
+            saved_labels = cellpose_cfg.get("channel_labels", {})
+            
+            self.channel_dropdowns['global'] = {}
+            for i in range(self.n_channels):
+                # Default: try to use saved value, or match index to option
+                saved_val = saved_labels.get(str(i), saved_labels.get(i, None))
+                if saved_val and saved_val in channel_options:
+                    default_val = saved_val
+                elif i < len(channel_options):
+                    default_val = channel_options[i]
+                else:
+                    default_val = channel_options[0] if channel_options else ''
+                
+                dropdown = widgets.Dropdown(
+                    options=channel_options,
+                    value=default_val,
+                    description=f'Channel {i}:',
+                    style={'description_width': '100px'},
+                    layout=widgets.Layout(width='300px')
+                )
+                self.channel_dropdowns['global'][i] = dropdown
+                children.append(dropdown)
+        
+        else:  # per_sample
+            children.append(widgets.HTML('<h4>Set channel labels per sample</h4>'))
+            
+            # Load saved per-sample labels
+            saved_per_sample = cellpose_cfg.get("per_sample_channel_labels", {})
+            
+            sample_names = self._get_sample_names()
+            
+            for sample_name in sample_names:
+                children.append(widgets.HTML(f'<b>{sample_name}</b>'))
+                self.channel_dropdowns[sample_name] = {}
+                
+                # Get saved labels for this sample
+                sample_saved = saved_per_sample.get(sample_name, {})
+                
+                sample_row = []
+                for i in range(self.n_channels):
+                    saved_val = sample_saved.get(str(i), sample_saved.get(i, None))
+                    if saved_val and saved_val in channel_options:
+                        default_val = saved_val
+                    elif i < len(channel_options):
+                        default_val = channel_options[i]
+                    else:
+                        default_val = channel_options[0] if channel_options else ''
+                    
+                    dropdown = widgets.Dropdown(
+                        options=channel_options,
+                        value=default_val,
+                        description=f'Ch {i}:',
+                        style={'description_width': '50px'},
+                        layout=widgets.Layout(width='180px')
+                    )
+                    self.channel_dropdowns[sample_name][i] = dropdown
+                    sample_row.append(dropdown)
+                
+                children.append(widgets.HBox(sample_row))
+        
+        self.channel_config_container.children = children
+    
+    def _persist_params(self):
+        """Save channel configuration to config file"""
+        cellpose_cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose", {})
+        
+        cellpose_cfg["number_of_channels"] = self.n_channels
+        cellpose_cfg["labels_mode"] = self.labels_mode.value
+        
+        if self.labels_mode.value == 'same_for_all':
+            # Save global channel labels
+            channel_labels = {}
+            if 'global' in self.channel_dropdowns:
+                for i, dropdown in self.channel_dropdowns['global'].items():
+                    channel_labels[i] = dropdown.value
+            cellpose_cfg["channel_labels"] = channel_labels
+            cellpose_cfg["per_sample_channel_labels"] = {}
+        else:
+            # Save per-sample channel labels
+            per_sample_labels = {}
+            for sample_name, dropdowns in self.channel_dropdowns.items():
+                if sample_name != 'global':
+                    per_sample_labels[sample_name] = {i: dd.value for i, dd in dropdowns.items()}
+            cellpose_cfg["per_sample_channel_labels"] = per_sample_labels
+            cellpose_cfg["channel_labels"] = {}
+        
+        # Save to file
+        if hasattr(self.metadata_loader, "behav3d_parameters_path"):
+            yaml.safe_dump(
+                self.metadata_loader.behav3d_parameters,
+                self.metadata_loader.behav3d_parameters_path.open("w"),
+                sort_keys=False
+            )
+    
+    def _on_save(self, btn):
+        """Save channel configuration"""
+        with self.out:
+            self.out.clear_output()
+            try:
+                self._persist_params()
+                print("Channel configuration saved successfully!")
+                
+                # Show summary
+                mode = self.labels_mode.value
+                if mode == 'same_for_all' and 'global' in self.channel_dropdowns:
+                    labels = {i: dd.value for i, dd in self.channel_dropdowns['global'].items()}
+                    print(f"   Mode: Same for all samples")
+                    print(f"   Labels: {labels}")
+                else:
+                    print(f"   Mode: Per-sample configuration")
+                    for sample_name, dropdowns in self.channel_dropdowns.items():
+                        if sample_name != 'global':
+                            labels = {i: dd.value for i, dd in dropdowns.items()}
+                            print(f"   {sample_name}: {labels}")
+            except Exception:
+                traceback.print_exc()
+    
+    def get_channel_labels(self, sample_name=None):
+        """Get channel labels for a specific sample or global labels.
+        
+        This method can be called by other widgets/functions to retrieve
+        the configured channel labels.
+        
+        Args:
+            sample_name: If provided and mode is per_sample, returns labels for that sample.
+                        If None or mode is same_for_all, returns global labels.
+        
+        Returns:
+            dict: Mapping of channel index to label name
+        """
+        cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {})
+        mode = cellpose_cfg.get("labels_mode", "same_for_all")
+        
+        if mode == 'same_for_all' or sample_name is None:
+            return cellpose_cfg.get("channel_labels", {})
+        else:
+            per_sample = cellpose_cfg.get("per_sample_channel_labels", {})
+            return per_sample.get(sample_name, cellpose_cfg.get("channel_labels", {}))
+
+
+class CellposeInferencePanel:
+    """Widget panel for Cellpose model loading and inference."""
+    
+    def __init__(self, metadata_loader, category='organoid'):
+        self.metadata_loader = metadata_loader
+        self.category = category  # 'organoid' or 'immune'
+        self._detect_cell_types()
+        
+        # Model Selection
+        self.model_path_text = widgets.Text(
+            value='',
+            placeholder='Type path or click Browse...',
+            description=f'{category.capitalize()} model:',
+            style={'description_width': 'initial'},
+            layout=widgets.Layout(width='70%')
+        )
+
+        self.browse_btn = widgets.Button(
+            description='Browse…',
+            icon='folder-open',
+            layout=widgets.Layout(width='100px')
+        )
+        self.browse_btn.on_click(self._on_browse_clicked)
+        self.browse_output = widgets.Output()
+
+        self.load_btn = widgets.Button(
+            description=f"Load {category.capitalize()} Model", 
+            button_style='info', 
+            layout={'width': 'max-content'}
+        )
+        self.load_btn.on_click(self._on_load_clicked)
+        
+        # Inference
+        self.label_selector = widgets.Dropdown(
+            description='Cell type to segment:',
+            style={'description_width': 'initial'},
+            layout={'width': 'max-content'},
+        )
+        self._update_label_options()
+
+        self.apply_btn = widgets.Button(
+            description=f"Apply {category.capitalize()} Segmentation", 
+            button_style='success', 
+            layout={'width': 'max-content'}
+        )
+        self.apply_btn.on_click(self._on_apply_clicked)
+        
+        self.out = widgets.Output()
+        
+        # State variables
+        self.pretrained_model_dir = None
+        self.channel_order = []
+        self.available_labels = []
+
+        # Build UI
+        parts = [
+            widgets.HBox([self.model_path_text, self.browse_btn]),
+            self.browse_output,
+            self.load_btn,
+            widgets.HTML("<hr>"),
+            self.label_selector,
+            self.apply_btn,
+            self.out
+        ]
+        
+        self.ui = widgets.VBox(parts, layout=widgets.Layout(grid_gap='10px'))
+
+    def _detect_cell_types(self):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel
+        )
+        metadata = self.metadata_loader.metadata
+        self.organoid_types = detect_organoid_types_from_metadata(metadata)
+        self.immune_types = detect_immune_cell_types_from_metadata(metadata)
+        self.other_types = detect_other_cell_types_from_metadata(metadata)
+        self.has_death = has_dead_channel(metadata)
+        
+        if self.category == 'organoid':
+            self.cell_types = self.organoid_types
+        else:
+            self.cell_types = self.immune_types + self.other_types
+
+    def _update_label_options(self):
+        if self.cell_types:
+            self.label_selector.options = self.cell_types
+            self.label_selector.value = self.cell_types[0]
+        else:
+            self.label_selector.options = ["None detected"]
+
+    def _on_browse_clicked(self, b):
+        with self.browse_output:
+            self.browse_output.clear_output()
+            fc = FileChooser('.', select_default=True, show_only_dirs=False)
+            def on_select(chooser):
+                if chooser.selected:
+                    self.model_path_text.value = str(chooser.selected)
+                self.browse_output.clear_output()
+            fc.register_callback(on_select)
+            widgets.display(fc)
+
+    def _on_load_clicked(self, b):
+        self.pretrained_model_dir = self.model_path_text.value
+        if not self.pretrained_model_dir:
+            with self.out:
+                self.out.clear_output()
+                print("Error: Please select a model path first.")
+            return
+
+        # Extract channel order from model name
+        try:
+            self.channel_order = self.pretrained_model_dir.split(os.path.sep)[-1].split('__')[-1].split('_')
+            self.channel_order = [ch.split('-')[-1] for ch in self.channel_order]
+        except:
+            self.channel_order = ["Unknown"]
+
+        # Get labels from config
+        self.available_labels = []
+        config_path = getattr(self.metadata_loader, 'behav3d_parameters_path', None)
+        if config_path and config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f) or {}
+                cellpose_cfg = config.get("cellpose", {})
+                mode = cellpose_cfg.get("labels_mode", "same_for_all")
+                if mode == "same_for_all":
+                    self.available_labels = list(cellpose_cfg.get("channel_labels", {}).values())
+                else:
+                    labels_set = set()
+                    for sl in cellpose_cfg.get("per_sample_channel_labels", {}).values():
+                        labels_set.update(sl.values())
+                    self.available_labels = sorted(list(labels_set))
+            except: pass
+        
+        self.available_labels = [l for l in self.available_labels if l and l != 'dead']
+
+        with self.out:
+            self.out.clear_output()
+            print(f"Loaded {self.category.capitalize()} model")
+            print(f"   Channels detected: {self.channel_order}")
+            print(f"   Cell types: {self.cell_types}")
+
+    def _on_apply_clicked(self, b):
+        if not self.pretrained_model_dir:
+            with self.out:
+                print("Error: Load a model first.")
+            return
+            
+        label = self.label_selector.value
+        with self.out:
+            self.out.clear_output()
+            try:
+                # updates memory and saves CSV
+                _, summary = run_cellpose_and_sync_metadata(
+                    output_dir=self.metadata_loader.output_dir,
+                    metadata_loader=self.metadata_loader,
+                    pretrained_model_dir=self.pretrained_model_dir,
+                    input_channels=[label], # assign to ch0
+                    label_name=label,
+                    timepoint_range= None
+                )
+                
+                # summary
+                n_proc = len(summary['processed'])
+                n_skip = len(summary['skipped'])
+                if n_skip > 0:
+                    print(f"Cellpose segmentation finished: {n_proc} processed, {n_skip} skipped.")
+                    print(f"Skipped samples: {', '.join(summary['skipped'])}")
+                else:
+                    print(f"Cellpose segmentation finished for all {n_proc} samples.")
+                print("Metadata updated.")
+            except Exception:
+                traceback.print_exc()
+
+    def display(self):
+        display(self.ui)
+
+
+class DeadMaskPanel:
+    """Widget panel for Run Dead Mask (Otsu) segmentation."""
+
+    def __init__(self, metadata_loader):
+        self.metadata_loader = metadata_loader
+        self.has_death = has_dead_channel(metadata_loader.metadata)
+        
+        self.btn = widgets.Button(
+            description="Run Dead Mask (Otsu)", 
+            button_style='warning', 
+            layout={'width': 'max-content'},
+            disabled=not self.has_death
+        )
+        self.btn.on_click(self._on_clicked)
+        self.out = widgets.Output()
+        
+        if not self.has_death:
+            with self.out:
+                print("No dead channel detected in metadata.")
+
+        self.ui = widgets.VBox([self.btn, self.out])
+
+    def _on_clicked(self, b):
+        with self.out:
+            self.out.clear_output()
+            print("Starting Dead Mask (Otsu) segmentation...")
+            try:
+                _, summary = run_otsu_and_sync_metadata(
+                    output_dir=self.metadata_loader.output_dir,
+                    metadata_loader=self.metadata_loader,
+                    mask_suffix="_mask_dead",
+                    timepoint_range=None
+                )
+                # summary
+                n_proc = len(summary['processed'])
+                n_skip = len(summary['skipped'])
+                if n_skip > 0:
+                    print(f"Dead mask segmentation finished: {n_proc} processed, {n_skip} skipped.")
+                    print(f"Skipped samples: {', '.join(summary['skipped'])}")
+                else:
+                    print(f"Dead mask segmentation finished for all {n_proc} samples.")
+                print("Metadata updated.")
+            except Exception:
+                traceback.print_exc()
+
+    def display(self):
+        display(self.ui)

@@ -44,6 +44,7 @@ import pandas as pd
 from pathlib import Path
 import time
 from typing import Optional, List, Tuple, Dict, Union
+import numpy as np
 
 from behav3d.core.metadata import detect_organoid_types_from_metadata
 from behav3d.core.utils import get_current_time, format_time
@@ -273,6 +274,7 @@ def analyze_active_killing_per_timepoint(
     observation_window: int = 5,
     death_signal_column: str = "mean_dead_dye",
     killing_threshold_multiplier: float = 1.5,
+    absolute_killing_threshold: Optional[float] = None,
     background_rates: Optional[Dict[str, float]] = None,
 ) -> pd.DataFrame:
     """
@@ -297,7 +299,10 @@ def analyze_active_killing_per_timepoint(
     death_signal_column : str
         Column in target tracks containing death signal
     killing_threshold_multiplier : float
-        Multiplier for background rate to determine killing threshold
+        Multiplier for background rate to determine killing threshold (used when absolute_killing_threshold is None)
+    absolute_killing_threshold : float, optional
+        If provided, use this absolute value as the killing threshold instead of 
+        multiplier-based threshold. Useful when background death rate is near zero.
     background_rates : Dict[str, float], optional
         Pre-computed per-sample background rates
         
@@ -337,6 +342,8 @@ def analyze_active_killing_per_timepoint(
         last_death_increase = 0.0
         last_is_active = False
         last_efficiency = 0.0
+        last_killing_threshold = 0.0
+        last_target_id = None
         
         for i, t in enumerate(contact_timepoints):
             observation_end_t = t + observation_window
@@ -379,17 +386,28 @@ def analyze_active_killing_per_timepoint(
                         after_window = after_window.iloc[[0]]
                     
                     death_after = after_window[death_signal_column].values[0]
-                    death_increases.append(death_after - death_at_t)
+                    death_increases.append((target_id_int, death_after - death_at_t))
                 
                 # Use max death increase across all touched targets
                 if death_increases:
-                    death_increase = max(death_increases)
+                    # Find which target had the max increase
+                    max_idx = np.argmax([d[1] for d in death_increases])
+                    target_id_max = death_increases[max_idx][0]
+                    death_increase = death_increases[max_idx][1]
                 else:
+                    target_id_max = None
                     death_increase = 0.0
                 
                 # Calculate killing threshold
                 expected_increase = sample_bg_rate * observation_window
-                killing_threshold = expected_increase * killing_threshold_multiplier
+                
+                # Use absolute threshold if provided, otherwise use multiplier-based threshold
+                if absolute_killing_threshold is not None:
+                    killing_threshold = absolute_killing_threshold
+                    threshold_type = "absolute"
+                else:
+                    killing_threshold = expected_increase * killing_threshold_multiplier
+                    threshold_type = "multiplier"
                 
                 is_active = death_increase > killing_threshold
                 efficiency = death_increase / (expected_increase + 1e-10) if expected_increase > 0 else 0.0
@@ -398,11 +416,15 @@ def analyze_active_killing_per_timepoint(
                 last_death_increase = death_increase
                 last_is_active = is_active
                 last_efficiency = efficiency
+                last_killing_threshold = killing_threshold
+                last_target_id = target_id_max
             else:
                 # Cannot observe full window - forward-fill last known values
                 death_increase = last_death_increase
                 is_active = last_is_active
                 efficiency = last_efficiency
+                killing_threshold = last_killing_threshold
+                target_id_max = last_target_id
             
             killing_results.append({
                 "contact_event_id": event["contact_event_id"],
@@ -412,7 +434,9 @@ def analyze_active_killing_per_timepoint(
                 "death_signal_increase": death_increase,
                 "is_active_killing": is_active,
                 "killing_efficiency": efficiency,
+                "targeted_track_id": target_id_max if is_active else None,
                 "sample_background_rate": sample_bg_rate,
+                "killing_threshold_used": killing_threshold if can_observe else last_killing_threshold,
                 "observation_complete": can_observe,
             })
     
@@ -428,6 +452,7 @@ def run_active_killing_analysis(
     death_signal_column: str = "mean_dead_dye",
     min_contact_duration: int = 1,
     killing_threshold_multiplier: float = 1.5,
+    absolute_killing_threshold: Optional[float] = None,
     save_results: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
     """
@@ -463,7 +488,11 @@ def run_active_killing_analysis(
     min_contact_duration : int
         Minimum TOTAL contact duration (continuous) in timepoints
     killing_threshold_multiplier : float
-        Multiplier for background rate threshold
+        Multiplier for background rate threshold. Used when absolute_killing_threshold is None.
+    absolute_killing_threshold : float, optional
+        If provided, use this absolute value as the killing threshold instead of the
+        multiplier-based threshold. Useful when background death rate is close to 0.
+        Default is None (uses killing_threshold_multiplier instead).
     save_results : bool
         Whether to save results to CSV files
         
@@ -492,6 +521,10 @@ def run_active_killing_analysis(
     print(f"Target cell types: {target_cell_types}")
     print(f"Observation window: {observation_window} timepoints")
     print(f"Min contact duration: {min_contact_duration} timepoints")
+    if absolute_killing_threshold is not None:
+        print(f"Killing threshold mode: ABSOLUTE ({absolute_killing_threshold})")
+    else:
+        print(f"Killing threshold mode: MULTIPLIER ({killing_threshold_multiplier}x background rate)")
     
     # Load immune cell tracks
     immune_feature_dir = output_dir / "analysis" / immune_cell_type / "track_features"
@@ -582,6 +615,7 @@ def run_active_killing_analysis(
         observation_window=observation_window,
         death_signal_column=death_signal_column,
         killing_threshold_multiplier=killing_threshold_multiplier,
+        absolute_killing_threshold=absolute_killing_threshold,
         background_rates=background_rates,
     )
     
@@ -615,6 +649,9 @@ def run_active_killing_analysis(
         "observation_window": observation_window,
         "min_contact_duration": min_contact_duration,
         "killing_threshold_multiplier": killing_threshold_multiplier,
+        "absolute_killing_threshold": absolute_killing_threshold,
+        "threshold_mode": "absolute" if absolute_killing_threshold is not None else "multiplier",
+        "targeted_organoids_tracked": True
     }
     
     print(f"{get_current_time()} - Active killing analysis complete:")
@@ -701,6 +738,8 @@ def create_advanced_features_csv(
     df["is_active_killing"] = False
     df["killing_efficiency"] = 0.0
     df[f"death_signal_increase{window_suffix}"] = 0.0
+    df["targeted_track_id"] = -1
+    df["contact_event_id"] = -1
     
     if df_killing_per_timepoint.empty:
         print("No killing events to merge - returning original features with zero killing columns")
@@ -728,7 +767,7 @@ def create_advanced_features_csv(
     
     # Create indexed Series for vectorized lookup
     killing_indexed = df_killing_deduped.set_index("_merge_key")[
-        ["is_active_killing", "killing_efficiency", "death_signal_increase"]
+        ["is_active_killing", "killing_efficiency", "death_signal_increase", "targeted_track_id", "contact_event_id"]
     ]
     
     # Vectorized assignment using reindex - matches df's merge keys to killing data
@@ -738,6 +777,8 @@ def create_advanced_features_csv(
     df["is_active_killing"] = matched_values["is_active_killing"].fillna(False).astype(bool).values
     df["killing_efficiency"] = matched_values["killing_efficiency"].fillna(0.0).values
     df[f"death_signal_increase{window_suffix}"] = matched_values["death_signal_increase"].fillna(0.0).values
+    df["targeted_track_id"] = matched_values["targeted_track_id"].fillna(-1).values
+    df["contact_event_id"] = matched_values["contact_event_id"].fillna(-1).astype(int).values
     
     # Clean up merge key
     df.drop(columns=["_merge_key"], inplace=True)
