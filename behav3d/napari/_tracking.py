@@ -4,6 +4,7 @@ BEHAV3D napari plugin – Tracking Tab.
 Provides per-cell-type sub-tabs with method selection (LAP / TrackPy / Propagation),
 method-specific parameters, and batch-tracking options.
 """
+import sys
 import traceback
 from pathlib import Path
 
@@ -362,6 +363,10 @@ class CellTypeTrackingPanel(QWidget):
         metadata = self.metadata_loader.metadata
         out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
 
+        print(f"\n{'='*50}", file=sys.stderr)
+        print(f"  Tracking: {cell_type} ({method.upper()})", file=sys.stderr)
+        print(f"{'='*50}", file=sys.stderr)
+
         if method == "lap":
             from behav3d.preprocessing.tracking.laptracking import run_laptracking
             tc = int(self.lap_track_cost.value()) ** 2
@@ -387,15 +392,17 @@ class CellTypeTrackingPanel(QWidget):
                 memory=int(self.tp_memory.value()),
                 adaptive_stop=float(self.tp_adaptive_stop.value()),
                 adaptive_step=float(self.tp_adaptive_step.value()),
+                log_callback=self.log,
             )
 
         else:  # propagation
             from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
-            # Use defaults or saved params from metadata loader if needed
             new_md = run_propagation_tracking(
                 metadata=metadata, output_dir=out_dir, cell_type=cell_type,
                 overwrite=overwrite
             )
+
+        print(f"\u2705 {cell_type} tracking finished.", file=sys.stderr)
 
         # Update shared metadata
         self.metadata_loader.metadata = new_md
@@ -404,31 +411,48 @@ class CellTypeTrackingPanel(QWidget):
         if csv_path:
             new_md.to_csv(csv_path, sep=",", index=False)
 
+    def _check_existing_tracking(self, cell_types: list) -> list:
+        """Return descriptions of existing tracking data that would be overwritten."""
+        warnings = []
+        md = self.metadata_loader.metadata
+        if md is None:
+            return warnings
+        out_dir = Path(self.metadata_loader.output_dir)
+        for ct in cell_types:
+            for _, sample in md.iterrows():
+                sn = sample.get("sample_name", "unknown")
+                zarr_path = out_dir / "images" / sn / f"{sn}_{ct}_tracked.zarr"
+                csv_dir = out_dir / "trackdata" / sn / ct
+                if zarr_path.exists() or (csv_dir.exists() and list(csv_dir.glob("*.csv"))):
+                    warnings.append(f"{ct} tracking data for {sn}")
+        return warnings
+
     def _on_run_clicked(self):
         self._persist()
         method = self._get_method_key()
         self.log(f"Running {method.upper()} tracking for: {self.cell_type}")
 
-        # Check for existing data
-        out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
-        target_csv = Path(out_dir) / "images" / self.cell_type / f"{self.cell_type}_Tracks.csv"
-        
+        # Check for existing data across all samples
+        existing = self._check_existing_tracking([self.cell_type])
+
         overwrite = True
-        if target_csv.exists():
+        if existing:
             from qtpy.QtWidgets import QMessageBox
-            res = QMessageBox.question(
+            details = "\n".join(f"  \u2022 {w}" for w in existing)
+            res = QMessageBox.warning(
                 self, "Overwrite Existing Tracking?",
-                f"Pre-existing tracking data found for {self.cell_type}.\n\nDo you want to overwrite it?",
-                QMessageBox.Yes | QMessageBox.No
+                f"The following tracking data already exists:\n\n{details}\n\n"
+                "Do you want to overwrite it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
-            if res == QMessageBox.No:
+            if res != QMessageBox.Yes:
                 self.log(f"Tracking for {self.cell_type} cancelled.")
                 return
             overwrite = True
 
         try:
             self._run_tracking_for(self.cell_type, overwrite=overwrite)
-            self.log(f"✅ {self.cell_type} tracking finished.")
+            self.log(f"\u2705 {self.cell_type} tracking finished.")
             
             # Show visualizer prompt
             from qtpy.QtWidgets import QMessageBox
@@ -446,6 +470,16 @@ class CellTypeTrackingPanel(QWidget):
 
     def _switch_to_viz_and_show_tracks(self):
         """Utility to switch to visualization tab and enable track layers."""
+        # Stop any running napari animation to avoid stale slider references
+        # (prevents RuntimeError: wrapped C/C++ object has been deleted)
+        try:
+            qt_dims = self.viewer.window._qt_viewer.dims
+            if hasattr(qt_dims, '_animation_thread') and qt_dims._animation_thread is not None:
+                qt_dims._animation_thread.quit()
+                qt_dims._animation_thread.wait()
+        except Exception:
+            pass
+
         parent = self.parent()
         while parent and not hasattr(parent, 'tabs'):
             parent = parent.parent()
@@ -609,38 +643,56 @@ class TrackingTab(QWidget):
             self._log("No cell type panels to track.")
             return
 
-        self._log(f"Starting batch tracking for {len(self.panels)} cell types...")
-        
-        # Check for existing data across all targeted cell types
-        out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
-        existing_types = []
-        for ct in self.panels:
-            target_csv = Path(out_dir) / "images" / ct / f"{ct}_Tracks.csv"
-            if target_csv.exists():
-                existing_types.append(ct)
-        
+        total = len(self.panels)
+        self._log(f"Starting batch tracking for {total} cell types...")
+
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"  Running batch tracking for {total} cell types", file=sys.stderr)
+        print(f"{'='*60}", file=sys.stderr)
+
+        # Check for existing tracking data across all cell types
+        all_cts = list(self.panels.keys())
+        existing = []
+        out_dir = Path(self.metadata_loader.output_dir)
+        md = self.metadata_loader.metadata
+        for ct in all_cts:
+            for _, sample in md.iterrows():
+                sn = sample.get("sample_name", "unknown")
+                zarr_path = out_dir / "images" / sn / f"{sn}_{ct}_tracked.zarr"
+                csv_dir = out_dir / "trackdata" / sn / ct
+                if zarr_path.exists() or (csv_dir.exists() and list(csv_dir.glob("*.csv"))):
+                    existing.append(f"{ct} tracking data for {sn}")
+
         overwrite = True
-        if existing_types and interactive:
+        if existing and interactive:
             from qtpy.QtWidgets import QMessageBox
-            msg = f"Pre-existing tracking data found for: {', '.join(existing_types)}.\n\nDo you want to overwrite it?"
-            res = QMessageBox.question(
+            details = "\n".join(f"  \u2022 {w}" for w in existing)
+            res = QMessageBox.warning(
                 self, "Overwrite Existing Tracking?",
-                msg,
-                QMessageBox.Yes | QMessageBox.No
+                f"The following tracking data already exists:\n\n{details}\n\n"
+                "Do you want to overwrite it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
-            if res == QMessageBox.No:
+            if res != QMessageBox.Yes:
                 self._log("Batch tracking cancelled by user.")
                 return
             overwrite = True
 
+        # Persist all panel params before starting so config is saved even if an error occurs
+        for ct, panel in self.panels.items():
+            panel._persist()
+
         try:
-            for ct, panel in self.panels.items():
-                self._log(f"--- Tracking {ct} ---")
-                panel._persist()
+            for i, (ct, panel) in enumerate(self.panels.items(), 1):
+                print(f"\n\u25b6 [{i}/{total}] Tracking {ct}...", file=sys.stderr)
+                self._log(f"--- [{i}/{total}] Tracking {ct} ---")
                 panel._run_tracking_for(ct, overwrite=overwrite)
                 self._log(f"Done: {ct}")
             
-            self._log("✅ Batch tracking finished.")
+            self._log("\u2705 Batch tracking finished.")
+            print(f"\n{'='*60}", file=sys.stderr)
+            print(f"  \u2705 Batch tracking complete", file=sys.stderr)
+            print(f"{'='*60}\n", file=sys.stderr)
 
             if interactive:
                 from qtpy.QtWidgets import QMessageBox
@@ -655,4 +707,4 @@ class TrackingTab(QWidget):
 
         except Exception as e:
             traceback.print_exc()
-            self._log(f"❌ Batch tracking error: {e}")
+            self._log(f"\u274c Batch tracking error: {e}")

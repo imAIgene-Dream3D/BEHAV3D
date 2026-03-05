@@ -276,6 +276,15 @@ class VisualizationTab(QWidget):
         self.toggle_tracks.setChecked(False) # Tracks are hidden by default
 
         # if self.clear_layers_cb.isChecked():
+        # Stop any running napari dim animation before clearing layers
+        # (prevents RuntimeError: wrapped C/C++ object has been deleted)
+        try:
+            qt_dims = self.viewer.window._qt_viewer.dims
+            if hasattr(qt_dims, '_animation_thread') and qt_dims._animation_thread is not None:
+                qt_dims._animation_thread.quit()
+                qt_dims._animation_thread.wait()
+        except Exception:
+            pass
         self.viewer.layers.clear()
 
         output_dir = self.data_prep.output_dir or ""

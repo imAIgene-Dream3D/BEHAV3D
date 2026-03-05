@@ -170,6 +170,10 @@ class SegmentationTab(QWidget):
                 self.cleanup_session()
 
         self.param_stack.setCurrentIndex(index)
+        
+        # If switching to Import tab (index 2), refresh it to avoid outdated info
+        if index == 2:
+            self.import_page._on_metadata_updated()
 
     def request_tab_exit(self):
         """Called by the main widget when the user tries to leave this tab."""
@@ -392,12 +396,13 @@ class PixelClassifierWidget(QWidget):
         self.workers_form = QFormLayout()
         self.workers_form.setContentsMargins(6, 6, 6, 6)
         self.workers_form.setSpacing(4)
+        n_cores = os.cpu_count() or 4
         self.workers_form.addRow("Workers:", make_help_row(
             self.spin_workers,
             "Workers",
-            "Number of parallel CPU threads used during batch segmentation.\n\n"
-            "Higher values speed up processing but use more memory. "
-            "A good default is the number of CPU cores on your machine."
+            f"Number of parallel CPU threads to use.\n\n"
+            f"Your machine has {n_cores} cores.\n"
+            f"Recommendation: Use at most {max(1, n_cores - 1)} cores to keep the system responsive."
         ))
         self.param_layout.addLayout(self.workers_form)
 
@@ -847,7 +852,7 @@ class PixelClassifierWidget(QWidget):
             for ct in self.other_types:
                 clf_other_paths[ct] = get_clf_path(ct)
             if self.has_death:
-                clf_death_path = get_clf_path('Dead')
+                clf_death_path = get_clf_path('Death')
 
             # Call the segmentation function
             updated_metadata = run_pixel_classifier_segmentation(
@@ -1660,6 +1665,22 @@ class ImportWidget(QWidget):
         out_dir = Path(self.metadata_loader.output_dir)
         return out_dir / "images" / sample_name / f"{sample_name}_{cell_type}_segments.zarr"
 
+    def _resolve_path(self, path_str):
+        """Resolve a path string, trying the metadata CSV directory if not absolute/found."""
+        if not path_str:
+            return None
+        p = Path(path_str)
+        if p.exists():
+            return p
+        
+        # Try relative to metadata CSV
+        md_path = getattr(self.metadata_loader, "_loaded_csv_path", None)
+        if md_path:
+            p_rel = Path(md_path).parent / path_str
+            if p_rel.exists():
+                return p_rel
+        return p # Return original if still not found (will trigger 'File not found' UI)
+
     # ── zarr validation ─────────────────────────────────────────────────
     @staticmethod
     def _check_zarr_structure(path):
@@ -1823,11 +1844,11 @@ class ImportWidget(QWidget):
                 row_lay.addWidget(status)
             else:
                 path_str = str(raw_val).strip().strip('"').strip("'")
-                file_path = Path(path_str)
+                file_path = self._resolve_path(path_str)
 
                 if not file_path.exists():
                     status = QLabel(f"⚠️  File not found")
-                    status.setToolTip(path_str)
+                    status.setToolTip(str(file_path))
                     status.setStyleSheet("color:#E65100;")
                     row_lay.addWidget(status)
 
@@ -1842,16 +1863,12 @@ class ImportWidget(QWidget):
                                 import zarr
                                 raw_store = zarr.open(str(raw_path), mode='r')
                                 seg_store = zarr.open(str(file_path), mode='r')
+                                raw_shape = raw_store.shape
+                                seg_shape = seg_store.shape
                                 
-                                # Compare dimensions
-                                # raw_shape might be (T, C, Z, Y, X) or (T, Z, Y, X)
-                                # seg_shape is (T, Z, Y, X)
-                                
-                                # 1. Check spatial dimensions (Z, Y, X) - always the last 3
                                 if len(seg_shape) < 3 or raw_shape[-3:] != seg_shape[-3:]:
                                     dims_match = False
                                     reason = f"Spatial mismatch: Raw {raw_shape[-3:]} vs Seg {seg_shape[-3:]}"
-                                # 2. Check timepoints (index 0)
                                 elif raw_shape[0] != seg_shape[0]:
                                     dims_match = False
                                     reason = f"Time mismatch: Raw {raw_shape[0]}T vs Seg {seg_shape[0]}T"
@@ -2035,7 +2052,7 @@ class ImportWidget(QWidget):
                 continue
 
             path_str = str(raw_val).strip().strip('"').strip("'")
-            file_path = Path(path_str)
+            file_path = self._resolve_path(path_str)
 
             if not file_path.exists():
                 continue
