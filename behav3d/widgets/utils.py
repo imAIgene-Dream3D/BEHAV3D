@@ -242,6 +242,17 @@ _DEFAULT_CONFIG = {
         "use_absolute_threshold": False,
         "absolute_killing_threshold": None,
         "save_results": True,
+    },
+    "death_dynamics": {
+        "organoid": {
+            "dead_perc_threshold": 0.02
+        },
+        "immune": {
+            "dead_perc_threshold": 0.25
+        },
+        "other": {
+            "dead_perc_threshold": 0.10
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 
 import numpy as np
 import pandas as pd
@@ -145,6 +146,8 @@ def create_fulltrack_max_projection_stacks_with_track(
     pmax=99,
     mask_margin=False,
     normalize_per_channel=True,
+    zarr_img=None,
+    percentiles=None,
 ):
     sample_name = df_window["sample_name"]
     start_t = int(df_window["window_start_position_t"])
@@ -155,22 +158,26 @@ def create_fulltrack_max_projection_stacks_with_track(
         & (df_positions["TrackID"].astype(int) == int(df_window["TrackID"]))
     ]
 
-    zarr_path = Path(output_folder, "images", sample_name, f"{sample_name}.zarr")
-    zarr = load_zarr(zarr_path)
+    if zarr_img is None:
+        zarr_path = Path(output_folder, "images", sample_name, f"{sample_name}.zarr")
+        zarr = load_zarr(zarr_path)
+    else:
+        zarr = zarr_img
     T, C, Z, Y, X = zarr.shape
 
     if normalize_per_channel:
-        p_img = np.asarray(zarr[-1])
-        percentiles = {}
-        for c in range(C):
-            ch = p_img[c]
-            lo = np.percentile(ch, pmin)
-            hi = np.percentile(ch, pmax)
-            hi_floor = 30000
-            hi = max(hi, hi_floor)
-            if hi <= lo:
-                hi = lo + 1e-6
-            percentiles[c] = (float(lo), float(hi))
+        if percentiles is None:
+            p_img = np.asarray(zarr[-1])
+            percentiles = {}
+            for c in range(C):
+                ch = p_img[c]
+                lo = np.percentile(ch, pmin)
+                hi = np.percentile(ch, pmax)
+                hi_floor = 30000
+                hi = max(hi, hi_floor)
+                if hi <= lo:
+                    hi = lo + 1e-6
+                percentiles[c] = (float(lo), float(hi))
     else:
         percentiles = None
 
@@ -359,6 +366,26 @@ def _concat_rows_vertically(rows):
     return out
 
 
+def _pad_frame_to_macro_block(frame_rgb, macro_block_size=16):
+    frame = np.asarray(frame_rgb)
+    if frame.ndim != 3:
+        raise ValueError(f"Expected 3D RGB frame, got shape={frame.shape}.")
+    h, w = int(frame.shape[0]), int(frame.shape[1])
+    block = max(1, int(macro_block_size))
+    h_pad = (block - (h % block)) % block
+    w_pad = (block - (w % block)) % block
+    if h_pad == 0 and w_pad == 0:
+        return frame, False, (h, w), (h, w)
+
+    padded = np.pad(
+        frame,
+        ((0, h_pad), (0, w_pad), (0, 0)),
+        mode="constant",
+        constant_values=0,
+    )
+    return padded, True, (h, w), (int(padded.shape[0]), int(padded.shape[1]))
+
+
 def _concat_examples_horizontally(examples):
     heights = [e.shape[0] for e in examples]
     max_h = max(heights)
@@ -413,6 +440,7 @@ def _add_row_title(row_img, title, fontsize=40):
     buf = np.asarray(canvas.buffer_rgba())[..., :3]
     plt.close(fig)
     return buf
+
 
 def colorize_channels_to_rgb(
     img, 
@@ -695,7 +723,8 @@ def create_cluster_videos(
 
     results = {}
     for cluster_id, sub in picks.groupby("ClusterID"):
-        print(f"Processing Cluster {cluster_id} with {len(sub)} exemplars...")
+        cluster_started = time.perf_counter()
+        print(f"[track_max_projection] Backprojecting cluster {cluster_id}")
         rows_info = []
         max_T = 0
 
@@ -737,13 +766,14 @@ def create_cluster_videos(
         video_path = out_path / f"cluster_{int(cluster_id)}.mp4"
         if video_path.exists():
             video_path.unlink()
-
         writer = imageio.get_writer(
             video_path,
             fps=fps,
             codec="libx264",
             ffmpeg_log_level="warning",
             quality=9,
+            macro_block_size=16,
+            pixelformat="yuv420p",
         )
 
         try:
@@ -766,14 +796,20 @@ def create_cluster_videos(
                     row_imgs.append(frame)
 
                 full_frame = _concat_rows_vertically(row_imgs)
+                full_frame, was_padded, shape_in, shape_out = _pad_frame_to_macro_block(
+                    full_frame, 16
+                )
                 writer.append_data(full_frame)
         finally:
             writer.close()
+        print(
+            f"[track_max_projection] Finished cluster {cluster_id} in "
+            f"{time.perf_counter() - cluster_started:.2f}s"
+        )
 
         results[int(cluster_id)] = str(video_path)
 
     return results
-
 
 
 def create_cluster_overview_video(
@@ -793,6 +829,8 @@ def create_cluster_overview_video(
     figsize_per_example=(12.0, 4.0),
     traj_pad_frac=0.05,
 ):
+    overview_started = time.perf_counter()
+    print("[track_max_projection] Backprojecting cluster overview video")
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     video_path = out_path / "clusters_overview.mp4"
@@ -849,13 +887,14 @@ def create_cluster_overview_video(
 
     if video_path.exists():
         video_path.unlink()
-
     writer = imageio.get_writer(
         video_path,
         fps=fps,
         codec="libx264",
         ffmpeg_log_level="warning",
         quality=9,
+        macro_block_size=16,
+        pixelformat="yuv420p",
     )
 
     try:
@@ -887,12 +926,19 @@ def create_cluster_overview_video(
                 cluster_row_imgs.append(row_with_title)
 
             full_frame = _concat_rows_vertically(cluster_row_imgs)
+            full_frame, was_padded, shape_in, shape_out = _pad_frame_to_macro_block(
+                full_frame, 16
+            )
             writer.append_data(full_frame)
     finally:
         writer.close()
 
-    return str(video_path)
+    print(
+        "[track_max_projection] Finished cluster overview video in "
+        f"{time.perf_counter() - overview_started:.2f}s"
+    )
 
+    return str(video_path)
 
 
 def create_fulltrack_cluster_videos(
@@ -935,7 +981,8 @@ def create_fulltrack_cluster_videos(
     results = {}
 
     for cluster_id, sub in picks.groupby("ClusterID"):
-        print(f"[fulltrack] Processing Cluster {cluster_id} with {len(sub)} exemplars...")
+        cluster_started = time.perf_counter()
+        print(f"[track_max_projection] Backprojecting fulltrack cluster {cluster_id}")
         rows_info = []
         max_T = 0
 
@@ -978,13 +1025,14 @@ def create_fulltrack_cluster_videos(
         video_path = out_path / f"cluster_{int(cluster_id)}_fulltrack.mp4"
         if video_path.exists():
             video_path.unlink()
-
         writer = imageio.get_writer(
             video_path,
             fps=fps,
             codec="libx264",
             ffmpeg_log_level="warning",
             quality=9,
+            macro_block_size=16,
+            pixelformat="yuv420p",
         )
 
         try:
@@ -1009,9 +1057,16 @@ def create_fulltrack_cluster_videos(
                     row_imgs.append(frame_row)
 
                 full_frame = _concat_rows_vertically(row_imgs)
+                full_frame, was_padded, shape_in, shape_out = _pad_frame_to_macro_block(
+                    full_frame, 16
+                )
                 writer.append_data(full_frame)
         finally:
             writer.close()
+        print(
+            f"[track_max_projection] Finished fulltrack cluster {cluster_id} in "
+            f"{time.perf_counter() - cluster_started:.2f}s"
+        )
 
         results[int(cluster_id)] = str(video_path)
 

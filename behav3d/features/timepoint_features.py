@@ -1594,8 +1594,7 @@ def _calculate_morphology_single_timepoint(args):
         # Guard against divide-by-zero in solidity calculation
         with np.errstate(divide='ignore', invalid='ignore'):
             properties["solidity"] = properties["volume"] / properties["convex_volume"]
-            properties["surfrace_to_volume_ratio"] = properties["surface_area"] / properties["volume"]
-        # Attach NEW principal-axis results
+            properties["surface_to_volume_ratio"] = properties["surface_area"] / properties["volume"]
         properties["axis1_length"] = axis_length_a_list
         properties["axis2_length"] = axis_length_b_list
         properties["axis3_length"] = axis_length_c_list
