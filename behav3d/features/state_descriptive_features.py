@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from sklearn.feature_selection import VarianceThreshold
+from scipy import sparse
 
 from behav3d.core.anndata import df_to_adata
 
@@ -255,6 +256,10 @@ Accessory feature selection or scaling methods
 
 
 def scale_feature_blocks(adata, blocks, layer=None, mode="sqrt"):  # "sqrt" or "linear"
+    X_target = adata.layers[layer] if layer is not None else adata.X
+    n_vars = int(X_target.shape[1])
+    col_scale = np.ones(n_vars, dtype=float)
+
     for block in blocks:
         d = len(block)
         if d == 0:
@@ -266,11 +271,20 @@ def scale_feature_blocks(adata, blocks, layer=None, mode="sqrt"):  # "sqrt" or "
 
         if np.any(idx < 0):
             raise ValueError("Some block features not found in adata.var_names")
+        col_scale[idx] /= float(scale)
 
-        if layer is not None:
-            adata.layers[layer][:, idx] /= scale
-        else:
-            adata.X[:, idx] /= scale
+    if sparse.issparse(X_target):
+        # Sparse-safe column scaling without expensive structural setitem updates.
+        scale_diag = sparse.diags(col_scale, offsets=0, format="csr")
+        scaled = X_target @ scale_diag
+    else:
+        X_dense = np.asarray(X_target, dtype=float)
+        scaled = X_dense * col_scale[np.newaxis, :]
+
+    if layer is not None:
+        adata.layers[layer] = scaled
+    else:
+        adata.X = scaled
 
     return adata
 
@@ -278,19 +292,27 @@ def scale_feature_blocks(adata, blocks, layer=None, mode="sqrt"):  # "sqrt" or "
 def l2_normalize_block(adata, cols, layer=None):
     """Row-wise L2 normalize selected columns. Leaves all-zero rows unchanged."""
     adata_norm = adata.copy()
-    if layer is not None:
-        X = adata_norm[:, cols].layers[layer]
-    else:
-        X = adata_norm[:, cols].X
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    idx = adata_norm.var_names.get_indexer(cols)
+    if np.any(idx < 0):
+        missing = [str(cols[i]) for i, j in enumerate(idx) if j < 0]
+        raise ValueError(f"Some normalization columns not found in adata.var_names: {missing[:20]}")
+
+    X_all = adata_norm.layers[layer] if layer is not None else adata_norm.X
+    X_dense = X_all.toarray().astype(float, copy=False) if sparse.issparse(X_all) else np.asarray(X_all, dtype=float).copy()
+    block = X_dense[:, idx]
+    norms = np.linalg.norm(block, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
-    adata_norm[:, cols] = X / norms
+    X_dense[:, idx] = block / norms
+    if layer is not None:
+        adata_norm.layers[layer] = X_dense
+    else:
+        adata_norm.X = X_dense
     return adata_norm
 
 
 def l2_normalize_all(adata):
     """Row-wise L2 normalize all columns. Leaves all-zero rows unchanged."""
-    X = adata.X.copy()
+    X = adata.X.toarray().astype(float, copy=False) if sparse.issparse(adata.X) else np.asarray(adata.X, dtype=float).copy()
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     adata.X = X / norms

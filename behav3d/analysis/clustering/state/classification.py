@@ -41,6 +41,40 @@ A4_LANDSCAPE = (11.69, 8.27)
 STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION = 1
 
 
+def _vinfo(verbose, prefix, message):
+    if not bool(verbose):
+        return
+    print(f"[{prefix}] INFO {str(message)}")
+
+
+def _vstart(verbose, prefix, step_name):
+    if bool(verbose):
+        print(f"[{prefix}] START {step_name}")
+    return time.perf_counter()
+
+
+def _vdone(verbose, prefix, step_name, t_start):
+    if bool(verbose):
+        dt = time.perf_counter() - float(t_start)
+        print(f"[{prefix}] DONE {step_name} | took {dt:.2f}s")
+
+
+def _vsave(verbose, prefix, label, path):
+    if not bool(verbose):
+        return
+    print(f"[{prefix}] SAVED {str(label)}: {path}")
+
+
+def _short_reasons(reasons):
+    if reasons is None:
+        return "none"
+    if not isinstance(reasons, (list, tuple)):
+        return str(reasons)
+    if len(reasons) == 0:
+        return "none"
+    return f"count={len(reasons)}, first={reasons[0]}"
+
+
 def _binary_col_to_group_name(col: str) -> str:
     name = str(col)
     name = name.replace("_pixels", "")
@@ -325,11 +359,9 @@ def prepare_state_classification_dataset(
         try:
             adata_prepared = sc.read_h5ad(prepared_dataset_path)
             loaded_from_cache = True
-            if verbose:
-                print(f"Loaded prepared window dataset from cache: {prepared_dataset_path}")
+            _vinfo(verbose, "state-clustering", f"Loaded prepared window cache from: {prepared_dataset_path}")
         except Exception as exc:
-            if verbose:
-                print(f"Could not load prepared dataset cache ({exc}); recomputing windows.")
+            _vinfo(verbose, "state-clustering", f"Prepared cache load failed; recomputing windows ({exc})")
 
     if not loaded_from_cache:
         df_windows_descriptive = create_descriptive_track_dataset(
@@ -939,19 +971,18 @@ def check_model_clusterid_consistency(
         "match_rate": float(n_match / n_total) if n_total > 0 else np.nan,
     }
 
-    if verbose:
-        print(
-            "ClusterID consistency check "
-            f"(mode={summary['match_mode']}): "
-            f"checked={summary['n_model_rows_checked']}, "
-            f"matches={summary['n_matching_clusterid']}, "
-            f"mismatches={summary['n_mismatched_clusterid']}, "
-            f"missing_in_full={summary['n_missing_rows_in_adata_full']}"
-        )
-        if n_mismatch > 0:
-            cols = [c for c in merged.columns if c not in {"_match"}]
-            print("First mismatches:")
-            print(merged.loc[(~merged["_match"]) & merged["_cluster_full"].notna(), cols].head(max_examples))
+    _vinfo(
+        verbose,
+        "state-apply",
+        "clusterid consistency check "
+        f"(mode={summary['match_mode']}): "
+        f"checked={summary['n_model_rows_checked']}, "
+        f"matches={summary['n_matching_clusterid']}, "
+        f"mismatches={summary['n_mismatched_clusterid']}, "
+        f"missing_in_full={summary['n_missing_rows_in_adata_full']}",
+    )
+    if n_mismatch > 0:
+        _vinfo(verbose, "state-apply", f"mismatch preview suppressed (n_mismatch={n_mismatch})")
 
     return summary, merged
 
@@ -1702,12 +1733,12 @@ def _resolve_classifier_artifacts_with_defaults(
         if default_type is not None:
             label_source_type = default_type
             label_source_path = default_path
-            if verbose:
-                print(f"Using default intrinsic classifier path: {default_path}")
-        elif verbose:
-            print(
-                "No intrinsic classifier provided and default path not found: "
-                f"{state_paths.intrinsic_classifier_default_path}"
+            _vinfo(verbose, "state-apply", f"using default intrinsic classifier path: {default_path}")
+        else:
+            _vinfo(
+                verbose,
+                "state-apply",
+                f"no intrinsic classifier provided and default path not found: {state_paths.intrinsic_classifier_default_path}",
             )
 
     if full_label_classifier_selected is None:
@@ -1718,12 +1749,12 @@ def _resolve_classifier_artifacts_with_defaults(
         if default_type is not None:
             full_source_type = default_type
             full_source_path = default_path
-            if verbose:
-                print(f"Using default full classifier path: {default_path}")
-        elif verbose:
-            print(
-                "No full classifier provided and default path not found: "
-                f"{state_paths.full_classifier_default_path}"
+            _vinfo(verbose, "state-apply", f"using default full classifier path: {default_path}")
+        else:
+            _vinfo(
+                verbose,
+                "state-apply",
+                f"no full classifier provided and default path not found: {state_paths.full_classifier_default_path}",
             )
 
     if label_classifier_selected is None and full_label_classifier_selected is None:
@@ -1976,12 +2007,15 @@ def train_clusterid_classifier_from_model_adata(
         class_weight=class_weight,
     )
     fit_info["cluster_col"] = cluster_col
-    if verbose:
-        print(
-            "Trained cluster classifier "
+    _vinfo(
+        verbose,
+        "state-training",
+        (
+            "Trained intrinsic classifier "
             f"(backend={fit_info['backend']}, rows={fit_info['n_train_rows']}, "
             f"features={fit_info['n_features']}, train_acc={fit_info['train_accuracy']:.4f})"
-        )
+        ),
+    )
     return clf, fit_info
 
 
@@ -2237,12 +2271,15 @@ def evaluate_clusterid_classifier_on_model_adata(
         row_normalized_decimals=row_normalized_decimals,
     )
 
-    if verbose:
-        print(
-            "Classifier QC on model data: "
+    _vinfo(
+        verbose,
+        "state-training",
+        (
+            "Intrinsic model-data QC: "
             f"n={summary['n_rows']}, classes={summary['n_classes']}, "
             f"accuracy={summary['accuracy']:.4f}, balanced_accuracy={summary['balanced_accuracy']:.4f}"
-        )
+        ),
+    )
 
     return summary
 
@@ -2404,12 +2441,15 @@ def train_full_clusterid_classifier_from_adata(
     fit_info["n_features_continuous"] = int(len(continuous_feature_cols))
     fit_info["n_features_binary"] = int(len(binary_cols))
     fit_info["n_features_binary_expanded"] = int(len(expanded_binary_cols))
-    if verbose:
-        print(
-            "Trained full ClusterID classifier "
+    _vinfo(
+        verbose,
+        "state-training",
+        (
+            "Trained full classifier "
             f"(rows={fit_info['n_train_rows']}, total_features={fit_info['n_features_total']}, "
             f"train_acc={fit_info['train_accuracy']:.4f})"
-        )
+        ),
+    )
     return artifact, fit_info
 
 
@@ -2534,15 +2574,18 @@ def train_full_classifier_on_labeled_adata(
         filename_prefix=qc_filename_prefix,
     )
     full_cm_pdf = full_classifier_qc_model_data.get("artifacts", {}).get("confusion_matrices_pdf", None)
-    if verbose and full_cm_pdf is not None:
-        print(f"Saved full-classifier confusion matrix PDF: {full_cm_pdf}")
-    if verbose:
-        print(
-            "Full classifier QC on adata_full labels: "
+    if full_cm_pdf is not None:
+        _vsave(verbose, "state-training", "full-classifier confusion matrices", full_cm_pdf)
+    _vinfo(
+        verbose,
+        "state-training",
+        (
+            "Full model-data QC: "
             f"n={full_classifier_qc_model_data['n_rows']}, "
             f"accuracy={full_classifier_qc_model_data['accuracy']:.4f}, "
             f"balanced_accuracy={full_classifier_qc_model_data['balanced_accuracy']:.4f}"
-        )
+        ),
+    )
     if "classification" not in adata.uns:
         adata.uns["classification"] = {}
     adata.uns["classification"]["full_classifier_fit_info"] = full_classifier_fit_info
@@ -2666,11 +2709,14 @@ def plot_binary_group_behavioral_cluster_grid(
     fig.suptitle("Behavioral Cluster Composition per Binary Group", fontsize=12, y=0.995)
     fig.tight_layout(rect=[0, 0, 0.82, 0.97])
 
-    # Diagnostic print to quickly verify cluster presence in plotting table.
     if verbose and "5" in ctab.columns:
         by_group = (ctab["5"] * 100.0).round(3)
-        print(f"Cluster 5 total n={int(cluster_counts.get('5', 0))}; per-group proportions (%):")
-        print(by_group[by_group > 0].sort_values(ascending=False))
+        nonzero = int((by_group > 0).sum())
+        _vinfo(
+            verbose,
+            "state-apply",
+            f"Cluster 5 composition summary: total_n={int(cluster_counts.get('5', 0))}, nonzero_groups={nonzero}",
+        )
 
     if csv_path is None and pdf_path is not None:
         csv_path = Path(pdf_path).with_suffix(".csv")
@@ -2836,6 +2882,7 @@ def run_state_clustering(
     - model_adata.uns["clustering"]
     - model_adata.uns["preprocessing"]["prepared_adata_full_*"] cache metadata
     """
+    run_started = _vstart(verbose, "state-clustering", "run state clustering")
     state_paths = state_paths or _resolve_state_paths(output_dir, cell_type)
     state_outdir = state_paths.state_outdir
     state_clustering_outdir = _resolve_state_clustering_outdir(state_paths.processing_outdir)
@@ -2887,33 +2934,34 @@ def run_state_clustering(
             if pre_match_cached:
                 adata_prepared = cached_prepared
                 prepared_cache_used = True
-                if verbose:
-                    print(f"reusing prepared full adata cache: {prepared_adata_read_path}")
-                    if prepared_adata_read_path != prepared_adata_full_path:
-                        print(
-                            "Loaded legacy prepared cache path; future writes use: "
-                            f"{prepared_adata_full_path}"
-                        )
-            elif verbose:
-                print(
-                    "Prepared full cache mismatch; rebuilding from raw positions. "
-                    f"reasons={pre_reasons_cached}"
+                _vinfo(verbose, "state-clustering", f"reusing prepared full adata cache: {prepared_adata_read_path}")
+                if prepared_adata_read_path != prepared_adata_full_path:
+                    _vinfo(
+                        verbose,
+                        "state-clustering",
+                        f"using legacy prepared cache for read; future writes use {prepared_adata_full_path}",
+                    )
+            else:
+                _vinfo(
+                    verbose,
+                    "state-clustering",
+                    "prepared full cache mismatch; rebuilding from raw positions | "
+                    f"{_short_reasons(pre_reasons_cached)}",
                 )
         except Exception as exc:
-            if verbose:
-                print(f"Could not load prepared full cache ({exc}); rebuilding from raw positions.")
+            _vinfo(verbose, "state-clustering", f"could not load prepared full cache; rebuilding ({exc})")
 
     if adata_prepared is None:
         _load_positions_if_needed()
-        if verbose:
-            print(
-                "# Preparing dataset for state classification and clustering "
-                "(windowed feature extraction, quantile capping, scaling)..."
-            )
-            if positions_loaded_from_csv:
-                print(f"Using input track-features CSV: {df_tracks_path}")
-            else:
-                print("Using provided df_positions DataFrame input (caller-managed ordering).")
+        _vinfo(
+            verbose,
+            "state-clustering",
+            "preparing dataset (windowed feature extraction, quantile capping, scaling)",
+        )
+        if positions_loaded_from_csv:
+            _vinfo(verbose, "state-clustering", f"input track-features CSV: {df_tracks_path}")
+        else:
+            _vinfo(verbose, "state-clustering", "input source: provided df_positions DataFrame")
 
         prepare_kwargs = {
             "df_positions": df_positions,
@@ -2946,21 +2994,22 @@ def run_state_clustering(
             scale_features=True,
         )
         if not pre_match:
-            if verbose:
-                print(
-                    "Prepared full cache mismatch; recomputing full preprocessing from input track-features CSV. "
-                    f"reasons={pre_mismatch_reasons}"
-                )
+            _vinfo(
+                verbose,
+                "state-clustering",
+                "prepared full cache mismatch; recomputing full preprocessing | "
+                f"{_short_reasons(pre_mismatch_reasons)}",
+            )
             prepare_kwargs["reuse_prepared_dataset"] = False
             adata_prepared = prepare_state_classification_dataset(**prepare_kwargs)
         del df_positions
-    elif verbose:
-        print(
-            "# Preparing dataset for state classification and clustering "
-            "(windowed feature extraction, quantile capping, scaling)..."
+    else:
+        _vinfo(
+            verbose,
+            "state-clustering",
+            "preparing dataset (windowed feature extraction, quantile capping, scaling)",
         )
-    if verbose:
-        print(f"[timing] preprocessing prepare/reuse: {time.perf_counter() - stage_prepare_started:.2f}s")
+    _vdone(verbose, "state-clustering", "prepare/reuse full dataset", stage_prepare_started)
     
     pre_meta = (
         adata_prepared.uns.get("preprocessing", {})
@@ -2998,12 +3047,13 @@ def run_state_clustering(
 
     if adata_prepared.n_obs < 50:
         raise ValueError("Insufficient rows in full descriptive dataset for clustering.")
-    if verbose:
-        print(
-            "Prepared dataset: "
-            f"rows={adata_prepared.n_obs}, continuous_features={len(kept_features)}, "
-            f"binary_group_features={len(binary_cols_to_merge)}"
-        )
+    _vinfo(
+        verbose,
+        "state-clustering",
+        "prepared dataset summary | "
+        f"rows={adata_prepared.n_obs}, continuous_features={len(kept_features)}, "
+        f"binary_group_features={len(binary_cols_to_merge)}",
+    )
 
     if min_spacing is None:
         spacing_to_use = int(window_size)
@@ -3013,7 +3063,11 @@ def run_state_clustering(
     sampling_time_col = "position_t"
     nan_policy = "drop_any_nan_in_kept_features"
 
-    stage_sampling_started = time.perf_counter()
+    stage_sampling_started = _vstart(
+        verbose,
+        "state-clustering",
+        f"sampling + NaN cleanup | min_spacing={spacing_to_use} | max_samples={max_samples}",
+    )
     model_adata = None
     model_cache_loaded = False
     if (
@@ -3048,33 +3102,29 @@ def run_state_clustering(
             if pre_match_model and sampling_match:
                 model_adata = cached_model_adata
                 model_cache_loaded = True
-                if verbose:
-                    print(
-                        "reusing saved model adata and skipping subsampling/NaN-clean stage: "
-                        f"{prepared_adata_model_path}"
-                    )
-            elif verbose:
+                _vinfo(
+                    verbose,
+                    "state-clustering",
+                    f"reusing cached model adata: {prepared_adata_model_path}",
+                )
+            else:
                 mismatch_reasons = []
                 if not pre_match_model:
                     mismatch_reasons.extend([f"preprocessing: {r}" for r in pre_reasons_model])
                 if not sampling_match:
                     mismatch_reasons.extend([f"sampling: {r}" for r in sampling_reasons])
-                print(
-                    "Cached model adata mismatch; rebuilding sampling/clean stage from prepared full data. "
-                    f"reasons={mismatch_reasons}"
+                _vinfo(
+                    verbose,
+                    "state-clustering",
+                    "cached model adata mismatch; rebuilding sampling/clean stage | "
+                    f"{_short_reasons(mismatch_reasons)}",
                 )
         except Exception as exc:
-            if verbose:
-                print(f"Could not load cached model adata ({exc}); rebuilding sampling/clean stage.")
+            _vinfo(verbose, "state-clustering", f"could not load cached model adata; rebuilding ({exc})")
 
     subsampled_rows_for_log = None
     rows_after_nan_for_pca = None
     if model_adata is None:
-        if verbose:
-            print(
-                f"# Subsampling dataset for clustering with temporal spacing (min_spacing={spacing_to_use}, "
-                f"# max_samples={max_samples})..."
-            )
         adata_train = subsample_with_temporal_spacing(
             adata_prepared,
             id_cols=sampling_id_cols,
@@ -3094,8 +3144,8 @@ def run_state_clustering(
         if n_valid < 50:
             raise ValueError("Insufficient rows after dropping NaNs for PCA stage.")
         rows_after_nan_for_pca = int(n_valid)
-        if verbose and n_valid != adata_train.n_obs:
-            print(f"Dropped NaNs for PCA input: kept {n_valid} / {adata_train.n_obs} rows.")
+        if n_valid != adata_train.n_obs:
+            _vinfo(verbose, "state-clustering", f"dropped NaN rows before PCA: kept {n_valid}/{adata_train.n_obs}")
         model_adata = adata_train[valid_mask, kept_features].copy()
         del X_train, valid_mask, adata_train
     else:
@@ -3108,17 +3158,21 @@ def run_state_clustering(
     if ncomps_requested < 2:
         raise ValueError("Insufficient rows/features to run PCA stage.")
 
-    if verbose:
-        print(f"[timing] sampling + NaN cleanup: {time.perf_counter() - stage_sampling_started:.2f}s")
-
-    if verbose:
-        print(f"Subsampled {subsampled_rows_for_log} rows for clustering (spacing={spacing_to_use}).")
-
-    stage_pca_started = time.perf_counter()
-    pca_recomputed = False
-    neighbors_recomputed = False
+    _vdone(verbose, "state-clustering", "sampling + NaN cleanup", stage_sampling_started)
+    _vinfo(verbose, "state-clustering", f"subsampled rows={subsampled_rows_for_log} (spacing={spacing_to_use})")
 
     pca_input_shape = (int(model_adata.n_obs), int(len(kept_features)))
+    stage_pca_started = _vstart(
+        verbose,
+        "state-clustering",
+        (
+            "PCA stage | "
+            f"matrix_shape={pca_input_shape}, kept_features={len(kept_features)}, "
+            f"rows_after_nan={rows_after_nan_for_pca}, min_var_selection={pca_var_selection}"
+        ),
+    )
+    pca_recomputed = False
+    neighbors_recomputed = False
 
     if model_cache_loaded:
         pca_match, pca_reasons = _matches_cached_pca_stage(
@@ -3129,21 +3183,13 @@ def run_state_clustering(
             ncomps_requested=ncomps_requested,
         )
         if pca_match:
-            if verbose:
-                print("reusing saved PCA stage (X_pca).")
+            _vinfo(verbose, "state-clustering", "reusing cached PCA stage")
         else:
-            if verbose:
-                print(
-                    "PCA input diagnostics: "
-                    f"matrix_shape={pca_input_shape}, "
-                    f"kept_features={len(kept_features)}, "
-                    f"rows_after_nan={rows_after_nan_for_pca}"
-                )
-                print(
-                    f"# Running PCA for dimensionality reduction before clustering (n_features={len(kept_features)}, "
-                    f"# n_samples={model_adata.n_obs}, min_var_selection={pca_var_selection}). "
-                    f"reasons={pca_reasons}"
-                )
+            _vinfo(
+                verbose,
+                "state-clustering",
+                f"PCA recompute required | reasons={_short_reasons(pca_reasons)}",
+            )
             model_adata = run_pca(
                 model_adata,
                 pca_var_selection=pca_var_selection,
@@ -3153,17 +3199,6 @@ def run_state_clustering(
             )
             pca_recomputed = True
     else:
-        if verbose:
-            print(
-                "PCA input diagnostics: "
-                f"matrix_shape={pca_input_shape}, "
-                f"kept_features={len(kept_features)}, "
-                f"rows_after_nan={rows_after_nan_for_pca}"
-            )
-            print(
-                f"# Running PCA for dimensionality reduction before clustering (n_features={len(kept_features)}, "
-                f"# n_samples={model_adata.n_obs}, min_var_selection={pca_var_selection})."
-            )
         model_adata = run_pca(
             model_adata,
             pca_var_selection=pca_var_selection,
@@ -3172,10 +3207,13 @@ def run_state_clustering(
             random_state=random_state,
         )
         pca_recomputed = True
-    if verbose:
-        print(f"[timing] PCA stage: {time.perf_counter() - stage_pca_started:.2f}s")
+    _vdone(verbose, "state-clustering", "PCA stage", stage_pca_started)
 
-    stage_neighbors_started = time.perf_counter()
+    stage_neighbors_started = _vstart(
+        verbose,
+        "state-clustering",
+        f"neighbors stage | n_neighbors={n_neighbors}",
+    )
     if model_cache_loaded:
         neighbors_match, neighbors_reasons = _matches_cached_neighbors_stage(
             model_adata,
@@ -3187,25 +3225,25 @@ def run_state_clustering(
             neighbors_match = False
             neighbors_reasons = list(neighbors_reasons) + ["upstream PCA recomputed"]
         if neighbors_match:
-            if verbose:
-                print(f"reusing saved neighbors graph with n_neighbors={n_neighbors}.")
+            _vinfo(verbose, "state-clustering", f"reusing cached neighbors graph (n_neighbors={n_neighbors})")
         else:
-            if verbose:
-                print(
-                    f"Recomputing neighbors graph (n_neighbors={n_neighbors}, use_rep='X_pca'). "
-                    f"reasons={neighbors_reasons}"
-                )
+            _vinfo(
+                verbose,
+                "state-clustering",
+                f"neighbors recompute required | reasons={_short_reasons(neighbors_reasons)}",
+            )
             sc.pp.neighbors(model_adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=random_state)
             neighbors_recomputed = True
     else:
-        if verbose:
-            print(f"Running neighbors graph (n_neighbors={n_neighbors}, use_rep='X_pca').")
         sc.pp.neighbors(model_adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=random_state)
         neighbors_recomputed = True
-    if verbose:
-        print(f"[timing] neighbors stage: {time.perf_counter() - stage_neighbors_started:.2f}s")
+    _vdone(verbose, "state-clustering", "neighbors stage", stage_neighbors_started)
 
-    stage_umap_started = time.perf_counter()
+    stage_umap_started = _vstart(
+        verbose,
+        "state-clustering",
+        f"UMAP stage | min_dist={min_dist}, random_state={random_state}",
+    )
     if model_cache_loaded:
         umap_match, umap_reasons = _matches_cached_umap_stage(
             model_adata,
@@ -3216,14 +3254,13 @@ def run_state_clustering(
             umap_match = False
             umap_reasons = list(umap_reasons) + ["upstream representation/graph recomputed"]
         if umap_match:
-            if verbose:
-                print(f"reusing saved UMAP embedding (min_dist={min_dist}).")
+            _vinfo(verbose, "state-clustering", f"reusing cached UMAP embedding (min_dist={min_dist})")
         else:
-            if verbose:
-                print(
-                    f"Recomputing UMAP embedding (min_dist={min_dist}, random_state={random_state}). "
-                    f"reasons={umap_reasons}"
-                )
+            _vinfo(
+                verbose,
+                "state-clustering",
+                f"UMAP recompute required | reasons={_short_reasons(umap_reasons)}",
+            )
             sc.tl.umap(
                 model_adata, 
                 min_dist=min_dist, 
@@ -3231,24 +3268,22 @@ def run_state_clustering(
                 n_components=2
                 )
     else:
-        if verbose:
-            print(f"Running UMAP embedding (min_dist={min_dist}, random_state={random_state}).")
         sc.tl.umap(
             model_adata, 
             min_dist=min_dist, 
             random_state=random_state,
             n_components=2
             )
-    if verbose:
-        print(f"[timing] UMAP stage: {time.perf_counter() - stage_umap_started:.2f}s")
+    _vdone(verbose, "state-clustering", "UMAP stage", stage_umap_started)
 
-    if verbose:
-        print(
-            f"# Running {clustering_method} clustering with n_neighbors={n_neighbors}, min_dist={min_dist}, "
-            f"# resolution={resolution}..."
-        )
-
-    stage_clustering_started = time.perf_counter()
+    stage_clustering_started = _vstart(
+        verbose,
+        "state-clustering",
+        (
+            f"{clustering_method} clustering | "
+            f"n_neighbors={n_neighbors}, min_dist={min_dist}, resolution={resolution}"
+        ),
+    )
     if isinstance(resolution, (list, tuple, np.ndarray, pd.Series)):
         stability_resolutions = [float(r) for r in list(resolution)]
     else:
@@ -3286,8 +3321,7 @@ def run_state_clustering(
         binary_cols_to_merge=binary_cols_to_merge,
         intrinsic_col="intrinsic_behavioral_cluster",
     )
-    if verbose:
-        print(f"[timing] clustering stage: {time.perf_counter() - stage_clustering_started:.2f}s")
+    _vdone(verbose, "state-clustering", "clustering stage", stage_clustering_started)
 
     stage_prepared_write_started = time.perf_counter()
     prepared_adata_full = adata_prepared[:, kept_features].copy()
@@ -3296,17 +3330,16 @@ def run_state_clustering(
     prepared_adata_full.uns["preprocessing"]["prepared_adata_full_path"] = str(prepared_adata_full_path)
     prepared_adata_full.write(prepared_adata_full_path, compression="gzip")
     del prepared_adata_full, adata_prepared
-    if verbose:
-        print(f"[timing] cache write prepared_full_adata: {time.perf_counter() - stage_prepared_write_started:.2f}s")
+    _vdone(verbose, "state-clustering", "write prepared full adata cache", stage_prepared_write_started)
 
-    if verbose:
-        n_intrinsic = int(model_adata.obs["intrinsic_behavioral_cluster"].astype(str).nunique())
-        n_full = int(model_adata.obs["full_behavioral_cluster"].astype(str).nunique())
-        print(
-            "Finished stage-1 clustering: "
-            f"intrinsic_clusters={n_intrinsic}, full_behavioral_clusters={n_full}, "
-            f"model_rows={model_adata.n_obs}"
-        )
+    n_intrinsic = int(model_adata.obs["intrinsic_behavioral_cluster"].astype(str).nunique())
+    n_full = int(model_adata.obs["full_behavioral_cluster"].astype(str).nunique())
+    _vinfo(
+        verbose,
+        "state-clustering",
+        "stage-1 clustering summary | "
+        f"intrinsic_clusters={n_intrinsic}, full_behavioral_clusters={n_full}, model_rows={model_adata.n_obs}",
+    )
 
     diagnostics_csvs = {}
     diagnostics_pdf = None
@@ -3400,10 +3433,10 @@ def run_state_clustering(
 
     stage_model_write_started = time.perf_counter()
     model_adata.write(prepared_adata_model_path, compression="gzip")
-    if verbose:
-        print(f"[timing] cache write model_adata: {time.perf_counter() - stage_model_write_started:.2f}s")
-        print(f"Saved model-stage cache: {prepared_adata_model_path}")
-        print(f"Saved prepared full adata cache: {prepared_adata_full_path}")
+    _vdone(verbose, "state-clustering", "write model adata cache", stage_model_write_started)
+    _vsave(verbose, "state-clustering", "model-stage cache", prepared_adata_model_path)
+    _vsave(verbose, "state-clustering", "prepared full adata cache", prepared_adata_full_path)
+    _vdone(verbose, "state-clustering", "run state clustering", run_started)
     return model_adata
 
 
@@ -3444,9 +3477,11 @@ def train_state_classifiers(
             "partial_classifier_path": str | None,
         }
     """
+    train_started = _vstart(verbose, "state-training", "train state classifiers")
     state_paths = state_paths or _resolve_state_paths(output_dir, cell_type)
     model_adata_path = state_paths.model_adata_path
     if model_adata is None:
+        load_started = _vstart(verbose, "state-training", "load model adata")
         if not model_adata_path.exists():
             raise FileNotFoundError(
                 "Could not load model_adata for classifier training. "
@@ -3454,8 +3489,10 @@ def train_state_classifiers(
                 "Run run_state_clustering(...) first or pass model_adata explicitly."
             )
         model_adata = sc.read_h5ad(model_adata_path)
-        if verbose:
-            print(f"Loaded model_adata from: {model_adata_path}")
+        _vdone(verbose, "state-training", "load model adata", load_started)
+        _vinfo(verbose, "state-training", f"Using model adata with rows={model_adata.n_obs}, features={len(model_adata.var_names)}")
+    else:
+        _vinfo(verbose, "state-training", f"Using provided model adata with rows={model_adata.n_obs}, features={len(model_adata.var_names)}")
 
     if isinstance(model_adata, dict):
         raise ValueError(
@@ -3463,12 +3500,6 @@ def train_state_classifiers(
         )
     if not (hasattr(model_adata, "uns") and hasattr(model_adata, "var_names")):
         raise ValueError("model_adata must be an AnnData-like object with .uns and .var_names.")
-    if verbose:
-        print(
-            "# Starting classifier training on model_adata: "
-            f"# rows={model_adata.n_obs}, features={len(model_adata.var_names)}"
-        )
-
     pre_meta = model_adata.uns.get("preprocessing", None)
     clust_meta = model_adata.uns.get("clustering", None)
     if not isinstance(pre_meta, dict):
@@ -3601,6 +3632,7 @@ def train_state_classifiers(
     full_qc_outfolder.mkdir(parents=True, exist_ok=True)
 
     if train_continuous_classifier:
+        intrinsic_started = _vstart(verbose, "state-training", "train intrinsic classifier")
         X_intrinsic_all = _to_numpy_2d(model_adata[:, cont_cols].X).astype(float, copy=False)
         y_intrinsic_all = model_adata.obs["intrinsic_behavioral_cluster"].astype(str).to_numpy()
         X_intrinsic_train = X_intrinsic_all
@@ -3682,28 +3714,47 @@ def train_state_classifiers(
             intrinsic_validation["oob_score_train_split"] if validation_mode != "holdout" else None
         )
 
-        if verbose and validation_mode == "holdout":
+        if validation_mode == "holdout":
             tm = intrinsic_validation["train_metrics"] or {}
             vm = intrinsic_validation["test_metrics"] or {}
-            print(
-                "Intrinsic classifier holdout validation: "
-                f"n_train={intrinsic_validation['n_train']}, n_test={intrinsic_validation['n_test']}, "
-                f"train_acc={tm.get('accuracy', np.nan):.4f}, "
-                f"test_acc={vm.get('accuracy', np.nan):.4f}, "
-                f"test_bal_acc={vm.get('balanced_accuracy', np.nan):.4f}, "
-                f"test_macro_f1={vm.get('macro_f1', np.nan):.4f}, "
-                f"oob_train_split={intrinsic_validation.get('oob_score_train_split', np.nan):.4f}"
+            _vinfo(
+                verbose,
+                "state-training",
+                (
+                    "Intrinsic validation_set scores: "
+                    f"n_val={intrinsic_validation['n_test']}, "
+                    f"val_acc={vm.get('accuracy', np.nan):.4f}, "
+                    f"val_bal_acc={vm.get('balanced_accuracy', np.nan):.4f}, "
+                    f"val_macro_f1={vm.get('macro_f1', np.nan):.4f}"
+                ),
             )
-        elif verbose:
+            _vinfo(
+                verbose,
+                "state-training",
+                (
+                    "Intrinsic training/OOB scores: "
+                    f"n_train={intrinsic_validation['n_train']}, "
+                    f"train_acc={tm.get('accuracy', np.nan):.4f}, "
+                    f"train_bal_acc={tm.get('balanced_accuracy', np.nan):.4f}, "
+                    f"train_macro_f1={tm.get('macro_f1', np.nan):.4f}, "
+                    f"oob_train_split={intrinsic_validation.get('oob_score_train_split', np.nan):.4f}"
+                ),
+            )
+        else:
             tm = intrinsic_validation["train_metrics"] or {}
-            print(
-                "Intrinsic classifier OOB-only validation: "
-                f"n_train={intrinsic_validation['n_train']}, "
-                f"train_acc={tm.get('accuracy', np.nan):.4f}, "
-                f"train_bal_acc={tm.get('balanced_accuracy', np.nan):.4f}, "
-                f"train_macro_f1={tm.get('macro_f1', np.nan):.4f}, "
-                f"oob_train_split={intrinsic_validation.get('oob_score_train_split', np.nan):.4f}"
+            _vinfo(
+                verbose,
+                "state-training",
+                (
+                    "Intrinsic training/OOB scores: "
+                    f"n_train={intrinsic_validation['n_train']}, "
+                    f"train_acc={tm.get('accuracy', np.nan):.4f}, "
+                    f"train_bal_acc={tm.get('balanced_accuracy', np.nan):.4f}, "
+                    f"train_macro_f1={tm.get('macro_f1', np.nan):.4f}, "
+                    f"oob_train_split={intrinsic_validation.get('oob_score_train_split', np.nan):.4f}"
+                ),
             )
+        _vdone(verbose, "state-training", "train intrinsic classifier", intrinsic_started)
         del X_intrinsic_all, y_intrinsic_all, X_intrinsic_train, y_intrinsic_train
         if validation_mode == "holdout":
             del X_intrinsic_test, y_intrinsic_test
@@ -3727,6 +3778,7 @@ def train_state_classifiers(
     }
 
     if train_full_classifier:
+        full_started = _vstart(verbose, "state-training", "train full classifier")
         y_full_all = model_adata.obs["full_behavioral_cluster"].astype(str).to_numpy()
 
         if validation_mode == "holdout":
@@ -3846,35 +3898,57 @@ def train_state_classifiers(
         full_validation["oob_score_full_data"] = (
             full_validation["oob_score_train_split"] if validation_mode != "holdout" else None
         )
-        if verbose:
-            print(
-                "Full classifier QC on model labels: "
+        _vinfo(
+            verbose,
+            "state-training",
+            (
+                "Full model-data QC: "
                 f"n={full_classifier_qc_model_data['n_rows']}, "
                 f"accuracy={full_classifier_qc_model_data['accuracy']:.4f}, "
                 f"balanced_accuracy={full_classifier_qc_model_data['balanced_accuracy']:.4f}"
-            )
-        if verbose and validation_mode == "holdout":
+            ),
+        )
+        if validation_mode == "holdout":
             tm = full_validation["train_metrics"] or {}
             vm = full_validation["test_metrics"] or {}
-            print(
-                "Full classifier holdout validation: "
-                f"n_train={full_validation['n_train']}, n_test={full_validation['n_test']}, "
-                f"train_acc={tm.get('accuracy', np.nan):.4f}, "
-                f"test_acc={vm.get('accuracy', np.nan):.4f}, "
-                f"test_bal_acc={vm.get('balanced_accuracy', np.nan):.4f}, "
-                f"test_macro_f1={vm.get('macro_f1', np.nan):.4f}, "
-                f"oob_train_split={full_validation.get('oob_score_train_split', np.nan):.4f}"
+            _vinfo(
+                verbose,
+                "state-training",
+                (
+                    "Full validation_set scores: "
+                    f"n_val={full_validation.get('n_test', 0)}, "
+                    f"val_acc={vm.get('accuracy', np.nan):.4f}, "
+                    f"val_bal_acc={vm.get('balanced_accuracy', np.nan):.4f}, "
+                    f"val_macro_f1={vm.get('macro_f1', np.nan):.4f}"
+                ),
             )
-        elif verbose:
+            _vinfo(
+                verbose,
+                "state-training",
+                (
+                    "Full training/OOB scores: "
+                    f"n_train={full_validation['n_train']}, "
+                    f"train_acc={tm.get('accuracy', np.nan):.4f}, "
+                    f"train_bal_acc={tm.get('balanced_accuracy', np.nan):.4f}, "
+                    f"train_macro_f1={tm.get('macro_f1', np.nan):.4f}, "
+                    f"oob_train_split={full_validation.get('oob_score_train_split', np.nan):.4f}"
+                ),
+            )
+        else:
             tm = full_validation["train_metrics"] or {}
-            print(
-                "Full classifier OOB-only validation: "
-                f"n_train={full_validation['n_train']}, "
-                f"train_acc={tm.get('accuracy', np.nan):.4f}, "
-                f"train_bal_acc={tm.get('balanced_accuracy', np.nan):.4f}, "
-                f"train_macro_f1={tm.get('macro_f1', np.nan):.4f}, "
-                f"oob_train_split={full_validation.get('oob_score_train_split', np.nan):.4f}"
+            _vinfo(
+                verbose,
+                "state-training",
+                (
+                    "Full training/OOB scores: "
+                    f"n_train={full_validation['n_train']}, "
+                    f"train_acc={tm.get('accuracy', np.nan):.4f}, "
+                    f"train_bal_acc={tm.get('balanced_accuracy', np.nan):.4f}, "
+                    f"train_macro_f1={tm.get('macro_f1', np.nan):.4f}, "
+                    f"oob_train_split={full_validation.get('oob_score_train_split', np.nan):.4f}"
+                ),
             )
+        _vdone(verbose, "state-training", "train full classifier", full_started)
         del X_full_train, y_full_train, X_full_all, y_pred_full_train, y_pred_full_all
         if validation_mode == "holdout":
             del X_full_test, y_full_test, y_pred_full_test
@@ -3906,6 +3980,7 @@ def train_state_classifiers(
             intrinsic_qc_outfolder / f"state_classification_intrinsic_classifier_metrics_{classifier_backend_name}.csv"
         )
         pd.DataFrame([intrinsic_metrics_row]).to_csv(intrinsic_metrics_csv, index=False)
+        _vsave(verbose, "state-training", "intrinsic metrics csv", intrinsic_metrics_csv)
 
     if full_qc_outfolder is not None and train_full_classifier:
         full_tm = full_validation.get("train_metrics") or {}
@@ -3932,6 +4007,7 @@ def train_state_classifiers(
             full_qc_outfolder / f"state_classification_full_classifier_metrics_{classifier_backend_name}.csv"
         )
         pd.DataFrame([full_metrics_row]).to_csv(full_metrics_csv, index=False)
+        _vsave(verbose, "state-training", "full metrics csv", full_metrics_csv)
 
     model_adata.uns["classification"] = {
         "label_transfer_method": transfer_mode,
@@ -3996,8 +4072,7 @@ def train_state_classifiers(
         label_classifier_artifact_train_split["pipeline_metadata"] = _build_pipeline_metadata_payload()
         with open(classifier_model_path, "wb") as f:
             pickle.dump(label_classifier_artifact_train_split, f)
-        if verbose:
-            print(f"Saved intrinsic classifier artifact: {classifier_model_path}")
+        _vsave(verbose, "state-training", "intrinsic classifier artifact", classifier_model_path)
 
     if train_full_classifier and save_full_label_classifier and full_label_classifier_artifact_train_split is not None:
         full_classifier_model_path = state_paths.full_classifier_default_path
@@ -4008,17 +4083,20 @@ def train_state_classifiers(
         full_label_classifier_artifact_train_split["pipeline_metadata"] = _build_pipeline_metadata_payload()
         with open(full_classifier_model_path, "wb") as f:
             pickle.dump(full_label_classifier_artifact_train_split, f)
-        if verbose:
-            print(f"Saved full classifier artifact: {full_classifier_model_path}")
+        _vsave(verbose, "state-training", "full classifier artifact", full_classifier_model_path)
 
+    write_started = _vstart(verbose, "state-training", "write model adata")
     model_adata.write(state_paths.model_adata_path, compression="gzip")
-    if verbose:
-        n_intrinsic = int(model_adata.obs["intrinsic_behavioral_cluster"].astype(str).nunique())
-        n_full = int(model_adata.obs["full_behavioral_cluster"].astype(str).nunique()) if "full_behavioral_cluster" in model_adata.obs.columns else 0
-        print(
-            "Completed stage-2 classifier training: "
-            f"intrinsic_clusters={n_intrinsic}, full_behavioral_clusters={n_full}"
-        )
+    _vdone(verbose, "state-training", "write model adata", write_started)
+    _vsave(verbose, "state-training", "model adata", state_paths.model_adata_path)
+    n_intrinsic = int(model_adata.obs["intrinsic_behavioral_cluster"].astype(str).nunique())
+    n_full = int(model_adata.obs["full_behavioral_cluster"].astype(str).nunique()) if "full_behavioral_cluster" in model_adata.obs.columns else 0
+    _vinfo(
+        verbose,
+        "state-training",
+        f"Training summary: intrinsic_clusters={n_intrinsic}, full_behavioral_clusters={n_full}",
+    )
+    _vdone(verbose, "state-training", "train state classifiers", train_started)
     return {
         "full_classifier_path": None if full_classifier_model_path is None else str(full_classifier_model_path),
         "partial_classifier_path": None if classifier_model_path is None else str(classifier_model_path),
@@ -4050,6 +4128,7 @@ def apply_state_classifiers_to_full_dataset(
     Confidence columns are always derived as `<output_col>_confidence`.
     If artifacts are omitted, canonical default classifier paths are probed.
     """
+    apply_started = _vstart(verbose, "state-apply", "apply state classifiers")
     state_paths = state_paths or _resolve_state_paths(output_dir, cell_type)
     state_outdir = state_paths.state_outdir
 
@@ -4093,17 +4172,24 @@ def apply_state_classifiers_to_full_dataset(
     clust_meta = dict(reference_pipeline_meta["clustering"])
     pre_meta = dict(reference_pipeline_meta["preprocessing"])
 
-    if verbose:
-        print(
-            "Applying classifiers to full dataset: "
-            f"continuous_variant={continuous_model_variant if label_classifier_selected is not None else None}, "
-            f"full_variant={full_model_variant if full_label_classifier_selected is not None else None}"
-        )
-        print(
-            "Classifier source summary: "
+    _vinfo(
+        verbose,
+        "state-apply",
+        (
+            "Classifier variants: "
+            f"continuous={continuous_model_variant if label_classifier_selected is not None else None}, "
+            f"full={full_model_variant if full_label_classifier_selected is not None else None}"
+        ),
+    )
+    _vinfo(
+        verbose,
+        "state-apply",
+        (
+            "Classifier sources: "
             f"intrinsic=({label_source_type}, {label_source_path}), "
             f"full=({full_source_type}, {full_source_path})"
-        )
+        ),
+    )
 
     full_predicted_in_primary = False
     adata_full = None
@@ -4138,7 +4224,9 @@ def apply_state_classifiers_to_full_dataset(
         prepared_cache_read_path = legacy_prepared_cache_path
 
     if prepared_cache_read_path is not None:
+        cache_load_started = _vstart(verbose, "state-apply", "load prepared full cache")
         cached_adata = sc.read_h5ad(prepared_cache_read_path)
+        _vdone(verbose, "state-apply", "load prepared full cache", cache_load_started)
         try:
             cache_payload = _build_adata_preprocessing_compare_payload(cached_adata)
             classifier_payload = _build_classifier_preprocessing_compare_payload(reference_classifier_artifact)
@@ -4150,38 +4238,53 @@ def apply_state_classifiers_to_full_dataset(
             )
             if is_match:
                 adata_full = cached_adata
-                if verbose:
-                    print(
-                        "Using cached prepared full adata and skipping preprocessing: "
-                        f"{prepared_cache_read_path}"
+                _vinfo(
+                    verbose,
+                    "state-apply",
+                    f"Using prepared full cache: {prepared_cache_read_path}",
+                )
+                if prepared_cache_read_path != prepared_cache_path:
+                    _vinfo(
+                        verbose,
+                        "state-apply",
+                        f"Legacy cache path detected; future writes use: {prepared_cache_path}",
                     )
-                    if prepared_cache_read_path != prepared_cache_path:
-                        print(
-                            "Loaded legacy prepared cache path; future writes use: "
-                            f"{prepared_cache_path}"
-                        )
             else:
                 err_msg = (
                     "ERROR: cached prepared adata preprocessing mismatch; recomputing from input track-features CSV. "
                     f"reasons={list(mismatch_reasons)}"
                 )
                 warnings.warn(err_msg, RuntimeWarning)
-                if verbose:
-                    print(err_msg)
+                _vinfo(
+                    verbose,
+                    "state-apply",
+                    (
+                        "Prepared full cache mismatch; recomputing "
+                        f"(n_reasons={len(mismatch_reasons)}, first_reason={_short_reasons(mismatch_reasons)})"
+                    ),
+                )
         except Exception as exc:
             warnings.warn(
                 f"Could not validate cached prepared adata; recomputing from input track-features CSV ({exc}).",
                 RuntimeWarning,
             )
-            if verbose:
-                print(f"Could not validate cached prepared adata; recomputing from CSV: {exc}")
-    elif verbose:
-        print(
-            "Prepared adata cache is missing; recomputing. "
-            f"expected_new='{prepared_cache_path}', checked_legacy='{legacy_prepared_cache_path}'"
+            _vinfo(
+                verbose,
+                "state-apply",
+                f"Prepared full cache validation failed; recomputing ({exc})",
+            )
+    else:
+        _vinfo(
+            verbose,
+            "state-apply",
+            (
+                "Prepared full cache missing; recomputing "
+                f"(expected_new={prepared_cache_path}, checked_legacy={legacy_prepared_cache_path})"
+            ),
         )
 
     if adata_full is None:
+        prep_started = _vstart(verbose, "state-apply", "prepare dataset for classifier apply")
         _load_positions_if_needed()
         if label_classifier_selected is not None:
             adata_full = apply_classifier(
@@ -4203,6 +4306,7 @@ def apply_state_classifiers_to_full_dataset(
             )
             full_predicted_in_primary = True
         del df_positions
+        _vdone(verbose, "state-apply", "prepare dataset for classifier apply", prep_started)
     else:
         if label_classifier_selected is not None:
             cont_cols = list(
@@ -4322,8 +4426,7 @@ def apply_state_classifiers_to_full_dataset(
                 f"{exc}",
                 RuntimeWarning,
             )
-            if verbose:
-                print(f"Skipping state composition report export due to error: {exc}")
+            _vinfo(verbose, "state-apply", f"State composition report skipped: {exc}")
     else:
         state_composition_report_error = (
             "Could not generate state composition report: "
@@ -4338,6 +4441,10 @@ def apply_state_classifiers_to_full_dataset(
         state_composition_report_plot_csvs
     )
     adata_full.uns["classification"]["state_composition_report_error"] = state_composition_report_error
+    if state_composition_report_pdf is not None:
+        _vsave(verbose, "state-apply", "state composition report pdf", state_composition_report_pdf)
+    if state_composition_report_auc_csv is not None:
+        _vsave(verbose, "state-apply", "state composition report csv", state_composition_report_auc_csv)
 
     state_transition_report_dir = None
     state_transition_matrix_counts_csv = None
@@ -4393,8 +4500,7 @@ def apply_state_classifiers_to_full_dataset(
                     f"{exc}",
                     RuntimeWarning,
                 )
-                if verbose:
-                    print(f"Skipping state transition report export due to error: {exc}")
+                _vinfo(verbose, "state-apply", f"State transition report skipped: {exc}")
         else:
             state_transition_report_error = (
                 "Could not generate state transition report: "
@@ -4424,6 +4530,10 @@ def apply_state_classifiers_to_full_dataset(
     adata_full.uns["classification"]["state_transition_sankey_pdf"] = state_transition_sankey_pdf
     adata_full.uns["classification"]["state_transition_sankey_html_dir"] = state_transition_sankey_html_dir
     adata_full.uns["classification"]["state_transition_report_error"] = state_transition_report_error
+    if state_transition_report_dir is not None:
+        _vsave(verbose, "state-apply", "state transition report dir", state_transition_report_dir)
+    if state_transition_sankey_pdf is not None:
+        _vsave(verbose, "state-apply", "state transition sankey pdf", state_transition_sankey_pdf)
 
     behavioral_state_backprojection = {
         "enabled": bool(export_behavioral_state_images),
@@ -4433,6 +4543,7 @@ def apply_state_classifiers_to_full_dataset(
         "errors": [],
     }
     if bool(export_behavioral_state_images):
+        backprojection_started = _vstart(verbose, "state-apply", "export behavioral-state backprojection")
         export_state_col = (
             str(behavioral_state_image_col)
             if behavioral_state_image_col is not None
@@ -4451,22 +4562,26 @@ def apply_state_classifiers_to_full_dataset(
         )
         behavioral_state_backprojection["enabled"] = True
         behavioral_state_backprojection["state_col"] = export_state_col
+        _vdone(verbose, "state-apply", "export behavioral-state backprojection", backprojection_started)
     adata_full.uns["classification"]["behavioral_state_backprojection"] = behavioral_state_backprojection
 
+    write_started = _vstart(verbose, "state-apply", "write classified full adata")
     adata_full.write(state_paths.full_output_adata_path, compression="gzip")
-
-    if verbose:
-        n_rows = int(adata_full.n_obs)
-        n_intrinsic = int(
-            adata_full.obs["intrinsic_behavioral_cluster"].astype(str).nunique()
-        ) if "intrinsic_behavioral_cluster" in adata_full.obs.columns else 0
-        n_full = int(
-            adata_full.obs["full_behavioral_cluster"].astype(str).nunique()
-        ) if "full_behavioral_cluster" in adata_full.obs.columns else 0
-        print(
-            "Completed apply to full dataset: "
-            f"rows={n_rows}, intrinsic_clusters={n_intrinsic}, full_behavioral_clusters={n_full}"
-        )
+    _vdone(verbose, "state-apply", "write classified full adata", write_started)
+    _vsave(verbose, "state-apply", "classified full adata", state_paths.full_output_adata_path)
+    n_rows = int(adata_full.n_obs)
+    n_intrinsic = int(
+        adata_full.obs["intrinsic_behavioral_cluster"].astype(str).nunique()
+    ) if "intrinsic_behavioral_cluster" in adata_full.obs.columns else 0
+    n_full = int(
+        adata_full.obs["full_behavioral_cluster"].astype(str).nunique()
+    ) if "full_behavioral_cluster" in adata_full.obs.columns else 0
+    _vinfo(
+        verbose,
+        "state-apply",
+        f"Apply summary: rows={n_rows}, intrinsic_clusters={n_intrinsic}, full_behavioral_clusters={n_full}",
+    )
+    _vdone(verbose, "state-apply", "apply state classifiers", apply_started)
 
     return adata_full
 
@@ -4588,8 +4703,7 @@ def test_pipeline():
             "test_pipeline could not resolve a sample_name from adata_full.obs for backprojection visualization."
         )
     selected_sample_name = "ROCHE_JM1_Exp042-8_Img03_10T_HER2II"
-    if verbose:
-        print(f"Opening behavioral-state backprojection viewer for sample '{selected_sample_name}'")
+    _vinfo(verbose, "state-apply", f"Opening backprojection viewer for sample '{selected_sample_name}'")
     _viewer = show_behavioral_state_backprojection(
         sample_name=selected_sample_name,
         output_dir=output_dir,

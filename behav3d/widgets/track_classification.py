@@ -35,15 +35,19 @@ from behav3d.core.metadata import (
 from behav3d.widgets.utils import spinning_loader
 
 
+def _winfo(prefix, message):
+    print(f"[{prefix}] INFO {message}")
+
+
 class TrackClassificationPanel:
     """
-    Widget for track-level behavioral clustering.
+    Widget for behavioral state trajectory clustering/classification.
 
     Workflow:
-    1) Run clustering
-    2) Rename discovered track clusters
-    3) Train/apply classifier on (sub)tracks
-    4) Backproject renamed track clusters
+    1) Run behavioral state trajectory clustering
+    2) Rename discovered behavioral state trajectory clusters
+    3) Train/apply behavioral state trajectory classifier on (sub)trajectories
+    4) Backproject renamed behavioral state trajectory clusters
     """
 
     def __init__(self, metadata_loader, cell_type=None, show_fixed_io=False, show_ngram_weight=False):
@@ -93,7 +97,7 @@ class TrackClassificationPanel:
 
         self.ui = widgets.VBox(
             [
-                widgets.HTML('<div style="font-size:20px;font-weight:700;">Track Classification</div>'),
+                widgets.HTML('<div style="font-size:20px;font-weight:700;">Behavioral State Trajectory Classification</div>'),
                 widgets.HBox(
                     [self.cell_type_dd, self.refresh_btn, self.refresh_spinner],
                     layout=widgets.Layout(align_items="center", gap="8px"),
@@ -111,10 +115,10 @@ class TrackClassificationPanel:
 
     def _build_steps(self):
         step_defs = [
-            ("Track clustering", self.clustering_section),
-            ("Rename clusters", self.rename_section),
-            ("Train classifier", self.train_classifier_section),
-            ("Apply classifier", self.apply_classifier_section),
+            ("Behavioral state trajectory clustering", self.clustering_section),
+            ("Rename behavioral state trajectory clusters", self.rename_section),
+            ("Train behavioral state trajectory classifier", self.train_classifier_section),
+            ("Apply behavioral state trajectory classifier", self.apply_classifier_section),
             ("Backprojection", self.backprojection_section),
         ]
         self._step_accordions = []
@@ -138,17 +142,11 @@ class TrackClassificationPanel:
     def _build_clustering_section(self):
         self.fixed_io_html = widgets.HTML("")
 
-        self.min_length = widgets.IntText(
-            description="Min length",
+        self.behavioral_trajectory_size = widgets.IntText(
+            description="Behavioral trajectory size",
             value=100,
-            layout=widgets.Layout(width="220px"),
-            style={"description_width": "100px"},
-        )
-        self.max_length = widgets.IntText(
-            description="Max length",
-            value=100,
-            layout=widgets.Layout(width="220px"),
-            style={"description_width": "100px"},
+            layout=widgets.Layout(width="300px"),
+            style={"description_width": "170px"},
         )
         self.use_fractions = widgets.Checkbox(
             description="state_proportion",
@@ -242,9 +240,9 @@ class TrackClassificationPanel:
         )
 
         self.btn_cluster = widgets.Button(
-            description="Run track clustering",
+            description="Run behavioral state trajectory clustering",
             button_style="success",
-            layout=widgets.Layout(width="220px"),
+            layout=widgets.Layout(width="360px"),
         )
         self.btn_cluster.on_click(self._on_cluster_clicked)
         self.cluster_spinner = widgets.HTML(value=spinning_loader)
@@ -265,10 +263,10 @@ class TrackClassificationPanel:
             children.append(self.fixed_io_html)
         children.extend(
             [
-                widgets.HTML("<h4 style='margin:0;'>Filter and cut tracks</h4>"),
-                widgets.HBox([self.min_length, self.max_length]),
+                widgets.HTML("<h4 style='margin:0;'>Filter and cut trajectories</h4>"),
+                widgets.HBox([self.behavioral_trajectory_size]),
                 widgets.HTML("<h4 style='margin:6px 0 0 0;'>Feature selection</h4>"),
-                widgets.HTML("<i>Select which track-state feature families to include in clustering.</i>"),
+                widgets.HTML("<i>Select which state-trajectory feature families to include in clustering.</i>"),
                 widgets.HBox([self.use_fractions]),
                 widgets.HBox([self.use_bouts_mean_length, self.use_bouts_nr, self.use_bouts_max_length]),
                 widgets.HBox([self.use_transitions]),
@@ -289,12 +287,12 @@ class TrackClassificationPanel:
         return children
 
     def _build_rename_section(self):
-        self.rename_status = widgets.HTML("<i>Run clustering or load existing track model first.</i>")
+        self.rename_status = widgets.HTML("<i>Run clustering or load existing behavioral state trajectory model first.</i>")
         self.rename_rows = widgets.VBox([])
         self.btn_rename = widgets.Button(
-            description="Rename clusters",
+            description="Rename behavioral state trajectory clusters",
             button_style="warning",
-            layout=widgets.Layout(width="180px"),
+            layout=widgets.Layout(width="360px"),
         )
         self.btn_rename.on_click(self._on_rename_clicked)
         self.rename_spinner = widgets.HTML(value=spinning_loader)
@@ -311,7 +309,7 @@ class TrackClassificationPanel:
         )
 
     def _build_classifier_section(self):
-        self.classifier_status = widgets.HTML("<i>Run clustering or load existing track model first.</i>")
+        self.classifier_status = widgets.HTML("<i>Run clustering or load existing behavioral state trajectory model first.</i>")
         self.classifier_path = widgets.Text(
             description="Classifier .pkl",
             value="",
@@ -380,9 +378,9 @@ class TrackClassificationPanel:
         )
 
         self.btn_train_classifier = widgets.Button(
-            description="Train classifier",
+            description="Train behavioral state trajectory classifier",
             button_style="success",
-            layout=widgets.Layout(width="170px"),
+            layout=widgets.Layout(width="330px"),
         )
         self.btn_train_classifier.on_click(self._on_train_classifier_clicked)
         self.train_classifier_spinner = widgets.HTML(value=spinning_loader)
@@ -390,9 +388,9 @@ class TrackClassificationPanel:
         self.out_train_classifier = widgets.Output()
 
         self.btn_apply_classifier = widgets.Button(
-            description="Apply to (sub)tracks",
+            description="Apply to (sub)trajectories",
             button_style="success",
-            layout=widgets.Layout(width="190px"),
+            layout=widgets.Layout(width="230px"),
         )
         self.btn_apply_classifier.on_click(self._on_apply_classifier_clicked)
         self.apply_classifier_spinner = widgets.HTML(value=spinning_loader)
@@ -561,7 +559,7 @@ class TrackClassificationPanel:
 
     def _track_outdir(self, cell_type=None):
         ct = self._current_cell_type() if cell_type is None else str(cell_type)
-        return Path(self.output_dir, "analysis", ct, "behavioral_states", "behavioral_tracks")
+        return Path(self.output_dir, "analysis", ct, "behavioral_state_trajectories")
 
     def _clustering_plot_outdir(self, cell_type=None):
         return self._track_outdir(cell_type=cell_type) / "clustering"
@@ -613,8 +611,9 @@ class TrackClassificationPanel:
         )
         self.use_transitions.value = bool(cfg.get("use_transitions", self.use_transitions.value))
         self.use_bigrams.value = bool(cfg.get("use_bigrams", self.use_bigrams.value))
-        self.min_length.value = int(cfg.get("min_length", self.min_length.value))
-        self.max_length.value = int(cfg.get("max_length", self.max_length.value))
+        self.behavioral_trajectory_size.value = int(
+            cfg.get("behavioral_trajectory_size", self.behavioral_trajectory_size.value)
+        )
         self.use_trigrams.value = bool(cfg.get("use_trigrams", self.use_trigrams.value))
         self.ngram_weight.value = str(cfg.get("ngram_weight", self.ngram_weight.value))
         self.n_neighbors.value = int(cfg.get("n_neighbors", self.n_neighbors.value))
@@ -664,8 +663,7 @@ class TrackClassificationPanel:
                 "use_bouts_max_length": bool(self.use_bouts_max_length.value),
                 "use_transitions": bool(self.use_transitions.value),
                 "use_bigrams": bool(self.use_bigrams.value),
-                "min_length": int(self.min_length.value),
-                "max_length": int(self.max_length.value),
+                "behavioral_trajectory_size": int(self.behavioral_trajectory_size.value),
                 "use_trigrams": bool(self.use_trigrams.value),
                 "ngram_weight": str(self.ngram_weight.value),
                 "n_neighbors": int(self.n_neighbors.value),
@@ -803,10 +801,10 @@ class TrackClassificationPanel:
                 f"<b>Model loaded:</b> {loaded_name} "
                 f"({self.model_adata.n_obs} rows)"
             )
-            self.classifier_status.value = "<b>Model loaded.</b> Train or apply classifier."
+            self.classifier_status.value = "<b>Model loaded.</b> Train or apply behavioral state trajectory classifier."
         else:
-            self.status_html.value = "<i>Run clustering or load existing model.</i>"
-            self.classifier_status.value = "<i>Run clustering or load existing track model first.</i>"
+            self.status_html.value = "<i>Run behavioral state trajectory clustering or load existing model.</i>"
+            self.classifier_status.value = "<i>Run clustering or load existing behavioral state trajectory model first.</i>"
 
     def _refresh_context(self):
         self.output_dir = str(Path(getattr(self.metadata_loader, "output_dir", "")).expanduser())
@@ -879,7 +877,7 @@ class TrackClassificationPanel:
                 )
                 if selected_track_feature_count == 0:
                     raise ValueError(
-                        "At least one track-state feature option must be enabled "
+                        "At least one trajectory-state feature option must be enabled "
                         "(fractions, bout stats, transitions, bigrams, or trigrams)."
                     )
                 ct = self._current_cell_type()
@@ -891,8 +889,7 @@ class TrackClassificationPanel:
                     state_col=self._fixed_state_col(),
                     groupby_cols=("sample_name", "TrackID"),
                     time_col=self._fixed_time_col(),
-                    min_length=int(self.min_length.value),
-                    max_length=int(self.max_length.value),
+                    behavioral_trajectory_size=int(self.behavioral_trajectory_size.value),
                     use_fractions=bool(self.use_fractions.value),
                     use_bout_stats=bool(use_bout_stats),
                     include_bouts_mean_length=bool(self.use_bouts_mean_length.value),
@@ -921,11 +918,11 @@ class TrackClassificationPanel:
                     n_per_cluster=int(self.n_per_cluster.value),
                     autosave_plots=True,
                     save_outputs=True,
-                    output_subdir_name="behavioral_tracks",
+                    output_subdir_name="behavioral_state_trajectories",
                     random_state=int(self.random_state.value),
                 )
                 self._save_model_adata()
-                print(f"Saved track model adata: {self._model_adata_path()}")
+                _winfo("trajectory-widget", f"Saved model adata: {self._model_adata_path()}")
                 self._rebuild_rename_rows()
                 self._refresh_backprojection_samples()
                 self._open_step(1)
@@ -956,7 +953,7 @@ class TrackClassificationPanel:
                 self._save_model_adata(compression="lzf")
                 self._regenerate_clustering_plots(cluster_col=cluster_col)
                 self._rebuild_rename_rows()
-                print(f"Track clusters renamed and saved to: {self._model_adata_path()}")
+                _winfo("trajectory-widget", f"Renamed clusters and saved: {self._model_adata_path()}")
                 self._open_step(2)
             except Exception:
                 traceback.print_exc()
@@ -981,11 +978,11 @@ class TrackClassificationPanel:
             plot_dpi=300,
             filename_suffix="_renamed",
         )
-        print(f"Regenerated clustering diagnostics PDF: {report_paths['diagnostics_pdf']}")
+        _winfo("trajectory-widget", f"Regenerated diagnostics PDF: {report_paths['diagnostics_pdf']}")
 
         adata_full_path = self._default_adata_full_path()
         if not adata_full_path.exists():
-            print(f"Skipped exemplar replot (missing full dataset): {adata_full_path}")
+            _winfo("trajectory-widget", f"Skipped exemplar replot (missing full dataset): {adata_full_path}")
             return
         adata_full = sc.read_h5ad(adata_full_path)
         filter_cfg = {}
@@ -997,14 +994,18 @@ class TrackClassificationPanel:
         if not isinstance(groupby_cols, (list, tuple)) or len(groupby_cols) == 0:
             groupby_cols = ("sample_name", "TrackID")
         time_col = str(filter_cfg.get("time_col", self._fixed_time_col()))
-        min_length = int(filter_cfg.get("min_length", int(self.min_length.value)))
-        max_length = int(filter_cfg.get("max_length", int(self.max_length.value)))
+        if "behavioral_trajectory_size" not in filter_cfg:
+            raise ValueError(
+                "Model adata is missing required 'track_filtering.behavioral_trajectory_size'. "
+                "Regenerate the behavioral state trajectory model."
+            )
+        behavioral_trajectory_size = int(filter_cfg["behavioral_trajectory_size"])
         adata_plot = filter_and_truncate_tracks_anndata(
             adata_full,
             groupby_cols=[str(c) for c in groupby_cols],
             time_col=time_col,
-            min_length=int(min_length),
-            max_length=int(max_length),
+            min_length=int(behavioral_trajectory_size),
+            max_length=int(behavioral_trajectory_size),
         )
         state_key = self._fixed_state_col()
         fig, _, _ = plot_exemplar_tracks_by_cluster(
@@ -1015,18 +1016,22 @@ class TrackClassificationPanel:
             cluster_key=str(cluster_col),
             seed=int(self.random_state.value),
         )
-        plot_name = (
-            f"exemplar_tracks_"
-            f"{self._sanitize_filename_token(cluster_col, fallback='cluster')}_"
-            f"state_{self._sanitize_filename_token(state_key, fallback='state')}_renamed.pdf"
+        plot_name = "example_tracks_overview_renamed.pdf"
+        exemplar_outdir = (
+            self._track_outdir()
+            / "clustering"
+            / "example_tracks"
+            / "per_cluster"
+            / "pdf"
         )
-        plot_path = plot_outdir / plot_name
+        exemplar_outdir.mkdir(parents=True, exist_ok=True)
+        plot_path = exemplar_outdir / plot_name
         width, height = fig.get_size_inches()
         if abs(width - height) < 0.05:
             fig.set_size_inches(max(width, height * 1.25), height, forward=True)
         with PdfPages(plot_path) as pdf:
             pdf.savefig(fig, dpi=300, bbox_inches="tight")
-        print(f"Regenerated exemplar plot: {plot_path}")
+        _winfo("trajectory-widget", f"Regenerated exemplar plot: {plot_path}")
         plt.close(fig)
 
     def _plot_classifier_exemplars(self, cluster_col):
@@ -1050,15 +1055,19 @@ class TrackClassificationPanel:
         if not isinstance(groupby_cols, (list, tuple)) or len(groupby_cols) == 0:
             groupby_cols = ("sample_name", "TrackID")
         time_col = str(filter_cfg.get("time_col", self._fixed_time_col()))
-        min_length = int(filter_cfg.get("min_length", int(self.min_length.value)))
-        max_length = int(filter_cfg.get("max_length", int(self.max_length.value)))
+        if "behavioral_trajectory_size" not in filter_cfg:
+            raise ValueError(
+                "Model adata is missing required 'track_filtering.behavioral_trajectory_size'. "
+                "Regenerate the behavioral state trajectory model."
+            )
+        behavioral_trajectory_size = int(filter_cfg["behavioral_trajectory_size"])
 
         adata_plot = filter_and_truncate_tracks_anndata(
             adata_full,
             groupby_cols=[str(c) for c in groupby_cols],
             time_col=time_col,
-            min_length=int(min_length),
-            max_length=int(max_length),
+            min_length=int(behavioral_trajectory_size),
+            max_length=int(behavioral_trajectory_size),
         )
         state_key = self._fixed_state_col()
         fig, _, _ = plot_exemplar_tracks_by_cluster(
@@ -1069,13 +1078,15 @@ class TrackClassificationPanel:
             cluster_key=str(cluster_col),
             seed=int(self.random_state.value),
         )
-        class_outdir = self._track_outdir() / "classification"
-        class_outdir.mkdir(parents=True, exist_ok=True)
-        plot_name = (
-            f"exemplar_tracks_"
-            f"{self._sanitize_filename_token(cluster_col, fallback='cluster')}_"
-            f"state_{self._sanitize_filename_token(state_key, fallback='state')}_classified.pdf"
+        class_outdir = (
+            self._track_outdir()
+            / "classification"
+            / "example_tracks"
+            / "per_cluster"
+            / "pdf"
         )
+        class_outdir.mkdir(parents=True, exist_ok=True)
+        plot_name = "example_tracks_overview_classified.pdf"
         plot_path = class_outdir / plot_name
         width, height = fig.get_size_inches()
         if abs(width - height) < 0.05:
@@ -1083,7 +1094,7 @@ class TrackClassificationPanel:
         with PdfPages(plot_path) as pdf:
             pdf.savefig(fig, dpi=300, bbox_inches="tight")
         plt.close(fig)
-        print(f"Saved classifier exemplar plot: {plot_path}")
+        _winfo("trajectory-widget", f"Saved classifier exemplar plot: {plot_path}")
 
     def _on_train_classifier_clicked(self, _):
         self._set_busy(self.btn_train_classifier, self.train_classifier_spinner, busy=True)
@@ -1115,7 +1126,7 @@ class TrackClassificationPanel:
                     classifier_min_samples_split=int(self.cls_min_samples_split.value),
                     classifier_max_features=str(self.cls_max_features.value).strip(),
                     classifier_class_weight=class_weight,
-                    output_subdir_name="behavioral_tracks",
+                    output_subdir_name="behavioral_state_trajectories",
                     save_classifier=True,
                     classifier_path=(str(self.classifier_path.value).strip() or None),
                     random_state=int(self.random_state.value),
@@ -1130,35 +1141,11 @@ class TrackClassificationPanel:
                 if classifier_path is not None:
                     self.classifier_path.value = str(classifier_path)
                 self._refresh_apply_default_paths()
-                fit_info = out.get("fit_info", {})
-                classifier_validation = out.get("classifier_validation", {})
                 qc_metrics_csv = out.get("classifier_metrics_csv", None)
-                print("Track classifier training finished.")
-                print(f"Classifier path: {classifier_path}")
+                _winfo("trajectory-widget", "Classifier training finished.")
+                _winfo("trajectory-widget", f"Classifier path: {classifier_path}")
                 if qc_metrics_csv is not None:
-                    print(f"Classifier QC metrics: {qc_metrics_csv}")
-                if isinstance(fit_info, dict):
-                    print(f"Train split accuracy: {fit_info.get('train_accuracy', float('nan')):.4f}")
-                if isinstance(classifier_validation, dict):
-                    mode = str(classifier_validation.get("mode", "oob_only"))
-                    tm = classifier_validation.get("train_metrics") or {}
-                    vm = classifier_validation.get("test_metrics") or {}
-                    if mode == "holdout":
-                        print(
-                            "Validation summary: "
-                            f"train_acc={tm.get('accuracy', float('nan')):.4f}, "
-                            f"test_acc={vm.get('accuracy', float('nan')):.4f}, "
-                            f"test_bal_acc={vm.get('balanced_accuracy', float('nan')):.4f}, "
-                            f"test_macro_f1={vm.get('macro_f1', float('nan')):.4f}"
-                        )
-                    else:
-                        print(
-                            "Validation summary (OOB-only): "
-                            f"train_acc={tm.get('accuracy', float('nan')):.4f}, "
-                            f"train_bal_acc={tm.get('balanced_accuracy', float('nan')):.4f}, "
-                            f"train_macro_f1={tm.get('macro_f1', float('nan')):.4f}, "
-                            f"oob_train_split={classifier_validation.get('oob_score_train_split', float('nan')):.4f}"
-                        )
+                    _winfo("trajectory-widget", f"Classifier metrics CSV: {qc_metrics_csv}")
                 self._open_step(3)
             except Exception:
                 traceback.print_exc()
@@ -1186,7 +1173,7 @@ class TrackClassificationPanel:
                     state_col=self._fixed_state_col(),
                     output_col=self._fixed_cluster_key(),
                     confidence_col=f"{self._fixed_cluster_key()}_confidence",
-                    output_subdir_name="behavioral_tracks",
+                    output_subdir_name="behavioral_state_trajectories",
                     n_per_cluster=int(self.n_per_cluster.value),
                     save_outputs=True,
                     save_as_model=True,
@@ -1200,8 +1187,8 @@ class TrackClassificationPanel:
                 self._rebuild_rename_rows()
                 self._refresh_backprojection_samples()
                 self._plot_classifier_exemplars(cluster_col=self._fixed_cluster_key())
-                print("Applied classifier to (sub)tracks.")
-                print(f"Saved track model adata: {self._model_adata_path()}")
+                _winfo("trajectory-widget", "Classifier apply finished.")
+                _winfo("trajectory-widget", f"Saved model adata: {self._model_adata_path()}")
                 self._open_step(4)
             except Exception:
                 traceback.print_exc()
@@ -1245,8 +1232,10 @@ class TrackClassificationPanel:
                         f"'{sample_key}'. manifest={manifest}"
                     )
 
-                print(f"Opening track-cluster backprojection for sample '{sample_key}'")
-                print(f"State image: {state_img_path}")
+                _winfo(
+                    "trajectory-widget",
+                    f"Opening backprojection for sample '{sample_key}' | state_image={state_img_path}",
+                )
                 show_behavioral_state_backprojection(
                     sample_name=sample_key,
                     output_dir=self.output_dir,

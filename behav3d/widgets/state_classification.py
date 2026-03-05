@@ -30,6 +30,10 @@ from behav3d.core.utils import expand_column_patterns
 from behav3d.widgets.utils import PathPicker, behav3d_calculated_features, spinning_loader
 
 
+def _winfo(prefix, message):
+    print(f"[{prefix}] INFO {message}")
+
+
 class StateClassificationPanel:
     """
     Compact state-classification panel for notebook usage.
@@ -37,8 +41,8 @@ class StateClassificationPanel:
     Workflow (accordion sections):
     1) Apply
     2) Clustering
-    3) Rename Intrinsic
-    4) Rename Full Mapping
+    3) Rename primary dynamic state clusters
+    4) Rename clusters assigned to binary groups
     5) Train
     """
 
@@ -122,9 +126,9 @@ class StateClassificationPanel:
 
     def _build_steps(self):
         step_defs = [
-            ("Intrinsic state clustering", self.clustering_section),
-            ("Rename Intrinsic", self.rename_intrinsic_section),
-            ("Rename Full Mapping", self.rename_full_section),
+            ("Primary dynamic state clustering (based on continuous features)", self.clustering_section),
+            ("Rename primary dynamic state clusters", self.rename_intrinsic_section),
+            ("Rename clusters assigned to binary groups", self.rename_full_section),
             ("Train classification", self.train_section),
             ("Apply classification", self.apply_section),
             ("Backprojection", self.backprojection_section),
@@ -294,7 +298,7 @@ class StateClassificationPanel:
         }
 
         self.btn_cluster = widgets.Button(
-            description="Run intrinsic state clustering",
+            description="Run primary dynamic state clustering",
             button_style="success",
             layout=widgets.Layout(width="240px"),
         )
@@ -408,9 +412,9 @@ class StateClassificationPanel:
         self.rename_intrinsic_status = widgets.HTML("<i>Run clustering or load existing model first.</i>")
         self.rename_intrinsic_rows = widgets.VBox([])
         self.btn_rename_intrinsic = widgets.Button(
-            description="Rename intrinsic clusters",
+            description="Rename primary dynamic state clusters",
             button_style="warning",
-            layout=widgets.Layout(width="230px"),
+            layout=widgets.Layout(width="320px"),
         )
         self.btn_rename_intrinsic.on_click(self._on_rename_intrinsic_clicked)
         self.rename_intrinsic_spinner = widgets.HTML(value=spinning_loader)
@@ -426,7 +430,7 @@ class StateClassificationPanel:
         )
 
     def _build_full_rename_section(self):
-        self.rename_full_status = widgets.HTML("<i>Rename intrinsic clusters first.</i>")
+        self.rename_full_status = widgets.HTML("<i>Rename primary dynamic state clusters first.</i>")
         self.rename_full_rows = widgets.VBox([])
         self.rename_full_rows.layout = widgets.Layout(width="560px")
         self.full_combine_name = widgets.Text(
@@ -453,9 +457,9 @@ class StateClassificationPanel:
             layout=widgets.Layout(width="390px", align_items="flex-start"),
         )
         self.btn_rename_full = widgets.Button(
-            description="Rename full mapping clusters",
+            description="Rename clusters assigned to binary groups",
             button_style="warning",
-            layout=widgets.Layout(width="230px"),
+            layout=widgets.Layout(width="320px"),
         )
         self.btn_rename_full.on_click(self._on_rename_full_clicked)
         self.rename_full_spinner = widgets.HTML(value=spinning_loader)
@@ -1152,7 +1156,7 @@ class StateClassificationPanel:
                 )
             )
         self.rename_intrinsic_rows.children = rows
-        self.rename_intrinsic_status.value = f"<b>Intrinsic clusters:</b> {len(rows)}"
+        self.rename_intrinsic_status.value = f"<b>Primary dynamic state clusters:</b> {len(rows)}"
         self.btn_rename_intrinsic.disabled = False
 
     def _rebuild_full_rename_rows(self):
@@ -1161,7 +1165,7 @@ class StateClassificationPanel:
         self.full_combine_name.value = ""
         if self.model_adata is None or "full_behavioral_cluster" not in self.model_adata.obs.columns:
             self.rename_full_rows.children = []
-            self.rename_full_status.value = "<i>Run intrinsic rename first.</i>"
+            self.rename_full_status.value = "<i>Run primary dynamic state cluster rename first.</i>"
             self.btn_rename_full.disabled = True
             self.btn_combine_full.disabled = True
             self.full_combine_name.disabled = True
@@ -1189,7 +1193,7 @@ class StateClassificationPanel:
                 )
             )
         self.rename_full_rows.children = rows
-        self.rename_full_status.value = f"<b>Full mapping clusters:</b> {len(rows)}"
+        self.rename_full_status.value = f"<b>Clusters assigned to binary groups:</b> {len(rows)}"
         self.btn_rename_full.disabled = False
 
     def _refresh_enablement(self):
@@ -1278,9 +1282,12 @@ class StateClassificationPanel:
                 sample_name = self.backproj_sample_dd.value
                 if sample_name is None or len(str(sample_name).strip()) == 0:
                     raise ValueError("Please select a sample name.")
-                print(
-                    "Opening full-cluster backprojection for "
-                    f"sample '{sample_name}' and cell type '{self._current_cell_type()}'."
+                _winfo(
+                    "state-widget",
+                    (
+                        "Opening full-cluster backprojection for "
+                        f"sample '{sample_name}' and cell_type '{self._current_cell_type()}'"
+                    ),
                 )
                 show_behavioral_state_backprojection(
                     sample_name=str(sample_name),
@@ -1349,9 +1356,12 @@ class StateClassificationPanel:
                     if "full_behavioral_cluster" in self.adata_full.obs.columns
                     else 0
                 )
-                print(
-                    "Apply finished: "
-                    f"rows={n_rows}, intrinsic_clusters={n_intrinsic}, full_clusters={n_full}"
+                _winfo(
+                    "state-widget",
+                    (
+                        "Apply finished: "
+                        f"rows={n_rows}, intrinsic_clusters={n_intrinsic}, full_clusters={n_full}"
+                    ),
                 )
             except Exception:
                 traceback.print_exc()
@@ -1394,7 +1404,7 @@ class StateClassificationPanel:
                     verbose=True,
                 )
                 self._save_model_adata()
-                print(f"Saved model adata: {self._model_adata_path()}")
+                _winfo("state-widget", f"Saved model adata: {self._model_adata_path()}")
                 self._rebuild_intrinsic_rename_rows()
                 self._rebuild_full_rename_rows()
                 # Keep compact behavior: open rename-intrinsic section next.
@@ -1425,7 +1435,7 @@ class StateClassificationPanel:
                 self._save_model_adata(compression="lzf")
                 self._rebuild_intrinsic_rename_rows()
                 self._rebuild_full_rename_rows()
-                print(f"Intrinsic clusters renamed and persisted to {self._model_adata_path()}")
+                _winfo("state-widget", f"Renamed intrinsic clusters and saved: {self._model_adata_path()}")
                 # Open full mapping next.
                 self._open_step(2)
             except Exception:
@@ -1451,12 +1461,11 @@ class StateClassificationPanel:
                     new_name = str(txt.value).strip()
                     mapping[str(old_name)] = new_name if new_name != "" else str(old_name)
 
-                print("Renaming and saving full mapping...")
                 result = self._apply_full_rename_mapping(mapping, save_compression="lzf")
                 if not bool(result.get("changed", False)):
-                    print("No changes to apply.")
+                    _winfo("state-widget", "No full-mapping changes to apply.")
                 else:
-                    print(f"Full mapping clusters renamed and persisted to {self._model_adata_path()}")
+                    _winfo("state-widget", f"Renamed full-mapping clusters and saved: {self._model_adata_path()}")
             except Exception:
                 traceback.print_exc()
             finally:
@@ -1549,12 +1558,11 @@ class StateClassificationPanel:
                     new_name = str(txt.value).strip()
                     mapping[str(old_name)] = new_name if new_name != "" else str(old_name)
 
-                print("Combining and saving...")
                 result = self._apply_full_rename_mapping(mapping, save_compression="lzf")
                 if not bool(result.get("changed", False)):
-                    print("No changes to apply.")
+                    _winfo("state-widget", "No full-state combine changes to apply.")
                 else:
-                    print(f"Combined {len(selected)} full states into '{target}' and persisted changes.")
+                    _winfo("state-widget", f"Combined {len(selected)} full states into '{target}'.")
             except Exception:
                 traceback.print_exc()
             finally:
@@ -1608,9 +1616,9 @@ class StateClassificationPanel:
                     verbose=True,
                 )
                 self._save_model_adata()
-                print("Training finished.")
-                print(f"Intrinsic classifier: {out.get('partial_classifier_path', None)}")
-                print(f"Full classifier: {out.get('full_classifier_path', None)}")
+                _winfo("state-widget", "Training finished.")
+                _winfo("state-widget", f"Intrinsic classifier: {out.get('partial_classifier_path', None)}")
+                _winfo("state-widget", f"Full classifier: {out.get('full_classifier_path', None)}")
             except Exception:
                 traceback.print_exc()
             finally:

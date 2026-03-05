@@ -1,4 +1,5 @@
 import re
+import shutil
 import warnings
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import numpy as np
 import pandas as pd
 import zarr
 
+from behav3d.io.formats.zarr import append_to_zarr
 from behav3d.io.images import load_image
 
 
@@ -55,7 +57,7 @@ def _behavioral_state_backprojection_dir(output_dir, cell_type):
         output_dir,
         "analysis",
         str(cell_type),
-        "behavioral_states",
+        "behavioral_state_trajectories",
         "backprojection",
     )
 
@@ -204,6 +206,7 @@ def backproject_single_sample_behavioral_states(
     sample_name=None,
     policy_hint=None,
     source_h5ad_path=None,
+    require_all_rows_present=False,
     verbose=True,
 ):
     """
@@ -228,6 +231,9 @@ def backproject_single_sample_behavioral_states(
         Output value for unmatched voxels.
     verbose : bool, default True
         Print progress messages.
+    require_all_rows_present : bool, default False
+        If True, every (time_col, track_col) entry in sample_obs must be present
+        in the tracked segmentation at that frame; otherwise raise ValueError.
     """
     tracked_img_path = Path(tracked_img_path)
     output_path = Path(output_path)
@@ -266,51 +272,54 @@ def backproject_single_sample_behavioral_states(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         if output_path.is_dir():
-            import shutil
             shutil.rmtree(output_path)
         else:
             output_path.unlink()
 
-    out_arr = zarr.open(
-        str(output_path),
-        mode="w",
-        shape=output_shape,
-        chunks=(1,) + output_shape[1:],
-        dtype=np.int32,
-    )
+    all_codes = [int(background_value)] + [int(v) for v in code_map.values()]
+    min_code = int(min(all_codes)) if len(all_codes) > 0 else int(background_value)
+    max_code = int(max(all_codes)) if len(all_codes) > 0 else int(background_value)
+    if min_code >= 0 and max_code <= int(np.iinfo(np.uint16).max):
+        output_dtype = np.uint16
+    elif min_code >= 0 and max_code <= int(np.iinfo(np.uint32).max):
+        output_dtype = np.uint32
+    else:
+        output_dtype = np.int32
 
-    def _align_mapped_frame_to_output(mapped_t, output_frame_shape):
+    def _align_mapped_frame_to_output(mapped_t, output_frame_shape, dtype):
         mapped_t = np.asarray(mapped_t)
         output_frame_shape = tuple(output_frame_shape)
         if mapped_t.shape == output_frame_shape:
-            return mapped_t.astype(np.int32, copy=False)
+            return mapped_t.astype(dtype, copy=False)
 
         # (Z, Y, X) -> (C, Z, Y, X)
         if mapped_t.ndim == 3 and len(output_frame_shape) == 4:
             c = int(output_frame_shape[0])
             tiled = np.repeat(np.expand_dims(mapped_t, axis=0), repeats=c, axis=0)
             if tiled.shape == output_frame_shape:
-                return tiled.astype(np.int32, copy=False)
+                return tiled.astype(dtype, copy=False)
 
         # (C, Z, Y, X) -> (Z, Y, X), only allow C=1 squeeze.
         if mapped_t.ndim == 4 and len(output_frame_shape) == 3 and int(mapped_t.shape[0]) == 1:
             squeezed = mapped_t[0]
             if squeezed.shape == output_frame_shape:
-                return squeezed.astype(np.int32, copy=False)
+                return squeezed.astype(dtype, copy=False)
 
         # (C1, Z, Y, X) -> (C2, Z, Y, X), allow C1=1 tiling.
         if mapped_t.ndim == 4 and len(output_frame_shape) == 4 and mapped_t.shape[1:] == output_frame_shape[1:]:
             if int(mapped_t.shape[0]) == int(output_frame_shape[0]):
-                return mapped_t.astype(np.int32, copy=False)
+                return mapped_t.astype(dtype, copy=False)
             if int(mapped_t.shape[0]) == 1:
                 tiled = np.repeat(mapped_t, repeats=int(output_frame_shape[0]), axis=0)
                 if tiled.shape == output_frame_shape:
-                    return tiled.astype(np.int32, copy=False)
+                    return tiled.astype(dtype, copy=False)
 
         raise ValueError(
             f"Could not align mapped frame shape {mapped_t.shape} to output frame shape {output_frame_shape}."
         )
 
+    # Matching contract: one-sample export keyed by (position_t, TrackID).
+    # position_t is used directly as frame/time id.
     work = sample_obs[[track_col, time_col, state_col]].copy()
     work["_track_id"] = pd.to_numeric(work[track_col], errors="coerce")
     work["_time_id"] = pd.to_numeric(work[time_col], errors="coerce")
@@ -344,6 +353,18 @@ def backproject_single_sample_behavioral_states(
         max_missing_leading_frames=int(coverage_check_max_missing_leading_frames),
     )
 
+    if len(work) > 0:
+        observed_time_ids = work["_time_id"].to_numpy(dtype=np.int64, copy=False)
+        bad_time_mask = (observed_time_ids < 0) | (observed_time_ids >= int(tracked_shape[0]))
+        if bool(np.any(bad_time_mask)):
+            bad_times = sorted(set(observed_time_ids[bad_time_mask].tolist()))
+            preview = [int(v) for v in bad_times[:20]]
+            raise ValueError(
+                "Backprojection has rows with timepoints outside tracked image range. "
+                f"sample='{resolved_sample_name}', tracked_range=[0,{int(tracked_shape[0]) - 1}], "
+                f"bad_time_ids_preview={preview}"
+            )
+
     per_time_maps = {}
     if len(work) > 0:
         for time_id, g in work.groupby("_time_id", observed=False):
@@ -355,12 +376,48 @@ def backproject_single_sample_behavioral_states(
             )
 
     n_timepoints = tracked_shape[0]
+    rows_requested = int(len(work))
+    rows_mapped = 0
+    rows_unmatched_ignored = 0
+
+    if verbose:
+        print(
+            "Backprojecting behavioral states (streaming): "
+            f"sample='{resolved_sample_name}', source='{tracked_img_path}', "
+            f"dest='{output_path}', timepoints={int(n_timepoints)} | "
+            f"match_key=(sample_name, {time_col}, {track_col})"
+        )
+
+    progress_stride = max(1, min(50, int(n_timepoints)))
     for t in range(n_timepoints):
         label_t = np.asarray(tracked_img[t]).astype(np.int64, copy=False)
         mapping = per_time_maps.get(int(t), {})
 
         unique_labels, inverse = np.unique(label_t.ravel(), return_inverse=True)
-        mapped_unique = np.full(unique_labels.shape, int(background_value), dtype=np.int32)
+        if len(mapping) > 0:
+            present_track_ids = set(int(v) for v in unique_labels.tolist())
+            matched_here = sum(
+                1 for track_id in mapping.keys() if int(track_id) in present_track_ids
+            )
+            unmatched_here = int(len(mapping)) - int(matched_here)
+            rows_mapped += int(matched_here)
+            rows_unmatched_ignored += int(unmatched_here)
+        if bool(require_all_rows_present) and len(mapping) > 0:
+            missing_track_ids = sorted(
+                int(track_id)
+                for track_id in mapping.keys()
+                if int(track_id) not in present_track_ids
+            )
+            if len(missing_track_ids) > 0:
+                preview = [int(v) for v in missing_track_ids[:20]]
+                raise ValueError(
+                    "Backprojection row(s) not found in tracked segmentation frame. "
+                    f"sample='{resolved_sample_name}', time_id={int(t)}, "
+                    f"missing_track_ids_preview={preview}, n_missing={int(len(missing_track_ids))}, "
+                    f"tracked_path='{tracked_img_path}'"
+                )
+
+        mapped_unique = np.full(unique_labels.shape, int(background_value), dtype=output_dtype)
         if len(mapping) > 0:
             mapped_unique = np.asarray(
                 [
@@ -369,13 +426,21 @@ def backproject_single_sample_behavioral_states(
                     else int(background_value)
                     for lbl in unique_labels
                 ],
-                dtype=np.int32,
+                dtype=output_dtype,
             )
 
         mapped_t = mapped_unique[inverse].reshape(label_t.shape)
-        mapped_t = _align_mapped_frame_to_output(mapped_t, output_shape[1:])
-        out_arr[t] = mapped_t
+        mapped_t = _align_mapped_frame_to_output(
+            mapped_t,
+            output_shape[1:],
+            dtype=output_dtype,
+        )
+        append_to_zarr(img=mapped_t[np.newaxis, ...], outpath=output_path)
 
+        if verbose and ((t == 0) or ((t + 1) % progress_stride == 0) or (t == (n_timepoints - 1))):
+            print(f"  backprojection frame {int(t) + 1}/{int(n_timepoints)}")
+
+    out_arr = zarr.open(str(output_path), mode="a")
     code_to_label = {str(code): str(label) for label, code in code_map.items()}
     out_arr.attrs["state_col"] = str(state_col)
     out_arr.attrs["background_value"] = int(background_value)
@@ -397,13 +462,24 @@ def backproject_single_sample_behavioral_states(
     out_arr.attrs["backprojection_shape_mode"] = "tracked_shape"
 
     if verbose:
-        print(f"Saved behavioral-state image: {output_path}")
+        summary = (
+            f"Saved behavioral-state image: {output_path} | "
+            f"rows_requested={int(rows_requested)} | rows_mapped={int(rows_mapped)}"
+        )
+        if not bool(require_all_rows_present):
+            summary = (
+                f"{summary} | rows_unmatched_ignored={int(rows_unmatched_ignored)}"
+            )
+        print(summary)
 
     return {
         "output_path": str(output_path),
         "tracked_img_path": str(tracked_img_path),
         "n_timepoints": int(n_timepoints),
         "n_obs_rows_used": int(len(work)),
+        "rows_requested": int(rows_requested),
+        "rows_mapped": int(rows_mapped),
+        "rows_unmatched_ignored": int(rows_unmatched_ignored),
     }
 
 
@@ -417,11 +493,13 @@ def export_behavioral_state_backprojection_zarrs(
     time_col="position_t",
     background_value=0,
     enforce_time_coverage=True,
+    raise_on_error=True,
+    require_all_rows_present=False,
     verbose=True,
 ):
     """
     Export one behavioral-state label image per sample under:
-    output_dir/analysis/<cell_type>/behavioral_states/backprojection/<sample>_<cell_type>_behavioral_states.zarr
+    output_dir/analysis/<cell_type>/behavioral_state_trajectories/backprojection/<sample>_<cell_type>_behavioral_states.zarr
     """
     if adata is None or not hasattr(adata, "obs"):
         raise ValueError("adata with .obs is required for behavioral-state backprojection.")
@@ -523,6 +601,7 @@ def export_behavioral_state_backprojection_zarrs(
                 sample_name=str(sample_name),
                 policy_hint=policy_hint,
                 source_h5ad_path=getattr(adata, "filename", None),
+                require_all_rows_present=bool(require_all_rows_present),
                 verbose=verbose,
             )
             manifest["output_paths"][str(sample_name)] = str(sample_result["output_path"])
@@ -544,6 +623,15 @@ def export_behavioral_state_backprojection_zarrs(
             f"written={len(manifest['output_paths'])}, "
             f"skipped={len(manifest['skipped_samples'])}, "
             f"errors={len(manifest['errors'])}"
+        )
+
+    if bool(raise_on_error) and len(manifest["errors"]) > 0:
+        first_err = manifest["errors"][0]
+        raise RuntimeError(
+            "Behavioral-state backprojection export failed for one or more samples. "
+            f"first_error_sample='{first_err.get('sample_name', 'unknown')}', "
+            f"first_error='{first_err.get('error', 'unknown')}', "
+            f"n_errors={int(len(manifest['errors']))}"
         )
 
     return manifest
