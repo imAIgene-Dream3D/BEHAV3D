@@ -60,6 +60,12 @@ def summarize_track_features(
 
     df_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
     df_tracks = pd.read_csv(df_tracks_path)
+
+    # Force touching_* columns to string so they are never treated as numeric
+    for col in df_tracks.columns:
+        if col.startswith("touching_"):
+            df_tracks[col] = df_tracks[col].astype(str)
+
     # Calculate mean values of track features over the whole track
     grouped_df_tracks=df_tracks.groupby(['sample_name','TrackID'])
     df_summarized_tracks = grouped_df_tracks.size().reset_index(name="track_length")

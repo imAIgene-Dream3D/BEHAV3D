@@ -16,14 +16,21 @@ from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
     train_pixel_classifier,
     run_pixel_classifier_segmentation
 )
+import numpy as np
 import napari
 from ipyfilechooser import FileChooser
 from behav3d.preprocessing.segmentation.cellpose_prediction import (
     run_cellpose_and_sync_metadata,
     run_otsu_threshold_segmentation_from_zarr,
-    run_otsu_and_sync_metadata
+    run_otsu_and_sync_metadata,
 )
-from behav3d.core.metadata import has_dead_channel
+from behav3d.io.images import load_zarr
+from behav3d.core.metadata import (
+    has_dead_channel,
+    detect_organoid_types_from_metadata,
+    detect_immune_cell_types_from_metadata,
+    detect_other_cell_types_from_metadata,
+)
 
 
 class PixelClassifierPanel:
@@ -262,9 +269,12 @@ class PixelClassifierPanel:
             elif cell_type in self.immune_types: default_threshold = 2.5
             else: default_threshold = 1.0
             saved_threshold = pc.get(f"{cell_type}_edt_threshold", default_threshold)
-            self.edt_thresholds[cell_type] = widgets.FloatText(
+            self.edt_thresholds[cell_type] = widgets.BoundedFloatText(
                 description=f"{cell_type.capitalize()} EDT:",
                 value=float(saved_threshold),
+                min=0.1,
+                max=50.0,
+                step=0.5,
                 style={'description_width': '160px'},
             )
     
@@ -293,17 +303,23 @@ class PixelClassifierPanel:
             
             # Segment size min
             saved_size = pc.get(f"{cell_type}_segment_size_min", default_size)
-            self.segment_size_mins[cell_type] = widgets.IntText(
+            self.segment_size_mins[cell_type] = widgets.BoundedIntText(
                 description=f"{cell_type.capitalize()} min size:",
                 value=int(saved_size),
+                min=1,
+                max=100000,
+                step=10,
                 style={'description_width': '160px'},
             )
             
             # Opening nr pixels
             saved_opening = pc.get(f"{cell_type}_opening_nr_pixels", default_opening)
-            self.opening_nr_pixels[cell_type] = widgets.IntText(
+            self.opening_nr_pixels[cell_type] = widgets.BoundedIntText(
                 description=f"{cell_type.capitalize()} opening px:",
                 value=int(saved_opening),
+                min=0,
+                max=10,
+                step=1,
                 style={'description_width': '160px'},
             )
             
@@ -427,15 +443,27 @@ class PixelClassifierPanel:
         except Exception: pass
 
     def _get_current_params(self):
-        """Collect current parameter values from widgets into a dict"""
+        """Collect current parameter values and widget limits into a dict"""
         params = {}
         for cell_type in self.all_cell_types:
             if cell_type in self.edt_thresholds:
-                params[f"{cell_type}_edt_threshold"] = float(self.edt_thresholds[cell_type].value)
+                w = self.edt_thresholds[cell_type]
+                params[f"{cell_type}_edt_threshold"] = float(w.value)
+                params[f"{cell_type}_edt_min"] = float(w.min)
+                params[f"{cell_type}_edt_max"] = float(w.max)
+                params[f"{cell_type}_edt_step"] = float(w.step)
             if cell_type in self.segment_size_mins:
-                params[f"{cell_type}_segment_size_min"] = int(self.segment_size_mins[cell_type].value)
+                w = self.segment_size_mins[cell_type]
+                params[f"{cell_type}_segment_size_min"] = int(w.value)
+                params[f"{cell_type}_segment_size_min_limit"] = int(w.min)
+                params[f"{cell_type}_segment_size_max_limit"] = int(w.max)
+                params[f"{cell_type}_segment_size_step"] = int(w.step)
             if cell_type in self.opening_nr_pixels:
-                params[f"{cell_type}_opening_nr_pixels"] = int(self.opening_nr_pixels[cell_type].value)
+                w = self.opening_nr_pixels[cell_type]
+                params[f"{cell_type}_opening_nr_pixels"] = int(w.value)
+                params[f"{cell_type}_opening_min"] = int(w.min)
+                params[f"{cell_type}_opening_max"] = int(w.max)
+                params[f"{cell_type}_opening_step"] = int(w.step)
             if cell_type in self.fill_holes:
                 params[f"{cell_type}_fill_holes"] = bool(self.fill_holes[cell_type].value)
         return params
@@ -1043,3 +1071,232 @@ class DeadMaskPanel:
 
     def display(self):
         display(self.ui)
+
+
+class SegmentationVisualizationPanel:
+    """Panel for visualizing segmentation results (pixel classifier, Cellpose, Otsu, …) in Napari."""
+
+    _CHANNEL_COLORS = (
+        "cyan", "yellow", "red", "green", "magenta", "blue",
+        "gray", "turbo", "viridis", "plasma", "inferno", "twilight",
+    )
+
+    def __init__(self, metadata_loader):
+        self.metadata_loader = metadata_loader
+        self._viewer = None
+
+        self._status = widgets.HTML("<b>Waiting for metadata…</b>")
+        self._refresh_btn = widgets.Button(
+            description="Refresh",
+            tooltip="Reload sample list from metadata",
+        )
+        self._refresh_btn.on_click(self._on_refresh_clicked)
+
+        self.sample_dropdown = widgets.Dropdown(
+            options=[],
+            value=None,
+            description="Sample:",
+            layout=widgets.Layout(width="350px"),
+            disabled=True,
+        )
+
+        self.use_range = widgets.Checkbox(
+            description="Use custom time range",
+            value=False,
+            indent=False,
+        )
+        self.start_t = widgets.IntText(value=0, description="Start T:", layout=widgets.Layout(width="180px"))
+        self.end_t   = widgets.IntText(value=2, description="End T:",   layout=widgets.Layout(width="180px"))
+        self.range_box = widgets.HBox([self.start_t, self.end_t])
+        self.range_box.layout.display = "none"
+        self.use_range.observe(
+            lambda ch: setattr(self.range_box.layout, "display", "flex" if ch["new"] else "none"),
+            names="value",
+        )
+
+        self.open_button = widgets.Button(
+            description="Visualize segmentation results",
+            button_style="primary",
+            icon="eye",
+            layout=widgets.Layout(width="max-content"),
+            disabled=True,
+        )
+        self.close_button = widgets.Button(
+            description="Close viewer",
+            button_style="danger",
+            icon="stop",
+            layout=widgets.Layout(width="max-content", display="none"),
+        )
+        self.msg = widgets.Output()
+
+        self.open_button.on_click(self._on_open_clicked)
+        self.close_button.on_click(self._on_close_clicked)
+
+        self._panel = widgets.VBox([
+            widgets.HBox([self._status, self._refresh_btn]),
+            self.sample_dropdown,
+            self.use_range,
+            self.range_box,
+            widgets.HBox([self.open_button, self.close_button]),
+            self.msg,
+        ])
+        self._maybe_build_from_loader()
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+    @property
+    def ui(self):
+        return self._panel
+
+    def display(self):
+        display(self._panel)
+
+    # ------------------------------------------------------------------
+    # Core viewer logic
+    # ------------------------------------------------------------------
+    def open_viewer(self):
+        """Build mask list from metadata and launch Napari."""
+        sample_name = self.sample_dropdown.value
+        time_range  = (int(self.start_t.value), int(self.end_t.value)) if self.use_range.value else None
+        metadata    = self.metadata_loader.metadata
+        output_dir  = Path(self.metadata_loader.output_dir)
+
+        with self.msg:
+            self.msg.clear_output()
+            try:
+                print(f"Sample: {sample_name}")
+                print(f"Timepoint range: {time_range}")
+
+                raw_image_zarr = output_dir / "images" / sample_name / f"{sample_name}.zarr"
+
+                # ---- collect mask paths from metadata ----
+                mask_files = {}
+                organoid_types = detect_organoid_types_from_metadata(metadata)
+                immune_types   = detect_immune_cell_types_from_metadata(metadata)
+                other_types    = detect_other_cell_types_from_metadata(metadata)
+                print(f"Detected cell types – Organoids: {organoid_types}, Immune: {immune_types}, Other: {other_types}")
+
+                sample_row = metadata[metadata["sample_name"] == sample_name]
+                if sample_row.empty:
+                    print(f"[Warning] '{sample_name}' not found in metadata")
+                else:
+                    row = sample_row.iloc[0]
+                    for cell_type, prefix in (
+                        [(ct, "or") for ct in organoid_types]
+                        + [(ct, "im") for ct in immune_types]
+                        + [(ct, "ot") for ct in other_types]
+                    ):
+                        col = f"{prefix}_{cell_type}_segments_image_path"
+                        if col in metadata.columns:
+                            p = row.get(col)
+                            if p and not pd.isna(p):
+                                mask_files[f"{cell_type}_segments"] = Path(p)
+
+                    if has_dead_channel(metadata) and "dead_mask_path" in metadata.columns:
+                        p = row.get("dead_mask_path")
+                        if p and not pd.isna(p):
+                            mask_files["mask_dead"] = Path(p)
+
+                if not mask_files:
+                    # Fallback: scan directory for any *_segments.zarr
+                    sample_dir = output_dir / "images" / sample_name
+                    if sample_dir.exists():
+                        for zarr_path in sample_dir.glob("*_segments.zarr"):
+                            name = zarr_path.stem.replace(f"{sample_name}_", "").replace("_segments", "")
+                            mask_files[f"{name}_segments"] = zarr_path
+                        dead = sample_dir / f"{sample_name}_mask_dead.zarr"
+                        if dead.exists():
+                            mask_files["mask_dead"] = dead
+
+                for name, path in mask_files.items():
+                    print(f"Segments/Mask '{name}': {path}")
+
+                # ---- load arrays ----
+                loaded_masks = {}
+                for name, path in mask_files.items():
+                    if path.exists():
+                        loaded_masks[name] = load_zarr(path)
+                    else:
+                        print(f"[Warning] Segments/Mask '{name}' not found: {path}")
+
+                img_arr = load_zarr(raw_image_zarr)
+                print(f"Image shape: {img_arr.shape}")
+
+                # ---- time slicing ----
+                if time_range is not None:
+                    s, e = time_range
+                    s = max(0, min(s, img_arr.shape[0] - 1))
+                    e = max(s,  min(e, img_arr.shape[0] - 1))
+                    print(f"Slicing T={s}…{e}")
+                    img_arr = img_arr[s:e + 1]
+                    loaded_masks = {k: v[s:e + 1] for k, v in loaded_masks.items()}
+
+                img_np = np.asarray(img_arr)
+                loaded_masks = {k: np.asarray(v) for k, v in loaded_masks.items()}
+
+                # ---- build viewer ----
+                if self._viewer is not None:
+                    try:
+                        self._viewer.close()
+                    except Exception:
+                        pass
+
+                viewer = napari.Viewer()
+
+                if img_np.ndim != 5:
+                    raise ValueError(f"Expected (T,C,Z,Y,X), got {img_np.shape}")
+
+                T, C, Z, Y, X = img_np.shape
+                for ch in range(C):
+                    viewer.add_image(
+                        img_np[:, ch],
+                        name=f"channel_{ch}",
+                        colormap=self._CHANNEL_COLORS[ch] if ch < len(self._CHANNEL_COLORS) else "gray",
+                        scale=(1, 1, 1, 1),
+                        blending="additive",
+                        opacity=0.8,
+                        channel_axis=None,
+                    )
+
+                for name, mask_np in loaded_masks.items():
+                    print(f"Adding layer '{name}'…")
+                    viewer.add_labels(mask_np, name=name, scale=(1, 1, 1, 1), blending="additive", opacity=0.8)
+
+                if not loaded_masks:
+                    print("No segments/mask layers added.")
+
+                napari.run()
+                self._viewer = viewer
+                self.close_button.layout.display = "inline-block"
+
+            except Exception:
+                traceback.print_exc()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _maybe_build_from_loader(self):
+        df = getattr(self.metadata_loader, "metadata", None)
+        if isinstance(df, pd.DataFrame) and not df.empty and "sample_name" in df.columns:
+            names = df["sample_name"].astype(str).unique().tolist()
+            self.sample_dropdown.options = names
+            self.sample_dropdown.value   = names[0]
+            self.sample_dropdown.disabled = False
+            self.open_button.disabled     = False
+            self._status.value = "<span style='color:green'>Metadata loaded ✅</span>"
+        else:
+            self._status.value = "<b>Waiting for metadata…</b>"
+            self.sample_dropdown.disabled = True
+            self.open_button.disabled     = True
+
+    def _on_open_clicked(self, _):    self.open_viewer()
+    def _on_refresh_clicked(self, _): self._maybe_build_from_loader()
+    def _on_close_clicked(self, _):
+        with self.msg:
+            try:
+                if self._viewer:
+                    self._viewer.close()
+                    self._viewer = None
+            finally:
+                self.close_button.layout.display = "none"
