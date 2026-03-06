@@ -73,7 +73,7 @@ def run_organoid_analysis(
     df_tracks["TrackID"] = df_tracks["TrackID"].astype(str)
     
     # Check if dead channel data exists in tracks
-    dead_columns = ["nr_dead_mask_pixels", "percentage_dead_mask", "mean_dead_dye"]
+    dead_columns = ["nr_dead_mask_pixels", "percentage_dead_mask"]
     has_dead_data = all(col in df_tracks.columns for col in dead_columns)
     
     if not has_dead_data:
@@ -105,14 +105,17 @@ def run_organoid_analysis(
             groupby=["TrackID", "sample_name"]
         )
     
-    df_tracks["smoothed_mean_dead_dye"] = smooth_value_over_time(
-            df_tracks, 
-            column="mean_dead_dye", 
-            rolling_meanspeed_window=20,
-            min_periods=20,
-            groupby=["TrackID", "sample_name"]
-        )
-    
+    if "mean_dead_dye" in df_tracks.columns:
+        df_tracks["smoothed_mean_dead_dye"] = smooth_value_over_time(
+                df_tracks,
+                column="mean_dead_dye",
+                rolling_meanspeed_window=20,
+                min_periods=20,
+                groupby=["TrackID", "sample_name"]
+            )
+    else:
+        df_tracks["smoothed_mean_dead_dye"] = np.nan
+
     df_tracks["dead"] = (df_tracks["smoothed_percentage_dead_mask"] > dead_perc_threshold)
     df_tracks["dead"] = df_tracks.groupby(["sample_name","TrackID"])["dead"].transform(lambda x: x.cummax())
 

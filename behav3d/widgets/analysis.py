@@ -1,5 +1,6 @@
 import ipywidgets as widgets
 from pathlib import Path
+import fnmatch 
 import os
 import yaml
 import traceback
@@ -14,12 +15,13 @@ from .utils import (
     _cfg_get, 
     spinning_loader,
     detect_cell_type_category,
-    _DEFAULT_CONFIG
+    _DEFAULT_CONFIG,
+    behav3d_calculated_features
 )
 from behav3d.core.utils import expand_column_patterns
 from behav3d.io.formats.zarr import load_zarr
 from behav3d.io.images import load_image
-from behav3d.features.timepoint_features import run_feature_extraction
+from behav3d.features._timepoint_features import run_feature_extraction
 from behav3d.analysis.tcell_analysis import (
     filter_cell_tracks,
     run_tcell_analysis
@@ -36,8 +38,8 @@ from behav3d.analysis import summarize_track_features
 from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
 from behav3d.analysis.interaction_analysis import run_interaction_analysis
 
-# Fallback for default features
-try:
+# Fallback for default features: behav3d_calculated_features is now imported from .utils
+'''try:
     from behav3d.defaults import behav3d_calculated_features
 except ImportError:
     behav3d_calculated_features = {
@@ -47,7 +49,7 @@ except ImportError:
         "contact": ["*_contact", "*_distance"],
         "death": ["mean_dead_dye", "percentage_dead_mask"],
         "active_killing": ["is_active_killing", "killing_efficiency"]
-    }
+    }'''
 
 class FeatureExtractionPanel:
     """
@@ -1515,21 +1517,38 @@ class MotileCellAnalysisPanel:
         df_p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
         if not df_p.exists(): df_p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features.csv")
         
-        cols = []
+        self._no_csv = False
+        valid_cols = []
         if df_p.exists():
-            try: cols = pd.read_csv(df_p, nrows=0).columns.tolist()
-            except Exception: pass
+            try:
+                df_head = pd.read_csv(df_p, nrows=10)
+                # Only keep numeric/bool columns; always omit touching_* (string TrackID lists)
+                valid_cols = [
+                    c for c in df_head.columns
+                    if (pd.api.types.is_numeric_dtype(df_head[c]) or pd.api.types.is_bool_dtype(df_head[c]))
+                    and not c.startswith("touching_")
+                ]
+            except Exception:
+                valid_cols = []
         
-        # Filter groups based on actual columns
-        if cols:
+        # Filter groups: only show features that actually exist in the CSV and are numeric/bool
+        if valid_cols:
             expanded = {}
             for g, patterns in groups.items():
                 matches = []
                 for p in patterns:
-                    if '*' in p or '?' in p: matches.extend(expand_column_patterns(p, cols))
-                    elif p in cols: matches.append(p)
-                if matches: expanded[g] = sorted(set(matches))
+                    if '*' in p or '?' in p:
+                        # Only add columns that actually match — drop pattern silently if no match
+                        matches.extend([c for c in valid_cols if fnmatch.fnmatchcase(c, p)])
+                    elif p in valid_cols:
+                        matches.append(p)
+                if matches:
+                    expanded[g] = sorted(set(matches))
             groups = expanded
+        else:
+            # No CSV found or no valid columns
+            groups = {}
+            self._no_csv = True
 
         self.seed_widget = widgets.IntText(description="Seed", value=int(self._panel_cfg.get("seed", 42)), style={"description_width": "80px"})
         
@@ -1561,14 +1580,29 @@ class MotileCellAnalysisPanel:
         self.spinner_html.layout.display = "none"
         self.out = widgets.Output()
         
+        # Build feature selector or warning
+        if self._no_csv:
+            feature_section = widgets.HTML(
+                '<div style="color:#856404;background:#fff3cd;border:1px solid #ffc107;'
+                'padding:10px;border-radius:4px;margin:6px 0;">'
+                '<b>⚠️ No feature CSV found.</b> Run feature extraction first so that '
+                'available features can be detected from your data.</div>'
+            )
+        else:
+            feature_section = widgets.VBox(sel_boxes) if sel_boxes else widgets.HTML(
+                '<div style="color:#856404;background:#fff3cd;border:1px solid #ffc107;'
+                'padding:10px;border-radius:4px;margin:6px 0;">'
+                '<b>⚠️ No matching features found in CSV.</b></div>'
+            )
+
         self.ui = widgets.VBox([
             widgets.HTML(f'<div style="font-size:22px;font-weight:700;">{self.cell_type} behavioral analysis</div>'),
             self.seed_widget, widgets.HTML('<b>Select features for DTW:</b>'),
-            widgets.VBox(sel_boxes),
+            feature_section,
             widgets.HBox([self.umap_dist, self.umap_neigh, self.clusters]),
             widgets.HBox([self.btn_run, self.spinner_html]), self.out
         ])
-
+        
     def _on_run_clicked(self, *_):
         sel = [cb.description for r in self._group_rows.values() for cb in r["child_cbs"] if cb.value]
         if not sel: return

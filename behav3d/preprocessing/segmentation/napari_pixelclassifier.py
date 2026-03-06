@@ -8,8 +8,8 @@ import shutil
 
 import napari
 from magicgui import magicgui
-from magicgui.widgets import PushButton, FloatSlider
-from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout, QApplication, QLabel, QCheckBox
+from magicgui.widgets import PushButton
+from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout, QApplication, QLabel, QCheckBox, QDoubleSpinBox, QSpinBox, QPushButton as QtPushButton
 
 from aicspylibczi import CziFile
 
@@ -924,7 +924,8 @@ def train_pixel_classifier(
             name=channel_name, 
             contrast_limits=contrast_limits,
             colormap=channel_colors[ch] if ch < len(channel_colors) else 'gray',
-            blending='additive'  # This allows channels to blend together
+            blending='additive', # This allows channels to blend together
+            opacity=0.8
         )
         img_layer.contrast_limits_range = (0, float(channel_data.max()))
 
@@ -974,15 +975,18 @@ def train_pixel_classifier(
     
     # Add all user label layers to viewer
     for name, data in user_layers.items():
-        layer = viewer.add_labels(data, name=name, opacity=0.3)
+        layer = viewer.add_labels(data, name=name, opacity=0.8)
+        layer.blending = 'additive'
     
     # Add all pixel classification layers to viewer
     for name, data in pixelclass_layers.items():
-        layer = viewer.add_labels(data, name=name, opacity=0.3, visible=False)
+        layer = viewer.add_labels(data, name=name, opacity=0.8, visible=False)
+        layer.blending = 'additive'
    
     # Add all segment layers to viewer
     for name, data in segment_layers.items():
-        viewer.add_labels(data, name=name, opacity=0.7, visible=False)
+        layer = viewer.add_labels(data, name=name, opacity=0.8, visible=False)
+        layer.blending = 'additive'
 
     log_output = QPlainTextEdit()
     log_output.setReadOnly(True)
@@ -1005,16 +1009,16 @@ def train_pixel_classifier(
                 auto_call=False
     )
     
-    # Create dynamic sliders for all cell types (organoids, immune, other)
-    # Store sliders in dictionaries organized by parameter type
-    edt_sliders = {}
-    segment_size_sliders = {}
-    opening_sliders = {}
+    # Create dynamic spinboxes for all cell types (organoids, immune, other)
+    # Store spinboxes in dictionaries organized by parameter type
+    edt_spinboxes = {}
+    segment_size_spinboxes = {}
+    opening_spinboxes = {}
     fill_holes_checkboxes = {}
     
-    # Helper function to add sliders for a cell type
-    def add_cell_type_sliders(cell_type, category):
-        """Add all parameter sliders for a given cell type"""
+    # Helper function to add spinboxes for a cell type
+    def add_cell_type_spinboxes(cell_type, category):
+        """Add all parameter spinboxes for a given cell type"""
         # Default values based on category
         if category == 'organoid':
             default_edt = 12.0
@@ -1039,44 +1043,52 @@ def train_pixel_classifier(
             default_opening = initial_params.get(f"{cell_type}_opening_nr_pixels", default_opening)
             default_fill_holes = initial_params.get(f"{cell_type}_fill_holes", default_fill_holes)
         
-        # EDT threshold slider
+        # Read spinbox limits from initial_params (fall back to defaults per category)
+        edt_min = float(initial_params.get(f"{cell_type}_edt_min", 0.1)) if initial_params else 0.1
+        edt_max = float(initial_params.get(f"{cell_type}_edt_max", 50.0)) if initial_params else 50.0
+        edt_step = float(initial_params.get(f"{cell_type}_edt_step", 0.5)) if initial_params else 0.5
+        size_min = int(initial_params.get(f"{cell_type}_segment_size_min_limit", 1)) if initial_params else 1
+        size_max = int(initial_params.get(f"{cell_type}_segment_size_max_limit", 100000)) if initial_params else 100000
+        size_step = int(initial_params.get(f"{cell_type}_segment_size_step", 10)) if initial_params else 10
+        opening_min = int(initial_params.get(f"{cell_type}_opening_min", 0)) if initial_params else 0
+        opening_max = int(initial_params.get(f"{cell_type}_opening_max", 10)) if initial_params else 10
+        opening_step = int(initial_params.get(f"{cell_type}_opening_step", 1)) if initial_params else 1
+        
+        # EDT threshold spinbox
         label = QLabel(f"{cell_type} EDT threshold")
         gui.native.layout().addWidget(label)
-        edt_slider = FloatSlider(
-            value=default_edt,
-            min=0.5,
-            max=20.0,
-            step=0.5,
-            name=f"{cell_type}_edt_threshold"
-        )
-        edt_sliders[cell_type] = edt_slider
-        gui.native.layout().addWidget(edt_slider.native)
+        edt_spinbox = QDoubleSpinBox()
+        edt_spinbox.setMinimum(edt_min)
+        edt_spinbox.setMaximum(edt_max)
+        edt_spinbox.setSingleStep(edt_step)
+        edt_spinbox.setValue(default_edt)
+        edt_spinbox.setObjectName(f"{cell_type}_edt_threshold")
+        edt_spinboxes[cell_type] = edt_spinbox
+        gui.native.layout().addWidget(edt_spinbox)
         
-        # Segment size min slider
+        # Segment size min spinbox
         label = QLabel(f"{cell_type} min segment size")
         gui.native.layout().addWidget(label)
-        segment_size_slider = FloatSlider(
-            value=float(default_segment_size),
-            min=1.0,
-            max=5000.0,
-            step=10.0,
-            name=f"{cell_type}_segment_size_min"
-        )
-        segment_size_sliders[cell_type] = segment_size_slider
-        gui.native.layout().addWidget(segment_size_slider.native)
+        segment_size_spinbox = QSpinBox()
+        segment_size_spinbox.setMinimum(size_min)
+        segment_size_spinbox.setMaximum(size_max)
+        segment_size_spinbox.setSingleStep(size_step)
+        segment_size_spinbox.setValue(int(default_segment_size))
+        segment_size_spinbox.setObjectName(f"{cell_type}_segment_size_min")
+        segment_size_spinboxes[cell_type] = segment_size_spinbox
+        gui.native.layout().addWidget(segment_size_spinbox)
         
-        # Opening pixels slider
+        # Opening pixels spinbox
         label = QLabel(f"{cell_type} opening pixels")
         gui.native.layout().addWidget(label)
-        opening_slider = FloatSlider(
-            value=float(default_opening),
-            min=0.0,
-            max=10.0,
-            step=1.0,
-            name=f"{cell_type}_opening_nr_pixels"
-        )
-        opening_sliders[cell_type] = opening_slider
-        gui.native.layout().addWidget(opening_slider.native)
+        opening_spinbox = QSpinBox()
+        opening_spinbox.setMinimum(opening_min)
+        opening_spinbox.setMaximum(opening_max)
+        opening_spinbox.setSingleStep(opening_step)
+        opening_spinbox.setValue(int(default_opening))
+        opening_spinbox.setObjectName(f"{cell_type}_opening_nr_pixels")
+        opening_spinboxes[cell_type] = opening_spinbox
+        gui.native.layout().addWidget(opening_spinbox)
         
         # Fill holes checkbox
         fill_holes_cb = QCheckBox(f"{cell_type} fill holes")
@@ -1085,35 +1097,35 @@ def train_pixel_classifier(
         fill_holes_checkboxes[cell_type] = fill_holes_cb
         gui.native.layout().addWidget(fill_holes_cb)
     
-    # Add sliders for all cell types
+    # Add spinboxes for all cell types
     for organoid_type in organoid_types:
-        add_cell_type_sliders(organoid_type, 'organoid')
+        add_cell_type_spinboxes(organoid_type, 'organoid')
     
     for immune_type in immune_types:
-        add_cell_type_sliders(immune_type, 'immune')
+        add_cell_type_spinboxes(immune_type, 'immune')
     
     for other_type in other_types:
-        add_cell_type_sliders(other_type, 'other')
+        add_cell_type_spinboxes(other_type, 'other')
     
     # Override the call behavior to include all parameters
     def custom_call(*args, **kwargs):
-        """Custom call function that collects all parameters from sliders"""
+        """Custom call function that collects all parameters from spinboxes"""
         print("Custom call function triggered")  # Debug
         
         # Collect all parameters
         all_params = {}
         
         # EDT thresholds
-        for cell_type, slider in edt_sliders.items():
-            all_params[f"{cell_type}_edt_threshold"] = slider.value
+        for cell_type, spinbox in edt_spinboxes.items():
+            all_params[f"{cell_type}_edt_threshold"] = spinbox.value()
         
         # Segment size mins
-        for cell_type, slider in segment_size_sliders.items():
-            all_params[f"{cell_type}_segment_size_min"] = int(slider.value)
+        for cell_type, spinbox in segment_size_spinboxes.items():
+            all_params[f"{cell_type}_segment_size_min"] = int(spinbox.value())
         
         # Opening pixels
-        for cell_type, slider in opening_sliders.items():
-            all_params[f"{cell_type}_opening_nr_pixels"] = int(slider.value)
+        for cell_type, spinbox in opening_spinboxes.items():
+            all_params[f"{cell_type}_opening_nr_pixels"] = int(spinbox.value())
         
         # Fill holes
         for cell_type, checkbox in fill_holes_checkboxes.items():
@@ -1164,6 +1176,25 @@ def train_pixel_classifier(
     )
     save_button.clicked.connect(save_function)
     gui.native.layout().addWidget(save_button.native)
+
+    # Add "Clear Labels" buttons per user label layer
+    gui.native.layout().addWidget(QLabel("--- Clear Labels ---"))
+    
+    if has_death:
+        clear_dead_btn = QtPushButton("Clear Labels: Dead")
+        def _make_clear_fn(layer_name):
+            def _clear():
+                lyr = viewer.layers[layer_name]
+                lyr.data = np.zeros_like(lyr.data)
+            return _clear
+        clear_dead_btn.clicked.connect(_make_clear_fn('User Provided Labels (Dead)'))
+        gui.native.layout().addWidget(clear_dead_btn)
+    
+    for cell_type in all_cell_types:
+        layer_name = f'User Provided Labels ({cell_type.capitalize()})'
+        clear_btn = QtPushButton(f"Clear Labels: {cell_type.capitalize()}")
+        clear_btn.clicked.connect(_make_clear_fn(layer_name))
+        gui.native.layout().addWidget(clear_btn)
 
     #napari.run()
     return viewer

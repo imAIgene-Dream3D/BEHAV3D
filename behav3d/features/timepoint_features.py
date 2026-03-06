@@ -406,22 +406,27 @@ def run_feature_extraction(
         else:
             print(f"{get_current_time()} - Skipping movement features as not requested in features_choice")
             
-        if "contact" in features_choice:
+        if "death" in features_choice:
             # Calculate death features if threshold specified and dead_channel exists
             if dead_mask_percentage_threshold is not None and dead_channel is not None and pd.notna(dead_channel):
                 print(f"{get_current_time()} - Calculating cell death based on dead_mask_percentage_threshold {dead_mask_percentage_threshold}")
                 df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
             
-            # Calculate active contact for any cell type with same-type contacts
-            touching_col = f'touching_{cell_type}s'
-            if touching_col in df_tracks.columns:
-                print(f"{get_current_time()} - Calculating active contact features for {cell_type}...")
-                df_tracks = calculate_active_contact_features(
-                    df_tracks,
-                    cell_type=cell_type
-                )
-            else:
-                print(f"{get_current_time()} - No same-type contacts found for {cell_type}, skipping active_contact calculation")
+        if "contact" in features_choice:    
+            # Calculate active contact for ALL cell types that have touching columns
+            for col in df_tracks.columns:
+                if col.startswith('touching_') and col.endswith('s'):
+                    # Extract target cell type from column name
+                    target_type = col[len('touching_'):-1]
+                    contact_col = f'{target_type}_contact'
+                    if contact_col in df_tracks.columns:
+                        print(f"{get_current_time()} - Calculating active contact features for {cell_type} vs {target_type}...")
+                        df_tracks = calculate_active_contact_features(
+                            df_tracks,
+                            cell_type=target_type
+                        )
+                    else:
+                        print(f"{get_current_time()} - Skipping active contact for {target_type}: no {contact_col} column found")
        
             
         tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
@@ -1286,7 +1291,7 @@ def calculate_segment_intensity(segments, intensity_image, calculation="mean"):
     column_mapping = {}
     for i in range(df_intensity.shape[1]):
         old_col_name = f'intensity_mean-{i}'
-        new_col_name = f'mean_intensity_ch{i+1}'
+        new_col_name = f'mean_intensity_ch{i}'
         column_mapping[old_col_name] = new_col_name
     column_mapping["label"]="TrackID"
     df_intensity=df_intensity.rename(columns=column_mapping)
