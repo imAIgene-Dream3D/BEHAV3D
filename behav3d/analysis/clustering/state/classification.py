@@ -7,6 +7,7 @@ import copy
 import warnings
 import re
 import time
+from itertools import combinations
 from matplotlib.backends.backend_pdf import PdfPages
 from dataclasses import asdict, dataclass
 
@@ -82,24 +83,201 @@ def _binary_col_to_group_name(col: str) -> str:
     return name
 
 
-def _assign_binary_group_labels(df: pd.DataFrame, binary_cols: list[str]) -> pd.Series:
+def _binary_value_is_active(val) -> bool:
+    if pd.isna(val):
+        return False
+    try:
+        return float(val) == 1.0
+    except Exception:
+        return False
+
+
+def _active_binary_groups_from_row(row, binary_cols: list[str]) -> list[str]:
+    active = []
+    for col in binary_cols:
+        if _binary_value_is_active(row[col]):
+            active.append(_binary_col_to_group_name(col))
+    return active
+
+
+def _binary_groups_to_label(active_groups: list[str]) -> str:
+    if len(active_groups) == 0:
+        return "no_contact"
+    if len(active_groups) == 1:
+        return str(active_groups[0])
+    return "_and_".join([str(x) for x in active_groups])
+
+
+def _infer_binary_group_constraints(df: pd.DataFrame, binary_cols: list[str]) -> dict:
+    """Infer allowed binary groups and forbidden binary pairs from train-time data."""
+    cols = [str(c) for c in list(binary_cols or []) if str(c) in df.columns]
+    clean_cols = [_binary_col_to_group_name(c) for c in cols]
+
+    if len(cols) == 0:
+        return {
+            "inference_rule": "exact_zero_cooccurrence",
+            "binary_cols": [],
+            "binary_group_names": [],
+            "allowed_binary_groups": ["no_contact"],
+            "forbidden_binary_pairs": [],
+            "support_counts": {},
+        }
+
+    support_counts = {name: 0 for name in clean_cols}
+    cooccur_counts = {}
+    allowed_groups = set()
+
+    for _, row in df[cols].iterrows():
+        active = _active_binary_groups_from_row(row, cols)
+        allowed_groups.add(_binary_groups_to_label(active))
+        for grp in active:
+            support_counts[grp] = int(support_counts.get(grp, 0)) + 1
+        for left, right in combinations(active, 2):
+            pair = tuple(sorted((str(left), str(right))))
+            cooccur_counts[pair] = int(cooccur_counts.get(pair, 0)) + 1
+
+    forbidden_pairs = []
+    for i, left in enumerate(clean_cols):
+        if int(support_counts.get(left, 0)) <= 0:
+            continue
+        for right in clean_cols[i + 1 :]:
+            if int(support_counts.get(right, 0)) <= 0:
+                continue
+            pair = tuple(sorted((str(left), str(right))))
+            if int(cooccur_counts.get(pair, 0)) == 0:
+                forbidden_pairs.append([pair[0], pair[1]])
+
+    return {
+        "inference_rule": "exact_zero_cooccurrence",
+        "binary_cols": list(cols),
+        "binary_group_names": list(clean_cols),
+        "allowed_binary_groups": sorted([str(x) for x in allowed_groups], key=_mixed_label_sort_key),
+        "forbidden_binary_pairs": sorted(
+            [[str(p[0]), str(p[1])] for p in forbidden_pairs],
+            key=lambda x: (x[0], x[1]),
+        ),
+        "support_counts": {str(k): int(v) for k, v in support_counts.items()},
+    }
+
+
+def _normalize_binary_group_constraints(binary_group_constraints):
+    if binary_group_constraints is None:
+        return None
+    if not isinstance(binary_group_constraints, dict):
+        raise ValueError(
+            "binary_group_constraints must be a dict when provided."
+        )
+
+    allowed_raw = binary_group_constraints.get("allowed_binary_groups", None)
+    forbidden_raw = binary_group_constraints.get("forbidden_binary_pairs", None)
+    if allowed_raw is None and forbidden_raw is None:
+        return None
+
+    allowed_set = None
+    if allowed_raw is not None:
+        if not isinstance(allowed_raw, list):
+            raise ValueError(
+                "binary_group_constraints['allowed_binary_groups'] must be a list."
+            )
+        allowed_set = set([str(x) for x in allowed_raw])
+
+    forbidden_set = set()
+    if forbidden_raw is not None:
+        if not isinstance(forbidden_raw, list):
+            raise ValueError(
+                "binary_group_constraints['forbidden_binary_pairs'] must be a list."
+            )
+        for item in forbidden_raw:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError(
+                    "binary_group_constraints['forbidden_binary_pairs'] entries must be length-2 lists/tuples."
+                )
+            left = str(item[0])
+            right = str(item[1])
+            if left == right:
+                continue
+            forbidden_set.add(tuple(sorted((left, right))))
+
+    return {
+        "allowed_binary_groups": allowed_set,
+        "forbidden_binary_pairs": forbidden_set,
+    }
+
+
+def _assign_binary_group_labels(
+    df: pd.DataFrame,
+    binary_cols: list[str],
+    binary_group_constraints=None,
+    enforce_binary_group_constraints: bool = False,
+) -> pd.Series:
     """Build a single categorical group label from binary indicator columns."""
     if len(binary_cols) == 0:
+        if enforce_binary_group_constraints and binary_group_constraints is not None:
+            normalized = _normalize_binary_group_constraints(binary_group_constraints)
+            if normalized is not None:
+                allowed = normalized.get("allowed_binary_groups", None)
+                if allowed is not None and "no_contact" not in allowed:
+                    raise ValueError(
+                        "Binary group constraints violated: 'no_contact' is required for empty binary_cols."
+                    )
         return pd.Series(["no_contact"] * len(df), index=df.index, dtype="object")
 
+    normalized_constraints = None
+    if binary_group_constraints is not None:
+        normalized_constraints = _normalize_binary_group_constraints(binary_group_constraints)
+
     labels = []
+    forbidden_hits = {}
+    unknown_hits = {}
     for _, row in df[binary_cols].iterrows():
-        active = []
-        for col in binary_cols:
-            val = row[col]
-            if pd.notna(val) and float(val) == 1.0:
-                active.append(_binary_col_to_group_name(col))
-        if len(active) == 0:
-            labels.append("no_contact")
-        elif len(active) == 1:
-            labels.append(active[0])
-        else:
-            labels.append("_and_".join(active))
+        active = _active_binary_groups_from_row(row, binary_cols)
+        label = _binary_groups_to_label(active)
+        labels.append(label)
+
+        if not enforce_binary_group_constraints or normalized_constraints is None:
+            continue
+
+        row_idx = str(row.name)
+        forbidden_pairs = normalized_constraints.get("forbidden_binary_pairs", set())
+        for left, right in combinations(active, 2):
+            pair = tuple(sorted((str(left), str(right))))
+            if pair in forbidden_pairs:
+                hit = forbidden_hits.setdefault(
+                    pair,
+                    {"count": 0, "first_index": row_idx},
+                )
+                hit["count"] = int(hit["count"]) + 1
+
+        allowed_groups = normalized_constraints.get("allowed_binary_groups", None)
+        if allowed_groups is not None and label not in allowed_groups:
+            hit = unknown_hits.setdefault(
+                label,
+                {"count": 0, "first_index": row_idx},
+            )
+            hit["count"] = int(hit["count"]) + 1
+
+    if enforce_binary_group_constraints and (len(forbidden_hits) > 0 or len(unknown_hits) > 0):
+        parts = []
+        if len(forbidden_hits) > 0:
+            pair_msgs = []
+            for pair, info in sorted(forbidden_hits.items(), key=lambda x: (x[0][0], x[0][1])):
+                pair_msgs.append(
+                    f"{pair[0]}+{pair[1]} (n={int(info['count'])}, first_index={info['first_index']})"
+                )
+            parts.append("forbidden_pairs=[" + "; ".join(pair_msgs[:8]) + "]")
+        if len(unknown_hits) > 0:
+            group_msgs = []
+            for group, info in sorted(unknown_hits.items(), key=lambda x: x[0]):
+                group_msgs.append(
+                    f"{group} (n={int(info['count'])}, first_index={info['first_index']})"
+                )
+            parts.append("unknown_binary_groups=[" + "; ".join(group_msgs[:8]) + "]")
+        raise ValueError(
+            "Binary group constraints violated while rebuilding full behavioral clusters. "
+            + " | ".join(parts)
+            + " | This indicates the supplied data contains binary-group combinations not present in training."
+        )
+
     return pd.Series(labels, index=df.index, dtype="object")
 
 
@@ -121,6 +299,8 @@ def _rebuild_full_behavioral_cluster_from_intrinsic(
     adata,
     binary_cols_to_merge,
     intrinsic_col="intrinsic_behavioral_cluster",
+    binary_group_constraints=None,
+    enforce_binary_group_constraints=False,
 ):
     """Rebuild binary_group/full_behavioral_cluster columns from intrinsic cluster labels."""
     if intrinsic_col not in adata.obs.columns:
@@ -130,7 +310,10 @@ def _rebuild_full_behavioral_cluster_from_intrinsic(
     adata.obs = _add_clean_binary_annotation_columns(adata.obs, binary_cols)
     adata.obs["behavioral_clusterid"] = adata.obs[intrinsic_col].astype(str)
     adata.obs["binary_group"] = _assign_binary_group_labels(
-        adata.obs, binary_cols
+        adata.obs,
+        binary_cols,
+        binary_group_constraints=binary_group_constraints,
+        enforce_binary_group_constraints=bool(enforce_binary_group_constraints),
     ).astype("category")
     adata.obs["full_behavioral_cluster"] = (
         adata.obs["binary_group"].astype(str) + "_" + adata.obs["behavioral_clusterid"].astype(str)
@@ -166,11 +349,20 @@ def rename_intrinsic_behavioral_clusters(
             binary_cols_to_merge = list(
                 adata.uns.get("clustering", {}).get("binary_cols_to_merge", [])
             )
+    binary_group_constraints = None
+    enforce_binary_group_constraints = False
+    if isinstance(adata.uns, dict):
+        clustering_meta = adata.uns.get("clustering", {})
+        if isinstance(clustering_meta, dict):
+            binary_group_constraints = clustering_meta.get("binary_group_constraints", None)
+            enforce_binary_group_constraints = isinstance(binary_group_constraints, dict)
 
     return _rebuild_full_behavioral_cluster_from_intrinsic(
         adata=adata,
         binary_cols_to_merge=binary_cols_to_merge,
         intrinsic_col="intrinsic_behavioral_cluster",
+        binary_group_constraints=binary_group_constraints,
+        enforce_binary_group_constraints=enforce_binary_group_constraints,
     )
 
 
@@ -3316,10 +3508,25 @@ def run_state_clustering(
     else:
         raise ValueError("clustering_method must be one of: 'leiden', 'kmeans'.")
 
+    binary_group_constraints = _infer_binary_group_constraints(
+        model_adata.obs,
+        binary_cols_to_merge,
+    )
+    _vinfo(
+        verbose,
+        "state-clustering",
+        (
+            "binary-group constraints inferred | "
+            f"allowed_groups={len(binary_group_constraints.get('allowed_binary_groups', []))}, "
+            f"forbidden_pairs={len(binary_group_constraints.get('forbidden_binary_pairs', []))}"
+        ),
+    )
     _rebuild_full_behavioral_cluster_from_intrinsic(
         adata=model_adata,
         binary_cols_to_merge=binary_cols_to_merge,
         intrinsic_col="intrinsic_behavioral_cluster",
+        binary_group_constraints=binary_group_constraints,
+        enforce_binary_group_constraints=True,
     )
     _vdone(verbose, "state-clustering", "clustering stage", stage_clustering_started)
 
@@ -3427,6 +3634,7 @@ def run_state_clustering(
         "random_state": int(random_state),
         "non_feature_cols": list(non_feature_cols),
         "binary_cols_to_merge": list(binary_cols_to_merge),
+        "binary_group_constraints": copy.deepcopy(dict(binary_group_constraints)),
         "diagnostics_pdf": None if diagnostics_pdf is None else str(diagnostics_pdf),
         "diagnostics_csvs": dict(diagnostics_csvs),
     }
@@ -4211,6 +4419,19 @@ def apply_state_classifiers_to_full_dataset(
             "Re-train classifiers with the updated pipeline."
         )
     binary_cols_to_merge = [str(c) for c in list(binary_cols_to_merge)]
+    binary_group_constraints = clust_meta.get("binary_group_constraints", None)
+    if (binary_group_constraints is not None) and (not isinstance(binary_group_constraints, dict)):
+        raise ValueError(
+            "Classifier artifact pipeline metadata has invalid 'clustering.binary_group_constraints'. "
+            "Re-train classifiers with the updated pipeline."
+        )
+    enforce_binary_group_constraints = (
+        isinstance(binary_group_constraints, dict)
+        and (
+            ("allowed_binary_groups" in binary_group_constraints)
+            or ("forbidden_binary_pairs" in binary_group_constraints)
+        )
+    )
 
     prepared_cache_path = state_paths.prepared_full_adata_path
     legacy_prepared_cache_path = _resolve_legacy_prepared_full_adata_path(
@@ -4348,6 +4569,8 @@ def apply_state_classifiers_to_full_dataset(
             adata=adata_full,
             binary_cols_to_merge=binary_cols_to_merge,
             intrinsic_col="intrinsic_behavioral_cluster",
+            binary_group_constraints=binary_group_constraints,
+            enforce_binary_group_constraints=enforce_binary_group_constraints,
         )
 
     if full_label_classifier_selected is not None and (not full_predicted_in_primary):

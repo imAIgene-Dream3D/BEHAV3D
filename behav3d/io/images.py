@@ -73,7 +73,9 @@ def convert_file_to_zarr(
     path,
     outpath=None,
     chunks=None,
-    overwrite=False
+    overwrite=False,
+    t_start=None,
+    t_end=None,
     ):
     if  (
         (path.suffix == ".zarr" and path.exists()) or 
@@ -84,6 +86,10 @@ def convert_file_to_zarr(
     else:
         print(f"Converting {path} to {outpath}")
         img = load_image(path)
+        # Clip along T axis if requested
+        if t_start is not None and t_end is not None:
+            print(f"  Clipping timepoints: {t_start} to {t_end} (of {img.shape[0]} total)")
+            img = img[t_start:t_end + 1]
         if chunks is None:
             chunks = (1,) + img.shape[1:]
         save_as_zarr(
