@@ -625,21 +625,21 @@ def train_pixel_classifier(
             # Apply postprocessing to user labels before training
             # Extract foreground mask (label 2) for postprocessing
             # Get postprocessing parameters for this cell type
-            opening_nr_pixels = opening_nr_pixels_dict.get(cell_type, 
-                (3 if cell_type in organoid_types else 0))
-            fill_holes = fill_holes_dict.get(cell_type, True)
+            # opening_nr_pixels = opening_nr_pixels_dict.get(cell_type, 
+            #     (3 if cell_type in organoid_types else 0))
+            # fill_holes = fill_holes_dict.get(cell_type, True)
             
-            # Extract foreground mask and postprocess
-            fg_mask = (label_data == 2).astype(bool)
-            if np.any(fg_mask):
-                processed_fg = postprocess_mask(
-                    fg_mask, 
-                    fill_holes=fill_holes, 
-                    opening_nr_pixels=int(opening_nr_pixels)
-                )
-                # Reconstruct labels: background=1, foreground=2
-                label_data = np.where(processed_fg, 2, 
-                                     np.where(label_data == 1, 1, 0)).astype(label_data.dtype)
+            # # Extract foreground mask and postprocess
+            # fg_mask = (label_data == 2).astype(bool)
+            # if np.any(fg_mask):
+            #     processed_fg = postprocess_mask(
+            #         fg_mask, 
+            #         fill_holes=fill_holes, 
+            #         opening_nr_pixels=int(opening_nr_pixels)
+            #     )
+            #     # Reconstruct labels: background=1, foreground=2
+            #     label_data = np.where(processed_fg, 2, 
+            #                          np.where(label_data == 1, 1, 0)).astype(label_data.dtype)
             
             labels_outpath = Path(pixel_class_outdir, f'PixelClassifier_User{cell_type.capitalize()}Labels.zarr')
             # Remove existing zarr to avoid ContainsArrayError
@@ -759,19 +759,6 @@ def train_pixel_classifier(
                 QApplication.processEvents()
                 pred_mask = apply_classifier(classifiers[cell_type], features_outpath, pred_labels_paths[cell_type], n_workers=n_workers)
                 _log_mem(f"after {cell_type} prediction", log)
-                
-                # Get postprocessing parameters for this cell type
-                opening_nr_pixels = opening_nr_pixels_dict.get(cell_type, 
-                    (3 if cell_type in organoid_types else 0))
-                fill_holes = fill_holes_dict.get(cell_type, True)
-                
-                # Convert label mask to binary for postprocessing
-                # pred_mask has labels: 0=background, 1=background_label, 2=foreground
-                # Extract foreground mask (label 2) and postprocess
-                fg_mask = (pred_mask == 2).astype(bool)
-                processed_fg = postprocess_mask(fg_mask, fill_holes=fill_holes, opening_nr_pixels=int(opening_nr_pixels))
-                # Reconstruct labels: keep background labels (1) and update foreground (2)
-                pred_mask = np.where(processed_fg, 2, np.where(pred_mask == 1, 1, 0)).astype(pred_mask.dtype)
 
                 pred_masks[cell_type] = pred_mask
                 viewer.layers[f"Pixel Classification ({cell_type.capitalize()})"].data = pred_mask
@@ -802,6 +789,10 @@ def train_pixel_classifier(
                 (12.0 if cell_type in organoid_types else (2.5 if cell_type in immune_types else 1.0)))
             segment_size_min = segment_size_mins.get(cell_type,
                 (1000 if cell_type in organoid_types else (10 if cell_type in immune_types else 10)))
+              # Get postprocessing parameters for this cell type
+            opening_nr_pixels = opening_nr_pixels_dict.get(cell_type, 
+                (3 if cell_type in organoid_types else 0))
+            fill_holes = fill_holes_dict.get(cell_type, True)
             
             log(f"\n### Segmenting {cell_type.capitalize()} (EDT threshold={edt_threshold}, min_size={segment_size_min})")
             QApplication.processEvents()
@@ -833,6 +824,13 @@ def train_pixel_classifier(
                     log(f"   [T{t_idx+1}] Segmenting via segment_mask()...")
                     QApplication.processEvents()
 
+                    # log(f"\n### Preprocessing {cell_type.capitalize()} classifier mask (opening_nr_pixels={opening_nr_pixels}, fill_holes={fill_holes})")
+                    # Convert label mask to binary for postprocessing
+                    # pred_mask has labels: 0=background, 1=background_label, 2=foreground
+                    # Extract foreground mask (label 2) and postprocess
+                    # fg_mask = (pred_mask == 2).astype(bool)
+                    mask_t = postprocess_mask(mask_t, fill_holes=fill_holes, opening_nr_pixels=int(opening_nr_pixels))
+                
                     segmented = segment_mask(
                         mask=mask_t,
                         edt_thr=edt_threshold,          # first pass threshold
