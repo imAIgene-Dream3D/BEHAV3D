@@ -6,10 +6,10 @@ from scipy.ndimage import distance_transform_edt
 from skimage.draw import ellipsoid
 from skimage.filters import median, threshold_sauvola
 from skimage.morphology import (
-    binary_closing,
-    binary_dilation,
-    binary_erosion,
-    binary_opening,
+    closing,
+    dilation,
+    erosion,
+    opening,
     disk,
 )
 from behav3d.io.images import convert_file_to_zarr, get_image_shape
@@ -97,7 +97,7 @@ def dilate_mask(image, use_dimensions=2, nr_pixels=1):
     """
     img_dim = image.ndim
     k = create_footprint(img_dim, use_dimensions=use_dimensions, nr_pixels=nr_pixels)
-    data_expanded = binary_dilation(image=image, footprint=k)
+    data_expanded = dilation(image=image, footprint=k)
     return(data_expanded)
 
 def erode_mask(image, use_dimensions=2, nr_pixels=1):
@@ -107,7 +107,7 @@ def erode_mask(image, use_dimensions=2, nr_pixels=1):
     img_dim = image.ndim
     k = create_footprint(img_dim, use_dimensions=use_dimensions, nr_pixels=nr_pixels)
     # print(f"Performing median smoothing with a ellipsoid of shape {k.shape}")
-    data_expanded = binary_erosion(image=image, footprint=k)
+    data_expanded = erosion(image=image, footprint=k)
     return(data_expanded)
 
 def open_mask(image, use_dimensions=2, nr_pixels=1):
@@ -117,7 +117,7 @@ def open_mask(image, use_dimensions=2, nr_pixels=1):
     """
     img_dim = image.ndim
     k = create_footprint(img_dim, use_dimensions=use_dimensions, nr_pixels=nr_pixels)
-    data_expanded = binary_opening(image=image, footprint=k)
+    data_expanded = opening(image=image, footprint=k)
     return(data_expanded)
 
 def close_mask(image, use_dimensions=2, nr_pixels=1):
@@ -127,7 +127,7 @@ def close_mask(image, use_dimensions=2, nr_pixels=1):
     """
     img_dim = image.ndim
     k = create_footprint(img_dim, use_dimensions=use_dimensions, nr_pixels=nr_pixels)
-    data_expanded = binary_closing(image=image, footprint=k)
+    data_expanded = closing(image=image, footprint=k)
     return(data_expanded)
 
 def filter_median(image, use_dimensions=3, radius=None, filter_shape=None, elsize=None):
@@ -284,6 +284,8 @@ def calc_z_projection(im, z_axis=-3, projection='max'):
 def convert_input_files_to_zarr(
     output_dir,
     metadata,
+    t_start=None,
+    t_end=None,
     ):
     
     for idx, sample in metadata.iterrows():
@@ -297,7 +299,9 @@ def convert_input_files_to_zarr(
         convert_file_to_zarr(
             path=raw_image_path, 
             outpath=raw_image_zarr, 
-            overwrite=False
+            overwrite=False,
+            t_start=t_start,
+            t_end=t_end,
         )
                 
         metadata.at[idx, "raw_image_path"] = str(raw_image_zarr)
