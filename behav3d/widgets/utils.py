@@ -225,12 +225,23 @@ _DEFAULT_CONFIG = {
     },
     "active_killing": {
         "observation_window": 5,
-        "death_signal_column": "mean_dead_dye",
+        "death_signal_column": "percentage_dead_mask",
         "killing_threshold_multiplier": 1.5,
         "min_contact_duration": 1,
         "use_absolute_threshold": False,
         "absolute_killing_threshold": None,
         "save_results": True,
+    },
+    "death_dynamics": {
+        "organoid": {
+            "dead_perc_threshold": 0.02
+        },
+        "immune": {
+            "dead_perc_threshold": 0.25
+        },
+        "other": {
+            "dead_perc_threshold": 0.10
+        }
     }
 }
 

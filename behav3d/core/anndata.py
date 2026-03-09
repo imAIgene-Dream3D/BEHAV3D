@@ -97,9 +97,12 @@ def df_to_adata(df, feature_cols, obs_cols=None):
     """Create AnnData from df, store metadata in .obs."""
     X = df[feature_cols].to_numpy()
     adata = sc.AnnData(X)
-    adata.var_names = feature_cols
+    adata.var_names = [str(c) for c in list(feature_cols)]
     if obs_cols is not None:
-        adata.obs = df[obs_cols].copy()
+        obs_df = df[obs_cols].copy()
+        # AnnData expects string-like obs index; pre-coerce to avoid implicit conversion warnings.
+        obs_df.index = pd.Index(obs_df.index.astype(str), dtype="object")
+        adata.obs = obs_df
     return adata
 
 def adata_add_back_to_df(df, adata, cols_from_obs, prefix=None):

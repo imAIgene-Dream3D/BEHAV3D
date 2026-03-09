@@ -52,9 +52,9 @@ def trim_to_maximal_track_length(
     ):
 
     if max_track_length is not None:
-        last_t = df.groupby(group_cols)[time_column].transform("last")
-        within_last_window = (last_t - df[time_column]) <= float(max_track_length)
-        df = df[within_last_window].reset_index(drop=True)
+        first_t = df.groupby(group_cols)[time_column].transform("first")
+        within_first_window = (df[time_column] - first_t) <= float(max_track_length)
+        df = df[within_first_window].reset_index(drop=True)
     return df
 
 

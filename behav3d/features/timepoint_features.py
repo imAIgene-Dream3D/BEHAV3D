@@ -426,22 +426,27 @@ def run_feature_extraction(
         else:
             print(f"{get_current_time()} - Skipping movement features as not requested in features_choice")
             
-        if "contact" in features_choice:
+        if "death" in features_choice:
             # Calculate death features if threshold specified and dead_channel exists
             if dead_mask_percentage_threshold is not None and dead_channel is not None and pd.notna(dead_channel):
                 print(f"{get_current_time()} - Calculating cell death based on dead_mask_percentage_threshold {dead_mask_percentage_threshold}")
                 df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
             
-            # Calculate active contact for any cell type with same-type contacts
-            touching_col = f'touching_{cell_type}s'
-            if touching_col in df_tracks.columns:
-                print(f"{get_current_time()} - Calculating active contact features for {cell_type}...")
-                df_tracks = calculate_active_contact_features(
-                    df_tracks,
-                    cell_type=cell_type
-                )
-            else:
-                print(f"{get_current_time()} - No same-type contacts found for {cell_type}, skipping active_contact calculation")
+        if "contact" in features_choice:    
+            # Calculate active contact for ALL cell types that have touching columns
+            for col in df_tracks.columns:
+                if col.startswith('touching_') and col.endswith('s'):
+                    # Extract target cell type from column name
+                    target_type = col[len('touching_'):-1]
+                    contact_col = f'{target_type}_contact'
+                    if contact_col in df_tracks.columns:
+                        print(f"{get_current_time()} - Calculating active contact features for {cell_type} vs {target_type}...")
+                        df_tracks = calculate_active_contact_features(
+                            df_tracks,
+                            cell_type=target_type
+                        )
+                    else:
+                        print(f"{get_current_time()} - Skipping active contact for {target_type}: no {contact_col} column found")
        
             
         tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
@@ -1316,7 +1321,7 @@ def calculate_segment_intensity(segments, intensity_image, calculation="mean"):
     column_mapping = {}
     for i in range(df_intensity.shape[1]):
         old_col_name = f'intensity_mean-{i}'
-        new_col_name = f'mean_intensity_ch{i+1}'
+        new_col_name = f'mean_intensity_ch{i}'
         column_mapping[old_col_name] = new_col_name
     column_mapping["label"]="TrackID"
     df_intensity=df_intensity.rename(columns=column_mapping)
@@ -1568,26 +1573,42 @@ def _calculate_morphology_single_timepoint(args):
 
             if coords.shape[0] >= 3:
                 try:
-                    pts = coords.astype(float) * np.array(voxel_spacing, dtype=float)  # (N,3)
-                    center = pts.mean(axis=0, keepdims=True)
-                    X = pts - center
+                    # Suppress local floating-point warnings and fallback to NaNs on non-finite intermediates.
+                    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+                        pts = coords.astype(float) * np.array(voxel_spacing, dtype=float)  # (N,3)
+                        if not np.isfinite(pts).all():
+                            raise FloatingPointError("non-finite points")
 
-                    # SVD gives principal directions; Vt rows are unit vectors
-                    U, S, Vt = np.linalg.svd(X, full_matrices=False)
-                    V = Vt.T  # (3,3) columns are principal directions
+                        center = pts.mean(axis=0, keepdims=True)
+                        X = pts - center
+                        if not np.isfinite(X).all():
+                            raise FloatingPointError("non-finite centered points")
 
-                    # Project onto principal directions and get extent along each
-                    proj = X @ V  # (N,3)
-                    lengths = np.ptp(proj, axis=0)  # full lengths along each axis (a',b',c')
+                        # SVD gives principal directions; Vt rows are unit vectors
+                        _, _, Vt = np.linalg.svd(X, full_matrices=False)
+                        V = Vt.T  # (3,3) columns are principal directions
+                        if not np.isfinite(V).all():
+                            raise FloatingPointError("non-finite principal directions")
 
-                    # Order by descending length: a >= b >= c
-                    order = np.argsort(lengths)[::-1]
-                    a, b, c = lengths[order]
-                    V_sorted = V[:, order]  # columns aligned with (a,b,c)
+                        # Project onto principal directions and get extent along each
+                        proj = X @ V  # (N,3)
+                        if not np.isfinite(proj).all():
+                            raise FloatingPointError("non-finite projections")
 
-                    # Oblate and prolate ellipticity
-                    e_ob = 1 - (c / a) if a > 0 else np.nan
-                    e_pro = 1 - (b / a) if a > 0 else np.nan
+                        lengths = np.ptp(proj, axis=0)  # full lengths along each axis (a',b',c')
+                        if not np.isfinite(lengths).all():
+                            raise FloatingPointError("non-finite axis lengths")
+
+                        # Order by descending length: a >= b >= c
+                        order = np.argsort(lengths)[::-1]
+                        a, b, c = lengths[order]
+                        V_sorted = V[:, order]  # columns aligned with (a,b,c)
+                        if not np.isfinite(V_sorted).all():
+                            raise FloatingPointError("non-finite sorted principal directions")
+
+                        # Oblate and prolate ellipticity
+                        e_ob = 1 - (c / a) if a > 0 else np.nan
+                        e_pro = 1 - (b / a) if a > 0 else np.nan
                     
                     axis_length_a_list.append(a)
                     axis_length_b_list.append(b)
@@ -1607,6 +1628,7 @@ def _calculate_morphology_single_timepoint(args):
                 axis_length_b_list.append(np.nan)
                 axis_length_c_list.append(np.nan)
                 oblateness_list.append(np.nan)
+                prolateness_list.append(np.nan)
                 principal_axes_list.append([[np.nan, np.nan, np.nan]] * 3)
             # ----------------------------------------------------------------
 
@@ -1617,8 +1639,7 @@ def _calculate_morphology_single_timepoint(args):
         # Guard against divide-by-zero in solidity calculation
         with np.errstate(divide='ignore', invalid='ignore'):
             properties["solidity"] = properties["volume"] / properties["convex_volume"]
-            properties["surfrace_to_volume_ratio"] = properties["surface_area"] / properties["volume"]
-        # Attach NEW principal-axis results
+            properties["surface_to_volume_ratio"] = properties["surface_area"] / properties["volume"]
         properties["axis1_length"] = axis_length_a_list
         properties["axis2_length"] = axis_length_b_list
         properties["axis3_length"] = axis_length_c_list

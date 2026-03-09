@@ -447,8 +447,9 @@ class MetadataBuilder(widgets.VBox):
             style={'description_width': '150px'}
         )
         
-        form_data['basic']['time_unit'] = widgets.Text(
+        form_data['basic']['time_unit'] = widgets.Dropdown(
             description='Time unit*:',
+            options=[('Seconds (s)', 's'), ('Minutes (m)', 'm'), ('Hours (h)', 'h')],
             value='s',
             style={'description_width': '150px'}
         )
@@ -466,17 +467,51 @@ class MetadataBuilder(widgets.VBox):
                 layout=widgets.Layout(width='600px')
             )
             
-            # Dead channel number - IntText
-            dead_number = widgets.IntText(
+            # Calculate max valid channel index
+            n_total_channels = self.n_organoid_types + self.n_immune_types + self.n_other_types + 1  # +1 for dead
+            max_channel_idx = n_total_channels - 1
+            
+            # Dead channel number - BoundedIntText with min=0
+            dead_number = widgets.BoundedIntText(
                 description='Dead channel:',
                 value=0,
+                min=0,
+                max=max(max_channel_idx, 0),
                 style={'description_width': '120px'}
             )
+            
+            dead_channel_warning = widgets.HTML(
+                f'<div style="color:#856404;background:#fff3cd;border:1px solid #ffeeba;'
+                f'padding:6px 10px;border-radius:4px;font-size:12px;margin-top:2px;">'
+                f'⚠️ <b>Channel index starts at 0.</b> '
+                f'You have {n_total_channels} total channels '
+                f'({self.n_organoid_types} organoid + {self.n_immune_types} immune + '
+                f'{self.n_other_types} other + 1 dead), '
+                f'so valid indices are <b>0–{max_channel_idx}</b>,'
+                f'make sure you set the correct channel index.</div>'
+            )
+            
+            dead_channel_error = widgets.HTML(value='')
+            
+            def _validate_dead_channel(change, err_widget=dead_channel_error, max_idx=max_channel_idx, n_ch=n_total_channels):
+                if change['new'] > max_idx:
+                    err_widget.value = (
+                        f'<div style="color:#721c24;background:#f8d7da;border:1px solid #f5c6cb;'
+                        f'padding:6px 10px;border-radius:4px;font-size:12px;margin-top:2px;">'
+                        f'❌ Invalid channel index <b>{change["new"]}</b>. '
+                        f'You only have {n_ch} channels (indices 0–{max_idx}).</div>'
+                    )
+                else:
+                    err_widget.value = ''
+            
+            dead_number.observe(_validate_dead_channel, names='value')
             
             form_data['dead_channel']['mask_path'] = dead_mask_path
             form_data['dead_channel']['number'] = dead_number
             
-            dead_channel_widgets = [dead_channel_label, dead_mask_path, dead_number]
+            dead_channel_widgets = [dead_channel_label, dead_mask_path,
+                                    widgets.HBox([dead_number, dead_channel_warning]),
+                                    dead_channel_error]
         
         # Cell type configuration widgets
         cell_type_widgets = []
@@ -644,6 +679,19 @@ class MetadataBuilder(widgets.VBox):
                 self.save_output.clear_output()
                 print(f'⚠️ Output directory does not exist: {output_dir}')
             return
+        
+        # Validate dead channel indices before saving
+        if self.include_dead_channel:
+            n_total_channels = self.n_organoid_types + self.n_immune_types + self.n_other_types + 1
+            max_channel_idx = n_total_channels - 1
+            for i, form in enumerate(self.sample_forms):
+                ch_val = form['dead_channel']['number'].value
+                if ch_val > max_channel_idx:
+                    with self.save_output:
+                        self.save_output.clear_output()
+                        print(f'❌ Sample {i+1}: Dead channel index {ch_val} is invalid. '
+                              f'You have {n_total_channels} channels (indices 0–{max_channel_idx}).')
+                    return
         
         rows = []
         for form in self.sample_forms:
