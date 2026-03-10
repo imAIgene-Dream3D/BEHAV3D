@@ -542,7 +542,7 @@ class PixelClassifierWidget(QWidget):
             saved_fill = pc.get(f"{cell_type}_fill_holes", def_fill)
 
             w_edt = QDoubleSpinBox()
-            w_edt.setRange(0.1, 50.0)
+            w_edt.setRange(0.0, 50.0)
             w_edt.setSingleStep(0.5)
             w_edt.setValue(float(saved_edt))
             w_edt.setMaximumWidth(70)
@@ -555,6 +555,7 @@ class PixelClassifierWidget(QWidget):
                 "Typical values:\n"
                 "  • Organoids: 8–15\n"
                 "  • Immune cells: 1.5–4.0"
+                "  • Disable: 0.0 (not recommended, leads to under-segmentation)"
             ))
 
             w_size = QSpinBox()
