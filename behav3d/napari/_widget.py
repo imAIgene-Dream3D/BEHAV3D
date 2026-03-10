@@ -91,9 +91,27 @@ class BEHAV3DWidget(QWidget):
             lambda: self.queue_panel.add_step(StepType.FILTER)
         )
 
+        # Cellpose +🛒 button
+        cp = self.segmentation_tab.cellpose_page
+        cp.btn_queue_cellpose.clicked.connect(self._add_cellpose_to_queue)
+        cp.btn_queue_otsu.clicked.connect(
+            lambda: self.queue_panel.add_step(StepType.DEAD_MASK)
+        )
+
         # --- Tab Switch Logic ---------------------------------------------
         self._last_tab_index = self.tabs.currentIndex()
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _add_cellpose_to_queue(self):
+        """Validate cellpose config and add a CELLPOSE_SEGMENT step to the queue."""
+        cp = self.segmentation_tab.cellpose_page
+        ok, msg = cp.validate_for_queue()
+        if not ok:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Cannot Add to Queue", msg)
+            return
+        params = cp.get_queue_params()
+        self.queue_panel.add_step(StepType.CELLPOSE_SEGMENT, params=params)
 
     def _on_tab_changed(self, index):
         """Intercept tab switches to handle exit warnings and missing output dir."""

@@ -7,7 +7,7 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
     QStackedWidget, QPushButton, QGroupBox, QFormLayout, 
     QSpinBox, QDoubleSpinBox, QCheckBox, QFileDialog, QScrollArea,
-    QPlainTextEdit, QTextEdit, QMessageBox
+    QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox
 )
 from qtpy.QtCore import Qt
 import pandas as pd
@@ -95,7 +95,7 @@ class SegmentationTab(QWidget):
         self.param_stack.addWidget(self.pixel_classifier_page)
 
         # 2. Cellpose Page
-        self.cellpose_page = CellposeWidget(self.viewer, self.metadata_loader)
+        self.cellpose_page = CellposeWidget(self.viewer, self.metadata_loader, log_callback=self._log)
         self.param_stack.addWidget(self.cellpose_page)
 
         # 3. Import Page
@@ -138,7 +138,7 @@ class SegmentationTab(QWidget):
         """Trigger updates in sub-widgets."""
         if hasattr(self, 'pixel_classifier_page'):
             self.pixel_classifier_page._on_metadata_updated()
-        # self.cellpose_page._on_metadata_updated()
+        self.cellpose_page._on_metadata_updated()
         self.import_page._on_metadata_updated()
 
     def _log(self, msg):
@@ -1637,17 +1637,660 @@ class PixelClassifierWidget(QWidget):
 
 
 class CellposeWidget(QWidget):
-    def __init__(self, viewer, metadata_loader):
+    """Napari widget for Cellpose channel configuration, model loading, and inference."""
+
+    def __init__(self, viewer, metadata_loader, log_callback=None):
         super().__init__()
         self.viewer = viewer
         self.metadata_loader = metadata_loader
+        self.log = log_callback or print
+        self.pretrained_model_dir = None
+        self._detect_cell_types()
+        _cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+        self._manual_n_channels = _cellpose_cfg.get("manual_n_channels")
         self._init_ui()
-    
+
+    # ── cell-type detection ─────────────────────────────────────────────
+    def _detect_cell_types(self):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel,
+        )
+        metadata = self.metadata_loader.metadata
+        if metadata is None:
+            self.organoid_types = []
+            self.immune_types = []
+            self.other_types = []
+            self.has_death = False
+            self.all_cell_types = []
+            return
+        self.organoid_types = detect_organoid_types_from_metadata(metadata)
+        self.immune_types = detect_immune_cell_types_from_metadata(metadata)
+        self.other_types = detect_other_cell_types_from_metadata(metadata)
+        self.has_death = has_dead_channel(metadata)
+        self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
+
+    def _calculate_number_of_channels(self):
+        n = len(self.organoid_types) + len(self.immune_types) + len(self.other_types)
+        if self.has_death:
+            n += 1
+        return n
+
+    def _channel_detail_text(self):
+        parts = [
+            f"Organoids: {len(self.organoid_types)}",
+            f"Immune: {len(self.immune_types)}",
+            f"Other: {len(self.other_types)}",
+        ]
+        if self.has_death:
+            parts.append("Dead: 1")
+        if self._manual_n_channels is not None:
+            parts.append(f"Manual total: {self._manual_n_channels}")
+        return "  ·  ".join(parts)
+
+    def _get_channel_options(self):
+        opts = list(self.organoid_types) + list(self.immune_types) + list(self.other_types)
+        if self.has_death:
+            opts.append("dead")
+        # Add a single "none" option when manual override adds extra channels
+        if self._manual_n_channels is not None and self._manual_n_channels > len(opts):
+            opts.append("none")
+        return opts
+
+    def _get_sample_names(self):
+        if self.metadata_loader.metadata is None:
+            return []
+        return list(self.metadata_loader.metadata["sample_name"].unique())
+
+    # ── helpers ─────────────────────────────────────────────────────────
+    def _get_prefix(self, cell_type):
+        if cell_type in self.organoid_types:
+            return "or"
+        if cell_type in self.immune_types:
+            return "im"
+        return "ot"
+
+    # ── UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
+        if hasattr(self.metadata_loader, "metadata_loaded"):
+            self.metadata_loader.metadata_loaded.connect(self._on_metadata_updated)
+
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
-        layout.addWidget(QLabel("Cellpose Configuration (Coming Soon)"))
-        layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(4, 4, 4, 4)
+        content_layout.setSpacing(4)
+        content.setLayout(content_layout)
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
+
+        # ── Section 1: Channel Configuration ─────────────────────────
+        self.channel_group = QGroupBox("1. Channel Configuration")
+        ch_layout = QVBoxLayout()
+        self.channel_group.setLayout(ch_layout)
+
+        self.n_channels = self._calculate_number_of_channels()
+        # Primary: compact channel count
+        self.n_channels_label = QLabel(f"<b>Detected:</b> {self.n_channels} channel(s)")
+        self.n_channels_label.setWordWrap(True)
+        ch_layout.addWidget(self.n_channels_label)
+
+        # Secondary: per-type breakdown
+        self.n_channels_detail_label = QLabel(self._channel_detail_text())
+        self.n_channels_detail_label.setWordWrap(True)
+        self.n_channels_detail_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        ch_layout.addWidget(self.n_channels_detail_label)
+
+        # Manual override row
+        override_row = QWidget()
+        override_hl = QHBoxLayout()
+        override_hl.setContentsMargins(0, 2, 0, 2)
+        override_row.setLayout(override_hl)
+        self.btn_override_channels = QPushButton("⚙ Set Manually")
+        self.btn_override_channels.setToolTip("Manually set a higher channel count for extra unlabelled channels")
+        self.btn_override_channels.setFixedWidth(110)
+        self.btn_override_channels.clicked.connect(self._on_show_override)
+        override_hl.addWidget(self.btn_override_channels)
+        self.spin_manual_channels = QSpinBox()
+        self.spin_manual_channels.setRange(1, 99)
+        self.spin_manual_channels.setValue(max(1, self.n_channels))
+        self._lbl_manual_ch = QLabel("Channels:")
+        override_hl.addWidget(self._lbl_manual_ch)
+        override_hl.addWidget(self.spin_manual_channels)
+        self.btn_apply_override = QPushButton("Apply")
+        self.btn_apply_override.setFixedWidth(55)
+        self.btn_apply_override.clicked.connect(self._on_apply_override)
+        override_hl.addWidget(self.btn_apply_override)
+        self.btn_clear_override = QPushButton("↺")
+        self.btn_clear_override.setFixedWidth(32)
+        self.btn_clear_override.setToolTip("Clear manual override, revert to auto-detected count")
+        self.btn_clear_override.clicked.connect(self._on_clear_override)
+        override_hl.addWidget(self.btn_clear_override)
+        override_hl.addStretch()
+        ch_layout.addWidget(override_row)
+        # Hide spinbox controls initially; show if a saved override exists
+        _override_active = self._manual_n_channels is not None
+        self.btn_override_channels.setVisible(not _override_active)
+        self.spin_manual_channels.setVisible(_override_active)
+        self._lbl_manual_ch.setVisible(_override_active)
+        self.btn_apply_override.setVisible(_override_active)
+        self.btn_clear_override.setVisible(_override_active)
+        if _override_active:
+            self.spin_manual_channels.setValue(self._manual_n_channels)
+
+        # Mode selection
+        from qtpy.QtWidgets import QRadioButton, QButtonGroup
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode:"))
+        self.radio_same = QRadioButton("Same for all")
+        self.radio_per_sample = QRadioButton("Per sample")
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.addButton(self.radio_same, 0)
+        self.mode_group.addButton(self.radio_per_sample, 1)
+        mode_row.addWidget(self.radio_same)
+        mode_row.addWidget(self.radio_per_sample)
+        ch_layout.addLayout(mode_row)
+
+        # Container for dynamic dropdowns
+        self.channel_container = QWidget()
+        self.channel_container_layout = QVBoxLayout()
+        self.channel_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.channel_container.setLayout(self.channel_container_layout)
+        ch_layout.addWidget(self.channel_container)
+
+        # Save button
+        self.btn_save_channels = QPushButton("💾  Save Channel Configuration")
+        self.btn_save_channels.setStyleSheet(
+            "QPushButton { background: #28a745; color: white; border-radius: 4px; "
+            "padding: 4px 8px; font-weight: bold; }"
+            "QPushButton:hover { background: #218838; }"
+        )
+        self.btn_save_channels.clicked.connect(self._on_save_channels)
+        ch_layout.addWidget(self.btn_save_channels)
+
+        content_layout.addWidget(self.channel_group)
+
+        # Load saved mode and build dropdowns
+        cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {})
+        saved_mode = cellpose_cfg.get("labels_mode", "same_for_all") if cellpose_cfg else "same_for_all"
+        if saved_mode == "per_sample":
+            self.radio_per_sample.setChecked(True)
+        else:
+            self.radio_same.setChecked(True)
+
+        self.channel_dropdowns = {}
+        self._build_channel_dropdowns()
+        self.mode_group.buttonClicked.connect(lambda _btn: self._build_channel_dropdowns())
+
+        # ── Section 2: Model & Cell Type ─────────────────────────────
+        model_group = QGroupBox("2. Model & Cell Type")
+        model_layout = QVBoxLayout()
+        model_group.setLayout(model_layout)
+
+        # Model path
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Model:"))
+        self.model_path_edit = QLineEdit()
+        self.model_path_edit.setPlaceholderText("Path to Cellpose model file…")
+        path_row.addWidget(self.model_path_edit, stretch=1)
+        self.btn_browse = QPushButton("Browse…")
+        self.btn_browse.clicked.connect(self._on_browse)
+        path_row.addWidget(self.btn_browse)
+        model_layout.addLayout(path_row)
+
+        # Load model button
+        self.btn_load_model = QPushButton("📂  Load Model")
+        self.btn_load_model.setStyleSheet(
+            "QPushButton { background: #17a2b8; color: white; border-radius: 4px; "
+            "padding: 4px 8px; font-weight: bold; }"
+            "QPushButton:hover { background: #138496; }"
+        )
+        self.btn_load_model.clicked.connect(self._on_load_model)
+        model_layout.addWidget(self.btn_load_model)
+
+        self.model_info_label = QLabel("")
+        self.model_info_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        model_layout.addWidget(self.model_info_label)
+
+        # Cell type selector
+        ct_row = QHBoxLayout()
+        ct_row.addWidget(QLabel("Cell type to segment:"))
+        self.cell_type_combo = QComboBox()
+        if self.all_cell_types:
+            self.cell_type_combo.addItems(self.all_cell_types)
+        else:
+            self.cell_type_combo.addItem("(load metadata)")
+        ct_row.addWidget(self.cell_type_combo, stretch=1)
+        model_layout.addLayout(ct_row)
+
+        # Timepoint range — checkbox on its own row, spinboxes on a second row
+        tp_check_row = QHBoxLayout()
+        self.check_process_all = QCheckBox("Process all timepoints")
+        self.check_process_all.setChecked(True)
+        tp_check_row.addWidget(self.check_process_all)
+        tp_check_row.addStretch()
+        model_layout.addLayout(tp_check_row)
+
+        tp_range_row = QHBoxLayout()
+        tp_range_row.addWidget(QLabel("  Start:"))
+        self.spin_t_start = QSpinBox()
+        self.spin_t_start.setRange(0, 9999)
+        self.spin_t_start.setValue(0)
+        self.spin_t_start.setMaximumWidth(70)
+        tp_range_row.addWidget(self.spin_t_start)
+        tp_range_row.addWidget(QLabel("End:"))
+        self.spin_t_end = QSpinBox()
+        self.spin_t_end.setRange(0, 9999)
+        self.spin_t_end.setValue(0)
+        self.spin_t_end.setMaximumWidth(70)
+        tp_range_row.addWidget(self.spin_t_end)
+        tp_range_row.addStretch()
+        model_layout.addLayout(tp_range_row)
+
+        self.check_process_all.toggled.connect(lambda on: (
+            self.spin_t_start.setEnabled(not on),
+            self.spin_t_end.setEnabled(not on),
+        ))
+        self.spin_t_start.setEnabled(False)
+        self.spin_t_end.setEnabled(False)
+
+        content_layout.addWidget(model_group)
+
+        # ── Section 3: Run & Queue ───────────────────────────────────
+        run_group = QGroupBox("3. Run")
+        run_layout = QVBoxLayout()
+        run_group.setLayout(run_layout)
+
+        # Run Cellpose button (text updates with cell type)
+        run_btn_row = QHBoxLayout()
+        run_btn_row.setSpacing(4)
+        self.btn_run_cellpose = QPushButton("▶  Run Cellpose")
+        self.btn_run_cellpose.setStyleSheet(
+            "QPushButton { background: #28a745; color: white; border-radius: 4px; "
+            "padding: 6px; font-weight: bold; font-size: 12px; }"
+            "QPushButton:hover { background: #218838; }"
+        )
+        self.btn_run_cellpose.clicked.connect(lambda: self.run_batch_cellpose(interactive=True))
+        run_btn_row.addWidget(self.btn_run_cellpose, stretch=1)
+
+        # +🛒 queue button
+        self.btn_queue_cellpose = QPushButton("+🛒")
+        self.btn_queue_cellpose.setFixedSize(36, 28)
+        self.btn_queue_cellpose.setToolTip("Add Cellpose Segmentation to Processing Queue")
+        self.btn_queue_cellpose.setStyleSheet(
+            "QPushButton { background: #1a1a2e; color: #ffc107; border: 1px solid #ffc107; "
+            "border-radius: 4px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
+        )
+        self.btn_queue_cellpose.setVisible(False)  # shown after metadata loaded
+        run_btn_row.addWidget(self.btn_queue_cellpose)
+        run_layout.addLayout(run_btn_row)
+
+        # Dead mask (Otsu) button + queue button
+        otsu_row = QHBoxLayout()
+        otsu_row.setSpacing(4)
+        self.btn_run_otsu = QPushButton("☠  Run Dead Mask (Otsu)")
+        self.btn_run_otsu.setStyleSheet(
+            "QPushButton { background: #6c757d; color: white; border-radius: 4px; "
+            "padding: 4px; font-weight: bold; }"
+            "QPushButton:hover { background: #5a6268; }"
+        )
+        self.btn_run_otsu.clicked.connect(lambda: self.run_otsu_threshold(interactive=True))
+        self.btn_run_otsu.setVisible(self.has_death)
+        otsu_row.addWidget(self.btn_run_otsu, stretch=1)
+        self.btn_queue_otsu = QPushButton("+🛒")
+        self.btn_queue_otsu.setFixedSize(36, 28)
+        self.btn_queue_otsu.setToolTip("Add Dead Mask (Otsu) to Processing Queue")
+        self.btn_queue_otsu.setStyleSheet(
+            "QPushButton { background: #1a1a2e; color: #ffc107; border: 1px solid #ffc107; "
+            "border-radius: 4px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
+        )
+        self.btn_queue_otsu.setVisible(False)  # shown after metadata loaded
+        otsu_row.addWidget(self.btn_queue_otsu)
+        run_layout.addLayout(otsu_row)
+
+        content_layout.addWidget(run_group)
+        content_layout.addStretch()
+
+        # Update run button label when cell type changes
+        self.cell_type_combo.currentTextChanged.connect(self._update_run_button_label)
+
+    # ── dynamic run button label ────────────────────────────────────────
+    def _update_run_button_label(self, text):
+        if text and text != "(load metadata)":
+            self.btn_run_cellpose.setText(f"▶  Run Cellpose — {text}")
+        else:
+            self.btn_run_cellpose.setText("▶  Run Cellpose")
+
+    # ── channel dropdown builder ────────────────────────────────────────
+    def _build_channel_dropdowns(self):
+        """Rebuild the channel label dropdowns based on current mode."""
+        # Clear existing
+        while self.channel_container_layout.count():
+            item = self.channel_container_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+            elif item.layout():
+                while item.layout().count():
+                    child = item.layout().takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
+
+        self.channel_dropdowns = {}
+        n_channels = self._manual_n_channels if self._manual_n_channels is not None else self._calculate_number_of_channels()
+        channel_options = self._get_channel_options()
+        auto_n = self._calculate_number_of_channels()  # channels with a real label
+        if n_channels == 0:
+            self.channel_container_layout.addWidget(
+                QLabel('<span style="color: orange;">No channels detected. Load metadata first.</span>')
+            )
+            return
+
+        cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+        is_per_sample = self.radio_per_sample.isChecked()
+
+        if not is_per_sample:
+            # ── Same for all ──
+            saved_labels = cellpose_cfg.get("channel_labels", {})
+            self.channel_dropdowns["global"] = {}
+            for i in range(n_channels):
+                row = QHBoxLayout()
+                row.addWidget(QLabel(f"Channel {i}:"))
+                combo = QComboBox()
+                combo.addItems(channel_options)
+                saved_val = saved_labels.get(str(i), saved_labels.get(i))
+                if saved_val and saved_val in channel_options:
+                    combo.setCurrentText(saved_val)
+                elif i < auto_n:
+                    combo.setCurrentIndex(i)  # auto channel — assign by position
+                elif "none" in channel_options:
+                    combo.setCurrentText("none")  # extra channel — default to none
+                row.addWidget(combo, stretch=1)
+                self.channel_dropdowns["global"][i] = combo
+                self.channel_container_layout.addLayout(row)
+        else:
+            # ── Per sample — same vertical layout as "same for all"
+            saved_per_sample = cellpose_cfg.get("per_sample_channel_labels", {})
+            for sample_name in self._get_sample_names():
+                header = QLabel(f"<b>{sample_name}</b>")
+                self.channel_container_layout.addWidget(header)
+                self.channel_dropdowns[sample_name] = {}
+                sample_saved = saved_per_sample.get(sample_name, {})
+                for i in range(n_channels):
+                    row = QHBoxLayout()
+                    row.addWidget(QLabel(f"Channel {i}:"))
+                    combo = QComboBox()
+                    combo.addItems(channel_options)
+                    saved_val = sample_saved.get(str(i), sample_saved.get(i))
+                    if saved_val and saved_val in channel_options:
+                        combo.setCurrentText(saved_val)
+                    elif i < auto_n:
+                        combo.setCurrentIndex(i)  # auto channel — assign by position
+                    elif "none" in channel_options:
+                        combo.setCurrentText("none")  # extra channel — default to none
+                    row.addWidget(combo, stretch=1)
+                    self.channel_dropdowns[sample_name][i] = combo
+                    self.channel_container_layout.addLayout(row)
+
+    # ── save / persist ──────────────────────────────────────────────────
+    def _persist_channel_config(self):
+        """Save channel configuration to behav3d_parameters.yml."""
+        cellpose_cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose", {})
+        cellpose_cfg["number_of_channels"] = self._manual_n_channels if self._manual_n_channels is not None else self._calculate_number_of_channels()
+        if self._manual_n_channels is not None:
+            cellpose_cfg["manual_n_channels"] = self._manual_n_channels
+        else:
+            cellpose_cfg.pop("manual_n_channels", None)
+
+        is_per_sample = self.radio_per_sample.isChecked()
+        cellpose_cfg["labels_mode"] = "per_sample" if is_per_sample else "same_for_all"
+
+        if not is_per_sample:
+            channel_labels = {}
+            if "global" in self.channel_dropdowns:
+                for i, combo in self.channel_dropdowns["global"].items():
+                    channel_labels[i] = combo.currentText()
+            cellpose_cfg["channel_labels"] = channel_labels
+            cellpose_cfg["per_sample_channel_labels"] = {}
+        else:
+            per_sample_labels = {}
+            for sample_name, combos in self.channel_dropdowns.items():
+                if sample_name != "global":
+                    per_sample_labels[sample_name] = {i: c.currentText() for i, c in combos.items()}
+            cellpose_cfg["per_sample_channel_labels"] = per_sample_labels
+            cellpose_cfg["channel_labels"] = {}
+
+        if hasattr(self.metadata_loader, "behav3d_parameters_path"):
+            yaml.safe_dump(
+                self.metadata_loader.behav3d_parameters,
+                self.metadata_loader.behav3d_parameters_path.open("w"),
+                sort_keys=False,
+            )
+
+    def _on_save_channels(self):
+        self._persist_channel_config()
+        self.log("✅ Cellpose channel configuration saved.")
+
+    # ── override channel count ──────────────────────────────────────────
+    def _on_show_override(self):
+        calc = self._calculate_number_of_channels()
+        self.spin_manual_channels.setRange(max(1, calc), 99)
+        self.spin_manual_channels.setValue(self._manual_n_channels or max(1, calc))
+        self.btn_override_channels.setVisible(False)
+        self._lbl_manual_ch.setVisible(True)
+        self.spin_manual_channels.setVisible(True)
+        self.btn_apply_override.setVisible(True)
+        self.btn_clear_override.setVisible(True)
+
+    def _on_apply_override(self):
+        self._manual_n_channels = self.spin_manual_channels.value()
+        self.n_channels_detail_label.setText(self._channel_detail_text())
+        self._build_channel_dropdowns()
+        self.log(f"✅ Channel count manually set to {self._manual_n_channels}.")
+
+    def _on_clear_override(self):
+        self._manual_n_channels = None
+        self._lbl_manual_ch.setVisible(False)
+        self.spin_manual_channels.setVisible(False)
+        self.btn_apply_override.setVisible(False)
+        self.btn_clear_override.setVisible(False)
+        self.btn_override_channels.setVisible(True)
+        self.n_channels_detail_label.setText(self._channel_detail_text())
+        self._build_channel_dropdowns()
+        self.log("↺ Channel count reset to auto-detected.")
+
+    # ── browse / load model ─────────────────────────────────────────────
+    def _on_browse(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Cellpose Model File")
+        if path:
+            self.model_path_edit.setText(path)
+
+    def _on_load_model(self):
+        path = self.model_path_edit.text().strip()
+        if not path:
+            self.log("⚠️ Please enter or browse for a model path first.")
+            return
+        self.pretrained_model_dir = path
+        # Parse channel order from model dirname
+        try:
+            channel_order = path.replace("\\", "/").split("/")[-1].split("__")[-1].split("_")
+            channel_order = [ch.split("-")[-1] for ch in channel_order]
+        except Exception:
+            channel_order = ["Unknown"]
+        self.model_info_label.setText(f"Model loaded  ·  Channels: {', '.join(channel_order)}")
+        self.log(f"✅ Loaded Cellpose model from: {path}")
+        self.log(f"   Channels detected: {channel_order}")
+
+    # ── metadata update ─────────────────────────────────────────────────
+    def _on_metadata_updated(self, _metadata=None):
+        self._detect_cell_types()
+        self.n_channels = self._calculate_number_of_channels()
+        self.n_channels_label.setText(f"<b>Detected:</b> {self.n_channels} channel(s)")
+        self.n_channels_detail_label.setText(self._channel_detail_text())
+        self._build_channel_dropdowns()
+        # Refresh cell type combo
+        current = self.cell_type_combo.currentText()
+        self.cell_type_combo.blockSignals(True)
+        self.cell_type_combo.clear()
+        if self.all_cell_types:
+            self.cell_type_combo.addItems(self.all_cell_types)
+            if current in self.all_cell_types:
+                self.cell_type_combo.setCurrentText(current)
+        else:
+            self.cell_type_combo.addItem("(load metadata)")
+        self.cell_type_combo.blockSignals(False)
+        self._update_run_button_label(self.cell_type_combo.currentText())
+        # Show queue & otsu buttons
+        self.btn_queue_cellpose.setVisible(True)
+        self.btn_run_otsu.setVisible(self.has_death)
+        self.btn_queue_otsu.setVisible(self.has_death)
+
+    # ── queue validation ────────────────────────────────────────────────
+    def validate_for_queue(self):
+        """Return (ok, error_msg) — checks channel config + model + cell type."""
+        # 1. Channel config saved?
+        cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {})
+        if not cellpose_cfg or not cellpose_cfg.get("channel_labels") and not cellpose_cfg.get("per_sample_channel_labels"):
+            return False, "Channel configuration not saved. Please configure and save channel labels first (Section 1)."
+        # 2. Model loaded?
+        if not self.pretrained_model_dir:
+            return False, "No Cellpose model loaded. Please load a model first (Section 2)."
+        # 3. Cell type selected?
+        ct = self.cell_type_combo.currentText()
+        if not ct or ct == "(load metadata)":
+            return False, "No cell type selected. Please select a cell type to segment (Section 2)."
+        return True, ""
+
+    def get_queue_params(self):
+        """Return the params dict for a queue step."""
+        return {
+            "cell_type": self.cell_type_combo.currentText(),
+            "model_path": self.pretrained_model_dir,
+        }
+
+    # ── run cellpose ────────────────────────────────────────────────────
+    def run_batch_cellpose(self, interactive=True, skip_existing=False,
+                           cell_type_override=None, model_path_override=None):
+        """Run Cellpose segmentation for the selected cell type."""
+        from behav3d.preprocessing.segmentation.cellpose_prediction import (
+            run_cellpose_and_sync_metadata,
+        )
+        if self.metadata_loader.metadata is None:
+            self.log("⚠️ Cannot run Cellpose: No metadata loaded.")
+            return
+
+        cell_type = cell_type_override or self.cell_type_combo.currentText()
+        model_path = model_path_override or self.pretrained_model_dir
+
+        if not model_path:
+            self.log("⚠️ Cannot run Cellpose: No model loaded.")
+            return
+        if not cell_type or cell_type == "(load metadata)":
+            self.log("⚠️ Cannot run Cellpose: No cell type selected.")
+            return
+
+        self._persist_channel_config()
+
+        if interactive:
+            box = QMessageBox(self)
+            box.setWindowTitle("Existing Cellpose Results")
+            box.setText(
+                f"Cellpose segmentation for '{cell_type}' may already exist.\n\n"
+                "What do you want to do?"
+            )
+            btn_overwrite = box.addButton("Overwrite All", QMessageBox.DestructiveRole)
+            btn_skip = box.addButton("Skip Existing", QMessageBox.AcceptRole)
+            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_cancel)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == btn_cancel:
+                self.log("Cellpose segmentation cancelled.")
+                return
+            overwrite = clicked == btn_overwrite
+        else:
+            overwrite = not skip_existing
+
+        # Timepoint range
+        if self.check_process_all.isChecked():
+            timepoint_range = None
+        else:
+            t_start = self.spin_t_start.value()
+            t_end = self.spin_t_end.value()
+            if t_start > t_end:
+                self.log("Error: Start timepoint must be <= End timepoint.")
+                return
+            timepoint_range = (t_start, t_end)
+
+        self.log(f"Starting Cellpose segmentation for '{cell_type}'...")
+
+        try:
+            _, summary = run_cellpose_and_sync_metadata(
+                output_dir=self.metadata_loader.output_dir,
+                metadata_loader=self.metadata_loader,
+                pretrained_model_dir=model_path,
+                input_channels=[cell_type],
+                label_name=cell_type,
+                timepoint_range=timepoint_range,
+            )
+            n_proc = len(summary["processed"])
+            n_skip = len(summary["skipped"])
+            if n_skip > 0:
+                self.log(f"Cellpose finished: {n_proc} processed, {n_skip} skipped.")
+            else:
+                self.log(f"Cellpose finished for all {n_proc} samples.")
+            self.log("Metadata updated.")
+        except Exception as e:
+            traceback.print_exc()
+            self.log(f"❌ Cellpose error: {e}")
+            if not interactive:
+                raise
+
+    # ── run Otsu dead mask ──────────────────────────────────────────────
+    def run_otsu_threshold(self, interactive=True):
+        """Run Otsu thresholding on the dead channel."""
+        from behav3d.preprocessing.segmentation.cellpose_prediction import (
+            run_otsu_threshold_segmentation_from_zarr,
+        )
+        if self.metadata_loader.metadata is None:
+            self.log("⚠️ Cannot run Otsu: No metadata loaded.")
+            return
+
+        self._persist_channel_config()
+        self.log("Starting Otsu dead mask segmentation...")
+
+        # Timepoint range
+        if self.check_process_all.isChecked():
+            timepoint_range = None
+        else:
+            timepoint_range = (self.spin_t_start.value(), self.spin_t_end.value())
+
+        try:
+            updated_metadata, summary = run_otsu_threshold_segmentation_from_zarr(
+                output_dir=self.metadata_loader.output_dir,
+                metadata=self.metadata_loader.metadata,
+                timepoint_range=timepoint_range,
+            )
+            self.metadata_loader.metadata = updated_metadata
+            csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
+            if csv_path:
+                updated_metadata.to_csv(csv_path, index=False)
+            n_proc = len(summary["processed"])
+            self.log(f"Otsu dead mask finished: {n_proc} samples processed.")
+        except Exception as e:
+            traceback.print_exc()
+            self.log(f"❌ Otsu error: {e}")
+
 
 class ImportWidget(QWidget):
     """Widget to validate and import pre-existing segmentation files.

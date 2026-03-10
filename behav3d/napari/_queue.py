@@ -27,6 +27,8 @@ from qtpy.QtGui import QFont
 class StepType(Enum):
     TRAIN = "train"
     SEGMENT = "segment"
+    CELLPOSE_SEGMENT = "cellpose_segment"
+    DEAD_MASK = "dead_mask"
     TRACK = "track"
     FEATURE_EXTRACT = "feature_extract"
     FILTER = "filter"
@@ -36,6 +38,8 @@ class StepType(Enum):
         return {
             StepType.TRAIN: "🧠 Train Classifier",
             StepType.SEGMENT: "🦠 Batch Segmentation",
+            StepType.CELLPOSE_SEGMENT: "🔬 Cellpose Segmentation",
+            StepType.DEAD_MASK: "☠ Dead Mask (Otsu)",
             StepType.TRACK: "📍 Batch Tracking",
             StepType.FEATURE_EXTRACT: "🧪 Feature Extraction",
             StepType.FILTER: "🧹 Filtering",
@@ -46,6 +50,8 @@ class StepType(Enum):
         return {
             StepType.TRAIN: 0,
             StepType.SEGMENT: 1,
+            StepType.CELLPOSE_SEGMENT: 1.5,
+            StepType.DEAD_MASK: 1.6,
             StepType.TRACK: 2,
             StepType.FEATURE_EXTRACT: 3,
             StepType.FILTER: 4,
@@ -62,9 +68,18 @@ class StepStatus(Enum):
 @dataclass
 class QueueStep:
     step_type: StepType
+    params: dict = field(default_factory=dict)
     status: StepStatus = StepStatus.PENDING
     error_msg: str = ""
     elapsed: float = 0.0
+
+    @property
+    def display_label(self):
+        """Label for queue row display. Includes cell type for cellpose steps."""
+        cell_type = self.params.get("cell_type")
+        if cell_type and self.step_type == StepType.CELLPOSE_SEGMENT:
+            return f"🔬 Cellpose — {cell_type}"
+        return self.step_type.label
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -99,7 +114,7 @@ class QueueStepRow(QFrame):
         self.status_label.setFixedWidth(28)
         row.addWidget(self.status_label)
 
-        self.name_label = QLabel(step.step_type.label)
+        self.name_label = QLabel(step.display_label)
         self.name_label.setStyleSheet("color: #ddd; font-size: 10px;")
         row.addWidget(self.name_label, stretch=1)
 
@@ -288,31 +303,51 @@ class ProcessingQueuePanel(QWidget):
     # ── Adding / Removing steps ────────────────────────────────────────
 
     @Slot(object)
-    def add_step(self, step_type: StepType):
-        """Add a step to the queue, with conditional dependency prompting."""
-        if any(s.step_type == step_type for s in self._steps):
-            # Already in queue
-            return
+    def add_step(self, step_type: StepType, params: dict = None):
+        """Add a step to the queue, with conditional dependency prompting.
+
+        For CELLPOSE_SEGMENT steps, *params* must contain at least
+        ``{"cell_type": ..., "model_path": ...}``.  Multiple cellpose steps
+        with different cell types are allowed; duplicates (same cell type)
+        are silently ignored.
+        """
+        if params is None:
+            params = {}
+
+        # Dedup: for cellpose, dedup by (step_type, cell_type); others by step_type
+        if step_type == StepType.CELLPOSE_SEGMENT:
+            ct = params.get("cell_type", "")
+            if any(
+                s.step_type == StepType.CELLPOSE_SEGMENT
+                and s.params.get("cell_type") == ct
+                for s in self._steps
+            ):
+                return  # same cell type already queued
+        else:
+            if any(s.step_type == step_type for s in self._steps):
+                return
 
         from qtpy.QtWidgets import QMessageBox
 
         # Dependency chain logic
         added_already = [s.step_type for s in self._steps]
-        
-        # 1. TRACK needs SEGMENT
+
+        # 1. TRACK needs segmentation data
         if step_type == StepType.TRACK and StepType.SEGMENT not in added_already:
             missing = self._check_input_data_missing(StepType.TRACK)
             if missing:
-                res = QMessageBox.question(
-                    self, "Missing Segmentation Data",
-                    "Segmentation data is missing for some samples/cell types.\n\n"
-                    "Would you like to add Batch Segmentation to the pipeline?",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                if res == QMessageBox.Yes:
-                    self.add_step(StepType.SEGMENT)
-                else:
-                    return # Cancel adding Track
+                # Check if all missing cell types are covered by cellpose steps
+                if not self._cellpose_covers_all_cell_types():
+                    res = QMessageBox.question(
+                        self, "Missing Segmentation Data",
+                        "Segmentation data is missing for some samples/cell types.\n\n"
+                        "Would you like to add Batch Segmentation to the pipeline?",
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    if res == QMessageBox.Yes:
+                        self.add_step(StepType.SEGMENT)
+                    else:
+                        return  # Cancel adding Track
 
         # 2. FEATURE_EXTRACT needs TRACK
         elif step_type == StepType.FEATURE_EXTRACT and StepType.TRACK not in added_already:
@@ -327,7 +362,7 @@ class ProcessingQueuePanel(QWidget):
                 if res == QMessageBox.Yes:
                     self.add_step(StepType.TRACK)
                 else:
-                    return # Cancel adding Feature Extract
+                    return  # Cancel adding Feature Extract
 
         # 3. FILTER needs FEATURE_EXTRACT
         elif step_type == StepType.FILTER and StepType.FEATURE_EXTRACT not in added_already:
@@ -342,20 +377,20 @@ class ProcessingQueuePanel(QWidget):
                 if res == QMessageBox.Yes:
                     self.add_step(StepType.FEATURE_EXTRACT)
                 else:
-                    return # Cancel adding Filter
+                    return  # Cancel adding Filter
 
         # Finally add the requested step
-        step = QueueStep(step_type=step_type)
+        step = QueueStep(step_type=step_type, params=params)
         self._steps.append(step)
-        
-        # Train still auto-adds Segment (as per existing logic, likely desired)
+
+        # Train still auto-adds Segment
         if step_type == StepType.TRAIN:
             if not any(s.step_type == StepType.SEGMENT for s in self._steps):
                 self._steps.append(QueueStep(step_type=StepType.SEGMENT))
 
         self._steps.sort(key=lambda s: s.step_type.order)
         self._rebuild_list()
-        
+
         # Auto-expand when adding
         if not self.body.isVisible():
             self._toggle_body()
@@ -365,26 +400,78 @@ class ProcessingQueuePanel(QWidget):
         self.preset_combo.setCurrentIndex(0)
         self.preset_combo.blockSignals(False)
 
-    def remove_step(self, step_type: StepType):
-        """Remove a step from the queue (deferred to avoid crash)."""
+    def _cellpose_covers_all_cell_types(self) -> bool:
+        """Return True if every cell type that needs segmentation is covered
+        by a CELLPOSE_SEGMENT step already in the queue (or has data on disk)."""
+        md = self.metadata_loader.metadata
+        if md is None:
+            return False
+        out_dir = Path(self.metadata_loader.output_dir)
+
+        all_cts = []
+        if self.tracking_tab:
+            all_cts = list(self.tracking_tab.panels.keys())
+        if not all_cts:
+            return False
+
+        queued_cellpose_cts = {
+            s.params.get("cell_type")
+            for s in self._steps
+            if s.step_type == StepType.CELLPOSE_SEGMENT
+        }
+
+        for ct in all_cts:
+            # Check if data already exists on disk
+            all_exist = True
+            for _, sample in md.iterrows():
+                sn = sample.get("sample_name", "unknown")
+                seg_zarr = out_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
+                if not seg_zarr.exists():
+                    all_exist = False
+                    break
+            if all_exist:
+                continue  # this cell type is covered by existing data
+            # Not on disk — check if a cellpose step covers it
+            if ct not in queued_cellpose_cts:
+                return False
+        return True
+
+    def remove_step(self, step):
+        """Remove a step from the queue (deferred to avoid crash).
+
+        *step* can be a StepType (removes first matching) or a QueueStep
+        instance (removes that exact step).  For SEGMENT, also removes TRAIN.
+        """
         if self._is_running:
             return
-        # Defer so the signal-emitting row widget fully returns before we touch it
-        QTimer.singleShot(0, lambda: self._do_remove_step(step_type))
+        QTimer.singleShot(0, lambda: self._do_remove_step(step))
 
-    def _do_remove_step(self, step_type: StepType):
+    def _do_remove_step(self, step):
         """Actually remove the step — runs after the signal handler has returned."""
-        # If removing Segment, also remove Train (Train without Segment is invalid)
-        types_to_remove = {step_type}
-        if step_type == StepType.SEGMENT:
-            types_to_remove.add(StepType.TRAIN)
+        if isinstance(step, QueueStep):
+            # Identity-based removal (used for cellpose with per-cell-type steps)
+            indices_to_remove = []
+            for i, s in enumerate(self._steps):
+                if s is step:
+                    indices_to_remove.append(i)
+                    # If removing Segment, also remove Train
+                    if s.step_type == StepType.SEGMENT:
+                        for j, s2 in enumerate(self._steps):
+                            if s2.step_type == StepType.TRAIN and j not in indices_to_remove:
+                                indices_to_remove.append(j)
+                    break
+        else:
+            # Legacy: step is a StepType enum
+            step_type = step
+            types_to_remove = {step_type}
+            if step_type == StepType.SEGMENT:
+                types_to_remove.add(StepType.TRAIN)
+            indices_to_remove = [
+                i for i, s in enumerate(self._steps)
+                if s.step_type in types_to_remove
+            ]
 
-        indices_to_remove = []
-        for i, step in enumerate(self._steps):
-            if step.step_type in types_to_remove:
-                indices_to_remove.append(i)
-        # Remove in reverse order to preserve indices
-        for i in reversed(indices_to_remove):
+        for i in reversed(sorted(indices_to_remove)):
             self._steps.pop(i)
             row = self._step_rows.pop(i)
             self.steps_layout.removeWidget(row)
@@ -427,7 +514,7 @@ class ProcessingQueuePanel(QWidget):
 
         for step in self._steps:
             row = QueueStepRow(step)
-            row.remove_requested.connect(lambda st=step.step_type: self.remove_step(st))
+            row.remove_requested.connect(lambda _s=step: self.remove_step(_s))
             self.steps_layout.addWidget(row)
             self._step_rows.append(row)
 
@@ -531,6 +618,24 @@ class ProcessingQueuePanel(QWidget):
                             warnings.append(f"Segmentation data for {sn}")
                             break
 
+            elif step.step_type == StepType.CELLPOSE_SEGMENT:
+                ct = step.params.get("cell_type", "")
+                if ct:
+                    for _, sample in md.iterrows():
+                        sn = sample.get("sample_name", "unknown")
+                        seg_zarr = out_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
+                        if seg_zarr.exists():
+                            warnings.append(f"Cellpose segmentation for {ct} ({sn})")
+                            break
+
+            elif step.step_type == StepType.DEAD_MASK:
+                for _, sample in md.iterrows():
+                    sn = sample.get("sample_name", "unknown")
+                    dead_zarr = out_dir / "images" / sn / f"{sn}_dead_segments.zarr"
+                    if dead_zarr.exists():
+                        warnings.append(f"Dead mask for {sn}")
+                        break
+
             elif step.step_type == StepType.TRACK:
                 for _, sample in md.iterrows():
                     sn = sample.get("sample_name", "unknown")
@@ -616,25 +721,25 @@ class ProcessingQueuePanel(QWidget):
             QApplication.processEvents()
 
             step_start = time.time()
-            print(f"\n▶ [{i+1}/{len(self._steps)}] {step.step_type.label}...", file=sys.stderr)
+            print(f"\n▶ [{i+1}/{len(self._steps)}] {step.display_label}...", file=sys.stderr)
 
             try:
                 self._execute_step(step, skip_existing=skip_existing)
                 step.elapsed = time.time() - step_start
                 step.status = StepStatus.DONE
-                print(f"✅ {step.step_type.label} completed in {step.elapsed:.1f}s", file=sys.stderr)
+                print(f"✅ {step.display_label} completed in {step.elapsed:.1f}s", file=sys.stderr)
             except Exception as e:
                 step.elapsed = time.time() - step_start
                 step.status = StepStatus.ERROR
                 step.error_msg = str(e)
                 traceback.print_exc()
-                print(f"❌ {step.step_type.label} failed: {e}", file=sys.stderr)
+                print(f"❌ {step.display_label} failed: {e}", file=sys.stderr)
                 
                 # Show error dialog and stop queue
                 QMessageBox.critical(
                     self, 
                     "Queue Error", 
-                    f"An error occurred during {step.step_type.label}:\n\n{e}\n\nQueue execution stopped."
+                    f"An error occurred during {step.display_label}:\n\n{e}\n\nQueue execution stopped."
                 )
                 
                 # Stop on first error
@@ -661,6 +766,10 @@ class ProcessingQueuePanel(QWidget):
             self._run_train()
         elif step.step_type == StepType.SEGMENT:
             self._run_segment(skip_existing=skip_existing)
+        elif step.step_type == StepType.CELLPOSE_SEGMENT:
+            self._run_cellpose_segment(step, skip_existing=skip_existing)
+        elif step.step_type == StepType.DEAD_MASK:
+            self._run_dead_mask(skip_existing=skip_existing)
         elif step.step_type == StepType.TRACK:
             self._run_track(skip_existing=skip_existing)
         elif step.step_type == StepType.FEATURE_EXTRACT:
@@ -696,6 +805,21 @@ class ProcessingQueuePanel(QWidget):
             self.feature_extraction_tab.run_batch_feature_extraction(interactive=False, skip_existing=skip_existing)
         else:
             raise RuntimeError("Feature Extraction tab not wired to queue.")
+
+    def _run_cellpose_segment(self, step: QueueStep, skip_existing: bool = False):
+        """Run cellpose segmentation for the cell type stored in step.params."""
+        cp_widget = self.segmentation_tab.cellpose_page
+        cp_widget.run_batch_cellpose(
+            interactive=False,
+            skip_existing=skip_existing,
+            cell_type_override=step.params.get("cell_type"),
+            model_path_override=step.params.get("model_path"),
+        )
+
+    def _run_dead_mask(self, skip_existing: bool = False):
+        """Run Otsu dead mask segmentation (non-interactive)."""
+        cp_widget = self.segmentation_tab.cellpose_page
+        cp_widget.run_otsu_threshold(interactive=False)
 
     def _run_filter(self, skip_existing: bool = False):
         """Run batch filtering (non-interactive)."""

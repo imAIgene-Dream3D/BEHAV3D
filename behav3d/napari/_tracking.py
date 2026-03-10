@@ -134,15 +134,18 @@ class _ImportTrackingPage(QWidget):
             return
 
         info = QLabel(
-            f"<b>Import pre-tracked files for <code>{self.cell_type}</code></b><br>"
-            f"<span style='color:#888; font-size:10px'>"
-            f"Set <code>{self._tracks_img_col()}</code> in your metadata CSV "
-            f"to the path of your pre-tracked image (.zarr or .tif/.tiff). "
-            f"Outputs are written to the standard BEHAV3D locations.</span>"
+            f"<b>Import pre-tracked files for <code>{self.cell_type}</code></b>"
         )
-        info.setWordWrap(True)
-        info.setStyleSheet("padding:6px 4px 10px 4px;")
+        info.setStyleSheet("padding:6px 4px 2px 4px;")
         scroll_layout.addWidget(info)
+        desc = QLabel(
+            f"Set the tracking image path in your metadata CSV "
+            f"to a pre-tracked image (.zarr or .tif/.tiff). "
+            f"Column: {self._tracks_img_col()}"
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color:#888; font-size:10px; padding:0 4px 10px 4px;")
+        scroll_layout.addWidget(desc)
 
         any_action = False
         for idx, row in md.iterrows():
@@ -218,8 +221,8 @@ class _ImportTrackingPage(QWidget):
                     )
                     row_lay.addWidget(btn_regen)
                 else:
-                    btn = QPushButton("🔄  Convert TIFF → zarr + Generate CSV")
-                    btn.setToolTip(f"Will write:\n  {dest_z}\n  {dest_c}")
+                    btn = QPushButton("🔄  Convert TIFF → zarr")
+                    btn.setToolTip(f"Convert TIFF to zarr + generate CSV tracking data.\nWill write:\n  {dest_z}\n  {dest_c}")
                     btn.setStyleSheet(
                         "QPushButton{background:#1565C0;color:white;padding:4px 10px;border-radius:3px}"
                         "QPushButton:hover{background:#1976D2}"
@@ -251,9 +254,9 @@ class _ImportTrackingPage(QWidget):
                     row_lay.addWidget(btn_regen)
                     # Re-process is available but doesn't count for "Process All"
                 else:
-                    btn = QPushButton("📄  Import zarr + Generate CSV")
+                    btn = QPushButton("📄  Import zarr")
                     btn.setToolTip(
-                        f"Will write:\n  {dest_z}\n  {dest_c}"
+                        f"Import zarr + generate CSV tracking data.\nWill write:\n  {dest_z}\n  {dest_c}"
                     )
                     btn.setStyleSheet(
                         "QPushButton{background:#2E7D32;color:white;padding:4px 10px;border-radius:3px}"
@@ -685,10 +688,15 @@ class CellTypeTrackingPanel(QWidget):
         ))
 
         self.bt_update_method = QComboBox()
-        self.bt_update_method.addItems(["EXACT (recommended)", "APPROXIMATE (large datasets)"])
+        self.bt_update_method.addItems(["EXACT", "APPROXIMATE"])
+        self.bt_update_method.setToolTip(
+            "EXACT — full Bayesian belief matrix (accurate, slower).\n"
+            "APPROXIMATE — local spatial search (faster, for >1000 cells/frame)."
+        )
         self.bt_update_method.setCurrentIndex(
             1 if bt_cfg.get("update_method", "EXACT").upper() == "APPROXIMATE" else 0
         )
+        self.bt_update_method.setMaximumWidth(130)
         step1_form.addRow("Update method:", make_help_row(
             self.bt_update_method,
             "Update Method",
