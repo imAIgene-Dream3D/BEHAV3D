@@ -6,8 +6,10 @@ method-specific parameters, and batch-tracking options.
 """
 import sys
 import traceback
+from functools import partial
 from pathlib import Path
 
+import pandas as pd
 import yaml
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -19,6 +21,373 @@ from qtpy.QtWidgets import (
 from qtpy.QtCore import Qt
 
 from behav3d.napari._widgets import make_help_row
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _ImportTrackingPage — Page 4 of CellTypeTrackingPanel
+# ═══════════════════════════════════════════════════════════════════════════
+class _ImportTrackingPage(QWidget):
+    """Per-cell-type widget for importing pre-tracked zarr/tiff files.
+
+    Reads the source path from the metadata column
+    ``{prefix}_{cell_type}_tracks_image_path``, validates/converts it,
+    and writes outputs to the standard BEHAV3D output locations — exactly
+    the same paths used by every other tracking algorithm.
+    """
+
+    def __init__(self, cell_type: str, category: str, metadata_loader, parent=None):
+        super().__init__(parent)
+        self.cell_type = cell_type
+        self.category = category
+        self.metadata_loader = metadata_loader
+        self._prefix = {"organoid": "or", "immune": "im"}.get(category, "ot")
+        self._init_ui()
+        if hasattr(metadata_loader, "metadata_loaded"):
+            metadata_loader.metadata_loaded.connect(self._on_metadata_updated)
+        if getattr(metadata_loader, "metadata", None) is not None:
+            self._rebuild()
+
+    # ── column helpers ──────────────────────────────────────────────────
+    def _tracks_img_col(self):
+        return f"{self._prefix}_{self.cell_type}_tracks_image_path"
+
+    def _tracks_csv_col(self):
+        return f"{self._prefix}_{self.cell_type}_tracks_csv_path"
+
+    # ── standard output paths (same as all tracking algorithms) ────────
+    def _dest_zarr(self, sample_name: str) -> Path:
+        return (Path(self.metadata_loader.output_dir)
+                / "images" / sample_name
+                / f"{sample_name}_{self.cell_type}_tracked.zarr")
+
+    def _dest_csv(self, sample_name: str) -> Path:
+        return (Path(self.metadata_loader.output_dir)
+                / "trackdata" / sample_name / self.cell_type
+                / f"{sample_name}_{self.cell_type}_tracks.csv")
+
+    # ── path helpers ────────────────────────────────────────────────────
+    def _resolve_path(self, path_str: str):
+        if not path_str:
+            return None
+        p = Path(path_str)
+        if p.exists():
+            return p
+        md_csv = (self.metadata_loader.behav3d_parameters
+                  .get("paths", {}).get("metadata_csv"))
+        if md_csv:
+            p_rel = Path(md_csv).parent / path_str
+            if p_rel.exists():
+                return p_rel
+        return p  # return non-existent path so caller can report it
+
+    @staticmethod
+    def _check_zarr_structure(path) -> tuple:
+        import zarr
+        try:
+            root = zarr.open(str(path), mode="r")
+            if isinstance(root, zarr.Group):
+                return False, "Zarr contains sub-groups instead of a root array"
+            if root.chunks[0] != 1:
+                return False, f"First chunk dim is {root.chunks[0]}, expected 1"
+            return True, "OK"
+        except Exception as exc:
+            return False, str(exc)
+
+    # ── UI ──────────────────────────────────────────────────────────────
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # Initial placeholder content
+        content = QWidget()
+        self.scroll_layout = QVBoxLayout(content)
+        self.scroll_layout.setAlignment(Qt.AlignTop)
+        self._scroll.setWidget(content)
+        layout.addWidget(self._scroll)
+
+    def _on_metadata_updated(self, _=None):
+        self._rebuild()
+
+    def _rebuild(self):
+        # Detach the old content widget without destroying it — this prevents
+        # Qt from synchronously deleting the clicked button while its signal
+        # emission is still on the C++ stack.
+        old_content = self._scroll.takeWidget()
+
+        content = QWidget()
+        scroll_layout = QVBoxLayout(content)
+        scroll_layout.setAlignment(Qt.AlignTop)
+        self.scroll_layout = scroll_layout
+
+        md = self.metadata_loader.metadata
+        if md is None or md.empty:
+            lbl = QLabel("No metadata loaded.")
+            lbl.setStyleSheet("color:#888; font-style:italic; padding:20px;")
+            scroll_layout.addWidget(lbl)
+            self._scroll.setWidget(content)
+            if old_content is not None:
+                old_content.deleteLater()
+            return
+
+        info = QLabel(
+            f"<b>Import pre-tracked files for <code>{self.cell_type}</code></b><br>"
+            f"<span style='color:#888; font-size:10px'>"
+            f"Set <code>{self._tracks_img_col()}</code> in your metadata CSV "
+            f"to the path of your pre-tracked image (.zarr or .tif/.tiff). "
+            f"Outputs are written to the standard BEHAV3D locations.</span>"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("padding:6px 4px 10px 4px;")
+        scroll_layout.addWidget(info)
+
+        any_action = False
+        for idx, row in md.iterrows():
+            sample_name = str(row.get("sample_name", f"Row {idx + 1}"))
+            if self._add_sample_row(sample_name, int(idx), row):
+                any_action = True
+
+        if any_action:
+            btn_all = QPushButton("⚡  Process All Samples")
+            btn_all.setStyleSheet(
+                "QPushButton{background:#1565C0;color:white;padding:7px 16px;"
+                "border-radius:4px;font-weight:bold;font-size:12px}"
+                "QPushButton:hover{background:#1976D2}"
+            )
+            btn_all.clicked.connect(self._process_all)
+            scroll_layout.addWidget(btn_all)
+
+        scroll_layout.addStretch()
+        self._scroll.setWidget(content)
+        if old_content is not None:
+            old_content.deleteLater()
+
+    def _add_sample_row(self, sample_name: str, row_idx: int, row) -> bool:
+        """Add one sample row. Returns True if an action button was added."""
+        header = QLabel(f"📁  {sample_name}")
+        header.setStyleSheet("font-weight:bold; font-size:12px; padding:6px 0 2px 0;")
+        self.scroll_layout.addWidget(header)
+
+        col = self._tracks_img_col()
+        raw_val = row.get(col) if col in row.index else None
+        has_value = (
+            raw_val is not None
+            and pd.notna(raw_val)
+            and str(raw_val).strip() not in ("", "nan")
+        )
+
+        row_w = QWidget()
+        row_lay = QHBoxLayout(row_w)
+        row_lay.setContentsMargins(16, 2, 4, 4)
+        needs_action = False
+
+        if not has_value:
+            lbl = QLabel("No source path set in metadata")
+            lbl.setStyleSheet("color:#999; font-style:italic;")
+            row_lay.addWidget(lbl)
+
+        else:
+            path_str = str(raw_val).strip().strip('"').strip("'")
+            file_path = self._resolve_path(path_str)
+
+            if not file_path.exists():
+                lbl = QLabel(f"⚠️  File not found: {file_path}")
+                lbl.setWordWrap(True)
+                lbl.setStyleSheet("color:#E65100;")
+                row_lay.addWidget(lbl)
+
+            elif file_path.suffix.lower() in (".tif", ".tiff"):
+                dest_z = self._dest_zarr(sample_name)
+                dest_c = self._dest_csv(sample_name)
+                if dest_z.exists() and dest_c.exists():
+                    lbl = QLabel("✅  Already processed")
+                    lbl.setStyleSheet("color:#2E7D32; font-weight:bold;")
+                    row_lay.addWidget(lbl)
+                    btn_regen = QPushButton("🔄  Re-process")
+                    btn_regen.setToolTip(f"Will overwrite:\n  {dest_z}\n  {dest_c}")
+                    btn_regen.setStyleSheet(
+                        "QPushButton{background:#546E7A;color:white;padding:4px 8px;"
+                        "border-radius:3px;font-size:10px}"
+                        "QPushButton:hover{background:#607D8B}"
+                    )
+                    btn_regen.clicked.connect(
+                        partial(self._process_single, path_str, sample_name, row_idx)
+                    )
+                    row_lay.addWidget(btn_regen)
+                else:
+                    btn = QPushButton("🔄  Convert TIFF → zarr + Generate CSV")
+                    btn.setToolTip(f"Will write:\n  {dest_z}\n  {dest_c}")
+                    btn.setStyleSheet(
+                        "QPushButton{background:#1565C0;color:white;padding:4px 10px;border-radius:3px}"
+                        "QPushButton:hover{background:#1976D2}"
+                    )
+                    btn.clicked.connect(partial(self._process_single, path_str, sample_name, row_idx))
+                    row_lay.addWidget(btn)
+                    needs_action = True
+
+            elif file_path.suffix == ".zarr" or file_path.is_dir():
+                dest_z = self._dest_zarr(sample_name)
+                dest_c = self._dest_csv(sample_name)
+
+                if dest_z.exists() and dest_c.exists():
+                    lbl = QLabel("✅  Already processed")
+                    lbl.setStyleSheet("color:#2E7D32; font-weight:bold;")
+                    row_lay.addWidget(lbl)
+                    btn_regen = QPushButton("🔄  Re-process")
+                    btn_regen.setToolTip(
+                        f"Will overwrite:\n  {dest_z}\n  {dest_c}"
+                    )
+                    btn_regen.setStyleSheet(
+                        "QPushButton{background:#546E7A;color:white;padding:4px 8px;"
+                        "border-radius:3px;font-size:10px}"
+                        "QPushButton:hover{background:#607D8B}"
+                    )
+                    btn_regen.clicked.connect(
+                        partial(self._process_single, path_str, sample_name, row_idx)
+                    )
+                    row_lay.addWidget(btn_regen)
+                    # Re-process is available but doesn't count for "Process All"
+                else:
+                    btn = QPushButton("📄  Import zarr + Generate CSV")
+                    btn.setToolTip(
+                        f"Will write:\n  {dest_z}\n  {dest_c}"
+                    )
+                    btn.setStyleSheet(
+                        "QPushButton{background:#2E7D32;color:white;padding:4px 10px;border-radius:3px}"
+                        "QPushButton:hover{background:#388E3C}"
+                    )
+                    btn.clicked.connect(
+                        partial(self._process_single, path_str, sample_name, row_idx)
+                    )
+                    row_lay.addWidget(btn)
+                    needs_action = True
+            else:
+                lbl = QLabel(f"⚠️  Unsupported format ({file_path.suffix})")
+                lbl.setStyleSheet("color:#E65100;")
+                row_lay.addWidget(lbl)
+
+        row_lay.addStretch()
+        self.scroll_layout.addWidget(row_w)
+
+        sep = QWidget()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background:#ddd; margin:2px 0;")
+        self.scroll_layout.addWidget(sep)
+        return needs_action
+
+    # ── processing ──────────────────────────────────────────────────────
+    def _process_single(self, src_path_str: str, sample_name: str,
+                        row_idx: int, _=None, save: bool = True):
+        import shutil
+        from qtpy.QtWidgets import QMessageBox
+        from behav3d.io.images import load_image, save_as_zarr
+        from behav3d.preprocessing.tracking import convert_tracked_image_to_csv
+
+        src = self._resolve_path(src_path_str)
+        dest_z = self._dest_zarr(sample_name)
+        dest_c = self._dest_csv(sample_name)
+        dest_z.parent.mkdir(parents=True, exist_ok=True)
+        dest_c.parent.mkdir(parents=True, exist_ok=True)
+
+        # Warn only if the destination zarr already exists
+        if dest_z.exists():
+            res = QMessageBox.question(
+                self,
+                "Overwrite existing tracking?",
+                f"A tracked zarr already exists at:\n{dest_z}\n\nOverwrite it?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if res != QMessageBox.Yes:
+                return
+
+        try:
+            # Step 1 — ensure valid zarr at dest_z
+            zarr_ok = False
+            if src.suffix == ".zarr" or src.is_dir():
+                zarr_ok, _ = self._check_zarr_structure(src)
+
+            if src.suffix.lower() in (".tif", ".tiff") or not zarr_ok:
+                print(f"  Converting {src.name} → {dest_z.name} …", flush=True)
+                if dest_z.exists():
+                    shutil.rmtree(dest_z)
+                save_as_zarr(load_image(src), dest_z)
+            else:
+                # Valid zarr — copy to standard output location if needed
+                if src.resolve() != dest_z.resolve():
+                    print(f"  Copying {src.name} → {dest_z.name} …", flush=True)
+                    if dest_z.exists():
+                        shutil.rmtree(dest_z)
+                    shutil.copytree(str(src), str(dest_z))
+
+            zarr_path = dest_z
+
+            # Step 2 — generate tracks CSV
+            md_row = self.metadata_loader.metadata.iloc[row_idx]
+            element_size_x = float(md_row.get("pixel_distance_xy") or 1)
+            element_size_y = float(md_row.get("pixel_distance_xy") or 1)
+            element_size_z = float(md_row.get("pixel_distance_z") or 1)
+
+            print(f"  Generating tracks CSV from {zarr_path.name} …", flush=True)
+            convert_tracked_image_to_csv(
+                img_path=zarr_path,
+                outpath=dest_c,
+                element_size_x=element_size_x,
+                element_size_y=element_size_y,
+                element_size_z=element_size_z,
+            )
+            print(f"  ✅ {dest_c.name}", flush=True)
+
+            # Step 3 — update metadata (same pattern as _run_tracking_for)
+            img_col = self._tracks_img_col()
+            csv_col = self._tracks_csv_col()
+            md = self.metadata_loader.metadata.copy()
+            if img_col not in md.columns:
+                md[img_col] = pd.Series(dtype=object)
+            if csv_col not in md.columns:
+                md[csv_col] = pd.Series(dtype=object)
+            md.at[row_idx, img_col] = str(zarr_path)
+            md.at[row_idx, csv_col] = str(dest_c)
+            self.metadata_loader.metadata = md
+
+            if save:
+                self._save_metadata(md)
+
+        except Exception as exc:
+            traceback.print_exc()
+            print(f"  ❌ Error processing {sample_name}: {exc}", flush=True)
+
+    def _process_all(self, _=None):
+        col = self._tracks_img_col()
+        md = self.metadata_loader.metadata
+        if md is None:
+            return
+        for idx, row in md.iterrows():
+            raw_val = row.get(col) if col in row.index else None
+            if raw_val is None or not pd.notna(raw_val) or str(raw_val).strip() in ("", "nan"):
+                continue
+            path_str = str(raw_val).strip().strip('"').strip("'")
+            fp = self._resolve_path(path_str)
+            if fp is None or not fp.exists():
+                continue
+            sample_name = str(row.get("sample_name", f"Row {idx + 1}"))
+            self._process_single(path_str, sample_name, int(idx), save=False)
+        self._save_metadata(self.metadata_loader.metadata)
+
+    def _save_metadata(self, md):
+        csv_path = (self.metadata_loader.behav3d_parameters
+                    .get("paths", {}).get("metadata_csv"))
+        if csv_path:
+            md.to_csv(csv_path, sep=",", index=False)
+            print(f"  Metadata saved → {csv_path}", flush=True)
+        # Defer _rebuild() to the next event-loop cycle so that any button
+        # click handler that triggered this call has fully returned before Qt
+        # destroys the button widget (avoids 0xC0000005 access violation).
+        from qtpy.QtCore import QTimer
+        QTimer.singleShot(0, self._rebuild)
 
 
 def _cfg_get(cfg: dict, dotted_key: str, default=None):
@@ -427,17 +796,12 @@ class CellTypeTrackingPanel(QWidget):
         btrack_lay.addStretch()
         self.param_stack.addWidget(btrack_page)
 
-        # Page 4 — Import tracking (Coming soon)
-        import_page = QWidget()
-        import_lay = QVBoxLayout(import_page)
-        import_notice = QLabel(
-            "Import tracking will be\navailable in a future release."
+        # Page 4 — Import tracking
+        import_page = _ImportTrackingPage(
+            cell_type=self.cell_type,
+            category=self.category,
+            metadata_loader=self.metadata_loader,
         )
-        import_notice.setWordWrap(True)
-        import_notice.setAlignment(Qt.AlignCenter)
-        import_notice.setStyleSheet("color: #999; font-style: italic; padding: 10px;")
-        import_lay.addWidget(import_notice)
-        import_lay.addStretch()
         self.param_stack.addWidget(import_page)
 
         # Set active page
