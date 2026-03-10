@@ -14,6 +14,7 @@ from qtpy.QtWidgets import (
     QTabWidget, QGroupBox, QLabel, QPushButton,
     QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox,
     QScrollArea, QTextEdit, QStackedWidget,
+    QLineEdit, QFileDialog,
 )
 from qtpy.QtCore import Qt
 
@@ -238,16 +239,191 @@ class CellTypeTrackingPanel(QWidget):
 
         self.param_stack.addWidget(prop_page)
 
-        # Page 3 — btrack (Coming soon)
+        # Page 3 — btrack (Bayesian tracking)
+        bt_cfg = tcfg.get("btrack", {})
         btrack_page = QWidget()
         btrack_lay = QVBoxLayout(btrack_page)
-        btrack_notice = QLabel(
-            "btrack (Bayesian tracking) will be\navailable in a future release."
+        btrack_lay.setContentsMargins(6, 4, 6, 4)
+        btrack_lay.setSpacing(4)
+
+        # Info banner
+        _bt_info = QLabel(
+            "<b>btrack</b> \u2014 Bayesian multi-object tracker.<br>"
+            "<b>Step 1</b> (Kalman filter): always runs \u2014 tune and validate first.<br>"
+            "<b>Step 2</b> (optimizer): opt-in \u2014 enable only once Step 1 looks correct.<br>"
+            "See <tt>models/README_btrack.md</tt> for full parameter reference."
         )
-        btrack_notice.setWordWrap(True)
-        btrack_notice.setAlignment(Qt.AlignCenter)
-        btrack_notice.setStyleSheet("color: #999; font-style: italic; padding: 10px;")
-        btrack_lay.addWidget(btrack_notice)
+        _bt_info.setWordWrap(True)
+        _bt_info.setStyleSheet("color: #888; font-size: 10px; padding: 2px 0 6px 0;")
+        btrack_lay.addWidget(_bt_info)
+
+        # ── Sub-group A: Core Tracking (Step 1) ─────────────────
+        step1_group = QGroupBox("Step 1 \u2014 Kalman Filter Tracking")
+        step1_form = QFormLayout(step1_group)
+        step1_form.setContentsMargins(6, 4, 6, 4)
+        step1_form.setSpacing(3)
+        step1_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        self.bt_config_preset = QComboBox()
+        self.bt_config_preset.addItems([
+            "Cell (bundled)", "Particle (bundled)", "Custom JSON…",
+        ])
+        preset_val = bt_cfg.get("config_preset", "cell")
+        preset_idx = {"cell": 0, "particle": 1}.get(str(preset_val).lower(), 2)
+        self.bt_config_preset.setCurrentIndex(preset_idx)
+        step1_form.addRow("Config preset:", make_help_row(
+            self.bt_config_preset,
+            "Configuration Preset",
+            "Select a bundled motion/hypothesis model, or provide\n"
+            "your own JSON configuration file.\n\n"
+            "• Cell — tuned for biological cell tracking\n"
+            "• Particle — tuned for small particle tracking\n"
+            "• Custom JSON — browse to your own config file"
+        ))
+
+        config_path_row = QHBoxLayout()
+        self.bt_config_path = QLineEdit()
+        self.bt_config_path.setPlaceholderText("Path to custom btrack JSON…")
+        self.bt_config_path.setText(bt_cfg.get("config_path", ""))
+        self.bt_config_path.setEnabled(preset_idx == 2)
+        self.bt_browse_btn = QPushButton("Browse")
+        self.bt_browse_btn.setFixedWidth(60)
+        self.bt_browse_btn.setEnabled(preset_idx == 2)
+        self.bt_browse_btn.clicked.connect(self._bt_browse_config)
+        config_path_row.addWidget(self.bt_config_path)
+        config_path_row.addWidget(self.bt_browse_btn)
+        config_path_widget = QWidget()
+        config_path_widget.setLayout(config_path_row)
+        step1_form.addRow("", config_path_widget)
+
+        def _on_preset_changed(idx):
+            is_custom = idx == 2
+            self.bt_config_path.setEnabled(is_custom)
+            self.bt_browse_btn.setEnabled(is_custom)
+        self.bt_config_preset.currentIndexChanged.connect(_on_preset_changed)
+
+        self.bt_max_search_radius = QSpinBox()
+        self.bt_max_search_radius.setRange(1, 9999)
+        self.bt_max_search_radius.setValue(int(bt_cfg.get("max_search_radius", 100)))
+        self.bt_max_search_radius.setMaximumWidth(80)
+        step1_form.addRow("Max search radius (px):", make_help_row(
+            self.bt_max_search_radius,
+            "Max Search Radius (pixels)",
+            "Maximum isotropic distance (pixels) to search for\n"
+            "linking objects between frames.\n\n"
+            "Increase for fast-moving cells; decrease to\n"
+            "prevent long-range false links."
+        ))
+
+        self.bt_update_method = QComboBox()
+        self.bt_update_method.addItems(["EXACT (recommended)", "APPROXIMATE (large datasets)"])
+        self.bt_update_method.setCurrentIndex(
+            1 if bt_cfg.get("update_method", "EXACT").upper() == "APPROXIMATE" else 0
+        )
+        step1_form.addRow("Update method:", make_help_row(
+            self.bt_update_method,
+            "Update Method",
+            "EXACT — full Bayesian belief matrix (accurate, slower).\n"
+            "APPROXIMATE — local spatial search (faster, for >1000\n"
+            "cells per frame).\n\n"
+            "Use EXACT unless tracking is too slow."
+        ))
+
+        self.bt_step_size = QSpinBox()
+        self.bt_step_size.setRange(1, 10000)
+        self.bt_step_size.setValue(int(bt_cfg.get("step_size", 100)))
+        self.bt_step_size.setMaximumWidth(80)
+        step1_form.addRow("Step size (frames):", make_help_row(
+            self.bt_step_size,
+            "Step Size",
+            "Number of frames processed per tracking iteration.\n\n"
+            "Lower values use less RAM but may be slightly slower."
+        ))
+
+        btrack_lay.addWidget(step1_group)
+
+        # ── Sub-group B: Global Optimizer (Step 2 — opt-in) ─────
+        step2_group = QGroupBox("Step 2 — Global Hypothesis Optimizer")
+        step2_lay = QVBoxLayout(step2_group)
+        step2_lay.setContentsMargins(6, 4, 6, 4)
+        step2_lay.setSpacing(3)
+
+        self.bt_use_optimize = QCheckBox("Enable global track optimization")
+        self.bt_use_optimize.setChecked(bt_cfg.get("use_optimize", False))
+        self.bt_use_optimize.setToolTip(
+            "Step 2 runs a global integer-programming optimizer\n"
+            "to resolve track merges, splits, and false positives.\n\n"
+            "Recommended: first tune Step 1 without optimization,\n"
+            "then enable this for refinement."
+        )
+        step2_lay.addWidget(self.bt_use_optimize)
+
+        # Hypotheses checkboxes
+        hyp_group = QGroupBox("Hypotheses")
+        hyp_lay = QVBoxLayout(hyp_group)
+        hyp_lay.setContentsMargins(4, 2, 4, 2)
+        hyp_lay.setSpacing(1)
+        saved_hyps = bt_cfg.get("hypotheses",
+                                ["P_FP", "P_init", "P_term", "P_link"])
+        self.bt_hyp_checks = {}
+        for hyp_name, hyp_desc, default_on in [
+            ("P_FP",     "False positive",    True),
+            ("P_init",   "Track initialization", True),
+            ("P_term",   "Track termination",  True),
+            ("P_link",   "Track linking",      True),
+            ("P_branch", "Track branching",    False),
+            ("P_dead",   "Cell death",         False),
+            ("P_merge",  "Track merging",      False),
+        ]:
+            cb = QCheckBox(f"{hyp_name} — {hyp_desc}")
+            is_on = hyp_name in saved_hyps if saved_hyps else default_on
+            cb.setChecked(is_on)
+            if hyp_name == "P_FP":
+                cb.setEnabled(False)  # P_FP is always required
+            hyp_lay.addWidget(cb)
+            self.bt_hyp_checks[hyp_name] = cb
+        step2_lay.addWidget(hyp_group)
+
+        step2_form = QFormLayout()
+        step2_form.setContentsMargins(0, 0, 0, 0)
+        step2_form.setSpacing(3)
+        step2_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        self.bt_dist_thresh = QSpinBox()
+        self.bt_dist_thresh.setRange(1, 9999)
+        self.bt_dist_thresh.setValue(int(bt_cfg.get("dist_thresh", 60)))
+        self.bt_dist_thresh.setMaximumWidth(80)
+        step2_form.addRow("Distance threshold:", make_help_row(
+            self.bt_dist_thresh,
+            "Distance Threshold",
+            "Maximum distance (pixels) for generating\n"
+            "link/branch hypotheses in the optimizer."
+        ))
+
+        self.bt_time_thresh = QSpinBox()
+        self.bt_time_thresh.setRange(1, 999)
+        self.bt_time_thresh.setValue(int(bt_cfg.get("time_thresh", 3)))
+        self.bt_time_thresh.setMaximumWidth(60)
+        step2_form.addRow("Time threshold:", make_help_row(
+            self.bt_time_thresh,
+            "Time Threshold",
+            "Maximum frame gap for generating link\n"
+            "hypotheses in the optimizer."
+        ))
+        step2_lay.addLayout(step2_form)
+
+        btrack_lay.addWidget(step2_group)
+
+        # Toggle Step 2 widgets enabled state
+        self._bt_step2_widgets = [
+            hyp_group, self.bt_dist_thresh, self.bt_time_thresh,
+        ]
+        def _on_optimize_toggled(checked):
+            for w in self._bt_step2_widgets:
+                w.setEnabled(checked)
+        self.bt_use_optimize.toggled.connect(_on_optimize_toggled)
+        _on_optimize_toggled(self.bt_use_optimize.isChecked())
+
         btrack_lay.addStretch()
         self.param_stack.addWidget(btrack_page)
 
@@ -289,9 +465,9 @@ class CellTypeTrackingPanel(QWidget):
         self.btn_run.clicked.connect(self._on_run_clicked)
         layout.addWidget(self.btn_run)
 
-        # Disable run button for coming-soon methods
+        # Disable run button for coming-soon methods (only Import at index 4)
         def _on_method_idx_changed(idx):
-            is_coming_soon = idx >= 3
+            is_coming_soon = idx >= 4
             self.btn_run.setEnabled(not is_coming_soon)
             if is_coming_soon:
                 self.btn_run.setToolTip("This tracking method is not yet available.")
@@ -309,6 +485,29 @@ class CellTypeTrackingPanel(QWidget):
         return ["lap", "trackpy", "propagation", "btrack", "import"][
             self.combo_method.currentIndex()
         ]
+
+    def _bt_browse_config(self):
+        """Open file dialog for custom btrack JSON config."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select btrack config JSON", "",
+            "JSON files (*.json);;All files (*)",
+        )
+        if path:
+            self.bt_config_path.setText(path)
+
+    def _bt_get_config_preset(self):
+        """Return the resolved config preset value."""
+        idx = self.bt_config_preset.currentIndex()
+        if idx == 0:
+            return "cell"
+        elif idx == 1:
+            return "particle"
+        else:
+            return self.bt_config_path.text().strip()
+
+    def _bt_get_hypotheses(self):
+        """Return list of checked hypothesis names."""
+        return [name for name, cb in self.bt_hyp_checks.items() if cb.isChecked()]
 
     def _collect_params(self) -> dict:
         """Collect current widget values into a dict."""
@@ -329,6 +528,17 @@ class CellTypeTrackingPanel(QWidget):
             },
             "propagation": {
                 # Notice: no tunable params currently exposed
+            },
+            "btrack": {
+                "config_preset": self._bt_get_config_preset(),
+                "config_path": self.bt_config_path.text().strip(),
+                "max_search_radius": int(self.bt_max_search_radius.value()),
+                "update_method": "APPROXIMATE" if self.bt_update_method.currentIndex() == 1 else "EXACT",
+                "step_size": int(self.bt_step_size.value()),
+                "use_optimize": self.bt_use_optimize.isChecked(),
+                "hypotheses": self._bt_get_hypotheses(),
+                "dist_thresh": int(self.bt_dist_thresh.value()),
+                "time_thresh": int(self.bt_time_thresh.value()),
             },
         }
 
@@ -351,7 +561,7 @@ class CellTypeTrackingPanel(QWidget):
             if ct in parent_tab.panels:
                 panel = parent_tab.panels[ct]
                 # Apply settings
-                idx_map = {"lap": 0, "trackpy": 1, "propagation": 2}
+                idx_map = {"lap": 0, "trackpy": 1, "propagation": 2, "btrack": 3}
                 panel.combo_method.setCurrentIndex(idx_map.get(settings["method"], 0))
                 
                 # LAP
@@ -366,6 +576,27 @@ class CellTypeTrackingPanel(QWidget):
                 panel.tp_memory.setValue(settings["trackpy"]["memory_frames"])
                 panel.tp_adaptive_stop.setValue(settings["trackpy"]["adaptive_stop"])
                 panel.tp_adaptive_step.setValue(settings["trackpy"]["adaptive_step"])
+                
+                # btrack
+                bt = settings.get("btrack", {})
+                preset = bt.get("config_preset", "cell")
+                preset_idx = {"cell": 0, "particle": 1}.get(
+                    str(preset).lower(), 2
+                )
+                panel.bt_config_preset.setCurrentIndex(preset_idx)
+                panel.bt_config_path.setText(bt.get("config_path", ""))
+                panel.bt_max_search_radius.setValue(bt.get("max_search_radius", 100))
+                panel.bt_update_method.setCurrentIndex(
+                    1 if bt.get("update_method", "EXACT").upper() == "APPROXIMATE" else 0
+                )
+                panel.bt_step_size.setValue(bt.get("step_size", 100))
+                panel.bt_use_optimize.setChecked(bt.get("use_optimize", False))
+                for hyp_name, cb in panel.bt_hyp_checks.items():
+                    if hyp_name == "P_FP":
+                        continue
+                    cb.setChecked(hyp_name in bt.get("hypotheses", []))
+                panel.bt_dist_thresh.setValue(bt.get("dist_thresh", 60))
+                panel.bt_time_thresh.setValue(bt.get("time_thresh", 3))
                 
                 count += 1
         
@@ -433,6 +664,25 @@ class CellTypeTrackingPanel(QWidget):
                 memory=int(self.tp_memory.value()),
                 adaptive_stop=float(self.tp_adaptive_stop.value()),
                 adaptive_step=float(self.tp_adaptive_step.value()),
+                log_callback=self.log,
+            )
+
+        elif method == "btrack":
+            from behav3d.preprocessing.tracking.btrack_tracking import run_btracking
+            config_preset = self._bt_get_config_preset()
+            update_method = "APPROXIMATE" if self.bt_update_method.currentIndex() == 1 else "EXACT"
+            use_opt = self.bt_use_optimize.isChecked()
+            new_md = run_btracking(
+                metadata=metadata, output_dir=out_dir, cell_type=cell_type,
+                overwrite=overwrite,
+                config_preset=config_preset,
+                max_search_radius=int(self.bt_max_search_radius.value()),
+                update_method=update_method,
+                step_size=int(self.bt_step_size.value()),
+                use_optimize=use_opt,
+                hypotheses=self._bt_get_hypotheses() if use_opt else None,
+                dist_thresh=int(self.bt_dist_thresh.value()) if use_opt else None,
+                time_thresh=int(self.bt_time_thresh.value()) if use_opt else None,
                 log_callback=self.log,
             )
 

@@ -21,7 +21,7 @@ from .utils import (
 from behav3d.core.utils import expand_column_patterns
 from behav3d.io.formats.zarr import load_zarr
 from behav3d.io.images import load_image
-from behav3d.features._timepoint_features import run_feature_extraction
+from behav3d.features.timepoint_features import run_feature_extraction
 from behav3d.analysis.tcell_analysis import (
     filter_cell_tracks,
     run_tcell_analysis

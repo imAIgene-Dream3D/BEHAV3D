@@ -373,7 +373,8 @@ class DataPreparationTab(QWidget):
         fields["time_interval"].setMaximum(99999); fields["time_interval"].setValue(1.0); fields["time_interval"].setMaximumWidth(90)
         layout.addRow("Time interval*:", fields["time_interval"])
 
-        fields["time_unit"] = QLineEdit("s")
+        fields["time_unit"] = QComboBox()
+        fields["time_unit"].addItems(["s", "m", "h"])
         fields["time_unit"].setMaximumWidth(60)
         layout.addRow("Time unit*:", fields["time_unit"])
 
@@ -433,6 +434,8 @@ class DataPreparationTab(QWidget):
                 tw = tgt["basic"][k]
                 if isinstance(w, QLineEdit):
                     tw.setText(w.text())
+                elif isinstance(w, QComboBox):
+                    tw.setCurrentText(w.currentText())
                 elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
                     tw.setValue(w.value())
             for ct, fields in src["cell_types"].items():
@@ -594,6 +597,8 @@ class DataPreparationTab(QWidget):
                     continue
                 if isinstance(widget, QLineEdit):
                     widget.setText(str(val))
+                elif isinstance(widget, QComboBox):
+                    widget.setCurrentText(str(val))
                 elif isinstance(widget, QSpinBox):
                     widget.setValue(int(val))
                 elif isinstance(widget, QDoubleSpinBox):
@@ -671,6 +676,8 @@ class DataPreparationTab(QWidget):
             for k, w in form["basic"].items():
                 if isinstance(w, QLineEdit):
                     row[k] = w.text().strip().strip('"').strip("'")
+                elif isinstance(w, QComboBox):
+                    row[k] = w.currentText()
                 elif isinstance(w, QSpinBox):
                     row[k] = w.value()
                 elif isinstance(w, QDoubleSpinBox):
