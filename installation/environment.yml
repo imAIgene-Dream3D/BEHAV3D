@@ -38,8 +38,6 @@ dependencies:
   - matplotlib>=3.9
   - seaborn>=0.13
   - plotly>=5.0
-  - kaleido>=1.2
-  - pypdf>=6.7
 
   # -------------------------------------------------------------------------
   # Image Processing & File I/O
@@ -58,7 +56,6 @@ dependencies:
   # -------------------------------------------------------------------------
   - laptrack>=0.17
   - trackpy>=0.6
-  - btrack>=0.6
 
   # -------------------------------------------------------------------------
   # Machine Learning & Clustering
@@ -119,9 +116,12 @@ dependencies:
   - wheel>=0.40
 
   # -------------------------------------------------------------------------
-  # Pip-only packages
+  # Pip-only packages (not available on conda-forge)
   # -------------------------------------------------------------------------
   - pip:
+    - btrack>=0.6
+    - kaleido>=1.2
+    - pypdf>=6.7
     - imageio-ffmpeg>=0.5.1
     - torchsummary>=1.5.1
     # PyTorch and Cellpose installed separately via install script
