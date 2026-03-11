@@ -88,8 +88,13 @@ def convert_file_to_zarr(
         img = load_image(path)
         # Clip along T axis if requested
         if t_start is not None and t_end is not None:
-            print(f"  Clipping timepoints: {t_start} to {t_end} (of {img.shape[0]} total)")
-            img = img[t_start:t_end + 1]
+            t_start = max(0, t_start)
+            t_end = min(img.shape[0] - 1, t_end)
+            if t_start > t_end:
+                 print(f"Warning: Invalid range {t_start} to {t_end}. Defaulting to full image.")
+            else:
+                print(f"  Clipping timepoints: {t_start} to {t_end} (of {img.shape[0]} total)")
+                img = img[t_start:t_end + 1]
         if chunks is None:
             chunks = (1,) + img.shape[1:]
         save_as_zarr(
