@@ -14,6 +14,7 @@ from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout, QApplication, Q
 from aicspylibczi import CziFile
 
 from skimage import data, segmentation, feature, future
+from skimage import filters as skimage_filters
 from skimage.measure import label
 from skimage.segmentation import watershed, relabel_sequential
 
@@ -105,17 +106,98 @@ def calculate_image_features(
     feats_restored = feats.reshape((*orig_spatial_shape, n_features))
     return feats_restored
 '''
-sigma_min = 1
-sigma_max = 16
-features_func = partial(
-        feature.multiscale_basic_features,
-        intensity=True,
-        edges=True,
-        texture=False,
-        # sigma_min=sigma_min,
-        sigma_max=sigma_max,
-        channel_axis=0,
-    )
+# ---------------------------------------------------------------------------
+# Sigma values in µm — optimised via random-forest feature importance.
+# They are converted to pixel units at runtime using the sample's pixel size.
+# ---------------------------------------------------------------------------
+SIGMA_UM = [0.89, 1.77, 3.54, 14.16]
+
+
+def make_features(pixel_size_xy_um=1.0, pixel_size_z_um=1.0, verbose=True):
+    """
+    Build a feature extractor whose Gaussian sigmas are expressed in **pixels**,
+    derived from the physical SIGMA_UM values and the given pixel sizes.
+
+    Parameters
+    ----------
+    pixel_size_xy_um : float
+        XY pixel size in µm/px.
+    pixel_size_z_um : float
+        Z pixel size in µm/px.
+    verbose : bool
+        If True, print the sigma conversion table.
+
+    Returns
+    -------
+    callable
+        A function with signature ``f(image)`` that returns multiscale features.
+    """
+    sigmas_px = []
+    for s_um in SIGMA_UM:
+        sz = s_um / pixel_size_z_um
+        sxy = s_um / pixel_size_xy_um
+        sigmas_px.append((sz, sxy, sxy))
+
+    if verbose:
+        print("Sigma values (µm → px) used for feature extraction:")
+        print(f"  Pixel size  :  xy = {pixel_size_xy_um:.4f} µm/px   z = {pixel_size_z_um:.4f} µm/px")
+        print(f"  {'σ (µm)':>10s}  {'σ_z (px)':>10s}  {'σ_xy (px)':>10s}")
+        print(f"  {'-'*36}")
+        for s_um, (sz, sxy, _) in zip(SIGMA_UM, sigmas_px):
+            print(f"  {s_um:10.2f}  {sz:10.2f}  {sxy:10.2f}")
+
+    def _features(image):
+        all_features = []
+        for sigma in sigmas_px:
+            for func in [skimage_filters.gaussian,
+                         skimage_filters.sobel]:
+                if image.ndim > 3 and image.shape[0] > 1:  # channel axis present
+                    per_ch = []
+                    for ch in range(image.shape[0]):
+                        filtered = func(image[ch], sigma=sigma) if func is skimage_filters.gaussian else func(skimage_filters.gaussian(image[ch], sigma=sigma))
+                        per_ch.append(filtered)
+                    all_features.extend(per_ch)
+                else:
+                    filtered = func(image, sigma=sigma) if func is skimage_filters.gaussian else func(skimage_filters.gaussian(image, sigma=sigma))
+                    all_features.append(filtered)
+        return np.stack(all_features, axis=-1)
+
+    return _features
+
+
+def format_sigma_table(pixel_size_xy_um, pixel_size_z_um):
+    """Return a formatted string showing σ (µm) → σ (px) conversion."""
+    lines = []
+    lines.append("Sigma values (µm → px) used for feature extraction:")
+    lines.append(f"  Pixel size  :  xy = {pixel_size_xy_um:.4f} µm/px   z = {pixel_size_z_um:.4f} µm/px")
+    lines.append(f"  {'σ (µm)':>10s}  {'σ_z (px)':>10s}  {'σ_xy (px)':>10s}")
+    lines.append(f"  {'-'*36}")
+    for s_um in SIGMA_UM:
+        sz = s_um / pixel_size_z_um
+        sxy = s_um / pixel_size_xy_um
+        lines.append(f"  {s_um:10.2f}  {sz:10.2f}  {sxy:10.2f}")
+    lines.append(f"  SIGMA_UM = {SIGMA_UM}")
+    return "\n".join(lines)
+
+
+# Module-level fallback: pixel_size=1.0 → sigmas in µm used as-is in pixels.
+# Wraps the real function so it prints a warning the first time it's called.
+_fallback_compute = make_features(1.0, 1.0, verbose=False)
+_fallback_warned = False
+
+def compute_features(image):
+    """Fallback feature extractor — warns that pixel sizes were not provided."""
+    global _fallback_warned
+    if not _fallback_warned:
+        print(
+            "⚠️  compute_features called without pixel-size calibration.\n"
+            "    Sigma values are being used in µm as-is (pixel_size = 1.0).\n"
+            "    Please provide pixel_distance_xy / pixel_distance_z in the metadata\n"
+            "    so that sigmas are correctly converted to pixels."
+        )
+        _fallback_warned = True
+    return _fallback_compute(image)
+
 
 def postprocess_mask(mask, fill_holes=True, opening_nr_pixels=1):
     """
@@ -263,7 +345,7 @@ def _refine_segment(args):
     # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
     return (new_seg, tuple(minc))
 
-def segment_mask(mask, edt_thr=1.5, edt_thr_refined=None, segment_size_min=15, use_dims=3, n_workers=1):
+def segment_mask(mask, edt_thr=1.5, edt_thr_refined=None, segment_size_min=15, use_dims=2, n_workers=1):
     edt = calculate_edt(mask, use_dims=use_dims)
 
     # Normalize refined thresholds
@@ -491,12 +573,24 @@ def train_pixel_classifier(
             # Calculate the maximum shape that the images need to be in each dimension
             max_shape = tuple(max(img.shape[i] for img in all_images) for i in range(images[0].ndim))
 
+            # --- Build feature extractor from metadata pixel sizes ---
+            pixel_sizes_xy = metadata['pixel_distance_xy'].unique()
+            pixel_sizes_z  = metadata['pixel_distance_z'].unique()
+            assert len(pixel_sizes_xy) == 1 and len(pixel_sizes_z) == 1, (
+                "All samples must have the same pixel size for consistent feature extraction.\n"
+                f"  pixel_distance_xy values: {pixel_sizes_xy}\n"
+                f"  pixel_distance_z  values: {pixel_sizes_z}"
+            )
+            pixel_size_xy_um = float(pixel_sizes_xy[0])
+            pixel_size_z_um  = float(pixel_sizes_z[0])
+            extract_features = make_features(pixel_size_xy_um, pixel_size_z_um, verbose=True)
+
             print(f"Calculating features...")
             for img in tqdm(all_images):
                 append_to_zarr(
                     np.expand_dims(
                         zeropad_image_to_match_shape(
-                            img = features_func(img),
+                            img = extract_features(img),
                             target_shape=max_shape[-3:],
                             axes=[-4, -3, -2]
                         ), axis=0), 
@@ -524,7 +618,7 @@ def train_pixel_classifier(
         all_images = []
         all_features = []
         for img in images:
-            feature_img = features_func(img)
+            feature_img = compute_features(img)
             all_images.append(img)
             all_features.append(feature_img)
         
@@ -915,7 +1009,7 @@ def train_pixel_classifier(
             contrast_limits = (0, 1e-3)  # or any small dummy range
         
         # Add channel as separate layer with color
-        channel_name = f"Channel {ch+1}"
+        channel_name = f"Channel {ch}"
         
         img_layer = viewer.add_image(
             channel_data, 
@@ -1042,10 +1136,10 @@ def train_pixel_classifier(
             default_fill_holes = initial_params.get(f"{cell_type}_fill_holes", default_fill_holes)
         
         # Read spinbox limits from initial_params (fall back to defaults per category)
-        edt_min = float(initial_params.get(f"{cell_type}_edt_min", 0.1)) if initial_params else 0.1
+        edt_min = float(initial_params.get(f"{cell_type}_edt_min", 0)) if initial_params else 0
         edt_max = float(initial_params.get(f"{cell_type}_edt_max", 50.0)) if initial_params else 50.0
         edt_step = float(initial_params.get(f"{cell_type}_edt_step", 0.5)) if initial_params else 0.5
-        size_min = int(initial_params.get(f"{cell_type}_segment_size_min_limit", 1)) if initial_params else 1
+        size_min = int(initial_params.get(f"{cell_type}_segment_size_min_limit", 0)) if initial_params else 0
         size_max = int(initial_params.get(f"{cell_type}_segment_size_max_limit", 100000)) if initial_params else 100000
         size_step = int(initial_params.get(f"{cell_type}_segment_size_step", 10)) if initial_params else 10
         opening_min = int(initial_params.get(f"{cell_type}_opening_min", 0)) if initial_params else 0
@@ -1197,7 +1291,7 @@ def train_pixel_classifier(
     #napari.run()
     return viewer
 
-def _process_single_timepoint(args):
+'''def _process_single_timepoint(args):
     """
     Worker function to process a single timepoint in parallel.
     
@@ -1206,7 +1300,7 @@ def _process_single_timepoint(args):
     args : tuple
         (t, t_img, classifiers, clf_death, all_cell_types, organoid_types, immune_types, 
          other_types, all_edt_thresholds, all_segment_size_mins, all_opening_nr_pixels,
-         all_fill_holes, only_segment, loaded_masks, has_death)
+         all_fill_holes, only_segment, loaded_masks, has_death, sample_extract_features)
     
     Returns
     -------
@@ -1215,7 +1309,7 @@ def _process_single_timepoint(args):
     """
     (t, t_img, classifiers, clf_death, all_cell_types, organoid_types, immune_types, 
      other_types, all_edt_thresholds, all_segment_size_mins, all_opening_nr_pixels,
-     all_fill_holes, only_segment, loaded_masks, has_death) = args
+     all_fill_holes, only_segment, loaded_masks, has_death, sample_extract_features) = args
     
     result = {
         'timepoint': t,
@@ -1226,7 +1320,7 @@ def _process_single_timepoint(args):
     
     # Extract features once for all classifiers
     if not only_segment:
-        features = features_func(t_img)
+        features = sample_extract_features(t_img)
     
     # Apply classifiers and get predictions for each cell type
     if not only_segment:
@@ -1271,14 +1365,14 @@ def _process_single_timepoint(args):
         seg = segment_mask(
             mask=mask,
             edt_thr=edt_threshold,
-            edt_thr_refined=[edt_threshold+0.5, edt_threshold+1.0, edt_threshold+1.5] if (cell_type in immune_types or cell_type in other_types) else None,
+            edt_thr_refined=None,
             segment_size_min=segment_size_min,
-            use_dims=3
+            use_dims=2
         )
         
         result['segments'][cell_type] = seg
     
-    return result
+    return result'''
 
 def run_pixel_classifier_segmentation(
     output_dir,
@@ -1510,10 +1604,38 @@ def run_pixel_classifier_segmentation(
         # Check if already segmented
         all_segments_exist = all(p.exists() for p in segments_outpaths.values())
         
-        # Check if already segmented (Check metadata AND disk)
-        skip_sample = False
-        if not overwrite_existing and not only_segment:
-            # 1. Check metadata for existing paths
+        # -----------------------------------------------------------------
+        # Resume / skip / overwrite decision
+        # -----------------------------------------------------------------
+        processing_marker = img_outdir / ".seg_processing"
+        resuming = False     # will be True when we continue an interrupted run
+
+        if overwrite_existing:
+            # Overwrite: start fresh
+            for seg_path in segments_outpaths.values():
+                if seg_path.exists():
+                    shutil.rmtree(seg_path)
+            for mask_path in mask_outpaths.values():
+                if mask_path.exists():
+                    shutil.rmtree(mask_path)
+            if death_mask_outpath.exists():
+                shutil.rmtree(death_mask_outpath)
+            # Remove any stale markers
+            for f in img_outdir.glob(".seg_done_*"):
+                f.unlink()
+            if processing_marker.exists():
+                processing_marker.unlink()
+
+        elif processing_marker.exists():
+            # Interrupted run detected --> RESUME
+            # zarrs exist but may be incomplete,open them in r+ mode
+            # only reprocess timepoints whose .seg_done marker is missing.
+            resuming = True
+            log(f"  ⚡ Interrupted run detected for {sample_name} — resuming")
+
+        elif not only_segment:
+            # Check if sample is already fully done
+            skip_sample = False
             for cell_type in all_cell_types:
                 prefix = 'or' if cell_type in organoid_types else ('im' if cell_type in immune_types else 'ot')
                 path_col = f'{prefix}_{cell_type}_segments_image_path'
@@ -1522,250 +1644,303 @@ def run_pixel_classifier_segmentation(
                     if Path(str(existing_path)).exists():
                         skip_sample = True
                         break
-            
-            # 2. Check calculated output paths for safety
             if not skip_sample and all(p.exists() for p in segments_outpaths.values()):
                 skip_sample = True
 
-        if skip_sample:
-            log(f"  Sample {sample_name} already segmented. Skipping (Overwrite existing unchecked).")
-            continue
-        else:   
-            # Remove existing outputs if overwriting
-            for cell_type, seg_path in segments_outpaths.items():
+            if skip_sample:
+                log(f"  Sample {sample_name} already segmented. Skipping (Overwrite existing unchecked).")
+                continue
+
+        # If we are NOT resuming and NOT overwriting, clean for masks too
+        if not resuming and not overwrite_existing:
+            for seg_path in segments_outpaths.values():
                 if seg_path.exists():
                     shutil.rmtree(seg_path)
-            
-            # Load existing masks if only_segment mode
-            loaded_masks = {}
-            if only_segment:
-                for cell_type, mask_path in mask_outpaths.items():
-                    if mask_path.exists():
-                        loaded_masks[cell_type] = load_image(mask_path)
-                    else:
-                        log(f"  Warning: Mask not found for {cell_type}: {mask_path}")
-            else:
-                # Remove mask files if not in only_segment mode
+            if not only_segment:
                 if death_mask_outpath.exists():
                     shutil.rmtree(death_mask_outpath)
                 for mask_path in mask_outpaths.values():
                     if mask_path.exists():
                         shutil.rmtree(mask_path)
-                                             
-            # Determine which timepoints to process
-            if timepoint_range is not None:
-                start_t, end_t = timepoint_range
-                start_t = max(0, min(start_t, img.shape[0]-1))
-                end_t = max(start_t, min(end_t, img.shape[0]-1))
-                timepoint_indices = list(range(start_t, end_t + 1))
-                log(f"  Processing timepoints: {start_t} to {end_t} (total: {len(timepoint_indices)})")
-            else:
-                timepoint_indices = list(range(img.shape[0]))
-                log(f"  Processing all timepoints: 0 to {img.shape[0]-1}")
-            
-            n_total = len(timepoint_indices)
-            # Mask/segment spatial shape: skip T and C dimensions
-            # features_func uses channel_axis=0, so predict_segmenter output is (Z, Y, X)
-            spatial_shape = tuple(img.shape[2:])  # (Z, Y, X), NOT (C, Z, Y, X)
-            
-            # MEJORA 2: Dynamic RAM check — reduce workers if images are too large
-            # Compute real feature count from a tiny dummy array (microseconds, ~4 KB).
-            # This is just a measurement — no side effects on real data.
-            dummy = np.zeros((img.shape[1],) + (8, 8, 8), dtype=np.float32)
-            n_features = features_func(dummy).shape[-1]
-            del dummy
-            
-            # Accurate memory estimate per worker:
-            # - features array: spatial_voxels × n_features × 8 bytes (float64)
-            # - raw timepoint held briefly: timepoint_bytes
-            # - intermediates (masks, segments): ~50% overhead
-            spatial_voxels = int(np.prod(spatial_shape))
-            features_bytes = spatial_voxels * n_features * 8  # float64
-            timepoint_bytes = int(np.prod(img.shape[1:])) * 2  # int16 = 2 bytes
-            estimated_memory_per_worker = int(features_bytes + timepoint_bytes)
-            print(f"  Feature probe: {n_features} features → {features_bytes/1e9:.2f} GB features array, "
-                  f"{estimated_memory_per_worker/1e9:.2f} GB/worker estimated")
-            
-            if _HAS_PSUTIL:
-                available_ram = psutil.virtual_memory().available
-                safe_workers = max(1, int(available_ram * 0.8 // estimated_memory_per_worker))
-                actual_workers = min(n_workers, safe_workers)
-                
-                if actual_workers < n_workers:
-                    print(
-                        f"⚠️ Large images ({timepoint_bytes/1e9:.2f} GB/timepoint, "
-                        f"~{estimated_memory_per_worker/1e9:.2f} GB/worker estimated). "
-                        f"Available RAM: {available_ram/1e9:.1f} GB. "
-                        f"Reducing workers {n_workers} → {actual_workers} to avoid crash."
-                    )
+
+        # Load existing masks if only_segment mode
+        loaded_masks = {}
+        if only_segment:
+            # If a previous classification left the processing flag, masks may be incomplete
+            if processing_marker.exists() and not resuming:
+                raise RuntimeError(
+                    f"only_segment mode: {sample_name} has a .seg_processing marker, "
+                    f"meaning a previous full classification was interrupted. "
+                    f"Masks may be incomplete — re-run full classification first."
+                )
+            missing_masks = []
+            for cell_type, mask_path in mask_outpaths.items():
+                if mask_path.exists():
+                    loaded_masks[cell_type] = load_image(mask_path)
                 else:
-                    print(
-                        f"  Memory OK: {available_ram/1e9:.1f} GB available, "
-                        f"~{estimated_memory_per_worker/1e9:.2f} GB/worker → using {actual_workers} workers"
+                    missing_masks.append(cell_type)
+            if missing_masks:
+                raise FileNotFoundError(
+                    f"only_segment mode: mask(s) not found for {missing_masks} "
+                    f"in {img_outdir}. Run full classification first."
+                )
+            # Validate mask timepoint dimensions match the raw image
+            for cell_type, mask_arr in loaded_masks.items():
+                if mask_arr.shape[0] < img.shape[0]:
+                    raise ValueError(
+                        f"only_segment mode: {cell_type} mask has {mask_arr.shape[0]} "
+                        f"timepoints but raw image has {img.shape[0]}. "
+                        f"Mask appears truncated — re-run full classification for this sample."
                     )
+
+        # Determine which timepoints to process
+        if timepoint_range is not None:
+            start_t, end_t = timepoint_range
+            start_t = max(0, min(start_t, img.shape[0]-1))
+            end_t = max(start_t, min(end_t, img.shape[0]-1))
+            timepoint_indices = list(range(start_t, end_t + 1))
+            log(f"  Processing timepoints: {start_t} to {end_t} (total: {len(timepoint_indices)})")
+        else:
+            timepoint_indices = list(range(img.shape[0]))
+            log(f"  Processing all timepoints: 0 to {img.shape[0]-1}")
+        
+        n_total = len(timepoint_indices)
+        # Mask/segment spatial shape: skip T and C dimensions
+        # predict_segmenter output is (Z, Y, X)
+        spatial_shape = tuple(img.shape[2:])  # (Z, Y, X), NOT (C, Z, Y, X)
+        
+        # Build per-sample feature extractor from pixel size metadata
+        sample_pixel_xy = float(sample.get('pixel_distance_xy', 1.0))
+        sample_pixel_z  = float(sample.get('pixel_distance_z', 1.0))
+        sample_extract_features = make_features(sample_pixel_xy, sample_pixel_z, verbose=True)
+        
+        # MEJORA 2: Dynamic RAM check — reduce workers if images are too large
+        # Compute real feature count from a tiny dummy array (microseconds, ~4 KB).
+        # This is just a measurement — no side effects on real data.
+        dummy = np.zeros((img.shape[1],) + (8, 8, 8), dtype=np.float32)
+        n_features = sample_extract_features(dummy).shape[-1]
+        del dummy
+        
+        # Accurate memory estimate per worker:
+        # - features array: spatial_voxels × n_features × 8 bytes (float64)
+        # - raw timepoint held briefly: timepoint_bytes
+        # - intermediates (masks, segments): ~50% overhead
+        spatial_voxels = int(np.prod(spatial_shape))
+        features_bytes = spatial_voxels * n_features * 8  # float64
+        timepoint_bytes = int(np.prod(img.shape[1:])) * 2  # int16 = 2 bytes
+        estimated_memory_per_worker = int(features_bytes + timepoint_bytes)
+        print(f"  Feature probe: {n_features} features → {features_bytes/1e9:.2f} GB features array, "
+              f"{estimated_memory_per_worker/1e9:.2f} GB/worker estimated")
+        
+        if _HAS_PSUTIL:
+            available_ram = psutil.virtual_memory().available
+            safe_workers = max(1, int(available_ram * 0.8 // estimated_memory_per_worker))
+            actual_workers = min(n_workers, safe_workers)
+            
+            if actual_workers < n_workers:
+                print(
+                    f"⚠️ Large images ({timepoint_bytes/1e9:.2f} GB/timepoint, "
+                    f"~{estimated_memory_per_worker/1e9:.2f} GB/worker estimated). "
+                    f"Available RAM: {available_ram/1e9:.1f} GB. "
+                    f"Reducing workers {n_workers} → {actual_workers} to avoid crash."
+                )
             else:
-                actual_workers = n_workers
-                print(f"  psutil not installed, skipping RAM check. Using {actual_workers} workers.")
+                print(
+                    f"  Memory OK: {available_ram/1e9:.1f} GB available, "
+                    f"~{estimated_memory_per_worker/1e9:.2f} GB/worker → using {actual_workers} workers"
+                )
+        else:
+            actual_workers = n_workers
+            print(f"  psutil not installed, skipping RAM check. Using {actual_workers} workers.")
+        
+        _log_mem(f"before processing loop ({n_total} timepoints, {actual_workers} workers)")
+        
+        # ---------------------------------------------------------
+        # Create the sample-level processing marker
+        # ---------------------------------------------------------
+        processing_marker.touch()
+
+        # ---------------------------------------------------------
+        # Determine which timepoints are already done (resume mode)
+        # ---------------------------------------------------------
+        done_indices = set()
+        if resuming:
+            for p in img_outdir.glob(".seg_done_*"):
+                try:
+                    done_indices.add(int(p.name.split("_")[-1]))
+                except ValueError:
+                    pass
+
+        # Filter out completed timepoints
+        if done_indices:
+            args_list_filtered = [(t_i, t) for t_i, t in enumerate(timepoint_indices) if t_i not in done_indices]
+            log(f"  Resume: {len(done_indices)}/{n_total} timepoints already done, {len(args_list_filtered)} remaining")
+        else:
+            args_list_filtered = None  # will build later
+
+        # MEJORA 3: Pre-allocated zarrs with fixed size — thread-safe index writes
+        # Instead of append_to_zarr (which requires strict sequential order),
+        # create zarrs with final size and each worker writes zarr[t_i] = data.
+        # Two workers never touch the same index.
+        # Result is always zarr[0]=T0, zarr[1]=T1... regardless of completion order.
+        zarr_mode = "r+" if resuming else "w"
+        zarr_kw = dict(shape=(n_total,) + spatial_shape, chunks=(1,) + spatial_shape)
+
+        if not only_segment:
+            zarr_masks = {}
+            zarr_segs = {}
+            for cell_type in all_cell_types:
+                zarr_masks[cell_type] = zarr.open(
+                    str(mask_outpaths[cell_type]),
+                    mode=zarr_mode, dtype="int16", **zarr_kw,
+                )
+                zarr_segs[cell_type] = zarr.open(
+                    str(segments_outpaths[cell_type]),
+                    mode=zarr_mode, dtype="uint16", **zarr_kw,
+                )
+            zarr_death = None
+            if has_death and clf_death is not None:
+                zarr_death = zarr.open(
+                    str(death_mask_outpath),
+                    mode=zarr_mode, dtype="int16", **zarr_kw,
+                )
+        else:
+            zarr_segs = {}
+            for cell_type in all_cell_types:
+                zarr_segs[cell_type] = zarr.open(
+                    str(segments_outpaths[cell_type]),
+                    mode=zarr_mode, dtype="uint16", **zarr_kw,
+                )
+            zarr_masks = None
+            zarr_death = None
+        
+        # -----------------------------------------------------------------
+        # Per-timepoint worker function
+        # -----------------------------------------------------------------
+        def process_timepoint(args, _ff=sample_extract_features):
+            t_i, t = args
+            t_start = time.time()
             
-            _log_mem(f"before processing loop ({n_total} timepoints, {actual_workers} workers)")
+            # Read 1 timepoint from zarr (lazy read, materialized here)
+            t_img = np.asarray(img[t])
             
-            # MEJORA 3: Pre-allocated zarrs with fixed size — thread-safe index writes
-            # Instead of append_to_zarr (which requires strict sequential order),
-            # create zarrs with final size and each worker writes zarr[t_i] = data.
-            # Two workers never touch the same index.
-            # Result is always zarr[0]=T0, zarr[1]=T1... regardless of completion order.
             if not only_segment:
-                zarr_masks = {}
-                zarr_segs = {}
-                for cell_type in all_cell_types:
-                    zarr_masks[cell_type] = zarr.open(
-                        str(mask_outpaths[cell_type]),
-                        mode="w",
-                        shape=(n_total,) + spatial_shape,
-                        chunks=(1,) + spatial_shape,
-                        dtype="int16",
-                    )
-                    zarr_segs[cell_type] = zarr.open(
-                        str(segments_outpaths[cell_type]),
-                        mode="w",
-                        shape=(n_total,) + spatial_shape,
-                        chunks=(1,) + spatial_shape,
-                        dtype="uint16",
-                    )
-                zarr_death = None
-                if has_death and clf_death is not None:
-                    zarr_death = zarr.open(
-                        str(death_mask_outpath),
-                        mode="w",
-                        shape=(n_total,) + spatial_shape,
-                        chunks=(1,) + spatial_shape,
-                        dtype="int16",
-                    )
-            else:
-                zarr_segs = {}
-                for cell_type in all_cell_types:
-                    zarr_segs[cell_type] = zarr.open(
-                        str(segments_outpaths[cell_type]),
-                        mode="w",
-                        shape=(n_total,) + spatial_shape,
-                        chunks=(1,) + spatial_shape,
-                        dtype="uint16",
-                    )
-                zarr_masks = None
-                zarr_death = None
-            
-            # -----------------------------------------------------------------
-            # Per-timepoint worker function
-            # -----------------------------------------------------------------
-            def process_timepoint(args):
-                t_i, t = args
-                t_start = time.time()
-                
-                # Read 1 timepoint from zarr (lazy read, materialized here)
-                t_img = np.asarray(img[t])
-                
-                if not only_segment:
-                    # MEJORA 4: threadpoolctl limits features_func to 1 internal thread
-                    # multiscale_basic_features (scikit-image) internally uses all cores.
-                    # Without control: 4 workers × 16 cores = 64 competing threads.
-                    # With limits=1: 4 workers × 1 thread = actual_workers cores total.
-                    if _HAS_THREADPOOLCTL:
-                        with threadpoolctl.threadpool_limits(limits=1):
-                            features = features_func(t_img)
-                    else:
-                        features = features_func(t_img)
-                    del t_img  # free immediately — features is all we need from here
-                    
-                    for cell_type in all_cell_types:
-                        # RF already has n_jobs=1 (Mejora 1) → 1 core per worker
-                        pred_mask = future.predict_segmenter(features, classifiers[cell_type])
-                        pred_mask[pred_mask > 0] -= 1
-                        
-                        opening_nr_pixels_val = all_opening_nr_pixels.get(cell_type, 0)
-                        fill_holes_val = all_fill_holes.get(cell_type, True)
-                        fg_mask = (pred_mask == 1).astype(bool)
-                        processed_fg = postprocess_mask(fg_mask, fill_holes=fill_holes_val, opening_nr_pixels=int(opening_nr_pixels_val))
-                        pred_mask = processed_fg.astype(np.int16)
-                        
-                        # Write mask by exact index (Mejora 3)
-                        # t_i=0 is always T0, t_i=1 is always T1, etc.
-                        zarr_masks[cell_type][t_i] = pred_mask
-                        
-                        edt_threshold = all_edt_thresholds.get(cell_type, 1.0)
-                        segment_size_min = all_segment_size_mins.get(cell_type, 10)
-                        seg = segment_mask(
-                            mask=pred_mask.astype(bool),
-                            edt_thr=edt_threshold,
-                            edt_thr_refined=[edt_threshold+0.5, edt_threshold+1.0, edt_threshold+1.5] if (cell_type in immune_types or cell_type in other_types) else None,
-                            segment_size_min=segment_size_min,
-                            use_dims=3
-                        )
-                        
-                        zarr_segs[cell_type][t_i] = seg
-                        del pred_mask, fg_mask, processed_fg, seg
-                    
-                    # Death classifier
-                    if has_death and clf_death is not None and zarr_death is not None:
-                        death_mask = future.predict_segmenter(features, clf_death)
-                        death_mask[death_mask > 0] -= 1
-                        zarr_death[t_i] = death_mask
-                        del death_mask
-                    
-                    del features
+                # MEJORA 4: threadpoolctl limits feature extraction to 1 internal thread
+                # multiscale_basic_features (scikit-image) internally uses all cores.
+                # Without control: 4 workers × 16 cores = 64 competing threads.
+                # With limits=1: 4 workers × 1 thread = actual_workers cores total.
+                if _HAS_THREADPOOLCTL:
+                    with threadpoolctl.threadpool_limits(limits=1):
+                        features = _ff(t_img)
                 else:
-                    # only_segment mode: read existing masks, segment, write
-                    for cell_type in all_cell_types:
-                        if cell_type not in loaded_masks:
-                            continue
-                        mask = np.asarray(loaded_masks[cell_type][t])
-                        
-                        edt_threshold = all_edt_thresholds.get(cell_type, 1.0)
-                        segment_size_min = all_segment_size_mins.get(cell_type, 10)
-                        seg = segment_mask(
-                            mask=mask,
-                            edt_thr=edt_threshold,
-                            edt_thr_refined=[edt_threshold+0.5, edt_threshold+1.0, edt_threshold+1.5] if (cell_type in immune_types or cell_type in other_types) else None,
-                            segment_size_min=segment_size_min,
-                            use_dims=3
-                        )
-                        
-                        zarr_segs[cell_type][t_i] = seg
-                        del mask, seg
-                    del t_img  # free in only_segment branch too
+                    features = _ff(t_img)
+                del t_img  # free immediately — features is all we need from here
                 
-                gc.collect()
+                for cell_type in all_cell_types:
+                    # RF already has n_jobs=1 (Mejora 1) → 1 core per worker
+                    pred_mask = future.predict_segmenter(features, classifiers[cell_type])
+                    pred_mask[pred_mask > 0] -= 1
+                    
+                    opening_nr_pixels_val = all_opening_nr_pixels.get(cell_type, 0)
+                    fill_holes_val = all_fill_holes.get(cell_type, True)
+                    fg_mask = (pred_mask == 1).astype(bool)
+                    processed_fg = postprocess_mask(fg_mask, fill_holes=fill_holes_val, opening_nr_pixels=int(opening_nr_pixels_val))
+                    pred_mask = processed_fg.astype(np.int16)
+                    
+                    # Write mask by exact index (Mejora 3)
+                    # t_i=0 is always T0, t_i=1 is always T1, etc.
+                    zarr_masks[cell_type][t_i] = pred_mask
+                    
+                    edt_threshold = all_edt_thresholds.get(cell_type, 1.0)
+                    segment_size_min = all_segment_size_mins.get(cell_type, 10)
+                    seg = segment_mask(
+                        mask=pred_mask.astype(bool),
+                        edt_thr=edt_threshold,
+                        edt_thr_refined=None,
+                        segment_size_min=segment_size_min,
+                        use_dims=2
+                    )
+                    
+                    zarr_segs[cell_type][t_i] = seg
+                    del pred_mask, fg_mask, processed_fg, seg
                 
-                t_elapsed = time.time() - t_start
-                if (t_i + 1) % 10 == 0 or t_i == 0 or (t_i + 1) == n_total:
-                    _log_mem(f"T{t} ({t_i+1}/{n_total}, {t_elapsed:.1f}s)")
+                # Death classifier
+                if has_death and clf_death is not None and zarr_death is not None:
+                    death_mask = future.predict_segmenter(features, clf_death)
+                    death_mask[death_mask > 0] -= 1
+                    zarr_death[t_i] = death_mask
+                    del death_mask
                 
-                return t_i, t
+                del features
+            else:
+                # only_segment mode: read existing masks, segment, write
+                for cell_type in all_cell_types:
+                    if cell_type not in loaded_masks:
+                        continue
+                    mask = np.asarray(loaded_masks[cell_type][t])
+                    
+                    edt_threshold = all_edt_thresholds.get(cell_type, 1.0)
+                    segment_size_min = all_segment_size_mins.get(cell_type, 10)
+                    seg = segment_mask(
+                        mask=mask,
+                        edt_thr=edt_threshold,
+                        edt_thr_refined=None,
+                        segment_size_min=segment_size_min,
+                        use_dims=2
+                    )
+                    
+                    zarr_segs[cell_type][t_i] = seg
+                    del mask, seg
+                del t_img  # free in only_segment branch too
             
-            # MEJORA 5: ThreadPoolExecutor at timepoint level
-            # Instead of 1 sequential timepoint with N chaotic internal threads,
-            # actual_workers timepoints in parallel with 1 thread each.
-            # Speedup ≈ actual_workers×, stable on any machine.
-            print(f"  Starting parallel processing with {actual_workers} workers...")
+            gc.collect()
+            
+            # Mark this timepoint as fully written
+            (img_outdir / f".seg_done_{t_i:06d}").touch()
+            
+            t_elapsed = time.time() - t_start
+            if (t_i + 1) % 10 == 0 or t_i == 0 or (t_i + 1) == n_total:
+                _log_mem(f"T{t} ({t_i+1}/{n_total}, {t_elapsed:.1f}s)")
+            
+            return t_i, t
+        
+        # MEJORA 5: ThreadPoolExecutor at timepoint level
+        # Instead of 1 sequential timepoint with N chaotic internal threads,
+        # actual_workers timepoints in parallel with 1 thread each.
+        # Speedup ≈ actual_workers×, stable on any machine.
+        if args_list_filtered is None:
             args_list = list(enumerate(timepoint_indices))
-            
-            with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-                futures_map = {
-                    executor.submit(process_timepoint, args): args
-                    for args in args_list
-                }
-                completed = 0
-                for fut in tqdm(as_completed(futures_map), total=n_total, desc=f"  {sample_name}"):
-                    try:
-                        t_i, t = fut.result()
-                        completed += 1
-                        if completed % 10 == 0 or completed == 1 or completed == n_total:
-                            print(f"  Progress: {completed}/{n_total} timepoints completed")
-                    except Exception as e:
-                        args = futures_map[fut]
-                        print(f"  ❌ Error in timepoint {args}: {e}")
-                        raise
-            
-            print(f"  ✓ All {n_total} timepoints written successfully")
+        else:
+            args_list = args_list_filtered
+
+        n_to_process = len(args_list)
+        print(f"  Starting parallel processing with {actual_workers} workers ({n_to_process} timepoints)...")
+        
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            futures_map = {
+                executor.submit(process_timepoint, args): args
+                for args in args_list
+            }
+            completed = 0
+            for fut in tqdm(as_completed(futures_map), total=n_to_process, desc=f"  {sample_name}"):
+                try:
+                    t_i, t = fut.result()
+                    completed += 1
+                    if completed % 10 == 0 or completed == 1 or completed == n_to_process:
+                        print(f"  Progress: {completed}/{n_to_process} timepoints completed")
+                except Exception as e:
+                    args = futures_map[fut]
+                    print(f"  ❌ Error in timepoint {args}: {e}")
+                    raise
+        
+        # ---------------------------------------------------------
+        # All timepoints done — clean up markers
+        # ---------------------------------------------------------
+        for f in img_outdir.glob(".seg_done_*"):
+            f.unlink()
+        if processing_marker.exists():
+            processing_marker.unlink()
+        print(f"  ✓ All {n_to_process} timepoints written successfully (markers cleaned)")
                 
         # Update metadata with segment paths (with prefixes)
         for cell_type in all_cell_types:
