@@ -14,7 +14,9 @@ from .utils import (
 )
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
     train_pixel_classifier,
-    run_pixel_classifier_segmentation
+    run_pixel_classifier_segmentation,
+    SIGMA_UM,
+    format_sigma_table,
 )
 import numpy as np
 import napari
@@ -272,7 +274,7 @@ class PixelClassifierPanel:
             self.edt_thresholds[cell_type] = widgets.BoundedFloatText(
                 description=f"{cell_type.capitalize()} EDT:",
                 value=float(saved_threshold),
-                min=0.1,
+                min=0,
                 max=50.0,
                 step=0.5,
                 style={'description_width': '160px'},
@@ -306,7 +308,7 @@ class PixelClassifierPanel:
             self.segment_size_mins[cell_type] = widgets.BoundedIntText(
                 description=f"{cell_type.capitalize()} min size:",
                 value=int(saved_size),
-                min=1,
+                min=0,
                 max=100000,
                 step=10,
                 style={'description_width': '160px'},
@@ -499,6 +501,15 @@ class PixelClassifierPanel:
                 print("Starting pixel classifier training...")
                 print("Napari viewer will open. Close it when done labeling.")
                 
+                # Print sigma table for the pixel sizes in metadata
+                try:
+                    md = self.metadata_loader.metadata
+                    px_xy = float(md['pixel_distance_xy'].iloc[0])
+                    px_z  = float(md['pixel_distance_z'].iloc[0])
+                    print(format_sigma_table(px_xy, px_z))
+                except Exception:
+                    pass
+                
                 ret = train_pixel_classifier(
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
@@ -546,6 +557,16 @@ class PixelClassifierPanel:
                 clf_death_path = str(self.clf_death_path.value) if (self.manual_clf_paths.value and self.has_death and self.clf_death_path.value) else None
 
                 self.spinner_apply.layout.display = None
+                
+                # Print sigma table for the pixel sizes in metadata
+                try:
+                    md = self.metadata_loader.metadata
+                    px_xy = float(md['pixel_distance_xy'].iloc[0])
+                    px_z  = float(md['pixel_distance_z'].iloc[0])
+                    print(format_sigma_table(px_xy, px_z))
+                except Exception:
+                    pass
+                
                 new_md = run_pixel_classifier_segmentation(
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
