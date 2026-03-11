@@ -5,18 +5,20 @@ import numpy as np
 from behav3d.core.utils import format_time
 
 def smooth_value_over_time(
-    df, 
-    column, 
-    rolling_meanspeed_window, 
-    min_periods=1,
+    df,
+    column,
+    rolling_meanspeed_window=None,  # kept for backward compatibility, unused
+    window_fraction=0.2,
+    min_window=3,
+    min_periods=None,
     groupby=["TrackID", "sample_name"]
     ):
-    smoothed_column = df.groupby(groupby)[column].transform(
-        lambda x: x.rolling(
-            window=rolling_meanspeed_window, 
-            min_periods=min_periods
-        ).mean()
-    )
+    def _fractional_rolling_mean(x):
+        window = max(min_window, round(len(x) * window_fraction))
+        effective_min = min_periods if min_periods is not None else max(1, window // 2)
+        return x.rolling(window=window, min_periods=effective_min).mean()
+
+    smoothed_column = df.groupby(groupby)[column].transform(_fractional_rolling_mean)
     return smoothed_column
 
 
@@ -97,8 +99,9 @@ def summarize_track_features(
             active_col = f"active_{contact_col}"
             if active_col in df_tracks.columns:
                 def calculate_active_contact_when_contact(group, contact_col=contact_col, active_col=active_col):
-                    if group[contact_col].any():
-                        return group[group[contact_col]][active_col].mean()
+                    mask = group[contact_col].fillna(False).astype(bool)
+                    if mask.any():
+                        return group[mask][active_col].mean()
                     else:
                         return 0
                 # Use include_groups=False for pandas >= 2.1.0 compatibility
