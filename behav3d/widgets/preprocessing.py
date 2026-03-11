@@ -27,12 +27,29 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
     spinner.layout.display = "none"
     out = widgets.Output()
 
+    selector = widgets.RadioButtons(
+        options=['All timepoints', 'Custom time range'],
+        value='All timepoints',
+        description='Temporal Range:',
+        disabled=False,
+        style={'description_width': 'initial'}
+    )
+    
+    start_t = widgets.IntText(value=0, description='Start T:', layout=widgets.Layout(width='150px'))
+    end_t = widgets.IntText(value=0, description='End T:', layout=widgets.Layout(width='150px'))
+    
+    range_box = widgets.HBox([start_t, end_t], layout=widgets.Layout(display='none', margin='0 0 10px 0'))
+
+    def _on_selector_change(change):
+        range_box.layout.display = 'flex' if change['new'] == 'Custom time range' else 'none'
+
+    selector.observe(_on_selector_change, names='value')
+
     row = widgets.HBox([btn, spinner], layout=widgets.Layout(align_items="center", gap="8px"))
 
     def _run_conversion(_):
         with out:
             out.clear_output()
-            print("Starting conversion…")
             btn.disabled = True
             spinner.layout.display = None
 
@@ -41,11 +58,33 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
             except Exception:
                 pass
 
+            t_start = None
+            t_end = None
+            if selector.value == 'Custom time range':
+                if start_t.value < 0 or end_t.value < 0:
+                    print("Error: Timepoints cannot be negative.")
+                    btn.disabled = False
+                    spinner.layout.display = "none"
+                    return
+                if start_t.value > end_t.value:
+                    print(f"Error: Start T ({start_t.value}) must be less than or equal to End T ({end_t.value}).")
+                    btn.disabled = False
+                    spinner.layout.display = "none"
+                    return
+                
+                t_start = start_t.value
+                t_end = end_t.value
+                print(f"Starting conversion for timepoints {t_start} to {t_end}…")
+            else:
+                print("Starting conversion for all timepoints…")
+
             result = metadata_loader.metadata
             try:
                 result = convert_input_files_to_zarr(
                     metadata=metadata_loader.metadata,
-                    output_dir=metadata_loader.output_dir
+                    output_dir=metadata_loader.output_dir,
+                    t_start=t_start,
+                    t_end=t_end
                 )
             except Exception:
                 traceback.print_exc()
@@ -60,7 +99,7 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
                 spinner.layout.display = "none"
 
     btn.on_click(_run_conversion)
-    return widgets.VBox([row, out])
+    return widgets.VBox([selector, range_box, row, out])
 
 class DimOrderTable:
     DIM_ORDER_OPTIONS = [
