@@ -241,7 +241,7 @@ class TrackFilterPanel:
         self.spinner_html.layout.display = "none"
         self.out_run = widgets.Output()
         
-        ui_elements = [widgets.HTML(f'<div style="font-size:22px;font-weight:700;">{self.cell_type.capitalize()} Track Filtering</div>'), self.en_exp_duration, self.row_exp, self.en_min_length, self.row_min, self.en_max_length, self.row_max, self.filter_t0_dead]
+        ui_elements = [widgets.HTML(f'<div style="font-size:14px;font-weight:700;">{self.cell_type.capitalize()} Track Filtering</div>'), self.en_exp_duration, self.row_exp, self.en_min_length, self.row_min, self.en_max_length, self.row_max, self.filter_t0_dead]
         if self.row_size_t1: ui_elements.append(self.row_size_t1)
         if self.category != "organoid": 
              ui_elements.extend([widgets.HTML('<b>Unit for time-based filters:</b>'), self.time_type])

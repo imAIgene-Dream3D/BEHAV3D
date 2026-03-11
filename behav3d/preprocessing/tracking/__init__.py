@@ -217,7 +217,7 @@ def visualize_tracks(
         channel_data = raw_image[:, ch]  # (T, Z, Y, X)
         viewer.add_image(
             channel_data,
-            name=f"channel_{ch+1}",
+            name=f"channel_{ch}",
             colormap=channel_colors[ch % len(channel_colors)],
             scale=elsizes,  # T, Z, Y, X
             blending="additive",

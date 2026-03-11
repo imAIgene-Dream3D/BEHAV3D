@@ -731,7 +731,7 @@ def calculate_active_contact_features(df_tracks, cell_type):
         .explode(touching_col)
     )
     df_explode = df_explode[df_explode[touching_col].str.strip() != '']
-    df_explode[touching_col] = df_explode[touching_col].astype(int)
+    df_explode[touching_col] = pd.to_numeric(df_explode[touching_col], errors='coerce').astype('Int64')
 
     # --- Step 2: Get mean_speed of each touching cell ---
     speed_map = df_tracks[['TrackID', 'position_t', 'mean_speed']].rename(

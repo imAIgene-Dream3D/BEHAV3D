@@ -90,18 +90,14 @@ def run_organoid_analysis(
     
     # death analysis (only runs if has_dead_data)
     df_tracks["smoothed_nr_dead_mask_pixels"] = smooth_value_over_time(
-            df_tracks, 
-            column="nr_dead_mask_pixels", 
-            rolling_meanspeed_window=20,
-            min_periods=20,
+            df_tracks,
+            column="nr_dead_mask_pixels",
             groupby=["TrackID", "sample_name"]
         )
     
     df_tracks["smoothed_percentage_dead_mask"] = smooth_value_over_time(
-            df_tracks, 
-            column="percentage_dead_mask", 
-            rolling_meanspeed_window=20,
-            min_periods=20,
+            df_tracks,
+            column="percentage_dead_mask",
             groupby=["TrackID", "sample_name"]
         )
     
@@ -109,8 +105,6 @@ def run_organoid_analysis(
         df_tracks["smoothed_mean_dead_dye"] = smooth_value_over_time(
                 df_tracks,
                 column="mean_dead_dye",
-                rolling_meanspeed_window=20,
-                min_periods=20,
                 groupby=["TrackID", "sample_name"]
             )
     else:

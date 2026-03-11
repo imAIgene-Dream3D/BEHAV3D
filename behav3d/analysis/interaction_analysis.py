@@ -192,10 +192,8 @@ def _process_death_classification(df: pd.DataFrame, dead_threshold: float):
         
         # Smooth the percentage_dead_mask
         df["smoothed_percentage_dead_mask"] = smooth_value_over_time(
-            df, 
-            column="percentage_dead_mask", 
-            rolling_meanspeed_window=20,
-            min_periods=20,
+            df,
+            column="percentage_dead_mask",
             groupby=["TrackID", "sample_name"]
         )
         
@@ -276,7 +274,7 @@ def calculate_interaction_stats(
             "sample_name": sample,
             "organoid_type": cell_type,
             "interacting_cell_type": interacting_type,
-            "n_organoids": track_sample["TrackID"].nunique(),
+            "n_organoids": track_sample.groupby(["sample_name", "TrackID"]).ngroups,
             "mean_contact_percentage": track_sample["contact_percentage"].mean(),
             "std_contact_percentage": track_sample["contact_percentage"].std(),
             "mean_total_contacts": track_sample["max_cumulative_contacts"].mean(),
@@ -417,7 +415,7 @@ def plot_cumulative_per_sample(
     for idx, sample in enumerate(samples):
         ax = axes[idx]
         df_sample = df[df["sample_name"] == sample]
-        n_org_sample = df_sample["TrackID"].nunique()
+        n_org_sample = df_sample.groupby(["sample_name", "TrackID"]).ngroups
         
         stats_sample = df_sample.groupby("position_t")[cumulative_col].agg(
             ["mean", "std", "count"]
@@ -465,7 +463,7 @@ def plot_alive_vs_dead_overall(
     
     for survives, label, color in [(True, "Survives", "forestgreen"), (False, "Dies", "crimson")]:
         df_subset = df[df["survives"] == survives]
-        n_subset = df_subset["TrackID"].nunique()
+        n_subset = df_subset.groupby(["sample_name", "TrackID"]).ngroups
         
         if n_subset == 0:
             continue
@@ -526,8 +524,8 @@ def plot_alive_vs_dead_per_sample(
         
         for survives, label, color in [(True, "Survives", "forestgreen"), (False, "Dies", "crimson")]:
             df_subset = df_sample[df_sample["survives"] == survives]
-            n_subset = df_subset["TrackID"].nunique()
-            
+            n_subset = df_subset.groupby(["sample_name", "TrackID"]).ngroups
+                
             if n_subset == 0:
                 continue
             
