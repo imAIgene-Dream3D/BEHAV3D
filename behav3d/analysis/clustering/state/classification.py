@@ -14,6 +14,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 import pickle
 
+import anndata as ad
+ad.settings.allow_write_nullable_strings = True
+
 import scanpy as sc
 from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestClassifier
