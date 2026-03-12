@@ -119,6 +119,9 @@ dependencies:
   # Pip-only packages
   # -------------------------------------------------------------------------
   - pip:
+    - btrack>=0.6
+    - kaleido>=1.2
+    - pypdf>=6.7
     - imageio-ffmpeg>=0.5.1
     - torchsummary>=1.5.1
     # PyTorch and Cellpose installed separately via install script

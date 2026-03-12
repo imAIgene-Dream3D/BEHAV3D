@@ -12,6 +12,7 @@ from .utils import (
 from behav3d.preprocessing.tracking.laptracking import run_laptracking
 from behav3d.preprocessing.tracking.trackpy_tracking import run_trackpy_tracking_generic
 from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
+from behav3d.preprocessing.tracking.btrack_tracking import run_btracking
 from behav3d.preprocessing.tracking import visualize_tracks
 
 class TrackingPanel:
@@ -38,7 +39,8 @@ class TrackingPanel:
             description="Tracking method",
             options=[("LAP (laptrack)", "lap"),
                      ("TrackPy", "trackpy"),
-                     ("Propagation", "propagation")],
+                     ("Propagation", "propagation"),
+                     ("btrack (Bayesian)", "btrack")],
             value=str(tcfg.get("method", "lap")),
             style={'description_width': '160px'}
         )
@@ -111,6 +113,115 @@ class TrackingPanel:
             widgets.HTML("<i>No tunable parameters.</i>")
         ])
 
+        # btrack params
+        bt = tcfg.get("btrack", {})
+        self.bt_config_preset = widgets.Dropdown(
+            description="Config preset",
+            options=[("Cell (bundled)", "cell"),
+                     ("Particle (bundled)", "particle"),
+                     ("Custom JSON", "custom")],
+            value=str(bt.get("config_preset", "cell")),
+            style={'description_width': '160px'}
+        )
+        self.bt_config_path = widgets.Text(
+            description="JSON path",
+            value=str(bt.get("config_path", "")),
+            placeholder="Path to custom btrack JSON…",
+            style={'description_width': '160px'},
+            layout=widgets.Layout(width='400px')
+        )
+        self.bt_config_path.disabled = (self.bt_config_preset.value != "custom")
+        def _bt_preset_changed(change):
+            self.bt_config_path.disabled = (change['new'] != "custom")
+        self.bt_config_preset.observe(_bt_preset_changed, names='value')
+
+        self.bt_max_search_radius = widgets.IntText(
+            description="Max search radius (px)",
+            value=int(bt.get("max_search_radius", 100)),
+            style={'description_width': '160px'}
+        )
+        self.bt_update_method = widgets.Dropdown(
+            description="Update method",
+            options=[("EXACT (recommended)", "EXACT"),
+                     ("APPROXIMATE (large datasets)", "APPROXIMATE")],
+            value=str(bt.get("update_method", "EXACT")),
+            style={'description_width': '160px'}
+        )
+        self.bt_step_size = widgets.IntText(
+            description="Step size (frames)",
+            value=int(bt.get("step_size", 100)),
+            style={'description_width': '160px'}
+        )
+        self.bt_use_optimize = widgets.Checkbox(
+            description="Enable global track optimization",
+            value=bool(bt.get("use_optimize", False)),
+            indent=False
+        )
+        saved_hyps = bt.get("hypotheses", ["P_FP", "P_init", "P_term", "P_link"])
+        self.bt_hyp_checks = {}
+        hyp_checkboxes = []
+        for hyp_name, hyp_desc, default_on in [
+            ("P_FP",     "False positive",    True),
+            ("P_init",   "Track initialization", True),
+            ("P_term",   "Track termination",  True),
+            ("P_link",   "Track linking",      True),
+            ("P_branch", "Track branching",    False),
+            ("P_dead",   "Cell death",         False),
+            ("P_merge",  "Track merging",      False),
+        ]:
+            is_on = hyp_name in saved_hyps if saved_hyps else default_on
+            cb = widgets.Checkbox(
+                description=f"{hyp_name} — {hyp_desc}",
+                value=is_on,
+                indent=False,
+                disabled=(hyp_name == "P_FP"),
+            )
+            self.bt_hyp_checks[hyp_name] = cb
+            hyp_checkboxes.append(cb)
+
+        self.bt_dist_thresh = widgets.IntText(
+            description="Distance threshold",
+            value=int(bt.get("dist_thresh", 60)),
+            style={'description_width': '160px'}
+        )
+        self.bt_time_thresh = widgets.IntText(
+            description="Time threshold",
+            value=int(bt.get("time_thresh", 3)),
+            style={'description_width': '160px'}
+        )
+
+        self.bt_optimizer_box = widgets.VBox([
+            widgets.HTML("<b>Hypotheses</b>"),
+            *hyp_checkboxes,
+            self.bt_dist_thresh,
+            self.bt_time_thresh,
+        ])
+        # Toggle optimizer widgets visibility
+        self.bt_optimizer_box.layout.display = "flex" if self.bt_use_optimize.value else "none"
+        def _bt_optimize_toggled(change):
+            self.bt_optimizer_box.layout.display = "flex" if change['new'] else "none"
+        self.bt_use_optimize.observe(_bt_optimize_toggled, names='value')
+
+        self.bt_params = widgets.VBox([
+            widgets.HTML(
+                "<b>btrack — Bayesian multi-object tracker</b><br>"
+                "<span style='color:#666'>"
+                "<b>Step 1</b> (Kalman filter): always runs — tune and validate first "
+                "by running <i>without</i> optimization.<br>"
+                "<b>Step 2</b> (optimizer): opt-in — enable only once Step 1 looks correct. "
+                "See <code>models/README_btrack.md</code> for full parameter reference."
+                "</span>"
+            ),
+            self.bt_config_preset,
+            self.bt_config_path,
+            self.bt_max_search_radius,
+            self.bt_update_method,
+            self.bt_step_size,
+            widgets.HTML("<hr>"),
+            self.bt_use_optimize,
+            self.bt_optimizer_box,
+        ])
+
         self.param_container = widgets.VBox()
         self.method.observe(self._toggle_param_groups, names='value')
         self._toggle_param_groups()
@@ -169,13 +280,21 @@ class TrackingPanel:
     def _toggle_param_groups(self, change=None):
         if self.method.value == "lap": self.param_container.children = (self.lap_params,)
         elif self.method.value == "trackpy": self.param_container.children = (self.tp_params,)
+        elif self.method.value == "btrack": self.param_container.children = (self.bt_params,)
         else: self.param_container.children = (self.prop_params,)
 
     def _lock(self, state: bool):
         for w in [self.method, self.overwrite, self.track_cost_dist, self.gap_cost_dist, self.gap_max_frames,
                   self.merging_cost_dist, self.splitting_cost_dist, self.tp_search_range, self.tp_memory,
-                  self.tp_adaptive_stop, self.tp_adaptive_step, self.btn_run]:
+                  self.tp_adaptive_stop, self.tp_adaptive_step,
+                  self.bt_config_preset, self.bt_config_path, self.bt_max_search_radius,
+                  self.bt_update_method, self.bt_step_size, self.bt_use_optimize,
+                  self.bt_dist_thresh, self.bt_time_thresh,
+                  self.btn_run]:
             if hasattr(w, "disabled"): w.disabled = state
+        for cb in self.bt_hyp_checks.values():
+            if cb is not self.bt_hyp_checks.get("P_FP"):
+                cb.disabled = state           
 
     def _force_commit_pending_changes(self):
         try:
@@ -200,6 +319,17 @@ class TrackingPanel:
         prof["overwrite"] = bool(self.overwrite.value)
         prof["lap"].update({"track_cost_px": int(self.track_cost_dist.value), "gap_close_cost_px": int(self.gap_cost_dist.value), "gap_close_max_frames": int(self.gap_max_frames.value), "merging_cost_px": int(self.merging_cost_dist.value), "splitting_cost_px": int(self.splitting_cost_dist.value)})
         prof["trackpy"].update({"search_range_px": int(self.tp_search_range.value), "memory_frames": int(self.tp_memory.value), "adaptive_stop": float(self.tp_adaptive_stop.value), "adaptive_step": float(self.tp_adaptive_step.value)})
+        bt = prof.setdefault("btrack", {})
+        preset_val = str(self.bt_config_preset.value)
+        bt["config_preset"] = self.bt_config_path.value.strip() if preset_val == "custom" else preset_val
+        bt["config_path"] = self.bt_config_path.value.strip()
+        bt["max_search_radius"] = int(self.bt_max_search_radius.value)
+        bt["update_method"] = str(self.bt_update_method.value)
+        bt["step_size"] = int(self.bt_step_size.value)
+        bt["use_optimize"] = bool(self.bt_use_optimize.value)
+        bt["hypotheses"] = [name for name, cb in self.bt_hyp_checks.items() if cb.value]
+        bt["dist_thresh"] = int(self.bt_dist_thresh.value)
+        bt["time_thresh"] = int(self.bt_time_thresh.value)        
         self.metadata_loader.behav3d_parameters = params
         with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(params, f, sort_keys=False)
 
@@ -221,6 +351,25 @@ class TrackingPanel:
                     new_md = run_laptracking(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, track_cost_cutoff=tc, gap_closing_cost_cutoff=gc, gap_closing_max_frame_count=int(self.gap_max_frames.value), merging_cost_cutoff=(mc**2 if mc>0 else False), splitting_cost_cutoff=(sc**2 if sc>0 else False), overwrite=bool(self.overwrite.value))
                 elif method == "trackpy":
                     new_md = run_trackpy_tracking_generic(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, overwrite=bool(self.overwrite.value), search_range=int(self.tp_search_range.value), memory=int(self.tp_memory.value), adaptive_stop=float(self.tp_adaptive_stop.value), adaptive_step=float(self.tp_adaptive_step.value))
+                elif method == "btrack":
+                    preset_val = str(self.bt_config_preset.value)
+                    config_preset = self.bt_config_path.value.strip() if preset_val == "custom" else preset_val
+                    use_opt = bool(self.bt_use_optimize.value)
+                    hyps = [name for name, cb in self.bt_hyp_checks.items() if cb.value] if use_opt else None
+                    new_md = run_btracking(
+                        metadata=self.metadata_loader.metadata,
+                        output_dir=str(out_dir),
+                        cell_type=self.cell_type,
+                        overwrite=bool(self.overwrite.value),
+                        config_preset=config_preset,
+                        max_search_radius=int(self.bt_max_search_radius.value),
+                        update_method=str(self.bt_update_method.value),
+                        step_size=int(self.bt_step_size.value),
+                        use_optimize=use_opt,
+                        hypotheses=hyps,
+                        dist_thresh=int(self.bt_dist_thresh.value) if use_opt else None,
+                        time_thresh=int(self.bt_time_thresh.value) if use_opt else None,
+                    )
                 else:
                     new_md = run_propagation_tracking(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, overwrite=bool(self.overwrite.value))
 
