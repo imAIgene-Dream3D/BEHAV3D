@@ -683,31 +683,33 @@ def view_napari(
     # Add all image/label layers
     for k, v in backproject_data.items():
         if k == "Targeted_IDs": continue
-        
-        # Handle transposition if not already correct
-        if v["img"].ndim == 5 and v["img"].shape[0] != df_tracks_full["position_t"].max() + 1:
-            try:
-                v["img"] = np.transpose(v["img"], (1, 0, 2, 3, 4))
-            except Exception: pass
-            
-        if k == "Active_Killing":
-            layer = viewer.add_labels(v["img"], name="Killing T-cells", scale=elsize, opacity=0.8)
-            layer.contour = 2
-            layer.visible = True
-            
-        elif k == "Killing_Efficiency":
-            img_np = np.asarray(v["img"])
-            valid_vals = img_np[(img_np != 0) & np.isfinite(img_np)]
-            vmax = np.percentile(valid_vals, 98) if valid_vals.size > 0 else 1
-            layer = viewer.add_image(v["img"], name=k, scale=elsize, colormap='hot', contrast_limits=[0, float(vmax)], opacity=0.8, visible=False)
-            
-        elif v["type"] == "label":
-            viewer.add_labels(v["img"], name=k, scale=elsize, visible=(k == "ClusterID"))
-        else:
-            img_np = np.asarray(v["img"])
-            valid_vals = img_np[(img_np != 0) & np.isfinite(img_np)]
-            vmin, vmax = np.percentile(valid_vals, [2, 98]) if valid_vals.size > 0 else (0, 1)
-            viewer.add_image(v["img"], name=k, scale=elsize, colormap='inferno', contrast_limits=[float(vmin), float(vmax)], visible=False)
+        try:
+            # Handle transposition if not already correct
+            if v["img"].ndim == 5 and v["img"].shape[0] != df_tracks_full["position_t"].max() + 1:
+                try:
+                    v["img"] = np.transpose(v["img"], (1, 0, 2, 3, 4))
+                except Exception: pass
+
+            if k == "Active_Killing":
+                layer = viewer.add_labels(v["img"], name="Killing T-cells", scale=elsize, opacity=0.8)
+                layer.contour = 2
+                layer.visible = True
+
+            elif k == "Killing_Efficiency":
+                img_np = np.asarray(v["img"])
+                valid_vals = img_np[(img_np != 0) & np.isfinite(img_np)]
+                vmax = np.percentile(valid_vals, 98) if valid_vals.size > 0 else 1
+                layer = viewer.add_image(v["img"], name=k, scale=elsize, colormap='hot', contrast_limits=[0, float(vmax)], opacity=0.8, visible=False)
+
+            elif v["type"] == "label":
+                viewer.add_labels(v["img"], name=k, scale=elsize, visible=(k == "ClusterID"))
+            else:
+                img_np = np.asarray(v["img"])
+                valid_vals = img_np[(img_np != 0) & np.isfinite(img_np)]
+                vmin, vmax = np.percentile(valid_vals, [2, 98]) if valid_vals.size > 0 else (0, 1)
+                viewer.add_image(v["img"], name=k, scale=elsize, colormap='inferno', contrast_limits=[float(vmin), float(vmax)], visible=False)
+        except Exception as e:
+            print(f"  Skipping layer '{k}': {e}")
 
     # Specific logic for Targeted Organoids layer
     if targeted_ids_per_tp:
@@ -722,10 +724,12 @@ def view_napari(
     # Add tracks
     napari_tracks_clustered = df_tracks_clustered[["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
     features = {'ClusterID': df_tracks_clustered["ClusterID"].to_numpy().astype(float)}
-    
-    tracks_layer = viewer.add_tracks(napari_tracks_clustered, name=f'Filtered {cell_type} Tracks', features=features, tail_length=75)
-    tracks_layer.color_by = 'ClusterID'
-    tracks_layer.colormap = 'turbo'
+    try:
+        tracks_layer = viewer.add_tracks(napari_tracks_clustered, name=f'Filtered {cell_type} Tracks', features=features, tail_length=75)
+        tracks_layer.color_by = 'ClusterID'
+        tracks_layer.colormap = 'turbo'
+    except Exception as e:
+        print(f"  Skipping {cell_type} tracks layer: {e}")
     
     # Add raw data
     if 'raw_data' in backproject_data:

@@ -353,6 +353,10 @@ def run_feature_extraction(
         df_tracks=pd.read_csv(df_tracks_path, sep=",")
         # Adding a sample name for later combination of multiple track experiments
         df_tracks['sample_name']=sample_name
+
+        if df_tracks.empty or df_tracks['TrackID'].nunique() == 0:
+            print(f"⚠️  No tracks found for {cell_type} in sample {sample_name} – skipping.")
+            continue
         
         print(f"{get_current_time()} - Generalizing the units of position and time to um and hours")
         df_tracks = generalize_units_of_track_features(
@@ -872,6 +876,7 @@ def interpolate_missing_positions(
     """
     As not every track has a segment at every timepoint, interpolate the missing values of
     the missing timepoints.
+    Returns df_tracks unchanged when there are no rows to process.
     
     Fully dynamic - automatically detects ALL contact columns from dataframe.
     
@@ -915,7 +920,11 @@ def interpolate_missing_positions(
     # Filter to only numeric columns - np.interp cannot handle object/string dtypes
     numeric_cols = df_tracks.select_dtypes(include=[np.number]).columns.tolist()
     cols_to_interpolate = [col for col in cols_to_interpolate if col in numeric_cols]
-     
+
+    # Nothing to interpolate – return as-is to avoid empty-concat errors downstream.
+    if df_tracks.empty:
+        return df_tracks
+
     grouped_df = df_tracks.groupby('TrackID')
     def interpolate_group(group, cols_to_interpolate, cols_to_copy):
         # group=group.set_index('time', drop=False)
@@ -1140,10 +1149,14 @@ def _calculate_contact_single_timepoint(args):
     
     df_contacts = []
     segment_ids = np.unique(current_segments)
+
+    # If there are no foreground segments at this timepoint, return an empty
+    # DataFrame so that downstream concatenation can proceed without error.
+    foreground_ids = [sid for sid in segment_ids if sid != 0]
+    if not foreground_ids:
+        return pd.DataFrame(columns=["TrackID", "position_t"])
     
-    for segment_id in segment_ids:
-        if segment_id == 0:
-            continue
+    for segment_id in foreground_ids:
         
         stack_max_z, stack_max_y, stack_max_x = current_segments.shape
         seg_locs = np.argwhere(current_segments == segment_id)
@@ -1244,10 +1257,12 @@ def _calculate_contact_single_timepoint(args):
 
         df_contacts.append(pd.DataFrame([contact_data]))
 
+    # It is still possible (though unlikely) that no contact data is produced;
+    # in that case, return an empty-but-valid DataFrame.
+    if not df_contacts:
+        return pd.DataFrame(columns=["TrackID", "position_t"])
 
-
-
-    return pd.concat(df_contacts)
+    return pd.concat(df_contacts, ignore_index=True)
 
 def calculate_contact_features(
     current_cell_segments_path,
@@ -1378,26 +1393,60 @@ def calculate_dead_mask(segments, dead_mask):
     The calculation can be the minimum, maximum, mean or median
     """
     df_intensity = []
-    # for t, (tcell_stack, intensity_stack) in enumerate(zip(segments, intensity_image)):      
-    for t, (tcell_stack, dead_mask_stack) in tqdm(enumerate(zip(segments, dead_mask)),total=len(segments)):      
+    # for t, (tcell_stack, intensity_stack) in enumerate(zip(segments, intensity_image)):
+    for t, (tcell_stack, dead_mask_stack) in tqdm(enumerate(zip(segments, dead_mask)), total=len(segments)):
         tcell_stack = np.asarray(tcell_stack)
         dead_mask_stack = np.asarray(dead_mask_stack)
-        properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=dead_mask_stack, properties=['label', 'num_pixels', f'intensity_mean']))
-        properties["position_t"]=t
-        properties.rename(columns={"intensity_mean":"percentage_dead_mask"}, inplace=True)
+        properties = pd.DataFrame(
+            regionprops_table(
+                label_image=tcell_stack,
+                intensity_image=dead_mask_stack,
+                properties=["label", "num_pixels", "intensity_mean"],
+            )
+        )
+        # No objects at this timepoint → nothing to append
+        if properties.empty:
+            continue
+        properties["position_t"] = t
+        properties.rename(columns={"intensity_mean": "percentage_dead_mask"}, inplace=True)
         properties["nr_dead_mask_pixels"] = properties["num_pixels"] * properties["percentage_dead_mask"]
-        properties=properties.rename(columns={"label":"TrackID"})
+        properties = properties.rename(columns={"label": "TrackID"})
         properties = properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]]
         df_intensity.append(properties)
-    df_intensity = pd.concat(df_intensity)
-    df_intensity = df_intensity.sort_values(by=["TrackID", "position_t"]).reset_index(drop=True)
-    df_intensity["increase_dead_mask"] = calculate_relative_increase(
-            df = df_intensity,
-            column="nr_dead_mask_pixels",
-            nr_timepoints_back=10,
-            groupby="TrackID"
+
+    # If no segments/dead-mask pixels were found across all timepoints,
+    # return an empty but well-formed DataFrame so downstream code can continue.
+    if not df_intensity:
+        return pd.DataFrame(
+            columns=[
+                "TrackID",
+                "position_t",
+                "percentage_dead_mask",
+                "nr_dead_mask_pixels",
+                "increase_dead_mask",
+            ]
         )
-    return(df_intensity)
+
+    df_intensity = pd.concat(df_intensity, ignore_index=True)
+    if df_intensity.empty:
+        # Should not happen because of the guard above, but keep this
+        # as an extra safety net.
+        df_intensity["increase_dead_mask"] = pd.Series(dtype=float)
+        return df_intensity
+
+    df_intensity = df_intensity.sort_values(by=["TrackID", "position_t"]).reset_index(drop=True)
+
+    rel_increase = calculate_relative_increase(
+        df=df_intensity,
+        column="nr_dead_mask_pixels",
+        nr_timepoints_back=10,
+        groupby="TrackID",
+    )
+
+    # Ensure we always assign a 1D array/Series, even if calculation returns empty.
+    rel_increase = np.asarray(rel_increase).reshape(-1,) if np.asarray(rel_increase).ndim > 1 else rel_increase
+    df_intensity["increase_dead_mask"] = rel_increase
+    return df_intensity
 
 def _basic_counts_single_timepoint(args):
     """

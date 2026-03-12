@@ -51,10 +51,10 @@ class PixelClassifierPanel:
             description="Examples per sample",
             value=int(pc.get("examples_per_sample", 3))
         )
-        self.sample_specific_classifier = widgets.Checkbox(
+        '''self.sample_specific_classifier = widgets.Checkbox(
             description="Sample-specific classifier",
             value=bool(pc.get("sample_specific_classifier", False))
-        )
+        )'''
         
         self.n_workers = widgets.IntText(
             description="Workers",
@@ -219,7 +219,7 @@ class PixelClassifierPanel:
             widgets.VBox([
                 widgets.HTML("<b>Train pixel classifier</b>"),
                 widgets.HBox([self.examples_per_sample, self.n_workers]),
-                self.sample_specific_classifier,
+                #self.sample_specific_classifier,
                 self.train_row,
             ]),
             widgets.HTML("<hr>"),
@@ -336,7 +336,7 @@ class PixelClassifierPanel:
     def _persist_params(self):
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
         pc["examples_per_sample"] = int(self.examples_per_sample.value)
-        pc["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
+        #pc["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
         pc["workers"] = int(self.n_workers.value)
         pc["use_all_timepoints"] = bool(self.use_all_timepoints.value)
         pc["tp_start"] = int(self.tp_start.value)
@@ -424,7 +424,8 @@ class PixelClassifierPanel:
     def _lock(self, state: bool):
         to_lock = [
             self.btn_train, self.btn_run, self.btn_resegment,
-            self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
+            #self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
+            self.examples_per_sample, self.n_workers,
             self.use_all_timepoints, self.tp_start, self.tp_end,
             self.manual_clf_paths, self.overwrite_existing,
         ]
@@ -514,7 +515,7 @@ class PixelClassifierPanel:
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
                     examples_per_sample=int(self.examples_per_sample.value),
-                    sample_specific_classifier=bool(self.sample_specific_classifier.value),
+                    #sample_specific_classifier=bool(self.sample_specific_classifier.value),
                     n_workers=int(self.n_workers.value),
                     organoid_types=self.organoid_types,
                     immune_types=self.immune_types,
@@ -1281,8 +1282,11 @@ class SegmentationVisualizationPanel:
                     )
 
                 for name, mask_np in loaded_masks.items():
-                    print(f"Adding layer '{name}'…")
-                    viewer.add_labels(mask_np, name=name, scale=(1, 1, 1, 1), blending="additive", opacity=0.8)
+                    try:
+                        print(f"Adding layer '{name}'…")
+                        viewer.add_labels(mask_np, name=name, scale=(1, 1, 1, 1), blending="additive", opacity=0.8)
+                    except Exception as e:
+                        print(f"  Skipping layer '{name}': {e}")
 
                 if not loaded_masks:
                     print("No segments/mask layers added.")

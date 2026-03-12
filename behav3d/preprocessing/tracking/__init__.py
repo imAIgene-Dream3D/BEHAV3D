@@ -245,9 +245,16 @@ def visualize_tracks(
         color = colors_list[color_idx % len(colors_list)]  # Cycle through colors if more types than colors
         category_counts[prefix] += 1
         
-        viewer.add_labels(data['tracks'], name=f"{cell_type} segments (tracked)", scale=elsizes)
+        try:
+            viewer.add_labels(data['tracks'], name=f"{cell_type} segments (tracked)", scale=elsizes)
+        except Exception as e:
+            print(f"  Skipping {cell_type} segments layer: {e}")
+
         track_coords = data['df'][["TrackID", "position_t", "position_z", "position_y", "position_x"]].to_numpy()
-        viewer.add_tracks(track_coords, name=f'{cell_type} Tracks', colormap=color, tail_length=20)
+        try:
+            viewer.add_tracks(track_coords, name=f'{cell_type} Tracks', colormap=color, tail_length=20)
+        except Exception as e:
+            print(f"  Skipping {cell_type} tracks layer: {e}")
     
 
     print("Launching Napari viewer...")
