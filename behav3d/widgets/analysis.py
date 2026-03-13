@@ -23,15 +23,14 @@ from behav3d.io.formats.zarr import load_zarr
 from behav3d.io.images import load_image
 from behav3d.features.timepoint_features import run_feature_extraction
 from behav3d.analysis.tcell_analysis import (
-    filter_cell_tracks,
     run_tcell_analysis
 )
 from behav3d.analysis.organoid_analysis import (
-    filter_organoid_tracks,
     run_organoid_analysis,
     plot_multi_organoid_death_dynamics,
     run_organoid_morphology_dead_analysis
 )
+from behav3d.analysis.filtering import filter_tracks
 
 from behav3d.io.images import load_zarr
 from behav3d.analysis import summarize_track_features
@@ -216,16 +215,17 @@ class TrackFilterPanel:
         from behav3d.core.metadata import has_dead_channel
         self.has_dead = has_dead_channel(self.metadata_loader.metadata)
         
-        if self.category == "organoid":
-            self.filter_t0_dead = widgets.Checkbox(description="Filter by minimal size at t=1", value=bool(cfg.get("filter_min_size_t1", True)), indent=False)
-            self.min_size_t1 = widgets.IntText(description="Minimal size (px @ t=1)", value=int(cfg.get("min_size_t1", 1000)), style={'description_width': '180px'})
-            self.row_size_t1 = widgets.HBox([self.min_size_t1], layout=widgets.Layout(display=(None if self.filter_t0_dead.value else "none")))
-            self.filter_t0_dead.observe(lambda c: setattr(self.row_size_t1.layout, 'display', None if c['new'] else 'none'), names="value")
-        else:
-            self.filter_t0_dead = widgets.Checkbox(description="Filter tracks that are dead at t=0", value=bool(cfg.get("filter_t0_dead", True)), indent=False)
-            if not self.has_dead: self.filter_t0_dead.layout.display = "none"
-            self.min_size_t1 = self.row_size_t1 = None
+        # --- Min size at first timepoint (available for ALL cell types) ---
+        self.en_min_size = widgets.Checkbox(description="Filter by minimal size at first timepoint", value=bool(cfg.get("filter_min_size", False)), indent=False)
+        self.min_size_val = widgets.IntText(description="Minimal size (px)", value=int(cfg.get("min_size", 1000)), style={'description_width': '180px'})
+        self.row_min_size = widgets.HBox([self.min_size_val], layout=widgets.Layout(display=(None if self.en_min_size.value else "none")))
+        self.en_min_size.observe(lambda c: setattr(self.row_min_size.layout, 'display', None if c['new'] else 'none'), names="value")
+
+        # --- Dead at t=0 (available for ALL cell types, hidden if no dead channel) ---
+        self.filter_t0_dead = widgets.Checkbox(description="Filter tracks that are dead at first timepoint", value=bool(cfg.get("filter_t0_dead", False)), indent=False)
+        if not self.has_dead: self.filter_t0_dead.layout.display = "none"
         
+        # --- Time unit toggle (available for ALL cell types) ---
         self.time_type = widgets.ToggleButtons(options=["frames", "hours"], value=cfg.get("time_type", "frames"))
         def _on_time_unit_change(change):
             if change['name'] == 'value':
@@ -241,17 +241,21 @@ class TrackFilterPanel:
         self.spinner_html.layout.display = "none"
         self.out_run = widgets.Output()
         
-        ui_elements = [widgets.HTML(f'<div style="font-size:14px;font-weight:700;">{self.cell_type.capitalize()} Track Filtering</div>'), self.en_exp_duration, self.row_exp, self.en_min_length, self.row_min, self.en_max_length, self.row_max, self.filter_t0_dead]
-        if self.row_size_t1: ui_elements.append(self.row_size_t1)
-        if self.category != "organoid": 
-             ui_elements.extend([widgets.HTML('<b>Unit for time-based filters:</b>'), self.time_type])
-        ui_elements.extend([widgets.HBox([self.btn_run, self.spinner_html]), self.out_run])
+        ui_elements = [
+            widgets.HTML(f'<div style="font-size:14px;font-weight:700;">{self.cell_type.capitalize()} Track Filtering</div>'),
+            self.en_exp_duration, self.row_exp,
+            self.en_min_length, self.row_min,
+            self.en_max_length, self.row_max,
+            self.en_min_size, self.row_min_size,
+            self.filter_t0_dead,
+            widgets.HTML('<b>Unit for time-based filters:</b>'), self.time_type,
+            widgets.HBox([self.btn_run, self.spinner_html]),
+            self.out_run
+        ]
         self.ui = widgets.VBox(ui_elements)
-        self._filter_fn = filter_organoid_tracks if self.category == "organoid" else filter_cell_tracks
 
     def _lock(self, locked):
-        w_list = [self.en_exp_duration, self.exp_duration, self.en_min_length, self.min_track_length, self.en_max_length, self.max_track_length, self.filter_t0_dead, self.time_type, self.btn_run]
-        if self.min_size_t1: w_list.append(self.min_size_t1)
+        w_list = [self.en_exp_duration, self.exp_duration, self.en_min_length, self.min_track_length, self.en_max_length, self.max_track_length, self.en_min_size, self.min_size_val, self.filter_t0_dead, self.time_type, self.btn_run]
         for w in w_list: w.disabled = locked
 
     def _on_run_clicked(self, *_):
@@ -259,18 +263,34 @@ class TrackFilterPanel:
         with self.out_run:
             try:
                 cfg = self.metadata_loader.behav3d_parameters["track_filtering"][self.cell_type]
-                cfg.update({"exp_duration_enabled": self.en_exp_duration.value, "exp_duration": int(self.exp_duration.value), "min_length_enabled": self.en_min_length.value, "min_track_length": int(self.min_track_length.value), "max_length_enabled": self.en_max_length.value, "max_track_length": int(self.max_track_length.value), "time_type": str(self.time_type.value)})
-                if self.category == "organoid":
-                    cfg.update({"filter_min_size_t1": self.filter_t0_dead.value, "min_size_t1": int(self.min_size_t1.value)})
-                else: cfg["filter_t0_dead"] = bool(self.filter_t0_dead.value)
+                cfg.update({
+                    "exp_duration_enabled": self.en_exp_duration.value,
+                    "exp_duration": int(self.exp_duration.value),
+                    "min_length_enabled": self.en_min_length.value,
+                    "min_track_length": int(self.min_track_length.value),
+                    "max_length_enabled": self.en_max_length.value,
+                    "max_track_length": int(self.max_track_length.value),
+                    "filter_min_size": self.en_min_size.value,
+                    "min_size": int(self.min_size_val.value),
+                    "filter_t0_dead": bool(self.filter_t0_dead.value),
+                    "time_type": str(self.time_type.value)
+                })
                 with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
 
                 df_input_path = str(self._advanced_features_path) if self._use_advanced_features else None
-                filter_kwargs = {"metadata": self.metadata_loader.metadata, "output_dir": self.output_dir, "exp_duration": (int(self.exp_duration.value) if self.en_exp_duration.value else None), "min_track_length": (int(self.min_track_length.value) if self.en_min_length.value else None), "max_track_length": (int(self.max_track_length.value) if self.en_max_length.value else None), "time_type": str(self.time_type.value), "cell_type": self.cell_type, "df_input_path": df_input_path}
-                if self.category == "organoid": filter_kwargs["min_size"] = (int(self.min_size_t1.value) if self.filter_t0_dead.value else None)
-                else: filter_kwargs.update({"filter_t0_dead": (bool(self.filter_t0_dead.value) if self.has_dead else False), "plot_results": True})
-                
-                self._filter_fn(**filter_kwargs)
+                filter_tracks(
+                    metadata=self.metadata_loader.metadata,
+                    output_dir=self.output_dir,
+                    exp_duration=(int(self.exp_duration.value) if self.en_exp_duration.value else None),
+                    min_track_length=(int(self.min_track_length.value) if self.en_min_length.value else None),
+                    max_track_length=(int(self.max_track_length.value) if self.en_max_length.value else None),
+                    filter_t0_dead=(bool(self.filter_t0_dead.value) if self.has_dead else False),
+                    min_size=(int(self.min_size_val.value) if self.en_min_size.value else None),
+                    cell_type=self.cell_type,
+                    time_type=str(self.time_type.value),
+                    plot_results=True,
+                    df_input_path=df_input_path
+                )
                 print("✅ Filtering done. Summarizing tracks...")
                 summarize_track_features(output_dir=self.output_dir, cell_type=self.cell_type)
                 print(f"✅ {self.cell_type} filtering complete!")

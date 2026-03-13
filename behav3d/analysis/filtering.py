@@ -287,12 +287,18 @@ def filter_tracks(
         df_track_counts=df_track_counts
         )
 
-    # Filter out tracks whose volume at t=1 is below min_size
-    if min_size is not None and "volume" in df_all_tracks_filt.columns:
-        t1_small = df_all_tracks_filt[
-            (df_all_tracks_filt["relative_time"] == 1) &
-            (df_all_tracks_filt["volume"] < min_size)
-        ][["TrackID", "sample_name"]]
+    # Filter out tracks whose size at the first timepoint is below min_size
+    # Checks 'volume' first, falls back to 'nr_pixels'
+    size_col = None
+    if min_size is not None:
+        if "volume" in df_all_tracks_filt.columns:
+            size_col = "volume"
+        elif "nr_pixels" in df_all_tracks_filt.columns:
+            size_col = "nr_pixels"
+
+    if min_size is not None and size_col is not None:
+        first_tp = df_all_tracks_filt[df_all_tracks_filt["relative_time"] == 1]
+        t1_small = first_tp[first_tp[size_col] < min_size][["TrackID", "sample_name"]]
         before = df_all_tracks_filt[["TrackID", "sample_name"]].drop_duplicates().shape[0]
         df_all_tracks_filt = df_all_tracks_filt[
             ~df_all_tracks_filt.set_index(["TrackID", "sample_name"]).index.isin(
@@ -300,7 +306,7 @@ def filter_tracks(
             )
         ]
         after = df_all_tracks_filt[["TrackID", "sample_name"]].drop_duplicates().shape[0]
-        print(f"  Filtered by min size ({min_size}): {before} → {after} tracks")
+        print(f"  Filtered by min size ({size_col} < {min_size}): {before} → {after} tracks")
         df_track_counts = count_tracks(
             df_all_tracks_filt,
             col_name="nr_tracks_min_size",
@@ -346,6 +352,9 @@ def filter_tracks(
             )
     
     filter_cols=["nr_tracks_before_filtering", "nr_tracks_exp_duration", "nr_tracks_min_track_length"]
+    if min_size is not None and size_col is not None:
+        filter_cols.append("nr_tracks_min_size")
+
     if "mean_dead_dye" in df_all_tracks_filt.columns:
         # Plot the distribution of dead dye intensity of all timepoints and at timepoint 1
         # Can be used to aid in the choice of dead_dye_threshold
@@ -359,7 +368,7 @@ def filter_tracks(
             )
     
         plot_dead_dye_distr_t0_outpath = Path(qc_outdir, f"BEHAV3D_dead_dye_distribution_t0.pdf")
-        print(f"- Plotting dead dye distribution at timepoint 1 to {plot_dead_dye_distr_outpath}")
+        print(f"- Plotting dead dye distribution at first timepoint to {plot_dead_dye_distr_t0_outpath}")
         plot_dead_dye_distribution(
             df_all_tracks_filt[df_all_tracks_filt["relative_time"]==1],
             outpath=plot_dead_dye_distr_t0_outpath,
@@ -367,16 +376,15 @@ def filter_tracks(
             rows_per_page=2
             )
     
-        # Filter out all T cells that are dead based on the threshold at the first timepoint of a track
-        if filter_t0_dead:
-            assert 'dead' in df_all_tracks_filt.columns, "The column 'dead' is not present in the DataFrame, but filter_t0_dead is supplied"
-            dead_t0 = df_all_tracks_filt[
-                (df_all_tracks_filt["relative_time"]==1) & 
-                (df_all_tracks_filt["dead"])
-                ][["TrackID","sample_name"]]
-            df_all_tracks_filt=df_all_tracks_filt[~df_all_tracks_filt.set_index(['TrackID', 'sample_name']).index.isin(dead_t0.set_index(['TrackID', 'sample_name']).index)]
-            filter_cols.append("nr_tracks_dead_t1")   
-        df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_dead_t1", df_track_counts=df_track_counts)
+    # Filter out tracks that are dead at the first timepoint (relative_time==1)
+    if filter_t0_dead and 'dead' in df_all_tracks_filt.columns:
+        dead_t0 = df_all_tracks_filt[
+            (df_all_tracks_filt["relative_time"]==1) & 
+            (df_all_tracks_filt["dead"])
+            ][["TrackID","sample_name"]]
+        df_all_tracks_filt=df_all_tracks_filt[~df_all_tracks_filt.set_index(['TrackID', 'sample_name']).index.isin(dead_t0.set_index(['TrackID', 'sample_name']).index)]
+        filter_cols.append("nr_tracks_dead_t0")   
+        df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_dead_t0", df_track_counts=df_track_counts)
 
     plot_filter_count_outpath = Path(qc_outdir, f"BEHAV3D_filter_counts.pdf")
     print(f"- Plotting track counts after filtering steps to {plot_filter_count_outpath}")
