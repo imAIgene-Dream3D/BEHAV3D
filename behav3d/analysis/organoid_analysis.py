@@ -30,7 +30,7 @@ from sklearn.preprocessing import MinMaxScaler
 
 
 def run_organoid_analysis(
-    dead_perc_threshold,
+    dead_perc_threshold=None,
     config=None,
     output_dir=None,
     metadata=None,
@@ -72,14 +72,14 @@ def run_organoid_analysis(
     df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
     df_tracks["TrackID"] = df_tracks["TrackID"].astype(str)
     
-    # Check if dead channel data exists in tracks
-    dead_columns = ["nr_dead_mask_pixels", "percentage_dead_mask"]
+    # Death dynamics now reads the final death classification from feature extraction.
+    dead_columns = ["nr_dead_mask_pixels", "percentage_dead_mask", "dead"]
     has_dead_data = all(col in df_tracks.columns for col in dead_columns)
     
     if not has_dead_data:
         print(f"\n⚠️  WARNING: Dead channel data not found in features.")
         print(f"   Missing columns: {[col for col in dead_columns if col not in df_tracks.columns]}")
-        print(f"   To run death dynamics analysis, enable dead_channel in MetadataBuilder before running feature extraction.")
+        print(f"   Re-run Feature Extraction and Track Filtering so the final 'dead' column is present in the track features CSV.")
         print(f"   Skipping death dynamics analysis.\n")
         
         # Cannot run death dynamics analysis without dead channel data
@@ -101,6 +101,17 @@ def run_organoid_analysis(
             groupby=["TrackID", "sample_name"]
         )
     
+    if pd.api.types.is_bool_dtype(df_tracks["dead"]):
+        df_tracks["dead"] = df_tracks["dead"].fillna(False)
+    else:
+        df_tracks["dead"] = (
+            df_tracks["dead"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin({"true", "1", "1.0", "yes"})
+        )
+
     if "mean_dead_dye" in df_tracks.columns:
         df_tracks["smoothed_mean_dead_dye"] = smooth_value_over_time(
                 df_tracks,
@@ -109,9 +120,6 @@ def run_organoid_analysis(
             )
     else:
         df_tracks["smoothed_mean_dead_dye"] = np.nan
-
-    df_tracks["dead"] = (df_tracks["smoothed_percentage_dead_mask"] > dead_perc_threshold)
-    df_tracks["dead"] = df_tracks.groupby(["sample_name","TrackID"])["dead"].transform(lambda x: x.cummax())
 
     # Summarize tracks to their time of death
     summ = (

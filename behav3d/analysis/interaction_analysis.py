@@ -19,8 +19,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-from behav3d.analysis import smooth_value_over_time
-
 
 def run_interaction_analysis(
     output_dir: str,
@@ -42,7 +40,8 @@ def run_interaction_analysis(
     interacting_cell_types : list
         List of cell types to analyze interactions with (e.g., ["tcell", "macrophage"])
     dead_threshold : float
-        Threshold for percentage_dead_mask to classify organoid as dead (default: 0.02)
+        Retained for backward compatibility. Interaction analysis now reads the
+        final death classification directly from the ``dead`` column in the CSV.
     df_tracks_path : str, optional
         Path to filtered track features CSV. If None, uses default location.
     show_plots : bool
@@ -93,13 +92,13 @@ def run_interaction_analysis(
     n_samples = df["sample_name"].nunique()
     print(f"   Loaded {len(df)} timepoints from {n_organoids} {cell_type}s across {n_samples} samples")
     
-    # Process death classification
-    df, has_dead_column = _process_death_classification(df, dead_threshold)
+    # Process death classification from the final feature-extraction output.
+    df, has_dead_column = _process_death_classification(df)
     
     if has_dead_column:
         n_alive = (df.groupby(["sample_name", "TrackID"])["survives"].first()).sum()
         n_dead = n_organoids - n_alive
-        print(f"   Death status: {n_alive} survive, {n_dead} die (threshold={dead_threshold})")
+        print(f"   Death status: {n_alive} survive, {n_dead} die")
     else:
         print("   ⚠️ No death data available - skipping alive vs dead comparisons")
     
@@ -172,7 +171,7 @@ def run_interaction_analysis(
     return results
 
 
-def _process_death_classification(df: pd.DataFrame, dead_threshold: float):
+def _process_death_classification(df: pd.DataFrame):
     """
     Process death classification for the dataframe.
     
@@ -184,22 +183,19 @@ def _process_death_classification(df: pd.DataFrame, dead_threshold: float):
     
     
     has_dead_column = "dead" in df.columns
-    has_percentage_dead = "percentage_dead_mask" in df.columns
-    
-    if not has_dead_column and has_percentage_dead:
-        # Create dead classification based on threshold
-        print(f"   Calculating death classification (threshold={dead_threshold})...")
-        
-        # Smooth the percentage_dead_mask
-        df["smoothed_percentage_dead_mask"] = smooth_value_over_time(
-            df,
-            column="percentage_dead_mask",
-            groupby=["TrackID", "sample_name"]
+    if not has_dead_column:
+        return df, False
+
+    if pd.api.types.is_bool_dtype(df["dead"]):
+        df["dead"] = df["dead"].fillna(False)
+    else:
+        df["dead"] = (
+            df["dead"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin({"true", "1", "1.0", "yes"})
         )
-        
-        df["dead"] = (df["smoothed_percentage_dead_mask"] > dead_threshold)
-        df["dead"] = df.groupby(["sample_name", "TrackID"])["dead"].transform(lambda x: x.cummax())
-        has_dead_column = True
     
     # Determine final alive/dead status for each organoid
     if has_dead_column:
