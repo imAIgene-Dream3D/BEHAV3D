@@ -153,6 +153,12 @@ class PixelClassifierPanel:
             [self.btn_run, self.btn_resegment, self.spinner_apply],
             layout=widgets.Layout(align_items="center", gap="8px")
         )
+        self.only_resegment_warning = widgets.HTML(
+            "<span style='color:#b26a00;'>"
+            "Warning: Only resegment must use the same timepoint range as the masks/segmentation it comes from. "
+            "If you want a different range, run full segmentation again."
+            "</span>"
+        )
 
         self.btn_train.on_click(self._on_train_clicked)
         self.close_button.on_click(self._on_close_clicked)
@@ -230,6 +236,7 @@ class PixelClassifierPanel:
                 *segmentation_widgets,
                 self.overwrite_existing,
                 widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end]),
+                self.only_resegment_warning,
                 self.apply_row,
             ]),
             widgets.HTML("<hr>"),
@@ -571,6 +578,7 @@ class PixelClassifierPanel:
                 new_md = run_pixel_classifier_segmentation(
                     output_dir=str(odir),
                     metadata=self.metadata_loader.metadata,
+                    metadata_csv_path=str(self.metadata_loader.metadata_csv_path),
                     organoid_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.organoid_types if ct in self.edt_thresholds},
                     immune_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.immune_types if ct in self.edt_thresholds},
                     other_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.other_types if ct in self.edt_thresholds},

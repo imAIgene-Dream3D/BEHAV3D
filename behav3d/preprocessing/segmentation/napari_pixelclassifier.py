@@ -60,52 +60,6 @@ def _log_mem(tag, log_func=print):
     else:
         log_func(f"[MEM] {tag}: psutil not installed, skipping memory log")
 
-## TODO create a function for BEHAV3D notebook
-'''
-def calculate_image_features(
-    image,
-    intensity=True,
-    edges=True,
-    texture=False,
-    # sigma_min=sigma_min,
-    sigma_max=16,
-    channel_axis=0,
-    ):
-    """
-    Calculate multiscale basic features for a given image.
-    Possible to save as a joblib and load later
-    """
-    img = np.asarray(image)
-    orig_shape = img.shape
-    ndim = img.ndim
-    
-    # Identify spatial axes (everything except channel_axis)
-    if channel_axis is None:
-        spatial_axes = list(range(ndim))
-    else:
-        spatial_axes = [ax for ax in range(ndim) if ax != channel_axis]
-    
-    # If image is 2D, squeeze pseudo-3D-axis
-    squeeze_axes = [ax for ax in spatial_axes if orig_shape[ax] == 1]
-    if squeeze_axes:
-        img_squeezed = np.squeeze(img, axis=tuple(squeeze_axes))
-    else:
-        img_squeezed = img
-        
-    feats = features_func(
-        img_squeezed,
-        intensity=intensity,
-        edges=edges,
-        texture=texture,
-        channel_axis=channel_axis,
-        sigma_max=sigma_max,
-        )
-    
-    n_features = feats.shape[-1]
-    orig_spatial_shape = [orig_shape[ax] for ax in spatial_axes]
-    feats_restored = feats.reshape((*orig_spatial_shape, n_features))
-    return feats_restored
-'''
 # ---------------------------------------------------------------------------
 # Sigma values in µm — optimised via random-forest feature importance.
 # They are converted to pixel units at runtime using the sample's pixel size.
@@ -113,76 +67,127 @@ def calculate_image_features(
 SIGMA_UM = [0.89, 1.77, 3.54, 14.16]
 
 
-def make_features(pixel_size_xy_um=1.0, pixel_size_z_um=1.0, verbose=True):
+def make_features(
+    pixel_size_xy_um=1.0,
+    pixel_size_z_um=None,
+    intensity=True,
+    edges=True,
+    verbose=True,
+):
     """
-    Build a feature extractor whose Gaussian sigmas are expressed in **pixels**,
-    derived from the physical SIGMA_UM values and the given pixel sizes.
+    Build a pixel-classifier features function with physical-unit sigma values.
+
+    Replaces the previous ``skimage.feature.multiscale_basic_features`` partial,
+    which used sigma_min/sigma_max in pixel units.  Here each sigma in ``SIGMA_UM``
+    is divided by the physical pixel size to get the per-axis Gaussian width in
+    pixels, allowing consistent feature scales regardless of image resolution.
 
     Parameters
     ----------
     pixel_size_xy_um : float
-        XY pixel size in µm/px.
-    pixel_size_z_um : float
-        Z pixel size in µm/px.
-    verbose : bool
-        If True, print the sigma conversion table.
+        Physical pixel size in µm for the XY plane (from metadata
+        ``pixel_distance_xy``).
+    pixel_size_z_um : float, optional
+        Physical pixel size in µm for the Z axis (from metadata
+        ``pixel_distance_z``).  Defaults to ``pixel_size_xy_um`` (isotropic).
+    intensity : bool
+        Include Gaussian-smoothed intensity features (one per sigma per channel).
+    edges : bool
+        Include Sobel edge-magnitude features (one per sigma per channel).
 
     Returns
     -------
     callable
-        A function with signature ``f(image)`` that returns multiscale features.
+        ``func(image) -> np.ndarray`` of shape ``(..., n_features)`` where the
+        leading axes are the spatial axes of the input and ``n_features =
+        n_channels * len(SIGMA_UM) * (intensity + edges)``.
+        Input image must have ``channel_axis=0``, i.e. shape ``(C, Z, Y, X)``
+        for 4-D data or ``(C, Y, X)`` for 2-D data.
     """
-    sigmas_px = []
-    for s_um in SIGMA_UM:
-        sz = s_um / pixel_size_z_um
-        sxy = s_um / pixel_size_xy_um
-        sigmas_px.append((sz, sxy, sxy))
+    if pixel_size_z_um is None:
+        pixel_size_z_um = pixel_size_xy_um
+
+    # Per-sigma anisotropic Gaussian widths: (sigma_z_px, sigma_y_px, sigma_x_px)
+    sigma_list_3d = [
+        (s / pixel_size_z_um, s / pixel_size_xy_um, s / pixel_size_xy_um)
+        for s in SIGMA_UM
+    ]
+
+    # 2-D fallback: (sigma_y_px, sigma_x_px)
+    sigma_list_2d = [
+        (s / pixel_size_xy_um, s / pixel_size_xy_um)
+        for s in SIGMA_UM
+    ]
+    sigma_info = "  |  ".join(
+        f"{s_um:.2f}um -> z={s_um/pixel_size_z_um:.2f}px, xy={s_um/pixel_size_xy_um:.2f}px"
+        for s_um in SIGMA_UM
+    )
 
     if verbose:
-        print("Sigma values (µm → px) used for feature extraction:")
-        print(f"  Pixel size  :  xy = {pixel_size_xy_um:.4f} µm/px   z = {pixel_size_z_um:.4f} µm/px")
-        print(f"  {'σ (µm)':>10s}  {'σ_z (px)':>10s}  {'σ_xy (px)':>10s}")
-        print(f"  {'-'*36}")
-        for s_um, (sz, sxy, _) in zip(SIGMA_UM, sigmas_px):
-            print(f"  {s_um:10.2f}  {sz:10.2f}  {sxy:10.2f}")
+        print(
+            f"[features] pixel_size_xy={pixel_size_xy_um:.4f}um  "
+            f"pixel_size_z={pixel_size_z_um:.4f}um\n"
+            f"[features] sigmas:  {sigma_info}"
+        )
+
+    n_feature_types = int(bool(intensity)) + int(bool(edges))
+    if n_feature_types == 0:
+        raise ValueError("make_features requires at least one of intensity or edges to be enabled")
+
+    dtype_probe = np.zeros((2, 2), dtype=np.float32)
+    smoothed_probe = skimage_filters.gaussian(dtype_probe, sigma=1, preserve_range=True)
+    feature_dtype = np.result_type(
+        smoothed_probe.dtype,
+        skimage_filters.sobel(smoothed_probe).dtype if edges else smoothed_probe.dtype,
+    )
 
     def _features(image):
-        all_features = []
-        for sigma in sigmas_px:
-            for func in [skimage_filters.gaussian,
-                         skimage_filters.sobel]:
-                if image.ndim > 3 and image.shape[0] > 1:  # channel axis present
-                    per_ch = []
-                    for ch in range(image.shape[0]):
-                        filtered = func(image[ch], sigma=sigma) if func is skimage_filters.gaussian else func(skimage_filters.gaussian(image[ch], sigma=sigma))
-                        per_ch.append(filtered)
-                    all_features.extend(per_ch)
-                else:
-                    filtered = func(image, sigma=sigma) if func is skimage_filters.gaussian else func(skimage_filters.gaussian(image, sigma=sigma))
-                    all_features.append(filtered)
-        return np.stack(all_features, axis=-1)
+        image = np.asarray(image, dtype=np.float32)
+        # image: (C, [Z,] Y, X) — channel_axis=0
+        n_channels = image.shape[0]
+        is_3d = image.ndim == 4     # (C, Z, Y, X)
+        sigma_list = sigma_list_3d if is_3d else sigma_list_2d
+
+        n_features = n_channels * len(sigma_list) * n_feature_types
+        out = np.empty(image.shape[1:] + (n_features,), dtype=feature_dtype)
+        k = 0
+        for ch in range(n_channels):
+            ch_img = image[ch]  # (Z, Y, X) or (Y, X)
+            for sigma in sigma_list:
+                smoothed = skimage_filters.gaussian(
+                    ch_img, sigma=sigma, preserve_range=True
+                )
+                if intensity:
+                    out[..., k] = smoothed
+                    k += 1
+                if edges:
+                    out[..., k] = skimage_filters.sobel(smoothed)
+                    k += 1
+        return out
 
     return _features
 
 
-def format_sigma_table(pixel_size_xy_um, pixel_size_z_um):
+def format_sigma_table(pixel_size_xy_um, pixel_size_z_um=None):
     """Return a formatted string showing σ (µm) → σ (px) conversion."""
-    lines = []
-    lines.append("Sigma values (µm → px) used for feature extraction:")
-    lines.append(f"  Pixel size  :  xy = {pixel_size_xy_um:.4f} µm/px   z = {pixel_size_z_um:.4f} µm/px")
-    lines.append(f"  {'σ (µm)':>10s}  {'σ_z (px)':>10s}  {'σ_xy (px)':>10s}")
-    lines.append(f"  {'-'*36}")
-    for s_um in SIGMA_UM:
-        sz = s_um / pixel_size_z_um
-        sxy = s_um / pixel_size_xy_um
-        lines.append(f"  {s_um:10.2f}  {sz:10.2f}  {sxy:10.2f}")
-    lines.append(f"  SIGMA_UM = {SIGMA_UM}")
+    if pixel_size_z_um is None:
+        pixel_size_z_um = pixel_size_xy_um
+    lines = [
+        f"  Pixel size  :  xy = {pixel_size_xy_um:.4f} um/px   "
+        f"z = {pixel_size_z_um:.4f} um/px",
+        f"  {'sigma (um)':>10}   {'sigma_z (px)':>12}   {'sigma_xy (px)':>13}",
+        f"  {'-'*41}",
+    ]
+    for s in SIGMA_UM:
+        lines.append(
+            f"  {s:>10.2f}   {s/pixel_size_z_um:>12.2f}   {s/pixel_size_xy_um:>13.2f}"
+        )
     return "\n".join(lines)
 
 
 # Module-level fallback: pixel_size=1.0 → sigmas in µm used as-is in pixels.
 # Wraps the real function so it prints a warning the first time it's called.
-_fallback_compute = make_features(1.0, 1.0, verbose=False)
+_fallback_compute = make_features(pixel_size_xy_um=1.0, verbose=False)
 _fallback_warned = False
 
 def compute_features(image):
@@ -407,9 +412,37 @@ def apply_classifier(classifier, features_outpath, pred_labels_outpath, n_worker
     classifier.n_jobs = 1
 
     args_list = [(classifier, str(features_outpath), str(pred_labels_outpath), idx) for idx in range(pred_labels.shape[0])]
-    test=[]
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        test+=list(tqdm(executor.map(_apply_classifier, args_list), total=len(args_list)))
+    test = []
+    # zarr v3 reads chunks concurrently per __getitem__ (async.concurrency defaults to 10).
+    # If we also parallelize over timepoints, total concurrency can explode and on Windows this
+    # can surface as OSError(22) from the local store. Limit internal chunk concurrency so that
+    # "n_workers" controls overall parallelism.
+    prev_async_cfg = None
+    try:
+        prev_async_cfg = zarr.config.get("async")
+        zarr.config.set({"async.concurrency": 1})
+    except Exception:
+        prev_async_cfg = None
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            test += list(tqdm(executor.map(_apply_classifier, args_list), total=len(args_list)))
+    except OSError as e:
+        # Windows sometimes throws Errno 22 when zarr chunks are read concurrently.
+        # Fallback to sequential to keep the pipeline working.
+        if getattr(e, "errno", None) == 22 and n_workers != 1:
+            print(f"⚠️  apply_classifier failed with OSError(22) using {n_workers} workers. Retrying with 1 worker...")
+            test = []
+            for args in tqdm(args_list, total=len(args_list)):
+                _apply_classifier(args)
+                test.append(None)
+        else:
+            raise
+    finally:
+        if prev_async_cfg is not None:
+            try:
+                zarr.config.set({"async": prev_async_cfg})
+            except Exception:
+                pass
 
     classifier.n_jobs = original_n_jobs
     
@@ -716,25 +749,6 @@ def train_pixel_classifier(
             label_layer = viewer.layers[layer_name]
             label_data = label_layer.data.copy()
             
-            # Apply postprocessing to user labels before training
-            # Extract foreground mask (label 2) for postprocessing
-            # Get postprocessing parameters for this cell type
-            # opening_nr_pixels = opening_nr_pixels_dict.get(cell_type, 
-            #     (3 if cell_type in organoid_types else 0))
-            # fill_holes = fill_holes_dict.get(cell_type, True)
-            
-            # # Extract foreground mask and postprocess
-            # fg_mask = (label_data == 2).astype(bool)
-            # if np.any(fg_mask):
-            #     processed_fg = postprocess_mask(
-            #         fg_mask, 
-            #         fill_holes=fill_holes, 
-            #         opening_nr_pixels=int(opening_nr_pixels)
-            #     )
-            #     # Reconstruct labels: background=1, foreground=2
-            #     label_data = np.where(processed_fg, 2, 
-            #                          np.where(label_data == 1, 1, 0)).astype(label_data.dtype)
-            
             labels_outpath = Path(pixel_class_outdir, f'PixelClassifier_User{cell_type.capitalize()}Labels.zarr')
             # Remove existing zarr to avoid ContainsArrayError
             if labels_outpath.exists():
@@ -769,13 +783,17 @@ def train_pixel_classifier(
             # Use scikit-learn RandomForestClassifier (fallback if napari_apoc not available)
             clf = RandomForestClassifier(
                 n_estimators=50,
-                n_jobs=-1, 
+                n_jobs=1,
                 max_depth=20, 
                 # max_samples=0.05,
                 class_weight=class_weights
             )
             
-            clf = future.fit_segmenter(selected_labels, selected_features, clf)
+            if _HAS_THREADPOOLCTL:
+                with threadpoolctl.threadpool_limits(limits=1):
+                    clf = future.fit_segmenter(selected_labels, selected_features, clf)
+            else:
+                clf = future.fit_segmenter(selected_labels, selected_features, clf)
             return clf
         
         # Train classifiers for all cell types
@@ -1291,92 +1309,10 @@ def train_pixel_classifier(
     #napari.run()
     return viewer
 
-'''def _process_single_timepoint(args):
-    """
-    Worker function to process a single timepoint in parallel.
-    
-    Parameters
-    ----------
-    args : tuple
-        (t, t_img, classifiers, clf_death, all_cell_types, organoid_types, immune_types, 
-         other_types, all_edt_thresholds, all_segment_size_mins, all_opening_nr_pixels,
-         all_fill_holes, only_segment, loaded_masks, has_death, sample_extract_features)
-    
-    Returns
-    -------
-    dict
-        Contains masks and segments for all cell types at this timepoint
-    """
-    (t, t_img, classifiers, clf_death, all_cell_types, organoid_types, immune_types, 
-     other_types, all_edt_thresholds, all_segment_size_mins, all_opening_nr_pixels,
-     all_fill_holes, only_segment, loaded_masks, has_death, sample_extract_features) = args
-    
-    result = {
-        'timepoint': t,
-        'masks': {},
-        'segments': {},
-        'death_mask': None
-    }
-    
-    # Extract features once for all classifiers
-    if not only_segment:
-        features = sample_extract_features(t_img)
-    
-    # Apply classifiers and get predictions for each cell type
-    if not only_segment:
-        # Apply pixel classifiers for each cell type
-        for cell_type in all_cell_types:
-            # Predict pixels using classifier
-            pred_mask = future.predict_segmenter(features, classifiers[cell_type])
-            # Convert to binary mask: label 1 = background -> 0, label 2 = foreground -> 1
-            pred_mask[pred_mask > 0] -= 1  # Convert 1->0 (bg), 2->1 (fg)
-            
-            # Apply postprocessing
-            opening_nr_pixels = all_opening_nr_pixels.get(cell_type, 0)
-            fill_holes = all_fill_holes.get(cell_type, True)
-            
-            # Extract foreground mask (now label 1 after subtraction) for postprocessing
-            fg_mask = (pred_mask == 1).astype(bool)
-            processed_fg = postprocess_mask(fg_mask, fill_holes=fill_holes, opening_nr_pixels=int(opening_nr_pixels))
-            # Reconstruct binary mask: 0=background, 1=foreground
-            pred_mask = processed_fg.astype(pred_mask.dtype)
-            
-            result['masks'][cell_type] = pred_mask
-        
-        # Apply death classifier (only if present)
-        if has_death and clf_death is not None:
-            death_mask = future.predict_segmenter(features, clf_death)
-            death_mask[death_mask > 0] -= 1
-            result['death_mask'] = death_mask
-    
-    # Segment each cell type
-    for cell_type in all_cell_types:
-        edt_threshold = all_edt_thresholds.get(cell_type, 1.0)
-        segment_size_min = all_segment_size_mins.get(cell_type, 10)
-        
-        if only_segment and cell_type in loaded_masks:
-            mask = np.asarray(loaded_masks[cell_type][t])
-        elif cell_type in result['masks']:
-            mask = result['masks'][cell_type]
-        else:
-            continue
-        
-        # Segment the mask
-        seg = segment_mask(
-            mask=mask,
-            edt_thr=edt_threshold,
-            edt_thr_refined=None,
-            segment_size_min=segment_size_min,
-            use_dims=2
-        )
-        
-        result['segments'][cell_type] = seg
-    
-    return result'''
-
 def run_pixel_classifier_segmentation(
     output_dir,
     metadata,
+    metadata_csv_path=None,
     organoid_edt_thresholds=None,  # Dict: {organoid_type: threshold}
     immune_edt_thresholds=None,    # Dict: {immune_type: threshold}
     other_edt_thresholds=None,      # Dict: {other_type: threshold}
@@ -1422,6 +1358,7 @@ def run_pixel_classifier_segmentation(
     
     # Use log_callback instead of print
     log = log_callback
+    metadata_csv_path = Path(metadata_csv_path).expanduser() if metadata_csv_path else None
 
     # Validate and cap n_workers to available CPU count
     max_workers = multiprocessing.cpu_count()
@@ -1569,6 +1506,10 @@ def run_pixel_classifier_segmentation(
             metadata[path_col] = pd.NA
         # Ensure column has object dtype to prevent FutureWarning
         metadata[path_col] = metadata[path_col].astype('object')
+
+    def _persist_metadata_snapshot():
+        if metadata_csv_path is not None:
+            metadata.to_csv(metadata_csv_path, index=False)
     
     # Process each sample
     for idx, sample in metadata.iterrows():
@@ -1593,21 +1534,56 @@ def run_pixel_classifier_segmentation(
         
         death_mask_outpath = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
 
-        # Load or convert raw image
-        if not raw_image_zarr.exists():
-            img = load_image(raw_image_path)
-            save_as_zarr(img, raw_image_zarr)
-        img = load_image(raw_image_zarr)
-        print(f"  Image shape: {img.shape}")
-        _log_mem(f"after loading image zarr handle")
-        
-        # Check if already segmented
-        all_segments_exist = all(p.exists() for p in segments_outpaths.values())
+        def _path_col_for_cell_type(cell_type):
+            if cell_type in organoid_types:
+                prefix = 'or'
+            elif cell_type in immune_types:
+                prefix = 'im'
+            elif cell_type in other_types:
+                prefix = 'ot'
+            else:
+                return None
+            return f'{prefix}_{cell_type}_segments_image_path'
+
+        def _existing_valid_path(value):
+            if pd.isna(value):
+                return None
+            value = str(value).strip()
+            if not value:
+                return None
+            path = Path(value)
+            return value if path.exists() else None
+
+        def _backfill_sample_metadata(*, preserve_existing=True):
+            for cell_type in all_cell_types:
+                path_col = _path_col_for_cell_type(cell_type)
+                if path_col is None:
+                    continue
+                current_value = metadata.at[idx, path_col]
+                chosen_value = _existing_valid_path(current_value) if preserve_existing else None
+                if chosen_value is None and segments_outpaths[cell_type].exists():
+                    chosen_value = str(segments_outpaths[cell_type])
+                if chosen_value is not None:
+                    metadata.at[idx, path_col] = chosen_value
+
+            if has_death and 'dead_mask_path' in metadata.columns:
+                metadata['dead_mask_path'] = metadata['dead_mask_path'].astype('object')
+                current_dead = metadata.at[idx, 'dead_mask_path']
+                chosen_dead = _existing_valid_path(current_dead) if preserve_existing else None
+                if chosen_dead is None and death_mask_outpath.exists():
+                    chosen_dead = str(death_mask_outpath)
+                if chosen_dead is not None:
+                    metadata.at[idx, 'dead_mask_path'] = chosen_dead
+
+        img = None
+        raw_shape = None
         
         # -----------------------------------------------------------------
         # Resume / skip / overwrite decision
         # -----------------------------------------------------------------
         processing_marker = img_outdir / ".seg_processing"
+        done_marker_paths = list(img_outdir.glob(".seg_done_*"))
+        stale_done_markers = bool(done_marker_paths)
         resuming = False     # will be True when we continue an interrupted run
 
         if overwrite_existing:
@@ -1621,10 +1597,16 @@ def run_pixel_classifier_segmentation(
             if death_mask_outpath.exists():
                 shutil.rmtree(death_mask_outpath)
             # Remove any stale markers
-            for f in img_outdir.glob(".seg_done_*"):
+            for f in done_marker_paths:
                 f.unlink()
             if processing_marker.exists():
                 processing_marker.unlink()
+
+        elif only_segment and (processing_marker.exists() or done_marker_paths):
+            raise RuntimeError(
+                f"only_segment mode: found truncation flags in {img_outdir}. "
+                f"Segmentation needs to be run again before resegmenting."
+            )
 
         elif processing_marker.exists():
             # Interrupted run detected --> RESUME
@@ -1633,35 +1615,29 @@ def run_pixel_classifier_segmentation(
             resuming = True
             log(f"  ⚡ Interrupted run detected for {sample_name} — resuming")
 
-        elif not only_segment:
+        elif not only_segment and timepoint_range is None:
             # Check if sample is already fully done
-            skip_sample = False
-            for cell_type in all_cell_types:
-                prefix = 'or' if cell_type in organoid_types else ('im' if cell_type in immune_types else 'ot')
-                path_col = f'{prefix}_{cell_type}_segments_image_path'
-                existing_path = sample.get(path_col)
-                if pd.notna(existing_path) and str(existing_path).strip():
-                    if Path(str(existing_path)).exists():
-                        skip_sample = True
+            skip_sample = not stale_done_markers
+            if stale_done_markers:
+                log(
+                    f"  Found stale .seg_done_* markers for {sample_name}. "
+                    f"Will recompute instead of skipping."
+                )
+            else:
+                for cell_type in all_cell_types:
+                    path_col = _path_col_for_cell_type(cell_type)
+                    existing_path = sample.get(path_col) if path_col is not None else None
+                    existing_valid = _existing_valid_path(existing_path)
+                    output_valid = segments_outpaths[cell_type].exists()
+                    if not (existing_valid or output_valid):
+                        skip_sample = False
                         break
-            if not skip_sample and all(p.exists() for p in segments_outpaths.values()):
-                skip_sample = True
 
             if skip_sample:
+                _backfill_sample_metadata(preserve_existing=True)
+                _persist_metadata_snapshot()
                 log(f"  Sample {sample_name} already segmented. Skipping (Overwrite existing unchecked).")
                 continue
-
-        # If we are NOT resuming and NOT overwriting, clean for masks too
-        if not resuming and not overwrite_existing:
-            for seg_path in segments_outpaths.values():
-                if seg_path.exists():
-                    shutil.rmtree(seg_path)
-            if not only_segment:
-                if death_mask_outpath.exists():
-                    shutil.rmtree(death_mask_outpath)
-                for mask_path in mask_outpaths.values():
-                    if mask_path.exists():
-                        shutil.rmtree(mask_path)
 
         # Load existing masks if only_segment mode
         loaded_masks = {}
@@ -1671,7 +1647,7 @@ def run_pixel_classifier_segmentation(
                 raise RuntimeError(
                     f"only_segment mode: {sample_name} has a .seg_processing marker, "
                     f"meaning a previous full classification was interrupted. "
-                    f"Masks may be incomplete — re-run full classification first."
+                    f"Masks may be incomplete. Segmentation needs to be run again before resegmenting."
                 )
             missing_masks = []
             for cell_type, mask_path in mask_outpaths.items():
@@ -1682,62 +1658,326 @@ def run_pixel_classifier_segmentation(
             if missing_masks:
                 raise FileNotFoundError(
                     f"only_segment mode: mask(s) not found for {missing_masks} "
-                    f"in {img_outdir}. Run full classification first."
+                    f"in {img_outdir}. Segmentation needs to be run again before resegmenting."
                 )
+            if raw_image_zarr.exists():
+                raw_shape = tuple(load_image(raw_image_zarr).shape)
+                print(f"  Raw image shape: {raw_shape}")
+                _log_mem(f"after loading image zarr handle")
+            else:
+                try:
+                    raw_shape = tuple(get_image_shape(raw_image_path))
+                    print(f"  Raw image shape: {raw_shape}")
+                    _log_mem(f"after reading raw image shape")
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"only_segment mode requires the raw image shape for {sample_name}. "
+                        f"Could not determine it from {raw_image_path}. "
+                        f"Convert the raw image to zarr first or provide a readable raw format."
+                    ) from exc
+
             # Validate mask timepoint dimensions match the raw image
             for cell_type, mask_arr in loaded_masks.items():
-                if mask_arr.shape[0] < img.shape[0]:
+                if tuple(mask_arr.shape[1:]) != tuple(raw_shape[2:]):
                     raise ValueError(
-                        f"only_segment mode: {cell_type} mask has {mask_arr.shape[0]} "
-                        f"timepoints but raw image has {img.shape[0]}. "
-                        f"Mask appears truncated — re-run full classification for this sample."
+                        f"only_segment mode: spatial shape mismatch for {cell_type}. "
+                        f"Expected {tuple(raw_shape[2:])}, got {tuple(mask_arr.shape[1:])}."
                     )
+        else:
+            # Load or convert raw image for full classification
+            if not raw_image_zarr.exists():
+                img = load_image(raw_image_path)
+                save_as_zarr(img, raw_image_zarr)
+            img = load_image(raw_image_zarr)
+            print(f"  Raw image shape: {img.shape}")
+            _log_mem(f"after loading image zarr handle")
+            raw_shape = tuple(img.shape)
 
         # Determine which timepoints to process
+        if raw_shape is None:
+            raise RuntimeError(f"Could not determine image shape for sample {sample_name}")
+
+        def _read_stored_range_payload(arr):
+            attrs = dict(arr.attrs)
+            required_keys = (
+                "behav3d_time_indexing",
+                "behav3d_raw_timepoint_start",
+                "behav3d_raw_timepoint_end",
+                "behav3d_raw_timepoint_count",
+                "behav3d_raw_total_timepoints",
+            )
+            if not all(key in attrs for key in required_keys):
+                return None
+            return {
+                "behav3d_time_indexing": str(attrs["behav3d_time_indexing"]),
+                "behav3d_raw_timepoint_start": int(attrs["behav3d_raw_timepoint_start"]),
+                "behav3d_raw_timepoint_end": int(attrs["behav3d_raw_timepoint_end"]),
+                "behav3d_raw_timepoint_count": int(attrs["behav3d_raw_timepoint_count"]),
+                "behav3d_raw_total_timepoints": int(attrs["behav3d_raw_total_timepoints"]),
+            }
+
+        loaded_mask_stores = {}
+        inferred_mask_range_payload = None
+        if only_segment:
+            mask_modes = set()
+            for cell_type, mask_arr in loaded_masks.items():
+                mask_store = zarr.open(str(mask_outpaths[cell_type]), mode="r")
+                loaded_mask_stores[cell_type] = mask_store
+                if mask_arr.shape[0] == raw_shape[0]:
+                    mask_modes.add("absolute")
+                    continue
+                payload = _read_stored_range_payload(mask_store)
+                if payload is None:
+                    raise ValueError(
+                        f"only_segment mode: {cell_type} mask has compact length {mask_arr.shape[0]} "
+                        f"but no stored raw timepoint range metadata. Remove it or rerun full segmentation."
+                    )
+                if payload["behav3d_time_indexing"] != "compact_range":
+                    raise ValueError(
+                        f"only_segment mode: unsupported mask time indexing mode "
+                        f"{payload['behav3d_time_indexing']} for {cell_type}."
+                    )
+                if payload["behav3d_raw_total_timepoints"] != int(raw_shape[0]):
+                    raise ValueError(
+                        f"only_segment mode: {cell_type} mask was created from a raw image with "
+                        f"{payload['behav3d_raw_total_timepoints']} timepoints, but the current raw image has "
+                        f"{raw_shape[0]}."
+                    )
+                if payload["behav3d_raw_timepoint_count"] != int(mask_arr.shape[0]):
+                    raise ValueError(
+                        f"only_segment mode: {cell_type} mask attrs say range length "
+                        f"{payload['behav3d_raw_timepoint_count']}, but the stored mask has length {mask_arr.shape[0]}."
+                    )
+                mask_modes.add("compact")
+                if inferred_mask_range_payload is None:
+                    inferred_mask_range_payload = payload
+                elif payload != inferred_mask_range_payload:
+                    raise ValueError(
+                        f"only_segment mode: masks for {sample_name} do not all come from the same original raw range."
+                    )
+            if len(mask_modes) > 1:
+                raise ValueError(
+                    f"only_segment mode: masks for {sample_name} mix full-timeline and compact range layouts. "
+                    f"Rerun full segmentation to regenerate a consistent mask set."
+                )
+
         if timepoint_range is not None:
             start_t, end_t = timepoint_range
-            start_t = max(0, min(start_t, img.shape[0]-1))
-            end_t = max(start_t, min(end_t, img.shape[0]-1))
+            start_t = max(0, min(start_t, raw_shape[0]-1))
+            end_t = max(start_t, min(end_t, raw_shape[0]-1))
             timepoint_indices = list(range(start_t, end_t + 1))
             log(f"  Processing timepoints: {start_t} to {end_t} (total: {len(timepoint_indices)})")
+        elif only_segment and inferred_mask_range_payload is not None:
+            start_t = int(inferred_mask_range_payload["behav3d_raw_timepoint_start"])
+            end_t = int(inferred_mask_range_payload["behav3d_raw_timepoint_end"])
+            timepoint_indices = list(range(start_t, end_t + 1))
+            log(
+                f"  only_segment mode: inferred timepoint range {start_t} to {end_t} "
+                f"from mask metadata (total: {len(timepoint_indices)})"
+            )
         else:
-            timepoint_indices = list(range(img.shape[0]))
-            log(f"  Processing all timepoints: 0 to {img.shape[0]-1}")
-        
+            timepoint_indices = list(range(raw_shape[0]))
+            log(f"  Processing all timepoints: 0 to {raw_shape[0]-1}")
+
         n_total = len(timepoint_indices)
         # Mask/segment spatial shape: skip T and C dimensions
         # predict_segmenter output is (Z, Y, X)
-        spatial_shape = tuple(img.shape[2:])  # (Z, Y, X), NOT (C, Z, Y, X)
+        spatial_shape = tuple(raw_shape[2:])
+        requested_range_start = int(timepoint_indices[0])
+        requested_range_end = int(timepoint_indices[-1])
+        requested_range_count = int(n_total)
+        requested_total_timepoints = int(raw_shape[0])
+
+        def _range_attr_payload():
+            return {
+                "behav3d_time_indexing": "compact_range",
+                "behav3d_raw_timepoint_start": requested_range_start,
+                "behav3d_raw_timepoint_end": requested_range_end,
+                "behav3d_raw_timepoint_count": requested_range_count,
+                "behav3d_raw_total_timepoints": requested_total_timepoints,
+            }
+
+        def _read_range_attr_payload(arr):
+            return _read_stored_range_payload(arr)
+
+        def _write_range_attr_payload(arr):
+            arr.attrs.update(_range_attr_payload())
+
+        def _range_metadata_matches(arr):
+            stored = _read_range_attr_payload(arr)
+            if stored is None:
+                return None
+            return stored == _range_attr_payload()
+
+        def _validate_compact_output_array(arr, context):
+            expected_shape = (requested_range_count,) + spatial_shape
+            if tuple(arr.shape) != expected_shape:
+                if (
+                    timepoint_range is None
+                    and tuple(arr.shape) == (requested_total_timepoints,) + spatial_shape
+                ):
+                    _write_range_attr_payload(arr)
+                    return
+                raise ValueError(
+                    f"{context}: existing zarr has shape {tuple(arr.shape)} but expected "
+                    f"{expected_shape} for requested raw range {requested_range_start}:{requested_range_end}."
+                )
+            metadata_matches = _range_metadata_matches(arr)
+            if metadata_matches is True:
+                return
+            if metadata_matches is None:
+                if timepoint_range is None:
+                    _write_range_attr_payload(arr)
+                    return
+                raise ValueError(
+                    f"{context}: existing compact zarr matches the requested length but has no stored raw "
+                    f"timepoint range metadata. Remove it or rerun segmentation from scratch."
+                )
+            raise ValueError(
+                f"{context}: existing zarr belongs to a different raw timepoint range than the requested "
+                f"{requested_range_start}:{requested_range_end}. Remove it or use overwrite."
+            )
+
+        loaded_mask_index_modes = {}
+        if only_segment:
+            for cell_type, mask_arr in loaded_masks.items():
+                mask_store = loaded_mask_stores[cell_type]
+                if tuple(mask_arr.shape[1:]) != tuple(raw_shape[2:]):
+                    raise ValueError(
+                        f"only_segment mode: spatial shape mismatch for {cell_type}. "
+                        f"Expected {tuple(raw_shape[2:])}, got {tuple(mask_arr.shape[1:])}."
+                    )
+                if mask_arr.shape[0] == requested_total_timepoints:
+                    loaded_mask_index_modes[cell_type] = "absolute"
+                elif mask_arr.shape[0] == requested_range_count:
+                    metadata_matches = _range_metadata_matches(mask_store)
+                    if metadata_matches is True:
+                        loaded_mask_index_modes[cell_type] = "compact"
+                    elif metadata_matches is None:
+                        raise ValueError(
+                            f"only_segment mode: {cell_type} mask has compact length {mask_arr.shape[0]} "
+                            f"but no stored raw timepoint range metadata. Remove it or rerun full segmentation."
+                        )
+                    else:
+                        raise ValueError(
+                            f"only_segment mode: {cell_type} mask belongs to a different raw timepoint range "
+                            f"than the requested {requested_range_start}:{requested_range_end}."
+                        )
+                else:
+                    raise ValueError(
+                        f"only_segment mode: {cell_type} mask has incompatible time axis length "
+                        f"{mask_arr.shape[0]}. Expected either {requested_total_timepoints} (full timeline) or "
+                        f"{requested_range_count} (compact requested range)."
+                    )
+
+        # Range-aware reuse/skip checks must happen after the requested raw range is known.
+        if not resuming and not overwrite_existing and not only_segment:
+            existing_segment_paths = [p for p in segments_outpaths.values() if p.exists()]
+            if existing_segment_paths:
+                if stale_done_markers:
+                    log(
+                        f"  Found stale .seg_done_* markers for {sample_name}. "
+                        f"Will recompute instead of reusing existing outputs."
+                    )
+                else:
+                    all_outputs_match = True
+                    for cell_type, seg_path in segments_outpaths.items():
+                        if not seg_path.exists():
+                            all_outputs_match = False
+                            break
+                        try:
+                            _validate_compact_output_array(
+                                zarr.open(str(seg_path), mode="r+"),
+                                context=f"{sample_name} {cell_type} segments",
+                            )
+                        except ValueError:
+                            all_outputs_match = False
+                            break
+                    if all_outputs_match:
+                        _backfill_sample_metadata(preserve_existing=True)
+                        _persist_metadata_snapshot()
+                        log(
+                            f"  Sample {sample_name} already segmented for raw range "
+                            f"{requested_range_start}:{requested_range_end}. Skipping."
+                        )
+                        continue
+                    raise RuntimeError(
+                        f"Sample {sample_name} already has segmentation outputs on disk, but they do not match the "
+                        f"requested raw range {requested_range_start}:{requested_range_end}. "
+                        f"Use overwrite or remove the existing outputs first."
+                    )
+
+        # If we are NOT resuming and NOT overwriting, clean outputs only after range compatibility checks.
+        if not resuming and not overwrite_existing:
+            if not only_segment:
+                for seg_path in segments_outpaths.values():
+                    if seg_path.exists():
+                        shutil.rmtree(seg_path)
+                if death_mask_outpath.exists():
+                    shutil.rmtree(death_mask_outpath)
+                for mask_path in mask_outpaths.values():
+                    if mask_path.exists():
+                        shutil.rmtree(mask_path)
         
         # Build per-sample feature extractor from pixel size metadata
         sample_pixel_xy = float(sample.get('pixel_distance_xy', 1.0))
         sample_pixel_z  = float(sample.get('pixel_distance_z', 1.0))
-        sample_extract_features = make_features(sample_pixel_xy, sample_pixel_z, verbose=True)
+        sample_extract_features = None
         
         # MEJORA 2: Dynamic RAM check — reduce workers if images are too large
-        # Compute real feature count from a tiny dummy array (microseconds, ~4 KB).
-        # This is just a measurement — no side effects on real data.
-        dummy = np.zeros((img.shape[1],) + (8, 8, 8), dtype=np.float32)
-        n_features = sample_extract_features(dummy).shape[-1]
-        del dummy
-        
-        # Accurate memory estimate per worker:
-        # - features array: spatial_voxels × n_features × 8 bytes (float64)
-        # - raw timepoint held briefly: timepoint_bytes
-        # - intermediates (masks, segments): ~50% overhead
         spatial_voxels = int(np.prod(spatial_shape))
-        features_bytes = spatial_voxels * n_features * 8  # float64
-        timepoint_bytes = int(np.prod(img.shape[1:])) * 2  # int16 = 2 bytes
-        estimated_memory_per_worker = int(features_bytes + timepoint_bytes)
-        print(f"  Feature probe: {n_features} features → {features_bytes/1e9:.2f} GB features array, "
-              f"{estimated_memory_per_worker/1e9:.2f} GB/worker estimated")
-        
+        if only_segment:
+            timepoint_bytes = spatial_voxels * 2  # int16 mask volume
+            segmentation_bytes = spatial_voxels * (8 + 4 + 2)  # EDT + labels + output labels
+            estimated_memory_per_worker = int(timepoint_bytes + segmentation_bytes)
+            print(
+                f"  only_segment memory estimate: "
+                f"{estimated_memory_per_worker/1e9:.2f} GB/worker estimated"
+            )
+        else:
+            sample_extract_features = make_features(sample_pixel_xy, sample_pixel_z, verbose=True)
+
+            # Compute real feature count from a tiny dummy array (microseconds, ~4 KB).
+            # This is just a measurement — no side effects on real data.
+            dummy = np.zeros((raw_shape[1],) + (8, 8, 8), dtype=np.float32)
+            dummy_features = sample_extract_features(dummy)
+            n_features = int(dummy_features.shape[-1])
+            feature_itemsize = int(dummy_features.dtype.itemsize)
+            del dummy, dummy_features
+
+            # Accurate memory estimate per worker:
+            # - features array: spatial_voxels × n_features × 8 bytes (float64)
+            # - raw timepoint held briefly: timepoint_bytes
+            # - segmentation scratch: EDT + labels + output labels
+            features_bytes = spatial_voxels * n_features * feature_itemsize
+            feature_working_bytes = spatial_voxels * feature_itemsize * 2
+            timepoint_bytes = int(np.prod(raw_shape[1:])) * 2  # int16 = 2 bytes
+            segmentation_bytes = spatial_voxels * (8 + 4 + 2)
+            estimated_memory_per_worker = int(
+                features_bytes + feature_working_bytes + timepoint_bytes + segmentation_bytes
+            )
+            print(f"  Feature probe: {n_features} features → {features_bytes/1e9:.2f} GB features array, "
+                  f"{estimated_memory_per_worker/1e9:.2f} GB/worker estimated")
+
         if _HAS_PSUTIL:
             available_ram = psutil.virtual_memory().available
             safe_workers = max(1, int(available_ram * 0.8 // estimated_memory_per_worker))
-            actual_workers = min(n_workers, safe_workers)
+            responsive_workers = max(1, max_workers // 2)
+            actual_workers = min(n_workers, safe_workers, responsive_workers)
             
-            if actual_workers < n_workers:
+            if only_segment:
+                if actual_workers < n_workers:
+                    print(
+                        f"  only_segment mode: using {actual_workers} workers "
+                        f"(requested {n_workers}, memory-safe limit {safe_workers}) "
+                        f"with 1 timepoint per worker"
+                    )
+                else:
+                    print(
+                        f"  only_segment mode: using {actual_workers} workers "
+                        f"with 1 timepoint per worker"
+                    )
+            elif actual_workers < n_workers:
                 print(
                     f"⚠️ Large images ({timepoint_bytes/1e9:.2f} GB/timepoint, "
                     f"~{estimated_memory_per_worker/1e9:.2f} GB/worker estimated). "
@@ -1750,8 +1990,14 @@ def run_pixel_classifier_segmentation(
                     f"~{estimated_memory_per_worker/1e9:.2f} GB/worker → using {actual_workers} workers"
                 )
         else:
-            actual_workers = n_workers
-            print(f"  psutil not installed, skipping RAM check. Using {actual_workers} workers.")
+            actual_workers = min(n_workers, max(1, max_workers // 2))
+            if only_segment:
+                print(
+                    f"  psutil not installed; using {actual_workers} workers "
+                    f"with 1 timepoint per worker"
+                )
+            else:
+                print(f"  psutil not installed, skipping RAM check. Using {actual_workers} workers.")
         
         _log_mem(f"before processing loop ({n_total} timepoints, {actual_workers} workers)")
         
@@ -1773,43 +2019,68 @@ def run_pixel_classifier_segmentation(
 
         # Filter out completed timepoints
         if done_indices:
-            args_list_filtered = [(t_i, t) for t_i, t in enumerate(timepoint_indices) if t_i not in done_indices]
+            args_list_filtered = [
+                (t_i, t)
+                for t_i, t in enumerate(timepoint_indices)
+                if t_i not in done_indices
+            ]
             log(f"  Resume: {len(done_indices)}/{n_total} timepoints already done, {len(args_list_filtered)} remaining")
         else:
             args_list_filtered = None  # will build later
 
         # MEJORA 3: Pre-allocated zarrs with fixed size — thread-safe index writes
         # Instead of append_to_zarr (which requires strict sequential order),
-        # create zarrs with final size and each worker writes zarr[t_i] = data.
+        # create zarrs with final size and each worker writes to a fixed index.
         # Two workers never touch the same index.
-        # Result is always zarr[0]=T0, zarr[1]=T1... regardless of completion order.
+        # Range outputs are compact in both modes; raw-range provenance is stored in zarr attrs.
+        output_timepoints = n_total
         zarr_mode = "r+" if resuming else "w"
-        zarr_kw = dict(shape=(n_total,) + spatial_shape, chunks=(1,) + spatial_shape)
+        zarr_kw = dict(shape=(output_timepoints,) + spatial_shape, chunks=(1,) + spatial_shape)
+
+        def _open_output_array(outpath, dtype, context, reuse_existing, force_recreate=False):
+            if force_recreate and outpath.exists():
+                shutil.rmtree(outpath)
+            if reuse_existing and outpath.exists():
+                arr = zarr.open(str(outpath), mode="r+")
+                _validate_compact_output_array(arr, context=context)
+                return arr
+            arr = zarr.open(str(outpath), mode=zarr_mode, dtype=dtype, **zarr_kw)
+            _write_range_attr_payload(arr)
+            return arr
 
         if not only_segment:
             zarr_masks = {}
             zarr_segs = {}
             for cell_type in all_cell_types:
-                zarr_masks[cell_type] = zarr.open(
-                    str(mask_outpaths[cell_type]),
-                    mode=zarr_mode, dtype="int16", **zarr_kw,
+                zarr_masks[cell_type] = _open_output_array(
+                    mask_outpaths[cell_type],
+                    "int16",
+                    context=f"{sample_name} {cell_type} mask",
+                    reuse_existing=resuming,
                 )
-                zarr_segs[cell_type] = zarr.open(
-                    str(segments_outpaths[cell_type]),
-                    mode=zarr_mode, dtype="uint16", **zarr_kw,
+                zarr_segs[cell_type] = _open_output_array(
+                    segments_outpaths[cell_type],
+                    "uint16",
+                    context=f"{sample_name} {cell_type} segments",
+                    reuse_existing=resuming,
                 )
             zarr_death = None
             if has_death and clf_death is not None:
-                zarr_death = zarr.open(
-                    str(death_mask_outpath),
-                    mode=zarr_mode, dtype="int16", **zarr_kw,
+                zarr_death = _open_output_array(
+                    death_mask_outpath,
+                    "int16",
+                    context=f"{sample_name} death mask",
+                    reuse_existing=resuming,
                 )
         else:
             zarr_segs = {}
             for cell_type in all_cell_types:
-                zarr_segs[cell_type] = zarr.open(
-                    str(segments_outpaths[cell_type]),
-                    mode=zarr_mode, dtype="uint16", **zarr_kw,
+                zarr_segs[cell_type] = _open_output_array(
+                    segments_outpaths[cell_type],
+                    "uint16",
+                    context=f"{sample_name} {cell_type} segments",
+                    reuse_existing=False,
+                    force_recreate=True,
                 )
             zarr_masks = None
             zarr_death = None
@@ -1820,11 +2091,11 @@ def run_pixel_classifier_segmentation(
         def process_timepoint(args, _ff=sample_extract_features):
             t_i, t = args
             t_start = time.time()
-            
-            # Read 1 timepoint from zarr (lazy read, materialized here)
-            t_img = np.asarray(img[t])
+            write_idx = t_i
             
             if not only_segment:
+                # Read 1 timepoint from zarr (lazy read, materialized here)
+                t_img = np.asarray(img[t])
                 # MEJORA 4: threadpoolctl limits feature extraction to 1 internal thread
                 # multiscale_basic_features (scikit-image) internally uses all cores.
                 # Without control: 4 workers × 16 cores = 64 competing threads.
@@ -1847,9 +2118,8 @@ def run_pixel_classifier_segmentation(
                     processed_fg = postprocess_mask(fg_mask, fill_holes=fill_holes_val, opening_nr_pixels=int(opening_nr_pixels_val))
                     pred_mask = processed_fg.astype(np.int16)
                     
-                    # Write mask by exact index (Mejora 3)
-                    # t_i=0 is always T0, t_i=1 is always T1, etc.
-                    zarr_masks[cell_type][t_i] = pred_mask
+                    # Write mask by fixed index (Mejora 3)
+                    zarr_masks[cell_type][write_idx] = pred_mask
                     
                     edt_threshold = all_edt_thresholds.get(cell_type, 1.0)
                     segment_size_min = all_segment_size_mins.get(cell_type, 10)
@@ -1861,14 +2131,14 @@ def run_pixel_classifier_segmentation(
                         use_dims=2
                     )
                     
-                    zarr_segs[cell_type][t_i] = seg
+                    zarr_segs[cell_type][write_idx] = seg
                     del pred_mask, fg_mask, processed_fg, seg
                 
                 # Death classifier
                 if has_death and clf_death is not None and zarr_death is not None:
                     death_mask = future.predict_segmenter(features, clf_death)
                     death_mask[death_mask > 0] -= 1
-                    zarr_death[t_i] = death_mask
+                    zarr_death[write_idx] = death_mask
                     del death_mask
                 
                 del features
@@ -1877,7 +2147,9 @@ def run_pixel_classifier_segmentation(
                 for cell_type in all_cell_types:
                     if cell_type not in loaded_masks:
                         continue
-                    mask = np.asarray(loaded_masks[cell_type][t])
+                    index_mode = loaded_mask_index_modes.get(cell_type, "absolute")
+                    mask_idx = t if index_mode == "absolute" else t_i
+                    mask = np.asarray(loaded_masks[cell_type][mask_idx])
                     
                     edt_threshold = all_edt_thresholds.get(cell_type, 1.0)
                     segment_size_min = all_segment_size_mins.get(cell_type, 10)
@@ -1889,14 +2161,12 @@ def run_pixel_classifier_segmentation(
                         use_dims=2
                     )
                     
-                    zarr_segs[cell_type][t_i] = seg
+                    zarr_segs[cell_type][write_idx] = seg
                     del mask, seg
-                del t_img  # free in only_segment branch too
-            
             gc.collect()
             
             # Mark this timepoint as fully written
-            (img_outdir / f".seg_done_{t_i:06d}").touch()
+            (img_outdir / f".seg_done_{write_idx:06d}").touch()
             
             t_elapsed = time.time() - t_start
             if (t_i + 1) % 10 == 0 or t_i == 0 or (t_i + 1) == n_total:
@@ -1942,26 +2212,12 @@ def run_pixel_classifier_segmentation(
             processing_marker.unlink()
         print(f"  ✓ All {n_to_process} timepoints written successfully (markers cleaned)")
                 
-        # Update metadata with segment paths (with prefixes)
+        _backfill_sample_metadata(preserve_existing=False)
+        _persist_metadata_snapshot()
         for cell_type in all_cell_types:
-            # Determine prefix based on category
-            if cell_type in organoid_types:
-                prefix = 'or'
-            elif cell_type in immune_types:
-                prefix = 'im'
-            elif cell_type in other_types:
-                prefix = 'ot'
-            else:
-                continue  # Skip unknown types
-            
-            path_col = f'{prefix}_{cell_type}_segments_image_path'
-            metadata.at[idx, path_col] = str(segments_outpaths[cell_type])
-            log(f"  Saved {cell_type} segments: {segments_outpaths[cell_type]}")
-        
-        # Update dead_mask_path in metadata if death channel is present AND column exists
+            if segments_outpaths[cell_type].exists():
+                log(f"  Saved {cell_type} segments: {segments_outpaths[cell_type]}")
         if has_death and 'dead_mask_path' in metadata.columns and death_mask_outpath.exists():
-            metadata['dead_mask_path'] = metadata['dead_mask_path'].astype('object')
-            metadata.at[idx, 'dead_mask_path'] = str(death_mask_outpath)
             log(f"  Updated dead_mask_path: {death_mask_outpath}")
         
         _log_mem(f"sample {sample_name} END")
