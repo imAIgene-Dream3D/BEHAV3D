@@ -1061,7 +1061,11 @@ class StateClassificationPanel:
             self.binary_group_status.value = "<i>No binary columns detected from values (0/1 or true/false).</i>"
             self.binary_group_checks_box.children = []
         else:
-            self.binary_group_status.value = f"<b>Detected binary columns:</b> {len(binary_checks)}"
+            self.binary_group_status.value = (
+                f"<b>Detected binary columns:</b> {len(binary_checks)} "
+                "(each selected column is treated as an independent binary group; "
+                "full labels show observed training combinations only)"
+            )
             self.binary_group_checks_box.children = binary_checks
 
     def _selected_feature_columns(self):
@@ -1193,7 +1197,10 @@ class StateClassificationPanel:
                 )
             )
         self.rename_full_rows.children = rows
-        self.rename_full_status.value = f"<b>Clusters assigned to binary groups:</b> {len(rows)}"
+        self.rename_full_status.value = (
+            f"<b>Clusters assigned to binary groups:</b> {len(rows)} "
+            "(observed combinations from training data)"
+        )
         self.btn_rename_full.disabled = False
 
     def _refresh_enablement(self):
