@@ -42,7 +42,7 @@ from behav3d.analysis.clustering.state.visualization.backprojection import (
 
 A4_PORTRAIT = (8.27, 11.69)
 A4_LANDSCAPE = (11.69, 8.27)
-STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION = 1
+STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION = 3
 
 
 def _vinfo(verbose, prefix, message):
@@ -80,10 +80,8 @@ def _short_reasons(reasons):
 
 
 def _binary_col_to_group_name(col: str) -> str:
-    name = str(col)
-    name = name.replace("_pixels", "")
-    name = name.replace("_value", "")
-    return name
+    # Breaking change (schema v3): binary groups are exact selected column names.
+    return str(col)
 
 
 def _binary_value_is_active(val) -> bool:
@@ -112,7 +110,7 @@ def _binary_groups_to_label(active_groups: list[str]) -> str:
 
 
 def _infer_binary_group_constraints(df: pd.DataFrame, binary_cols: list[str]) -> dict:
-    """Infer allowed binary groups and forbidden binary pairs from train-time data."""
+    """Infer allowed binary groups and forbidden binary-group combinations from train-time data."""
     cols = [str(c) for c in list(binary_cols or []) if str(c) in df.columns]
     clean_cols = [_binary_col_to_group_name(c) for c in cols]
 
@@ -122,7 +120,7 @@ def _infer_binary_group_constraints(df: pd.DataFrame, binary_cols: list[str]) ->
             "binary_cols": [],
             "binary_group_names": [],
             "allowed_binary_groups": ["no_contact"],
-            "forbidden_binary_pairs": [],
+            "forbidden_binary_combinations": [],
             "support_counts": {},
         }
 
@@ -135,29 +133,27 @@ def _infer_binary_group_constraints(df: pd.DataFrame, binary_cols: list[str]) ->
         allowed_groups.add(_binary_groups_to_label(active))
         for grp in active:
             support_counts[grp] = int(support_counts.get(grp, 0)) + 1
-        for left, right in combinations(active, 2):
-            pair = tuple(sorted((str(left), str(right))))
-            cooccur_counts[pair] = int(cooccur_counts.get(pair, 0)) + 1
+        for size in range(2, len(active) + 1):
+            for combo in combinations(active, size):
+                combo_key = tuple(sorted([str(x) for x in combo]))
+                cooccur_counts[combo_key] = int(cooccur_counts.get(combo_key, 0)) + 1
 
-    forbidden_pairs = []
-    for i, left in enumerate(clean_cols):
-        if int(support_counts.get(left, 0)) <= 0:
-            continue
-        for right in clean_cols[i + 1 :]:
-            if int(support_counts.get(right, 0)) <= 0:
-                continue
-            pair = tuple(sorted((str(left), str(right))))
-            if int(cooccur_counts.get(pair, 0)) == 0:
-                forbidden_pairs.append([pair[0], pair[1]])
+    forbidden_combinations = []
+    supported_groups = [str(name) for name, count in support_counts.items() if int(count) > 0]
+    for size in range(2, len(supported_groups) + 1):
+        for combo in combinations(supported_groups, size):
+            combo_key = tuple(sorted([str(x) for x in combo]))
+            if int(cooccur_counts.get(combo_key, 0)) == 0:
+                forbidden_combinations.append(list(combo_key))
 
     return {
         "inference_rule": "exact_zero_cooccurrence",
         "binary_cols": list(cols),
         "binary_group_names": list(clean_cols),
         "allowed_binary_groups": sorted([str(x) for x in allowed_groups], key=_mixed_label_sort_key),
-        "forbidden_binary_pairs": sorted(
-            [[str(p[0]), str(p[1])] for p in forbidden_pairs],
-            key=lambda x: (x[0], x[1]),
+        "forbidden_binary_combinations": sorted(
+            [[str(x) for x in combo] for combo in forbidden_combinations],
+            key=lambda x: (len(x), tuple(x)),
         ),
         "support_counts": {str(k): int(v) for k, v in support_counts.items()},
     }
@@ -172,9 +168,11 @@ def _normalize_binary_group_constraints(binary_group_constraints):
         )
 
     allowed_raw = binary_group_constraints.get("allowed_binary_groups", None)
-    forbidden_raw = binary_group_constraints.get("forbidden_binary_pairs", None)
+    forbidden_raw = binary_group_constraints.get("forbidden_binary_combinations", None)
     if allowed_raw is None and forbidden_raw is None:
-        return None
+        raise ValueError(
+            "binary_group_constraints['forbidden_binary_combinations'] is required."
+        )
 
     allowed_set = None
     if allowed_raw is not None:
@@ -185,25 +183,29 @@ def _normalize_binary_group_constraints(binary_group_constraints):
         allowed_set = set([str(x) for x in allowed_raw])
 
     forbidden_set = set()
-    if forbidden_raw is not None:
-        if not isinstance(forbidden_raw, list):
+    if forbidden_raw is None:
+        raise ValueError(
+            "binary_group_constraints['forbidden_binary_combinations'] is required."
+        )
+    if not isinstance(forbidden_raw, list):
+        raise ValueError(
+            "binary_group_constraints['forbidden_binary_combinations'] must be a list."
+        )
+    for item in forbidden_raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
             raise ValueError(
-                "binary_group_constraints['forbidden_binary_pairs'] must be a list."
+                "binary_group_constraints['forbidden_binary_combinations'] entries must be length-2+ lists/tuples."
             )
-        for item in forbidden_raw:
-            if not isinstance(item, (list, tuple)) or len(item) != 2:
-                raise ValueError(
-                    "binary_group_constraints['forbidden_binary_pairs'] entries must be length-2 lists/tuples."
-                )
-            left = str(item[0])
-            right = str(item[1])
-            if left == right:
-                continue
-            forbidden_set.add(tuple(sorted((left, right))))
+        combo = tuple(sorted([str(x) for x in item]))
+        if len(set(combo)) != len(combo):
+            raise ValueError(
+                "binary_group_constraints['forbidden_binary_combinations'] entries must not contain duplicate group names."
+            )
+        forbidden_set.add(combo)
 
     return {
         "allowed_binary_groups": allowed_set,
-        "forbidden_binary_pairs": forbidden_set,
+        "forbidden_binary_combinations": forbidden_set,
     }
 
 
@@ -241,12 +243,14 @@ def _assign_binary_group_labels(
             continue
 
         row_idx = str(row.name)
-        forbidden_pairs = normalized_constraints.get("forbidden_binary_pairs", set())
-        for left, right in combinations(active, 2):
-            pair = tuple(sorted((str(left), str(right))))
-            if pair in forbidden_pairs:
+        forbidden_combinations = normalized_constraints.get("forbidden_binary_combinations", set())
+        for size in range(2, len(active) + 1):
+            for combo in combinations(active, size):
+                combo_key = tuple(sorted([str(x) for x in combo]))
+                if combo_key not in forbidden_combinations:
+                    continue
                 hit = forbidden_hits.setdefault(
-                    pair,
+                    combo_key,
                     {"count": 0, "first_index": row_idx},
                 )
                 hit["count"] = int(hit["count"]) + 1
@@ -262,12 +266,12 @@ def _assign_binary_group_labels(
     if enforce_binary_group_constraints and (len(forbidden_hits) > 0 or len(unknown_hits) > 0):
         parts = []
         if len(forbidden_hits) > 0:
-            pair_msgs = []
-            for pair, info in sorted(forbidden_hits.items(), key=lambda x: (x[0][0], x[0][1])):
-                pair_msgs.append(
-                    f"{pair[0]}+{pair[1]} (n={int(info['count'])}, first_index={info['first_index']})"
+            combo_msgs = []
+            for combo, info in sorted(forbidden_hits.items(), key=lambda x: (len(x[0]), x[0])):
+                combo_msgs.append(
+                    f"{'+'.join(list(combo))} (n={int(info['count'])}, first_index={info['first_index']})"
                 )
-            parts.append("forbidden_pairs=[" + "; ".join(pair_msgs[:8]) + "]")
+            parts.append("forbidden_combinations=[" + "; ".join(combo_msgs[:8]) + "]")
         if len(unknown_hits) > 0:
             group_msgs = []
             for group, info in sorted(unknown_hits.items(), key=lambda x: x[0]):
@@ -285,7 +289,7 @@ def _assign_binary_group_labels(
 
 
 def _add_clean_binary_annotation_columns(df: pd.DataFrame, binary_cols: list[str]) -> pd.DataFrame:
-    """Add user-facing binary annotation columns (e.g. organoid_contact) to obs."""
+    """Back-compat shim for annotation columns; no-op for schema v3 exact-name grouping."""
     out = df.copy()
     for col in binary_cols:
         if col not in out.columns:
@@ -358,7 +362,10 @@ def rename_intrinsic_behavioral_clusters(
         clustering_meta = adata.uns.get("clustering", {})
         if isinstance(clustering_meta, dict):
             binary_group_constraints = clustering_meta.get("binary_group_constraints", None)
-            enforce_binary_group_constraints = isinstance(binary_group_constraints, dict)
+            enforce_binary_group_constraints = (
+                isinstance(binary_group_constraints, dict)
+                and ("forbidden_binary_combinations" in binary_group_constraints)
+            )
 
     return _rebuild_full_behavioral_cluster_from_intrinsic(
         adata=adata,
@@ -1732,7 +1739,7 @@ def _apply_preprocessing_to_continuous_matrix(
 
 
 def load_state_classifier_artifact(path):
-    """Load a saved state classification v2 classifier artifact pickle."""
+    """Load a saved state classification v3 classifier artifact pickle."""
     with open(path, "rb") as f:
         artifact = pickle.load(f)
     if not isinstance(artifact, dict) or "classifier" not in artifact:
@@ -2483,10 +2490,7 @@ def _resolve_binary_classifier_feature_cols(adata, binary_cols_to_merge):
     """Resolve binary classifier features strictly from supplied binary columns."""
     cols = []
     for col in list(binary_cols_to_merge):
-        clean_col = _binary_col_to_group_name(col)
-        if clean_col in adata.obs.columns:
-            cols.append(clean_col)
-        elif col in adata.obs.columns:
+        if col in adata.obs.columns:
             cols.append(col)
     # Preserve order while removing duplicates.
     return list(dict.fromkeys(cols))
@@ -3521,7 +3525,7 @@ def run_state_clustering(
         (
             "binary-group constraints inferred | "
             f"allowed_groups={len(binary_group_constraints.get('allowed_binary_groups', []))}, "
-            f"forbidden_pairs={len(binary_group_constraints.get('forbidden_binary_pairs', []))}"
+            f"forbidden_combinations={len(binary_group_constraints.get('forbidden_binary_combinations', []))}"
         ),
     )
     _rebuild_full_behavioral_cluster_from_intrinsic(
@@ -4430,10 +4434,7 @@ def apply_state_classifiers_to_full_dataset(
         )
     enforce_binary_group_constraints = (
         isinstance(binary_group_constraints, dict)
-        and (
-            ("allowed_binary_groups" in binary_group_constraints)
-            or ("forbidden_binary_pairs" in binary_group_constraints)
-        )
+        and ("forbidden_binary_combinations" in binary_group_constraints)
     )
 
     prepared_cache_path = state_paths.prepared_full_adata_path
@@ -4860,18 +4861,18 @@ def test_pipeline():
         'no_contact_plastic_scanner': 'plastic_scanner',
         'no_contact_round_scanner': 'round_scanner',
         'no_contact_static': 'static',
-        'organoid_contact_and_tcell_contact_dead': 'dead',
-        'organoid_contact_and_tcell_contact_plastic_scanner': 'organoid_contact',
-        'organoid_contact_and_tcell_contact_round_scanner': 'organoid_contact',
-        'organoid_contact_and_tcell_contact_static': 'organoid_contact',
-        'organoid_contact_dead': 'dead',
-        'organoid_contact_plastic_scanner': 'organoid_contact',
-        'organoid_contact_round_scanner': 'organoid_contact',
-        'organoid_contact_static': 'organoid_contact',
-        'tcell_contact_dead': 'dead',
-        'tcell_contact_plastic_scanner': 'tcell_contact',
-        'tcell_contact_round_scanner': 'tcell_contact',
-        'tcell_contact_static': 'tcell_contact'
+        'organoid_contact_pixels_and_tcell_contact_pixels_dead': 'dead',
+        'organoid_contact_pixels_and_tcell_contact_pixels_plastic_scanner': 'organoid_contact_pixels',
+        'organoid_contact_pixels_and_tcell_contact_pixels_round_scanner': 'organoid_contact_pixels',
+        'organoid_contact_pixels_and_tcell_contact_pixels_static': 'organoid_contact_pixels',
+        'organoid_contact_pixels_dead': 'dead',
+        'organoid_contact_pixels_plastic_scanner': 'organoid_contact_pixels',
+        'organoid_contact_pixels_round_scanner': 'organoid_contact_pixels',
+        'organoid_contact_pixels_static': 'organoid_contact_pixels',
+        'tcell_contact_pixels_dead': 'dead',
+        'tcell_contact_pixels_plastic_scanner': 'tcell_contact_pixels',
+        'tcell_contact_pixels_round_scanner': 'tcell_contact_pixels',
+        'tcell_contact_pixels_static': 'tcell_contact_pixels'
         }
     
     model_adata = relabel_cluster_ids(

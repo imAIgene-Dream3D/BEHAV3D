@@ -38,7 +38,7 @@ Flly flexible - works with ANY cell types defined in metadata using prefixes:
 
 DYNAMIC CONTACT FEATURES (generated for ALL cell types in metadata):
 - {cell_type}_contact               (bool) - Real distance-based contact
-- {cell_type}_contact_pixels        (bool) - Pixel-based contact (1.73 diagonal)
+- {cell_type}_contact_on_distance        (bool) - Pixel-based contact (1.73 diagonal)
 - touching_{cell_type}s             (str)  - Comma-separated TrackIDs
 - active_{cell_type}_contact        (bool) - Active interaction (works for any cell type)
 
@@ -77,7 +77,7 @@ Per segment, creates a ZYX cutout with extended range around the segment border
 and calculates a distance transform using physical spacing (µm). Any other cell
 within "contact_threshold" µm counts as contacting.
 
-### {cell_type}_contact_pixels  
+### {cell_type}_contact_on_distance  
 - True/False
 Same as above but uses pixel-based threshold (1.73 = diagonal distance) without
 physical spacing. More lenient threshold for pixel-touching.
@@ -436,21 +436,21 @@ def run_feature_extraction(
                 print(f"{get_current_time()} - Calculating cell death based on dead_mask_percentage_threshold {dead_mask_percentage_threshold}")
                 df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
             
-        if "contact" in features_choice:    
-            # Calculate active contact for ALL cell types that have touching columns
-            for col in df_tracks.columns:
-                if col.startswith('touching_') and col.endswith('s'):
-                    # Extract target cell type from column name
-                    target_type = col[len('touching_'):-1]
-                    contact_col = f'{target_type}_contact'
-                    if contact_col in df_tracks.columns:
-                        print(f"{get_current_time()} - Calculating active contact features for {cell_type} vs {target_type}...")
-                        df_tracks = calculate_active_contact_features(
-                            df_tracks,
-                            cell_type=target_type
-                        )
-                    else:
-                        print(f"{get_current_time()} - Skipping active contact for {target_type}: no {contact_col} column found")
+        # if "contact" in features_choice:    
+        #     # Calculate active contact for ALL cell types that have touching columns
+        #     for col in df_tracks.columns:
+        #         if col.startswith('touching_') and col.endswith('s'):
+        #             # Extract target cell type from column name
+        #             target_type = col[len('touching_'):-1]
+        #             contact_col = f'{target_type}_contact'
+        #             if contact_col in df_tracks.columns:
+        #                 print(f"{get_current_time()} - Calculating active contact features for {cell_type} vs {target_type}...")
+        #                 df_tracks = calculate_active_contact_features(
+        #                     df_tracks,
+        #                     cell_type=target_type
+        #                 )
+        #             else:
+        #                 print(f"{get_current_time()} - Skipping active contact for {target_type}: no {contact_col} column found")
        
             
         tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
@@ -884,7 +884,7 @@ def interpolate_missing_positions(
     -   Interpolates the numerical columns of [cols_to_interpolate] such as speed using linear
         interpolation
     -   Copies the columns of [cols_to_copy] using a forward fill from the last non-interpolated
-        row of each TrackID (includes all *_contact, *_contact_pixels, touching_* columns)
+        row of each TrackID (includes all *_contact, *_contact_on_distance, touching_* columns)
     -   Puts None in any column not specified, such as SegmentID, as no actual segment exists
     """
     
@@ -906,7 +906,7 @@ def interpolate_missing_positions(
         # Add all dynamically-generated contact columns
         for col in df_tracks.columns:
             if (col.endswith('_contact') or 
-                col.endswith('_contact_pixels') or 
+                col.endswith('_contact_on_distance') or 
                 col.startswith('touching_')):
                 if col not in cols_to_copy:
                     cols_to_copy.append(col)
@@ -1202,11 +1202,13 @@ def _calculate_contact_single_timepoint(args):
             pix_org_contacts = [
                 str(x) for x in np.unique(org_cutout[pix_distances <= 1.73]) if x != 0
             ]
+            if calculate_from == org_type:
+                pix_org_contacts = [x for x in pix_org_contacts if x != str(segment_id)]
             pix_org_contact = len(pix_org_contacts) > 0
             
             # Add columns for this organoid type
-            contact_data[f'{org_type}_contact'] = real_org_contact
-            contact_data[f'{org_type}_contact_pixels'] = pix_org_contact
+            contact_data[f'{org_type}_contact'] = pix_org_contact
+            contact_data[f'{org_type}_contact_on_distance'] = real_org_contact
             contact_data[f'touching_{org_type}s'] = ",".join(org_contacts) if real_org_contact else ""
         
         # Calculate contacts with ALL immune cell types
@@ -1225,11 +1227,13 @@ def _calculate_contact_single_timepoint(args):
             pix_immune_contacts = [
                 str(x) for x in np.unique(immune_cutout[pix_distances <= 1.73]) if x != 0
             ]
+            if calculate_from == immune_type:
+                pix_immune_contacts = [x for x in pix_immune_contacts if x != str(segment_id)]
             pix_immune_contact = len(pix_immune_contacts) > 0
             
             # Add columns for this immune type
-            contact_data[f'{immune_type}_contact'] = real_immune_contact
-            contact_data[f'{immune_type}_contact_pixels'] = pix_immune_contact
+            contact_data[f'{immune_type}_contact'] = pix_immune_contact
+            contact_data[f'{immune_type}_contact_on_distance'] = real_immune_contact
             contact_data[f'touching_{immune_type}s'] = ",".join(immune_contacts) if real_immune_contact else ""
         
         # Calculate contacts with ALL other cell types
@@ -1248,11 +1252,13 @@ def _calculate_contact_single_timepoint(args):
             pix_other_contacts = [
                 str(x) for x in np.unique(other_cutout[pix_distances <= 1.73]) if x != 0
             ]
+            if calculate_from == other_type:
+                pix_other_contacts = [x for x in pix_other_contacts if x != str(segment_id)]
             pix_other_contact = len(pix_other_contacts) > 0
             
             # Add columns for this other type
-            contact_data[f'{other_type}_contact'] = real_other_contact
-            contact_data[f'{other_type}_contact_pixels'] = pix_other_contact
+            contact_data[f'{other_type}_contact'] = pix_other_contact
+            contact_data[f'{other_type}_contact_on_distance'] = real_other_contact
             contact_data[f'touching_{other_type}s'] = ",".join(other_contacts) if real_other_contact else ""
 
         df_contacts.append(pd.DataFrame([contact_data]))
