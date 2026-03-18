@@ -35,7 +35,7 @@ from pathlib import Path
 
 DEFAULT_ENV_NAME = "behav3d"
 PYTHON_VERSION = "3.12"
-CUDA_VERSION = "12.1"  # Default CUDA version for PyTorch
+CUDA_VERSION = "cu128"  # Default CUDA version for PyTorch
 
 # Global variable that will be set from command line args
 ENV_NAME = DEFAULT_ENV_NAME
@@ -441,7 +441,7 @@ def install_pytorch(conda_path, gpu_info, force_cpu=False):
     try:
         if backend == "cuda":
             # Install PyTorch with CUDA from pytorch channel
-            cmd = f'{run_prefix} pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121'
+            cmd = f'{run_prefix} pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/{CUDA_VERSION}'
         elif backend == "mps" or system == "Darwin":
             # macOS - use default PyTorch (includes MPS support)
             cmd = f'{run_prefix} pip install torch torchvision torchaudio'
