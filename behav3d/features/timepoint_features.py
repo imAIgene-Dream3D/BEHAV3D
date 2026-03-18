@@ -165,7 +165,7 @@ import ast
 import math
 import time
 from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
-from behav3d.io.images import load_image, convert_input_files_to_zarr
+from behav3d.io.images import load_image, convert_input_files_to_zarr, _ensure_zarr
 from tqdm import tqdm
 from datetime import datetime
 
@@ -317,14 +317,8 @@ def run_feature_extraction(
                 print(f"⚠️ Warning: dead_mask_path in metadata does not exist: {dead_mask_path}")
                 dead_mask_path = None
         
-        print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
-        current_cell_segments_path, raw_image_path = convert_input_files_to_zarr(
-            sample_name=sample_name,
-            current_cell_segments_path=current_cell_segments_path,
-            raw_image_path=raw_image_path,
-            output_dir=img_outdir,
-            overwrite=overwrite
-        )
+        _ensure_zarr(current_cell_segments_path, label="Cell segments")
+        _ensure_zarr(raw_image_path, label="Raw image")
 
         if not track_outdir.exists():
             track_outdir.mkdir(parents=True)

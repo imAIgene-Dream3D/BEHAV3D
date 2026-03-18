@@ -5,52 +5,67 @@ import numpy as np
 from readlif.reader import LifFile
 
 
+def _get_liff_series_dims(img_series):
+    """Extract dimension sizes from a readlif image series object."""
+    n_channels = img_series.channels
+    n_z = img_series.nz if hasattr(img_series, 'nz') else (
+        img_series.dims.z if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'z') else 1
+    )
+    n_t = img_series.nt if hasattr(img_series, 'nt') else 1
+    height = img_series.dims.y if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'y') else img_series.dims[1]
+    width = img_series.dims.x if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'x') else img_series.dims[0]
+    return n_t, n_channels, n_z, height, width
+
+
+def _get_liff_frame(img_series, z, t, c):
+    """Get a single frame, handling different readlif API versions."""
+    try:
+        return np.asarray(img_series.get_frame(z=z, t=t, c=c))
+    except TypeError:
+        return np.asarray(img_series.get_frame(z=z, t=t, channel=c))
+
+
+def load_liff_timepoint_czyx(path, t):
+    """
+    Load a single timepoint from a LIF file.
+    Returns array in CZYX order (C, Z, Y, X) without loading other timepoints.
+    """
+    path = Path(path)
+    lf = LifFile(str(path))
+    if len(lf.image_list) == 0:
+        raise ValueError(f"No images found in LIF file: {path}")
+    img_series = lf.get_image(0)
+    _, n_channels, n_z, _, _ = _get_liff_series_dims(img_series)
+
+    z_slices = []
+    for z in range(n_z):
+        c_slices = [_get_liff_frame(img_series, z=z, t=t, c=c) for c in range(n_channels)]
+        z_slices.append(np.stack(c_slices, axis=0))  # (C, Y, X)
+    return np.stack(z_slices, axis=1)  # (C, Z, Y, X)
+
+
 def _load_liff_raw(path):
     """
     Internal helper: open a .lif file and return (array, dims_string).
-    
-    Uses readlif.reader.LifFile to read Leica LIF files.
     Returns array in (T, C, Z, Y, X) order.
     """
     path = Path(path)
     lf = LifFile(str(path))
-    
-    # Get the first image series (LIF files can contain multiple series)
     if len(lf.image_list) == 0:
         raise ValueError(f"No images found in LIF file: {path}")
-    
-    # Get first image series
     img_series = lf.get_image(0)
-    
-    # Get dimensions from the image series
-    n_channels = img_series.channels
-    n_z = img_series.nz if hasattr(img_series, 'nz') else (img_series.dims.z if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'z') else 1)
-    n_t = img_series.nt if hasattr(img_series, 'nt') else 1
-    height = img_series.dims.y if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'y') else img_series.dims[1]
-    width = img_series.dims.x if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'x') else img_series.dims[0]
-    
-    # Build array by iterating through all frames
-    # readlif returns frames as PIL images or numpy arrays
+    n_t, n_channels, n_z, _, _ = _get_liff_series_dims(img_series)
+
     frames = []
     for t in range(n_t):
         time_frames = []
         for z in range(n_z):
-            channel_frames = []
-            for c in range(n_channels):
-                try:
-                    frame = img_series.get_frame(z=z, t=t, c=c)
-                except TypeError:
-                    # Some versions use different parameter names
-                    frame = img_series.get_frame(z=z, t=t, channel=c)
-                channel_frames.append(np.asarray(frame))
-            time_frames.append(np.stack(channel_frames, axis=0))  # Stack channels: (C, Y, X)
-        frames.append(np.stack(time_frames, axis=0))  # Stack Z: (Z, C, Y, X)
-    
-    arr = np.stack(frames, axis=0)  # Stack T: (T, Z, C, Y, X)
-    
-    # Reorder from (T, Z, C, Y, X) to (T, C, Z, Y, X)
-    arr = np.transpose(arr, axes=(0, 2, 1, 3, 4))
-    
+            channel_frames = [_get_liff_frame(img_series, z=z, t=t, c=c) for c in range(n_channels)]
+            time_frames.append(np.stack(channel_frames, axis=0))  # (C, Y, X)
+        frames.append(np.stack(time_frames, axis=0))  # (Z, C, Y, X)
+
+    arr = np.stack(frames, axis=0)              # (T, Z, C, Y, X)
+    arr = np.transpose(arr, axes=(0, 2, 1, 3, 4))  # → (T, C, Z, Y, X)
     dims = "TCZYX"
     return arr, dims
 

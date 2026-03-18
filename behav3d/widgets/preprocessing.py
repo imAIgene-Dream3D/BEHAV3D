@@ -55,8 +55,11 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
 
             try:
                 dim_order_widget.write_dimorder_to_metadata()
-            except Exception:
-                pass
+            except ValueError as e:
+                print(f"⚠️ {e}")
+                btn.disabled = False
+                spinner.layout.display = "none"
+                return
 
             t_start = None
             t_end = None
@@ -102,6 +105,7 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
     return widgets.VBox([selector, range_box, row, out])
 
 class DimOrderTable:
+    PLACEHOLDER = "-- select --"
     DIM_ORDER_OPTIONS = [
         "TCZYX", "TZCYX", "ZCTYX", "ZTCYX", "CZTYX", "CTZYX",
     ]
@@ -131,20 +135,6 @@ class DimOrderTable:
         self._refresh_btn = widgets.Button(description="Refresh", tooltip="Build/Update table from metadata")
         self._refresh_btn.on_click(self._on_refresh)
 
-        _apply_default = str(_cfg_get(self.metadata_loader.behav3d_parameters, "dim_order.default_apply_all", self.DEFAULT_ORDER))
-        if _apply_default not in self.DIM_ORDER_OPTIONS:
-            _apply_default = self.DEFAULT_ORDER
-
-        self._apply_all_dd = widgets.Dropdown(
-            options=self.DIM_ORDER_OPTIONS,
-            value=_apply_default,
-            description="Apply to all:",
-            style={'description_width': 'initial'},
-            layout=widgets.Layout(width="350px", margin="6px 8px 6px 0")
-        )
-        self._apply_all_btn = widgets.Button(description="Apply", layout=widgets.Layout(width="100px"))
-        self._apply_all_btn.on_click(lambda _: self.set_all(self._apply_all_dd.value))
-
         self._header = widgets.HBox([
             widgets.Label("Sample", layout=widgets.Layout(width=self._width_sample, overflow="hidden")),
             widgets.Label("Image shape", layout=widgets.Layout(width=self._width_shape, overflow="hidden")),
@@ -158,7 +148,6 @@ class DimOrderTable:
             widgets.HBox([self._refresh_btn]),
             self._header,
             self._table_body,
-            widgets.HBox([self._apply_all_dd, self._apply_all_btn]),
             self._out
         ])
 
@@ -214,15 +203,15 @@ class DimOrderTable:
             raise ValueError("metadata_loader.metadata is empty.")
         if self.sample_col not in df.columns:
             raise ValueError(f"metadata is missing '{self.sample_col}' column.")
+        unset = [s for s, v in self._selections.items() if v == self.PLACEHOLDER]
+        if unset:
+            raise ValueError(
+                f"Dimension order not set for: {', '.join(unset)}.\n"
+                "Please select a dimension order for every sample before converting."
+            )
         str_map = self.get_selections_str()
         self.metadata_loader.metadata[col] = df[self.sample_col].map(str_map)
         return self.metadata_loader.metadata
-
-    def set_all(self, order_tuple):
-        if isinstance(order_tuple, str):
-            order_tuple = tuple(order_tuple)
-        for row in self._rows:
-            row['dd'].value = order_tuple
 
     def refresh_shapes(self):
         for row in self._rows:
@@ -250,6 +239,8 @@ class DimOrderTable:
         if self.dim_col in df.columns:
             prefill = df[self.dim_col].astype(str).to_dict()
 
+        opts_with_placeholder = [self.PLACEHOLDER] + self.DIM_ORDER_OPTIONS
+
         for idx, r in df.iterrows():
             sample = str(r[self.sample_col])
             path = r[self.path_col]
@@ -258,39 +249,85 @@ class DimOrderTable:
             sample_lbl = widgets.Label(sample, layout=widgets.Layout(width=self._width_sample, overflow="hidden"))
             shape_lbl  = widgets.Label(probed_shape, layout=widgets.Layout(width=self._width_shape, overflow="hidden"))
 
-            default_val = get_image_dimension_order(path)
-            if default_val is None:
-                default_val = self.DEFAULT_ORDER
-            if prefill is not None:
-                s = prefill.get(idx, None)
-                if isinstance(s, str):
-                    tu = tuple(s.upper())
-                    if tu in self.DIM_ORDER_OPTIONS:
-                        default_val = tu
+            detected_from_image = get_image_dimension_order(path)
 
-            dd = widgets.Dropdown(
-                options=self.DIM_ORDER_OPTIONS,
-                value=default_val,
-                layout=widgets.Layout(width=self._width_order),
+            # Two possible sources for a pre-filled value:
+            #   1) Detected from the image file metadata  (CZI dims, OME-TIFF axes)
+            #   2) Previously saved by the user in the metadata CSV
+            # If neither exists → placeholder, user must choose before conversion.
+            default_val = None
+            val_source = None
+
+            if detected_from_image is not None and detected_from_image in self.DIM_ORDER_OPTIONS:
+                default_val = detected_from_image
+                val_source = "image"
+            elif prefill is not None:
+                s = prefill.get(idx, None)
+                if isinstance(s, str) and s.upper() in self.DIM_ORDER_OPTIONS:
+                    default_val = s.upper()
+                    val_source = "csv"
+
+            if default_val is not None:
+                dd = widgets.Dropdown(
+                    options=self.DIM_ORDER_OPTIONS,
+                    value=default_val,
+                    layout=widgets.Layout(width=self._width_order),
+                )
+            else:
+                dd = widgets.Dropdown(
+                    options=opts_with_placeholder,
+                    value=self.PLACEHOLDER,
+                    layout=widgets.Layout(width=self._width_order),
+                )
+
+            if val_source == "image":
+                source_html = (
+                    f"<span style='color:#1a7f1a; font-style:italic;'>"
+                    f"detected from image: {detected_from_image}</span>"
+                )
+            elif val_source == "csv":
+                source_html = (
+                    f"<span style='color:#555; font-style:italic;'>"
+                    f"previous user selection: {default_val}</span>"
+                )
+            else:
+                source_html = (
+                    "<span style='color:#cc0000; font-style:italic;'>"
+                    "⚠ not detected — please select</span>"
+                )
+
+            detected_lbl = widgets.HTML(
+                source_html,
+                layout=widgets.Layout(width="200px"),
             )
 
             self._selections[sample] = dd.value
             dd.observe(lambda ch, s=sample: self._on_dd_changed(s, ch), names='value')
 
             self._rows.append({"sample": sample, "path": path, "shape_label": shape_lbl, "dd": dd})
-            row_boxes.append(widgets.HBox([sample_lbl, shape_lbl, dd]))
+            row_boxes.append(widgets.HBox([sample_lbl, shape_lbl, dd, detected_lbl]))
 
         self._table_body.children = tuple(row_boxes)
 
     def _on_dd_changed(self, sample_name, change):
         if change.get('name') == 'value':
-            new_tuple = change['new']
-            self._selections[sample_name] = new_tuple
+            new_val = change['new']
+            self._selections[sample_name] = new_val
+
+            # Once the user picks a real value, remove the placeholder from options
+            if new_val != self.PLACEHOLDER:
+                for row in self._rows:
+                    if row["sample"] == sample_name:
+                        dd = row["dd"]
+                        if self.PLACEHOLDER in dd.options:
+                            dd.options = self.DIM_ORDER_OPTIONS
+                        break
+
             if self.auto_write:
                 df = getattr(self.metadata_loader, "metadata", None)
                 if isinstance(df, pd.DataFrame) and self.sample_col in df.columns:
                     mask = df[self.sample_col].astype(str) == str(sample_name)
-                    df.loc[mask, self.dim_col] = self._order_to_str(new_tuple)
+                    df.loc[mask, self.dim_col] = self._order_to_str(new_val)
 
     def _probe_image_shape(self, path):
         path = Path(path)
@@ -303,8 +340,10 @@ class DimOrderTable:
             return f"⚠️ {type(e).__name__}"
 
     @staticmethod
-    def _order_to_str(order_tuple):
-        return "".join(order_tuple)
+    def _order_to_str(order_val):
+        if isinstance(order_val, str):
+            return order_val
+        return "".join(order_val)
     
 
 ########################## INFO ##############################
