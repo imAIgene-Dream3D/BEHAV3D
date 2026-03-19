@@ -126,7 +126,6 @@ dependencies:
     - imageio-ffmpeg>=0.5.1
     - torchsummary>=1.5.1
     - apoc>=0.12  # GPU-accelerated pixel classifier (optional, requires OpenCL)
-    - pyclesperanto>=0.21
     # PyTorch and Cellpose installed separately via install script
     # to handle CUDA detection properly
     # cellpose==3.1.1.2  # Installed by install_behav3d.py with proper GPU support

@@ -1,29 +1,25 @@
 """
 Custom APOC (Accelerated Pixel and Object Classification) widget for BEHAV3D.
 
-Replicates the original napari-accelerated-pixel-and-object-classification GUI
-using only the `apoc` Python backend, avoiding the plugin dependency that
-conflicts with NumPy 2.0.
-
-This file is self-contained: it handles image loading, the Qt training widget,
-and APOC train/predict calls. The original pixel classifier in
-napari_pixelclassifier.py is left completely untouched.
+This file is self-contained: it handles image loading, the Qt training widget
+(with per-cell-type tabs), and APOC train/predict calls.
+The original pixel classifier in napari_pixelclassifier.py is left completely untouched.
 """
 
 import os
 import gc
+import json
 import time
 import shutil
 from pathlib import Path
 
 import numpy as np
 import napari
-from magicgui.widgets import PushButton
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QSpinBox, QDoubleSpinBox, QLineEdit, QPushButton as QtPushButton,
+    QSpinBox, QLineEdit, QPushButton as QtPushButton,
     QCheckBox, QGroupBox, QPlainTextEdit, QApplication, QScrollArea,
-    QSizePolicy,
+    QSizePolicy, QTabWidget, QFrame, QMessageBox,
 )
 from qtpy.QtCore import Qt
 
@@ -34,26 +30,71 @@ from behav3d.io.images import load_image, load_zarr, save_as_zarr, append_to_zar
 from behav3d.preprocessing import zeropad_image_to_match_shape
 
 # ---------------------------------------------------------------------------
-# Feature set presets (matching the original APOC plugin)
+# Feature set presets (matching APOC convention)
 # ---------------------------------------------------------------------------
+
 FEATURE_PRESETS = {
-    "small_quick": "original gaussian_blur=1 sobel_of_gaussian_blur=1",
-    "medium_quick": "original gaussian_blur=1 gaussian_blur=5 sobel_of_gaussian_blur=1 sobel_of_gaussian_blur=5",
-    "large_quick": (
-        "original gaussian_blur=1 gaussian_blur=5 gaussian_blur=25 "
-        "sobel_of_gaussian_blur=1 sobel_of_gaussian_blur=5 sobel_of_gaussian_blur=25"
-    ),
-    "custom": "",
+    "small_quick": {
+        "features": ["gaussian_blur", "sobel_of_gaussian_blur"],
+        "default_sigmas": "1",
+    },
+    "medium_quick": {
+        "features": ["original", "gaussian_blur", "sobel_of_gaussian_blur"],
+        "default_sigmas": "1, 5",
+    },
+    "large_quick": {
+        "features": ["original", "gaussian_blur", "sobel_of_gaussian_blur",
+                      "laplace_box_of_gaussian_blur"],
+        "default_sigmas": "1, 5, 25",
+    },
+    "custom": {
+        "features": [],
+        "default_sigmas": "",
+    },
 }
 
 
+def _build_feature_string(preset_name, sigmas_str):
+    """Build a full APOC feature string from a preset name + comma-separated sigmas.
+    For 'custom' preset, sigmas_str is used as the raw feature string directly.
+    """
+    if preset_name == "custom":
+        return sigmas_str.strip()
+
+    preset = FEATURE_PRESETS.get(preset_name, FEATURE_PRESETS["medium_quick"])
+    features = preset["features"]
+
+    try:
+        sigmas = [s.strip() for s in sigmas_str.split(",") if s.strip()]
+    except Exception:
+        sigmas = ["1"]
+
+    if not sigmas:
+        sigmas = ["1"]
+
+    parts = []
+    for feat in features:
+        if feat == "original":
+            parts.append("original")
+        else:
+            for s in sigmas:
+                parts.append(f"{feat}={s}")
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Image loading (same logic as CPU pipeline for consistency)
+# ---------------------------------------------------------------------------
+
 def _load_training_images(
-    metadata, output_dir, examples_per_sample, organoid_types, immune_types, other_types
+    metadata, output_dir, examples_per_sample, organoid_types, immune_types, other_types, overwrite_images=False
 ):
     """
-    Load training images from metadata, reusing the same logic as the original
-    pixel classifier.  Returns a list of (C, Z, Y, X) arrays — one per sample
-    timepoint — plus the pixel_class_outdir path and cell type lists.
+    Load training images from metadata.
+    Returns a list of (C, Z, Y, X) arrays — one per selected timepoint — plus
+    the pixel_class_outdir path, has_death flag, and all cell types list.
     """
     from behav3d.core.metadata import has_dead_channel
 
@@ -65,17 +106,21 @@ def _load_training_images(
 
     image_outpath = Path(pixel_class_outdir, "PixelClassifier_Images.zarr")
 
-    # If images were already saved from a previous session, reload them
+    # --- Check cached dataset ---
     if image_outpath.exists():
-        print("Loading cached training images from previous session...")
-        cached = np.asarray(load_image(image_outpath))  # (C, T, Z, Y, X)
-        # Split T back into a list of (C, Z, Y, X)
-        all_images = [cached[:, t, ...] for t in range(cached.shape[1])]
-        return all_images, pixel_class_outdir, has_death, all_cell_types
+        if overwrite_images:
+            print("Overwrite sample images requested — deleting cached data...")
+            shutil.rmtree(image_outpath)
+        else:
+            print("Loading cached training images from previous session...")
+            cached = np.asarray(load_image(image_outpath))  # (C, T, Z, Y, X)
+            all_images = [cached[:, t, ...] for t in range(cached.shape[1])]
+            return all_images, pixel_class_outdir, has_death, all_cell_types
 
-    # Otherwise load fresh from raw files
+    # --- Load fresh from raw files ---
     all_images = []
     max_shape = None
+    n_samples = 0
 
     for _, sample in metadata.iterrows():
         sample_name = sample.get("sample_name", "unknown")
@@ -85,6 +130,7 @@ def _load_training_images(
             print(f"⚠️ Skipping {sample_name}: raw image not found")
             continue
 
+        n_samples += 1
         img_dir = Path(output_dir, "images", sample_name)
         img_dir.mkdir(parents=True, exist_ok=True)
 
@@ -117,103 +163,290 @@ def _load_training_images(
     if max_shape is not None:
         all_images = [zeropad_image_to_match_shape(img, max_shape) for img in all_images]
 
+    # Stash on disk for next time
+    import dask.array as da
+    import gc
+    all_images_stack = da.stack(all_images)
+    all_images_stack = all_images_stack.transpose(1, 0, 2, 3, 4)  # (C, T, Z, Y, X)
+    save_as_zarr(all_images_stack, image_outpath)
+    del all_images_stack
+    gc.collect()
+
+    all_images_cached = np.asarray(load_image(image_outpath))
+    all_images = [all_images_cached[:, t, ...] for t in range(all_images_cached.shape[1])]
+
     return all_images, pixel_class_outdir, has_death, all_cell_types
 
 
-class APOCTrainingWidget(QWidget):
+# ---------------------------------------------------------------------------
+# Per-cell-type tab panel
+# ---------------------------------------------------------------------------
+
+class CellTypeTab(QWidget):
     """
-    A Qt widget that replicates the original APOC Napari plugin interface.
-    Docks directly into the Napari viewer.
+    Widget for a single cell type tab.
+    Contains: channel selection, feature preset, sigma values, read-only
+    feature preview, max_depth, num_ensembles.
     """
 
-    def __init__(self, viewer, pixel_class_outdir, all_cell_types, has_death, parent=None):
+    def __init__(self, cell_type, viewer, initial_params=None, parent=None):
+        super().__init__(parent)
+        self.cell_type = cell_type
+        self.viewer = viewer
+        ip = initial_params or {}
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(5)
+
+        # --- Channel selection ---
+        chan_group = QGroupBox("Image Channel Inputs")
+        chan_layout = QVBoxLayout()
+        chan_layout.setSpacing(2)
+        self.channel_checkboxes = []
+        self.chan_checkbox_container = QWidget()
+        self.chan_checkbox_layout = QVBoxLayout()
+        self.chan_checkbox_layout.setContentsMargins(0, 0, 0, 0)
+        self.chan_checkbox_container.setLayout(self.chan_checkbox_layout)
+        chan_layout.addWidget(self.chan_checkbox_container)
+        chan_group.setLayout(chan_layout)
+        layout.addWidget(chan_group)
+
+        # Labeling hint
+        hint = QLabel("Labels: <b>1</b> = background&nbsp;&nbsp; <b>2</b> = foreground")
+        hint.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(hint)
+
+        # --- Feature preset ---
+        feat_row = QHBoxLayout()
+        feat_row.addWidget(QLabel("Preset:"))
+        self.feature_combo = QComboBox()
+        self.feature_combo.addItems(list(FEATURE_PRESETS.keys()))
+        saved_preset = ip.get(f"apoc_{cell_type}_feature_preset", "medium_quick")
+        self.feature_combo.setCurrentText(saved_preset if saved_preset in FEATURE_PRESETS else "medium_quick")
+        feat_row.addWidget(self.feature_combo)
+        layout.addLayout(feat_row)
+
+        # --- Sigma values (comma-separated) ---
+        sigma_row = QHBoxLayout()
+        self.sigma_label = QLabel("Sigma values:")
+        sigma_row.addWidget(self.sigma_label)
+        self.sigma_edit = QLineEdit()
+        default_sigmas = FEATURE_PRESETS.get(saved_preset, FEATURE_PRESETS["medium_quick"])["default_sigmas"]
+        saved_sigmas = ip.get(f"apoc_{cell_type}_sigmas", default_sigmas)
+        self.sigma_edit.setText(str(saved_sigmas))
+        self.sigma_edit.setPlaceholderText("e.g. 1, 5, 25")
+        self.sigma_edit.setToolTip("Comma-separated sigma (scale) values for Gaussian filters.\nSmall σ (1-2) = fine detail; Large σ (5-25) = coarse/shape.")
+        sigma_row.addWidget(self.sigma_edit)
+        layout.addLayout(sigma_row)
+
+        # --- Custom feature string (only visible when preset = custom) ---
+        self.custom_feat_label = QLabel("Custom feature string:")
+        self.custom_feat_edit = QLineEdit()
+        saved_custom = ip.get(f"apoc_{cell_type}_custom_feature_string", "")
+        self.custom_feat_edit.setText(saved_custom)
+        self.custom_feat_edit.setPlaceholderText("e.g. original gaussian_blur=1 sobel_of_gaussian_blur=5")
+        layout.addWidget(self.custom_feat_label)
+        layout.addWidget(self.custom_feat_edit)
+
+        # --- Read-only feature preview ---
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet("color: #888; font-size: 11px; padding: 2px 4px; background: #f5f5f5; border-radius: 3px;")
+        layout.addWidget(self.preview_label)
+
+        # Connect signals to update preview
+        self.feature_combo.currentTextChanged.connect(self._on_preset_changed)
+        self.sigma_edit.textChanged.connect(self._update_preview)
+        self.custom_feat_edit.textChanged.connect(self._update_preview)
+
+        # Initial visibility / preview
+        self._on_preset_changed(self.feature_combo.currentText())
+
+        # --- RF parameters ---
+        rf_row = QHBoxLayout()
+        rf_row.addWidget(QLabel("Max depth:"))
+        self.max_depth_spin = QSpinBox()
+        self.max_depth_spin.setRange(1, 20)
+        self.max_depth_spin.setValue(int(ip.get(f"apoc_{cell_type}_max_depth", 2)))
+        rf_row.addWidget(self.max_depth_spin)
+
+        rf_row.addWidget(QLabel("Trees:"))
+        self.num_ensembles_spin = QSpinBox()
+        self.num_ensembles_spin.setRange(10, 1000)
+        self.num_ensembles_spin.setSingleStep(10)
+        self.num_ensembles_spin.setValue(int(ip.get(f"apoc_{cell_type}_num_ensembles", 100)))
+        rf_row.addWidget(self.num_ensembles_spin)
+        layout.addLayout(rf_row)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+    def _on_preset_changed(self, preset_name):
+        """Toggle visibility of sigma vs custom field, update sigma defaults."""
+        is_custom = preset_name == "custom"
+        self.sigma_edit.setVisible(not is_custom)
+        self.sigma_label.setVisible(not is_custom)
+        self.custom_feat_label.setVisible(is_custom)
+        self.custom_feat_edit.setVisible(is_custom)
+
+        if not is_custom:
+            # Auto-fill default sigmas for the new preset
+            preset = FEATURE_PRESETS.get(preset_name, FEATURE_PRESETS["medium_quick"])
+            self.sigma_edit.setText(preset["default_sigmas"])
+
+        self._update_preview()
+
+    def _update_preview(self):
+        """Rebuild the feature string preview from current preset + sigmas."""
+        feat_str = self.get_feature_string()
+        self.preview_label.setText(f"<b>Features:</b> {feat_str}")
+
+    def get_feature_string(self):
+        """Return the full APOC feature string based on current widget values."""
+        preset = self.feature_combo.currentText()
+        if preset == "custom":
+            return self.custom_feat_edit.text().strip()
+        return _build_feature_string(preset, self.sigma_edit.text())
+
+    def refresh_channel_checkboxes(self):
+        """Rebuild channel checkboxes from current Napari image layers."""
+        for cb in self.channel_checkboxes:
+            self.chan_checkbox_layout.removeWidget(cb)
+            cb.deleteLater()
+        self.channel_checkboxes = []
+
+        for layer in self.viewer.layers:
+            if isinstance(layer, napari.layers.Image) and not layer.name.startswith("Pixel Classification"):
+                cb = QCheckBox(layer.name)
+                cb.setChecked(True)
+                self.chan_checkbox_layout.addWidget(cb)
+                self.channel_checkboxes.append(cb)
+
+    def get_config(self):
+        """Return a dict with all current widget values."""
+        return {
+            "feature_preset":          self.feature_combo.currentText(),
+            "sigmas":                  self.sigma_edit.text().strip(),
+            "custom_feature_string":   self.custom_feat_edit.text().strip(),
+            "feature_string":          self.get_feature_string(),  # computed, for training
+            "max_depth":               self.max_depth_spin.value(),
+            "num_ensembles":           self.num_ensembles_spin.value(),
+            "channels":                [cb.text() for cb in self.channel_checkboxes if cb.isChecked()],
+        }
+
+    def apply_config(self, cfg):
+        """Restore widget values from a config dict."""
+        if "feature_preset" in cfg:
+            self.feature_combo.setCurrentText(cfg["feature_preset"])
+        if "sigmas" in cfg:
+            self.sigma_edit.setText(cfg["sigmas"])
+        if "custom_feature_string" in cfg:
+            self.custom_feat_edit.setText(cfg["custom_feature_string"])
+        if "max_depth" in cfg:
+            self.max_depth_spin.setValue(int(cfg["max_depth"]))
+        if "num_ensembles" in cfg:
+            self.num_ensembles_spin.setValue(int(cfg["num_ensembles"]))
+        if "channels" in cfg:
+            for cb in self.channel_checkboxes:
+                cb.setChecked(cb.text() in cfg["channels"])
+
+
+# ---------------------------------------------------------------------------
+# Main APOC training widget
+# ---------------------------------------------------------------------------
+
+class APOCTrainingWidget(QWidget):
+    """
+    Tabbed APOC training widget docked inside the Napari viewer.
+    One tab per cell type (+ Death if applicable), each with:
+      - channel selection
+      - feature preset + sigma values + auto-preview
+      - max_depth / num_ensembles
+    Global controls: Apply-to-All, Train Current, Train-All, Save Labels.
+    """
+
+    def __init__(
+        self,
+        viewer,
+        pixel_class_outdir,
+        all_cell_types,
+        has_death,
+        initial_params=None,
+        on_params_changed=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.viewer = viewer
         self.pixel_class_outdir = pixel_class_outdir
         self.all_cell_types = all_cell_types
         self.has_death = has_death
+        self._initial_params = initial_params or {}
+        self._on_params_changed = on_params_changed
+
+        # All tab labels = cell types + optional Death
+        self._tab_cell_types = list(all_cell_types)
+        if has_death:
+            self._tab_cell_types.append("dead")
 
         self._build_ui()
         self._connect_signals()
-        # Populate layer dropdowns
-        self._refresh_layers()
+        self._refresh_all_channels()
+
         # Listen for layer changes
-        self.viewer.layers.events.inserted.connect(lambda _: self._refresh_layers())
-        self.viewer.layers.events.removed.connect(lambda _: self._refresh_layers())
+        self.viewer.layers.events.inserted.connect(lambda _: self._refresh_all_channels())
+        self.viewer.layers.events.removed.connect(lambda _: self._refresh_all_channels())
 
     def _build_ui(self):
         layout = QVBoxLayout()
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        # Title
         title = QLabel("<h3>APOC Pixel Classification</h3>")
         layout.addWidget(title)
 
-        # Labeling guidance
-        info = QLabel("Draw labels: <b>1</b> = background, <b>2</b> = foreground")
-        info.setStyleSheet("color: #888; font-style: italic; padding: 2px 0;")
-        layout.addWidget(info)
+        # --- Tab widget ---
+        self.tab_widget = QTabWidget()
+        self.tabs = {}  # cell_type -> CellTypeTab
 
-        # --- Image layers section ---
-        img_group = QGroupBox("Image Layers (select inputs)")
-        img_layout = QVBoxLayout()
-        img_layout.setSpacing(2)
-        self.image_checkboxes = []
-        # Will be populated dynamically when layers change
-        self.img_checkbox_container = QWidget()
-        self.img_checkbox_layout = QVBoxLayout()
-        self.img_checkbox_layout.setContentsMargins(0, 0, 0, 0)
-        self.img_checkbox_container.setLayout(self.img_checkbox_layout)
-        img_layout.addWidget(self.img_checkbox_container)
-        img_group.setLayout(img_layout)
-        layout.addWidget(img_group)
+        for ct in self._tab_cell_types:
+            tab = CellTypeTab(ct, self.viewer, initial_params=self._initial_params)
+            self.tabs[ct] = tab
+            self.tab_widget.addTab(tab, ct.capitalize())
 
-        # --- Feature set ---
-        feat_layout = QHBoxLayout()
-        feat_layout.addWidget(QLabel("Feature set:"))
-        self.feature_combo = QComboBox()
-        self.feature_combo.addItems(list(FEATURE_PRESETS.keys()))
-        self.feature_combo.setCurrentText("medium_quick")
-        feat_layout.addWidget(self.feature_combo)
-        layout.addLayout(feat_layout)
+        layout.addWidget(self.tab_widget)
 
-        # Custom features text
-        self.custom_features_label = QLabel("Custom features:")
-        self.custom_features_edit = QLineEdit()
-        self.custom_features_edit.setPlaceholderText(
-            "e.g. original gaussian_blur=1 sobel_of_gaussian_blur=1"
+        # --- Separator ---
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(line)
+
+        # --- Global buttons ---
+        global_row1 = QHBoxLayout()
+
+        self.apply_all_btn = QtPushButton("⬇ Apply config to all tabs")
+        self.apply_all_btn.setStyleSheet("padding: 5px 10px;")
+        self.apply_all_btn.setToolTip("Copy the current tab's preset, sigmas, depth and trees to ALL other tabs")
+        global_row1.addWidget(self.apply_all_btn)
+        layout.addLayout(global_row1)
+
+        global_row2 = QHBoxLayout()
+
+        self.train_current_btn = QtPushButton("▶ Train current tab")
+        self.train_current_btn.setStyleSheet(
+            "background-color: #1976D2; color: white; font-weight: bold; padding: 6px 12px;"
         )
-        self.custom_features_edit.setText(FEATURE_PRESETS["medium_quick"])
-        layout.addWidget(self.custom_features_label)
-        layout.addWidget(self.custom_features_edit)
-        # Initially hide custom field
-        self._toggle_custom_features()
+        global_row2.addWidget(self.train_current_btn)
 
-        # --- RF parameters ---
-        rf_layout = QHBoxLayout()
-        rf_layout.addWidget(QLabel("Max depth:"))
-        self.max_depth_spin = QSpinBox()
-        self.max_depth_spin.setRange(1, 20)
-        self.max_depth_spin.setValue(2)
-        rf_layout.addWidget(self.max_depth_spin)
+        self.train_all_btn = QtPushButton("▶▶ Train ALL classifiers")
+        self.train_all_btn.setStyleSheet(
+            "background-color: #2e7d32; color: white; font-weight: bold; padding: 6px 12px;"
+        )
+        global_row2.addWidget(self.train_all_btn)
+        layout.addLayout(global_row2)
 
-        rf_layout.addWidget(QLabel("Trees:"))
-        self.num_ensembles_spin = QSpinBox()
-        self.num_ensembles_spin.setRange(10, 1000)
-        self.num_ensembles_spin.setSingleStep(10)
-        self.num_ensembles_spin.setValue(100)
-        rf_layout.addWidget(self.num_ensembles_spin)
-        layout.addLayout(rf_layout)
-
-        # --- Buttons ---
-        btn_layout = QHBoxLayout()
-        self.run_btn = QtPushButton("Train & Apply APOC Classifiers")
-        self.run_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px 16px;")
-        btn_layout.addWidget(self.run_btn)
-        layout.addLayout(btn_layout)
-
-        # --- Status ---
+        # --- Status label ---
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -222,40 +455,46 @@ class APOCTrainingWidget(QWidget):
         self.setLayout(layout)
 
     def _connect_signals(self):
-        self.feature_combo.currentTextChanged.connect(self._toggle_custom_features)
-        self.run_btn.clicked.connect(self._on_run_all)
+        self.apply_all_btn.clicked.connect(self._on_apply_to_all)
+        self.train_current_btn.clicked.connect(self._on_train_current)
+        self.train_all_btn.clicked.connect(self._on_train_all)
 
-    def _toggle_custom_features(self, *_):
-        is_custom = self.feature_combo.currentText() == "custom"
-        self.custom_features_label.setVisible(is_custom)
-        self.custom_features_edit.setVisible(is_custom)
+    def _refresh_all_channels(self):
+        """Refresh channel checkboxes in all tabs."""
+        for tab in self.tabs.values():
+            tab.refresh_channel_checkboxes()
 
-    def _refresh_layers(self):
-        """Rebuild image checkboxes from viewer layers."""
-        # Clear old checkboxes
-        for cb in self.image_checkboxes:
-            self.img_checkbox_layout.removeWidget(cb)
-            cb.deleteLater()
-        self.image_checkboxes = []
+    # ------------------------------------------------------------------
+    # Button handlers
+    # ------------------------------------------------------------------
 
-        # Add checkboxes for Image layers
-        for layer in self.viewer.layers:
-            if isinstance(layer, napari.layers.Image) and not layer.name.startswith("Pixel Classification"):
-                cb = QCheckBox(layer.name)
-                cb.setChecked(True)
-                self.img_checkbox_layout.addWidget(cb)
-                self.image_checkboxes.append(cb)
+    def _on_apply_to_all(self):
+        """Copy current tab's config to all other tabs."""
+        current_ct = self._tab_cell_types[self.tab_widget.currentIndex()]
+        cfg = self.tabs[current_ct].get_config()
+        for ct, tab in self.tabs.items():
+            if ct != current_ct:
+                tab.apply_config(cfg)
+        self.status_label.setText(f"↪ Config applied from '{current_ct}' to all other tabs.")
 
-    def _get_feature_string(self):
-        preset = self.feature_combo.currentText()
-        if preset == "custom":
-            return self.custom_features_edit.text().strip()
-        return FEATURE_PRESETS.get(preset, FEATURE_PRESETS["medium_quick"])
+    def _on_train_current(self):
+        """Train only the classifier for the currently visible tab."""
+        current_ct = self._tab_cell_types[self.tab_widget.currentIndex()]
+        self._run_training([current_ct])
 
-    def _get_selected_images(self):
-        """Return a list of numpy arrays for checked image layers."""
+    def _on_train_all(self):
+        """Train classifiers for ALL cell types using each tab's individual config."""
+        self._run_training(self._tab_cell_types)
+
+    # ------------------------------------------------------------------
+    # Core training logic
+    # ------------------------------------------------------------------
+
+    def _get_images_for_tab(self, ct):
+        """Return numpy arrays for the image layers checked in a tab."""
+        tab = self.tabs[ct]
         images = []
-        for cb in self.image_checkboxes:
+        for cb in tab.channel_checkboxes:
             if cb.isChecked():
                 try:
                     layer = self.viewer.layers[cb.text()]
@@ -264,144 +503,191 @@ class APOCTrainingWidget(QWidget):
                     pass
         return images
 
-    def _on_run_all(self):
+    def save_user_labels(self, log=print):
+        """Save all user-provided labels for all cell types and Dead (if present)."""
+        import shutil
+        for cell_type in self.all_cell_types:
+            lname = f"User Provided Labels ({cell_type.capitalize()})"
+            if lname not in [l.name for l in self.viewer.layers]:
+                continue
+            label_layer = self.viewer.layers[lname]
+            outpath = Path(self.pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
+            if outpath.exists():
+                shutil.rmtree(outpath)
+            save_as_zarr(label_layer.data, outpath)
+            log(f"Saved {cell_type} labels → {outpath}")
+
+        if self.has_death and "User Provided Labels (Dead)" in [l.name for l in self.viewer.layers]:
+            dead_layer = self.viewer.layers["User Provided Labels (Dead)"]
+            dead_outpath = Path(self.pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
+            if dead_outpath.exists():
+                shutil.rmtree(dead_outpath)
+            save_as_zarr(dead_layer.data, dead_outpath)
+            log(f"Saved Death labels → {dead_outpath}")
+
+        log("✅ All user labels saved!")
+
+    def _run_training(self, cell_types_to_train):
+        """Train (and apply) APOC classifiers for the given list of cell types."""
         import apoc
 
-        images = self._get_selected_images()
-        if not images:
-            self.status_label.setText("⚠️ No image layers selected!")
-            return
-
-        feature_string = self._get_feature_string()
-        max_depth = self.max_depth_spin.value()
-        num_ensembles = self.num_ensembles_spin.value()
-        
-        self.status_label.setText("Starting training/prediction run...")
-        QApplication.processEvents()
-
-        # Build list of tasks
-        tasks = []
-        for ct in self.all_cell_types:
-            layer_name = f"User Provided Labels ({ct.capitalize()})"
-            clf_name = f"PixelClassifier_{ct.capitalize()}.cl"
-            pred_layer_name = f"Pixel Classification ({ct.capitalize()})"
-            tasks.append((layer_name, clf_name, pred_layer_name))
-            
-        if self.has_death:
-            tasks.append(("User Provided Labels (Dead)", "PixelClassifier_Death.cl", "Pixel Classification (Dead)"))
+        # Auto-save labels before training
+        print("Auto-saving user labels before training...")
+        self.save_user_labels(log=print)
 
         successes = []
         try:
-            for layer_name, clf_name, pred_layer_name in tasks:
-                self.status_label.setText(f"Processing {clf_name}...")
+            for ct in cell_types_to_train:
+                tab = self.tabs[ct]
+                cfg = tab.get_config()
+                feature_string = cfg["feature_string"]
+                max_depth = cfg["max_depth"]
+                num_ensembles = cfg["num_ensembles"]
+
+                self.status_label.setText(f"Processing {ct}...")
                 QApplication.processEvents()
-                
-                # 1. Fetch annotation
+
+                images = self._get_images_for_tab(ct)
+                if not images:
+                    self.status_label.setText(f"⚠️ No image layers selected for '{ct}'!")
+                    continue
+
+                # Get annotation layer
+                if ct == "dead":
+                    layer_name = "User Provided Labels (Dead)"
+                else:
+                    layer_name = f"User Provided Labels ({ct.capitalize()})"
+
                 try:
                     annotation = np.asarray(self.viewer.layers[layer_name].data)
                 except KeyError:
-                    # Layer deleted or not found
+                    print(f"Skipping '{ct}': annotation layer not found")
                     continue
-                    
-                # 2. Check if there are any labels drawn
+
                 if not np.any(annotation):
-                    print(f"Skipping {clf_name} (no user labels found)")
+                    print(f"Skipping '{ct}': no labels drawn")
                     continue
-                    
+
+                if ct == "dead":
+                    clf_name = "PixelClassifier_Death.cl"
+                else:
+                    clf_name = f"PixelClassifier_{ct.capitalize()}.cl"
+
                 clf_path = str(Path(self.pixel_class_outdir, clf_name))
-                
-                # 3. Train
-                n_timepoints = annotation.shape[0] if annotation.ndim == 4 else 1
-                has_trained = False
-                
-                # Erase any preexisting classifier to guarantee we train from scratch as per APOC documentation
+
+                # Erase existing classifier
                 if Path(clf_path).exists():
                     apoc.erase_classifier(clf_path)
-                
-                # Use ObjectSegmenter for native APOC instance segmentation
+
+                # Train with ObjectSegmenter
                 clf = apoc.ObjectSegmenter(
-                    opencl_filename=clf_path, 
-                    max_depth=max_depth, 
+                    opencl_filename=clf_path,
+                    max_depth=max_depth,
                     num_ensembles=num_ensembles,
-                    positive_class_identifier=2
+                    positive_class_identifier=2,
                 )
-                
+
+                has_trained = False
+                n_timepoints = annotation.shape[0] if annotation.ndim == 4 else 1
+
                 if annotation.ndim == 4:
                     for t in range(n_timepoints):
                         ann_t = annotation[t]
-                        if not np.any(ann_t): continue
+                        if not np.any(ann_t):
+                            continue
                         imgs_t = [img[t] for img in images]
-                        if len(imgs_t) == 1: imgs_t = imgs_t[0]
+                        imgs_t = imgs_t[0] if len(imgs_t) == 1 else imgs_t
                         clf.train(feature_string, ann_t, imgs_t, continue_training=has_trained)
                         has_trained = True
                 else:
                     imgs = images[0] if len(images) == 1 else images
                     clf.train(feature_string, annotation, imgs)
                     has_trained = True
-                    
+
                 if not has_trained:
                     continue
-                    
-                # 4. Predict / Apply
-                ndim = images[0].ndim
-                if ndim == 4:
+
+                # Predict
+                if images[0].ndim == 4:
                     results = []
                     for t in range(n_timepoints):
                         imgs_t = [img[t] for img in images]
-                        if len(imgs_t) == 1: imgs_t = imgs_t[0]
+                        imgs_t = imgs_t[0] if len(imgs_t) == 1 else imgs_t
                         res_t = clf.predict(image=imgs_t)
                         results.append(np.asarray(res_t).astype(np.int16))
                     result = np.stack(results, axis=0)
                 else:
                     imgs = images[0] if len(images) == 1 else images
-                    result = clf.predict(image=imgs)
-                    result = np.asarray(result).astype(np.int16)
-                    
-                # 5. Add or update result layer (Predicted instance labels)
-                # We name the layer Segments directly since ObjectSegmenter runs connected components
-                layer_name_final = pred_layer_name if "Death" in clf_name else f"{clf_name.replace('PixelClassifier_', '').replace('.cl', '')} Segments"
-                
-                if layer_name_final in [l.name for l in self.viewer.layers]:
-                    self.viewer.layers[layer_name_final].data = result
+                    result = np.asarray(clf.predict(image=imgs)).astype(np.int16)
+
+                # Show in viewer
+                seg_layer_name = (
+                    "Pixel Classification (Dead)" if ct == "dead"
+                    else f"{ct.capitalize()} Segments"
+                )
+                if seg_layer_name in [l.name for l in self.viewer.layers]:
+                    self.viewer.layers[seg_layer_name].data = result
+                    self.viewer.layers[seg_layer_name].visible = True
                 else:
-                    self.viewer.add_labels(result, name=layer_name_final, opacity=0.8)
-                    
-                # Save to disk to match original behavior
-                from behav3d.io.images import save_as_zarr
-                
-                # Save as PredictedLabels.zarr so the rest of the BEHAV3D pipeline can find it
+                    self.viewer.add_labels(result, name=seg_layer_name, opacity=0.8, visible=True)
+
+                # Save to disk
                 arr_path = Path(self.pixel_class_outdir, f"{Path(clf_path).stem}_PredictedLabels.zarr")
                 if arr_path.exists():
-                    import shutil
                     shutil.rmtree(arr_path)
                 save_as_zarr(result, arr_path)
-                
-                # Also save the raw segments if not death
-                if "Death" not in clf_name:
-                    seg_path = Path(self.pixel_class_outdir, f"segmentation_{Path(clf_path).stem.replace('PixelClassifier_','')}.zarr")
-                    if seg_path.exists():
-                        import shutil
-                        shutil.rmtree(seg_path)
-                    save_as_zarr(result, seg_path)
-                
-                successes.append(clf_name)
+
+                successes.append(ct)
 
             if successes:
-                self.status_label.setText(f"✅ Successfully trained & applied:\n{', '.join(successes)}")
+                self.status_label.setText(f"✅ Trained: {', '.join(successes)}")
             else:
-                self.status_label.setText("⚠️ Finished, but found NO drawn labels in any layer!")
+                self.status_label.setText("⚠️ No cell types were trained (check labels).")
+
+            # Persist all params back to caller
+            self._persist_params()
 
         except Exception as e:
-            self.status_label.setText(f"❌ Failed: {e}")
+            self.status_label.setText(f"❌ Error: {e}")
             import traceback
             traceback.print_exc()
 
+    # ------------------------------------------------------------------
+    # Config persistence
+    # ------------------------------------------------------------------
+
+    def _collect_all_params(self):
+        """Return a flat param dict for all tabs, suitable for storing in BEHAV3D config."""
+        params = {}
+        for ct, tab in self.tabs.items():
+            cfg = tab.get_config()
+            params[f"apoc_{ct}_feature_preset"]        = cfg["feature_preset"]
+            params[f"apoc_{ct}_sigmas"]                = cfg["sigmas"]
+            params[f"apoc_{ct}_custom_feature_string"] = cfg["custom_feature_string"]
+            params[f"apoc_{ct}_feature_string"]        = cfg["feature_string"]
+            params[f"apoc_{ct}_max_depth"]             = cfg["max_depth"]
+            params[f"apoc_{ct}_num_ensembles"]         = cfg["num_ensembles"]
+            params[f"apoc_{ct}_channels"]              = cfg["channels"]
+        return params
+
+    def _persist_params(self):
+        """Push current params back to the notebook via the on_params_changed callback."""
+        if callable(self._on_params_changed):
+            try:
+                self._on_params_changed(self._collect_all_params())
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Entry-point called from segmentation.py
+# ---------------------------------------------------------------------------
 
 def train_pixel_classifier_apoc(
     output_dir,
-    metadata=None,
+    metadata,
     examples_per_sample=3,
-    n_workers=None,
+    overwrite_images=False,
     organoid_types=None,
     immune_types=None,
     other_types=None,
@@ -409,18 +695,13 @@ def train_pixel_classifier_apoc(
     on_params_changed=None,
 ):
     """
-    APOC version of the pixel classifier training.
-    Opens a Napari viewer with the custom APOC widget docked on the right.
-    The original pixel classifier code is NOT called.
+    Open a Napari viewer with the tabbed APOC classification widget.
+    The original napari_pixelclassifier.py is NOT called.
     """
-    from behav3d.core.metadata import has_dead_channel
-    from functools import partial
-
     organoid_types = organoid_types or []
-    immune_types = immune_types or []
-    other_types = other_types or []
+    immune_types   = immune_types   or []
+    other_types    = other_types    or []
     all_cell_types = organoid_types + immune_types + other_types
-    has_death = has_dead_channel(metadata) if metadata is not None else False
 
     # --- Load images ---
     print("Loading training images for APOC...")
@@ -431,73 +712,63 @@ def train_pixel_classifier_apoc(
         organoid_types=organoid_types,
         immune_types=immune_types,
         other_types=other_types,
+        overwrite_images=overwrite_images,
     )
 
     if not image_list:
         print("⚠️ No training images found!")
         return None
 
-    # --- Stack along Time ---
+    # --- Pad images to the same shape and stack along T ---
     max_shape = list(image_list[0].shape)
     for img in image_list[1:]:
         for i in range(len(max_shape)):
             max_shape[i] = max(max_shape[i], img.shape[i])
     image_list = [zeropad_image_to_match_shape(img, max_shape) for img in image_list]
 
-    stacked = np.stack(image_list, axis=0)  # Shape depends on disk cache order
-    
-    # Heuristic constraint: Ensure shape is (Channels, Timepoints, Z, Y, X)
-    # Usually Timepoints > Channels. If it's (Timepoints, Channels, Z, Y, X), flip the first two.
+    stacked = np.stack(image_list, axis=0)  # (T_selected, C, Z, Y, X)
+
+    # Ensure (C, T, Z, Y, X) — flip dims if T looks bigger than C
     if stacked.shape[0] > stacked.shape[1]:
-        print(f"Flipping dimensions {stacked.shape[:2]} to match (C, T, Z, Y, X)")
         stacked = stacked.transpose(1, 0, 2, 3, 4)
-        
-    print(f"Final normalized shape {stacked.shape} (C, T, Z, Y, X)")
+
+    print(f"Training data shape: {stacked.shape}  (C, T, Z, Y, X)")
 
     # --- Create Napari viewer ---
     viewer = napari.Viewer()
 
-    # Add each channel as a separate image layer
     n_channels = stacked.shape[0]
     channel_colors = [
-        'cyan', 'yellow', 'red', 'green', 'magenta', 'blue',
-        'gray', 'turbo', 'viridis', 'plasma', 'inferno', 'twilight'
+        "cyan", "yellow", "red", "green", "magenta", "blue",
+        "gray", "turbo", "viridis", "plasma", "inferno", "twilight",
     ]
-    for ch in range(n_channels):
-        channel_data = stacked[ch, ...] # (T, Z, Y, X)
-        nonzero = channel_data[channel_data > 0]
-        if nonzero.size > 0:
-            clim = (0, float(np.percentile(nonzero, 99.8)))
-        else:
-            clim = (0, 1e-3)
 
+    for ch in range(n_channels):
+        channel_data = stacked[ch, ...]  # (T, Z, Y, X)
+        nonzero = channel_data[channel_data > 0]
+        clim = (0, float(np.percentile(nonzero, 99.8))) if nonzero.size > 0 else (0, 1e-3)
         viewer.add_image(
             channel_data,
             name=f"Channel {ch}",
             contrast_limits=clim,
             colormap=channel_colors[ch % len(channel_colors)],
-            blending='additive',
+            blending="additive",
             opacity=0.8,
         )
 
-    # Add annotation labels layers per cell type
-    spatial_shape = stacked.shape[2:]  # (Z, Y, X)
-    time_shape = stacked.shape[1]      # T
-    full_shape = (time_shape,) + spatial_shape # (T, Z, Y, X)
-    
+    # --- Annotation label layers per cell type ---
+    time_shape    = stacked.shape[1]
+    spatial_shape = stacked.shape[2:]
+    full_shape    = (time_shape,) + spatial_shape  # (T, Z, Y, X)
+
+    ip = initial_params or {}
+
+    # 1. User Provided Labels (all cell types)
     for cell_type in all_cell_types:
-        labels_outpath = Path(pixel_class_outdir, f'PixelClassifier_User{cell_type.capitalize()}Labels.zarr')
-        if labels_outpath.exists():
-            print(f"Loading existing labels for {cell_type}")
-            existing = np.asarray(load_zarr(labels_outpath))
-            
-            # If stored as mosaiced, we can't easily map it perfectly if we don't know N_samples
-            # So let's just initialize an empty array of the correct shape if it mismatches
-            if existing.shape != full_shape:
-                print(f"⚠️ Existing labels shape {existing.shape} doesn't match {full_shape}. Initializing empty.")
-                user_labels = np.zeros(full_shape, dtype=np.int16)
-            else:
-                user_labels = existing
+        saved_path = Path(pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
+        if saved_path.exists():
+            existing = np.asarray(load_zarr(saved_path))
+            user_labels = existing if existing.shape == full_shape else np.zeros(full_shape, dtype=np.int16)
         else:
             user_labels = np.zeros(full_shape, dtype=np.int16)
 
@@ -507,25 +778,44 @@ def train_pixel_classifier_apoc(
             opacity=0.5,
         )
 
-        # Create segment layers to mimic original widget
-        seg_layer_name = f"{cell_type.capitalize()} Segments"
-        seg_labels = np.zeros(full_shape, dtype=np.int16)
-        viewer.add_labels(
-            seg_labels,
-            name=seg_layer_name,
-            opacity=0.8,
-            visible=False
-        )
-
     if has_death:
-        dead_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserDeadLabels.zarr')
-        if dead_outpath.exists():
-            dead_labels = np.asarray(load_zarr(dead_outpath))
+        dead_path = Path(pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
+        if dead_path.exists():
+            dead_labels = np.asarray(load_zarr(dead_path))
             if dead_labels.shape != full_shape:
                 dead_labels = np.zeros(full_shape, dtype=np.int16)
         else:
             dead_labels = np.zeros(full_shape, dtype=np.int16)
         viewer.add_labels(dead_labels, name="User Provided Labels (Dead)", opacity=0.5)
+
+    # 2. Results (Pixel Classification / Segments) on top
+    # Dead result
+    if has_death:
+        pred_death_path = Path(pixel_class_outdir, "PixelClassifier_Death_PredictedLabels.zarr")
+        if pred_death_path.exists():
+            pred_death = np.asarray(load_zarr(pred_death_path))
+            if pred_death.shape != full_shape:
+                pred_death = np.zeros(full_shape, dtype=np.int16)
+        else:
+            pred_death = np.zeros(full_shape, dtype=np.int16)
+        viewer.add_labels(pred_death, name="Pixel Classification (Dead)", opacity=0.8, visible=False)
+
+    # Cell type segments
+    for cell_type in all_cell_types:
+        pred_path = Path(pixel_class_outdir, f"PixelClassifier_{cell_type.capitalize()}_PredictedLabels.zarr")
+        if pred_path.exists():
+            pred_data = np.asarray(load_zarr(pred_path))
+            if pred_data.shape != full_shape:
+                pred_data = np.zeros(full_shape, dtype=np.int16)
+        else:
+            pred_data = np.zeros(full_shape, dtype=np.int16)
+
+        viewer.add_labels(
+            pred_data,
+            name=f"{cell_type.capitalize()} Segments",
+            opacity=0.8,
+            visible=False,
+        )
 
     # --- Dock the APOC widget ---
     apoc_widget = APOCTrainingWidget(
@@ -533,43 +823,23 @@ def train_pixel_classifier_apoc(
         pixel_class_outdir=pixel_class_outdir,
         all_cell_types=all_cell_types,
         has_death=has_death,
+        initial_params=ip,
+        on_params_changed=on_params_changed,
     )
     viewer.window.add_dock_widget(apoc_widget, area="right", name="APOC Pixel Classification")
 
-    # --- Save labels button ---
-    def save_labels(log=print):
-        """Save user labels to Zarr."""
-        if has_death:
-            dead_layer = viewer.layers['User Provided Labels (Dead)']
-            dead_outpath = Path(pixel_class_outdir, 'PixelClassifier_UserDeadLabels.zarr')
-            if dead_outpath.exists():
-                shutil.rmtree(dead_outpath)
-            save_as_zarr(dead_layer.data, dead_outpath)
-            log(f"Saved death labels to: {dead_outpath}")
-
-        for cell_type in all_cell_types:
-            layer_name = f'User Provided Labels ({cell_type.capitalize()})'
-            label_layer = viewer.layers[layer_name]
-            labels_outpath = Path(pixel_class_outdir, f'PixelClassifier_User{cell_type.capitalize()}Labels.zarr')
-            if labels_outpath.exists():
-                shutil.rmtree(labels_outpath)
-            save_as_zarr(label_layer.data, labels_outpath)
-            log(f"Saved {cell_type} labels to: {labels_outpath}")
-
-        log("All user labels saved!")
-
-    # Add log widget + save button
     log_output = QPlainTextEdit()
     log_output.setReadOnly(True)
+    log_output.setMaximumHeight(120)
     log_widget = QWidget()
     log_layout = QVBoxLayout()
     log_layout.addWidget(log_output)
     log_widget.setLayout(log_layout)
     viewer.window.add_dock_widget(log_widget, area="right", name="Log Output")
 
-    save_button = QtPushButton("Save User Labels")
+    save_button = QtPushButton("💾 Save User Labels")
     save_button.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 6px;")
-    save_button.clicked.connect(lambda: save_labels(log=log_output.appendPlainText))
+    save_button.clicked.connect(lambda: apoc_widget.save_user_labels(log=log_output.appendPlainText))
     apoc_widget.layout().addWidget(save_button)
 
     return viewer

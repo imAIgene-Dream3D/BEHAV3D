@@ -68,7 +68,8 @@ hmmlearn>=0.3
 dtaidistance>=2.3
 apoc>=0.12        # GPU-accelerated pixel classifier (optional, requires OpenCL)
 pyopencl>=2026.1    # OpenCL backend for APOC
-pyclesperanto>=0.21
+pyclesperanto>=0.21,<0.22       # 0.21.x is compatible with pyclesperanto_prototype<0.24
+pyclesperanto_prototype>=0.20,<0.24  # 0.24+ incompatible with pyclesperanto 0.21.x
 
 # -----------------------------------------------------------------------------
 # Graph Analysis & Single-Cell

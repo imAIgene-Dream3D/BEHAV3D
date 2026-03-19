@@ -8,15 +8,29 @@ the same directory layout that the rest of the BEHAV3D pipeline (tracking etc.)
 expects.
 """
 
+import os
+import sys
 import time
 import shutil
 from pathlib import Path
+from tqdm import tqdm
+
+# Defeat buggy PyOpenCL compiler caching that causes TypeErrors on some systems
+os.environ['PYOPENCL_NO_CACHE'] = '1'
+# Suppress compiler output unless there is an actual error
+os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
 
 import numpy as np
 import zarr
 import apoc
 
 from behav3d.io.images import load_image, save_as_zarr
+from behav3d.core.metadata import (
+    detect_organoid_types_from_metadata,
+    detect_immune_cell_types_from_metadata,
+    detect_other_cell_types_from_metadata,
+    has_dead_channel,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -24,17 +38,46 @@ from behav3d.io.images import load_image, save_as_zarr
 # ---------------------------------------------------------------------------
 
 def _load_classifier(pixelclass_dir, cell_type, provided_path=None):
-    """Load an APOC ObjectSegmenter .cl file."""
-    default_path = pixelclass_dir / f'PixelClassifier_{cell_type.capitalize()}.cl'
+    """Load an APOC ObjectSegmenter .cl file. Case-insensitive lookup."""
+    pixelclass_dir = Path(pixelclass_dir)
+
+    # 1. Use manually-provided path if it exists
     if provided_path:
         provided_path = Path(provided_path)
-        if not provided_path.samefile(default_path):
-            shutil.copy(provided_path, default_path)
-    clf_path = default_path
-    if clf_path.exists():
-        return apoc.ObjectSegmenter(opencl_filename=str(clf_path))
-    else:
-        raise FileNotFoundError(f"APOC classifier not found for {cell_type}: {clf_path}")
+        if provided_path.exists() and provided_path.suffix.lower() == '.cl':
+            print(f"  ✅ {cell_type}: using provided classifier → {provided_path.name}")
+            return apoc.ObjectSegmenter(opencl_filename=str(provided_path))
+
+    # 2. Try well-known name patterns
+    filenames_to_try = [
+        f'PixelClassifier_{cell_type}.cl',
+        f'PixelClassifier_{cell_type.capitalize()}.cl',
+        f'PixelClassifier_{cell_type.lower()}.cl',
+        f'PixelClassifier_{cell_type.upper()}.cl',
+    ]
+    for fname in filenames_to_try:
+        p = pixelclass_dir / fname
+        if p.exists():
+            print(f"  ✅ {cell_type}: found classifier → {p.name}")
+            return apoc.ObjectSegmenter(opencl_filename=str(p))
+
+    # 3. Fallback: scan directory for ANY .cl file whose name contains the cell type
+    if pixelclass_dir.is_dir():
+        ct_lower = cell_type.lower()
+        for cl_file in pixelclass_dir.glob('*.cl'):
+            if ct_lower in cl_file.stem.lower():
+                print(f"  ✅ {cell_type}: found classifier (scan) → {cl_file.name}")
+                return apoc.ObjectSegmenter(opencl_filename=str(cl_file))
+
+    # 4. Not found – emit diagnostic warnings
+    if pixelclass_dir.is_dir():
+        for jf in pixelclass_dir.glob('*.joblib'):
+            if cell_type.lower() in jf.stem.lower():
+                print(f"  ⚠️ Found {jf.name} but APOC engine needs .cl files. "
+                      f"Please (re-)train with APOC.")
+                break
+    print(f"  ❌ {cell_type}: no .cl classifier found in {pixelclass_dir}")
+    return None
 
 
 def _open_zarr_output(path, dtype, shape, overwrite):
@@ -64,6 +107,10 @@ def run_apoc_segmentation(
     clf_immune_paths=None,
     clf_other_paths=None,
     clf_death_path=None,
+    apoc_config=None,
+    organoid_types=None,
+    immune_types=None,
+    other_types=None,
     only_segment=False,
     overwrite_existing=False,
     n_workers=1,
@@ -83,70 +130,104 @@ def run_apoc_segmentation(
     output_dir = Path(output_dir)
     pixelclass_dir = output_dir / "images" / "PixelClassification"
 
-    # --- Discover cell types from metadata ---
-    organoid_types = (
-        metadata['organoid_type'].dropna().unique().tolist()
-        if 'organoid_type' in metadata.columns else []
-    )
-    immune_types = (
-        metadata['immune_type'].dropna().unique().tolist()
-        if 'immune_type' in metadata.columns else []
-    )
-    other_types = (
-        metadata['other_channel_type'].dropna().unique().tolist()
-        if 'other_channel_type' in metadata.columns else []
-    )
+    # --- Discover cell types from metadata (same logic as the rest of BEHAV3D) ---
+    organoid_types = detect_organoid_types_from_metadata(metadata)
+    immune_types = detect_immune_cell_types_from_metadata(metadata)
+    other_types = detect_other_cell_types_from_metadata(metadata)
     all_cell_types = organoid_types + immune_types + other_types
 
-    has_death = (
-        'dead_channel' in metadata.columns
-        and not metadata['dead_channel'].isnull().all()
-    )
+    has_death = has_dead_channel(metadata)
 
     # --- Load classifiers ---
     classifiers = {}
     clf_organoid_paths = clf_organoid_paths or {}
     for ct in organoid_types:
-        classifiers[ct] = _load_classifier(pixelclass_dir, ct, clf_organoid_paths.get(ct))
+        clf = _load_classifier(pixelclass_dir, ct, clf_organoid_paths.get(ct))
+        if clf: classifiers[ct] = clf
 
     clf_immune_paths = clf_immune_paths or {}
     for ct in immune_types:
-        classifiers[ct] = _load_classifier(pixelclass_dir, ct, clf_immune_paths.get(ct))
+        clf = _load_classifier(pixelclass_dir, ct, clf_immune_paths.get(ct))
+        if clf: classifiers[ct] = clf
 
     clf_other_paths = clf_other_paths or {}
     for ct in other_types:
-        classifiers[ct] = _load_classifier(pixelclass_dir, ct, clf_other_paths.get(ct))
+        clf = _load_classifier(pixelclass_dir, ct, clf_other_paths.get(ct))
+        if clf: classifiers[ct] = clf
+
+    active_cell_types = [ct for ct in all_cell_types if ct in classifiers]
 
     clf_death = None
     if has_death:
         death_default = pixelclass_dir / 'PixelClassifier_Death.cl'
         if clf_death_path:
             p = Path(clf_death_path)
-            if not p.samefile(death_default):
-                shutil.copy(p, death_default)
+            if p.exists() and p.suffix.lower() == '.cl':
+                # Copy to canonical location only if it's a different file
+                if not death_default.exists() or not p.samefile(death_default):
+                    pixelclass_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(p, death_default)
+        # Also try the directory-scan fallback for Death
+        if not death_default.exists() and pixelclass_dir.is_dir():
+            for cl_file in pixelclass_dir.glob('*.cl'):
+                if 'death' in cl_file.stem.lower() or 'dead' in cl_file.stem.lower():
+                    death_default = cl_file
+                    break
         if death_default.exists():
             clf_death = apoc.ObjectSegmenter(opencl_filename=str(death_default))
 
     print(f"  Loaded classifiers for: {list(classifiers.keys())}"
           + (f" + Death" if clf_death else ""))
 
+    # --- Prepare channel indices and post-processing params ---
+    def get_indices(ct):
+        if not apoc_config: return [0]
+        chan_names = apoc_config.get(f"apoc_{ct}_channels", [])
+        if not chan_names: return [0]
+        indices = []
+        for name in chan_names:
+            try: indices.append(int(name.split(" ")[-1]))
+            except: pass
+        return indices if indices else [0]
+
+    clf_channels = {ct: get_indices(ct) for ct in all_cell_types}
+    death_channels = get_indices("dead") if clf_death else []
+
     # --- Process each sample ---
-    for sample_name in metadata['sample_name'].unique():
+    sample_names = metadata['sample_name'].unique()
+    
+    for sample_name in sample_names:
         t0 = time.time()
-        print(f"\n▶ Processing sample: {sample_name}")
+ 
+        # Output directory
+        img_outdir = output_dir / "images" / sample_name
+ 
+        # SKIP LOGIC: If all active outputs already exist and overwrite=False, skip
+        if not overwrite_existing:
+            all_done = True
+            for ct in active_cell_types:
+                if not (img_outdir / f"{sample_name}_{ct}_segments.zarr").exists():
+                    all_done = False
+                    break
+            if all_done and has_death and clf_death:
+                if not (img_outdir / f"{sample_name}_mask_dead.zarr").exists():
+                    all_done = False
+
+            if all_done and active_cell_types:  # guard: don't skip if nothing was checked
+                print(f"  ⏭️ Skipping {sample_name} (all outputs already exist)")
+                continue
 
         # Find raw zarr
         raw_zarr = output_dir / "images" / sample_name / f"{sample_name}.zarr"
         if not raw_zarr.exists():
-            print(f"  ⚠️ Raw zarr not found at {raw_zarr}, skipping.")
+            print(f"  ⚠️ Raw zarr not found for {sample_name}")
             continue
 
         img = load_image(raw_zarr)             # lazy zarr / dask array
         img = np.asarray(img)                   # materialise
         n_timepoints = img.shape[0]
 
-        # Output directory (same as CPU pipeline)
-        img_outdir = output_dir / "images" / sample_name
+        # Ensure output directory exists
         img_outdir.mkdir(parents=True, exist_ok=True)
 
         # Spatial shape for output arrays
@@ -156,7 +237,7 @@ def run_apoc_segmentation(
         # Create output zarr arrays
         zarr_segs = {}
         zarr_masks = {}
-        for ct in all_cell_types:
+        for ct in active_cell_types:
             zarr_segs[ct] = _open_zarr_output(
                 img_outdir / f"{sample_name}_{ct}_segments.zarr",
                 "uint16", out_shape, overwrite_existing,
@@ -173,29 +254,35 @@ def run_apoc_segmentation(
                 "uint16", out_shape, overwrite_existing,
             )
 
-        # Timepoint range
+        # Timepoint progress via tqdm (per-sample)
         if timepoint_range is not None:
             t_range = list(timepoint_range)
         else:
             t_range = list(range(n_timepoints))
 
-        for t_i, t in enumerate(t_range):
+        pbar = tqdm(t_range, desc=f"  ⏱️ {sample_name}", leave=True, unit="tp", file=sys.stdout, dynamic_ncols=True)
+        for t in pbar:
             t_img = img[t]                      # (C, Z, Y, X)
 
-            for ct in all_cell_types:
-                seg = np.asarray(classifiers[ct].predict(image=t_img)).astype(np.uint16)
+            for ct in active_cell_types:
+                
+                indices = clf_channels[ct]
+                imgs = [t_img[i] for i in indices]
+                imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
+                
+                # Predict gives labels (segments) directly
+                seg = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
                 mask = (seg > 0).astype(np.uint16)
+                
                 zarr_segs[ct][t] = seg
                 zarr_masks[ct][t] = mask
 
             if zarr_death is not None:
-                death_mask = (
-                    np.asarray(clf_death.predict(image=t_img)) > 0
-                ).astype(np.uint16)
+                indices = death_channels
+                imgs = [t_img[i] for i in indices]
+                imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
+                death_mask = (np.asarray(clf_death.predict(image=imgs_to_pass)) > 0).astype(np.uint16)
                 zarr_death[t] = death_mask
-
-            if (t_i + 1) % 5 == 0 or t_i == len(t_range) - 1:
-                print(f"    Timepoint {t_i + 1}/{len(t_range)}")
 
         elapsed = time.time() - t0
         print(f"  ✅ {sample_name} done in {elapsed:.1f}s")
