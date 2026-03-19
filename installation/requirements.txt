@@ -66,6 +66,9 @@ scikit-learn>=1.5
 umap-learn>=0.5
 hmmlearn>=0.3
 dtaidistance>=2.3
+apoc>=0.12        # GPU-accelerated pixel classifier (optional, requires OpenCL)
+pyopencl>=2026.1    # OpenCL backend for APOC
+pyclesperanto>=0.21
 
 # -----------------------------------------------------------------------------
 # Graph Analysis & Single-Cell

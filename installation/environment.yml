@@ -64,6 +64,7 @@ dependencies:
   - umap-learn>=0.5
   - hmmlearn>=0.3
   - dtaidistance>=2.3
+  - pyopencl>=2026.1    # OpenCL backend for APOC GPU classifier
 
   # -------------------------------------------------------------------------
   # Graph Analysis & Single-Cell
@@ -124,6 +125,8 @@ dependencies:
     - pypdf>=6.7
     - imageio-ffmpeg>=0.5.1
     - torchsummary>=1.5.1
+    - apoc>=0.12  # GPU-accelerated pixel classifier (optional, requires OpenCL)
+    - pyclesperanto>=0.21
     # PyTorch and Cellpose installed separately via install script
     # to handle CUDA detection properly
     # cellpose==3.1.1.2  # Installed by install_behav3d.py with proper GPU support
