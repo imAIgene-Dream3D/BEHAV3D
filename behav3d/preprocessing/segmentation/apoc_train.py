@@ -124,7 +124,8 @@ def _load_training_images(
             remaining_axes = axis_order.replace('T', '')
             c_axis_in_stacked = 1 + remaining_axes.find('C')
             
-            cached = load_image(image_outpath) 
+            from behav3d.io.images import load_zarr
+            cached = load_zarr(image_outpath)
             n_channels = cached.shape[c_axis_in_stacked]
             all_images = [np.take(cached, ch, axis=c_axis_in_stacked) for ch in range(n_channels)]
             all_images = [np.asarray(img) for img in all_images] # Load into mem for viewer
@@ -171,7 +172,8 @@ def _load_training_images(
             t_indices = np.round(np.linspace(0, n_timepoints - 1, n_to_select)).astype(int)
             t_indices = sorted(list(set(t_indices)))
             
-        print(f"  {sample_name}: selected {len(t_indices)} equidistant timepoints {t_indices}")
+        t_indices_list = [int(t) for t in t_indices]
+        print(f"  {sample_name}: selected {len(t_indices)} equidistant timepoints {t_indices_list}")
 
         for t_idx in t_indices:
             # Fetch only the specific timepoint slice into memory
@@ -204,7 +206,8 @@ def _load_training_images(
     remaining_axes = axis_order.replace('T', '')
     c_axis_in_stacked = 1 + remaining_axes.find('C')
 
-    all_images_cached = load_image(image_outpath)
+    from behav3d.io.images import load_zarr
+    all_images_cached = load_zarr(image_outpath)
     n_channels = all_images_cached.shape[c_axis_in_stacked]
     all_images = [np.take(all_images_cached, ch, axis=c_axis_in_stacked) for ch in range(n_channels)]
     all_images = [np.asarray(img) for img in all_images]
@@ -772,7 +775,9 @@ def train_pixel_classifier_apoc(
             max_shape[i] = max(max_shape[i], img.shape[i])
     image_list = [zeropad_image_to_match_shape(img, max_shape) for img in image_list]
 
-    stacked = np.stack(image_list, axis=0)  # (T_selected, C, Z, Y, X)
+    # image_list is a list of channels [ch1(T,Z,Y,X), ch2(T,Z,Y,X), ...]
+    # Stacking along axis 1 gives (T, C, Z, Y, X)
+    stacked = np.stack(image_list, axis=1)
 
     print(f"Training data shape (TCZYX): {stacked.shape}")
 
