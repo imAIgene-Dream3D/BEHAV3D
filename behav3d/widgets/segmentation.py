@@ -214,6 +214,30 @@ class PixelClassifierPanel:
         self.btn_run.on_click(partial(self._on_apply_clicked, only_segment=False))
         self.btn_resegment.on_click(partial(self._on_apply_clicked, only_segment=True))
 
+        # --- Post-processing: size filtering ---
+        saved_min_size = int(pc.get("min_segment_size_voxels", 100))
+        self.min_segment_size = widgets.BoundedIntText(
+            description="Min size (voxels):",
+            value=saved_min_size,
+            min=0,
+            max=100000,
+            step=10,
+            style={'description_width': '130px'},
+            layout=widgets.Layout(width='280px'),
+        )
+        self.btn_size_filter = widgets.Button(
+            description="Run size filtering",
+            button_style="warning",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto"),
+        )
+        self.spinner_filter = widgets.HTML(value=spinning_loader)
+        self.spinner_filter.layout.display = "none"
+        self.filter_row = widgets.HBox(
+            [self.min_segment_size, self.btn_size_filter, self.spinner_filter],
+            layout=widgets.Layout(align_items="center", gap="8px"),
+        )
+        self.btn_size_filter.on_click(self._on_size_filter_clicked)
+
         self.out = widgets.Output()
 
         self.clf_paths_box = widgets.VBox()
@@ -291,6 +315,16 @@ class PixelClassifierPanel:
                 widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end]),
                 self.only_resegment_warning,
                 self.apply_row,
+            ]),
+            widgets.HTML("<hr>"),
+            widgets.VBox([
+                widgets.HTML("<b>Post-processing</b>"),
+                widgets.HTML(
+                    "<span style='color:#666;font-size:0.9em;'>"
+                    "Remove segments smaller than a given 3D volume (in voxels) from existing segmentation results."
+                    "</span>"
+                ),
+                self.filter_row,
             ]),
             widgets.HTML("<hr>"),
             self.out
@@ -780,7 +814,71 @@ class PixelClassifierPanel:
             finally:
                 self.spinner_apply.layout.display = "none"
                 self._lock(False)
+
+    def _on_size_filter_clicked(self, _):
+        """Remove segments smaller than the user-specified voxel threshold."""
+        self._lock(True)
+        with self.out:
+            self.out.clear_output()
+            self.spinner_filter.layout.display = None
+            try:
+                from behav3d.preprocessing.segmentation.size_filter import filter_segments_by_size
+
+                min_size = int(self.min_segment_size.value)
+                odir = Path(self.metadata_loader.output_dir).expanduser()
+                metadata = self.metadata_loader.metadata
+
+                # Persist the setting
+                pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+                pc["min_segment_size_voxels"] = min_size
+                if hasattr(self.metadata_loader, "behav3d_parameters_path"):
+                    yaml.safe_dump(
+                        self.metadata_loader.behav3d_parameters,
+                        self.metadata_loader.behav3d_parameters_path.open("w"),
+                        sort_keys=False,
+                    )
+
+                all_cell_types = self.organoid_types + self.immune_types + self.other_types
+                sample_names = metadata['sample_name'].unique()
+
+                print(f"🔍 Size filtering: removing segments < {min_size} voxels")
+
+                for sample_name in sample_names:
+                    img_dir = odir / "images" / sample_name
+                    found_any = False
+
+                    for ct in all_cell_types:
+                        seg_path = img_dir / f"{sample_name}_{ct}_segments.zarr"
+                        mask_path = img_dir / f"{sample_name}_{ct}_mask.zarr"
+
+                        if seg_path.exists():
+                            found_any = True
+                            print(f"  {sample_name} / {ct}:")
+                            removed = filter_segments_by_size(seg_path, mask_path, min_size)
+                            print(f"    → removed {removed} small segments")
+
+                    # Also filter dead mask if present
+                    if self.has_death:
+                        dead_seg = img_dir / f"{sample_name}_mask_dead.zarr"
+                        if dead_seg.exists():
+                            found_any = True
+                            print(f"  {sample_name} / dead:")
+                            removed = filter_segments_by_size(dead_seg, dead_seg, min_size)
+                            print(f"    → removed {removed} small segments")
+
+                    if not found_any:
+                        print(f"  ⚠️ No segmentation files found for {sample_name}")
+
+                print("\n✅ Size filtering complete!")
+
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_filter.layout.display = "none"
+                self._lock(False)
+
 class CellposeChannelConfigPanel:
+
     """Panel for configuring channel labels for Cellpose segmentation.
     
     This panel calculates the number of channels from metadata cell types
