@@ -14,6 +14,7 @@ import time
 import shutil
 from pathlib import Path
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
 # Defeat buggy PyOpenCL compiler caching that causes TypeErrors on some systems
 os.environ['PYOPENCL_NO_CACHE'] = '1'
@@ -23,6 +24,7 @@ os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
 import numpy as np
 import zarr
 import apoc
+import pyclesperanto_prototype as cle
 
 from behav3d.io.images import load_image, save_as_zarr
 from behav3d.core.metadata import (
@@ -114,6 +116,7 @@ def run_apoc_segmentation(
     only_segment=False,
     overwrite_existing=False,
     n_workers=1,
+    gpu_device=None,
     **_kwargs,  # absorb unused CPU-specific params (EDT, opening, fill_holes etc.)
 ):
     """
@@ -125,6 +128,10 @@ def run_apoc_segmentation(
         images/{sample_name}/{sample_name}_{cell_type}_mask.zarr
         images/{sample_name}/{sample_name}_mask_dead.zarr
     """
+    if gpu_device:
+        print(f"Selecting GPU device: {gpu_device}")
+        cle.select_device(gpu_device)
+        
     print("Running fully independent APOC ObjectSegmenter pipeline...")
 
     output_dir = Path(output_dir)
@@ -224,7 +231,6 @@ def run_apoc_segmentation(
             continue
 
         img = load_image(raw_zarr)             # lazy zarr / dask array
-        img = np.asarray(img)                   # materialise
         n_timepoints = img.shape[0]
 
         # Ensure output directory exists
@@ -260,29 +266,44 @@ def run_apoc_segmentation(
         else:
             t_range = list(range(n_timepoints))
 
+        def _load_tp(img_obj, t_idx):
+            return np.asarray(img_obj[t_idx])
+
         pbar = tqdm(t_range, desc=f"  ⏱️ {sample_name}", leave=True, unit="tp", file=sys.stdout, dynamic_ncols=True)
-        for t in pbar:
-            t_img = img[t]                      # (C, Z, Y, X)
+        
+        # Prefetch pipeline via ThreadPoolExecutor
+        # Overlaps disk I/O (loading next TP) with GPU work (predicting current TP)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            # Prefetch the first timepoint
+            future = executor.submit(_load_tp, img, t_range[0])
+            
+            for i, t in enumerate(pbar):
+                # 1. Get current timepoint (blocks if disk I/O not finished)
+                t_img = future.result() 
+                
+                # 2. Prefetch the NEXT timepoint immediately
+                if i + 1 < len(t_range):
+                    future = executor.submit(_load_tp, img, t_range[i + 1])
 
-            for ct in active_cell_types:
-                
-                indices = clf_channels[ct]
-                imgs = [t_img[i] for i in indices]
-                imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
-                
-                # Predict gives labels (segments) directly
-                seg = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
-                mask = (seg > 0).astype(np.uint16)
-                
-                zarr_segs[ct][t] = seg
-                zarr_masks[ct][t] = mask
+                # 3. Process current timepoint (GPU-bound)
+                for ct in active_cell_types:
+                    indices = clf_channels[ct]
+                    imgs = [t_img[i_ch] for i_ch in indices]
+                    imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
+                    
+                    # Predict gives labels (segments) directly
+                    seg = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
+                    mask = (seg > 0).astype(np.uint16)
+                    
+                    zarr_segs[ct][t] = seg
+                    zarr_masks[ct][t] = mask
 
-            if zarr_death is not None:
-                indices = death_channels
-                imgs = [t_img[i] for i in indices]
-                imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
-                death_mask = (np.asarray(clf_death.predict(image=imgs_to_pass)) > 0).astype(np.uint16)
-                zarr_death[t] = death_mask
+                if zarr_death is not None:
+                    indices = death_channels
+                    imgs = [t_img[i_ch] for i_ch in indices]
+                    imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
+                    death_mask = (np.asarray(clf_death.predict(image=imgs_to_pass)) > 0).astype(np.uint16)
+                    zarr_death[t] = death_mask
 
         elapsed = time.time() - t0
         print(f"  ✅ {sample_name} done in {elapsed:.1f}s")

@@ -25,6 +25,7 @@ from qtpy.QtCore import Qt
 
 import dask.array as da
 import zarr
+import pyclesperanto_prototype as cle
 
 from behav3d.io.images import load_image, load_zarr, save_as_zarr, append_to_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
@@ -698,6 +699,12 @@ def train_pixel_classifier_apoc(
     Open a Napari viewer with the tabbed APOC classification widget.
     The original napari_pixelclassifier.py is NOT called.
     """
+    ip = initial_params or {}
+    gpu_device = ip.get("gpu_device_name")
+    if gpu_device:
+        print(f"APOC Training: Selecting device {gpu_device}")
+        cle.select_device(gpu_device)
+
     organoid_types = organoid_types or []
     immune_types   = immune_types   or []
     other_types    = other_types    or []

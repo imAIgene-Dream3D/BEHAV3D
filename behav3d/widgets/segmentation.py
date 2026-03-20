@@ -56,9 +56,12 @@ class PixelClassifierPanel:
         try:
             import apoc
             import pyopencl as cl
+            import pyclesperanto_prototype as cle
             APOC_AVAILABLE = len(cl.get_platforms()) > 0
+            _gpu_devices = cle.available_device_names()
         except Exception:
             APOC_AVAILABLE = False
+            _gpu_devices = []
 
         _engine_options = (
             ["Scikit-Learn (CPU)", "APOC (GPU-Accelerated)"] if APOC_AVAILABLE
@@ -77,6 +80,14 @@ class PixelClassifierPanel:
         )
         if not APOC_AVAILABLE:
             self.classifier_engine.tooltip = "APOC (GPU) disabled: 'apoc' and 'pyopencl' required."
+
+        self.gpu_device = widgets.Dropdown(
+            options=_gpu_devices,
+            value=pc.get("gpu_device_name", _gpu_devices[0]) if _gpu_devices else "",
+            description="GPU Device:",
+            layout=widgets.Layout(width="auto", display="none")  # Hidden by default
+        )
+        self.gpu_device.observe(self._on_gpu_changed, names="value")
 
 
         self.examples_per_sample = widgets.IntText(
@@ -265,7 +276,7 @@ class PixelClassifierPanel:
         self.ui = widgets.VBox([
             widgets.VBox([
                 widgets.HTML("<b>Train pixel classifier</b>"),
-                widgets.HBox([self.classifier_engine]),
+                widgets.HBox([self.classifier_engine, self.gpu_device]),
                 widgets.HBox([self.examples_per_sample, self.overwrite_sample_images, self.n_workers]),
                 #self.sample_specific_classifier,
                 self.train_row,
@@ -397,6 +408,7 @@ class PixelClassifierPanel:
         pc["tp_end"]   = int(self.tp_end.value)
         pc["manual_clf_paths"] = bool(self.manual_clf_paths.value)
         pc["overwrite_existing"] = bool(self.overwrite_existing.value)
+        pc["gpu_device_name"] = str(self.gpu_device.value)
         
         for cell_type, threshold_widget in self.edt_thresholds.items():
             pc[f"{cell_type}_edt_threshold"] = float(threshold_widget.value)
@@ -435,6 +447,12 @@ class PixelClassifierPanel:
         # CPU segmentation parameters (EDT, min size, opening, fill holes)
         self._cpu_seg_params_box.layout.display = hide
         self.n_workers.layout.display = hide
+        
+        # GPU Device selection (APOC only)
+        self.gpu_device.layout.display = (None if is_apoc else 'none')
+        
+        if is_apoc:
+            self._apply_gpu_selection()
 
         # 'Only resegment' button (CPU-only concept)
         self.btn_resegment.layout.display = hide
@@ -444,6 +462,20 @@ class PixelClassifierPanel:
         self.manual_clf_paths.layout.display = hide
         if is_apoc:
             self.clf_paths_box.layout.display = 'none'
+
+    def _on_gpu_changed(self, change):
+        if change['new']:
+            self._apply_gpu_selection()
+
+    def _apply_gpu_selection(self):
+        device = str(self.gpu_device.value)
+        if device:
+            try:
+                import pyclesperanto_prototype as cle
+                print(f"APOC: Explicitly selecting GPU device: {device}")
+                cle.select_device(device)
+            except Exception as e:
+                print(f"⚠️ Error selecting GPU device: {e}")
 
     def _toggle_timepoint_inputs(self, change=None):
         show = not self.use_all_timepoints.value
@@ -551,6 +583,9 @@ class PixelClassifierPanel:
             if cell_type in self.fill_holes:
                 params[f"{cell_type}_fill_holes"] = bool(self.fill_holes[cell_type].value)
 
+        # Include global GPU selection
+        params["gpu_device_name"] = str(self.gpu_device.value)
+
         # Include saved APOC per-cell-type params from config YAML
         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
         all_apoc_types = list(self.all_cell_types)
@@ -605,7 +640,7 @@ class PixelClassifierPanel:
                 
                 if engine == "APOC (GPU-Accelerated)":
                     # Use the custom APOC widget
-                    from behav3d.preprocessing.segmentation.apoc_widget import train_pixel_classifier_apoc
+                    from behav3d.preprocessing.segmentation.apoc_train import train_pixel_classifier_apoc
                     print("Starting APOC pixel classifier training...")
                     print("Napari viewer will open with the APOC widget.")
                     ret = train_pixel_classifier_apoc(
@@ -683,7 +718,7 @@ class PixelClassifierPanel:
                 self.spinner_apply.layout.display = None
                 
                 if str(self.classifier_engine.value) == "APOC (GPU-Accelerated)":
-                    from behav3d.preprocessing.segmentation.apoc_queue import run_apoc_segmentation
+                    from behav3d.preprocessing.segmentation.apoc_segment import run_apoc_segmentation
                     pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
                     new_md = run_apoc_segmentation(
                         output_dir=str(odir),
