@@ -224,19 +224,23 @@ def run_apoc_segmentation(
                 print(f"  ⏭️ Skipping {sample_name} (all outputs already exist)")
                 continue
 
-        # Find raw zarr
-        raw_zarr = output_dir / "images" / sample_name / f"{sample_name}.zarr"
-        if not raw_zarr.exists():
-            print(f"  ⚠️ Raw zarr not found for {sample_name}")
+        # Use raw_image_path from metadata (source of truth)
+        sample_row = metadata[metadata['sample_name'] == sample_name].iloc[0]
+        raw_image_path = sample_row.get('raw_image_path')
+        if not raw_image_path:
+            print(f"  ⚠️ No raw_image_path found in metadata for {sample_name}")
+            continue
+        raw_image_path = Path(raw_image_path)
+        if not raw_image_path.exists():
+            print(f"  ⚠️ Raw image not found for {sample_name}: {raw_image_path}")
             continue
 
         # Get dimension order from metadata for this sample
-        sample_row = metadata[metadata['sample_name'] == sample_name].iloc[0]
         axis_order = sample_row.get('dimension_order', "TCZYX")
         if not isinstance(axis_order, str) or not axis_order:
             axis_order = "TCZYX"
 
-        img = load_image(raw_zarr, axis_order=axis_order)             # lazy zarr / dask array
+        img = load_image(raw_image_path, axis_order=axis_order)             # lazy load via metadata path
         n_timepoints = img.shape[0]
 
         # Ensure output directory exists

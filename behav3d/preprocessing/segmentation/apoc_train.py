@@ -114,8 +114,20 @@ def _load_training_images(
             shutil.rmtree(image_outpath)
         else:
             print("Loading cached training images from previous session...")
-            cached = np.asarray(load_image(image_outpath))  # (C, T, Z, Y, X)
-            all_images = [cached[:, t, ...] for t in range(cached.shape[1])]
+            # We assume the cache matches the metadata order of the experimental setup
+            # Find the channel axis based on metadata of the first sample
+            first_sample = metadata.iloc[0]
+            axis_order = first_sample.get("dimension_order", "TCZYX")
+            if not isinstance(axis_order, str) or not axis_order:
+                axis_order = "TCZYX"
+            
+            remaining_axes = axis_order.replace('T', '')
+            c_axis_in_stacked = 1 + remaining_axes.find('C')
+            
+            cached = load_image(image_outpath) 
+            n_channels = cached.shape[c_axis_in_stacked]
+            all_images = [np.take(cached, ch, axis=c_axis_in_stacked) for ch in range(n_channels)]
+            all_images = [np.asarray(img) for img in all_images] # Load into mem for viewer
             return all_images, pixel_class_outdir, has_death, all_cell_types
 
     # --- Load fresh from raw files ---
@@ -140,23 +152,30 @@ def _load_training_images(
         if not isinstance(axis_order, str) or not axis_order:
             axis_order = "TCZYX"
 
-        if raw_zarr.exists():
-            img = load_image(raw_zarr, axis_order=axis_order)
+        # Use raw_image_path directly as it is the source of truth in metadata
+        # (and is updated to the .zarr path if conversion was run)
+        img = load_image(raw_image_path, axis_order=axis_order)
+
+        # Find which axis is Time in this specific image
+        t_axis = axis_order.find('T')
+        if t_axis == -1:
+            t_axis = 0 # Fallback
+            
+        n_timepoints = img.shape[t_axis]
+        n_to_select = min(examples_per_sample, n_timepoints)
+
+        # Select equally spaced timepoints (first, last, and middle)
+        if n_to_select <= 1:
+            t_indices = [0]
         else:
-            img = load_image(raw_image_path, axis_order=axis_order)
-
-        img = np.asarray(img)
-        n_timepoints = img.shape[0]
-
-        # Select random timepoints
-        np.random.seed(42)
-        t_indices = sorted(
-            np.random.choice(n_timepoints, min(examples_per_sample, n_timepoints), replace=False)
-        )
-        print(f"  {sample_name}: selected timepoints {t_indices}")
+            t_indices = np.round(np.linspace(0, n_timepoints - 1, n_to_select)).astype(int)
+            t_indices = sorted(list(set(t_indices)))
+            
+        print(f"  {sample_name}: selected {len(t_indices)} equidistant timepoints {t_indices}")
 
         for t_idx in t_indices:
-            frame = img[t_idx]  # (C, Z, Y, X)
+            # Fetch only the specific timepoint slice into memory
+            frame = np.asarray(np.take(img, t_idx, axis=t_axis)) 
             all_images.append(frame)
             frame_shape = frame.shape
             if max_shape is None:
@@ -172,14 +191,23 @@ def _load_training_images(
     import dask.array as da
     import gc
     all_images_stack = da.stack(all_images)
-    # BEHAV3D pipeline standard: (T, C, Z, Y, X)
-    # No transpose needed here if load_image returns TCZYX and we stacked along T
     save_as_zarr(all_images_stack, image_outpath)
     del all_images_stack
     gc.collect()
 
-    all_images_cached = np.asarray(load_image(image_outpath))
-    all_images = [all_images_cached[:, t, ...] for t in range(all_images_cached.shape[1])]
+    # Get dimension info from the last processed sample's metadata
+    # (assuming all samples in the same training set share the same dimension order)
+    if 'axis_order' not in locals():
+        # Fallback if the loop didn't run for some reason
+        axis_order = "TCZYX"
+        
+    remaining_axes = axis_order.replace('T', '')
+    c_axis_in_stacked = 1 + remaining_axes.find('C')
+
+    all_images_cached = load_image(image_outpath)
+    n_channels = all_images_cached.shape[c_axis_in_stacked]
+    all_images = [np.take(all_images_cached, ch, axis=c_axis_in_stacked) for ch in range(n_channels)]
+    all_images = [np.asarray(img) for img in all_images]
 
     return all_images, pixel_class_outdir, has_death, all_cell_types
 
@@ -504,7 +532,8 @@ class APOCTrainingWidget(QWidget):
             if cb.isChecked():
                 try:
                     layer = self.viewer.layers[cb.text()]
-                    images.append(np.asarray(layer.data))
+                    # Keep data lazy (dask/zarr) to save memory
+                    images.append(layer.data)
                 except KeyError:
                     pass
         return images
@@ -558,14 +587,14 @@ class APOCTrainingWidget(QWidget):
                     self.status_label.setText(f"⚠️ No image layers selected for '{ct}'!")
                     continue
 
-                # Get annotation layer
+                # Get annotation layer (keep lazy if possible)
                 if ct == "dead":
                     layer_name = "User Provided Labels (Dead)"
                 else:
                     layer_name = f"User Provided Labels ({ct.capitalize()})"
 
                 try:
-                    annotation = np.asarray(self.viewer.layers[layer_name].data)
+                    annotation = self.viewer.layers[layer_name].data
                 except KeyError:
                     print(f"Skipping '{ct}': annotation layer not found")
                     continue
@@ -598,28 +627,33 @@ class APOCTrainingWidget(QWidget):
 
                 if annotation.ndim == 4:
                     for t in range(n_timepoints):
-                        ann_t = annotation[t]
+                        # Load only the current timepoint slice into memory
+                        ann_t = np.asarray(annotation[t])
                         if not np.any(ann_t):
                             continue
-                        imgs_t = [img[t] for img in images]
-                        imgs_t = imgs_t[0] if len(imgs_t) == 1 else imgs_t
-                        clf.train(feature_string, ann_t, imgs_t, continue_training=has_trained)
+                        imgs_t = [np.asarray(img[t]) for img in images]
+                        imgs_to_pass = imgs_t[0] if len(imgs_t) == 1 else imgs_t
+                        clf.train(feature_string, ann_t, imgs_to_pass, continue_training=has_trained)
                         has_trained = True
                 else:
-                    imgs = images[0] if len(images) == 1 else images
-                    clf.train(feature_string, annotation, imgs)
+                    # Single timepoint
+                    ann_np = np.asarray(annotation)
+                    imgs_np = [np.asarray(img) for img in images]
+                    imgs_to_pass = imgs_np[0] if len(imgs_np) == 1 else imgs_np
+                    clf.train(feature_string, ann_np, imgs_to_pass)
                     has_trained = True
 
                 if not has_trained:
                     continue
 
-                # Predict
+                # Predict (visual confirmation)
                 if images[0].ndim == 4:
                     results = []
                     for t in range(n_timepoints):
-                        imgs_t = [img[t] for img in images]
-                        imgs_t = imgs_t[0] if len(imgs_t) == 1 else imgs_t
-                        res_t = clf.predict(image=imgs_t)
+                        # Load only current timepoint for prediction
+                        imgs_t = [np.asarray(img[t]) for img in images]
+                        imgs_to_pass = imgs_t[0] if len(imgs_t) == 1 else imgs_t
+                        res_t = clf.predict(image=imgs_to_pass)
                         results.append(np.asarray(res_t).astype(np.int16))
                     result = np.stack(results, axis=0)
                 else:
