@@ -230,7 +230,13 @@ def run_apoc_segmentation(
             print(f"  ⚠️ Raw zarr not found for {sample_name}")
             continue
 
-        img = load_image(raw_zarr)             # lazy zarr / dask array
+        # Get dimension order from metadata for this sample
+        sample_row = metadata[metadata['sample_name'] == sample_name].iloc[0]
+        axis_order = sample_row.get('dimension_order', "TCZYX")
+        if not isinstance(axis_order, str) or not axis_order:
+            axis_order = "TCZYX"
+
+        img = load_image(raw_zarr, axis_order=axis_order)             # lazy zarr / dask array
         n_timepoints = img.shape[0]
 
         # Ensure output directory exists

@@ -135,11 +135,15 @@ def _load_training_images(
         img_dir = Path(output_dir, "images", sample_name)
         img_dir.mkdir(parents=True, exist_ok=True)
 
-        raw_zarr = Path(img_dir, "RawImage.zarr")
+        # Get dimension order from metadata if available
+        axis_order = sample.get("dimension_order", "TCZYX")
+        if not isinstance(axis_order, str) or not axis_order:
+            axis_order = "TCZYX"
+
         if raw_zarr.exists():
-            img = load_image(raw_zarr)
+            img = load_image(raw_zarr, axis_order=axis_order)
         else:
-            img = load_image(raw_image_path)
+            img = load_image(raw_image_path, axis_order=axis_order)
 
         img = np.asarray(img)
         n_timepoints = img.shape[0]
@@ -168,7 +172,8 @@ def _load_training_images(
     import dask.array as da
     import gc
     all_images_stack = da.stack(all_images)
-    all_images_stack = all_images_stack.transpose(1, 0, 2, 3, 4)  # (C, T, Z, Y, X)
+    # BEHAV3D pipeline standard: (T, C, Z, Y, X)
+    # No transpose needed here if load_image returns TCZYX and we stacked along T
     save_as_zarr(all_images_stack, image_outpath)
     del all_images_stack
     gc.collect()
@@ -735,23 +740,19 @@ def train_pixel_classifier_apoc(
 
     stacked = np.stack(image_list, axis=0)  # (T_selected, C, Z, Y, X)
 
-    # Ensure (C, T, Z, Y, X) — flip dims if T looks bigger than C
-    if stacked.shape[0] > stacked.shape[1]:
-        stacked = stacked.transpose(1, 0, 2, 3, 4)
-
-    print(f"Training data shape: {stacked.shape}  (C, T, Z, Y, X)")
+    print(f"Training data shape (TCZYX): {stacked.shape}")
 
     # --- Create Napari viewer ---
     viewer = napari.Viewer()
 
-    n_channels = stacked.shape[0]
+    n_channels = stacked.shape[1]
     channel_colors = [
         "cyan", "yellow", "red", "green", "magenta", "blue",
         "gray", "turbo", "viridis", "plasma", "inferno", "twilight",
     ]
 
     for ch in range(n_channels):
-        channel_data = stacked[ch, ...]  # (T, Z, Y, X)
+        channel_data = stacked[:, ch, ...]  # (T, Z, Y, X)
         nonzero = channel_data[channel_data > 0]
         clim = (0, float(np.percentile(nonzero, 99.8))) if nonzero.size > 0 else (0, 1e-3)
         viewer.add_image(
@@ -764,7 +765,7 @@ def train_pixel_classifier_apoc(
         )
 
     # --- Annotation label layers per cell type ---
-    time_shape    = stacked.shape[1]
+    time_shape    = stacked.shape[0]
     spatial_shape = stacked.shape[2:]
     full_shape    = (time_shape,) + spatial_shape  # (T, Z, Y, X)
 
