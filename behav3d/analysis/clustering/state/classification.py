@@ -7,6 +7,7 @@ import copy
 import warnings
 import re
 import time
+import shutil
 from itertools import combinations
 from matplotlib.backends.backend_pdf import PdfPages
 from dataclasses import asdict, dataclass
@@ -1033,6 +1034,8 @@ def _render_state_cluster_exemplar_videos(
         / "example_windows"
         / _sanitize_filename_token(cluster_key, fallback="cluster")
     )
+    if exemplar_root.exists():
+        shutil.rmtree(exemplar_root)
     exemplar_root.mkdir(parents=True, exist_ok=True)
 
     try:
