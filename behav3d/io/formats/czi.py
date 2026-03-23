@@ -7,14 +7,23 @@ def load_czi(path, t=None, z=None, c=None):
     Loading .czi images
     """
     czifile=CziFile(path)
-    # Load specific timepoints, z-slice, etc.
-    img, _ = czifile.read_image()
-    # img, _ = czifile.read_image(T=t, Z=z, C=c)
+    read_kwargs = {}
+    if t is not None:
+        read_kwargs["T"] = t
+    if z is not None:
+        read_kwargs["Z"] = z
+    if c is not None:
+        read_kwargs["C"] = c
+
+    if read_kwargs:
+        img, _ = czifile.read_image(**read_kwargs)
+    else:
+        img, _ = czifile.read_image()
 
     # The shape of img contain a lot of singular dimensions
     # img.shape = (1, 1, 1, 1, 1, 1, 350, 3, 36, 200, 200)
     # np.squeeze removes preceding or trailing "empty" dimensions
-    img = np.squeeze(img) # img.shape = (350, 3, 36, 200, 200)
+    img = np.squeeze(img)
     return(img)
 
 def load_czi_metadata(path):

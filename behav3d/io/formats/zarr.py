@@ -52,18 +52,22 @@ def save_as_zarr(
         shutil.make_archive(path, "zip", path)
         shutil.rmtree(path)
 
-def append_to_zarr(img, outpath):
+def append_to_zarr(img, outpath, chunks=None):
     """
     Append a timepoint to an existing .zarr array
-    If non-existent, create the .zarr array
+    If non-existent, create the .zarr array.
+    chunks excludes the leading time axis.
     """
     outpath = Path(outpath)
+    if chunks is None:
+        chunks = img.shape[1:]
+
     if not outpath.exists():
         zarr_file = zarr.open(
             outpath, 
             mode='w', 
             shape=(0,) + img.shape[1:], 
-            chunks=(1,) + img.shape[1:], 
+            chunks=(1,) + tuple(chunks), 
             dtype=img.dtype
             )
     else:

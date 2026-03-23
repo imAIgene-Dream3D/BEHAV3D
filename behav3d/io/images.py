@@ -1,5 +1,6 @@
 import numpy as np
 from pathlib import Path
+from tqdm import tqdm
 from .formats.czi import load_czi, load_czi_metadata, load_elsizes_czi, get_czi_shape
 from .formats.h5 import load_h5
 from .formats.ims import load_ims, load_ims_metadata
@@ -77,6 +78,8 @@ def convert_file_to_zarr(
     t_start=None,
     t_end=None,
     ):
+    path = Path(path)
+    outpath = Path(outpath)
     if  (
         (path.suffix == ".zarr" and path.exists()) or 
         outpath.exists() and not overwrite
@@ -85,23 +88,45 @@ def convert_file_to_zarr(
     
     else:
         print(f"Converting {path} to {outpath}")
-        img = load_image(path)
-        # Clip along T axis if requested
-        if t_start is not None and t_end is not None:
-            t_start = max(0, t_start)
-            t_end = min(img.shape[0] - 1, t_end)
-            if t_start > t_end:
-                 print(f"Warning: Invalid range {t_start} to {t_end}. Defaulting to full image.")
-            else:
-                print(f"  Clipping timepoints: {t_start} to {t_end} (of {img.shape[0]} total)")
-                img = img[t_start:t_end + 1]
-        if chunks is None:
-            chunks = (1,) + img.shape[1:]
-        save_as_zarr(
-            img=img, 
-            path=outpath, 
-            chunks=chunks
-            )
+        if path.suffix == ".czi" and outpath.suffix == ".zarr":
+            img_shape = tuple(get_czi_shape(path))
+            n_timepoints = img_shape[0]
+            timepoints = range(n_timepoints)
+
+            if t_start is not None and t_end is not None:
+                t_start = max(0, t_start)
+                t_end = min(n_timepoints - 1, t_end)
+                if t_start > t_end:
+                    print(f"Warning: Invalid range {t_start} to {t_end}. Defaulting to full image.")
+                else:
+                    print(f"  Clipping timepoints: {t_start} to {t_end} (of {n_timepoints} total)")
+                    timepoints = range(t_start, t_end + 1)
+
+            for t in tqdm(timepoints, desc="Converting timepoints"):
+                img = np.expand_dims(load_czi(path, t=t), axis=0)
+                append_to_zarr(
+                    img=img,
+                    outpath=outpath,
+                    chunks=chunks,
+                )
+        else:
+            img = load_image(path)
+            # Clip along T axis if requested
+            if t_start is not None and t_end is not None:
+                t_start = max(0, t_start)
+                t_end = min(img.shape[0] - 1, t_end)
+                if t_start > t_end:
+                    print(f"Warning: Invalid range {t_start} to {t_end}. Defaulting to full image.")
+                else:
+                    print(f"  Clipping timepoints: {t_start} to {t_end} (of {img.shape[0]} total)")
+                    img = img[t_start:t_end + 1]
+            if chunks is None:
+                chunks = (1,) + img.shape[1:]
+            save_as_zarr(
+                img=img, 
+                path=outpath, 
+                chunks=chunks
+                )
 
 def convert_input_files_to_zarr(
     sample_name,
