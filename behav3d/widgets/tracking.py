@@ -115,17 +115,18 @@ class TrackingPanel:
 
         # btrack params
         bt = tcfg.get("btrack", {})
+        bt_preset_value, bt_config_path_value = self._normalize_btrack_config(bt)
         self.bt_config_preset = widgets.Dropdown(
             description="Config preset",
             options=[("Cell (bundled)", "cell"),
                      ("Particle (bundled)", "particle"),
                      ("Custom JSON", "custom")],
-            value=str(bt.get("config_preset", "cell")),
+            value=bt_preset_value,
             style={'description_width': '160px'}
         )
         self.bt_config_path = widgets.Text(
             description="JSON path",
-            value=str(bt.get("config_path", "")),
+            value=bt_config_path_value,
             placeholder="Path to custom btrack JSON…",
             style={'description_width': '160px'},
             layout=widgets.Layout(width='400px')
@@ -134,6 +135,15 @@ class TrackingPanel:
         def _bt_preset_changed(change):
             self.bt_config_path.disabled = (change['new'] != "custom")
         self.bt_config_preset.observe(_bt_preset_changed, names='value')
+        self.bt_use_visual_features = widgets.Checkbox(
+            description="Use visual features",
+            value=bool(bt.get("use_visual_features", False)),
+            indent=False
+        )
+        self.bt_visual_help = widgets.HTML(
+            "<span style='color:#666'>Requires <code>raw_image_path</code> and uses "
+            "raw-image-derived features during linking.</span>"
+        )
 
         self.bt_max_search_radius = widgets.IntText(
             description="Max search radius (px)",
@@ -150,6 +160,11 @@ class TrackingPanel:
         self.bt_step_size = widgets.IntText(
             description="Step size (frames)",
             value=int(bt.get("step_size", 100)),
+            style={'description_width': '160px'}
+        )
+        self.bt_n_workers = widgets.IntText(
+            description="Workers",
+            value=int(bt.get("n_workers", 8)),
             style={'description_width': '160px'}
         )
         self.bt_use_optimize = widgets.Checkbox(
@@ -214,9 +229,12 @@ class TrackingPanel:
             ),
             self.bt_config_preset,
             self.bt_config_path,
+            self.bt_use_visual_features,
+            self.bt_visual_help,
             self.bt_max_search_radius,
             self.bt_update_method,
             self.bt_step_size,
+            self.bt_n_workers,
             widgets.HTML("<hr>"),
             self.bt_use_optimize,
             self.bt_optimizer_box,
@@ -277,6 +295,23 @@ class TrackingPanel:
         if self.category == 'immune': return tracking_cfg.get('immune', {})
         return tracking_cfg.get('other', {})
 
+    def _normalize_btrack_config(self, bt):
+        valid_presets = {"cell", "particle", "custom"}
+
+        preset_raw = bt.get("config_preset", "")
+        path_raw = bt.get("config_path", "")
+
+        preset = str(preset_raw).strip() if preset_raw is not None else ""
+        config_path = str(path_raw).strip() if path_raw is not None else ""
+
+        if preset in valid_presets:
+            return preset, config_path
+        if preset:
+            return "custom", preset
+        if config_path:
+            return "custom", config_path
+        return "cell", ""
+
     def _toggle_param_groups(self, change=None):
         if self.method.value == "lap": self.param_container.children = (self.lap_params,)
         elif self.method.value == "trackpy": self.param_container.children = (self.tp_params,)
@@ -287,8 +322,9 @@ class TrackingPanel:
         for w in [self.method, self.overwrite, self.track_cost_dist, self.gap_cost_dist, self.gap_max_frames,
                   self.merging_cost_dist, self.splitting_cost_dist, self.tp_search_range, self.tp_memory,
                   self.tp_adaptive_stop, self.tp_adaptive_step,
-                  self.bt_config_preset, self.bt_config_path, self.bt_max_search_radius,
-                  self.bt_update_method, self.bt_step_size, self.bt_use_optimize,
+                  self.bt_config_preset, self.bt_config_path, self.bt_use_visual_features,
+                  self.bt_max_search_radius,
+                  self.bt_update_method, self.bt_step_size, self.bt_n_workers, self.bt_use_optimize,
                   self.bt_dist_thresh, self.bt_time_thresh,
                   self.btn_run]:
             if hasattr(w, "disabled"): w.disabled = state
@@ -306,9 +342,9 @@ class TrackingPanel:
     def _ensure_cfg_skeleton(self):
         p = dict(self.metadata_loader.behav3d_parameters or {})
         p.setdefault("tracking", {})
-        p["tracking"].setdefault("immune", {"method": "trackpy", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 45, "gap_close_max_frames": 5, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 31, "memory_frames": 5, "adaptive_stop": 5.0, "adaptive_step": 0.95}})
-        p["tracking"].setdefault("other", {"method": "trackpy", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 45, "gap_close_max_frames": 5, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 31, "memory_frames": 5, "adaptive_stop": 5.0, "adaptive_step": 0.95}})
-        p["tracking"].setdefault("organoid", {"method": "propagation", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 80, "gap_close_max_frames": 3, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 35, "memory_frames": 2, "adaptive_stop": 10.0, "adaptive_step": 0.95}})
+        p["tracking"].setdefault("immune", {"method": "trackpy", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 45, "gap_close_max_frames": 5, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 31, "memory_frames": 5, "adaptive_stop": 5.0, "adaptive_step": 0.95}, "btrack": {"config_preset": "cell", "config_path": "", "use_visual_features": False, "max_search_radius": 100, "update_method": "EXACT", "step_size": 100, "n_workers": 16, "use_optimize": False, "hypotheses": ["P_FP", "P_init", "P_term", "P_link"], "dist_thresh": 60, "time_thresh": 3}})
+        p["tracking"].setdefault("other", {"method": "trackpy", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 45, "gap_close_max_frames": 5, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 31, "memory_frames": 5, "adaptive_stop": 5.0, "adaptive_step": 0.95}, "btrack": {"config_preset": "cell", "config_path": "", "use_visual_features": False, "max_search_radius": 100, "update_method": "EXACT", "step_size": 100, "n_workers": 8, "use_optimize": False, "hypotheses": ["P_FP", "P_init", "P_term", "P_link"], "dist_thresh": 60, "time_thresh": 3}})
+        p["tracking"].setdefault("organoid", {"method": "propagation", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 80, "gap_close_max_frames": 3, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 35, "memory_frames": 2, "adaptive_stop": 10.0, "adaptive_step": 0.95}, "btrack": {"config_preset": "cell", "config_path": "", "use_visual_features": False, "max_search_radius": 100, "update_method": "EXACT", "step_size": 100, "n_workers": 8, "use_optimize": False, "hypotheses": ["P_FP", "P_init", "P_term", "P_link"], "dist_thresh": 60, "time_thresh": 3}})
         self.metadata_loader.behav3d_parameters = p
 
     def _persist_params(self):
@@ -321,11 +357,13 @@ class TrackingPanel:
         prof["trackpy"].update({"search_range_px": int(self.tp_search_range.value), "memory_frames": int(self.tp_memory.value), "adaptive_stop": float(self.tp_adaptive_stop.value), "adaptive_step": float(self.tp_adaptive_step.value)})
         bt = prof.setdefault("btrack", {})
         preset_val = str(self.bt_config_preset.value)
-        bt["config_preset"] = self.bt_config_path.value.strip() if preset_val == "custom" else preset_val
-        bt["config_path"] = self.bt_config_path.value.strip()
+        bt["config_preset"] = "custom" if preset_val == "custom" else preset_val
+        bt["config_path"] = self.bt_config_path.value.strip() if preset_val == "custom" else ""
+        bt["use_visual_features"] = bool(self.bt_use_visual_features.value)
         bt["max_search_radius"] = int(self.bt_max_search_radius.value)
         bt["update_method"] = str(self.bt_update_method.value)
         bt["step_size"] = int(self.bt_step_size.value)
+        bt["n_workers"] = max(1, int(self.bt_n_workers.value))
         bt["use_optimize"] = bool(self.bt_use_optimize.value)
         bt["hypotheses"] = [name for name, cb in self.bt_hyp_checks.items() if cb.value]
         bt["dist_thresh"] = int(self.bt_dist_thresh.value)
@@ -362,9 +400,11 @@ class TrackingPanel:
                         cell_type=self.cell_type,
                         overwrite=bool(self.overwrite.value),
                         config_preset=config_preset,
+                        use_visual_features=bool(self.bt_use_visual_features.value),
                         max_search_radius=int(self.bt_max_search_radius.value),
                         update_method=str(self.bt_update_method.value),
                         step_size=int(self.bt_step_size.value),
+                        n_workers=max(1, int(self.bt_n_workers.value)),
                         use_optimize=use_opt,
                         hypotheses=hyps,
                         dist_thresh=int(self.bt_dist_thresh.value) if use_opt else None,

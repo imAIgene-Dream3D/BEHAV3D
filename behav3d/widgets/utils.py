@@ -68,6 +68,18 @@ _DEFAULT_CONFIG = {
                 "memory_frames": 5,
                 "adaptive_stop": 5.0,
                 "adaptive_step": 0.95
+            },
+            "btrack": {
+                "config_preset": "cell",
+                "config_path": "",
+                "max_search_radius": 100,
+                "update_method": "EXACT",
+                "step_size": 100,
+                "n_workers": 16,
+                "use_optimize": False,
+                "hypotheses": ["P_FP", "P_init", "P_term", "P_link"],
+                "dist_thresh": 60,
+                "time_thresh": 3
             }
         },
         "other": {
@@ -85,6 +97,18 @@ _DEFAULT_CONFIG = {
                 "memory_frames": 5,
                 "adaptive_stop": 5.0,
                 "adaptive_step": 0.95
+            },
+            "btrack": {
+                "config_preset": "cell",
+                "config_path": "",
+                "max_search_radius": 100,
+                "update_method": "EXACT",
+                "step_size": 100,
+                "n_workers": 8,
+                "use_optimize": False,
+                "hypotheses": ["P_FP", "P_init", "P_term", "P_link"],
+                "dist_thresh": 60,
+                "time_thresh": 3
             }
         },
         "organoid": {
@@ -102,6 +126,18 @@ _DEFAULT_CONFIG = {
                 "memory_frames": 2,
                 "adaptive_stop": 10.0,
                 "adaptive_step": 0.95
+            },
+            "btrack": {
+                "config_preset": "cell",
+                "config_path": "",
+                "max_search_radius": 100,
+                "update_method": "EXACT",
+                "step_size": 100,
+                "n_workers": 8,
+                "use_optimize": False,
+                "hypotheses": ["P_FP", "P_init", "P_term", "P_link"],
+                "dist_thresh": 60,
+                "time_thresh": 3
             }
         }
     },
