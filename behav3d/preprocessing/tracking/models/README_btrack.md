@@ -12,7 +12,8 @@ Run **without the optimizer first** and validate the result before enabling Step
 
 | Parameter | What it controls | When to change |
 |---|---|---|
-| **Config preset** | Bundled motion + hypothesis model | *Cell* for T cells/organoids; *Particle* for small fast objects; *Custom* for your own JSON |
+| **Config preset** | Bundled tracking preset | *Cell* for motion-only cell tracking; *Particle* for small fast objects; *Custom* for your own JSON |
+| **Use visual features** | Whether to use raw-image-derived appearance features during linking | Enable this when you want btrack to use `area`, `major_axis_length`, `minor_axis_length`, and per-channel mean intensities from `raw_image_path` |
 | **Max search radius (px)** | Maximum per-frame displacement allowed | Increase if cells move fast; decrease to avoid false links |
 | **Update method** | EXACT (default) vs APPROXIMATE | Switch to APPROXIMATE only for >1000 objects/frame |
 | **Step size (frames)** | Batch size for iterative linking | Leave at 100 unless memory is an issue |
@@ -56,6 +57,8 @@ Bundled JSON configs are in this folder (`behav3d/preprocessing/tracking/models/
 | `particle_config.json` | `particle` | Small, fast particles |
 
 Copy and edit either file to create a custom config. Select *Custom JSON* in the GUI and browse to your file.
+
+When **Use visual features** is enabled, BEHAV3D adds these skimage-derived features to each object before tracking and then runs btrack with `tracking_updates=["motion", "visual"]`. Any valid btrack JSON can be used with or without visual features; the JSON itself does not decide that. The output tracks CSV stays the standard BEHAV3D schema.
 
 ### Key JSON fields (inside `"TrackerConfig"`)
 

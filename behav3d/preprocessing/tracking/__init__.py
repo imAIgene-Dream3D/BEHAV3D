@@ -1,6 +1,5 @@
-from pathlib import Path
-import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import shutil
 
 import napari
@@ -10,7 +9,7 @@ from tqdm import tqdm
 
 from skimage.measure import regionprops_table
 
-from behav3d.io.images import save_as_zarr, load_image, load_zarr
+from behav3d.io.images import append_to_zarr, save_as_zarr, load_image, load_zarr, write_zarr_parallel
 
 def convert_segments_to_tracks(
     df_tracks,
@@ -18,10 +17,7 @@ def convert_segments_to_tracks(
     outpath,
     n_workers=None
     ):
-    # tracked_img = np.zeros_like(segments)
-    if n_workers is None:
-        n_workers = multiprocessing.cpu_count()
-        
+    n_workers = max(1, int(n_workers or 1))
     outpath = Path(outpath)
     if outpath.exists():
         if outpath.is_dir():
@@ -36,25 +32,47 @@ def convert_segments_to_tracks(
         outpath = Path(outpath.parent, outpath.stem)
     
     assert outpath.suffix == ".zarr", "Supplied outpath is not .zarr or .zarr.zip"
-    
-    def _apply_segment_to_track(args):
-        t_segment_img, t_df_tracks, t, track_out_path = args
-        
-        t_segment_img = np.asarray(t_segment_img)
+
+    def _build_tracked_img(t, t_segments, t_pairs):
+        t_segment_img = np.asarray(t_segments)
         t_tracked_img = np.zeros_like(t_segment_img)
-        
-        for _, row in t_df_tracks.iterrows():
-            # print(row["SegmentID"], row["TrackID"], (tracked_img[t]==row["SegmentID"]).any())
-            t_tracked_img[t_segment_img==row["SegmentID"]] = row["TrackID"]
+
+        for segment_id, track_id in t_pairs:
+            t_tracked_img[t_segment_img == segment_id] = track_id
+
         return t_tracked_img
-        
-    args_list = [(t_segments, df_tracks[df_tracks["position_t"]==t] , t, outpath) for t, t_segments in enumerate(segments)]
-    result=[]
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        result+=list(tqdm(executor.map(_apply_segment_to_track, args_list), total=len(args_list)))
-    
-    tracked_img = np.stack(result, axis=0)
-    save_as_zarr(tracked_img, path=outpath)
+
+    tracks_by_time = {
+        int(t): group[["SegmentID", "TrackID"]].to_numpy(copy=False)
+        for t, group in df_tracks.groupby("position_t", sort=False)
+    }
+
+    if n_workers == 1:
+        for t, t_segments in tqdm(enumerate(segments), total=len(segments)):
+            t_tracked_img = _build_tracked_img(t, t_segments, tracks_by_time.get(t, ()))
+            append_to_zarr(
+                img=np.expand_dims(t_tracked_img, axis=0),
+                outpath=outpath,
+            )
+    else:
+        if len(segments) == 0:
+            raise ValueError("segments must contain at least one timepoint for parallel writing")
+        first_seg = np.asarray(segments[0])
+        write_zarr_parallel(
+            outpath=outpath,
+            shape=(len(segments),) + tuple(first_seg.shape),
+            dtype=first_seg.dtype,
+            overwrite=True,
+        )
+
+        def _write_timepoint(t):
+            t_tracked_img = _build_tracked_img(t, segments[t], tracks_by_time.get(t, ()))
+            write_zarr_parallel(outpath=outpath, index=t, data=t_tracked_img)
+            return t
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            for _ in tqdm(executor.map(_write_timepoint, range(len(segments))), total=len(segments)):
+                pass
     return(outpath)
 
 def convert_all_tracked_images_to_csv(

@@ -3,7 +3,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import hashlib
+import multiprocessing
 import re
+import threading
 import warnings
 from io import BytesIO
 from pathlib import Path
@@ -12,6 +14,130 @@ from matplotlib.backends.backend_pdf import PdfPages
 # -----------------------------
 # Plot timepoint>timepoint state transition matrix
 # -----------------------------
+
+
+def _is_main_thread():
+    """Return True when running on the interpreter's main thread."""
+    return threading.current_thread() is threading.main_thread()
+
+
+def _plotly_static_export_worker(payload, conn):
+    """Render a Plotly figure inside a spawned child process."""
+    try:
+        fig = go.Figure(payload["figure"])
+        export_format = str(payload["export_format"])
+        width = int(payload.get("width", 1400))
+        height = int(payload.get("height", 700))
+        scale = int(payload.get("scale", 2))
+        output_path = payload.get("output_path", None)
+
+        if export_format == "pdf":
+            if output_path is None:
+                raise ValueError("output_path is required for PDF static export.")
+            fig.write_image(str(output_path), format="pdf", width=width, height=height, scale=scale)
+            conn.send({"ok": True, "output_path": str(output_path)})
+        elif export_format == "png":
+            png_bytes = fig.to_image(format="png", width=width, height=height, scale=scale)
+            conn.send({"ok": True, "png_bytes": png_bytes})
+        else:
+            raise ValueError(f"Unsupported Plotly static export format: {export_format}")
+    except Exception as exc:
+        conn.send({"ok": False, "error": str(exc)})
+    finally:
+        conn.close()
+
+
+def _export_plotly_static_with_spawn(
+    fig,
+    *,
+    export_format,
+    output_path=None,
+    width=1400,
+    height=700,
+    scale=2,
+):
+    """Run Plotly static export in a dedicated spawned child process."""
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    payload = {
+        "figure": fig.to_dict(),
+        "export_format": str(export_format),
+        "output_path": (str(output_path) if output_path is not None else None),
+        "width": int(width),
+        "height": int(height),
+        "scale": int(scale),
+    }
+    proc = ctx.Process(target=_plotly_static_export_worker, args=(payload, child_conn))
+    try:
+        proc.start()
+        child_conn.close()
+        try:
+            result = parent_conn.recv()
+        except EOFError:
+            result = {"ok": False, "error": "spawned Plotly export worker exited without returning a result"}
+        proc.join()
+        if (proc.exitcode not in (0, None)) and bool(result.get("ok", False)):
+            result = {
+                "ok": False,
+                "error": f"spawned Plotly export worker exited with code {proc.exitcode}",
+            }
+        return result
+    finally:
+        try:
+            parent_conn.close()
+        except Exception:
+            pass
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+
+
+def _export_plotly_static(
+    fig,
+    *,
+    export_format,
+    output_path=None,
+    width=1400,
+    height=700,
+    scale=2,
+    use_spawn=False,
+):
+    """Export Plotly figure either directly or through a spawned child process."""
+    if use_spawn:
+        return _export_plotly_static_with_spawn(
+            fig,
+            export_format=export_format,
+            output_path=output_path,
+            width=width,
+            height=height,
+            scale=scale,
+        )
+
+    if str(export_format) == "pdf":
+        if output_path is None:
+            raise ValueError("output_path is required for PDF static export.")
+        fig.write_image(str(output_path), format="pdf", width=width, height=height, scale=scale)
+        return {"ok": True, "output_path": str(output_path)}
+    if str(export_format) == "png":
+        png_bytes = fig.to_image(format="png", width=width, height=height, scale=scale)
+        return {"ok": True, "png_bytes": png_bytes}
+    raise ValueError(f"Unsupported Plotly static export format: {export_format}")
+
+
+def _write_sankey_html(fig, *, html_dir, start_state, end_state):
+    """Persist Sankey plot as HTML and return the written path."""
+    html_dir = Path(html_dir)
+    html_dir.mkdir(parents=True, exist_ok=True)
+    html_name = (
+        "sankey_"
+        + _sanitize_filename_token(start_state, "start")
+        + "_to_"
+        + _sanitize_filename_token(end_state, "end")
+        + ".html"
+    )
+    html_path = html_dir / html_name
+    fig.write_html(str(html_path), include_plotlyjs="cdn", full_html=True)
+    return html_path
 
 def compute_cluster_transition_matrix(
     adata,
@@ -81,7 +207,13 @@ def compute_cluster_transition_matrix(
 
     # Optionally remove self-transitions in the returned matrices
     if only_transitions:
-        np.fill_diagonal(transition_counts.values, 0)
+        counts_arr = transition_counts.to_numpy(copy=True)
+        np.fill_diagonal(counts_arr, 0)
+        transition_counts = pd.DataFrame(
+            counts_arr,
+            index=transition_counts.index,
+            columns=transition_counts.columns,
+        )
 
     # Row-normalize to probabilities
     row_sums = transition_counts.sum(axis=1)
@@ -1040,6 +1172,11 @@ def save_state_transition_report(
     sankey_pdf_path = output_dir / "sankey_all_pairs.pdf"
     kaleido_available = True
     kaleido_warned = False
+    use_spawn_for_static_export = not _is_main_thread()
+    if use_spawn_for_static_export and verbose:
+        print(
+            "Sankey static export delegated to a spawned child process because the current thread is not the main thread."
+        )
 
     for start_state in states:
         for end_state in states:
@@ -1119,7 +1256,17 @@ def save_state_transition_report(
                         + ".pdf"
                     )
                     page_path = sankey_pdf_pages_dir / page_filename
-                    fig.write_image(str(page_path), format="pdf", width=1400, height=700, scale=2)
+                    export_result = _export_plotly_static(
+                        fig,
+                        export_format="pdf",
+                        output_path=page_path,
+                        width=1400,
+                        height=700,
+                        scale=2,
+                        use_spawn=use_spawn_for_static_export,
+                    )
+                    if not bool(export_result.get("ok", False)):
+                        raise RuntimeError(str(export_result.get("error", "unknown Plotly export error")))
                     row["status"] = "pdf_unmerged"
                     row["sankey_output_path"] = str(page_path)
                     sankey_pdf_page_rows.append({"row": row, "pdf_path": page_path})
@@ -1135,7 +1282,17 @@ def save_state_transition_report(
 
             if kaleido_available and (not sankey_vector_export):
                 try:
-                    png_bytes = fig.to_image(format="png", width=1400, height=700, scale=2)
+                    export_result = _export_plotly_static(
+                        fig,
+                        export_format="png",
+                        width=1400,
+                        height=700,
+                        scale=2,
+                        use_spawn=use_spawn_for_static_export,
+                    )
+                    if not bool(export_result.get("ok", False)):
+                        raise RuntimeError(str(export_result.get("error", "unknown Plotly export error")))
+                    png_bytes = export_result["png_bytes"]
                     row["status"] = "pdf_pending"
                     sankey_png_rows.append({"row": row, "png_bytes": png_bytes})
                 except Exception as exc:
@@ -1149,17 +1306,13 @@ def save_state_transition_report(
                         kaleido_warned = True
 
             if not kaleido_available:
-                html_dir.mkdir(parents=True, exist_ok=True)
-                html_name = (
-                    "sankey_"
-                    + _sanitize_filename_token(start_state, "start")
-                    + "_to_"
-                    + _sanitize_filename_token(end_state, "end")
-                    + ".html"
-                )
-                html_path = html_dir / html_name
                 try:
-                    fig.write_html(str(html_path), include_plotlyjs="cdn", full_html=True)
+                    html_path = _write_sankey_html(
+                        fig,
+                        html_dir=html_dir,
+                        start_state=start_state,
+                        end_state=end_state,
+                    )
                     row["status"] = "html"
                     row["sankey_output_path"] = str(html_path)
                 except Exception as exc:

@@ -4,7 +4,7 @@ from pathlib import Path
 from skimage.measure import regionprops_table
 from laptrack import LapTrack
 from tqdm import tqdm
-from behav3d.io.images import load_image, append_to_zarr, get_filepath_stem
+from behav3d.io.images import load_image, get_filepath_stem
 from behav3d.preprocessing.tracking import convert_segments_to_tracks
 
 def laptrack_image(
@@ -20,6 +20,7 @@ def laptrack_image(
     gap_closing_max_frame_count=3,
     merging_cost_cutoff=False,
     splitting_cost_cutoff=False,
+    n_workers=1,
     return_trackimg=True,
     
     ):
@@ -86,7 +87,8 @@ def laptrack_image(
         tracked_img_outpath = convert_segments_to_tracks(
             df_tracks=df_tracks,
             segments=segments,
-            outpath=tracked_img_outpath
+            outpath=tracked_img_outpath,
+            n_workers=n_workers,
         )
    
 def run_laptracking(
@@ -98,6 +100,7 @@ def run_laptracking(
     gap_closing_max_frame_count=3,
     merging_cost_cutoff=False,
     splitting_cost_cutoff=False,
+    n_workers=1,
     return_trackimg=True,
     overwrite=False,
     **kwargs
@@ -178,6 +181,7 @@ def run_laptracking(
                 gap_closing_max_frame_count=gap_closing_max_frame_count,
                 merging_cost_cutoff=merging_cost_cutoff,
                 splitting_cost_cutoff=splitting_cost_cutoff,
+                n_workers=n_workers,
                 return_trackimg=return_trackimg
             )
         else:
