@@ -58,22 +58,35 @@ def filter_segments_by_size(
 
     for t in pbar:
         vol = np.asarray(seg[t])  # single 3-D volume (Z, Y, X)
+        n_labels_before = len(np.unique(vol))
+        
         if not np.any(vol):
             continue
 
         # Count voxels per label directly (no re-labeling)
         sizes = np.bincount(vol.ravel())
         if len(sizes) <= 1:
+            if n_labels_before > 1: # only print if there's data
+                 print(f"    [T{t}] 0 segments < {min_size_voxels} voxels (Total labels: {n_labels_before})")
             continue
 
-        # Find labels that are too small (skip background at index 0)
+        # Find labels that are too small (skip background at index 0 and missing labels)
         labels = np.arange(len(sizes))
-        small_mask = (sizes < min_size_voxels)
+        small_mask = (sizes < min_size_voxels) & (sizes > 0)
         small_mask[0] = False # background never small
         small_labels = labels[small_mask]
 
         if len(small_labels) == 0:
-            continue
+            # We still might want to check for holes if fill_holes is True
+            # but if no segments were removed and no segments are small, 
+            # there are probably no new holes. 
+            # For now, let's skip if no small labels AND no holes to fill.
+            if not fill_holes:
+                if n_labels_before > 1:
+                     print(f"    [T{t}] 0 segments < {min_size_voxels} voxels (Total labels: {n_labels_before})")
+                continue
+        else:
+             print(f"    [T{t}] Found {len(small_labels)} segments < {min_size_voxels} voxels (Total labels: {n_labels_before})")
 
         removed_total += len(small_labels)
 
@@ -130,7 +143,16 @@ def filter_segments_by_size(
             vol[to_remove_mask] = 0
 
         seg[t] = vol
-        pbar.set_postfix(removed=removed_total)
+        
+        # VERIFICATION: Read back and check
+        check_vol = np.asarray(seg[t])
+        n_labels_after = len(np.unique(check_vol))
+        
+        if n_labels_before != n_labels_after:
+             print(f"    ✅ T{t} updated: {n_labels_before} → {n_labels_after} labels.")
+        
+        if not np.array_equal(vol, check_vol):
+            print(f"    ⚠️ T{t} written volume does not match read volume!")
 
     print(f"  ✨ Finished filtering {segments_zarr_path.name}. Total removed: {removed_total}")
     return removed_total
