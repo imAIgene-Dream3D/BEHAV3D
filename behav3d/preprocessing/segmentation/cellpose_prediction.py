@@ -112,14 +112,14 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) - unavoidable for pipe
     if verbose:
         print("Loaded image with shape (T, C, Z, Y, X):", image.shape)
     
-    # Optional time sub-setting
+    T_total = image.shape[0]
+    # Optional time sub-setting - we no longer slice the image here to maintain global indexing
     if timepoint_range is not None:
         start_t, end_t = timepoint_range
-        start_t = max(0, min(start_t, image.shape[0] - 1))
-        end_t = max(start_t, min(end_t, image.shape[0] - 1))
-        image = image[start_t : end_t + 1]
+        start_t = max(0, min(start_t, T_total - 1))
+        end_t = max(start_t, min(end_t, T_total - 1))
         if verbose:
-            print(f"Using timepoints {start_t}-{end_t} (total {image.shape[0]})")
+            print(f"Range requested: {start_t}-{end_t} (Global total: {T_total})")
             
     T, C, Z, Y, X = image.shape
 
@@ -144,22 +144,47 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) - unavoidable for pipe
     # ---------------------------------------------------------------------
     # 2. Run prediction per time point
     # ---------------------------------------------------------------------
-    masks = np.zeros((T, Z, Y, X), dtype=np.uint16)
+    # Global indexing: Initialize masks array with the FULL length of the input data
+    # (T_total if we have it, else T from the current image view)
+    masks = np.zeros((T_total, Z, Y, X), dtype=np.uint16)
+    
+    # Try to load existing results to support incremental updates
+    existing_masks_loaded = False
+    if masks_outpath is not None:
+        target_path = Path(masks_outpath)
+        if target_path.exists():
+            try:
+                existing_arr = load_image(target_path)
+                if existing_arr.shape == masks.shape:
+                    print(f"  [INCREMENTAL] Loading existing data from {target_path.name}...")
+                    masks[:] = existing_arr.compute()
+                    existing_masks_loaded = True
+                else:
+                    print(f"  [OVERWRITE] Existing array shape {existing_arr.shape} != {masks.shape}. Re-initializing.")
+            except Exception as e:
+                print(f"  [WARNING] Could not load existing masks: {e}")
+
+    # If we are using a range, we iterate through the requested range.
+    if timepoint_range is not None:
+        start_t, end_t = timepoint_range
+        print(f"  Global indexing: processing T {start_t} to {end_t} (Total: {T_total})")
+        indices_to_process = range(start_t, end_t + 1)
+    else:
+        indices_to_process = range(T_total)
 
     if verbose:
         print("Starting Cellpose prediction...")
 
-    for t in range(T):
+    for t in indices_to_process:
         # Extract data for one time point - shape (C, Z, Y, X).
         img_t = image[t]
 
         if verbose:
-            print(f"  - Timepoint {t+1}/{T} -", end="", flush=True)
+            print(f"  - Timepoint {t+1}/{T_total} -", end="", flush=True)
         start_ts = torch.cuda.Event(enable_timing=True) if torch_device.type == "cuda" else None
         end_ts = torch.cuda.Event(enable_timing=True) if torch_device.type == "cuda" else None
         if start_ts is not None:
             start_ts.record()
-
 
         # Cellpose expects channels first (C, Z, Y, X) with channel_axis=0, z_axis=1.
         mask_t, *_ = model.eval(
@@ -177,10 +202,10 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) - unavoidable for pipe
 
         masks[t] = mask_t.astype(np.uint16)
 
-        if end_ts is not None:
+        if start_ts is not None and end_ts is not None:
             end_ts.record()
             torch.cuda.synchronize()
-            dur = start_ts.elapsed_time(end_ts) / 1000  # ms ? s
+            dur = start_ts.elapsed_time(end_ts) / 1000  # s
             if verbose:
                 print(f" done in {dur:.2f} s.")
         elif verbose:
@@ -531,22 +556,36 @@ def run_otsu_threshold_segmentation_from_zarr(
 
         # Load image in (T, C, Z, Y, X)
         images = load_image(raw_image_zarr)
+        T_total = images.shape[0]
+        spatial_shape = images.shape[2:]
 
-        # Time cropping
+        # Select indices to process
         if timepoint_range is not None:
             start_t, end_t = timepoint_range
-            images = images[start_t:end_t + 1]
+            indices_to_process = range(start_t, end_t + 1)
+            print(f"  Otsu global indexing: processing T {start_t} to {end_t} (Total: {T_total})")
+        else:
+            indices_to_process = range(T_total)
 
-        # Select single channel: (T, Z, Y, X)
-        channel_img = images[:, death_channel]
+        # Initialize full-length masks array
+        masks = np.zeros((T_total,) + spatial_shape, dtype=np.uint8)
 
-        # Flatten to compute global threshold
-        flat_vals = channel_img.ravel()
+        # Apply thresholding
+        # To be efficient and follow user 1-point-at-a-time pattern, we'll process timepoints
+        # but compute a global threshold if possible or use the requested range.
+        
+        # Select single channel for relevant timepoints: (T_subset, Z, Y, X)
+        channel_img_subset = images[indices_to_process, death_channel]
+
+        # Flatten to compute threshold on the requested range
+        flat_vals = channel_img_subset.ravel()
         global_thresh = threshold_otsu(flat_vals.compute())
-        print(f"[INFO] Global Otsu threshold: {global_thresh}")
+        print(f"  [INFO] Otsu threshold (computed on requested range): {global_thresh}")
 
-        # Apply threshold to the entire 4D array (T, Z, Y, X)
-        masks = (channel_img > global_thresh).astype(np.uint8)
+        # Apply threshold and write to the correct absolute indices in 'masks'
+        # Dask array comparison is lazy, compute() it for use.
+        for i, t in enumerate(indices_to_process):
+            masks[t] = (channel_img_subset[i] > global_thresh).compute().astype(np.uint8)
 
         save_as_zarr(masks, masks_outpath)
         print(f"[SAVED] Dead mask at {masks_outpath}")
