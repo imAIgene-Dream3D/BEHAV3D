@@ -7,12 +7,358 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 import imageio
 
+from behav3d.analysis.clustering.state.visualization.backprojection import (
+    _resolve_tracked_image_path,
+)
 from behav3d.io.images import load_zarr
 from behav3d.preprocessing import calc_z_projection
+
+
+def _mixed_label_sort_key(value):
+    text = str(value)
+    return (0, int(text)) if text.isdigit() else (1, text)
+
+
+def _sanitize_filename_token(value, fallback="cluster"):
+    token = str(value).strip()
+    if token == "":
+        token = str(fallback)
+    token = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in token)
+    token = token.strip("._-")
+    return token if token != "" else str(fallback)
+
+
+def _normalize_segment_style(segment_style):
+    style = str(segment_style).strip().lower()
+    if style in {"", "outline", "contour"}:
+        return "outline"
+    raise ValueError(
+        f"Unsupported segment_style='{segment_style}'. Only 'outline' is currently supported."
+    )
+
+
+def resolve_tracked_zarr_path(output_folder, sample_name, cell_type=None, verbose=False):
+    if cell_type is not None and len(str(cell_type).strip()) > 0:
+        resolved = _resolve_tracked_image_path(
+            output_dir=output_folder,
+            sample_name=sample_name,
+            cell_type=cell_type,
+            verbose=verbose,
+        )
+        if resolved is not None:
+            return Path(resolved)
+
+    sample_dir = Path(output_folder, "images", str(sample_name))
+    if not sample_dir.exists():
+        return None
+
+    fallback = []
+    fallback.extend(sorted(sample_dir.glob("*tracked.zarr")))
+    fallback.extend(sorted(sample_dir.glob("*tracked.zarr.zip")))
+    return None if len(fallback) == 0 else Path(fallback[0])
+
+
+def _coerce_tracked_frame_to_zyx(frame):
+    arr = np.asarray(frame)
+    if arr.ndim == 3:
+        return arr
+    if arr.ndim == 4:
+        if int(arr.shape[0]) == 1:
+            return np.asarray(arr[0])
+        return np.asarray(arr.max(axis=0))
+    raise ValueError(f"Tracked frame has unsupported shape {arr.shape}; expected (Z,Y,X) or (C,Z,Y,X).")
+
+
+def _compute_outline_mask(mask_2d):
+    mask = np.asarray(mask_2d, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D mask, got shape={mask.shape}.")
+    if not bool(mask.any()):
+        return np.zeros(mask.shape, dtype=bool)
+
+    padded = np.pad(mask, ((1, 1), (1, 1)), mode="constant", constant_values=False)
+    center = padded[1:-1, 1:-1]
+    neighbors_all = (
+        padded[:-2, 1:-1]
+        & padded[2:, 1:-1]
+        & padded[1:-1, :-2]
+        & padded[1:-1, 2:]
+        & padded[:-2, :-2]
+        & padded[:-2, 2:]
+        & padded[2:, :-2]
+        & padded[2:, 2:]
+    )
+    return center & (~neighbors_all)
+
+
+def _outline_stack_to_rgba_stack(outline_stack, color="#ffffff", alpha=0.95):
+    outline_stack = np.asarray(outline_stack, dtype=bool)
+    if outline_stack.ndim != 3:
+        raise ValueError(f"Expected outline stack with shape (T,H,W), got {outline_stack.shape}.")
+
+    rgba = np.zeros(outline_stack.shape + (4,), dtype=float)
+    rgb = np.asarray(mcolors.to_rgb(color), dtype=float)
+    rgba[..., 0] = rgb[0]
+    rgba[..., 1] = rgb[1]
+    rgba[..., 2] = rgb[2]
+    rgba[..., 3] = outline_stack.astype(float) * float(alpha)
+    return rgba
+
+
+def _build_projected_segment_outline_stacks(
+    tracked_crop,
+    *,
+    track_id,
+    segment_style="outline",
+    segment_color="#ffffff",
+    segment_alpha=0.95,
+):
+    _normalize_segment_style(segment_style)
+    tracked_crop = np.asarray(tracked_crop)
+    if tracked_crop.ndim not in {4, 5}:
+        raise ValueError(
+            f"Tracked crop has unsupported shape {tracked_crop.shape}; expected (T,Z,Y,X) or (T,C,Z,Y,X)."
+        )
+
+    xy_outlines = []
+    xz_outlines = []
+    yz_outlines = []
+    for frame in tracked_crop:
+        frame_zyx = _coerce_tracked_frame_to_zyx(frame)
+        mask_zyx = np.asarray(frame_zyx == int(track_id), dtype=bool)
+        xy_outlines.append(_compute_outline_mask(mask_zyx.any(axis=0)))
+        xz_outlines.append(_compute_outline_mask(mask_zyx.any(axis=1)))
+        yz_outlines.append(_compute_outline_mask(mask_zyx.any(axis=2)))
+
+    xy_outline_stack = np.stack(xy_outlines, axis=0)
+    xz_outline_stack = np.stack(xz_outlines, axis=0)
+    yz_outline_stack = np.stack(yz_outlines, axis=0)
+    return {
+        "xy": _outline_stack_to_rgba_stack(
+            xy_outline_stack, color=segment_color, alpha=segment_alpha
+        ),
+        "xz": _outline_stack_to_rgba_stack(
+            xz_outline_stack, color=segment_color, alpha=segment_alpha
+        ),
+        "yz": _outline_stack_to_rgba_stack(
+            yz_outline_stack, color=segment_color, alpha=segment_alpha
+        ),
+    }
+
+
+def prepare_fulltrack_max_projection_bundle(
+    df_window,
+    df_positions,
+    output_folder,
+    margin=10,
+    pmin=0,
+    pmax=99,
+    mask_margin=False,
+    normalize_per_channel=True,
+    zarr_img=None,
+    percentiles=None,
+    *,
+    show_segment_outlines=False,
+    segment_style="outline",
+    segment_color="#ffffff",
+    segment_alpha=0.95,
+    tracked_img=None,
+    tracked_img_path=None,
+    cell_type=None,
+):
+    sample_name = df_window["sample_name"]
+    start_t = int(df_window["window_start_position_t"])
+    end_t = int(df_window["window_end_position_t"])
+    track_id = int(df_window["TrackID"])
+
+    df_track = df_positions[
+        (df_positions["sample_name"] == sample_name)
+        & (df_positions["TrackID"].astype(int) == int(track_id))
+    ]
+
+    if zarr_img is None:
+        zarr_path = Path(output_folder, "images", sample_name, f"{sample_name}.zarr")
+        zarr = load_zarr(zarr_path)
+    else:
+        zarr = zarr_img
+    T, C, Z, Y, X = zarr.shape
+
+    if normalize_per_channel:
+        if percentiles is None:
+            p_img = np.asarray(zarr[-1])
+            percentiles = {}
+            for c in range(C):
+                ch = p_img[c]
+                lo = np.percentile(ch, pmin)
+                hi = np.percentile(ch, pmax)
+                hi_floor = 30000
+                hi = max(hi, hi_floor)
+                if hi <= lo:
+                    hi = lo + 1e-6
+                percentiles[c] = (float(lo), float(hi))
+    else:
+        percentiles = None
+
+    if mask_margin:
+        masked = np.zeros_like(zarr)
+        for t in range(start_t, end_t + 1):
+            df_track_t = df_track[df_track["position_t"] == t]
+            if len(df_track_t) == 0:
+                continue
+            pos_x = int(df_track_t["pixel_position_x"].values[0])
+            pos_y = int(df_track_t["pixel_position_y"].values[0])
+            pos_z = int(df_track_t["pixel_position_z"].values[0])
+
+            x0 = max(0, pos_x - margin)
+            x1 = min(X, pos_x + margin + 1)
+            y0 = max(0, pos_y - margin)
+            y1 = min(Y, pos_y + margin + 1)
+            z0 = max(0, pos_z - margin)
+            z1 = min(Z, pos_z + margin + 1)
+
+            masked[t, :, z0:z1, y0:y1, x0:x1] = zarr[t, :, z0:z1, y0:y1, x0:x1]
+    else:
+        masked = zarr
+
+    df_track_window = df_track[
+        (df_track["position_t"] >= start_t) & (df_track["position_t"] <= end_t)
+    ]
+    df_bbox = df_track_window if len(df_track_window) else df_track
+
+    z_min = int(df_bbox["pixel_position_z"].min())
+    z_max = int(df_bbox["pixel_position_z"].max())
+    y_min = int(df_bbox["pixel_position_y"].min())
+    y_max = int(df_bbox["pixel_position_y"].max())
+    x_min = int(df_bbox["pixel_position_x"].min())
+    x_max = int(df_bbox["pixel_position_x"].max())
+
+    z_min = max(0, int(z_min - margin))
+    y_min = max(0, int(y_min - margin))
+    x_min = max(0, int(x_min - margin))
+
+    z_max = min(Z, int(z_max + margin + 1))
+    y_max = min(Y, int(y_max + margin + 1))
+    x_max = min(X, int(x_max + margin + 1))
+
+    cropped_img = masked[
+        start_t : end_t + 1,
+        :,
+        z_min:z_max,
+        y_min:y_max,
+        x_min:x_max,
+    ]
+    cropped_img = np.asarray(cropped_img)
+
+    xy_proj = calc_z_projection(cropped_img, z_axis=-3, projection="max")
+    xz_proj = calc_z_projection(cropped_img, z_axis=-2, projection="max")
+    yz_proj = calc_z_projection(cropped_img, z_axis=-1, projection="max")
+
+    xy_proj_rgb = colorize_channels_to_rgb(xy_proj, percentiles=percentiles)
+    xz_proj_rgb = colorize_channels_to_rgb(xz_proj, percentiles=percentiles)
+    yz_proj_rgb = colorize_channels_to_rgb(yz_proj, percentiles=percentiles)
+
+    T_window = cropped_img.shape[0]
+    track_xy = np.full((T_window, 2), np.nan, dtype=float)
+    track_xz = np.full((T_window, 2), np.nan, dtype=float)
+    track_yz = np.full((T_window, 2), np.nan, dtype=float)
+
+    for idx, t in enumerate(range(start_t, end_t + 1)):
+        df_t = df_track[df_track["position_t"] == t]
+        if len(df_t) == 0:
+            continue
+        pos_x = float(df_t["pixel_position_x"].values[0])
+        pos_y = float(df_t["pixel_position_y"].values[0])
+        pos_z = float(df_t["pixel_position_z"].values[0])
+
+        x_local = pos_x - x_min
+        y_local = pos_y - y_min
+        z_local = pos_z - z_min
+
+        track_xy[idx, 0] = x_local
+        track_xy[idx, 1] = y_local
+
+        track_xz[idx, 0] = x_local
+        track_xz[idx, 1] = z_local
+
+        track_yz[idx, 0] = y_local
+        track_yz[idx, 1] = z_local
+
+    segment_xy_rgba = None
+    segment_xz_rgba = None
+    segment_yz_rgba = None
+    segment_outline_error = None
+    resolved_tracked_path = None
+
+    if bool(show_segment_outlines):
+        try:
+            tracked_source = tracked_img
+            if tracked_source is None:
+                if tracked_img_path is None:
+                    tracked_img_path = resolve_tracked_zarr_path(
+                        output_folder=output_folder,
+                        sample_name=sample_name,
+                        cell_type=cell_type,
+                    )
+                if tracked_img_path is None:
+                    raise FileNotFoundError(
+                        f"Could not resolve tracked zarr for sample='{sample_name}'."
+                    )
+                resolved_tracked_path = str(Path(tracked_img_path))
+                tracked_source = load_zarr(tracked_img_path)
+            else:
+                resolved_tracked_path = None if tracked_img_path is None else str(Path(tracked_img_path))
+
+            tracked_window = tracked_source[start_t : end_t + 1]
+            if tracked_window.ndim == 4:
+                tracked_crop = tracked_window[:, z_min:z_max, y_min:y_max, x_min:x_max]
+            elif tracked_window.ndim == 5:
+                tracked_crop = tracked_window[:, :, z_min:z_max, y_min:y_max, x_min:x_max]
+            else:
+                raise ValueError(
+                    f"Tracked zarr has unsupported window shape {tracked_window.shape}; "
+                    "expected (T,Z,Y,X) or (T,C,Z,Y,X)."
+                )
+            tracked_crop = np.asarray(tracked_crop)
+            overlays = _build_projected_segment_outline_stacks(
+                tracked_crop,
+                track_id=track_id,
+                segment_style=segment_style,
+                segment_color=segment_color,
+                segment_alpha=segment_alpha,
+            )
+            segment_xy_rgba = overlays["xy"]
+            segment_xz_rgba = overlays["xz"]
+            segment_yz_rgba = overlays["yz"]
+        except Exception as exc:
+            segment_outline_error = str(exc)
+
+    return {
+        "xy_proj_rgb": xy_proj_rgb,
+        "xz_proj_rgb": xz_proj_rgb,
+        "yz_proj_rgb": yz_proj_rgb,
+        "track_xy": track_xy,
+        "track_xz": track_xz,
+        "track_yz": track_yz,
+        "segment_xy_rgba": segment_xy_rgba,
+        "segment_xz_rgba": segment_xz_rgba,
+        "segment_yz_rgba": segment_yz_rgba,
+        "segment_outline_error": segment_outline_error,
+        "tracked_img_path": resolved_tracked_path,
+        "crop_bounds": {
+            "z_min": int(z_min),
+            "z_max": int(z_max),
+            "y_min": int(y_min),
+            "y_max": int(y_max),
+            "x_min": int(x_min),
+            "x_max": int(x_max),
+        },
+    }
+
 
 def stratified_pick_examples(df_windows, X, seed=0):
     """
@@ -149,123 +495,26 @@ def create_fulltrack_max_projection_stacks_with_track(
     zarr_img=None,
     percentiles=None,
 ):
-    sample_name = df_window["sample_name"]
-    start_t = int(df_window["window_start_position_t"])
-    end_t = int(df_window["window_end_position_t"])
-
-    df_track = df_positions[
-        (df_positions["sample_name"] == sample_name)
-        & (df_positions["TrackID"].astype(int) == int(df_window["TrackID"]))
-    ]
-
-    if zarr_img is None:
-        zarr_path = Path(output_folder, "images", sample_name, f"{sample_name}.zarr")
-        zarr = load_zarr(zarr_path)
-    else:
-        zarr = zarr_img
-    T, C, Z, Y, X = zarr.shape
-
-    if normalize_per_channel:
-        if percentiles is None:
-            p_img = np.asarray(zarr[-1])
-            percentiles = {}
-            for c in range(C):
-                ch = p_img[c]
-                lo = np.percentile(ch, pmin)
-                hi = np.percentile(ch, pmax)
-                hi_floor = 30000
-                hi = max(hi, hi_floor)
-                if hi <= lo:
-                    hi = lo + 1e-6
-                percentiles[c] = (float(lo), float(hi))
-    else:
-        percentiles = None
-
-    if mask_margin:
-        masked = np.zeros_like(zarr)
-        for t in range(start_t, end_t + 1):
-            df_track_t = df_track[df_track["position_t"] == t]
-            if len(df_track_t) == 0:
-                continue
-            pos_x = int(df_track_t["pixel_position_x"].values[0])
-            pos_y = int(df_track_t["pixel_position_y"].values[0])
-            pos_z = int(df_track_t["pixel_position_z"].values[0])
-
-            x0 = max(0, pos_x - margin)
-            x1 = min(X, pos_x + margin + 1)
-            y0 = max(0, pos_y - margin)
-            y1 = min(Y, pos_y + margin + 1)
-            z0 = max(0, pos_z - margin)
-            z1 = min(Z, pos_z + margin + 1)
-
-            masked[t, :, z0:z1, y0:y1, x0:x1] = zarr[t, :, z0:z1, y0:y1, x0:x1]
-    else:
-        masked = zarr
-
-    df_track_window = df_track[
-        (df_track["position_t"] >= start_t) & (df_track["position_t"] <= end_t)
-    ]
-    df_bbox = df_track_window if len(df_track_window) else df_track
-
-    z_min = int(df_bbox["pixel_position_z"].min())
-    z_max = int(df_bbox["pixel_position_z"].max())
-    y_min = int(df_bbox["pixel_position_y"].min())
-    y_max = int(df_bbox["pixel_position_y"].max())
-    x_min = int(df_bbox["pixel_position_x"].min())
-    x_max = int(df_bbox["pixel_position_x"].max())
-
-    z_min = max(0, int(z_min - margin))
-    y_min = max(0, int(y_min - margin))
-    x_min = max(0, int(x_min - margin))
-
-    z_max = min(Z, int(z_max + margin + 1))
-    y_max = min(Y, int(y_max + margin + 1))
-    x_max = min(X, int(x_max + margin + 1))
-
-    cropped_img = masked[
-        start_t : end_t + 1,
-        :,
-        z_min:z_max,
-        y_min:y_max,
-        x_min:x_max,
-    ]
-    cropped_img = np.asarray(cropped_img)
-
-    xy_proj = calc_z_projection(cropped_img, z_axis=-3, projection="max")
-    xz_proj = calc_z_projection(cropped_img, z_axis=-2, projection="max")
-    yz_proj = calc_z_projection(cropped_img, z_axis=-1, projection="max")
-
-    xy_proj_rgb = colorize_channels_to_rgb(xy_proj, percentiles=percentiles)
-    xz_proj_rgb = colorize_channels_to_rgb(xz_proj, percentiles=percentiles)
-    yz_proj_rgb = colorize_channels_to_rgb(yz_proj, percentiles=percentiles)
-
-    T_window = cropped_img.shape[0]
-    track_xy = np.full((T_window, 2), np.nan, dtype=float)
-    track_xz = np.full((T_window, 2), np.nan, dtype=float)
-    track_yz = np.full((T_window, 2), np.nan, dtype=float)
-
-    for idx, t in enumerate(range(start_t, end_t + 1)):
-        df_t = df_track[df_track["position_t"] == t]
-        if len(df_t) == 0:
-            continue
-        pos_x = float(df_t["pixel_position_x"].values[0])
-        pos_y = float(df_t["pixel_position_y"].values[0])
-        pos_z = float(df_t["pixel_position_z"].values[0])
-
-        x_local = pos_x - x_min
-        y_local = pos_y - y_min
-        z_local = pos_z - z_min
-
-        track_xy[idx, 0] = x_local
-        track_xy[idx, 1] = y_local
-
-        track_xz[idx, 0] = x_local
-        track_xz[idx, 1] = z_local
-
-        track_yz[idx, 0] = y_local
-        track_yz[idx, 1] = z_local
-
-    return xy_proj_rgb, xz_proj_rgb, yz_proj_rgb, track_xy, track_xz, track_yz
+    bundle = prepare_fulltrack_max_projection_bundle(
+        df_window=df_window,
+        df_positions=df_positions,
+        output_folder=output_folder,
+        margin=margin,
+        pmin=pmin,
+        pmax=pmax,
+        mask_margin=mask_margin,
+        normalize_per_channel=normalize_per_channel,
+        zarr_img=zarr_img,
+        percentiles=percentiles,
+    )
+    return (
+        bundle["xy_proj_rgb"],
+        bundle["xz_proj_rgb"],
+        bundle["yz_proj_rgb"],
+        bundle["track_xy"],
+        bundle["track_xz"],
+        bundle["track_yz"],
+    )
 
 
 def _pca_project_xyz(xyz):
@@ -384,6 +633,212 @@ def _pad_frame_to_macro_block(frame_rgb, macro_block_size=16):
         constant_values=0,
     )
     return padded, True, (h, w), (int(padded.shape[0]), int(padded.shape[1]))
+
+
+def save_selected_fulltrack_cluster_videos(
+    chosen_df,
+    df_positions,
+    output_folder,
+    *,
+    out_dir,
+    cluster_key="ClusterID",
+    sample_key="sample_name",
+    track_key="TrackID",
+    tmin_key="window_start_position_t",
+    tmax_key="window_end_position_t",
+    fps=12,
+    dpi=200,
+    margin=10,
+    pmin=0.0,
+    pmax=99.99,
+    track_color="green",
+    show_segment_outlines=False,
+    segment_style="outline",
+    segment_color="#ffffff",
+    cell_type=None,
+    verbose=False,
+):
+    """
+    Render one MP4 per cluster from an explicit chosen window table.
+
+    Each example row is shown as XY | XZ | YZ only, with track overlays and a
+    row title containing sample/track information.
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    required_cols = [sample_key, track_key, cluster_key, tmin_key, tmax_key]
+    missing = [c for c in required_cols if c not in chosen_df.columns]
+    if len(missing) > 0:
+        raise ValueError(f"chosen_df missing required columns: {missing}")
+
+    work = chosen_df.dropna(subset=[cluster_key, tmin_key, tmax_key]).copy()
+    if len(work) == 0:
+        raise ValueError("No exemplar rows available after dropping rows with missing cluster/window bounds.")
+
+    video_paths_by_cluster = {}
+    segment_outline_errors = {}
+    cluster_values = list(pd.unique(work[cluster_key]))
+    cluster_values = sorted(cluster_values, key=_mixed_label_sort_key)
+    sample_cache = {}
+
+    for cluster_value in cluster_values:
+        sub = work.loc[work[cluster_key] == cluster_value].copy()
+        if len(sub) == 0:
+            continue
+
+        cluster_started = time.perf_counter()
+        if bool(verbose):
+            print(f"[track_max_projection] Backprojecting selected cluster {cluster_value}")
+        rows_info = []
+        max_T = 0
+
+        for _, w in sub.iterrows():
+            sample_name = w[sample_key]
+            track_id = int(w[track_key])
+            sample_name_key = str(sample_name)
+            if sample_name_key not in sample_cache:
+                raw_zarr_path = Path(output_folder, "images", sample_name_key, f"{sample_name_key}.zarr")
+                zarr_img = load_zarr(raw_zarr_path)
+                percentiles = {}
+                p_img = np.asarray(zarr_img[-1])
+                for c in range(int(p_img.shape[0])):
+                    ch = p_img[c]
+                    lo = np.percentile(ch, pmin)
+                    hi = np.percentile(ch, pmax)
+                    hi = max(hi, 30000)
+                    if hi <= lo:
+                        hi = lo + 1e-6
+                    percentiles[int(c)] = (float(lo), float(hi))
+
+                cached = {
+                    "zarr_img": zarr_img,
+                    "percentiles": percentiles,
+                    "tracked_img": None,
+                    "tracked_img_path": None,
+                    "tracked_img_error": None,
+                }
+                if bool(show_segment_outlines):
+                    try:
+                        tracked_img_path = resolve_tracked_zarr_path(
+                            output_folder=output_folder,
+                            sample_name=sample_name_key,
+                            cell_type=cell_type,
+                        )
+                        if tracked_img_path is None:
+                            raise FileNotFoundError(
+                                f"Could not resolve tracked zarr for sample='{sample_name_key}'."
+                            )
+                        cached["tracked_img_path"] = str(Path(tracked_img_path))
+                        cached["tracked_img"] = load_zarr(tracked_img_path)
+                    except Exception as exc:
+                        cached["tracked_img_error"] = str(exc)
+                sample_cache[sample_name_key] = cached
+
+            cached = sample_cache[sample_name_key]
+            bundle = prepare_fulltrack_max_projection_bundle(
+                df_window=w,
+                df_positions=df_positions,
+                output_folder=output_folder,
+                margin=margin,
+                pmin=pmin,
+                pmax=pmax,
+                mask_margin=False,
+                normalize_per_channel=True,
+                zarr_img=cached["zarr_img"],
+                percentiles=cached["percentiles"],
+                show_segment_outlines=bool(show_segment_outlines) and (cached["tracked_img_error"] is None),
+                segment_style=segment_style,
+                segment_color=segment_color,
+                tracked_img=cached["tracked_img"],
+                tracked_img_path=cached["tracked_img_path"],
+                cell_type=cell_type,
+            )
+
+            row_key = (
+                f"{sample_name_key}|track={track_id}|"
+                f"t={int(w[tmin_key])}-{int(w[tmax_key])}"
+            )
+            row_error = cached.get("tracked_img_error", None) or bundle.get("segment_outline_error", None)
+            if row_error is not None:
+                segment_outline_errors[row_key] = str(row_error)
+
+            T_w = int(bundle["xy_proj_rgb"].shape[0])
+            max_T = max(max_T, T_w)
+            rows_info.append(
+                {
+                    "label": f"{sample_name} • Track {track_id}",
+                    "xy": bundle["xy_proj_rgb"],
+                    "xz": bundle["xz_proj_rgb"],
+                    "yz": bundle["yz_proj_rgb"],
+                    "track_xy": bundle["track_xy"],
+                    "track_xz": bundle["track_xz"],
+                    "track_yz": bundle["track_yz"],
+                    "segment_xy": bundle["segment_xy_rgba"],
+                    "segment_xz": bundle["segment_xz_rgba"],
+                    "segment_yz": bundle["segment_yz_rgba"],
+                    "T": T_w,
+                }
+            )
+
+        cluster_token = _sanitize_filename_token(cluster_value, fallback="cluster")
+        video_path = out_path / f"cluster_{cluster_token}_fulltrack.mp4"
+        if video_path.exists():
+            video_path.unlink()
+        writer = imageio.get_writer(
+            video_path,
+            fps=int(fps),
+            codec="libx264",
+            ffmpeg_log_level="warning",
+            quality=9,
+            macro_block_size=16,
+            pixelformat="yuv420p",
+        )
+
+        try:
+            for t in range(max_T):
+                row_imgs = []
+                for r in rows_info:
+                    ti = min(int(t), int(r["T"]) - 1)
+                    frame_row = _render_fulltrack_frame_with_overlay(
+                        xy_rgb=r["xy"][ti],
+                        xz_rgb=r["xz"][ti],
+                        yz_rgb=r["yz"][ti],
+                        track_xy=r["track_xy"],
+                        track_xz=r["track_xz"],
+                        track_yz=r["track_yz"],
+                        t_idx=ti,
+                        fig_w=9.0,
+                        fig_h=3.0,
+                        dpi=int(dpi),
+                        titles=("XY", "XZ", "YZ"),
+                        track_color=track_color,
+                        segment_xy_rgba=None if r["segment_xy"] is None else r["segment_xy"][ti],
+                        segment_xz_rgba=None if r["segment_xz"] is None else r["segment_xz"][ti],
+                        segment_yz_rgba=None if r["segment_yz"] is None else r["segment_yz"][ti],
+                    )
+                    row_imgs.append(_add_row_title(frame_row, r["label"], fontsize=18))
+
+                full_frame = _concat_rows_vertically(row_imgs)
+                full_frame, _, _, _ = _pad_frame_to_macro_block(full_frame, 16)
+                writer.append_data(full_frame)
+        finally:
+            writer.close()
+
+        if bool(verbose):
+            print(
+                f"[track_max_projection] Finished selected cluster {cluster_value} in "
+                f"{time.perf_counter() - cluster_started:.2f}s"
+            )
+
+        video_paths_by_cluster[str(cluster_value)] = str(video_path)
+
+    return {
+        "video_paths_by_cluster": video_paths_by_cluster,
+        "n_clusters": int(len(video_paths_by_cluster)),
+        "n_rows": int(len(work)),
+        "segment_outline_errors": dict(segment_outline_errors),
+    }
 
 
 def _concat_examples_horizontally(examples):
@@ -646,6 +1101,9 @@ def _render_fulltrack_frame_with_overlay(
     dpi,
     titles=("XY", "XZ", "YZ"),
     track_color="green",
+    segment_xy_rgba=None,
+    segment_xz_rgba=None,
+    segment_yz_rgba=None,
 ):
     """
     Render a single frame with three projections and an overlaid track that grows
@@ -670,18 +1128,24 @@ def _render_fulltrack_frame_with_overlay(
         ax.scatter(coords[-1, 0], coords[-1, 1], s=10, color=track_color)
 
     ax_xy.imshow(xy_rgb)
+    if segment_xy_rgba is not None:
+        ax_xy.imshow(segment_xy_rgba, interpolation="nearest")
     _plot_track(ax_xy, track_xy)
     ax_xy.set_title(titles[0])
     ax_xy.set_xticks([])
     ax_xy.set_yticks([])
 
     ax_xz.imshow(xz_rgb)
+    if segment_xz_rgba is not None:
+        ax_xz.imshow(segment_xz_rgba, interpolation="nearest")
     _plot_track(ax_xz, track_xz)
     ax_xz.set_title(titles[1])
     ax_xz.set_xticks([])
     ax_xz.set_yticks([])
 
     ax_yz.imshow(yz_rgb)
+    if segment_yz_rgba is not None:
+        ax_yz.imshow(segment_yz_rgba, interpolation="nearest")
     _plot_track(ax_yz, track_yz)
     ax_yz.set_title(titles[2])
     ax_yz.set_xticks([])
