@@ -454,6 +454,7 @@ def train_pixel_classifier(
     output_dir,
     metadata=None,
     examples_per_sample = 3,
+    overwrite_images=False,
     sample_specific_classifier=False,
     n_workers=None,
     manual_dim_order=None,
@@ -534,6 +535,14 @@ def train_pixel_classifier(
     
     
     if images is None:
+        # If user requested overwrite, delete cached images and features
+        if overwrite_images:
+            print("Overwrite sample images requested — deleting cached data...")
+            if image_outpath.exists():
+                shutil.rmtree(image_outpath)
+            if features_outpath.exists():
+                shutil.rmtree(features_outpath)
+
         if not features_outpath.exists() or not image_outpath.exists():
             if image_outpath.exists():
                 shutil.rmtree(image_outpath)
