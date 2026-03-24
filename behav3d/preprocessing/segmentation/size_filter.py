@@ -43,8 +43,8 @@ def filter_segments_by_size(
             return 0
 
     n_timepoints = seg.shape[0]
-    print(f"  📦 Processing {n_timepoints} timepoints in {segments_zarr_path.name}")
-    print(f"    📝 Path: {segments_zarr_path.absolute()}")
+    # print(f"  📦 Processing {n_timepoints} timepoints in {segments_zarr_path.name}")
+    # print(f"    📝 Path: {segments_zarr_path.absolute()}")
 
     removed_total = 0
 
@@ -154,5 +154,5 @@ def filter_segments_by_size(
         if not np.array_equal(vol, check_vol):
             print(f"    ⚠️ T{t} written volume does not match read volume!")
 
-    print(f"  ✨ Finished filtering {segments_zarr_path.name}. Total removed: {removed_total}")
+    # print(f"  ✨ Finished filtering {segments_zarr_path.name}. Total removed: {removed_total}")
     return removed_total
