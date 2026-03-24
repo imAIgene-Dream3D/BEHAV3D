@@ -7,12 +7,16 @@ import copy
 import warnings
 import re
 import time
+import shutil
 from itertools import combinations
 from matplotlib.backends.backend_pdf import PdfPages
 from dataclasses import asdict, dataclass
 
 from pathlib import Path
 import pickle
+
+import anndata as ad
+ad.settings.allow_write_nullable_strings = True
 
 import scanpy as sc
 from sklearn.cluster import KMeans
@@ -36,10 +40,13 @@ from behav3d.analysis.clustering.state.visualization.backprojection import (
     export_behavioral_state_backprojection_zarrs,
     show_behavioral_state_backprojection,
 )
+from behav3d.analysis.clustering.state.visualization.videos.track_max_projection import (
+    save_selected_fulltrack_cluster_videos,
+)
 
 A4_PORTRAIT = (8.27, 11.69)
 A4_LANDSCAPE = (11.69, 8.27)
-STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION = 1
+STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION = 3
 
 
 def _vinfo(verbose, prefix, message):
@@ -77,10 +84,8 @@ def _short_reasons(reasons):
 
 
 def _binary_col_to_group_name(col: str) -> str:
-    name = str(col)
-    name = name.replace("_pixels", "")
-    name = name.replace("_value", "")
-    return name
+    # Breaking change (schema v3): binary groups are exact selected column names.
+    return str(col)
 
 
 def _binary_value_is_active(val) -> bool:
@@ -109,7 +114,7 @@ def _binary_groups_to_label(active_groups: list[str]) -> str:
 
 
 def _infer_binary_group_constraints(df: pd.DataFrame, binary_cols: list[str]) -> dict:
-    """Infer allowed binary groups and forbidden binary pairs from train-time data."""
+    """Infer allowed binary groups and forbidden binary-group combinations from train-time data."""
     cols = [str(c) for c in list(binary_cols or []) if str(c) in df.columns]
     clean_cols = [_binary_col_to_group_name(c) for c in cols]
 
@@ -119,7 +124,7 @@ def _infer_binary_group_constraints(df: pd.DataFrame, binary_cols: list[str]) ->
             "binary_cols": [],
             "binary_group_names": [],
             "allowed_binary_groups": ["no_contact"],
-            "forbidden_binary_pairs": [],
+            "forbidden_binary_combinations": [],
             "support_counts": {},
         }
 
@@ -132,29 +137,27 @@ def _infer_binary_group_constraints(df: pd.DataFrame, binary_cols: list[str]) ->
         allowed_groups.add(_binary_groups_to_label(active))
         for grp in active:
             support_counts[grp] = int(support_counts.get(grp, 0)) + 1
-        for left, right in combinations(active, 2):
-            pair = tuple(sorted((str(left), str(right))))
-            cooccur_counts[pair] = int(cooccur_counts.get(pair, 0)) + 1
+        for size in range(2, len(active) + 1):
+            for combo in combinations(active, size):
+                combo_key = tuple(sorted([str(x) for x in combo]))
+                cooccur_counts[combo_key] = int(cooccur_counts.get(combo_key, 0)) + 1
 
-    forbidden_pairs = []
-    for i, left in enumerate(clean_cols):
-        if int(support_counts.get(left, 0)) <= 0:
-            continue
-        for right in clean_cols[i + 1 :]:
-            if int(support_counts.get(right, 0)) <= 0:
-                continue
-            pair = tuple(sorted((str(left), str(right))))
-            if int(cooccur_counts.get(pair, 0)) == 0:
-                forbidden_pairs.append([pair[0], pair[1]])
+    forbidden_combinations = []
+    supported_groups = [str(name) for name, count in support_counts.items() if int(count) > 0]
+    for size in range(2, len(supported_groups) + 1):
+        for combo in combinations(supported_groups, size):
+            combo_key = tuple(sorted([str(x) for x in combo]))
+            if int(cooccur_counts.get(combo_key, 0)) == 0:
+                forbidden_combinations.append(list(combo_key))
 
     return {
         "inference_rule": "exact_zero_cooccurrence",
         "binary_cols": list(cols),
         "binary_group_names": list(clean_cols),
         "allowed_binary_groups": sorted([str(x) for x in allowed_groups], key=_mixed_label_sort_key),
-        "forbidden_binary_pairs": sorted(
-            [[str(p[0]), str(p[1])] for p in forbidden_pairs],
-            key=lambda x: (x[0], x[1]),
+        "forbidden_binary_combinations": sorted(
+            [[str(x) for x in combo] for combo in forbidden_combinations],
+            key=lambda x: (len(x), tuple(x)),
         ),
         "support_counts": {str(k): int(v) for k, v in support_counts.items()},
     }
@@ -169,9 +172,11 @@ def _normalize_binary_group_constraints(binary_group_constraints):
         )
 
     allowed_raw = binary_group_constraints.get("allowed_binary_groups", None)
-    forbidden_raw = binary_group_constraints.get("forbidden_binary_pairs", None)
+    forbidden_raw = binary_group_constraints.get("forbidden_binary_combinations", None)
     if allowed_raw is None and forbidden_raw is None:
-        return None
+        raise ValueError(
+            "binary_group_constraints['forbidden_binary_combinations'] is required."
+        )
 
     allowed_set = None
     if allowed_raw is not None:
@@ -182,25 +187,29 @@ def _normalize_binary_group_constraints(binary_group_constraints):
         allowed_set = set([str(x) for x in allowed_raw])
 
     forbidden_set = set()
-    if forbidden_raw is not None:
-        if not isinstance(forbidden_raw, list):
+    if forbidden_raw is None:
+        raise ValueError(
+            "binary_group_constraints['forbidden_binary_combinations'] is required."
+        )
+    if not isinstance(forbidden_raw, list):
+        raise ValueError(
+            "binary_group_constraints['forbidden_binary_combinations'] must be a list."
+        )
+    for item in forbidden_raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
             raise ValueError(
-                "binary_group_constraints['forbidden_binary_pairs'] must be a list."
+                "binary_group_constraints['forbidden_binary_combinations'] entries must be length-2+ lists/tuples."
             )
-        for item in forbidden_raw:
-            if not isinstance(item, (list, tuple)) or len(item) != 2:
-                raise ValueError(
-                    "binary_group_constraints['forbidden_binary_pairs'] entries must be length-2 lists/tuples."
-                )
-            left = str(item[0])
-            right = str(item[1])
-            if left == right:
-                continue
-            forbidden_set.add(tuple(sorted((left, right))))
+        combo = tuple(sorted([str(x) for x in item]))
+        if len(set(combo)) != len(combo):
+            raise ValueError(
+                "binary_group_constraints['forbidden_binary_combinations'] entries must not contain duplicate group names."
+            )
+        forbidden_set.add(combo)
 
     return {
         "allowed_binary_groups": allowed_set,
-        "forbidden_binary_pairs": forbidden_set,
+        "forbidden_binary_combinations": forbidden_set,
     }
 
 
@@ -238,12 +247,14 @@ def _assign_binary_group_labels(
             continue
 
         row_idx = str(row.name)
-        forbidden_pairs = normalized_constraints.get("forbidden_binary_pairs", set())
-        for left, right in combinations(active, 2):
-            pair = tuple(sorted((str(left), str(right))))
-            if pair in forbidden_pairs:
+        forbidden_combinations = normalized_constraints.get("forbidden_binary_combinations", set())
+        for size in range(2, len(active) + 1):
+            for combo in combinations(active, size):
+                combo_key = tuple(sorted([str(x) for x in combo]))
+                if combo_key not in forbidden_combinations:
+                    continue
                 hit = forbidden_hits.setdefault(
-                    pair,
+                    combo_key,
                     {"count": 0, "first_index": row_idx},
                 )
                 hit["count"] = int(hit["count"]) + 1
@@ -259,12 +270,12 @@ def _assign_binary_group_labels(
     if enforce_binary_group_constraints and (len(forbidden_hits) > 0 or len(unknown_hits) > 0):
         parts = []
         if len(forbidden_hits) > 0:
-            pair_msgs = []
-            for pair, info in sorted(forbidden_hits.items(), key=lambda x: (x[0][0], x[0][1])):
-                pair_msgs.append(
-                    f"{pair[0]}+{pair[1]} (n={int(info['count'])}, first_index={info['first_index']})"
+            combo_msgs = []
+            for combo, info in sorted(forbidden_hits.items(), key=lambda x: (len(x[0]), x[0])):
+                combo_msgs.append(
+                    f"{'+'.join(list(combo))} (n={int(info['count'])}, first_index={info['first_index']})"
                 )
-            parts.append("forbidden_pairs=[" + "; ".join(pair_msgs[:8]) + "]")
+            parts.append("forbidden_combinations=[" + "; ".join(combo_msgs[:8]) + "]")
         if len(unknown_hits) > 0:
             group_msgs = []
             for group, info in sorted(unknown_hits.items(), key=lambda x: x[0]):
@@ -282,7 +293,7 @@ def _assign_binary_group_labels(
 
 
 def _add_clean_binary_annotation_columns(df: pd.DataFrame, binary_cols: list[str]) -> pd.DataFrame:
-    """Add user-facing binary annotation columns (e.g. organoid_contact) to obs."""
+    """Back-compat shim for annotation columns; no-op for schema v3 exact-name grouping."""
     out = df.copy()
     for col in binary_cols:
         if col not in out.columns:
@@ -355,7 +366,10 @@ def rename_intrinsic_behavioral_clusters(
         clustering_meta = adata.uns.get("clustering", {})
         if isinstance(clustering_meta, dict):
             binary_group_constraints = clustering_meta.get("binary_group_constraints", None)
-            enforce_binary_group_constraints = isinstance(binary_group_constraints, dict)
+            enforce_binary_group_constraints = (
+                isinstance(binary_group_constraints, dict)
+                and ("forbidden_binary_combinations" in binary_group_constraints)
+            )
 
     return _rebuild_full_behavioral_cluster_from_intrinsic(
         adata=adata,
@@ -397,6 +411,7 @@ def subsample_with_temporal_spacing(
     id_cols=None,
     time_col="position_t",
     min_spacing=5,
+    min_time_from_track_start=None,
     max_samples=None,
     random_state=123,
 ):
@@ -405,6 +420,28 @@ def subsample_with_temporal_spacing(
         id_cols = ["sample_name", "TrackID"]
 
     rng = np.random.RandomState(random_state)
+
+    def _select_track_row_indices(track_df):
+        n_rows = len(track_df)
+        if n_rows == 0:
+            return []
+
+        eligible_positions = np.arange(n_rows, dtype=int)
+        if min_time_from_track_start is not None:
+            time_values = pd.to_numeric(track_df[time_col], errors="coerce").to_numpy(dtype=float, copy=False)
+            finite_mask = np.isfinite(time_values)
+            if not np.any(finite_mask):
+                return []
+            track_start_t = float(np.nanmin(time_values[finite_mask]))
+            min_eligible_t = track_start_t + float(min_time_from_track_start)
+            eligible_positions = np.flatnonzero(finite_mask & (time_values >= min_eligible_t))
+
+        n_eligible = int(len(eligible_positions))
+        if n_eligible == 0:
+            return []
+
+        start_offset = int(rng.randint(0, min(int(min_spacing), n_eligible)))
+        return eligible_positions[start_offset:: int(min_spacing)].tolist()
 
     if hasattr(data, "obs") and hasattr(data, "n_obs"):
         obs = data.obs
@@ -421,15 +458,9 @@ def subsample_with_temporal_spacing(
 
         for _, track_obs in obs_work.groupby(id_cols, observed=False):
             track_obs = track_obs.sort_values(time_col).reset_index(drop=True)
-            n = len(track_obs)
-            if n == 0:
+            local_selected = _select_track_row_indices(track_obs)
+            if len(local_selected) == 0:
                 continue
-            start_idx = int(rng.randint(0, min(int(min_spacing), n)))
-            local_selected = []
-            idx = start_idx
-            while idx < n:
-                local_selected.append(int(idx))
-                idx += int(min_spacing)
             selected_obs_idx.extend(track_obs.iloc[local_selected]["_obs_idx"].tolist())
 
         if len(selected_obs_idx) == 0:
@@ -447,15 +478,9 @@ def subsample_with_temporal_spacing(
     subsampled_rows = []
     for _, track_df in data.groupby(id_cols):
         track_df = track_df.sort_values(time_col).reset_index(drop=True)
-        n = len(track_df)
-        if n == 0:
+        selected_indices = _select_track_row_indices(track_df)
+        if len(selected_indices) == 0:
             continue
-        start_idx = int(rng.randint(0, min(int(min_spacing), n)))
-        selected_indices = []
-        idx = start_idx
-        while idx < n:
-            selected_indices.append(int(idx))
-            idx += int(min_spacing)
         subsampled_rows.append(track_df.iloc[selected_indices])
 
     if len(subsampled_rows) == 0:
@@ -882,6 +907,211 @@ def _sanitize_filename_token(value, fallback="value"):
     token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
     token = token.strip("._-")
     return token if len(token) > 0 else str(fallback)
+
+
+def _select_exemplar_windows_by_cluster(
+    adata_windows,
+    *,
+    cluster_key="intrinsic_behavioral_cluster",
+    n_per_cluster=5,
+    sample_key="sample_name",
+    track_key="TrackID",
+    time_key="position_t",
+    tmin_key="window_start_position_t",
+    tmax_key="window_end_position_t",
+    seed=0,
+):
+    required_cols = [sample_key, track_key, cluster_key, time_key, tmin_key, tmax_key]
+    missing = [c for c in required_cols if c not in adata_windows.obs.columns]
+    if len(missing) > 0:
+        raise ValueError(f"adata_windows.obs missing required columns for exemplar selection: {missing}")
+
+    rng = np.random.default_rng(seed)
+    window_df = adata_windows.obs[required_cols].copy()
+    window_df = window_df.dropna(subset=[cluster_key, tmin_key, tmax_key]).copy()
+    if len(window_df) == 0:
+        raise ValueError("No windows available after dropping rows missing cluster or window bounds.")
+
+    cluster_total_counts = window_df.groupby(cluster_key, observed=True).size().to_dict()
+    chosen_parts = []
+
+    for _, df_cl in window_df.groupby(cluster_key, sort=False, observed=True):
+        if len(df_cl) == 0:
+            continue
+
+        df_cl = df_cl.copy()
+        df_cl["_draw"] = rng.random(len(df_cl))
+        df_cl = df_cl.sort_values(
+            ["_draw", str(time_key), str(tmin_key), str(tmax_key)],
+            kind="stable",
+        )
+        df_cl = df_cl.drop_duplicates(
+            subset=[sample_key, track_key],
+            keep="first",
+        ).copy()
+
+        k = min(int(n_per_cluster), len(df_cl))
+        if k <= 0:
+            continue
+        idx = rng.choice(len(df_cl), size=k, replace=False)
+        chosen_parts.append(df_cl.iloc[idx].copy())
+
+    if len(chosen_parts) == 0:
+        raise ValueError("No exemplar windows were selected.")
+
+    chosen = pd.concat(chosen_parts, axis=0, ignore_index=True)
+    chosen = chosen.sort_values(
+        [str(cluster_key), str(sample_key), str(track_key), str(tmin_key), str(tmax_key), str(time_key)],
+        kind="stable",
+    ).reset_index(drop=True)
+    chosen["example_rank"] = (
+        chosen.groupby(cluster_key, observed=True).cumcount() + 1
+    ).astype(int)
+    return chosen, cluster_total_counts
+
+
+def _render_state_cluster_exemplar_videos(
+    model_adata,
+    *,
+    state_paths,
+    cell_type,
+    state_clustering_outdir,
+    cluster_key="intrinsic_behavioral_cluster",
+    n_per_cluster=5,
+    random_state=123,
+    video_fps=6,
+    video_dpi=180,
+    video_margin=20,
+    video_pmin=0.0,
+    video_pmax=99.99,
+    video_track_color="#63ff33",
+    video_show_segments=True,
+    video_segment_style="outline",
+    video_segment_color="#ffffff",
+    verbose=True,
+):
+    result = {
+        "enabled": True,
+        "cluster_key": str(cluster_key),
+        "selection_csv": None,
+        "video_paths_by_cluster": {},
+        "global_xy_shape": None,
+        "cluster_total_counts": {},
+        "segment_outline_errors": {},
+        "error": None,
+        "render_config": {
+            "stage": "after_clustering",
+            "cluster_key": str(cluster_key),
+            "state_key": str(cluster_key),
+            "n_per_cluster": int(n_per_cluster),
+            "selection_random_state": int(random_state),
+            "layout_mode": "per_cluster",
+            "video_fps": int(video_fps),
+            "video_dpi": int(video_dpi),
+            "video_margin": int(video_margin),
+            "video_pmin": float(video_pmin),
+            "video_pmax": float(video_pmax),
+            "video_track_color": str(video_track_color),
+            "video_show_segments": bool(video_show_segments),
+            "video_segment_style": str(video_segment_style),
+            "video_segment_color": str(video_segment_color),
+            "show_state_legend": False,
+            "positions_csv_path": None,
+        },
+    }
+
+    if str(cluster_key) not in model_adata.obs.columns:
+        result["error"] = f"Missing clustering exemplar column '{cluster_key}' in model_adata.obs."
+        return result
+
+    exemplar_started = _vstart(
+        verbose,
+        "state-clustering",
+        f"render exemplar videos | cluster_key={cluster_key}",
+    )
+    exemplar_root = (
+        Path(state_clustering_outdir)
+        / "example_windows"
+        / _sanitize_filename_token(cluster_key, fallback="cluster")
+    )
+    if exemplar_root.exists():
+        shutil.rmtree(exemplar_root)
+    exemplar_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        positions_csv_path = _resolve_positions_csv_path(state_paths=state_paths)
+        result["render_config"]["positions_csv_path"] = str(positions_csv_path)
+        df_positions = pd.read_csv(positions_csv_path, low_memory=False)
+        df_positions = df_positions.sort_values(["sample_name", "TrackID", "position_t"])
+        required_pos_cols = [
+            "sample_name",
+            "TrackID",
+            "position_t",
+            "pixel_position_x",
+            "pixel_position_y",
+            "pixel_position_z",
+        ]
+        missing_pos_cols = [c for c in required_pos_cols if c not in df_positions.columns]
+        if len(missing_pos_cols) > 0:
+            raise ValueError(
+                "State exemplar videos require pixel-position columns in the positions CSV. "
+                f"Missing columns: {missing_pos_cols}. csv='{positions_csv_path}'"
+            )
+
+        chosen_exemplars, cluster_total_counts = _select_exemplar_windows_by_cluster(
+            adata_windows=model_adata,
+            n_per_cluster=int(n_per_cluster),
+            cluster_key=str(cluster_key),
+            seed=int(random_state),
+        )
+        result["cluster_total_counts"] = {
+            str(k): int(v) for k, v in dict(cluster_total_counts).items()
+        }
+        chosen_exemplars["cluster_total_windows"] = chosen_exemplars[str(cluster_key)].astype(str).map(
+            result["cluster_total_counts"]
+        )
+
+        selection_csv = exemplar_root / (
+            f"example_window_selection_cluster_{_sanitize_filename_token(cluster_key, fallback='cluster')}.csv"
+        )
+        chosen_exemplars.to_csv(selection_csv, index=False)
+        result["selection_csv"] = str(selection_csv)
+        _vsave(verbose, "state-clustering", "example window selection CSV", selection_csv)
+
+        backprojection_video_out = save_selected_fulltrack_cluster_videos(
+            chosen_df=chosen_exemplars,
+            df_positions=df_positions,
+            output_folder=state_paths.output_dir,
+            out_dir=exemplar_root,
+            cluster_key=str(cluster_key),
+            sample_key="sample_name",
+            track_key="TrackID",
+            tmin_key="window_start_position_t",
+            tmax_key="window_end_position_t",
+            fps=int(video_fps),
+            dpi=int(video_dpi),
+            margin=int(video_margin),
+            pmin=float(video_pmin),
+            pmax=float(video_pmax),
+            track_color=str(video_track_color),
+            show_segment_outlines=bool(video_show_segments),
+            segment_style=str(video_segment_style),
+            segment_color=str(video_segment_color),
+            cell_type=cell_type,
+            verbose=bool(verbose),
+        )
+        result["video_paths_by_cluster"] = dict(
+            backprojection_video_out.get("video_paths_by_cluster", {})
+        )
+        result["segment_outline_errors"] = dict(
+            backprojection_video_out.get("segment_outline_errors", {})
+        )
+    except Exception as exc:
+        result["error"] = str(exc)
+        _vinfo(verbose, "state-clustering", f"State exemplar videos skipped: {exc}")
+
+    _vdone(verbose, "state-clustering", "render exemplar videos", exemplar_started)
+    return result
 
 
 def plot_clustering_diagnostics_pdf(
@@ -1506,6 +1736,8 @@ def _matches_model_sampling_cache(
     *,
     kept_features,
     min_spacing_used,
+    start_cutoff_mode=None,
+    start_cutoff_window_size=None,
     max_samples,
     random_state,
     id_cols=("sample_name", "TrackID"),
@@ -1564,6 +1796,18 @@ def _matches_model_sampling_cache(
         reasons.append("model_cache.sampling.id_cols mismatch")
     if str(sampling_meta.get("time_col", "")) != str(time_col):
         reasons.append("model_cache.sampling.time_col mismatch")
+    got_start_cutoff_mode = sampling_meta.get("start_cutoff_mode", None)
+    got_start_cutoff_mode = None if got_start_cutoff_mode is None else str(got_start_cutoff_mode)
+    exp_start_cutoff_mode = None if start_cutoff_mode is None else str(start_cutoff_mode)
+    if got_start_cutoff_mode != exp_start_cutoff_mode:
+        reasons.append("model_cache.sampling.start_cutoff_mode mismatch")
+    got_start_cutoff_window = sampling_meta.get("start_cutoff_window_size", None)
+    got_start_cutoff_window = None if got_start_cutoff_window is None else int(got_start_cutoff_window)
+    exp_start_cutoff_window = (
+        None if start_cutoff_window_size is None else int(start_cutoff_window_size)
+    )
+    if got_start_cutoff_window != exp_start_cutoff_window:
+        reasons.append("model_cache.sampling.start_cutoff_window_size mismatch")
 
     cleaning_meta = model_cache.get("cleaning", {})
     cleaning_meta = cleaning_meta if isinstance(cleaning_meta, dict) else {}
@@ -1729,7 +1973,7 @@ def _apply_preprocessing_to_continuous_matrix(
 
 
 def load_state_classifier_artifact(path):
-    """Load a saved state classification v2 classifier artifact pickle."""
+    """Load a saved state classification v3 classifier artifact pickle."""
     with open(path, "rb") as f:
         artifact = pickle.load(f)
     if not isinstance(artifact, dict) or "classifier" not in artifact:
@@ -2480,10 +2724,7 @@ def _resolve_binary_classifier_feature_cols(adata, binary_cols_to_merge):
     """Resolve binary classifier features strictly from supplied binary columns."""
     cols = []
     for col in list(binary_cols_to_merge):
-        clean_col = _binary_col_to_group_name(col)
-        if clean_col in adata.obs.columns:
-            cols.append(clean_col)
-        elif col in adata.obs.columns:
+        if col in adata.obs.columns:
             cols.append(col)
     # Preserve order while removing duplicates.
     return list(dict.fromkeys(cols))
@@ -3062,6 +3303,17 @@ def run_state_clustering(
     incomplete_window_policy="partial",
     random_state=123,
     reuse_prepared_dataset=True,
+    plot_exemplar_videos=True,
+    exemplar_n_per_cluster=5,
+    exemplar_video_fps=6,
+    exemplar_video_dpi=180,
+    exemplar_video_margin=20,
+    exemplar_video_pmin=0.0,
+    exemplar_video_pmax=99.99,
+    exemplar_video_track_color="#63ff33",
+    exemplar_video_show_segments=True,
+    exemplar_video_segment_style="outline",
+    exemplar_video_segment_color="#ffffff",
     # save_prepared_dataset=True,
     df_positions=None,
     state_paths=None,
@@ -3253,6 +3505,13 @@ def run_state_clustering(
         spacing_to_use = int(min_spacing)
     sampling_id_cols = ["sample_name", "TrackID"]
     sampling_time_col = "position_t"
+    sampling_start_cutoff_mode = "time_from_track_start"
+    sampling_start_cutoff_window_size = None if window_size is None else int(window_size)
+    sampling_min_time_from_track_start = (
+        None
+        if sampling_start_cutoff_window_size is None
+        else max(int(sampling_start_cutoff_window_size) - 1, 0)
+    )
     nan_policy = "drop_any_nan_in_kept_features"
 
     stage_sampling_started = _vstart(
@@ -3285,6 +3544,8 @@ def run_state_clustering(
                 cached_model_adata,
                 kept_features=kept_features,
                 min_spacing_used=spacing_to_use,
+                start_cutoff_mode=sampling_start_cutoff_mode,
+                start_cutoff_window_size=sampling_start_cutoff_window_size,
                 max_samples=max_samples,
                 random_state=random_state,
                 id_cols=sampling_id_cols,
@@ -3322,6 +3583,7 @@ def run_state_clustering(
             id_cols=sampling_id_cols,
             time_col=sampling_time_col,
             min_spacing=spacing_to_use,
+            min_time_from_track_start=sampling_min_time_from_track_start,
             max_samples=max_samples,
             random_state=random_state,
         )
@@ -3518,7 +3780,7 @@ def run_state_clustering(
         (
             "binary-group constraints inferred | "
             f"allowed_groups={len(binary_group_constraints.get('allowed_binary_groups', []))}, "
-            f"forbidden_pairs={len(binary_group_constraints.get('forbidden_binary_pairs', []))}"
+            f"forbidden_combinations={len(binary_group_constraints.get('forbidden_binary_combinations', []))}"
         ),
     )
     _rebuild_full_behavioral_cluster_from_intrinsic(
@@ -3595,6 +3857,12 @@ def run_state_clustering(
             "random_state": int(random_state),
             "time_col": str(sampling_time_col),
             "id_cols": [str(c) for c in sampling_id_cols],
+            "start_cutoff_mode": str(sampling_start_cutoff_mode),
+            "start_cutoff_window_size": (
+                None
+                if sampling_start_cutoff_window_size is None
+                else int(sampling_start_cutoff_window_size)
+            ),
         },
         "cleaning": {
             "nan_policy": str(nan_policy),
@@ -3638,6 +3906,83 @@ def run_state_clustering(
         "diagnostics_pdf": None if diagnostics_pdf is None else str(diagnostics_pdf),
         "diagnostics_csvs": dict(diagnostics_csvs),
     }
+
+    exemplar_render_result = {
+        "enabled": bool(plot_exemplar_videos),
+        "cluster_key": "intrinsic_behavioral_cluster",
+        "selection_csv": None,
+        "video_paths_by_cluster": {},
+        "global_xy_shape": None,
+        "cluster_total_counts": {},
+        "error": None,
+        "render_config": {
+            "stage": "after_clustering",
+            "cluster_key": "intrinsic_behavioral_cluster",
+            "state_key": "intrinsic_behavioral_cluster",
+            "n_per_cluster": int(exemplar_n_per_cluster),
+            "selection_random_state": int(random_state),
+            "layout_mode": "per_cluster",
+            "video_fps": int(exemplar_video_fps),
+            "video_dpi": int(exemplar_video_dpi),
+            "video_margin": int(exemplar_video_margin),
+            "video_pmin": float(exemplar_video_pmin),
+            "video_pmax": float(exemplar_video_pmax),
+            "video_track_color": str(exemplar_video_track_color),
+            "video_show_segments": bool(exemplar_video_show_segments),
+            "video_segment_style": str(exemplar_video_segment_style),
+            "video_segment_color": str(exemplar_video_segment_color),
+            "show_state_legend": False,
+            "positions_csv_path": None,
+        },
+    }
+    if bool(plot_exemplar_videos):
+        exemplar_render_result = _render_state_cluster_exemplar_videos(
+            model_adata=model_adata,
+            state_paths=state_paths,
+            cell_type=cell_type,
+            state_clustering_outdir=state_clustering_outdir,
+            cluster_key="intrinsic_behavioral_cluster",
+            n_per_cluster=int(exemplar_n_per_cluster),
+            random_state=int(random_state),
+            video_fps=int(exemplar_video_fps),
+            video_dpi=int(exemplar_video_dpi),
+            video_margin=int(exemplar_video_margin),
+            video_pmin=float(exemplar_video_pmin),
+            video_pmax=float(exemplar_video_pmax),
+            video_track_color=str(exemplar_video_track_color),
+            video_show_segments=bool(exemplar_video_show_segments),
+            video_segment_style=str(exemplar_video_segment_style),
+            video_segment_color=str(exemplar_video_segment_color),
+            verbose=verbose,
+        )
+
+    model_adata.uns.setdefault("visualization", {})
+    model_adata.uns["visualization"].update(
+        {
+            "exemplar_render_stage": "after_clustering",
+            "exemplar_cluster_key": str(exemplar_render_result.get("cluster_key", "intrinsic_behavioral_cluster")),
+            "exemplar_selection_csv": exemplar_render_result.get("selection_csv", None),
+            "exemplar_video_paths_by_cluster": dict(
+                exemplar_render_result.get("video_paths_by_cluster", {})
+            ),
+            "exemplar_backprojection_video_paths_by_cluster": dict(
+                exemplar_render_result.get("video_paths_by_cluster", {})
+            ),
+            "exemplar_video_canvas_shape": exemplar_render_result.get(
+                "global_xy_shape", None
+            ),
+            "exemplar_cluster_total_counts": dict(
+                exemplar_render_result.get("cluster_total_counts", {})
+            ),
+            "exemplar_render_config": dict(
+                exemplar_render_result.get("render_config", {})
+            ),
+            "exemplar_segment_outline_errors": dict(
+                exemplar_render_result.get("segment_outline_errors", {})
+            ),
+            "exemplar_render_error": exemplar_render_result.get("error", None),
+        }
+    )
 
     stage_model_write_started = time.perf_counter()
     model_adata.write(prepared_adata_model_path, compression="gzip")
@@ -4427,10 +4772,7 @@ def apply_state_classifiers_to_full_dataset(
         )
     enforce_binary_group_constraints = (
         isinstance(binary_group_constraints, dict)
-        and (
-            ("allowed_binary_groups" in binary_group_constraints)
-            or ("forbidden_binary_pairs" in binary_group_constraints)
-        )
+        and ("forbidden_binary_combinations" in binary_group_constraints)
     )
 
     prepared_cache_path = state_paths.prepared_full_adata_path
@@ -4857,18 +5199,18 @@ def test_pipeline():
         'no_contact_plastic_scanner': 'plastic_scanner',
         'no_contact_round_scanner': 'round_scanner',
         'no_contact_static': 'static',
-        'organoid_contact_and_tcell_contact_dead': 'dead',
-        'organoid_contact_and_tcell_contact_plastic_scanner': 'organoid_contact',
-        'organoid_contact_and_tcell_contact_round_scanner': 'organoid_contact',
-        'organoid_contact_and_tcell_contact_static': 'organoid_contact',
-        'organoid_contact_dead': 'dead',
-        'organoid_contact_plastic_scanner': 'organoid_contact',
-        'organoid_contact_round_scanner': 'organoid_contact',
-        'organoid_contact_static': 'organoid_contact',
-        'tcell_contact_dead': 'dead',
-        'tcell_contact_plastic_scanner': 'tcell_contact',
-        'tcell_contact_round_scanner': 'tcell_contact',
-        'tcell_contact_static': 'tcell_contact'
+        'organoid_contact_pixels_and_tcell_contact_pixels_dead': 'dead',
+        'organoid_contact_pixels_and_tcell_contact_pixels_plastic_scanner': 'organoid_contact_pixels',
+        'organoid_contact_pixels_and_tcell_contact_pixels_round_scanner': 'organoid_contact_pixels',
+        'organoid_contact_pixels_and_tcell_contact_pixels_static': 'organoid_contact_pixels',
+        'organoid_contact_pixels_dead': 'dead',
+        'organoid_contact_pixels_plastic_scanner': 'organoid_contact_pixels',
+        'organoid_contact_pixels_round_scanner': 'organoid_contact_pixels',
+        'organoid_contact_pixels_static': 'organoid_contact_pixels',
+        'tcell_contact_pixels_dead': 'dead',
+        'tcell_contact_pixels_plastic_scanner': 'tcell_contact_pixels',
+        'tcell_contact_pixels_round_scanner': 'tcell_contact_pixels',
+        'tcell_contact_pixels_static': 'tcell_contact_pixels'
         }
     
     model_adata = relabel_cluster_ids(

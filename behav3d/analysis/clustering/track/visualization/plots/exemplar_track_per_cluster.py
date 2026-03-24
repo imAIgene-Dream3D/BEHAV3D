@@ -15,6 +15,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 from behav3d.analysis.clustering.state.visualization.videos.track_max_projection import (
     create_fulltrack_max_projection_stacks_with_track,
+    prepare_fulltrack_max_projection_bundle,
+    resolve_tracked_zarr_path,
 )
 from behav3d.io.images import load_zarr
 
@@ -840,7 +842,14 @@ def _normalize_layout_mode(layout_mode):
     return mode
 
 
-def _pad_xy_stack_and_track_to_shape(xy_stack, track_xy, target_h, target_w):
+def _pad_xy_stack_and_track_to_shape(
+    xy_stack,
+    track_xy,
+    target_h,
+    target_w,
+    *,
+    xy_segment_outline_rgba=None,
+):
     if xy_stack.ndim != 4:
         raise ValueError(f"xy_stack must be 4D (T,H,W,3), got shape {xy_stack.shape}.")
     h = int(xy_stack.shape[1])
@@ -862,11 +871,31 @@ def _pad_xy_stack_and_track_to_shape(xy_stack, track_xy, target_h, target_w):
         constant_values=0,
     )
 
+    padded_outline = None
+    if xy_segment_outline_rgba is not None:
+        xy_segment_outline_rgba = np.asarray(xy_segment_outline_rgba)
+        if xy_segment_outline_rgba.ndim != 4 or int(xy_segment_outline_rgba.shape[-1]) != 4:
+            raise ValueError(
+                "xy_segment_outline_rgba must be 4D (T,H,W,4), "
+                f"got shape {xy_segment_outline_rgba.shape}."
+            )
+        if int(xy_segment_outline_rgba.shape[1]) != h or int(xy_segment_outline_rgba.shape[2]) != w:
+            raise ValueError(
+                "xy_segment_outline_rgba spatial shape must match xy_stack. "
+                f"Got outline={xy_segment_outline_rgba.shape}, xy_stack={xy_stack.shape}."
+            )
+        padded_outline = np.pad(
+            xy_segment_outline_rgba,
+            ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+            mode="constant",
+            constant_values=0,
+        )
+
     track_shifted = np.array(track_xy, dtype=float, copy=True)
     valid = ~np.isnan(track_shifted[:, 0]) & ~np.isnan(track_shifted[:, 1])
     track_shifted[valid, 0] = track_shifted[valid, 0] + float(pad_left)
     track_shifted[valid, 1] = track_shifted[valid, 1] + float(pad_top)
-    return padded, track_shifted
+    return padded, track_shifted, padded_outline
 
 
 def _render_state_legend_panel(
@@ -1048,6 +1077,7 @@ def _prepare_exemplar_backprojection_data(
     adata_full,
     *,
     output_dir,
+    cell_type=None,
     chosen_df,
     sample_key,
     track_key,
@@ -1062,6 +1092,9 @@ def _prepare_exemplar_backprojection_data(
     cmap_name,
     coordinate_source_hint,
     examples_per_cluster,
+    show_segment_outlines=False,
+    segment_style="outline",
+    segment_color="#ffffff",
 ):
     _validate_required_columns(
         chosen_df,
@@ -1110,6 +1143,7 @@ def _prepare_exemplar_backprojection_data(
         [sample_key, track_key, time_key, "pixel_position_x", "pixel_position_y", "pixel_position_z"]
     ].copy()
     sample_cache = {}
+    segment_outline_errors = {}
 
     rows_info = []
     max_h = 0
@@ -1137,7 +1171,25 @@ def _prepare_exemplar_backprojection_data(
                     pmin=float(pmin),
                     pmax=float(pmax),
                 ),
+                "tracked_img": None,
+                "tracked_img_path": None,
+                "tracked_img_error": None,
             }
+            if bool(show_segment_outlines):
+                try:
+                    tracked_img_path = resolve_tracked_zarr_path(
+                        output_folder=output_dir,
+                        sample_name=sample_name_key,
+                        cell_type=cell_type,
+                    )
+                    if tracked_img_path is None:
+                        raise FileNotFoundError(
+                            f"Could not resolve tracked zarr for sample='{sample_name_key}'."
+                        )
+                    sample_cache[sample_name_key]["tracked_img_path"] = str(Path(tracked_img_path))
+                    sample_cache[sample_name_key]["tracked_img"] = load_zarr(tracked_img_path)
+                except Exception as exc:
+                    sample_cache[sample_name_key]["tracked_img_error"] = str(exc)
         cached = sample_cache[sample_name_key]
 
         track_df = _extract_track_window_obs(
@@ -1181,7 +1233,7 @@ def _prepare_exemplar_backprojection_data(
             "window_end_position_t": t1,
         }
         try:
-            xy_stack, _, _, track_xy, _, _ = create_fulltrack_max_projection_stacks_with_track(
+            bundle = prepare_fulltrack_max_projection_bundle(
                 df_window=window_row,
                 df_positions=df_positions,
                 output_folder=output_dir,
@@ -1192,12 +1244,26 @@ def _prepare_exemplar_backprojection_data(
                 normalize_per_channel=True,
                 zarr_img=cached["zarr_img"],
                 percentiles=cached["percentiles"],
+                show_segment_outlines=bool(show_segment_outlines) and (cached["tracked_img_error"] is None),
+                segment_style=segment_style,
+                segment_color=segment_color,
+                tracked_img=cached["tracked_img"],
+                tracked_img_path=cached["tracked_img_path"],
+                cell_type=cell_type,
             )
         except Exception as exc:
             raise ValueError(
                 "Failed to create exemplar backprojection stack for "
                 f"cluster='{cluster_value}', sample='{sample_name}', track='{track_id}': {exc}"
             ) from exc
+
+        xy_stack = bundle["xy_proj_rgb"]
+        track_xy = bundle["track_xy"]
+        xy_segment_outline_rgba = bundle["segment_xy_rgba"]
+        row_error = cached.get("tracked_img_error", None) or bundle.get("segment_outline_error", None)
+        if row_error is not None:
+            row_key = f"{sample_name_key}|track={track_id}|t={t0}-{t1}"
+            segment_outline_errors[row_key] = str(row_error)
 
         if xy_stack.ndim != 4 or int(xy_stack.shape[0]) == 0:
             raise ValueError(
@@ -1216,6 +1282,7 @@ def _prepare_exemplar_backprojection_data(
                 "cluster_text": str(cluster_value),
                 "example_rank": int(rank_value),
                 "xy_stack": xy_stack,
+                "xy_segment_outline_rgba": xy_segment_outline_rgba,
                 "track_xy": track_xy,
                 "segments": segments,
                 "xlim": xlim,
@@ -1230,11 +1297,16 @@ def _prepare_exemplar_backprojection_data(
     target_h = int(max_h)
     target_w = int(max_w)
     for row in rows_info:
-        xy_pad, track_pad = _pad_xy_stack_and_track_to_shape(
-            row["xy_stack"], row["track_xy"], target_h=target_h, target_w=target_w
+        xy_pad, track_pad, xy_outline_pad = _pad_xy_stack_and_track_to_shape(
+            row["xy_stack"],
+            row["track_xy"],
+            target_h=target_h,
+            target_w=target_w,
+            xy_segment_outline_rgba=row.get("xy_segment_outline_rgba", None),
         )
         row["xy_stack"] = xy_pad
         row["track_xy"] = track_pad
+        row["xy_segment_outline_rgba"] = xy_outline_pad
 
     return {
         "rows_info": rows_info,
@@ -1243,12 +1315,14 @@ def _prepare_exemplar_backprojection_data(
         "state_values": state_values,
         "state_color_map": state_color_map,
         "global_xy_shape": [int(target_h), int(target_w)],
+        "segment_outline_errors": dict(segment_outline_errors),
     }
 
 
 def _render_statebar_xy_frame(
     *,
     xy_rgb,
+    xy_segment_outline_rgba=None,
     track_xy,
     t_idx,
     segments,
@@ -1287,6 +1361,8 @@ def _render_statebar_xy_frame(
 
     base = xy_rgb if bool(show_raw_image) else np.zeros_like(xy_rgb)
     ax_xy.imshow(base, interpolation="nearest", aspect="equal")
+    if xy_segment_outline_rgba is not None:
+        ax_xy.imshow(xy_segment_outline_rgba, interpolation="nearest", aspect="equal")
     h, w = int(base.shape[0]), int(base.shape[1])
     ax_xy.set_xlim(-0.5, float(w) - 0.5)
     ax_xy.set_ylim(float(h) - 0.5, -0.5)
@@ -1361,7 +1437,9 @@ def _init_statebar_xy_row_renderer(
 
     h, w = int(xy_shape[0]), int(xy_shape[1])
     blank = np.zeros((h, w, 3), dtype=np.uint8)
+    blank_outline = np.zeros((h, w, 4), dtype=float)
     img_artist = ax_xy.imshow(blank, interpolation="nearest", aspect="equal")
+    segment_artist = ax_xy.imshow(blank_outline, interpolation="nearest", aspect="equal")
     ax_xy.set_xlim(-0.5, float(w) - 0.5)
     ax_xy.set_ylim(float(h) - 0.5, -0.5)
     ax_xy.set_title("Raw XY + track", fontsize=8)
@@ -1376,10 +1454,12 @@ def _init_statebar_xy_row_renderer(
         "fig": fig,
         "canvas": canvas,
         "img_artist": img_artist,
+        "segment_artist": segment_artist,
         "path_line": path_line,
         "point_line": point_line,
         "cursor_line": cursor_line,
         "blank": blank,
+        "blank_outline": blank_outline,
     }
 
 
@@ -1387,6 +1467,7 @@ def _render_statebar_xy_frame_from_renderer(
     renderer,
     *,
     xy_rgb,
+    xy_segment_outline_rgba=None,
     track_xy,
     t_idx,
     cursor_x,
@@ -1398,6 +1479,10 @@ def _render_statebar_xy_frame_from_renderer(
         renderer["img_artist"].set_data(xy_rgb)
     else:
         renderer["img_artist"].set_data(renderer["blank"])
+    if xy_segment_outline_rgba is not None:
+        renderer["segment_artist"].set_data(xy_segment_outline_rgba)
+    else:
+        renderer["segment_artist"].set_data(renderer["blank_outline"])
 
     t_clamped = max(0, min(int(t_idx), int(track_xy.shape[0]) - 1))
     path = track_xy[: t_clamped + 1]
@@ -1462,6 +1547,7 @@ def save_exemplar_statebar_backprojection_pdf(
     adata_full,
     *,
     output_dir,
+    cell_type=None,
     out_dir,
     chosen_df=None,
     adata_tracks=None,
@@ -1479,6 +1565,9 @@ def save_exemplar_statebar_backprojection_pdf(
     pmin=0.0,
     pmax=99.99,
     track_color="#63ff33",
+    show_segment_outlines=False,
+    segment_style="outline",
+    segment_color="#ffffff",
     coordinate_source_hint=None,
     seed=0,
     cmap_name="tab20",
@@ -1515,6 +1604,7 @@ def save_exemplar_statebar_backprojection_pdf(
         prep = _prepare_exemplar_backprojection_data(
             adata_full=adata_full,
             output_dir=output_dir,
+            cell_type=cell_type,
             chosen_df=chosen_df.copy().reset_index(drop=True),
             sample_key=sample_key,
             track_key=track_key,
@@ -1529,6 +1619,9 @@ def save_exemplar_statebar_backprojection_pdf(
             cmap_name=cmap_name,
             coordinate_source_hint=coordinate_source_hint,
             examples_per_cluster=examples_per_cluster,
+            show_segment_outlines=bool(show_segment_outlines),
+            segment_style=segment_style,
+            segment_color=segment_color,
         )
         if bool(verbose):
             print(
@@ -1577,6 +1670,9 @@ def save_exemplar_statebar_backprojection_pdf(
                     t_last = int(row["T"]) - 1
                     row_frame = _render_statebar_xy_frame(
                         xy_rgb=row["xy_stack"][t_last],
+                        xy_segment_outline_rgba=None
+                        if row.get("xy_segment_outline_rgba", None) is None
+                        else row["xy_segment_outline_rgba"][t_last],
                         track_xy=row["track_xy"],
                         t_idx=t_last,
                         segments=row["segments"],
@@ -1631,6 +1727,7 @@ def save_exemplar_statebar_backprojection_pdf(
         "n_tracks_selected": int(len(prep["ranked_df"])),
         "layout_mode": str(mode),
         "global_xy_shape": list(prep["global_xy_shape"]),
+        "segment_outline_errors": dict(prep.get("segment_outline_errors", {})),
     }
     if bool(verbose):
         elapsed = time.perf_counter() - t_start
@@ -1646,6 +1743,7 @@ def save_exemplar_statebar_backprojection_video_per_cluster(
     adata_full,
     *,
     output_dir,
+    cell_type=None,
     out_dir,
     chosen_df=None,
     adata_tracks=None,
@@ -1663,6 +1761,9 @@ def save_exemplar_statebar_backprojection_video_per_cluster(
     pmin=0.0,
     pmax=99.99,
     track_color="#63ff33",
+    show_segment_outlines=False,
+    segment_style="outline",
+    segment_color="#ffffff",
     coordinate_source_hint=None,
     seed=0,
     cmap_name="tab20",
@@ -1701,6 +1802,7 @@ def save_exemplar_statebar_backprojection_video_per_cluster(
         prep = _prepare_exemplar_backprojection_data(
             adata_full=adata_full,
             output_dir=output_dir,
+            cell_type=cell_type,
             chosen_df=chosen_df.copy().reset_index(drop=True),
             sample_key=sample_key,
             track_key=track_key,
@@ -1715,6 +1817,9 @@ def save_exemplar_statebar_backprojection_video_per_cluster(
             cmap_name=cmap_name,
             coordinate_source_hint=coordinate_source_hint,
             examples_per_cluster=examples_per_cluster,
+            show_segment_outlines=bool(show_segment_outlines),
+            segment_style=segment_style,
+            segment_color=segment_color,
         )
     else:
         prep = prepared_data
@@ -1823,6 +1928,9 @@ def save_exemplar_statebar_backprojection_video_per_cluster(
                         frame = _render_statebar_xy_frame_from_renderer(
                             item["renderer"],
                             xy_rgb=row["xy_stack"][ti],
+                            xy_segment_outline_rgba=None
+                            if row.get("xy_segment_outline_rgba", None) is None
+                            else row["xy_segment_outline_rgba"][ti],
                             track_xy=row["track_xy"],
                             t_idx=ti,
                             cursor_x=float(row["t0"] + ti),
@@ -1881,6 +1989,7 @@ def save_exemplar_statebar_backprojection_video_per_cluster(
         "n_tracks_selected": int(len(prep["ranked_df"])),
         "layout_mode": str(mode),
         "global_xy_shape": list(prep["global_xy_shape"]),
+        "segment_outline_errors": dict(prep.get("segment_outline_errors", {})),
     }
     if bool(verbose):
         elapsed = time.perf_counter() - t_start

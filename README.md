@@ -97,33 +97,15 @@ python install_behav3d.py --pytorch-only
 
 ## How to Run
 
-### Napari GUI (Recommended)
+BEHAV3D is run through Jupyter notebooks. We recommend using **Visual Studio Code**:
 
-BEHAV3D provides a full graphical interface through the napari viewer:
+1. Install [VS Code](https://code.visualstudio.com/Download)
+2. Install the Python and Jupyter extensions
+3. Open the BEHAV3D folder
+4. Open `notebooks/run_behav3d.ipynb`
+5. Select kernel: Python Environments > behav3d
 
-**Quick launch:**
-1. Double-click `napari/run_behav3d.bat` (Windows) or `napari/run_behav3d.sh` (macOS/Linux)
-2. The BEHAV3D plugin will open automatically inside napari
-
-**Manual launch:**
-```bash
-mamba activate behav3d
-napari
-```
-Then open the BEHAV3D plugin from the **Plugins** menu.
-
-The napari GUI covers the full pipeline: data preparation → segmentation → tracking → feature extraction → filtering.
-
-### Jupyter Notebook (Alternative)
-
-> **Note:** The Jupyter notebook provides an alternative, script-based interface for advanced users who prefer more control over individual pipeline steps.
-
-1. Install [VS Code](https://code.visualstudio.com/Download) with the Python and Jupyter extensions
-2. Open the BEHAV3D folder
-3. Open `notebooks/run_behav3d.ipynb`
-4. Select kernel: Python Environments > behav3d
-
-Or in a web browser:
+Alternatively, run in a web browser:
 ```bash
 mamba activate behav3d
 jupyter notebook notebooks/run_behav3d.ipynb
@@ -179,7 +161,7 @@ jupyter notebook notebooks/run_behav3d.ipynb
 To use **Cellpose** for 3D segmentation with pretrained models using the `run_behav3d.ipynb` notebook:
 
 ### Pretrained Models
-You can find and download pretrained T cell and Organoid Cellpose models in [Zenodo](https://zenodo.org/records/18872978).
+You can find and download pretrained T cell and Organoid Cellpose models in [Zenodo](https://zenodo.org/records/18872978) or in the `behav3d/preprocessing/segmentation/models` folder.
 
 
 ### Prerequisites
@@ -218,6 +200,59 @@ After segmentation, use the **Visualize the sample** button:
 2.  Click **"Visualize the sample"**.
 3.  This launches **Napari**: overlay segmented and original raw channels for easy inspection.
 
+
 ---
 
 *Note: To train a new Cellpose model, refer to the `train_behav3d_cellpose.ipynb` notebook.*
+
+
+## btrack Tracking
+
+[btrack](https://github.com/quantumjot/btrack) is a Bayesian multi-object tracking library designed for cell tracking in time-lapse imaging. It uses a motion model and object features to build consistent cell trajectories across timepoints, handling cell divisions, disappearances, and re-appearances robustly.
+
+BEHAV3D uses btrack to link segmented cell instances across frames into full tracks, producing per-cell trajectory data used in downstream behavioral analysis.
+
+### Provided Default Configurations
+
+Pre-configured btrack motion model config files (`.json`) for common cell types are included in the `behav3d/preprocessing/tracking/models/` folder:
+
+| Config file | Suitable for |
+|---|---|
+| `cell_config.json` | Generic cell tracking (moderate speed, large objects) |
+| `particle_config.json` | Fast, small objects (e.g. T cells, immune cells) |
+
+These configs define the motion model parameters (e.g., max search radius, noise covariance) and are passed directly to the btrack `BayesianTracker`.
+
+### Workflow in `run_behav3d.ipynb`
+
+#### 1. Select a Tracking Configuration
+- In the **Tracking** section of the notebook, select the config file appropriate for your cell type.
+- You can point to a custom `.json` config if the defaults don't match your acquisition settings.
+
+#### 2. Configure Tracking Parameters
+
+| Parameter | Description |
+|---|---|
+| **Volume** | Physical XYZ bounding box of your acquisition in micrometers |
+| **Max search radius** | Maximum distance (µm) a cell can travel between frames |
+| **Step size** | Number of frames to look ahead/behind when linking |
+
+#### 3. Run Tracking
+- Click **"Run Tracking"** to link segmented objects into tracks.
+- Output tracks are saved as `.csv` and `.zarr` files per sample in `images/{sample_name}/`.
+
+#### 4. Visualize Tracks
+- Use the **"Visualize the sample"** button to open Napari with the tracked data overlaid on the raw image.
+
+### Output Files
+
+| File | Contents |
+|---|---|
+| `{sample_name}_{cell_type}_tracks.csv` | Per-cell track data (position, time, track ID) |
+| `{sample_name}_{cell_type}_tracks.zarr` | Tracked labels as a 4D array (T, Z, Y, X) |
+
+These files are automatically picked up by the downstream **Analysis** module to compute behavioral metrics (speed, contact duration, killing events, etc.).
+
+---
+
+*Note: For custom motion models, refer to the [btrack documentation](https://btrack.readthedocs.io).*

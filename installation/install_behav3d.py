@@ -27,7 +27,6 @@ import shutil
 import tempfile
 import urllib.request
 import argparse
-import json
 from pathlib import Path
 
 # =============================================================================
@@ -36,7 +35,7 @@ from pathlib import Path
 
 DEFAULT_ENV_NAME = "behav3d"
 PYTHON_VERSION = "3.12"
-CUDA_VERSION = "12.1"  # Default CUDA version for PyTorch
+CUDA_VERSION = "cu128"  # Default CUDA version for PyTorch
 
 # Global variable that will be set from command line args
 ENV_NAME = DEFAULT_ENV_NAME
@@ -45,15 +44,14 @@ ENV_NAME = DEFAULT_ENV_NAME
 MINIFORGE_URLS = {
     "Windows": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Windows-x86_64.exe",
     "Darwin": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-{arch}.sh",
-    "Linux": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-{arch}.sh",
+    "Linux": "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh",
 }
 
 # Micromamba download URLs (lightweight, standalone conda alternative)
-# These return tar.bz2 archives containing bin/micromamba
 MICROMAMBA_URLS = {
     "Windows": "https://micro.mamba.pm/api/micromamba/win-64/latest",
     "Darwin": "https://micro.mamba.pm/api/micromamba/osx-{arch}/latest",
-    "Linux": "https://micro.mamba.pm/api/micromamba/linux-{arch}/latest",
+    "Linux": "https://micro.mamba.pm/api/micromamba/linux-64/latest",
 }
 
 # =============================================================================
@@ -101,18 +99,6 @@ def get_architecture():
     if machine in ('arm64', 'aarch64'):
         return 'arm64'
     return 'x86_64'
-
-def get_micromamba_arch():
-    """Get the architecture string used in micromamba download URLs.
-    
-    macOS uses osx-arm64, Linux uses linux-aarch64 for ARM.
-    """
-    machine = platform.machine().lower()
-    if machine in ('arm64', 'aarch64'):
-        if platform.system() == 'Darwin':
-            return 'arm64'   # osx-arm64
-        return 'aarch64'     # linux-aarch64
-    return '64'
 
 def run_command(cmd, shell=True, capture=False, check=True):
     """Run a shell command."""
@@ -182,8 +168,6 @@ def install_miniforge():
     
     if system == "Darwin":
         url = MINIFORGE_URLS[system].format(arch=arch)
-    elif system == "Linux":
-        url = MINIFORGE_URLS[system].format(arch=arch)
     else:
         url = MINIFORGE_URLS[system]
     
@@ -231,26 +215,18 @@ def install_miniforge():
             return None
 
 def install_micromamba():
-    """Download and install Micromamba (lightweight conda alternative).
-    
-    The micromamba API returns a tar.bz2 archive containing the binary at
-    bin/micromamba (Unix) or Library/bin/micromamba.exe (Windows).
-    """
-    import tarfile
-    
+    """Download and install Micromamba (lightweight conda alternative)."""
     print_step("Installing Micromamba (lightweight conda alternative)...")
     
     system = get_platform()
-    mm_arch = get_micromamba_arch()
+    arch = get_architecture()
     
-    # Build download URL with correct architecture
     if system == "Darwin":
-        url = MICROMAMBA_URLS[system].format(arch=mm_arch)
-    elif system == "Linux":
-        url = MICROMAMBA_URLS[system].format(arch=mm_arch)
+        url = MICROMAMBA_URLS[system].format(arch=arch)
     else:
         url = MICROMAMBA_URLS[system]
     
+    # Download micromamba
     print_info(f"Downloading from: {url}")
     
     install_path = Path.home() / "micromamba"
@@ -263,41 +239,12 @@ def install_micromamba():
         (install_path / "bin").mkdir(exist_ok=True)
     
     try:
-        # Download the tar.bz2 archive to a temporary file, then extract
-        with tempfile.TemporaryDirectory() as tmpdir:
-            archive_path = Path(tmpdir) / "micromamba.tar.bz2"
-            urllib.request.urlretrieve(url, archive_path)
-            print_success("Download complete")
-            
-            # Extract the micromamba binary from the archive
-            print_step("Extracting micromamba binary...")
-            with tarfile.open(archive_path, "r:bz2") as tar:
-                if system == "Windows":
-                    # Windows binary is at Library/bin/micromamba.exe
-                    member_name = "Library/bin/micromamba.exe"
-                else:
-                    # Unix binary is at bin/micromamba
-                    member_name = "bin/micromamba"
-                
-                # Extract only the micromamba binary
-                member = tar.getmember(member_name)
-                # Extract to temp dir first, then move to final location
-                tar.extract(member, path=tmpdir)
-                extracted = Path(tmpdir) / member_name
-                
-                # Move to final install location
-                shutil.copy2(str(extracted), str(micromamba_exe))
+        urllib.request.urlretrieve(url, micromamba_exe)
         
         if system != "Windows":
             os.chmod(micromamba_exe, 0o755)
         
-        # Verify the binary works
-        print_step("Verifying micromamba binary...")
-        result = run_command(f'"{micromamba_exe}" --version', capture=True, check=False)
-        if result:
-            print_success(f"Micromamba {result} installed at: {micromamba_exe}")
-        else:
-            print_success(f"Micromamba installed at: {micromamba_exe}")
+        print_success(f"Micromamba installed at: {micromamba_exe}")
         
         # Initialize micromamba
         print_step("Initializing micromamba...")
@@ -494,7 +441,7 @@ def install_pytorch(conda_path, gpu_info, force_cpu=False):
     try:
         if backend == "cuda":
             # Install PyTorch with CUDA from pytorch channel
-            cmd = f'{run_prefix} pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121'
+            cmd = f'{run_prefix} pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/{CUDA_VERSION}'
         elif backend == "mps" or system == "Darwin":
             # macOS - use default PyTorch (includes MPS support)
             cmd = f'{run_prefix} pip install torch torchvision torchaudio'
@@ -533,6 +480,49 @@ def install_cellpose(conda_path, gpu_info, force_cpu=False):
         print_error(f"Failed to install Cellpose: {e}")
         return False
 
+
+# =============================================================================
+# OPENCL BACKEND (for APOC / pyopencl)
+# =============================================================================
+
+def install_opencl_backend(conda_path):
+    """Install platform-specific OpenCL ICD loader for APOC/pyopencl.
+    
+    - macOS : conda install -c conda-forge ocl_icd_wrapper_apple
+    - Linux : conda install -c conda-forge ocl-icd-system
+    - Windows: uses the OS built-in ICD loader — no extra package needed.
+    """
+    system = get_platform()
+    
+    if system not in ("Darwin", "Linux"):
+        # Windows uses the system ICD loader automatically
+        return True
+    
+    pkg_mgr = get_package_manager() or conda_path
+    
+    print_header("OPENCL BACKEND FOR APOC")
+    
+    if system == "Darwin":
+        print_step("Installing macOS OpenCL ICD wrapper (required for APOC GPU classifier)...")
+        cmd = f'"{pkg_mgr}" install -n {ENV_NAME} -c conda-forge ocl_icd_wrapper_apple -y'
+        try:
+            run_command(cmd, check=False)
+            print_success("macOS OpenCL ICD wrapper installed (ocl_icd_wrapper_apple)")
+        except Exception as e:
+            print_warning(f"Could not install ocl_icd_wrapper_apple: {e}")
+            print_info("APOC may still work if an OpenCL platform is already available.")
+    
+    elif system == "Linux":
+        print_step("Installing Linux OpenCL ICD system loader (required for APOC GPU classifier)...")
+        cmd = f'"{pkg_mgr}" install -n {ENV_NAME} -c conda-forge ocl-icd-system -y'
+        try:
+            run_command(cmd, check=False)
+            print_success("Linux OpenCL ICD system loader installed (ocl-icd-system)")
+        except Exception as e:
+            print_warning(f"Could not install ocl-icd-system: {e}")
+            print_info("APOC may still work if an OpenCL platform is already provided by your GPU driver.")
+    
+    return True
 
 # =============================================================================
 # BEHAV3D PACKAGE INSTALLATION
@@ -600,7 +590,6 @@ def verify_installation(conda_path):
         ("CUDA Available", 'python -c "import torch; print(f\'CUDA: {torch.cuda.is_available()}\')"'),
         ("Cellpose", 'python -c "from importlib.metadata import version; print(f\'Cellpose {version(\\\"cellpose\\\")}\')"'),
         ("Napari", 'python -c "import napari; print(f\'Napari {napari.__version__}\')"'),
-        ("BEHAV3D Plugin", 'python -c "from behav3d.napari._widget import BEHAV3DWidget; print(\'Plugin OK\')"'),
     ]
     
     all_passed = True
@@ -617,125 +606,6 @@ def verify_installation(conda_path):
             all_passed = False
     
     return all_passed
-
-
-# =============================================================================
-# ENVIRONMENT CONFIG PERSISTENCE & NAPARI LAUNCH
-# =============================================================================
-
-def save_env_config(conda_path):
-    """Save the package manager path and env name to napari/behav3d_env.json."""
-    project_root = find_project_root()
-    napari_dir = project_root / "napari"
-    napari_dir.mkdir(exist_ok=True)
-    
-    # Use the best available package manager (same one used during install)
-    pkg_mgr = get_package_manager()
-    if not pkg_mgr:
-        pkg_mgr = conda_path
-    
-    config_path = napari_dir / "behav3d_env.json"
-    config = {
-        "pkg_manager": str(pkg_mgr),
-        "env_name": ENV_NAME,
-    }
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-    
-    print_success(f"Environment config saved to: {config_path}")
-    print_info(f"  Package manager: {pkg_mgr}")
-    print_info(f"  Environment name: {ENV_NAME}")
-    return config_path
-
-
-def _find_env_python(pkg_manager, env_name):
-    """Locate the Python binary inside a conda/mamba/micromamba environment.
-    
-    Avoids 'micromamba run' which generates a wrapper script using 'exec --'
-    that fails on Ubuntu where /bin/sh is dash.
-    """
-    pkg_path = Path(pkg_manager)
-    system = get_platform()
-    
-    # Strategy 1: query '<pkg> env list --json'
-    try:
-        result = subprocess.run(
-            [str(pkg_path), "env", "list", "--json"],
-            capture_output=True, text=True, check=False
-        )
-        if result.returncode == 0:
-            import json as _json
-            data = _json.loads(result.stdout)
-            for env_path_str in data.get("envs", []):
-                env_path = Path(env_path_str)
-                if env_path.name == env_name:
-                    py = env_path / ("python.exe" if system == "Windows" else "bin/python")
-                    if py.exists():
-                        return str(py)
-    except Exception:
-        pass
-    
-    # Strategy 2: well-known locations
-    home = Path.home()
-    candidate_roots = [
-        home / "micromamba" / "envs",
-        home / "miniforge3" / "envs",
-        home / "mambaforge" / "envs",
-        home / "miniconda3" / "envs",
-        home / "anaconda3" / "envs",
-    ]
-    mamba_root = os.environ.get("MAMBA_ROOT_PREFIX")
-    if mamba_root:
-        candidate_roots.insert(0, Path(mamba_root))
-    
-    for root in candidate_roots:
-        env_dir = root / env_name
-        py = env_dir / ("python.exe" if system == "Windows" else "bin/python")
-        if py.exists():
-            return str(py)
-    
-    return None
-
-
-def launch_napari(conda_path):
-    """Launch napari with the BEHAV3D plugin."""
-    project_root = find_project_root()
-    script_path = project_root / "napari" / "launch_napari.py"
-    
-    if not script_path.exists():
-        print_warning(f"Startup script not found at {script_path}")
-        print_info("Falling back to standard napari launch...")
-        cmd = f'{get_conda_run_prefix(conda_path, ENV_NAME)} napari'
-    else:
-        # Try to use the environment's Python directly (avoids micromamba run issues)
-        env_python = _find_env_python(
-            get_package_manager() or conda_path, ENV_NAME
-        )
-        if env_python:
-            cmd = f'"{env_python}" "{script_path}" --internal'
-        else:
-            run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
-            cmd = f'{run_prefix} python "{script_path}" --internal'
-        
-    print_info(f"Running: {cmd}")
-    try:
-        kwargs = {}
-        if platform.system() == "Windows":
-            # Open in a new console window
-            kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
-        else:
-            # On Linux/macOS, detach the process so it survives when we exit
-            kwargs['start_new_session'] = True
-            # Redirect output to devnull if creating a new session to avoid clutter/hanging
-            kwargs['stdout'] = subprocess.DEVNULL
-            kwargs['stderr'] = subprocess.DEVNULL
-        
-        subprocess.Popen(cmd, shell=True, **kwargs)
-        print_success("Napari is starting with BEHAV3D plugin...")
-        print_info("Closing installation window...")
-        sys.exit(0)
-    except Exception as e:
-        print_error(f"Failed to launch napari: {e}")
 
 # =============================================================================
 # MAIN INSTALLATION FLOW
@@ -893,6 +763,9 @@ Examples:
                 print_error("Failed to create conda environment.")
                 return 1
     
+    # Install OpenCL backend for APOC (platform-specific)
+    install_opencl_backend(conda_path)
+    
     # Install nomkl to prevent OpenMP conflicts between conda MKL and PyTorch
     # This must be done BEFORE installing PyTorch
     # First, switch igraph's BLAS dependency from MKL to OpenBLAS to avoid conflict:
@@ -930,85 +803,48 @@ Examples:
         print_error("Failed to install Cellpose.")
         return 1
     
-    # Install BEHAV3D package (includes napari plugin via setup.py entry points)
+    # Install BEHAV3D package
     if not args.skip_behav3d and not args.pytorch_only:
         print_header("BEHAV3D PACKAGE INSTALLATION")
         if not install_behav3d_package(conda_path):
             print_warning("BEHAV3D package installation failed (non-critical)")
-        else:
-            # Verify the napari plugin was registered (using npe2 discovery)
-            print_step("Verifying napari plugin registration...")
-            run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
-            try:
-                # Check 1: Import the widget class
-                cmd_import = f'{run_prefix} python -c "from behav3d.napari._widget import BEHAV3DWidget"'
-                run_command(cmd_import, capture=True)
-                
-                # Check 2: Check npe2 manifest discovery
-                cmd_npe2 = f'{run_prefix} python -c "import npe2; pm=npe2.PluginManager.instance(); pm.discover(); found=\'behav3d\' in pm._manifests; print(\'FOUND\' if found else \'NOT_FOUND\')"'
-                result = run_command(cmd_npe2, capture=True)
-                
-                if result and "FOUND" in result:
-                    print_success("BEHAV3D napari plugin installed and registered successfully")
-                else:
-                    print_warning("Plugin package installed, but npe2 did not discover the manifest. 'pip install -e .' might need to be run again manually.")
-            except Exception as e:
-                print_warning(f"Plugin verification warning: {e}")
     
     # Verify installation
     print_header("VERIFICATION")
     verify_installation(conda_path)
     
-    # Save environment config for launchers
-    print_header("LAUNCHER CONFIGURATION")
-    config_path = save_env_config(conda_path)
-    
-    project_root = find_project_root()
-    napari_dir = project_root / "napari"
-    
     # Final message
     print_header("INSTALLATION COMPLETE")
     print_success("BEHAV3D has been installed successfully!")
     print()
-    
-    # Show launcher info
-    if get_platform() == "Windows":
-        launcher = napari_dir / "run_behav3d.bat"
-    elif get_platform() == "Darwin":
-        launcher = napari_dir / "run_behav3d.command"
-    else:
-        launcher = napari_dir / "run_behav3d.sh"
-    
-    print(f"  Napari launcher:  {launcher}")
-    print(f"  Manual command:   conda activate {ENV_NAME} && napari")
-    print()
-    
-    # Offer options
-    print("Would you like to launch napari now?")
-    print("  [1] Yes")
-    print("  [2] No")
-    print()
-    
+    # Ask user if they want to run the BEHAV3D notebook now
     try:
-        response = input("Choose [1/2]: ").strip()
-        if response == '1':
-            print()
-            launch_napari(conda_path)
-        else:
-            print()
-            print_header("ALTERNATIVES")
-            print("To open the Jupyter Notebook interface:")
-            print(f"  conda activate {ENV_NAME}")
-            print("  jupyter notebook")
-            print()
-            print("To launch napari later:")
-            print(f"  Double-click: {launcher}")
-            print()
-            input("Press Enter to exit...")
-            
-    except (EOFError, KeyboardInterrupt):
-        pass
-    
+        response = input("\nWould you like to open the BEHAV3D notebook now? [1] Yes  [2] No: ").strip()
+    except EOFError:
+        response = "2"
+    if response == "1" or response.lower() == "yes":
+        # Try to open the notebook directly
+        print_info("Attempting to launch the BEHAV3D notebook...")
+        notebooks_path = os.path.join(find_project_root(), "notebooks", "run_behav3d.ipynb")
+        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+        # Use jupyter notebook command to open the notebook
+        try:
+            cmd = f'{run_prefix} jupyter notebook "{notebooks_path}"'
+            print_info(f"Running: {cmd}")
+            run_command(cmd)
+        except Exception as e:
+            print_warning(f"Could not open notebook automatically: {e}")
+            print("You can open it manually as described below.")
+    else:
+        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+        notebooks_path = os.path.join(find_project_root(), "notebooks", "run_behav3d.ipynb")
+        cmd = f'{run_prefix} jupyter notebook "{notebooks_path}"'
+
+        print("\nStart using BEHAV3D!")
+        print()
+        print("To run the Jupyter notebook, open a Command Line Interface (CMD/Terminal) and run this code:")
+        print(cmd)
+    print()
     return 0
 
 if __name__ == "__main__":

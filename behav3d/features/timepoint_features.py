@@ -38,7 +38,7 @@ Flly flexible - works with ANY cell types defined in metadata using prefixes:
 
 DYNAMIC CONTACT FEATURES (generated for ALL cell types in metadata):
 - {cell_type}_contact               (bool) - Real distance-based contact
-- {cell_type}_contact_pixels        (bool) - Pixel-based contact (1.73 diagonal)
+- {cell_type}_contact_on_distance        (bool) - Pixel-based contact (1.73 diagonal)
 - touching_{cell_type}s             (str)  - Comma-separated TrackIDs
 - active_{cell_type}_contact        (bool) - Active interaction (works for any cell type)
 
@@ -77,7 +77,7 @@ Per segment, creates a ZYX cutout with extended range around the segment border
 and calculates a distance transform using physical spacing (µm). Any other cell
 within "contact_threshold" µm counts as contacting.
 
-### {cell_type}_contact_pixels  
+### {cell_type}_contact_on_distance  
 - True/False
 Same as above but uses pixel-based threshold (1.73 = diagonal distance) without
 physical spacing. More lenient threshold for pixel-touching.
@@ -164,6 +164,7 @@ import seaborn as sns
 import ast
 import math
 import time
+import traceback
 from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
 from behav3d.io.images import load_image, convert_input_files_to_zarr
 from tqdm import tqdm
@@ -210,6 +211,9 @@ def run_feature_extraction(
         output_dir = config['output_dir']
 
     df_all_tracks=pd.DataFrame()
+
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
+    feature_outdir = Path(analysis_outdir, "track_features")
     
     for _, sample_metadata in metadata.iterrows():
     
@@ -217,249 +221,284 @@ def run_feature_extraction(
         start_time = time.time()
 
         sample_name = sample_metadata['sample_name']
-        
-        distance_unit=sample_metadata['distance_unit']
-        # dead_dye_threshold=sample_metadata['dead_dye_threshold']
-        
-        # Sometimes excel saves the encoding for µm differently, the following lines converts
-        # other variants of µm to ones comparable in this code
-        # The two written "μm" have different formatting
-        if distance_unit=='_m':
-            distance_unit ='μm'
-        if distance_unit=='µm':
-            distance_unit="μm"
-        
-        element_size_x=sample_metadata['pixel_distance_xy']
-        element_size_y=sample_metadata['pixel_distance_xy'] 
-        element_size_z=sample_metadata['pixel_distance_z']
-        
-        #Convert elekment size to um and hours, default settings for behav3d
-        element_size_x = convert_distance(element_size_x, distance_unit)
-        element_size_y = convert_distance(element_size_y, distance_unit)
-        element_size_z = convert_distance(element_size_z, distance_unit)
-        
-        time_interval = sample_metadata['time_interval']
-        time_unit = sample_metadata['time_unit']
-        
-        # For Imaris: Collect all cell-type-specific contact thresholds from metadata
-        contact_thresholds = {}
-        if imaris:
-            for col in sample_metadata.index:
-                if col.endswith('_contact_threshold'):
-                    # Extract cell type from column name (e.g., 'tcell_contact_threshold' -> 'tcell')
-                    cell_type_name = col.replace('_contact_threshold', '')
-                    if pd.notna(sample_metadata[col]):
-                        contact_thresholds[cell_type_name] = sample_metadata[col]
 
-        dead_channel=sample_metadata['dead_channel']
-        
-        print("###### Running track feature calculation")
-        img_outdir = Path(output_dir, "images", sample_name)
-        if not img_outdir.exists():
-            img_outdir.mkdir(parents=True)
-
-        analysis_outdir = Path(output_dir, "analysis", cell_type)
-        track_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
-        track_intermediate_outdir= Path(track_outdir, "intermediate_results")
-        feature_outdir = Path(analysis_outdir, "track_features")
-        
-        raw_image_path = sample_metadata['raw_image_path']
-        
-        # Dynamically find the current cell type's segments path
-        current_cell_segments_path = None
-        for prefix in ['or', 'im', 'ot']:
-            col_name = f"{prefix}_{cell_type}_tracks_image_path"
-            if col_name in sample_metadata.index and pd.notna(sample_metadata[col_name]):
-                current_cell_segments_path = sample_metadata[col_name]
-                break
-        
-        if current_cell_segments_path is None:
-            raise ValueError(f"No tracks_image_path found for cell_type='{cell_type}' in sample {sample_name}")
-        
-        # Dynamically collect ALL organoid types' paths (for contact calculation)
-        organoid_segments_paths = {}
-        for col in sample_metadata.index:
-            if col.startswith('or_') and col.endswith('_tracks_image_path'):
-                parts = col.split('_')
-                if len(parts) >= 4:
-                    organoid_type = '_'.join(parts[1:-3])  # Extract organoid type name
-                    if pd.notna(sample_metadata[col]):
-                        organoid_segments_paths[organoid_type] = sample_metadata[col]
-        
-        # Dynamically collect ALL immune cell types' paths (for contact calculation)
-        immune_segments_paths = {}
-        for col in sample_metadata.index:
-            if col.startswith('im_') and col.endswith('_tracks_image_path'):
-                parts = col.split('_')
-                if len(parts) >= 4:
-                    immune_type = '_'.join(parts[1:-3])  # Extract immune type name
-                    if pd.notna(sample_metadata[col]):
-                        immune_segments_paths[immune_type] = sample_metadata[col]
-        
-        # Dynamically collect ALL other cell types' paths (for contact calculation)
-        other_segments_paths = {}
-        for col in sample_metadata.index:
-            if col.startswith('ot_') and col.endswith('_tracks_image_path'):
-                parts = col.split('_')
-                if len(parts) >= 4:
-                    other_type = '_'.join(parts[1:-3])  # Extract other type name
-                    if pd.notna(sample_metadata[col]):
-                        other_segments_paths[other_type] = sample_metadata[col]
-
-        # Old: Construct dead_mask_path from output directory (kept for reference)
-        # dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
-        
-        # New: Read dead_mask_path from metadata (if it exists)
-        dead_mask_path = None
-        if 'dead_mask_path' in sample_metadata.index and pd.notna(sample_metadata['dead_mask_path']):
-            dead_mask_path = Path(sample_metadata['dead_mask_path'])
-            if not dead_mask_path.exists():
-                print(f"⚠️ Warning: dead_mask_path in metadata does not exist: {dead_mask_path}")
-                dead_mask_path = None
-        
-        print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
-        current_cell_segments_path, raw_image_path = convert_input_files_to_zarr(
-            sample_name=sample_name,
-            current_cell_segments_path=current_cell_segments_path,
-            raw_image_path=raw_image_path,
-            output_dir=img_outdir,
-            overwrite=overwrite
-        )
-
-        if not track_outdir.exists():
-            track_outdir.mkdir(parents=True)
-        if not track_intermediate_outdir.exists():
-            track_intermediate_outdir.mkdir()
-        if not analysis_outdir.exists():
-            analysis_outdir.mkdir(parents=True)
-        if not feature_outdir.exists():
-            feature_outdir.mkdir(parents=True)
-        
-        print(f"{get_current_time()} - Loading in tracks csv...")
-        # Find the correct prefixed column (or_, im_, ot_)
-        tracks_csv_col = None
-        for prefix in ['or', 'im', 'ot']:
-            col_name = f"{prefix}_{cell_type}_tracks_csv_path"
-            if col_name in sample_metadata.index and pd.notna(sample_metadata[col_name]):
-                tracks_csv_col = col_name
-                break
-        
-        if tracks_csv_col is None:
-            # Fallback to old non-prefixed format for backward compatibility
-            tracks_csv_col = f"{cell_type}_tracks_csv_path"
-        
-        df_tracks_path = sample_metadata[tracks_csv_col]
-        
-        df_tracks=pd.read_csv(df_tracks_path, sep=",")
-        # Adding a sample name for later combination of multiple track experiments
-        df_tracks['sample_name']=sample_name
-        
-        print(f"{get_current_time()} - Generalizing the units of position and time to um and hours")
-        df_tracks = generalize_units_of_track_features(
-            df_tracks=df_tracks,
-            distance_unit=distance_unit,
-            time_interval=time_interval,
-            time_unit=time_unit
-            )
-        time_interval=convert_time(time_interval, time_unit)
-        time_unit = "h"
-        
-        required_features = {"morphology", "intensity", "contact", "death"}
-
-        if any(feature in features_choice for feature in required_features):
-            ### Calculate image based features (per timepoint)
-            print(f"{get_current_time()} - Calculating single-timepoint image-based features...")
-            df_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_intensity.csv")
-            df_contacts_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_contact.csv")
-            df_dead_mask_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_dead_mask.csv")
-            df_morphology_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_morphology.csv")
+        try:
+            distance_unit=sample_metadata['distance_unit']
+            # dead_dye_threshold=sample_metadata['dead_dye_threshold']
             
+            # Sometimes excel saves the encoding for µm differently, the following lines converts
+            # other variants of µm to ones comparable in this code
+            # The two written "μm" have different formatting
+            if distance_unit=='_m':
+                distance_unit ='μm'
+            if distance_unit=='µm':
+                distance_unit="μm"
+            
+            element_size_x=sample_metadata['pixel_distance_xy']
+            element_size_y=sample_metadata['pixel_distance_xy'] 
+            element_size_z=sample_metadata['pixel_distance_z']
+            
+            #Convert elekment size to um and hours, default settings for behav3d
+            element_size_x = convert_distance(element_size_x, distance_unit)
+            element_size_y = convert_distance(element_size_y, distance_unit)
+            element_size_z = convert_distance(element_size_z, distance_unit)
+            
+            time_interval = sample_metadata['time_interval']
+            time_unit = sample_metadata['time_unit']
+            
+            # For Imaris: Collect all cell-type-specific contact thresholds from metadata
+            contact_thresholds = {}
             if imaris:
-                df_tracks=calculate_imaris_track_features(
-                    df_tracks=df_tracks,
-                    cell_type=cell_type,
-                    contact_threshold=contact_threshold,
-                    contact_thresholds=contact_thresholds,
-                    distance_unit=distance_unit,
-                )
-            else:
-                df_tracks=calculate_image_based_track_features(
-                    df_tracks=df_tracks,
-                    cell_type=cell_type,
-                    features_choice=features_choice,
-                    df_dead_mask_outpath=df_dead_mask_outpath,
-                    df_morphology_outpath=df_morphology_outpath,
-                    df_intensity_outpath=df_intensity_outpath,
-                    df_contacts_outpath=df_contacts_outpath,
-                    dead_channel=dead_channel,
-                    contact_threshold=contact_threshold,
-                    element_size_x=element_size_x,
-                    element_size_y=element_size_y,
-                    element_size_z=element_size_z,
-                    raw_image_path=raw_image_path,
-                    dead_mask_path=dead_mask_path,
-                    current_cell_segments_path=current_cell_segments_path,
-                    organoid_segments_paths=organoid_segments_paths,
-                    immune_segments_paths=immune_segments_paths,
-                    other_segments_paths=other_segments_paths,
-                    overwrite=overwrite,
-                    n_workers=n_workers
-                )
-        else:
-            print(f"{get_current_time()} - Skipping image-based features as none requested in features_choice (morphology, intensity, contact, death)")
-            
-        
-        print(f"{get_current_time()} - Interpolating missing timepoints based on time interval")
-        # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
-        # Values are interpolated linearly, forward filled or left blank based on the column
-        # More explanation within the function
-        df_tracks= interpolate_missing_positions(df_tracks)
+                for col in sample_metadata.index:
+                    if col.endswith('_contact_threshold'):
+                        # Extract cell type from column name (e.g., 'tcell_contact_threshold' -> 'tcell')
+                        cell_type_name = col.replace('_contact_threshold', '')
+                        if pd.notna(sample_metadata[col]):
+                            contact_thresholds[cell_type_name] = sample_metadata[col]
 
-        if "movement" in features_choice:
-            print(f"{get_current_time()} - Calculating movement features...")
-            df_tracks=calculate_movement_features(
-                df_tracks,
-                time_interval = time_interval,
-                rolling_meanspeed_window=rolling_meanspeed_window
+            dead_channel=sample_metadata['dead_channel']
+            
+            print("###### Running track feature calculation")
+            img_outdir = Path(output_dir, "images", sample_name)
+            if not img_outdir.exists():
+                img_outdir.mkdir(parents=True)
+
+            track_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
+            track_intermediate_outdir= Path(track_outdir, "intermediate_results")
+            
+            raw_image_path = sample_metadata['raw_image_path']
+            
+            # Dynamically find the current cell type's segments path
+            current_cell_segments_path = None
+            for prefix in ['or', 'im', 'ot']:
+                col_name = f"{prefix}_{cell_type}_tracks_image_path"
+                if col_name in sample_metadata.index and pd.notna(sample_metadata[col_name]):
+                    current_cell_segments_path = sample_metadata[col_name]
+                    break
+            
+            if current_cell_segments_path is None:
+                print(f"⚠️  {cell_type} channel is empty for sample {sample_name} (no segments/tracks path in metadata) – skipping.")
+                continue
+            
+            if not Path(current_cell_segments_path).exists():
+                print(f"⚠️  {cell_type} channel is empty for sample {sample_name} (file not found: {current_cell_segments_path}) – skipping.")
+                continue
+            
+            # Dynamically collect ALL organoid types' paths (for contact calculation)
+            # Only include paths that actually exist on disk.
+            organoid_segments_paths = {}
+            for col in sample_metadata.index:
+                if col.startswith('or_') and col.endswith('_tracks_image_path'):
+                    parts = col.split('_')
+                    if len(parts) >= 4:
+                        organoid_type = '_'.join(parts[1:-3])
+                        if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
+                            organoid_segments_paths[organoid_type] = sample_metadata[col]
+            
+            # Dynamically collect ALL immune cell types' paths (for contact calculation)
+            immune_segments_paths = {}
+            for col in sample_metadata.index:
+                if col.startswith('im_') and col.endswith('_tracks_image_path'):
+                    parts = col.split('_')
+                    if len(parts) >= 4:
+                        immune_type = '_'.join(parts[1:-3])
+                        if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
+                            immune_segments_paths[immune_type] = sample_metadata[col]
+            
+            # Dynamically collect ALL other cell types' paths (for contact calculation)
+            other_segments_paths = {}
+            for col in sample_metadata.index:
+                if col.startswith('ot_') and col.endswith('_tracks_image_path'):
+                    parts = col.split('_')
+                    if len(parts) >= 4:
+                        other_type = '_'.join(parts[1:-3])
+                        if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
+                            other_segments_paths[other_type] = sample_metadata[col]
+
+            # Old: Construct dead_mask_path from output directory (kept for reference)
+            # dead_mask_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
+            
+            # Dead mask path is metadata-driven only (no hidden fallbacks).
+            dead_mask_path = None
+            if 'dead_mask_path' in sample_metadata.index and pd.notna(sample_metadata['dead_mask_path']):
+                dead_mask_path = Path(sample_metadata['dead_mask_path'])
+
+            needs_dead_mask = ("death" in features_choice) and (dead_channel is not None and pd.notna(dead_channel))
+            if needs_dead_mask:
+                if dead_mask_path is None:
+                    print(
+                        f"⚠️  {cell_type} in sample {sample_name} requires dead_mask_path in metadata "
+                        "(death feature requested with dead_channel), but it is missing – skipping."
+                    )
+                    continue
+                if not dead_mask_path.exists():
+                    print(
+                        f"⚠️  {cell_type} in sample {sample_name} dead_mask_path file not found: "
+                        f"{dead_mask_path} – skipping."
+                    )
+                    continue
+            
+            print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
+            current_cell_segments_path, raw_image_path = convert_input_files_to_zarr(
+                sample_name=sample_name,
+                current_cell_segments_path=current_cell_segments_path,
+                raw_image_path=raw_image_path,
+                output_dir=img_outdir,
+                overwrite=overwrite
+            )
+
+            if not track_outdir.exists():
+                track_outdir.mkdir(parents=True)
+            if not track_intermediate_outdir.exists():
+                track_intermediate_outdir.mkdir()
+            if not analysis_outdir.exists():
+                analysis_outdir.mkdir(parents=True)
+            if not feature_outdir.exists():
+                feature_outdir.mkdir(parents=True)
+            
+            print(f"{get_current_time()} - Loading in tracks csv...")
+            # Find the correct prefixed column (or_, im_, ot_)
+            tracks_csv_col = None
+            for prefix in ['or', 'im', 'ot']:
+                col_name = f"{prefix}_{cell_type}_tracks_csv_path"
+                if col_name in sample_metadata.index and pd.notna(sample_metadata[col_name]):
+                    tracks_csv_col = col_name
+                    break
+            
+            if tracks_csv_col is None:
+                # Fallback to old non-prefixed format for backward compatibility
+                tracks_csv_col = f"{cell_type}_tracks_csv_path"
+            
+            df_tracks_path = sample_metadata.get(tracks_csv_col)
+            if df_tracks_path is None or (isinstance(df_tracks_path, float) and pd.isna(df_tracks_path)):
+                print(f"⚠️  {cell_type} channel is empty for sample {sample_name} (no tracks CSV path) – skipping.")
+                continue
+            
+            df_tracks_path = Path(df_tracks_path)
+            if not df_tracks_path.exists():
+                print(f"⚠️  Tracks CSV not found for {cell_type} in sample {sample_name}: {df_tracks_path} – skipping.")
+                continue
+            
+            df_tracks=pd.read_csv(df_tracks_path, sep=",")
+            # Adding a sample name for later combination of multiple track experiments
+            df_tracks['sample_name']=sample_name
+
+            if df_tracks.empty or df_tracks['TrackID'].nunique() == 0:
+                print(f"⚠️  No tracks found for {cell_type} in sample {sample_name} – skipping.")
+                continue
+            
+            print(f"{get_current_time()} - Generalizing the units of position and time to um and hours")
+            df_tracks = generalize_units_of_track_features(
+                df_tracks=df_tracks,
+                distance_unit=distance_unit,
+                time_interval=time_interval,
+                time_unit=time_unit
                 )
-            df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
-        else:
-            print(f"{get_current_time()} - Skipping movement features as not requested in features_choice")
+            time_interval=convert_time(time_interval, time_unit)
+            time_unit = "h"
             
-        if "death" in features_choice:
-            # Calculate death features if threshold specified and dead_channel exists
-            if dead_mask_percentage_threshold is not None and dead_channel is not None and pd.notna(dead_channel):
-                print(f"{get_current_time()} - Calculating cell death based on dead_mask_percentage_threshold {dead_mask_percentage_threshold}")
-                df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
+            required_features = {"morphology", "intensity", "contact", "death"}
+
+            if any(feature in features_choice for feature in required_features):
+                ### Calculate image based features (per timepoint)
+                print(f"{get_current_time()} - Calculating single-timepoint image-based features...")
+                df_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_intensity.csv")
+                df_contacts_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_contact.csv")
+                df_dead_mask_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_dead_mask.csv")
+                df_morphology_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_morphology.csv")
+                
+                if imaris:
+                    df_tracks=calculate_imaris_track_features(
+                        df_tracks=df_tracks,
+                        cell_type=cell_type,
+                        contact_threshold=contact_threshold,
+                        contact_thresholds=contact_thresholds,
+                        distance_unit=distance_unit,
+                    )
+                else:
+                    df_tracks=calculate_image_based_track_features(
+                        df_tracks=df_tracks,
+                        cell_type=cell_type,
+                        features_choice=features_choice,
+                        df_dead_mask_outpath=df_dead_mask_outpath,
+                        df_morphology_outpath=df_morphology_outpath,
+                        df_intensity_outpath=df_intensity_outpath,
+                        df_contacts_outpath=df_contacts_outpath,
+                        dead_channel=dead_channel,
+                        contact_threshold=contact_threshold,
+                        element_size_x=element_size_x,
+                        element_size_y=element_size_y,
+                        element_size_z=element_size_z,
+                        raw_image_path=raw_image_path,
+                        dead_mask_path=dead_mask_path,
+                        current_cell_segments_path=current_cell_segments_path,
+                        organoid_segments_paths=organoid_segments_paths,
+                        immune_segments_paths=immune_segments_paths,
+                        other_segments_paths=other_segments_paths,
+                        overwrite=overwrite,
+                        n_workers=n_workers
+                    )
+            else:
+                print(f"{get_current_time()} - Skipping image-based features as none requested in features_choice (morphology, intensity, contact, death)")
+                
             
-        if "contact" in features_choice:    
-            # Calculate active contact for ALL cell types that have touching columns
-            for col in df_tracks.columns:
-                if col.startswith('touching_') and col.endswith('s'):
-                    # Extract target cell type from column name
-                    target_type = col[len('touching_'):-1]
-                    contact_col = f'{target_type}_contact'
-                    if contact_col in df_tracks.columns:
-                        print(f"{get_current_time()} - Calculating active contact features for {cell_type} vs {target_type}...")
-                        df_tracks = calculate_active_contact_features(
-                            df_tracks,
-                            cell_type=target_type
-                        )
-                    else:
-                        print(f"{get_current_time()} - Skipping active contact for {target_type}: no {contact_col} column found")
-       
+            print(f"{get_current_time()} - Interpolating missing timepoints based on time interval")
+            # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
+            # Values are interpolated linearly, forward filled or left blank based on the column
+            # More explanation within the function
+            df_tracks= interpolate_missing_positions(df_tracks)
+
+            if "movement" in features_choice:
+                print(f"{get_current_time()} - Calculating movement features...")
+                df_tracks=calculate_movement_features(
+                    df_tracks,
+                    time_interval = time_interval,
+                    rolling_meanspeed_window=rolling_meanspeed_window
+                    )
+                df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
+            else:
+                print(f"{get_current_time()} - Skipping movement features as not requested in features_choice")
+                
+            if "death" in features_choice:
+                # Calculate death features if threshold specified and dead_channel exists
+                if dead_mask_percentage_threshold is not None and dead_channel is not None and pd.notna(dead_channel):
+                    print(f"{get_current_time()} - Calculating cell death based on dead_mask_percentage_threshold {dead_mask_percentage_threshold}")
+                    df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
+                
+            # if "contact" in features_choice:    
+            #     # Calculate active contact for ALL cell types that have touching columns
+            #     for col in df_tracks.columns:
+            #         if col.startswith('touching_') and col.endswith('s'):
+            #             # Extract target cell type from column name
+            #             target_type = col[len('touching_'):-1]
+            #             contact_col = f'{target_type}_contact'
+            #             if contact_col in df_tracks.columns:
+            #                 print(f"{get_current_time()} - Calculating active contact features for {cell_type} vs {target_type}...")
+            #                 df_tracks = calculate_active_contact_features(
+            #                     df_tracks,
+            #                     cell_type=target_type
+            #                 )
+            #             else:
+            #                 print(f"{get_current_time()} - Skipping active contact for {target_type}: no {contact_col} column found")
+           
+                
+            tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
+            print(f"{get_current_time()} - Writing output to {tracks_out_path}")
+            df_tracks.to_csv(tracks_out_path, sep=",", index=False)
             
-        tracks_out_path = Path(track_outdir, f"{sample_name}_{cell_type}_track_features.csv")
-        print(f"{get_current_time()} - Writing output to {tracks_out_path}")
-        df_tracks.to_csv(tracks_out_path, sep=",", index=False)
+            df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
+            df_all_tracks = pd.concat([df_all_tracks, df_tracks])
+            
+            end_time = time.time()
+            h,m,s = format_time(start_time, end_time)
+            print(f"###### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
+
+        except Exception:
+            traceback.print_exc()
+            print(f"⚠️  Error processing {cell_type} for sample {sample_name} – skipping to next sample.\n")
+            continue
         
-        df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
-        df_all_tracks = pd.concat([df_all_tracks, df_tracks])
-        
-        end_time = time.time()
-        h,m,s = format_time(start_time, end_time)
-        print(f"###### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
-        
+    feature_outdir.mkdir(parents=True, exist_ok=True)
     all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
     df_all_tracks.to_csv(all_tracks_out_path, index=False) 
     return(df_all_tracks)       
@@ -731,7 +770,7 @@ def calculate_active_contact_features(df_tracks, cell_type):
         .explode(touching_col)
     )
     df_explode = df_explode[df_explode[touching_col].str.strip() != '']
-    df_explode[touching_col] = df_explode[touching_col].astype(int)
+    df_explode[touching_col] = pd.to_numeric(df_explode[touching_col], errors='coerce').astype('Int64')
 
     # --- Step 2: Get mean_speed of each touching cell ---
     speed_map = df_tracks[['TrackID', 'position_t', 'mean_speed']].rename(
@@ -872,6 +911,7 @@ def interpolate_missing_positions(
     """
     As not every track has a segment at every timepoint, interpolate the missing values of
     the missing timepoints.
+    Returns df_tracks unchanged when there are no rows to process.
     
     Fully dynamic - automatically detects ALL contact columns from dataframe.
     
@@ -879,7 +919,7 @@ def interpolate_missing_positions(
     -   Interpolates the numerical columns of [cols_to_interpolate] such as speed using linear
         interpolation
     -   Copies the columns of [cols_to_copy] using a forward fill from the last non-interpolated
-        row of each TrackID (includes all *_contact, *_contact_pixels, touching_* columns)
+        row of each TrackID (includes all *_contact, *_contact_on_distance, touching_* columns)
     -   Puts None in any column not specified, such as SegmentID, as no actual segment exists
     """
     
@@ -901,7 +941,7 @@ def interpolate_missing_positions(
         # Add all dynamically-generated contact columns
         for col in df_tracks.columns:
             if (col.endswith('_contact') or 
-                col.endswith('_contact_pixels') or 
+                col.endswith('_contact_on_distance') or 
                 col.startswith('touching_')):
                 if col not in cols_to_copy:
                     cols_to_copy.append(col)
@@ -915,7 +955,11 @@ def interpolate_missing_positions(
     # Filter to only numeric columns - np.interp cannot handle object/string dtypes
     numeric_cols = df_tracks.select_dtypes(include=[np.number]).columns.tolist()
     cols_to_interpolate = [col for col in cols_to_interpolate if col in numeric_cols]
-     
+
+    # Nothing to interpolate – return as-is to avoid empty-concat errors downstream.
+    if df_tracks.empty:
+        return df_tracks
+
     grouped_df = df_tracks.groupby('TrackID')
     def interpolate_group(group, cols_to_interpolate, cols_to_copy):
         # group=group.set_index('time', drop=False)
@@ -1140,10 +1184,14 @@ def _calculate_contact_single_timepoint(args):
     
     df_contacts = []
     segment_ids = np.unique(current_segments)
+
+    # If there are no foreground segments at this timepoint, return an empty
+    # DataFrame so that downstream concatenation can proceed without error.
+    foreground_ids = [sid for sid in segment_ids if sid != 0]
+    if not foreground_ids:
+        return pd.DataFrame(columns=["TrackID", "position_t"])
     
-    for segment_id in segment_ids:
-        if segment_id == 0:
-            continue
+    for segment_id in foreground_ids:
         
         stack_max_z, stack_max_y, stack_max_x = current_segments.shape
         seg_locs = np.argwhere(current_segments == segment_id)
@@ -1189,11 +1237,13 @@ def _calculate_contact_single_timepoint(args):
             pix_org_contacts = [
                 str(x) for x in np.unique(org_cutout[pix_distances <= 1.73]) if x != 0
             ]
+            if calculate_from == org_type:
+                pix_org_contacts = [x for x in pix_org_contacts if x != str(segment_id)]
             pix_org_contact = len(pix_org_contacts) > 0
             
             # Add columns for this organoid type
-            contact_data[f'{org_type}_contact'] = real_org_contact
-            contact_data[f'{org_type}_contact_pixels'] = pix_org_contact
+            contact_data[f'{org_type}_contact'] = pix_org_contact
+            contact_data[f'{org_type}_contact_on_distance'] = real_org_contact
             contact_data[f'touching_{org_type}s'] = ",".join(org_contacts) if real_org_contact else ""
         
         # Calculate contacts with ALL immune cell types
@@ -1212,11 +1262,13 @@ def _calculate_contact_single_timepoint(args):
             pix_immune_contacts = [
                 str(x) for x in np.unique(immune_cutout[pix_distances <= 1.73]) if x != 0
             ]
+            if calculate_from == immune_type:
+                pix_immune_contacts = [x for x in pix_immune_contacts if x != str(segment_id)]
             pix_immune_contact = len(pix_immune_contacts) > 0
             
             # Add columns for this immune type
-            contact_data[f'{immune_type}_contact'] = real_immune_contact
-            contact_data[f'{immune_type}_contact_pixels'] = pix_immune_contact
+            contact_data[f'{immune_type}_contact'] = pix_immune_contact
+            contact_data[f'{immune_type}_contact_on_distance'] = real_immune_contact
             contact_data[f'touching_{immune_type}s'] = ",".join(immune_contacts) if real_immune_contact else ""
         
         # Calculate contacts with ALL other cell types
@@ -1235,19 +1287,23 @@ def _calculate_contact_single_timepoint(args):
             pix_other_contacts = [
                 str(x) for x in np.unique(other_cutout[pix_distances <= 1.73]) if x != 0
             ]
+            if calculate_from == other_type:
+                pix_other_contacts = [x for x in pix_other_contacts if x != str(segment_id)]
             pix_other_contact = len(pix_other_contacts) > 0
             
             # Add columns for this other type
-            contact_data[f'{other_type}_contact'] = real_other_contact
-            contact_data[f'{other_type}_contact_pixels'] = pix_other_contact
+            contact_data[f'{other_type}_contact'] = pix_other_contact
+            contact_data[f'{other_type}_contact_on_distance'] = real_other_contact
             contact_data[f'touching_{other_type}s'] = ",".join(other_contacts) if real_other_contact else ""
 
         df_contacts.append(pd.DataFrame([contact_data]))
 
+    # It is still possible (though unlikely) that no contact data is produced;
+    # in that case, return an empty-but-valid DataFrame.
+    if not df_contacts:
+        return pd.DataFrame(columns=["TrackID", "position_t"])
 
-
-
-    return pd.concat(df_contacts)
+    return pd.concat(df_contacts, ignore_index=True)
 
 def calculate_contact_features(
     current_cell_segments_path,
@@ -1378,26 +1434,60 @@ def calculate_dead_mask(segments, dead_mask):
     The calculation can be the minimum, maximum, mean or median
     """
     df_intensity = []
-    # for t, (tcell_stack, intensity_stack) in enumerate(zip(segments, intensity_image)):      
-    for t, (tcell_stack, dead_mask_stack) in tqdm(enumerate(zip(segments, dead_mask)),total=len(segments)):      
+    # for t, (tcell_stack, intensity_stack) in enumerate(zip(segments, intensity_image)):
+    for t, (tcell_stack, dead_mask_stack) in tqdm(enumerate(zip(segments, dead_mask)), total=len(segments)):
         tcell_stack = np.asarray(tcell_stack)
         dead_mask_stack = np.asarray(dead_mask_stack)
-        properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=dead_mask_stack, properties=['label', 'num_pixels', f'intensity_mean']))
-        properties["position_t"]=t
-        properties.rename(columns={"intensity_mean":"percentage_dead_mask"}, inplace=True)
+        properties = pd.DataFrame(
+            regionprops_table(
+                label_image=tcell_stack,
+                intensity_image=dead_mask_stack,
+                properties=["label", "num_pixels", "intensity_mean"],
+            )
+        )
+        # No objects at this timepoint → nothing to append
+        if properties.empty:
+            continue
+        properties["position_t"] = t
+        properties.rename(columns={"intensity_mean": "percentage_dead_mask"}, inplace=True)
         properties["nr_dead_mask_pixels"] = properties["num_pixels"] * properties["percentage_dead_mask"]
-        properties=properties.rename(columns={"label":"TrackID"})
+        properties = properties.rename(columns={"label": "TrackID"})
         properties = properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]]
         df_intensity.append(properties)
-    df_intensity = pd.concat(df_intensity)
-    df_intensity = df_intensity.sort_values(by=["TrackID", "position_t"]).reset_index(drop=True)
-    df_intensity["increase_dead_mask"] = calculate_relative_increase(
-            df = df_intensity,
-            column="nr_dead_mask_pixels",
-            nr_timepoints_back=10,
-            groupby="TrackID"
+
+    # If no segments/dead-mask pixels were found across all timepoints,
+    # return an empty but well-formed DataFrame so downstream code can continue.
+    if not df_intensity:
+        return pd.DataFrame(
+            columns=[
+                "TrackID",
+                "position_t",
+                "percentage_dead_mask",
+                "nr_dead_mask_pixels",
+                "increase_dead_mask",
+            ]
         )
-    return(df_intensity)
+
+    df_intensity = pd.concat(df_intensity, ignore_index=True)
+    if df_intensity.empty:
+        # Should not happen because of the guard above, but keep this
+        # as an extra safety net.
+        df_intensity["increase_dead_mask"] = pd.Series(dtype=float)
+        return df_intensity
+
+    df_intensity = df_intensity.sort_values(by=["TrackID", "position_t"]).reset_index(drop=True)
+
+    rel_increase = calculate_relative_increase(
+        df=df_intensity,
+        column="nr_dead_mask_pixels",
+        nr_timepoints_back=10,
+        groupby="TrackID",
+    )
+
+    # Ensure we always assign a 1D array/Series, even if calculation returns empty.
+    rel_increase = np.asarray(rel_increase).reshape(-1,) if np.asarray(rel_increase).ndim > 1 else rel_increase
+    df_intensity["increase_dead_mask"] = rel_increase
+    return df_intensity
 
 def _basic_counts_single_timepoint(args):
     """

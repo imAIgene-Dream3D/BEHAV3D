@@ -18,20 +18,25 @@ from .utils import (
     _DEFAULT_CONFIG,
     behav3d_calculated_features
 )
+from behav3d.core.metadata import (
+    detect_organoid_types_from_metadata,
+    detect_immune_cell_types_from_metadata,
+    detect_other_cell_types_from_metadata,
+    has_dead_channel,
+)
 from behav3d.core.utils import expand_column_patterns
 from behav3d.io.formats.zarr import load_zarr
 from behav3d.io.images import load_image
 from behav3d.features.timepoint_features import run_feature_extraction
 from behav3d.analysis.tcell_analysis import (
-    filter_cell_tracks,
     run_tcell_analysis
 )
 from behav3d.analysis.organoid_analysis import (
-    filter_organoid_tracks,
     run_organoid_analysis,
     plot_multi_organoid_death_dynamics,
     run_organoid_morphology_dead_analysis
 )
+from behav3d.analysis.filtering import filter_tracks
 
 from behav3d.io.images import load_zarr
 from behav3d.analysis import summarize_track_features
@@ -51,37 +56,189 @@ except ImportError:
         "active_killing": ["is_active_killing", "killing_efficiency"]
     }'''
 
-class FeatureExtractionPanel:
+def _feature_output_csv_path(output_dir, cell_type):
+    return Path(output_dir, "analysis", cell_type, "track_features", f"BEHAV3D_{cell_type}_combined_track_features.csv")
+
+
+def _csv_has_columns(csv_path, required_columns):
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        return False
+    try:
+        columns = set(pd.read_csv(csv_path, nrows=0).columns)
+    except Exception:
+        return False
+    return set(required_columns).issubset(columns)
+
+
+def _get_channel_labels_for_sample(metadata_loader, sample_name=None):
+    cellpose_cfg = _cfg_get(metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+    mode = str(cellpose_cfg.get("labels_mode", "same_for_all"))
+    if sample_name is not None and mode == "per_sample":
+        per_sample = cellpose_cfg.get("per_sample_channel_labels", {}) or {}
+        labels = per_sample.get(sample_name)
+        if labels:
+            return labels
+    return cellpose_cfg.get("channel_labels", {}) or {}
+
+
+def _guess_channel_index(metadata_loader, sample_name, cell_type):
+    labels = _get_channel_labels_for_sample(metadata_loader, sample_name=sample_name)
+    for idx, label in labels.items():
+        if str(label).strip() == str(cell_type).strip():
+            try:
+                return int(idx)
+            except Exception:
+                continue
+    return None
+
+
+def _persist_threshold_for_cell_types(metadata_loader, cell_types, threshold):
+    params = dict(metadata_loader.behav3d_parameters or {})
+    params.setdefault("features", {})
+    threshold = float(threshold)
+
+    for ct in cell_types:
+        params["features"].setdefault(ct, {})["dead_mask_percentage_threshold"] = threshold
+
+    if getattr(metadata_loader, "metadata_csv_path", None):
+        params.setdefault("paths", {})["metadata_csv"] = str(Path(metadata_loader.metadata_csv_path).expanduser())
+    if getattr(metadata_loader, "output_dir", None):
+        params.setdefault("paths", {})["output_dir"] = str(Path(metadata_loader.output_dir).expanduser())
+
+    metadata_loader.behav3d_parameters = params
+    with metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(params, f, sort_keys=False)
+
+
+def _prepare_threshold_preview_features(
+    metadata_loader,
+    cell_type,
+    threshold,
+    sample_name,
+    *,
+    contact_threshold=None,
+    n_workers=None,
+    overwrite=False,
+):
+    output_dir = Path(metadata_loader.output_dir).expanduser()
+    csv_path = _feature_output_csv_path(output_dir, cell_type)
+    required_columns = {"sample_name", "TrackID", "position_t", "percentage_dead_mask"}
+
+    if _csv_has_columns(csv_path, required_columns):
+        try:
+            existing = pd.read_csv(csv_path, usecols=["sample_name"], dtype=str)
+            if sample_name in existing["sample_name"].values:
+                return csv_path
+        except Exception:
+            pass
+
+    fcfg = _cfg_get(metadata_loader.behav3d_parameters, f"features.{cell_type}", {}) or {}
+    if n_workers is None:
+        n_workers = int(fcfg.get("n_workers", max(8, (os.cpu_count() or 8))))
+    if contact_threshold is None:
+        contact_threshold = float(fcfg.get("contact_threshold", 0.0))
+
+    sample_metadata = metadata_loader.metadata[
+        metadata_loader.metadata["sample_name"] == sample_name
+    ]
+
+    run_feature_extraction(
+        metadata=sample_metadata,
+        output_dir=str(output_dir),
+        cell_type=cell_type,
+        features_choice=["intensity", "death"],
+        dead_mask_percentage_threshold=float(threshold),
+        contact_threshold=float(contact_threshold),
+        overwrite=bool(overwrite),
+        n_workers=int(n_workers),
+    )
+    return csv_path
+
+
+def _reset_feature_intermediate_csvs(metadata_loader, output_dir, cell_type, *, has_dead):
+    sample_names = metadata_loader.metadata.get("sample_name", pd.Series(dtype=str))
+    for sample_name in sample_names.dropna().astype(str).unique():
+        intermediate_dir = Path(output_dir, "trackdata", sample_name, cell_type, "intermediate_results")
+        stale_csvs = [
+            intermediate_dir / f"{sample_name}_{cell_type}_intensity.csv",
+            intermediate_dir / f"{sample_name}_{cell_type}_contact.csv",
+        ]
+        if has_dead:
+            stale_csvs.append(intermediate_dir / f"{sample_name}_{cell_type}_dead_mask.csv")
+        for csv_path in stale_csvs:
+            if csv_path.exists():
+                csv_path.unlink()
+
+
+class _CellTypeFeatureExtractionPanel:
     """
-    Minimal UI for feature extraction (per-cell-type).
+    Single cell-type feature extraction row.
     """
-    def __init__(self, metadata_loader, cell_type="tcell"):
+    def __init__(
+        self,
+        metadata_loader,
+        cell_type,
+        *,
+        shared_threshold_widget=None,
+        threshold_targets=None,
+        enable_preview=True,
+        show_title=True,
+        shared_n_workers_widget=None,
+    ):
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
+        self.output_dir = Path(self.metadata_loader.output_dir).expanduser()
+        self.category = detect_cell_type_category(self.cell_type, self.metadata_loader.metadata)
+        self.has_dead = has_dead_channel(self.metadata_loader.metadata)
+        self.shared_threshold_widget = shared_threshold_widget
+        self.threshold_targets = list(threshold_targets or [self.cell_type])
+        self._owns_threshold_widget = self.shared_threshold_widget is None
+        self._show_preview = bool(enable_preview and self.has_dead and self._owns_threshold_widget)
 
         fcfg = _cfg_get(self.metadata_loader.behav3d_parameters, f"features.{self.cell_type}", {}) or {}
 
-        has_dead_channel = False
-        if hasattr(metadata_loader, 'metadata') and metadata_loader.metadata is not None:
-            has_dead_channel = 'dead_channel' in metadata_loader.metadata.columns and \
-                              metadata_loader.metadata['dead_channel'].notna().any()
-        
-        self.dead_mask_threshold = widgets.FloatText(
-            description="Dead mask % thr",
-            value=float(fcfg.get("dead_mask_percentage_threshold", 0.05)),
-            style={'description_width':'160px'}
-        )
-        if not has_dead_channel: self.dead_mask_threshold.layout.display = "none"
+        if self._owns_threshold_widget:
+            self.dead_mask_threshold = widgets.BoundedFloatText(
+                description="Dead % threshold",
+                value=float(fcfg.get("dead_mask_percentage_threshold", 0.05)),
+                min=0.0,
+                max=1.0,
+                step=0.001,
+                style={'description_width': '160px'},
+                layout=widgets.Layout(width="220px")
+            )
+            if self.has_dead:
+                self.dead_mask_threshold.observe(self._on_threshold_changed, names="value")
+            else:
+                self.dead_mask_threshold.layout.display = "none"
+        else:
+            self.dead_mask_threshold = self.shared_threshold_widget
 
         self._all_features = ["movement", "intensity", "morphology", "contact", "death"]
+        self._mandatory_features = {"intensity", "contact"}
+        if self.category in {"immune", "other"}:
+            self._mandatory_features.add("movement")
+        if self.has_dead:
+            self._mandatory_features.add("death")
+        self._optional_features = {"movement", "morphology"} if self.category == "organoid" else {"morphology"}
+
         default_feats = fcfg.get("features_choice", self._all_features)
-        if not isinstance(default_feats, (list, tuple)): default_feats = self._all_features
+        if not isinstance(default_feats, (list, tuple)):
+            default_feats = self._all_features
         default_feats = [f for f in default_feats if f in self._all_features] or self._all_features
+        for feature_name in self._mandatory_features:
+            if feature_name not in default_feats:
+                default_feats.append(feature_name)
 
         self.feature_checks = {
             f: widgets.Checkbox(description=f.capitalize(), value=(f in default_feats), indent=False)
             for f in self._all_features
         }
+        for feature_name in self._mandatory_features:
+            if feature_name in self.feature_checks:
+                self.feature_checks[feature_name].value = True
+                self.feature_checks[feature_name].disabled = True
 
         self.contact_threshold = widgets.FloatText(
             description="Contact Threshold (µm)",
@@ -90,6 +247,7 @@ class FeatureExtractionPanel:
             style={'description_width': '180px'}
         )
 
+        self.contact_threshold.description = "Contact Threshold (\u00B5m)"
         contact_row = widgets.HBox([self.feature_checks["contact"], self.contact_threshold], layout=widgets.Layout(align_items="center", gap="12px"))
 
         def _toggle_contact_threshold(change=None):
@@ -100,48 +258,121 @@ class FeatureExtractionPanel:
 
         feat_rows = []
         for f in self._all_features:
-            if f == "contact": feat_rows.append(contact_row)
-            elif f == "death" and not has_dead_channel: continue
-            else: feat_rows.append(self.feature_checks[f])
-                
-        self.features_box = widgets.VBox([widgets.HTML("<b>Features</b>")] + feat_rows)
+            if f == "contact":
+                feat_rows.append(contact_row)
+            elif f == "death" and not self.has_dead:
+                continue
+            else:
+                feat_rows.append(self.feature_checks[f])
 
-        self.n_workers = widgets.IntText(
-            description="Workers",
-            value=int(fcfg.get("n_workers", max(8, (os.cpu_count() or 8)))),
-            max=max(8, (os.cpu_count() or 8)),
-            style={'description_width':'160px'}
-        )
+        self.features_box = widgets.VBox([
+            widgets.HTML("<b>Features</b>"),
+            widgets.HTML("<div style='font-size:12px;color:#666;'>Checked disabled features are always computed. Only the category-specific optional features stay editable.</div>"),
+        ] + feat_rows)
+
+        if shared_n_workers_widget is not None:
+            self.n_workers = shared_n_workers_widget
+            self._owns_n_workers_widget = False
+        else:
+            self.n_workers = widgets.IntText(
+                description="Workers",
+                value=int(fcfg.get("n_workers", max(8, (os.cpu_count() or 8)))),
+                max=max(8, (os.cpu_count() or 8)),
+                style={'description_width': '160px'}
+            )
+            self._owns_n_workers_widget = True
 
         self.overwrite = widgets.Checkbox(description="Overwrite existing", value=bool(fcfg.get("overwrite", False)))
 
-        self.btn_run = widgets.Button(description=f"Run {cell_type} feature extraction", button_style="success", layout=widgets.Layout(width="fit-content", flex="0 0 auto"))
+        self.btn_run = widgets.Button(description=f"Run {self.cell_type} feature extraction", button_style="success", layout=widgets.Layout(width="fit-content", flex="0 0 auto"))
         self.btn_run.on_click(self._on_run_clicked)
-        
+
+        self.btn_preview = None
+        self.preview_spinner_html = widgets.HTML(value=spinning_loader)
+        self.preview_spinner_html.layout.display = "none"
+        self.preview_status = widgets.Output()
+        self.preview_container = widgets.VBox([])
+        self.sample_dd = None
+        if self._show_preview:
+            samples = self.metadata_loader.metadata['sample_name'].tolist()
+            self.sample_dd = widgets.Dropdown(
+                options=samples,
+                value=samples[0] if samples else None,
+                description="Sample:",
+                layout=widgets.Layout(width="250px"),
+            )
+            self.btn_preview = widgets.ToggleButton(
+                description="Preview Threshold",
+                button_style="info",
+                layout=widgets.Layout(width="180px")
+            )
+            self.btn_preview.observe(self._on_preview_toggled, names="value")
+
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
 
         self.run_row = widgets.HBox([self.btn_run, self.spinner_html], layout=widgets.Layout(align_items="center", gap="10px"))
         self.out = widgets.Output()
 
-        self.ui = widgets.VBox([
-            widgets.HTML(f"<b> {self.cell_type} Feature Extraction</b>"),
-            widgets.HBox([self.dead_mask_threshold, self.n_workers]),
+        title = widgets.HTML(f"<div style='font-size:14px;font-weight:700;'>{self.cell_type} Feature Extraction</div>")
+
+        controls = []
+        if self.has_dead:
+            if self._show_preview:
+                controls.append(
+                    widgets.HTML(
+                        "<div style='font-size:12px;color:#666;'>Select a sample, then preview. The final extraction replaces the preview CSV with the complete feature table for all samples.</div>"
+                    )
+                )
+                controls.append(self.sample_dd)
+                controls.append(
+                    widgets.HBox(
+                        [self.dead_mask_threshold, self.btn_preview, self.preview_spinner_html],
+                        layout=widgets.Layout(align_items="center", gap="10px")
+                    )
+                )
+                controls.append(self.preview_container)
+            elif self._owns_threshold_widget:
+                controls.append(self.dead_mask_threshold)
+            else:
+                controls.append(
+                    widgets.HTML("<div style='font-size:12px;color:#666;'>Uses the shared organoid dead % threshold above.</div>")
+                )
+
+        ui_children = []
+        if show_title:
+            ui_children.append(title)
+        ui_children.extend(controls)
+        n_workers_row = []
+        if self._owns_n_workers_widget:
+            n_workers_row.append(widgets.HBox([self.n_workers], layout=widgets.Layout(align_items="center")))
+        ui_children.extend(n_workers_row)
+        ui_children.extend([
             self.features_box,
             self.overwrite,
             self.run_row,
-            widgets.HTML("<hr>"),
-            self.out
+            self.out,
+            widgets.HTML("<hr>")
         ])
+        self.ui = widgets.VBox(ui_children, layout=widgets.Layout(gap="6px"))
 
     def _selected_features(self):
-        return [f for f in self._all_features if self.feature_checks[f].value]
+        selected = []
+        for feature_name in self._all_features:
+            if feature_name == "death" and not self.has_dead:
+                continue
+            if feature_name in self._mandatory_features or self.feature_checks[feature_name].value:
+                selected.append(feature_name)
+        return selected
+
+    def _current_dead_threshold(self):
+        return float(self.dead_mask_threshold.value)
 
     def _persist_params(self):
         params = self.metadata_loader.behav3d_parameters
         prof = params.setdefault("features", {}).setdefault(self.cell_type, {})
         prof.update({
-            "dead_mask_percentage_threshold": float(self.dead_mask_threshold.value),
+            "dead_mask_percentage_threshold": self._current_dead_threshold(),
             "features_choice": self._selected_features(),
             "n_workers": int(self.n_workers.value),
             "overwrite": bool(self.overwrite.value),
@@ -151,35 +382,363 @@ class FeatureExtractionPanel:
             params.setdefault("paths", {})["metadata_csv"] = str(Path(self.metadata_loader.metadata_csv_path).expanduser())
         if getattr(self.metadata_loader, "output_dir", None):
             params.setdefault("paths", {})["output_dir"] = str(Path(self.metadata_loader.output_dir).expanduser())
+        if self.has_dead:
+            for ct in self.threshold_targets:
+                params.setdefault("features", {}).setdefault(ct, {})["dead_mask_percentage_threshold"] = self._current_dead_threshold()
 
         with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(params, f, sort_keys=False)
 
     def _lock(self, state: bool):
-        for w in [self.dead_mask_threshold, self.n_workers, self.overwrite, self.btn_run, *self.feature_checks.values()]:
-            if hasattr(w, "disabled"): w.disabled = state
+        widgets_to_lock = [self.n_workers, self.overwrite, self.btn_run, self.contact_threshold]
+        if self._owns_threshold_widget and self.has_dead:
+            widgets_to_lock.append(self.dead_mask_threshold)
+        if self.btn_preview is not None:
+            widgets_to_lock.append(self.btn_preview)
+        for w in widgets_to_lock:
+            if hasattr(w, "disabled"):
+                w.disabled = state
+        for feature_name, checkbox in self.feature_checks.items():
+            if feature_name == "death" and not self.has_dead:
+                continue
+            checkbox.disabled = bool(state or feature_name in self._mandatory_features)
+
+    def _on_threshold_changed(self, _):
+        if self.has_dead:
+            _persist_threshold_for_cell_types(
+                self.metadata_loader,
+                self.threshold_targets,
+                self._current_dead_threshold(),
+            )
+
+    def _prepare_preview_data(self, sample_name):
+        _persist_threshold_for_cell_types(
+            self.metadata_loader,
+            self.threshold_targets,
+            self._current_dead_threshold(),
+        )
+        return _prepare_threshold_preview_features(
+            self.metadata_loader,
+            self.cell_type,
+            self._current_dead_threshold(),
+            sample_name=sample_name,
+            contact_threshold=float(self.contact_threshold.value),
+            n_workers=int(self.n_workers.value),
+            overwrite=bool(self.overwrite.value),
+        )
+
+    def _reset_required_intermediates(self):
+        _reset_feature_intermediate_csvs(
+            self.metadata_loader,
+            self.output_dir,
+            self.cell_type,
+            has_dead=self.has_dead,
+        )
+
+    def _on_preview_toggled(self, change):
+        if not change["new"]:
+            self.preview_container.children = []
+            return
+
+        selected_sample = self.sample_dd.value if self.sample_dd is not None else None
+        if selected_sample is None:
+            with self.preview_status:
+                print("Please select a sample first.")
+            self.btn_preview.value = False
+            return
+
+        self.preview_spinner_html.layout.display = None
+        self.preview_status.clear_output()
+        try:
+            with self.preview_status:
+                print(f"Preparing preview data for {self.cell_type} – sample {selected_sample}...")
+                self._prepare_preview_data(selected_sample)
+                print("Preview data ready.")
+
+            preview = DeathThresholdPreview(
+                self.metadata_loader,
+                cell_type=self.cell_type,
+                threshold_widget=self.dead_mask_threshold,
+                sample_name=selected_sample,
+            )
+            self.preview_container.children = [self.preview_status, preview.ui]
+        except Exception:
+            with self.preview_status:
+                traceback.print_exc()
+            self.preview_container.children = [self.preview_status]
+        finally:
+            self.preview_spinner_html.layout.display = "none"
 
     def _on_run_clicked(self, _):
-        self._lock(True); self.spinner_html.layout.display = None
+        self._lock(True)
+        self.spinner_html.layout.display = None
         with self.out:
             self.out.clear_output()
             try:
                 self._persist_params()
-                out_dir = Path(self.metadata_loader.output_dir).expanduser()
-                out_dir.mkdir(parents=True, exist_ok=True)
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                self._reset_required_intermediates()
                 run_feature_extraction(
-                    dead_mask_percentage_threshold=float(self.dead_mask_threshold.value),
+                    dead_mask_percentage_threshold=(self._current_dead_threshold() if self.has_dead else None),
                     contact_threshold=float(self.contact_threshold.value),
                     metadata=self.metadata_loader.metadata,
-                    output_dir=str(out_dir),
+                    output_dir=str(self.output_dir),
                     features_choice=self._selected_features(),
                     cell_type=self.cell_type,
                     n_workers=int(self.n_workers.value),
                     overwrite=bool(self.overwrite.value)
                 )
-                print("✅ Feature extraction finished.")
-            except Exception: traceback.print_exc()
-            finally: self.spinner_html.layout.display = "none"; self._lock(False)
+                print("Feature extraction finished.")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
+
+
+class _SharedOrganoidThresholdPanel:
+    """
+    Shared preview/threshold row for all detected organoid types.
+    """
+    def __init__(self, metadata_loader, cell_types, *, shared_n_workers_widget=None):
+        self.metadata_loader = metadata_loader
+        self.cell_types = [str(ct).strip() for ct in cell_types]
+        self.shared_n_workers_widget = shared_n_workers_widget
+
+        threshold_default = None
+        for ct in self.cell_types:
+            fcfg = _cfg_get(self.metadata_loader.behav3d_parameters, f"features.{ct}", {}) or {}
+            if "dead_mask_percentage_threshold" in fcfg:
+                threshold_default = float(fcfg["dead_mask_percentage_threshold"])
+                break
+        if threshold_default is None:
+            threshold_default = 0.05
+
+        samples = self.metadata_loader.metadata['sample_name'].tolist()
+        self.sample_dd = widgets.Dropdown(
+            options=samples,
+            value=samples[0] if samples else None,
+            description="Sample:",
+            layout=widgets.Layout(width="250px"),
+        )
+
+        self.dead_mask_threshold = widgets.BoundedFloatText(
+            description="Dead % threshold",
+            value=float(threshold_default),
+            min=0.0,
+            max=1.0,
+            step=0.001,
+            style={'description_width': '160px'},
+            layout=widgets.Layout(width="220px")
+        )
+        self.dead_mask_threshold.observe(self._on_threshold_changed, names="value")
+
+        self.btn_preview = widgets.ToggleButton(
+            description="Preview Threshold",
+            button_style="info",
+            layout=widgets.Layout(width="180px")
+        )
+        self.btn_preview.observe(self._on_preview_toggled, names="value")
+
+        self.preview_spinner_html = widgets.HTML(value=spinning_loader)
+        self.preview_spinner_html.layout.display = "none"
+        self.preview_status = widgets.Output()
+        self.preview_container = widgets.VBox([])
+
+        self.ui = widgets.VBox([
+            widgets.HTML("<div style='font-size:12px;color:#666;'>Shared organoid threshold preview. Select a sample, then preview. The final extraction replaces the preview CSV with the complete feature table for all samples.</div>"),
+            self.sample_dd,
+            widgets.HBox(
+                [self.dead_mask_threshold, self.btn_preview, self.preview_spinner_html],
+                layout=widgets.Layout(align_items="center", gap="10px")
+            ),
+            self.preview_container,
+        ], layout=widgets.Layout(gap="6px"))
+
+        _persist_threshold_for_cell_types(self.metadata_loader, self.cell_types, self.dead_mask_threshold.value)
+
+    def _on_threshold_changed(self, _):
+        _persist_threshold_for_cell_types(
+            self.metadata_loader,
+            self.cell_types,
+            float(self.dead_mask_threshold.value),
+        )
+
+    def _prepare_preview_data(self, sample_name):
+        _persist_threshold_for_cell_types(
+            self.metadata_loader,
+            self.cell_types,
+            float(self.dead_mask_threshold.value),
+        )
+        n_workers_val = None
+        if self.shared_n_workers_widget is not None:
+            n_workers_val = int(self.shared_n_workers_widget.value)
+        for ct in self.cell_types:
+            fcfg = _cfg_get(self.metadata_loader.behav3d_parameters, f"features.{ct}", {}) or {}
+            _prepare_threshold_preview_features(
+                self.metadata_loader,
+                ct,
+                float(self.dead_mask_threshold.value),
+                sample_name=sample_name,
+                contact_threshold=float(fcfg.get("contact_threshold", 0.0)),
+                n_workers=n_workers_val if n_workers_val is not None else int(fcfg.get("n_workers", max(8, (os.cpu_count() or 8)))),
+                overwrite=bool(fcfg.get("overwrite", False)),
+            )
+
+    def _on_preview_toggled(self, change):
+        if not change["new"]:
+            self.preview_container.children = []
+            return
+
+        selected_sample = self.sample_dd.value
+        if selected_sample is None:
+            with self.preview_status:
+                print("Please select a sample first.")
+            self.btn_preview.value = False
+            return
+
+        self.preview_spinner_html.layout.display = None
+        self.preview_status.clear_output()
+        try:
+            with self.preview_status:
+                print(f"Preparing shared organoid preview data for sample {selected_sample}...")
+                self._prepare_preview_data(selected_sample)
+                print("Preview data ready.")
+
+            preview = DeathThresholdPreview(
+                self.metadata_loader,
+                cell_types=self.cell_types,
+                threshold_widget=self.dead_mask_threshold,
+                sample_name=selected_sample,
+            )
+            self.preview_container.children = [self.preview_status, preview.ui]
+        except Exception:
+            with self.preview_status:
+                traceback.print_exc()
+            self.preview_container.children = [self.preview_status]
+        finally:
+            self.preview_spinner_html.layout.display = "none"
+
+
+class FeatureExtractionPanel:
+    """
+    Feature extraction UI.
+
+    When ``cell_type`` is supplied, renders a single per-cell-type panel.
+    When ``cell_type`` is omitted, renders the grouped dynamic feature
+    extraction UI used by the main notebook.
+    """
+    def __init__(self, metadata_loader, cell_type=None):
+        self.metadata_loader = metadata_loader
+        self.output_dir = Path(self.metadata_loader.output_dir).expanduser()
+        self.metadata = getattr(self.metadata_loader, "metadata", None)
+        self.has_dead = has_dead_channel(self.metadata)
+        self.cell_type = str(cell_type).strip() if cell_type else None
+
+        if self.cell_type:
+            self.single_panel = _CellTypeFeatureExtractionPanel(
+                metadata_loader=self.metadata_loader,
+                cell_type=self.cell_type,
+                show_title=True,
+                enable_preview=self.has_dead,
+            )
+            self.ui = self.single_panel.ui
+            self.btn_run = self.single_panel.btn_run
+            self.run_buttons = [self.btn_run]
+            return
+
+        organoid_types = detect_organoid_types_from_metadata(self.metadata)
+        immune_types = detect_immune_cell_types_from_metadata(self.metadata)
+        other_types = detect_other_cell_types_from_metadata(self.metadata)
+
+        self.cell_panels = {}
+        self.run_buttons = []
+        blocks = [widgets.HTML("<h3>Feature Extraction</h3>")]
+
+        if not (organoid_types or immune_types or other_types):
+            blocks.append(widgets.HTML("<i>No cell types detected in metadata.</i>"))
+            self.ui = widgets.VBox(blocks)
+            return
+
+        # ── Shared n_workers widget at the top of the panel ──
+        # Read default from the first cell type that has a config, or fall back to CPU count.
+        all_cell_types = list(organoid_types) + list(immune_types) + list(other_types)
+        default_n_workers = max(8, (os.cpu_count() or 8))
+        for ct in all_cell_types:
+            fcfg = _cfg_get(self.metadata_loader.behav3d_parameters, f"features.{ct}", {}) or {}
+            if "n_workers" in fcfg:
+                default_n_workers = int(fcfg["n_workers"])
+                break
+
+        self.n_workers = widgets.IntText(
+            description="Workers",
+            value=default_n_workers,
+            max=max(8, (os.cpu_count() or 8)),
+            style={'description_width': '160px'}
+        )
+        blocks.append(
+            widgets.HBox(
+                [self.n_workers],
+                layout=widgets.Layout(align_items="center", margin="0 0 6px 0")
+            )
+        )
+
+        self.organoid_threshold_panel = None
+        if organoid_types:
+            blocks.append(widgets.HTML("<h4>Organoids</h4>"))
+            if self.has_dead:
+                self.organoid_threshold_panel = _SharedOrganoidThresholdPanel(
+                    metadata_loader=self.metadata_loader,
+                    cell_types=organoid_types,
+                    shared_n_workers_widget=self.n_workers,
+                )
+                blocks.append(self.organoid_threshold_panel.ui)
+            for ct in organoid_types:
+                panel = _CellTypeFeatureExtractionPanel(
+                    metadata_loader=self.metadata_loader,
+                    cell_type=ct,
+                    shared_threshold_widget=(
+                        self.organoid_threshold_panel.dead_mask_threshold
+                        if self.organoid_threshold_panel is not None else None
+                    ),
+                    threshold_targets=organoid_types,
+                    enable_preview=False,
+                    show_title=True,
+                    shared_n_workers_widget=self.n_workers,
+                )
+                self.cell_panels[ct] = panel
+                self.run_buttons.append(panel.btn_run)
+                blocks.append(panel.ui)
+
+        if immune_types:
+            blocks.append(widgets.HTML("<h4>Immune Cells</h4>"))
+            for ct in immune_types:
+                panel = _CellTypeFeatureExtractionPanel(
+                    metadata_loader=self.metadata_loader,
+                    cell_type=ct,
+                    show_title=True,
+                    enable_preview=self.has_dead,
+                    shared_n_workers_widget=self.n_workers,
+                )
+                self.cell_panels[ct] = panel
+                self.run_buttons.append(panel.btn_run)
+                blocks.append(panel.ui)
+
+        if other_types:
+            blocks.append(widgets.HTML("<h4>Other Cells</h4>"))
+            for ct in other_types:
+                panel = _CellTypeFeatureExtractionPanel(
+                    metadata_loader=self.metadata_loader,
+                    cell_type=ct,
+                    show_title=True,
+                    enable_preview=self.has_dead,
+                    shared_n_workers_widget=self.n_workers,
+                )
+                self.cell_panels[ct] = panel
+                self.run_buttons.append(panel.btn_run)
+                blocks.append(panel.ui)
+
+        self.ui = widgets.VBox(blocks, layout=widgets.Layout(gap="10px"))
 
 class TrackFilterPanel:
     """
@@ -189,6 +748,7 @@ class TrackFilterPanel:
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+        self.has_dead_channel_in_metadata = has_dead_channel(self.metadata_loader.metadata)
         self.category = detect_cell_type_category(self.cell_type, metadata_loader.metadata)
         
         active_killing_dir = Path(self.output_dir, "analysis", self.cell_type, "active_killing")
@@ -213,19 +773,19 @@ class TrackFilterPanel:
         self.row_max = widgets.HBox([self.max_track_length], layout=widgets.Layout(display=(None if self.en_max_length.value else "none")))
         self.en_max_length.observe(lambda c: setattr(self.row_max.layout, 'display', None if c['new'] else 'none'), names="value")
 
-        from behav3d.core.metadata import has_dead_channel
         self.has_dead = has_dead_channel(self.metadata_loader.metadata)
         
-        if self.category == "organoid":
-            self.filter_t0_dead = widgets.Checkbox(description="Filter by minimal size at t=1", value=bool(cfg.get("filter_min_size_t1", True)), indent=False)
-            self.min_size_t1 = widgets.IntText(description="Minimal size (px @ t=1)", value=int(cfg.get("min_size_t1", 1000)), style={'description_width': '180px'})
-            self.row_size_t1 = widgets.HBox([self.min_size_t1], layout=widgets.Layout(display=(None if self.filter_t0_dead.value else "none")))
-            self.filter_t0_dead.observe(lambda c: setattr(self.row_size_t1.layout, 'display', None if c['new'] else 'none'), names="value")
-        else:
-            self.filter_t0_dead = widgets.Checkbox(description="Filter tracks that are dead at t=0", value=bool(cfg.get("filter_t0_dead", True)), indent=False)
-            if not self.has_dead: self.filter_t0_dead.layout.display = "none"
-            self.min_size_t1 = self.row_size_t1 = None
+        # --- Min size at first timepoint (available for ALL cell types) ---
+        self.en_min_size = widgets.Checkbox(description="Filter by minimal size at first timepoint", value=bool(cfg.get("filter_min_size", False)), indent=False)
+        self.min_size_val = widgets.IntText(description="Minimal size (px)", value=int(cfg.get("min_size", 1000)), style={'description_width': '180px'})
+        self.row_min_size = widgets.HBox([self.min_size_val], layout=widgets.Layout(display=(None if self.en_min_size.value else "none")))
+        self.en_min_size.observe(lambda c: setattr(self.row_min_size.layout, 'display', None if c['new'] else 'none'), names="value")
+
+        # --- Dead at t=0 (available for ALL cell types, hidden if no dead channel) ---
+        self.filter_t0_dead = widgets.Checkbox(description="Filter tracks that are dead at first timepoint", value=bool(cfg.get("filter_t0_dead", False)), indent=False)
+        if not self.has_dead: self.filter_t0_dead.layout.display = "none"
         
+        # --- Time unit toggle (available for ALL cell types) ---
         self.time_type = widgets.ToggleButtons(options=["frames", "hours"], value=cfg.get("time_type", "frames"))
         def _on_time_unit_change(change):
             if change['name'] == 'value':
@@ -241,17 +801,21 @@ class TrackFilterPanel:
         self.spinner_html.layout.display = "none"
         self.out_run = widgets.Output()
         
-        ui_elements = [widgets.HTML(f'<div style="font-size:22px;font-weight:700;">{self.cell_type.capitalize()} Track Filtering</div>'), self.en_exp_duration, self.row_exp, self.en_min_length, self.row_min, self.en_max_length, self.row_max, self.filter_t0_dead]
-        if self.row_size_t1: ui_elements.append(self.row_size_t1)
-        if self.category != "organoid": 
-             ui_elements.extend([widgets.HTML('<b>Unit for time-based filters:</b>'), self.time_type])
-        ui_elements.extend([widgets.HBox([self.btn_run, self.spinner_html]), self.out_run])
+        ui_elements = [
+            widgets.HTML(f'<div style="font-size:14px;font-weight:700;">{self.cell_type.capitalize()} Track Filtering</div>'),
+            self.en_exp_duration, self.row_exp,
+            self.en_min_length, self.row_min,
+            self.en_max_length, self.row_max,
+            self.en_min_size, self.row_min_size,
+            self.filter_t0_dead,
+            widgets.HTML('<b>Unit for time-based filters:</b>'), self.time_type,
+            widgets.HBox([self.btn_run, self.spinner_html]),
+            self.out_run
+        ]
         self.ui = widgets.VBox(ui_elements)
-        self._filter_fn = filter_organoid_tracks if self.category == "organoid" else filter_cell_tracks
 
     def _lock(self, locked):
-        w_list = [self.en_exp_duration, self.exp_duration, self.en_min_length, self.min_track_length, self.en_max_length, self.max_track_length, self.filter_t0_dead, self.time_type, self.btn_run]
-        if self.min_size_t1: w_list.append(self.min_size_t1)
+        w_list = [self.en_exp_duration, self.exp_duration, self.en_min_length, self.min_track_length, self.en_max_length, self.max_track_length, self.en_min_size, self.min_size_val, self.filter_t0_dead, self.time_type, self.btn_run]
         for w in w_list: w.disabled = locked
 
     def _on_run_clicked(self, *_):
@@ -259,18 +823,34 @@ class TrackFilterPanel:
         with self.out_run:
             try:
                 cfg = self.metadata_loader.behav3d_parameters["track_filtering"][self.cell_type]
-                cfg.update({"exp_duration_enabled": self.en_exp_duration.value, "exp_duration": int(self.exp_duration.value), "min_length_enabled": self.en_min_length.value, "min_track_length": int(self.min_track_length.value), "max_length_enabled": self.en_max_length.value, "max_track_length": int(self.max_track_length.value), "time_type": str(self.time_type.value)})
-                if self.category == "organoid":
-                    cfg.update({"filter_min_size_t1": self.filter_t0_dead.value, "min_size_t1": int(self.min_size_t1.value)})
-                else: cfg["filter_t0_dead"] = bool(self.filter_t0_dead.value)
+                cfg.update({
+                    "exp_duration_enabled": self.en_exp_duration.value,
+                    "exp_duration": int(self.exp_duration.value),
+                    "min_length_enabled": self.en_min_length.value,
+                    "min_track_length": int(self.min_track_length.value),
+                    "max_length_enabled": self.en_max_length.value,
+                    "max_track_length": int(self.max_track_length.value),
+                    "filter_min_size": self.en_min_size.value,
+                    "min_size": int(self.min_size_val.value),
+                    "filter_t0_dead": bool(self.filter_t0_dead.value),
+                    "time_type": str(self.time_type.value)
+                })
                 with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
 
                 df_input_path = str(self._advanced_features_path) if self._use_advanced_features else None
-                filter_kwargs = {"metadata": self.metadata_loader.metadata, "output_dir": self.output_dir, "exp_duration": (int(self.exp_duration.value) if self.en_exp_duration.value else None), "min_track_length": (int(self.min_track_length.value) if self.en_min_length.value else None), "max_track_length": (int(self.max_track_length.value) if self.en_max_length.value else None), "time_type": str(self.time_type.value), "cell_type": self.cell_type, "df_input_path": df_input_path}
-                if self.category == "organoid": filter_kwargs["min_size"] = (int(self.min_size_t1.value) if self.filter_t0_dead.value else None)
-                else: filter_kwargs.update({"filter_t0_dead": (bool(self.filter_t0_dead.value) if self.has_dead else False), "plot_results": True})
-                
-                self._filter_fn(**filter_kwargs)
+                filter_tracks(
+                    metadata=self.metadata_loader.metadata,
+                    output_dir=self.output_dir,
+                    exp_duration=(int(self.exp_duration.value) if self.en_exp_duration.value else None),
+                    min_track_length=(int(self.min_track_length.value) if self.en_min_length.value else None),
+                    max_track_length=(int(self.max_track_length.value) if self.en_max_length.value else None),
+                    filter_t0_dead=(bool(self.filter_t0_dead.value) if self.has_dead else False),
+                    min_size=(int(self.min_size_val.value) if self.en_min_size.value else None),
+                    cell_type=self.cell_type,
+                    time_type=str(self.time_type.value),
+                    plot_results=True,
+                    df_input_path=df_input_path
+                )
                 print("✅ Filtering done. Summarizing tracks...")
                 summarize_track_features(output_dir=self.output_dir, cell_type=self.cell_type)
                 print(f"✅ {self.cell_type} filtering complete!")
@@ -907,53 +1487,98 @@ class ActiveKillingPanel:
 
 class DeathThresholdPreview:
     """
-    Interactive visual preview for tuning the organoid death threshold.
+    Interactive threshold preview based on unfiltered track features.
+
+    Supports either a single fixed cell type or a dropdown of selectable cell
+    types. Shared organoid previews automatically expose the segment selector,
+    while single-cell previews do not.
     """
-    def __init__(self, metadata_loader, cell_type):
+    def __init__(
+        self,
+        metadata_loader,
+        cell_type=None,
+        *,
+        cell_types=None,
+        threshold_widget=None,
+        sample_name=None,
+    ):
         self.metadata_loader = metadata_loader
-        self.cell_type = str(cell_type).strip()
         self.output_dir = Path(self.metadata_loader.output_dir).expanduser()
-        
-        # Paths
-        feature_outdir = self.output_dir / "analysis" / self.cell_type / "track_features"
-        #self.df_tracks_path = feature_outdir / f"BEHAV3D_{self.cell_type}_combined_track_features.csv"
-        self.df_tracks_path = feature_outdir / f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv"
+        self._syncing_segment_options = False
+        self._tracks_cache = {}
 
-        #if not self.df_tracks_path.exists():
-            #self.df_tracks_path = feature_outdir / f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv"
-
-        if not self.df_tracks_path.exists():
-            self.df_tracks = None
+        if cell_types is None:
+            if cell_type is None:
+                raise ValueError("Either cell_type or cell_types must be provided.")
+            self.cell_types = [str(cell_type).strip()]
         else:
-            self.df_tracks = pd.read_csv(self.df_tracks_path)
-            self.df_tracks['TrackID'] = self.df_tracks['TrackID'].astype(str)
+            self.cell_types = [str(ct).strip() for ct in cell_types if str(ct).strip()]
+            if not self.cell_types:
+                raise ValueError("cell_types cannot be empty.")
+        self.sample_name = str(sample_name).strip() if sample_name else None
 
-        self.samples = self.metadata_loader.metadata['sample_name'].tolist()
-        
-        # UI Elements
-        self.sample_dd = widgets.Dropdown(options=self.samples, description="Sample:", layout={'width': '250px'})
-        self.time_slider = widgets.IntSlider(description="Time:", continuous_update=False, layout={'width': '400px'})
-        #self.threshold_slider = widgets.FloatSlider(value=0.02, min=0, max=0.5, step=0.005, description="Threshold:", continuous_update=False, layout={'width': '400px'})
-        self.threshold_input = widgets.BoundedFloatText(
-            value=0.02, min=0, max=1, step=0.0005,
-            description="Threshold:", style={'description_width': 'initial'},
-            layout={'width': '120px'}
+        self._owns_threshold_widget = threshold_widget is None
+        if threshold_widget is None:
+            self.threshold_widget = widgets.BoundedFloatText(
+                value=0.05,
+                min=0,
+                max=1,
+                step=0.0005,
+                description="Threshold:",
+                style={'description_width': 'initial'},
+                layout={'width': '130px'}
             )
-        self.org_ch_input = widgets.IntText(value=0, description=f"{self.cell_type} Channel:", style={'description_width': 'initial'}, layout={'width': '200px'})
-        self.dead_ch_input = widgets.IntText(value=1, description="Dead Channel:", style={'description_width': 'initial'}, layout={'width': '200px'})
+        else:
+            self.threshold_widget = threshold_widget
 
+        if len(self.cell_types) > 1:
+            self.cell_type_dd = widgets.Dropdown(
+                options=self.cell_types,
+                value=self.cell_types[0],
+                description="Cell type:",
+                layout=widgets.Layout(width="250px"),
+            )
+        else:
+            self.cell_type_dd = None
+
+        self.sample_label = widgets.HTML(
+            f"<b>Sample:</b> {self.sample_name or '(none)'}",
+        )
+        self.time_slider = widgets.IntSlider(
+            description="Time:",
+            continuous_update=False,
+            layout={'width': '400px'}
+        )
+        self.org_ch_input = widgets.IntText(
+            value=0,
+            description="Cell Channel:",
+            style={'description_width': 'initial'},
+            layout={'width': '190px'}
+        )
+        self.dead_ch_input = widgets.IntText(
+            value=1,
+            description="Dead Channel:",
+            style={'description_width': 'initial'},
+            layout={'width': '190px'}
+        )
         self.out = widgets.Output(layout={'overflow': 'visible', 'height': 'auto'})
-        
-        # Observers
-        self.sample_dd.observe(self._on_sample_change, names='value')
+
+        if self.cell_type_dd is not None:
+            self.cell_type_dd.observe(self._on_context_change, names='value')
         self.time_slider.observe(self._update, names='value')
-        self.threshold_input.observe(self._update, names='value')
+        self.threshold_widget.observe(self._update, names='value')
         self.org_ch_input.observe(self._update, names='value')
         self.dead_ch_input.observe(self._update, names='value')
 
+        header_row = [self.sample_label]
+        if self.cell_type_dd is not None:
+            header_row.insert(0, self.cell_type_dd)
+        if self._owns_threshold_widget:
+            header_row.append(self.threshold_widget)
+
         self.ui = widgets.VBox([
-            widgets.HTML(f"<b>Visual Threshold Preview</b> <i>(Max Intensity Projection)</i>"),
-            widgets.HBox([self.sample_dd, self.threshold_input]),
+            widgets.HTML("<b>Visual Threshold Preview</b> <i>(Max Intensity Projection)</i>"),
+            widgets.HBox(header_row, layout=widgets.Layout(align_items="center", gap="10px")),
             widgets.HBox([
                 widgets.HTML("<b>Channels: </b>"),
                 self.org_ch_input,
@@ -964,82 +1589,225 @@ class DeathThresholdPreview:
             self.out,
         ])
 
-        # Initial Load
-        if self.samples:
-            self._on_sample_change({'new': self.samples[0]})
-
-    def _on_sample_change(self, change):
-        sample = change['new']
-        row = self.metadata_loader.metadata[self.metadata_loader.metadata['sample_name'] == sample].iloc[0]
-        
-        sample_dir = self.output_dir / "images" / sample
-        self.raw_path = sample_dir / f"{sample}.zarr"
-        
-        # Segmentation/tracked image path from metadata
+        self.raw_path = None
         self.label_path = None
+        self.dead_mask_path = None
+        self.tracks_csv_path = None
+        self._preview_block_reason = None
+
+        if self.sample_name:
+            self._on_context_change(None)
+
+    def _current_cell_type(self):
+        return self.cell_type_dd.value if self.cell_type_dd is not None else self.cell_types[0]
+
+    def _tracks_dataframe(self, cell_type):
+        if cell_type in self._tracks_cache:
+            return self._tracks_cache[cell_type]
+
+        csv_path = _feature_output_csv_path(self.output_dir, cell_type)
+        if not csv_path.exists():
+            self._tracks_cache[cell_type] = None
+            return None
+
+        try:
+            df_tracks = pd.read_csv(csv_path)
+            if "TrackID" in df_tracks.columns:
+                df_tracks["TrackID"] = df_tracks["TrackID"].astype(str)
+        except Exception:
+            df_tracks = None
+        self._tracks_cache[cell_type] = df_tracks
+        return df_tracks
+
+    def _resolve_label_path(self, row, sample, cell_type):
         for prefix in ['or', 'im', 'ot']:
-            col = f"{prefix}_{self.cell_type}_tracks_image_path"
+            col = f"{prefix}_{cell_type}_tracks_image_path"
             if col in row and pd.notna(row[col]) and str(row[col]).strip():
                 p = Path(row[col])
                 if p.exists():
-                    self.label_path = p
-                    break
-        
-        # Fallback:tracked.zarr
-        if self.label_path is None or not self.label_path.exists():
-            tracked_fallback = sample_dir / f"{sample}_{self.cell_type}_tracked.zarr"
-            #segments_fallback = sample_dir / f"{sample}_{self.cell_type}_segments.zarr"
-            if tracked_fallback.exists():
-                self.label_path = tracked_fallback
-            #elif segments_fallback.exists():
-            #    self.label_path = segments_fallback
+                    return p
+                return None
+        return None
+
+    def _resolve_tracks_csv_path(self, row, cell_type):
+        for prefix in ['or', 'im', 'ot']:
+            col = f"{prefix}_{cell_type}_tracks_csv_path"
+            if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                p = Path(row[col])
+                if p.exists():
+                    return p
+                return None
+        legacy_col = f"{cell_type}_tracks_csv_path"
+        if legacy_col in row and pd.notna(row[legacy_col]) and str(row[legacy_col]).strip():
+            p = Path(row[legacy_col])
+            if p.exists():
+                return p
+        return None
+
+    def _tracks_csv_has_track_rows(self, csv_path):
+        try:
+            df_tracks = pd.read_csv(csv_path, usecols=["TrackID"])
+        except Exception:
+            return False
+        if df_tracks.empty or "TrackID" not in df_tracks.columns:
+            return False
+        return pd.to_numeric(df_tracks["TrackID"], errors="coerce").notna().any()
+
+    def _on_context_change(self, _):
+        sample = self.sample_name
+        cell_type = self._current_cell_type()
+        if sample is None or cell_type is None:
+            return
+
+        self._preview_block_reason = None
+
+        md_match = self.metadata_loader.metadata[self.metadata_loader.metadata['sample_name'] == sample]
+        if md_match.empty:
+            self._preview_block_reason = f"Sample {sample} not found in metadata."
+            return
+        row = md_match.iloc[0]
+
+        self.raw_path = None
+        if 'raw_image_path' in row and pd.notna(row['raw_image_path']) and str(row['raw_image_path']).strip():
+            raw_path = Path(row['raw_image_path'])
+            if raw_path.exists():
+                self.raw_path = raw_path
             else:
-                self.label_path = tracked_fallback  # will fail with informative error
-            
-        self.dead_mask_path = sample_dir / f"{sample}_mask_dead.zarr"
-        if 'dead_mask_path' in row and pd.notna(row['dead_mask_path']):
+                self._preview_block_reason = (
+                    f"{cell_type} preview for sample {sample} is blocked "
+                    f"(raw_image_path file not found on disk: {raw_path})."
+                )
+        else:
+            self._preview_block_reason = (
+                f"{cell_type} preview for sample {sample} is blocked "
+                "(raw_image_path is missing in metadata)."
+            )
+
+        self.label_path = self._resolve_label_path(row, sample, cell_type)
+        if self.label_path is None:
+            self._preview_block_reason = (
+                f"{cell_type} channel is empty for sample {sample} "
+                "(no valid tracks image path in metadata or file missing on disk)."
+            )
+
+        self.tracks_csv_path = self._resolve_tracks_csv_path(row, cell_type)
+        if self.tracks_csv_path is None:
+            self._preview_block_reason = (
+                f"{cell_type} channel is empty for sample {sample} "
+                "(no valid tracks CSV path in metadata or file missing on disk)."
+            )
+        elif not self._tracks_csv_has_track_rows(self.tracks_csv_path):
+            self._preview_block_reason = (
+                f"{cell_type} channel is empty for sample {sample} "
+                "(tracks CSV has no valid TrackID rows)."
+            )
+
+        self.dead_mask_path = None
+        if 'dead_mask_path' in row and pd.notna(row['dead_mask_path']) and str(row['dead_mask_path']).strip():
             dp = Path(row['dead_mask_path'])
             if dp.exists():
                 self.dead_mask_path = dp
-        
+            else:
+                self._preview_block_reason = (
+                    f"{cell_type} preview for sample {sample} is blocked "
+                    f"(dead_mask_path file not found on disk: {dp})."
+                )
+        else:
+            self._preview_block_reason = (
+                f"{cell_type} preview for sample {sample} is blocked "
+                "(dead_mask_path is missing in metadata)."
+            )
+
+        guessed_channel = _guess_channel_index(self.metadata_loader, sample, cell_type)
+        if guessed_channel is not None:
+            self.org_ch_input.value = int(guessed_channel)
+        if 'dead_channel' in row and pd.notna(row['dead_channel']):
+            self.dead_ch_input.value = int(row['dead_channel'])
+
         try:
+            time_lengths = []
             raw = load_zarr(self.raw_path)
-            # T, C, Z, Y, X or T, Z, Y, X
-            self.time_slider.max = raw.shape[0] - 1
-            self.time_slider.value = raw.shape[0] // 2
-        except: pass
-        
+            time_lengths.append(int(raw.shape[0]))
+            if self.label_path is not None and Path(self.label_path).exists():
+                label = load_zarr(self.label_path)
+                time_lengths.append(int(label.shape[0]))
+            if self.dead_mask_path is not None and Path(self.dead_mask_path).exists():
+                dead_mask = load_zarr(self.dead_mask_path)
+                time_lengths.append(int(dead_mask.shape[0]))
+
+            shared_max = max(0, min(time_lengths) - 1)
+            self.time_slider.max = shared_max
+            if self.time_slider.value > shared_max:
+                self.time_slider.value = shared_max
+            elif self.time_slider.value == 0 and shared_max > 0:
+                self.time_slider.value = shared_max // 2
+        except Exception:
+            pass
+
         self._update(None)
 
     @staticmethod
     def _contrast_limits(img):
-        """Compute display vmin/vmax using 1st–99th percentile of non-zero pixels."""
         pos = img[img > 0]
         if pos.size == 0:
             return 0, max(1, img.max())
         return float(np.percentile(pos, 1)), float(np.percentile(pos, 99))
 
+    @staticmethod
+    def _shared_time_max(*arrays):
+        lengths = [int(arr.shape[0]) for arr in arrays if arr is not None and hasattr(arr, "shape") and len(arr.shape) > 0]
+        if not lengths:
+            return 0
+        return max(0, min(lengths) - 1)
+
     def _update(self, _):
-        sample = self.sample_dd.value
+        sample = self.sample_name
+        cell_type = self._current_cell_type()
         t = self.time_slider.value
-        thr = self.threshold_input.value
-        
+        thr = float(self.threshold_widget.value)
+
         self.out.clear_output(wait=False)
         with self.out:
             try:
-                org_ch = self.org_ch_input.value
-                dead_ch = self.dead_ch_input.value
+                if sample is None or cell_type is None:
+                    print("Select a sample and cell type to preview.")
+                    return
+                if getattr(self, "_preview_block_reason", None):
+                    print(self._preview_block_reason)
+                    return
+                if self.raw_path is None or not Path(self.raw_path).exists():
+                    print("Preview raw data is not available yet. Use the preview button to prepare preview data first.")
+                    return
+                if self.label_path is None or not Path(self.label_path).exists():
+                    print(f"Tracks image not found for {cell_type} in sample {sample}.")
+                    return
+                if self.dead_mask_path is None or not Path(self.dead_mask_path).exists():
+                    print(f"Dead mask not found for sample {sample}.")
+                    return
 
-                # Load Z stacks and apply Maximum Intensity Projection per channel
+                org_ch = int(self.org_ch_input.value)
+                dead_ch = int(self.dead_ch_input.value)
+
                 raw_zarr = load_zarr(self.raw_path)
+                label_zarr = load_zarr(self.label_path)
+                dead_mask_zarr = load_zarr(self.dead_mask_path)
+                shared_max = self._shared_time_max(raw_zarr, label_zarr, dead_mask_zarr)
+                if t > shared_max:
+                    print(
+                        f"Preview timepoint {t} is outside the shared range for raw image, tracks, and dead mask. "
+                        f"Use a timepoint between 0 and {shared_max}."
+                    )
+                    if self.time_slider.value != shared_max:
+                        self.time_slider.value = shared_max
+                    return
                 has_channels = (raw_zarr.ndim == 5)
+                n_channels = raw_zarr.shape[1] if has_channels else 1
                 if has_channels:
-                    n_channels = raw_zarr.shape[1]
                     if org_ch >= n_channels:
-                        print(f"{self.cell_type} Channel {org_ch} out of range (0–{n_channels-1}). Select a valid channel.")
+                        print(f"{cell_type} Channel {org_ch} out of range (0-{n_channels - 1}).")
                         return
                     if dead_ch >= n_channels:
-                        print(f"Dead Channel {dead_ch} out of range (0–{n_channels-1}). Select a valid channel.")
+                        print(f"Dead Channel {dead_ch} out of range (0-{n_channels - 1}).")
                         return
                     raw_img = np.asarray(raw_zarr[t, org_ch]).max(axis=0)
                     dead_raw = np.asarray(raw_zarr[t, dead_ch]).max(axis=0)
@@ -1047,8 +1815,6 @@ class DeathThresholdPreview:
                     raw_img = np.asarray(raw_zarr[t]).max(axis=0)
                     dead_raw = raw_img
 
-                # Segmentation: first-nonzero projection (avoids label mixing from MIP)
-                label_zarr = load_zarr(self.label_path)
                 label_vol = np.asarray(label_zarr[t])
                 if label_vol.ndim == 3:
                     first_nz_idx = np.argmax(label_vol > 0, axis=0)
@@ -1056,73 +1822,68 @@ class DeathThresholdPreview:
                 else:
                     label_img = label_vol
 
-                # Dead mask: MIP over Z (binary OR: correct for 0/1 masks)
-                dead_mask_zarr = load_zarr(self.dead_mask_path)
+                # No label restriction: preview always uses all segments.
+                label_view = label_img
+
                 dead_vol = np.asarray(dead_mask_zarr[t])
                 dead_mask = dead_vol.max(axis=0) if dead_vol.ndim == 3 else dead_vol
 
-                # Classification image (red=dead, green=alive, gray=unknown)
-                class_img = np.zeros((*label_img.shape, 3), dtype=float)
-                if self.df_tracks is not None:
-                    df_t = self.df_tracks[(self.df_tracks['sample_name'] == sample) & (self.df_tracks['position_t'] == t)]
-                    for label_id in np.unique(label_img):
-                        if label_id == 0: continue
+                df_tracks = self._tracks_dataframe(cell_type)
+                class_img = np.zeros((*label_view.shape, 3), dtype=float)
+                if df_tracks is not None and "percentage_dead_mask" in df_tracks.columns:
+                    time_mask = pd.to_numeric(df_tracks['position_t'], errors='coerce').fillna(-1).astype(int) == int(t)
+                    df_t = df_tracks[(df_tracks['sample_name'] == sample) & time_mask]
+                    for label_id in np.unique(label_view):
+                        if label_id == 0:
+                            continue
                         row = df_t[df_t['TrackID'] == str(label_id)]
                         if not row.empty:
-                            perc = row['percentage_dead_mask'].values[0]
-                            color = [1, 0, 0] if perc >= thr else [0, 1, 0]
-                            class_img[label_img == label_id] = color
+                            perc = float(row['percentage_dead_mask'].iloc[0])
+                            class_img[label_view == label_id] = [1, 0, 0] if perc >= thr else [0, 1, 0]
                         else:
-                            class_img[label_img == label_id] = [0.5, 0.5, 0.5]
+                            class_img[label_view == label_id] = [0.5, 0.5, 0.5]
 
-                # Contrast limits
                 vmin_r, vmax_r = self._contrast_limits(raw_img)
                 vmin_d, vmax_d = self._contrast_limits(dead_raw)
 
-                # Masks for overlay
-                seg_display = np.ma.masked_where(label_img == 0, label_img)
-                dead_mask_overlay = np.ma.masked_where(dead_mask == 0, dead_mask)
+                seg_display = np.ma.masked_where(label_view == 0, label_view)
+                overlay_source = dead_mask
+                dead_mask_overlay = np.ma.masked_where(overlay_source == 0, overlay_source)
                 red_cmap = ListedColormap(['#FF2020'])
 
-                #fig, axes = plt.subplots(1, 5, figsize=(25, 5))
                 fig, axes = plt.subplots(1, 5, figsize=(30, 6), dpi=150)
-                # 1) Raw Organoid
                 axes[0].imshow(raw_img, cmap='gray', vmin=vmin_r, vmax=vmax_r)
-                axes[0].set_title(f"Raw {self.cell_type} (Ch {org_ch})")
-                # 2) Segmentation
-                axes[1].imshow(np.zeros_like(label_img), cmap='gray', vmin=0, vmax=1)
+                axes[0].set_title(f"Raw {cell_type} (Ch {org_ch})")
+                axes[1].imshow(np.zeros_like(label_view), cmap='gray', vmin=0, vmax=1)
                 axes[1].imshow(seg_display, cmap='nipy_spectral', interpolation='nearest')
                 axes[1].set_title(f"Segments ({Path(self.label_path).stem})")
-                # 3) Raw Dead channel
                 axes[2].imshow(dead_raw, cmap='gray', vmin=vmin_d, vmax=vmax_d)
                 axes[2].set_title(f"Raw Dead (Ch {dead_ch})")
-                # 4) Dead mask (red) on raw organoid
                 axes[3].imshow(raw_img, cmap='gray', vmin=vmin_r, vmax=vmax_r)
                 axes[3].imshow(dead_mask_overlay, cmap=red_cmap, alpha=0.55)
-                axes[3].set_title(f"Dead Mask on {self.cell_type}")
-                # 5) Classification
+                axes[3].set_title(f"Dead Mask on {cell_type}")
                 axes[4].imshow(class_img)
                 axes[4].set_title(f"Classification (Thr: {thr:.3f})\nRed=Dead, Green=Alive")
-                for ax in axes: ax.axis('off')
+                for ax in axes:
+                    ax.axis('off')
                 plt.tight_layout()
                 plt.show()
-                
-                ch_note = f"Raw: {raw_zarr.shape} ({n_channels} ch)" if has_channels else f"Raw: {raw_zarr.shape} (no channel dim)"
-                info_html = f"""
+
+                legend_html = """
                 <div style='padding: 5px; border: 1px solid #ccc; background-color: #f9f9f9; font-size: 12px;'>
                     <b>Legend:</b>
                     <span style='color: green;'>●</span> Alive |
                     <span style='color: red;'>●</span> Dead |
-                    <span style='color: gray;'>●</span> Track missing/filtered |
+                    <span style='color: gray;'>●</span> Track missing in preview CSV
                 </div>
                 """
-                display(widgets.HTML(info_html))
-                
-                if self.df_tracks is None:
-                    print("Please run Feature Extraction and track filtering first.")
+                display(widgets.HTML(legend_html))
+                if df_tracks is None:
+                    print("Preview CSV is missing. Use the preview button in Feature Extraction to prepare intensity/death features first.")
             except Exception as e:
-                import traceback; traceback.print_exc()
+                traceback.print_exc()
                 print(f"Preview unavailable: {e}")
+
 
 class DeathDynamicsPanel:
     """
@@ -1132,67 +1893,65 @@ class DeathDynamicsPanel:
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
-        
+        self.has_dead_channel_in_metadata = has_dead_channel(self.metadata_loader.metadata)
+
         feature_outdir = Path(self.output_dir, "analysis", self.cell_type, "track_features")
         p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features.csv")
         self.has_death_features = False
         if p.exists():
-            try: self.has_death_features = bool({'mean_dead_dye', 'percentage_dead_mask', 'nr_dead_mask_pixels'}.intersection(set(pd.read_csv(p, nrows=0).columns)))
-            except Exception: pass
-        
-        params = dict(self.metadata_loader.behav3d_parameters or {})
-        cfg = params.setdefault("death_dynamics", {}).setdefault(self.cell_type, deepcopy(_DEFAULT_CONFIG.get("death_dynamics", {}).get("organoid", {})))
-        self._params = params
-        self._panel_cfg = cfg
-        self.metadata_loader.behav3d_parameters = self._params
-        
-        self.dead_perc_threshold = widgets.FloatText(description="Dead % threshold", value=float(cfg.get("dead_perc_threshold", 0.02)), style={'description_width': '160px'}, layout=widgets.Layout(width="220px"))
-        self.btn_run = widgets.Button(description=f"Run {cell_type} death dynamics", button_style="warning", layout=widgets.Layout(width="300px"))
+            try:
+                cols = set(pd.read_csv(p, nrows=0).columns)
+                self.has_death_features = bool({"dead", "percentage_dead_mask", "nr_dead_mask_pixels"}.issubset(cols))
+            except Exception:
+                pass
+
+        self.btn_run = widgets.Button(
+            description=f"Run {cell_type} death dynamics",
+            button_style="warning",
+            layout=widgets.Layout(width="300px")
+        )
         self.btn_run.on_click(self._on_run_clicked)
-        
-        self.btn_preview = widgets.ToggleButton(description="Preview Threshold", button_style="info", layout=widgets.Layout(width="200px"))
-        self.btn_preview.observe(self._on_preview_toggled, names='value')
-        self.preview_container = widgets.VBox([])
 
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
         self.out = widgets.Output()
-        
-        if not self.has_death_features:
-            self.ui = widgets.VBox([widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'), widgets.HTML('<div style="color:#b00;">No death features found. Run feature extraction first.</div>')])
+
+        if not self.has_dead_channel_in_metadata:
+            self.ui = widgets.VBox([
+                widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'),
+                widgets.HTML('<div style="color:#b00;">No dead channel is configured in metadata for this dataset.</div>')
+            ])
+        elif not self.has_death_features:
+            self.ui = widgets.VBox([
+                widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'),
+                widgets.HTML('<div style="color:#b00;">No final death classification found. Run Feature Extraction and Track Filtering first so the CSV contains the dead column.</div>')
+            ])
         else:
             self.ui = widgets.VBox([
-                widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'), 
-                self.btn_preview,
-                self.preview_container,
-                widgets.HTML("<hr>"),
-                widgets.HBox([self.dead_perc_threshold, widgets.HTML('<div style="font-size:12px;color:#666;">(Adjust value manually or use preview slider)</div>')], layout=widgets.Layout(align_items="center")),
-                widgets.HBox([self.btn_run, self.spinner_html]), 
+                widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'),
+                widgets.HTML('<div style="font-size:12px;color:#666;">Uses the final dead column from track features. Threshold selection now lives only in Feature Extraction.</div>'),
+                widgets.HBox([self.btn_run, self.spinner_html]),
                 self.out
             ])
 
-    def _on_preview_toggled(self, change):
-        if change['new']:
-            try:
-                preview = DeathThresholdPreview(self.metadata_loader, self.cell_type)
-                widgets.jslink((self.dead_perc_threshold, 'value'), (preview.threshold_input, 'value'))
-                self.preview_container.children = [preview.ui]
-            except Exception as e:
-                with self.out: print(f"Error launching preview: {e}")
-        else:
-            self.preview_container.children = []
-
     def _on_run_clicked(self, *_):
-        self.btn_run.disabled = True; self.spinner_html.layout.display = None; self.out.clear_output()
+        self.btn_run.disabled = True
+        self.spinner_html.layout.display = None
+        self.out.clear_output()
         with self.out:
             try:
-                self._panel_cfg["dead_perc_threshold"] = float(self.dead_perc_threshold.value)
-                self.metadata_loader.behav3d_parameters = self._params
-                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self._params, f, sort_keys=False)
-                run_organoid_analysis(dead_perc_threshold=float(self.dead_perc_threshold.value), output_dir=self.output_dir, df_tracks_path=None, org_type=self.cell_type, metadata=self.metadata_loader.metadata)
-                print(f"✅ {self.cell_type} death dynamics complete!")
-            except Exception: traceback.print_exc()
-            finally: self.spinner_html.layout.display = "none"; self.btn_run.disabled = False
+                run_organoid_analysis(
+                    output_dir=self.output_dir,
+                    df_tracks_path=None,
+                    org_type=self.cell_type,
+                    metadata=self.metadata_loader.metadata
+                )
+                print(f"{self.cell_type} death dynamics complete!")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self.btn_run.disabled = False
 
 
 class MultiOrganoidDeathDynamicsPanel:
@@ -1492,8 +2251,7 @@ class InteractionAnalysisPanel:
         self.btn_run.disabled = True; self.spinner_html.layout.display = None; self.out.clear_output()
         with self.out:
             try:
-                thr = _cfg_get(self.metadata_loader.behav3d_parameters, f"death_dynamics.{self.cell_type}.dead_perc_threshold", 0.02)
-                run_interaction_analysis(output_dir=self.output_dir, cell_type=self.cell_type, interacting_cell_types=sel, dead_threshold=thr, df_tracks_path=str(self.df_tracks_path), show_plots=True)
+                run_interaction_analysis(output_dir=self.output_dir, cell_type=self.cell_type, interacting_cell_types=sel, df_tracks_path=str(self.df_tracks_path), show_plots=True)
                 print("✅ Interaction Analysis complete!")
             except Exception: traceback.print_exc()
             finally: self.spinner_html.layout.display = "none"; self.btn_run.disabled = False
