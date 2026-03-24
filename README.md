@@ -97,15 +97,33 @@ python install_behav3d.py --pytorch-only
 
 ## How to Run
 
-BEHAV3D is run through Jupyter notebooks. We recommend using **Visual Studio Code**:
+### Napari GUI (Recommended)
 
-1. Install [VS Code](https://code.visualstudio.com/Download)
-2. Install the Python and Jupyter extensions
-3. Open the BEHAV3D folder
-4. Open `notebooks/run_behav3d.ipynb`
-5. Select kernel: Python Environments > behav3d
+BEHAV3D provides a full graphical interface through the napari viewer:
 
-Alternatively, run in a web browser:
+**Quick launch:**
+1. Double-click `napari/run_behav3d.bat` (Windows) or `napari/run_behav3d.sh` (macOS/Linux)
+2. The BEHAV3D plugin will open automatically inside napari
+
+**Manual launch:**
+```bash
+mamba activate behav3d
+napari
+```
+Then open the BEHAV3D plugin from the **Plugins** menu.
+
+The napari GUI covers the full pipeline: data preparation → segmentation → tracking → feature extraction → filtering.
+
+### Jupyter Notebook (Alternative)
+
+> **Note:** The Jupyter notebook provides an alternative, script-based interface for advanced users who prefer more control over individual pipeline steps.
+
+1. Install [VS Code](https://code.visualstudio.com/Download) with the Python and Jupyter extensions
+2. Open the BEHAV3D folder
+3. Open `notebooks/run_behav3d.ipynb`
+4. Select kernel: Python Environments > behav3d
+
+Or in a web browser:
 ```bash
 mamba activate behav3d
 jupyter notebook notebooks/run_behav3d.ipynb
