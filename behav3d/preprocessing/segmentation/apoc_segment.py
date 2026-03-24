@@ -272,7 +272,12 @@ def run_apoc_segmentation(
 
         # Timepoint progress via tqdm (per-sample)
         if timepoint_range is not None:
-            t_range = list(timepoint_range)
+            if isinstance(timepoint_range, (range, list)):
+                t_range = list(timepoint_range)
+            else:
+                # Handle old tuple (start, end)
+                s, e = timepoint_range
+                t_range = list(range(s, e + 1))
         else:
             t_range = list(range(n_timepoints))
 

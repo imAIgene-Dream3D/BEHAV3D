@@ -36,17 +36,18 @@ from behav3d.preprocessing import zeropad_image_to_match_shape
 
 FEATURE_PRESETS = {
     "small_quick": {
-        "features": ["gaussian_blur", "sobel_of_gaussian_blur"],
-        "default_sigmas": "1",
+        "features": ["difference_of_gaussian", "laplace_box_of_gaussian_blur"],
+        "default_sigmas": "1, 2",
     },
     "medium_quick": {
-        "features": ["original", "gaussian_blur", "sobel_of_gaussian_blur"],
-        "default_sigmas": "1, 5",
+        "features": ["difference_of_gaussian", "laplace_box_of_gaussian_blur", 
+                      "sobel_of_gaussian_blur"],
+        "default_sigmas": "1, 2, 5",
     },
     "large_quick": {
-        "features": ["original", "gaussian_blur", "sobel_of_gaussian_blur",
-                      "laplace_box_of_gaussian_blur"],
-        "default_sigmas": "1, 5, 25",
+        "features": ["original", "gaussian_blur", "difference_of_gaussian", 
+                      "laplace_box_of_gaussian_blur", "sobel_of_gaussian_blur"],
+        "default_sigmas": "1, 2, 5, 10, 25",
     },
     "custom": {
         "features": [],
@@ -151,12 +152,11 @@ def _load_training_images(
 
         # Use raw_image_path directly as it is the source of truth in metadata
         # (and is updated to the .zarr path if conversion was run)
+        # load_image already normalizes to TCZYX (default_axis_order in images.py)
         img = load_image(raw_image_path, axis_order=axis_order)
 
-        # Find which axis is Time in this specific image
-        t_axis = axis_order.find('T')
-        if t_axis == -1:
-            t_axis = 0 # Fallback
+        # Since load_image returned TCZYX, T is always axis 0
+        t_axis = 0
             
         n_timepoints = img.shape[t_axis]
         n_to_select = min(examples_per_sample, n_timepoints)
@@ -189,20 +189,17 @@ def _load_training_images(
     import dask.array as da
     import gc
     all_images_stack = da.stack(all_images)
+    # Transpose to (C, T, Z, Y, X) to match original classifier
+    all_images_stack = all_images_stack.transpose(1, 0, 2, 3, 4)
     save_as_zarr(all_images_stack, image_outpath)
     del all_images_stack
     gc.collect()
 
-    # Get dimension info from the last processed sample's metadata
-    # (assuming all samples in the same training set share the same dimension order)
-    if 'axis_order' not in locals():
-        # Fallback if the loop didn't run for some reason
-        axis_order = "TCZYX"
-        
-    from behav3d.io.images import load_zarr
-    all_images_cached = load_zarr(image_outpath)
-    all_images = [all_images_cached[t] for t in range(all_images_cached.shape[0])]
-    all_images = [np.asarray(img) for img in all_images]
+    # Re-load to ensure we have the right shape
+    cached = load_zarr(image_outpath)
+    # The cached data is (C, T, Z, Y, X)
+    # We need to return a list of (C, Z, Y, X) arrays, one per timepoint
+    all_images = [np.asarray(cached[:, t, :, :, :]) for t in range(cached.shape[1])]
 
     return all_images, pixel_class_outdir, has_death, all_cell_types
 
@@ -771,30 +768,25 @@ def train_pixel_classifier_apoc(
     # Stacking along axis 0 gives (T_total, C, Z, Y, X)
     stacked = np.stack(image_list, axis=0)
 
-    # Get dimension info from first sample to know where 'C' is in the 3D frame
-    first_sample = metadata.iloc[0]
-    axis_order = first_sample.get("dimension_order", "TCZYX")
-    if not isinstance(axis_order, str) or not axis_order:
-        axis_order = "TCZYX"
-    remaining_axes = axis_order.replace('T', '')
-    c_axis_in_stacked = 1 + remaining_axes.find('C')
-
-    print(f"Training data shape ({axis_order}): {stacked.shape}")
+    # Since stacked was created by stacking (C,Z,Y,X) frames along axis 0,
+    # it is ALWAYS (T_total, C, Z, Y, X).
+    c_axis_in_stacked = 1
 
     # --- Create Napari viewer ---
     viewer = napari.Viewer()
 
-    n_channels = stacked.shape[c_axis_in_stacked]
+    # stacked shape is (C, T, Z, Y, X)
+    n_channels = stacked.shape[0]
     channel_colors = [
         "cyan", "yellow", "red", "green", "magenta", "blue",
         "gray", "turbo", "viridis", "plasma", "inferno", "twilight",
     ]
 
     for ch in range(n_channels):
-        channel_data = np.take(stacked, ch, axis=c_axis_in_stacked) # (T, spatial...)
+        channel_data = stacked[ch] # (T, Z, Y, X)
         nonzero = channel_data[channel_data > 0]
         clim = (0, float(np.percentile(nonzero, 99.8))) if nonzero.size > 0 else (0, 1e-3)
-        viewer.add_image(
+        img_layer = viewer.add_image(
             channel_data,
             name=f"Channel {ch}",
             contrast_limits=clim,
@@ -802,13 +794,11 @@ def train_pixel_classifier_apoc(
             blending="additive",
             opacity=0.8,
         )
+        img_layer.contrast_limits_range = (0, float(channel_data.max()))
 
     # --- Annotation label layers per cell type ---
-    # Label layers are (T, spatial...)
-    # We construct full_shape by removing the Channel axis from stacked.shape
-    full_shape = list(stacked.shape)
-    full_shape.pop(c_axis_in_stacked)
-    full_shape = tuple(full_shape)
+    # Label layers are (T, Z, Y, X)
+    full_shape = stacked.shape[1:]
 
     ip = initial_params or {}
 

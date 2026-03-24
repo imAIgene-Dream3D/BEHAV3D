@@ -215,16 +215,26 @@ class PixelClassifierPanel:
         self.btn_resegment.on_click(partial(self._on_apply_clicked, only_segment=True))
 
         # --- Post-processing: size filtering ---
-        saved_min_size = int(pc.get("min_segment_size_voxels", 100))
-        self.min_segment_size = widgets.BoundedIntText(
-            description="Min size (voxels):",
-            value=saved_min_size,
-            min=0,
-            max=100000,
-            step=10,
-            style={'description_width': '130px'},
-            layout=widgets.Layout(width='280px'),
-        )
+        # We create a list of min size inputs, one per cell type
+        self.apoc_min_size_inputs = {}
+        for ct in self.all_cell_types:
+            # Re-use values from CPU params if available, else standard defaults
+            if ct in self.organoid_types: default_size = 1000
+            else: default_size = 10
+            
+            saved_size = pc.get(f"apoc_{ct}_min_size_voxels", default_size)
+            self.apoc_min_size_inputs[ct] = widgets.BoundedIntText(
+                description=f"{ct.capitalize()}:",
+                value=int(saved_size),
+                min=0,
+                max=1000000,
+                step=10,
+                style={'description_width': '100px'},
+                layout=widgets.Layout(width='200px'),
+            )
+
+        self.apoc_size_inputs_box = widgets.VBox(list(self.apoc_min_size_inputs.values()))
+
         self.btn_size_filter = widgets.Button(
             description="Run size filtering",
             button_style="warning",
@@ -232,11 +242,23 @@ class PixelClassifierPanel:
         )
         self.spinner_filter = widgets.HTML(value=spinning_loader)
         self.spinner_filter.layout.display = "none"
+        
+        # New row for size filtering: inputs on the left, button on the right
         self.filter_row = widgets.HBox(
-            [self.min_segment_size, self.btn_size_filter, self.spinner_filter],
-            layout=widgets.Layout(align_items="center", gap="8px"),
+            [self.apoc_size_inputs_box, self.btn_size_filter, self.spinner_filter],
+            layout=widgets.Layout(align_items="flex-end", gap="12px"),
         )
         self.btn_size_filter.on_click(self._on_size_filter_clicked)
+
+        self.post_processing_box = widgets.VBox([
+            widgets.HTML("<b>Post-processing</b>"),
+            widgets.HTML(
+                "<span style='color:#666;font-size:0.9em;'>"
+                "Remove segments smaller than threshold (voxels). Holes left by removed embedded objects are filled."
+                "</span>"
+            ),
+            self.filter_row,
+        ])
 
         self.out = widgets.Output()
 
@@ -317,15 +339,7 @@ class PixelClassifierPanel:
                 self.apply_row,
             ]),
             widgets.HTML("<hr>"),
-            widgets.VBox([
-                widgets.HTML("<b>Post-processing</b>"),
-                widgets.HTML(
-                    "<span style='color:#666;font-size:0.9em;'>"
-                    "Remove segments smaller than a given 3D volume (in voxels) from existing segmentation results."
-                    "</span>"
-                ),
-                self.filter_row,
-            ]),
+            self.post_processing_box,
             widgets.HTML("<hr>"),
             self.out
         ])
@@ -444,6 +458,9 @@ class PixelClassifierPanel:
         pc["overwrite_existing"] = bool(self.overwrite_existing.value)
         pc["gpu_device_name"] = str(self.gpu_device.value)
         
+        for ct, w in self.apoc_min_size_inputs.items():
+            pc[f"apoc_{ct}_min_size_voxels"] = int(w.value)
+
         for cell_type, threshold_widget in self.edt_thresholds.items():
             pc[f"{cell_type}_edt_threshold"] = float(threshold_widget.value)
         
@@ -496,6 +513,9 @@ class PixelClassifierPanel:
         self.manual_clf_paths.layout.display = hide
         if is_apoc:
             self.clf_paths_box.layout.display = 'none'
+
+        # Post-processing (Size Filtering) only for APOC as requested
+        self.post_processing_box.layout.display = (None if is_apoc else 'none')
 
     def _on_gpu_changed(self, change):
         if change['new']:
@@ -577,6 +597,8 @@ class PixelClassifierPanel:
         to_lock.extend(self.segment_size_mins.values())
         to_lock.extend(self.opening_nr_pixels.values())
         to_lock.extend(self.fill_holes.values())
+        for w in self.apoc_min_size_inputs.values(): w.disabled = state
+        for w in [self.btn_size_filter]: w.disabled = state
         for w in to_lock: w.disabled = state
         try:
             self.clf_dir.text.disabled = state
@@ -824,13 +846,16 @@ class PixelClassifierPanel:
             try:
                 from behav3d.preprocessing.segmentation.size_filter import filter_segments_by_size
 
-                min_size = int(self.min_segment_size.value)
                 odir = Path(self.metadata_loader.output_dir).expanduser()
                 metadata = self.metadata_loader.metadata
+                all_cell_types = self.organoid_types + self.immune_types + self.other_types
+                sample_names = metadata['sample_name'].unique()
 
                 # Persist the setting
                 pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
-                pc["min_segment_size_voxels"] = min_size
+                for ct, w in self.apoc_min_size_inputs.items():
+                    pc[f"apoc_{ct}_min_size_voxels"] = int(w.value)
+
                 if hasattr(self.metadata_loader, "behav3d_parameters_path"):
                     yaml.safe_dump(
                         self.metadata_loader.behav3d_parameters,
@@ -838,10 +863,7 @@ class PixelClassifierPanel:
                         sort_keys=False,
                     )
 
-                all_cell_types = self.organoid_types + self.immune_types + self.other_types
-                sample_names = metadata['sample_name'].unique()
-
-                print(f"🔍 Size filtering: removing segments < {min_size} voxels")
+                print(f"🔍 Size filtering: removing small segments and filling holes")
 
                 for sample_name in sample_names:
                     img_dir = odir / "images" / sample_name
@@ -849,22 +871,21 @@ class PixelClassifierPanel:
 
                     for ct in all_cell_types:
                         seg_path = img_dir / f"{sample_name}_{ct}_segments.zarr"
-                        mask_path = img_dir / f"{sample_name}_{ct}_mask.zarr"
+                        if not seg_path.exists():
+                            continue
 
-                        if seg_path.exists():
-                            found_any = True
-                            print(f"  {sample_name} / {ct}:")
-                            removed = filter_segments_by_size(seg_path, mask_path, min_size)
-                            print(f"    → removed {removed} small segments")
+                        min_size = int(self.apoc_min_size_inputs[ct].value)
+                        if min_size <= 0:
+                            continue
 
-                    # Also filter dead mask if present
-                    if self.has_death:
-                        dead_seg = img_dir / f"{sample_name}_mask_dead.zarr"
-                        if dead_seg.exists():
-                            found_any = True
-                            print(f"  {sample_name} / dead:")
-                            removed = filter_segments_by_size(dead_seg, dead_seg, min_size)
-                            print(f"    → removed {removed} small segments")
+                        found_any = True
+                        print(f"  {sample_name} / {ct} (min_size={min_size}):")
+                        removed = filter_segments_by_size(
+                            seg_path, 
+                            min_size, 
+                            fill_holes=True
+                        )
+                        print(f"    → removed {removed} segments/holes")
 
                     if not found_any:
                         print(f"  ⚠️ No segmentation files found for {sample_name}")

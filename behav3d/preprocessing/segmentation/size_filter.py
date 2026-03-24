@@ -1,10 +1,3 @@
-"""
-Size-based filtering of labelled segmentation volumes stored as Zarr.
-
-The filtering is performed **per-timepoint** so that the full 5-D image
-never needs to be loaded into memory at once.
-"""
-
 import numpy as np
 import zarr
 from pathlib import Path
@@ -15,39 +8,43 @@ import sys
 
 def filter_segments_by_size(
     segments_zarr_path,
-    mask_zarr_path,
     min_size_voxels,
+    fill_holes=True,
 ):
-    """Remove connected components smaller than *min_size_voxels* from a
-    segmentation zarr and regenerate the corresponding binary mask zarr.
+    """Remove segments smaller than *min_size_voxels* from a segmentation zarr.
+    If *fill_holes* is True, holes left by removed segments that were embedded
+    inside larger segments are filled with the surrounding label.
 
     Parameters
     ----------
     segments_zarr_path : str | Path
         Path to the ``*_segments.zarr`` array (T, Z, Y, X) with uint16 labels.
-    mask_zarr_path : str | Path
-        Path to the matching ``*_mask.zarr`` array that will be regenerated.
     min_size_voxels : int
         Minimum 3-D volume (in voxels) a segment must have to be kept.
+    fill_holes : bool
+        Whether to fill holes left by removed "embedded" segments.
     """
     segments_zarr_path = Path(segments_zarr_path)
-    mask_zarr_path = Path(mask_zarr_path)
 
     if not segments_zarr_path.exists():
         print(f"  ⚠️ Segments file not found: {segments_zarr_path}")
-        return
+        return 0
 
     seg = zarr.open(str(segments_zarr_path), mode="r+")
-    n_timepoints = seg.shape[0]
+    
+    # If the user opened a group instead of an array, pick the first array
+    if isinstance(seg, zarr.Group):
+        if len(list(seg.array_keys())) > 0:
+            dataset_name = list(seg.array_keys())[0]
+            print(f"  📂 Zarr is a group. Using internal array: {dataset_name}")
+            seg = seg[dataset_name]
+        else:
+            print(f"  ⚠️ No arrays found in Zarr group: {segments_zarr_path}")
+            return 0
 
-    # Open / create the mask with the same shape
-    mask = zarr.open(
-        str(mask_zarr_path),
-        mode="w",
-        shape=seg.shape,
-        chunks=seg.chunks,
-        dtype="uint16",
-    )
+    n_timepoints = seg.shape[0]
+    print(f"  📦 Processing {n_timepoints} timepoints in {segments_zarr_path.name}")
+    print(f"    📝 Path: {segments_zarr_path.absolute()}")
 
     removed_total = 0
 
@@ -61,30 +58,79 @@ def filter_segments_by_size(
 
     for t in pbar:
         vol = np.asarray(seg[t])  # single 3-D volume (Z, Y, X)
-
-        # Label connected components in the 3-D volume
-        labelled, n_labels = ndimage.label(vol > 0)
-
-        if n_labels == 0:
-            mask[t] = np.zeros_like(vol, dtype=np.uint16)
+        if not np.any(vol):
             continue
 
-        # Count voxels per label (index 0 = background)
-        sizes = np.bincount(labelled.ravel())
+        # Count voxels per label directly (no re-labeling)
+        sizes = np.bincount(vol.ravel())
+        if len(sizes) <= 1:
+            continue
 
         # Find labels that are too small (skip background at index 0)
-        small_labels = np.where(sizes[1:] < min_size_voxels)[0] + 1
+        labels = np.arange(len(sizes))
+        small_mask = (sizes < min_size_voxels)
+        small_mask[0] = False # background never small
+        small_labels = labels[small_mask]
+
+        if len(small_labels) == 0:
+            continue
+
         removed_total += len(small_labels)
 
-        if len(small_labels) > 0:
-            # Build a boolean mask of voxels belonging to small labels
-            remove_mask = np.isin(labelled, small_labels)
-            vol[remove_mask] = 0
+        # Create mask of voxels to remove
+        to_remove_mask = np.isin(vol, small_labels)
+        
+        if not fill_holes:
+            vol[to_remove_mask] = 0
             seg[t] = vol
+            pbar.set_postfix(removed=removed_total)
+            continue
 
-        # Regenerate binary mask
-        mask[t] = (vol > 0).astype(np.uint16)
+        # --- Hole Filling Logic ---
+        # 1. Mask of kept voxels
+        kept_mask = (vol > 0) & ~to_remove_mask
+        
+        # 2. Find holes in the kept mask
+        filled_mask = ndimage.binary_fill_holes(kept_mask)
+        holes_to_fill = filled_mask & ~kept_mask
+        
+        # We only want to fill holes that were specifically created/occupied by 
+        # the removed segments (though binary_fill_holes might fill other 
+        # pre-existing background holes too).
+        
+        # 3. Assign labels to new voxels in holes
+        # For each voxel in holes_to_fill, assign it to the nearest kept label
+        if np.any(holes_to_fill):
+            # Distance transform to find nearest non-zero labels
+            # We use the kept volume as source of labels
+            kept_vol = vol.copy()
+            kept_vol[to_remove_mask] = 0
+            
+            # Label connected components of holes to fill them efficiently?
+            # Or just use a nearest-neighbor approach
+            indices = ndimage.distance_transform_edt(
+                kept_vol == 0, 
+                return_distances=False, 
+                return_indices=True
+            )
+            
+            # Map hole voxels to their nearest kept neighbor's value
+            # indices is (ndim, Z, Y, X). We want the values at those indices
+            new_vol = kept_vol[tuple(indices)]
+            
+            # Only update the voxels that were part of holes
+            vol[holes_to_fill] = new_vol[holes_to_fill]
+            
+            # Also ensure to_remove_mask that were NOT holes are set to 0
+            # (If a small segment was on the edge, it's not a hole)
+            not_hole = to_remove_mask & ~holes_to_fill
+            vol[not_hole] = 0
+        else:
+            # No holes to fill, just clear small labels
+            vol[to_remove_mask] = 0
 
+        seg[t] = vol
         pbar.set_postfix(removed=removed_total)
 
+    print(f"  ✨ Finished filtering {segments_zarr_path.name}. Total removed: {removed_total}")
     return removed_total
