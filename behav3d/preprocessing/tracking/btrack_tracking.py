@@ -5,11 +5,8 @@ import pandas as pd
 from pathlib import Path
 from skimage.measure import regionprops_table
 from tqdm import tqdm
-<<<<<<< HEAD
-=======
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
->>>>>>> dev
 
 import btrack
 import btrack.io
@@ -28,8 +25,6 @@ _PRESET_MAP = {
 }
 
 
-<<<<<<< HEAD
-=======
 def _run_parallel_with_fallback(fn, args_list, n_workers):
     try:
         with ProcessPoolExecutor(max_workers=n_workers) as ex:
@@ -222,7 +217,6 @@ def _extract_btrack_objects_dataframe(
     return df_objects, visual_feature_cols
 
 
->>>>>>> dev
 def _resolve_config(config_preset):
     """Return an absolute Path to a btrack JSON config file.
 
@@ -285,11 +279,8 @@ def _override_hypothesis_model(config_path, hypotheses=None, dist_thresh=None,
 def btrack_image(
     segments=None,
     segments_path=None,
-<<<<<<< HEAD
-=======
     raw_image=None,
     raw_image_path=None,
->>>>>>> dev
     tracked_img_outpath=None,
     tracked_csv_outpath=None,
     element_size_x=1,
@@ -304,11 +295,8 @@ def btrack_image(
     hypotheses=None,
     dist_thresh=None,
     time_thresh=None,
-<<<<<<< HEAD
-=======
     n_workers=1,
     use_visual_features=None,
->>>>>>> dev
     return_trackimg=True,
 ):
     """Run btrack (Bayesian tracking) on a single segmentation array.
@@ -319,13 +307,10 @@ def btrack_image(
         Segmentation label array (T, Z, Y, X) or (T, Y, X).
     segments_path : str or Path, optional
         Path to zarr / tiff segmentation (used if *segments* is None).
-<<<<<<< HEAD
-=======
     raw_image : ndarray, optional
         Raw image array in BEHAV3D order (T, C, Z, Y, X).
     raw_image_path : str or Path, optional
         Path to raw image used for visual features when enabled.
->>>>>>> dev
     tracked_img_outpath : Path, optional
         Where to save the tracked zarr image.
     tracked_csv_outpath : Path, optional
@@ -352,15 +337,12 @@ def btrack_image(
         Override distance threshold for hypothesis generation.
     time_thresh : int, optional
         Override time threshold for hypothesis generation.
-<<<<<<< HEAD
-=======
     n_workers : int, optional
         Number of parallel workers for regionprops extraction. Path-backed
         inputs use multiprocessing when ``n_workers > 1``.
     use_visual_features : bool, optional
         Whether to use raw-image-derived visual features during linking.
         ``None`` is treated the same as ``False``.
->>>>>>> dev
     return_trackimg : bool
         Whether to produce a tracked zarr image.
     """
@@ -369,11 +351,8 @@ def btrack_image(
 
     if segments_path is not None:
         segments_path = Path(segments_path)
-<<<<<<< HEAD
-=======
     if raw_image_path is not None:
         raw_image_path = Path(raw_image_path)
->>>>>>> dev
     if segments is None:
         segments = load_image(segments_path)
 
@@ -386,40 +365,6 @@ def btrack_image(
                                    f"{basename}_tracks.csv")
 
     # ------------------------------------------------------------------
-<<<<<<< HEAD
-    # 1. Extract centroids per timepoint (same pattern as laptracking.py)
-    # ------------------------------------------------------------------
-    df_centroids = []
-    for t, t_seg in enumerate(tqdm(segments, desc="Extracting centroids")):
-        t_seg = np.asarray(t_seg)
-        if t_seg.max() == 0:
-            continue
-        props = pd.DataFrame(
-            regionprops_table(label_image=t_seg,
-                              properties=["label", "centroid", "area"])
-        )
-        props["position_t"] = t
-        df_centroids.append(props)
-
-    if not df_centroids:
-        print("WARNING: No objects found in segmentation — skipping btrack.")
-        return
-
-    df_centroids = pd.concat(df_centroids, ignore_index=True)
-    df_centroids["position_z"] = df_centroids["centroid-0"] * element_size_z
-    df_centroids["position_y"] = df_centroids["centroid-1"] * element_size_y
-    df_centroids["position_x"] = df_centroids["centroid-2"] * element_size_x
-
-    # Keep pixel positions for output
-    df_centroids.rename(columns={
-        "centroid-0": "pixel_position_z",
-        "centroid-1": "pixel_position_y",
-        "centroid-2": "pixel_position_x",
-    }, inplace=True)
-
-    # ------------------------------------------------------------------
-    # 2. Build btrack objects from centroids
-=======
     # Resolve config and whether this run should use visual updates
     # ------------------------------------------------------------------
     config_path = _resolve_config(config_preset)
@@ -452,7 +397,6 @@ def btrack_image(
 
     # ------------------------------------------------------------------
     # 2. Build btrack objects from detections
->>>>>>> dev
     # ------------------------------------------------------------------
     obj_cols = ["position_t", "position_x", "position_y", "position_z", "label"]
     objects_arr = df_centroids[obj_cols].to_numpy()
@@ -460,18 +404,10 @@ def btrack_image(
         objects_arr,
         default_keys=["t", "x", "y", "z", "label"],
     )
-<<<<<<< HEAD
-
-    # ------------------------------------------------------------------
-    # 3. Configure & run tracker
-    # ------------------------------------------------------------------
-    config_path = _resolve_config(config_preset)
-=======
     if visual_feature_cols:
         feature_records = df_centroids[visual_feature_cols].to_dict(orient="records")
         for obj, props in zip(objects, feature_records):
             obj.properties = props
->>>>>>> dev
 
     # Load config, optionally overriding hypothesis params
     # Resolve the config file path, writing a patched temp file when needed.
@@ -493,11 +429,8 @@ def btrack_image(
     try:
         with btrack.BayesianTracker() as tracker:
             tracker.configure(str(active_config_path))
-<<<<<<< HEAD
-=======
             if visual_feature_cols:
                 tracker.features = visual_feature_cols
->>>>>>> dev
 
             tracker.append(objects)
 
@@ -522,15 +455,11 @@ def btrack_image(
                 tracker.max_search_radius = max_search_radius
 
             # Step 1 — Kalman filter linking
-<<<<<<< HEAD
-            tracker.track(step_size=step_size)
-=======
             tracking_updates = ["motion", "visual"] if visual_feature_cols else ["motion"]
             tracker.track(
                 step_size=step_size,
                 tracking_updates=tracking_updates,
             )
->>>>>>> dev
 
             # Step 2 — Global hypothesis optimizer (optional)
             if use_optimize:
@@ -598,10 +527,7 @@ def btrack_image(
             df_tracks=df_tracks,
             segments=segments,
             outpath=tracked_img_outpath,
-<<<<<<< HEAD
-=======
             n_workers=n_workers,
->>>>>>> dev
         )
 
 
@@ -621,11 +547,8 @@ def run_btracking(
     hypotheses=None,
     dist_thresh=None,
     time_thresh=None,
-<<<<<<< HEAD
-=======
     n_workers=1,
     use_visual_features=None,
->>>>>>> dev
     return_trackimg=True,
     overwrite=False,
     log_callback=None,
@@ -659,14 +582,11 @@ def run_btracking(
         Override distance threshold.
     time_thresh : int, optional
         Override time threshold.
-<<<<<<< HEAD
-=======
     n_workers : int
         Number of parallel workers for regionprops extraction.
     use_visual_features : bool, optional
         Whether to use raw-image-derived visual features during linking.
         ``None`` is treated the same as ``False``.
->>>>>>> dev
     return_trackimg : bool
         Whether to save tracked zarr image.
     overwrite : bool
@@ -717,10 +637,7 @@ def run_btracking(
                 or overwrite):
             btrack_image(
                 segments_path=segments_path,
-<<<<<<< HEAD
-=======
                 raw_image_path=sample["raw_image_path"],
->>>>>>> dev
                 tracked_img_outpath=tracked_img_outpath,
                 tracked_csv_outpath=tracked_csv_outpath,
                 element_size_x=element_size_x,
@@ -735,11 +652,8 @@ def run_btracking(
                 hypotheses=hypotheses,
                 dist_thresh=dist_thresh,
                 time_thresh=time_thresh,
-<<<<<<< HEAD
-=======
                 n_workers=n_workers,
                 use_visual_features=use_visual_features,
->>>>>>> dev
                 return_trackimg=return_trackimg,
             )
         else:
