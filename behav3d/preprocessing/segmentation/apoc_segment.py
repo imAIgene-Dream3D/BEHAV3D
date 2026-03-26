@@ -39,6 +39,73 @@ from behav3d.core.metadata import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _get_probability_classifier(clf, positive_class_id=2):
+    """Create a probability-output classifier from an existing ObjectSegmenter.
+
+    The ObjectSegmenter .cl file contains OpenCL code that outputs integer class
+    labels. This function patches the footer to output the probability of the
+    foreground class instead (vote fraction s{class-1} / sum_s).
+
+    The patched file is cached per .cl path so it's only created once.
+    """
+    import re, tempfile
+
+    if not hasattr(_get_probability_classifier, '_cache'):
+        _get_probability_classifier._cache = {}
+
+    src_path = clf.opencl_file
+    if src_path in _get_probability_classifier._cache:
+        return _get_probability_classifier._cache[src_path]
+
+    with open(src_path, 'r') as f:
+        content = f.read()
+
+    # The label-mode footer looks like:
+    #   float max_s=s0;
+    #   int cls=1;
+    #   if (max_s < s1) { ... cls=2; }
+    #   ...
+    #   WRITE_IMAGE (out, POS_out_INSTANCE(x,y,z,0), cls);
+    # }
+    #
+    # Replace with probability-mode footer:
+    #   float sum_s = s0 + s1 [+ s2 ...];
+    #   WRITE_IMAGE (out, POS_out_INSTANCE(x,y,z,0), s{idx} / sum_s);
+    # }
+
+    # Determine number of classes from the header (counts "float s0=0", "float s1=0", etc.)
+    class_vars = re.findall(r' float (s\d+)=0;', content)
+    n_classes = len(class_vars)
+    prob_idx = positive_class_id - 1  # APOC classes are 1-indexed, vars are 0-indexed
+
+    # Build the new footer
+    sum_expr = ' + '.join(class_vars)
+    new_footer = f' float sum_s={sum_expr};\n'
+    new_footer += f' WRITE_IMAGE (out, POS_out_INSTANCE(x,y,z,0), s{prob_idx} / sum_s);\n}}\n'
+
+    # Replace: everything from " float max_s=s0;" to the end of the kernel
+    patched = re.sub(
+        r' float max_s=s0;.*',
+        new_footer,
+        content,
+        flags=re.DOTALL,
+    )
+
+    # Write to a temp .cl file
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.cl', prefix='apoc_prob_')
+    with os.fdopen(tmp_fd, 'w') as f:
+        f.write(patched)
+
+    # Load as a PixelClassifier with probability output
+    prob_clf = apoc.PixelClassifier(
+        opencl_filename=tmp_path,
+        overwrite_classname='ObjectSegmenter',  # match the class name in the header
+    )
+    prob_clf.output_probability_of_class = positive_class_id
+
+    _get_probability_classifier._cache[src_path] = prob_clf
+    return prob_clf
+
 def _load_classifier(pixelclass_dir, cell_type, provided_path=None):
     """Load an APOC ObjectSegmenter .cl file. Case-insensitive lookup."""
     pixelclass_dir = Path(pixelclass_dir)
@@ -117,6 +184,7 @@ def run_apoc_segmentation(
     overwrite_existing=False,
     n_workers=1,
     gpu_device=None,
+    apoc_strategy="APOC (Direct Instance Segmentation)",
     **_kwargs,  # absorb unused CPU-specific params (EDT, opening, fill_holes etc.)
 ):
     """
@@ -256,15 +324,22 @@ def run_apoc_segmentation(
         for ct in active_cell_types:
             zarr_segs[ct] = _open_zarr_output(
                 img_outdir / f"{sample_name}_{ct}_segments.zarr",
-                "uint16", out_shape, overwrite_existing,
+                "uint16", out_shape, overwrite_existing if not only_segment else True,
             )
-            zarr_masks[ct] = _open_zarr_output(
-                img_outdir / f"{sample_name}_{ct}_mask.zarr",
-                "uint16", out_shape, overwrite_existing,
-            )
+            if only_segment:
+                # Open mask in read-only mode, we need it to do resegmentation
+                mask_path = img_outdir / f"{sample_name}_{ct}_mask.zarr"
+                if not mask_path.exists():
+                    raise FileNotFoundError(f"Cannot 'Only Resegment' because mask does not exist: {mask_path}")
+                zarr_masks[ct] = zarr.open(str(mask_path), mode="r")
+            else:
+                zarr_masks[ct] = _open_zarr_output(
+                    img_outdir / f"{sample_name}_{ct}_mask.zarr",
+                    "uint16", out_shape, overwrite_existing,
+                )
 
         zarr_death = None
-        if has_death and clf_death:
+        if has_death and clf_death and not only_segment:
             zarr_death = _open_zarr_output(
                 img_outdir / f"{sample_name}_mask_dead.zarr",
                 "uint16", out_shape, overwrite_existing,
@@ -300,18 +375,116 @@ def run_apoc_segmentation(
                 if i + 1 < len(t_range):
                     future = executor.submit(_load_tp, img, t_range[i + 1])
 
-                # 3. Process current timepoint (GPU-bound)
+                # 3. Process current timepoint (GPU-bound or CPU-bound if only_segment)
                 for ct in active_cell_types:
+                    cfg = apoc_config or {}
                     indices = clf_channels[ct]
                     imgs = [t_img[i_ch] for i_ch in indices]
                     imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
-                    
-                    # Predict gives labels (segments) directly
-                    seg = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
-                    mask = (seg > 0).astype(np.uint16)
-                    
-                    zarr_segs[ct][t] = seg
-                    zarr_masks[ct][t] = mask
+
+                    if apoc_strategy == "APOC Probability Map + Watershed":
+                        # ── Probability Map strategy ──────────────────────
+                        from skimage.measure import label as sk_label
+                        from skimage.segmentation import watershed
+                        from behav3d.preprocessing.segmentation import segment_size_filter, segment_2d_filter
+                        _diag = (i == 0)  # print timings on first timepoint only
+
+                        if not only_segment:
+                            _t0 = time.time()
+                            prob_clf = _get_probability_classifier(classifiers[ct])
+                            prob_map = np.asarray(
+                                prob_clf.predict(image=imgs_to_pass)
+                            ).astype(np.float32)
+                            if _diag: print(f"    ⏱ {ct} predict (prob): {time.time()-_t0:.2f}s  range=[{prob_map.min():.3f}, {prob_map.max():.3f}]")
+
+                            _t0 = time.time()
+                            mask_thr = float(cfg.get(f"{ct}_prob_mask_threshold", 0.5))
+                            mask_out = (prob_map > mask_thr).astype(np.uint16)
+                            zarr_masks[ct][t] = mask_out
+                            if _diag: print(f"    ⏱ {ct} mask threshold + write: {time.time()-_t0:.2f}s")
+                        else:
+                            mask_out = np.asarray(zarr_masks[ct][t])
+                            prob_map = None
+
+                        seed_thr = float(cfg.get(f"{ct}_prob_seed_threshold", 0.8))
+                        segment_size_min = int(cfg.get(f"{ct}_segment_size_min", 10))
+
+                        if prob_map is not None:
+                            _t0 = time.time()
+                            from scipy import ndimage as ndi
+                            mask_bool = mask_out.astype(bool)
+                            cc_labels = sk_label(mask_bool)
+                            seed_mask = prob_map > seed_thr
+                            segments = np.zeros_like(cc_labels)
+                            next_id = 0
+                            obj_slices = ndi.find_objects(cc_labels)
+                            n_comps = len(obj_slices)
+                            n_split = 0
+
+                            for comp_idx, slc in enumerate(obj_slices, start=1):
+                                if slc is None:
+                                    continue
+                                comp_mask = cc_labels[slc] == comp_idx
+                                sub_seeds = sk_label(seed_mask[slc] & comp_mask)
+                                n_seeds = sub_seeds.max()
+
+                                if n_seeds <= 1:
+                                    next_id += 1
+                                    segments[slc][comp_mask] = next_id
+                                else:
+                                    n_split += 1
+                                    sub_result = watershed(
+                                        -prob_map[slc], markers=sub_seeds, mask=comp_mask
+                                    )
+                                    for s in range(1, sub_result.max() + 1):
+                                        next_id += 1
+                                        segments[slc][sub_result == s] = next_id
+                            if _diag: print(f"    ⏱ {ct} per-component watershed: {time.time()-_t0:.2f}s ({n_comps} components, {n_split} split)")
+                        else:
+                            from behav3d.preprocessing.segmentation.segmentation_utils import segment_mask
+                            segments = segment_mask(mask_out.astype(bool), edt_thr=seed_thr, segment_size_min=segment_size_min, use_dims=3, n_workers=1)
+
+                        _t0 = time.time()
+                        segments = segment_size_filter(segments, size_min=segment_size_min)
+                        if _diag: print(f"    ⏱ {ct} size_filter: {time.time()-_t0:.2f}s")
+                        _t0 = time.time()
+                        segments = segment_2d_filter(segments)
+                        if _diag: print(f"    ⏱ {ct} 2d_filter: {time.time()-_t0:.2f}s")
+                        zarr_segs[ct][t] = np.asarray(segments).astype(np.uint16)
+
+                    elif apoc_strategy == "APOC Mask + EDT/Watershed Resegmentation":
+                        # ── EDT/Watershed strategy ────────────────────────
+                        from behav3d.preprocessing.segmentation.segmentation_utils import (
+                            postprocess_mask, segment_mask
+                        )
+                        if not only_segment:
+                            seg_out = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
+                            mask_out = (seg_out > 0).astype(np.uint16)
+                            zarr_masks[ct][t] = mask_out
+                        else:
+                            mask_out = np.asarray(zarr_masks[ct][t])
+
+                        fill_holes = cfg.get(f"{ct}_fill_holes", True)
+                        opening_nr_pixels = cfg.get(f"{ct}_opening_nr_pixels", 0)
+                        proc_mask = postprocess_mask(mask_out, fill_holes=fill_holes, opening_nr_pixels=opening_nr_pixels)
+
+                        edt_thr = cfg.get(f"{ct}_edt_threshold", 1.0)
+                        segment_size_min = cfg.get(f"{ct}_segment_size_min", 10)
+                        seg_refined = segment_mask(proc_mask, edt_thr=edt_thr, edt_thr_refined=None, segment_size_min=segment_size_min, use_dims=3, n_workers=1)
+                        zarr_segs[ct][t] = np.asarray(seg_refined).astype(np.uint16)
+
+                    else:
+                        # ── Default: Direct APOC ──────────────────────────
+                        if not only_segment:
+                            seg_out = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
+                            mask_out = (seg_out > 0).astype(np.uint16)
+                            zarr_masks[ct][t] = mask_out
+                        else:
+                            mask_out = np.asarray(zarr_masks[ct][t])
+                            seg_out = mask_out
+                            if t == 0:
+                                print(f"⚠️ Warning: 'Only resegment' selected but strategy is Direct APOC. Cannot tweak instance rules without EDT method. Resaving {ct} instances.")
+                        zarr_segs[ct][t] = seg_out
 
                 if zarr_death is not None:
                     indices = death_channels
@@ -319,6 +492,33 @@ def run_apoc_segmentation(
                     imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
                     death_mask = (np.asarray(clf_death.predict(image=imgs_to_pass)) > 0).astype(np.uint16)
                     zarr_death[t] = death_mask
+
+        # Update metadata with output paths
+        row_idx = metadata.index[metadata['sample_name'] == sample_name].tolist()[0]
+        for ct in active_cell_types:
+            if ct in organoid_types: prefix = 'or'
+            elif ct in immune_types: prefix = 'im'
+            elif ct in other_types: prefix = 'ot'
+            else: continue
+            
+            path_col = f'{prefix}_{ct}_segments_image_path'
+            seg_path = img_outdir / f"{sample_name}_{ct}_segments.zarr"
+            if seg_path.exists():
+                # Ensure column exists and has object dtype to prevent warnings
+                if path_col not in metadata.columns:
+                    metadata[path_col] = pd.NA
+                if metadata[path_col].dtype != 'object':
+                    metadata[path_col] = metadata[path_col].astype('object')
+                metadata.at[row_idx, path_col] = str(seg_path)
+                
+        if zarr_death is not None:
+             death_path = img_outdir / f"{sample_name}_mask_dead.zarr"
+             if death_path.exists():
+                 if 'dead_mask_path' not in metadata.columns:
+                     metadata['dead_mask_path'] = pd.NA
+                 if metadata['dead_mask_path'].dtype != 'object':
+                     metadata['dead_mask_path'] = metadata['dead_mask_path'].astype('object')
+                 metadata.at[row_idx, 'dead_mask_path'] = str(death_path)
 
         elapsed = time.time() - t0
         print(f"  ✅ {sample_name} done in {elapsed:.1f}s")
