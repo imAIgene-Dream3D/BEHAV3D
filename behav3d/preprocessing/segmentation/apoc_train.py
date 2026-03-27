@@ -16,12 +16,14 @@ from pathlib import Path
 import numpy as np
 import napari
 from qtpy.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox,
     QSpinBox, QLineEdit, QPushButton as QtPushButton,
     QCheckBox, QGroupBox, QPlainTextEdit, QApplication, QScrollArea,
     QSizePolicy, QTabWidget, QFrame, QMessageBox,
+    QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
 )
 from qtpy.QtCore import Qt
+from qtpy.QtGui import QColor
 
 import dask.array as da
 import zarr
@@ -31,56 +33,103 @@ from behav3d.io.images import load_image, load_zarr, save_as_zarr, append_to_zar
 from behav3d.preprocessing import zeropad_image_to_match_shape
 
 # ---------------------------------------------------------------------------
-# Feature set presets (matching APOC convention)
+# Feature grid constants (matching the official napari-apoc widget)
 # ---------------------------------------------------------------------------
 
+# Sigma columns (these match the default column headers in the official widget)
+APOC_SIGMAS = [0.3, 0.5, 1, 2, 3, 4, 5, 10, 15, 25]
+
+# Feature rows shown in presets
+APOC_FEATURES = [
+    ("gaussian_blur",               "Gauss"),
+    ("difference_of_gaussian",      "DoG"),
+    ("laplace_box_of_gaussian_blur","LoG"),
+    ("sobel_of_gaussian_blur",      "SoG"),
+]
+# For custom preset every feature is available (same list here; extend if needed)
+APOC_ALL_FEATURES = APOC_FEATURES
+
+# Format sigma values nicely (drop trailing .0)
+def _fmt_sigma(s):
+    return str(int(s)) if float(s) == int(s) else str(s)
+
+
+# Each preset is a set of (feature_key, sigma_str) pairs that should be
+# pre-checked.  The sigma value is stored as a string matching _fmt_sigma().
 FEATURE_PRESETS = {
     "small_quick": {
-        "features": ["difference_of_gaussian", "laplace_box_of_gaussian_blur"],
-        "default_sigmas": "1, 2",
+        "label": "Small / Quick",
+        "checked": {
+            ("difference_of_gaussian",      "1"),
+            ("difference_of_gaussian",      "2"),
+            ("laplace_box_of_gaussian_blur","1"),
+            ("laplace_box_of_gaussian_blur","2"),
+        },
     },
     "medium_quick": {
-        "features": ["difference_of_gaussian", "laplace_box_of_gaussian_blur", 
-                      "sobel_of_gaussian_blur"],
-        "default_sigmas": "1, 2, 5",
+        "label": "Medium / Quick",
+        "checked": {
+            ("difference_of_gaussian",      "1"),
+            ("difference_of_gaussian",      "2"),
+            ("difference_of_gaussian",      "5"),
+            ("laplace_box_of_gaussian_blur","1"),
+            ("laplace_box_of_gaussian_blur","2"),
+            ("laplace_box_of_gaussian_blur","5"),
+            ("sobel_of_gaussian_blur",      "1"),
+            ("sobel_of_gaussian_blur",      "2"),
+            ("sobel_of_gaussian_blur",      "5"),
+        },
     },
     "large_quick": {
-        "features": ["original", "gaussian_blur", "difference_of_gaussian", 
-                      "laplace_box_of_gaussian_blur", "sobel_of_gaussian_blur"],
-        "default_sigmas": "1, 2, 5, 10, 25",
+        "label": "Large / Quick",
+        "checked": {
+            ("gaussian_blur",               "1"),
+            ("gaussian_blur",               "2"),
+            ("gaussian_blur",               "5"),
+            ("gaussian_blur",               "10"),
+            ("gaussian_blur",               "25"),
+            ("difference_of_gaussian",      "1"),
+            ("difference_of_gaussian",      "2"),
+            ("difference_of_gaussian",      "5"),
+            ("difference_of_gaussian",      "10"),
+            ("difference_of_gaussian",      "25"),
+            ("laplace_box_of_gaussian_blur","1"),
+            ("laplace_box_of_gaussian_blur","2"),
+            ("laplace_box_of_gaussian_blur","5"),
+            ("laplace_box_of_gaussian_blur","10"),
+            ("laplace_box_of_gaussian_blur","25"),
+            ("sobel_of_gaussian_blur",      "1"),
+            ("sobel_of_gaussian_blur",      "2"),
+            ("sobel_of_gaussian_blur",      "5"),
+            ("sobel_of_gaussian_blur",      "10"),
+            ("sobel_of_gaussian_blur",      "25"),
+        },
     },
     "custom": {
-        "features": [],
-        "default_sigmas": "",
+        "label": "Custom",
+        "checked": set(),  # user starts with all unchecked
     },
 }
 
 
-def _build_feature_string(preset_name, sigmas_str):
-    """Build a full APOC feature string from a preset name + comma-separated sigmas.
-    For 'custom' preset, sigmas_str is used as the raw feature string directly.
-    """
-    if preset_name == "custom":
-        return sigmas_str.strip()
+def _checked_set_for_preset(preset_name):
+    """Return the set of (feature_key, sigma_str) pairs that should be checked for a preset."""
+    return set(FEATURE_PRESETS.get(preset_name, FEATURE_PRESETS["medium_quick"])["checked"])
 
-    preset = FEATURE_PRESETS.get(preset_name, FEATURE_PRESETS["medium_quick"])
-    features = preset["features"]
 
-    try:
-        sigmas = [s.strip() for s in sigmas_str.split(",") if s.strip()]
-    except Exception:
-        sigmas = ["1"]
-
-    if not sigmas:
-        sigmas = ["1"]
-
+def _build_feature_string_from_checked(checked_set, consider_original=False, current_sigmas=None):
+    """Build an APOC feature string from a set of (feature_key, sigma_str) pairs."""
     parts = []
-    for feat in features:
-        if feat == "original":
-            parts.append("original")
-        else:
-            for s in sigmas:
-                parts.append(f"{feat}={s}")
+    if consider_original:
+        parts.append("original")
+    if current_sigmas is None:
+        current_sigmas = APOC_SIGMAS
+    sigma_strs = [_fmt_sigma(s) for s in current_sigmas]
+    # Keep deterministic order: rows in APOC_ALL_FEATURES order, sigmas in current_sigmas order
+    for feat_key, _label in APOC_ALL_FEATURES:
+        for s_str in sigma_strs:
+            if (feat_key, s_str) in checked_set:
+                parts.append(f"{feat_key}={s_str}")
     return " ".join(parts)
 
 
@@ -122,10 +171,10 @@ def _load_training_images(
             if not isinstance(axis_order, str) or not axis_order:
                 axis_order = "TCZYX"
             
-            from behav3d.io.images import load_zarr
             cached = load_zarr(image_outpath)
-            all_images = [cached[t] for t in range(cached.shape[0])]
-            all_images = [np.asarray(img) for img in all_images] # Load into mem for viewer
+            # The cached data is (C, T, Z, Y, X)
+            # We need to return a list of (C, Z, Y, X) arrays, one per timepoint
+            all_images = [np.asarray(cached[:, t, :, :, :]) for t in range(cached.shape[1])]
             return all_images, pixel_class_outdir, has_death, all_cell_types
 
     # --- Load fresh from raw files ---
@@ -211,8 +260,13 @@ def _load_training_images(
 class CellTypeTab(QWidget):
     """
     Widget for a single cell type tab.
-    Contains: channel selection, feature preset, sigma values, read-only
-    feature preview, max_depth, num_ensembles.
+    Contains:
+      - channel selection group
+      - preset dropdown (kept)
+      - collapsible "Tune Features" QGroupBox with a sigma × feature checkbox grid
+      - "Consider original image as well" standalone checkbox
+      - "Show classifier statistics" button
+      - max_depth / num_ensembles RF parameters
     """
 
     def __init__(self, cell_type, viewer, initial_params=None, parent=None):
@@ -223,9 +277,9 @@ class CellTypeTab(QWidget):
 
         layout = QVBoxLayout()
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(5)
+        layout.setSpacing(6)
 
-        # --- Channel selection ---
+        # ── Channel selection ────────────────────────────────────────────────
         chan_group = QGroupBox("Image Channel Inputs")
         chan_layout = QVBoxLayout()
         chan_layout.setSpacing(2)
@@ -243,97 +297,285 @@ class CellTypeTab(QWidget):
         hint.setStyleSheet("color: #666; font-style: italic;")
         layout.addWidget(hint)
 
-        # --- Feature preset ---
+        # ── Preset dropdown ──────────────────────────────────────────────────
         feat_row = QHBoxLayout()
         feat_row.addWidget(QLabel("Preset:"))
         self.feature_combo = QComboBox()
         self.feature_combo.addItems(list(FEATURE_PRESETS.keys()))
         saved_preset = ip.get(f"apoc_{cell_type}_feature_preset", "medium_quick")
-        self.feature_combo.setCurrentText(saved_preset if saved_preset in FEATURE_PRESETS else "medium_quick")
+        if saved_preset not in FEATURE_PRESETS:
+            saved_preset = "medium_quick"
+        self.feature_combo.setCurrentText(saved_preset)
         feat_row.addWidget(self.feature_combo)
+        feat_row.addStretch()
         layout.addLayout(feat_row)
 
-        # --- Sigma values (comma-separated) ---
+        # ── Tune Features collapsible group ─────────────────────────────────
+        self.tune_group = QGroupBox("Tune Features")
+        self.tune_group.setCheckable(True)
+        self.tune_group.setChecked(False)  # collapsed by default
+        self.tune_layout = QVBoxLayout()
+        self.tune_layout.setContentsMargins(4, 4, 4, 4)
+        self.tune_layout.setSpacing(2)
+
+        # ── Sigmas Input Row ──
         sigma_row = QHBoxLayout()
-        self.sigma_label = QLabel("Sigma values:")
-        sigma_row.addWidget(self.sigma_label)
-        self.sigma_edit = QLineEdit()
-        default_sigmas = FEATURE_PRESETS.get(saved_preset, FEATURE_PRESETS["medium_quick"])["default_sigmas"]
-        saved_sigmas = ip.get(f"apoc_{cell_type}_sigmas", default_sigmas)
-        self.sigma_edit.setText(str(saved_sigmas))
-        self.sigma_edit.setPlaceholderText("e.g. 1, 5, 25")
-        self.sigma_edit.setToolTip("Comma-separated sigma (scale) values for Gaussian filters.\nSmall σ (1-2) = fine detail; Large σ (5-25) = coarse/shape.")
-        sigma_row.addWidget(self.sigma_edit)
-        layout.addLayout(sigma_row)
+        sigma_row.addWidget(QLabel("Custom Sigmas:"))
+        self.sigma_input = QLineEdit(", ".join(_fmt_sigma(s) for s in APOC_SIGMAS))
+        self.sigma_input.setToolTip("Comma or space-separated list of sigmas to use for APOC filtering.")
+        sigma_row.addWidget(self.sigma_input)
+        self.update_grid_btn = QtPushButton("Update Grid")
+        self.update_grid_btn.clicked.connect(self._on_update_grid)
+        sigma_row.addWidget(self.update_grid_btn)
+        self.tune_layout.addLayout(sigma_row)
 
-        # --- Custom feature string (only visible when preset = custom) ---
-        self.custom_feat_label = QLabel("Custom feature string:")
-        self.custom_feat_edit = QLineEdit()
-        saved_custom = ip.get(f"apoc_{cell_type}_custom_feature_string", "")
-        self.custom_feat_edit.setText(saved_custom)
-        self.custom_feat_edit.setPlaceholderText("e.g. original gaussian_blur=1 sobel_of_gaussian_blur=5")
-        layout.addWidget(self.custom_feat_label)
-        layout.addWidget(self.custom_feat_edit)
+        self.current_sigmas = list(APOC_SIGMAS)
+        self._feat_sigma_checks = {}
+        self._grid_widget = None
 
-        # --- Read-only feature preview ---
+        self.tune_group.setLayout(self.tune_layout)
+        layout.addWidget(self.tune_group)
+
+        # ── Consider original image checkbox ─────────────────────────────────
+        self.consider_original_cb = QCheckBox("Consider original image as well")
+        saved_orig = bool(ip.get(f"apoc_{cell_type}_consider_original", False))
+        self.consider_original_cb.setChecked(saved_orig)
+        self.consider_original_cb.stateChanged.connect(self._update_preview)
+        layout.addWidget(self.consider_original_cb)
+
+        # ── Feature string preview ───────────────────────────────────────────
         self.preview_label = QLabel("")
         self.preview_label.setWordWrap(True)
-        self.preview_label.setStyleSheet("color: #888; font-size: 11px; padding: 2px 4px; background: #f5f5f5; border-radius: 3px;")
+        self.preview_label.setStyleSheet(
+            "color: #888; font-size: 10px; padding: 2px 4px; "
+            "background: rgba(0,0,0,0.05); border-radius: 3px;"
+        )
         layout.addWidget(self.preview_label)
 
-        # Connect signals to update preview
-        self.feature_combo.currentTextChanged.connect(self._on_preset_changed)
-        self.sigma_edit.textChanged.connect(self._update_preview)
-        self.custom_feat_edit.textChanged.connect(self._update_preview)
+        # ── Show classifier statistics button ────────────────────────────────
+        self.stats_btn = QtPushButton("Show classifier statistics")
+        self.stats_btn.setToolTip(
+            "Display the feature importance distribution of the trained classifier."
+        )
+        self.stats_btn.clicked.connect(self._on_show_statistics)
+        layout.addWidget(self.stats_btn)
 
-        # Initial visibility / preview
-        self._on_preset_changed(self.feature_combo.currentText())
-
-        # --- RF parameters ---
+        # ── RF parameters ────────────────────────────────────────────────────
         rf_row = QHBoxLayout()
         rf_row.addWidget(QLabel("Max depth:"))
         self.max_depth_spin = QSpinBox()
         self.max_depth_spin.setRange(1, 20)
         self.max_depth_spin.setValue(int(ip.get(f"apoc_{cell_type}_max_depth", 2)))
         rf_row.addWidget(self.max_depth_spin)
-
         rf_row.addWidget(QLabel("Trees:"))
         self.num_ensembles_spin = QSpinBox()
         self.num_ensembles_spin.setRange(10, 1000)
         self.num_ensembles_spin.setSingleStep(10)
         self.num_ensembles_spin.setValue(int(ip.get(f"apoc_{cell_type}_num_ensembles", 100)))
         rf_row.addWidget(self.num_ensembles_spin)
+        rf_row.addStretch()
         layout.addLayout(rf_row)
 
         layout.addStretch()
         self.setLayout(layout)
 
-    def _on_preset_changed(self, preset_name):
-        """Toggle visibility of sigma vs custom field, update sigma defaults."""
-        is_custom = preset_name == "custom"
-        self.sigma_edit.setVisible(not is_custom)
-        self.sigma_label.setVisible(not is_custom)
-        self.custom_feat_label.setVisible(is_custom)
-        self.custom_feat_edit.setVisible(is_custom)
+        # Wire up preset changes LAST so initial_params can be applied first
+        # (we do not auto-reset when the user changes the preset manually —
+        #  we only reset if the preset is changed *and* the user hasn't
+        #  customised the grid yet; simplest UX: always reset on preset change)
+        self.feature_combo.currentTextChanged.connect(self._on_preset_changed)
+        self.tune_group.toggled.connect(self._on_tune_toggled)
 
-        if not is_custom:
-            # Auto-fill default sigmas for the new preset
-            preset = FEATURE_PRESETS.get(preset_name, FEATURE_PRESETS["medium_quick"])
-            self.sigma_edit.setText(preset["default_sigmas"])
+        # Restore saved grid configuration
+        saved_sigmas = ip.get(f"apoc_{cell_type}_grid_sigmas")
+        if saved_sigmas:
+            self.sigma_input.setText(saved_sigmas)
+            self._on_update_grid() # This parses sigmas, builds the grid, etc.
+        else:
+            self._build_grid()
+
+        # Restore saved checkbox state from config (if available)
+        saved_checked = ip.get(f"apoc_{cell_type}_checked_features")
+        if saved_checked:
+            # saved_checked is a list of [feat_key, sigma_str] pairs
+            saved_set = {tuple(pair) for pair in saved_checked}
+            self._apply_checked_set(saved_set)
+        else:
+            # Apply preset defaults
+            self._apply_preset_defaults(saved_preset)
 
         self._update_preview()
 
+    # ────────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _apply_checked_set(self, checked_set):
+        """Check/uncheck grid cells according to the given set of (feat_key, sigma_str)."""
+        for key, cb in self._feat_sigma_checks.items():
+            cb.blockSignals(True)
+            cb.setChecked(key in checked_set)
+            cb.blockSignals(False)
+
+    def _apply_preset_defaults(self, preset_name):
+        """Reset the grid to the preset's default checked cells."""
+        self._apply_checked_set(_checked_set_for_preset(preset_name))
+
+    def _get_current_checked_set(self):
+        """Return the set of (feat_key, sigma_str) currently checked in the grid."""
+        return {key for key, cb in self._feat_sigma_checks.items() if cb.isChecked()}
+
+    def _on_preset_changed(self, preset_name):
+        """Reset grid checkboxes to the new preset's defaults."""
+        if preset_name != "custom":
+            self.sigma_input.setText(", ".join(_fmt_sigma(s) for s in APOC_SIGMAS))
+            self.current_sigmas = list(APOC_SIGMAS)
+            self._build_grid()
+            self._apply_preset_defaults(preset_name)
+        self._update_preview()
+
+    def _on_tune_toggled(self, checked):
+        """Show/hide the inner grid widget when the group box is toggled."""
+        if self._grid_widget:
+            self._grid_widget.setVisible(checked)
+
+    def _on_update_grid(self):
+        """Parse custom sigmas from input and rebuild the feature grid."""
+        text = self.sigma_input.text()
+        try:
+            parts = text.replace(",", " ").split()
+            new_sigmas = [float(p) for p in parts if p.strip()]
+            if not new_sigmas:
+                raise ValueError("Empty list")
+            self.current_sigmas = new_sigmas
+            self.feature_combo.setCurrentText("custom")
+            self._build_grid()
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Sigmas", "Could not parse sigma values. Please enter numbers separated by spaces or commas.")
+
+    def _build_grid(self):
+        """Rebuild the checkbox grid based on current_sigmas."""
+        old_checked = set()
+        if self._feat_sigma_checks:
+            old_checked = self._get_current_checked_set()
+
+        if self._grid_widget is not None:
+            self.tune_layout.removeWidget(self._grid_widget)
+            self._grid_widget.deleteLater()
+
+        self._grid_widget = QWidget()
+        grid = QGridLayout()
+        grid.setSpacing(2)
+        grid.setContentsMargins(0, 0, 0, 0)
+        self._feat_sigma_checks = {}
+
+        sigma_header = QLabel("sigma")
+        sigma_header.setStyleSheet("font-weight: bold; font-size: 11px;")
+        grid.addWidget(sigma_header, 0, 0)
+
+        for col_idx, s in enumerate(self.current_sigmas):
+            s_str = _fmt_sigma(s)
+            lbl = QLabel(s_str)
+            lbl.setStyleSheet("font-size: 10px;")
+            lbl.setAlignment(Qt.AlignCenter)
+            grid.addWidget(lbl, 0, col_idx + 1)
+
+        for row_idx, (feat_key, feat_label) in enumerate(APOC_ALL_FEATURES):
+            feat_lbl = QLabel(feat_label)
+            feat_lbl.setStyleSheet("font-size: 11px;")
+            grid.addWidget(feat_lbl, row_idx + 1, 0)
+            for col_idx, s in enumerate(self.current_sigmas):
+                s_str = _fmt_sigma(s)
+                cb = QCheckBox()
+                cb.setChecked(False)
+                cb.setStyleSheet("QCheckBox { margin: 0px; padding: 0px; }")
+                cb.stateChanged.connect(self._update_preview)
+                grid.addWidget(cb, row_idx + 1, col_idx + 1, alignment=Qt.AlignCenter)
+                self._feat_sigma_checks[(feat_key, s_str)] = cb
+
+        self._grid_widget.setLayout(grid)
+        self.tune_layout.insertWidget(1, self._grid_widget)
+
+        # Retain checked state for checkboxes that still exist in the new grid
+        self._apply_checked_set(old_checked)
+        self._update_preview()
+
     def _update_preview(self):
-        """Rebuild the feature string preview from current preset + sigmas."""
+        """Rebuild the feature string preview from the current grid state."""
         feat_str = self.get_feature_string()
-        self.preview_label.setText(f"<b>Features:</b> {feat_str}")
+        # Show a truncated preview if very long
+        if len(feat_str) > 120:
+            display = feat_str[:117] + "…"
+        else:
+            display = feat_str
+        self.preview_label.setText(f"<b>Features:</b> {display}")
+        self.preview_label.setToolTip(feat_str)
+
+    def _get_clf_path(self):
+        """Return the expected .cl file path for this cell type."""
+        if not hasattr(self, '_pixel_class_outdir') or not self._pixel_class_outdir:
+            return None
+        ct = self.cell_type
+        if ct == "dead":
+            fname = "PixelClassifier_Death.cl"
+        else:
+            fname = f"PixelClassifier_{ct.capitalize()}.cl"
+        return Path(self._pixel_class_outdir) / fname
+
+    def _on_show_statistics(self):
+        """Show a window with the classifier feature statistics."""
+        clf_path = self._get_clf_path()
+        if clf_path is None or not Path(clf_path).exists():
+            QMessageBox.information(
+                self,
+                "Classifier Statistics",
+                f"No trained classifier found for '{self.cell_type}'.\n"
+                "Train the classifier first, then click this button."
+            )
+            return
+        try:
+            import apoc
+            clf = apoc.ObjectSegmenter(opencl_filename=str(clf_path))
+            feature_importances = clf.feature_importances()  # dict feature -> importance
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"Classifier Statistics — {self.cell_type.capitalize()}")
+            dlg_layout = QVBoxLayout(dlg)
+
+            table = QTableWidget(len(feature_importances), 2)
+            table.setHorizontalHeaderLabels(["Feature", "Importance"])
+            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            for i, (feat, imp) in enumerate(sorted(
+                feature_importances.items(), key=lambda x: -x[1]
+            )):
+                table.setItem(i, 0, QTableWidgetItem(str(feat)))
+                item = QTableWidgetItem(f"{imp:.4f}")
+                item.setTextAlignment(Qt.AlignCenter)
+                # Colour code: green for high importance
+                r = int(max(0, 255 - imp * 1200))
+                g = int(min(255, 80 + imp * 1200))
+                item.setBackground(QColor(r, g, 80))
+                table.setItem(i, 1, item)
+
+            dlg_layout.addWidget(table)
+            dlg.setMinimumSize(500, 400)
+            dlg.exec_()
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Classifier Statistics Error",
+                f"Could not load statistics for '{self.cell_type}':\n{exc}"
+            )
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Public API
+    # ────────────────────────────────────────────────────────────────────────
 
     def get_feature_string(self):
-        """Return the full APOC feature string based on current widget values."""
-        preset = self.feature_combo.currentText()
-        if preset == "custom":
-            return self.custom_feat_edit.text().strip()
-        return _build_feature_string(preset, self.sigma_edit.text())
+        """Return the full APOC feature string based on current grid state."""
+        checked = self._get_current_checked_set()
+        consider_orig = self.consider_original_cb.isChecked()
+        return _build_feature_string_from_checked(checked, consider_original=consider_orig, current_sigmas=self.current_sigmas)
 
     def refresh_channel_checkboxes(self):
         """Rebuild channel checkboxes from current Napari image layers."""
@@ -343,7 +585,10 @@ class CellTypeTab(QWidget):
         self.channel_checkboxes = []
 
         for layer in self.viewer.layers:
-            if isinstance(layer, napari.layers.Image) and not layer.name.startswith("Pixel Classification"):
+            if (
+                isinstance(layer, napari.layers.Image)
+                and not layer.name.startswith("Pixel Classification")
+            ):
                 cb = QCheckBox(layer.name)
                 cb.setChecked(True)
                 self.chan_checkbox_layout.addWidget(cb)
@@ -351,24 +596,44 @@ class CellTypeTab(QWidget):
 
     def get_config(self):
         """Return a dict with all current widget values."""
+        checked_set = self._get_current_checked_set()
         return {
-            "feature_preset":          self.feature_combo.currentText(),
-            "sigmas":                  self.sigma_edit.text().strip(),
-            "custom_feature_string":   self.custom_feat_edit.text().strip(),
-            "feature_string":          self.get_feature_string(),  # computed, for training
-            "max_depth":               self.max_depth_spin.value(),
-            "num_ensembles":           self.num_ensembles_spin.value(),
-            "channels":                [cb.text() for cb in self.channel_checkboxes if cb.isChecked()],
+            "feature_preset":     self.feature_combo.currentText(),
+            "grid_sigmas":        self.sigma_input.text().strip(),
+            # Legacy keys kept for backward compat:
+            "sigmas":             ",".join(
+                sorted({s for _, s in checked_set},
+                       key=lambda x: APOC_SIGMAS.index(float(x)) if float(x) in APOC_SIGMAS else 999)
+            ),
+            "custom_feature_string": "",
+            "feature_string":     self.get_feature_string(),
+            "consider_original":  self.consider_original_cb.isChecked(),
+            # Rich state for round-tripping
+            "checked_features":   [list(pair) for pair in checked_set],
+            "max_depth":          self.max_depth_spin.value(),
+            "num_ensembles":      self.num_ensembles_spin.value(),
+            "channels":           [
+                cb.text() for cb in self.channel_checkboxes if cb.isChecked()
+            ],
         }
 
     def apply_config(self, cfg):
-        """Restore widget values from a config dict."""
+        """Restore widget values from a config dict (used by 'Apply to all tabs')."""
         if "feature_preset" in cfg:
+            # Block the auto-reset signal while we apply config
+            self.feature_combo.blockSignals(True)
             self.feature_combo.setCurrentText(cfg["feature_preset"])
-        if "sigmas" in cfg:
-            self.sigma_edit.setText(cfg["sigmas"])
-        if "custom_feature_string" in cfg:
-            self.custom_feat_edit.setText(cfg["custom_feature_string"])
+            self.feature_combo.blockSignals(False)
+        if "grid_sigmas" in cfg:
+            self.sigma_input.setText(cfg["grid_sigmas"])
+            self._on_update_grid()
+        if "checked_features" in cfg and cfg["checked_features"]:
+            saved_set = {tuple(pair) for pair in cfg["checked_features"]}
+            self._apply_checked_set(saved_set)
+        elif "feature_preset" in cfg:
+            self._apply_preset_defaults(cfg["feature_preset"])
+        if "consider_original" in cfg:
+            self.consider_original_cb.setChecked(bool(cfg["consider_original"]))
         if "max_depth" in cfg:
             self.max_depth_spin.setValue(int(cfg["max_depth"]))
         if "num_ensembles" in cfg:
@@ -376,6 +641,7 @@ class CellTypeTab(QWidget):
         if "channels" in cfg:
             for cb in self.channel_checkboxes:
                 cb.setChecked(cb.text() in cfg["channels"])
+        self._update_preview()
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +703,7 @@ class APOCTrainingWidget(QWidget):
 
         for ct in self._tab_cell_types:
             tab = CellTypeTab(ct, self.viewer, initial_params=self._initial_params)
+            tab._pixel_class_outdir = self.pixel_class_outdir  # for statistics button
             self.tabs[ct] = tab
             self.tab_widget.addTab(tab, ct.capitalize())
 
@@ -673,6 +940,10 @@ class APOCTrainingWidget(QWidget):
 
             if successes:
                 self.status_label.setText(f"✅ Trained: {', '.join(successes)}")
+                # Auto-show statistics for each successfully trained classifier
+                for ct in successes:
+                    if ct in self.tabs:
+                        self.tabs[ct]._on_show_statistics()
             else:
                 self.status_label.setText("⚠️ No cell types were trained (check labels).")
 
@@ -697,6 +968,8 @@ class APOCTrainingWidget(QWidget):
             params[f"apoc_{ct}_sigmas"]                = cfg["sigmas"]
             params[f"apoc_{ct}_custom_feature_string"] = cfg["custom_feature_string"]
             params[f"apoc_{ct}_feature_string"]        = cfg["feature_string"]
+            params[f"apoc_{ct}_consider_original"]     = cfg["consider_original"]
+            params[f"apoc_{ct}_checked_features"]      = cfg["checked_features"]
             params[f"apoc_{ct}_max_depth"]             = cfg["max_depth"]
             params[f"apoc_{ct}_num_ensembles"]         = cfg["num_ensembles"]
             params[f"apoc_{ct}_channels"]              = cfg["channels"]
@@ -775,15 +1048,17 @@ def train_pixel_classifier_apoc(
     # --- Create Napari viewer ---
     viewer = napari.Viewer()
 
-    # stacked shape is (C, T, Z, Y, X)
-    n_channels = stacked.shape[0]
+    # stacked is (T_total, C, Z, Y, X).
+    # Axis 0 = timepoints, axis 1 = channels.
+    T_total = stacked.shape[0]
+    n_channels = stacked.shape[1]   # ← was incorrectly stacked.shape[0]
     channel_colors = [
         "cyan", "yellow", "red", "green", "magenta", "blue",
         "gray", "turbo", "viridis", "plasma", "inferno", "twilight",
     ]
 
     for ch in range(n_channels):
-        channel_data = stacked[ch] # (T, Z, Y, X)
+        channel_data = stacked[:, ch, :, :, :]  # (T_total, Z, Y, X)
         nonzero = channel_data[channel_data > 0]
         clim = (0, float(np.percentile(nonzero, 99.8))) if nonzero.size > 0 else (0, 1e-3)
         img_layer = viewer.add_image(
@@ -797,8 +1072,8 @@ def train_pixel_classifier_apoc(
         img_layer.contrast_limits_range = (0, float(channel_data.max()))
 
     # --- Annotation label layers per cell type ---
-    # Label layers are (T, Z, Y, X)
-    full_shape = stacked.shape[1:]
+    # Labels must be (T_total, Z, Y, X) — NOT (C, Z, Y, X)
+    label_shape = (T_total,) + stacked.shape[2:]  # (T_total, Z, Y, X)
 
     ip = initial_params or {}
 
@@ -807,9 +1082,14 @@ def train_pixel_classifier_apoc(
         saved_path = Path(pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
         if saved_path.exists():
             existing = np.asarray(load_zarr(saved_path))
-            user_labels = existing if existing.shape == full_shape else np.zeros(full_shape, dtype=np.int16)
+            if existing.shape == label_shape:
+                user_labels = existing
+                print(f"  ↩ Restored saved labels for '{cell_type}' ({label_shape})")
+            else:
+                print(f"  ⚠️ Saved labels shape {existing.shape} ≠ expected {label_shape} — starting fresh")
+                user_labels = np.zeros(label_shape, dtype=np.int16)
         else:
-            user_labels = np.zeros(full_shape, dtype=np.int16)
+            user_labels = np.zeros(label_shape, dtype=np.int16)
 
         viewer.add_labels(
             user_labels,
@@ -821,10 +1101,13 @@ def train_pixel_classifier_apoc(
         dead_path = Path(pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
         if dead_path.exists():
             dead_labels = np.asarray(load_zarr(dead_path))
-            if dead_labels.shape != full_shape:
-                dead_labels = np.zeros(full_shape, dtype=np.int16)
+            if dead_labels.shape == label_shape:
+                print(f"  ↩ Restored saved labels for 'dead' ({label_shape})")
+            else:
+                print(f"  ⚠️ Saved Death labels shape {dead_labels.shape} ≠ {label_shape} — starting fresh")
+                dead_labels = np.zeros(label_shape, dtype=np.int16)
         else:
-            dead_labels = np.zeros(full_shape, dtype=np.int16)
+            dead_labels = np.zeros(label_shape, dtype=np.int16)
         viewer.add_labels(dead_labels, name="User Provided Labels (Dead)", opacity=0.5)
 
     # 2. Results (Pixel Classification / Segments) on top
@@ -833,10 +1116,10 @@ def train_pixel_classifier_apoc(
         pred_death_path = Path(pixel_class_outdir, "PixelClassifier_Death_PredictedLabels.zarr")
         if pred_death_path.exists():
             pred_death = np.asarray(load_zarr(pred_death_path))
-            if pred_death.shape != full_shape:
-                pred_death = np.zeros(full_shape, dtype=np.int16)
+            if pred_death.shape != label_shape:
+                pred_death = np.zeros(label_shape, dtype=np.int16)
         else:
-            pred_death = np.zeros(full_shape, dtype=np.int16)
+            pred_death = np.zeros(label_shape, dtype=np.int16)
         viewer.add_labels(pred_death, name="Pixel Classification (Dead)", opacity=0.8, visible=False)
 
     # Cell type segments
@@ -844,10 +1127,10 @@ def train_pixel_classifier_apoc(
         pred_path = Path(pixel_class_outdir, f"PixelClassifier_{cell_type.capitalize()}_PredictedLabels.zarr")
         if pred_path.exists():
             pred_data = np.asarray(load_zarr(pred_path))
-            if pred_data.shape != full_shape:
-                pred_data = np.zeros(full_shape, dtype=np.int16)
+            if pred_data.shape != label_shape:
+                pred_data = np.zeros(label_shape, dtype=np.int16)
         else:
-            pred_data = np.zeros(full_shape, dtype=np.int16)
+            pred_data = np.zeros(label_shape, dtype=np.int16)
 
         viewer.add_labels(
             pred_data,

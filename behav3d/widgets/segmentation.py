@@ -89,6 +89,19 @@ class PixelClassifierPanel:
         )
         self.gpu_device.observe(self._on_gpu_changed, names="value")
 
+        self.apoc_strategy = widgets.Dropdown(
+            options=[
+                "APOC (Direct Instance Segmentation)",
+                "APOC Mask + EDT/Watershed Resegmentation",
+                "APOC Probability Map + Watershed"
+            ],
+            value=pc.get("apoc_strategy", "APOC (Direct Instance Segmentation)"),
+            description="Strategy:",
+            style={'description_width': 'initial'},
+            layout=widgets.Layout(width="auto", display="none")
+        )
+        self.apoc_strategy.observe(self._toggle_engine_widgets, names="value")
+
 
         self.examples_per_sample = widgets.IntText(
             description="Examples per sample",
@@ -154,6 +167,7 @@ class PixelClassifierPanel:
         self.edt_thresholds = {}
         self._create_edt_threshold_inputs()
         self._create_postprocessing_inputs()
+        self._create_probability_threshold_inputs()
         self.use_all_timepoints = widgets.Checkbox(
             description="Process ALL timepoints",
             value=bool(pc.get("use_all_timepoints", True))
@@ -319,10 +333,21 @@ class PixelClassifierPanel:
         # Store CPU-only widget groups so we can hide them when APOC is selected
         self._cpu_seg_params_box = widgets.VBox(segmentation_widgets)
 
+        # Build probability map parameter widgets
+        prob_widgets = [widgets.HTML("<b>Probability Map parameters per cell type</b>")]
+        for ct in self.all_cell_types:
+            if ct in self.prob_mask_thresholds:
+                prob_widgets.append(widgets.HBox([
+                    self.prob_mask_thresholds[ct],
+                    self.prob_seed_thresholds[ct],
+                    self.segment_size_mins[ct],
+                ]))
+        self._prob_params_box = widgets.VBox(prob_widgets)
+
         self.ui = widgets.VBox([
             widgets.VBox([
                 widgets.HTML("<b>Train pixel classifier</b>"),
-                widgets.HBox([self.classifier_engine, self.gpu_device]),
+                widgets.HBox([self.classifier_engine, self.gpu_device, self.apoc_strategy]),
                 widgets.HBox([self.examples_per_sample, self.overwrite_sample_images, self.n_workers]),
                 #self.sample_specific_classifier,
                 self.train_row,
@@ -333,6 +358,7 @@ class PixelClassifierPanel:
                 self.manual_clf_paths,
                 self.clf_paths_box,
                 self._cpu_seg_params_box,
+                self._prob_params_box,
                 self.overwrite_existing,
                 widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end]),
                 self.only_resegment_warning,
@@ -444,6 +470,36 @@ class PixelClassifierPanel:
                 value=bool(saved_fill),
                 indent=False,
             )
+
+    def _create_probability_threshold_inputs(self):
+        """Create per-cell-type mask and seed threshold inputs for probability map strategy."""
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+
+        self.prob_mask_thresholds = {}
+        self.prob_seed_thresholds = {}
+
+        for cell_type in self.all_cell_types:
+            saved_mask = pc.get(f"{cell_type}_prob_mask_threshold", 0.5)
+            self.prob_mask_thresholds[cell_type] = widgets.BoundedFloatText(
+                description=f"{cell_type.capitalize()} mask thr:",
+                value=float(saved_mask),
+                min=0.0,
+                max=1.0,
+                step=0.05,
+                style={'description_width': '160px'},
+                layout=widgets.Layout(width='auto'),
+            )
+
+            saved_seed = pc.get(f"{cell_type}_prob_seed_threshold", 0.8)
+            self.prob_seed_thresholds[cell_type] = widgets.BoundedFloatText(
+                description=f"{cell_type.capitalize()} seed thr:",
+                value=float(saved_seed),
+                min=0.0,
+                max=1.0,
+                step=0.05,
+                style={'description_width': '160px'},
+                layout=widgets.Layout(width='auto'),
+            )
     
     def _persist_params(self):
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
@@ -457,6 +513,7 @@ class PixelClassifierPanel:
         pc["manual_clf_paths"] = bool(self.manual_clf_paths.value)
         pc["overwrite_existing"] = bool(self.overwrite_existing.value)
         pc["gpu_device_name"] = str(self.gpu_device.value)
+        pc["apoc_strategy"] = str(self.apoc_strategy.value)
         
         for ct, w in self.apoc_min_size_inputs.items():
             pc[f"apoc_{ct}_min_size_voxels"] = int(w.value)
@@ -471,6 +528,10 @@ class PixelClassifierPanel:
                 pc[f"{cell_type}_opening_nr_pixels"] = int(self.opening_nr_pixels[cell_type].value)
             if cell_type in self.fill_holes:
                 pc[f"{cell_type}_fill_holes"] = bool(self.fill_holes[cell_type].value)
+            if cell_type in self.prob_mask_thresholds:
+                pc[f"{cell_type}_prob_mask_threshold"] = float(self.prob_mask_thresholds[cell_type].value)
+            if cell_type in self.prob_seed_thresholds:
+                pc[f"{cell_type}_prob_seed_threshold"] = float(self.prob_seed_thresholds[cell_type].value)
         
         if self.manual_clf_paths.value:
             pc["clf_dir"] = str(self.clf_dir.value or "")
@@ -486,36 +547,42 @@ class PixelClassifierPanel:
             )
 
     def _toggle_engine_widgets(self, change=None):
-        """Hide CPU-only widgets when APOC engine is selected.
-
-        APOC's ObjectSegmenter handles segmentation internally (pixel classification
-        + connected components), so EDT thresholds, min sizes, opening, fill_holes,
-        and the 'Only resegment' button don't apply.
-        """
+        """Show/hide widgets depending on engine and strategy."""
         is_apoc = str(self.classifier_engine.value) == "APOC (GPU-Accelerated)"
-        hide = 'none' if is_apoc else None
+        strategy = str(self.apoc_strategy.value)
+        is_edt = is_apoc and strategy == "APOC Mask + EDT/Watershed Resegmentation"
+        is_prob = is_apoc and strategy == "APOC Probability Map + Watershed"
+        is_cpu_like = not is_apoc or is_edt
+        
+        hide_cpu = None if is_cpu_like else 'none'
 
         # CPU segmentation parameters (EDT, min size, opening, fill holes)
-        self._cpu_seg_params_box.layout.display = hide
-        self.n_workers.layout.display = hide
+        self._cpu_seg_params_box.layout.display = hide_cpu
+        self.n_workers.layout.display = hide_cpu
+
+        # Probability Map parameters (only visible for prob strategy)
+        self._prob_params_box.layout.display = (None if is_prob else 'none')
         
-        # GPU Device selection (APOC only)
+        # GPU Device and APOC Strategy selection
         self.gpu_device.layout.display = (None if is_apoc else 'none')
+        self.apoc_strategy.layout.display = (None if is_apoc else 'none')
         
         if is_apoc:
             self._apply_gpu_selection()
 
-        # 'Only resegment' button (CPU-only concept)
-        self.btn_resegment.layout.display = hide
-        self.only_resegment_warning.layout.display = hide
+        # 'Only resegment' button (available for EDT and Probability strategies)
+        show_reseg = is_cpu_like or is_prob
+        self.btn_resegment.layout.display = (None if show_reseg else 'none')
+        self.only_resegment_warning.layout.display = (None if show_reseg else 'none')
 
         # Manual classifier paths (APOC uses .cl files from training dir)
-        self.manual_clf_paths.layout.display = hide
+        self.manual_clf_paths.layout.display = ('none' if is_apoc else None)
         if is_apoc:
             self.clf_paths_box.layout.display = 'none'
 
-        # Post-processing (Size Filtering) only for APOC as requested
-        self.post_processing_box.layout.display = (None if is_apoc else 'none')
+        # Post-processing (Size Filtering via standalone button)
+        # Shown only for Direct APOC strategy
+        self.post_processing_box.layout.display = (None if is_apoc and not is_cpu_like and not is_prob else 'none')
 
     def _on_gpu_changed(self, change):
         if change['new']:
@@ -638,6 +705,10 @@ class PixelClassifierPanel:
                 params[f"{cell_type}_opening_step"] = int(w.step)
             if cell_type in self.fill_holes:
                 params[f"{cell_type}_fill_holes"] = bool(self.fill_holes[cell_type].value)
+            if cell_type in self.prob_mask_thresholds:
+                params[f"{cell_type}_prob_mask_threshold"] = float(self.prob_mask_thresholds[cell_type].value)
+            if cell_type in self.prob_seed_thresholds:
+                params[f"{cell_type}_prob_seed_threshold"] = float(self.prob_seed_thresholds[cell_type].value)
 
         # Include global GPU selection
         params["gpu_device_name"] = str(self.gpu_device.value)
@@ -667,6 +738,10 @@ class PixelClassifierPanel:
                 self.opening_nr_pixels[cell_type].value = int(params[f"{cell_type}_opening_nr_pixels"])
             if f"{cell_type}_fill_holes" in params and cell_type in self.fill_holes:
                 self.fill_holes[cell_type].value = bool(params[f"{cell_type}_fill_holes"])
+            if f"{cell_type}_prob_mask_threshold" in params and cell_type in self.prob_mask_thresholds:
+                self.prob_mask_thresholds[cell_type].value = float(params[f"{cell_type}_prob_mask_threshold"])
+            if f"{cell_type}_prob_seed_threshold" in params and cell_type in self.prob_seed_thresholds:
+                self.prob_seed_thresholds[cell_type].value = float(params[f"{cell_type}_prob_seed_threshold"])
 
         # Cache APOC per-cell-type params into the YAML config dict
         # (they will be written to disk by _persist_params below)
@@ -792,6 +867,8 @@ class PixelClassifierPanel:
                         only_segment=bool(only_segment),
                         overwrite_existing=bool(self.overwrite_existing.value),
                         n_workers=int(self.n_workers.value),
+                        gpu_device=str(self.gpu_device.value),
+                        apoc_strategy=str(self.apoc_strategy.value),
                     )
                 else:
                     # Original scikit-learn pixel classifier
