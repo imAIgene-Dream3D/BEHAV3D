@@ -581,6 +581,207 @@ def plot_general_organoid_analysis(
         plt.close(fig)
 
 
+def plot_dead_signal_per_organoid(
+    df_combined,
+    figsize=(12, 10),
+    feature="smoothed_percentage_dead_mask",
+    color_by="organoid_type",
+    style_by=None,
+    autoscale_y=True,
+    y_quantile=0.99,
+    min_ymax=None,
+    title=None,
+    ylabel=None,
+    show_legends=True,
+    linewidth=2.2,
+    alpha=0.65,
+    legend_max_items=40,
+):
+    """
+    Plot individual organoid dead signal over time.
+
+    - `color_by`: column used for colors (e.g. "organoid_type" or "condition_line")
+    - `style_by`: optional column used for line styles (e.g. "organoid_type")
+    - `autoscale_y`: when True, scales y-axis to the observed data range (not fixed 0–1),
+      using the ``y_quantile`` upper bound so brief spikes do not flatten small signals.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    dfp = df_combined.copy()
+
+    # Allow passing multiple columns for color/style (builds a combined key)
+    def _ensure_cols(cols, what):
+        if cols is None:
+            return []
+        if isinstance(cols, (list, tuple)):
+            cols_list = list(cols)
+        else:
+            cols_list = [cols]
+        missing = [c for c in cols_list if c not in dfp.columns]
+        if missing:
+            raise ValueError(f"{what} column(s) missing in df_combined: {missing}")
+        return cols_list
+
+    color_cols = _ensure_cols(color_by, "color_by")
+    style_cols = _ensure_cols(style_by, "style_by") if style_by is not None else []
+
+    if feature not in dfp.columns:
+        raise ValueError(f"feature='{feature}' not found in df_combined columns.")
+
+    # Combined keys
+    if len(color_cols) == 1:
+        color_key_col = color_cols[0]
+    else:
+        color_key_col = "__color_key__"
+        dfp[color_key_col] = dfp[color_cols].astype(str).agg(" | ".join, axis=1)
+
+    if style_cols:
+        if len(style_cols) == 1:
+            style_key_col = style_cols[0]
+        else:
+            style_key_col = "__style_key__"
+            dfp[style_key_col] = dfp[style_cols].astype(str).agg(" | ".join, axis=1)
+    else:
+        style_key_col = None
+    
+    # Create unique ID for each organoid if not present
+    if "organoid_id" not in dfp.columns:
+        dfp["organoid_id"] = (
+            dfp["sample_name"].astype(str) + "_" +
+            dfp.get("organoid_type", pd.Series(["unknown"] * len(dfp))).astype(str) + "_" +
+            dfp["TrackID"].astype(str)
+        )
+
+    # Build palettes and linestyles
+    color_levels = sorted(dfp[color_key_col].dropna().astype(str).unique())
+    n_colors = len(color_levels)
+    palette = sns.color_palette("tab10", n_colors) if n_colors <= 10 else sns.color_palette("husl", n_colors)
+    color_map = dict(zip(color_levels, palette))
+
+    if style_key_col is not None:
+        style_levels = sorted(dfp[style_key_col].dropna().astype(str).unique())
+        # cycle through a small set of visually distinct linestyles
+        linestyles = ["-", "--", ":", "-.", (0, (5, 2)), (0, (1, 2))]
+        linestyle_map = {lvl: linestyles[i % len(linestyles)] for i, lvl in enumerate(style_levels)}
+    else:
+        style_levels = []
+        linestyle_map = {}
+
+    # Plot each organoid track as its own line, inheriting group color/style
+    group_cols = ["organoid_id", "position_t", feature, color_key_col] + ([style_key_col] if style_key_col else [])
+    df_plot = dfp[group_cols].copy()
+    df_plot[color_key_col] = df_plot[color_key_col].astype(str)
+    if style_key_col is not None:
+        df_plot[style_key_col] = df_plot[style_key_col].astype(str)
+
+    for oid, df_oid in df_plot.groupby("organoid_id", sort=False):
+        cval = df_oid[color_key_col].iloc[0]
+        if isinstance(cval, pd.Series):
+            cval = " | ".join(cval.astype(str).tolist())
+        else:
+            cval = str(cval)
+
+        sval = df_oid[style_key_col].iloc[0] if style_key_col is not None else None
+        if isinstance(sval, pd.Series):
+            sval = " | ".join(sval.astype(str).tolist())
+        elif sval is not None:
+            sval = str(sval)
+        ax.plot(
+            df_oid["position_t"].to_numpy(),
+            df_oid[feature].to_numpy(),
+            color=color_map.get(cval, "C0"),
+            linestyle=linestyle_map.get(sval, "-") if style_key_col is not None else "-",
+            alpha=alpha,
+            linewidth=linewidth,
+            zorder=2,
+        )
+
+    # Legends: colors (color_by) and optional styles (style_by)
+    if show_legends:
+        from matplotlib.lines import Line2D
+
+        # Put legends outside the axes (right side) and reserve space for them.
+        # If there are too many entries, show the first N (still better than none).
+        shown_color_levels = color_levels[:legend_max_items]
+        color_handles = [
+            Line2D([0], [0], color=color_map[lvl], lw=3, linestyle="-", label=str(lvl))
+            for lvl in shown_color_levels
+        ]
+        color_title = " / ".join(color_cols) if len(color_cols) > 1 else color_cols[0]
+        leg1 = ax.legend(
+            handles=color_handles,
+            title=color_title,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0,
+            prop={"size": 8},
+            frameon=True,
+        )
+        ax.add_artist(leg1)
+
+        if style_key_col is not None and style_levels:
+            shown_style_levels = style_levels[:legend_max_items]
+            style_handles = [
+                Line2D([0], [0], color="black", lw=3, linestyle=linestyle_map[lvl], label=str(lvl))
+                for lvl in shown_style_levels
+            ]
+            style_title = " / ".join(style_cols) if len(style_cols) > 1 else style_cols[0]
+            ax.legend(
+                handles=style_handles,
+                title=style_title,
+                loc="upper left",
+                bbox_to_anchor=(1.02, 0.55),
+                borderaxespad=0,
+                prop={"size": 8},
+                frameon=True,
+                handlelength=3.5,
+                handletextpad=0.8,
+            )
+    
+    # Backwards-compatible defaults (keep old title/ylabel unless caller overrides)
+    if title is None:
+        title = "Dead Signal Increase Per Individual Organoid"
+    if ylabel is None:
+        if feature == "smoothed_percentage_dead_mask":
+            ylabel = "Dead Signal (Smoothed % Dead Mask)"
+        elif feature == "smoothed_nr_dead_mask_pixels":
+            ylabel = "Dead Signal (Smoothed # Dead Mask Pixels)"
+        else:
+            ylabel = feature
+
+    ax.set_title(title, fontsize=14)
+    ax.set_xlabel("Timepoint", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.grid(True, linestyle=":", alpha=0.5)
+    
+    # Ensure it starts at 0 on X axis
+    ax.set_xlim(0, dfp["position_t"].max())
+
+    # Y scaling: robust autoscale so small death signals are visible
+    ax.set_ylim(bottom=0)
+    if autoscale_y:
+        y = pd.to_numeric(dfp[feature], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        if len(y) > 0:
+            ymax = float(y.max())
+            if min_ymax is not None:
+                ymax = max(ymax, float(min_ymax))
+            if ymax <= 0:
+                ymax = 1.0 if "percentage" in feature else 10.0
+            ax.set_ylim(0, ymax * 1.1)
+        else:
+            ax.set_ylim(0, 1.05 if "percentage" in feature else 1.0)
+    else:
+        if "percentage" in feature:
+            ax.set_ylim(0, 1.05)
+        else:
+            ax.set_ylim(0)
+
+    fig.subplots_adjust(right=0.76)
+    plt.tight_layout()
+    plt.show()
+    return fig
+
+
 def plot_multi_organoid_death_dynamics(
     output_dir,
     organoid_types,
@@ -643,7 +844,86 @@ def plot_multi_organoid_death_dynamics(
     combined_csv_path = results_outdir / "combined_multi_organoid_death_dynamics.csv"
     df_combined.to_csv(combined_csv_path, index=False)
     print(f"\nCombined data saved to: {combined_csv_path}")
+
+    # Load and combine full track features for individual track plotting
+    all_tracks_data = []
+    skipped_types = []
+
+    # Load metadata to fetch per-sample line condition info.
+    # Prefer "metadata.csv", but also support "metadata1.csv", "metadata_*.csv", etc.
+    metadata_df = None
+    metadata_path = Path(output_dir, "metadata.csv")
+    if not metadata_path.exists():
+        candidates = sorted(Path(output_dir).glob("metadata*.csv"))
+        metadata_path = candidates[0] if candidates else metadata_path
+
+    if metadata_path.exists():
+        try:
+            metadata_df = pd.read_csv(metadata_path, low_memory=False)
+            print(f"Using metadata file: {metadata_path}")
+        except Exception as exc:
+            print(f"\n⚠️  WARNING: Could not read metadata at {metadata_path}: {exc}")
+            metadata_df = None
+    else:
+        print(
+            f"\n⚠️  WARNING: No metadata*.csv found in {output_dir}. "
+            f"Line-condition coloring will fall back to organoid_type."
+        )
     
+    for org_type in available_data.keys():
+        track_csv_path = Path(output_dir, "analysis", org_type, "track_features", f"BEHAV3D_{org_type}_combined_track_features_filtered.csv")
+        if track_csv_path.exists():
+            df_t = pd.read_csv(track_csv_path)
+            
+            # Check if dead data columns exist
+            dead_columns = ["nr_dead_mask_pixels", "percentage_dead_mask", "dead"]
+            if not all(col in df_t.columns for col in dead_columns):
+                skipped_types.append(org_type)
+                continue
+                
+            df_t["organoid_type"] = org_type
+
+            # Attach line condition from metadata (per sample) if available.
+            # Metadata convention: columns like "or_{org_name}_line_condition".
+            if metadata_df is not None and "sample_name" in metadata_df.columns:
+                preferred = f"or_{org_type}_line_condition"
+                if preferred in metadata_df.columns:
+                    md_col = preferred
+                else:
+                    # fallback: any column that ends with "_line_condition" and contains org_type
+                    candidates = [
+                        c for c in metadata_df.columns
+                        if c.endswith("_line_condition") and org_type.lower() in c.lower()
+                    ]
+                    md_col = candidates[0] if candidates else None
+
+                if md_col is not None:
+                    md_map = metadata_df.set_index("sample_name")[md_col].to_dict()
+                    df_t["line_condition"] = df_t["sample_name"].map(md_map)
+                else:
+                    df_t["line_condition"] = np.nan
+            else:
+                df_t["line_condition"] = np.nan
+            
+            # Ensure smoothed_percentage_dead_mask is present and starts at 0 (min_periods=1)
+            # Default smoothing helps reduce noise from flickering segmentation
+            df_t["smoothed_percentage_dead_mask"] = smooth_value_over_time(
+                df_t, column="percentage_dead_mask", groupby=["TrackID", "sample_name"], min_periods=1
+            )
+
+            # Smoothed dead pixel count (often more interpretable than percentages)
+            df_t["smoothed_nr_dead_mask_pixels"] = smooth_value_over_time(
+                df_t, column="nr_dead_mask_pixels", groupby=["TrackID", "sample_name"], min_periods=1
+            )
+            
+            all_tracks_data.append(df_t)
+            
+    if skipped_types:
+        print(f"\n⚠️  WARNING: Dead data not found for: {', '.join(skipped_types)}")
+        print(f"   Run feature extraction and track filtering for these types first to enable individual dead signal plotting.\n")
+
+    df_tracks_combined = pd.concat(all_tracks_data, ignore_index=True) if all_tracks_data else None
+
     # Plots
     pdf_path = results_outdir / "multi_organoid_death_dynamics_comparison.pdf"
     
@@ -753,6 +1033,51 @@ def plot_multi_organoid_death_dynamics(
         plt.show()
         pdf.savefig(fig2, bbox_inches='tight')
         plt.close(fig2)
+
+        # Plot 3: Individual track signal over time
+        if df_tracks_combined is not None:
+            # Line style per organoid_type; color by line condition when metadata has values.
+            df_indiv = df_tracks_combined.copy()
+            has_line_cond = (
+                "line_condition" in df_indiv.columns
+                and df_indiv["line_condition"].notna().any()
+            )
+            if has_line_cond:
+                df_indiv["line_condition"] = df_indiv["line_condition"].fillna("(no line condition)")
+                color_key = "line_condition"
+            else:
+                color_key = "organoid_type"
+            style_key = "organoid_type"
+
+            # 3a) Smoothed percentage dead mask (auto-scaled so small values are visible)
+            fig3a = plot_dead_signal_per_organoid(
+                df_indiv,
+                figsize=figsize,
+                feature="smoothed_percentage_dead_mask",
+                color_by=color_key,
+                style_by=style_key,
+                autoscale_y=True,
+                title=None,
+                ylabel=None,
+                linewidth=2.6,
+            )
+            pdf.savefig(fig3a, bbox_inches="tight")
+            plt.close(fig3a)
+
+            # 3b) Smoothed number of dead pixels (auto-scaled)
+            fig3b = plot_dead_signal_per_organoid(
+                df_indiv,
+                figsize=figsize,
+                feature="smoothed_nr_dead_mask_pixels",
+                color_by=color_key,
+                style_by=style_key,
+                autoscale_y=True,
+                title=None,
+                ylabel=None,
+                linewidth=2.6,
+            )
+            pdf.savefig(fig3b, bbox_inches="tight")
+            plt.close(fig3b)
     
     print(f"PDF saved to: {pdf_path}")
     print(f"### DONE\n")
@@ -832,7 +1157,7 @@ def run_organoid_morphology_dead_analysis(
         'volume',
         'sphericity',
         'solidity',
-        'surfrace_to_volume_ratio',
+        'surface_to_volume_ratio',
     ]
 
     required_cols = ["TrackID", "sample_name", "relative_time", "dead"] + base_feature_cols
