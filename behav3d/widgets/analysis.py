@@ -41,7 +41,10 @@ from behav3d.analysis.filtering import filter_tracks
 from behav3d.io.images import load_zarr
 from behav3d.analysis import summarize_track_features
 from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
-from behav3d.analysis.interaction_analysis import run_interaction_analysis
+from behav3d.analysis.interaction_analysis import (
+    run_interaction_analysis,
+    run_multi_organoid_interaction_comparison,
+)
 
 # Fallback for default features: behav3d_calculated_features is now imported from .utils
 '''try:
@@ -1924,12 +1927,11 @@ class DeathDynamicsPanel:
         elif not self.has_death_features:
             self.ui = widgets.VBox([
                 widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'),
-                widgets.HTML('<div style="color:#b00;">No final death classification found. Run Feature Extraction and Track Filtering first so the CSV contains the dead column.</div>')
+                widgets.HTML('<div style="color:#b00;">No final death classification found. Run feature extraction and track filtering first.</div>')
             ])
         else:
             self.ui = widgets.VBox([
                 widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'),
-                widgets.HTML('<div style="font-size:12px;color:#666;">Uses the final dead column from track features. Threshold selection now lives only in Feature Extraction.</div>'),
                 widgets.HBox([self.btn_run, self.spinner_html]),
                 self.out
             ])
@@ -1974,7 +1976,7 @@ class MultiOrganoidDeathDynamicsPanel:
         
         self.btn_refresh = widgets.Button(description="🔄 Refresh", button_style="info", layout=widgets.Layout(width="100px"))
         self.btn_refresh.on_click(self._on_refresh_clicked)
-        self.btn_run = widgets.Button(description="Generate Comparison Plot", button_style="warning", layout=widgets.Layout(width="250px"))
+        self.btn_run = widgets.Button(description="Run Death Comparison Plot", button_style="warning", layout=widgets.Layout(width="250px"))
         self.btn_run.on_click(self._on_run_clicked)
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
@@ -1985,7 +1987,7 @@ class MultiOrganoidDeathDynamicsPanel:
         
         self.ui = widgets.VBox([
             widgets.HTML('<b>Multi-Organoid Death Dynamics Comparison</b>'),
-            widgets.HTML('<div style="font-size:12px;color:#666;">Compare death dynamics across all organoid types on the same plot.</div>'),
+            widgets.HTML('<div style="font-size:12px;color:#666;">Compare death dynamics across all organoid types.</div>'),
             widgets.HBox([self.status_html, self.btn_refresh], layout=widgets.Layout(align_items="center", gap="10px")),
             widgets.HTML("<hr>"),
             widgets.HBox([self.btn_run, self.spinner_html]),
@@ -2029,6 +2031,184 @@ class MultiOrganoidDeathDynamicsPanel:
             finally:
                 self.spinner_html.layout.display = "none"
                 self.btn_run.disabled = False
+
+
+class MultiOrganoidInteractionComparisonPanel:
+    """
+    Compare interactions across organoid types / treatments.
+    Produces a violin plot (dying vs live) and TOD-aligned cumulative curves.
+    """
+    def __init__(self, metadata_loader, organoid_types):
+        self.metadata_loader = metadata_loader
+        self.organoid_types = organoid_types
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+
+        md = self.metadata_loader.metadata
+        self.immune_types = (
+            detect_immune_cell_types_from_metadata(md)
+            + detect_other_cell_types_from_metadata(md)
+        )
+
+        # --- widgets ---
+        group_options = [
+            ("By organoid type", "organoid_type"),
+            ("By treatment (immune cell)", "treatment"),
+        ]
+        self.group_by = widgets.Dropdown(
+            options=group_options,
+            value="organoid_type",
+            description="Group by:",
+            style={"description_width": "80px"},
+            layout=widgets.Layout(width="300px"),
+        )
+
+        self.time_window = widgets.IntText(
+            value=60,
+            description="Time window (min):",
+            style={"description_width": "140px"},
+            layout=widgets.Layout(width="240px"),
+        )
+
+        self.immune_checkboxes = {}
+        for ct in self.immune_types:
+            self.immune_checkboxes[ct] = widgets.Checkbox(
+                value=True, description=ct, indent=False,
+            )
+        self.immune_box = widgets.VBox(list(self.immune_checkboxes.values()))
+
+        self.btn_refresh = widgets.Button(
+            description="🔄 Refresh", button_style="info",
+            layout=widgets.Layout(width="100px"),
+        )
+        self.btn_refresh.on_click(self._on_refresh_clicked)
+        self.btn_run = widgets.Button(
+            description="Run Interaction Comparison", button_style="warning",
+            layout=widgets.Layout(width="280px"),
+        )
+        self.btn_run.on_click(self._on_run_clicked)
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
+        self.status_html = widgets.HTML("")
+        self.out = widgets.Output()
+
+        self._refresh_status()
+
+        self.ui = widgets.VBox([
+            widgets.HTML(
+                '<b>Multi-Organoid Interaction Comparison</b>'
+            ),
+            widgets.HTML(
+                '<div style="font-size:12px;color:#666;">'
+                'Compare cumulative interactions across organoid types or treatments. '
+                'Violin plot shows dying vs live distributions; '
+                'cumulative curve shows mean interactions before death.</div>'
+            ),
+            widgets.HBox(
+                [self.status_html, self.btn_refresh],
+                layout=widgets.Layout(align_items="center", gap="10px"),
+            ),
+            widgets.HBox([self.group_by, self.time_window]),
+            widgets.HTML("<b>Immune / interacting cell types:</b>"),
+            self.immune_box,
+            widgets.HTML("<hr>"),
+            widgets.HBox([self.btn_run, self.spinner_html]),
+            self.out,
+        ])
+
+    # ---- status ----
+    def _refresh_status(self):
+        ready_types = []
+        for org_type in self.organoid_types:
+            csv = Path(
+                self.output_dir, "analysis", org_type, "track_features",
+                f"BEHAV3D_{org_type}_combined_track_features_filtered.csv",
+            )
+            if csv.exists():
+                cols = pd.read_csv(csv, nrows=0).columns
+                if any(f"{ct}_contact" in cols for ct in self.immune_types):
+                    ready_types.append(org_type)
+
+        if not ready_types:
+            self.status_html.value = (
+                '<div style="color:#b00;">Waiting for filtered track data '
+                'with contact columns.</div>'
+            )
+            self.btn_run.disabled = True
+        else:
+            self.status_html.value = (
+                f'<div style="color:#080;">Ready: {", ".join(ready_types)}</div>'
+            )
+            self.btn_run.disabled = False
+
+    def _on_refresh_clicked(self, *_):
+        self._refresh_status()
+
+    # ---- run ----
+    def _on_run_clicked(self, *_):
+        selected_im = [
+            ct for ct, cb in self.immune_checkboxes.items() if cb.value
+        ]
+        if not selected_im:
+            return
+        self.btn_run.disabled = True
+        self.spinner_html.layout.display = None
+        self.out.clear_output()
+
+        with self.out:
+            try:
+                run_multi_organoid_interaction_comparison(
+                    output_dir=self.output_dir,
+                    organoid_types=self.organoid_types,
+                    immune_types=selected_im,
+                    metadata=self.metadata_loader.metadata,
+                    group_by=self.group_by.value,
+                    time_window_min=float(self.time_window.value),
+                    show_plots=True,
+                )
+                print("✅ Multi-organoid interaction comparison complete!")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self.btn_run.disabled = False
+
+
+class MultiOrganoidAnalysisPanel:
+    """
+    Wrapper that groups all cross-organoid comparison panels:
+      1. Death Dynamics Comparison  (existing)
+      2. Interaction Comparison     (new)
+    """
+    def __init__(self, metadata_loader, organoid_types):
+        self.metadata_loader = metadata_loader
+        self.organoid_types = organoid_types
+
+        # --- Sub-panel 1: Death Dynamics ---
+        self.death_panel = MultiOrganoidDeathDynamicsPanel(
+            metadata_loader=metadata_loader,
+            organoid_types=organoid_types,
+        )
+
+        # --- Sub-panel 2: Interaction Comparison ---
+        self.interaction_panel = MultiOrganoidInteractionComparisonPanel(
+            metadata_loader=metadata_loader,
+            organoid_types=organoid_types,
+        )
+
+        self.ui = widgets.VBox([
+            widgets.HTML(
+                '<h3>Multi-Organoid Analysis</h3>'
+            ),
+            widgets.HTML('<h4>1. Death Dynamics Comparison</h4>'),
+            self.death_panel.ui,
+            widgets.HTML('<h4>2. Interaction Comparison</h4>'),
+            self.interaction_panel.ui,
+        ])
+
+    @property
+    def btn_run(self):
+        """Expose first run button for register_buttons_in compatibility."""
+        return self.death_panel.btn_run
 
 
 class MultiOrganoidMorphologyDeathPanel:
