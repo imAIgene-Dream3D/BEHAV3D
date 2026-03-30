@@ -454,6 +454,7 @@ def train_pixel_classifier(
     output_dir,
     metadata=None,
     examples_per_sample = 3,
+    overwrite_images=False,
     sample_specific_classifier=False,
     n_workers=None,
     manual_dim_order=None,
@@ -534,6 +535,14 @@ def train_pixel_classifier(
     
     
     if images is None:
+        # If user requested overwrite, delete cached images and features
+        if overwrite_images:
+            print("Overwrite sample images requested — deleting cached data...")
+            if image_outpath.exists():
+                shutil.rmtree(image_outpath)
+            if features_outpath.exists():
+                shutil.rmtree(features_outpath)
+
         if not features_outpath.exists() or not image_outpath.exists():
             if image_outpath.exists():
                 shutil.rmtree(image_outpath)
@@ -1788,33 +1797,14 @@ def run_pixel_classifier_segmentation(
                 return None
             return stored == _range_attr_payload()
 
-        def _validate_compact_output_array(arr, context):
-            expected_shape = (requested_range_count,) + spatial_shape
-            if tuple(arr.shape) != expected_shape:
-                if (
-                    timepoint_range is None
-                    and tuple(arr.shape) == (requested_total_timepoints,) + spatial_shape
-                ):
-                    _write_range_attr_payload(arr)
-                    return
-                raise ValueError(
-                    f"{context}: existing zarr has shape {tuple(arr.shape)} but expected "
-                    f"{expected_shape} for requested raw range {requested_range_start}:{requested_range_end}."
-                )
-            metadata_matches = _range_metadata_matches(arr)
-            if metadata_matches is True:
+        def _validate_output_array(arr, context):
+            # If we match the total timepoints, we are good (global indexing)
+            if tuple(arr.shape) == (requested_total_timepoints,) + spatial_shape:
                 return
-            if metadata_matches is None:
-                if timepoint_range is None:
-                    _write_range_attr_payload(arr)
-                    return
-                raise ValueError(
-                    f"{context}: existing compact zarr matches the requested length but has no stored raw "
-                    f"timepoint range metadata. Remove it or rerun segmentation from scratch."
-                )
+
             raise ValueError(
-                f"{context}: existing zarr belongs to a different raw timepoint range than the requested "
-                f"{requested_range_start}:{requested_range_end}. Remove it or use overwrite."
+                f"{context}: existing zarr has shape {tuple(arr.shape)} but expected "
+                f"full length {(requested_total_timepoints,) + spatial_shape}."
             )
 
         loaded_mask_index_modes = {}
@@ -1865,7 +1855,7 @@ def run_pixel_classifier_segmentation(
                             all_outputs_match = False
                             break
                         try:
-                            _validate_compact_output_array(
+                            _validate_output_array(
                                 zarr.open(str(seg_path), mode="r+"),
                                 context=f"{sample_name} {cell_type} segments",
                             )
@@ -2011,19 +2001,20 @@ def run_pixel_classifier_segmentation(
         # Instead of append_to_zarr (which requires strict sequential order),
         # create zarrs with final size and each worker writes to a fixed index.
         # Two workers never touch the same index.
-        # Range outputs are compact in both modes; raw-range provenance is stored in zarr attrs.
-        output_timepoints = n_total
+        output_timepoints = requested_total_timepoints
         zarr_mode = "r+" if resuming else "w"
         zarr_kw = dict(shape=(output_timepoints,) + spatial_shape, chunks=(1,) + spatial_shape)
 
         def _open_output_array(outpath, dtype, context, reuse_existing, force_recreate=False):
+            if not force_recreate and reuse_existing and outpath.exists():
+                arr = zarr.open(str(outpath), mode="r+")
+                _validate_output_array(arr, context=context)
+                return arr
+            
             if force_recreate and outpath.exists():
                 shutil.rmtree(outpath)
-            if reuse_existing and outpath.exists():
-                arr = zarr.open(str(outpath), mode="r+")
-                _validate_compact_output_array(arr, context=context)
-                return arr
-            arr = zarr.open(str(outpath), mode=zarr_mode, dtype=dtype, **zarr_kw)
+                
+            arr = zarr.open(str(outpath), mode="w", shape=(output_timepoints,) + spatial_shape, chunks=(1,) + spatial_shape, dtype=dtype)
             _write_range_attr_payload(arr)
             return arr
 
@@ -2070,7 +2061,7 @@ def run_pixel_classifier_segmentation(
         def process_timepoint(args, _ff=sample_extract_features):
             t_i, t = args
             t_start = time.time()
-            write_idx = t_i
+            write_idx = t
             
             if not only_segment:
                 # Read 1 timepoint from zarr (lazy read, materialized here)

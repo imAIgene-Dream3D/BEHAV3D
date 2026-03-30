@@ -3,6 +3,11 @@ from IPython.display import display
 from pathlib import Path
 import os
 import pandas as pd
+
+# DEFEAT BUGGY PyOpenCL caching (Windows/Python 3.12 bug)
+# MUST BE SET BEFORE pyopencl or apoc ARE IMPORTED
+os.environ['PYOPENCL_NO_CACHE'] = '1'
+os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
 import yaml
 import traceback
 from functools import partial
@@ -47,9 +52,66 @@ class PixelClassifierPanel:
         print(f"Detected other cell types: {self.other_types}")
         print(f"Dead channel present: {self.has_death}")
 
+        # Check for APOC availability
+        try:
+            import apoc
+            import pyopencl as cl
+            import pyclesperanto_prototype as cle
+            APOC_AVAILABLE = len(cl.get_platforms()) > 0
+            _gpu_devices = cle.available_device_names()
+        except Exception:
+            APOC_AVAILABLE = False
+            _gpu_devices = []
+
+        _engine_options = (
+            ["Scikit-Learn (CPU)", "APOC (GPU-Accelerated)"] if APOC_AVAILABLE
+            else ["Scikit-Learn (CPU)"]
+        )
+        _saved_engine = pc.get("classifier_engine", "Scikit-Learn (CPU)")
+        # Guard: if the saved engine is no longer available (e.g. APOC not installed),
+        # fall back to the first available option instead of crashing with TraitError.
+        if _saved_engine not in _engine_options:
+            _saved_engine = _engine_options[0]
+
+        self.classifier_engine = widgets.Dropdown(
+            options=_engine_options,
+            value=_saved_engine,
+            description="Engine:"
+        )
+        if not APOC_AVAILABLE:
+            self.classifier_engine.tooltip = "APOC (GPU) disabled: 'apoc' and 'pyopencl' required."
+
+        self.gpu_device = widgets.Dropdown(
+            options=_gpu_devices,
+            value=pc.get("gpu_device_name", _gpu_devices[0]) if _gpu_devices else "",
+            description="GPU Device:",
+            layout=widgets.Layout(width="auto", display="none")  # Hidden by default
+        )
+        self.gpu_device.observe(self._on_gpu_changed, names="value")
+
+        self.apoc_strategy = widgets.Dropdown(
+            options=[
+                "APOC (Direct Instance Segmentation)",
+                "APOC Mask + EDT/Watershed Resegmentation",
+                "APOC Probability Map + Watershed"
+            ],
+            value=pc.get("apoc_strategy", "APOC (Direct Instance Segmentation)"),
+            description="Strategy:",
+            style={'description_width': 'initial'},
+            layout=widgets.Layout(width="auto", display="none")
+        )
+        self.apoc_strategy.observe(self._toggle_engine_widgets, names="value")
+
+
         self.examples_per_sample = widgets.IntText(
             description="Examples per sample",
             value=int(pc.get("examples_per_sample", 3))
+        )
+        self.overwrite_sample_images = widgets.Checkbox(
+            description="Overwrite sample images",
+            value=False,
+            indent=False,
+            style={"description_width": "auto"},
         )
         '''self.sample_specific_classifier = widgets.Checkbox(
             description="Sample-specific classifier",
@@ -105,6 +167,7 @@ class PixelClassifierPanel:
         self.edt_thresholds = {}
         self._create_edt_threshold_inputs()
         self._create_postprocessing_inputs()
+        self._create_probability_threshold_inputs()
         self.use_all_timepoints = widgets.Checkbox(
             description="Process ALL timepoints",
             value=bool(pc.get("use_all_timepoints", True))
@@ -165,6 +228,52 @@ class PixelClassifierPanel:
         self.btn_run.on_click(partial(self._on_apply_clicked, only_segment=False))
         self.btn_resegment.on_click(partial(self._on_apply_clicked, only_segment=True))
 
+        # --- Post-processing: size filtering ---
+        # We create a list of min size inputs, one per cell type
+        self.apoc_min_size_inputs = {}
+        for ct in self.all_cell_types:
+            # Re-use values from CPU params if available, else standard defaults
+            if ct in self.organoid_types: default_size = 1000
+            else: default_size = 10
+            
+            saved_size = pc.get(f"apoc_{ct}_min_size_voxels", default_size)
+            self.apoc_min_size_inputs[ct] = widgets.BoundedIntText(
+                description=f"{ct.capitalize()}:",
+                value=int(saved_size),
+                min=0,
+                max=1000000,
+                step=10,
+                style={'description_width': '100px'},
+                layout=widgets.Layout(width='200px'),
+            )
+
+        self.apoc_size_inputs_box = widgets.VBox(list(self.apoc_min_size_inputs.values()))
+
+        self.btn_size_filter = widgets.Button(
+            description="Run size filtering",
+            button_style="warning",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto"),
+        )
+        self.spinner_filter = widgets.HTML(value=spinning_loader)
+        self.spinner_filter.layout.display = "none"
+        
+        # New row for size filtering: inputs on the left, button on the right
+        self.filter_row = widgets.HBox(
+            [self.apoc_size_inputs_box, self.btn_size_filter, self.spinner_filter],
+            layout=widgets.Layout(align_items="flex-end", gap="12px"),
+        )
+        self.btn_size_filter.on_click(self._on_size_filter_clicked)
+
+        self.post_processing_box = widgets.VBox([
+            widgets.HTML("<b>Post-processing</b>"),
+            widgets.HTML(
+                "<span style='color:#666;font-size:0.9em;'>"
+                "Remove segments smaller than threshold (voxels). Holes left by removed embedded objects are filled."
+                "</span>"
+            ),
+            self.filter_row,
+        ])
+
         self.out = widgets.Output()
 
         self.clf_paths_box = widgets.VBox()
@@ -221,10 +330,25 @@ class PixelClassifierPanel:
                         self.fill_holes[other_type],
                     ]))
 
+        # Store CPU-only widget groups so we can hide them when APOC is selected
+        self._cpu_seg_params_box = widgets.VBox(segmentation_widgets)
+
+        # Build probability map parameter widgets
+        prob_widgets = [widgets.HTML("<b>Probability Map parameters per cell type</b>")]
+        for ct in self.all_cell_types:
+            if ct in self.prob_mask_thresholds:
+                prob_widgets.append(widgets.HBox([
+                    self.prob_mask_thresholds[ct],
+                    self.prob_seed_thresholds[ct],
+                    self.segment_size_mins[ct],
+                ]))
+        self._prob_params_box = widgets.VBox(prob_widgets)
+
         self.ui = widgets.VBox([
             widgets.VBox([
                 widgets.HTML("<b>Train pixel classifier</b>"),
-                widgets.HBox([self.examples_per_sample, self.n_workers]),
+                widgets.HBox([self.classifier_engine, self.gpu_device, self.apoc_strategy]),
+                widgets.HBox([self.examples_per_sample, self.overwrite_sample_images, self.n_workers]),
                 #self.sample_specific_classifier,
                 self.train_row,
             ]),
@@ -233,15 +357,22 @@ class PixelClassifierPanel:
                 widgets.HTML("<b>Apply segmentation</b>"),
                 self.manual_clf_paths,
                 self.clf_paths_box,
-                *segmentation_widgets,
+                self._cpu_seg_params_box,
+                self._prob_params_box,
                 self.overwrite_existing,
                 widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end]),
                 self.only_resegment_warning,
                 self.apply_row,
             ]),
             widgets.HTML("<hr>"),
+            self.post_processing_box,
+            widgets.HTML("<hr>"),
             self.out
         ])
+
+        # Engine toggle: hide CPU-only widgets when APOC is selected
+        self.classifier_engine.observe(self._toggle_engine_widgets, names='value')
+        self._toggle_engine_widgets()  # apply on init
 
         self._viewer = None
 
@@ -339,9 +470,40 @@ class PixelClassifierPanel:
                 value=bool(saved_fill),
                 indent=False,
             )
+
+    def _create_probability_threshold_inputs(self):
+        """Create per-cell-type mask and seed threshold inputs for probability map strategy."""
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+
+        self.prob_mask_thresholds = {}
+        self.prob_seed_thresholds = {}
+
+        for cell_type in self.all_cell_types:
+            saved_mask = pc.get(f"{cell_type}_prob_mask_threshold", 0.5)
+            self.prob_mask_thresholds[cell_type] = widgets.BoundedFloatText(
+                description=f"{cell_type.capitalize()} mask thr:",
+                value=float(saved_mask),
+                min=0.0,
+                max=1.0,
+                step=0.05,
+                style={'description_width': '160px'},
+                layout=widgets.Layout(width='auto'),
+            )
+
+            saved_seed = pc.get(f"{cell_type}_prob_seed_threshold", 0.8)
+            self.prob_seed_thresholds[cell_type] = widgets.BoundedFloatText(
+                description=f"{cell_type.capitalize()} seed thr:",
+                value=float(saved_seed),
+                min=0.0,
+                max=1.0,
+                step=0.05,
+                style={'description_width': '160px'},
+                layout=widgets.Layout(width='auto'),
+            )
     
     def _persist_params(self):
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        pc["classifier_engine"] = str(self.classifier_engine.value)
         pc["examples_per_sample"] = int(self.examples_per_sample.value)
         #pc["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
         pc["workers"] = int(self.n_workers.value)
@@ -350,7 +512,12 @@ class PixelClassifierPanel:
         pc["tp_end"]   = int(self.tp_end.value)
         pc["manual_clf_paths"] = bool(self.manual_clf_paths.value)
         pc["overwrite_existing"] = bool(self.overwrite_existing.value)
+        pc["gpu_device_name"] = str(self.gpu_device.value)
+        pc["apoc_strategy"] = str(self.apoc_strategy.value)
         
+        for ct, w in self.apoc_min_size_inputs.items():
+            pc[f"apoc_{ct}_min_size_voxels"] = int(w.value)
+
         for cell_type, threshold_widget in self.edt_thresholds.items():
             pc[f"{cell_type}_edt_threshold"] = float(threshold_widget.value)
         
@@ -361,6 +528,10 @@ class PixelClassifierPanel:
                 pc[f"{cell_type}_opening_nr_pixels"] = int(self.opening_nr_pixels[cell_type].value)
             if cell_type in self.fill_holes:
                 pc[f"{cell_type}_fill_holes"] = bool(self.fill_holes[cell_type].value)
+            if cell_type in self.prob_mask_thresholds:
+                pc[f"{cell_type}_prob_mask_threshold"] = float(self.prob_mask_thresholds[cell_type].value)
+            if cell_type in self.prob_seed_thresholds:
+                pc[f"{cell_type}_prob_seed_threshold"] = float(self.prob_seed_thresholds[cell_type].value)
         
         if self.manual_clf_paths.value:
             pc["clf_dir"] = str(self.clf_dir.value or "")
@@ -374,6 +545,58 @@ class PixelClassifierPanel:
                 self.metadata_loader.behav3d_parameters_path.open("w"),
                 sort_keys=False
             )
+
+    def _toggle_engine_widgets(self, change=None):
+        """Show/hide widgets depending on engine and strategy."""
+        is_apoc = str(self.classifier_engine.value) == "APOC (GPU-Accelerated)"
+        strategy = str(self.apoc_strategy.value)
+        is_edt = is_apoc and strategy == "APOC Mask + EDT/Watershed Resegmentation"
+        is_prob = is_apoc and strategy == "APOC Probability Map + Watershed"
+        is_cpu_like = not is_apoc or is_edt
+        
+        hide_cpu = None if is_cpu_like else 'none'
+
+        # CPU segmentation parameters (EDT, min size, opening, fill holes)
+        self._cpu_seg_params_box.layout.display = hide_cpu
+        self.n_workers.layout.display = hide_cpu
+
+        # Probability Map parameters (only visible for prob strategy)
+        self._prob_params_box.layout.display = (None if is_prob else 'none')
+        
+        # GPU Device and APOC Strategy selection
+        self.gpu_device.layout.display = (None if is_apoc else 'none')
+        self.apoc_strategy.layout.display = (None if is_apoc else 'none')
+        
+        if is_apoc:
+            self._apply_gpu_selection()
+
+        # 'Only resegment' button (available for EDT and Probability strategies)
+        show_reseg = is_cpu_like or is_prob
+        self.btn_resegment.layout.display = (None if show_reseg else 'none')
+        self.only_resegment_warning.layout.display = (None if show_reseg else 'none')
+
+        # Manual classifier paths (APOC uses .cl files from training dir)
+        self.manual_clf_paths.layout.display = ('none' if is_apoc else None)
+        if is_apoc:
+            self.clf_paths_box.layout.display = 'none'
+
+        # Post-processing (Size Filtering via standalone button)
+        # Shown only for Direct APOC strategy
+        self.post_processing_box.layout.display = (None if is_apoc and not is_cpu_like and not is_prob else 'none')
+
+    def _on_gpu_changed(self, change):
+        if change['new']:
+            self._apply_gpu_selection()
+
+    def _apply_gpu_selection(self):
+        device = str(self.gpu_device.value)
+        if device:
+            try:
+                import pyclesperanto_prototype as cle
+                print(f"APOC: Explicitly selecting GPU device: {device}")
+                cle.select_device(device)
+            except Exception as e:
+                print(f"⚠️ Error selecting GPU device: {e}")
 
     def _toggle_timepoint_inputs(self, change=None):
         show = not self.use_all_timepoints.value
@@ -431,6 +654,7 @@ class PixelClassifierPanel:
     def _lock(self, state: bool):
         to_lock = [
             self.btn_train, self.btn_run, self.btn_resegment,
+            self.classifier_engine,
             #self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
             self.examples_per_sample, self.n_workers,
             self.use_all_timepoints, self.tp_start, self.tp_end,
@@ -440,6 +664,8 @@ class PixelClassifierPanel:
         to_lock.extend(self.segment_size_mins.values())
         to_lock.extend(self.opening_nr_pixels.values())
         to_lock.extend(self.fill_holes.values())
+        for w in self.apoc_min_size_inputs.values(): w.disabled = state
+        for w in [self.btn_size_filter]: w.disabled = state
         for w in to_lock: w.disabled = state
         try:
             self.clf_dir.text.disabled = state
@@ -453,7 +679,10 @@ class PixelClassifierPanel:
         except Exception: pass
 
     def _get_current_params(self):
-        """Collect current parameter values and widget limits into a dict"""
+        """Collect current parameter values and widget limits into a dict.
+        Also includes saved APOC per-cell-type params from the config YAML
+        so the APOC widget can restore previous settings on open.
+        """
         params = {}
         for cell_type in self.all_cell_types:
             if cell_type in self.edt_thresholds:
@@ -476,10 +705,30 @@ class PixelClassifierPanel:
                 params[f"{cell_type}_opening_step"] = int(w.step)
             if cell_type in self.fill_holes:
                 params[f"{cell_type}_fill_holes"] = bool(self.fill_holes[cell_type].value)
+            if cell_type in self.prob_mask_thresholds:
+                params[f"{cell_type}_prob_mask_threshold"] = float(self.prob_mask_thresholds[cell_type].value)
+            if cell_type in self.prob_seed_thresholds:
+                params[f"{cell_type}_prob_seed_threshold"] = float(self.prob_seed_thresholds[cell_type].value)
+
+        # Include global GPU selection
+        params["gpu_device_name"] = str(self.gpu_device.value)
+
+        # Include saved APOC per-cell-type params from config YAML
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+        all_apoc_types = list(self.all_cell_types)
+        if self.has_death:
+            all_apoc_types.append("dead")
+        for ct in all_apoc_types:
+            for key in ["feature_preset", "feature_string", "sigmas", "custom_feature_string", "max_depth", "num_ensembles", "channels"]:
+                saved = pc.get(f"apoc_{ct}_{key}")
+                if saved is not None:
+                    params[f"apoc_{ct}_{key}"] = saved
         return params
     
     def _update_widgets_from_params(self, params):
-        """Update widget values from a params dict and persist to config"""
+        """Update widget values from a params dict and persist to config.
+        Accepts both CPU segmentation params and APOC per-cell-type params.
+        """
         for cell_type in self.all_cell_types:
             if f"{cell_type}_edt_threshold" in params and cell_type in self.edt_thresholds:
                 self.edt_thresholds[cell_type].value = float(params[f"{cell_type}_edt_threshold"])
@@ -489,6 +738,18 @@ class PixelClassifierPanel:
                 self.opening_nr_pixels[cell_type].value = int(params[f"{cell_type}_opening_nr_pixels"])
             if f"{cell_type}_fill_holes" in params and cell_type in self.fill_holes:
                 self.fill_holes[cell_type].value = bool(params[f"{cell_type}_fill_holes"])
+            if f"{cell_type}_prob_mask_threshold" in params and cell_type in self.prob_mask_thresholds:
+                self.prob_mask_thresholds[cell_type].value = float(params[f"{cell_type}_prob_mask_threshold"])
+            if f"{cell_type}_prob_seed_threshold" in params and cell_type in self.prob_seed_thresholds:
+                self.prob_seed_thresholds[cell_type].value = float(params[f"{cell_type}_prob_seed_threshold"])
+
+        # Cache APOC per-cell-type params into the YAML config dict
+        # (they will be written to disk by _persist_params below)
+        pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        for key, value in params.items():
+            if key.startswith("apoc_"):
+                pc[key] = value
+
         # Persist updated values to config file
         self._persist_params()
         print("Parameters updated from training and saved to config")
@@ -506,30 +767,51 @@ class PixelClassifierPanel:
                 # Collect initial parameters from widget
                 initial_params = self._get_current_params()
                 
-                print("Starting pixel classifier training...")
-                print("Napari viewer will open. Close it when done labeling.")
+                engine = str(self.classifier_engine.value)
                 
-                # Print sigma table for the pixel sizes in metadata
-                try:
-                    md = self.metadata_loader.metadata
-                    px_xy = float(md['pixel_distance_xy'].iloc[0])
-                    px_z  = float(md['pixel_distance_z'].iloc[0])
-                    print(format_sigma_table(px_xy, px_z))
-                except Exception:
-                    pass
-                
-                ret = train_pixel_classifier(
-                    output_dir=str(odir),
-                    metadata=self.metadata_loader.metadata,
-                    examples_per_sample=int(self.examples_per_sample.value),
-                    #sample_specific_classifier=bool(self.sample_specific_classifier.value),
-                    n_workers=int(self.n_workers.value),
-                    organoid_types=self.organoid_types,
-                    immune_types=self.immune_types,
-                    other_types=self.other_types,
-                    initial_params=initial_params,
-                    on_params_changed=self._update_widgets_from_params,
-                )
+                if engine == "APOC (GPU-Accelerated)":
+                    # Use the custom APOC widget
+                    from behav3d.preprocessing.segmentation.apoc_train import train_pixel_classifier_apoc
+                    print("Starting APOC pixel classifier training...")
+                    print("Napari viewer will open with the APOC widget.")
+                    ret = train_pixel_classifier_apoc(
+                        output_dir=str(odir),
+                        metadata=self.metadata_loader.metadata,
+                        examples_per_sample=int(self.examples_per_sample.value),
+                        overwrite_images=bool(self.overwrite_sample_images.value),
+                        organoid_types=self.organoid_types,
+                        immune_types=self.immune_types,
+                        other_types=self.other_types,
+                        initial_params=initial_params,
+                        on_params_changed=self._update_widgets_from_params,
+                    )
+                else:
+                    # Use the original scikit-learn pixel classifier
+                    print("Starting pixel classifier training...")
+                    print("Napari viewer will open. Close it when done labeling.")
+                    
+                    # Print sigma table for the pixel sizes in metadata
+                    try:
+                        md = self.metadata_loader.metadata
+                        px_xy = float(md['pixel_distance_xy'].iloc[0])
+                        px_z  = float(md['pixel_distance_z'].iloc[0])
+                        print(format_sigma_table(px_xy, px_z))
+                    except Exception:
+                        pass
+                    
+                    ret = train_pixel_classifier(
+                        output_dir=str(odir),
+                        metadata=self.metadata_loader.metadata,
+                        examples_per_sample=int(self.examples_per_sample.value),
+                        overwrite_images=bool(self.overwrite_sample_images.value),
+                        #sample_specific_classifier=bool(self.sample_specific_classifier.value),
+                        n_workers=int(self.n_workers.value),
+                        organoid_types=self.organoid_types,
+                        immune_types=self.immune_types,
+                        other_types=self.other_types,
+                        initial_params=initial_params,
+                        on_params_changed=self._update_widgets_from_params,
+                    )
                 self._viewer = ret if (ret is not None and hasattr(ret, "close")) else None
                 self.spinner_train.layout.display = "none"
                 self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
@@ -566,40 +848,63 @@ class PixelClassifierPanel:
 
                 self.spinner_apply.layout.display = None
                 
-                # Print sigma table for the pixel sizes in metadata
-                try:
-                    md = self.metadata_loader.metadata
-                    px_xy = float(md['pixel_distance_xy'].iloc[0])
-                    px_z  = float(md['pixel_distance_z'].iloc[0])
-                    print(format_sigma_table(px_xy, px_z))
-                except Exception:
-                    pass
-                
-                new_md = run_pixel_classifier_segmentation(
-                    output_dir=str(odir),
-                    metadata=self.metadata_loader.metadata,
-                    metadata_csv_path=str(self.metadata_loader.metadata_csv_path),
-                    organoid_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.organoid_types if ct in self.edt_thresholds},
-                    immune_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.immune_types if ct in self.edt_thresholds},
-                    other_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.other_types if ct in self.edt_thresholds},
-                    organoid_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.organoid_types if ct in self.segment_size_mins},
-                    immune_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.immune_types if ct in self.segment_size_mins},
-                    other_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.other_types if ct in self.segment_size_mins},
-                    organoid_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.organoid_types if ct in self.opening_nr_pixels},
-                    immune_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.immune_types if ct in self.opening_nr_pixels},
-                    other_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.other_types if ct in self.opening_nr_pixels},
-                    organoid_fill_holes={ct: bool(self.fill_holes[ct].value) for ct in self.organoid_types if ct in self.fill_holes},
-                    immune_fill_holes={ct: bool(self.fill_holes[ct].value) for ct in self.immune_types if ct in self.fill_holes},
-                    other_fill_holes={ct: bool(self.fill_holes[ct].value) for ct in self.other_types if ct in self.fill_holes},
-                    timepoint_range=tpr,
-                    clf_organoid_paths=clf_organoid_paths,
-                    clf_immune_paths=clf_immune_paths,
-                    clf_other_paths=clf_other_paths,
-                    clf_death_path=clf_death_path,
-                    only_segment=bool(only_segment),
-                    overwrite_existing=bool(self.overwrite_existing.value),
-                    n_workers=int(self.n_workers.value),
-                )
+                if str(self.classifier_engine.value) == "APOC (GPU-Accelerated)":
+                    from behav3d.preprocessing.segmentation.apoc_segment import run_apoc_segmentation
+                    pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+                    new_md = run_apoc_segmentation(
+                        output_dir=str(odir),
+                        metadata=self.metadata_loader.metadata,
+                        metadata_csv_path=str(self.metadata_loader.metadata_csv_path),
+                        apoc_config=pc,
+                        organoid_types=self.organoid_types,
+                        immune_types=self.immune_types,
+                        other_types=self.other_types,
+                        timepoint_range=tpr,
+                        clf_organoid_paths=clf_organoid_paths,
+                        clf_immune_paths=clf_immune_paths,
+                        clf_other_paths=clf_other_paths,
+                        clf_death_path=clf_death_path,
+                        only_segment=bool(only_segment),
+                        overwrite_existing=bool(self.overwrite_existing.value),
+                        n_workers=int(self.n_workers.value),
+                        gpu_device=str(self.gpu_device.value),
+                        apoc_strategy=str(self.apoc_strategy.value),
+                    )
+                else:
+                    # Original scikit-learn pixel classifier
+                    try:
+                        md = self.metadata_loader.metadata
+                        px_xy = float(md['pixel_distance_xy'].iloc[0])
+                        px_z  = float(md['pixel_distance_z'].iloc[0])
+                        print(format_sigma_table(px_xy, px_z))
+                    except Exception:
+                        pass
+                    
+                    new_md = run_pixel_classifier_segmentation(
+                        output_dir=str(odir),
+                        metadata=self.metadata_loader.metadata,
+                        metadata_csv_path=str(self.metadata_loader.metadata_csv_path),
+                        organoid_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.organoid_types if ct in self.edt_thresholds},
+                        immune_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.immune_types if ct in self.edt_thresholds},
+                        other_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.other_types if ct in self.edt_thresholds},
+                        organoid_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.organoid_types if ct in self.segment_size_mins},
+                        immune_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.immune_types if ct in self.segment_size_mins},
+                        other_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.other_types if ct in self.segment_size_mins},
+                        organoid_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.organoid_types if ct in self.opening_nr_pixels},
+                        immune_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.immune_types if ct in self.opening_nr_pixels},
+                        other_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.other_types if ct in self.opening_nr_pixels},
+                        organoid_fill_holes={ct: bool(self.fill_holes[ct].value) for ct in self.organoid_types if ct in self.fill_holes},
+                        immune_fill_holes={ct: bool(self.fill_holes[ct].value) for ct in self.immune_types if ct in self.fill_holes},
+                        other_fill_holes={ct: bool(self.fill_holes[ct].value) for ct in self.other_types if ct in self.fill_holes},
+                        timepoint_range=tpr,
+                        clf_organoid_paths=clf_organoid_paths,
+                        clf_immune_paths=clf_immune_paths,
+                        clf_other_paths=clf_other_paths,
+                        clf_death_path=clf_death_path,
+                        only_segment=bool(only_segment),
+                        overwrite_existing=bool(self.overwrite_existing.value),
+                        n_workers=int(self.n_workers.value),
+                    )
                 if new_md is not None:
                     self.metadata_loader.metadata = new_md
                     new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
@@ -608,7 +913,70 @@ class PixelClassifierPanel:
             finally:
                 self.spinner_apply.layout.display = "none"
                 self._lock(False)
+
+    def _on_size_filter_clicked(self, _):
+        """Remove segments smaller than the user-specified voxel threshold."""
+        self._lock(True)
+        with self.out:
+            self.out.clear_output()
+            self.spinner_filter.layout.display = None
+            try:
+                from behav3d.preprocessing.segmentation.size_filter import filter_segments_by_size
+
+                odir = Path(self.metadata_loader.output_dir).expanduser()
+                metadata = self.metadata_loader.metadata
+                all_cell_types = self.organoid_types + self.immune_types + self.other_types
+                sample_names = metadata['sample_name'].unique()
+
+                # Persist the setting
+                pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+                for ct, w in self.apoc_min_size_inputs.items():
+                    pc[f"apoc_{ct}_min_size_voxels"] = int(w.value)
+
+                if hasattr(self.metadata_loader, "behav3d_parameters_path"):
+                    yaml.safe_dump(
+                        self.metadata_loader.behav3d_parameters,
+                        self.metadata_loader.behav3d_parameters_path.open("w"),
+                        sort_keys=False,
+                    )
+
+                print(f"🔍 Size filtering: removing small segments and filling holes")
+
+                for sample_name in sample_names:
+                    img_dir = odir / "images" / sample_name
+                    found_any = False
+
+                    for ct in all_cell_types:
+                        seg_path = img_dir / f"{sample_name}_{ct}_segments.zarr"
+                        if not seg_path.exists():
+                            continue
+
+                        min_size = int(self.apoc_min_size_inputs[ct].value)
+                        if min_size <= 0:
+                            continue
+
+                        found_any = True
+                        print(f"  {sample_name} / {ct} (min_size={min_size}):")
+                        removed = filter_segments_by_size(
+                            seg_path, 
+                            min_size, 
+                            fill_holes=True
+                        )
+                        print(f"    → removed {removed} segments/holes")
+
+                    if not found_any:
+                        print(f"  ⚠️ No segmentation files found for {sample_name}")
+
+                print("\n✅ Size filtering complete!")
+
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_filter.layout.display = "none"
+                self._lock(False)
+
 class CellposeChannelConfigPanel:
+
     """Panel for configuring channel labels for Cellpose segmentation.
     
     This panel calculates the number of channels from metadata cell types

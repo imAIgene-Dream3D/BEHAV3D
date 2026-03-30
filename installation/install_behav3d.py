@@ -482,6 +482,49 @@ def install_cellpose(conda_path, gpu_info, force_cpu=False):
 
 
 # =============================================================================
+# OPENCL BACKEND (for APOC / pyopencl)
+# =============================================================================
+
+def install_opencl_backend(conda_path):
+    """Install platform-specific OpenCL ICD loader for APOC/pyopencl.
+    
+    - macOS : conda install -c conda-forge ocl_icd_wrapper_apple
+    - Linux : conda install -c conda-forge ocl-icd-system
+    - Windows: uses the OS built-in ICD loader — no extra package needed.
+    """
+    system = get_platform()
+    
+    if system not in ("Darwin", "Linux"):
+        # Windows uses the system ICD loader automatically
+        return True
+    
+    pkg_mgr = get_package_manager() or conda_path
+    
+    print_header("OPENCL BACKEND FOR APOC")
+    
+    if system == "Darwin":
+        print_step("Installing macOS OpenCL ICD wrapper (required for APOC GPU classifier)...")
+        cmd = f'"{pkg_mgr}" install -n {ENV_NAME} -c conda-forge ocl_icd_wrapper_apple -y'
+        try:
+            run_command(cmd, check=False)
+            print_success("macOS OpenCL ICD wrapper installed (ocl_icd_wrapper_apple)")
+        except Exception as e:
+            print_warning(f"Could not install ocl_icd_wrapper_apple: {e}")
+            print_info("APOC may still work if an OpenCL platform is already available.")
+    
+    elif system == "Linux":
+        print_step("Installing Linux OpenCL ICD system loader (required for APOC GPU classifier)...")
+        cmd = f'"{pkg_mgr}" install -n {ENV_NAME} -c conda-forge ocl-icd-system -y'
+        try:
+            run_command(cmd, check=False)
+            print_success("Linux OpenCL ICD system loader installed (ocl-icd-system)")
+        except Exception as e:
+            print_warning(f"Could not install ocl-icd-system: {e}")
+            print_info("APOC may still work if an OpenCL platform is already provided by your GPU driver.")
+    
+    return True
+
+# =============================================================================
 # BEHAV3D PACKAGE INSTALLATION
 # =============================================================================
 
@@ -719,6 +762,9 @@ Examples:
             if not create_conda_environment(conda_path):
                 print_error("Failed to create conda environment.")
                 return 1
+    
+    # Install OpenCL backend for APOC (platform-specific)
+    install_opencl_backend(conda_path)
     
     # Install nomkl to prevent OpenMP conflicts between conda MKL and PyTorch
     # This must be done BEFORE installing PyTorch

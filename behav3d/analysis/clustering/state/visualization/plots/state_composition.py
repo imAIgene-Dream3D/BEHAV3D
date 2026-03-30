@@ -2,6 +2,11 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.gridspec import GridSpec
+
+
+A4_PORTRAIT = (8.27, 11.69)
 
 
 def plot_state_composition_over_time(
@@ -256,6 +261,26 @@ def _compute_relative_matrices_by_sample(
     return relative_by_sample, relative_pooled
 
 
+def _compute_overall_relative_composition_by_sample(
+    df,
+    *,
+    state_col,
+    sample_col,
+    state_order,
+    sample_order,
+):
+    """Compute pooled relative composition per sample across the full experiment."""
+    overall_by_sample = {}
+    for sample in sample_order:
+        panel = df[df[sample_col] == sample]
+        counts = panel[state_col].value_counts().reindex(state_order, fill_value=0).astype(float)
+        total = float(counts.sum())
+        if total > 0:
+            counts = counts / total
+        overall_by_sample[str(sample)] = counts
+    return overall_by_sample
+
+
 def _build_color_map(labels, cmap_name="tab20"):
     """Create deterministic label->color mapping."""
     labels = [str(x) for x in list(labels)]
@@ -350,9 +375,90 @@ def _build_relative_plot_data_table(relative_by_sample, plot_view=None):
     return out
 
 
+def _build_overall_summary_plot_data_table(overall_by_sample, plot_view=None):
+    """Build long-form CSV table for pooled per-sample summary bars."""
+    rows = []
+    for sample_name, ser in overall_by_sample.items():
+        if ser is None or len(ser) == 0:
+            continue
+        for state_id, value in ser.items():
+            rows.append(
+                {
+                    "sample_name": str(sample_name),
+                    "time": np.nan,
+                    "state_id": str(state_id),
+                    "relative_proportion": float(value),
+                }
+            )
+    out = pd.DataFrame(rows)
+    if plot_view is not None:
+        out["plot_view"] = str(plot_view)
+    return out
+
+
+def _paginate_samples(sample_names, samples_per_page=4):
+    """Split sample names into page-sized chunks while preserving order."""
+    sample_names = [str(x) for x in list(sample_names)]
+    samples_per_page = max(int(samples_per_page), 1)
+    return [
+        sample_names[i : i + samples_per_page]
+        for i in range(0, len(sample_names), samples_per_page)
+    ]
+
+
+def _compute_state_panel_ylims(
+    relative_by_sample,
+    *,
+    state_order,
+    headroom=0.10,
+    min_positive_ylim=0.05,
+):
+    """Compute per-state y-limits from the largest observed relative proportion."""
+    ylims = {}
+    for state in state_order:
+        max_value = 0.0
+        for mat in relative_by_sample.values():
+            if mat is None or len(mat) == 0 or state not in mat.columns:
+                continue
+            state_max = float(np.nanmax(mat[state].to_numpy(dtype=float))) if len(mat.index) > 0 else 0.0
+            if np.isfinite(state_max):
+                max_value = max(max_value, state_max)
+        if max_value <= 0.0:
+            ylims[str(state)] = (0.0, 1.0)
+            continue
+        y_max = min(1.0, max(max_value * (1.0 + float(headroom)), float(min_positive_ylim)))
+        ylims[str(state)] = (0.0, float(y_max))
+    return ylims
+
+
+def _plot_overall_summary_bar(ax, overall, *, state_order, state_colors, show_ylabel=False):
+    """Draw a narrow vertical stacked bar for pooled sample composition."""
+    bottom = 0.0
+    for state in state_order:
+        value = float(overall.get(state, 0.0))
+        ax.bar(
+            [0.0],
+            [value],
+            bottom=bottom,
+            width=0.8,
+            color=state_colors[state],
+            linewidth=0,
+        )
+        bottom += value
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlim(-0.6, 0.6)
+    ax.set_xticks([])
+    if show_ylabel:
+        ax.set_ylabel("Proportion")
+    else:
+        ax.set_yticklabels([])
+    ax.set_xlabel("Overall")
+
+
 def _plot_page_relative_stacked_grid(
     relative_by_sample,
     *,
+    overall_by_sample,
     state_order,
     time_col,
     sample_col,
@@ -364,9 +470,19 @@ def _plot_page_relative_stacked_grid(
 ):
     """Page 1: relative stacked composition per sample (grid)."""
     samples = list(relative_by_sample.keys())
-    fig, axes = _make_panel_grid(len(samples), grid_ncols, figsize_per_panel)
+    ncols = max(1, int(grid_ncols))
+    nrows = max(1, int(np.ceil(float(len(samples)) / float(ncols))))
+    fig = plt.figure(figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows))
+    outer = GridSpec(nrows=nrows, ncols=ncols, figure=fig)
+    plot_axes = []
+    first_handles = []
+    first_labels = []
+
     for i, sample in enumerate(samples):
-        ax = axes[i]
+        inner = outer[i].subgridspec(1, 2, width_ratios=[8, 1], wspace=0.10)
+        ax = fig.add_subplot(inner[0, 0])
+        ax_bar = fig.add_subplot(inner[0, 1], sharey=ax)
+        plot_axes.append(ax)
         mat = relative_by_sample[sample]
         x = mat.index.to_numpy(dtype=float)
         if len(x) == 0:
@@ -376,6 +492,7 @@ def _plot_page_relative_stacked_grid(
                 pad=sample_title_pad,
             )
             ax.axis("off")
+            ax_bar.axis("off")
             continue
         y_arrays = [mat[state].to_numpy(dtype=float) for state in state_order]
         colors = [state_colors[state] for state in state_order]
@@ -388,15 +505,26 @@ def _plot_page_relative_stacked_grid(
         )
         ax.set_xlabel(time_col)
         ax.set_ylabel("Proportion")
+        _plot_overall_summary_bar(
+            ax_bar,
+            overall_by_sample[sample],
+            state_order=state_order,
+            state_colors=state_colors,
+        )
+        if len(first_labels) == 0:
+            first_handles, first_labels = ax.get_legend_handles_labels()
+
+    for i in range(len(samples), nrows * ncols):
+        ax_empty = fig.add_subplot(outer[i])
+        ax_empty.axis("off")
 
     fig.subplots_adjust(hspace=0.35)
-    handles, labels = axes[0].get_legend_handles_labels() if len(samples) > 0 else ([], [])
-    if len(labels) > 0:
+    if len(first_labels) > 0:
         fig.legend(
-            handles,
-            labels,
+            first_handles,
+            first_labels,
             loc="lower center",
-            ncol=min(len(labels), 8),
+            ncol=min(len(first_labels), 8),
             frameon=False,
         )
         fig.tight_layout(rect=(0, 0.06, 1, 1))
@@ -468,6 +596,84 @@ def _plot_page_nonstacked_state_lines_grid(
     return fig
 
 
+def _plot_nonstacked_state_lines_page(
+    relative_by_sample,
+    *,
+    overall_by_sample,
+    state_order,
+    time_col,
+    sample_col,
+    state_colors,
+    sample_title_fontsize=8,
+    sample_title_pad=2,
+    page_size=A4_PORTRAIT,
+):
+    """Render one portrait PDF page with one sample panel per row."""
+    samples = list(relative_by_sample.keys())
+    nrows = max(len(samples), 1)
+    fig = plt.figure(figsize=page_size)
+    outer = GridSpec(nrows=nrows, ncols=1, figure=fig)
+    plot_axes = []
+    first_handles = []
+    first_labels = []
+
+    for i, sample in enumerate(samples):
+        inner = outer[i].subgridspec(1, 2, width_ratios=[8, 1], wspace=0.10)
+        ax = fig.add_subplot(inner[0, 0])
+        ax_bar = fig.add_subplot(inner[0, 1], sharey=ax)
+        plot_axes.append(ax)
+        mat = relative_by_sample[sample]
+        x = mat.index.to_numpy(dtype=float)
+        if len(x) == 0:
+            ax.set_title(
+                f"{sample_col}: {sample} (empty)",
+                fontsize=sample_title_fontsize,
+                pad=sample_title_pad,
+            )
+            ax.axis("off")
+            ax_bar.axis("off")
+            continue
+        for state in state_order:
+            ax.plot(
+                x,
+                mat[state].to_numpy(dtype=float),
+                color=state_colors[state],
+                linewidth=1.4,
+                alpha=0.9,
+                label=str(state),
+            )
+        ax.set_ylim(0.0, 1.0)
+        ax.set_title(
+            f"{sample_col}: {sample}",
+            fontsize=sample_title_fontsize,
+            pad=sample_title_pad,
+        )
+        ax.set_xlabel(time_col)
+        ax.set_ylabel("Proportion")
+        _plot_overall_summary_bar(
+            ax_bar,
+            overall_by_sample[sample],
+            state_order=state_order,
+            state_colors=state_colors,
+        )
+        if len(first_labels) == 0:
+            first_handles, first_labels = ax.get_legend_handles_labels()
+
+    if len(first_labels) > 0:
+        fig.legend(
+            first_handles,
+            first_labels,
+            loc="lower center",
+            ncol=min(len(first_labels), 8),
+            frameon=False,
+        )
+        fig.tight_layout(rect=(0, 0.06, 1, 0.98))
+    else:
+        fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.suptitle("Relative State Composition (Non-Stacked Lines) by Sample", y=0.995, fontsize=12)
+    return fig
+
+
 def _plot_page_per_state_sample_lines_grid(
     relative_by_sample,
     *,
@@ -477,6 +683,7 @@ def _plot_page_per_state_sample_lines_grid(
     grid_ncols,
     figsize_per_panel,
     sample_colors,
+    state_ylims=None,
 ):
     """Page 3: one panel per state, with sample-colored lines."""
     fig, axes = _make_panel_grid(len(state_order), grid_ncols, figsize_per_panel)
@@ -496,7 +703,10 @@ def _plot_page_per_state_sample_lines_grid(
                 alpha=0.9,
                 label=str(sample),
             )
-        ax.set_ylim(0.0, 1.0)
+        if isinstance(state_ylims, dict) and str(state) in state_ylims:
+            ax.set_ylim(*state_ylims[str(state)])
+        else:
+            ax.set_ylim(0.0, 1.0)
         ax.set_title(f"{state}")
         ax.set_xlabel(time_col)
         ax.set_ylabel("Proportion")
@@ -536,30 +746,24 @@ def save_state_composition_report(
     sample_title_pad: float = 2,
 ):
     """
-    Save split PDF reports + CSV companions for relative state composition.
+    Save a combined multi-page PDF report + merged plot-data CSV for relative state composition.
 
     Outputs:
-      1) one PDF + CSV for relative stacked composition by sample
-      2) one PDF + CSV for non-stacked state lines by sample
-      3) one PDF + CSV for per-state panels with sample-colored lines
-      4) one AUC CSV
+      1) one combined PDF with all report pages
+      2) one merged plot-data CSV for all report views
+      3) one AUC CSV
     """
     output_pdf_path = Path(output_pdf_path)
     stem = output_pdf_path.stem
     parent = output_pdf_path.parent
-    stacked_pdf_path = output_pdf_path
-    nonstacked_pdf_path = parent / f"{stem}_nonstacked_by_sample.pdf"
-    per_state_pdf_path = parent / f"{stem}_per_state_by_sample.pdf"
-
-    stacked_csv_path = stacked_pdf_path.with_suffix(".csv")
-    nonstacked_csv_path = nonstacked_pdf_path.with_suffix(".csv")
-    per_state_csv_path = per_state_pdf_path.with_suffix(".csv")
+    merged_pdf_path = output_pdf_path
+    merged_plot_csv_path = output_pdf_path.with_suffix(".csv")
 
     if output_csv_path is None:
         output_auc_csv_path = parent / f"{stem}_auc.csv"
     else:
         output_auc_csv_path = Path(output_csv_path)
-    if output_auc_csv_path == stacked_csv_path:
+    if output_auc_csv_path == merged_plot_csv_path:
         output_auc_csv_path = parent / f"{stem}_auc.csv"
 
     output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -581,6 +785,13 @@ def save_state_composition_report(
         state_order=state_order,
         sample_order=sample_order,
     )
+    overall_by_sample = _compute_overall_relative_composition_by_sample(
+        df,
+        state_col=state_col,
+        sample_col=sample_col,
+        state_order=state_order,
+        sample_order=sample_order,
+    )
 
     auc_table = _compute_relative_auc_table(
         relative_by_sample,
@@ -592,78 +803,107 @@ def save_state_composition_report(
 
     state_colors = _build_color_map(state_order, cmap_name="tab20")
     sample_colors = _build_color_map(sample_order, cmap_name="tab20")
+    nonstacked_samples_per_page = 4
+    per_state_ylim_headroom = 0.10
 
-    fig1 = _plot_page_relative_stacked_grid(
-        relative_by_sample,
-        state_order=state_order,
-        time_col=time_col,
-        sample_col=sample_col,
-        grid_ncols=grid_ncols,
-        figsize_per_panel=figsize_per_panel,
-        state_colors=state_colors,
-        sample_title_fontsize=sample_title_fontsize,
-        sample_title_pad=sample_title_pad,
-    )
-    fig1.savefig(stacked_pdf_path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig1)
-    stacked_plot_data = _build_relative_plot_data_table(relative_by_sample, plot_view="stacked_by_sample")
-    stacked_plot_data.to_csv(stacked_csv_path, index=False)
+    nonstacked_pages = _paginate_samples(sample_order, samples_per_page=nonstacked_samples_per_page)
+    with PdfPages(merged_pdf_path) as pdf:
+        fig1 = _plot_page_relative_stacked_grid(
+            relative_by_sample,
+            overall_by_sample=overall_by_sample,
+            state_order=state_order,
+            time_col=time_col,
+            sample_col=sample_col,
+            grid_ncols=grid_ncols,
+            figsize_per_panel=figsize_per_panel,
+            state_colors=state_colors,
+            sample_title_fontsize=sample_title_fontsize,
+            sample_title_pad=sample_title_pad,
+        )
+        pdf.savefig(fig1, dpi=dpi, bbox_inches="tight")
+        plt.close(fig1)
 
-    fig2 = _plot_page_nonstacked_state_lines_grid(
-        relative_by_sample,
-        state_order=state_order,
-        time_col=time_col,
-        sample_col=sample_col,
-        grid_ncols=grid_ncols,
-        figsize_per_panel=figsize_per_panel,
-        state_colors=state_colors,
-        sample_title_fontsize=sample_title_fontsize,
-        sample_title_pad=sample_title_pad,
-    )
-    fig2.savefig(nonstacked_pdf_path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig2)
-    nonstacked_plot_data = _build_relative_plot_data_table(relative_by_sample, plot_view="nonstacked_by_sample")
-    nonstacked_plot_data.to_csv(nonstacked_csv_path, index=False)
+        for page_samples in nonstacked_pages:
+            page_relative = {
+                sample: relative_by_sample[sample]
+                for sample in page_samples
+                if sample in relative_by_sample
+            }
+            page_overall = {
+                sample: overall_by_sample[sample]
+                for sample in page_samples
+                if sample in overall_by_sample
+            }
+            fig2 = _plot_nonstacked_state_lines_page(
+                page_relative,
+                overall_by_sample=page_overall,
+                state_order=state_order,
+                time_col=time_col,
+                sample_col=sample_col,
+                state_colors=state_colors,
+                sample_title_fontsize=sample_title_fontsize,
+                sample_title_pad=sample_title_pad,
+            )
+            pdf.savefig(fig2, dpi=dpi, bbox_inches="tight")
+            plt.close(fig2)
 
-    fig3 = _plot_page_per_state_sample_lines_grid(
-        relative_by_sample,
-        state_order=state_order,
-        time_col=time_col,
-        sample_col=sample_col,
-        grid_ncols=grid_ncols,
-        figsize_per_panel=figsize_per_panel,
-        sample_colors=sample_colors,
+        state_ylims = _compute_state_panel_ylims(
+            relative_by_sample,
+            state_order=state_order,
+            headroom=per_state_ylim_headroom,
+        )
+        fig3 = _plot_page_per_state_sample_lines_grid(
+            relative_by_sample,
+            state_order=state_order,
+            time_col=time_col,
+            sample_col=sample_col,
+            grid_ncols=grid_ncols,
+            figsize_per_panel=figsize_per_panel,
+            sample_colors=sample_colors,
+            state_ylims=state_ylims,
+        )
+        pdf.savefig(fig3, dpi=dpi, bbox_inches="tight")
+        plt.close(fig3)
+
+    merged_plot_data = pd.concat(
+        [
+            _build_relative_plot_data_table(relative_by_sample, plot_view="stacked_by_sample").assign(
+                plot_component="timecourse"
+            ),
+            _build_overall_summary_plot_data_table(overall_by_sample, plot_view="stacked_by_sample").assign(
+                plot_component="overall_summary"
+            ),
+            _build_relative_plot_data_table(relative_by_sample, plot_view="nonstacked_by_sample").assign(
+                plot_component="timecourse"
+            ),
+            _build_overall_summary_plot_data_table(overall_by_sample, plot_view="nonstacked_by_sample").assign(
+                plot_component="overall_summary"
+            ),
+            _build_relative_plot_data_table(relative_by_sample, plot_view="per_state_by_sample").assign(
+                plot_component="timecourse"
+            ),
+        ],
+        ignore_index=True,
     )
-    fig3.savefig(per_state_pdf_path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig3)
-    per_state_plot_data = _build_relative_plot_data_table(relative_by_sample, plot_view="per_state_by_sample")
-    per_state_plot_data.to_csv(per_state_csv_path, index=False)
+    merged_plot_data.to_csv(merged_plot_csv_path, index=False)
 
     if verbose:
-        print(f"Saved state composition report PDF: {stacked_pdf_path}")
-        print(f"Saved state composition report CSV: {stacked_csv_path}")
-        print(f"Saved state composition report PDF: {nonstacked_pdf_path}")
-        print(f"Saved state composition report CSV: {nonstacked_csv_path}")
-        print(f"Saved state composition report PDF: {per_state_pdf_path}")
-        print(f"Saved state composition report CSV: {per_state_csv_path}")
+        print(f"Saved state composition report PDF: {merged_pdf_path}")
+        print(f"Saved state composition report CSV: {merged_plot_csv_path}")
         print(f"Saved state composition AUC CSV: {output_auc_csv_path}")
 
     return {
-        "pdf_path": str(stacked_pdf_path),
+        "pdf_path": str(merged_pdf_path),
         "csv_path": str(output_auc_csv_path),
-        "plot_data_csv_path": str(stacked_csv_path),
+        "plot_data_csv_path": str(merged_plot_csv_path),
         "pdf_paths": {
-            "stacked_by_sample": str(stacked_pdf_path),
-            "nonstacked_by_sample": str(nonstacked_pdf_path),
-            "per_state_by_sample": str(per_state_pdf_path),
+            "combined": str(merged_pdf_path),
         },
         "plot_data_csv_paths": {
-            "stacked_by_sample": str(stacked_csv_path),
-            "nonstacked_by_sample": str(nonstacked_csv_path),
-            "per_state_by_sample": str(per_state_csv_path),
+            "combined": str(merged_plot_csv_path),
         },
         "auc_table": auc_table,
-        "plot_data_table": stacked_plot_data,
+        "plot_data_table": merged_plot_data,
         "relative_by_sample": relative_by_sample,
         "relative_pooled": relative_pooled if include_pooled_summary else None,
     }

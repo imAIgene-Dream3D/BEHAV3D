@@ -176,6 +176,7 @@ def run_trackpy_tracking_generic(
     memory=2,
     adaptive_stop=10.0,
     adaptive_step=0.95,
+    n_workers=1,
     return_trackimg=True,
     log_callback=None,
     **kwargs
@@ -327,7 +328,8 @@ def run_trackpy_tracking_generic(
                 tracked_img_outpath = convert_segments_to_tracks(
                     df_tracks=df_tracks,
                     segments=segments,
-                    outpath=tracked_img_outpath
+                    outpath=tracked_img_outpath,
+                    n_workers=n_workers,
                 )
         else:
             print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
