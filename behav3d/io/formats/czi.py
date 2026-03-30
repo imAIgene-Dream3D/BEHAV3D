@@ -26,6 +26,25 @@ def load_czi(path, t=None, z=None, c=None):
     img = np.squeeze(img)
     return(img)
 
+
+def load_czi_timepoint_czyx(path, t, source_order):
+    """
+    Load a single timepoint from a CZI file.
+    Returns array in CZYX order (C, Z, Y, X).
+
+    source_order : str
+        5-char axis order string as detected from the file (e.g. "TCZYX", "TZCYX").
+    """
+    czifile = CziFile(path)
+    img, _ = czifile.read_image(T=t)
+    img = np.squeeze(img)
+    # After squeezing, the remaining dims follow source_order with T (and singletons) removed.
+    remaining_order = "".join(ax for ax in source_order if ax != "T" and ax in "CZYX")
+    if remaining_order != "CZYX" and len(remaining_order) == 4:
+        perm = [list(remaining_order).index(ax) for ax in "CZYX"]
+        img = np.transpose(img, perm)
+    return img  # (C, Z, Y, X)
+
 def load_czi_metadata(path):
     """
     Loading .czi metadata

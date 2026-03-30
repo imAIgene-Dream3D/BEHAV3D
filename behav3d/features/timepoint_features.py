@@ -166,7 +166,7 @@ import math
 import time
 import traceback
 from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
-from behav3d.io.images import load_image, convert_input_files_to_zarr
+from behav3d.io.images import load_image, convert_input_files_to_zarr, _ensure_zarr
 from tqdm import tqdm
 from datetime import datetime
 

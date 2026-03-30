@@ -34,6 +34,21 @@ def load_ims_as_numpy(path):
     img=np.stack(image_channels, axis=0)
     return(img)
 
+def load_ims_timepoint_czyx(path, t):
+    """
+    Load a single timepoint from an IMS file.
+    Returns array in CZYX order (C, Z, Y, X) without loading other timepoints.
+    """
+    with h5py.File(str(path), "r") as f:
+        g0 = f["/DataSet/ResolutionLevel 0"]
+        chan_keys = sorted(
+            [k for k in g0[f"TimePoint {t}"].keys() if k.startswith("Channel ")],
+            key=lambda s: int(s.split()[-1])
+        )
+        c_arrays = [g0[f"TimePoint {t}/{ck}/Data"][:] for ck in chan_keys]
+    return np.stack(c_arrays, axis=0)  # (C, Z, Y, X)
+
+
 def load_ims(path, as_numpy=False):
     f = h5py.File(path, "r")  # keep open while dask graph exists
     g0 = f["/DataSet/ResolutionLevel 0"]
