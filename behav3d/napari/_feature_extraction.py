@@ -15,6 +15,7 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QCheckBox,
     QDoubleSpinBox, QSpinBox, QGroupBox, QMessageBox, QScrollArea,
+    QSlider,
 )
 from qtpy.QtCore import Qt
 
@@ -45,6 +46,7 @@ class CellTypeFeaturePanel(QWidget):
         self.category_types = category_types
         self.log = log_callback or (lambda m: None)
         self.viewer = None
+        self._preview_connected = False  # track whether spinner signal is connected
 
         # Read saved config
         params = self.metadata_loader.behav3d_parameters
@@ -123,6 +125,68 @@ class CellTypeFeaturePanel(QWidget):
 
         layout.addWidget(feat_group)
 
+        # ── Dead threshold ────────────────────────────────────────
+        dead_group = QGroupBox("Death Threshold")
+        dead_lay = QVBoxLayout(dead_group)
+        dead_lay.setSpacing(4)
+
+        dead_desc = QLabel(
+            "Set the percentage of dead-mask pixels overlapping a segment\n"
+            "above which the cell is classified as 'dead'. The 'dead' column\n"
+            "is created during feature extraction when this threshold is set."
+        )
+        dead_desc.setWordWrap(True)
+        dead_desc.setStyleSheet("color: #888; font-size: 10px;")
+        dead_lay.addWidget(dead_desc)
+
+        dead_form = QFormLayout()
+        dead_form.setContentsMargins(0, 0, 0, 0)
+        dead_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        self.spin_dead_threshold = QDoubleSpinBox()
+        self.spin_dead_threshold.setRange(0.0, 100.0)
+        self.spin_dead_threshold.setSingleStep(1.0)
+        self.spin_dead_threshold.setDecimals(1)
+        self.spin_dead_threshold.setValue(float(fcfg.get("dead_mask_percentage_threshold", 0.0)))
+        self.spin_dead_threshold.setSuffix(" %")
+        self.spin_dead_threshold.setMaximumWidth(100)
+        dead_form.addRow("Dead mask % threshold:", make_help_row(
+            self.spin_dead_threshold,
+            "Dead Mask Percentage Threshold",
+            "Percentage of dead-mask pixels overlapping a segment's\n"
+            "volume required to classify the cell as dead.\n\n"
+            "Set to 0 to skip dead classification.\n"
+            "Typical range: 5–30%."
+        ))
+        dead_lay.addLayout(dead_form)
+
+        # Preview button
+        self.btn_preview_dead = QPushButton("\U0001F441 Preview Dead Threshold in Viewer")
+        self.btn_preview_dead.setStyleSheet(
+            "QPushButton { background: #37474F; color: white; padding: 5px 10px; "
+            "border-radius: 3px; font-size: 11px; } "
+            "QPushButton:hover { background: #546E7A; }"
+        )
+        self.btn_preview_dead.setToolTip(
+            "Load the first sample's segments + dead mask data and show\n"
+            "a dead/alive overlay in the napari viewer. Adjust the threshold\n"
+            "slider to see how the classification changes."
+        )
+        self.btn_preview_dead.clicked.connect(self._on_preview_dead_clicked)
+        dead_lay.addWidget(self.btn_preview_dead)
+
+        dead_group.setVisible(self._has_dead)
+        layout.addWidget(dead_group)
+        self._dead_group = dead_group
+
+        # Toggle dead group visibility with Death feature checkbox
+        def _toggle_dead_group(state=None):
+            cb = self.feature_checks.get("death")
+            self._dead_group.setVisible(self._has_dead and (cb is not None and cb.isChecked()))
+        if "death" in self.feature_checks:
+            self.feature_checks["death"].stateChanged.connect(_toggle_dead_group)
+        _toggle_dead_group()
+
 
 
         # ── Workers ────────────────────────────────────────────────────
@@ -183,9 +247,11 @@ class CellTypeFeaturePanel(QWidget):
         return [f for f, cb in self.feature_checks.items() if cb.isChecked()]
 
     def _collect_params(self) -> dict:
+        thr = float(self.spin_dead_threshold.value())
         return {
             "features_choice": self._selected_features(),
             "contact_threshold": float(self.contact_threshold.value()),
+            "dead_mask_percentage_threshold": thr if thr > 0 else None,
             "n_workers": int(self.spin_workers.value()),
         }
 
@@ -208,6 +274,9 @@ class CellTypeFeaturePanel(QWidget):
                     cb.setChecked(f in settings["features_choice"])
                 p.contact_threshold.setValue(settings["contact_threshold"])
                 p.spin_workers.setValue(settings["n_workers"])
+                if hasattr(p, 'spin_dead_threshold'):
+                    thr_val = settings.get("dead_mask_percentage_threshold")
+                    p.spin_dead_threshold.setValue(thr_val if thr_val is not None else 0.0)
                 count += 1
         scope = "category" if category_only else "all"
         self.log(f"Applied feature settings to {count} other cell types ({scope}).")
@@ -236,12 +305,17 @@ class CellTypeFeaturePanel(QWidget):
 
         out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
 
+        # Dead threshold
+        dead_thr = float(self.spin_dead_threshold.value())
+        dead_mask_pct = dead_thr if dead_thr > 0 else None
+
         run_feature_extraction(
             metadata=self.metadata_loader.metadata,
             output_dir=out_dir,
             cell_type=cell_type,
             features_choice=self._selected_features(),
             contact_threshold=float(self.contact_threshold.value()),
+            dead_mask_percentage_threshold=dead_mask_pct,
             n_workers=int(self.spin_workers.value()),
             overwrite=overwrite,
         )
@@ -295,6 +369,173 @@ class CellTypeFeaturePanel(QWidget):
         except Exception as e:
             traceback.print_exc()
             self.log(f"Error during feature extraction: {e}")
+
+    # ---- Dead Threshold Preview -------------------------------------------
+    def _on_preview_dead_clicked(self):
+        """Load segments + dead mask for 1st sample & show dead/alive overlay."""
+        try:
+            import numpy as np
+            from behav3d.io.images import load_image
+            import pandas as pd
+
+            viewer = self.viewer
+            if viewer is None:
+                self.log("⚠️ No viewer available for dead threshold preview.")
+                return
+
+            md = self.metadata_loader.metadata
+            if md is None or md.empty:
+                self.log("⚠️ No metadata loaded.")
+                return
+
+            # Find first sample with both segments & dead mask
+            sample_row = None
+            seg_path = None
+            dead_mask_path = None
+            for _, row in md.iterrows():
+                # Find segments path for this cell type
+                for prefix in ['or', 'im', 'ot']:
+                    col = f"{prefix}_{self.cell_type}_segments_image_path"
+                    if col in row.index and pd.notna(row.get(col)):
+                        seg_path = row[col]
+                        break
+                # Find dead mask path
+                dead_col = f"dead_mask_path"
+                if dead_col in row.index and pd.notna(row.get(dead_col)):
+                    dead_mask_path = row[dead_col]
+                if seg_path and dead_mask_path:
+                    sample_row = row
+                    break
+
+            if sample_row is None or seg_path is None or dead_mask_path is None:
+                self.log("⚠️ Could not find a sample with both segments and dead mask paths.")
+                return
+
+            sample_name = sample_row.get('sample_name', 'Unknown')
+            self.log(f"Loading preview for sample: {sample_name}")
+
+            # Load segments and dead mask (use first timepoint)
+            segments = load_image(seg_path)
+            dead_mask = load_image(dead_mask_path)
+            t = 0  # Preview at first timepoint
+            seg_t = np.asarray(segments[t])
+            dead_t = np.asarray(dead_mask[t])
+
+            # Also try to load raw image for context (dead channel)
+            raw_path = sample_row.get('raw_image_path')
+            dead_ch_idx = sample_row.get('dead_channel')
+
+            # Remove old preview layers
+            for name in ['Dead Mask Preview', 'Dead/Alive Preview', 'Segments Preview', 'Dead Channel']:
+                try:
+                    viewer.layers.remove(name)
+                except (KeyError, ValueError):
+                    pass
+
+            # Add dead channel if available
+            if raw_path and pd.notna(dead_ch_idx):
+                try:
+                    raw = load_image(raw_path)
+                    raw_t = np.asarray(raw[t])
+                    ch_idx = int(dead_ch_idx)
+                    if raw_t.ndim >= 2 and ch_idx < raw_t.shape[0]:
+                        dead_ch_data = raw_t[ch_idx]
+                        viewer.add_image(
+                            dead_ch_data, name='Dead Channel',
+                            colormap='magenta', blending='additive',
+                            opacity=0.5
+                        )
+                except Exception:
+                    pass  # Skip if raw loading fails
+
+            # Add segments preview
+            viewer.add_labels(seg_t, name='Segments Preview', opacity=0.3)
+
+            # Add dead mask
+            viewer.add_image(
+                dead_t.astype(float), name='Dead Mask Preview',
+                colormap='magenta', blending='additive', opacity=0.4
+            )
+
+            # Compute and add dead/alive overlay
+            threshold = float(self.spin_dead_threshold.value())
+            self._update_dead_alive_overlay(viewer, seg_t, dead_t, threshold)
+
+            # Connect spinner to live-update if not already connected
+            if not self._preview_connected:
+                self._preview_seg_t = seg_t
+                self._preview_dead_t = dead_t
+                self.spin_dead_threshold.valueChanged.connect(self._on_threshold_spin_changed)
+                self._preview_connected = True
+            else:
+                # Update cached data
+                self._preview_seg_t = seg_t
+                self._preview_dead_t = dead_t
+
+            self.log(f"✅ Dead threshold preview loaded. Adjust threshold to see changes.")
+
+        except Exception as e:
+            traceback.print_exc()
+            self.log(f"Error loading dead threshold preview: {e}")
+
+    def _on_threshold_spin_changed(self, value):
+        """Live-update the dead/alive overlay when threshold changes."""
+        viewer = self.viewer
+        if viewer is None:
+            return
+        if not hasattr(self, '_preview_seg_t') or not hasattr(self, '_preview_dead_t'):
+            return
+        self._update_dead_alive_overlay(
+            viewer, self._preview_seg_t, self._preview_dead_t, float(value)
+        )
+
+    @staticmethod
+    def _update_dead_alive_overlay(viewer, seg_t, dead_t, threshold_pct):
+        """Compute dead/alive per-segment overlay and update napari layer."""
+        import numpy as np
+        from skimage.measure import regionprops
+
+        # Create a colored label image: green=alive (1), red=dead (2)
+        overlay = np.zeros_like(seg_t, dtype=np.uint8)
+
+        # Binarize dead mask
+        dead_binary = dead_t > 0
+
+        for region in regionprops(seg_t):
+            label_val = region.label
+            mask = seg_t == label_val
+            total_pixels = mask.sum()
+            if total_pixels == 0:
+                continue
+            dead_pixels = (mask & dead_binary).sum()
+            pct = (dead_pixels / total_pixels) * 100.0
+
+            if pct >= threshold_pct and threshold_pct > 0:
+                overlay[mask] = 2  # Dead → red
+            else:
+                overlay[mask] = 1  # Alive → green
+
+        # Define custom colormap: 0=transparent, 1=green, 2=red
+        from napari.utils.colormaps import DirectLabelColormap
+        try:
+            cmap = DirectLabelColormap(
+                color_dict={0: [0, 0, 0, 0], 1: [0, 0.8, 0, 0.5], 2: [0.9, 0, 0, 0.5]}
+            )
+        except Exception:
+            cmap = None
+
+        layer_name = 'Dead/Alive Preview'
+        try:
+            layer = viewer.layers[layer_name]
+            layer.data = overlay
+        except (KeyError, ValueError):
+            if cmap is not None:
+                viewer.add_labels(
+                    overlay, name=layer_name, opacity=0.6,
+                    colormap=cmap,
+                )
+            else:
+                viewer.add_labels(overlay, name=layer_name, opacity=0.6)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -431,6 +672,7 @@ class FeatureExtractionTab(QWidget):
             all_cell_types=all_types, category_types=cat_types,
             log_callback=self._log,
         )
+        panel.viewer = self.viewer  # Pass viewer for dead threshold preview
         self.panels[ct] = panel
         icon = color_map.get(category, "")
         self.cell_tabs.addTab(panel, f"{icon} {ct}")

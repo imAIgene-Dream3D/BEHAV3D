@@ -4,6 +4,7 @@ BEHAV3D napari plugin – Tracking Tab.
 Provides per-cell-type sub-tabs with method selection (LAP / TrackPy / Propagation),
 method-specific parameters, and batch-tracking options.
 """
+import os
 import sys
 import traceback
 from functools import partial
@@ -717,6 +718,34 @@ class CellTypeTrackingPanel(QWidget):
             "Lower values use less RAM but may be slightly slower."
         ))
 
+        # ── Visual features checkbox ─────────────────────────
+        self.bt_use_visual_features = QCheckBox("Use visual features")
+        self.bt_use_visual_features.setChecked(bool(bt_cfg.get("use_visual_features", False)))
+        step1_form.addRow("", make_help_row(
+            self.bt_use_visual_features,
+            "Visual Features",
+            "When enabled, raw image intensity statistics (mean, std per channel)\n"
+            "are computed alongside centroids and used by the Kalman filter for\n"
+            "more accurate linking.\n\n"
+            "Requires raw image data (raw_image_path) in metadata."
+        ))
+
+        # ── Workers spinbox ──────────────────────────────────
+        n_cores = os.cpu_count() or 4
+        max_allowed_bt = max(1, n_cores - 1)
+        self.bt_n_workers = QSpinBox()
+        self.bt_n_workers.setRange(1, max_allowed_bt)
+        self.bt_n_workers.setValue(min(int(bt_cfg.get("n_workers", 1)), max_allowed_bt))
+        self.bt_n_workers.setMaximumWidth(60)
+        step1_form.addRow("Workers:", make_help_row(
+            self.bt_n_workers,
+            "Number of Workers",
+            f"Number of CPU cores for parallel regionprops extraction\n"
+            f"and zarr writing during btrack.\n\n"
+            f"Your machine has {n_cores} cores.\n"
+            f"Recommendation: Use at most {max_allowed_bt} to keep the system responsive."
+        ))
+
         btrack_lay.addWidget(step1_group)
 
         # ── Sub-group B: Global Optimizer (Step 2 — opt-in) ─────
@@ -904,9 +933,11 @@ class CellTypeTrackingPanel(QWidget):
             "btrack": {
                 "config_preset": self._bt_get_config_preset(),
                 "config_path": self.bt_config_path.text().strip(),
+                "use_visual_features": self.bt_use_visual_features.isChecked(),
                 "max_search_radius": int(self.bt_max_search_radius.value()),
                 "update_method": "APPROXIMATE" if self.bt_update_method.currentIndex() == 1 else "EXACT",
                 "step_size": int(self.bt_step_size.value()),
+                "n_workers": max(1, int(self.bt_n_workers.value())),
                 "use_optimize": self.bt_use_optimize.isChecked(),
                 "hypotheses": self._bt_get_hypotheses(),
                 "dist_thresh": int(self.bt_dist_thresh.value()),
@@ -957,11 +988,13 @@ class CellTypeTrackingPanel(QWidget):
                 )
                 panel.bt_config_preset.setCurrentIndex(preset_idx)
                 panel.bt_config_path.setText(bt.get("config_path", ""))
+                panel.bt_use_visual_features.setChecked(bt.get("use_visual_features", False))
                 panel.bt_max_search_radius.setValue(bt.get("max_search_radius", 100))
                 panel.bt_update_method.setCurrentIndex(
                     1 if bt.get("update_method", "EXACT").upper() == "APPROXIMATE" else 0
                 )
                 panel.bt_step_size.setValue(bt.get("step_size", 100))
+                panel.bt_n_workers.setValue(bt.get("n_workers", 1))
                 panel.bt_use_optimize.setChecked(bt.get("use_optimize", False))
                 for hyp_name, cb in panel.bt_hyp_checks.items():
                     if hyp_name == "P_FP":
@@ -1048,9 +1081,11 @@ class CellTypeTrackingPanel(QWidget):
                 metadata=metadata, output_dir=out_dir, cell_type=cell_type,
                 overwrite=overwrite,
                 config_preset=config_preset,
+                use_visual_features=bool(self.bt_use_visual_features.isChecked()),
                 max_search_radius=int(self.bt_max_search_radius.value()),
                 update_method=update_method,
                 step_size=int(self.bt_step_size.value()),
+                n_workers=max(1, int(self.bt_n_workers.value())),
                 use_optimize=use_opt,
                 hypotheses=self._bt_get_hypotheses() if use_opt else None,
                 dist_thresh=int(self.bt_dist_thresh.value()) if use_opt else None,

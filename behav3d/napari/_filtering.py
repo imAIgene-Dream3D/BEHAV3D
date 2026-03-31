@@ -140,8 +140,8 @@ class CellTypeFilterPanel(QWidget):
         self.en_max_length.stateChanged.connect(_toggle_max)
         _toggle_max(None)
 
-        # ── Min size at t=1 filter ──────────────────────────────────────
-        self.check_filter_min_size = QCheckBox("Filter by minimal size at t=1")
+        # ── Min size at first timepoint filter ───────────────────────────
+        self.check_filter_min_size = QCheckBox("Filter by minimal size at first timepoint")
         self.check_filter_min_size.setChecked(bool(cfg.get("filter_min_size_t1", False)))
         layout.addWidget(self.check_filter_min_size)
 
@@ -160,6 +160,18 @@ class CellTypeFilterPanel(QWidget):
             self.size_widget.setVisible(self.check_filter_min_size.isChecked())
         self.check_filter_min_size.stateChanged.connect(_toggle_size)
         _toggle_size(None)
+
+        # ── Filter dead at first timepoint ────────────────────────────────
+        self.check_filter_dead_t0 = QCheckBox("Filter dead cells at first timepoint")
+        self.check_filter_dead_t0.setChecked(bool(cfg.get("filter_t0_dead", False)))
+        self.check_filter_dead_t0.setToolTip(
+            "When enabled, tracks where the cell is already marked as 'dead'\n"
+            "at the first timepoint (relative_time == 1) are removed.\n\n"
+            "Requires the 'dead' column to have been created during\n"
+            "Feature Extraction with a dead threshold."
+        )
+        self.check_filter_dead_t0.setVisible(self._has_dead)
+        layout.addWidget(self.check_filter_dead_t0)
 
 
 
@@ -207,6 +219,7 @@ class CellTypeFilterPanel(QWidget):
             "max_track_length": int(self.spin_max_length.value()),
             "filter_min_size_t1": self.check_filter_min_size.isChecked(),
             "min_size_t1": int(self.spin_min_size_t1.value()),
+            "filter_t0_dead": self.check_filter_dead_t0.isChecked(),
             "time_type": self.combo_time_type.currentText(),
         }
         return d
@@ -234,6 +247,7 @@ class CellTypeFilterPanel(QWidget):
                 p.spin_max_length.setValue(settings["max_track_length"])
                 p.check_filter_min_size.setChecked(settings["filter_min_size_t1"])
                 p.spin_min_size_t1.setValue(settings["min_size_t1"])
+                p.check_filter_dead_t0.setChecked(settings.get("filter_t0_dead", False))
                 p.combo_time_type.setCurrentText(settings["time_type"])
                 count += 1
         scope = "category" if category_only else "all"
@@ -279,7 +293,7 @@ class CellTypeFilterPanel(QWidget):
             "df_input_path": df_input_path,
             "time_type": self.combo_time_type.currentText(),
             "plot_results": True,
-            "filter_t0_dead": False,
+            "filter_t0_dead": bool(self.check_filter_dead_t0.isChecked()),
         }
 
         if self.check_filter_min_size.isChecked():

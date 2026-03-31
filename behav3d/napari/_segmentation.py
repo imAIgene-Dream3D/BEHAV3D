@@ -1,4 +1,4 @@
-﻿
+
 import napari
 from behav3d.napari._widgets import HelpButton, make_help_row
 import yaml
@@ -80,7 +80,12 @@ class SegmentationTab(QWidget):
         method_group = QGroupBox("Segmentation Method")
         method_layout = QHBoxLayout()
         self.method_combo = QComboBox()
-        self.method_combo.addItems(["Pixel Classifier (Random Forest)", "Cellpose (Deep Learning)", "Import segmentation"])
+        self.method_combo.addItems([
+            "APOC (GPU)",
+            "Pixel Classifier (Random Forest)",
+            "Cellpose (Deep Learning)",
+            "Import segmentation",
+        ])
         self.method_combo.currentIndexChanged.connect(self._on_method_changed)
         method_layout.addWidget(QLabel("Method:"))
         method_layout.addWidget(self.method_combo)
@@ -90,15 +95,19 @@ class SegmentationTab(QWidget):
         # Stacked Widget for Method Parameters
         self.param_stack = QStackedWidget()
         
-        # 1. Pixel Classifier Page
+        # 0. APOC (GPU) Page  ← matches combo index 0
+        self.apoc_page = APOCWidget(self.viewer, self.metadata_loader, log_callback=self._log)
+        self.param_stack.addWidget(self.apoc_page)
+
+        # 1. Pixel Classifier Page  ← matches combo index 1
         self.pixel_classifier_page = PixelClassifierWidget(self.viewer, self.metadata_loader, log_callback=self._log)
         self.param_stack.addWidget(self.pixel_classifier_page)
 
-        # 2. Cellpose Page
+        # 2. Cellpose Page  ← matches combo index 2
         self.cellpose_page = CellposeWidget(self.viewer, self.metadata_loader, log_callback=self._log)
         self.param_stack.addWidget(self.cellpose_page)
 
-        # 3. Import Page
+        # 3. Import Page  ← matches combo index 3
         self.import_page = ImportWidget(self.viewer, self.metadata_loader, log_callback=self._log)
         self.param_stack.addWidget(self.import_page)
 
@@ -140,6 +149,8 @@ class SegmentationTab(QWidget):
             self.pixel_classifier_page._on_metadata_updated()
         self.cellpose_page._on_metadata_updated()
         self.import_page._on_metadata_updated()
+        if hasattr(self, 'apoc_page'):
+            self.apoc_page._on_metadata_updated()
 
     def _log(self, msg):
         import datetime
@@ -150,9 +161,9 @@ class SegmentationTab(QWidget):
         )
 
     def _on_method_changed(self, index):
-        # If switching away from Pixel Classifier (index 0), check session
+        # If switching away from Pixel Classifier (index 1), check session
         current_idx = self.param_stack.currentIndex()
-        if current_idx == 0 and self.pixel_classifier_page.is_session_active:
+        if current_idx == 1 and self.pixel_classifier_page.is_session_active:
             from qtpy.QtWidgets import QMessageBox
             res = QMessageBox.question(
                 self, 
@@ -171,8 +182,11 @@ class SegmentationTab(QWidget):
 
         self.param_stack.setCurrentIndex(index)
         
-        # If switching to Import tab (index 2), refresh it to avoid outdated info
-        if index == 2:
+        # If switching to APOC tab (index 0), refresh it
+        if index == 0:
+            self.apoc_page._on_metadata_updated()
+        # If switching to Import tab (index 3), refresh it to avoid outdated info
+        elif index == 3:
             self.import_page._on_metadata_updated()
 
     def request_tab_exit(self):
@@ -2775,3 +2789,465 @@ class ImportWidget(QWidget):
                                     f"The metadata CSV has been updated:\n{csv_path}")
         if refresh_ui:
             self._rebuild_table()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# APOC Segmentation Widget — GPU-accelerated pixel classification
+# ═══════════════════════════════════════════════════════════════════════════
+class APOCWidget(QWidget):
+    """APOC (GPU) segmentation page with embedded training and batch inference."""
+
+    STRATEGIES = [
+        "APOC (Direct Instance Segmentation)",
+        "APOC + EDT/Watershed",
+        "APOC Probability Map + Watershed",
+    ]
+
+    def __init__(self, viewer, metadata_loader, log_callback=None, parent=None):
+        super().__init__(parent)
+        self.viewer = viewer
+        self.metadata_loader = metadata_loader
+        self.log = log_callback or print
+        self._training_widget = None
+        self._init_ui()
+
+    def _init_ui(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        # ── Info banner ─────────────────────────────────────────
+        info = QLabel(
+            "<b>APOC GPU Segmentation</b><br>"
+            "Uses <tt>apoc</tt> + <tt>pyclesperanto</tt> for GPU-accelerated<br>"
+            "pixel classification and instance segmentation."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #888; font-size: 11px; padding: 4px 0 6px 0;")
+        layout.addWidget(info)
+
+        # ── Training section (embedded APOCTrainingWidget) ──────
+        self.training_group = QGroupBox("🎯 APOC Classifier Training")
+        self.training_layout = QVBoxLayout(self.training_group)
+        self.training_layout.setContentsMargins(4, 4, 4, 4)
+        self.training_placeholder = QLabel(
+            "Load metadata to enable APOC classifier training."
+        )
+        self.training_placeholder.setWordWrap(True)
+        self.training_placeholder.setStyleSheet("color:#888; font-style:italic; padding:10px;")
+        self.training_layout.addWidget(self.training_placeholder)
+        layout.addWidget(self.training_group)
+
+        # ── Strategy selector (global) ──────────────────────────
+        strat_group = QGroupBox("⚙️ Segmentation Strategy")
+        strat_lay = QVBoxLayout(strat_group)
+        strat_lay.setSpacing(4)
+
+        strat_desc = QLabel(
+            "Strategy determines how the APOC classifier output is<br>"
+            "converted to instance segmentation labels."
+        )
+        strat_desc.setWordWrap(True)
+        strat_desc.setStyleSheet("color:#888; font-size:10px;")
+        strat_lay.addWidget(strat_desc)
+
+        self.combo_strategy = QComboBox()
+        self.combo_strategy.addItems(self.STRATEGIES)
+        strat_lay.addWidget(self.combo_strategy)
+
+        # Strategy-specific parameters (stacked)
+        self.strategy_stack = QStackedWidget()
+
+        # Page 0: Direct — no extra params
+        direct_page = QWidget()
+        direct_lay = QVBoxLayout(direct_page)
+        direct_lay.addWidget(QLabel("No additional parameters for direct APOC segmentation."))
+        direct_lay.addStretch()
+        self.strategy_stack.addWidget(direct_page)
+
+        # Page 1: EDT/Watershed
+        edt_page = QWidget()
+        edt_form = QFormLayout(edt_page)
+        edt_form.setContentsMargins(0, 0, 0, 0)
+        edt_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        self.spin_edt_threshold = QDoubleSpinBox()
+        self.spin_edt_threshold.setRange(0.1, 100.0)
+        self.spin_edt_threshold.setSingleStep(0.5)
+        self.spin_edt_threshold.setValue(2.5)
+        self.spin_edt_threshold.setMaximumWidth(90)
+        edt_form.addRow("EDT threshold:", make_help_row(
+            self.spin_edt_threshold,
+            "EDT Threshold",
+            "Euclidean Distance Transform threshold for watershed\n"
+            "seed detection. Higher = fewer, larger segments."
+        ))
+
+        self.spin_edt_min_size = QSpinBox()
+        self.spin_edt_min_size.setRange(1, 999999)
+        self.spin_edt_min_size.setValue(100)
+        self.spin_edt_min_size.setMaximumWidth(90)
+        edt_form.addRow("Min segment size:", make_help_row(
+            self.spin_edt_min_size,
+            "Minimum Segment Size",
+            "Segments with fewer pixels than this are removed."
+        ))
+        self.strategy_stack.addWidget(edt_page)
+
+        # Page 2: Probability Map + Watershed
+        prob_page = QWidget()
+        prob_form = QFormLayout(prob_page)
+        prob_form.setContentsMargins(0, 0, 0, 0)
+        prob_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        self.spin_prob_threshold = QDoubleSpinBox()
+        self.spin_prob_threshold.setRange(0.0, 1.0)
+        self.spin_prob_threshold.setSingleStep(0.05)
+        self.spin_prob_threshold.setDecimals(2)
+        self.spin_prob_threshold.setValue(0.50)
+        self.spin_prob_threshold.setMaximumWidth(90)
+        prob_form.addRow("Probability threshold:", make_help_row(
+            self.spin_prob_threshold,
+            "Probability Threshold",
+            "Minimum probability for a pixel to be considered foreground.\n"
+            "Range 0-1. Higher = stricter, fewer false positives."
+        ))
+
+        self.spin_prob_min_size = QSpinBox()
+        self.spin_prob_min_size.setRange(1, 999999)
+        self.spin_prob_min_size.setValue(100)
+        self.spin_prob_min_size.setMaximumWidth(90)
+        prob_form.addRow("Min segment size:", make_help_row(
+            self.spin_prob_min_size,
+            "Minimum Segment Size",
+            "Segments with fewer pixels than this are removed."
+        ))
+        self.strategy_stack.addWidget(prob_page)
+
+        self.combo_strategy.currentIndexChanged.connect(self.strategy_stack.setCurrentIndex)
+        strat_lay.addWidget(self.strategy_stack)
+        layout.addWidget(strat_group)
+
+        # ── Batch controls ──────────────────────────────────────
+        batch_group = QGroupBox("🚀 Batch Segmentation")
+        batch_lay = QVBoxLayout(batch_group)
+        batch_lay.setSpacing(4)
+
+        # Timepoint range
+        self.check_process_all = QCheckBox("Process ALL timepoints")
+        self.check_process_all.setChecked(True)
+        batch_lay.addWidget(self.check_process_all)
+
+        tp_row = QHBoxLayout()
+        tp_row.addWidget(QLabel("From t:"))
+        self.spin_t_start = QSpinBox()
+        self.spin_t_start.setRange(0, 99999)
+        self.spin_t_start.setValue(0)
+        self.spin_t_start.setMaximumWidth(70)
+        tp_row.addWidget(self.spin_t_start)
+        tp_row.addWidget(QLabel("to t:"))
+        self.spin_t_end = QSpinBox()
+        self.spin_t_end.setRange(0, 99999)
+        self.spin_t_end.setValue(100)
+        self.spin_t_end.setMaximumWidth(70)
+        tp_row.addWidget(self.spin_t_end)
+        tp_row.addStretch()
+        self.tp_widget = QWidget()
+        self.tp_widget.setLayout(tp_row)
+        batch_lay.addWidget(self.tp_widget)
+
+        def _toggle_tp(state):
+            self.tp_widget.setVisible(not self.check_process_all.isChecked())
+        self.check_process_all.stateChanged.connect(_toggle_tp)
+        _toggle_tp(None)
+
+        # Workers
+        n_cores = os.cpu_count() or 4
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(1, max(1, n_cores - 1))
+        self.spin_workers.setValue(1)
+        self.spin_workers.setMaximumWidth(60)
+        w_form = QFormLayout()
+        w_form.setContentsMargins(0, 0, 0, 0)
+        w_form.addRow("Workers:", self.spin_workers)
+        batch_lay.addLayout(w_form)
+
+        # Overwrite checkbox
+        self.check_overwrite = QCheckBox("Overwrite existing results")
+        self.check_overwrite.setChecked(False)
+        batch_lay.addWidget(self.check_overwrite)
+
+        # Run button
+        self.btn_run_segmentation = QPushButton("▶ Run APOC Batch Segmentation")
+        self.btn_run_segmentation.setStyleSheet(
+            "QPushButton { background: #007bff; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 10px; font-size: 13px; } "
+            "QPushButton:hover { background: #0069d9; }"
+        )
+        self.btn_run_segmentation.clicked.connect(self._on_run_segmentation)
+        batch_lay.addWidget(self.btn_run_segmentation)
+
+        # Add-to-queue button
+        self.btn_queue_apoc_segment = QPushButton("🛒+ Add APOC Segmentation to Queue")
+        self.btn_queue_apoc_segment.setStyleSheet(
+            "QPushButton { background: #5a3e8e; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px; font-size: 11px; } "
+            "QPushButton:hover { background: #7952b3; }"
+        )
+        batch_lay.addWidget(self.btn_queue_apoc_segment)
+
+        layout.addWidget(batch_group)
+
+        # ── Size filtering ──────────────────────────────────────
+        size_group = QGroupBox("📐 Post-Processing: Size Filter")
+        size_lay = QVBoxLayout(size_group)
+
+        size_desc = QLabel(
+            "Remove segments smaller than a minimum voxel count.\n"
+            "Applied per-timepoint, per cell type."
+        )
+        size_desc.setWordWrap(True)
+        size_desc.setStyleSheet("color:#888; font-size:10px;")
+        size_lay.addWidget(size_desc)
+
+        # Per-cell-type spinboxes — rebuilt in _rebuild_size_filter_form()
+        self._size_filter_spins: dict = {}   # ct → QSpinBox
+        self._sf_form_widget = QWidget()
+        self._sf_form_layout = QFormLayout(self._sf_form_widget)
+        self._sf_form_layout.setContentsMargins(0, 0, 0, 0)
+        self._sf_form_layout.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        self._sf_placeholder = QLabel("Load metadata to configure per-cell-type thresholds.")
+        self._sf_placeholder.setStyleSheet("color:#888; font-style:italic; font-size:10px;")
+        self._sf_form_layout.addRow(self._sf_placeholder)
+        size_lay.addWidget(self._sf_form_widget)
+
+        self.btn_run_size_filter = QPushButton("▶ Run Size Filtering")
+        self.btn_run_size_filter.setStyleSheet(
+            "QPushButton { background: #28a745; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px; font-size: 12px; } "
+            "QPushButton:hover { background: #218838; }"
+        )
+        self.btn_run_size_filter.clicked.connect(self._on_run_size_filter)
+        size_lay.addWidget(self.btn_run_size_filter)
+
+        # Add size-filter step to queue
+        self.btn_queue_size_filter = QPushButton("🛒+ Add Size Filter to Queue")
+        self.btn_queue_size_filter.setStyleSheet(
+            "QPushButton { background: #5a3e8e; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px; font-size: 11px; } "
+            "QPushButton:hover { background: #7952b3; }"
+        )
+        size_lay.addWidget(self.btn_queue_size_filter)
+
+        layout.addWidget(size_group)
+
+        layout.addStretch()
+        scroll.setWidget(content)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+    # ── Per-CT size filter form ─────────────────────────────────
+    def _rebuild_size_filter_form(self, all_types: list):
+        """Rebuild per-cell-type min-size spinboxes for the size filter group."""
+        # Clear old widgets
+        while self._sf_form_layout.rowCount():
+            self._sf_form_layout.removeRow(0)
+        self._size_filter_spins.clear()
+
+        if not all_types:
+            self._sf_form_layout.addRow(self._sf_placeholder)
+            return
+
+        for ct in all_types:
+            spin = QSpinBox()
+            spin.setRange(1, 9_999_999)
+            spin.setValue(500)
+            spin.setMaximumWidth(100)
+            spin.setSuffix(" vx")
+            self._sf_form_layout.addRow(f"{ct}:", spin)
+            self._size_filter_spins[ct] = spin
+
+    # ── Metadata update ─────────────────────────────────────────
+    def _on_metadata_updated(self):
+        """Called when metadata is loaded/updated. Rebuild training widget."""
+        md = self.metadata_loader.metadata
+        if md is None:
+            return
+
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel,
+        )
+
+        org = detect_organoid_types_from_metadata(md)
+        imm = detect_immune_cell_types_from_metadata(md)
+        oth = detect_other_cell_types_from_metadata(md)
+        all_types = org + imm + oth
+        has_death = has_dead_channel(md)
+
+        if not all_types:
+            return
+
+        # Rebuild per-CT size filter spinboxes
+        self._rebuild_size_filter_form(all_types)
+
+        # Remove old training widget if present
+        if self._training_widget is not None:
+            self.training_layout.removeWidget(self._training_widget)
+            self._training_widget.deleteLater()
+            self._training_widget = None
+        if self.training_placeholder.parent() is not None:
+            self.training_layout.removeWidget(self.training_placeholder)
+            self.training_placeholder.hide()
+
+        # Create and embed APOCTrainingWidget
+        output_dir = Path(self.metadata_loader.output_dir)
+        pixel_class_outdir = output_dir / "images" / "PixelClassification"
+        pixel_class_outdir.mkdir(parents=True, exist_ok=True)
+
+        from behav3d.preprocessing.segmentation.apoc_train import APOCTrainingWidget
+        params = self.metadata_loader.behav3d_parameters
+        apoc_params = params.get("apoc", {})
+
+        self._training_widget = APOCTrainingWidget(
+            viewer=self.viewer,
+            pixel_class_outdir=str(pixel_class_outdir),
+            all_cell_types=all_types,
+            has_death=has_death,
+            initial_params=apoc_params,
+        )
+        self.training_layout.addWidget(self._training_widget)
+
+    # ── Queue param snapshot ────────────────────────────────────
+    def get_queue_params(self) -> dict:
+        """Snapshot current widget state for use by the processing queue."""
+        idx = self.combo_strategy.currentIndex()
+        params = {
+            "strategy_index": idx,
+            "strategy_name": self.STRATEGIES[idx],
+            "overwrite": self.check_overwrite.isChecked(),
+            "workers": self.spin_workers.value(),
+            "process_all": self.check_process_all.isChecked(),
+            "t_start": self.spin_t_start.value(),
+            "t_end": self.spin_t_end.value(),
+        }
+        if idx == 1:  # EDT/Watershed
+            params["edt_threshold"] = self.spin_edt_threshold.value()
+            params["edt_min_size"] = self.spin_edt_min_size.value()
+        elif idx == 2:  # Probability Map + Watershed
+            params["prob_threshold"] = self.spin_prob_threshold.value()
+            params["prob_min_size"] = self.spin_prob_min_size.value()
+        return params
+
+    def get_size_filter_queue_params(self) -> dict:
+        """Snapshot per-cell-type size-filter params for the processing queue."""
+        return {"min_sizes": {ct: spin.value() for ct, spin in self._size_filter_spins.items()}}
+
+    # ── Run batch segmentation ──────────────────────────────────
+    def _on_run_segmentation(self):
+        try:
+            md = self.metadata_loader.metadata
+            if md is None:
+                self.log("⚠️ No metadata loaded.")
+                return
+
+            from behav3d.preprocessing.segmentation.apoc_segment import run_apoc_segmentation
+
+            output_dir = Path(self.metadata_loader.output_dir)
+            strategy = self.STRATEGIES[self.combo_strategy.currentIndex()]
+
+            # Timepoint range
+            if self.check_process_all.isChecked():
+                timepoint_range = None
+            else:
+                t_start = self.spin_t_start.value()
+                t_end = self.spin_t_end.value()
+                if t_start > t_end:
+                    self.log("Error: Start timepoint must be <= End timepoint.")
+                    return
+                timepoint_range = (t_start, t_end)
+
+            # Collect APOC config from training widget if available
+            apoc_config = {}
+            if self._training_widget is not None:
+                for ct, tab in self._training_widget.tabs.items():
+                    if hasattr(tab, 'get_params'):
+                        p = tab.get_params()
+                        for k, v in p.items():
+                            apoc_config[f"apoc_{ct}_{k}"] = v
+
+            # Classifier paths: scan PixelClassification dir for .cl files
+            pixel_class_outdir = output_dir / "images" / "PixelClassification"
+
+            self.log(f"Starting APOC batch segmentation ({strategy})...")
+
+            metadata_csv = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv", "")
+
+            updated_metadata = run_apoc_segmentation(
+                output_dir=str(output_dir),
+                metadata=md,
+                metadata_csv_path=metadata_csv,
+                timepoint_range=timepoint_range,
+                apoc_config=apoc_config,
+                overwrite_existing=self.check_overwrite.isChecked(),
+                n_workers=self.spin_workers.value(),
+                apoc_strategy=strategy,
+            )
+
+            # Update metadata
+            if updated_metadata is not None:
+                self.metadata_loader.metadata = updated_metadata
+                if metadata_csv:
+                    try:
+                        updated_metadata.to_csv(metadata_csv, index=False)
+                    except Exception as e:
+                        self.log(f"Warning: Could not save metadata: {e}")
+
+            self.log("✅ APOC batch segmentation finished!")
+
+        except Exception as e:
+            traceback.print_exc()
+            self.log(f"❌ Error during APOC segmentation: {e}")
+
+    # ── Run size filtering ──────────────────────────────────────
+    def _on_run_size_filter(self):
+        try:
+            md = self.metadata_loader.metadata
+            if md is None:
+                self.log("⚠️ No metadata loaded.")
+                return
+
+            if not self._size_filter_spins:
+                self.log("⚠️ No cell types configured. Load metadata first.")
+                return
+
+            from behav3d.preprocessing.segmentation.size_filter import filter_segments_by_size
+
+            output_dir = Path(self.metadata_loader.output_dir)
+
+            self.log("Running size filtering...")
+            for ct, spin in self._size_filter_spins.items():
+                min_size = spin.value()
+                for sample_name in md['sample_name'].unique():
+                    seg_path = output_dir / "images" / sample_name / f"{sample_name}_{ct}_segments.zarr"
+                    if seg_path.exists():
+                        self.log(f"  [{ct}] {sample_name} — min={min_size} vx")
+                        filter_segments_by_size(
+                            segments_zarr_path=str(seg_path),
+                            min_size_voxels=min_size,
+                        )
+
+            self.log("✅ Size filtering finished!")
+
+        except Exception as e:
+            traceback.print_exc()
+            self.log(f"❌ Error during size filtering: {e}")

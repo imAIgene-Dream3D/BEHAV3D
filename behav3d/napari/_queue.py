@@ -29,6 +29,8 @@ class StepType(Enum):
     SEGMENT = "segment"
     CELLPOSE_SEGMENT = "cellpose_segment"
     DEAD_MASK = "dead_mask"
+    APOC_SEGMENT = "apoc_segment"
+    APOC_SIZE_FILTER = "apoc_size_filter"
     TRACK = "track"
     FEATURE_EXTRACT = "feature_extract"
     FILTER = "filter"
@@ -40,6 +42,8 @@ class StepType(Enum):
             StepType.SEGMENT: "🦠 Batch Segmentation",
             StepType.CELLPOSE_SEGMENT: "🔬 Cellpose Segmentation",
             StepType.DEAD_MASK: "☠ Dead Mask (Otsu)",
+            StepType.APOC_SEGMENT: "⚡ APOC GPU Segmentation",
+            StepType.APOC_SIZE_FILTER: "퓣 APOC Size Filter",
             StepType.TRACK: "📍 Batch Tracking",
             StepType.FEATURE_EXTRACT: "🧪 Feature Extraction",
             StepType.FILTER: "🧹 Filtering",
@@ -52,6 +56,8 @@ class StepType(Enum):
             StepType.SEGMENT: 1,
             StepType.CELLPOSE_SEGMENT: 1.5,
             StepType.DEAD_MASK: 1.6,
+            StepType.APOC_SEGMENT: 1.7,
+            StepType.APOC_SIZE_FILTER: 1.8,
             StepType.TRACK: 2,
             StepType.FEATURE_EXTRACT: 3,
             StepType.FILTER: 4,
@@ -75,10 +81,15 @@ class QueueStep:
 
     @property
     def display_label(self):
-        """Label for queue row display. Includes cell type for cellpose steps."""
+        """Label for queue row display. Includes cell type/strategy where relevant."""
         cell_type = self.params.get("cell_type")
         if cell_type and self.step_type == StepType.CELLPOSE_SEGMENT:
             return f"🔬 Cellpose — {cell_type}"
+        if self.step_type == StepType.APOC_SEGMENT:
+            strat = self.params.get("strategy_name", "")
+            return f"⚡ APOC — {strat}" if strat else self.step_type.label
+        if self.step_type == StepType.APOC_SIZE_FILTER:
+            return self.step_type.label
         return self.step_type.label
 
 
@@ -772,6 +783,10 @@ class ProcessingQueuePanel(QWidget):
             self._run_dead_mask(skip_existing=skip_existing)
         elif step.step_type == StepType.TRACK:
             self._run_track(skip_existing=skip_existing)
+        elif step.step_type == StepType.APOC_SEGMENT:
+            self._run_apoc_segment(step, skip_existing=skip_existing)
+        elif step.step_type == StepType.APOC_SIZE_FILTER:
+            self._run_apoc_size_filter(step)
         elif step.step_type == StepType.FEATURE_EXTRACT:
             self._run_feature_extract(skip_existing=skip_existing)
         elif step.step_type == StepType.FILTER:
@@ -827,3 +842,42 @@ class ProcessingQueuePanel(QWidget):
             self.filtering_tab.run_batch_filtering(interactive=False, skip_existing=skip_existing)
         else:
             raise RuntimeError("Filtering tab not wired to queue.")
+
+    def _run_apoc_segment(self, step: QueueStep, skip_existing: bool = False):
+        """Run APOC GPU batch segmentation, restoring snapshotted params first."""
+        apoc_widget = self.segmentation_tab.apoc_page
+        p = step.params
+        # Restore snapshot into widgets so _on_run_segmentation reads the right values
+        if "strategy_index" in p:
+            apoc_widget.combo_strategy.setCurrentIndex(p["strategy_index"])
+        if "edt_threshold" in p:
+            apoc_widget.spin_edt_threshold.setValue(p["edt_threshold"])
+        if "edt_min_size" in p:
+            apoc_widget.spin_edt_min_size.setValue(p["edt_min_size"])
+        if "prob_threshold" in p:
+            apoc_widget.spin_prob_threshold.setValue(p["prob_threshold"])
+        if "prob_min_size" in p:
+            apoc_widget.spin_prob_min_size.setValue(p["prob_min_size"])
+        if "workers" in p:
+            apoc_widget.spin_workers.setValue(p["workers"])
+        # Timepoint range
+        if p.get("process_all", True):
+            apoc_widget.check_process_all.setChecked(True)
+        else:
+            apoc_widget.check_process_all.setChecked(False)
+            apoc_widget.spin_t_start.setValue(p.get("t_start", 0))
+            apoc_widget.spin_t_end.setValue(p.get("t_end", 100))
+        # skip_existing overrides the stored overwrite flag
+        apoc_widget.check_overwrite.setChecked(not skip_existing)
+        apoc_widget._on_run_segmentation()
+
+    def _run_apoc_size_filter(self, step: QueueStep = None):
+        """Run APOC size filtering, restoring snapshotted per-CT min sizes first."""
+        apoc_widget = self.segmentation_tab.apoc_page
+        if step is not None:
+            min_sizes = step.params.get("min_sizes", {})
+            for ct, val in min_sizes.items():
+                spin = apoc_widget._size_filter_spins.get(ct)
+                if spin is not None:
+                    spin.setValue(val)
+        apoc_widget._on_run_size_filter()
