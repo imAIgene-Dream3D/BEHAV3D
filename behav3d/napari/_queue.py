@@ -30,7 +30,6 @@ class StepType(Enum):
     CELLPOSE_SEGMENT = "cellpose_segment"
     DEAD_MASK = "dead_mask"
     APOC_SEGMENT = "apoc_segment"
-    APOC_SIZE_FILTER = "apoc_size_filter"
     TRACK = "track"
     FEATURE_EXTRACT = "feature_extract"
     FILTER = "filter"
@@ -42,8 +41,7 @@ class StepType(Enum):
             StepType.SEGMENT: "🦠 Batch Segmentation",
             StepType.CELLPOSE_SEGMENT: "🔬 Cellpose Segmentation",
             StepType.DEAD_MASK: "☠ Dead Mask (Otsu)",
-            StepType.APOC_SEGMENT: "⚡ APOC GPU Segmentation",
-            StepType.APOC_SIZE_FILTER: "퓣 APOC Size Filter",
+            StepType.APOC_SEGMENT: "⚡ APOC",
             StepType.TRACK: "📍 Batch Tracking",
             StepType.FEATURE_EXTRACT: "🧪 Feature Extraction",
             StepType.FILTER: "🧹 Filtering",
@@ -56,8 +54,7 @@ class StepType(Enum):
             StepType.SEGMENT: 1,
             StepType.CELLPOSE_SEGMENT: 1.5,
             StepType.DEAD_MASK: 1.6,
-            StepType.APOC_SEGMENT: 1.7,
-            StepType.APOC_SIZE_FILTER: 1.8,
+            StepType.APOC_SEGMENT: 1.5,
             StepType.TRACK: 2,
             StepType.FEATURE_EXTRACT: 3,
             StepType.FILTER: 4,
@@ -88,8 +85,6 @@ class QueueStep:
         if self.step_type == StepType.APOC_SEGMENT:
             strat = self.params.get("strategy_name", "")
             return f"⚡ APOC — {strat}" if strat else self.step_type.label
-        if self.step_type == StepType.APOC_SIZE_FILTER:
-            return self.step_type.label
         return self.step_type.label
 
 
@@ -785,8 +780,6 @@ class ProcessingQueuePanel(QWidget):
             self._run_track(skip_existing=skip_existing)
         elif step.step_type == StepType.APOC_SEGMENT:
             self._run_apoc_segment(step, skip_existing=skip_existing)
-        elif step.step_type == StepType.APOC_SIZE_FILTER:
-            self._run_apoc_size_filter(step)
         elif step.step_type == StepType.FEATURE_EXTRACT:
             self._run_feature_extract(skip_existing=skip_existing)
         elif step.step_type == StepType.FILTER:
@@ -870,14 +863,3 @@ class ProcessingQueuePanel(QWidget):
         # skip_existing overrides the stored overwrite flag
         apoc_widget.check_overwrite.setChecked(not skip_existing)
         apoc_widget._on_run_segmentation()
-
-    def _run_apoc_size_filter(self, step: QueueStep = None):
-        """Run APOC size filtering, restoring snapshotted per-CT min sizes first."""
-        apoc_widget = self.segmentation_tab.apoc_page
-        if step is not None:
-            min_sizes = step.params.get("min_sizes", {})
-            for ct, val in min_sizes.items():
-                spin = apoc_widget._size_filter_spins.get(ct)
-                if spin is not None:
-                    spin.setValue(val)
-        apoc_widget._on_run_size_filter()

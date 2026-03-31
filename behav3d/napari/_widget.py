@@ -101,7 +101,6 @@ class BEHAV3DWidget(QWidget):
         # APOC +🛒 buttons
         apoc = self.segmentation_tab.apoc_page
         apoc.btn_queue_apoc_segment.clicked.connect(self._add_apoc_segment_to_queue)
-        apoc.btn_queue_size_filter.clicked.connect(self._add_apoc_size_filter_to_queue)
 
         # --- Tab Switch Logic ---------------------------------------------
         self._last_tab_index = self.tabs.currentIndex()
@@ -122,11 +121,6 @@ class BEHAV3DWidget(QWidget):
         """Snapshot APOC segmentation params and add an APOC_SEGMENT step."""
         params = self.segmentation_tab.apoc_page.get_queue_params()
         self.queue_panel.add_step(StepType.APOC_SEGMENT, params=params)
-
-    def _add_apoc_size_filter_to_queue(self):
-        """Snapshot size-filter params and add an APOC_SIZE_FILTER step."""
-        params = self.segmentation_tab.apoc_page.get_size_filter_queue_params()
-        self.queue_panel.add_step(StepType.APOC_SIZE_FILTER, params=params)
 
     def _on_tab_changed(self, index):
         """Intercept tab switches to handle exit warnings and missing output dir."""

@@ -2835,6 +2835,26 @@ class APOCWidget(QWidget):
         self.training_group = QGroupBox("🎯 APOC Classifier Training")
         self.training_layout = QVBoxLayout(self.training_group)
         self.training_layout.setContentsMargins(4, 4, 4, 4)
+
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+        
+        train_ctrl_lay = QHBoxLayout()
+        train_ctrl_lay.addWidget(QLabel("Examples/sample:"))
+        self.spin_examples = QSpinBox()
+        self.spin_examples.setValue(int(pc.get("examples_per_sample", 3)))
+        self.spin_examples.setRange(1, 10)
+        self.spin_examples.setMaximumWidth(70)
+        train_ctrl_lay.addWidget(self.spin_examples)
+        
+        self.btn_load_training = QPushButton("Generate Training Data")
+        self.btn_load_training.setToolTip("Clears viewer and loads selected timepoints for labeling")
+        self.btn_load_training.setStyleSheet("background-color: #007bff; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
+        self.btn_load_training.clicked.connect(self._on_load_training_clicked)
+        train_ctrl_lay.addWidget(self.btn_load_training)
+        train_ctrl_lay.addStretch()
+        
+        self.training_layout.addLayout(train_ctrl_lay)
+
         self.training_placeholder = QLabel(
             "Load metadata to enable APOC classifier training."
         )
@@ -2863,10 +2883,28 @@ class APOCWidget(QWidget):
         # Strategy-specific parameters (stacked)
         self.strategy_stack = QStackedWidget()
 
-        # Page 0: Direct — no extra params
+        # Page 0: Direct — only size filter
         direct_page = QWidget()
         direct_lay = QVBoxLayout(direct_page)
-        direct_lay.addWidget(QLabel("No additional parameters for direct APOC segmentation."))
+        direct_lay.setContentsMargins(0, 0, 0, 0)
+        
+        # Per-cell-type spinboxes — rebuilt in _rebuild_size_filter_form()
+        self._size_filter_spins: dict = {}   # ct → QSpinBox
+        self._sf_form_widget = QWidget()
+        self._sf_form_layout = QFormLayout(self._sf_form_widget)
+        self._sf_form_layout.setContentsMargins(0, 0, 0, 0)
+        self._sf_form_layout.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        self._sf_placeholder = QLabel("Load metadata to configure per-cell-type thresholds.")
+        self._sf_placeholder.setStyleSheet("color:#888; font-style:italic; font-size:10px;")
+        self._sf_form_layout.addRow(self._sf_placeholder)
+        
+        sf_desc = QLabel(
+            "Remove segments smaller than a minimum voxel count.\n"
+            "Applied per-timepoint, per cell type."
+        )
+        sf_desc.setStyleSheet("color:#888; font-size:10px;")
+        direct_lay.addWidget(sf_desc)
+        direct_lay.addWidget(self._sf_form_widget)
         direct_lay.addStretch()
         self.strategy_stack.addWidget(direct_page)
 
@@ -2990,61 +3028,24 @@ class APOCWidget(QWidget):
             "QPushButton:hover { background: #0069d9; }"
         )
         self.btn_run_segmentation.clicked.connect(self._on_run_segmentation)
-        batch_lay.addWidget(self.btn_run_segmentation)
 
         # Add-to-queue button
-        self.btn_queue_apoc_segment = QPushButton("🛒+ Add APOC Segmentation to Queue")
+        self.btn_queue_apoc_segment = QPushButton("+🛒")
+        self.btn_queue_apoc_segment.setFixedSize(36, 36)
+        self.btn_queue_apoc_segment.setToolTip("Add APOC Segmentation to Queue")
         self.btn_queue_apoc_segment.setStyleSheet(
-            "QPushButton { background: #5a3e8e; color: white; font-weight: bold; "
-            "border-radius: 4px; padding: 6px; font-size: 11px; } "
-            "QPushButton:hover { background: #7952b3; }"
+            "QPushButton { background: #1a1a2e; color: #ffc107; border: 1px solid #ffc107; "
+            "border-radius: 4px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
         )
-        batch_lay.addWidget(self.btn_queue_apoc_segment)
+
+        batch_btn_row = QHBoxLayout()
+        batch_btn_row.setSpacing(4)
+        batch_btn_row.addWidget(self.btn_run_segmentation, stretch=1)
+        batch_btn_row.addWidget(self.btn_queue_apoc_segment)
+        batch_lay.addLayout(batch_btn_row)
 
         layout.addWidget(batch_group)
-
-        # ── Size filtering ──────────────────────────────────────
-        size_group = QGroupBox("📐 Post-Processing: Size Filter")
-        size_lay = QVBoxLayout(size_group)
-
-        size_desc = QLabel(
-            "Remove segments smaller than a minimum voxel count.\n"
-            "Applied per-timepoint, per cell type."
-        )
-        size_desc.setWordWrap(True)
-        size_desc.setStyleSheet("color:#888; font-size:10px;")
-        size_lay.addWidget(size_desc)
-
-        # Per-cell-type spinboxes — rebuilt in _rebuild_size_filter_form()
-        self._size_filter_spins: dict = {}   # ct → QSpinBox
-        self._sf_form_widget = QWidget()
-        self._sf_form_layout = QFormLayout(self._sf_form_widget)
-        self._sf_form_layout.setContentsMargins(0, 0, 0, 0)
-        self._sf_form_layout.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
-        self._sf_placeholder = QLabel("Load metadata to configure per-cell-type thresholds.")
-        self._sf_placeholder.setStyleSheet("color:#888; font-style:italic; font-size:10px;")
-        self._sf_form_layout.addRow(self._sf_placeholder)
-        size_lay.addWidget(self._sf_form_widget)
-
-        self.btn_run_size_filter = QPushButton("▶ Run Size Filtering")
-        self.btn_run_size_filter.setStyleSheet(
-            "QPushButton { background: #28a745; color: white; font-weight: bold; "
-            "border-radius: 4px; padding: 6px; font-size: 12px; } "
-            "QPushButton:hover { background: #218838; }"
-        )
-        self.btn_run_size_filter.clicked.connect(self._on_run_size_filter)
-        size_lay.addWidget(self.btn_run_size_filter)
-
-        # Add size-filter step to queue
-        self.btn_queue_size_filter = QPushButton("🛒+ Add Size Filter to Queue")
-        self.btn_queue_size_filter.setStyleSheet(
-            "QPushButton { background: #5a3e8e; color: white; font-weight: bold; "
-            "border-radius: 4px; padding: 6px; font-size: 11px; } "
-            "QPushButton:hover { background: #7952b3; }"
-        )
-        size_lay.addWidget(self.btn_queue_size_filter)
-
-        layout.addWidget(size_group)
 
         layout.addStretch()
         scroll.setWidget(content)
@@ -3052,6 +3053,172 @@ class APOCWidget(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
+
+    # ── Load Training Data ──────────────────────────────────────
+    def _on_load_training_clicked(self, interactive=True):
+        try:
+            if self.metadata_loader.metadata is None:
+                self.log("⚠️ Cannot generate training data: No metadata loaded.")
+                return
+
+            self.log("Loading training data...")
+            
+            # --- Save params if needed ---
+            pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+            pc["examples_per_sample"] = int(self.spin_examples.value())
+            
+            output_dir = Path(self.metadata_loader.output_dir)
+            if output_dir:
+                params_path = Path(output_dir) / "behav3d_parameters.yml"
+                try:
+                    with open(params_path, "w") as f:
+                        yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
+                except Exception as e:
+                    self.log(f"Warning: Could not save parameters: {e}")
+
+            md = self.metadata_loader.metadata
+            from behav3d.core.metadata import (
+                detect_organoid_types_from_metadata,
+                detect_immune_cell_types_from_metadata,
+                detect_other_cell_types_from_metadata,
+            )
+            organoid_types = detect_organoid_types_from_metadata(md)
+            immune_types = detect_immune_cell_types_from_metadata(md)
+            other_types = detect_other_cell_types_from_metadata(md)
+            
+            # Use apoc_train helper to fetch and process images
+            from behav3d.preprocessing.segmentation.apoc_train import _load_training_images
+            from behav3d.preprocessing import zeropad_image_to_match_shape
+            
+            # This handles caching automatically. Interactive dialog for overwrite could be added here
+            # But the backend handles it properly (usually overwriting or loading existing).
+            load_existing = True
+            if interactive:
+                # Same check as pixel classifier
+                pixel_class_outdir = output_dir / "images" / "PixelClassification"
+                image_outpath = pixel_class_outdir / 'PixelClassifier_Images.zarr'
+                saved_examples = pc.get("examples_per_sample", None)
+                if image_outpath.exists():
+                    from qtpy.QtWidgets import QMessageBox
+                    msg = f"Pre-existing training data found.\n\nDo you want to generate NEW training data (overwriting) or LOAD the already saved data?"
+                    box = QMessageBox(self)
+                    box.setWindowTitle("Training Data Detected")
+                    box.setText(msg)
+                    btn_generate = box.addButton("Generate New", QMessageBox.AcceptRole)
+                    btn_load = box.addButton("Load Existing", QMessageBox.YesRole)
+                    btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+                    box.exec_()
+                    if box.clickedButton() == btn_cancel:
+                        self.log("Action cancelled.")
+                        return
+                    elif box.clickedButton() == btn_generate:
+                        load_existing = False
+
+            # Clear viewer layers related to this
+            layers_to_remove = [l for l in self.viewer.layers if 'Channel' in l.name or 'User Provided Labels' in l.name]
+            for l in layers_to_remove:
+                self.viewer.layers.remove(l)
+
+            # Load images
+            self.log("Running _load_training_images...")
+            image_list, pixel_class_outdir, has_death, all_cell_types = _load_training_images(
+                metadata=md,
+                output_dir=str(output_dir),
+                examples_per_sample=self.spin_examples.value(),
+                organoid_types=organoid_types,
+                immune_types=immune_types,
+                other_types=other_types,
+                overwrite_images=not load_existing,
+            )
+            
+            if not image_list:
+                self.log("⚠️ No training images found!")
+                return
+
+            self.log("Padding and stacking images...")
+            max_shape = list(image_list[0].shape)
+            for img in image_list[1:]:
+                for i in range(len(max_shape)):
+                    max_shape[i] = max(max_shape[i], img.shape[i])
+            image_list = [zeropad_image_to_match_shape(img, max_shape) for img in image_list]
+            stacked = np.stack(image_list, axis=0) # (T_total, C, Z, Y, X)
+
+            T_total = stacked.shape[0]
+            n_channels = stacked.shape[1]
+            channel_colors = [
+                "cyan", "yellow", "red", "green", "magenta", "blue",
+                "gray", "turbo", "viridis", "plasma", "inferno", "twilight",
+            ]
+
+            # Add Image layers
+            for ch in range(n_channels):
+                channel_data = stacked[:, ch, :, :, :]
+                nonzero = channel_data[channel_data > 0]
+                clim = (0, float(np.percentile(nonzero, 99.8))) if nonzero.size > 0 else (0, 1e-3)
+                img_layer = self.viewer.add_image(
+                    channel_data,
+                    name=f"Channel {ch}",
+                    contrast_limits=clim,
+                    colormap=channel_colors[ch % len(channel_colors)],
+                    blending="additive",
+                    opacity=0.8,
+                )
+                img_layer.contrast_limits_range = (0, float(channel_data.max()))
+
+            # Add Label layers
+            label_shape = (T_total,) + stacked.shape[2:] 
+
+            for cell_type in all_cell_types:
+                saved_path = Path(pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
+                if saved_path.exists():
+                    existing = np.asarray(load_zarr(saved_path))
+                    if existing.shape == label_shape:
+                        user_labels = existing
+                        self.log(f"  ↩ Restored saved labels for '{cell_type}'")
+                    else:
+                        self.log(f"  ⚠️ Saved labels shape {existing.shape} ≠ expected {label_shape} — starting fresh")
+                        user_labels = np.zeros(label_shape, dtype=np.int16)
+                else:
+                    user_labels = np.zeros(label_shape, dtype=np.int16)
+
+                # Use original pixel classifier setup function for consistency
+                new_layer = self.viewer.add_labels(
+                    user_labels,
+                    name=f"User Provided Labels ({cell_type.capitalize()})",
+                    opacity=0.5,
+                )
+                self._configure_user_label_layer(new_layer)
+
+            if has_death:
+                dead_path = Path(pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
+                if dead_path.exists():
+                    dead_labels = np.asarray(load_zarr(dead_path))
+                    if dead_labels.shape == label_shape:
+                        self.log(f"  ↩ Restored saved labels for 'dead'")
+                    else:
+                        dead_labels = np.zeros(label_shape, dtype=np.int16)
+                else:
+                    dead_labels = np.zeros(label_shape, dtype=np.int16)
+                    
+                dead_layer = self.viewer.add_labels(dead_labels, name="User Provided Labels (Dead)", opacity=0.5)
+                self._configure_user_label_layer(dead_layer)
+
+            self.log("✅ Training data generated/loaded in viewer!")
+            
+        except Exception as e:
+            traceback.print_exc()
+            self.log(f"❌ Error during training data generation: {e}")
+
+    def _configure_user_label_layer(self, layer):
+        """Configure a user label layer for simplified APOC usage."""
+        import numpy as np
+        layer.blending = "additive"
+        layer.color = {0: (0, 0, 0, 0), 1: (1.0, 0.2, 0.2, 1), 2: (0.0, 1.0, 1.0, 1)}
+        layer.selected_label = 1
+        def _clamp_label(event):
+            if layer.selected_label > 2:
+                layer.selected_label = 2
+        layer.events.selected_label.connect(_clamp_label)
 
     # ── Per-CT size filter form ─────────────────────────────────
     def _rebuild_size_filter_form(self, all_types: list):
@@ -3140,7 +3307,9 @@ class APOCWidget(QWidget):
             "t_start": self.spin_t_start.value(),
             "t_end": self.spin_t_end.value(),
         }
-        if idx == 1:  # EDT/Watershed
+        if idx == 0:  # Direct APOC
+            params["min_sizes"] = {ct: spin.value() for ct, spin in self._size_filter_spins.items()}
+        elif idx == 1:  # EDT/Watershed
             params["edt_threshold"] = self.spin_edt_threshold.value()
             params["edt_min_size"] = self.spin_edt_min_size.value()
         elif idx == 2:  # Probability Map + Watershed
@@ -3148,9 +3317,7 @@ class APOCWidget(QWidget):
             params["prob_min_size"] = self.spin_prob_min_size.value()
         return params
 
-    def get_size_filter_queue_params(self) -> dict:
-        """Snapshot per-cell-type size-filter params for the processing queue."""
-        return {"min_sizes": {ct: spin.value() for ct, spin in self._size_filter_spins.items()}}
+
 
     # ── Run batch segmentation ──────────────────────────────────
     def _on_run_segmentation(self):
@@ -3185,6 +3352,10 @@ class APOCWidget(QWidget):
                         for k, v in p.items():
                             apoc_config[f"apoc_{ct}_{k}"] = v
 
+            # Embed the per CT size filters into apoc_config so direct APOC sees them
+            for ct, spin in self._size_filter_spins.items():
+                apoc_config[f"{ct}_segment_size_min"] = spin.value()
+
             # Classifier paths: scan PixelClassification dir for .cl files
             pixel_class_outdir = output_dir / "images" / "PixelClassification"
 
@@ -3203,6 +3374,24 @@ class APOCWidget(QWidget):
                 apoc_strategy=strategy,
             )
 
+            # Apply size filtering immediately if strategy is Direct APOC
+            if self.combo_strategy.currentIndex() == 0:
+                self.log("Applying size filtering for Direct APOC strategy...")
+                try:
+                    from behav3d.preprocessing.segmentation.size_filter import filter_segments_by_size
+                    for ct, spin in self._size_filter_spins.items():
+                        min_size = spin.value()
+                        for sample_name in md['sample_name'].unique():
+                            seg_path = output_dir / "images" / sample_name / f"{sample_name}_{ct}_segments.zarr"
+                            if seg_path.exists():
+                                self.log(f"  [{ct}] {sample_name} — min={min_size} vx")
+                                filter_segments_by_size(
+                                    segments_zarr_path=str(seg_path),
+                                    min_size_voxels=min_size,
+                                )
+                except Exception as ex:
+                    self.log(f"Warning: size filtering failed: {ex}")
+
             # Update metadata
             if updated_metadata is not None:
                 self.metadata_loader.metadata = updated_metadata
@@ -3218,36 +3407,4 @@ class APOCWidget(QWidget):
             traceback.print_exc()
             self.log(f"❌ Error during APOC segmentation: {e}")
 
-    # ── Run size filtering ──────────────────────────────────────
-    def _on_run_size_filter(self):
-        try:
-            md = self.metadata_loader.metadata
-            if md is None:
-                self.log("⚠️ No metadata loaded.")
-                return
 
-            if not self._size_filter_spins:
-                self.log("⚠️ No cell types configured. Load metadata first.")
-                return
-
-            from behav3d.preprocessing.segmentation.size_filter import filter_segments_by_size
-
-            output_dir = Path(self.metadata_loader.output_dir)
-
-            self.log("Running size filtering...")
-            for ct, spin in self._size_filter_spins.items():
-                min_size = spin.value()
-                for sample_name in md['sample_name'].unique():
-                    seg_path = output_dir / "images" / sample_name / f"{sample_name}_{ct}_segments.zarr"
-                    if seg_path.exists():
-                        self.log(f"  [{ct}] {sample_name} — min={min_size} vx")
-                        filter_segments_by_size(
-                            segments_zarr_path=str(seg_path),
-                            min_size_voxels=min_size,
-                        )
-
-            self.log("✅ Size filtering finished!")
-
-        except Exception as e:
-            traceback.print_exc()
-            self.log(f"❌ Error during size filtering: {e}")
