@@ -5,7 +5,8 @@ from datetime import datetime, timedelta
 
 def load_ims_as_numpy(path):
     """
-    Loading .ims images
+    Loading .ims images.
+    Always returns a 5-D array in TCZYX order, even when T=1 or C=1.
     """
     imsfile = h5py.File(name=path, mode="r")
 
@@ -14,25 +15,30 @@ def load_ims_as_numpy(path):
 
     image_channels = []
     for channel in range(nr_channels):
-        # print("Loading Channel {}".format(channel))
-        if nr_timepoints>1:
-            image_timepoints = []
-            for timepoint in range(nr_timepoints):
-                # Loads in single timepoint and single channel
-                # print("Loading TimePoint {}".format(timepoint))
-                time_img=imsfile[f'/DataSet/ResolutionLevel 0/TimePoint {timepoint}/Channel {channel}/Data'][:]
-                image_timepoints.append(time_img)
-                
-            #Stack all timepoints to create single channel image over all timepoints
-            image_timepoints = np.stack(image_timepoints, axis=0)
-        else:
-            image_timepoints = imsfile[f'/DataSet/ResolutionLevel 0/TimePoint 0/Channel {channel}/Data'][:]
-            
-        image_channels.append(image_timepoints)
-    
-    #Stack all channels to create full image
-    img=np.stack(image_channels, axis=0)
-    return(img)
+        image_timepoints = []
+        for timepoint in range(nr_timepoints):
+            time_img = imsfile[f'/DataSet/ResolutionLevel 0/TimePoint {timepoint}/Channel {channel}/Data'][:]
+            image_timepoints.append(time_img)
+        image_channels.append(np.stack(image_timepoints, axis=0))  # (T, Z, Y, X)
+
+    img = np.stack(image_channels, axis=0)  # (C, T, Z, Y, X)
+    img = np.transpose(img, (1, 0, 2, 3, 4))  # → (T, C, Z, Y, X)
+    return img
+
+def load_ims_timepoint_czyx(path, t):
+    """
+    Load a single timepoint from an IMS file.
+    Returns array in CZYX order (C, Z, Y, X) without loading other timepoints.
+    """
+    with h5py.File(str(path), "r") as f:
+        g0 = f["/DataSet/ResolutionLevel 0"]
+        chan_keys = sorted(
+            [k for k in g0[f"TimePoint {t}"].keys() if k.startswith("Channel ")],
+            key=lambda s: int(s.split()[-1])
+        )
+        c_arrays = [g0[f"TimePoint {t}/{ck}/Data"][:] for ck in chan_keys]
+    return np.stack(c_arrays, axis=0)  # (C, Z, Y, X)
+
 
 def load_ims(path, as_numpy=False):
     f = h5py.File(path, "r")  # keep open while dask graph exists
@@ -91,6 +97,23 @@ def load_ims_metadata(path):
         c = len(chan_keys)
 
         return (t, c, z, y, x)
+
+
+def get_ims_dimension_order(path=None):
+    """
+    Return the axis order for IMS files.
+
+    IMS (Imaris) HDF5 always stores data as TimePoint N / Channel N / Data,
+    so the order is always TCZYX — including singletons at size 1.
+    """
+    return "TCZYX"
+
+
+def get_ims_shape(path):
+    """
+    Return the shape of an IMS file as (T, C, Z, Y, X) without loading data.
+    """
+    return load_ims_metadata(path)
 
 def save_as_imaris(
     img,
