@@ -2,6 +2,7 @@ import warnings
 from collections import defaultdict
 import numpy as np
 from skimage.measure import label
+from scipy import ndimage
 
 def keep_largest_connected_components(segments):
     """
@@ -21,15 +22,60 @@ def keep_largest_connected_components(segments):
     return segments
 
 def segment_size_filter(segments, size_min=None, size_max=None):
-    labels, counts = np.unique(segments, return_counts=True)
-    for label, count in zip(labels, counts):
-        if size_min != None:
-            if count < size_min:
-                segments[segments == label] = 0
-        if size_max!= None:
-            if count > size_max:
-                segments[segments == label] = 0
-    return(segments)
+    def _filter_one_volume(vol):
+        vol = np.asarray(vol).copy()
+        if not np.any(vol):
+            return vol
+
+        labels, counts = np.unique(vol, return_counts=True)
+        remove_labels = []
+        for lbl, count in zip(labels, counts):
+            if lbl == 0:
+                continue
+            if size_min is not None and count < size_min:
+                remove_labels.append(lbl)
+                continue
+            if size_max is not None and count > size_max:
+                remove_labels.append(lbl)
+
+        if not remove_labels:
+            return vol
+
+        to_remove_mask = np.isin(vol, remove_labels)
+        kept_mask = (vol > 0) & ~to_remove_mask
+        if not np.any(kept_mask):
+            vol[to_remove_mask] = 0
+            return vol
+
+        filled_mask = ndimage.binary_fill_holes(kept_mask)
+        holes_to_fill = filled_mask & ~kept_mask
+
+        if np.any(holes_to_fill):
+            kept_vol = vol.copy()
+            kept_vol[to_remove_mask] = 0
+            indices = ndimage.distance_transform_edt(
+                kept_vol == 0,
+                return_distances=False,
+                return_indices=True,
+            )
+            new_vol = kept_vol[tuple(indices)]
+            vol[holes_to_fill] = new_vol[holes_to_fill]
+            vol[to_remove_mask & ~holes_to_fill] = 0
+        else:
+            vol[to_remove_mask] = 0
+        return vol
+
+    segments = np.asarray(segments)
+    if segments.ndim == 4:
+        out = np.zeros_like(segments)
+        for t in range(segments.shape[0]):
+            out[t] = _filter_one_volume(segments[t])
+        segments[...] = out
+        return segments
+
+    filtered = _filter_one_volume(segments)
+    segments[...] = filtered
+    return segments
 
 def segment_2d_filter(segments):
     """

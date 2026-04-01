@@ -15,6 +15,109 @@ from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_
 from behav3d.preprocessing.tracking.btrack_tracking import run_btracking
 from behav3d.preprocessing.tracking import visualize_tracks
 
+
+_TRACKING_PROFILE_DEFAULTS = {
+    "immune": {
+        "method": "trackpy",
+        "overwrite": False,
+        "lap": {
+            "track_cost_px": 60,
+            "gap_close_cost_px": 45,
+            "gap_close_max_frames": 5,
+            "merging_cost_px": 0,
+            "splitting_cost_px": 0,
+        },
+        "trackpy": {
+            "search_range_px": 31,
+            "memory_frames": 5,
+            "adaptive_stop": 5.0,
+            "adaptive_step": 0.95,
+        },
+        "btrack": {
+            "config_preset": "cell",
+            "config_path": "",
+            "use_visual_features": False,
+            "max_search_radius": 100,
+            "update_method": "EXACT",
+            "step_size": 100,
+            "n_workers": 16,
+            "use_optimize": False,
+            "hypotheses": ["P_FP", "P_init", "P_term", "P_link"],
+            "dist_thresh": 60,
+            "time_thresh": 3,
+        },
+    },
+    "other": {
+        "method": "trackpy",
+        "overwrite": False,
+        "lap": {
+            "track_cost_px": 60,
+            "gap_close_cost_px": 45,
+            "gap_close_max_frames": 5,
+            "merging_cost_px": 0,
+            "splitting_cost_px": 0,
+        },
+        "trackpy": {
+            "search_range_px": 31,
+            "memory_frames": 5,
+            "adaptive_stop": 5.0,
+            "adaptive_step": 0.95,
+        },
+        "btrack": {
+            "config_preset": "cell",
+            "config_path": "",
+            "use_visual_features": False,
+            "max_search_radius": 100,
+            "update_method": "EXACT",
+            "step_size": 100,
+            "n_workers": 8,
+            "use_optimize": False,
+            "hypotheses": ["P_FP", "P_init", "P_term", "P_link"],
+            "dist_thresh": 60,
+            "time_thresh": 3,
+        },
+    },
+    "organoid": {
+        "method": "propagation",
+        "overwrite": False,
+        "lap": {
+            "track_cost_px": 60,
+            "gap_close_cost_px": 80,
+            "gap_close_max_frames": 3,
+            "merging_cost_px": 0,
+            "splitting_cost_px": 0,
+        },
+        "trackpy": {
+            "search_range_px": 35,
+            "memory_frames": 2,
+            "adaptive_stop": 10.0,
+            "adaptive_step": 0.95,
+        },
+        "btrack": {
+            "config_preset": "cell",
+            "config_path": "",
+            "use_visual_features": False,
+            "max_search_radius": 100,
+            "update_method": "EXACT",
+            "step_size": 100,
+            "n_workers": 8,
+            "use_optimize": False,
+            "hypotheses": ["P_FP", "P_init", "P_term", "P_link"],
+            "dist_thresh": 60,
+            "time_thresh": 3,
+        },
+    },
+    "all_organoids": {
+        "method": "propagation_all_organoids",
+        "overwrite": False,
+    },
+}
+
+
+def _tracking_profile_defaults(category):
+    return deepcopy(_TRACKING_PROFILE_DEFAULTS[category])
+
+
 class TrackingPanel:
     """
     Minimal UI for tracking (LAP, TrackPy, or Propagation) for any cell type.
@@ -24,24 +127,38 @@ class TrackingPanel:
     - Updates metadata_loader.metadata and always saves CSV
     - cell_type is supplied in __init__
     """
-    def __init__(self, metadata_loader, cell_type):
+    def __init__(self, metadata_loader, cell_type, organoid_group_context=None, organoid_panel_index=None):
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
 
         self._detect_all_cell_types()
         self._detect_category()
         self._ensure_cfg_skeleton()
+        self.organoid_panel_index = organoid_panel_index
+        self.organoid_group_context = self._prepare_organoid_group_context(organoid_group_context)
+        self._syncing_organoid_toggle = False
         
         params = dict(self.metadata_loader.behav3d_parameters or {})
         tcfg = self._get_config_for_cell_type(params)
+        individual_method_options = [
+            ("LAP (laptrack)", "lap"),
+            ("TrackPy", "trackpy"),
+            ("Propagation", "propagation"),
+        ]
+        if self.category == "organoid" and not self._has_linked_organoid_mode():
+            individual_method_options.append(("Propagation (all organoids)", "propagation_all_organoids"))
+        individual_method_options.append(("btrack (Bayesian)", "btrack"))
+        self._individual_method_options = individual_method_options
+        self._combined_method_options = [("Propagation (all organoids)", "propagation_all_organoids")]
+        default_method = str(tcfg.get("method", "propagation" if self.category == "organoid" else "trackpy"))
+        valid_methods = {value for _, value in individual_method_options}
+        if default_method not in valid_methods:
+            default_method = "propagation" if self.category == "organoid" else "trackpy"
 
         self.method = widgets.Dropdown(
             description="Tracking method",
-            options=[("LAP (laptrack)", "lap"),
-                     ("TrackPy", "trackpy"),
-                     ("Propagation", "propagation"),
-                     ("btrack (Bayesian)", "btrack")],
-            value=str(tcfg.get("method", "lap")),
+            options=individual_method_options,
+            value=default_method,
             style={'description_width': '160px'}
         )
 
@@ -244,6 +361,18 @@ class TrackingPanel:
         self.method.observe(self._toggle_param_groups, names='value')
         self._toggle_param_groups()
 
+        self.title_html = widgets.HTML(f"<b>{cell_type} Tracking</b>")
+        self.track_organoids_together = widgets.Checkbox(
+            description="Track organoids together",
+            value=self._organoids_together_enabled(),
+            indent=False,
+        )
+        self.track_organoids_together.observe(self._on_track_organoids_together_changed, names='value')
+        self.track_organoids_together_box = widgets.HBox([self.track_organoids_together])
+        self.track_organoids_together_box.layout.display = "flex" if self._has_linked_organoid_mode() else "none"
+        self.organoid_group_info = widgets.HTML("")
+        self.organoid_group_info.layout.display = "none"
+
         self.btn_run = widgets.Button(
             description=f"Run {cell_type} tracking",
             button_style="success",
@@ -260,7 +389,9 @@ class TrackingPanel:
         self.out = widgets.Output()
 
         self.ui = widgets.VBox([
-            widgets.HTML(f"<b>{cell_type} Tracking</b>"),
+            self.title_html,
+            self.track_organoids_together_box,
+            self.organoid_group_info,
             self.method,
             widgets.HBox([self.overwrite]),
             self.param_container,
@@ -268,6 +399,13 @@ class TrackingPanel:
             widgets.HTML("<hr>"),
             self.out
         ])
+
+        self._load_individual_profile_into_widgets(tcfg)
+        if self._has_linked_organoid_mode():
+            self._register_organoid_group_panel()
+            self._apply_organoid_group_mode(load_from_config=True)
+        else:
+            self._render_individual_panel(load_from_config=True)
 
     def display(self):
         widgets.display(self.ui)
@@ -312,6 +450,183 @@ class TrackingPanel:
             return "custom", config_path
         return "cell", ""
 
+    def _prepare_organoid_group_context(self, organoid_group_context):
+        if self.category != "organoid" or organoid_group_context is None:
+            return None
+        if not isinstance(organoid_group_context, dict):
+            raise TypeError("organoid_group_context must be a dict or None.")
+
+        tracking_cfg = dict((self.metadata_loader.behav3d_parameters or {}).get("tracking", {}))
+        organoid_group_context["organoid_types"] = list(
+            organoid_group_context.get("organoid_types") or self.organoid_types
+        )
+        organoid_group_context.setdefault(
+            "enabled",
+            bool(tracking_cfg.get("track_organoids_together", False)),
+        )
+        organoid_group_context.setdefault("panels", [])
+        return organoid_group_context
+
+    def _register_organoid_group_panel(self):
+        if self.organoid_group_context is None:
+            return
+        panels = self.organoid_group_context.setdefault("panels", [])
+        if self not in panels:
+            panels.append(self)
+
+    def _has_linked_organoid_mode(self):
+        if self.category != "organoid" or self.organoid_group_context is None:
+            return False
+        return len(self.organoid_group_context.get("organoid_types", [])) >= 2
+
+    def _organoids_together_enabled(self):
+        return self._has_linked_organoid_mode() and bool(self.organoid_group_context.get("enabled", False))
+
+    def _is_first_organoid_panel(self):
+        if not self._has_linked_organoid_mode():
+            return False
+        if self.organoid_panel_index is not None:
+            return int(self.organoid_panel_index) == 0
+        organoid_types = self.organoid_group_context.get("organoid_types", [])
+        return bool(organoid_types) and self.cell_type == organoid_types[0]
+
+    def _write_behav3d_parameters(self):
+        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
+
+    def _get_all_organoids_config(self, params):
+        tracking_cfg = params.get("tracking", {})
+        return tracking_cfg.get("all_organoids", {})
+
+    def _load_individual_profile_into_widgets(self, profile):
+        profile = dict(profile or {})
+        self.overwrite.value = bool(profile.get("overwrite", False))
+
+        lap = profile.get("lap", {})
+        self.track_cost_dist.value = int(lap.get("track_cost_px", 45))
+        self.gap_cost_dist.value = int(lap.get("gap_close_cost_px", 60))
+        self.gap_max_frames.value = int(lap.get("gap_close_max_frames", 3))
+        self.merging_cost_dist.value = int(lap.get("merging_cost_px", 0))
+        self.splitting_cost_dist.value = int(lap.get("splitting_cost_px", 0))
+
+        tpy = profile.get("trackpy", {})
+        self.tp_search_range.value = int(tpy.get("search_range_px", 31))
+        self.tp_memory.value = int(tpy.get("memory_frames", 2))
+        self.tp_adaptive_stop.value = float(tpy.get("adaptive_stop", 10.0))
+        self.tp_adaptive_step.value = float(tpy.get("adaptive_step", 0.95))
+
+        bt = profile.get("btrack", {})
+        bt_preset_value, bt_config_path_value = self._normalize_btrack_config(bt)
+        self.bt_config_preset.value = bt_preset_value
+        self.bt_config_path.value = bt_config_path_value
+        self.bt_use_visual_features.value = bool(bt.get("use_visual_features", False))
+        self.bt_max_search_radius.value = int(bt.get("max_search_radius", 100))
+        self.bt_update_method.value = str(bt.get("update_method", "EXACT"))
+        self.bt_step_size.value = int(bt.get("step_size", 100))
+        self.bt_n_workers.value = int(bt.get("n_workers", 8))
+        self.bt_use_optimize.value = bool(bt.get("use_optimize", False))
+
+        saved_hyps = bt.get("hypotheses", ["P_FP", "P_init", "P_term", "P_link"])
+        default_hyps = {
+            "P_FP": True,
+            "P_init": True,
+            "P_term": True,
+            "P_link": True,
+            "P_branch": False,
+            "P_dead": False,
+            "P_merge": False,
+        }
+        for hyp_name, cb in self.bt_hyp_checks.items():
+            if hyp_name == "P_FP":
+                cb.value = True
+            else:
+                cb.value = hyp_name in saved_hyps if saved_hyps else default_hyps.get(hyp_name, False)
+
+        self.bt_dist_thresh.value = int(bt.get("dist_thresh", 60))
+        self.bt_time_thresh.value = int(bt.get("time_thresh", 3))
+        self._toggle_param_groups()
+
+    def _set_method_options_and_value(self, options, value):
+        self.method.options = options
+        valid_values = {option_value for _, option_value in options}
+        if value not in valid_values:
+            value = options[0][1]
+        self.method.value = value
+
+    def _render_individual_panel(self, load_from_config=True):
+        self.ui.layout.display = "flex"
+        self.title_html.value = f"<b>{self.cell_type} Tracking</b>"
+        self.organoid_group_info.layout.display = "none"
+        self.btn_run.description = f"Run {self.cell_type} tracking"
+
+        if load_from_config:
+            params = dict(self.metadata_loader.behav3d_parameters or {})
+            profile = self._get_config_for_cell_type(params)
+            default_method = "propagation" if self.category == "organoid" else "trackpy"
+            method_value = str(profile.get("method", default_method))
+            self._set_method_options_and_value(self._individual_method_options, method_value)
+            self._load_individual_profile_into_widgets(profile)
+        else:
+            self._set_method_options_and_value(self._individual_method_options, self.method.value)
+            self._toggle_param_groups()
+
+    def _render_all_organoids_panel(self, load_from_config=True):
+        self.ui.layout.display = "flex"
+        organoid_types = self.organoid_group_context.get("organoid_types", [])
+        organoid_text = ", ".join(organoid_types) if organoid_types else "No organoid types detected"
+        self.title_html.value = "<b>All Organoids Tracking</b>"
+        self.organoid_group_info.value = (
+            "<div style='color:#555;font-size:13px;'>"
+            f"Tracking together: <b>{organoid_text}</b>"
+            "</div>"
+        )
+        self.organoid_group_info.layout.display = "flex"
+        self.btn_run.description = "Run all organoid tracking"
+
+        params = dict(self.metadata_loader.behav3d_parameters or {})
+        profile = self._get_all_organoids_config(params) if load_from_config else {}
+        method_value = str(profile.get("method", "propagation_all_organoids"))
+        self._set_method_options_and_value(self._combined_method_options, method_value)
+        self.overwrite.value = bool(profile.get("overwrite", False))
+        self._toggle_param_groups()
+
+    def _apply_organoid_group_mode(self, load_from_config=True):
+        if not self._has_linked_organoid_mode():
+            self.ui.layout.display = "flex"
+            return
+
+        self._syncing_organoid_toggle = True
+        try:
+            self.track_organoids_together.value = self._organoids_together_enabled()
+        finally:
+            self._syncing_organoid_toggle = False
+
+        if self._organoids_together_enabled():
+            if self._is_first_organoid_panel():
+                self._render_all_organoids_panel(load_from_config=load_from_config)
+            else:
+                self.ui.layout.display = "none"
+        else:
+            self._render_individual_panel(load_from_config=load_from_config)
+
+    def _on_track_organoids_together_changed(self, change):
+        if self._syncing_organoid_toggle or not self._has_linked_organoid_mode():
+            return
+
+        panels = list(self.organoid_group_context.get("panels", []))
+        for panel in panels:
+            panel._persist_current_mode(write_file=False)
+
+        self.organoid_group_context["enabled"] = bool(change["new"])
+        self._ensure_cfg_skeleton()
+        params = dict(self.metadata_loader.behav3d_parameters or {})
+        params.setdefault("tracking", {})["track_organoids_together"] = bool(change["new"])
+        self.metadata_loader.behav3d_parameters = params
+        self._write_behav3d_parameters()
+
+        for panel in panels:
+            panel._apply_organoid_group_mode(load_from_config=True)
+
     def _toggle_param_groups(self, change=None):
         if self.method.value == "lap": self.param_container.children = (self.lap_params,)
         elif self.method.value == "trackpy": self.param_container.children = (self.tp_params,)
@@ -325,7 +640,7 @@ class TrackingPanel:
                   self.bt_config_preset, self.bt_config_path, self.bt_use_visual_features,
                   self.bt_max_search_radius,
                   self.bt_update_method, self.bt_step_size, self.bt_n_workers, self.bt_use_optimize,
-                  self.bt_dist_thresh, self.bt_time_thresh,
+                  self.bt_dist_thresh, self.bt_time_thresh, self.track_organoids_together,
                   self.btn_run]:
             if hasattr(w, "disabled"): w.disabled = state
         for cb in self.bt_hyp_checks.values():
@@ -341,35 +656,72 @@ class TrackingPanel:
 
     def _ensure_cfg_skeleton(self):
         p = dict(self.metadata_loader.behav3d_parameters or {})
-        p.setdefault("tracking", {})
-        p["tracking"].setdefault("immune", {"method": "trackpy", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 45, "gap_close_max_frames": 5, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 31, "memory_frames": 5, "adaptive_stop": 5.0, "adaptive_step": 0.95}, "btrack": {"config_preset": "cell", "config_path": "", "use_visual_features": False, "max_search_radius": 100, "update_method": "EXACT", "step_size": 100, "n_workers": 16, "use_optimize": False, "hypotheses": ["P_FP", "P_init", "P_term", "P_link"], "dist_thresh": 60, "time_thresh": 3}})
-        p["tracking"].setdefault("other", {"method": "trackpy", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 45, "gap_close_max_frames": 5, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 31, "memory_frames": 5, "adaptive_stop": 5.0, "adaptive_step": 0.95}, "btrack": {"config_preset": "cell", "config_path": "", "use_visual_features": False, "max_search_radius": 100, "update_method": "EXACT", "step_size": 100, "n_workers": 8, "use_optimize": False, "hypotheses": ["P_FP", "P_init", "P_term", "P_link"], "dist_thresh": 60, "time_thresh": 3}})
-        p["tracking"].setdefault("organoid", {"method": "propagation", "overwrite": False, "lap": {"track_cost_px": 60, "gap_close_cost_px": 80, "gap_close_max_frames": 3, "merging_cost_px": 0, "splitting_cost_px": 0}, "trackpy": {"search_range_px": 35, "memory_frames": 2, "adaptive_stop": 10.0, "adaptive_step": 0.95}, "btrack": {"config_preset": "cell", "config_path": "", "use_visual_features": False, "max_search_radius": 100, "update_method": "EXACT", "step_size": 100, "n_workers": 8, "use_optimize": False, "hypotheses": ["P_FP", "P_init", "P_term", "P_link"], "dist_thresh": 60, "time_thresh": 3}})
+        tracking_cfg = p.setdefault("tracking", {})
+        tracking_cfg.setdefault("immune", _tracking_profile_defaults("immune"))
+        tracking_cfg.setdefault("other", _tracking_profile_defaults("other"))
+        tracking_cfg.setdefault("organoid", _tracking_profile_defaults("organoid"))
+        tracking_cfg.setdefault("all_organoids", _tracking_profile_defaults("all_organoids"))
+        tracking_cfg.setdefault("track_organoids_together", False)
         self.metadata_loader.behav3d_parameters = p
 
-    def _persist_params(self):
+    def _persist_current_mode(self, write_file=True):
         self._ensure_cfg_skeleton()
         params = dict(self.metadata_loader.behav3d_parameters or {})
-        prof = params["tracking"].setdefault(self.cell_type, {"lap": {}, "trackpy": {}})
-        prof["method"] = str(self.method.value)
-        prof["overwrite"] = bool(self.overwrite.value)
-        prof["lap"].update({"track_cost_px": int(self.track_cost_dist.value), "gap_close_cost_px": int(self.gap_cost_dist.value), "gap_close_max_frames": int(self.gap_max_frames.value), "merging_cost_px": int(self.merging_cost_dist.value), "splitting_cost_px": int(self.splitting_cost_dist.value)})
-        prof["trackpy"].update({"search_range_px": int(self.tp_search_range.value), "memory_frames": int(self.tp_memory.value), "adaptive_stop": float(self.tp_adaptive_stop.value), "adaptive_step": float(self.tp_adaptive_step.value)})
-        bt = prof.setdefault("btrack", {})
-        preset_val = str(self.bt_config_preset.value)
-        bt["config_preset"] = "custom" if preset_val == "custom" else preset_val
-        bt["config_path"] = self.bt_config_path.value.strip() if preset_val == "custom" else ""
-        bt["use_visual_features"] = bool(self.bt_use_visual_features.value)
-        bt["max_search_radius"] = int(self.bt_max_search_radius.value)
-        bt["update_method"] = str(self.bt_update_method.value)
-        bt["step_size"] = int(self.bt_step_size.value)
-        bt["n_workers"] = max(1, int(self.bt_n_workers.value))
-        bt["use_optimize"] = bool(self.bt_use_optimize.value)
-        bt["hypotheses"] = [name for name, cb in self.bt_hyp_checks.items() if cb.value]
-        bt["dist_thresh"] = int(self.bt_dist_thresh.value)
-        bt["time_thresh"] = int(self.bt_time_thresh.value)        
+        tracking_cfg = params.setdefault("tracking", {})
+        tracking_cfg["track_organoids_together"] = bool(
+            self.organoid_group_context.get("enabled", False)
+        ) if self._has_linked_organoid_mode() else bool(tracking_cfg.get("track_organoids_together", False))
+
+        if self._organoids_together_enabled() and not self._is_first_organoid_panel():
+            self.metadata_loader.behav3d_parameters = params
+            if write_file:
+                self._write_behav3d_parameters()
+            return
+
+        if self._organoids_together_enabled() and self._is_first_organoid_panel():
+            prof = tracking_cfg.setdefault("all_organoids", _tracking_profile_defaults("all_organoids"))
+            prof["method"] = str(self.method.value)
+            prof["overwrite"] = bool(self.overwrite.value)
+        else:
+            if self.cell_type not in tracking_cfg:
+                base_key = self.category if self.category in _TRACKING_PROFILE_DEFAULTS else "other"
+                tracking_cfg[self.cell_type] = _tracking_profile_defaults(base_key)
+            prof = tracking_cfg[self.cell_type]
+            prof["method"] = str(self.method.value)
+            prof["overwrite"] = bool(self.overwrite.value)
+            prof.setdefault("lap", {}).update({
+                "track_cost_px": int(self.track_cost_dist.value),
+                "gap_close_cost_px": int(self.gap_cost_dist.value),
+                "gap_close_max_frames": int(self.gap_max_frames.value),
+                "merging_cost_px": int(self.merging_cost_dist.value),
+                "splitting_cost_px": int(self.splitting_cost_dist.value),
+            })
+            prof.setdefault("trackpy", {}).update({
+                "search_range_px": int(self.tp_search_range.value),
+                "memory_frames": int(self.tp_memory.value),
+                "adaptive_stop": float(self.tp_adaptive_stop.value),
+                "adaptive_step": float(self.tp_adaptive_step.value),
+            })
+            bt = prof.setdefault("btrack", {})
+            preset_val = str(self.bt_config_preset.value)
+            bt["config_preset"] = "custom" if preset_val == "custom" else preset_val
+            bt["config_path"] = self.bt_config_path.value.strip() if preset_val == "custom" else ""
+            bt["use_visual_features"] = bool(self.bt_use_visual_features.value)
+            bt["max_search_radius"] = int(self.bt_max_search_radius.value)
+            bt["update_method"] = str(self.bt_update_method.value)
+            bt["step_size"] = int(self.bt_step_size.value)
+            bt["n_workers"] = max(1, int(self.bt_n_workers.value))
+            bt["use_optimize"] = bool(self.bt_use_optimize.value)
+            bt["hypotheses"] = [name for name, cb in self.bt_hyp_checks.items() if cb.value]
+            bt["dist_thresh"] = int(self.bt_dist_thresh.value)
+            bt["time_thresh"] = int(self.bt_time_thresh.value)
+
         self.metadata_loader.behav3d_parameters = params
-        with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(params, f, sort_keys=False)
+        if write_file:
+            self._write_behav3d_parameters()
+
+    def _persist_params(self):
+        self._persist_current_mode(write_file=True)
 
     def _on_run_clicked(self, _):
         self._lock(True)
@@ -384,6 +736,10 @@ class TrackingPanel:
                 csv_path = Path(self.metadata_loader.metadata_csv_path).expanduser()
 
                 method = self.method.value
+                run_all_organoids = (
+                    (self._organoids_together_enabled() and self._is_first_organoid_panel())
+                    or (method == "propagation_all_organoids")
+                )
                 if method == "lap":
                     tc, gc, mc, sc = int(self.track_cost_dist.value)**2, int(self.gap_cost_dist.value)**2, int(self.merging_cost_dist.value), int(self.splitting_cost_dist.value)
                     new_md = run_laptracking(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, track_cost_cutoff=tc, gap_closing_cost_cutoff=gc, gap_closing_max_frame_count=int(self.gap_max_frames.value), merging_cost_cutoff=(mc**2 if mc>0 else False), splitting_cost_cutoff=(sc**2 if sc>0 else False), overwrite=bool(self.overwrite.value))
@@ -411,7 +767,13 @@ class TrackingPanel:
                         time_thresh=int(self.bt_time_thresh.value) if use_opt else None,
                     )
                 else:
-                    new_md = run_propagation_tracking(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, overwrite=bool(self.overwrite.value))
+                    new_md = run_propagation_tracking(
+                        metadata=self.metadata_loader.metadata,
+                        output_dir=str(out_dir),
+                        cell_type=self.cell_type,
+                        overwrite=bool(self.overwrite.value),
+                        all_organoids=run_all_organoids,
+                    )
 
                 self.metadata_loader.metadata = new_md
                 new_md.to_csv(csv_path, sep=",", index=False)

@@ -22,6 +22,7 @@ os.environ['PYOPENCL_NO_CACHE'] = '1'
 os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
 
 import numpy as np
+import pandas as pd
 import zarr
 import apoc
 import pyclesperanto_prototype as cle
@@ -46,7 +47,8 @@ def _get_probability_classifier(clf, positive_class_id=2):
     labels. This function patches the footer to output the probability of the
     foreground class instead (vote fraction s{class-1} / sum_s).
 
-    The patched file is cached per .cl path so it's only created once.
+    The patched file is cached per classifier file identity so it is recreated
+    when the source .cl changes after retraining.
     """
     import re, tempfile
 
@@ -54,8 +56,15 @@ def _get_probability_classifier(clf, positive_class_id=2):
         _get_probability_classifier._cache = {}
 
     src_path = clf.opencl_file
-    if src_path in _get_probability_classifier._cache:
-        return _get_probability_classifier._cache[src_path]
+    src_stat = os.stat(src_path)
+    cache_key = (
+        src_path,
+        int(src_stat.st_mtime_ns),
+        int(src_stat.st_size),
+        int(positive_class_id),
+    )
+    if cache_key in _get_probability_classifier._cache:
+        return _get_probability_classifier._cache[cache_key]
 
     with open(src_path, 'r') as f:
         content = f.read()
@@ -103,7 +112,7 @@ def _get_probability_classifier(clf, positive_class_id=2):
     )
     prob_clf.output_probability_of_class = positive_class_id
 
-    _get_probability_classifier._cache[src_path] = prob_clf
+    _get_probability_classifier._cache[cache_key] = prob_clf
     return prob_clf
 
 def _load_classifier(pixelclass_dir, cell_type, provided_path=None):
@@ -387,8 +396,10 @@ def run_apoc_segmentation(
                         from skimage.measure import label as sk_label
                         from skimage.segmentation import watershed
                         from behav3d.preprocessing.segmentation import segment_size_filter, segment_2d_filter
+                        from behav3d.preprocessing.segmentation.segmentation_utils import postprocess_mask, segment_mask
                         _diag = (i == 0)  # print timings on first timepoint only
 
+                        opening_nr_pixels = int(cfg.get(f"{ct}_opening_nr_pixels", 0))
                         if not only_segment:
                             _t0 = time.time()
                             prob_clf = _get_probability_classifier(classifiers[ct])
@@ -399,9 +410,13 @@ def run_apoc_segmentation(
 
                             _t0 = time.time()
                             mask_thr = float(cfg.get(f"{ct}_prob_mask_threshold", 0.5))
-                            mask_out = (prob_map > mask_thr).astype(np.uint16)
+                            mask_out = postprocess_mask(
+                                prob_map > mask_thr,
+                                fill_holes=False,
+                                opening_nr_pixels=opening_nr_pixels,
+                            ).astype(np.uint16)
                             zarr_masks[ct][t] = mask_out
-                            if _diag: print(f"    ⏱ {ct} mask threshold + write: {time.time()-_t0:.2f}s")
+                            if _diag: print(f"    ⏱ {ct} mask threshold + opening + write: {time.time()-_t0:.2f}s")
                         else:
                             mask_out = np.asarray(zarr_masks[ct][t])
                             prob_map = None
@@ -414,7 +429,7 @@ def run_apoc_segmentation(
                             from scipy import ndimage as ndi
                             mask_bool = mask_out.astype(bool)
                             cc_labels = sk_label(mask_bool)
-                            seed_mask = prob_map > seed_thr
+                            seed_mask = (prob_map > seed_thr) & mask_bool
                             segments = np.zeros_like(cc_labels)
                             next_id = 0
                             obj_slices = ndi.find_objects(cc_labels)
@@ -441,7 +456,6 @@ def run_apoc_segmentation(
                                         segments[slc][sub_result == s] = next_id
                             if _diag: print(f"    ⏱ {ct} per-component watershed: {time.time()-_t0:.2f}s ({n_comps} components, {n_split} split)")
                         else:
-                            from behav3d.preprocessing.segmentation.segmentation_utils import segment_mask
                             segments = segment_mask(mask_out.astype(bool), edt_thr=seed_thr, segment_size_min=segment_size_min, use_dims=3, n_workers=1)
 
                         _t0 = time.time()

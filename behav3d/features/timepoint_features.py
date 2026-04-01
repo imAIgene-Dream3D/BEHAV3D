@@ -1561,7 +1561,7 @@ def _calculate_morphology_single_timepoint(args):
     Features calculated:
     - volume
     - bbox_volume
-    - extent
+    - extent (orientation-invariant, principal-axis-based)
     - solidity
     - equivalent_diameter
     - major_axis_length
@@ -1590,7 +1590,7 @@ def _calculate_morphology_single_timepoint(args):
                 label_image=stack,
                 properties=[
                     "label", "num_pixels", "area", "bbox_area",
-                    "extent", "solidity", "equivalent_diameter",
+                    "solidity", "equivalent_diameter",
                     "major_axis_length", "minor_axis_length", "inertia_tensor",
                     "inertia_tensor_eigvals", "moments_central"
                 ],
@@ -1733,6 +1733,19 @@ def _calculate_morphology_single_timepoint(args):
         properties["axis1_length"] = axis_length_a_list
         properties["axis2_length"] = axis_length_b_list
         properties["axis3_length"] = axis_length_c_list
+        with np.errstate(divide='ignore', invalid='ignore'):
+            oriented_bbox_volume = (
+                properties["axis1_length"] * properties["axis2_length"] * properties["axis3_length"]
+            )
+            valid_oriented_bbox = (
+                np.isfinite(oriented_bbox_volume)
+                & (oriented_bbox_volume > 0)
+            )
+            properties["extent"] = np.where(
+                valid_oriented_bbox,
+                properties["volume"] / oriented_bbox_volume,
+                np.nan,
+            )
         properties["oblateness"] = oblateness_list
         properties["prolateness"] = prolateness_list
         # properties["principal_axes"] = principal_axes_list  # columns: a,b,c
