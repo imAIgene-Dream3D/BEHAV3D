@@ -12,7 +12,7 @@ from skimage.morphology import (
     opening,
     disk,
 )
-from behav3d.io.images import convert_file_to_zarr, get_image_shape
+from behav3d.io.images import convert_raw_file_to_zarr, get_image_shape
 from behav3d.core.utils import rel_elsize
 
 def calculate_edt(image, use_dims=3, elsize=None):
@@ -286,6 +286,7 @@ def convert_input_files_to_zarr(
     metadata,
     t_start=None,
     t_end=None,
+    n_workers=1,
     ):
     """
     Convert all raw images listed in metadata to .zarr in TCZYX order.
@@ -303,16 +304,18 @@ def convert_input_files_to_zarr(
         axis_order = None
         if "dimension_order" in sample.index:
             val = sample["dimension_order"]
-            if isinstance(val, str) and len(val) == 5:
+            if isinstance(val, str) and 2 <= len(val) <= 5:
                 axis_order = val.upper()
 
-        convert_file_to_zarr(
+        # Raw images: enforce TCZYX output (singleton-expand missing T/C/Z).
+        convert_raw_file_to_zarr(
             path=raw_image_path, 
             outpath=raw_image_zarr, 
             axis_order=axis_order,
             overwrite=False,
             t_start=t_start,
             t_end=t_end,
+            n_workers=n_workers,
         )
 
         metadata.at[idx, "raw_image_path"] = str(raw_image_zarr)

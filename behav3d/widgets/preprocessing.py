@@ -1,3 +1,4 @@
+import os
 import ipywidgets as widgets
 from pathlib import Path
 import pandas as pd
@@ -6,7 +7,8 @@ import yaml
 from copy import deepcopy
 from .utils import (
     _cfg_get, 
-    spinning_loader
+    spinning_loader,
+    DIM_ORDER_OPTIONS,
 )
 from behav3d.preprocessing import convert_input_files_to_zarr
 from behav3d.io.images import load_image, get_image_shape, get_image_dimension_order
@@ -39,6 +41,14 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
     end_t = widgets.IntText(value=0, description='End T:', layout=widgets.Layout(width='150px'))
     
     range_box = widgets.HBox([start_t, end_t], layout=widgets.Layout(display='none', margin='0 0 10px 0'))
+
+    _cpu = os.cpu_count() or 4
+    n_workers = widgets.IntText(
+        value=max(1, _cpu // 2),
+        description='Workers:',
+        style={'description_width': 'initial'},
+        layout=widgets.Layout(width='150px'),
+    )
 
     def _on_selector_change(change):
         range_box.layout.display = 'flex' if change['new'] == 'Custom time range' else 'none'
@@ -87,7 +97,8 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
                     metadata=metadata_loader.metadata,
                     output_dir=metadata_loader.output_dir,
                     t_start=t_start,
-                    t_end=t_end
+                    t_end=t_end,
+                    n_workers=max(1, int(n_workers.value)),
                 )
             except Exception:
                 traceback.print_exc()
@@ -102,13 +113,11 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
                 spinner.layout.display = "none"
 
     btn.on_click(_run_conversion)
-    return widgets.VBox([selector, range_box, row, out])
+    return widgets.VBox([selector, range_box, n_workers, row, out])
 
 class DimOrderTable:
     PLACEHOLDER = "-- select --"
-    DIM_ORDER_OPTIONS = [
-        "TCZYX", "TZCYX", "ZCTYX", "ZTCYX", "CZTYX", "CTZYX",
-    ]
+    DIM_ORDER_OPTIONS = DIM_ORDER_OPTIONS
     DEFAULT_ORDER = "TCZYX"
 
     def __init__(

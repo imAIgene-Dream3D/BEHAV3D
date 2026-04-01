@@ -74,26 +74,22 @@ def load_liff(path):
     """
     Load a .lif/.liff file and return data as (T, C, Z, Y, X).
     
-    Any missing axes are added as singleton dimensions (size 1),
-    so that the returned array always has 5 dimensions.
+    The readlif library always addresses frames by (t, z, c), so the
+    returned array is always 5D TCZYX — including singletons at size 1
+    (e.g. T=1, C=1, or Z=1).
     """
-    arr, dims = _load_liff_raw(path)
-    
-    # Ensure we have all 5 axes T,C,Z,Y,X present in dims
-    wanted = "TCZYX"
-    for ax in wanted:
-        if ax not in dims:
-            arr = np.expand_dims(arr, axis=0)
-            dims = ax + dims
-    
-    # Build a mapping from axis label -> index in current array
-    axis_map = {ax: i for i, ax in enumerate(dims)}
-    
-    # Reorder to (T, C, Z, Y, X)
-    order = [axis_map[ax] for ax in wanted]
-    arr = np.transpose(arr, axes=order)
-    
+    arr, _dims = _load_liff_raw(path)
     return arr
+
+
+def get_liff_dimension_order(path=None):
+    """
+    Return the axis order for LIF files.
+
+    LIF always has all 5 dimensions (T, C, Z, Y, X) — the readlif API addresses
+    frames by (t, z, c), so the order is always TCZYX even when T=1, C=1, or Z=1.
+    """
+    return "TCZYX"
 
 
 def get_liff_shape(path, take_dims="TCZYX"):

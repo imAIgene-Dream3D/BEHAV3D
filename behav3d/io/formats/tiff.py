@@ -25,7 +25,7 @@ def get_tiff_shape(path):
 def get_tiff_dimension_order(path):
     """
     Try to detect axis order from TIFF metadata (OME-TIFF / ImageJ TIFF).
-    Returns a 5-char axis string if detection succeeds, None otherwise.
+    Returns an axis string (e.g. "TCZYX", "ZYX") if detection succeeds, None otherwise.
     """
     path = Path(path)
     if path.is_dir():
@@ -38,7 +38,7 @@ def get_tiff_dimension_order(path):
             axes = axes.replace("S", "C").replace("I", "Z").replace("Q", "")
             known = set("TCZYX")
             axes = "".join(ax for ax in axes if ax in known)
-            if len(axes) == 5 and set(axes) == known:
+            if axes and len(axes) == len(set(axes)) and set(axes).issubset(known):
                 return axes
     except Exception:
         pass
