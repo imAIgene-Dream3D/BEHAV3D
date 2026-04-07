@@ -10,7 +10,7 @@ from .formats.h5 import load_h5
 from .formats.ims import load_ims, load_ims_metadata, load_ims_timepoint_czyx, get_ims_dimension_order, get_ims_shape
 from .formats.liff import load_liff, get_liff_shape, load_liff_metadata, load_elsizes_liff, load_liff_timepoint_czyx, get_liff_dimension_order
 from .formats.tiff import load_tiff, get_tiff_shape, get_tiff_dimension_order
-from .formats.zarr import load_zarr, save_as_zarr, write_zarr_parallel
+from .formats.zarr import load_zarr, append_to_zarr, save_as_zarr, write_zarr_parallel
 
 _FORMATS_WITH_TP_LOADER = {".czi", ".lif", ".liff", ".ims", ".zarr"}
 
