@@ -286,6 +286,7 @@ def convert_input_files_to_zarr(
     metadata,
     t_start=None,
     t_end=None,
+    n_workers=1,
     ):
     
     for idx, sample in metadata.iterrows():
@@ -302,6 +303,7 @@ def convert_input_files_to_zarr(
             overwrite=False,
             t_start=t_start,
             t_end=t_end,
+            n_workers=n_workers,
         )
                 
         metadata.at[idx, "raw_image_path"] = str(raw_image_zarr)

@@ -9,6 +9,7 @@ The original pixel classifier in napari_pixelclassifier.py is left completely un
 import os
 import gc
 import json
+import re
 import time
 import shutil
 from pathlib import Path
@@ -26,10 +27,9 @@ from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
 
 import dask.array as da
-import zarr
 import pyclesperanto_prototype as cle
 
-from behav3d.io.images import load_image, load_zarr, save_as_zarr, append_to_zarr
+from behav3d.io.images import load_image, load_zarr, save_as_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 
 # ---------------------------------------------------------------------------
@@ -51,7 +51,8 @@ APOC_ALL_FEATURES = APOC_FEATURES
 
 # Format sigma values nicely (drop trailing .0)
 def _fmt_sigma(s):
-    return str(int(s)) if float(s) == int(s) else str(s)
+    s_float = float(s)
+    return str(int(s_float)) if s_float == int(s_float) else str(s_float)
 
 
 # Each preset is a set of (feature_key, sigma_str) pairs that should be
@@ -156,14 +157,23 @@ def _parse_feature_string(feature_string):
     valid_features = {feat_key for feat_key, _ in APOC_ALL_FEATURES}
 
     for token in tokens:
+        token = str(token).strip()
         lower = token.lower()
-        if lower == "original":
+        if lower == "original" or re.fullmatch(r"original_channel\d+", lower):
             consider_original = True
             continue
-        if "=" not in token:
-            continue
-        feat_key, sigma_text = token.split("=", 1)
-        if feat_key not in valid_features:
+
+        feat_key = None
+        sigma_text = None
+        if "=" in token:
+            feat_key, sigma_text = token.split("=", 1)
+        else:
+            readable = re.sub(r"_channel\d+$", "", token)
+            match = re.fullmatch(r"(.+)_sigma([^_]+)", readable)
+            if match:
+                feat_key, sigma_text = match.groups()
+
+        if feat_key not in valid_features or sigma_text is None:
             continue
         try:
             sigma_text = _fmt_sigma(float(sigma_text))
@@ -183,10 +193,17 @@ def _parse_feature_string(feature_string):
                 feature_preset = preset_name
                 break
 
+    canonical_feature_string = _build_feature_string_from_checked(
+        checked_set,
+        consider_original=consider_original,
+        current_sigmas=sigmas or _default_grid_sigmas(),
+    )
+
     return {
-        "feature_string": feature_string,
+        "feature_string": canonical_feature_string,
         "checked_features": [list(pair) for pair in checked],
         "sigmas": ",".join(sigmas),
+        "grid_sigmas": ", ".join(sigmas),
         "consider_original": consider_original,
         "feature_preset": feature_preset,
     }
@@ -561,7 +578,11 @@ class CellTypeTab(QWidget):
         trained_cfg = _load_classifier_restore_config(pixel_class_outdir, cell_type)
         cfg = dict(saved_cfg)
         cfg.update({key: value for key, value in trained_cfg.items() if key != "grid_sigmas"})
-        cfg["grid_sigmas"] = saved_cfg.get("grid_sigmas") or _default_grid_sigmas_text()
+        cfg["grid_sigmas"] = (
+            saved_cfg.get("grid_sigmas")
+            or trained_cfg.get("grid_sigmas")
+            or _default_grid_sigmas_text()
+        )
         ip = {f"apoc_{cell_type}_{key}": value for key, value in cfg.items()}
         self._default_channel_names = list(saved_cfg.get("channels", []))
 
@@ -1125,6 +1146,7 @@ class APOCTrainingWidget(QWidget):
         self._initial_params = initial_params or {}
         self._on_params_changed = on_params_changed
         self._apoc_strategy = str(self._initial_params.get("apoc_strategy", "APOC (Direct Instance Segmentation)"))
+        self._log_fn = print
 
         # All tab labels = cell types + optional Death
         self._tab_cell_types = list(all_cell_types)
@@ -1139,6 +1161,17 @@ class APOCTrainingWidget(QWidget):
         # Listen for layer changes
         self.viewer.layers.events.inserted.connect(lambda _: self._refresh_all_channels())
         self.viewer.layers.events.removed.connect(lambda _: self._refresh_all_channels())
+
+    def set_log_fn(self, log_fn):
+        """Attach an optional GUI log sink."""
+        self._log_fn = log_fn or print
+
+    def _log(self, message):
+        """Write a message to stdout and, when available, to the GUI log."""
+        text = str(message)
+        print(text)
+        if callable(self._log_fn) and self._log_fn is not print:
+            self._log_fn(text)
 
     def _build_ui(self):
         layout = QVBoxLayout()
@@ -1284,6 +1317,64 @@ class APOCTrainingWidget(QWidget):
                     pass
         return images
 
+    def _get_selected_channel_names(self, ct):
+        """Return selected channel layer names in tab order."""
+        tab = self.tabs[ct]
+        return [cb.text() for cb in tab.channel_checkboxes if cb.isChecked()]
+
+    def _normalize_feature_string(self, feature_string):
+        feature_string = str(feature_string or "").replace(",", " ").replace("\t", " ").strip()
+        while "  " in feature_string:
+            feature_string = feature_string.replace("  ", " ")
+        return feature_string
+
+    def _feature_tokens(self, feature_string):
+        normalized = self._normalize_feature_string(feature_string)
+        return [tok for tok in normalized.split(" ") if tok]
+
+    def _format_feature_token_name(self, token):
+        """Convert an APOC feature token into a readable stable name."""
+        token = str(token or "").strip()
+        if not token:
+            return ""
+        if token.lower() == "original":
+            return "original"
+        if "=" not in token:
+            return token.replace(" ", "_")
+        feature_name, sigma_text = token.split("=", 1)
+        sigma_text = sigma_text.strip()
+        return f"{feature_name.strip()}_sigma{sigma_text}"
+
+    def _expanded_feature_names(self, ct, feature_string):
+        """Return one readable feature name per cached feature plane."""
+        channel_names = self._get_selected_channel_names(ct)
+        feature_tokens = self._feature_tokens(feature_string)
+        expanded = []
+        for channel_idx, _channel_name in enumerate(channel_names):
+            for token in feature_tokens:
+                feature_name = self._format_feature_token_name(token)
+                if feature_name:
+                    expanded.append(f"{feature_name}_channel{channel_idx}")
+        return expanded
+
+    def _generate_feature_list_for_timepoint(self, images, feature_string, t_idx=0, *, push_to_device=False):
+        """Generate APOC features for one timepoint without caching them on disk."""
+        import apoc
+
+        feature_tokens = self._feature_tokens(feature_string)
+        if not feature_tokens:
+            raise RuntimeError("No APOC features selected. Choose at least one feature before training.")
+
+        features = []
+        for img in images:
+            img_t = np.asarray(img[t_idx]) if getattr(img, "ndim", 0) == 4 else np.asarray(img)
+            generated = apoc.generate_feature_stack(img_t, feature_string)
+            if push_to_device:
+                features.extend(generated)
+            else:
+                features.extend(np.asarray(feat) for feat in generated)
+        return features
+
     def _set_labels_layer(self, name, data, visible=True, opacity=0.8):
         """Create or update a Napari labels layer."""
         if name in [layer.name for layer in self.viewer.layers]:
@@ -1323,6 +1414,7 @@ class APOCTrainingWidget(QWidget):
         images = self._get_images_for_tab(ct)
         if not images:
             raise RuntimeError(f"No image layers selected for '{ct}'.")
+        feature_string = self.tabs[ct].get_config()["feature_string"]
 
         if clf is None:
             clf_path = self.tabs[ct]._get_clf_path()
@@ -1331,20 +1423,29 @@ class APOCTrainingWidget(QWidget):
             clf = apoc.ObjectSegmenter(opencl_filename=str(clf_path))
 
         prob_clf = _get_probability_classifier(clf)
-        if images[0].ndim == 4:
+        if getattr(images[0], "ndim", 0) == 4:
             results = []
             prob_results = []
             for t in range(images[0].shape[0]):
-                imgs_t = [np.asarray(img[t]) for img in images]
-                imgs_to_pass = imgs_t[0] if len(imgs_t) == 1 else imgs_t
-                results.append(np.asarray(clf.predict(image=imgs_to_pass)).astype(np.int16))
-                prob_results.append(np.asarray(prob_clf.predict(image=imgs_to_pass)).astype(np.float32))
+                feats_t = self._generate_feature_list_for_timepoint(
+                    images,
+                    feature_string,
+                    t,
+                    push_to_device=True,
+                )
+                results.append(np.asarray(clf.predict(features=feats_t)).astype(np.int16))
+                prob_results.append(np.asarray(prob_clf.predict(features=feats_t)).astype(np.float32))
             return np.stack(results, axis=0), np.stack(prob_results, axis=0)
 
-        imgs = images[0] if len(images) == 1 else images
+        features = self._generate_feature_list_for_timepoint(
+            images,
+            feature_string,
+            0,
+            push_to_device=True,
+        )
         return (
-            np.asarray(clf.predict(image=imgs)).astype(np.int16),
-            np.asarray(prob_clf.predict(image=imgs)).astype(np.float32),
+            np.asarray(clf.predict(features=features)).astype(np.int16),
+            np.asarray(prob_clf.predict(features=features)).astype(np.float32),
         )
 
     def _update_prediction_layers(self, ct, segments_result, prob_result):
@@ -1435,24 +1536,25 @@ class APOCTrainingWidget(QWidget):
 
     def save_user_labels(self, log=print):
         """Save all user-provided labels for all cell types and Dead (if present)."""
-        import shutil
         for cell_type in self.all_cell_types:
             lname = f"User Provided Labels ({cell_type.capitalize()})"
             if lname not in [l.name for l in self.viewer.layers]:
                 continue
             label_layer = self.viewer.layers[lname]
+            label_data = np.asarray(label_layer.data)
             outpath = Path(self.pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
             if outpath.exists():
                 shutil.rmtree(outpath)
-            save_as_zarr(label_layer.data, outpath)
+            save_as_zarr(label_data, outpath)
             log(f"Saved {cell_type} labels → {outpath}")
 
         if self.has_death and "User Provided Labels (Dead)" in [l.name for l in self.viewer.layers]:
             dead_layer = self.viewer.layers["User Provided Labels (Dead)"]
+            dead_label_data = np.asarray(dead_layer.data)
             dead_outpath = Path(self.pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
             if dead_outpath.exists():
                 shutil.rmtree(dead_outpath)
-            save_as_zarr(dead_layer.data, dead_outpath)
+            save_as_zarr(dead_label_data, dead_outpath)
             log(f"Saved Death labels → {dead_outpath}")
 
         log("✅ All user labels saved!")
@@ -1460,10 +1562,11 @@ class APOCTrainingWidget(QWidget):
     def _run_training(self, cell_types_to_train):
         """Train (and apply) APOC classifiers for the given list of cell types."""
         import apoc
+        training_start = time.time()
 
         # Auto-save labels before training
-        print("Auto-saving user labels before training...")
-        self.save_user_labels(log=print)
+        self._log("Auto-saving user labels before training...")
+        self.save_user_labels(log=self._log)
 
         successes = []
         try:
@@ -1473,6 +1576,8 @@ class APOCTrainingWidget(QWidget):
                 feature_string = cfg["feature_string"]
                 max_depth = cfg["max_depth"]
                 num_ensembles = cfg["num_ensembles"]
+                expanded_feature_names = self._expanded_feature_names(ct, feature_string)
+                expanded_feature_spec = " ".join(expanded_feature_names)
 
                 self.status_label.setText(f"Processing {ct}...")
                 QApplication.processEvents()
@@ -1520,26 +1625,77 @@ class APOCTrainingWidget(QWidget):
                 has_trained = False
                 n_timepoints = annotation.shape[0] if annotation.ndim == 4 else 1
 
+                # Old APOC incremental-style training path kept for reference:
+                # if annotation.ndim == 4:
+                #     for t in range(n_timepoints):
+                #         # Load only the current timepoint slice into memory
+                #         ann_t = np.asarray(annotation[t])
+                #         if not np.any(ann_t):
+                #             continue
+                #         feats_t = self._generate_feature_list_for_timepoint(images, feature_string, t)
+                #         clf.feature_specification = expanded_feature_spec
+                #         clf.train(feats_t, ann_t, continue_training=has_trained)
+                #         clf.feature_specification = expanded_feature_spec
+                #         has_trained = True
+                # else:
+                #     # Single timepoint
+                #     ann_np = np.asarray(annotation)
+                #     feats_np = self._generate_feature_list_for_timepoint(images, feature_string, 0)
+                #     clf.feature_specification = expanded_feature_spec
+                #     clf.train(feats_np, ann_np)
+                #     clf.feature_specification = expanded_feature_spec
+                #     has_trained = True
+
+                from sklearn.ensemble import RandomForestClassifier
+
+                X_parts = []
+                y_parts = []
+                gt_ndim = None
+
                 if annotation.ndim == 4:
                     for t in range(n_timepoints):
-                        # Load only the current timepoint slice into memory
                         ann_t = np.asarray(annotation[t])
                         if not np.any(ann_t):
                             continue
-                        imgs_t = [np.asarray(img[t]) for img in images]
-                        imgs_to_pass = imgs_t[0] if len(imgs_t) == 1 else imgs_t
-                        clf.train(feature_string, ann_t, imgs_to_pass, continue_training=has_trained)
-                        has_trained = True
+                        feats_t = self._generate_feature_list_for_timepoint(images, feature_string, t)
+                        X_t, y_t = clf._to_np(feats_t, ann_t)
+                        if X_t.size == 0 or y_t.size == 0:
+                            continue
+                        X_parts.append(X_t)
+                        y_parts.append(y_t)
+                        gt_ndim = ann_t.ndim
                 else:
-                    # Single timepoint
                     ann_np = np.asarray(annotation)
-                    imgs_np = [np.asarray(img) for img in images]
-                    imgs_to_pass = imgs_np[0] if len(imgs_np) == 1 else imgs_np
-                    clf.train(feature_string, ann_np, imgs_to_pass)
+                    feats_np = self._generate_feature_list_for_timepoint(images, feature_string, 0)
+                    X_t, y_t = clf._to_np(feats_np, ann_np)
+                    if X_t.size > 0 and y_t.size > 0:
+                        X_parts.append(X_t)
+                        y_parts.append(y_t)
+                        gt_ndim = ann_np.ndim
+
+                if X_parts:
+                    X = np.concatenate(X_parts, axis=0)
+                    y = np.concatenate(y_parts, axis=0)
+                    fitted_rf = RandomForestClassifier(
+                        max_depth=max_depth,
+                        n_estimators=num_ensembles,
+                        random_state=0,
+                    )
+                    fitted_rf.fit(X, y)
+                    clf.classifier = fitted_rf
+                    clf._feature_importances = fitted_rf.feature_importances_
+                    clf._X = X
+                    clf._y = y
+                    clf.num_features = X.shape[1]
+                    clf.num_ground_truth_dimensions = gt_ndim
+                    clf.feature_specification = expanded_feature_spec
                     has_trained = True
 
                 if not has_trained:
                     continue
+
+                clf.feature_specification = expanded_feature_spec
+                clf.to_opencl_file(clf_path)
 
                 # Predict (visual confirmation)
                 raw_prediction, prob_result = self._predict_classifier_outputs(ct, clf=clf)
@@ -1556,13 +1712,19 @@ class APOCTrainingWidget(QWidget):
                 successes.append(ct)
 
             if successes:
-                self.status_label.setText(f"✅ Trained: {', '.join(successes)}")
+                elapsed_s = time.time() - training_start
+                elapsed_txt = f"{elapsed_s:.1f}s"
+                self.status_label.setText(f"✅ Trained: {', '.join(successes)} ({elapsed_txt})")
+                self._log(f"✅ Training finished in {elapsed_txt}")
                 # Auto-show statistics for each successfully trained classifier
                 for ct in successes:
                     if ct in self.tabs:
                         self.tabs[ct]._on_show_statistics()
             else:
-                self.status_label.setText("⚠️ No cell types were trained (check labels).")
+                elapsed_s = time.time() - training_start
+                elapsed_txt = f"{elapsed_s:.1f}s"
+                self.status_label.setText(f"⚠️ No cell types were trained (check labels). ({elapsed_txt})")
+                self._log(f"⚠️ No cell types were trained. Elapsed time: {elapsed_txt}")
 
             # Persist all params back to caller
             self._persist_params()
@@ -1708,19 +1870,24 @@ def train_pixel_classifier_apoc(
 
     ip = initial_params or {}
 
+    def _restore_saved_labels(saved_path, expected_shape, label_name):
+        if not saved_path.exists():
+            return np.zeros(expected_shape, dtype=np.int16)
+        try:
+            existing = np.asarray(load_zarr(saved_path))
+        except Exception as exc:
+            print(f"  ⚠️ Could not restore saved labels for '{label_name}' from {saved_path}: {exc}")
+            return np.zeros(expected_shape, dtype=np.int16)
+        if existing.shape == expected_shape:
+            print(f"  ↩ Restored saved labels for '{label_name}' ({expected_shape})")
+            return existing
+        print(f"  ⚠️ Saved labels shape {existing.shape} ≠ expected {expected_shape} — starting fresh")
+        return np.zeros(expected_shape, dtype=np.int16)
+
     # 1. User Provided Labels (all cell types)
     for cell_type in all_cell_types:
         saved_path = Path(pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
-        if saved_path.exists():
-            existing = np.asarray(load_zarr(saved_path))
-            if existing.shape == label_shape:
-                user_labels = existing
-                print(f"  ↩ Restored saved labels for '{cell_type}' ({label_shape})")
-            else:
-                print(f"  ⚠️ Saved labels shape {existing.shape} ≠ expected {label_shape} — starting fresh")
-                user_labels = np.zeros(label_shape, dtype=np.int16)
-        else:
-            user_labels = np.zeros(label_shape, dtype=np.int16)
+        user_labels = _restore_saved_labels(saved_path, label_shape, cell_type)
 
         viewer.add_labels(
             user_labels,
@@ -1730,15 +1897,7 @@ def train_pixel_classifier_apoc(
 
     if has_death:
         dead_path = Path(pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
-        if dead_path.exists():
-            dead_labels = np.asarray(load_zarr(dead_path))
-            if dead_labels.shape == label_shape:
-                print(f"  ↩ Restored saved labels for 'dead' ({label_shape})")
-            else:
-                print(f"  ⚠️ Saved Death labels shape {dead_labels.shape} ≠ {label_shape} — starting fresh")
-                dead_labels = np.zeros(label_shape, dtype=np.int16)
-        else:
-            dead_labels = np.zeros(label_shape, dtype=np.int16)
+        dead_labels = _restore_saved_labels(dead_path, label_shape, "dead")
         viewer.add_labels(dead_labels, name="User Provided Labels (Dead)", opacity=0.5)
 
     # 2. Results (Pixel Classification / Segments) on top
@@ -1826,6 +1985,7 @@ def train_pixel_classifier_apoc(
     log_layout.addWidget(log_output)
     log_widget.setLayout(log_layout)
     viewer.window.add_dock_widget(log_widget, area="right", name="Log Output")
+    apoc_widget.set_log_fn(log_output.appendPlainText)
 
     save_button = QtPushButton("💾 Save User Labels")
     save_button.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 6px;")
