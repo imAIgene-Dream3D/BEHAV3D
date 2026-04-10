@@ -12,7 +12,7 @@ from skimage.morphology import (
     opening,
     disk,
 )
-from behav3d.io.images import convert_file_to_zarr, get_image_shape
+from behav3d.io.images import convert_raw_file_to_zarr, get_image_shape
 from behav3d.core.utils import rel_elsize
 
 def calculate_edt(image, use_dims=3, elsize=None):
@@ -288,7 +288,11 @@ def convert_input_files_to_zarr(
     t_end=None,
     n_workers=1,
     ):
-    
+    """
+    Convert all raw images listed in metadata to .zarr in TCZYX order.
+    Reads the per-sample ``dimension_order`` column to determine the
+    source axis order for each image.
+    """
     for idx, sample in metadata.iterrows():
         print(f"Processing sample: {sample['sample_name']}") 
         start_time = time.time()
@@ -297,16 +301,25 @@ def convert_input_files_to_zarr(
         raw_image_path = Path(sample['raw_image_path'])
         raw_image_zarr =  Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
 
-        convert_file_to_zarr(
+        axis_order = None
+        if "dimension_order" in sample.index:
+            val = sample["dimension_order"]
+            if isinstance(val, str) and 2 <= len(val) <= 5:
+                axis_order = val.upper()
+
+        # Raw images: enforce TCZYX output (singleton-expand missing T/C/Z).
+        convert_raw_file_to_zarr(
             path=raw_image_path, 
             outpath=raw_image_zarr, 
+            axis_order=axis_order,
             overwrite=False,
             t_start=t_start,
             t_end=t_end,
             n_workers=n_workers,
         )
-                
+
         metadata.at[idx, "raw_image_path"] = str(raw_image_zarr)
+        metadata.at[idx, "dimension_order"] = "TCZYX"
     
     return(metadata)
 

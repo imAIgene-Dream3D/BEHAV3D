@@ -2,11 +2,31 @@ from aicspylibczi import CziFile
 from behav3d.core.utils import element_to_dict
 import numpy as np
 
+_DATA_AXES = set("TCZYX")
+
+
+def _squeeze_wrapper_dims(img, czi_dims, keep="TCZYX"):
+    """
+    Remove only CZI wrapper dimensions (Scene, Block, Mosaic, etc.)
+    while preserving all data axes in *keep*, even when their size is 1.
+    """
+    keep_set = set(keep)
+    axes_to_squeeze = tuple(
+        i for i, ax in enumerate(czi_dims) if ax not in keep_set
+    )
+    if axes_to_squeeze:
+        img = np.squeeze(img, axis=axes_to_squeeze)
+    return img
+
+
 def load_czi(path, t=None, z=None, c=None):
     """
-    Loading .czi images
+    Load a CZI image as-is.
+    Wrapper dimensions (Scene, Block, etc.) are removed but all TCZYX data
+    axes present in the file are preserved — even when their size is 1.
+    The axis order matches the file's native data dimension order.
     """
-    czifile=CziFile(path)
+    czifile = CziFile(path)
     read_kwargs = {}
     if t is not None:
         read_kwargs["T"] = t
@@ -20,11 +40,30 @@ def load_czi(path, t=None, z=None, c=None):
     else:
         img, _ = czifile.read_image()
 
-    # The shape of img contain a lot of singular dimensions
-    # img.shape = (1, 1, 1, 1, 1, 1, 350, 3, 36, 200, 200)
-    # np.squeeze removes preceding or trailing "empty" dimensions
-    img = np.squeeze(img)
-    return(img)
+    img = _squeeze_wrapper_dims(img, czifile.dims, keep="TCZYX")
+    return img
+
+
+def load_czi_timepoint_czyx(path, t, source_order):
+    """
+    Load a single timepoint from a CZI file as-is.
+    Wrapper dims are removed and the T axis is collapsed (since we loaded
+    a specific timepoint).  The returned array keeps whatever CZYX subset
+    the file actually has, in the file's native order.
+    Singleton expansion and CZYX reorder happen in _load_czyx_for_timepoint.
+    """
+    czifile = CziFile(path)
+    img, _ = czifile.read_image(T=t)
+
+    img = _squeeze_wrapper_dims(img, czifile.dims, keep="TCZYX")
+
+    remaining_order = "".join(ax for ax in czifile.dims if ax in _DATA_AXES)
+
+    if "T" in remaining_order:
+        t_pos = remaining_order.index("T")
+        img = np.squeeze(img, axis=t_pos)
+
+    return img
 
 def load_czi_metadata(path):
     """

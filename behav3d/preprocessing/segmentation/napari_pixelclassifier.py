@@ -25,7 +25,7 @@ from scipy.ndimage import binary_fill_holes, find_objects
 
 from behav3d.preprocessing.segmentation import segment_size_filter, get_border_segments, remove_boundary_segments, segment_2d_filter
 from behav3d.preprocessing import open_mask, dilate_mask, calculate_edt, zeropad_image_to_match_shape
-from behav3d.io.images import load_image, get_image_shape, load_zarr, save_as_zarr, append_to_zarr
+from behav3d.io.images import load_image, get_image_shape, load_zarr, save_as_zarr, append_to_zarr, _ensure_zarr
 
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -576,32 +576,10 @@ def train_pixel_classifier(
                 raw_image_path = Path(sample['raw_image_path'])
                 raw_image_zarr =  Path(output_dir, "images", sample_name, f"{sample_name}.zarr")
                 
+                _ensure_zarr(raw_image_path, label=f"Raw image for '{sample_name}'")
                 if not raw_image_zarr.exists():
-                    print(f"- Converting raw image to .zarr for memory efficiency...")
-                    images = load_image(raw_image_path)
-                    print(f"Original image shape: {images.shape}")
-                    default_order = ("T", "C", "Z", "Y", "X")  # T, C, Z, Y, X
-                    if manual_dim_order is not None:
-                        # Convert to tuple of characters if string
-                        if isinstance(manual_dim_order, str):
-                            manual_dim_order = tuple(manual_dim_order)
-                        if manual_dim_order != default_order:
-                            # Compute permutation: for each axis in default_order, find its index in manual_dim_order
-                            perm = [manual_dim_order.index(ax) for ax in default_order]
-                            print(f"Transposing image from {manual_dim_order} to {default_order} using permutation {perm}")
-                            images = images.transpose(perm)
-                            print(f"New image shape: {images.shape}")
-                        else:
-                            print("Image is already in default order (T, C, Z, Y, X).")
-                    # else:
-                    #     print("No manual_dim_order provided, assuming image is already in default order.")
-                    chunksize = (1,) + images.shape[1:]
-                    save_as_zarr(
-                        img=images, 
-                        path=raw_image_zarr, 
-                        chunks=chunksize
-                    )
-                            
+                    raw_image_zarr = raw_image_path
+
                 images = load_image(raw_image_zarr)
                 max_t = images.shape[0]-1
                 print(images.shape)
@@ -1299,13 +1277,14 @@ def train_pixel_classifier(
     # Add "Clear Labels" buttons per user label layer
     gui.native.layout().addWidget(QLabel("--- Clear Labels ---"))
     
+    def _make_clear_fn(layer_name):
+        def _clear():
+            lyr = viewer.layers[layer_name]
+            lyr.data = np.zeros_like(lyr.data)
+        return _clear
+
     if has_death:
         clear_dead_btn = QtPushButton("Clear Labels: Dead")
-        def _make_clear_fn(layer_name):
-            def _clear():
-                lyr = viewer.layers[layer_name]
-                lyr.data = np.zeros_like(lyr.data)
-            return _clear
         clear_dead_btn.clicked.connect(_make_clear_fn('User Provided Labels (Dead)'))
         gui.native.layout().addWidget(clear_dead_btn)
     
@@ -1693,10 +1672,10 @@ def run_pixel_classifier_segmentation(
                         f"Expected {tuple(raw_shape[2:])}, got {tuple(mask_arr.shape[1:])}."
                     )
         else:
-            # Load or convert raw image for full classification
+            # Load raw image (must already be zarr from Preprocessing step)
+            _ensure_zarr(raw_image_path, label=f"Raw image for '{sample_name}'")
             if not raw_image_zarr.exists():
-                img = load_image(raw_image_path)
-                save_as_zarr(img, raw_image_zarr)
+                raw_image_zarr = raw_image_path
             img = load_image(raw_image_zarr)
             print(f"  Raw image shape: {img.shape}")
             _log_mem(f"after loading image zarr handle")

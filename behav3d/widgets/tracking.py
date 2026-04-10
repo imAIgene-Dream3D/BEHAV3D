@@ -7,7 +7,8 @@ from copy import deepcopy
 from .utils import (
     _cfg_get, 
     spinning_loader,
-    detect_cell_type_category
+    detect_cell_type_category,
+    ExternalImageImporter,
 )
 from behav3d.preprocessing.tracking.laptracking import run_laptracking
 from behav3d.preprocessing.tracking.trackpy_tracking import run_trackpy_tracking_generic
@@ -388,6 +389,8 @@ class TrackingPanel:
         self.btn_run.on_click(self._on_run_clicked)
         self.out = widgets.Output()
 
+        self._build_import_section()
+
         self.ui = widgets.VBox([
             self.title_html,
             self.track_organoids_together_box,
@@ -409,6 +412,43 @@ class TrackingPanel:
 
     def display(self):
         widgets.display(self.ui)
+
+    def _build_import_section(self):
+        """Build external tracking image import widget for this cell type."""
+        ct = self.cell_type
+        cat = self.category
+        prefix = {"organoid": "or", "immune": "im", "other": "ot"}[cat]
+        img_col = f"{prefix}_{ct}_tracks_image_path"
+        csv_col = f"{prefix}_{ct}_tracks_csv_path"
+        metadata = self.metadata_loader.metadata
+        sample_names = list(metadata["sample_name"].astype(str))
+
+        out_dir = Path(self.metadata_loader.output_dir) / "images"
+        trackdata_dir = Path(self.metadata_loader.output_dir) / "trackdata"
+        # Note: per-sample subdirs are created inside the callback based on sample_name
+
+        # Build a callback that creates per-sample trackdata dirs
+        def _tracking_callback_factory():
+            from .utils import make_tracking_metadata_callback as _make_cb
+            def _on_converted(sample_name, src, zarr_path):
+                sample_trackdata = trackdata_dir / sample_name / ct
+                cb = _make_cb(self.metadata_loader, img_col, csv_col, str(sample_trackdata))
+                cb(sample_name, src, zarr_path)
+            return _on_converted
+
+        self._track_importer = ExternalImageImporter(
+            label=f"{ct} tracking",
+            output_dir=str(out_dir),
+            on_converted=_tracking_callback_factory(),
+            sample_names=sample_names,
+            output_filename="{sample_name}_" + ct + "_tracked.zarr",
+            is_label_image=True,
+        )
+        self._import_accordion = widgets.Accordion(
+            children=[self._track_importer],
+        )
+        self._import_accordion.set_title(0, "Import external tracking")
+        self._import_accordion.selected_index = None
 
     def _detect_all_cell_types(self):
         from behav3d.io.images import load_image, load_zarr, save_as_zarr

@@ -12,10 +12,13 @@ import yaml
 import traceback
 from functools import partial
 from .utils import (
-    _cfg_get, 
-    _mk_timepoint_range, 
+    _cfg_get,
+    _mk_timepoint_range,
+    detect_cell_type_category,
+    ExternalImageImporter,
+    make_metadata_callback,
+    PathPicker,
     spinning_loader,
-    PathPicker
 )
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
     train_pixel_classifier,
@@ -1035,6 +1038,53 @@ class PixelClassifierPanel:
             finally:
                 self.spinner_filter.layout.display = "none"
                 self._lock(False)
+
+
+def build_external_seg_import_ui(metadata_loader):
+    """Build a standalone widget for importing external segmentation masks (+ dead mask) to Zarr."""
+    metadata = metadata_loader.metadata
+    sample_names = list(metadata["sample_name"].astype(str))
+    out_dir = Path(metadata_loader.output_dir) / "images"
+
+    all_cell_types = (
+        detect_organoid_types_from_metadata(metadata)
+        + detect_immune_cell_types_from_metadata(metadata)
+        + detect_other_cell_types_from_metadata(metadata)
+    )
+
+    children = []
+    for ct in all_cell_types:
+        cat = detect_cell_type_category(ct, metadata)
+        prefix = {"organoid": "or", "immune": "im", "other": "ot"}[cat]
+        col = f"{prefix}_{ct}_segments_image_path"
+        children.append(ExternalImageImporter(
+            label=f"{ct} segmentation",
+            output_dir=str(out_dir),
+            on_converted=make_metadata_callback(metadata_loader, col),
+            sample_names=sample_names,
+            output_filename="{sample_name}_" + ct + "_segments.zarr",
+            is_label_image=True,
+        ))
+
+    if has_dead_channel(metadata):
+        children.append(ExternalImageImporter(
+            label="Dead mask",
+            output_dir=str(out_dir),
+            on_converted=make_metadata_callback(metadata_loader, "dead_mask_path"),
+            sample_names=sample_names,
+            output_filename="{sample_name}_dead_mask.zarr",
+            is_label_image=True,
+        ))
+
+    accordion = widgets.Accordion(children=[widgets.VBox(children)])
+    accordion.set_title(0, "Import external segmentation")
+    accordion.selected_index = None
+
+    return widgets.VBox([
+        widgets.HTML("<b>Import external segmentation</b>"),
+        accordion,
+    ])
+
 
 class CellposeChannelConfigPanel:
 

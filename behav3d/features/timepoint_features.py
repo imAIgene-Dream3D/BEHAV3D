@@ -180,7 +180,7 @@ import math
 import time
 import traceback
 from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
-from behav3d.io.images import load_image, convert_input_files_to_zarr
+from behav3d.io.images import load_image, convert_raw_file_to_zarr, convert_label_file_to_zarr, _ensure_zarr
 from tqdm import tqdm
 from datetime import datetime
 
@@ -353,13 +353,31 @@ def run_feature_extraction(
                     continue
             
             print(f"{get_current_time()} - Converting all input files to .zarr for memory efficiency...")
-            current_cell_segments_path, raw_image_path = convert_input_files_to_zarr(
-                sample_name=sample_name,
-                current_cell_segments_path=current_cell_segments_path,
-                raw_image_path=raw_image_path,
-                output_dir=img_outdir,
-                overwrite=overwrite
+            axis_order = None
+            if "dimension_order" in sample_metadata.index and pd.notna(sample_metadata.get("dimension_order")):
+                val = sample_metadata["dimension_order"]
+                if isinstance(val, str) and 2 <= len(val) <= 5:
+                    axis_order = val.upper()
+
+            seg_path = Path(current_cell_segments_path)
+            seg_zarr = seg_path if seg_path.suffix == ".zarr" else Path(img_outdir, f"{seg_path.stem}.zarr")
+            convert_label_file_to_zarr(
+                path=seg_path,
+                outpath=seg_zarr,
+                axis_order=axis_order,
+                overwrite=overwrite,
             )
+            current_cell_segments_path = seg_zarr
+
+            raw_path = Path(raw_image_path)
+            raw_zarr = raw_path if raw_path.suffix == ".zarr" else Path(img_outdir, f"{sample_name}.zarr")
+            convert_raw_file_to_zarr(
+                path=raw_path,
+                outpath=raw_zarr,
+                axis_order=axis_order,
+                overwrite=overwrite,
+            )
+            raw_image_path = raw_zarr
 
             if not track_outdir.exists():
                 track_outdir.mkdir(parents=True)
