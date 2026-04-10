@@ -909,6 +909,21 @@ def _sanitize_filename_token(value, fallback="value"):
     return token if len(token) > 0 else str(fallback)
 
 
+def _rmtree_ignore_missing(path):
+    """Remove a directory tree while tolerating concurrent missing-file races."""
+    path = Path(path)
+    if not path.exists():
+        return
+
+    def _ignore_missing(func, target, excinfo):
+        err = excinfo[1]
+        if isinstance(err, FileNotFoundError):
+            return
+        raise err
+
+    shutil.rmtree(path, onexc=_ignore_missing)
+
+
 def _select_exemplar_windows_by_cluster(
     adata_windows,
     *,
@@ -1034,8 +1049,7 @@ def _render_state_cluster_exemplar_videos(
         / "example_windows"
         / _sanitize_filename_token(cluster_key, fallback="cluster")
     )
-    if exemplar_root.exists():
-        shutil.rmtree(exemplar_root)
+    _rmtree_ignore_missing(exemplar_root)
     exemplar_root.mkdir(parents=True, exist_ok=True)
 
     try:

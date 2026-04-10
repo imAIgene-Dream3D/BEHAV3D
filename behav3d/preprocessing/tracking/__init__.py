@@ -132,12 +132,17 @@ def convert_tracked_image_to_csv(
     ):
     segments = load_image(img_path)
     df_tracks = []
+    prop_cols = ['label', 'centroid-0', 'centroid-1', 'centroid-2']
     for t, t_seg in tqdm(enumerate(segments), total=len(segments)):
         t_seg = np.asarray(t_seg)
-        properties=pd.DataFrame(regionprops_table(label_image=t_seg, properties=['label', f'centroid']))
+        properties = pd.DataFrame(regionprops_table(label_image=t_seg, properties=['label', 'centroid']))
+        properties = properties.reindex(columns=prop_cols)
         properties["position_t"]=t
         df_tracks.append(properties)
-    df_tracks = pd.concat(df_tracks)
+    if df_tracks:
+        df_tracks = pd.concat(df_tracks, ignore_index=True)
+    else:
+        df_tracks = pd.DataFrame(columns=prop_cols + ["position_t"])
     df_tracks.rename(
             columns={
                     'label': 'SegmentID',
