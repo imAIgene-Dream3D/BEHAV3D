@@ -9,6 +9,7 @@ The original pixel classifier in napari_pixelclassifier.py is left completely un
 import os
 import gc
 import json
+import re
 import time
 import shutil
 from pathlib import Path
@@ -17,7 +18,7 @@ import numpy as np
 import napari
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox,
-    QSpinBox, QLineEdit, QPushButton as QtPushButton,
+    QSpinBox, QDoubleSpinBox, QLineEdit, QPushButton as QtPushButton,
     QCheckBox, QGroupBox, QPlainTextEdit, QApplication, QScrollArea,
     QSizePolicy, QTabWidget, QFrame, QMessageBox,
     QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -26,10 +27,9 @@ from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
 
 import dask.array as da
-import zarr
 import pyclesperanto_prototype as cle
 
-from behav3d.io.images import load_image, load_zarr, save_as_zarr, append_to_zarr
+from behav3d.io.images import load_image, load_zarr, save_as_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 
 # ---------------------------------------------------------------------------
@@ -51,7 +51,8 @@ APOC_ALL_FEATURES = APOC_FEATURES
 
 # Format sigma values nicely (drop trailing .0)
 def _fmt_sigma(s):
-    return str(int(s)) if float(s) == int(s) else str(s)
+    s_float = float(s)
+    return str(int(s_float)) if s_float == int(s_float) else str(s_float)
 
 
 # Each preset is a set of (feature_key, sigma_str) pairs that should be
@@ -131,6 +132,291 @@ def _build_feature_string_from_checked(checked_set, consider_original=False, cur
             if (feat_key, s_str) in checked_set:
                 parts.append(f"{feat_key}={s_str}")
     return " ".join(parts)
+
+
+def _default_grid_sigmas():
+    """Return the default APOC sigma grid as display strings."""
+    return [_fmt_sigma(s) for s in APOC_SIGMAS]
+
+
+def _default_grid_sigmas_text():
+    """Return the default APOC sigma grid as a text field value."""
+    return ", ".join(_default_grid_sigmas())
+
+
+def _parse_feature_string(feature_string):
+    """Convert an APOC feature string into the grid config used by the widget."""
+    feature_string = str(feature_string or "").replace(",", " ").replace("\t", " ").strip()
+    while "  " in feature_string:
+        feature_string = feature_string.replace("  ", " ")
+
+    tokens = [tok for tok in feature_string.split(" ") if tok]
+    checked = []
+    sigmas = []
+    consider_original = False
+    valid_features = {feat_key for feat_key, _ in APOC_ALL_FEATURES}
+
+    for token in tokens:
+        token = str(token).strip()
+        lower = token.lower()
+        if lower == "original" or re.fullmatch(r"original_channel\d+", lower):
+            consider_original = True
+            continue
+
+        feat_key = None
+        sigma_text = None
+        if "=" in token:
+            feat_key, sigma_text = token.split("=", 1)
+        else:
+            readable = re.sub(r"_channel\d+$", "", token)
+            match = re.fullmatch(r"(.+)_sigma([^_]+)", readable)
+            if match:
+                feat_key, sigma_text = match.groups()
+
+        if feat_key not in valid_features or sigma_text is None:
+            continue
+        try:
+            sigma_text = _fmt_sigma(float(sigma_text))
+        except ValueError:
+            continue
+        checked.append((feat_key, sigma_text))
+        if sigma_text not in sigmas:
+            sigmas.append(sigma_text)
+
+    checked_set = set(checked)
+    feature_preset = "custom"
+    if not consider_original:
+        for preset_name, preset_cfg in FEATURE_PRESETS.items():
+            if preset_name == "custom":
+                continue
+            if checked_set == set(preset_cfg["checked"]):
+                feature_preset = preset_name
+                break
+
+    canonical_feature_string = _build_feature_string_from_checked(
+        checked_set,
+        consider_original=consider_original,
+        current_sigmas=sigmas or _default_grid_sigmas(),
+    )
+
+    return {
+        "feature_string": canonical_feature_string,
+        "checked_features": [list(pair) for pair in checked],
+        "sigmas": ",".join(sigmas),
+        "grid_sigmas": ", ".join(sigmas),
+        "consider_original": consider_original,
+        "feature_preset": feature_preset,
+    }
+
+
+def _read_classifier_header_value(opencl_path, key, default=None):
+    """Read a single APOC metadata value from the header of a trained .cl file."""
+    path = Path(opencl_path)
+    if not path.exists():
+        return default
+
+    prefix = f"{key} = "
+    with path.open() as f:
+        line = ""
+        count = 0
+        while line != "*/" and count < 50:
+            line = f.readline()
+            if not line:
+                break
+            count += 1
+            line = line.strip()
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
+    return default
+
+
+def _classifier_path(pixel_class_outdir, cell_type):
+    """Return the expected APOC classifier path for a cell type."""
+    if not pixel_class_outdir:
+        return None
+    if cell_type == "dead":
+        fname = "PixelClassifier_Death.cl"
+    else:
+        fname = f"PixelClassifier_{cell_type.capitalize()}.cl"
+    return Path(pixel_class_outdir) / fname
+
+
+def _predicted_labels_path(pixel_class_outdir, cell_type):
+    """Return the expected predicted-label zarr path for a cell type."""
+    if not pixel_class_outdir:
+        return None
+    if cell_type == "dead":
+        fname = "PixelClassifier_Death_PredictedLabels.zarr"
+    else:
+        fname = f"PixelClassifier_{cell_type.capitalize()}_PredictedLabels.zarr"
+    return Path(pixel_class_outdir) / fname
+
+
+def _probability_map_path(pixel_class_outdir, cell_type):
+    """Return the expected probability-map zarr path for a cell type."""
+    if not pixel_class_outdir:
+        return None
+    if cell_type == "dead":
+        fname = "PixelClassifier_Death_ProbabilityMap.zarr"
+    else:
+        fname = f"PixelClassifier_{cell_type.capitalize()}_ProbabilityMap.zarr"
+    return Path(pixel_class_outdir) / fname
+
+
+def _reorder_apoc_layers(viewer, all_cell_types, has_death=False):
+    """Group APOC layers by cell type with segments above probability above labels."""
+    layer_names = [layer.name for layer in viewer.layers]
+    channel_names = [name for name in layer_names if name.startswith("Channel ")]
+    ordered_names = list(channel_names)
+
+    for cell_type in all_cell_types:
+        ordered_names.extend([
+            f"User Provided Labels ({cell_type.capitalize()})",
+            f"Probability Map ({cell_type.capitalize()})",
+            f"{cell_type.capitalize()} Segments",
+        ])
+
+    if has_death:
+        ordered_names.extend([
+            "User Provided Labels (Dead)",
+            "Probability Map (Dead)",
+            "Pixel Classification (Dead)",
+        ])
+
+    target_names = [name for name in ordered_names if name in layer_names]
+    trailing_names = [name for name in layer_names if name not in target_names]
+    final_order = target_names + trailing_names
+
+    for target_idx, name in enumerate(final_order):
+        current_idx = viewer.layers.index(name)
+        if current_idx != target_idx:
+            viewer.layers.move(current_idx, target_idx)
+
+
+def _load_classifier_restore_config(pixel_class_outdir, cell_type):
+    """Recover APOC widget defaults from a trained classifier file when available."""
+    clf_path = _classifier_path(pixel_class_outdir, cell_type)
+    if clf_path is None or not clf_path.exists():
+        return {}
+
+    cfg = {}
+    feature_string = _read_classifier_header_value(clf_path, "feature_specification")
+    if feature_string:
+        cfg.update(_parse_feature_string(feature_string))
+
+    max_depth = _read_classifier_header_value(clf_path, "max_depth")
+    if max_depth is not None:
+        try:
+            cfg["max_depth"] = int(max_depth)
+        except (TypeError, ValueError):
+            pass
+
+    num_trees = _read_classifier_header_value(clf_path, "num_trees")
+    if num_trees is not None:
+        try:
+            cfg["num_ensembles"] = int(num_trees)
+        except (TypeError, ValueError):
+            pass
+
+    return cfg
+
+
+def _extract_cell_type_config(initial_params, cell_type):
+    """Gather APOC settings for one cell type from flat initial params."""
+    cfg = {}
+    prefix = f"apoc_{cell_type}_"
+    for key, value in (initial_params or {}).items():
+        if key.startswith(prefix):
+            cfg[key[len(prefix):]] = value
+    return cfg
+
+
+def _finalize_segments(segments, segment_size_min):
+    """Apply shared cleanup to a labeled segmentation volume."""
+    from behav3d.preprocessing.segmentation import segment_size_filter, segment_2d_filter
+
+    segments = np.asarray(segments).copy()
+    segments = segment_size_filter(segments, size_min=segment_size_min)
+    if segments.ndim == 3:
+        segments = segment_2d_filter(segments)
+    return np.asarray(segments).astype(np.uint16)
+
+
+def _probability_volume_to_segments(prob_map, mask_thr, seed_thr, opening_nr_pixels, segment_size_min):
+    """Convert a single probability-map volume to instances."""
+    from scipy import ndimage as ndi
+    from skimage.measure import label as sk_label
+    from skimage.segmentation import watershed
+    from behav3d.preprocessing.segmentation.segmentation_utils import postprocess_mask
+
+    prob_map = np.asarray(prob_map).astype(np.float32)
+    mask_out = postprocess_mask(
+        prob_map > mask_thr,
+        fill_holes=False,
+        opening_nr_pixels=opening_nr_pixels,
+    ).astype(bool)
+
+    cc_labels = sk_label(mask_out)
+    seed_mask = (prob_map > seed_thr) & mask_out
+    segments = np.zeros_like(cc_labels, dtype=np.uint16)
+    next_id = 0
+
+    for comp_idx, slc in enumerate(ndi.find_objects(cc_labels), start=1):
+        if slc is None:
+            continue
+        comp_mask = cc_labels[slc] == comp_idx
+        sub_seeds = sk_label(seed_mask[slc] & comp_mask)
+        n_seeds = int(sub_seeds.max())
+        if n_seeds <= 1:
+            next_id += 1
+            segments[slc][comp_mask] = next_id
+            continue
+
+        sub_result = watershed(-prob_map[slc], markers=sub_seeds, mask=comp_mask)
+        for seed_id in range(1, int(sub_result.max()) + 1):
+            next_id += 1
+            segments[slc][sub_result == seed_id] = next_id
+
+    return _finalize_segments(segments, segment_size_min)
+
+
+def _probability_array_to_segments(prob_map, mask_thr, seed_thr, opening_nr_pixels, segment_size_min):
+    """Convert a 3D/4D probability map array to instances."""
+    prob_map = np.asarray(prob_map)
+    if prob_map.ndim == 4:
+        return np.stack([
+            _probability_volume_to_segments(prob_map[t], mask_thr, seed_thr, opening_nr_pixels, segment_size_min)
+            for t in range(prob_map.shape[0])
+        ], axis=0)
+    return _probability_volume_to_segments(prob_map, mask_thr, seed_thr, opening_nr_pixels, segment_size_min)
+
+
+def _mask_array_to_segments(mask, edt_thr, opening_nr_pixels, segment_size_min, fill_holes):
+    """Convert a binary mask array to instances using the EDT workflow."""
+    from behav3d.preprocessing.segmentation.segmentation_utils import postprocess_mask, segment_mask
+
+    mask = np.asarray(mask)
+
+    def _segment_one(mask_volume):
+        proc_mask = postprocess_mask(
+            mask_volume.astype(bool),
+            fill_holes=fill_holes,
+            opening_nr_pixels=opening_nr_pixels,
+        )
+        return np.asarray(
+            segment_mask(
+                proc_mask,
+                edt_thr=edt_thr,
+                edt_thr_refined=None,
+                segment_size_min=segment_size_min,
+                use_dims=3,
+                n_workers=1,
+            )
+        ).astype(np.uint16)
+
+    if mask.ndim == 4:
+        return np.stack([_segment_one(mask[t]) for t in range(mask.shape[0])], axis=0)
+    return _segment_one(mask)
 
 
 # ---------------------------------------------------------------------------
@@ -269,11 +555,36 @@ class CellTypeTab(QWidget):
       - max_depth / num_ensembles RF parameters
     """
 
-    def __init__(self, cell_type, viewer, initial_params=None, parent=None):
+    def __init__(
+        self,
+        cell_type,
+        viewer,
+        pixel_class_outdir=None,
+        initial_params=None,
+        apoc_strategy="APOC (Direct Instance Segmentation)",
+        on_params_changed=None,
+        run_instance_callback=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.cell_type = cell_type
         self.viewer = viewer
-        ip = initial_params or {}
+        self._pixel_class_outdir = pixel_class_outdir
+        self._on_params_changed = on_params_changed
+        self._run_instance_callback = run_instance_callback
+        self._apoc_strategy = str(apoc_strategy)
+        root_params = initial_params or {}
+        saved_cfg = _extract_cell_type_config(initial_params, cell_type)
+        trained_cfg = _load_classifier_restore_config(pixel_class_outdir, cell_type)
+        cfg = dict(saved_cfg)
+        cfg.update({key: value for key, value in trained_cfg.items() if key != "grid_sigmas"})
+        cfg["grid_sigmas"] = (
+            saved_cfg.get("grid_sigmas")
+            or trained_cfg.get("grid_sigmas")
+            or _default_grid_sigmas_text()
+        )
+        ip = {f"apoc_{cell_type}_{key}": value for key, value in cfg.items()}
+        self._default_channel_names = list(saved_cfg.get("channels", []))
 
         layout = QVBoxLayout()
         layout.setContentsMargins(8, 8, 8, 8)
@@ -376,6 +687,16 @@ class CellTypeTab(QWidget):
         rf_row.addStretch()
         layout.addLayout(rf_row)
 
+        self.run_instance_btn = None
+        self.instance_group = None
+        self.prob_mask_threshold_spin = None
+        self.prob_seed_threshold_spin = None
+        self.edt_threshold_spin = None
+        self.segment_size_min_spin = None
+        self.opening_nr_pixels_spin = None
+        self.fill_holes_cb = None
+        self._build_instance_controls(root_params)
+
         layout.addStretch()
         self.setLayout(layout)
 
@@ -424,6 +745,106 @@ class CellTypeTab(QWidget):
     def _get_current_checked_set(self):
         """Return the set of (feat_key, sigma_str) currently checked in the grid."""
         return {key for key, cb in self._feat_sigma_checks.items() if cb.isChecked()}
+
+    def _build_instance_controls(self, initial_params):
+        """Create per-tab instance-segmentation preview controls."""
+        if self.cell_type == "dead" or self._apoc_strategy == "APOC (Direct Instance Segmentation)":
+            return
+
+        group = QGroupBox("Instance Segmentation Preview")
+        group_layout = QVBoxLayout()
+        group_layout.setContentsMargins(4, 4, 4, 4)
+        group_layout.setSpacing(4)
+        group_layout.addWidget(QLabel(f"Uses notebook strategy: {self._apoc_strategy}"))
+
+        if self._apoc_strategy == "APOC Probability Map + Watershed":
+            row1 = QHBoxLayout()
+            row2 = QHBoxLayout()
+            self.prob_mask_threshold_spin = QDoubleSpinBox()
+            self.prob_mask_threshold_spin.setRange(0.0, 1.0)
+            self.prob_mask_threshold_spin.setSingleStep(0.05)
+            self.prob_mask_threshold_spin.setValue(float(initial_params.get(f"{self.cell_type}_prob_mask_threshold", 0.5)))
+            row1.addWidget(QLabel("Mask threshold:"))
+            row1.addWidget(self.prob_mask_threshold_spin)
+
+            self.prob_seed_threshold_spin = QDoubleSpinBox()
+            self.prob_seed_threshold_spin.setRange(0.0, 1.0)
+            self.prob_seed_threshold_spin.setSingleStep(0.05)
+            self.prob_seed_threshold_spin.setValue(float(initial_params.get(f"{self.cell_type}_prob_seed_threshold", 0.8)))
+            row1.addWidget(QLabel("Seed threshold:"))
+            row1.addWidget(self.prob_seed_threshold_spin)
+            group_layout.addLayout(row1)
+
+            self.opening_nr_pixels_spin = QSpinBox()
+            self.opening_nr_pixels_spin.setRange(0, 10)
+            self.opening_nr_pixels_spin.setValue(int(initial_params.get(f"{self.cell_type}_opening_nr_pixels", 0)))
+            row2.addWidget(QLabel("Opening px:"))
+            row2.addWidget(self.opening_nr_pixels_spin)
+
+            self.segment_size_min_spin = QSpinBox()
+            self.segment_size_min_spin.setRange(0, 100000)
+            self.segment_size_min_spin.setSingleStep(10)
+            self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 10)))
+            row2.addWidget(QLabel("Min size:"))
+            row2.addWidget(self.segment_size_min_spin)
+            group_layout.addLayout(row2)
+
+        elif self._apoc_strategy == "APOC Mask + EDT/Watershed Resegmentation":
+            row1 = QHBoxLayout()
+            row2 = QHBoxLayout()
+            self.edt_threshold_spin = QDoubleSpinBox()
+            self.edt_threshold_spin.setRange(0.0, 50.0)
+            self.edt_threshold_spin.setSingleStep(0.5)
+            self.edt_threshold_spin.setValue(float(initial_params.get(f"{self.cell_type}_edt_threshold", 1.0)))
+            row1.addWidget(QLabel("EDT threshold:"))
+            row1.addWidget(self.edt_threshold_spin)
+
+            self.opening_nr_pixels_spin = QSpinBox()
+            self.opening_nr_pixels_spin.setRange(0, 10)
+            self.opening_nr_pixels_spin.setValue(int(initial_params.get(f"{self.cell_type}_opening_nr_pixels", 0)))
+            row1.addWidget(QLabel("Opening px:"))
+            row1.addWidget(self.opening_nr_pixels_spin)
+            group_layout.addLayout(row1)
+
+            self.segment_size_min_spin = QSpinBox()
+            self.segment_size_min_spin.setRange(0, 100000)
+            self.segment_size_min_spin.setSingleStep(10)
+            self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 10)))
+            row2.addWidget(QLabel("Min size:"))
+            row2.addWidget(self.segment_size_min_spin)
+
+            self.fill_holes_cb = QCheckBox("Fill holes")
+            self.fill_holes_cb.setChecked(bool(initial_params.get(f"{self.cell_type}_fill_holes", True)))
+            row2.addWidget(self.fill_holes_cb)
+            group_layout.addLayout(row2)
+
+        self.run_instance_btn = QtPushButton("Run instance segmentation")
+        self.run_instance_btn.clicked.connect(self._on_run_instance_segmentation)
+        group_layout.addWidget(self.run_instance_btn)
+        group.setLayout(group_layout)
+        self.instance_group = group
+
+        for widget in [
+            self.prob_mask_threshold_spin,
+            self.prob_seed_threshold_spin,
+            self.edt_threshold_spin,
+            self.segment_size_min_spin,
+            self.opening_nr_pixels_spin,
+        ]:
+            if widget is not None:
+                widget.valueChanged.connect(self._emit_params_changed)
+        if self.fill_holes_cb is not None:
+            self.fill_holes_cb.stateChanged.connect(self._emit_params_changed)
+
+    def _emit_params_changed(self, *_args):
+        """Notify the notebook widget that Napari-side params changed."""
+        if callable(self._on_params_changed):
+            self._on_params_changed()
+
+    def _on_run_instance_segmentation(self):
+        """Run instance-segmentation preview for this tab."""
+        if callable(self._run_instance_callback):
+            self._run_instance_callback(self.cell_type)
 
     def _on_preset_changed(self, preset_name):
         """Reset grid checkboxes to the new preset's defaults."""
@@ -579,6 +1000,11 @@ class CellTypeTab(QWidget):
 
     def refresh_channel_checkboxes(self):
         """Rebuild channel checkboxes from current Napari image layers."""
+        existing_names = {cb.text() for cb in self.channel_checkboxes}
+        checked_names = {cb.text() for cb in self.channel_checkboxes if cb.isChecked()}
+        default_names = set(self._default_channel_names)
+        use_defaults = not self.channel_checkboxes
+
         for cb in self.channel_checkboxes:
             self.chan_checkbox_layout.removeWidget(cb)
             cb.deleteLater()
@@ -588,11 +1014,24 @@ class CellTypeTab(QWidget):
             if (
                 isinstance(layer, napari.layers.Image)
                 and not layer.name.startswith("Pixel Classification")
+                and not layer.name.startswith("Probability Map")
+                and not layer.name.startswith("Instance Segmentation")
             ):
                 cb = QCheckBox(layer.name)
-                cb.setChecked(True)
+                if use_defaults and default_names:
+                    checked = layer.name in default_names
+                elif layer.name in existing_names:
+                    checked = layer.name in checked_names
+                elif default_names:
+                    checked = layer.name in default_names
+                else:
+                    checked = True
+                cb.setChecked(checked)
                 self.chan_checkbox_layout.addWidget(cb)
                 self.channel_checkboxes.append(cb)
+        self._default_channel_names = [
+            cb.text() for cb in self.channel_checkboxes if cb.isChecked()
+        ]
 
     def get_config(self):
         """Return a dict with all current widget values."""
@@ -615,6 +1054,24 @@ class CellTypeTab(QWidget):
             "channels":           [
                 cb.text() for cb in self.channel_checkboxes if cb.isChecked()
             ],
+            "prob_mask_threshold": (
+                float(self.prob_mask_threshold_spin.value()) if self.prob_mask_threshold_spin is not None else None
+            ),
+            "prob_seed_threshold": (
+                float(self.prob_seed_threshold_spin.value()) if self.prob_seed_threshold_spin is not None else None
+            ),
+            "edt_threshold": (
+                float(self.edt_threshold_spin.value()) if self.edt_threshold_spin is not None else None
+            ),
+            "segment_size_min": (
+                int(self.segment_size_min_spin.value()) if self.segment_size_min_spin is not None else None
+            ),
+            "opening_nr_pixels": (
+                int(self.opening_nr_pixels_spin.value()) if self.opening_nr_pixels_spin is not None else None
+            ),
+            "fill_holes": (
+                bool(self.fill_holes_cb.isChecked()) if self.fill_holes_cb is not None else None
+            ),
         }
 
     def apply_config(self, cfg):
@@ -641,6 +1098,19 @@ class CellTypeTab(QWidget):
         if "channels" in cfg:
             for cb in self.channel_checkboxes:
                 cb.setChecked(cb.text() in cfg["channels"])
+            self._default_channel_names = list(cfg["channels"])
+        if "prob_mask_threshold" in cfg and self.prob_mask_threshold_spin is not None and cfg["prob_mask_threshold"] is not None:
+            self.prob_mask_threshold_spin.setValue(float(cfg["prob_mask_threshold"]))
+        if "prob_seed_threshold" in cfg and self.prob_seed_threshold_spin is not None and cfg["prob_seed_threshold"] is not None:
+            self.prob_seed_threshold_spin.setValue(float(cfg["prob_seed_threshold"]))
+        if "edt_threshold" in cfg and self.edt_threshold_spin is not None and cfg["edt_threshold"] is not None:
+            self.edt_threshold_spin.setValue(float(cfg["edt_threshold"]))
+        if "segment_size_min" in cfg and self.segment_size_min_spin is not None and cfg["segment_size_min"] is not None:
+            self.segment_size_min_spin.setValue(int(cfg["segment_size_min"]))
+        if "opening_nr_pixels" in cfg and self.opening_nr_pixels_spin is not None and cfg["opening_nr_pixels"] is not None:
+            self.opening_nr_pixels_spin.setValue(int(cfg["opening_nr_pixels"]))
+        if "fill_holes" in cfg and self.fill_holes_cb is not None and cfg["fill_holes"] is not None:
+            self.fill_holes_cb.setChecked(bool(cfg["fill_holes"]))
         self._update_preview()
 
 
@@ -675,6 +1145,8 @@ class APOCTrainingWidget(QWidget):
         self.has_death = has_death
         self._initial_params = initial_params or {}
         self._on_params_changed = on_params_changed
+        self._apoc_strategy = str(self._initial_params.get("apoc_strategy", "APOC (Direct Instance Segmentation)"))
+        self._log_fn = print
 
         # All tab labels = cell types + optional Death
         self._tab_cell_types = list(all_cell_types)
@@ -683,11 +1155,23 @@ class APOCTrainingWidget(QWidget):
 
         self._build_ui()
         self._connect_signals()
+        self._refresh_instance_controls()
         self._refresh_all_channels()
 
         # Listen for layer changes
         self.viewer.layers.events.inserted.connect(lambda _: self._refresh_all_channels())
         self.viewer.layers.events.removed.connect(lambda _: self._refresh_all_channels())
+
+    def set_log_fn(self, log_fn):
+        """Attach an optional GUI log sink."""
+        self._log_fn = log_fn or print
+
+    def _log(self, message):
+        """Write a message to stdout and, when available, to the GUI log."""
+        text = str(message)
+        print(text)
+        if callable(self._log_fn) and self._log_fn is not print:
+            self._log_fn(text)
 
     def _build_ui(self):
         layout = QVBoxLayout()
@@ -702,8 +1186,15 @@ class APOCTrainingWidget(QWidget):
         self.tabs = {}  # cell_type -> CellTypeTab
 
         for ct in self._tab_cell_types:
-            tab = CellTypeTab(ct, self.viewer, initial_params=self._initial_params)
-            tab._pixel_class_outdir = self.pixel_class_outdir  # for statistics button
+            tab = CellTypeTab(
+                ct,
+                self.viewer,
+                pixel_class_outdir=self.pixel_class_outdir,
+                initial_params=self._initial_params,
+                apoc_strategy=self._apoc_strategy,
+                on_params_changed=self._persist_params,
+                run_instance_callback=self._run_instance_preview,
+            )
             self.tabs[ct] = tab
             self.tab_widget.addTab(tab, ct.capitalize())
 
@@ -739,6 +1230,14 @@ class APOCTrainingWidget(QWidget):
         global_row2.addWidget(self.train_all_btn)
         layout.addLayout(global_row2)
 
+        self.instance_controls_widget = QWidget()
+        self.instance_controls_layout = QVBoxLayout()
+        self.instance_controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.instance_controls_layout.setSpacing(6)
+        self.instance_controls_widget.setLayout(self.instance_controls_layout)
+        self.instance_controls_widget.setVisible(False)
+        layout.addWidget(self.instance_controls_widget)
+
         # --- Status label ---
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
@@ -751,6 +1250,26 @@ class APOCTrainingWidget(QWidget):
         self.apply_all_btn.clicked.connect(self._on_apply_to_all)
         self.train_current_btn.clicked.connect(self._on_train_current)
         self.train_all_btn.clicked.connect(self._on_train_all)
+        self.tab_widget.currentChanged.connect(lambda _idx: self._refresh_instance_controls())
+
+    def _refresh_instance_controls(self):
+        """Show the current tab's instance-segmentation controls in the main dock."""
+        while self.instance_controls_layout.count():
+            item = self.instance_controls_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+
+        current_ct = self._tab_cell_types[self.tab_widget.currentIndex()]
+        current_tab = self.tabs[current_ct]
+        group = getattr(current_tab, "instance_group", None)
+
+        if group is None:
+            self.instance_controls_widget.setVisible(False)
+            return
+
+        self.instance_controls_layout.addWidget(group)
+        self.instance_controls_widget.setVisible(True)
 
     def _refresh_all_channels(self):
         """Refresh channel checkboxes in all tabs."""
@@ -768,6 +1287,7 @@ class APOCTrainingWidget(QWidget):
         for ct, tab in self.tabs.items():
             if ct != current_ct:
                 tab.apply_config(cfg)
+        self._persist_params()
         self.status_label.setText(f"↪ Config applied from '{current_ct}' to all other tabs.")
 
     def _on_train_current(self):
@@ -797,26 +1317,244 @@ class APOCTrainingWidget(QWidget):
                     pass
         return images
 
+    def _get_selected_channel_names(self, ct):
+        """Return selected channel layer names in tab order."""
+        tab = self.tabs[ct]
+        return [cb.text() for cb in tab.channel_checkboxes if cb.isChecked()]
+
+    def _normalize_feature_string(self, feature_string):
+        feature_string = str(feature_string or "").replace(",", " ").replace("\t", " ").strip()
+        while "  " in feature_string:
+            feature_string = feature_string.replace("  ", " ")
+        return feature_string
+
+    def _feature_tokens(self, feature_string):
+        normalized = self._normalize_feature_string(feature_string)
+        return [tok for tok in normalized.split(" ") if tok]
+
+    def _format_feature_token_name(self, token):
+        """Convert an APOC feature token into a readable stable name."""
+        token = str(token or "").strip()
+        if not token:
+            return ""
+        if token.lower() == "original":
+            return "original"
+        if "=" not in token:
+            return token.replace(" ", "_")
+        feature_name, sigma_text = token.split("=", 1)
+        sigma_text = sigma_text.strip()
+        return f"{feature_name.strip()}_sigma{sigma_text}"
+
+    def _expanded_feature_names(self, ct, feature_string):
+        """Return one readable feature name per cached feature plane."""
+        channel_names = self._get_selected_channel_names(ct)
+        feature_tokens = self._feature_tokens(feature_string)
+        expanded = []
+        for channel_idx, _channel_name in enumerate(channel_names):
+            for token in feature_tokens:
+                feature_name = self._format_feature_token_name(token)
+                if feature_name:
+                    expanded.append(f"{feature_name}_channel{channel_idx}")
+        return expanded
+
+    def _generate_feature_list_for_timepoint(self, images, feature_string, t_idx=0, *, push_to_device=False):
+        """Generate APOC features for one timepoint without caching them on disk."""
+        import apoc
+
+        feature_tokens = self._feature_tokens(feature_string)
+        if not feature_tokens:
+            raise RuntimeError("No APOC features selected. Choose at least one feature before training.")
+
+        features = []
+        for img in images:
+            img_t = np.asarray(img[t_idx]) if getattr(img, "ndim", 0) == 4 else np.asarray(img)
+            generated = apoc.generate_feature_stack(img_t, feature_string)
+            if push_to_device:
+                features.extend(generated)
+            else:
+                features.extend(np.asarray(feat) for feat in generated)
+        return features
+
+    def _set_labels_layer(self, name, data, visible=True, opacity=0.8):
+        """Create or update a Napari labels layer."""
+        if name in [layer.name for layer in self.viewer.layers]:
+            self.viewer.layers[name].data = data
+            self.viewer.layers[name].visible = visible
+        else:
+            self.viewer.add_labels(data, name=name, opacity=opacity, visible=visible)
+
+    def _set_image_layer(self, name, data, visible=False, opacity=0.6):
+        """Create or update a Napari image layer."""
+        if name in [layer.name for layer in self.viewer.layers]:
+            self.viewer.layers[name].data = data
+            self.viewer.layers[name].visible = visible
+        else:
+            self.viewer.add_image(
+                data,
+                name=name,
+                opacity=opacity,
+                blending="additive",
+                colormap="magma",
+                contrast_limits=(0.0, 1.0),
+                visible=visible,
+            )
+
+    def _save_preview_array(self, path, data):
+        """Persist a preview array to zarr, replacing the old preview if needed."""
+        path = Path(path)
+        if path.exists():
+            shutil.rmtree(path)
+        save_as_zarr(data, path)
+
+    def _predict_classifier_outputs(self, ct, clf=None):
+        """Predict raw labels and probability maps for the selected tab images."""
+        import apoc
+        from behav3d.preprocessing.segmentation.apoc_segment import _get_probability_classifier
+
+        images = self._get_images_for_tab(ct)
+        if not images:
+            raise RuntimeError(f"No image layers selected for '{ct}'.")
+        feature_string = self.tabs[ct].get_config()["feature_string"]
+
+        if clf is None:
+            clf_path = self.tabs[ct]._get_clf_path()
+            if clf_path is None or not Path(clf_path).exists():
+                raise FileNotFoundError(f"No trained classifier found for '{ct}'.")
+            clf = apoc.ObjectSegmenter(opencl_filename=str(clf_path))
+
+        prob_clf = _get_probability_classifier(clf)
+        if getattr(images[0], "ndim", 0) == 4:
+            results = []
+            prob_results = []
+            for t in range(images[0].shape[0]):
+                feats_t = self._generate_feature_list_for_timepoint(
+                    images,
+                    feature_string,
+                    t,
+                    push_to_device=True,
+                )
+                results.append(np.asarray(clf.predict(features=feats_t)).astype(np.int16))
+                prob_results.append(np.asarray(prob_clf.predict(features=feats_t)).astype(np.float32))
+            return np.stack(results, axis=0), np.stack(prob_results, axis=0)
+
+        features = self._generate_feature_list_for_timepoint(
+            images,
+            feature_string,
+            0,
+            push_to_device=True,
+        )
+        return (
+            np.asarray(clf.predict(features=features)).astype(np.int16),
+            np.asarray(prob_clf.predict(features=features)).astype(np.float32),
+        )
+
+    def _update_prediction_layers(self, ct, segments_result, prob_result):
+        """Push classifier preview outputs into Napari layers."""
+        seg_layer_name = "Pixel Classification (Dead)" if ct == "dead" else f"{ct.capitalize()} Segments"
+        self._set_labels_layer(seg_layer_name, segments_result, visible=True, opacity=0.8)
+
+        prob_layer_name = "Probability Map (Dead)" if ct == "dead" else f"Probability Map ({ct.capitalize()})"
+        self._set_image_layer(prob_layer_name, prob_result, visible=False, opacity=0.6)
+        _reorder_apoc_layers(self.viewer, self.all_cell_types, has_death=self.has_death)
+
+    def _build_display_segments(self, ct, raw_prediction, prob_prediction):
+        """Convert raw classifier outputs into the segment layer shown in Napari."""
+        if ct == "dead" or self._apoc_strategy == "APOC (Direct Instance Segmentation)":
+            return np.asarray(raw_prediction).astype(np.int16)
+
+        tab = self.tabs[ct]
+        if self._apoc_strategy == "APOC Probability Map + Watershed":
+            return _probability_array_to_segments(
+                prob_prediction,
+                mask_thr=float(tab.prob_mask_threshold_spin.value()),
+                seed_thr=float(tab.prob_seed_threshold_spin.value()),
+                opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
+                segment_size_min=int(tab.segment_size_min_spin.value()),
+            )
+
+        return _mask_array_to_segments(
+            raw_prediction > 0,
+            edt_thr=float(tab.edt_threshold_spin.value()),
+            opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
+            segment_size_min=int(tab.segment_size_min_spin.value()),
+            fill_holes=bool(tab.fill_holes_cb.isChecked()),
+        )
+
+    def _run_instance_preview(self, ct):
+        """Run instance segmentation preview for a non-dead APOC tab."""
+        if ct == "dead":
+            return
+
+        tab = self.tabs[ct]
+        strategy = self._apoc_strategy
+        if strategy == "APOC (Direct Instance Segmentation)":
+            self.status_label.setText("Direct APOC does not use instance resegmentation preview.")
+            return
+
+        try:
+            self.status_label.setText(f"Running instance preview for {ct}...")
+            QApplication.processEvents()
+
+            prob_layer_name = f"Probability Map ({ct.capitalize()})"
+            prob_path = _probability_map_path(self.pixel_class_outdir, ct)
+            prob_prediction = None
+
+            if prob_layer_name in [layer.name for layer in self.viewer.layers]:
+                prob_prediction = np.asarray(self.viewer.layers[prob_layer_name].data)
+
+            if strategy == "APOC Probability Map + Watershed":
+                if prob_prediction is None or prob_path is None or not Path(prob_path).exists():
+                    _raw_prediction, prob_prediction = self._predict_classifier_outputs(ct)
+                instance_preview = _probability_array_to_segments(
+                    prob_prediction,
+                    mask_thr=float(tab.prob_mask_threshold_spin.value()),
+                    seed_thr=float(tab.prob_seed_threshold_spin.value()),
+                    opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
+                    segment_size_min=int(tab.segment_size_min_spin.value()),
+                )
+            else:
+                raw_prediction, prob_prediction = self._predict_classifier_outputs(ct)
+                instance_preview = _mask_array_to_segments(
+                    raw_prediction > 0,
+                    edt_thr=float(tab.edt_threshold_spin.value()),
+                    opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
+                    segment_size_min=int(tab.segment_size_min_spin.value()),
+                    fill_holes=bool(tab.fill_holes_cb.isChecked()),
+                )
+
+            self._update_prediction_layers(ct, instance_preview, prob_prediction)
+
+            pred_path = _predicted_labels_path(self.pixel_class_outdir, ct)
+            if pred_path is not None:
+                self._save_preview_array(pred_path, instance_preview)
+            if prob_path is not None and prob_prediction is not None:
+                self._save_preview_array(prob_path, prob_prediction)
+
+            self.status_label.setText(f"✅ Instance preview updated for {ct}")
+        except Exception as exc:
+            self.status_label.setText(f"❌ Instance preview failed for {ct}: {exc}")
+
     def save_user_labels(self, log=print):
         """Save all user-provided labels for all cell types and Dead (if present)."""
-        import shutil
         for cell_type in self.all_cell_types:
             lname = f"User Provided Labels ({cell_type.capitalize()})"
             if lname not in [l.name for l in self.viewer.layers]:
                 continue
             label_layer = self.viewer.layers[lname]
+            label_data = np.asarray(label_layer.data)
             outpath = Path(self.pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
             if outpath.exists():
                 shutil.rmtree(outpath)
-            save_as_zarr(label_layer.data, outpath)
+            save_as_zarr(label_data, outpath)
             log(f"Saved {cell_type} labels → {outpath}")
 
         if self.has_death and "User Provided Labels (Dead)" in [l.name for l in self.viewer.layers]:
             dead_layer = self.viewer.layers["User Provided Labels (Dead)"]
+            dead_label_data = np.asarray(dead_layer.data)
             dead_outpath = Path(self.pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
             if dead_outpath.exists():
                 shutil.rmtree(dead_outpath)
-            save_as_zarr(dead_layer.data, dead_outpath)
+            save_as_zarr(dead_label_data, dead_outpath)
             log(f"Saved Death labels → {dead_outpath}")
 
         log("✅ All user labels saved!")
@@ -824,10 +1562,11 @@ class APOCTrainingWidget(QWidget):
     def _run_training(self, cell_types_to_train):
         """Train (and apply) APOC classifiers for the given list of cell types."""
         import apoc
+        training_start = time.time()
 
         # Auto-save labels before training
-        print("Auto-saving user labels before training...")
-        self.save_user_labels(log=print)
+        self._log("Auto-saving user labels before training...")
+        self.save_user_labels(log=self._log)
 
         successes = []
         try:
@@ -837,6 +1576,8 @@ class APOCTrainingWidget(QWidget):
                 feature_string = cfg["feature_string"]
                 max_depth = cfg["max_depth"]
                 num_ensembles = cfg["num_ensembles"]
+                expanded_feature_names = self._expanded_feature_names(ct, feature_string)
+                expanded_feature_spec = " ".join(expanded_feature_names)
 
                 self.status_label.setText(f"Processing {ct}...")
                 QApplication.processEvents()
@@ -884,68 +1625,106 @@ class APOCTrainingWidget(QWidget):
                 has_trained = False
                 n_timepoints = annotation.shape[0] if annotation.ndim == 4 else 1
 
+                # Old APOC incremental-style training path kept for reference:
+                # if annotation.ndim == 4:
+                #     for t in range(n_timepoints):
+                #         # Load only the current timepoint slice into memory
+                #         ann_t = np.asarray(annotation[t])
+                #         if not np.any(ann_t):
+                #             continue
+                #         feats_t = self._generate_feature_list_for_timepoint(images, feature_string, t)
+                #         clf.feature_specification = expanded_feature_spec
+                #         clf.train(feats_t, ann_t, continue_training=has_trained)
+                #         clf.feature_specification = expanded_feature_spec
+                #         has_trained = True
+                # else:
+                #     # Single timepoint
+                #     ann_np = np.asarray(annotation)
+                #     feats_np = self._generate_feature_list_for_timepoint(images, feature_string, 0)
+                #     clf.feature_specification = expanded_feature_spec
+                #     clf.train(feats_np, ann_np)
+                #     clf.feature_specification = expanded_feature_spec
+                #     has_trained = True
+
+                from sklearn.ensemble import RandomForestClassifier
+
+                X_parts = []
+                y_parts = []
+                gt_ndim = None
+
                 if annotation.ndim == 4:
                     for t in range(n_timepoints):
-                        # Load only the current timepoint slice into memory
                         ann_t = np.asarray(annotation[t])
                         if not np.any(ann_t):
                             continue
-                        imgs_t = [np.asarray(img[t]) for img in images]
-                        imgs_to_pass = imgs_t[0] if len(imgs_t) == 1 else imgs_t
-                        clf.train(feature_string, ann_t, imgs_to_pass, continue_training=has_trained)
-                        has_trained = True
+                        feats_t = self._generate_feature_list_for_timepoint(images, feature_string, t)
+                        X_t, y_t = clf._to_np(feats_t, ann_t)
+                        if X_t.size == 0 or y_t.size == 0:
+                            continue
+                        X_parts.append(X_t)
+                        y_parts.append(y_t)
+                        gt_ndim = ann_t.ndim
                 else:
-                    # Single timepoint
                     ann_np = np.asarray(annotation)
-                    imgs_np = [np.asarray(img) for img in images]
-                    imgs_to_pass = imgs_np[0] if len(imgs_np) == 1 else imgs_np
-                    clf.train(feature_string, ann_np, imgs_to_pass)
+                    feats_np = self._generate_feature_list_for_timepoint(images, feature_string, 0)
+                    X_t, y_t = clf._to_np(feats_np, ann_np)
+                    if X_t.size > 0 and y_t.size > 0:
+                        X_parts.append(X_t)
+                        y_parts.append(y_t)
+                        gt_ndim = ann_np.ndim
+
+                if X_parts:
+                    X = np.concatenate(X_parts, axis=0)
+                    y = np.concatenate(y_parts, axis=0)
+                    fitted_rf = RandomForestClassifier(
+                        max_depth=max_depth,
+                        n_estimators=num_ensembles,
+                        random_state=0,
+                    )
+                    fitted_rf.fit(X, y)
+                    clf.classifier = fitted_rf
+                    clf._feature_importances = fitted_rf.feature_importances_
+                    clf._X = X
+                    clf._y = y
+                    clf.num_features = X.shape[1]
+                    clf.num_ground_truth_dimensions = gt_ndim
+                    clf.feature_specification = expanded_feature_spec
                     has_trained = True
 
                 if not has_trained:
                     continue
 
+                clf.feature_specification = expanded_feature_spec
+                clf.to_opencl_file(clf_path)
+
                 # Predict (visual confirmation)
-                if images[0].ndim == 4:
-                    results = []
-                    for t in range(n_timepoints):
-                        # Load only current timepoint for prediction
-                        imgs_t = [np.asarray(img[t]) for img in images]
-                        imgs_to_pass = imgs_t[0] if len(imgs_t) == 1 else imgs_t
-                        res_t = clf.predict(image=imgs_to_pass)
-                        results.append(np.asarray(res_t).astype(np.int16))
-                    result = np.stack(results, axis=0)
-                else:
-                    imgs = images[0] if len(images) == 1 else images
-                    result = np.asarray(clf.predict(image=imgs)).astype(np.int16)
+                raw_prediction, prob_result = self._predict_classifier_outputs(ct, clf=clf)
+                display_segments = self._build_display_segments(ct, raw_prediction, prob_result)
+                self._update_prediction_layers(ct, display_segments, prob_result)
 
-                # Show in viewer
-                seg_layer_name = (
-                    "Pixel Classification (Dead)" if ct == "dead"
-                    else f"{ct.capitalize()} Segments"
-                )
-                if seg_layer_name in [l.name for l in self.viewer.layers]:
-                    self.viewer.layers[seg_layer_name].data = result
-                    self.viewer.layers[seg_layer_name].visible = True
-                else:
-                    self.viewer.add_labels(result, name=seg_layer_name, opacity=0.8, visible=True)
-
-                # Save to disk
-                arr_path = Path(self.pixel_class_outdir, f"{Path(clf_path).stem}_PredictedLabels.zarr")
-                if arr_path.exists():
-                    shutil.rmtree(arr_path)
-                save_as_zarr(result, arr_path)
+                pred_path = _predicted_labels_path(self.pixel_class_outdir, ct)
+                if pred_path is not None:
+                    self._save_preview_array(pred_path, display_segments)
+                prob_path = _probability_map_path(self.pixel_class_outdir, ct)
+                if prob_path is not None:
+                    self._save_preview_array(prob_path, prob_result)
 
                 successes.append(ct)
 
             if successes:
-                self.status_label.setText(f"✅ Trained: {', '.join(successes)}")
+                elapsed_s = time.time() - training_start
+                elapsed_txt = f"{elapsed_s:.1f}s"
+                self.status_label.setText(f"✅ Trained: {', '.join(successes)} ({elapsed_txt})")
+                self._log(f"✅ Training finished in {elapsed_txt}")
                 # Auto-show statistics for each successfully trained classifier
                 for ct in successes:
                     if ct in self.tabs:
                         self.tabs[ct]._on_show_statistics()
             else:
-                self.status_label.setText("⚠️ No cell types were trained (check labels).")
+                elapsed_s = time.time() - training_start
+                elapsed_txt = f"{elapsed_s:.1f}s"
+                self.status_label.setText(f"⚠️ No cell types were trained (check labels). ({elapsed_txt})")
+                self._log(f"⚠️ No cell types were trained. Elapsed time: {elapsed_txt}")
 
             # Persist all params back to caller
             self._persist_params()
@@ -962,9 +1741,11 @@ class APOCTrainingWidget(QWidget):
     def _collect_all_params(self):
         """Return a flat param dict for all tabs, suitable for storing in BEHAV3D config."""
         params = {}
+        params["apoc_strategy"] = self._apoc_strategy
         for ct, tab in self.tabs.items():
             cfg = tab.get_config()
             params[f"apoc_{ct}_feature_preset"]        = cfg["feature_preset"]
+            params[f"apoc_{ct}_grid_sigmas"]           = cfg["grid_sigmas"]
             params[f"apoc_{ct}_sigmas"]                = cfg["sigmas"]
             params[f"apoc_{ct}_custom_feature_string"] = cfg["custom_feature_string"]
             params[f"apoc_{ct}_feature_string"]        = cfg["feature_string"]
@@ -973,6 +1754,18 @@ class APOCTrainingWidget(QWidget):
             params[f"apoc_{ct}_max_depth"]             = cfg["max_depth"]
             params[f"apoc_{ct}_num_ensembles"]         = cfg["num_ensembles"]
             params[f"apoc_{ct}_channels"]              = cfg["channels"]
+            if cfg["prob_mask_threshold"] is not None:
+                params[f"{ct}_prob_mask_threshold"] = cfg["prob_mask_threshold"]
+            if cfg["prob_seed_threshold"] is not None:
+                params[f"{ct}_prob_seed_threshold"] = cfg["prob_seed_threshold"]
+            if cfg["edt_threshold"] is not None:
+                params[f"{ct}_edt_threshold"] = cfg["edt_threshold"]
+            if cfg["segment_size_min"] is not None:
+                params[f"{ct}_segment_size_min"] = cfg["segment_size_min"]
+            if cfg["opening_nr_pixels"] is not None:
+                params[f"{ct}_opening_nr_pixels"] = cfg["opening_nr_pixels"]
+            if cfg["fill_holes"] is not None:
+                params[f"{ct}_fill_holes"] = cfg["fill_holes"]
         return params
 
     def _persist_params(self):
@@ -1077,19 +1870,24 @@ def train_pixel_classifier_apoc(
 
     ip = initial_params or {}
 
+    def _restore_saved_labels(saved_path, expected_shape, label_name):
+        if not saved_path.exists():
+            return np.zeros(expected_shape, dtype=np.int16)
+        try:
+            existing = np.asarray(load_zarr(saved_path))
+        except Exception as exc:
+            print(f"  ⚠️ Could not restore saved labels for '{label_name}' from {saved_path}: {exc}")
+            return np.zeros(expected_shape, dtype=np.int16)
+        if existing.shape == expected_shape:
+            print(f"  ↩ Restored saved labels for '{label_name}' ({expected_shape})")
+            return existing
+        print(f"  ⚠️ Saved labels shape {existing.shape} ≠ expected {expected_shape} — starting fresh")
+        return np.zeros(expected_shape, dtype=np.int16)
+
     # 1. User Provided Labels (all cell types)
     for cell_type in all_cell_types:
         saved_path = Path(pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
-        if saved_path.exists():
-            existing = np.asarray(load_zarr(saved_path))
-            if existing.shape == label_shape:
-                user_labels = existing
-                print(f"  ↩ Restored saved labels for '{cell_type}' ({label_shape})")
-            else:
-                print(f"  ⚠️ Saved labels shape {existing.shape} ≠ expected {label_shape} — starting fresh")
-                user_labels = np.zeros(label_shape, dtype=np.int16)
-        else:
-            user_labels = np.zeros(label_shape, dtype=np.int16)
+        user_labels = _restore_saved_labels(saved_path, label_shape, cell_type)
 
         viewer.add_labels(
             user_labels,
@@ -1099,21 +1897,13 @@ def train_pixel_classifier_apoc(
 
     if has_death:
         dead_path = Path(pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
-        if dead_path.exists():
-            dead_labels = np.asarray(load_zarr(dead_path))
-            if dead_labels.shape == label_shape:
-                print(f"  ↩ Restored saved labels for 'dead' ({label_shape})")
-            else:
-                print(f"  ⚠️ Saved Death labels shape {dead_labels.shape} ≠ {label_shape} — starting fresh")
-                dead_labels = np.zeros(label_shape, dtype=np.int16)
-        else:
-            dead_labels = np.zeros(label_shape, dtype=np.int16)
+        dead_labels = _restore_saved_labels(dead_path, label_shape, "dead")
         viewer.add_labels(dead_labels, name="User Provided Labels (Dead)", opacity=0.5)
 
     # 2. Results (Pixel Classification / Segments) on top
     # Dead result
     if has_death:
-        pred_death_path = Path(pixel_class_outdir, "PixelClassifier_Death_PredictedLabels.zarr")
+        pred_death_path = _predicted_labels_path(pixel_class_outdir, "dead")
         if pred_death_path.exists():
             pred_death = np.asarray(load_zarr(pred_death_path))
             if pred_death.shape != label_shape:
@@ -1122,9 +1912,26 @@ def train_pixel_classifier_apoc(
             pred_death = np.zeros(label_shape, dtype=np.int16)
         viewer.add_labels(pred_death, name="Pixel Classification (Dead)", opacity=0.8, visible=False)
 
+        prob_death_path = _probability_map_path(pixel_class_outdir, "dead")
+        if prob_death_path.exists():
+            prob_death = np.asarray(load_zarr(prob_death_path))
+            if prob_death.shape != label_shape:
+                prob_death = np.zeros(label_shape, dtype=np.float32)
+        else:
+            prob_death = np.zeros(label_shape, dtype=np.float32)
+        viewer.add_image(
+            prob_death,
+            name="Probability Map (Dead)",
+            opacity=0.6,
+            blending="additive",
+            colormap="magma",
+            contrast_limits=(0.0, 1.0),
+            visible=False,
+        )
+
     # Cell type segments
     for cell_type in all_cell_types:
-        pred_path = Path(pixel_class_outdir, f"PixelClassifier_{cell_type.capitalize()}_PredictedLabels.zarr")
+        pred_path = _predicted_labels_path(pixel_class_outdir, cell_type)
         if pred_path.exists():
             pred_data = np.asarray(load_zarr(pred_path))
             if pred_data.shape != label_shape:
@@ -1138,6 +1945,26 @@ def train_pixel_classifier_apoc(
             opacity=0.8,
             visible=False,
         )
+
+        prob_path = _probability_map_path(pixel_class_outdir, cell_type)
+        if prob_path.exists():
+            prob_data = np.asarray(load_zarr(prob_path))
+            if prob_data.shape != label_shape:
+                prob_data = np.zeros(label_shape, dtype=np.float32)
+        else:
+            prob_data = np.zeros(label_shape, dtype=np.float32)
+
+        viewer.add_image(
+            prob_data,
+            name=f"Probability Map ({cell_type.capitalize()})",
+            opacity=0.6,
+            blending="additive",
+            colormap="magma",
+            contrast_limits=(0.0, 1.0),
+            visible=False,
+        )
+
+    _reorder_apoc_layers(viewer, all_cell_types, has_death=has_death)
 
     # --- Dock the APOC widget ---
     apoc_widget = APOCTrainingWidget(
@@ -1158,6 +1985,7 @@ def train_pixel_classifier_apoc(
     log_layout.addWidget(log_output)
     log_widget.setLayout(log_layout)
     viewer.window.add_dock_widget(log_widget, area="right", name="Log Output")
+    apoc_widget.set_log_fn(log_output.appendPlainText)
 
     save_button = QtPushButton("💾 Save User Labels")
     save_button.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 6px;")

@@ -76,6 +76,11 @@ _DEFAULT_CONFIG = {
         "per_sample_channel_labels": {},  # {sample_name: {0: "organoid1", ...}, ...}
     },
     "tracking": {
+        "track_organoids_together": False,
+        "all_organoids": {
+            "method": "propagation_all_organoids",
+            "overwrite": False,
+        },
         "immune": {
             "method": "trackpy",
             "overwrite": False,
@@ -135,7 +140,7 @@ _DEFAULT_CONFIG = {
             }
         },
         "organoid": {
-            "method": "propagation",
+            "method": "propagation",  # also supports "propagation_all_organoids"
             "overwrite": False,
             "lap": {
                 "track_cost_px": 60,

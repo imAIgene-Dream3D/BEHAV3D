@@ -24,6 +24,20 @@ _PRESET_MAP = {
     "particle": _MODELS_DIR / "particle_config.json",
 }
 
+_SUPPORTED_BTRACK_VISUAL_FEATURES = (
+    "area",
+    "major_axis_length",
+    "minor_axis_length",
+    "intensity_mean",
+)
+
+_BTRACK_VISUAL_FEATURES = (
+    # "area",
+    # "major_axis_length",
+    # "minor_axis_length",
+    "intensity_mean",
+)
+
 
 def _run_parallel_with_fallback(fn, args_list, n_workers):
     try:
@@ -37,15 +51,79 @@ def _run_parallel_with_fallback(fn, args_list, n_workers):
         )
 
 
-def _rename_intensity_columns(df):
-    column_mapping = {}
-    for col in df.columns:
-        if col.startswith("intensity_mean-"):
-            ch_idx = col.split("-")[-1]
-            column_mapping[col] = f"mean_intensity_ch{ch_idx}"
-    if column_mapping:
-        df = df.rename(columns=column_mapping)
-    return df
+def _get_btrack_visual_feature_spec(use_visual_features=False):
+    if not use_visual_features:
+        return {
+            "selected_features": [],
+            "regionprops_properties": [],
+            "feature_columns": [],
+            "needs_raw_image": False,
+        }
+
+    selected_features = list(dict.fromkeys(_BTRACK_VISUAL_FEATURES))
+    invalid_features = [
+        feature for feature in selected_features
+        if feature not in _SUPPORTED_BTRACK_VISUAL_FEATURES
+    ]
+    if invalid_features:
+        supported = ", ".join(_SUPPORTED_BTRACK_VISUAL_FEATURES)
+        invalid = ", ".join(invalid_features)
+        raise ValueError(
+            f"Unsupported btrack visual feature(s): {invalid}. "
+            f"Supported features are: {supported}."
+        )
+
+    regionprops_properties = []
+    feature_columns = []
+    needs_raw_image = False
+    for feature in selected_features:
+        if feature == "intensity_mean":
+            needs_raw_image = True
+        else:
+            feature_columns.append(feature)
+        regionprops_properties.append(feature)
+
+    return {
+        "selected_features": selected_features,
+        "regionprops_properties": regionprops_properties,
+        "feature_columns": feature_columns,
+        "needs_raw_image": needs_raw_image,
+    }
+
+
+def _resolve_btrack_visual_feature_columns(df, visual_feature_spec):
+    missing_cols = [
+        col for col in visual_feature_spec["feature_columns"]
+        if col not in df.columns
+    ]
+    if missing_cols:
+        available = ", ".join(df.columns)
+        missing = ", ".join(missing_cols)
+        raise ValueError(
+            f"Requested visual feature columns are missing: {missing}. "
+            f"Available columns are: {available}."
+        )
+
+    intensity_cols = []
+    if "intensity_mean" in visual_feature_spec["selected_features"]:
+        intensity_cols = sorted(
+            [col for col in df.columns if col.startswith("intensity_mean-")],
+            key=lambda col: int(col.split("-")[-1]),
+        )
+        if not intensity_cols:
+            available = ", ".join(df.columns)
+            raise ValueError(
+                "Requested visual feature 'intensity_mean' but no "
+                f"'intensity_mean-*' columns were extracted. Available columns are: {available}."
+            )
+
+    feature_columns = []
+    for feature in visual_feature_spec["selected_features"]:
+        if feature == "intensity_mean":
+            feature_columns.extend(intensity_cols)
+        else:
+            feature_columns.append(feature)
+    return feature_columns
 
 
 def _sanitize_feature_columns(df, feature_cols):
@@ -62,17 +140,28 @@ def _sanitize_feature_columns(df, feature_cols):
     return df
 
 
-def _extract_btrack_props_single_timepoint(t, t_seg, t_raw=None, use_visual_features=False):
+def _extract_btrack_props_single_timepoint(
+    t,
+    t_seg,
+    t_raw=None,
+    visual_feature_spec=None,
+):
     t_seg = np.asarray(t_seg)
     if t_seg.max() == 0:
         return None
 
+    if visual_feature_spec is None:
+        visual_feature_spec = _get_btrack_visual_feature_spec(False)
+
     props_kwargs = {
         "label_image": t_seg,
-        "properties": ["label", "centroid", "area"],
+        "properties": ["label", "centroid"],
     }
 
-    if use_visual_features:
+    if visual_feature_spec["regionprops_properties"]:
+        props_kwargs["properties"] += visual_feature_spec["regionprops_properties"]
+
+    if visual_feature_spec["needs_raw_image"]:
         if t_raw is None:
             raise ValueError(
                 "Visual-feature btrack requires raw_image_path so mean intensities "
@@ -91,32 +180,26 @@ def _extract_btrack_props_single_timepoint(t, t_seg, t_raw=None, use_visual_feat
                 f"Got raw {t_raw.shape[1:]} and segmentation {t_seg.shape} "
                 f"at t={t}."
             )
-        props_kwargs["properties"] += [
-            "major_axis_length",
-            "minor_axis_length",
-            "intensity_mean",
-        ]
         props_kwargs["intensity_image"] = np.moveaxis(t_raw, 0, -1)
 
     props = pd.DataFrame(regionprops_table(**props_kwargs))
-    props = _rename_intensity_columns(props)
     props["position_t"] = t
     return props
 
 
 def _extract_btrack_props_single_timepoint_from_paths(args):
-    t, segments_path, raw_image_path, use_visual_features = args
+    t, segments_path, raw_image_path, visual_feature_spec = args
     segments = load_image(segments_path)
     t_seg = np.asarray(segments[t])
     t_raw = None
-    if use_visual_features:
+    if visual_feature_spec["needs_raw_image"]:
         raw_image = load_image(raw_image_path)
         t_raw = np.asarray(raw_image[t])
     return _extract_btrack_props_single_timepoint(
         t=t,
         t_seg=t_seg,
         t_raw=t_raw,
-        use_visual_features=use_visual_features,
+        visual_feature_spec=visual_feature_spec,
     )
 
 
@@ -133,8 +216,9 @@ def _extract_btrack_objects_dataframe(
 ):
     n_workers = max(1, int(n_workers or 1))
     df_objects = []
+    visual_feature_spec = _get_btrack_visual_feature_spec(use_visual_features)
 
-    if use_visual_features and raw_image is None and raw_image_path is None:
+    if visual_feature_spec["needs_raw_image"] and raw_image is None and raw_image_path is None:
         raise ValueError(
             "Visual-feature btrack requires raw_image_path so mean intensities "
             "can be extracted from the raw image."
@@ -143,14 +227,14 @@ def _extract_btrack_objects_dataframe(
     can_parallel = (
         n_workers > 1
         and segments_path is not None
-        and (not use_visual_features or raw_image_path is not None)
+        and (not visual_feature_spec["needs_raw_image"] or raw_image_path is not None)
     )
 
     if can_parallel:
         segments_ref = load_image(segments_path)
         timepoints = int(segments_ref.shape[0])
         args_list = [
-            (t, segments_path, raw_image_path, use_visual_features)
+            (t, segments_path, raw_image_path, visual_feature_spec)
             for t in range(timepoints)
         ]
         results = _run_parallel_with_fallback(
@@ -162,10 +246,10 @@ def _extract_btrack_objects_dataframe(
     else:
         if segments is None:
             segments = load_image(segments_path)
-        if use_visual_features and raw_image is None:
+        if visual_feature_spec["needs_raw_image"] and raw_image is None:
             raw_image = load_image(raw_image_path)
 
-        if use_visual_features:
+        if visual_feature_spec["needs_raw_image"]:
             if raw_image.ndim != 5:
                 raise ValueError(
                     f"Raw image should have 5 dimensions (T, C, Z, Y, X), but "
@@ -178,12 +262,14 @@ def _extract_btrack_objects_dataframe(
                 )
 
         for t, t_seg in enumerate(tqdm(segments, desc="Extracting objects")):
-            t_raw = None if not use_visual_features else np.asarray(raw_image[t])
+            t_raw = None
+            if visual_feature_spec["needs_raw_image"]:
+                t_raw = np.asarray(raw_image[t])
             props = _extract_btrack_props_single_timepoint(
                 t=t,
                 t_seg=t_seg,
                 t_raw=t_raw,
-                use_visual_features=use_visual_features,
+                visual_feature_spec=visual_feature_spec,
             )
             if props is not None and not props.empty:
                 df_objects.append(props)
@@ -200,18 +286,10 @@ def _extract_btrack_objects_dataframe(
         "centroid-1": "pixel_position_y",
         "centroid-2": "pixel_position_x",
     }, inplace=True)
-    intensity_cols = sorted(
-        [col for col in df_objects.columns if col.startswith("mean_intensity_ch")],
-        key=lambda col: int(col.replace("mean_intensity_ch", "")),
+    visual_feature_cols = _resolve_btrack_visual_feature_columns(
+        df_objects,
+        visual_feature_spec,
     )
-    visual_feature_cols = []
-    if use_visual_features:
-        visual_feature_cols = [
-            "area",
-            "major_axis_length",
-            "minor_axis_length",
-            *intensity_cols,
-        ]
     df_objects = _sanitize_feature_columns(df_objects, visual_feature_cols)
 
     return df_objects, visual_feature_cols
@@ -369,7 +447,8 @@ def btrack_image(
     # ------------------------------------------------------------------
     config_path = _resolve_config(config_preset)
     use_visual_updates = bool(use_visual_features)
-    if use_visual_updates and raw_image is None:
+    visual_feature_spec = _get_btrack_visual_feature_spec(use_visual_updates)
+    if visual_feature_spec["needs_raw_image"] and raw_image is None:
         if raw_image_path is None:
             raise ValueError(
                 "Visual-feature btrack requires raw_image_path in metadata."

@@ -39,6 +39,12 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
     
     start_t = widgets.IntText(value=0, description='Start T:', layout=widgets.Layout(width='150px'))
     end_t = widgets.IntText(value=0, description='End T:', layout=widgets.Layout(width='150px'))
+    n_workers = widgets.IntText(
+        value=1,
+        description='Workers:',
+        layout=widgets.Layout(width='160px'),
+        style={'description_width': 'initial'}
+    )
     
     range_box = widgets.HBox([start_t, end_t], layout=widgets.Layout(display='none', margin='0 0 10px 0'))
 
@@ -91,6 +97,9 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
             else:
                 print("Starting conversion for all timepoints…")
 
+            worker_count = max(1, int(n_workers.value))
+            print(f"Using {worker_count} worker(s)")
+
             result = metadata_loader.metadata
             try:
                 result = convert_input_files_to_zarr(
@@ -113,7 +122,8 @@ def convert_zarr_button(metadata_loader, dim_order_widget):
                 spinner.layout.display = "none"
 
     btn.on_click(_run_conversion)
-    return widgets.VBox([selector, range_box, n_workers, row, out])
+    controls = widgets.HBox([n_workers], layout=widgets.Layout(align_items="center", margin='0 0 10px 0'))
+    return widgets.VBox([selector, range_box, controls, row, out])
 
 class DimOrderTable:
     PLACEHOLDER = "-- select --"

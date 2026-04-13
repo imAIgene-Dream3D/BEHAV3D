@@ -37,9 +37,13 @@ Flly flexible - works with ANY cell types defined in metadata using prefixes:
 -------------------------------------
 
 DYNAMIC CONTACT FEATURES (generated for ALL cell types in metadata):
-- {cell_type}_contact               (bool) - Real distance-based contact
-- {cell_type}_contact_on_distance        (bool) - Pixel-based contact (1.73 diagonal)
+- {cell_type}_contact               (bool) - Pixel-based contact (1.73 diagonal)
+- {cell_type}_contact_on_distance   (bool) - Real distance-based contact
 - touching_{cell_type}s             (str)  - Comma-separated TrackIDs
+- any_organoid_contact              (bool) - Any organoid-type pixel-based contact
+- any_organoid_contact_on_distance  (bool) - Any organoid-type real distance-based contact
+- any_immune_cell_contact           (bool) - Any immune-type pixel-based contact
+- any_immune_cell_contact_on_distance (bool) - Any immune-type real distance-based contact
 - active_{cell_type}_contact        (bool) - Active interaction (works for any cell type)
 
 MORPHOLOGY FEATURES:
@@ -73,19 +77,29 @@ DEATH FEATURES:
 
 ### {cell_type}_contact
 - True/False
-Per segment, creates a ZYX cutout with extended range around the segment border
-and calculates a distance transform using physical spacing (µm). Any other cell
-within "contact_threshold" µm counts as contacting.
+Per segment, uses a pixel-based threshold (1.73 = diagonal distance) without
+physical spacing. More lenient threshold for pixel-touching.
 
 ### {cell_type}_contact_on_distance  
 - True/False
-Same as above but uses pixel-based threshold (1.73 = diagonal distance) without
-physical spacing. More lenient threshold for pixel-touching.
+Creates a ZYX cutout with extended range around the segment border and
+calculates a distance transform using physical spacing (µm). Any other cell
+within "contact_threshold" µm counts as contacting.
 
 ### touching_{cell_type}s
 - String (comma-separated TrackIDs)
 Contains TrackIDs of all contacting cells of this type. Empty string if none.
 Self-contact excluded when calculating from the same cell type.
+
+### any_organoid_contact / any_organoid_contact_on_distance
+- True/False
+Aggregate contact flags across all detected organoid types. These columns are
+separate from per-type columns so a literal cell type named "organoid" does not
+collide with the aggregate output.
+
+### any_immune_cell_contact / any_immune_cell_contact_on_distance
+- True/False
+Aggregate contact flags across all detected immune cell types.
 
 ### active_{cell_type}_contact
 - True/False
@@ -1238,6 +1252,10 @@ def _calculate_contact_single_timepoint(args):
             'TrackID': segment_id,
             'position_t': t,
         }
+        any_org_contact = []
+        any_org_contact_on_distance = []
+        any_immune_contact = []
+        any_immune_contact_on_distance = []
         
         # Calculate contacts with ALL organoid types
         for org_type, org_segments in organoid_segments_dict.items():
@@ -1263,6 +1281,8 @@ def _calculate_contact_single_timepoint(args):
             contact_data[f'{org_type}_contact'] = pix_org_contact
             contact_data[f'{org_type}_contact_on_distance'] = real_org_contact
             contact_data[f'touching_{org_type}s'] = ",".join(org_contacts) if real_org_contact else ""
+            any_org_contact.append(pix_org_contact)
+            any_org_contact_on_distance.append(real_org_contact)
         
         # Calculate contacts with ALL immune cell types
         for immune_type, immune_segments in immune_segments_dict.items():
@@ -1288,6 +1308,8 @@ def _calculate_contact_single_timepoint(args):
             contact_data[f'{immune_type}_contact'] = pix_immune_contact
             contact_data[f'{immune_type}_contact_on_distance'] = real_immune_contact
             contact_data[f'touching_{immune_type}s'] = ",".join(immune_contacts) if real_immune_contact else ""
+            any_immune_contact.append(pix_immune_contact)
+            any_immune_contact_on_distance.append(real_immune_contact)
         
         # Calculate contacts with ALL other cell types
         for other_type, other_segments in other_segments_dict.items():
@@ -1313,6 +1335,11 @@ def _calculate_contact_single_timepoint(args):
             contact_data[f'{other_type}_contact'] = pix_other_contact
             contact_data[f'{other_type}_contact_on_distance'] = real_other_contact
             contact_data[f'touching_{other_type}s'] = ",".join(other_contacts) if real_other_contact else ""
+
+        contact_data['any_organoid_contact'] = any(any_org_contact)
+        contact_data['any_organoid_contact_on_distance'] = any(any_org_contact_on_distance)
+        contact_data['any_immune_cell_contact'] = any(any_immune_contact)
+        contact_data['any_immune_cell_contact_on_distance'] = any(any_immune_contact_on_distance)
 
         df_contacts.append(pd.DataFrame([contact_data]))
 
@@ -1579,7 +1606,7 @@ def _calculate_morphology_single_timepoint(args):
     Features calculated:
     - volume
     - bbox_volume
-    - extent
+    - extent (orientation-invariant, principal-axis-based)
     - solidity
     - equivalent_diameter
     - major_axis_length
@@ -1608,7 +1635,7 @@ def _calculate_morphology_single_timepoint(args):
                 label_image=stack,
                 properties=[
                     "label", "num_pixels", "area", "bbox_area",
-                    "extent", "solidity", "equivalent_diameter",
+                    "solidity", "equivalent_diameter",
                     "major_axis_length", "minor_axis_length", "inertia_tensor",
                     "inertia_tensor_eigvals", "moments_central"
                 ],
@@ -1751,6 +1778,19 @@ def _calculate_morphology_single_timepoint(args):
         properties["axis1_length"] = axis_length_a_list
         properties["axis2_length"] = axis_length_b_list
         properties["axis3_length"] = axis_length_c_list
+        with np.errstate(divide='ignore', invalid='ignore'):
+            oriented_bbox_volume = (
+                properties["axis1_length"] * properties["axis2_length"] * properties["axis3_length"]
+            )
+            valid_oriented_bbox = (
+                np.isfinite(oriented_bbox_volume)
+                & (oriented_bbox_volume > 0)
+            )
+            properties["extent"] = np.where(
+                valid_oriented_bbox,
+                properties["volume"] / oriented_bbox_volume,
+                np.nan,
+            )
         properties["oblateness"] = oblateness_list
         properties["prolateness"] = prolateness_list
         # properties["principal_axes"] = principal_axes_list  # columns: a,b,c
