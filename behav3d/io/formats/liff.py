@@ -5,52 +5,67 @@ import numpy as np
 from readlif.reader import LifFile
 
 
+def _get_liff_series_dims(img_series):
+    """Extract dimension sizes from a readlif image series object."""
+    n_channels = img_series.channels
+    n_z = img_series.nz if hasattr(img_series, 'nz') else (
+        img_series.dims.z if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'z') else 1
+    )
+    n_t = img_series.nt if hasattr(img_series, 'nt') else 1
+    height = img_series.dims.y if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'y') else img_series.dims[1]
+    width = img_series.dims.x if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'x') else img_series.dims[0]
+    return n_t, n_channels, n_z, height, width
+
+
+def _get_liff_frame(img_series, z, t, c):
+    """Get a single frame, handling different readlif API versions."""
+    try:
+        return np.asarray(img_series.get_frame(z=z, t=t, c=c))
+    except TypeError:
+        return np.asarray(img_series.get_frame(z=z, t=t, channel=c))
+
+
+def load_liff_timepoint_czyx(path, t):
+    """
+    Load a single timepoint from a LIF file.
+    Returns array in CZYX order (C, Z, Y, X) without loading other timepoints.
+    """
+    path = Path(path)
+    lf = LifFile(str(path))
+    if len(lf.image_list) == 0:
+        raise ValueError(f"No images found in LIF file: {path}")
+    img_series = lf.get_image(0)
+    _, n_channels, n_z, _, _ = _get_liff_series_dims(img_series)
+
+    z_slices = []
+    for z in range(n_z):
+        c_slices = [_get_liff_frame(img_series, z=z, t=t, c=c) for c in range(n_channels)]
+        z_slices.append(np.stack(c_slices, axis=0))  # (C, Y, X)
+    return np.stack(z_slices, axis=1)  # (C, Z, Y, X)
+
+
 def _load_liff_raw(path):
     """
     Internal helper: open a .lif file and return (array, dims_string).
-    
-    Uses readlif.reader.LifFile to read Leica LIF files.
     Returns array in (T, C, Z, Y, X) order.
     """
     path = Path(path)
     lf = LifFile(str(path))
-    
-    # Get the first image series (LIF files can contain multiple series)
     if len(lf.image_list) == 0:
         raise ValueError(f"No images found in LIF file: {path}")
-    
-    # Get first image series
     img_series = lf.get_image(0)
-    
-    # Get dimensions from the image series
-    n_channels = img_series.channels
-    n_z = img_series.nz if hasattr(img_series, 'nz') else (img_series.dims.z if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'z') else 1)
-    n_t = img_series.nt if hasattr(img_series, 'nt') else 1
-    height = img_series.dims.y if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'y') else img_series.dims[1]
-    width = img_series.dims.x if hasattr(img_series, 'dims') and hasattr(img_series.dims, 'x') else img_series.dims[0]
-    
-    # Build array by iterating through all frames
-    # readlif returns frames as PIL images or numpy arrays
+    n_t, n_channels, n_z, _, _ = _get_liff_series_dims(img_series)
+
     frames = []
     for t in range(n_t):
         time_frames = []
         for z in range(n_z):
-            channel_frames = []
-            for c in range(n_channels):
-                try:
-                    frame = img_series.get_frame(z=z, t=t, c=c)
-                except TypeError:
-                    # Some versions use different parameter names
-                    frame = img_series.get_frame(z=z, t=t, channel=c)
-                channel_frames.append(np.asarray(frame))
-            time_frames.append(np.stack(channel_frames, axis=0))  # Stack channels: (C, Y, X)
-        frames.append(np.stack(time_frames, axis=0))  # Stack Z: (Z, C, Y, X)
-    
-    arr = np.stack(frames, axis=0)  # Stack T: (T, Z, C, Y, X)
-    
-    # Reorder from (T, Z, C, Y, X) to (T, C, Z, Y, X)
-    arr = np.transpose(arr, axes=(0, 2, 1, 3, 4))
-    
+            channel_frames = [_get_liff_frame(img_series, z=z, t=t, c=c) for c in range(n_channels)]
+            time_frames.append(np.stack(channel_frames, axis=0))  # (C, Y, X)
+        frames.append(np.stack(time_frames, axis=0))  # (Z, C, Y, X)
+
+    arr = np.stack(frames, axis=0)              # (T, Z, C, Y, X)
+    arr = np.transpose(arr, axes=(0, 2, 1, 3, 4))  # → (T, C, Z, Y, X)
     dims = "TCZYX"
     return arr, dims
 
@@ -59,26 +74,22 @@ def load_liff(path):
     """
     Load a .lif/.liff file and return data as (T, C, Z, Y, X).
     
-    Any missing axes are added as singleton dimensions (size 1),
-    so that the returned array always has 5 dimensions.
+    The readlif library always addresses frames by (t, z, c), so the
+    returned array is always 5D TCZYX — including singletons at size 1
+    (e.g. T=1, C=1, or Z=1).
     """
-    arr, dims = _load_liff_raw(path)
-    
-    # Ensure we have all 5 axes T,C,Z,Y,X present in dims
-    wanted = "TCZYX"
-    for ax in wanted:
-        if ax not in dims:
-            arr = np.expand_dims(arr, axis=0)
-            dims = ax + dims
-    
-    # Build a mapping from axis label -> index in current array
-    axis_map = {ax: i for i, ax in enumerate(dims)}
-    
-    # Reorder to (T, C, Z, Y, X)
-    order = [axis_map[ax] for ax in wanted]
-    arr = np.transpose(arr, axes=order)
-    
+    arr, _dims = _load_liff_raw(path)
     return arr
+
+
+def get_liff_dimension_order(path=None):
+    """
+    Return the axis order for LIF files.
+
+    LIF always has all 5 dimensions (T, C, Z, Y, X) — the readlif API addresses
+    frames by (t, z, c), so the order is always TCZYX even when T=1, C=1, or Z=1.
+    """
+    return "TCZYX"
 
 
 def get_liff_shape(path, take_dims="TCZYX"):

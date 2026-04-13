@@ -12,10 +12,13 @@ import yaml
 import traceback
 from functools import partial
 from .utils import (
-    _cfg_get, 
-    _mk_timepoint_range, 
+    _cfg_get,
+    _mk_timepoint_range,
+    detect_cell_type_category,
+    ExternalImageImporter,
+    make_metadata_callback,
+    PathPicker,
     spinning_loader,
-    PathPicker
 )
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
     train_pixel_classifier,
@@ -38,6 +41,47 @@ from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
 )
+
+
+def _normalize_segmentation_labels_for_view(label_arr, raw_img_shape, layer_name="labels"):
+    """
+    Normalize a label array to the raw-image viewer shape (T, Z, Y, X).
+
+    Raw images in the viewer are displayed per channel as ``img_arr[:, ch]``,
+    so labels must align to ``TZYX`` even when the stored array still carries a
+    singleton channel axis.
+    """
+    raw_shape = tuple(int(v) for v in raw_img_shape)
+    label_shape = tuple(int(v) for v in label_arr.shape)
+
+    if len(raw_shape) != 5:
+        raise ValueError(f"{layer_name}: expected raw image shape (T,C,Z,Y,X), got {raw_shape}.")
+
+    target_shape = (raw_shape[0],) + tuple(raw_shape[-3:])
+
+    if label_shape == target_shape:
+        return label_arr
+
+    if len(label_shape) == 5:
+        if label_shape[0] != target_shape[0] or tuple(label_shape[-3:]) != tuple(target_shape[1:]):
+            raise ValueError(
+                f"{layer_name}: expected label shape {target_shape} or {target_shape[:1] + (1,) + target_shape[1:]}, "
+                f"got {label_shape}."
+            )
+        if int(label_shape[1]) != 1:
+            raise ValueError(
+                f"{layer_name}: cannot align multi-channel labels with shape {label_shape} to viewer shape {target_shape}."
+            )
+        return label_arr[:, 0, ...]
+
+    if len(label_shape) != 4:
+        raise ValueError(
+            f"{layer_name}: expected 4D/5D label array compatible with viewer shape {target_shape}, got {label_shape}."
+        )
+
+    raise ValueError(
+        f"{layer_name}: expected label shape {target_shape}, got {label_shape}."
+    )
 
 
 class PixelClassifierPanel:
@@ -330,17 +374,20 @@ class PixelClassifierPanel:
                         self.fill_holes[other_type],
                     ]))
 
-        # Store CPU-only widget groups so we can hide them when APOC is selected
+        # Store CPU/EDT widget group so it can be reused for CPU and APOC EDT workflows
         self._cpu_seg_params_box = widgets.VBox(segmentation_widgets)
 
         # Build probability map parameter widgets
-        prob_widgets = [widgets.HTML("<b>Probability Map parameters per cell type</b>")]
+        prob_widgets = [widgets.HTML("<b>Probability Map + Watershed parameters per cell type</b>")]
         for ct in self.all_cell_types:
             if ct in self.prob_mask_thresholds:
                 prob_widgets.append(widgets.HBox([
                     self.prob_mask_thresholds[ct],
                     self.prob_seed_thresholds[ct],
+                ]))
+                prob_widgets.append(widgets.HBox([
                     self.segment_size_mins[ct],
+                    self.opening_nr_pixels[ct],
                 ]))
         self._prob_params_box = widgets.VBox(prob_widgets)
 
@@ -664,6 +711,9 @@ class PixelClassifierPanel:
         to_lock.extend(self.segment_size_mins.values())
         to_lock.extend(self.opening_nr_pixels.values())
         to_lock.extend(self.fill_holes.values())
+        to_lock.extend(self.prob_mask_thresholds.values())
+        to_lock.extend(self.prob_seed_thresholds.values())
+        to_lock.extend([self.gpu_device, self.apoc_strategy])
         for w in self.apoc_min_size_inputs.values(): w.disabled = state
         for w in [self.btn_size_filter]: w.disabled = state
         for w in to_lock: w.disabled = state
@@ -712,6 +762,7 @@ class PixelClassifierPanel:
 
         # Include global GPU selection
         params["gpu_device_name"] = str(self.gpu_device.value)
+        params["apoc_strategy"] = str(self.apoc_strategy.value)
 
         # Include saved APOC per-cell-type params from config YAML
         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
@@ -719,7 +770,18 @@ class PixelClassifierPanel:
         if self.has_death:
             all_apoc_types.append("dead")
         for ct in all_apoc_types:
-            for key in ["feature_preset", "feature_string", "sigmas", "custom_feature_string", "max_depth", "num_ensembles", "channels"]:
+            for key in [
+                "feature_preset",
+                "feature_string",
+                "sigmas",
+                "grid_sigmas",
+                "custom_feature_string",
+                "checked_features",
+                "consider_original",
+                "max_depth",
+                "num_ensembles",
+                "channels",
+            ]:
                 saved = pc.get(f"apoc_{ct}_{key}")
                 if saved is not None:
                     params[f"apoc_{ct}_{key}"] = saved
@@ -742,6 +804,8 @@ class PixelClassifierPanel:
                 self.prob_mask_thresholds[cell_type].value = float(params[f"{cell_type}_prob_mask_threshold"])
             if f"{cell_type}_prob_seed_threshold" in params and cell_type in self.prob_seed_thresholds:
                 self.prob_seed_thresholds[cell_type].value = float(params[f"{cell_type}_prob_seed_threshold"])
+        if "apoc_strategy" in params:
+            self.apoc_strategy.value = str(params["apoc_strategy"])
 
         # Cache APOC per-cell-type params into the YAML config dict
         # (they will be written to disk by _persist_params below)
@@ -974,6 +1038,53 @@ class PixelClassifierPanel:
             finally:
                 self.spinner_filter.layout.display = "none"
                 self._lock(False)
+
+
+def build_external_seg_import_ui(metadata_loader):
+    """Build a standalone widget for importing external segmentation masks (+ dead mask) to Zarr."""
+    metadata = metadata_loader.metadata
+    sample_names = list(metadata["sample_name"].astype(str))
+    out_dir = Path(metadata_loader.output_dir) / "images"
+
+    all_cell_types = (
+        detect_organoid_types_from_metadata(metadata)
+        + detect_immune_cell_types_from_metadata(metadata)
+        + detect_other_cell_types_from_metadata(metadata)
+    )
+
+    children = []
+    for ct in all_cell_types:
+        cat = detect_cell_type_category(ct, metadata)
+        prefix = {"organoid": "or", "immune": "im", "other": "ot"}[cat]
+        col = f"{prefix}_{ct}_segments_image_path"
+        children.append(ExternalImageImporter(
+            label=f"{ct} segmentation",
+            output_dir=str(out_dir),
+            on_converted=make_metadata_callback(metadata_loader, col),
+            sample_names=sample_names,
+            output_filename="{sample_name}_" + ct + "_segments.zarr",
+            is_label_image=True,
+        ))
+
+    if has_dead_channel(metadata):
+        children.append(ExternalImageImporter(
+            label="Dead mask",
+            output_dir=str(out_dir),
+            on_converted=make_metadata_callback(metadata_loader, "dead_mask_path"),
+            sample_names=sample_names,
+            output_filename="{sample_name}_dead_mask.zarr",
+            is_label_image=True,
+        ))
+
+    accordion = widgets.Accordion(children=[widgets.VBox(children)])
+    accordion.set_title(0, "Import external segmentation")
+    accordion.selected_index = None
+
+    return widgets.VBox([
+        widgets.HTML("<b>Import external segmentation</b>"),
+        accordion,
+    ])
+
 
 class CellposeChannelConfigPanel:
 
@@ -1630,9 +1741,6 @@ class SegmentationVisualizationPanel:
                     img_arr = img_arr[s:e + 1]
                     loaded_masks = {k: v[s:e + 1] for k, v in loaded_masks.items()}
 
-                img_np = np.asarray(img_arr)
-                loaded_masks = {k: np.asarray(v) for k, v in loaded_masks.items()}
-
                 # ---- build viewer ----
                 if self._viewer is not None:
                     try:
@@ -1642,13 +1750,17 @@ class SegmentationVisualizationPanel:
 
                 viewer = napari.Viewer()
 
-                if img_np.ndim != 5:
-                    raise ValueError(f"Expected (T,C,Z,Y,X), got {img_np.shape}")
+                if img_arr.ndim != 5:
+                    raise ValueError(f"Expected (T,C,Z,Y,X), got {img_arr.shape}")
 
-                T, C, Z, Y, X = img_np.shape
+                raw_shape = tuple(int(v) for v in img_arr.shape)
+                viewer_label_shape = (raw_shape[0],) + tuple(raw_shape[-3:])
+                print(f"Raw viewer shape for labels: {viewer_label_shape}")
+
+                T, C, Z, Y, X = raw_shape
                 for ch in range(C):
                     viewer.add_image(
-                        img_np[:, ch],
+                        img_arr[:, ch],
                         name=f"channel_{ch}",
                         colormap=self._CHANNEL_COLORS[ch] if ch < len(self._CHANNEL_COLORS) else "gray",
                         scale=(1, 1, 1, 1),
@@ -1657,15 +1769,39 @@ class SegmentationVisualizationPanel:
                         channel_axis=None,
                     )
 
-                for name, mask_np in loaded_masks.items():
+                added_label_layers = 0
+                for name, mask_arr in loaded_masks.items():
+                    source_path = mask_files.get(name)
+                    source_text = str(source_path) if source_path is not None else "<unknown>"
+                    original_shape = tuple(int(v) for v in mask_arr.shape)
                     try:
-                        print(f"Adding layer '{name}'…")
-                        viewer.add_labels(mask_np, name=name, scale=(1, 1, 1, 1), blending="additive", opacity=0.8)
+                        mask_view = _normalize_segmentation_labels_for_view(
+                            mask_arr,
+                            raw_shape,
+                            layer_name=name,
+                        )
+                        normalized_shape = tuple(int(v) for v in mask_view.shape)
+                        print(
+                            f"Adding layer '{name}' from {source_text} "
+                            f"(original shape {original_shape} -> viewer shape {normalized_shape})"
+                        )
+                        viewer.add_labels(
+                            mask_view,
+                            name=name,
+                            scale=(1, 1, 1, 1),
+                            opacity=0.6,
+                        )
+                        added_label_layers += 1
                     except Exception as e:
-                        print(f"  Skipping layer '{name}': {e}")
+                        print(
+                            f"Skipping layer '{name}' from {source_text} "
+                            f"(original shape {original_shape}, expected viewer shape {viewer_label_shape}): {e}"
+                        )
 
                 if not loaded_masks:
-                    print("No segments/mask layers added.")
+                    print("No segments/mask layers found.")
+                elif added_label_layers == 0:
+                    print("No segments/mask layers added after shape normalization.")
 
                 napari.run()
                 self._viewer = viewer

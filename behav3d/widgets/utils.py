@@ -1,11 +1,33 @@
-import ipywidgets as widgets
-from ipyfilechooser import FileChooser
-from pathlib import Path
-import yaml
-from copy import deepcopy
-import pandas as pd
+import os
 import re
+import traceback
+from copy import deepcopy
+from pathlib import Path
+
+import ipywidgets as widgets
+import numpy as np
+import pandas as pd
+import yaml
+from IPython.display import display
+from ipyfilechooser import FileChooser
 from traitlets import Any, Unicode, Bool
+
+from behav3d.core.metadata import (
+    check_behav3d_metadata,
+    detect_immune_cell_types_from_metadata,
+    detect_organoid_types_from_metadata,
+    detect_other_cell_types_from_metadata,
+    load_behav3d_metadata,
+)
+from behav3d.io.formats.zarr import save_as_zarr
+from behav3d.io.images import (
+    convert_label_file_to_zarr,
+    convert_raw_file_to_zarr,
+    get_image_dimension_order,
+    get_image_shape,
+    load_image,
+)
+from behav3d.preprocessing.tracking import convert_tracked_image_to_csv
 
 # ===============================
 # CONSTANTS
@@ -53,6 +75,11 @@ _DEFAULT_CONFIG = {
         "per_sample_channel_labels": {},  # {sample_name: {0: "organoid1", ...}, ...}
     },
     "tracking": {
+        "track_organoids_together": False,
+        "all_organoids": {
+            "method": "propagation_all_organoids",
+            "overwrite": False,
+        },
         "immune": {
             "method": "trackpy",
             "overwrite": False,
@@ -112,7 +139,7 @@ _DEFAULT_CONFIG = {
             }
         },
         "organoid": {
-            "method": "propagation",
+            "method": "propagation",  # also supports "propagation_all_organoids"
             "overwrite": False,
             "lap": {
                 "track_cost_px": 60,
@@ -359,12 +386,6 @@ def _mk_timepoint_range(use_all: bool, start: int, end: int):
     return (int(start), int(end))
 
 def detect_cell_type_category(cell_type, metadata):
-    from behav3d.core.metadata import (
-        detect_organoid_types_from_metadata,
-        detect_immune_cell_types_from_metadata,
-        detect_other_cell_types_from_metadata
-    )
-    
     organoid_types = detect_organoid_types_from_metadata(metadata)
     immune_types = detect_immune_cell_types_from_metadata(metadata)
     other_types = detect_other_cell_types_from_metadata(metadata)
@@ -464,6 +485,239 @@ class PathPicker(widgets.HBox):
         pass
 
 
+DIM_ORDER_OPTIONS = [
+    # 5D
+    "TCZYX", "TZCYX", "CTZYX", "CZTYX", "ZCTYX", "ZTCYX",
+    # 4D (missing one of T / C / Z)
+    "CZYX", "ZCYX", "TZYX", "ZTYX", "TCYX", "CTYX",
+    # 3D / 2D
+    "ZYX", "CYX", "TYX",
+    "YX",
+]
+
+
+def make_metadata_callback(metadata_loader, col):
+    """Return an on_converted callback that writes *zarr_path* into *col* for the given sample."""
+    def _cb(sample_name, src, zarr_path):
+        md = metadata_loader.metadata
+        if col not in md.columns:
+            md[col] = pd.NA
+        md[col] = md[col].astype("object")
+        mask = md["sample_name"].astype(str) == str(sample_name)
+        md.loc[mask, col] = str(zarr_path)
+        csv_path = getattr(metadata_loader, "metadata_csv_path", None)
+        if csv_path:
+            md.to_csv(csv_path, index=False)
+        print(f"  Metadata '{col}' for sample '{sample_name}' -> {zarr_path}")
+    return _cb
+
+
+def make_tracking_metadata_callback(metadata_loader, img_col, csv_col, trackdata_dir):
+    """
+    Return an on_converted callback for tracking imports.
+
+    After the zarr is created, automatically generates the tracks CSV
+    (same format as laptracking, trackpy, etc.) using the existing
+    convert_tracked_image_to_csv(), and stores both paths in metadata.
+    """
+    def _cb(sample_name, src, zarr_path):
+        md = metadata_loader.metadata
+
+        # --- 1. Store zarr path ---
+        for col in [img_col, csv_col]:
+            if col not in md.columns:
+                md[col] = pd.NA
+            md[col] = md[col].astype("object")
+
+        mask = md["sample_name"].astype(str) == str(sample_name)
+        md.loc[mask, img_col] = str(zarr_path)
+
+        # --- 2. Generate CSV (same as all tracking methods) ---
+        row = md.loc[mask].iloc[0]
+        el_xy = float(row.get("pixel_distance_xy", 1))
+        el_z = float(row.get("pixel_distance_z", 1))
+
+        csv_dir = Path(trackdata_dir)
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = csv_dir / f"{Path(zarr_path).stem.replace('_tracked', '_tracks')}.csv"
+
+        print(f"  Generating tracks CSV: {csv_path}")
+        convert_tracked_image_to_csv(
+            img_path=zarr_path,
+            outpath=csv_path,
+            element_size_x=el_xy,
+            element_size_y=el_xy,
+            element_size_z=el_z,
+        )
+        md.loc[mask, csv_col] = str(csv_path)
+
+        # --- 3. Save metadata ---
+        csv_meta_path = getattr(metadata_loader, "metadata_csv_path", None)
+        if csv_meta_path:
+            md.to_csv(csv_meta_path, index=False)
+
+        print(f"  Metadata '{img_col}' -> {zarr_path}")
+        print(f"  Metadata '{csv_col}' -> {csv_path}")
+    return _cb
+
+
+class ExternalImageImporter(widgets.VBox):
+    """
+    Widget: pick a sample, browse/paste an image path, probe its shape,
+    select axis order, and convert to Zarr.  Reuses PathPicker for the
+    file input.  *on_converted(sample_name, src_path, zarr_path)* is
+    called after a successful conversion so callers can update metadata.
+
+    Parameters
+    ----------
+    label : str
+        Display label (e.g. "tcell segmentation").
+    output_dir : str
+        Base output directory (zarr stored inside {output_dir}/{sample_name}/).
+    on_converted : callable
+        Callback(sample_name, src_path, zarr_path) after successful conversion.
+    sample_names : list[str]
+        Sample names for the dropdown.
+    output_filename : str or None
+        If set, a Python format string for the zarr filename using {sample_name}.
+        E.g. "{sample_name}_tcell_segments.zarr".  If None, uses "{src_stem}.zarr".
+    is_label_image : bool
+        If True, cast output to uint16 (same as all internal segmentation/tracking
+        methods). Raises ValueError if any value exceeds 65535.
+    """
+
+    def __init__(self, label="Image", output_dir=None, on_converted=None,
+                 sample_names=None, output_filename=None, is_label_image=False):
+        super().__init__()
+        self._get_shape, self._get_dim_order = get_image_shape, get_image_dimension_order
+        self._output_dir, self._on_converted = output_dir, on_converted
+        self._output_filename = output_filename
+        self._is_label_image = is_label_image
+        self.last_zarr_path = None
+
+        self.sample_dd = widgets.Dropdown(
+            options=sample_names or [], description="Sample:",
+            style={"description_width": "80px"}, layout=widgets.Layout(width="300px"))
+        self.path_picker = PathPicker(
+            description="File:", placeholder="Path to image (TIFF, H5, CZI, …)",
+            description_width="50px", width="100%")
+        self.btn_probe = widgets.Button(
+            description="Probe", icon="search", button_style="info",
+            layout=widgets.Layout(width="90px"))
+        self.info = widgets.HTML(value="")
+        self.axis_dd = widgets.Dropdown(
+            options=["-- probe first --"], description="Axis order:",
+            style={"description_width": "90px"}, layout=widgets.Layout(width="260px"))
+        n_cpu = os.cpu_count() or 4
+        self.n_workers = widgets.IntText(
+            value=max(1, n_cpu // 2), description="Workers:",
+            style={"description_width": "70px"}, layout=widgets.Layout(width="160px"))
+        self.btn_convert = widgets.Button(
+            description=f"Convert to Zarr", button_style="success",
+            icon="exchange", disabled=True, layout=widgets.Layout(width="180px"))
+        self.out = widgets.Output()
+
+        self.btn_probe.on_click(self._on_probe)
+        self.btn_convert.on_click(self._on_convert)
+
+        self.children = [
+            widgets.HTML(f"<b>Import external {label}</b>"),
+            widgets.HBox([self.sample_dd, self.path_picker, self.btn_probe]),
+            self.info,
+            widgets.HBox([self.axis_dd, self.n_workers, self.btn_convert]),
+            self.out,
+        ]
+
+    def _on_probe(self, _=None):
+        self.out.clear_output()
+        p = Path(self.path_picker.value.strip())
+        if not p.exists():
+            self.info.value = "<span style='color:red'>File not found.</span>"
+            self.btn_convert.disabled = True
+            return
+        try:
+            shape, detected = self._get_shape(p), self._get_dim_order(p)
+        except Exception as exc:
+            self.info.value = f"<span style='color:red'>Error: {exc}</span>"
+            self.btn_convert.disabled = True
+            return
+
+        shape_str = " x ".join(str(s) for s in shape)
+        det_str = detected or "not detected"
+        self.info.value = (
+            f"<b>Shape:</b> {shape_str} ({len(shape)}D) &nbsp;|&nbsp; "
+            f"<b>Detected order:</b> {det_str}")
+
+        matching = [o for o in DIM_ORDER_OPTIONS if len(o) == len(shape)] or list(DIM_ORDER_OPTIONS)
+        self.axis_dd.options = matching
+        self.axis_dd.value = detected if (detected and detected in matching) else matching[0]
+        self.btn_convert.disabled = False
+
+    def _on_convert(self, _=None):
+        self.out.clear_output()
+        self.btn_convert.disabled = True
+        src = Path(self.path_picker.value.strip())
+        if not src.exists():
+            with self.out: print(f"File not found: {src}")
+            self.btn_convert.disabled = False
+            return
+
+        sample_name = str(self.sample_dd.value)
+
+        # Output path: {output_dir}/{sample_name}/{filename}.zarr
+        base_dir = Path(self._output_dir) if self._output_dir else src.parent
+        sample_dir = base_dir / sample_name
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
+        if self._output_filename:
+            zarr_name = self._output_filename.format(sample_name=sample_name)
+        else:
+            zarr_name = f"{src.stem}.zarr"
+        zarr_path = sample_dir / zarr_name
+
+        with self.out:
+            try:
+                if self._is_label_image:
+                    convert_label_file_to_zarr(
+                        path=src,
+                        outpath=zarr_path,
+                        axis_order=self.axis_dd.value,
+                        overwrite=True,
+                    )
+                else:
+                    convert_raw_file_to_zarr(
+                        path=src,
+                        outpath=zarr_path,
+                        axis_order=self.axis_dd.value,
+                        overwrite=True,
+                        n_workers=max(1, int(self.n_workers.value)),
+                    )
+
+                # dtype check for label images (segmentation/tracking)
+                # Prefer uint16 (standard for pipeline), fall back to int32
+                # for very large label sets (>65535 objects).
+                if self._is_label_image:
+                    arr = load_image(zarr_path)
+                    max_val = int(np.max(np.asarray(arr)))
+                    if arr.dtype == np.uint16:
+                        pass  # Already correct
+                    elif max_val <= np.iinfo(np.uint16).max:
+                        print(f"  Casting from {arr.dtype} to uint16 (max value {max_val} fits)")
+                        save_as_zarr(np.asarray(arr).astype(np.uint16), zarr_path)
+                    elif arr.dtype != np.int32:
+                        print(f"  Casting from {arr.dtype} to int32 (max value {max_val} exceeds uint16)")
+                        save_as_zarr(np.asarray(arr).astype(np.int32), zarr_path)
+
+                self.last_zarr_path = str(zarr_path)
+                if self._on_converted:
+                    self._on_converted(sample_name, str(src), str(zarr_path))
+                print(f"Zarr saved: {zarr_path}")
+            except Exception:
+                traceback.print_exc()
+        self.btn_convert.disabled = False
+
+
+
 class MetadataLoader(widgets.VBox):
     def __init__(
         self,
@@ -474,7 +728,6 @@ class MetadataLoader(widgets.VBox):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
         self.load_behav3d_metadata = load_behav3d_metadata
         self.check_behav3d_metadata = check_behav3d_metadata
         
@@ -523,7 +776,6 @@ class MetadataLoader(widgets.VBox):
         except Exception as e:
             with self.out:
                 print(f"❌ Error loading metadata: {e}")
-                import traceback
                 traceback.print_exc()
 
     def _on_click(self, _):

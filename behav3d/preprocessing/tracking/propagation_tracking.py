@@ -1,32 +1,14 @@
-from behav3d.io.images import load_image, append_to_zarr, save_as_zarr
+from behav3d.io.images import load_image, append_to_zarr
 from behav3d.preprocessing import dilate_mask
 from behav3d.preprocessing.segmentation import segment_size_filter
 from behav3d.preprocessing.tracking import convert_tracked_image_to_csv
-import pandas as pd
 
 from skimage.segmentation import watershed
 import numpy as np
 import pandas as pd
 from pathlib import Path
-import zarr
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import shutil
-import dask.array as da
-
-# def propagate_segmentation(args):
-#     zarr_path, t, dilation_nr_pixels, segment_size_min = args
-#     t_seg = np.asarray(load_image(zarr_path)[t])
-#     seg_prev_tp = np.asarray(load_image(zarr_path)[max(0, t-1)])
-#     mask = t_seg!=0
-#     seg_prev_tp[mask==0]=0
-#     # seeds = keep_largest_connected_components(seeds)
-#     new_seg = watershed(mask, markers = seg_prev_tp, mask=mask)
-#     mask_dilated = dilate_mask(mask, nr_pixels=dilation_nr_pixels)
-#     new_seg = watershed(mask_dilated, markers = new_seg, mask=mask_dilated)
-#     new_seg[mask==0]=0
-#     new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
-#     return new_seg
 
 def _run_single_timepoint_propagation(
     t_seg,
@@ -44,7 +26,33 @@ def _run_single_timepoint_propagation(
     new_seg[mask==0]=0
     new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
     return(new_seg)
-    # return new_seg
+
+def _resolve_segments_column(sample, cell_type):
+    for prefix in ['or', 'im', 'ot']:
+        col_name = f"{prefix}_{cell_type}_segments_image_path"
+        if col_name in sample.index and pd.notna(sample[col_name]):
+            return col_name, sample[col_name]
+    legacy_col = f"{cell_type}_segments_image_path"
+    return legacy_col, sample.get(legacy_col)
+
+def _resolve_tracking_output_columns(cell_type, segments_col):
+    if segments_col and segments_col.startswith(('or_', 'im_', 'ot_')):
+        prefix = segments_col.split('_', 1)[0]
+        return (
+            f"{prefix}_{cell_type}_tracks_image_path",
+            f"{prefix}_{cell_type}_tracks_csv_path",
+        )
+    return (
+        f"{cell_type}_tracks_image_path",
+        f"{cell_type}_tracks_csv_path",
+    )
+
+def _ensure_metadata_output_columns(metadata, *cols):
+    for col in cols:
+        if col not in metadata.columns:
+            metadata[col] = pd.Series(index=metadata.index, dtype=object)
+        elif metadata[col].dtype != object:
+            metadata[col] = metadata[col].astype(object)
 
 def propagate_tracks(
     segments_path,
@@ -95,6 +103,7 @@ def run_propagation_tracking(
     overwrite=False,
     dilation_nr_pixels=2,
     segment_size_min=100,
+    all_organoids=False,
     **kwargs
     ):
     """Run propagation-based tracking on any cell type.
@@ -119,6 +128,20 @@ def run_propagation_tracking(
         Minimum segment size in voxels (smaller segments are filtered out)
     **kwargs : dict
     """
+    if all_organoids:
+        from behav3d.preprocessing.tracking.propagation_tracking_all_organoids import (
+            run_propagation_tracking_all_organoids,
+        )
+
+        return run_propagation_tracking_all_organoids(
+            metadata=metadata,
+            output_dir=output_dir,
+            overwrite=overwrite,
+            dilation_nr_pixels=dilation_nr_pixels,
+            segment_size_min=segment_size_min,
+            **kwargs,
+        )
+
     for idx, sample in metadata.iterrows():
         sample_name=sample['sample_name']
         print(f"Tracking sample: {sample_name}")
@@ -130,19 +153,7 @@ def run_propagation_tracking(
         tracked_img_outdir = Path(output_dir, "images", sample_name)
         tracked_csv_outdir = Path(output_dir, "trackdata", sample_name, cell_type)
         
-        # Find the correct prefixed column (or_, im_, ot_)
-        segments_col = None
-        for prefix in ['or', 'im', 'ot']:
-            col_name = f"{prefix}_{cell_type}_segments_image_path"
-            if col_name in sample.index and pd.notna(sample[col_name]):
-                segments_col = col_name
-                break
-        
-        if segments_col is None:
-            # Fallback to old non-prefixed format for backward compatibility
-            segments_col = f"{cell_type}_segments_image_path"
-        
-        segments_path = sample.get(segments_col)
+        segments_col, segments_path = _resolve_segments_column(sample, cell_type)
         
         # Check if segments_path is valid
         if pd.isna(segments_path) or segments_path is None:
@@ -180,18 +191,8 @@ def run_propagation_tracking(
         else:
             print("Tracking already exists... Provide overwrite=True to overwrite... Loading existing tracking data")
         
-        # Update metadata with prefixed column names
-        if segments_col is not None and segments_col.startswith(('or_', 'im_', 'ot_')):
-            # Use the same prefix as the segments column
-            prefix = segments_col.split('_')[0]
-            img_col = f"{prefix}_{cell_type}_tracks_image_path"
-            csv_col = f"{prefix}_{cell_type}_tracks_csv_path"
-        
-        # Ensure columns are object dtype
-        for col in [img_col, csv_col]:
-            if col not in metadata.columns or metadata[col].dtype != object:
-                metadata[col] = metadata.get(col, pd.Series(dtype=object)).astype(object)
-                
+        img_col, csv_col = _resolve_tracking_output_columns(cell_type, segments_col)
+        _ensure_metadata_output_columns(metadata, img_col, csv_col)
         metadata.at[idx, img_col] = str(tracked_img_outpath)
         metadata.at[idx, csv_col] = str(tracked_csv_outpath)
         

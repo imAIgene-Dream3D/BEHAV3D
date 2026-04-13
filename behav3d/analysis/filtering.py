@@ -9,6 +9,11 @@ import time
 from behav3d.core.utils import format_time
 import numpy as np
 
+def _require_columns(df: pd.DataFrame, columns, context: str):
+    missing = [col for col in columns if col not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns for {context}: {missing}")
+
 def filter_by_full_duration(df: pd.DataFrame,
                             exp_duration=None,
                             time_column="position_t"
@@ -226,18 +231,33 @@ def filter_tracks(
             f"Please run Feature Extraction for {cell_type} first."
         )
     
-    df_all_tracks = pd.read_csv(df_all_tracks_path)
+    df_all_tracks = pd.read_csv(df_all_tracks_path, low_memory=False)
     
     df_all_tracks['sample_name'] = df_all_tracks['sample_name'].astype(str)
     metadata['sample_name'] = metadata['sample_name'].astype(str)
 
     # Dynamically detect *_line_condition columns from metadata
     line_condition_cols = [c for c in metadata.columns if c.endswith('_line_condition')]
-    group_cols = ['TrackID', 'sample_name'] + line_condition_cols + ['exp_nr', 'well']
+    requested_group_cols = ['TrackID', 'sample_name'] + line_condition_cols + ['exp_nr', 'well']
 
-    cols_present = [c for c in group_cols if c in metadata.columns]
-    metadata_info = metadata.loc[:, cols_present].copy()
-    df_all_tracks_filt = pd.merge(df_all_tracks, metadata_info, how="left", on="sample_name")
+    # Advanced feature exports may already include grouping metadata. Only merge
+    # fields that are missing from the input file to avoid *_x/*_y suffixes.
+    missing_group_cols = [
+        c for c in requested_group_cols
+        if c not in df_all_tracks.columns and c in metadata.columns and c != "sample_name"
+    ]
+    if missing_group_cols:
+        metadata_info = metadata.loc[:, ['sample_name'] + missing_group_cols].copy()
+        df_all_tracks_filt = pd.merge(df_all_tracks, metadata_info, how="left", on="sample_name")
+    else:
+        df_all_tracks_filt = df_all_tracks.copy()
+
+    resolved_group_cols = [c for c in requested_group_cols if c in df_all_tracks_filt.columns]
+    _require_columns(
+        df_all_tracks_filt,
+        ["TrackID", "sample_name"],
+        context="track filtering",
+    )
     
     # Function to count the number of unique tracks in the DataFrame
     def count_tracks(df_all_tracks, col_name="nr_tracks", df_track_counts=None):
@@ -273,7 +293,13 @@ def filter_tracks(
         if max_track_length is not None:
             max_track_length = max_track_length - 1
     
-    df_all_tracks_filt = df_all_tracks_filt.sort_values(group_cols + [time_column]).reset_index(drop=True)
+    _require_columns(
+        df_all_tracks_filt,
+        resolved_group_cols + [time_column],
+        context="track filtering",
+    )
+
+    df_all_tracks_filt = df_all_tracks_filt.sort_values(resolved_group_cols + [time_column]).reset_index(drop=True)
 
     df_all_tracks_filt=filter_by_full_duration(
         df=df_all_tracks_filt,
@@ -318,7 +344,7 @@ def filter_tracks(
         df=df_all_tracks_filt,
         min_track_length=min_track_length,
         time_column=time_column,
-        group_cols=group_cols
+        group_cols=resolved_group_cols
     )
 
     # Cutting down tracks to maximal track length    
@@ -326,7 +352,7 @@ def filter_tracks(
         df=df_all_tracks_filt,
         max_track_length=max_track_length,
         time_column=time_column,
-        group_cols=group_cols
+        group_cols=resolved_group_cols
     )
     
     df_track_counts = count_tracks(
@@ -633,4 +659,3 @@ def round_legend_ticks(value):
     elif value <= 10000:
         return np.ceil(value / 500) * 500
     return value
-
