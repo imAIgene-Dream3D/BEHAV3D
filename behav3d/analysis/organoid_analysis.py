@@ -1130,6 +1130,56 @@ def plot_multi_organoid_death_dynamics(
             skip_annotation = f"Skipped (disappeared): {n_skipped} / {n_total} tracks"
             print(f"\n[Plot 4] {skip_annotation}")
 
+            def extend_dead_tracks_to_sample_end(df, group_cols, time_column="position_t"):
+                """
+                For tracks marked as dead that end before their sample's final timepoint,
+                extend the track by duplicating the last row for each missing timepoint.
+                This preserves real death events where tracking was lost late in the experiment.
+                """
+                df = df.copy()
+                extended_rows = []
+                
+                # Get the max timepoint per sample
+                sample_max_t = df.groupby("sample_name")[time_column].transform("max")
+                df["__sample_max_t"] = sample_max_t
+                
+                for track_id, track_group in df.groupby(group_cols):
+                    # Check if track is marked as dead
+                    if ("dead" in track_group.columns) and track_group["dead"].any():
+                        track_max_t = track_group[time_column].max()
+                        sample_max_t_val = track_group["__sample_max_t"].iloc[0]
+                        
+                        # If track ends before sample end, extend it
+                        if track_max_t < sample_max_t_val:
+                            last_row = track_group.sort_values(time_column).iloc[-1].copy()
+                            missing_times = np.arange(track_max_t + 1, sample_max_t_val + 1)
+                            
+                            for t in missing_times:
+                                extended_row = last_row.copy()
+                                extended_row[time_column] = t
+                                extended_rows.append(extended_row)
+                
+                if extended_rows:
+                    df_extended = pd.concat([df, pd.DataFrame(extended_rows)], ignore_index=True)
+                    df_extended = df_extended.drop(columns=["__sample_max_t"])
+                    
+                    n_original_rows = len(df) - len(extended_rows)  # rows before extension
+                    n_extended_rows = len(extended_rows)
+                    print(f"  [Dead track extension] Extended {n_extended_rows} timepoint(s) for dead tracks")
+                    print(f"    Original rows: {n_original_rows}, Extended rows: {n_extended_rows}, Total: {len(df_extended)}")
+                    
+                    return df_extended
+                else:
+                    df = df.drop(columns=["__sample_max_t"])
+                    print(f"  [Dead track extension] No dead tracks to extend")
+                    return df
+
+            # Extend dead tracks to sample end to preserve real death events
+            print(f"\n[Dead track extension] Processing tracks marked as dead...")
+            df_no_disapp = extend_dead_tracks_to_sample_end(df_no_disapp, track_groups, time_column="position_t")
+            n_after_extension = df_no_disapp.groupby(track_groups).ngroups
+            print(f"  Track count after extension: {n_after_extension} unique tracks")
+
             def normalize_to_zero(df, feature, group_cols):
                 """Subtract the first value of *feature* within each track group."""
                 df = df.copy()
@@ -1238,10 +1288,10 @@ def plot_multi_organoid_death_dynamics(
 
                     label = f"{cond_val} | {org_val}" if str(cond_val) != str(org_val) else str(cond_val)
                     ax5.plot(t, mean, linewidth=2.6, label=label, color=color, linestyle=ls)
-                    # Clip lower bound to 0: SD halo should never imply negative death increase
+                    # Fill uncertainty band (no clipping applied; mean ±  std after cummax is naturally >= 0)
                     ax5.fill_between(
                         t,
-                        np.maximum(mean - std, 0),
+                        mean - std,
                         mean + std,
                         alpha=0.18,
                         color=color,

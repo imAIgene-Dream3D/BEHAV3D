@@ -619,7 +619,7 @@ def filter_tracks(
         _append_track_length_histogram_pages(
             pdf,
             df_before_for_hist,
-            group_cols,
+            resolved_group_cols,
             suptitle="Track length — before filtering (input track-features CSV)",
             cell_type=cell_type,
             nr_cols=3,
@@ -637,7 +637,7 @@ def filter_tracks(
         _append_track_length_histogram_pages(
             pdf,
             df_after_for_hist,
-            group_cols,
+            resolved_group_cols,
             suptitle="Track length — after filtering (combined_track_features_filtered.csv)",
             cell_type=cell_type,
             nr_cols=3,
