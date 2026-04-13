@@ -851,6 +851,12 @@ class ProcessingQueuePanel(QWidget):
             apoc_widget.spin_prob_threshold.setValue(p["prob_threshold"])
         if "prob_min_size" in p:
             apoc_widget.spin_prob_min_size.setValue(p["prob_min_size"])
+        # Restore per-CT size filter thresholds (Direct APOC strategy)
+        if "min_sizes" in p:
+            for ct, val in p["min_sizes"].items():
+                spin = apoc_widget._size_filter_spins.get(ct)
+                if spin is not None:
+                    spin.setValue(val)
         if "workers" in p:
             apoc_widget.spin_workers.setValue(p["workers"])
         # Timepoint range

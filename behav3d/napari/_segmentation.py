@@ -161,18 +161,19 @@ class SegmentationTab(QWidget):
         )
 
     def _on_method_changed(self, index):
-        # If switching away from Pixel Classifier (index 1), check session
         current_idx = self.param_stack.currentIndex()
+
+        # If switching away from Pixel Classifier (index 1), check session
         if current_idx == 1 and self.pixel_classifier_page.is_session_active:
             from qtpy.QtWidgets import QMessageBox
             res = QMessageBox.question(
-                self, 
-                "Switch Method?", 
-                "A segmentation session is active. Switching methods will clear the viewer and reset your unsaved labeling session. \n\nDo you want to proceed?",
+                self,
+                "Switch Method?",
+                "A segmentation session is active. Switching methods will clear the viewer "
+                "and reset your unsaved labeling session.\n\nDo you want to proceed?",
                 QMessageBox.Yes | QMessageBox.No
             )
             if res == QMessageBox.No:
-                # Revert combo box index
                 self.method_combo.blockSignals(True)
                 self.method_combo.setCurrentIndex(current_idx)
                 self.method_combo.blockSignals(False)
@@ -180,8 +181,25 @@ class SegmentationTab(QWidget):
             else:
                 self.cleanup_session()
 
+        # If switching away from APOC tab (index 0), remove training layers
+        elif current_idx == 0 and self.apoc_page._is_session_active:
+            from qtpy.QtWidgets import QMessageBox
+            res = QMessageBox.question(
+                self,
+                "Switch Method?",
+                "APOC training layers are loaded in the viewer. Switching methods will remove them.\n\nDo you want to proceed?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if res == QMessageBox.No:
+                self.method_combo.blockSignals(True)
+                self.method_combo.setCurrentIndex(current_idx)
+                self.method_combo.blockSignals(False)
+                return
+            else:
+                self.apoc_page.cleanup_session()
+
         self.param_stack.setCurrentIndex(index)
-        
+
         # If switching to APOC tab (index 0), refresh it
         if index == 0:
             self.apoc_page._on_metadata_updated()
@@ -191,13 +209,15 @@ class SegmentationTab(QWidget):
 
     def request_tab_exit(self):
         """Called by the main widget when the user tries to leave this tab."""
+        from qtpy.QtWidgets import QMessageBox
+
         # 1. Pixel Classifier Page
         if self.pixel_classifier_page.is_session_active:
-            from qtpy.QtWidgets import QMessageBox
             res = QMessageBox.question(
-                self, 
-                "Leave Segmentation Tab?", 
-                "A segmentation session is active. Switching tabs will clear the viewer and reset your unsaved labeling session. \n\nDo you want to leave?",
+                self,
+                "Leave Segmentation Tab?",
+                "A segmentation session is active. Switching tabs will clear the viewer "
+                "and reset your unsaved labeling session.\n\nDo you want to leave?",
                 QMessageBox.Yes | QMessageBox.No
             )
             if res == QMessageBox.No:
@@ -205,11 +225,27 @@ class SegmentationTab(QWidget):
             else:
                 self.cleanup_session()
                 return True
+
+        # 2. APOC Page
+        if self.apoc_page._is_session_active:
+            res = QMessageBox.question(
+                self,
+                "Leave Segmentation Tab?",
+                "APOC training layers are loaded in the viewer. Leaving this tab will remove them.\n\nDo you want to leave?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if res == QMessageBox.No:
+                return False
+            else:
+                self.apoc_page.cleanup_session()
+                return True
+
         return True
 
     def cleanup_session(self):
-        """Clear viewer and reset tab state."""
+        """Clear viewer and reset tab state (both Pixel Classifier and APOC)."""
         self.pixel_classifier_page.reset_ui()
+        self.apoc_page.cleanup_session()
 
 def _cfg_get(cfg: dict, dotted_key: str, default=None):
     """Get a value from a nested dict using dotted key notation."""
@@ -303,7 +339,7 @@ class PixelClassifierWidget(QWidget):
         self.btn_load_training = QPushButton("Generate Training Data")
         self.btn_load_training.setToolTip("Clears viewer and loads selected timepoints for labeling")
         self.btn_load_training.setStyleSheet("background-color: #007bff; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
-        self.btn_load_training.clicked.connect(self._on_load_training_clicked)
+        self.btn_load_training.clicked.connect(lambda _: self._on_load_training_clicked(interactive=True))
         
         self.btn_save_labels = QPushButton("Save Labels")
         self.btn_save_labels.setToolTip("Save all user-provided label layers to disk")
@@ -987,12 +1023,38 @@ class PixelClassifierWidget(QWidget):
             pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
             saved_examples = pc.get("examples_per_sample", None)
             exists = features_outpath.exists() and image_outpath.exists()
-            
+
             load_existing = False
             if exists:
                 if interactive:
+                    # Read the actual number of stored training images from the zarr header
+                    # Pixel Classifier saves as (T, C, Z, Y, X) → shape[0] = image count
+                    try:
+                        import zarr as _zarr
+                        _cached = _zarr.open(str(image_outpath), mode="r")
+                        saved_image_count = _cached.shape[0]
+                        del _cached
+                    except Exception:
+                        saved_image_count = None
+
+                    n_samples = len(metadata['sample_name'].unique())
+                    total_new_images = n_samples * examples_per_sample
+                    if saved_image_count is not None:
+                        msg = (
+                            f"Training data already exists with {saved_image_count} images.\n\n"
+                            f"Currently selected: {n_samples} sample(s) × {examples_per_sample} examples/sample "
+                            f"= {total_new_images} images.\n\n"
+                            f"Overwrite with new training data, or load the existing data?"
+                        )
+                    else:
+                        msg = (
+                            f"Training data already exists.\n\n"
+                            f"Currently selected: {n_samples} sample(s) × {examples_per_sample} examples/sample "
+                            f"= {total_new_images} images.\n\n"
+                            f"Overwrite with new training data, or load the existing data?"
+                        )
+
                     from qtpy.QtWidgets import QMessageBox
-                    msg = f"Pre-existing training data found with {saved_examples} Examples/sample.\n\nDo you want to generate NEW training data (overwriting) or LOAD the already saved data?"
                     box = QMessageBox(self)
                     box.setWindowTitle("Training Data Detected")
                     box.setText(msg)
@@ -1000,14 +1062,14 @@ class PixelClassifierWidget(QWidget):
                     btn_load = box.addButton("Load Existing", QMessageBox.YesRole)
                     btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
                     box.exec_()
-                    
+
                     if box.clickedButton() == btn_cancel:
                         self.log("Action cancelled.")
                         return
                     elif box.clickedButton() == btn_load:
                         load_existing = True
                 else:
-                    # Non-interactive (Queue): Default to load existing if it exists
+                    # Non-interactive (Queue): default to loading existing data
                     load_existing = True
 
             self.viewer.layers.clear() # Clear after prompting, to avoid removing if cancel
@@ -2809,6 +2871,7 @@ class APOCWidget(QWidget):
         self.metadata_loader = metadata_loader
         self.log = log_callback or print
         self._training_widget = None
+        self._is_session_active = False
         self._init_ui()
 
     def _init_ui(self):
@@ -2849,7 +2912,7 @@ class APOCWidget(QWidget):
         self.btn_load_training = QPushButton("Generate Training Data")
         self.btn_load_training.setToolTip("Clears viewer and loads selected timepoints for labeling")
         self.btn_load_training.setStyleSheet("background-color: #007bff; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
-        self.btn_load_training.clicked.connect(self._on_load_training_clicked)
+        self.btn_load_training.clicked.connect(lambda _: self._on_load_training_clicked(interactive=True))
         train_ctrl_lay.addWidget(self.btn_load_training)
         train_ctrl_lay.addStretch()
         
@@ -3090,17 +3153,44 @@ class APOCWidget(QWidget):
             from behav3d.preprocessing.segmentation.apoc_train import _load_training_images
             from behav3d.preprocessing import zeropad_image_to_match_shape
             
-            # This handles caching automatically. Interactive dialog for overwrite could be added here
-            # But the backend handles it properly (usually overwriting or loading existing).
-            load_existing = True
-            if interactive:
-                # Same check as pixel classifier
-                pixel_class_outdir = output_dir / "images" / "PixelClassification"
-                image_outpath = pixel_class_outdir / 'PixelClassifier_Images.zarr'
-                saved_examples = pc.get("examples_per_sample", None)
-                if image_outpath.exists():
+            # Determine the cached data path and whether it already exists
+            pixel_class_outdir = output_dir / "images" / "PixelClassification"
+            image_outpath = pixel_class_outdir / 'PixelClassifier_Images.zarr'
+            saved_examples = pc.get("examples_per_sample", None)
+
+            # Default: generate if no data exists; prompt only if data already exists
+            load_existing = False
+            if image_outpath.exists():
+                if interactive:
+                    # Read the actual number of stored training images from the zarr header
+                    # APOC saves as (C, T, Z, Y, X) → shape[1] = image count
+                    try:
+                        import zarr as _zarr
+                        _cached = _zarr.open(str(image_outpath), mode="r")
+                        saved_image_count = _cached.shape[1] if len(_cached.shape) > 1 else _cached.shape[0]
+                        del _cached
+                    except Exception:
+                        saved_image_count = None
+
+                    n_samples = len(md['sample_name'].unique())
+                    examples_per_sample = self.spin_examples.value()
+                    total_new_images = n_samples * examples_per_sample
+                    if saved_image_count is not None:
+                        msg = (
+                            f"Training data already exists with {saved_image_count} images.\n\n"
+                            f"Currently selected: {n_samples} sample(s) × {examples_per_sample} examples/sample "
+                            f"= {total_new_images} images.\n\n"
+                            f"Overwrite with new training data, or load the existing data?"
+                        )
+                    else:
+                        msg = (
+                            f"Training data already exists.\n\n"
+                            f"Currently selected: {n_samples} sample(s) × {examples_per_sample} examples/sample "
+                            f"= {total_new_images} images.\n\n"
+                            f"Overwrite with new training data, or load the existing data?"
+                        )
+
                     from qtpy.QtWidgets import QMessageBox
-                    msg = f"Pre-existing training data found.\n\nDo you want to generate NEW training data (overwriting) or LOAD the already saved data?"
                     box = QMessageBox(self)
                     box.setWindowTitle("Training Data Detected")
                     box.setText(msg)
@@ -3111,8 +3201,13 @@ class APOCWidget(QWidget):
                     if box.clickedButton() == btn_cancel:
                         self.log("Action cancelled.")
                         return
-                    elif box.clickedButton() == btn_generate:
-                        load_existing = False
+                    elif box.clickedButton() == btn_load:
+                        load_existing = True
+                    # else: Generate New clicked → load_existing stays False
+                else:
+                    # Non-interactive: load existing to avoid discarding data
+                    load_existing = True
+            # else: no data exists → generate immediately without any dialog
 
             # Clear viewer layers related to this
             layers_to_remove = [l for l in self.viewer.layers if 'Channel' in l.name or 'User Provided Labels' in l.name]
@@ -3204,7 +3299,8 @@ class APOCWidget(QWidget):
                 self._configure_user_label_layer(dead_layer)
 
             self.log("✅ Training data generated/loaded in viewer!")
-            
+            self._is_session_active = True
+
         except Exception as e:
             traceback.print_exc()
             self.log(f"❌ Error during training data generation: {e}")
@@ -3219,6 +3315,21 @@ class APOCWidget(QWidget):
             if layer.selected_label > 2:
                 layer.selected_label = 2
         layer.events.selected_label.connect(_clamp_label)
+
+    def cleanup_session(self):
+        """Remove all APOC training layers from the viewer and reset session state.
+        Mirrors PixelClassifierWidget.reset_ui() — called when switching tabs or methods."""
+        layers_to_remove = [
+            l for l in list(self.viewer.layers)
+            if 'Channel' in l.name or 'User Provided Labels' in l.name
+        ]
+        for l in layers_to_remove:
+            try:
+                self.viewer.layers.remove(l)
+            except Exception:
+                pass
+        self._is_session_active = False
+        self.log("APOC training session cleared.")
 
     # ── Per-CT size filter form ─────────────────────────────────
     def _rebuild_size_filter_form(self, all_types: list):

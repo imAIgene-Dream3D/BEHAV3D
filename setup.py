@@ -23,7 +23,7 @@ setup(
     ],
     entry_points={
         "napari.manifest": [
-            "behav3d = behav3d.napari:napari.yaml",
+            "BEHAV3D = behav3d.napari:napari.yaml",
         ],
     },
 )
