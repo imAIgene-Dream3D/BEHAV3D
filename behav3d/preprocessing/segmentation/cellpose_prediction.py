@@ -6,7 +6,7 @@ into a re-usable function that can be imported and called from notebooks (e.g.
 `run_behav3d.ipynb`).
 
 The function
-1. Loads the image (OME-Tiff, regular Tiff, or Zarr) using `behav3d.utils.fileio`.
+1. Loads the image (OME-Tiff, regular Tiff, or Zarr) using `behav3d.io.images`.
 2. If the input is a Tiff, it is automatically converted to Zarr (chunked per
    time point) next to the original file so that subsequent calls can re-use
    the Zarr version directly.
@@ -31,7 +31,6 @@ import pandas as pd
 from skimage.filters import threshold_otsu
 
 from behav3d.io.images import save_as_zarr, load_zarr, load_image, append_to_zarr
-from skimage.filters import threshold_otsu
 from behav3d.preprocessing.segmentation import segment_2d_filter
 from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
@@ -39,6 +38,24 @@ from behav3d.core.metadata import (
     detect_other_cell_types_from_metadata,
     has_dead_channel,
 )
+
+# Must match CELLPOSE_CHANNEL_UNUSED in behav3d.widgets.segmentation
+_CELLPOSE_CHANNEL_UNUSED_LABEL = "(unused)"
+
+
+def _label_to_channel_from_stored_map(stored: dict | None) -> dict[str, int]:
+    """Invert {ch_idx: label} to {label: ch_idx}; skip '(unused)' / empty slots."""
+    if not stored:
+        return {}
+    out: dict[str, int] = {}
+    for ch_idx, label in stored.items():
+        if label is None:
+            continue
+        s = str(label).strip()
+        if not s or s.lower() == "none" or s == _CELLPOSE_CHANNEL_UNUSED_LABEL:
+            continue
+        out[str(label)] = int(ch_idx)
+    return out
 
 # Cellpose import is relatively expensive - only load when we actually need it.
 
@@ -363,7 +380,7 @@ def run_cellpose_segmentation(
         if labels_mode == "per_sample" and sample_name in per_sample_channel_labels:
             # Per-sample mode: use sample-specific channel labels from config
             sample_channel_labels = per_sample_channel_labels[sample_name]
-            label_to_channel = {str(label): int(ch_idx) for ch_idx, label in sample_channel_labels.items()}
+            label_to_channel = _label_to_channel_from_stored_map(sample_channel_labels)
             print(f"  Using per-sample channel config for '{sample_name}'")
         elif labels_mode == "per_sample" and sample_name not in per_sample_channel_labels:
             # Per-sample mode but this sample is missing
@@ -374,7 +391,7 @@ def run_cellpose_segmentation(
             )
         elif global_channel_labels:
             # Same for all mode: use global channel labels from config
-            label_to_channel = {str(label): int(ch_idx) for ch_idx, label in global_channel_labels.items()}
+            label_to_channel = _label_to_channel_from_stored_map(global_channel_labels)
             print(f"  Using global channel config (same for all samples)")
         else:
             # No channel labels configured at all
@@ -559,13 +576,19 @@ def run_otsu_threshold_segmentation_from_zarr(
         T_total = images.shape[0]
         spatial_shape = images.shape[2:]
 
-        # Select indices to process
+        # Select time indices for the loop. For dask, the actual array slice must use slice()
+        # or NumPy-style :, not a bare Python range — dask treats range as one fancy-index
+        # axis and fails inside normalize_index (TypeError: range vs int).
         if timepoint_range is not None:
             start_t, end_t = timepoint_range
-            indices_to_process = range(start_t, end_t + 1)
+            start_t = max(0, int(start_t))
+            end_t = min(T_total - 1, int(end_t))
+            indices_to_process = list(range(start_t, end_t + 1))
             print(f"  Otsu global indexing: processing T {start_t} to {end_t} (Total: {T_total})")
+            t_slice = slice(start_t, end_t + 1)
         else:
-            indices_to_process = range(T_total)
+            indices_to_process = list(range(T_total))
+            t_slice = slice(None)  # all T — same as images[:, death_channel]
 
         # Initialize full-length masks array
         masks = np.zeros((T_total,) + spatial_shape, dtype=np.uint8)
@@ -575,7 +598,7 @@ def run_otsu_threshold_segmentation_from_zarr(
         # but compute a global threshold if possible or use the requested range.
         
         # Select single channel for relevant timepoints: (T_subset, Z, Y, X)
-        channel_img_subset = images[indices_to_process, death_channel]
+        channel_img_subset = images[t_slice, death_channel]
 
         # Flatten to compute threshold on the requested range
         flat_vals = channel_img_subset.ravel()

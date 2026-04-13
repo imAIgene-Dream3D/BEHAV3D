@@ -11,7 +11,7 @@ from behav3d.analysis import smooth_value_over_time
 
 
 from behav3d.preprocessing import calc_z_projection
-from behav3d.io.images import load_image, load_zarr
+from behav3d.io.images import _ensure_zarr, load_image, load_zarr
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
@@ -20,6 +20,13 @@ import seaborn as sns
 
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib import colormaps
+from matplotlib.lines import Line2D
+from matplotlib.colors import LinearSegmentedColormap as _LSC
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Rectangle
+from scipy.ndimage import binary_dilation, binary_erosion
+
+
 from sklearn.preprocessing import MinMaxScaler
 
 
@@ -286,7 +293,10 @@ def plot_sample_organoid_analysis(
     dead_perc_threshold=None,
     figsize=(8.27, 11.69)
     ):
-    
+    _ensure_zarr(raw_img_path, label="Raw image")
+    _ensure_zarr(organoid_seg_path, label="Organoid segmentation")
+    _ensure_zarr(dead_mask_path, label="Dead mask")
+
     raw_img = load_image(raw_img_path)
     seg_img = load_image(organoid_seg_path)
     dead_mask = load_image(dead_mask_path)
@@ -596,6 +606,8 @@ def plot_dead_signal_per_organoid(
     linewidth=2.2,
     alpha=0.65,
     legend_max_items=40,
+    color_map=None,
+    linestyle_map=None,
 ):
     """
     Plot individual organoid dead signal over time.
@@ -604,6 +616,8 @@ def plot_dead_signal_per_organoid(
     - `style_by`: optional column used for line styles (e.g. "organoid_type")
     - `autoscale_y`: when True, scales y-axis to the observed data range (not fixed 0–1),
       using the ``y_quantile`` upper bound so brief spikes do not flatten small signals.
+    - `color_map`: optional dict mapping color_key levels to colors.
+    - `linestyle_map`: optional dict mapping style_key levels to linestyles.
     """
     fig, ax = plt.subplots(figsize=figsize)
     
@@ -652,20 +666,26 @@ def plot_dead_signal_per_organoid(
             dfp["TrackID"].astype(str)
         )
 
-    # Build palettes and linestyles
-    color_levels = sorted(dfp[color_key_col].dropna().astype(str).unique())
-    n_colors = len(color_levels)
-    palette = sns.color_palette("tab10", n_colors) if n_colors <= 10 else sns.color_palette("husl", n_colors)
-    color_map = dict(zip(color_levels, palette))
-
-    if style_key_col is not None:
-        style_levels = sorted(dfp[style_key_col].dropna().astype(str).unique())
-        # cycle through a small set of visually distinct linestyles
-        linestyles = ["-", "--", ":", "-.", (0, (5, 2)), (0, (1, 2))]
-        linestyle_map = {lvl: linestyles[i % len(linestyles)] for i, lvl in enumerate(style_levels)}
+    # Build palettes and linestyles if not provided
+    if color_map is None:
+        color_levels = sorted(dfp[color_key_col].dropna().astype(str).unique())
+        n_colors = len(color_levels)
+        palette = sns.color_palette("tab10", n_colors) if n_colors <= 10 else sns.color_palette("husl", n_colors)
+        color_map = dict(zip(color_levels, palette))
     else:
-        style_levels = []
-        linestyle_map = {}
+        color_levels = sorted(color_map.keys())
+
+    if linestyle_map is None:
+        if style_key_col is not None:
+            style_levels = sorted(dfp[style_key_col].dropna().astype(str).unique())
+            # cycle through a small set of visually distinct linestyles
+            linestyles = ["-", "--", ":", "-.", (0, (5, 2)), (0, (1, 2))]
+            linestyle_map = {lvl: linestyles[i % len(linestyles)] for i, lvl in enumerate(style_levels)}
+        else:
+            style_levels = []
+            linestyle_map = {}
+    else:
+        style_levels = sorted(linestyle_map.keys())
 
     # Plot each organoid track as its own line, inheriting group color/style
     group_cols = ["organoid_id", "position_t", feature, color_key_col] + ([style_key_col] if style_key_col else [])
@@ -698,8 +718,6 @@ def plot_dead_signal_per_organoid(
 
     # Legends: colors (color_by) and optional styles (style_by)
     if show_legends:
-        from matplotlib.lines import Line2D
-
         # Put legends outside the axes (right side) and reserve space for them.
         # If there are too many entries, show the first N (still better than none).
         shown_color_levels = color_levels[:legend_max_items]
@@ -1049,6 +1067,16 @@ def plot_multi_organoid_death_dynamics(
                 color_key = "organoid_type"
             style_key = "organoid_type"
 
+            # Pre-calculate consistent colors and linestyles using ALL tracks (before Plot 4/5 filtering)
+            color_levels_global = sorted(df_indiv[color_key].dropna().astype(str).unique())
+            n_colors_global = len(color_levels_global)
+            palette_global = sns.color_palette("tab10", n_colors_global) if n_colors_global <= 10 else sns.color_palette("husl", n_colors_global)
+            condition_color_map = dict(zip(color_levels_global, palette_global))
+
+            style_levels_global = sorted(df_indiv[style_key].dropna().astype(str).unique())
+            linestyles_cycle = ["-", "--", ":", "-.", (0, (5, 2)), (0, (1, 2))]
+            type_style_map = {lvl: linestyles_cycle[i % len(linestyles_cycle)] for i, lvl in enumerate(style_levels_global)}
+
             # 3a) Smoothed percentage dead mask (auto-scaled so small values are visible)
             fig3a = plot_dead_signal_per_organoid(
                 df_indiv,
@@ -1060,6 +1088,8 @@ def plot_multi_organoid_death_dynamics(
                 title=None,
                 ylabel=None,
                 linewidth=2.6,
+                color_map=condition_color_map,
+                linestyle_map=type_style_map,
             )
             pdf.savefig(fig3a, bbox_inches="tight")
             plt.close(fig3a)
@@ -1075,10 +1105,208 @@ def plot_multi_organoid_death_dynamics(
                 title=None,
                 ylabel=None,
                 linewidth=2.6,
+                color_map=condition_color_map,
+                linestyle_map=type_style_map,
             )
             pdf.savefig(fig3b, bbox_inches="tight")
             plt.close(fig3b)
-    
+
+            # --- Plots 4a & 4b: same as 3a/3b but baseline-normalized and disappearing tracks excluded ---
+
+            # Identify tracks that disappear: a track "disappears" if its last recorded
+            # timepoint is earlier than the last timepoint of its sample.
+            track_groups = ["TrackID", "sample_name", "organoid_type"]
+
+            # Heuristic: track ends before the global last timepoint of its sample
+            sample_max_t = df_indiv.groupby("sample_name")["position_t"].transform("max")
+            track_max_t  = df_indiv.groupby(track_groups)["position_t"].transform("max")
+            disappeared_mask = track_max_t < sample_max_t
+
+            n_total      = df_indiv.groupby(track_groups).ngroups
+            df_no_disapp = df_indiv[~disappeared_mask].copy()
+            n_kept       = df_no_disapp.groupby(track_groups).ngroups
+            n_skipped    = n_total - n_kept
+
+            skip_annotation = f"Skipped (disappeared): {n_skipped} / {n_total} tracks"
+            print(f"\n[Plot 4] {skip_annotation}")
+
+            def normalize_to_zero(df, feature, group_cols):
+                """Subtract the first value of *feature* within each track group."""
+                df = df.copy()
+                first_val = df.sort_values("position_t").groupby(group_cols)[feature].transform("first")
+                df[feature] = df[feature] - first_val
+                return df
+
+            def enforce_monotone_non_decreasing(df, features, group_cols, time_col="position_t"):
+                """Force per-track non-decreasing signals (cummax over time)."""
+                df = df.copy()
+                df = df.sort_values(time_col)
+                for feature in features:
+                    if feature in df.columns:
+                        df[feature] = df.groupby(group_cols)[feature].transform(lambda s: s.cummax())
+                return df
+
+            # Processing pipeline for plots 4 & 5:
+            # 1. Normalize to zero (change from baseline)
+            # 2. Enforce monotone non-decreasing (cummax on the change-from-baseline)
+            # This ensures we see "cumulative increase from baseline" — lines never go down.
+            processed_feats = [
+                "smoothed_percentage_dead_mask",
+                "smoothed_nr_dead_mask_pixels",
+            ]
+
+            df_processed = df_no_disapp.copy()
+            for feat in processed_feats:
+                df_processed = normalize_to_zero(df_processed, feat, track_groups)
+            df_processed = enforce_monotone_non_decreasing(
+                df_processed,
+                features=processed_feats,
+                group_cols=track_groups,
+                time_col="position_t",
+            )
+
+            for feat, label in [
+                ("smoothed_percentage_dead_mask",  "4a"),
+                ("smoothed_nr_dead_mask_pixels",   "4b"),
+            ]:
+                nice_feat = "% Dead Mask" if "percentage" in feat else "# Dead Pixels"
+
+                # Reuse plot_dead_signal_per_organoid by passing the pre-processed df,
+                # then annotate and save the returned figure.
+                fig_tmp = plot_dead_signal_per_organoid(
+                    df_processed,
+                    figsize=figsize,
+                    feature=feat,
+                    color_by=color_key,
+                    style_by=style_key,
+                    autoscale_y=True,
+                    title=(
+                        f"Dead Signal Change from Baseline ({nice_feat})\n"
+                        f"(baseline-normalized, non-decreasing, disappeared excluded)"
+                    ),
+                    ylabel=f"Change from baseline ({nice_feat})",
+                    linewidth=2.6,
+                    color_map=condition_color_map,
+                    linestyle_map=type_style_map,
+                )
+
+                # Baseline reference line (0 = no change from baseline)
+                fig_tmp.axes[0].axhline(0, color="black", linewidth=1, alpha=0.35, zorder=0)
+
+                # Add skipped-tracks annotation inside the plot (upper-left corner)
+                fig_tmp.axes[0].text(
+                    0.02, 0.97,
+                    skip_annotation,
+                    transform=fig_tmp.axes[0].transAxes,
+                    fontsize=8,
+                    verticalalignment="top",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8),
+                )
+
+                pdf.savefig(fig_tmp, bbox_inches="tight")
+                plt.close(fig_tmp)
+
+
+            # --- Plots 5a & 5b: mean ± std per condition + organoid type (baseline-normalized, disappeared excluded) ---
+            # Uses the same fully-processed data as plot 4 (normalize → cummax).
+            # Groups by BOTH color_key (line_condition) and organoid_type so color
+            # and linestyle match plots 3 & 4.
+
+            for feat, plot_label in [
+                ("smoothed_percentage_dead_mask", "5a"),
+                ("smoothed_nr_dead_mask_pixels",  "5b"),
+            ]:
+                fig5, ax5 = plt.subplots(figsize=figsize)
+                nice_feat = "% Dead Mask" if "percentage" in feat else "# Dead Pixels"
+
+                # Aggregate: mean and std per color_key x organoid_type x timepoint
+                group_cols_5 = [color_key, style_key, "position_t"]
+                agg = (
+                    df_processed
+                    .groupby(group_cols_5)[feat]
+                    .agg(mean_val="mean", std_val="std")
+                    .reset_index()
+                )
+
+                for (cond_val, org_val), grp in agg.groupby([color_key, style_key]):
+                    grp   = grp.sort_values("position_t")
+                    t     = grp["position_t"].values
+                    mean  = grp["mean_val"].values
+                    std   = grp["std_val"].fillna(0).values
+                    color = condition_color_map.get(str(cond_val), "C0")
+                    ls    = type_style_map.get(str(org_val), "-")
+
+                    label = f"{cond_val} | {org_val}" if str(cond_val) != str(org_val) else str(cond_val)
+                    ax5.plot(t, mean, linewidth=2.6, label=label, color=color, linestyle=ls)
+                    # Clip lower bound to 0: SD halo should never imply negative death increase
+                    ax5.fill_between(
+                        t,
+                        np.maximum(mean - std, 0),
+                        mean + std,
+                        alpha=0.18,
+                        color=color,
+                    )
+
+                # Baseline reference line (0 = no change from baseline)
+                ax5.axhline(0, color="black", linewidth=1, alpha=0.35, zorder=0)
+
+                ax5.set_xlim(left=0)
+                ax5.set_ylim(bottom=0)  # death increase can only be >= 0
+                ax5.set_xlabel("Timepoint")
+                ax5.set_ylabel(f"Change from baseline ({nice_feat})")
+                ax5.set_title(
+                    f"Mean ± Std per Condition & Organoid Type\n"
+                    f"({nice_feat}, baseline-normalized, non-decreasing, disappeared excluded)"
+                )
+                ax5.grid(True, linestyle=":", linewidth=1, alpha=0.5)
+
+                ax5.text(
+                    0.02, 0.97,
+                    skip_annotation,
+                    transform=ax5.transAxes,
+                    fontsize=8,
+                    verticalalignment="top",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8),
+                )
+
+                # Dual legends matching plots 3/4
+                color_handles = [
+                    Line2D([0], [0], color=condition_color_map[lvl], lw=3, linestyle="-", label=str(lvl))
+                    for lvl in sorted(condition_color_map.keys())
+                ]
+                leg1 = ax5.legend(
+                    handles=color_handles,
+                    title=color_key.replace("_", " ").title(),
+                    loc="upper left",
+                    bbox_to_anchor=(1.02, 1.0),
+                    borderaxespad=0,
+                    prop={"size": 8},
+                    frameon=True,
+                )
+                ax5.add_artist(leg1)
+
+                style_handles = [
+                    Line2D([0], [0], color="black", lw=3, linestyle=type_style_map[lvl], label=str(lvl))
+                    for lvl in sorted(type_style_map.keys())
+                ]
+                ax5.legend(
+                    handles=style_handles,
+                    title=style_key.replace("_", " ").title(),
+                    loc="upper left",
+                    bbox_to_anchor=(1.02, 0.55),
+                    borderaxespad=0,
+                    prop={"size": 8},
+                    frameon=True,
+                    handlelength=3.5,
+                    handletextpad=0.8,
+                )
+
+                plt.tight_layout()
+                plt.show()
+                pdf.savefig(fig5, bbox_inches="tight")
+                plt.close(fig5)
+
+                
     print(f"PDF saved to: {pdf_path}")
     print(f"### DONE\n")
     
@@ -1784,7 +2012,6 @@ def run_organoid_morphology_dead_analysis(
     )
 
     # Channel display colormaps (one per channel)
-    from matplotlib.colors import LinearSegmentedColormap as _LSC
     _ch_cmaps = [
         _LSC.from_list("_g", ["black", "#00FF00"]),   # Ch 0: green
         _LSC.from_list("_m", ["black", "#FF00FF"]),   # Ch 1: magenta
@@ -1814,7 +2041,6 @@ def run_organoid_morphology_dead_analysis(
 
     def _crop_per_channel(raw_zarr_data, seg_zarr_data, t_idx, track_id, margin=30):
         """Return (crops_list, contour_mask) for one organoid at one timepoint."""
-        from scipy.ndimage import binary_dilation, binary_erosion
         t_idx = int(t_idx)
         if seg_zarr_data is None or raw_zarr_data is None:
             return None
@@ -1957,7 +2183,6 @@ def run_organoid_morphology_dead_analysis(
             vmax = float(np.percentile(pos, 99)) if pos.size > 0 else max(1, img_f.max())
             ax.imshow(img_f, cmap=cmap, vmin=vmin, vmax=vmax)
             if highlight and contour is not None:
-                from matplotlib.colors import ListedColormap
                 red_cmap = ListedColormap(["red"])
                 contour_overlay = np.ma.masked_where(~contour, contour.astype(float))
                 ax.imshow(contour_overlay, cmap=red_cmap, vmin=0, vmax=1, alpha=0.9)
@@ -2027,7 +2252,6 @@ def run_organoid_morphology_dead_analysis(
 
                         # Red border around the organoid's channel
                         if is_org_ch:
-                            from matplotlib.patches import Rectangle
                             for ax, img in [
                                 (axes[ex_i, ci], img_s),
                                 (axes[ex_i, n_ch + ci], img_e),

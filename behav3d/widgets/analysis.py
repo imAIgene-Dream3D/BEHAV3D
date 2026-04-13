@@ -36,7 +36,7 @@ from behav3d.analysis.organoid_analysis import (
     plot_multi_organoid_death_dynamics,
     run_organoid_morphology_dead_analysis
 )
-from behav3d.analysis.filtering import filter_tracks
+from behav3d.analysis.filtering import filter_tracks, preview_track_length_before_filtering
 
 from behav3d.io.images import load_zarr
 from behav3d.analysis import summarize_track_features
@@ -800,26 +800,65 @@ class TrackFilterPanel:
 
         self.btn_run = widgets.Button(description=f"Filter {self.cell_type} tracks & summarize", button_style="success", layout=widgets.Layout(width="fit-content"))
         self.btn_run.on_click(self._on_run_clicked)
+        self.btn_preview_lengths = widgets.Button(
+            description="Show tracks length distribution (before filter)",
+            button_style="info",
+            layout=widgets.Layout(width="fit-content"),
+            tooltip="Histogram per sample from combined_track_features CSV (no filtering)",
+        )
+        self.btn_preview_lengths.on_click(self._on_preview_lengths_clicked)
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
         self.out_run = widgets.Output()
-        
+        self.out_preview = widgets.Output()
+
+        _qc_rel = Path("analysis", self.cell_type, "quality_control", "BEHAV3D_filter_counts.pdf")
+        self._qc_hint = widgets.HTML(
+            f"<div style=\"font-size:12px;color:#444;margin:6px 0;\">"
+            f"<b>QC:</b> After filtering, before/after track-length histograms and filter-step counts are saved in "
+            f"<code>{_qc_rel.as_posix()}</code> (under your output folder). "
+            f"Use the blue button to preview lengths from the <i>current</i> combined features file without filtering."
+            f"</div>"
+        )
+
         ui_elements = [
             widgets.HTML(f'<div style="font-size:14px;font-weight:700;">{self.cell_type.capitalize()} Track Filtering</div>'),
+            self._qc_hint,
+            widgets.HBox([self.btn_preview_lengths, self.spinner_html]),
+            self.out_preview,
             self.en_exp_duration, self.row_exp,
             self.en_min_length, self.row_min,
             self.en_max_length, self.row_max,
             self.en_min_size, self.row_min_size,
             self.filter_t0_dead,
             widgets.HTML('<b>Unit for time-based filters:</b>'), self.time_type,
-            widgets.HBox([self.btn_run, self.spinner_html]),
+            self.btn_run,
             self.out_run
         ]
         self.ui = widgets.VBox(ui_elements)
 
     def _lock(self, locked):
-        w_list = [self.en_exp_duration, self.exp_duration, self.en_min_length, self.min_track_length, self.en_max_length, self.max_track_length, self.en_min_size, self.min_size_val, self.filter_t0_dead, self.time_type, self.btn_run]
+        w_list = [self.en_exp_duration, self.exp_duration, self.en_min_length, self.min_track_length, self.en_max_length, self.max_track_length, self.en_min_size, self.min_size_val, self.filter_t0_dead, self.time_type, self.btn_run, self.btn_preview_lengths]
         for w in w_list: w.disabled = locked
+
+    def _on_preview_lengths_clicked(self, *_):
+        self._lock(True)
+        self.out_preview.clear_output()
+        self.spinner_html.layout.display = None
+        with self.out_preview:
+            try:
+                df_input_path = str(self._advanced_features_path) if self._use_advanced_features else None
+                preview_track_length_before_filtering(
+                    metadata=self.metadata_loader.metadata,
+                    output_dir=self.output_dir,
+                    cell_type=self.cell_type,
+                    df_input_path=df_input_path,
+                )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self._lock(False)
 
     def _on_run_clicked(self, *_):
         self._lock(True); self.out_run.clear_output(); self.spinner_html.layout.display = None
@@ -851,7 +890,7 @@ class TrackFilterPanel:
                     min_size=(int(self.min_size_val.value) if self.en_min_size.value else None),
                     cell_type=self.cell_type,
                     time_type=str(self.time_type.value),
-                    plot_results=True,
+                    plot_results=False,
                     df_input_path=df_input_path
                 )
                 print("✅ Filtering done. Summarizing tracks...")

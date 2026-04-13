@@ -9,7 +9,7 @@ from tqdm import tqdm
 import dask.array as da
 
 from behav3d.core.utils import format_time
-from behav3d.io.images import get_filepath_stem, load_image, load_zarr, save_as_zarr
+from behav3d.io.images import _ensure_zarr, get_filepath_stem, load_image, load_zarr, save_as_zarr
 from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_organoid_types_from_metadata,
@@ -225,6 +225,9 @@ def backproject_mean_features_behav3d(
     
     # Use separate zarr file for mean mode
     backproj_out_path = Path(backproj_outdir, f"{get_filepath_stem(track_img_path)}_backprojected_mean.zarr")
+    _ensure_zarr(raw_img_path, label=f"Raw image for '{sample_name}'")
+    _ensure_zarr(track_img_path, label=f"Tracked image for '{sample_name}'")
+
     raw_img = load_image(raw_img_path)
     
     raw_img_data = {
