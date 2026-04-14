@@ -1688,13 +1688,13 @@ class APOCTrainingWidget(QWidget):
                     clf._y = y
                     clf.num_features = X.shape[1]
                     clf.num_ground_truth_dimensions = gt_ndim
-                    clf.feature_specification = expanded_feature_spec
+                    clf.feature_specification = feature_string
                     has_trained = True
 
                 if not has_trained:
                     continue
 
-                clf.feature_specification = expanded_feature_spec
+                clf.feature_specification = feature_string
                 clf.to_opencl_file(clf_path)
 
                 # Predict (visual confirmation)
