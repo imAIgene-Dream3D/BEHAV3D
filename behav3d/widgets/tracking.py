@@ -395,6 +395,7 @@ class TrackingPanel:
             self.title_html,
             self.track_organoids_together_box,
             self.organoid_group_info,
+            self._import_accordion,
             self.method,
             widgets.HBox([self.overwrite]),
             self.param_container,

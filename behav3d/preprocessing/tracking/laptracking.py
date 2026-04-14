@@ -4,7 +4,7 @@ from pathlib import Path
 from skimage.measure import regionprops_table
 from laptrack import LapTrack
 from tqdm import tqdm
-from behav3d.io.images import load_image, get_filepath_stem
+from behav3d.io.images import _ensure_zarr, load_image, get_filepath_stem
 from behav3d.preprocessing.tracking import convert_segments_to_tracks
 
 def laptrack_image(
@@ -150,7 +150,8 @@ def run_laptracking(
             # Fallback to old non-prefixed format for backward compatibility
             segments_col = f"{cell_type}_segments_image_path"
         
-        segments_path = sample[segments_col]
+        segments_path = Path(sample[segments_col])
+        _ensure_zarr(segments_path, label=f"Segments for '{sample_name}'")
         tracked_img_outpath = Path(tracked_img_outdir, f"{sample_name}_{cell_type}_tracked.zarr")
         tracked_csv_outpath = Path(tracked_csv_outdir, f"{sample_name}_{cell_type}_tracks.csv")
     

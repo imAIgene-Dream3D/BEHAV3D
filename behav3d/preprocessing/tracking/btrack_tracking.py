@@ -11,7 +11,7 @@ from concurrent.futures.process import BrokenProcessPool
 import btrack
 import btrack.io
 
-from behav3d.io.images import load_image, get_filepath_stem
+from behav3d.io.images import _ensure_zarr, load_image, get_filepath_stem
 from behav3d.preprocessing.tracking import convert_segments_to_tracks
 
 # ---------------------------------------------------------------------------
@@ -694,7 +694,12 @@ def run_btracking(
         if segments_col is None:
             segments_col = f"{cell_type}_segments_image_path"
 
-        segments_path = sample[segments_col]
+        segments_path = Path(sample[segments_col])
+        _ensure_zarr(segments_path, label=f"Segments for '{sample_name}'")
+
+        raw_image_path = sample.get("raw_image_path", None)
+        if raw_image_path:
+            _ensure_zarr(Path(raw_image_path), label=f"Raw image for '{sample_name}'")
         tracked_img_outpath = Path(
             tracked_img_outdir,
             f"{sample_name}_{cell_type}_tracked.zarr",
@@ -716,7 +721,7 @@ def run_btracking(
                 or overwrite):
             btrack_image(
                 segments_path=segments_path,
-                raw_image_path=sample["raw_image_path"],
+                raw_image_path=raw_image_path,
                 tracked_img_outpath=tracked_img_outpath,
                 tracked_csv_outpath=tracked_csv_outpath,
                 element_size_x=element_size_x,

@@ -27,7 +27,7 @@ import zarr
 import apoc
 import pyclesperanto_prototype as cle
 
-from behav3d.io.images import load_image, save_as_zarr
+from behav3d.io.images import _ensure_zarr, load_image, save_as_zarr
 from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
@@ -311,6 +311,8 @@ def run_apoc_segmentation(
         if not raw_image_path.exists():
             print(f"  ⚠️ Raw image not found for {sample_name}: {raw_image_path}")
             continue
+
+        _ensure_zarr(raw_image_path, label=f"Raw image for '{sample_name}'")
 
         # Get dimension order from metadata for this sample
         axis_order = sample_row.get('dimension_order', "TCZYX")

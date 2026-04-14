@@ -70,6 +70,7 @@ _DEFAULT_CONFIG = {
     },
     "cellpose": {
         "number_of_channels": 0,
+        "extra_channel_slots": 0,
         "labels_mode": "same_for_all",  # "same_for_all" or "per_sample"
         "channel_labels": {},  # {0: "organoid1", 1: "tcell", ...}
         "per_sample_channel_labels": {},  # {sample_name: {0: "organoid1", ...}, ...}
@@ -599,7 +600,7 @@ class ExternalImageImporter(widgets.VBox):
             options=sample_names or [], description="Sample:",
             style={"description_width": "80px"}, layout=widgets.Layout(width="300px"))
         self.path_picker = PathPicker(
-            description="File:", placeholder="Path to image (TIFF, H5, CZI, …)",
+            description="File:", placeholder="Path to image (TIFF, TIF)",
             description_width="50px", width="100%")
         self.btn_probe = widgets.Button(
             description="Probe", icon="search", button_style="info",
@@ -635,6 +636,18 @@ class ExternalImageImporter(widgets.VBox):
             self.info.value = "<span style='color:red'>File not found.</span>"
             self.btn_convert.disabled = True
             return
+
+        # External segmentation/tracking imports must be TIFF only.
+        # (They are converted into per-sample .zarr and recorded in metadata.)
+        if self._is_label_image and p.suffix.lower() not in (".tif", ".tiff"):
+            self.info.value = (
+                "<span style='color:red'>"
+                f"Unsupported file type for external label import: {p.suffix}. "
+                "Please provide a .tif or .tiff file."
+                "</span>"
+            )
+            self.btn_convert.disabled = True
+            return
         try:
             shape, detected = self._get_shape(p), self._get_dim_order(p)
         except Exception as exc:
@@ -659,6 +672,15 @@ class ExternalImageImporter(widgets.VBox):
         src = Path(self.path_picker.value.strip())
         if not src.exists():
             with self.out: print(f"File not found: {src}")
+            self.btn_convert.disabled = False
+            return
+
+        if self._is_label_image and src.suffix.lower() not in (".tif", ".tiff"):
+            with self.out:
+                print(
+                    f"Unsupported file type for external label import: {src.suffix}. "
+                    "Please provide a .tif or .tiff file."
+                )
             self.btn_convert.disabled = False
             return
 

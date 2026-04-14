@@ -140,23 +140,14 @@ def load_image(path, group=None, mode="r", *, warn_if_not_zarr=True, **kwargs):
     Parameters
     ----------
     warn_if_not_zarr : bool
-        If True (default), print a reminder when the path is not already a
+        If True (default), raise an error when the path is not already a
         .zarr (intended for pipeline steps that expect converted data).
         Set False when loading a source file that is about to be converted
         (e.g. external segmentation/tracking import).
     """
     path = Path(path)
-    if (
-        warn_if_not_zarr
-        and path.suffix != ".zarr"
-        and not str(path).endswith(".zarr.zip")
-    ):
-        print(
-            f"WARNING: '{path.name}' is not in .zarr format ({path.suffix}). "
-            "All images should be converted to Zarr in the Preprocessing step "
-            "before running the rest of the pipeline. "
-            "Please go back to Format Conversion and convert to .zarr first."
-        )
+    if warn_if_not_zarr:
+        _ensure_zarr(path, label="Image")
     if path.suffix==".czi":
         img = load_czi(path, **kwargs)
     elif path.suffix==".h5":

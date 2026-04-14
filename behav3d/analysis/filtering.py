@@ -63,24 +63,201 @@ def trim_to_maximal_track_length(
     return df
 
 
+def _track_length_group_cols(df: pd.DataFrame, group_cols: list):
+    """Subset of group_cols present in df; require TrackID and sample_name."""
+    if df is None or df.empty:
+        return None
+    if "TrackID" not in df.columns or "sample_name" not in df.columns:
+        return None
+    gcols = [c for c in group_cols if c in df.columns]
+    if "TrackID" not in gcols:
+        gcols.append("TrackID")
+    if "sample_name" not in gcols:
+        gcols.append("sample_name")
+    ordered = [c for c in group_cols if c in gcols]
+    ordered.extend(c for c in gcols if c not in ordered)
+    return ordered
+
+
+def _figures_track_length_histogram_pages(
+    df: pd.DataFrame,
+    group_cols: list,
+    *,
+    suptitle: str,
+    cell_type: str,
+    nr_cols: int = 3,
+    rows_per_page: int = 3,
+    bins: int = 30,
+    figsize=(8.27, 11.69),
+):
+    """
+    Build one matplotlib Figure per page: per-sample track-length (rows in CSV) histograms.
+    Returns (list of figures, error reason or None).
+    """
+    gcols = _track_length_group_cols(df, group_cols)
+    if not gcols:
+        return [], "no valid columns"
+    tl = (
+        df.groupby(gcols, observed=True, sort=False)
+        .size()
+        .reset_index(name="track_length")
+    )
+    if tl.empty:
+        return [], "no tracks"
+
+    sample_names = sorted(tl["sample_name"].astype(str).unique())
+    n_plots = len(sample_names)
+    
+    # Round up to the next multiple of 20 for more space (e.g., 45 becomes 60)
+    xmax_raw = tl["track_length"].max()
+    xmax = int(((xmax_raw + 19) // 20) * 20) if xmax_raw > 0 else 20
+    
+    n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
+    nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
+
+    figs = []
+    plot_idx = 0
+    for _page in range(nr_pages):
+        fig = plt.figure(figsize=figsize)
+        gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.6, hspace=0.5)
+        axes_grid = [
+            fig.add_subplot(gs[i, j])
+            for i in range(rows_per_page)
+            for j in range(nr_cols)
+        ]
+
+        for ax in axes_grid:
+            if plot_idx >= n_plots:
+                ax.remove()
+                continue
+            sample = sample_names[plot_idx]
+            data = tl.loc[tl["sample_name"] == sample, "track_length"].to_numpy()
+            ax.hist(data, bins=bins, edgecolor="black")
+            ax.set_title(str(sample), fontsize=8, wrap=True, pad=10)
+            ax.set_xlabel("Track length (rows in CSV)")
+            ax.set_ylabel("Tracks")
+            ax.set_xlim(0, xmax)
+            # Show numbers every 20 units (0, 20, 40, 60...)
+            ax.set_xticks(range(0, xmax + 1, 20))
+            plot_idx += 1
+
+        fig.suptitle(f"{cell_type}: {suptitle}", fontsize=12)
+        fig.subplots_adjust(left=0.06, right=0.97, top=0.92, bottom=0.06)
+        figs.append(fig)
+    return figs, None
+
+
+def _append_track_length_histogram_pages(
+    pdf: PdfPages,
+    df: pd.DataFrame,
+    group_cols: list,
+    *,
+    suptitle: str,
+    cell_type: str,
+    nr_cols: int = 3,
+    rows_per_page: int = 3,
+    bins: int = 30,
+    figsize=(8.27, 11.69),
+    show_inline: bool = False,
+    hist_dpi: int = 600,
+) -> None:
+    """Histogram of rows-per-track (CSV timepoints) per sample; append to PdfPages."""
+    figs, err = _figures_track_length_histogram_pages(
+        df,
+        group_cols,
+        suptitle=suptitle,
+        cell_type=cell_type,
+        nr_cols=nr_cols,
+        rows_per_page=rows_per_page,
+        bins=bins,
+        figsize=figsize,
+    )
+    if err:
+        print(f"  (skip track length histogram: {err} — {suptitle})")
+        return
+    for fig in figs:
+        if show_inline:
+            plt.show()
+        pdf.savefig(fig, bbox_inches="tight", dpi=hist_dpi)
+        plt.close(fig)
+
+
+def preview_track_length_before_filtering(
+    metadata: pd.DataFrame,
+    output_dir,
+    cell_type: str,
+    df_input_path=None,
+):
+    """
+    Load the same combined track-features CSV used as filter input, merge metadata like
+    ``filter_tracks``, and display per-sample track-length histograms in the active
+    notebook / ipywidgets Output (does not write PDF, does not filter).
+    """
+    output_dir = Path(output_dir).expanduser()
+    analysis_outdir = Path(output_dir, "analysis", cell_type)
+    feature_outdir = Path(analysis_outdir, "track_features")
+
+    if df_input_path is not None:
+        df_all_tracks_path = Path(df_input_path)
+    else:
+        df_all_tracks_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
+
+    if not df_all_tracks_path.exists():
+        raise FileNotFoundError(
+            f"Track features file not found: {df_all_tracks_path}\n"
+            f"Run feature extraction for {cell_type} first."
+        )
+
+    md = metadata.copy()
+    df_raw = pd.read_csv(df_all_tracks_path)
+    df_raw["sample_name"] = df_raw["sample_name"].astype(str)
+    md["sample_name"] = md["sample_name"].astype(str)
+
+    line_condition_cols = [c for c in md.columns if c.endswith("_line_condition")]
+    group_cols = ["TrackID", "sample_name"] + line_condition_cols + ["exp_nr", "well"]
+    cols_present = [c for c in group_cols if c in md.columns]
+    metadata_info = md.loc[:, cols_present].copy()
+    df_merged = pd.merge(df_raw, metadata_info, how="left", on="sample_name")
+
+    figs, err = _figures_track_length_histogram_pages(
+        df_merged,
+        group_cols,
+        suptitle="Before filtering (from combined track-features CSV)",
+        cell_type=str(cell_type),
+    )
+    if err:
+        print(f"Track length preview: skipped ({err}).")
+        return
+    for fig in figs:
+        plt.show()
+        plt.close(fig)
+
+
 def plot_filter_count(
     df_track_counts,
-    outpath,
+    outpath=None,
+    pdf=None,
     nr_cols=3,
     rows_per_page = 3,
     figsize=(8.27, 11.69),
     filter_cols=["nr_tracks_before_filtering", "nr_tracks_exp_duration", "nr_tracks_min_track_length", "nr_tracks_dead_t1"],
     plot_results=False
     ):
-    
+    """
+    Bar plots of track counts per filtering stage. Pass `outpath` (writes its own PDF)
+    or `pdf` (append to an existing PdfPages, e.g. BEHAV3D_filter_counts.pdf).
+    """
+    if outpath is None and pdf is None:
+        raise ValueError("plot_filter_count requires `outpath` or `pdf`.")
+
     sample_names = df_track_counts["sample_name"].unique()
     n_plots = len(sample_names)
     n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0)
     nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
-    
-    with PdfPages(outpath) as pdf:
+
+    def _write_pages(pdf_writer):
         plot_idx = 0
-        for page in range(nr_pages):
+        for _page in range(nr_pages):
             fig = plt.figure(figsize=figsize)
             gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.5, hspace=0.3)
             remaining_axes = [
@@ -88,37 +265,42 @@ def plot_filter_count(
                 for i in range(rows_per_page)
                 for j in range(nr_cols)
             ]
-            
+
             for ax in remaining_axes:
                 if plot_idx >= n_plots:
                     ax.remove()
                     continue
-                
+
                 sample = sample_names[plot_idx]
                 df_subset = df_track_counts[df_track_counts["sample_name"] == sample]
-                
+
                 sns.barplot(
-                    x=filter_cols, 
+                    x=filter_cols,
                     y=df_subset[filter_cols].values.flatten(),
                     ax=ax
                 )
-                
+
                 ax.set_title(sample, fontsize=10, loc='center')
                 ax.set_xlabel("")
                 ax.set_ylabel("Count")
-                
-                # Force y-axis to use integer formatting (track counts should always be whole numbers)
+
                 ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-                
-                # Use plt.setp for better compatibility with matplotlib
+
                 plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
-                
+
                 plot_idx += 1
-            
+
             fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
-            # plt.show()
-            pdf.savefig(fig, bbox_inches='tight', dpi=600)
+            if plot_results:
+                plt.show()
+            pdf_writer.savefig(fig, bbox_inches='tight', dpi=600)
             plt.close(fig)
+
+    if pdf is not None:
+        _write_pages(pdf)
+    else:
+        with PdfPages(outpath) as pdf_writer:
+            _write_pages(pdf_writer)
 
 
 def filter_and_truncate_tracks_anndata(
@@ -412,28 +594,56 @@ def filter_tracks(
         filter_cols.append("nr_tracks_dead_t0")   
         df_track_counts=count_tracks(df_all_tracks_filt, col_name="nr_tracks_dead_t0", df_track_counts=df_track_counts)
 
-    plot_filter_count_outpath = Path(qc_outdir, f"BEHAV3D_filter_counts.pdf")
-    print(f"- Plotting track counts after filtering steps to {plot_filter_count_outpath}")
-    plot_filter_count(
-        df_track_counts,
-        outpath=plot_filter_count_outpath,
-        nr_cols=3,
-        rows_per_page = 3,
-        filter_cols=filter_cols,
-        plot_results=plot_results
-    )
-    
-    # Write the filtered tracks to a .csv
     filt_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
     print(f"- Writing filtered tracks to {filt_tracks_out_path}")
     df_all_tracks_filt = df_all_tracks_filt.sort_values(
-        by=["sample_name", "TrackID", "position_t"], 
-        ascending=[True, True, True]  # example: last column sorted descending
-    )    
+        by=["sample_name", "TrackID", "position_t"],
+        ascending=[True, True, True],
+    )
     new_order = ["sample_name"] + [c for c in df_all_tracks_filt.columns.tolist() if c != "sample_name"]
     df_all_tracks_filt = df_all_tracks_filt[new_order]
-    
+
     df_all_tracks_filt.to_csv(filt_tracks_out_path, sep=",", index=False)
+
+    plot_filter_count_outpath = Path(qc_outdir, f"BEHAV3D_filter_counts.pdf")
+    print(f"- Writing filter QC PDF (track length + counts) to {plot_filter_count_outpath}")
+
+    df_before_raw = pd.read_csv(df_all_tracks_path)
+    df_before_raw["sample_name"] = df_before_raw["sample_name"].astype(str)
+    df_before_for_hist = pd.merge(df_before_raw, metadata_info, how="left", on="sample_name")
+
+    df_after_for_hist = pd.read_csv(filt_tracks_out_path)
+    df_after_for_hist["sample_name"] = df_after_for_hist["sample_name"].astype(str)
+
+    with PdfPages(plot_filter_count_outpath) as pdf:
+        _append_track_length_histogram_pages(
+            pdf,
+            df_before_for_hist,
+            resolved_group_cols,
+            suptitle="Track length — before filtering (input track-features CSV)",
+            cell_type=cell_type,
+            nr_cols=3,
+            rows_per_page=3,
+            show_inline=bool(plot_results),
+        )
+        plot_filter_count(
+            df_track_counts,
+            pdf=pdf,
+            nr_cols=3,
+            rows_per_page=3,
+            filter_cols=filter_cols,
+            plot_results=bool(plot_results),
+        )
+        _append_track_length_histogram_pages(
+            pdf,
+            df_after_for_hist,
+            resolved_group_cols,
+            suptitle="Track length — after filtering (combined_track_features_filtered.csv)",
+            cell_type=cell_type,
+            nr_cols=3,
+            rows_per_page=3,
+            show_inline=False,
+        )
     end_time = time.time()
     h,m,s = format_time(start_time, end_time)
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")

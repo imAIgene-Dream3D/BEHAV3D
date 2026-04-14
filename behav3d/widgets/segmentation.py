@@ -42,6 +42,9 @@ from behav3d.core.metadata import (
     detect_other_cell_types_from_metadata,
 )
 
+# Cellpose channel config: extra raw C indices with no analyzed label
+CELLPOSE_CHANNEL_UNUSED = "(unused)"
+
 
 def _normalize_segmentation_labels_for_view(label_arr, raw_img_shape, layer_name="labels"):
     """
@@ -1089,33 +1092,23 @@ def build_external_seg_import_ui(metadata_loader):
 class CellposeChannelConfigPanel:
 
     """Panel for configuring channel labels for Cellpose segmentation.
-    
-    This panel calculates the number of channels from metadata cell types
-    and allows users to configure channel labels either:
-    - Same for all samples (global configuration)
-    - Per-sample configuration
-    
-    Channel labels are saved to the config file under the 'cellpose' section.
+
+    Channel count starts from metadata (organoid / immune / other + optional dead).
+    Use **Extra slots** for additional raw C indices (e.g. not listed in metadata).
+    Assign **(unused)** when that index should not map to a Cellpose label.
     """
-    
+
     def __init__(self, metadata_loader):
         self.metadata_loader = metadata_loader
         self._detect_cell_types()
-        self._calculate_number_of_channels()
-        
-        # Load saved config
+        self._calculate_base_channels()
+
         cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {})
-        
-        # Display calculated number of channels
-        self.n_channels_display = widgets.HTML(
-            value=f"<b>Number of channels:</b> {self.n_channels} "
-                  f"(Organoids: {len(self.organoid_types)}, "
-                  f"Immune: {len(self.immune_types)}, "
-                  f"Other: {len(self.other_types)}"
-                  f"{', Dead: 1' if self.has_death else ''})"
-        )
-        
-        # Mode selection: same for all vs per-sample
+        self.n_extra_slots = int(cellpose_cfg.get("extra_channel_slots", 0) or 0)
+        self.n_channels = self.n_base_channels + self.n_extra_slots
+
+        self.n_channels_display = widgets.HTML(value=self._channels_summary_html())
+
         saved_mode = cellpose_cfg.get("labels_mode", "same_for_all")
         self.labels_mode = widgets.RadioButtons(
             options=[
@@ -1126,31 +1119,50 @@ class CellposeChannelConfigPanel:
             description='Configuration mode:',
             style={'description_width': '140px'}
         )
-        
-        # Container for dynamic channel label UI
+
         self.channel_config_container = widgets.VBox()
-        
-        # Save button
+
+        self.extra_slots_input = widgets.BoundedIntText(
+            value=self.n_extra_slots,
+            min=0,
+            max=64,
+            description='Extra slots:',
+            style={'description_width': '100px'},
+            layout=widgets.Layout(width='260px'),
+        )
+        self.btn_apply_extra = widgets.Button(
+            description='Apply extra channels',
+            button_style='info',
+            tooltip='Rebuild dropdowns; click Save to write behav3d_parameters.yml',
+            layout=widgets.Layout(width='200px'),
+        )
+        self.btn_apply_extra.on_click(self._on_apply_extra_slots)
+        self.extra_help = widgets.HTML(
+            '<p style="font-size:12px;color:#555;margin:4px 0 0 0;">'
+            'Extra slots add Channel 5, 6, … when the raw image has more C planes than '
+            'metadata types. Use <b>(unused)</b> for indices that exist only for ordering '
+            'or reference, not for segmentation.</p>'
+        )
+
         self.btn_save = widgets.Button(
             description='Save Channel Configuration',
             button_style='success',
             icon='save'
         )
         self.btn_save.on_click(self._on_save)
-        
-        # Output for status messages
+
         self.out = widgets.Output()
-        
-        # Setup observers
+
         self.labels_mode.observe(self._on_mode_change, names='value')
-        
-        # Build initial UI
+
         self._build_channel_config_ui()
-        
-        # Main UI
+
         self.ui = widgets.VBox([
             widgets.HTML('<h3>Cellpose Channel Configuration</h3>'),
             self.n_channels_display,
+            widgets.HTML('<hr>'),
+            widgets.HBox([self.extra_slots_input, self.btn_apply_extra]),
+            self.extra_help,
             widgets.HTML('<hr>'),
             self.labels_mode,
             self.channel_config_container,
@@ -1173,18 +1185,40 @@ class CellposeChannelConfigPanel:
         self.has_death = has_dead_channel(metadata)
         self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
     
-    def _calculate_number_of_channels(self):
-        """Calculate total number of channels from cell types"""
-        self.n_channels = len(self.organoid_types) + len(self.immune_types) + len(self.other_types)
+    def _calculate_base_channels(self):
+        """Metadata-derived channel count (organoid + immune + other + optional dead)."""
+        self.n_base_channels = (
+            len(self.organoid_types) + len(self.immune_types) + len(self.other_types)
+        )
         if self.has_death:
-            self.n_channels += 1
-    
-    def _get_channel_options(self):
-        """Get available channel label options"""
+            self.n_base_channels += 1
+
+    def _channels_summary_html(self):
+        extra_txt = f" + {self.n_extra_slots} extra" if self.n_extra_slots else ""
+        return (
+            f"<p><b>Channel slots:</b> {self.n_channels} total "
+            f"({self.n_base_channels} from metadata{extra_txt}) — "
+            f"Organoids: {len(self.organoid_types)}, Immune: {len(self.immune_types)}, "
+            f"Other: {len(self.other_types)}"
+            f"{', Dead: 1' if self.has_death else ''}</p>"
+        )
+
+    def _on_apply_extra_slots(self, _):
+        self.n_extra_slots = int(self.extra_slots_input.value)
+        self.n_channels = self.n_base_channels + self.n_extra_slots
+        self.n_channels_display.value = self._channels_summary_html()
+        self._build_channel_config_ui()
+
+    def _analytic_channel_options(self):
+        """Real cell-type labels only (no (unused) sentinel)."""
         options = list(self.organoid_types) + list(self.immune_types) + list(self.other_types)
         if self.has_death:
             options.append('dead')
         return options
+
+    def _get_channel_options(self):
+        """Dropdown options: (unused) first, then analytic labels."""
+        return [CELLPOSE_CHANNEL_UNUSED] + self._analytic_channel_options()
     
     def _get_sample_names(self):
         """Get list of sample names from metadata"""
@@ -1203,29 +1237,32 @@ class CellposeChannelConfigPanel:
         children = []
         
         if self.n_channels == 0:
-            children.append(widgets.HTML('<p style="color: orange;">No channels detected. Please check your metadata configuration.</p>'))
+            children.append(widgets.HTML(
+                '<p style="color: orange;">No channel slots (metadata types empty and extra slots 0). '
+                'Configure populations or add extra slots.</p>'
+            ))
             self.channel_config_container.children = children
             return
-        
+
         channel_options = self._get_channel_options()
-        
+        analytic = self._analytic_channel_options()
+        n_analytic = len(analytic)
+
         if mode == 'same_for_all':
             children.append(widgets.HTML('<h4>Set channel labels (applies to all samples)</h4>'))
-            
-            # Load saved global channel labels
+
             saved_labels = cellpose_cfg.get("channel_labels", {})
-            
+
             self.channel_dropdowns['global'] = {}
             for i in range(self.n_channels):
-                # Default: try to use saved value, or match index to option
                 saved_val = saved_labels.get(str(i), saved_labels.get(i, None))
                 if saved_val and saved_val in channel_options:
                     default_val = saved_val
-                elif i < len(channel_options):
-                    default_val = channel_options[i]
+                elif i < n_analytic:
+                    default_val = analytic[i]
                 else:
-                    default_val = channel_options[0] if channel_options else ''
-                
+                    default_val = CELLPOSE_CHANNEL_UNUSED
+
                 dropdown = widgets.Dropdown(
                     options=channel_options,
                     value=default_val,
@@ -1235,32 +1272,30 @@ class CellposeChannelConfigPanel:
                 )
                 self.channel_dropdowns['global'][i] = dropdown
                 children.append(dropdown)
-        
+
         else:  # per_sample
             children.append(widgets.HTML('<h4>Set channel labels per sample</h4>'))
-            
-            # Load saved per-sample labels
+
             saved_per_sample = cellpose_cfg.get("per_sample_channel_labels", {})
-            
+
             sample_names = self._get_sample_names()
-            
+
             for sample_name in sample_names:
                 children.append(widgets.HTML(f'<b>{sample_name}</b>'))
                 self.channel_dropdowns[sample_name] = {}
-                
-                # Get saved labels for this sample
+
                 sample_saved = saved_per_sample.get(sample_name, {})
-                
+
                 sample_row = []
                 for i in range(self.n_channels):
                     saved_val = sample_saved.get(str(i), sample_saved.get(i, None))
                     if saved_val and saved_val in channel_options:
                         default_val = saved_val
-                    elif i < len(channel_options):
-                        default_val = channel_options[i]
+                    elif i < n_analytic:
+                        default_val = analytic[i]
                     else:
-                        default_val = channel_options[0] if channel_options else ''
-                    
+                        default_val = CELLPOSE_CHANNEL_UNUSED
+
                     dropdown = widgets.Dropdown(
                         options=channel_options,
                         value=default_val,
@@ -1270,7 +1305,7 @@ class CellposeChannelConfigPanel:
                     )
                     self.channel_dropdowns[sample_name][i] = dropdown
                     sample_row.append(dropdown)
-                
+
                 children.append(widgets.HBox(sample_row))
         
         self.channel_config_container.children = children
@@ -1278,8 +1313,13 @@ class CellposeChannelConfigPanel:
     def _persist_params(self):
         """Save channel configuration to config file"""
         cellpose_cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose", {})
-        
+
+        self.n_extra_slots = int(self.extra_slots_input.value)
+        self.n_channels = self.n_base_channels + self.n_extra_slots
+        cellpose_cfg["extra_channel_slots"] = self.n_extra_slots
         cellpose_cfg["number_of_channels"] = self.n_channels
+        self.n_channels_display.value = self._channels_summary_html()
+
         cellpose_cfg["labels_mode"] = self.labels_mode.value
         
         if self.labels_mode.value == 'same_for_all':
@@ -1489,7 +1529,10 @@ class CellposeInferencePanel:
                     self.available_labels = sorted(list(labels_set))
             except: pass
         
-        self.available_labels = [l for l in self.available_labels if l and l != 'dead']
+        self.available_labels = [
+            l for l in self.available_labels
+            if l and l != 'dead' and l != CELLPOSE_CHANNEL_UNUSED
+        ]
 
         with self.out:
             self.out.clear_output()
