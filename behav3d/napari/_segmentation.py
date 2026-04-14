@@ -1,4 +1,4 @@
-
+﻿
 import napari
 from behav3d.napari._widgets import HelpButton, make_help_row
 import yaml
@@ -7,7 +7,7 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
     QStackedWidget, QPushButton, QGroupBox, QFormLayout, 
     QSpinBox, QDoubleSpinBox, QCheckBox, QFileDialog, QScrollArea,
-    QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox
+    QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox, QFrame
 )
 from qtpy.QtCore import Qt
 import pandas as pd
@@ -2861,7 +2861,7 @@ class APOCWidget(QWidget):
 
     STRATEGIES = [
         "APOC (Direct Instance Segmentation)",
-        "APOC + EDT/Watershed",
+        "APOC Mask + EDT/Watershed Resegmentation",
         "APOC Probability Map + Watershed",
     ]
 
@@ -2894,12 +2894,33 @@ class APOCWidget(QWidget):
         info.setStyleSheet("color: #888; font-size: 11px; padding: 4px 0 6px 0;")
         layout.addWidget(info)
 
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {}) or {}
+
+        # Discover available OpenCL devices and restore last saved choice.
+        self._apoc_gpu_devices = self._discover_apoc_gpu_devices()
+
+        gpu_row = QHBoxLayout()
+        gpu_row.addWidget(QLabel("GPU Device:"))
+        self.combo_gpu_device = QComboBox()
+        self.combo_gpu_device.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        if self._apoc_gpu_devices:
+            self.combo_gpu_device.addItems(self._apoc_gpu_devices)
+            saved_gpu = str(pc.get("gpu_device_name", "")).strip()
+            if saved_gpu and saved_gpu in self._apoc_gpu_devices:
+                self.combo_gpu_device.setCurrentText(saved_gpu)
+        else:
+            self.combo_gpu_device.addItem("Auto (default OpenCL device)")
+            self.combo_gpu_device.setEnabled(False)
+        gpu_row.addWidget(self.combo_gpu_device, stretch=1)
+        gpu_row.addStretch()
+        layout.addLayout(gpu_row)
+
         # ── Training section (embedded APOCTrainingWidget) ──────
         self.training_group = QGroupBox("🎯 APOC Classifier Training")
         self.training_layout = QVBoxLayout(self.training_group)
         self.training_layout.setContentsMargins(4, 4, 4, 4)
 
-        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+        # Strategy config is now inside APOCTrainingWidget
         
         train_ctrl_lay = QHBoxLayout()
         train_ctrl_lay.addWidget(QLabel("Examples/sample:"))
@@ -2926,113 +2947,7 @@ class APOCWidget(QWidget):
         self.training_layout.addWidget(self.training_placeholder)
         layout.addWidget(self.training_group)
 
-        # ── Strategy selector (global) ──────────────────────────
-        strat_group = QGroupBox("⚙️ Segmentation Strategy")
-        strat_lay = QVBoxLayout(strat_group)
-        strat_lay.setSpacing(4)
-
-        strat_desc = QLabel(
-            "Strategy determines how the APOC classifier output is<br>"
-            "converted to instance segmentation labels."
-        )
-        strat_desc.setWordWrap(True)
-        strat_desc.setStyleSheet("color:#888; font-size:10px;")
-        strat_lay.addWidget(strat_desc)
-
-        self.combo_strategy = QComboBox()
-        self.combo_strategy.addItems(self.STRATEGIES)
-        strat_lay.addWidget(self.combo_strategy)
-
-        # Strategy-specific parameters (stacked)
-        self.strategy_stack = QStackedWidget()
-
-        # Page 0: Direct — only size filter
-        direct_page = QWidget()
-        direct_lay = QVBoxLayout(direct_page)
-        direct_lay.setContentsMargins(0, 0, 0, 0)
-        
-        # Per-cell-type spinboxes — rebuilt in _rebuild_size_filter_form()
-        self._size_filter_spins: dict = {}   # ct → QSpinBox
-        self._sf_form_widget = QWidget()
-        self._sf_form_layout = QFormLayout(self._sf_form_widget)
-        self._sf_form_layout.setContentsMargins(0, 0, 0, 0)
-        self._sf_form_layout.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
-        self._sf_placeholder = QLabel("Load metadata to configure per-cell-type thresholds.")
-        self._sf_placeholder.setStyleSheet("color:#888; font-style:italic; font-size:10px;")
-        self._sf_form_layout.addRow(self._sf_placeholder)
-        
-        sf_desc = QLabel(
-            "Remove segments smaller than a minimum voxel count.\n"
-            "Applied per-timepoint, per cell type."
-        )
-        sf_desc.setStyleSheet("color:#888; font-size:10px;")
-        direct_lay.addWidget(sf_desc)
-        direct_lay.addWidget(self._sf_form_widget)
-        direct_lay.addStretch()
-        self.strategy_stack.addWidget(direct_page)
-
-        # Page 1: EDT/Watershed
-        edt_page = QWidget()
-        edt_form = QFormLayout(edt_page)
-        edt_form.setContentsMargins(0, 0, 0, 0)
-        edt_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
-
-        self.spin_edt_threshold = QDoubleSpinBox()
-        self.spin_edt_threshold.setRange(0.1, 100.0)
-        self.spin_edt_threshold.setSingleStep(0.5)
-        self.spin_edt_threshold.setValue(2.5)
-        self.spin_edt_threshold.setMaximumWidth(90)
-        edt_form.addRow("EDT threshold:", make_help_row(
-            self.spin_edt_threshold,
-            "EDT Threshold",
-            "Euclidean Distance Transform threshold for watershed\n"
-            "seed detection. Higher = fewer, larger segments."
-        ))
-
-        self.spin_edt_min_size = QSpinBox()
-        self.spin_edt_min_size.setRange(1, 999999)
-        self.spin_edt_min_size.setValue(100)
-        self.spin_edt_min_size.setMaximumWidth(90)
-        edt_form.addRow("Min segment size:", make_help_row(
-            self.spin_edt_min_size,
-            "Minimum Segment Size",
-            "Segments with fewer pixels than this are removed."
-        ))
-        self.strategy_stack.addWidget(edt_page)
-
-        # Page 2: Probability Map + Watershed
-        prob_page = QWidget()
-        prob_form = QFormLayout(prob_page)
-        prob_form.setContentsMargins(0, 0, 0, 0)
-        prob_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
-
-        self.spin_prob_threshold = QDoubleSpinBox()
-        self.spin_prob_threshold.setRange(0.0, 1.0)
-        self.spin_prob_threshold.setSingleStep(0.05)
-        self.spin_prob_threshold.setDecimals(2)
-        self.spin_prob_threshold.setValue(0.50)
-        self.spin_prob_threshold.setMaximumWidth(90)
-        prob_form.addRow("Probability threshold:", make_help_row(
-            self.spin_prob_threshold,
-            "Probability Threshold",
-            "Minimum probability for a pixel to be considered foreground.\n"
-            "Range 0-1. Higher = stricter, fewer false positives."
-        ))
-
-        self.spin_prob_min_size = QSpinBox()
-        self.spin_prob_min_size.setRange(1, 999999)
-        self.spin_prob_min_size.setValue(100)
-        self.spin_prob_min_size.setMaximumWidth(90)
-        prob_form.addRow("Min segment size:", make_help_row(
-            self.spin_prob_min_size,
-            "Minimum Segment Size",
-            "Segments with fewer pixels than this are removed."
-        ))
-        self.strategy_stack.addWidget(prob_page)
-
-        self.combo_strategy.currentIndexChanged.connect(self.strategy_stack.setCurrentIndex)
-        strat_lay.addWidget(self.strategy_stack)
-        layout.addWidget(strat_group)
+        # (Strategy selector is now inside training_group above)
 
         # ── Batch controls ──────────────────────────────────────
         batch_group = QGroupBox("🚀 Batch Segmentation")
@@ -3090,7 +3005,7 @@ class APOCWidget(QWidget):
             "border-radius: 4px; padding: 10px; font-size: 13px; } "
             "QPushButton:hover { background: #0069d9; }"
         )
-        self.btn_run_segmentation.clicked.connect(self._on_run_segmentation)
+        self.btn_run_segmentation.clicked.connect(lambda _: self._on_run_segmentation(interactive=True))
 
         # Add-to-queue button
         self.btn_queue_apoc_segment = QPushButton("+🛒")
@@ -3117,12 +3032,266 @@ class APOCWidget(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
 
+        # ── Auto-save bindings ─────────────────────────────────────
+        self.spin_examples.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
+        self.spin_workers.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
+        self.combo_gpu_device.currentTextChanged.connect(self._on_gpu_device_changed)
+        self.check_process_all.stateChanged.connect(lambda _: self._save_apoc_params_to_yaml())
+        self.spin_t_start.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
+        self.spin_t_end.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
+
+        # Apply saved device immediately so training/preview runs on the intended GPU.
+        self._apply_apoc_gpu_selection(log_message=False)
+
+    def _discover_apoc_gpu_devices(self):
+        try:
+            import pyclesperanto_prototype as cle
+            names = list(cle.available_device_names() or [])
+        except Exception:
+            names = []
+
+        # Keep order stable and remove duplicates.
+        seen = set()
+        unique = []
+        for name in names:
+            key = str(name)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(key)
+        return unique
+
+    def _on_gpu_device_changed(self, _text):
+        self._save_apoc_params_to_yaml()
+        self._apply_apoc_gpu_selection(log_message=True)
+
+    def _selected_gpu_device_name(self):
+        if not hasattr(self, 'combo_gpu_device'):
+            return ""
+        if not self.combo_gpu_device.isEnabled():
+            return ""
+        return str(self.combo_gpu_device.currentText() or "").strip()
+
+    def _apply_apoc_gpu_selection(self, log_message=True):
+        gpu_device = self._selected_gpu_device_name()
+        if not gpu_device:
+            return False
+        try:
+            import pyclesperanto_prototype as cle
+            cle.select_device(gpu_device)
+            if log_message:
+                self.log(f"APOC: using OpenCL device '{gpu_device}'")
+            return True
+        except Exception as e:
+            if log_message:
+                self.log(f"⚠️ Could not select OpenCL device '{gpu_device}': {e}")
+            return False
+
+    def _update_training_controls_state(self):
+        """Lock/unlock APOC training controls based on whether training data is loaded."""
+        if self._training_widget is None:
+            return
+
+        can_train = bool(self._is_session_active)
+        tw = self._training_widget
+
+        # Global train buttons in APOCTrainingWidget
+        for name in ("apply_all_btn", "train_current_btn", "train_all_btn"):
+            w = getattr(tw, name, None)
+            if w is not None:
+                w.setEnabled(can_train)
+
+        # Per-tab training controls
+        for tab in getattr(tw, "tabs", {}).values():
+            for cb in getattr(tab, "channel_checkboxes", []):
+                cb.setEnabled(can_train)
+            for name in (
+                "feature_combo",
+                "tune_group",
+                "consider_original_cb",
+                "stats_btn",
+                "max_depth_spin",
+                "num_ensembles_spin",
+            ):
+                w = getattr(tab, name, None)
+                if w is not None:
+                    w.setEnabled(can_train)
+
+            # Keep preview parameter widgets editable for segmentation tuning.
+            for name in (
+                "prob_mask_threshold_spin",
+                "prob_seed_threshold_spin",
+                "edt_threshold_spin",
+                "segment_size_min_spin",
+                "opening_nr_pixels_spin",
+                "fill_holes_cb",
+            ):
+                w = getattr(tab, name, None)
+                if w is not None:
+                    w.setEnabled(True)
+
+            # User requested this disabled until training data is loaded.
+            run_btn = getattr(tab, "run_instance_btn", None)
+            if run_btn is not None:
+                run_btn.setEnabled(can_train)
+
+        if can_train:
+            self.log("APOC training controls unlocked (training data loaded).")
+        else:
+            self.log("APOC training controls locked. Load training data to enable classifier training.")
+
+    def _channel_index_from_name(self, channel_name):
+        text = str(channel_name or "")
+        import re
+        match = re.search(r"\((\d+)\)", text)
+        if match:
+            return int(match.group(1))
+        match = re.search(r"(?:^|\b)(?:channel|ch)\s*(\d+)(?:\b|$)", text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        nums = re.findall(r"\d+", text)
+        if nums:
+            return int(nums[-1])
+        return None
+
+    def _restore_tab_channels_fallback(self, tab, configured_channels):
+        configured = [str(name) for name in (configured_channels or []) if str(name).strip()]
+        exact = set(configured)
+        configured_idx = {
+            idx for idx in (self._channel_index_from_name(name) for name in configured)
+            if idx is not None
+        }
+
+        any_checked = False
+        for cb in getattr(tab, "channel_checkboxes", []):
+            checked = cb.text() in exact
+            if not checked and configured_idx:
+                current_idx = self._channel_index_from_name(cb.text())
+                checked = current_idx in configured_idx if current_idx is not None else False
+            cb.setChecked(checked)
+            any_checked = any_checked or checked
+
+        if hasattr(tab, "_default_channel_names"):
+            if any_checked:
+                tab._default_channel_names = [cb.text() for cb in getattr(tab, "channel_checkboxes", []) if cb.isChecked()]
+            else:
+                tab._default_channel_names = list(configured)
+
+    def _extract_tab_config(self, apoc_params, ct):
+        prefix = f"apoc_{ct}_"
+        cfg = {}
+        for key, value in (apoc_params or {}).items():
+            if key.startswith(prefix):
+                cfg[key[len(prefix):]] = value
+        return cfg
+
+    def _patch_tab_channel_refresh(self, ct, tab):
+        if getattr(tab, "_channel_restore_patch_applied", False):
+            return
+
+        original_refresh = tab.refresh_channel_checkboxes
+
+        def wrapped_refresh(*args, **kwargs):
+            original_refresh(*args, **kwargs)
+            # Keep channel inputs locked until training data is loaded.
+            can_train = bool(self._is_session_active)
+            for cb in getattr(tab, "channel_checkboxes", []):
+                cb.setEnabled(can_train)
+            cfg = getattr(tab, "_saved_config_for_restore", None)
+            if isinstance(cfg, dict) and cfg.get("channels"):
+                self._restore_tab_channels_fallback(tab, cfg.get("channels", []))
+
+        tab.refresh_channel_checkboxes = wrapped_refresh
+        tab._channel_restore_patch_applied = True
+
+    def _restore_training_tab_configs(self, apoc_params):
+        if self._training_widget is None:
+            return
+
+        for ct, tab in self._training_widget.tabs.items():
+            cfg = self._extract_tab_config(apoc_params, ct)
+            if not cfg:
+                continue
+            tab._saved_config_for_restore = dict(cfg)
+            self._patch_tab_channel_refresh(ct, tab)
+            try:
+                tab.apply_config(cfg)
+            except Exception as e:
+                self.log(f"⚠️ Could not restore APOC tab config for '{ct}': {e}")
+            if cfg.get("channels"):
+                self._restore_tab_channels_fallback(tab, cfg.get("channels", []))
+
+    def _reorder_apoc_training_layers(self):
+        """Enforce grouped training layer order: channels, labels, probabilities, segments."""
+        try:
+            layer_names = [layer.name for layer in self.viewer.layers]
+
+            channel_names = [name for name in layer_names if name.startswith("Channel ")]
+            label_names = [name for name in layer_names if name.startswith("User Provided Labels")]
+            prob_names = [name for name in layer_names if name.startswith("Probability Map")]
+            seg_names = [
+                name for name in layer_names
+                if name.endswith(" Segments") or name == "Pixel Classification (Dead)"
+            ]
+
+            grouped = channel_names + label_names + prob_names + seg_names
+            grouped_unique = []
+            seen = set()
+            for name in grouped:
+                if name in seen:
+                    continue
+                seen.add(name)
+                grouped_unique.append(name)
+
+            trailing = [name for name in layer_names if name not in seen]
+            final_order = grouped_unique + trailing
+
+            for target_idx, name in enumerate(final_order):
+                if name not in [layer.name for layer in self.viewer.layers]:
+                    continue
+                current_idx = self.viewer.layers.index(name)
+                if current_idx != target_idx:
+                    self.viewer.layers.move(current_idx, target_idx)
+        except Exception as e:
+            self.log(f"⚠️ Could not reorder APOC training layers: {e}")
+
+    def _prompt_visualize_after_apoc_segmentation(self):
+        """Prompt user to switch to Visualization tab and load first sample."""
+        res = QMessageBox.question(
+            self,
+            "Segmentation Finished",
+            "Batch segmentation finished successfully! \n\nDo you want to switch to the Visualization Tab and see the segments?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+
+        if res != QMessageBox.Yes:
+            return
+
+        parent = self.parent()
+        while parent and not hasattr(parent, 'tabs'):
+            parent = parent.parent()
+
+        if parent and hasattr(parent, 'tabs'):
+            parent.tabs.setCurrentIndex(1)
+            if hasattr(parent, 'visualization_tab'):
+                self.log("  Loading first sample in Visualization Tab...")
+                parent.visualization_tab.sample_combo.setCurrentIndex(0)
+                parent.visualization_tab._on_load_dataset()
+
+                for layer in self.viewer.layers:
+                    if "Segments" in layer.name:
+                        layer.visible = True
+
     # ── Load Training Data ──────────────────────────────────────
     def _on_load_training_clicked(self, interactive=True):
         try:
             if self.metadata_loader.metadata is None:
                 self.log("⚠️ Cannot generate training data: No metadata loaded.")
                 return
+
+            self._apply_apoc_gpu_selection(log_message=False)
+            gpu_name = self._selected_gpu_device_name() or "default OpenCL device"
+            self.log(f"APOC training pipeline using GPU device: {gpu_name}")
 
             self.log("Loading training data...")
             
@@ -3209,10 +3378,11 @@ class APOCWidget(QWidget):
                     load_existing = True
             # else: no data exists → generate immediately without any dialog
 
-            # Clear viewer layers related to this
-            layers_to_remove = [l for l in self.viewer.layers if 'Channel' in l.name or 'User Provided Labels' in l.name]
-            for l in layers_to_remove:
-                self.viewer.layers.remove(l)
+            # Save parameters
+            self._save_apoc_params_to_yaml()
+
+            # Clear all viewer layers entirely
+            self.viewer.layers.clear()
 
             # Load images
             self.log("Running _load_training_images...")
@@ -3298,8 +3468,11 @@ class APOCWidget(QWidget):
                 dead_layer = self.viewer.add_labels(dead_labels, name="User Provided Labels (Dead)", opacity=0.5)
                 self._configure_user_label_layer(dead_layer)
 
+            self._reorder_apoc_training_layers()
+
             self.log("✅ Training data generated/loaded in viewer!")
             self._is_session_active = True
+            self._update_training_controls_state()
 
         except Exception as e:
             traceback.print_exc()
@@ -3330,27 +3503,26 @@ class APOCWidget(QWidget):
                 pass
         self._is_session_active = False
         self.log("APOC training session cleared.")
+        self._update_training_controls_state()
 
-    # ── Per-CT size filter form ─────────────────────────────────
-    def _rebuild_size_filter_form(self, all_types: list):
-        """Rebuild per-cell-type min-size spinboxes for the size filter group."""
-        # Clear old widgets
-        while self._sf_form_layout.rowCount():
-            self._sf_form_layout.removeRow(0)
-        self._size_filter_spins.clear()
-
-        if not all_types:
-            self._sf_form_layout.addRow(self._sf_placeholder)
-            return
-
-        for ct in all_types:
-            spin = QSpinBox()
-            spin.setRange(1, 9_999_999)
-            spin.setValue(500)
-            spin.setMaximumWidth(100)
-            spin.setSuffix(" vx")
-            self._sf_form_layout.addRow(f"{ct}:", spin)
-            self._size_filter_spins[ct] = spin
+    # ── Strategy changed ───────────────────────────────────────────
+    def _on_strategy_changed(self, _idx=None):
+        """Rebuild training widget when strategy changes so each tab shows
+        the correct instance-segmentation controls for the new strategy."""
+        # Persist strategy choice immediately
+        pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        pc["apoc_strategy"] = self.STRATEGIES[self.combo_strategy.currentIndex()]
+        out_dir = self.metadata_loader.output_dir
+        if out_dir:
+            params_path = Path(out_dir) / "behav3d_parameters.yml"
+            try:
+                with open(params_path, "w") as f:
+                    yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
+            except Exception:
+                pass
+        # Rebuild deferred to avoid destroying the widget during its own signal
+        from qtpy.QtCore import QTimer
+        QTimer.singleShot(0, self._on_metadata_updated)
 
     # ── Metadata update ─────────────────────────────────────────
     def _on_metadata_updated(self):
@@ -3375,12 +3547,19 @@ class APOCWidget(QWidget):
         if not all_types:
             return
 
-        # Rebuild per-CT size filter spinboxes
-        self._rebuild_size_filter_form(all_types)
-
         # Remove old training widget if present
         if self._training_widget is not None:
+            # Disarm the dangling napari layer event callbacks that the backend set up
+            # Since the backend used lambdas closing over `self`, the napari viewer keeps
+            # a strong reference to this widget. If we delete it without this, it segfaults.
+            self._training_widget._refresh_all_channels = lambda *args, **kwargs: None
+
+            # Safely disconnect and hide before marking for deletion
+            if hasattr(self, 'combo_strategy') and self.combo_strategy is not None:
+                self.combo_strategy.blockSignals(True)
+            
             self.training_layout.removeWidget(self._training_widget)
+            self._training_widget.hide()
             self._training_widget.deleteLater()
             self._training_widget = None
         if self.training_placeholder.parent() is not None:
@@ -3394,7 +3573,12 @@ class APOCWidget(QWidget):
 
         from behav3d.preprocessing.segmentation.apoc_train import APOCTrainingWidget
         params = self.metadata_loader.behav3d_parameters
-        apoc_params = params.get("apoc", {})
+        apoc_params = dict(params.get("apoc", {}) or {})
+        pc = params.get("pixel_classifier", {}) or {}
+
+        # The strategy is handled by APOCTrainingWidget, we just ensure it gets initialized correctly.
+        current_strategy = pc.get("apoc_strategy", self.STRATEGIES[0])
+        apoc_params["apoc_strategy"] = current_strategy
 
         self._training_widget = APOCTrainingWidget(
             viewer=self.viewer,
@@ -3402,36 +3586,306 @@ class APOCWidget(QWidget):
             all_cell_types=all_types,
             has_death=has_death,
             initial_params=apoc_params,
+            on_params_changed=self._save_apoc_params_to_yaml,
         )
+        # Redirect backend internal logs to our GUI log
+        self._training_widget.set_log_fn(self.log)
+        self._restore_training_tab_configs(apoc_params)
+
+        # ── Informative Logging Patches (Frontend-only strategy) ──────────
+        # Wrap _run_training to add verbose progress logs
+        orig_run_training = self._training_widget._run_training
+        def wrapped_run_training(cell_types_to_train):
+            self._apply_apoc_gpu_selection(log_message=False)
+            gpu_name = self._selected_gpu_device_name() or "default OpenCL device"
+            self.log(f"🖥️ APOC training device: {gpu_name}")
+            self.log(f"▶ Starting APOC training for: {cell_types_to_train}")
+            res = orig_run_training(cell_types_to_train)
+            self._reorder_apoc_training_layers()
+            try:
+                pixel_class_outdir = Path(self.metadata_loader.output_dir) / "images" / "PixelClassification"
+                for ct in cell_types_to_train:
+                    ok, msg = self._apoc_try_migrate_from_tab_config(pixel_class_outdir, ct)
+                    if not ok:
+                        self.log(f"  ⚠️ {ct}: could not normalize classifier header after training ({msg})")
+            except Exception as e:
+                self.log(f"  ⚠️ Could not normalize classifier headers after training: {e}")
+            self.log("✅ APOC training process completed.")
+            return res
+        self._training_widget._run_training = wrapped_run_training
+
+        # Wrap _run_instance_preview to log whenever preview is triggered
+        orig_run_instance = self._training_widget._run_instance_preview
+        def wrapped_run_instance(ct):
+            self._apply_apoc_gpu_selection(log_message=False)
+            self.log(f"🔍 Running instance segmentation preview for '{ct}'...")
+            res = orig_run_instance(ct)
+            self._reorder_apoc_training_layers()
+            return res
+        self._training_widget._run_instance_preview = wrapped_run_instance
+
+        # Wrap _predict_classifier_outputs to log specific inference steps
+        orig_predict = self._training_widget._predict_classifier_outputs
+        def wrapped_predict(ct, clf=None):
+            self._apply_apoc_gpu_selection(log_message=False)
+            self.log(f"🧪 Running classifier inference (pixel classification) for '{ct}'...")
+            return orig_predict(ct, clf=clf)
+        self._training_widget._predict_classifier_outputs = wrapped_predict
+
+        # ── Inject Strategy selector into APOCTrainingWidget layout ──────────────
+        strat_row = QHBoxLayout()
+        strat_row.addWidget(QLabel("Strategy:"))
+        self.combo_strategy = QComboBox()
+        self.combo_strategy.addItems(self.STRATEGIES)
+        if current_strategy in self.STRATEGIES:
+            self.combo_strategy.setCurrentText(current_strategy)
+        strat_row.addWidget(self.combo_strategy, stretch=1)
+        
+        strat_desc = QLabel(
+            "Strategy determines how the APOC classifier output is"
+            " converted to instance segmentation labels."
+            " Post-processing parameters appear in each cell-type tab."
+        )
+        strat_desc.setWordWrap(True)
+        strat_desc.setStyleSheet("color:#888; font-size:10px; padding: 0 0 4px 0;")
+        
+        # Insert them right above global_row1 (after the QFrame separator)
+        t_layout = self._training_widget.layout()
+        insert_idx = 3 # fallback
+        for i in range(t_layout.count()):
+            item = t_layout.itemAt(i)
+            if item.widget() and isinstance(item.widget(), QFrame):
+                insert_idx = i + 1
+                break
+
+        t_layout.insertLayout(insert_idx, strat_row)
+        t_layout.insertWidget(insert_idx + 1, strat_desc)
+
+        self.combo_strategy.currentIndexChanged.connect(self._on_strategy_changed)
         self.training_layout.addWidget(self._training_widget)
+        self._update_training_controls_state()
 
     # ── Queue param snapshot ────────────────────────────────────
     def get_queue_params(self) -> dict:
         """Snapshot current widget state for use by the processing queue."""
+        strategy = self.combo_strategy.currentText()
         idx = self.combo_strategy.currentIndex()
         params = {
             "strategy_index": idx,
-            "strategy_name": self.STRATEGIES[idx],
+            "strategy_name": strategy,
+            "gpu_device_name": self._selected_gpu_device_name(),
             "overwrite": self.check_overwrite.isChecked(),
             "workers": self.spin_workers.value(),
             "process_all": self.check_process_all.isChecked(),
             "t_start": self.spin_t_start.value(),
             "t_end": self.spin_t_end.value(),
         }
-        if idx == 0:  # Direct APOC
-            params["min_sizes"] = {ct: spin.value() for ct, spin in self._size_filter_spins.items()}
-        elif idx == 1:  # EDT/Watershed
-            params["edt_threshold"] = self.spin_edt_threshold.value()
-            params["edt_min_size"] = self.spin_edt_min_size.value()
-        elif idx == 2:  # Probability Map + Watershed
-            params["prob_threshold"] = self.spin_prob_threshold.value()
-            params["prob_min_size"] = self.spin_prob_min_size.value()
+        # Collect per-cell-type params from training widget tabs
+        if self._training_widget is not None:
+            per_ct_params = {}
+            for ct, tab in self._training_widget.tabs.items():
+                cfg = tab.get_config()
+                per_ct_params[ct] = cfg
+            params["per_ct_params"] = per_ct_params
         return params
 
+    # ── Parameters Saving ───────────────────────────────────────
+    def _save_apoc_params_to_yaml(self, updated_apoc_params=None):
+        out_dir = self.metadata_loader.output_dir
+        if not out_dir:
+            return
+        
+        # Update apoc dict
+        apoc = self.metadata_loader.behav3d_parameters.setdefault("apoc", {})
+        if updated_apoc_params is not None:
+            # We must correctly handle the case where on_params_changed passes (cell_type, config_dict)
+            if isinstance(updated_apoc_params, str):
+                return
+            apoc.update(updated_apoc_params)
+            
+        # Collect top-level parameters from the GUI
+        pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        if hasattr(self, 'combo_strategy') and self.combo_strategy is not None:
+            pc["apoc_strategy"] = self.combo_strategy.currentText()
+        if hasattr(self, 'spin_examples') and self.spin_examples is not None:
+            pc["examples_per_sample"] = self.spin_examples.value()
+        if hasattr(self, 'combo_gpu_device') and self.combo_gpu_device is not None:
+            pc["gpu_device_name"] = self._selected_gpu_device_name()
+            
+        if hasattr(self, 'spin_workers') and hasattr(self, 'check_process_all'):
+            pc["workers"] = self.spin_workers.value()
+            pc["process_all"] = self.check_process_all.isChecked()
+            pc["t_start"] = self.spin_t_start.value()
+            pc["t_end"] = self.spin_t_end.value()
 
+        params_path = Path(out_dir) / "behav3d_parameters.yml"
+        import yaml
+        try:
+            with open(params_path, "w") as f:
+                yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
+        except Exception as e:
+            self.log(f"Warning: Could not save parameters: {e}")
+
+    # ── APOC GUI compatibility helpers (frontend-only) ──────────
+    def _apoc_normalize_feature_spec(self, feature_spec):
+        spec = str(feature_spec or "").replace(",", " ").replace("\t", " ").strip()
+        while "  " in spec:
+            spec = spec.replace("  ", " ")
+        return spec
+
+    def _apoc_parse_feature_tokens(self, feature_spec):
+        normalized = self._apoc_normalize_feature_spec(feature_spec)
+        return [tok for tok in normalized.split(" ") if tok]
+
+    def _apoc_validate_feature_spec(self, feature_spec):
+        tokens = self._apoc_parse_feature_tokens(feature_spec)
+        if not tokens:
+            return False, "empty feature_specification"
+
+        for tok in tokens:
+            lower_tok = tok.lower()
+            if "_channel" in lower_tok:
+                return False, "legacy expanded token format with _channel suffix"
+            if lower_tok == "original":
+                continue
+            if "=" not in tok:
+                return False, f"invalid token without '=': {tok}"
+            name, value = tok.split("=", 1)
+            if not name.strip() or not value.strip():
+                return False, f"invalid token format: {tok}"
+            try:
+                float(value)
+            except ValueError:
+                return False, f"non-numeric feature parameter: {tok}"
+        return True, "ok"
+
+    def _apoc_read_classifier_header_value(self, clf_path, key, default=None):
+        path = Path(clf_path)
+        if not path.exists():
+            return default
+
+        prefix = f"{key} = "
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                line_count = 0
+                for line in f:
+                    line_count += 1
+                    if line_count > 120:
+                        break
+                    stripped = line.strip()
+                    if stripped == "*/":
+                        break
+                    if stripped.startswith(prefix):
+                        return stripped[len(prefix):].strip()
+        except Exception:
+            return default
+        return default
+
+    def _apoc_rewrite_classifier_feature_spec(self, clf_path, new_feature_spec):
+        path = Path(clf_path)
+        if not path.exists():
+            return False, f"classifier file not found: {path.name}"
+
+        normalized = self._apoc_normalize_feature_spec(new_feature_spec)
+        is_valid, reason = self._apoc_validate_feature_spec(normalized)
+        if not is_valid:
+            return False, f"cannot rewrite invalid feature specification ({reason})"
+
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            lines = text.splitlines(keepends=True)
+            in_header = False
+            replaced = False
+
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith("/*"):
+                    in_header = True
+                if in_header and stripped.startswith("feature_specification = "):
+                    ending = "\r\n" if line.endswith("\r\n") else "\n"
+                    lines[i] = f"feature_specification = {normalized}{ending}"
+                    replaced = True
+                    break
+                if in_header and stripped == "*/":
+                    break
+
+            if not replaced:
+                return False, "feature_specification header line not found"
+
+            path.write_text("".join(lines), encoding="utf-8")
+            return True, "ok"
+        except Exception as e:
+            return False, str(e)
+
+    def _apoc_classifier_path(self, pixel_class_outdir, ct):
+        if ct == "dead":
+            return Path(pixel_class_outdir) / "PixelClassifier_Death.cl"
+        return Path(pixel_class_outdir) / f"PixelClassifier_{ct.capitalize()}.cl"
+
+    def _apoc_expected_cell_types(self, metadata):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel,
+        )
+        organoid_types = detect_organoid_types_from_metadata(metadata)
+        immune_types = detect_immune_cell_types_from_metadata(metadata)
+        other_types = detect_other_cell_types_from_metadata(metadata)
+        cell_types = organoid_types + immune_types + other_types
+        if has_dead_channel(metadata):
+            cell_types.append("dead")
+        return cell_types
+
+    def _apoc_try_migrate_from_tab_config(self, pixel_class_outdir, ct):
+        if self._training_widget is None:
+            return False, "training widget unavailable"
+        if ct not in self._training_widget.tabs:
+            return False, f"no GUI tab config for '{ct}'"
+
+        cfg = self._training_widget.tabs[ct].get_config()
+        canonical_spec = self._apoc_normalize_feature_spec(cfg.get("feature_string", ""))
+        ok, msg = self._apoc_rewrite_classifier_feature_spec(
+            self._apoc_classifier_path(pixel_class_outdir, ct),
+            canonical_spec,
+        )
+        if ok:
+            self.log(f"  🔧 {ct}: updated classifier header feature_specification from GUI tab config")
+        return ok, msg
+
+    def _apoc_preflight_classifier_headers(self, output_dir, metadata):
+        pixel_class_outdir = Path(output_dir) / "images" / "PixelClassification"
+        incompatible = []
+
+        for ct in self._apoc_expected_cell_types(metadata):
+            clf_path = self._apoc_classifier_path(pixel_class_outdir, ct)
+            if not clf_path.exists():
+                continue
+
+            header_spec = self._apoc_read_classifier_header_value(
+                clf_path,
+                "feature_specification",
+                "",
+            )
+            is_valid, reason = self._apoc_validate_feature_spec(header_spec)
+
+            if not is_valid:
+                mig_ok, mig_msg = self._apoc_try_migrate_from_tab_config(pixel_class_outdir, ct)
+                if mig_ok:
+                    header_spec = self._apoc_read_classifier_header_value(clf_path, "feature_specification", "")
+                    is_valid, reason = self._apoc_validate_feature_spec(header_spec)
+                else:
+                    reason = f"{reason}; migration failed: {mig_msg}"
+
+            if not is_valid:
+                incompatible.append((ct, clf_path.name, reason, str(header_spec or "")))
+            else:
+                self.log(f"  ✅ {ct}: feature_specification OK -> {header_spec}")
+
+        return incompatible
 
     # ── Run batch segmentation ──────────────────────────────────
-    def _on_run_segmentation(self):
+    def _on_run_segmentation(self, interactive=True):
         try:
             md = self.metadata_loader.metadata
             if md is None:
@@ -3441,7 +3895,7 @@ class APOCWidget(QWidget):
             from behav3d.preprocessing.segmentation.apoc_segment import run_apoc_segmentation
 
             output_dir = Path(self.metadata_loader.output_dir)
-            strategy = self.STRATEGIES[self.combo_strategy.currentIndex()]
+            strategy = self.combo_strategy.currentText()
 
             # Timepoint range
             if self.check_process_all.isChecked():
@@ -3454,23 +3908,50 @@ class APOCWidget(QWidget):
                     return
                 timepoint_range = (t_start, t_end)
 
-            # Collect APOC config from training widget if available
+            # Collect APOC config from training widget tabs
             apoc_config = {}
             if self._training_widget is not None:
                 for ct, tab in self._training_widget.tabs.items():
-                    if hasattr(tab, 'get_params'):
-                        p = tab.get_params()
-                        for k, v in p.items():
-                            apoc_config[f"apoc_{ct}_{k}"] = v
+                    cfg = tab.get_config()
+                    # Flatten per-cell-type config into apoc_config
+                    for k, v in cfg.items():
+                        apoc_config[f"apoc_{ct}_{k}"] = v
+                    # Also set the segment_size_min under the direct-APOC key
+                    if cfg.get("segment_size_min") is not None:
+                        apoc_config[f"{ct}_segment_size_min"] = cfg["segment_size_min"]
 
-            # Embed the per CT size filters into apoc_config so direct APOC sees them
-            for ct, spin in self._size_filter_spins.items():
-                apoc_config[f"{ct}_segment_size_min"] = spin.value()
+            # Save all parameters safely
+            self._save_apoc_params_to_yaml(updated_apoc_params=apoc_config)
+
+            # Fix channel names for apoc_segment.py parser (backend expects 'Ch 0' format)
+            import re
+            for key in list(apoc_config.keys()):
+                if key.endswith("_channels") and isinstance(apoc_config[key], list):
+                    fixed_chans = []
+                    for ch_name in apoc_config[key]:
+                        match = re.search(r'\((\d+)\)', str(ch_name))
+                        if match:
+                            fixed_chans.append(f"Ch {match.group(1)}")
+                        else:
+                            fixed_chans.append(ch_name)
+                    apoc_config[key] = fixed_chans
 
             # Classifier paths: scan PixelClassification dir for .cl files
             pixel_class_outdir = output_dir / "images" / "PixelClassification"
 
+            # GUI-side compatibility preflight: ensure classifier headers can drive predict(image=...).
+            incompatible = self._apoc_preflight_classifier_headers(output_dir, md)
+            if incompatible:
+                self.log("❌ APOC classifier preflight failed. Incompatible classifier header(s):")
+                for ct, fname, reason, header_spec in incompatible:
+                    shown = header_spec if header_spec else "<empty>"
+                    self.log(f"   - {ct} ({fname}): {reason}. header feature_specification='{shown}'")
+                self.log("Please retrain the listed classifier(s) from the GUI and run batch segmentation again.")
+                return
+
             self.log(f"Starting APOC batch segmentation ({strategy})...")
+
+            self._apply_apoc_gpu_selection(log_message=False)
 
             metadata_csv = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv", "")
 
@@ -3482,26 +3963,9 @@ class APOCWidget(QWidget):
                 apoc_config=apoc_config,
                 overwrite_existing=self.check_overwrite.isChecked(),
                 n_workers=self.spin_workers.value(),
+                gpu_device=self._selected_gpu_device_name(),
                 apoc_strategy=strategy,
             )
-
-            # Apply size filtering immediately if strategy is Direct APOC
-            if self.combo_strategy.currentIndex() == 0:
-                self.log("Applying size filtering for Direct APOC strategy...")
-                try:
-                    from behav3d.preprocessing.segmentation.size_filter import filter_segments_by_size
-                    for ct, spin in self._size_filter_spins.items():
-                        min_size = spin.value()
-                        for sample_name in md['sample_name'].unique():
-                            seg_path = output_dir / "images" / sample_name / f"{sample_name}_{ct}_segments.zarr"
-                            if seg_path.exists():
-                                self.log(f"  [{ct}] {sample_name} — min={min_size} vx")
-                                filter_segments_by_size(
-                                    segments_zarr_path=str(seg_path),
-                                    min_size_voxels=min_size,
-                                )
-                except Exception as ex:
-                    self.log(f"Warning: size filtering failed: {ex}")
 
             # Update metadata
             if updated_metadata is not None:
@@ -3513,6 +3977,9 @@ class APOCWidget(QWidget):
                         self.log(f"Warning: Could not save metadata: {e}")
 
             self.log("✅ APOC batch segmentation finished!")
+
+            if interactive:
+                self._prompt_visualize_after_apoc_segmentation()
 
         except Exception as e:
             traceback.print_exc()

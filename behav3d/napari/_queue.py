@@ -841,6 +841,10 @@ class ProcessingQueuePanel(QWidget):
         apoc_widget = self.segmentation_tab.apoc_page
         p = step.params
         # Restore snapshot into widgets so _on_run_segmentation reads the right values
+        if "gpu_device_name" in p and hasattr(apoc_widget, "combo_gpu_device"):
+            idx = apoc_widget.combo_gpu_device.findText(str(p["gpu_device_name"]))
+            if idx >= 0:
+                apoc_widget.combo_gpu_device.setCurrentIndex(idx)
         if "strategy_index" in p:
             apoc_widget.combo_strategy.setCurrentIndex(p["strategy_index"])
         if "edt_threshold" in p:
@@ -868,4 +872,4 @@ class ProcessingQueuePanel(QWidget):
             apoc_widget.spin_t_end.setValue(p.get("t_end", 100))
         # skip_existing overrides the stored overwrite flag
         apoc_widget.check_overwrite.setChecked(not skip_existing)
-        apoc_widget._on_run_segmentation()
+        apoc_widget._on_run_segmentation(interactive=False)

@@ -10,6 +10,10 @@ echo    BEHAV3D - Launching Napari
 echo  ========================================
 echo.
 
+:: Suppress PyOpenCL compiler cache warnings
+set PYOPENCL_NO_CACHE=1
+:: set PYOPENCL_COMPILER_OUTPUT=0
+
 :: Run the Python launcher script (located in the same directory)
 python "%~dp0launch_napari.py"
 

@@ -1231,6 +1231,28 @@ class TrackingTab(QWidget):
         layout.setSpacing(4)
         scroll.setWidget(content)
 
+        # ── "Track all organoids together" checkbox ──────────────
+        self._organoid_types = []
+        self.check_all_organoids = QCheckBox("Track all organoids together (propagation)")
+        self.check_all_organoids.setStyleSheet(
+            "QCheckBox { font-weight: bold; padding: 4px 0; }"
+        )
+        self.check_all_organoids.setVisible(False)
+        self.check_all_organoids.toggled.connect(self._on_all_organoids_toggled)
+        layout.addWidget(self.check_all_organoids)
+
+        self.lbl_all_organoids_warning = QLabel(
+            "⚠️ Propagation tracking will be applied to ALL organoid types "
+            "simultaneously. Individual organoid Run buttons are disabled."
+        )
+        self.lbl_all_organoids_warning.setWordWrap(True)
+        self.lbl_all_organoids_warning.setStyleSheet(
+            "color: #e65100; background: #fff3e0; border: 1px solid #ffcc80; "
+            "border-radius: 4px; padding: 6px; font-size: 11px; margin: 2px 0;"
+        )
+        self.lbl_all_organoids_warning.setVisible(False)
+        layout.addWidget(self.lbl_all_organoids_warning)
+
         # Sub-tab widget (West position = left tabs)
         self.cell_tabs = QTabWidget()
         self.cell_tabs.setTabPosition(QTabWidget.West)
@@ -1313,11 +1335,14 @@ class TrackingTab(QWidget):
 
         org, imm, oth = self._detect_cell_types()
         all_types = org + imm + oth
+        self._organoid_types = list(org)
 
         if not all_types:
             self.cell_tabs.addTab(self._placeholder, "—")
             self.btn_run_batch.setVisible(False)
             self.btn_queue_track.setVisible(False)
+            self.check_all_organoids.setVisible(False)
+            self.lbl_all_organoids_warning.setVisible(False)
             return
 
         self.btn_run_batch.setVisible(True)
@@ -1356,6 +1381,61 @@ class TrackingTab(QWidget):
             self.panels[ct] = panel
             self.cell_tabs.addTab(panel, f"🟡 {ct.capitalize()}")
 
+        # Show "all organoids" checkbox only when multiple organoid types exist
+        show_all_org = len(org) > 1
+        self.check_all_organoids.setVisible(show_all_org)
+        if show_all_org:
+            # Load saved preference, default True for multiple organoids
+            tcfg = _cfg_get(self.metadata_loader.behav3d_parameters, "tracking", {}) or {}
+            saved = tcfg.get("track_organoids_together", True)
+            self.check_all_organoids.blockSignals(True)
+            self.check_all_organoids.setChecked(saved)
+            self.check_all_organoids.blockSignals(False)
+            # Apply the toggled state immediately
+            self._on_all_organoids_toggled(saved)
+        else:
+            self.lbl_all_organoids_warning.setVisible(False)
+
+    # ------------------------------------------------------------------
+    def _on_all_organoids_toggled(self, checked):
+        """Handle toggling of 'Track all organoids together'."""
+        self.lbl_all_organoids_warning.setVisible(checked)
+
+        # Persist to config
+        params = self.metadata_loader.behav3d_parameters
+        tracking = params.setdefault("tracking", {})
+        tracking["track_organoids_together"] = bool(checked)
+        out_dir = self.metadata_loader.output_dir
+        if out_dir:
+            params_path = Path(out_dir) / "behav3d_parameters.yml"
+            try:
+                with open(params_path, "w") as f:
+                    yaml.safe_dump(params, f, sort_keys=False)
+            except Exception:
+                pass
+
+        # Update all organoid panels
+        for ct in self._organoid_types:
+            if ct not in self.panels:
+                continue
+            panel = self.panels[ct]
+            if checked:
+                # Force method to Propagation and disable controls
+                panel.combo_method.setCurrentIndex(2)  # Propagation
+                panel.combo_method.setEnabled(False)
+                panel.param_stack.setEnabled(False)
+                panel.btn_run.setEnabled(False)
+                panel.btn_run.setToolTip(
+                    "Disabled: 'Track all organoids together' is active.\n"
+                    "Use the global 'Run Batch Tracking' button instead."
+                )
+            else:
+                # Re-enable controls
+                panel.combo_method.setEnabled(True)
+                panel.param_stack.setEnabled(True)
+                panel.btn_run.setEnabled(True)
+                panel.btn_run.setToolTip("")
+
     def _on_run_batch_clicked(self):
         self.run_batch_tracking(interactive=True)
 
@@ -1367,7 +1447,13 @@ class TrackingTab(QWidget):
             return
 
         total = len(self.panels)
+        all_organoids_mode = (
+            self.check_all_organoids.isVisible()
+            and self.check_all_organoids.isChecked()
+        )
         self._log(f"Starting batch tracking for {total} cell types...")
+        if all_organoids_mode:
+            self._log("  Mode: All organoids tracked together (propagation)")
 
         print(f"\n{'='*60}", file=sys.stderr)
         print(f"  Running batch tracking for {total} cell types", file=sys.stderr)
@@ -1416,12 +1502,51 @@ class TrackingTab(QWidget):
             panel._persist()
 
         try:
+            # ── All-organoids propagation (single step) ─────────────
+            organoids_done = set()
+            if all_organoids_mode and self._organoid_types:
+                org_cts_to_run = [
+                    ct for ct in self._organoid_types
+                    if not (skip_existing_flag and ct in existing_cts)
+                ]
+                if org_cts_to_run:
+                    self._log(f"--- Tracking ALL organoids together ({', '.join(self._organoid_types)}) ---")
+                    print(f"\n▶ Tracking ALL organoids together...", file=sys.stderr)
+
+                    # Use the first organoid panel to get metadata + run
+                    first_org_ct = self._organoid_types[0]
+                    first_panel = self.panels[first_org_ct]
+
+                    from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
+                    new_md = run_propagation_tracking(
+                        metadata=self.metadata_loader.metadata,
+                        output_dir=str(Path(self.metadata_loader.output_dir).expanduser()),
+                        cell_type=first_org_ct,
+                        overwrite=overwrite,
+                        all_organoids=True,
+                    )
+                    self.metadata_loader.metadata = new_md
+                    csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
+                    if csv_path:
+                        new_md.to_csv(csv_path, sep=",", index=False)
+
+                    self._log(f"Done: all organoids propagation tracking")
+                    organoids_done = set(self._organoid_types)
+                else:
+                    self._log("All organoid tracking data already exists — skipping.")
+                    organoids_done = set(self._organoid_types)
+
+            # ── Per-cell-type tracking (non-organoids or individual organoids) ──
+            step = len(organoids_done)
             for i, (ct, panel) in enumerate(self.panels.items(), 1):
+                if ct in organoids_done:
+                    continue
                 if skip_existing_flag and ct in existing_cts:
                     self._log(f"--- [{i}/{total}] Skipping {ct} (existing data) ---")
                     continue
-                print(f"\n\u25b6 [{i}/{total}] Tracking {ct}...", file=sys.stderr)
-                self._log(f"--- [{i}/{total}] Tracking {ct} ---")
+                step += 1
+                print(f"\n▶ [{step}/{total}] Tracking {ct}...", file=sys.stderr)
+                self._log(f"--- [{step}/{total}] Tracking {ct} ---")
                 panel._run_tracking_for(ct, overwrite=overwrite)
                 self._log(f"Done: {ct}")
             

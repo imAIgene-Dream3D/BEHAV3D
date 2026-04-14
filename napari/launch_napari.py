@@ -22,6 +22,9 @@ from pathlib import Path
 def run_napari_payload():
     """Import napari, create viewer, add BEHAV3D widget, and start event loop."""
     print("Starting BEHAV3D Napari Plugin...")
+    # Suppress PyOpenCL compiler cache warnings
+    os.environ.setdefault('PYOPENCL_NO_CACHE', '1')
+    # os.environ.setdefault('PYOPENCL_COMPILER_OUTPUT', '0')
     try:
         import napari
         from behav3d.napari._widget import BEHAV3DWidget
