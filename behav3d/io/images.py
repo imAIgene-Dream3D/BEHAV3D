@@ -302,7 +302,7 @@ def convert_file_to_zarr(
     n_workers = max(1, int(n_workers or 1))
 
     if (
-        (path.suffix == ".zarr" and path.exists()) or
+        ((path.suffix == ".zarr" or str(path).endswith(".zarr.zip")) and path.exists()) or
         (outpath.exists() and not overwrite)
     ):
         print("Skipping conversion to zarr, as file already exists")
@@ -553,6 +553,13 @@ def convert_label_file_to_zarr(
     """
     path = Path(path)
     outpath = Path(outpath)
+
+    # If source is already zarr and target points to the same location,
+    # never attempt reconversion (protects against accidental self-overwrite).
+    if (path.suffix == ".zarr" or str(path).endswith(".zarr.zip")) and path.exists():
+        if path.resolve() == outpath.resolve():
+            print("Skipping label conversion to zarr, source is already .zarr")
+            return
 
     if outpath.exists() and not overwrite:
         print("Skipping label conversion to zarr, as file already exists")
