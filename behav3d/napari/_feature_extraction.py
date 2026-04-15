@@ -194,45 +194,102 @@ def _load_all_segments_for_sample(
     sample_row: pd.Series,
     all_cell_types: list,
     output_dir: Path,
-) -> "dict[str, np.ndarray]":
-    """Load t=0 segment arrays for every cell type that has data for *sample_row*.
+) -> "tuple[dict[str, np.ndarray], dict[str, str]]":
+    """Load segment arrays for every cell type that has data for *sample_row*.
 
-    Returns a dict mapping cell_type -> 3-D uint16 ndarray (Z, Y, X).
+    Returns a dict mapping cell_type -> ndarray, typically:
+      - 4-D (T, Z, Y, X) for timelapse labels, or
+      - 3-D (Z, Y, X) for single-volume labels.
     Missing or unreadable types are silently omitted.
+
+    Segment source priority is tracked-first:
+      1) metadata tracked path
+      2) constructed tracked path
+      3) metadata untracked path
+      4) constructed untracked path
+
+    Returns
+    -------
+    segs : dict[str, np.ndarray]
+        Loaded segment arrays by cell type.
+    sources : dict[str, str]
+        Source tag per loaded cell type: "tracked" or "untracked".
     """
     from behav3d.io.images import load_image as _li
     result = {}
+    sources = {}
     sample_name = str(sample_row.get("sample_name", ""))
+
+    def _normalize(arr):
+        arr_np = np.asarray(arr)
+        if arr_np.ndim == 5:
+            # Defensive: collapse channel axis if present.
+            arr_np = arr_np[:, 0, ...]
+        return arr_np
+
+    def _try_load(p: Path):
+        if not p.exists():
+            return None
+        try:
+            return _normalize(_li(str(p)))
+        except Exception:
+            return None
+
     for ct in all_cell_types:
-        # 1. Metadata column (any prefix)
+        # 1. Metadata tracked path (preferred)
+        tracked_cols = [
+            f"{pfx}_{ct}_tracks_image_path" for pfx in ("or", "im", "ot")
+        ] + [f"{ct}_tracks_image_path"]
+        for col in tracked_cols:
+            val = sample_row.get(col)
+            if val and pd.notna(val):
+                arr_np = _try_load(Path(str(val).strip()))
+                if arr_np is not None:
+                    result[ct] = arr_np
+                    sources[ct] = "tracked"
+                    break
+        if ct in result:
+            continue
+
+        # 2. Constructed tracked fallback
+        for suffix in (
+            f"{sample_name}_{ct}_tracked.zarr",
+            f"{ct}_tracked.zarr",
+        ):
+            p = output_dir / "images" / sample_name / suffix
+            arr_np = _try_load(p)
+            if arr_np is not None:
+                result[ct] = arr_np
+                sources[ct] = "tracked"
+                break
+        if ct in result:
+            continue
+
+        # 3. Metadata untracked path
         for pfx in ("or", "im", "ot"):
             col = f"{pfx}_{ct}_segments_image_path"
             val = sample_row.get(col)
             if val and pd.notna(val):
-                p = Path(str(val).strip())
-                if p.exists():
-                    try:
-                        arr = _li(str(p))
-                        result[ct] = np.asarray(arr[0]) if arr.ndim >= 4 else np.asarray(arr)
-                    except Exception:
-                        pass
+                arr_np = _try_load(Path(str(val).strip()))
+                if arr_np is not None:
+                    result[ct] = arr_np
+                    sources[ct] = "untracked"
                     break
         if ct in result:
             continue
-        # 2. Constructed fallback
+
+        # 4. Constructed untracked fallback
         for suffix in (
             f"{sample_name}_{ct}_segments.zarr",
             f"{ct}_segments.zarr",
         ):
             p = output_dir / "images" / sample_name / suffix
-            if p.exists():
-                try:
-                    arr = _li(str(p))
-                    result[ct] = np.asarray(arr[0]) if arr.ndim >= 4 else np.asarray(arr)
-                except Exception:
-                    pass
+            arr_np = _try_load(p)
+            if arr_np is not None:
+                result[ct] = arr_np
+                sources[ct] = "untracked"
                 break
-    return result
+    return result, sources
 
 
 def _add_channel_layers(viewer, dask_img, sample_name: str, prefix: str = _PREVIEW_PREFIX):
@@ -249,6 +306,7 @@ def _add_channel_layers(viewer, dask_img, sample_name: str, prefix: str = _PREVI
             name=f"{prefix} {sample_name} – Ch{c}",
             colormap=color,
             blending="additive",
+            opacity=0.7,
             visible=True,
         )
         # Auto-contrast on non-zero pixels
@@ -261,20 +319,10 @@ def _add_channel_layers(viewer, dask_img, sample_name: str, prefix: str = _PREVI
             pass
 
 
-def _remove_preview_layers(viewer, prefix: str = _PREVIEW_PREFIX):
-    """Remove all viewer layers whose name starts with *prefix*."""
-    to_remove = [l for l in list(viewer.layers) if l.name.startswith(prefix)]
-    for l in to_remove:
-        try:
-            viewer.layers.remove(l)
-        except Exception:
-            pass
-
-
 def _update_dead_alive_overlay(
     viewer,
-    seg_t: np.ndarray,
-    dead_t: np.ndarray,
+    seg_data: np.ndarray,
+    dead_data: np.ndarray,
     threshold_pct: float,
     layer_name: str = f"{_PREVIEW_PREFIX} Dead/Alive",
 ):
@@ -289,20 +337,48 @@ def _update_dead_alive_overlay(
     """
     from skimage.measure import regionprops
 
-    overlay = np.zeros_like(seg_t, dtype=np.uint8)
-    dead_binary = dead_t > 0
+    def _overlay_for_volume(seg_vol, dead_vol):
+        overlay_vol = np.zeros_like(seg_vol, dtype=np.uint8)
+        dead_binary = dead_vol > 0
 
-    # Use int32 for regionprops (avoids issues with large uint16 labels)
-    seg_int = seg_t.astype(np.int32)
-    for region in regionprops(seg_int):
-        label_val = region.label
-        mask = seg_int == label_val
-        total_pixels = int(mask.sum())
-        if total_pixels == 0:
-            continue
-        dead_pixels = int((mask & dead_binary).sum())
-        pct = (dead_pixels / total_pixels) * 100.0
-        overlay[mask] = 2 if (pct >= threshold_pct and threshold_pct > 0) else 1
+        seg_int = seg_vol.astype(np.int32)
+        for region in regionprops(seg_int):
+            label_val = region.label
+            mask = seg_int == label_val
+            total_pixels = int(mask.sum())
+            if total_pixels == 0:
+                continue
+            dead_pixels = int((mask & dead_binary).sum())
+            pct = (dead_pixels / total_pixels) * 100.0
+            overlay_vol[mask] = 2 if (pct >= threshold_pct and threshold_pct > 0) else 1
+        return overlay_vol
+
+    seg_arr = np.asarray(seg_data)
+    dead_arr = np.asarray(dead_data)
+
+    if seg_arr.ndim >= 4:
+        if dead_arr.ndim == 3:
+            dead_arr = np.repeat(dead_arr[np.newaxis, ...], seg_arr.shape[0], axis=0)
+        t_common = min(seg_arr.shape[0], dead_arr.shape[0])
+        overlay = np.zeros_like(seg_arr[:t_common], dtype=np.uint8)
+        for t in range(t_common):
+            seg_vol = np.asarray(seg_arr[t])
+            dead_vol = np.asarray(dead_arr[t])
+            if seg_vol.ndim > 3:
+                seg_vol = seg_vol[0]
+            if dead_vol.ndim > 3:
+                dead_vol = dead_vol[0]
+            if dead_vol.ndim < seg_vol.ndim:
+                dead_vol = np.broadcast_to(dead_vol, seg_vol.shape)
+            overlay[t] = _overlay_for_volume(seg_vol, dead_vol)
+    else:
+        seg_vol = np.asarray(seg_arr)
+        dead_vol = np.asarray(dead_arr)
+        if dead_vol.ndim > seg_vol.ndim:
+            dead_vol = dead_vol.max(axis=0)
+        if dead_vol.ndim < seg_vol.ndim:
+            dead_vol = np.broadcast_to(dead_vol, seg_vol.shape)
+        overlay = _overlay_for_volume(seg_vol, dead_vol)
 
     # Build DirectLabelColormap with a `None` fallback key to suppress napari
     # UserWarning "color_dict did not provide a default color"
@@ -323,9 +399,10 @@ def _update_dead_alive_overlay(
     try:
         layer = viewer.layers[layer_name]
         layer.data = overlay
+        layer.opacity = 1.0
         layer.refresh()
     except (KeyError, ValueError):
-        kw = dict(name=layer_name, opacity=0.7)
+        kw = dict(name=layer_name, opacity=1.0)
         if cmap is not None:
             kw["colormap"] = cmap
         viewer.add_labels(overlay, **kw)
@@ -522,10 +599,10 @@ class CellTypeFeaturePanel(QWidget):
 
         self.spin_dead_threshold = QDoubleSpinBox()
         self.spin_dead_threshold.setRange(0.0, 100.0)
-        self.spin_dead_threshold.setSingleStep(1.0)
-        self.spin_dead_threshold.setDecimals(1)
-        saved_thr = fcfg.get("dead_mask_percentage_threshold", 0.0)
-        self.spin_dead_threshold.setValue(float(saved_thr) if saved_thr else 0.0)
+        self.spin_dead_threshold.setSingleStep(0.1)
+        self.spin_dead_threshold.setDecimals(2)
+        saved_thr = fcfg.get("dead_mask_percentage_threshold", 0.1)
+        self.spin_dead_threshold.setValue(float(saved_thr) if saved_thr else 0.1)
         self.spin_dead_threshold.setSuffix(" %")
         self.spin_dead_threshold.setMaximumWidth(100)
         dead_form.addRow(
@@ -649,9 +726,9 @@ class CellTypeFeaturePanel(QWidget):
     def _get_threshold(self) -> float:
         """Return the effective dead-mask percentage threshold for this panel."""
         if self.spin_dead_threshold is not None:
-            return float(self.spin_dead_threshold.value())
+            return round(float(self.spin_dead_threshold.value()), 2)
         if self._threshold_getter is not None:
-            return float(self._threshold_getter())
+            return round(float(self._threshold_getter()), 2)
         return 0.0
 
     def _on_workers_changed(self, value):
@@ -848,7 +925,9 @@ class CellTypeFeaturePanel(QWidget):
 
             # Collect ALL available segments for this sample
             all_types = getattr(self, "all_cell_types", [self.cell_type])
-            segs_dict = _load_all_segments_for_sample(sample_row, all_types, output_dir)
+            segs_dict, seg_sources = _load_all_segments_for_sample(
+                sample_row, all_types, output_dir
+            )
             if self.cell_type not in segs_dict:
                 self.log(
                     f"\u26a0\ufe0f No segments found for '{self.cell_type}' "
@@ -856,8 +935,8 @@ class CellTypeFeaturePanel(QWidget):
                 )
                 return
 
-            # Clear old preview layers
-            _remove_preview_layers(viewer)
+            # Clear all viewer layers entirely
+            self.viewer.layers.clear()
 
             # Raw channels
             if raw_dask is not None:
@@ -867,13 +946,14 @@ class CellTypeFeaturePanel(QWidget):
             else:
                 self.log("  \u26a0\ufe0f Could not load raw image.")
 
-            # Dead mask layer
-            t = 0
-            dead_t = (
-                np.asarray(dead_arr[t]) if dead_arr.ndim >= 4 else np.asarray(dead_arr)
-            )
+            # Dead mask layer (timelapse-aware)
+            dead_stack = np.asarray(dead_arr)
+            if dead_stack.ndim == 2:
+                dead_stack = dead_stack[np.newaxis, np.newaxis, ...]
+            elif dead_stack.ndim == 3:
+                dead_stack = dead_stack[np.newaxis, ...]
             viewer.add_image(
-                dead_t.astype(float),
+                dead_stack.astype(float),
                 name=f"{_PREVIEW_PREFIX} Dead Mask",
                 colormap="magenta",
                 blending="additive",
@@ -881,34 +961,39 @@ class CellTypeFeaturePanel(QWidget):
             )
 
             # All segment layers (this type full opacity, others lighter)
-            primary_seg_t = segs_dict[self.cell_type]
+            primary_seg = segs_dict[self.cell_type]
             for ct, seg_arr in segs_dict.items():
                 is_primary = (ct == self.cell_type)
                 viewer.add_labels(
                     seg_arr,
                     name=f"{_PREVIEW_PREFIX} {ct} segments",
                     opacity=0.7 if is_primary else 0.3,
+                    visible=False,
                 )
             self.log(
                 "  Segments: "
                 + ", ".join(
-                    f"{ct}[primary]" if ct == self.cell_type else ct
+                    (
+                        f"{ct}[primary,{seg_sources.get(ct, 'untracked')}]"
+                        if ct == self.cell_type
+                        else f"{ct}[{seg_sources.get(ct, 'untracked')}]"
+                    )
                     for ct in segs_dict
                 )
             )
 
             # Compute dead/alive overlay
             thr = self._get_threshold()
-            _update_dead_alive_overlay(viewer, primary_seg_t, dead_t, thr)
+            _update_dead_alive_overlay(viewer, primary_seg, dead_stack, thr)
 
             # Cache for live spinner updates
-            self._preview_seg_t = primary_seg_t
-            self._preview_dead_t = dead_t
+            self._preview_seg_t = primary_seg
+            self._preview_dead_t = dead_stack
 
             # Organoid panels fill the shared tab cache too
             if self._is_organoid and self._org_preview_cache is not None:
-                self._org_preview_cache["seg_t"] = primary_seg_t
-                self._org_preview_cache["dead_t"] = dead_t
+                self._org_preview_cache["seg_t"] = primary_seg
+                self._org_preview_cache["dead_t"] = dead_stack
 
             # Wire non-organoid spinner -> live overlay (once)
             if not self._preview_connected and self.spin_dead_threshold is not None:
@@ -919,8 +1004,8 @@ class CellTypeFeaturePanel(QWidget):
                 self._preview_connected = True
 
             self.log(
-                f"\u2705 Preview loaded (t=0). "
-                f"Adjust threshold (currently {thr:.1f}%) to see live changes."
+                f"\u2705 Preview loaded (timelapse-aware). "
+                f"Adjust threshold (currently {thr:.2f}%) and use the viewer time slider to inspect frames."
             )
 
         except Exception as exc:
@@ -938,8 +1023,9 @@ class CellTypeFeaturePanel(QWidget):
             or self._preview_dead_t is None
         ):
             return
+        thr = round(float(value), 2)
         _update_dead_alive_overlay(
-            viewer, self._preview_seg_t, self._preview_dead_t, float(value)
+            viewer, self._preview_seg_t, self._preview_dead_t, thr
         )
 
 
@@ -972,6 +1058,7 @@ class ActiveKillingPanel(QWidget):
         metadata_loader,
         viewer=None,
         log_callback=None,
+        queue_callback=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -979,6 +1066,7 @@ class ActiveKillingPanel(QWidget):
         self.metadata_loader = metadata_loader
         self.viewer = viewer
         self.log = log_callback or (lambda m: None)
+        self._queue_callback = queue_callback
         self._init_ui()
 
     # ── UI ──────────────────────────────────────────────────────────────────
@@ -1137,13 +1225,30 @@ class ActiveKillingPanel(QWidget):
         layout.addWidget(viewer_group)
 
         # ── Run button ─────────────────────────────────────────────────────
+        action_row = QHBoxLayout()
+        action_row.setSpacing(6)
+
         self.btn_run = QPushButton("\u25b6  Run Active Killing Analysis")
         self.btn_run.setStyleSheet(
             "background-color: #c0392b; color: white; font-weight: bold; "
             "border-radius: 4px; padding: 8px; font-size: 13px;"
         )
         self.btn_run.clicked.connect(self._on_run_clicked)
-        layout.addWidget(self.btn_run)
+        action_row.addWidget(self.btn_run, stretch=1)
+
+        self.btn_queue = QPushButton("+\U0001f6d2")
+        self.btn_queue.setFixedSize(40, 34)
+        self.btn_queue.setToolTip("Add Active Killing Analysis to Processing Queue")
+        self.btn_queue.setStyleSheet(
+            "QPushButton { background: #1a1a2e; color: #ffc107; border: 1px solid #ffc107; "
+            "border-radius: 4px; font-size: 12px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
+            "QPushButton:disabled { background: #2a2a2a; color: #666; border: 1px solid #555; }"
+        )
+        self.btn_queue.clicked.connect(self._on_queue_clicked)
+        action_row.addWidget(self.btn_queue)
+
+        layout.addLayout(action_row)
         layout.addStretch()
 
         self._validate()
@@ -1168,12 +1273,36 @@ class ActiveKillingPanel(QWidget):
     def _active_killing_dir(self, immune_type: str) -> Path:
         return Path(self.metadata_loader.output_dir) / "analysis" / immune_type / "active_killing"
 
+    def set_queue_callback(self, callback):
+        """Set the callback used by the cart button to enqueue this analysis."""
+        self._queue_callback = callback
+        if hasattr(self, "btn_queue"):
+            self.btn_queue.setEnabled(callback is not None and self.btn_run.isEnabled())
+
+    def get_queue_params(self) -> dict:
+        """Snapshot the current Active Killing analysis settings for the queue."""
+        return {
+            "immune_type": self._get_immune_type(),
+            **self._collect_params(),
+        }
+
+    def _on_queue_clicked(self):
+        if self._queue_callback is None:
+            self.log("⚠️ Active Killing queue is not connected.")
+            return
+        self._validate()
+        if not self.btn_run.isEnabled():
+            return
+        self._queue_callback()
+
     def _validate(self):
         immune = self._get_immune_type()
         if not immune or "(no immune" in immune:
             self.validation_label.setText("\u26a0\ufe0f No immune cell types detected in metadata.")
             self.validation_label.setStyleSheet("color: #E57373; font-size: 10px;")
             self.btn_run.setEnabled(False)
+            if hasattr(self, "btn_queue"):
+                self.btn_queue.setEnabled(False)
             return
         csv = self._feature_csv_path(immune)
         if not csv.exists():
@@ -1184,10 +1313,14 @@ class ActiveKillingPanel(QWidget):
             )
             self.validation_label.setStyleSheet("color: #E57373; font-size: 10px;")
             self.btn_run.setEnabled(False)
+            if hasattr(self, "btn_queue"):
+                self.btn_queue.setEnabled(self._queue_callback is not None and False)
         else:
             self.validation_label.setText(f"\u2713 Ready  \u2014  using: {csv.name}")
             self.validation_label.setStyleSheet("color: #66BB6A; font-size: 10px;")
             self.btn_run.setEnabled(True)
+            if hasattr(self, "btn_queue"):
+                self.btn_queue.setEnabled(self._queue_callback is not None)
 
     def _collect_params(self) -> dict:
         return {
@@ -1294,86 +1427,13 @@ class ActiveKillingPanel(QWidget):
         except ImportError:
             _has_sns = False
 
-        def _histplot(data, ax, color):
-            if _has_sns and not data.empty:
-                sns.histplot(data, kde=True, ax=ax, color=color)
-            elif not data.empty:
-                ax.hist(data.dropna(), bins=20, color=color, alpha=0.8)
-
-        samples = df_killing["sample_name"].unique()
-        for sample_name in samples:
-            df_s_all = df_killing[df_killing["sample_name"] == sample_name]
-            df_s_active = df_s_all[df_s_all["is_active_killing"]].copy()
-
-            fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-            axes = axes.flatten()
-
-            # 1. Killing efficiency distribution
-            if not df_s_active.empty and "killing_efficiency" in df_s_active.columns:
-                _histplot(df_s_active["killing_efficiency"], axes[0], "red")
-            axes[0].set_title("1. Killing Efficiency Distribution", fontsize=14, fontweight="bold")
-            axes[0].set_xlabel("Efficiency Score (signal increase / expected background)")
-            axes[0].set_ylabel("Active Killing Events")
-            axes[0].set_xlim(left=0, right=10)
-
-            # 2. Smoothed kinetics
-            temp_counts = (
-                df_s_active.groupby("position_t").size()
-                if not df_s_active.empty else pd.Series(dtype=int)
-            )
-            full_t = None
-            if not temp_counts.empty:
-                max_t = int(df_s_all["position_t"].max())
-                full_t = pd.Series(0, index=range(max_t + 1))
-                full_t.update(temp_counts)
-                window = max(5, max_t // 20)
-                smoothed = full_t.rolling(window=window, center=True).mean()
-                axes[1].plot(full_t.index, full_t.values, color="darkred", alpha=0.2, label="Raw Counts")
-                axes[1].plot(smoothed.index, smoothed.values, color="red", linewidth=2, label="Kinetics Trend")
-                axes[1].fill_between(smoothed.index, 0, smoothed.values, color="red", alpha=0.1)
-            axes[1].set_title("2. Killing Intensity (Smoothed)", fontsize=14, fontweight="bold")
-            axes[1].set_xlabel("Timepoint")
-            axes[1].set_ylabel("Events / Timepoint")
-            axes[1].legend()
-
-            # 3. Cumulative progress
-            if full_t is not None:
-                cumulative = full_t.cumsum()
-                axes[2].plot(cumulative.index, cumulative.values, color="darkblue", linewidth=3)
-                axes[2].fill_between(cumulative.index, 0, cumulative.values, color="blue", alpha=0.1)
-            axes[2].set_title("3. Cumulative Killing Progress", fontsize=14, fontweight="bold")
-            axes[2].set_xlabel("Timepoint")
-            axes[2].set_ylabel("Cumulative Active Killing Events")
-            axes[2].grid(True, linestyle="--", alpha=0.6)
-
-            # 4. Events per immune cell
-            if not df_s_active.empty and "immune_track_id" in df_s_active.columns:
-                epc = df_s_active.groupby("immune_track_id").size()
-                max_ev = int(epc.max())
-                cnts = epc.value_counts().reindex(range(1, max_ev + 1), fill_value=0)
-                axes[3].bar(cnts.index, cnts.values, color="red", edgecolor="black", alpha=0.8)
-                axes[3].set_xticks(range(1, max_ev + 1))
-            axes[3].set_title("4. Distribution of Killing Events per Cell", fontsize=14, fontweight="bold")
-            axes[3].set_xlabel("Number of Active Killing Events")
-            axes[3].set_ylabel("Number of Cells")
-            axes[3].grid(True, axis="y", linestyle="--", alpha=0.6)
-
-            plt.tight_layout()
-            sample_plot_dir = results_dir / "plots" / str(sample_name)
-            sample_plot_dir.mkdir(parents=True, exist_ok=True)
-            plot_path = sample_plot_dir / f"killing_kinetics_summary_{sample_name}.png"
-            plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            try:
-                self.log(f"  \U0001f4ca Saved: {plot_path.relative_to(Path(self.metadata_loader.output_dir))}")
-            except ValueError:
-                self.log(f"  \U0001f4ca Saved: {plot_path}")
-
-        # Combined efficiency distribution (all samples)
         df_active_all = df_killing[df_killing["is_active_killing"]].copy()
         if not df_active_all.empty and "killing_efficiency" in df_active_all.columns:
             fig, ax = plt.subplots(figsize=(10, 6))
-            _histplot(df_active_all["killing_efficiency"], ax, "purple")
+            if _has_sns:
+                sns.histplot(df_active_all["killing_efficiency"], kde=True, ax=ax, color="purple")
+            else:
+                ax.hist(df_active_all["killing_efficiency"].dropna(), bins=20, color="purple", alpha=0.8)
             ax.set_title("Combined Killing Efficiency Distribution", fontsize=16, fontweight="bold")
             ax.set_xlabel("Efficiency Score (signal increase / expected background)")
             ax.set_ylabel("Active Killing Events")
@@ -1383,9 +1443,69 @@ class ActiveKillingPanel(QWidget):
             plt.savefig(combined_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
             try:
-                self.log(f"  \U0001f4ca Saved: {combined_path.relative_to(Path(self.metadata_loader.output_dir))}")
+                self.log(f"  📊 Saved: {combined_path.relative_to(Path(self.metadata_loader.output_dir))}")
             except ValueError:
-                self.log(f"  \U0001f4ca Saved: {combined_path}")
+                self.log(f"  📊 Saved: {combined_path}")
+
+    def run_analysis(self, interactive: bool = True):
+        """Run Active Killing analysis, optionally suppressing completion prompts."""
+        self._validate()
+        if not self.btn_run.isEnabled():
+            return
+
+        from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
+        from behav3d.core.metadata import detect_organoid_types_from_metadata
+
+        immune = self._get_immune_type()
+        params = self._collect_params()
+        md = self.metadata_loader.metadata
+        target_types = detect_organoid_types_from_metadata(md)
+        if not target_types:
+            self.log("⚠️ No organoid target types detected — cannot run active killing analysis.")
+            return
+
+        self.btn_run.setEnabled(False)
+        self.btn_run.setText("⏳ Running…")
+        if hasattr(self, "btn_queue"):
+            self.btn_queue.setEnabled(False)
+        try:
+            self.log(
+                f"▶ Active Killing Analysis: {immune} vs {target_types}  "
+                f"(window={params['observation_window']}, "
+                f"signal={params['death_signal_column']}, "
+                f"multiplier={params['killing_threshold_multiplier']})…"
+            )
+            df_killing, df_summary, stats = run_active_killing_analysis(
+                metadata=md,
+                output_dir=str(self.metadata_loader.output_dir),
+                immune_cell_type=immune,
+                target_cell_types=target_types,
+                observation_window=params["observation_window"],
+                death_signal_column=params["death_signal_column"],
+                killing_threshold_multiplier=params["killing_threshold_multiplier"],
+                absolute_killing_threshold=params["absolute_killing_threshold"],
+                min_contact_duration=params["min_contact_duration"],
+                save_results=True,
+            )
+            results_dir = self._active_killing_dir(immune)
+            self._save_plots(df_killing, immune, results_dir)
+            n_active = int(stats.get("total_active_killing_timepoints", 0))
+            rate = stats.get("overall_killing_rate", 0.0)
+            self.log(
+                f"✅ Active Killing Analysis complete — "
+                f"{n_active} active killing timepoints ({rate:.1%} of contact timepoints)."
+            )
+            if interactive:
+                self._offer_open_folder(results_dir)
+        except Exception as e:
+            import traceback as _tb
+            _tb.print_exc()
+            self.log(f"❌ Active Killing Analysis error: {e}")
+        finally:
+            self.btn_run.setEnabled(True)
+            if hasattr(self, "btn_queue"):
+                self.btn_queue.setEnabled(self._queue_callback is not None and self.btn_run.isEnabled())
+            self.btn_run.setText("▶  Run Active Killing Analysis")
 
     # ── Folder open popup ──────────────────────────────────────────────────────
     def _offer_open_folder(self, results_dir: Path):
@@ -1547,6 +1667,7 @@ class FeatureExtractionTab(QWidget):
         self.viewer = viewer
         self.metadata_loader = metadata_loader
         self.panels: dict[str, CellTypeFeaturePanel] = {}
+        self._queue_panel = None
 
         # Track which cell types are organoids (needed for sync)
         self._org_types: list = []
@@ -1613,8 +1734,11 @@ class FeatureExtractionTab(QWidget):
 
         # -- Active Killing Extended Analysis (collapsible) --------------------------
         # Panel body is hidden by default; user clicks the toggle to expand.
+        self._ak_toggle_label_base = (
+            "\U0001f9ec  Extended Analysis \u2014 Active Killing (Immune Cells)"
+        )
         self._ak_toggle_btn = QPushButton(
-            "\u25b6  \U0001f9ec  Extended Analysis \u2014 Active Killing (Immune Cells)"
+            f"\u25b6  {self._ak_toggle_label_base}"
         )
         self._ak_toggle_btn.setCheckable(True)
         self._ak_toggle_btn.setChecked(False)
@@ -1626,6 +1750,7 @@ class FeatureExtractionTab(QWidget):
             "QPushButton:hover { background: #3d1f15; }"
         )
         self._ak_toggle_btn.clicked.connect(self._on_ak_toggle)
+        self._ak_toggle_btn.setVisible(False)
         layout.addWidget(self._ak_toggle_btn)
 
         self._ak_body = QWidget()
@@ -1698,6 +1823,11 @@ class FeatureExtractionTab(QWidget):
             self.cell_tabs.addTab(self._placeholder, "—")
             self.btn_run_batch.setVisible(False)
             self.btn_queue_feature.setVisible(False)
+            self._ak_toggle_btn.setVisible(False)
+            self._ak_toggle_btn.blockSignals(True)
+            self._ak_toggle_btn.setChecked(False)
+            self._ak_toggle_btn.blockSignals(False)
+            self._set_ak_collapsible_state(False)
             return
 
         self.btn_run_batch.setVisible(True)
@@ -1727,9 +1857,17 @@ class FeatureExtractionTab(QWidget):
                 self.active_killing_panel.metadata_loader = self.metadata_loader
                 self.active_killing_panel.viewer = self.viewer
                 self.active_killing_panel.refresh_immune_types(list(imm))
-            self._active_killing_group.setVisible(True)
+            self.active_killing_panel.set_queue_callback(
+                self._queue_active_killing if self._queue_panel is not None else None
+            )
+            self._ak_toggle_btn.setVisible(True)
+            self._set_ak_collapsible_state(self._ak_toggle_btn.isChecked())
         else:
-            self._active_killing_group.setVisible(False)
+            self._ak_toggle_btn.setVisible(False)
+            self._ak_toggle_btn.blockSignals(True)
+            self._ak_toggle_btn.setChecked(False)
+            self._ak_toggle_btn.blockSignals(False)
+            self._set_ak_collapsible_state(False)
 
     def _add_panel(self, ct, category, all_types, cat_types, color_map, is_organoid: bool):
         panel = CellTypeFeaturePanel(
@@ -1749,12 +1887,30 @@ class FeatureExtractionTab(QWidget):
         icon = color_map.get(category, "")
         self.cell_tabs.addTab(panel, f"{icon} {ct}")
 
+    def set_queue_panel(self, queue_panel):
+        """Attach the processing queue so Active Killing can enqueue itself."""
+        self._queue_panel = queue_panel
+        if self.active_killing_panel is not None:
+            self.active_killing_panel.set_queue_callback(self._queue_active_killing)
+
+    def _queue_active_killing(self):
+        """Enqueue the currently selected Active Killing analysis."""
+        if self._queue_panel is None or self.active_killing_panel is None:
+            return
+        from behav3d.napari._queue import StepType
+        params = self.active_killing_panel.get_queue_params()
+        self._queue_panel.add_step(StepType.ACTIVE_KILLING, params=params)
+
+    def _set_ak_collapsible_state(self, checked: bool):
+        """Keep Active Killing toggle text and body visibility in sync."""
+        self._ak_body.setVisible(bool(checked))
+        arrow = "\u25bc" if checked else "\u25b6"
+        self._ak_toggle_btn.setText(f"{arrow}  {self._ak_toggle_label_base}")
+
     # ── Global (Organoid) Dead Threshold Preview ─────────────────────────────
     def _on_ak_toggle(self, checked: bool):
         """Toggle body visibility of the Active Killing collapsible section."""
-        self._ak_body.setVisible(checked)
-        txt = self._ak_toggle_btn.text()
-        self._ak_toggle_btn.setText(("\u25bc" if checked else "\u25b6") + txt[1:])
+        self._set_ak_collapsible_state(checked)
 
     def _notify_organoid_threshold_changed(self, source_ct: str, value: float):
         """Called by an organoid panel when its threshold spinner changes.
@@ -1782,7 +1938,6 @@ class FeatureExtractionTab(QWidget):
 
     def _on_run_batch_clicked(self):
         self.run_batch_feature_extraction(interactive=True)
-
     def run_batch_feature_extraction(self, interactive=True, skip_existing=False):
         """Run feature extraction for all cell types sequentially."""
         if not self.panels:
@@ -1791,6 +1946,11 @@ class FeatureExtractionTab(QWidget):
 
         # Persist global organoid threshold before any panel runs
         self._sync_global_threshold_to_params()
+
+        if self.active_killing_panel is not None:
+            self.active_killing_panel.set_queue_callback(
+                self._queue_active_killing if self._queue_panel is not None else None
+            )
 
         total = len(self.panels)
         self._log(f"Starting batch feature extraction for {total} cell type(s)…")

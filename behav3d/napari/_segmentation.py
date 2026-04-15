@@ -2871,6 +2871,7 @@ class APOCWidget(QWidget):
         self.metadata_loader = metadata_loader
         self.log = log_callback or print
         self._training_widget = None
+        self._strategy_help_button = None
         self._is_session_active = False
         self._init_ui()
 
@@ -3524,6 +3525,69 @@ class APOCWidget(QWidget):
         from qtpy.QtCore import QTimer
         QTimer.singleShot(0, self._on_metadata_updated)
 
+    def _apoc_strategy_help_content(self, strategy_name: str):
+        """Return strategy-specific help text for instance-preview parameters."""
+        if strategy_name == "APOC Mask + EDT/Watershed Resegmentation":
+            return (
+                "APOC Preview Parameters (Mask + EDT/Watershed)",
+                "This strategy uses classifier mask output, then refines instances with EDT + watershed.\n\n"
+                "Parameters for preview:\n"
+                "  • EDT threshold: controls split sensitivity for touching objects.\n"
+                "    Lower -> more aggressive splitting. Higher -> more merged objects.\n"
+                "  • Opening px: smooths boundaries and removes small protrusions/noise.\n"
+                "  • Min size: removes tiny segments below this size threshold.\n"
+                "  • Fill holes: fills internal gaps inside segmented objects."
+            )
+        if strategy_name == "APOC Probability Map + Watershed":
+            return (
+                "APOC Preview Parameters (Probability Map + Watershed)",
+                "This strategy uses probability maps and watershed for instance splitting.\n\n"
+                "Parameters for preview:\n"
+                "  • Mask threshold: foreground cutoff used to build the watershed mask.\n"
+                "  • Seed threshold: seed cutoff used to place watershed seeds.\n"
+                "    Lower -> more seeds and more splits. Higher -> fewer seeds and larger merged regions.\n"
+                "  • Opening px: smooths boundaries and removes small protrusions/noise.\n"
+                "  • Min size: removes tiny segments below this size threshold."
+            )
+        return (
+            "APOC Preview Parameters (Direct Instance Segmentation)",
+            "This strategy predicts instances directly from the classifier output.\n\n"
+            "There are no additional watershed post-processing controls in preview mode for this strategy.\n"
+            "If you need explicit split control, use one of the watershed-based strategies."
+        )
+
+    def _refresh_apoc_strategy_help(self, strategy_name=None):
+        """Update the strategy help popup content for the current selection."""
+        if self._strategy_help_button is None:
+            return
+        strategy = strategy_name or self.combo_strategy.currentText()
+        title, description = self._apoc_strategy_help_content(strategy)
+        self._strategy_help_button._title = title
+        self._strategy_help_button._description = description
+
+    def _clear_apoc_preview_layers_for_cell_type(self, ct: str):
+        """Remove stale APOC preview output layers for one cell type (GUI-side only)."""
+        names = []
+        if str(ct).strip().lower() == "dead":
+            names = ["Pixel Classification (Dead)", "Probability Map (Dead)"]
+        else:
+            ctc = str(ct).capitalize()
+            names = [f"{ctc} Segments", f"Probability Map ({ctc})"]
+
+        for lname in names:
+            if lname in [layer.name for layer in self.viewer.layers]:
+                try:
+                    self.viewer.layers.remove(self.viewer.layers[lname])
+                except Exception:
+                    pass
+
+    def _apoc_cli_info(self, message: str):
+        """Emit concise APOC progress info to stdout (best effort)."""
+        try:
+            print(f"APOC | {message}", flush=True)
+        except Exception:
+            pass
+
     # ── Metadata update ─────────────────────────────────────────
     def _on_metadata_updated(self):
         """Called when metadata is loaded/updated. Rebuild training widget."""
@@ -3598,8 +3662,10 @@ class APOCWidget(QWidget):
         def wrapped_run_training(cell_types_to_train):
             self._apply_apoc_gpu_selection(log_message=False)
             gpu_name = self._selected_gpu_device_name() or "default OpenCL device"
+            strategy_name = self.combo_strategy.currentText() if hasattr(self, 'combo_strategy') else self.STRATEGIES[0]
             self.log(f"🖥️ APOC training device: {gpu_name}")
             self.log(f"▶ Starting APOC training for: {cell_types_to_train}")
+            self._apoc_cli_info(f"training start | strategy={strategy_name} | gpu={gpu_name} | cell_types={cell_types_to_train}")
             res = orig_run_training(cell_types_to_train)
             self._reorder_apoc_training_layers()
             try:
@@ -3608,9 +3674,12 @@ class APOCWidget(QWidget):
                     ok, msg = self._apoc_try_migrate_from_tab_config(pixel_class_outdir, ct)
                     if not ok:
                         self.log(f"  ⚠️ {ct}: could not normalize classifier header after training ({msg})")
+                        self._apoc_cli_info(f"warning | {ct}: could not normalize classifier header ({msg})")
             except Exception as e:
                 self.log(f"  ⚠️ Could not normalize classifier headers after training: {e}")
+                self._apoc_cli_info(f"warning | classifier-header normalization failed: {e}")
             self.log("✅ APOC training process completed.")
+            self._apoc_cli_info("training complete")
             return res
         self._training_widget._run_training = wrapped_run_training
 
@@ -3618,9 +3687,15 @@ class APOCWidget(QWidget):
         orig_run_instance = self._training_widget._run_instance_preview
         def wrapped_run_instance(ct):
             self._apply_apoc_gpu_selection(log_message=False)
+            strategy_name = self.combo_strategy.currentText() if hasattr(self, 'combo_strategy') else ""
+            self._clear_apoc_preview_layers_for_cell_type(ct)
+            if strategy_name == "APOC (Direct Instance Segmentation)":
+                self._apoc_cli_info(f"instance preview skipped (direct strategy) | stale layers cleared | cell_type={ct}")
             self.log(f"🔍 Running instance segmentation preview for '{ct}'...")
+            self._apoc_cli_info(f"instance preview start | cell_type={ct}")
             res = orig_run_instance(ct)
             self._reorder_apoc_training_layers()
+            self._apoc_cli_info(f"instance preview complete | cell_type={ct}")
             return res
         self._training_widget._run_instance_preview = wrapped_run_instance
 
@@ -3629,6 +3704,7 @@ class APOCWidget(QWidget):
         def wrapped_predict(ct, clf=None):
             self._apply_apoc_gpu_selection(log_message=False)
             self.log(f"🧪 Running classifier inference (pixel classification) for '{ct}'...")
+            self._apoc_cli_info(f"inference start | cell_type={ct}")
             return orig_predict(ct, clf=clf)
         self._training_widget._predict_classifier_outputs = wrapped_predict
 
@@ -3648,6 +3724,16 @@ class APOCWidget(QWidget):
         )
         strat_desc.setWordWrap(True)
         strat_desc.setStyleSheet("color:#888; font-size:10px; padding: 0 0 4px 0;")
+
+        strategy_help_label = QLabel("Instance preview parameters")
+        strategy_help_label.setStyleSheet("color:#888; font-size:10px;")
+        self._strategy_help_button = HelpButton("", "")
+        self._refresh_apoc_strategy_help(current_strategy)
+        strategy_help_row = QHBoxLayout()
+        strategy_help_row.setContentsMargins(0, 0, 0, 0)
+        strategy_help_row.addWidget(strategy_help_label)
+        strategy_help_row.addWidget(self._strategy_help_button)
+        strategy_help_row.addStretch()
         
         # Insert them right above global_row1 (after the QFrame separator)
         t_layout = self._training_widget.layout()
@@ -3660,8 +3746,10 @@ class APOCWidget(QWidget):
 
         t_layout.insertLayout(insert_idx, strat_row)
         t_layout.insertWidget(insert_idx + 1, strat_desc)
+        t_layout.insertLayout(insert_idx + 2, strategy_help_row)
 
         self.combo_strategy.currentIndexChanged.connect(self._on_strategy_changed)
+        self.combo_strategy.currentTextChanged.connect(self._refresh_apoc_strategy_help)
         self.training_layout.addWidget(self._training_widget)
         self._update_training_controls_state()
 

@@ -1548,7 +1548,31 @@ class TrackingTab(QWidget):
                 print(f"\n▶ [{step}/{total}] Tracking {ct}...", file=sys.stderr)
                 self._log(f"--- [{step}/{total}] Tracking {ct} ---")
                 panel._run_tracking_for(ct, overwrite=overwrite)
+
+                # Verify tracked outputs exist for this cell type after tracking.
+                missing_outputs = []
+                for _, sample in self.metadata_loader.metadata.iterrows():
+                    sn = sample.get("sample_name", "unknown")
+                    zarr_path = out_dir / "images" / sn / f"{sn}_{ct}_tracked.zarr"
+                    csv_dir = out_dir / "trackdata" / sn / ct
+                    has_csv = csv_dir.exists() and bool(list(csv_dir.glob("*.csv")))
+                    if not zarr_path.exists() or not has_csv:
+                        missing_outputs.append(str(sn))
+                if missing_outputs:
+                    self._log(
+                        f"⚠️ {ct}: tracked outputs missing for {len(missing_outputs)} sample(s): "
+                        + ", ".join(missing_outputs)
+                    )
                 self._log(f"Done: {ct}")
+
+            # Persist final metadata state after full batch execution.
+            csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
+            if csv_path:
+                try:
+                    self.metadata_loader.metadata.to_csv(csv_path, sep=",", index=False)
+                    self._log("Saved metadata CSV after batch tracking.")
+                except Exception as e:
+                    self._log(f"⚠️ Could not save metadata CSV after batch tracking: {e}")
             
             self._log("\u2705 Batch tracking finished.")
             print(f"\n{'='*60}", file=sys.stderr)

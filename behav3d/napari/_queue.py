@@ -32,6 +32,7 @@ class StepType(Enum):
     APOC_SEGMENT = "apoc_segment"
     TRACK = "track"
     FEATURE_EXTRACT = "feature_extract"
+    ACTIVE_KILLING = "active_killing"
     FILTER = "filter"
 
     @property
@@ -44,6 +45,7 @@ class StepType(Enum):
             StepType.APOC_SEGMENT: "⚡ APOC",
             StepType.TRACK: "📍 Batch Tracking",
             StepType.FEATURE_EXTRACT: "🧪 Feature Extraction",
+            StepType.ACTIVE_KILLING: "🔥 Active Killing",
             StepType.FILTER: "🧹 Filtering",
         }[self]
 
@@ -57,6 +59,7 @@ class StepType(Enum):
             StepType.APOC_SEGMENT: 1.5,
             StepType.TRACK: 2,
             StepType.FEATURE_EXTRACT: 3,
+            StepType.ACTIVE_KILLING: 3.5,
             StepType.FILTER: 4,
         }[self]
 
@@ -85,6 +88,9 @@ class QueueStep:
         if self.step_type == StepType.APOC_SEGMENT:
             strat = self.params.get("strategy_name", "")
             return f"⚡ APOC — {strat}" if strat else self.step_type.label
+        if self.step_type == StepType.ACTIVE_KILLING:
+            immune = self.params.get("immune_type", "")
+            return f"🔥 Active Killing — {immune}" if immune else self.step_type.label
         return self.step_type.label
 
 
@@ -385,6 +391,21 @@ class ProcessingQueuePanel(QWidget):
                 else:
                     return  # Cancel adding Filter
 
+        # 4. ACTIVE_KILLING needs FEATURE_EXTRACT for the selected immune type
+        elif step_type == StepType.ACTIVE_KILLING and StepType.FEATURE_EXTRACT not in added_already:
+            missing = self._check_input_data_missing(StepType.ACTIVE_KILLING, params=params)
+            if missing:
+                res = QMessageBox.question(
+                    self, "Missing Feature Data",
+                    "Active Killing data is missing for the selected immune type.\n\n"
+                    "Would you like to add Feature Extraction to the pipeline?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if res == QMessageBox.Yes:
+                    self.add_step(StepType.FEATURE_EXTRACT)
+                else:
+                    return  # Cancel adding Active Killing
+
         # Finally add the requested step
         step = QueueStep(step_type=step_type, params=params)
         self._steps.append(step)
@@ -540,7 +561,7 @@ class ProcessingQueuePanel(QWidget):
 
     # ── Pre-run validation ─────────────────────────────────────────────
 
-    def _check_input_data_missing(self, step_type: StepType) -> bool:
+    def _check_input_data_missing(self, step_type: StepType, params: dict | None = None) -> bool:
         """Check if input data required for a step is missing."""
         md = self.metadata_loader.metadata
         if md is None:
@@ -594,6 +615,24 @@ class ProcessingQueuePanel(QWidget):
                 if not feat_csv.exists():
                     return True
             return False
+
+        elif step_type == StepType.ACTIVE_KILLING:
+            immune_type = None
+            if params:
+                immune_type = params.get("immune_type")
+            if not immune_type and hasattr(self, "_pending_active_killing_params"):
+                immune_type = self._pending_active_killing_params.get("immune_type")
+            if not immune_type:
+                return True
+            feat_csv = (
+                out_dir / "analysis" / immune_type / "track_features" /
+                f"BEHAV3D_{immune_type}_combined_track_features.csv"
+            )
+            filtered_csv = (
+                out_dir / "analysis" / immune_type / "track_features" /
+                f"BEHAV3D_{immune_type}_combined_track_features_filtered.csv"
+            )
+            return not (feat_csv.exists() or filtered_csv.exists())
 
         return False
 
@@ -660,6 +699,13 @@ class ProcessingQueuePanel(QWidget):
                         if feat_csv.exists():
                             warnings.append(f"Feature data for {ct_dir.name}")
                             break
+
+            elif step.step_type == StepType.ACTIVE_KILLING:
+                immune_type = step.params.get("immune_type", "")
+                if immune_type:
+                    ak_dir = out_dir / "analysis" / immune_type / "active_killing"
+                    if ak_dir.exists() and any(ak_dir.rglob("*.csv")):
+                        warnings.append(f"Active killing data for {immune_type}")
 
             elif step.step_type == StepType.FILTER:
                 analysis_dir = out_dir / "analysis"
@@ -782,6 +828,8 @@ class ProcessingQueuePanel(QWidget):
             self._run_apoc_segment(step, skip_existing=skip_existing)
         elif step.step_type == StepType.FEATURE_EXTRACT:
             self._run_feature_extract(skip_existing=skip_existing)
+        elif step.step_type == StepType.ACTIVE_KILLING:
+            self._run_active_killing(step, skip_existing=skip_existing)
         elif step.step_type == StepType.FILTER:
             self._run_filter(skip_existing=skip_existing)
 
@@ -813,6 +861,25 @@ class ProcessingQueuePanel(QWidget):
             self.feature_extraction_tab.run_batch_feature_extraction(interactive=False, skip_existing=skip_existing)
         else:
             raise RuntimeError("Feature Extraction tab not wired to queue.")
+
+    def _run_active_killing(self, step: QueueStep, skip_existing: bool = False):
+        """Run Active Killing analysis for the queued immune type."""
+        if self.feature_extraction_tab is None or not hasattr(self.feature_extraction_tab, "active_killing_panel"):
+            raise RuntimeError("Feature Extraction tab not wired to queue.")
+
+        panel = self.feature_extraction_tab.active_killing_panel
+        immune_type = step.params.get("immune_type", "")
+        if immune_type:
+            idx = panel.immune_combo.findText(str(immune_type))
+            if idx >= 0:
+                panel.immune_combo.setCurrentIndex(idx)
+
+        # Make the step-specific params visible to dependency checks.
+        self._pending_active_killing_params = dict(step.params)
+        try:
+            panel.run_analysis(interactive=False)
+        finally:
+            self._pending_active_killing_params = {}
 
     def _run_cellpose_segment(self, step: QueueStep, skip_existing: bool = False):
         """Run cellpose segmentation for the cell type stored in step.params."""

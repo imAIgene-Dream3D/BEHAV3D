@@ -72,6 +72,7 @@ class BEHAV3DWidget(QWidget):
             filtering_tab=self.filtering_tab,
         )
         layout.addWidget(self.queue_panel)
+        self.feature_extraction_tab.set_queue_panel(self.queue_panel)
 
         # Wire up +🛒 buttons to queue
         pc = self.segmentation_tab.pixel_classifier_page
