@@ -180,7 +180,7 @@ import math
 import time
 import traceback
 from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
-from behav3d.io.images import load_image, convert_raw_file_to_zarr, convert_label_file_to_zarr, _ensure_zarr
+from behav3d.io.images import load_image, convert_raw_file_to_zarr
 from tqdm import tqdm
 from datetime import datetime
 
@@ -270,7 +270,7 @@ def run_feature_extraction(
                         if pd.notna(sample_metadata[col]):
                             contact_thresholds[cell_type_name] = sample_metadata[col]
 
-            dead_channel=sample_metadata['dead_channel']
+            dead_channel=sample_metadata.get('dead_channel', None)
             
             print("###### Running track feature calculation")
             img_outdir = Path(output_dir, "images", sample_name)
@@ -360,14 +360,13 @@ def run_feature_extraction(
                     axis_order = val.upper()
 
             seg_path = Path(current_cell_segments_path)
-            seg_zarr = seg_path if seg_path.suffix == ".zarr" else Path(img_outdir, f"{seg_path.stem}.zarr")
-            convert_label_file_to_zarr(
-                path=seg_path,
-                outpath=seg_zarr,
-                axis_order=axis_order,
-                overwrite=overwrite,
-            )
-            current_cell_segments_path = seg_zarr
+            if seg_path.suffix != ".zarr" and not str(seg_path).endswith(".zarr.zip"):
+                print(
+                    f"⚠️  {cell_type} in sample {sample_name} uses a tracked image that is not .zarr: {seg_path}. "
+                    "Please run Tracking or Import external tracking first."
+                )
+                continue
+            current_cell_segments_path = seg_path
 
             raw_path = Path(raw_image_path)
             raw_zarr = raw_path if raw_path.suffix == ".zarr" else Path(img_outdir, f"{sample_name}.zarr")
