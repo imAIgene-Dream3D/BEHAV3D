@@ -823,8 +823,8 @@ def _resolve_state_paths(output_dir, cell_type):
         full_outdir=full_outdir,
         intrinsic_qc_outdir=intrinsic_qc_outdir,
         full_qc_outdir=full_qc_outdir,
-        intrinsic_classifier_default_path=intrinsic_outdir / f"intrinsic_state_classification_random_forest_{cell_type}.pkl",
-        full_classifier_default_path=full_outdir / f"state_classification_random_forest_{cell_type}.pkl",
+        intrinsic_classifier_default_path=intrinsic_outdir / f"intrinsic_state_random_forest_{cell_type}.pkl",
+        full_classifier_default_path=full_outdir / f"state_random_forest_{cell_type}.pkl",
         state_composition_outdir=state_outdir / "state_composition",
         state_transitions_outdir=state_outdir / "state_transitions",
     )
