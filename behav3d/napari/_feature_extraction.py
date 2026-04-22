@@ -26,9 +26,10 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QCheckBox,
     QDoubleSpinBox, QSpinBox, QGroupBox, QMessageBox, QScrollArea,
-    QComboBox,
+    QComboBox, QToolTip,
 )
 from qtpy.QtCore import Qt
+from qtpy.QtGui import QCursor
 
 from behav3d.napari._segmentation import make_help_row
 
@@ -37,7 +38,6 @@ _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
 
 # Prefix used for all temporary preview layers so they can be cleaned up easily
 _PREVIEW_PREFIX = "[Preview]"
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Shared preview helpers (module-level so panels + tab can both use them)
@@ -325,6 +325,7 @@ def _update_dead_alive_overlay(
     dead_data: np.ndarray,
     threshold_pct: float,
     layer_name: str = f"{_PREVIEW_PREFIX} Dead/Alive",
+    log_fn=None,
 ):
     """Compute a per-segment dead / alive overlay and update (or create) a
     napari Labels layer.
@@ -335,14 +336,28 @@ def _update_dead_alive_overlay(
     1  green  (alive)
     2  red    (dead)
     """
+    import datetime
     from skimage.measure import regionprops
 
-    def _overlay_for_volume(seg_vol, dead_vol):
+    _log = log_fn or (lambda m: None)
+
+    def _ts():
+        return datetime.datetime.now().strftime("%H:%M:%S")
+
+    def _overlay_for_volume(seg_vol, dead_vol, frame_label=""):
         overlay_vol = np.zeros_like(seg_vol, dtype=np.uint8)
         dead_binary = dead_vol > 0
+        region_stats = []
 
         seg_int = seg_vol.astype(np.int32)
-        for region in regionprops(seg_int):
+        ndim = seg_int.ndim
+        regions = regionprops(seg_int)
+        n_regions = len(regions)
+        if frame_label:
+            msg = f"[{_ts()}] [Preview] Computing overlay{frame_label}: {n_regions} segments…"
+            print(msg)
+            _log(f"  ⏳ Overlay{frame_label}: {n_regions} segments…")
+        for region in regions:
             label_val = region.label
             mask = seg_int == label_val
             total_pixels = int(mask.sum())
@@ -351,15 +366,29 @@ def _update_dead_alive_overlay(
             dead_pixels = int((mask & dead_binary).sum())
             pct = (dead_pixels / total_pixels) * 100.0
             overlay_vol[mask] = 2 if (pct >= threshold_pct and threshold_pct > 0) else 1
-        return overlay_vol
+
+            bbox_min = region.bbox[:ndim]
+            bbox_max = region.bbox[ndim:]
+            extent_x = float(bbox_max[-1] - bbox_min[-1])
+            region_stats.append(
+                {
+                    "label": int(label_val),
+                    "centroid": tuple(float(v) for v in region.centroid),
+                    "pct_dead": float(pct),
+                    "extent_x": extent_x,
+                }
+            )
+        return overlay_vol, region_stats
 
     seg_arr = np.asarray(seg_data)
     dead_arr = np.asarray(dead_data)
 
+    frame_stats = []
     if seg_arr.ndim >= 4:
         if dead_arr.ndim == 3:
             dead_arr = np.repeat(dead_arr[np.newaxis, ...], seg_arr.shape[0], axis=0)
         t_common = min(seg_arr.shape[0], dead_arr.shape[0])
+        print(f"[{_ts()}] [Preview] Dead/Alive overlay: {t_common} timepoint(s), threshold={threshold_pct:.2f}%")
         overlay = np.zeros_like(seg_arr[:t_common], dtype=np.uint8)
         for t in range(t_common):
             seg_vol = np.asarray(seg_arr[t])
@@ -370,7 +399,13 @@ def _update_dead_alive_overlay(
                 dead_vol = dead_vol[0]
             if dead_vol.ndim < seg_vol.ndim:
                 dead_vol = np.broadcast_to(dead_vol, seg_vol.shape)
-            overlay[t] = _overlay_for_volume(seg_vol, dead_vol)
+            overlay_t, stats_t = _overlay_for_volume(
+                seg_vol, dead_vol, frame_label=f" t={t}"
+            )
+            overlay[t] = overlay_t
+            frame_stats.append(stats_t)
+            n_dead = sum(1 for r in stats_t if r["pct_dead"] >= threshold_pct and threshold_pct > 0)
+            print(f"[{_ts()}] [Preview]   t={t} done — {len(stats_t)} cells, {n_dead} dead")
     else:
         seg_vol = np.asarray(seg_arr)
         dead_vol = np.asarray(dead_arr)
@@ -378,7 +413,11 @@ def _update_dead_alive_overlay(
             dead_vol = dead_vol.max(axis=0)
         if dead_vol.ndim < seg_vol.ndim:
             dead_vol = np.broadcast_to(dead_vol, seg_vol.shape)
-        overlay = _overlay_for_volume(seg_vol, dead_vol)
+        print(f"[{_ts()}] [Preview] Dead/Alive overlay: single volume, threshold={threshold_pct:.2f}%")
+        overlay, stats_0 = _overlay_for_volume(seg_vol, dead_vol, frame_label="")
+        n_dead = sum(1 for r in stats_0 if r["pct_dead"] >= threshold_pct and threshold_pct > 0)
+        print(f"[{_ts()}] [Preview]   Done — {len(stats_0)} cells, {n_dead} dead")
+        frame_stats = [stats_0]
 
     # Build DirectLabelColormap with a `None` fallback key to suppress napari
     # UserWarning "color_dict did not provide a default color"
@@ -395,6 +434,7 @@ def _update_dead_alive_overlay(
     except Exception:
         cmap = None
 
+    print(f"[{_ts()}] [Preview] Updating Dead/Alive layer in viewer…")
     # Update existing layer or create a new one
     try:
         layer = viewer.layers[layer_name]
@@ -406,6 +446,75 @@ def _update_dead_alive_overlay(
         if cmap is not None:
             kw["colormap"] = cmap
         viewer.add_labels(overlay, **kw)
+
+    print(f"[{_ts()}] [Preview] Dead/Alive layer ready.")
+    return overlay, frame_stats
+
+
+def _remove_layer_if_exists(viewer, layer_name: str):
+    try:
+        layer = viewer.layers[layer_name]
+        viewer.layers.remove(layer)
+    except Exception:
+        pass
+
+
+
+def _build_dead_pct_maps(frame_stats):
+    """Build per-frame {label_id: pct_dead} maps from region stats."""
+    pct_maps = []
+    for frame_regions in frame_stats or []:
+        frame_map = {}
+        for r in frame_regions:
+            label_id = int(r.get("label", 0))
+            if label_id > 0:
+                frame_map[label_id] = float(r.get("pct_dead", 0.0))
+        pct_maps.append(frame_map)
+    return pct_maps
+
+
+def _merge_org_segments(
+    segs_dict: dict, org_cell_types: list
+) -> "tuple[np.ndarray | None, dict]":
+    """Merge segment arrays for multiple organoid types into one array with
+    non-overlapping labels so the Dead/Alive overlay can cover all types.
+
+    Returns
+    -------
+    merged_arr : ndarray | None
+    label_type_map : dict
+        merged_label_id -> (cell_type, original_label_id)
+    """
+    available = [ct for ct in org_cell_types if ct in segs_dict]
+    if not available:
+        return None, {}
+    if len(available) == 1:
+        ct = available[0]
+        arr = np.asarray(segs_dict[ct])
+        label_map = {
+            int(lbl): (ct, int(lbl))
+            for lbl in np.unique(arr)
+            if lbl > 0
+        }
+        return arr.copy(), label_map
+
+    ref = np.asarray(segs_dict[available[0]])
+    merged = np.zeros(ref.shape, dtype=np.int32)
+    label_map: dict = {}
+    offset = 0
+    for ct in available:
+        arr = np.asarray(segs_dict[ct]).astype(np.int32)
+        if arr.shape != merged.shape:
+            continue
+        max_lbl = int(arr.max()) if arr.size > 0 else 0
+        for lbl in np.unique(arr):
+            if lbl <= 0:
+                continue
+            label_map[int(lbl + offset)] = (ct, int(lbl))
+        shifted = np.where(arr > 0, arr + offset, 0)
+        merged = np.where(shifted > 0, shifted, merged)
+        offset += max_lbl + 1
+    return merged, label_map
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -449,6 +558,8 @@ class CellTypeFeaturePanel(QWidget):
         self._is_organoid = is_organoid
         self._threshold_getter = threshold_getter  # kept for backward compat
         self._preview_connected = False
+        # List of organoid cell types (set by FeatureExtractionTab for org panels)
+        self._org_cell_types: list = []
 
         # Shared cache dict (for organoid panels, set by FeatureExtractionTab)
         self._org_preview_cache: dict | None = None
@@ -456,6 +567,11 @@ class CellTypeFeaturePanel(QWidget):
         # Cached arrays for live overlay updates
         self._preview_seg_t = None
         self._preview_dead_t = None
+        # merged_label_id -> (cell_type, original_label_id)  — organoid panels
+        self._preview_label_type_map: dict = {}
+        self._preview_stats_t = None
+        self._preview_label_pct_maps = None
+        self._preview_hover_callback = None
 
         # Read saved config
         params = self.metadata_loader.behav3d_parameters
@@ -731,6 +847,147 @@ class CellTypeFeaturePanel(QWidget):
             return round(float(self._threshold_getter()), 2)
         return 0.0
 
+    def _disconnect_preview_dead_hover(self):
+        if self.viewer is None or self._preview_hover_callback is None:
+            self._preview_hover_callback = None
+            return
+        try:
+            self.viewer.mouse_move_callbacks.remove(self._preview_hover_callback)
+        except Exception:
+            pass
+        self._preview_hover_callback = None
+
+    def _attach_preview_dead_hover(self, layer_name: str = f"{_PREVIEW_PREFIX} Dead/Alive"):
+        viewer = self.viewer
+        self._disconnect_preview_dead_hover()
+        if viewer is None or not self._preview_label_pct_maps or self._preview_seg_t is None:
+            return
+        try:
+            viewer.layers[layer_name]
+        except Exception:
+            return
+
+        seg_data = self._preview_seg_t
+        seg_layer_name = f"{_PREVIEW_PREFIX} {self.cell_type} segments"
+
+        def _segment_label_at(position, frame_idx: int) -> int:
+            try:
+                seg_arr = np.asarray(seg_data)
+                if seg_arr.ndim >= 4:
+                    if frame_idx < 0 or frame_idx >= seg_arr.shape[0]:
+                        return 0
+                    seg_vol = np.asarray(seg_arr[frame_idx])
+                else:
+                    seg_vol = np.asarray(seg_arr)
+                if seg_vol.ndim > 3:
+                    seg_vol = seg_vol[0]
+
+                try:
+                    seg_layer = self.viewer.layers[seg_layer_name]
+                except Exception:
+                    return 0
+                data_position = seg_layer.world_to_data(position)
+                coords = tuple(int(round(float(c))) for c in data_position[-seg_vol.ndim:])
+                for i, c in enumerate(coords):
+                    if c < 0 or c >= seg_vol.shape[i]:
+                        return 0
+                return int(seg_vol[coords])
+            except Exception:
+                return 0
+
+        def _show_tooltip(text: str):
+            try:
+                QToolTip.showText(QCursor.pos(), text, self.viewer.window._qt_window)
+            except Exception:
+                try:
+                    QToolTip.showText(QCursor.pos(), text)
+                except Exception:
+                    pass
+
+        def _hide_tooltip():
+            try:
+                QToolTip.hideText()
+            except Exception:
+                pass
+
+        # Capture label-type map so the closure always uses the current map
+        _label_type_map = getattr(self, "_preview_label_type_map", {})
+
+        def _on_mouse_move(*args):
+            """Works with both napari ≤0.4.18 (event,) and ≥0.4.19 (viewer,event)."""
+            if self.viewer is None:
+                return
+            position = getattr(self.viewer.cursor, "position", None)
+            if position is None:
+                self.viewer.status = ""
+                _hide_tooltip()
+                return
+
+            frame_idx = 0
+            if len(self._preview_label_pct_maps) > 1:
+                try:
+                    frame_idx = int(self.viewer.dims.current_step[0])
+                except Exception:
+                    frame_idx = 0
+            if frame_idx < 0 or frame_idx >= len(self._preview_label_pct_maps):
+                self.viewer.status = ""
+                _hide_tooltip()
+                return
+
+            label_id = _segment_label_at(position, frame_idx)
+            if label_id <= 0:
+                self.viewer.status = ""
+                _hide_tooltip()
+                return
+
+            pct_dead = self._preview_label_pct_maps[frame_idx].get(label_id)
+            # Resolve cell type + original label from merged organoid map
+            type_info = _label_type_map.get(label_id)
+            if type_info is not None:
+                ct_name, orig_lbl = type_info
+                if pct_dead is None:
+                    status_text = f"{ct_name} #{orig_lbl}"
+                else:
+                    status_text = f"{ct_name} #{orig_lbl} | {pct_dead:.2f}% dead"
+            else:
+                if pct_dead is None:
+                    status_text = f"Cell #{label_id}"
+                else:
+                    status_text = f"Cell #{label_id} | {pct_dead:.2f}% dead"
+            self.viewer.status = status_text
+            _show_tooltip(status_text)
+
+        self._preview_hover_callback = _on_mouse_move
+        # viewer.mouse_move_callbacks is the napari-version-agnostic API
+        viewer.mouse_move_callbacks.append(_on_mouse_move)
+
+    def _refresh_preview_dead_layers(self, value: float | None = None):
+        viewer = self.viewer
+        if (
+            viewer is None
+            or self._preview_seg_t is None
+            or self._preview_dead_t is None
+        ):
+            return
+        thr = self._get_threshold() if value is None else round(float(value), 2)
+        import datetime
+        print(
+            f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [Preview] "
+            f"Refreshing Dead/Alive overlay — threshold={thr:.2f}% "
+            f"({self.cell_type})"
+        )
+        _, frame_stats = _update_dead_alive_overlay(
+            viewer, self._preview_seg_t, self._preview_dead_t, thr,
+            log_fn=self.log,
+        )
+        self._preview_stats_t = frame_stats
+        self._preview_label_pct_maps = _build_dead_pct_maps(frame_stats)
+        self._attach_preview_dead_hover()
+
+        if self._is_organoid and self._org_preview_cache is not None:
+            self._org_preview_cache["stats_t"] = frame_stats
+            self._org_preview_cache["label_pct_maps"] = self._preview_label_pct_maps
+
     def _on_workers_changed(self, value):
         n_cores = os.cpu_count() or 4
         max_allowed = max(1, n_cores - 1)
@@ -903,17 +1160,28 @@ class CellTypeFeaturePanel(QWidget):
             output_dir = Path(self.metadata_loader.output_dir)
             self.log(f"Loading preview \u2014 {self.cell_type} / {sample_name}\u2026")
 
+            import datetime
+            def _ts():
+                return datetime.datetime.now().strftime("%H:%M:%S")
+
+            print(f"\n[{_ts()}] [Preview] {'='*46}")
+            print(f"[{_ts()}] [Preview] Dead threshold preview: {self.cell_type} / {sample_name}")
+            print(f"[{_ts()}] [Preview] {'='*46}")
+
             # Resolve dead mask (with diagnostic logging)
+            print(f"[{_ts()}] [Preview] Step 1/5 \u2014 Resolving dead mask...")
             dead_arr, dead_method, tried_paths = _resolve_dead_mask(
                 sample_row, output_dir, log_fn=self.log
             )
             if dead_arr is None:
+                print(f"[{_ts()}] [Preview] \u274c Dead mask not found.")
                 self.log(
                     "\u26a0\ufe0f Dead mask not found. Paths tried:\n"
                     + "\n".join(f"    {p}" for p in tried_paths)
                     + "\nRun dead mask segmentation first (Segmentation tab)."
                 )
                 return
+            print(f"[{_ts()}] [Preview]   Dead mask loaded (method={dead_method}).")
             if dead_method == "raw":
                 self.log(
                     "\u2139\ufe0f Dead mask estimated from raw dead channel (Otsu). "
@@ -921,14 +1189,27 @@ class CellTypeFeaturePanel(QWidget):
                 )
 
             # Load raw image (all channels, lazy)
+            print(f"[{_ts()}] [Preview] Step 2/5 \u2014 Loading raw image (lazy)...")
             raw_dask = _load_raw_dask(sample_row, output_dir)
+            if raw_dask is not None:
+                print(f"[{_ts()}] [Preview]   Raw image shape: {raw_dask.shape}")
+            else:
+                print(f"[{_ts()}] [Preview]   Raw image not found \u2014 skipping channel layers.")
 
             # Collect ALL available segments for this sample
             all_types = getattr(self, "all_cell_types", [self.cell_type])
+            print(
+                f"[{_ts()}] [Preview] Step 3/5 \u2014 Loading segments for "
+                f"{len(all_types)} type(s): {all_types}..."
+            )
             segs_dict, seg_sources = _load_all_segments_for_sample(
                 sample_row, all_types, output_dir
             )
+            for ct, arr in segs_dict.items():
+                shape_str = str(np.asarray(arr).shape)
+                print(f"[{_ts()}] [Preview]   {ct}: shape={shape_str}, source={seg_sources.get(ct,'?')}")
             if self.cell_type not in segs_dict:
+                print(f"[{_ts()}] [Preview] \u274c No segments for '{self.cell_type}' \u2014 aborting.")
                 self.log(
                     f"\u26a0\ufe0f No segments found for '{self.cell_type}' "
                     f"in '{sample_name}'. Run segmentation first."
@@ -936,6 +1217,8 @@ class CellTypeFeaturePanel(QWidget):
                 return
 
             # Clear all viewer layers entirely
+            print(f"[{_ts()}] [Preview] Clearing viewer layers...")
+            self._disconnect_preview_dead_hover()
             self.viewer.layers.clear()
 
             # Raw channels
@@ -952,6 +1235,7 @@ class CellTypeFeaturePanel(QWidget):
                 dead_stack = dead_stack[np.newaxis, np.newaxis, ...]
             elif dead_stack.ndim == 3:
                 dead_stack = dead_stack[np.newaxis, ...]
+            print(f"[{_ts()}] [Preview]   Dead mask stack shape: {dead_stack.shape}")
             viewer.add_image(
                 dead_stack.astype(float),
                 name=f"{_PREVIEW_PREFIX} Dead Mask",
@@ -982,18 +1266,50 @@ class CellTypeFeaturePanel(QWidget):
                 )
             )
 
+            # For organoid panels: merge ALL organoid types into a single
+            # segmentation so the Dead/Alive overlay covers every organoid type.
+            # The shared threshold applies equally to all.
+            if self._is_organoid and self._org_cell_types:
+                print(
+                    f"[{_ts()}] [Preview] Step 4/5 \u2014 Merging "
+                    f"{len(self._org_cell_types)} organoid type(s)..."
+                )
+                overlay_seg, label_type_map = _merge_org_segments(
+                    segs_dict, self._org_cell_types
+                )
+                if overlay_seg is None:
+                    overlay_seg = primary_seg
+                    label_type_map = {}
+                self._preview_label_type_map = label_type_map
+                org_names = [ct for ct in self._org_cell_types if ct in segs_dict]
+                n_labels = len(label_type_map)
+                print(f"[{_ts()}] [Preview]   Merged: {len(org_names)} type(s), {n_labels} total labels")
+                self.log(
+                    f"  Dead/Alive overlay merges {len(org_names)} organoid type(s): "
+                    + ", ".join(org_names)
+                )
+            else:
+                print(f"[{_ts()}] [Preview] Step 4/5 \u2014 Single type ({self.cell_type}), no merge needed.")
+                overlay_seg = primary_seg
+                self._preview_label_type_map = {}
+
             # Compute dead/alive overlay
             thr = self._get_threshold()
-            _update_dead_alive_overlay(viewer, primary_seg, dead_stack, thr)
-
+            print(f"[{_ts()}] [Preview] Step 5/5 \u2014 Computing Dead/Alive overlay (threshold={thr:.2f}%)...")
             # Cache for live spinner updates
-            self._preview_seg_t = primary_seg
+            self._preview_seg_t = overlay_seg
             self._preview_dead_t = dead_stack
+            self._preview_stats_t = None
+            self._preview_label_pct_maps = None
+
+            self._refresh_preview_dead_layers(thr)
 
             # Organoid panels fill the shared tab cache too
             if self._is_organoid and self._org_preview_cache is not None:
-                self._org_preview_cache["seg_t"] = primary_seg
+                self._org_preview_cache["seg_t"] = overlay_seg
                 self._org_preview_cache["dead_t"] = dead_stack
+                self._org_preview_cache["label_pct_maps"] = self._preview_label_pct_maps
+                self._org_preview_cache["label_type_map"] = self._preview_label_type_map
 
             # Wire non-organoid spinner -> live overlay (once)
             if not self._preview_connected and self.spin_dead_threshold is not None:
@@ -1023,10 +1339,7 @@ class CellTypeFeaturePanel(QWidget):
             or self._preview_dead_t is None
         ):
             return
-        thr = round(float(value), 2)
-        _update_dead_alive_overlay(
-            viewer, self._preview_seg_t, self._preview_dead_t, thr
-        )
+        self._refresh_preview_dead_layers(value)
 
 
 
@@ -1673,7 +1986,13 @@ class FeatureExtractionTab(QWidget):
         self._org_types: list = []
 
         # Shared preview cache for organoid panels (all org panels share same ref)
-        self._org_preview_cache: dict = {"seg_t": None, "dead_t": None}
+        self._org_preview_cache: dict = {
+            "seg_t": None,
+            "dead_t": None,
+            "stats_t": None,
+            "label_pct_maps": None,
+            "label_type_map": None,
+        }
 
         self._init_ui()
 
@@ -1883,6 +2202,7 @@ class FeatureExtractionTab(QWidget):
         panel.viewer = self.viewer
         if is_organoid:
             panel._org_preview_cache = self._org_preview_cache
+            panel._org_cell_types = list(self._org_types)
         self.panels[ct] = panel
         icon = color_map.get(category, "")
         self.cell_tabs.addTab(panel, f"{icon} {ct}")
@@ -1932,9 +2252,19 @@ class FeatureExtractionTab(QWidget):
             and cache.get("seg_t") is not None
             and cache.get("dead_t") is not None
         ):
-            _update_dead_alive_overlay(
+            _, frame_stats = _update_dead_alive_overlay(
                 viewer, cache["seg_t"], cache["dead_t"], float(value)
             )
+            label_pct_maps = _build_dead_pct_maps(frame_stats)
+            cache["stats_t"] = frame_stats
+            cache["label_pct_maps"] = label_pct_maps
+            label_type_map = cache.get("label_type_map") or {}
+            for ct, panel in self.panels.items():
+                if ct in self._org_types and panel._preview_seg_t is not None:
+                    panel._preview_stats_t = frame_stats
+                    panel._preview_label_pct_maps = label_pct_maps
+                    panel._preview_label_type_map = label_type_map
+                    panel._attach_preview_dead_hover()
 
     def _on_run_batch_clicked(self):
         self.run_batch_feature_extraction(interactive=True)
