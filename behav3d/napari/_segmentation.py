@@ -1,4 +1,4 @@
-﻿
+
 import napari
 from behav3d.napari._widgets import HelpButton, make_help_row
 import yaml
@@ -2863,6 +2863,14 @@ class APOCWidget(QWidget):
         "APOC (Direct Instance Segmentation)",
         "APOC Mask + EDT/Watershed Resegmentation",
         "APOC Probability Map + Watershed",
+        "Advanced (per cell type)",
+    ]
+
+    # Strategies available inside individual cell-type tabs (no 'Advanced' recursion)
+    _PER_TAB_STRATEGIES = [
+        "APOC (Direct Instance Segmentation)",
+        "APOC Mask + EDT/Watershed Resegmentation",
+        "APOC Probability Map + Watershed",
     ]
 
     def __init__(self, viewer, metadata_loader, log_callback=None, parent=None):
@@ -2873,6 +2881,10 @@ class APOCWidget(QWidget):
         self._training_widget = None
         self._strategy_help_button = None
         self._is_session_active = False
+        self._organoid_types = []          # set when metadata loaded
+        self._per_ct_strategies = {}       # ct -> strategy string (Advanced mode)
+        self._unify_organoids = False      # state of the unified-organoid checkbox
+        self._syncing_organoids = False    # recursion guard for continuous organoid sync
         self._init_ui()
 
     def _init_ui(self):
@@ -3131,7 +3143,7 @@ class APOCWidget(QWidget):
                 if w is not None:
                     w.setEnabled(True)
 
-            # User requested this disabled until training data is loaded.
+            # Preview button requires training data to be loaded.
             run_btn = getattr(tab, "run_instance_btn", None)
             if run_btn is not None:
                 run_btn.setEnabled(can_train)
@@ -3201,9 +3213,67 @@ class APOCWidget(QWidget):
             cfg = getattr(tab, "_saved_config_for_restore", None)
             if isinstance(cfg, dict) and cfg.get("channels"):
                 self._restore_tab_channels_fallback(tab, cfg.get("channels", []))
+            # Channel checkboxes are recreated by refresh; re-wire sync handlers.
+            self._wire_organoid_tab_sync_signals(ct, tab, include_channels=True, include_rf=False)
 
         tab.refresh_channel_checkboxes = wrapped_refresh
         tab._channel_restore_patch_applied = True
+
+    def _collect_apoc_tab_config(self):
+        """Collect flattened per-cell-type APOC config from training tabs."""
+        apoc_config = {}
+        tw = self._training_widget
+        if tw is None:
+            return apoc_config
+
+        for ct, tab in tw.tabs.items():
+            cfg = tab.get_config()
+            for k, v in cfg.items():
+                apoc_config[f"apoc_{ct}_{k}"] = v
+            if cfg.get("segment_size_min") is not None:
+                apoc_config[f"{ct}_segment_size_min"] = cfg["segment_size_min"]
+        return apoc_config
+
+    def _on_organoid_tab_input_changed(self, source_ct, *_args):
+        """Persist tab params and mirror organoid settings from the edited source tab."""
+        if self._syncing_organoids:
+            return
+        if source_ct not in self._organoid_types:
+            return
+
+        apoc_config = self._collect_apoc_tab_config()
+        self._save_apoc_params_to_yaml(
+            updated_apoc_params=apoc_config,
+            sync_source_ct=source_ct,
+        )
+
+    def _wire_organoid_tab_sync_signals(self, ct, tab, include_channels=True, include_rf=True):
+        """Wire organoid tab widgets so edits trigger immediate source-aware mirroring."""
+        if ct not in self._organoid_types:
+            return
+
+        def _connect_once(widget, signal_name):
+            if widget is None:
+                return
+            prop_name = f"_behav3d_sync_connected_{signal_name}"
+            try:
+                if bool(widget.property(prop_name)):
+                    return
+                signal = getattr(widget, signal_name, None)
+                if signal is None:
+                    return
+                signal.connect(lambda *_args, _ct=ct: self._on_organoid_tab_input_changed(_ct))
+                widget.setProperty(prop_name, True)
+            except Exception:
+                return
+
+        if include_rf:
+            _connect_once(getattr(tab, "max_depth_spin", None), "valueChanged")
+            _connect_once(getattr(tab, "num_ensembles_spin", None), "valueChanged")
+
+        if include_channels:
+            for cb in getattr(tab, "channel_checkboxes", []):
+                _connect_once(cb, "stateChanged")
 
     def _restore_training_tab_configs(self, apoc_params):
         if self._training_widget is None:
@@ -3527,6 +3597,16 @@ class APOCWidget(QWidget):
 
     def _apoc_strategy_help_content(self, strategy_name: str):
         """Return strategy-specific help text for instance-preview parameters."""
+        if strategy_name == "Advanced (per cell type)":
+            return (
+                "APOC Preview Parameters (Advanced — per cell type)",
+                "In Advanced mode each cell-type tab has its own strategy selector.\n\n"
+                "Select a strategy inside each tab to show the matching post-processing controls:\n"
+                "  \u2022 EDT threshold, Opening, Min size, Fill holes  (EDT/Watershed)\n"
+                "  \u2022 Mask threshold, Seed threshold, Opening, Min size  (Probability Map)\n"
+                "  \u2022 No extra controls  (Direct)\n\n"
+                "The '\u25b6 Run [Cell Type] Segmentation' button previews using that tab's strategy."
+            )
         if strategy_name == "APOC Mask + EDT/Watershed Resegmentation":
             return (
                 "APOC Preview Parameters (Mask + EDT/Watershed)",
@@ -3607,6 +3687,7 @@ class APOCWidget(QWidget):
         oth = detect_other_cell_types_from_metadata(md)
         all_types = org + imm + oth
         has_death = has_dead_channel(md)
+        self._organoid_types = list(org)  # keep for unified-organoid checkbox
 
         if not all_types:
             return
@@ -3683,17 +3764,33 @@ class APOCWidget(QWidget):
             return res
         self._training_widget._run_training = wrapped_run_training
 
-        # Wrap _run_instance_preview to log whenever preview is triggered
+        # Wrap _run_instance_preview to log and, in Advanced mode, temporarily set per-tab strategy
         orig_run_instance = self._training_widget._run_instance_preview
         def wrapped_run_instance(ct):
             self._apply_apoc_gpu_selection(log_message=False)
             strategy_name = self.combo_strategy.currentText() if hasattr(self, 'combo_strategy') else ""
             self._clear_apoc_preview_layers_for_cell_type(ct)
-            if strategy_name == "APOC (Direct Instance Segmentation)":
+
+            # In Advanced mode: temporarily override the training widget's global strategy
+            # with this tab's per-tab combo value before calling the inner preview.
+            tw = self._training_widget
+            orig_tw_strat = getattr(tw, "_apoc_strategy", strategy_name)
+            if strategy_name == "Advanced (per cell type)" and tw is not None:
+                tab = tw.tabs.get(ct) if tw.tabs else None
+                per_tab_combo = getattr(tab, "_per_tab_strategy_combo", None) if tab else None
+                effective = per_tab_combo.currentText() if per_tab_combo is not None else self._PER_TAB_STRATEGIES[0]
+                tw._apoc_strategy = effective
+            else:
+                effective = strategy_name
+
+            if effective == "APOC (Direct Instance Segmentation)":
                 self._apoc_cli_info(f"instance preview skipped (direct strategy) | stale layers cleared | cell_type={ct}")
-            self.log(f"🔍 Running instance segmentation preview for '{ct}'...")
-            self._apoc_cli_info(f"instance preview start | cell_type={ct}")
+            self.log(f"🔍 Running instance segmentation preview for '{ct}' (strategy: {effective})...")
+            self._apoc_cli_info(f"instance preview start | cell_type={ct} | strategy={effective}")
             res = orig_run_instance(ct)
+            # Restore training widget strategy after Advanced-mode override
+            if strategy_name == "Advanced (per cell type)":
+                tw._apoc_strategy = orig_tw_strat
             self._reorder_apoc_training_layers()
             self._apoc_cli_info(f"instance preview complete | cell_type={ct}")
             return res
@@ -3707,6 +3804,25 @@ class APOCWidget(QWidget):
             self._apoc_cli_info(f"inference start | cell_type={ct}")
             return orig_predict(ct, clf=clf)
         self._training_widget._predict_classifier_outputs = wrapped_predict
+
+        # Wrap _build_display_segments to resolve per-tab strategy in Advanced mode.
+        # Without this, "Advanced (per cell type)" falls through to the EDT path
+        # in the backend, crashing on None spinboxes for tabs using a different strategy.
+        orig_build_display = self._training_widget._build_display_segments
+        def wrapped_build_display(ct, raw_prediction, prob_prediction):
+            tw = self._training_widget
+            strategy_name = self.combo_strategy.currentText() if hasattr(self, 'combo_strategy') else ""
+            orig_tw_strat = getattr(tw, "_apoc_strategy", strategy_name)
+            if strategy_name == "Advanced (per cell type)" and tw is not None:
+                tab = tw.tabs.get(ct) if tw.tabs else None
+                per_tab_combo = getattr(tab, "_per_tab_strategy_combo", None) if tab else None
+                effective = per_tab_combo.currentText() if per_tab_combo is not None else self._PER_TAB_STRATEGIES[0]
+                tw._apoc_strategy = effective
+            try:
+                return orig_build_display(ct, raw_prediction, prob_prediction)
+            finally:
+                tw._apoc_strategy = orig_tw_strat
+        self._training_widget._build_display_segments = wrapped_build_display
 
         # ── Inject Strategy selector into APOCTrainingWidget layout ──────────────
         strat_row = QHBoxLayout()
@@ -3750,6 +3866,115 @@ class APOCWidget(QWidget):
 
         self.combo_strategy.currentIndexChanged.connect(self._on_strategy_changed)
         self.combo_strategy.currentTextChanged.connect(self._refresh_apoc_strategy_help)
+
+        # ── Post-construction tab setup ──────────────────────────────────────
+        # 1. Disable the default reparenting mechanism — instance controls live inside each tab.
+        self._training_widget._refresh_instance_controls = lambda: None
+        self._training_widget.instance_controls_widget.setVisible(False)
+
+        # 2. Rebuild each tab's instance controls inside the tab layout.
+        is_advanced = (current_strategy == "Advanced (per cell type)")
+        for ct, tab in self._training_widget.tabs.items():
+            saved_ct_strat = apoc_params.get(f"per_ct_strategy_{ct}", self._PER_TAB_STRATEGIES[0])
+            if saved_ct_strat not in self._PER_TAB_STRATEGIES:
+                saved_ct_strat = self._PER_TAB_STRATEGIES[0]
+            effective_initial = saved_ct_strat if is_advanced else current_strategy
+            self._rebuild_tab_instance_controls(tab, effective_initial, apoc_params)
+
+        # 3. Inject per-tab strategy combo into each non-dead tab (visible only in Advanced mode).
+        for ct, tab in self._training_widget.tabs.items():
+            if ct == "dead":
+                continue
+            saved_ct_strat = apoc_params.get(f"per_ct_strategy_{ct}", self._PER_TAB_STRATEGIES[0])
+            if saved_ct_strat not in self._PER_TAB_STRATEGIES:
+                saved_ct_strat = self._PER_TAB_STRATEGIES[0]
+
+            per_tab_strat_w = QWidget()
+            per_tab_strat_lay = QHBoxLayout(per_tab_strat_w)
+            per_tab_strat_lay.setContentsMargins(0, 2, 0, 4)
+            per_tab_strat_lay.addWidget(QLabel("↳ Cell type strategy:"))
+            per_tab_combo = QComboBox()
+            per_tab_combo.addItems(self._PER_TAB_STRATEGIES)
+            per_tab_combo.setCurrentText(saved_ct_strat)
+            per_tab_strat_lay.addWidget(per_tab_combo, stretch=1)
+            per_tab_strat_w.setVisible(is_advanced)
+            tab._per_tab_strategy_widget = per_tab_strat_w
+            tab._per_tab_strategy_combo = per_tab_combo
+
+            def _make_strat_handler(t):
+                def _on_per_tab_strat_changed(new_strat):
+                    params_snap = self.metadata_loader.behav3d_parameters.get("apoc", {})
+                    self._rebuild_tab_instance_controls(t, new_strat, params_snap)
+                    apoc_dict = self.metadata_loader.behav3d_parameters.setdefault("apoc", {})
+                    apoc_dict[f"per_ct_strategy_{t.cell_type}"] = new_strat
+                    self._save_apoc_params_to_yaml()
+                return _on_per_tab_strat_changed
+            per_tab_combo.currentTextChanged.connect(_make_strat_handler(tab))
+
+            # Insert at top of tab layout (index 0), above everything else.
+            tab.layout().insertWidget(0, per_tab_strat_w)
+
+        # 4. Add "Unify all organoids" checkbox if ≥2 organoid types.
+        if hasattr(self, '_check_unify_organoids') and self._check_unify_organoids is not None:
+            try:
+                self._check_unify_organoids.setParent(None)
+            except Exception:
+                pass
+        self._check_unify_organoids = None
+        if len(org) >= 2:
+            self._check_unify_organoids = QCheckBox("⛓ Apply same settings to all organoids")
+            self._check_unify_organoids.setChecked(self._unify_organoids)
+            self._check_unify_organoids.setToolTip(
+                "When checked, clicking will immediately mirror the first organoid tab's\n"
+                "config (features, strategy, params) to all other organoid tabs.\n"
+                "Toggle again to re-sync after making further changes."
+            )
+            self._check_unify_organoids.stateChanged.connect(self._on_unify_organoids_changed)
+            tw_layout = self._training_widget.layout()
+            for i in range(tw_layout.count()):
+                item = tw_layout.itemAt(i)
+                if item and item.widget() and type(item.widget()).__name__ == "QTabWidget":
+                    tw_layout.insertWidget(i, self._check_unify_organoids)
+                    break
+
+        # 5. Add global "▶ Run [CellType] Segmentation" button below Train buttons.
+        first_ct = self._training_widget._tab_cell_types[0] if self._training_widget._tab_cell_types else "?"
+        self._global_run_instance_btn = QPushButton(f"▶ Run {first_ct.capitalize()} Segmentation")
+        self._global_run_instance_btn.setStyleSheet(
+            "background-color:#1976D2; color:white; font-weight:bold; padding:6px 12px;"
+        )
+        self._global_run_instance_btn.setToolTip(
+            "Run instance segmentation preview for the currently active cell-type tab.\n"
+            "Uses the strategy and parameters configured in that tab."
+        )
+        self._global_run_instance_btn.clicked.connect(self._on_global_run_instance)
+
+        # Insert after Train ALL button row (find train_all_btn's parent layout)
+        tw_main = self._training_widget.layout()
+        # Find the layout item containing train_all_btn and insert after it
+        inserted_global = False
+        for i in range(tw_main.count()):
+            item = tw_main.itemAt(i)
+            if item and item.layout():
+                sub = item.layout()
+                for j in range(sub.count()):
+                    sub_item = sub.itemAt(j)
+                    if sub_item and sub_item.widget() is self._training_widget.train_all_btn:
+                        tw_main.insertWidget(i + 1, self._global_run_instance_btn)
+                        inserted_global = True
+                        break
+            if inserted_global:
+                break
+        if not inserted_global:
+            tw_main.addWidget(self._global_run_instance_btn)
+
+        # Update button label when tab changes
+        self._training_widget.tab_widget.currentChanged.connect(self._update_global_run_btn_label)
+
+        # Wire reactive organoid mirroring for channels + RF controls.
+        for ct, tab in self._training_widget.tabs.items():
+            self._wire_organoid_tab_sync_signals(ct, tab)
+
         self.training_layout.addWidget(self._training_widget)
         self._update_training_controls_state()
 
@@ -3771,14 +3996,20 @@ class APOCWidget(QWidget):
         # Collect per-cell-type params from training widget tabs
         if self._training_widget is not None:
             per_ct_params = {}
+            per_ct_strategies = {}
             for ct, tab in self._training_widget.tabs.items():
                 cfg = tab.get_config()
                 per_ct_params[ct] = cfg
+                per_tab_combo = getattr(tab, "_per_tab_strategy_combo", None)
+                if per_tab_combo is not None:
+                    per_ct_strategies[ct] = per_tab_combo.currentText()
             params["per_ct_params"] = per_ct_params
+            if strategy == "Advanced (per cell type)":
+                params["per_ct_strategies"] = per_ct_strategies
         return params
 
     # ── Parameters Saving ───────────────────────────────────────
-    def _save_apoc_params_to_yaml(self, updated_apoc_params=None):
+    def _save_apoc_params_to_yaml(self, updated_apoc_params=None, sync_source_ct=None, skip_sync=False):
         out_dir = self.metadata_loader.output_dir
         if not out_dir:
             return
@@ -3786,10 +4017,12 @@ class APOCWidget(QWidget):
         # Update apoc dict
         apoc = self.metadata_loader.behav3d_parameters.setdefault("apoc", {})
         if updated_apoc_params is not None:
-            # We must correctly handle the case where on_params_changed passes (cell_type, config_dict)
-            if isinstance(updated_apoc_params, str):
-                return
-            apoc.update(updated_apoc_params)
+            # Signals like stateChanged / valueChanged may pass an int or str;
+            # only merge if it is actually a dict.
+            if not isinstance(updated_apoc_params, dict):
+                pass  # ignore non-dict args (int from checkbox, str from combo, etc.)
+            else:
+                apoc.update(updated_apoc_params)
             
         # Collect top-level parameters from the GUI
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
@@ -3813,6 +4046,13 @@ class APOCWidget(QWidget):
                 yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
         except Exception as e:
             self.log(f"Warning: Could not save parameters: {e}")
+
+        # If unified mode is active, mirror organoid settings across tabs.
+        if not skip_sync:
+            if sync_source_ct is not None:
+                self._maybe_sync_organoid_tabs(source_ct=sync_source_ct)
+            else:
+                self._maybe_sync_organoid_tabs()
 
     # ── APOC GUI compatibility helpers (frontend-only) ──────────
     def _apoc_normalize_feature_spec(self, feature_spec):
@@ -3972,12 +4212,306 @@ class APOCWidget(QWidget):
 
         return incompatible
 
+    # ── Global Run [CellType] button helpers ────────────────────
+    def _on_global_run_instance(self):
+        """Run batch segmentation for the currently active cell type with overwrite prompt."""
+        tw = self._training_widget
+        if tw is None:
+            return
+        idx = tw.tab_widget.currentIndex()
+        ct = tw._tab_cell_types[idx] if idx < len(tw._tab_cell_types) else None
+        if ct is None:
+            return
+
+        md = self.metadata_loader.metadata
+        if md is None:
+            self.log("⚠️ No metadata loaded.")
+            return
+
+        output_dir = Path(self.metadata_loader.output_dir)
+
+        # Check for pre-existing segments and prompt
+        from qtpy.QtWidgets import QMessageBox
+        sample_names = md['sample_name'].unique()
+        existing = []
+        for sn in sample_names:
+            seg_path = output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
+            if seg_path.exists():
+                existing.append(sn)
+
+        overwrite = False
+        if existing:
+            msg = (
+                f"Found existing {ct} segments for {len(existing)}/{len(sample_names)} samples.\n\n"
+                f"What would you like to do?"
+            )
+            box = QMessageBox(self)
+            box.setWindowTitle(f"Run {ct.capitalize()} Segmentation")
+            box.setText(msg)
+            btn_overwrite = box.addButton("Overwrite", QMessageBox.DestructiveRole)
+            btn_skip = box.addButton("Skip existing", QMessageBox.AcceptRole)
+            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_skip)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked is btn_cancel:
+                return
+            overwrite = (clicked is btn_overwrite)
+
+        # Run segmentation for this cell type only.
+        orig_overwrite = self.check_overwrite.isChecked()
+        self.check_overwrite.setChecked(overwrite)
+        try:
+            self._on_run_segmentation(interactive=True, only_cell_types=[ct])
+        finally:
+            self.check_overwrite.setChecked(orig_overwrite)
+
+    def _update_global_run_btn_label(self, tab_index):
+        """Update the global Run button label to reflect the active cell-type tab."""
+        tw = self._training_widget
+        btn = getattr(self, "_global_run_instance_btn", None)
+        if tw is None or btn is None:
+            return
+        ct = tw._tab_cell_types[tab_index] if tab_index < len(tw._tab_cell_types) else "?"
+        btn.setText(f"▶ Run {ct.capitalize()} Segmentation")
+
+    # ── Helper: rebuild instance controls inside a tab ──────────
+    def _rebuild_tab_instance_controls(self, tab, strategy, initial_params):
+        """Create (or replace) the instance-segmentation preview controls inside a tab.
+
+        Called after APOCTrainingWidget construction so controls always live inside
+        the tab itself rather than being reparented by _refresh_instance_controls.
+        Also called when the per-tab strategy combo changes.
+        """
+        from qtpy.QtWidgets import (
+            QGroupBox, QVBoxLayout, QHBoxLayout, QLabel,
+            QPushButton, QDoubleSpinBox, QSpinBox, QCheckBox,
+        )
+        ct = tab.cell_type
+
+        # Remove previous instance_group from the tab layout (if it was already injected).
+        old_group = getattr(tab, "instance_group", None)
+        if old_group is not None:
+            old_group.setParent(None)
+            old_group.deleteLater()
+
+        # Reset all spinbox / button references on the tab object.
+        tab.run_instance_btn = None
+        tab.instance_group = None
+        tab.prob_mask_threshold_spin = None
+        tab.prob_seed_threshold_spin = None
+        tab.edt_threshold_spin = None
+        tab.segment_size_min_spin = None
+        tab.opening_nr_pixels_spin = None
+        tab.fill_holes_cb = None
+
+        # Dead cell type and Direct strategy have no instance controls.
+        if ct == "dead" or strategy == "APOC (Direct Instance Segmentation)":
+            return
+
+        group = QGroupBox("Instance Segmentation Parameters")
+        group_layout = QVBoxLayout()
+        group_layout.setContentsMargins(4, 4, 4, 4)
+        group_layout.setSpacing(4)
+
+        if strategy == "APOC Probability Map + Watershed":
+            row1 = QHBoxLayout()
+            row2 = QHBoxLayout()
+            tab.prob_mask_threshold_spin = QDoubleSpinBox()
+            tab.prob_mask_threshold_spin.setRange(0.0, 1.0)
+            tab.prob_mask_threshold_spin.setSingleStep(0.05)
+            tab.prob_mask_threshold_spin.setValue(
+                float(initial_params.get(f"{ct}_prob_mask_threshold", 0.5)))
+            row1.addWidget(QLabel("Mask threshold:"))
+            row1.addWidget(tab.prob_mask_threshold_spin)
+
+            tab.prob_seed_threshold_spin = QDoubleSpinBox()
+            tab.prob_seed_threshold_spin.setRange(0.0, 1.0)
+            tab.prob_seed_threshold_spin.setSingleStep(0.05)
+            tab.prob_seed_threshold_spin.setValue(
+                float(initial_params.get(f"{ct}_prob_seed_threshold", 0.8)))
+            row1.addWidget(QLabel("Seed threshold:"))
+            row1.addWidget(tab.prob_seed_threshold_spin)
+            group_layout.addLayout(row1)
+
+            tab.opening_nr_pixels_spin = QSpinBox()
+            tab.opening_nr_pixels_spin.setRange(0, 10)
+            tab.opening_nr_pixels_spin.setValue(
+                int(initial_params.get(f"{ct}_opening_nr_pixels", 0)))
+            row2.addWidget(QLabel("Opening px:"))
+            row2.addWidget(tab.opening_nr_pixels_spin)
+
+            tab.segment_size_min_spin = QSpinBox()
+            tab.segment_size_min_spin.setRange(0, 100000)
+            tab.segment_size_min_spin.setSingleStep(10)
+            tab.segment_size_min_spin.setValue(
+                int(initial_params.get(f"{ct}_segment_size_min", 10)))
+            row2.addWidget(QLabel("Min size:"))
+            row2.addWidget(tab.segment_size_min_spin)
+            group_layout.addLayout(row2)
+
+        elif strategy == "APOC Mask + EDT/Watershed Resegmentation":
+            row1 = QHBoxLayout()
+            row2 = QHBoxLayout()
+            tab.edt_threshold_spin = QDoubleSpinBox()
+            tab.edt_threshold_spin.setRange(0.0, 50.0)
+            tab.edt_threshold_spin.setSingleStep(0.5)
+            tab.edt_threshold_spin.setValue(
+                float(initial_params.get(f"{ct}_edt_threshold", 1.0)))
+            row1.addWidget(QLabel("EDT threshold:"))
+            row1.addWidget(tab.edt_threshold_spin)
+
+            tab.opening_nr_pixels_spin = QSpinBox()
+            tab.opening_nr_pixels_spin.setRange(0, 10)
+            tab.opening_nr_pixels_spin.setValue(
+                int(initial_params.get(f"{ct}_opening_nr_pixels", 0)))
+            row1.addWidget(QLabel("Opening px:"))
+            row1.addWidget(tab.opening_nr_pixels_spin)
+            group_layout.addLayout(row1)
+
+            tab.segment_size_min_spin = QSpinBox()
+            tab.segment_size_min_spin.setRange(0, 100000)
+            tab.segment_size_min_spin.setSingleStep(10)
+            tab.segment_size_min_spin.setValue(
+                int(initial_params.get(f"{ct}_segment_size_min", 10)))
+            row2.addWidget(QLabel("Min size:"))
+            row2.addWidget(tab.segment_size_min_spin)
+
+            tab.fill_holes_cb = QCheckBox("Fill holes")
+            tab.fill_holes_cb.setChecked(
+                bool(initial_params.get(f"{ct}_fill_holes", True)))
+            row2.addWidget(tab.fill_holes_cb)
+            group_layout.addLayout(row2)
+
+        # Preview button inside the tab — for tuning parameters with training data
+        tab.run_instance_btn = QPushButton("Run instance segmentation preview")
+        tab.run_instance_btn.setStyleSheet("padding:4px 8px;")
+        tab.run_instance_btn.setEnabled(self._is_session_active)  # disabled until training data loaded
+        tab.run_instance_btn.clicked.connect(
+            lambda _checked=False, _ct=ct: (
+                self._training_widget._run_instance_preview(_ct)
+                if self._training_widget else None
+            )
+        )
+        group_layout.addWidget(tab.run_instance_btn)
+        group.setLayout(group_layout)
+        tab.instance_group = group
+
+        # Wire value-changed signals to auto-save params
+        for widget in [
+            tab.prob_mask_threshold_spin, tab.prob_seed_threshold_spin,
+            tab.edt_threshold_spin, tab.segment_size_min_spin, tab.opening_nr_pixels_spin,
+        ]:
+            if widget is not None:
+                widget.valueChanged.connect(self._save_apoc_params_to_yaml)
+        if tab.fill_holes_cb is not None:
+            tab.fill_holes_cb.stateChanged.connect(self._save_apoc_params_to_yaml)
+
+        # Inject into the tab's own layout (before the final stretch item).
+        tab_layout = tab.layout()
+        inserted = False
+        for i in range(tab_layout.count() - 1, -1, -1):
+            item = tab_layout.itemAt(i)
+            if item and item.spacerItem():
+                tab_layout.insertWidget(i, group)
+                inserted = True
+                break
+        if not inserted:
+            tab_layout.addWidget(group)
+
+    # ── Helper: unify organoid settings ────────────────────────
+    def _on_unify_organoids_changed(self, state):
+        """When toggled ON, do an initial full sync from the first organoid tab."""
+        from qtpy.QtCore import Qt
+        self._unify_organoids = (state == Qt.Checked)
+        if not self._unify_organoids or self._training_widget is None:
+            return
+        # Perform initial full sync from the first organoid tab
+        if self._organoid_types:
+            self._maybe_sync_organoid_tabs(source_ct=self._organoid_types[0])
+
+    def _maybe_sync_organoid_tabs(self, source_ct=None):
+        """If unified mode is on, mirror the source organoid tab to all other organoid tabs.
+
+        If *source_ct* is not given, the currently visible tab is used.
+        Does nothing if it's not an organoid tab or the guard flag is set.
+        """
+        if not self._unify_organoids or self._syncing_organoids:
+            return
+        tw = self._training_widget
+        if tw is None:
+            return
+
+        # Determine source cell type
+        if source_ct is None:
+            idx = tw.tab_widget.currentIndex()
+            source_ct = tw._tab_cell_types[idx] if idx < len(tw._tab_cell_types) else None
+        if source_ct is None or source_ct not in self._organoid_types:
+            return  # only sync when an organoid tab is the source
+
+        source_tab = tw.tabs.get(source_ct)
+        if source_tab is None:
+            return
+
+        other_org_tabs = [
+            tw.tabs.get(ct) for ct in self._organoid_types
+            if ct != source_ct and ct in tw.tabs
+        ]
+        if not other_org_tabs:
+            return
+
+        self._syncing_organoids = True
+        try:
+            src_cfg = source_tab.get_config()
+            src_strat = getattr(
+                getattr(source_tab, "_per_tab_strategy_combo", None),
+                "currentText", lambda: None
+            )()
+            for tab in other_org_tabs:
+                if tab is None:
+                    continue
+                tab.apply_config(src_cfg)
+                per_combo = getattr(tab, "_per_tab_strategy_combo", None)
+                if per_combo is not None and src_strat and src_strat in self._PER_TAB_STRATEGIES:
+                    per_combo.blockSignals(True)
+                    per_combo.setCurrentText(src_strat)
+                    per_combo.blockSignals(False)
+                    params_snap = self.metadata_loader.behav3d_parameters.get("apoc", {})
+                    self._rebuild_tab_instance_controls(tab, src_strat, params_snap)
+                # Mirror instance segmentation parameter values from source
+                for attr in (
+                    "prob_mask_threshold_spin", "prob_seed_threshold_spin",
+                    "edt_threshold_spin", "segment_size_min_spin", "opening_nr_pixels_spin",
+                ):
+                    src_w = getattr(source_tab, attr, None)
+                    dst_w = getattr(tab, attr, None)
+                    if src_w is not None and dst_w is not None:
+                        dst_w.blockSignals(True)
+                        dst_w.setValue(src_w.value())
+                        dst_w.blockSignals(False)
+                src_fh = getattr(source_tab, "fill_holes_cb", None)
+                dst_fh = getattr(tab, "fill_holes_cb", None)
+                if src_fh is not None and dst_fh is not None:
+                    dst_fh.blockSignals(True)
+                    dst_fh.setChecked(src_fh.isChecked())
+                    dst_fh.blockSignals(False)
+                # Refresh preview after all updates to ensure it reflects all changes
+                # (apply_config updates all config but then spinners are changed after, so we need to update preview again)
+                tab._update_preview()
+            # Persist mirrored destination tab values without triggering another sync cycle.
+            self._save_apoc_params_to_yaml(
+                updated_apoc_params=self._collect_apoc_tab_config(),
+                skip_sync=True,
+            )
+        finally:
+            self._syncing_organoids = False
+
     # ── Run batch segmentation ──────────────────────────────────
-    def _on_run_segmentation(self, interactive=True):
+    def _on_run_segmentation(self, interactive=True, only_cell_types=None):
         try:
             md = self.metadata_loader.metadata
             if md is None:
-                self.log("⚠️ No metadata loaded.")
+                self.log("\u26a0\ufe0f No metadata loaded.")
                 return
 
             from behav3d.preprocessing.segmentation.apoc_segment import run_apoc_segmentation
@@ -4043,6 +4577,23 @@ class APOCWidget(QWidget):
 
             metadata_csv = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv", "")
 
+            # Collect per-cell-type strategies when in Advanced mode
+            per_ct_strategies = None
+            if strategy == "Advanced (per cell type)" and self._training_widget is not None:
+                per_ct_strategies = {}
+                for ct, tab in self._training_widget.tabs.items():
+                    per_tab_combo = getattr(tab, "_per_tab_strategy_combo", None)
+                    per_ct_strategies[ct] = (
+                        per_tab_combo.currentText() if per_tab_combo is not None
+                        else self._PER_TAB_STRATEGIES[0]
+                    )
+                # Persist so batch segmentation can recover after session restart
+                apoc_dict = self.metadata_loader.behav3d_parameters.setdefault("apoc", {})
+                apoc_dict["per_ct_strategies"] = per_ct_strategies
+                self._save_apoc_params_to_yaml()
+                strat_summary = ", ".join(f"{k}:{v[:4]}" for k, v in per_ct_strategies.items())
+                self.log(f"  Advanced strategies: {strat_summary}")
+
             updated_metadata = run_apoc_segmentation(
                 output_dir=str(output_dir),
                 metadata=md,
@@ -4053,6 +4604,8 @@ class APOCWidget(QWidget):
                 n_workers=self.spin_workers.value(),
                 gpu_device=self._selected_gpu_device_name(),
                 apoc_strategy=strategy,
+                per_ct_strategies=per_ct_strategies,
+                only_cell_types=only_cell_types,
             )
 
             # Update metadata

@@ -716,7 +716,7 @@ class CellTypeFeaturePanel(QWidget):
         self.spin_dead_threshold = QDoubleSpinBox()
         self.spin_dead_threshold.setRange(0.0, 100.0)
         self.spin_dead_threshold.setSingleStep(0.1)
-        self.spin_dead_threshold.setDecimals(2)
+        self.spin_dead_threshold.setDecimals(3)
         saved_thr = fcfg.get("dead_mask_percentage_threshold", 0.1)
         self.spin_dead_threshold.setValue(float(saved_thr) if saved_thr else 0.1)
         self.spin_dead_threshold.setSuffix(" %")
