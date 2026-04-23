@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 from pathlib import Path
 
@@ -7,7 +8,12 @@ import pandas as pd
 from scipy import ndimage
 from tqdm import tqdm
 
-from behav3d.core.metadata import load_behav3d_metadata
+from behav3d.core.metadata import (
+    detect_immune_cell_types_from_metadata,
+    detect_organoid_types_from_metadata,
+    detect_other_cell_types_from_metadata,
+    load_behav3d_metadata,
+)
 from behav3d.io.images import load_zarr, write_zarr_parallel
 from behav3d.preprocessing import erode_mask
 
@@ -109,6 +115,16 @@ def _infer_segment_name(path):
     if "_" in stem:
         return stem.split("_")[-1]
     return stem
+
+
+def _original_segment_backup_path(path):
+    path = Path(path)
+    if str(path).endswith(".zarr.zip"):
+        stem = path.name[:-9]
+        return path.with_name(f"{stem}_original.zarr.zip")
+    if path.suffix == ".zarr":
+        return path.with_name(f"{path.stem}_original.zarr")
+    return path.with_name(f"{path.name}_original")
 
 
 def _resolve_output_paths(segment_paths, output_paths, overwrite):
@@ -250,17 +266,6 @@ def _erode_candidate(mask, erosion_pixels):
     return np.asarray(eroded, dtype=bool)
 
 
-def _passes_size_filter(mask, min_size, max_size):
-    size = int(np.count_nonzero(mask))
-    if size == 0:
-        return False
-    if min_size is not None and size < int(min_size):
-        return False
-    if max_size is not None and size > int(max_size):
-        return False
-    return True
-
-
 def _partition_union_by_nearest_seeds(candidate_masks, union_mask):
     seed_codes = np.zeros(union_mask.shape, dtype=np.int32)
     code_to_node = {}
@@ -314,7 +319,7 @@ def _apply_group_resolution(volumes, processed_volumes, group_nodes, erosion_pix
             for node, mask in survivors.items():
                 candidate = mask & ~shared_voxels
                 candidate = _erode_candidate(candidate, erosion_pixels)
-                if _passes_size_filter(candidate, min_size=min_size, max_size=max_size):
+                if np.any(candidate):
                     candidate_masks[node] = candidate
 
             if len(candidate_masks) == 1:
@@ -339,6 +344,8 @@ def process_multicolor_segments(
     erosion_pixels=1,
     min_size=None,
     max_size=None,
+    show_progress=True,
+    n_workers=1,
 ):
     """
     Resolve overlaps across multiple labeled segmentation volumes.
@@ -356,14 +363,9 @@ def process_multicolor_segments(
     )
 
     n_timepoints = int(input_arrays[0].shape[0])
-    timepoints = tqdm(
-        range(n_timepoints),
-        desc="Resolving multicolor overlaps",
-        unit="tp",
-        dynamic_ncols=True,
-        disable=n_timepoints <= 1,
-    )
-    for t in timepoints:
+    n_workers = max(1, int(n_workers or 1))
+
+    def _process_timepoint(t):
         volumes = [np.asarray(arr[t]) for arr in input_arrays]
         processed_volumes = [vol.copy() for vol in volumes]
         for group_nodes in _build_conflict_groups(volumes):
@@ -388,11 +390,44 @@ def process_multicolor_segments(
                 index=t,
                 data=processed.astype(input_arr.dtype, copy=False),
             )
+        return t
+
+    if n_workers == 1 or n_timepoints <= 1:
+        timepoints = tqdm(
+            range(n_timepoints),
+            desc="Resolving multicolor overlaps",
+            unit="tp",
+            dynamic_ncols=True,
+            disable=(not show_progress) or n_timepoints <= 1,
+        )
+        for t in timepoints:
+            _process_timepoint(t)
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_process_timepoint, t): t
+                for t in range(n_timepoints)
+            }
+            progress = tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Resolving multicolor overlaps",
+                unit="tp",
+                dynamic_ncols=True,
+                disable=not show_progress,
+            )
+            for future in progress:
+                try:
+                    future.result()
+                except Exception:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
 
     return resolved_output_paths
 
 
-def calculate_multicolor_overlap(segment_paths):
+def calculate_multicolor_overlap(segment_paths, show_progress=True, n_workers=1):
     """
     Calculate pairwise and global overlap counts for multiple segmentation images.
     """
@@ -408,37 +443,92 @@ def calculate_multicolor_overlap(segment_paths):
     overlap_all_by_timepoint = np.zeros(n_timepoints, dtype=np.int64)
     overlap_mask = np.zeros(shape, dtype=np.uint8)
     overlap_degree = np.zeros(shape, dtype=np.uint8)
+    n_workers = max(1, int(n_workers or 1))
 
-    timepoints = tqdm(
-        range(n_timepoints),
-        desc="Calculating multicolor overlap",
-        unit="tp",
-        dynamic_ncols=True,
-        disable=n_timepoints <= 1,
-    )
-    for t in timepoints:
+    def _calculate_timepoint(t):
         occupancies = [np.asarray(arr[t]) > 0 for arr in input_arrays]
         occupancy_count = np.zeros(shape[1:], dtype=np.uint8)
         for occ in occupancies:
             occupancy_count += occ.astype(np.uint8)
 
-        overlap_degree[t] = occupancy_count
-        overlap_mask[t] = (occupancy_count >= 2).astype(np.uint8)
-        overlap_any_by_timepoint[t] = int(np.count_nonzero(overlap_mask[t]))
-        overlap_all_by_timepoint[t] = (
+        t_overlap_degree = occupancy_count
+        t_overlap_mask = (occupancy_count >= 2).astype(np.uint8)
+        t_overlap_any = int(np.count_nonzero(t_overlap_mask))
+        t_overlap_all = (
             int(np.count_nonzero(occupancy_count == n_images))
             if n_images >= 2
             else 0
         )
+        t_pairwise_overlap = np.zeros((n_images, n_images), dtype=np.int64)
+        t_pairwise_non_overlap = np.zeros((n_images, n_images), dtype=np.int64)
 
         for idx_a in range(n_images):
             for idx_b in range(idx_a + 1, n_images):
                 overlap_count = int(np.count_nonzero(occupancies[idx_a] & occupancies[idx_b]))
                 non_overlap_count = int(np.count_nonzero(occupancies[idx_a] ^ occupancies[idx_b]))
-                pairwise_overlap_by_timepoint[t, idx_a, idx_b] = overlap_count
-                pairwise_overlap_by_timepoint[t, idx_b, idx_a] = overlap_count
-                pairwise_non_overlap_by_timepoint[t, idx_a, idx_b] = non_overlap_count
-                pairwise_non_overlap_by_timepoint[t, idx_b, idx_a] = non_overlap_count
+                t_pairwise_overlap[idx_a, idx_b] = overlap_count
+                t_pairwise_overlap[idx_b, idx_a] = overlap_count
+                t_pairwise_non_overlap[idx_a, idx_b] = non_overlap_count
+                t_pairwise_non_overlap[idx_b, idx_a] = non_overlap_count
+
+        return (
+            t,
+            t_overlap_degree,
+            t_overlap_mask,
+            t_overlap_any,
+            t_overlap_all,
+            t_pairwise_overlap,
+            t_pairwise_non_overlap,
+        )
+
+    if n_workers == 1 or n_timepoints <= 1:
+        timepoints = tqdm(
+            range(n_timepoints),
+            desc="Calculating multicolor overlap",
+            unit="tp",
+            dynamic_ncols=True,
+            disable=(not show_progress) or n_timepoints <= 1,
+        )
+        results_iter = (_calculate_timepoint(t) for t in timepoints)
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_calculate_timepoint, t): t
+                for t in range(n_timepoints)
+            }
+            progress = tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Calculating multicolor overlap",
+                unit="tp",
+                dynamic_ncols=True,
+                disable=not show_progress,
+            )
+            results = []
+            for future in progress:
+                try:
+                    results.append(future.result())
+                except Exception:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+            results_iter = sorted(results, key=lambda item: item[0])
+
+    for (
+        t,
+        t_overlap_degree,
+        t_overlap_mask,
+        t_overlap_any,
+        t_overlap_all,
+        t_pairwise_overlap,
+        t_pairwise_non_overlap,
+    ) in results_iter:
+        overlap_degree[t] = t_overlap_degree
+        overlap_mask[t] = t_overlap_mask
+        overlap_any_by_timepoint[t] = t_overlap_any
+        overlap_all_by_timepoint[t] = t_overlap_all
+        pairwise_overlap_by_timepoint[t] = t_pairwise_overlap
+        pairwise_non_overlap_by_timepoint[t] = t_pairwise_non_overlap
 
     pairwise_overlap_matrix = pairwise_overlap_by_timepoint.sum(axis=0)
     pairwise_non_overlap_matrix = pairwise_non_overlap_by_timepoint.sum(axis=0)
@@ -480,6 +570,192 @@ def _coerce_metadata(metadata):
     if isinstance(metadata, pd.DataFrame):
         return metadata
     return load_behav3d_metadata(metadata)
+
+
+def _resolve_output_dir(metadata, output_dir=None):
+    if output_dir is not None:
+        return Path(output_dir).expanduser()
+    if isinstance(metadata, (str, Path)):
+        return Path(metadata).expanduser().parent
+    raise ValueError("output_dir is required when metadata is provided as a DataFrame.")
+
+
+def _normalize_cell_types(cell_types):
+    if isinstance(cell_types, str):
+        values = [part.strip() for part in cell_types.split(",")]
+    else:
+        values = [str(part).strip() for part in cell_types]
+    values = [value for value in values if value]
+    if not values:
+        raise ValueError("cell_types must contain at least one cell type.")
+    return values
+
+
+def _available_cell_types_from_metadata(metadata):
+    metadata = _coerce_metadata(metadata)
+    if metadata is None:
+        return set()
+
+    cell_types = set(detect_organoid_types_from_metadata(metadata))
+    cell_types.update(detect_immune_cell_types_from_metadata(metadata))
+    cell_types.update(detect_other_cell_types_from_metadata(metadata))
+
+    for col in metadata.columns:
+        if col.endswith("_segments_image_path"):
+            if col.startswith(("or_", "im_", "ot_")):
+                parts = col.split("_", 2)
+                if len(parts) >= 2:
+                    cell_types.add(parts[1])
+            else:
+                cell_types.add(col[: -len("_segments_image_path")])
+    return cell_types
+
+
+def _resolve_segment_column(sample, cell_type):
+    for prefix in ("or", "im", "ot"):
+        col = f"{prefix}_{cell_type}_segments_image_path"
+        if col in sample.index:
+            return col
+    legacy_col = f"{cell_type}_segments_image_path"
+    if legacy_col in sample.index:
+        return legacy_col
+    return None
+
+
+def _default_segment_path(output_dir, sample_name, cell_type):
+    return Path(output_dir, "images", sample_name, f"{sample_name}_{cell_type}_segments.zarr")
+
+
+def _resolve_sample_segment_path(sample, output_dir, cell_type):
+    sample_name = str(sample["sample_name"]).strip()
+    default_path = _default_segment_path(output_dir, sample_name, cell_type)
+    default_backup = _original_segment_backup_path(default_path)
+    if default_path.exists() or default_backup.exists():
+        return default_path
+
+    col = _resolve_segment_column(sample, cell_type)
+    if col is not None:
+        value = sample.get(col)
+        if pd.notna(value) and str(value).strip():
+            return Path(str(value)).expanduser()
+
+    return default_path
+
+
+def _build_sample_correction_plan(sample, output_dir, cell_types):
+    sample_name = str(sample["sample_name"]).strip()
+    segment_items = []
+    missing_items = []
+
+    for cell_type in cell_types:
+        output_path = _resolve_sample_segment_path(sample, output_dir, cell_type)
+        backup_path = _original_segment_backup_path(output_path)
+
+        if backup_path.exists():
+            input_path = backup_path
+        elif output_path.exists():
+            input_path = output_path
+        else:
+            missing_items.append(
+                {
+                    "sample_name": sample_name,
+                    "cell_type": cell_type,
+                    "expected_path": output_path,
+                }
+            )
+            continue
+
+        segment_items.append(
+            {
+                "cell_type": cell_type,
+                "input_path": input_path,
+                "output_path": output_path,
+                "backup_path": backup_path,
+            }
+        )
+
+    return {
+        "sample_name": sample_name,
+        "segments": segment_items,
+        "missing": missing_items,
+    }
+
+
+def _plan_multicolor_segment_correction(metadata, output_dir, cell_types, overwrite):
+    sample_names = (
+        metadata["sample_name"]
+        .dropna()
+        .astype("string")
+        .str.strip()
+        .replace("", pd.NA)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    if not sample_names:
+        raise ValueError("No valid sample_name values were found in metadata.")
+
+    sample_plans = []
+    missing_items = []
+    overwrite_conflicts = []
+    sample_name_col = metadata["sample_name"].astype("string").str.strip()
+
+    for sample_name in sample_names:
+        sample_rows = metadata[sample_name_col == sample_name]
+        sample = sample_rows.iloc[0]
+        sample_plan = _build_sample_correction_plan(sample, output_dir, cell_types)
+        sample_plans.append(sample_plan)
+        missing_items.extend(sample_plan["missing"])
+
+        if overwrite:
+            continue
+
+        for item in sample_plan["segments"]:
+            if item["input_path"] == item["backup_path"] and item["output_path"].exists():
+                overwrite_conflicts.append(
+                    {
+                        "sample_name": sample_name,
+                        "cell_type": item["cell_type"],
+                        "output_path": item["output_path"],
+                    }
+                )
+
+    if missing_items:
+        details = "\n".join(
+            f"sample='{item['sample_name']}', cell_type='{item['cell_type']}', expected_path='{item['expected_path']}'"
+            for item in missing_items
+        )
+        raise FileNotFoundError(
+            "Missing required segmentations for multicolor correction:\n"
+            f"{details}"
+        )
+
+    if overwrite_conflicts:
+        details = "\n".join(
+            f"sample='{item['sample_name']}', cell_type='{item['cell_type']}', output_path='{item['output_path']}'"
+            for item in overwrite_conflicts
+        )
+        raise FileExistsError(
+            "Corrected outputs already exist for one or more samples. "
+            "Use overwrite=True to recompute them from the preserved originals:\n"
+            f"{details}"
+        )
+
+    return sample_plans
+
+
+def _preserve_original_segment_path(path):
+    path = Path(path)
+    backup_path = _original_segment_backup_path(path)
+    if backup_path.exists():
+        return backup_path
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Could not find segmentation to preserve for '{path}'. "
+            f"Expected either '{path}' or existing backup '{backup_path}'."
+        )
+    path.rename(backup_path)
+    return backup_path
 
 
 def _resolve_raw_image_path(metadata, output_dir, sample_name):
@@ -586,14 +862,96 @@ def _load_metadata(metadata_path, output_dir):
     )
 
 
+def apply_multicolor_segment_correction(
+    metadata,
+    cell_types,
+    output_dir=None,
+    overwrite=False,
+    erosion_pixels=1,
+    min_size=None,
+    max_size=None,
+    n_workers=1,
+):
+    """
+    Apply multicolor overlap correction to all samples in metadata for the requested cell types.
+
+    Segmentations are resolved from the default BEHAV3D output layout when possible:
+    ``images/{sample_name}/{sample_name}_{cell_type}_segments.zarr``.
+    The original segmentation is preserved once as ``*_segments_original.zarr`` and the
+    corrected output is written back to the standard ``*_segments.zarr`` path.
+    Samples are processed sequentially. ``n_workers`` controls timepoint-level
+    parallelism within each sample.
+    """
+    metadata_df = _coerce_metadata(metadata)
+    if metadata_df is None:
+        raise ValueError("metadata is required.")
+    if "sample_name" not in metadata_df.columns:
+        raise ValueError("metadata must contain a 'sample_name' column.")
+
+    output_dir = _resolve_output_dir(metadata, output_dir=output_dir)
+    cell_types = _normalize_cell_types(cell_types)
+
+    available_cell_types = _available_cell_types_from_metadata(metadata_df)
+    missing_cell_types = [cell_type for cell_type in cell_types if cell_type not in available_cell_types]
+    if missing_cell_types:
+        raise ValueError(
+            f"Cell types not found in metadata: {missing_cell_types}. "
+            f"Available cell types: {sorted(available_cell_types)}"
+        )
+
+    sample_plans = _plan_multicolor_segment_correction(
+        metadata=metadata_df,
+        output_dir=output_dir,
+        cell_types=cell_types,
+        overwrite=overwrite,
+    )
+    n_workers = max(1, int(n_workers or 1))
+
+    print(
+        f"Applying multicolor segment correction to {len(sample_plans)} sample(s) "
+        f"sequentially with {n_workers} worker(s) per sample"
+    )
+
+    corrected_paths_by_sample = {}
+    for sample_plan in sample_plans:
+        output_paths = [item["output_path"] for item in sample_plan["segments"]]
+        input_paths = [_preserve_original_segment_path(path) for path in output_paths]
+        input_stats = calculate_multicolor_overlap(
+            input_paths,
+            n_workers=n_workers,
+        )
+        _print_overlap_summary(
+            f"Input overlap for sample '{sample_plan['sample_name']}'",
+            input_stats,
+        )
+
+        corrected_paths = process_multicolor_segments(
+            segment_paths=input_paths,
+            output_paths=output_paths,
+            overwrite=overwrite,
+            erosion_pixels=erosion_pixels,
+            min_size=min_size,
+            max_size=max_size,
+            n_workers=n_workers,
+        )
+        processed_stats = calculate_multicolor_overlap(
+            corrected_paths,
+            n_workers=n_workers,
+        )
+        _print_overlap_summary(
+            f"Processed overlap for sample '{sample_plan['sample_name']}'",
+            processed_stats,
+        )
+        corrected_paths_by_sample[sample_plan["sample_name"]] = corrected_paths
+
+    return corrected_paths_by_sample
+
+
 def _print_overlap_summary(label, stats):
     print(f"{label}:")
     print(f"  overlap_any_count = {stats['overlap_any_count']}")
     print(f"  overlap_all_count = {stats['overlap_all_count']}")
-    print("  pairwise_overlap_matrix =")
-    print(stats["pairwise_overlap_matrix"])
     if stats.get("pairwise_named_stats"):
-        print("  pairwise_named_stats =")
         for pair_stats in stats["pairwise_named_stats"]:
             print(
                 f"    {pair_stats['name']} "
@@ -668,5 +1026,20 @@ def main(
             segment_paths=processed_paths,
             overlap_mask=processed_stats["overlap_mask"],
         )
+
+
+    metadata = "/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/NatureBriefComm/LowDensity_MultiColor/metadata.csv"
+    metadata = pd.read_csv(metadata)
+    cell_types = ["tcell1", "tcell2", "tcell3"]
+    output_dir = "/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/NatureBriefComm/LowDensity_MultiColor"
+    min_size=200
+    apply_multicolor_segment_correction(
+        metadata=metadata,
+        cell_types=cell_types,
+        output_dir=output_dir,
+        min_size=min_size,
+        overwrite=True,
+        n_workers=16
+    )
 
     return processed_paths
