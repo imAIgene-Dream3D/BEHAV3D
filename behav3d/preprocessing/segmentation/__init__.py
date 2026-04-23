@@ -3,6 +3,11 @@ from collections import defaultdict
 import numpy as np
 from skimage.measure import label
 from scipy import ndimage
+from .multicolor_segment_processing import (
+    calculate_multicolor_overlap,
+    process_multicolor_segments,
+    visualize_multicolor_overlap,
+)
 
 def keep_largest_connected_components(segments):
     """

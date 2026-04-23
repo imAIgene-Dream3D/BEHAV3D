@@ -219,7 +219,7 @@ def _read_classifier_header_value(opencl_path, key, default=None):
     with path.open() as f:
         line = ""
         count = 0
-        while line != "*/" and count < 50:
+        while line != "*/" and count < 80:
             line = f.readline()
             if not line:
                 break
@@ -228,6 +228,157 @@ def _read_classifier_header_value(opencl_path, key, default=None):
             if line.startswith(prefix):
                 return line[len(prefix):].strip()
     return default
+
+
+def _parse_channel_indices(value):
+    """Parse a comma-separated list of channel indices from .cl metadata."""
+    if value is None:
+        return []
+    indices = []
+    for token in str(value).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            idx = int(token)
+        except (TypeError, ValueError):
+            continue
+        if idx >= 0 and idx not in indices:
+            indices.append(idx)
+    return indices
+
+
+def _parse_channel_names(value):
+    """Parse a pipe-separated list of channel names from .cl metadata."""
+    if value is None:
+        return []
+    names = []
+    for token in str(value).split("|"):
+        name = token.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _channel_index_from_name(name):
+    """Extract the integer index from a canonical Napari layer name."""
+    match = re.fullmatch(r"Channel\s+(\d+)", str(name or "").strip())
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _channel_name_from_index(index):
+    """Format a channel index as the canonical Napari training layer name."""
+    return f"Channel {int(index)}"
+
+
+def _normalize_channel_names(channel_names=None, channel_indices=None):
+    """Normalize restored channel metadata to stable Napari layer names."""
+    normalized = []
+    for name in channel_names or []:
+        clean_name = str(name).strip()
+        if clean_name and clean_name not in normalized:
+            normalized.append(clean_name)
+
+    for index in channel_indices or []:
+        try:
+            canonical = _channel_name_from_index(index)
+        except (TypeError, ValueError):
+            continue
+        if canonical not in normalized:
+            normalized.append(canonical)
+
+    return normalized
+
+
+def _read_classifier_channel_metadata(opencl_path):
+    """Return channel names and indices embedded in a trained classifier."""
+    channel_indices = _parse_channel_indices(
+        _read_classifier_header_value(opencl_path, "input_channel_indices")
+    )
+    channel_names = _parse_channel_names(
+        _read_classifier_header_value(opencl_path, "input_channel_names")
+    )
+    normalized_names = _normalize_channel_names(
+        channel_names=channel_names,
+        channel_indices=channel_indices,
+    )
+    return {
+        "channel_indices": channel_indices,
+        "channel_names": normalized_names,
+    }
+
+
+def _upsert_classifier_header_values(opencl_path, values):
+    """Insert or replace metadata lines inside the header comment of a .cl file."""
+    path = Path(opencl_path)
+    if not path.exists() or not values:
+        return
+
+    content = path.read_text()
+    newline = "\r\n" if "\r\n" in content else "\n"
+    lines = content.splitlines(keepends=True)
+
+    header_end = None
+    for idx, line in enumerate(lines[:80]):
+        if line.strip() == "*/":
+            header_end = idx
+            break
+
+    if header_end is None:
+        header_lines = ["/*" + newline]
+        for key, value in values.items():
+            header_lines.append(f"{key} = {value}{newline}")
+        header_lines.append("*/" + newline)
+        path.write_text("".join(header_lines) + content)
+        return
+
+    new_lines = []
+    replaced = set()
+    for idx, line in enumerate(lines):
+        if idx < header_end:
+            stripped = line.strip()
+            replaced_line = False
+            for key, value in values.items():
+                prefix = f"{key} = "
+                if stripped.startswith(prefix):
+                    new_lines.append(f"{key} = {value}{newline}")
+                    replaced.add(key)
+                    replaced_line = True
+                    break
+            if replaced_line:
+                continue
+
+        if idx == header_end:
+            for key, value in values.items():
+                if key not in replaced:
+                    new_lines.append(f"{key} = {value}{newline}")
+            new_lines.append(line)
+            continue
+
+        new_lines.append(line)
+
+    path.write_text("".join(new_lines))
+
+
+def _write_classifier_channel_metadata(opencl_path, channel_names):
+    """Persist selected input channels into a trained APOC classifier header."""
+    normalized_names = _normalize_channel_names(channel_names=channel_names)
+    channel_indices = []
+    for name in normalized_names:
+        index = _channel_index_from_name(name)
+        if index is not None and index not in channel_indices:
+            channel_indices.append(index)
+
+    values = {
+        "input_channel_indices": ",".join(str(idx) for idx in channel_indices),
+        "input_channel_names": "|".join(normalized_names),
+    }
+    _upsert_classifier_header_values(opencl_path, values)
 
 
 def _classifier_path(pixel_class_outdir, cell_type):
@@ -317,6 +468,10 @@ def _load_classifier_restore_config(pixel_class_outdir, cell_type):
             cfg["num_ensembles"] = int(num_trees)
         except (TypeError, ValueError):
             pass
+
+    channel_meta = _read_classifier_channel_metadata(clf_path)
+    if channel_meta["channel_names"]:
+        cfg["channels"] = channel_meta["channel_names"]
 
     return cfg
 
@@ -584,7 +739,7 @@ class CellTypeTab(QWidget):
             or _default_grid_sigmas_text()
         )
         ip = {f"apoc_{cell_type}_{key}": value for key, value in cfg.items()}
-        self._default_channel_names = list(saved_cfg.get("channels", []))
+        self._default_channel_names = list(cfg.get("channels", []))
 
         layout = QVBoxLayout()
         layout.setContentsMargins(8, 8, 8, 8)
@@ -1696,6 +1851,7 @@ class APOCTrainingWidget(QWidget):
 
                 clf.feature_specification = feature_string
                 clf.to_opencl_file(clf_path)
+                _write_classifier_channel_metadata(clf_path, cfg["channels"])
 
                 # Predict (visual confirmation)
                 raw_prediction, prob_result = self._predict_classifier_outputs(ct, clf=clf)

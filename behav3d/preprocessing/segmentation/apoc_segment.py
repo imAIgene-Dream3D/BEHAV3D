@@ -9,6 +9,7 @@ expects.
 """
 
 import os
+import re
 import sys
 import time
 import shutil
@@ -39,6 +40,110 @@ from behav3d.core.metadata import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _read_classifier_header_value(opencl_path, key, default=None):
+    """Read a single APOC metadata value from the header of a trained .cl file."""
+    path = Path(opencl_path)
+    if not path.exists():
+        return default
+
+    prefix = f"{key} = "
+    with path.open() as f:
+        line = ""
+        count = 0
+        while line != "*/" and count < 80:
+            line = f.readline()
+            if not line:
+                break
+            count += 1
+            line = line.strip()
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
+    return default
+
+
+def _parse_channel_indices(value):
+    """Parse a comma-separated list of channel indices."""
+    if value is None:
+        return []
+    indices = []
+    for token in str(value).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            idx = int(token)
+        except (TypeError, ValueError):
+            continue
+        if idx >= 0 and idx not in indices:
+            indices.append(idx)
+    return indices
+
+
+def _parse_channel_names(value):
+    """Parse a pipe-separated list of channel names."""
+    if value is None:
+        return []
+    names = []
+    for token in str(value).split("|"):
+        name = token.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _channel_index_from_name(name):
+    """Extract the integer index from a canonical `Channel N` layer name."""
+    match = re.fullmatch(r"Channel\s+(\d+)", str(name or "").strip())
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _channel_indices_from_names(names):
+    """Convert canonical channel layer names to integer indices."""
+    indices = []
+    for name in names or []:
+        idx = _channel_index_from_name(name)
+        if idx is not None and idx not in indices:
+            indices.append(idx)
+    return indices
+
+
+def _channel_indices_from_config(apoc_config, cell_type):
+    """Read legacy channel selections from saved BEHAV3D config."""
+    if not apoc_config:
+        return []
+    chan_names = apoc_config.get(f"apoc_{cell_type}_channels", [])
+    if isinstance(chan_names, str):
+        chan_names = [chan_names]
+    return _channel_indices_from_names(chan_names)
+
+
+def _resolve_classifier_channel_indices(opencl_path, cell_type, apoc_config=None):
+    """Resolve classifier input channels, preferring embedded .cl metadata."""
+    indices = _parse_channel_indices(
+        _read_classifier_header_value(opencl_path, "input_channel_indices")
+    )
+    if indices:
+        return indices
+
+    channel_names = _parse_channel_names(
+        _read_classifier_header_value(opencl_path, "input_channel_names")
+    )
+    indices = _channel_indices_from_names(channel_names)
+    if indices:
+        return indices
+
+    indices = _channel_indices_from_config(apoc_config, cell_type)
+    if indices:
+        return indices
+
+    return [0]
+
 
 def _get_probability_classifier(clf, positive_class_id=2):
     """Create a probability-output classifier from an existing ObjectSegmenter.
@@ -264,18 +369,14 @@ def run_apoc_segmentation(
           + (f" + Death" if clf_death else ""))
 
     # --- Prepare channel indices and post-processing params ---
-    def get_indices(ct):
-        if not apoc_config: return [0]
-        chan_names = apoc_config.get(f"apoc_{ct}_channels", [])
-        if not chan_names: return [0]
-        indices = []
-        for name in chan_names:
-            try: indices.append(int(name.split(" ")[-1]))
-            except: pass
-        return indices if indices else [0]
+    def get_indices(ct, clf=None):
+        opencl_path = getattr(clf, "opencl_file", None)
+        if not opencl_path:
+            return _channel_indices_from_config(apoc_config, ct) or [0]
+        return _resolve_classifier_channel_indices(opencl_path, ct, apoc_config=apoc_config)
 
-    clf_channels = {ct: get_indices(ct) for ct in all_cell_types}
-    death_channels = get_indices("dead") if clf_death else []
+    clf_channels = {ct: get_indices(ct, classifiers.get(ct)) for ct in all_cell_types}
+    death_channels = get_indices("dead", clf_death) if clf_death else []
 
     # --- Process each sample ---
     sample_names = metadata['sample_name'].unique()
@@ -389,7 +490,7 @@ def run_apoc_segmentation(
                 # 3. Process current timepoint (GPU-bound or CPU-bound if only_segment)
                 for ct in active_cell_types:
                     cfg = apoc_config or {}
-                    indices = clf_channels[ct]
+                    indices = [i_ch for i_ch in clf_channels[ct] if 0 <= i_ch < t_img.shape[0]] or [0]
                     imgs = [t_img[i_ch] for i_ch in indices]
                     imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
 
@@ -503,7 +604,7 @@ def run_apoc_segmentation(
                         zarr_segs[ct][t] = seg_out
 
                 if zarr_death is not None:
-                    indices = death_channels
+                    indices = [i_ch for i_ch in death_channels if 0 <= i_ch < t_img.shape[0]] or [0]
                     imgs = [t_img[i_ch] for i_ch in indices]
                     imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
                     death_mask = (np.asarray(clf_death.predict(image=imgs_to_pass)) > 0).astype(np.uint16)
