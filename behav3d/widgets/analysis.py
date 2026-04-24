@@ -2059,10 +2059,26 @@ class MultiOrganoidDeathDynamicsPanel:
         
         with self.out:
             try:
+                params = getattr(self.metadata_loader, "behav3d_parameters", {}) or {}
+                feat_cfg = params.get("features", {}) or {}
+                default_thr = float(
+                    _DEFAULT_CONFIG.get("death_dynamics", {})
+                    .get("organoid", {})
+                    .get("dead_perc_threshold", 0.02)
+                )
+                dead_perc_threshold_map = {}
+                for org_type in self.organoid_types:
+                    raw_thr = feat_cfg.get(org_type, {}).get("dead_mask_percentage_threshold", default_thr)
+                    try:
+                        dead_perc_threshold_map[str(org_type)] = float(raw_thr)
+                    except Exception:
+                        dead_perc_threshold_map[str(org_type)] = default_thr
+
                 # Call the analysis function from organoid_analysis module
                 plot_multi_organoid_death_dynamics(
                     output_dir=self.output_dir,
-                    organoid_types=self.organoid_types
+                    organoid_types=self.organoid_types,
+                    dead_perc_threshold_map=dead_perc_threshold_map,
                 )
                 print("✅ Multi-organoid comparison complete!")
             except Exception:

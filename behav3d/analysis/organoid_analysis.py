@@ -258,6 +258,13 @@ def run_organoid_analysis(
         
         # Skip PDF plotting if dead_mask_path is still None
         if dead_mask_path is None:
+            has_dead_channel = (
+                metadata is not None
+                and "sample_metadata" in locals()
+                and not sample_metadata.empty
+                and "dead_channel" in sample_metadata.columns
+                and sample_metadata["dead_channel"].notna().any()
+            )
             print(f"  ⚠️  Skipping PDF generation for {sample_name} - no dead_mask_path available")
             print(f"      (has_dead_channel={has_dead_channel}, metadata columns: {list(sample_metadata.columns) if metadata is not None and not sample_metadata.empty else 'N/A'})")
             continue
@@ -608,6 +615,12 @@ def plot_dead_signal_per_organoid(
     legend_max_items=40,
     color_map=None,
     linestyle_map=None,
+    highlight_dead_phase=False,
+    dead_phase_color="red",
+    disappearance_markers=None,
+    disappearance_marker_color="black",
+    disappearance_marker_size=38,
+    screen_show_scale=1.0,
 ):
     """
     Plot individual organoid dead signal over time.
@@ -689,12 +702,29 @@ def plot_dead_signal_per_organoid(
 
     # Plot each organoid track as its own line, inheriting group color/style
     group_cols = ["organoid_id", "position_t", feature, color_key_col] + ([style_key_col] if style_key_col else [])
+    if highlight_dead_phase and "dead" in dfp.columns:
+        group_cols.append("dead")
     df_plot = dfp[group_cols].copy()
     df_plot[color_key_col] = df_plot[color_key_col].astype(str)
     if style_key_col is not None:
         df_plot[style_key_col] = df_plot[style_key_col].astype(str)
 
+    if disappearance_markers is not None and not disappearance_markers.empty:
+        dm = disappearance_markers.copy()
+        if "organoid_id" in dm.columns and "position_t" in dm.columns:
+            dm["organoid_id"] = dm["organoid_id"].astype(str)
+            dm["position_t"] = pd.to_numeric(dm["position_t"], errors="coerce")
+            dm = dm.dropna(subset=["organoid_id", "position_t"])
+            disappearance_t_map = (
+                dm.groupby("organoid_id")["position_t"].first().to_dict()
+            )
+        else:
+            disappearance_t_map = {}
+    else:
+        disappearance_t_map = {}
+
     for oid, df_oid in df_plot.groupby("organoid_id", sort=False):
+        df_oid = df_oid.sort_values("position_t")
         cval = df_oid[color_key_col].iloc[0]
         if isinstance(cval, pd.Series):
             cval = " | ".join(cval.astype(str).tolist())
@@ -706,15 +736,47 @@ def plot_dead_signal_per_organoid(
             sval = " | ".join(sval.astype(str).tolist())
         elif sval is not None:
             sval = str(sval)
-        ax.plot(
-            df_oid["position_t"].to_numpy(),
-            df_oid[feature].to_numpy(),
-            color=color_map.get(cval, "C0"),
-            linestyle=linestyle_map.get(sval, "-") if style_key_col is not None else "-",
-            alpha=alpha,
-            linewidth=linewidth,
-            zorder=2,
-        )
+        x = df_oid["position_t"].to_numpy()
+        y = df_oid[feature].to_numpy()
+        ls = linestyle_map.get(sval, "-") if style_key_col is not None else "-"
+        base_color = color_map.get(cval, "C0")
+
+        ax.plot(x, y, color=base_color, linestyle=ls, alpha=alpha, linewidth=linewidth, zorder=2)
+
+        if highlight_dead_phase and "dead" in df_oid.columns:
+            dead_bool = df_oid["dead"].fillna(False).astype(bool).to_numpy()
+            if dead_bool.any():
+                first_dead_idx = int(np.argmax(dead_bool))
+                # Mark the first dead event with a "D" glyph instead of recoloring
+                # the post-death segment.
+                ax.scatter(
+                    [x[first_dead_idx]],
+                    [y[first_dead_idx]],
+                    marker="$D$",
+                    s=60,
+                    color=dead_phase_color,
+                    edgecolors=dead_phase_color,
+                    linewidths=0.8,
+                    alpha=0.95,
+                    zorder=3.2,
+                )
+
+        t_dis = disappearance_t_map.get(str(oid))
+        if t_dis is not None:
+            t_dis = int(t_dis)
+            hit = df_oid[df_oid["position_t"] == t_dis]
+            if not hit.empty:
+                y_dis = float(hit[feature].iloc[0])
+                ax.scatter(
+                    [t_dis],
+                    [y_dis],
+                    marker="x",
+                    s=disappearance_marker_size,
+                    linewidths=1.5,
+                    color=disappearance_marker_color,
+                    alpha=0.95,
+                    zorder=3.5,
+                )
 
     # Legends: colors (color_by) and optional styles (style_by)
     if show_legends:
@@ -730,7 +792,7 @@ def plot_dead_signal_per_organoid(
             handles=color_handles,
             title=color_title,
             loc="upper left",
-            bbox_to_anchor=(1.02, 1.0),
+            bbox_to_anchor=(1.01, 1.00),
             borderaxespad=0,
             prop={"size": 8},
             frameon=True,
@@ -744,17 +806,66 @@ def plot_dead_signal_per_organoid(
                 for lvl in shown_style_levels
             ]
             style_title = " / ".join(style_cols) if len(style_cols) > 1 else style_cols[0]
-            ax.legend(
+            leg_style = ax.legend(
                 handles=style_handles,
                 title=style_title,
                 loc="upper left",
-                bbox_to_anchor=(1.02, 0.55),
+                bbox_to_anchor=(1.01, 0.68),
                 borderaxespad=0,
                 prop={"size": 8},
                 frameon=True,
                 handlelength=3.5,
                 handletextpad=0.8,
             )
+            ax.add_artist(leg_style)
+
+        if highlight_dead_phase and "dead" in dfp.columns:
+            dead_handle = [
+                Line2D(
+                    [0], [0],
+                    marker="$D$",
+                    color=dead_phase_color,
+                    markerfacecolor=dead_phase_color,
+                    markeredgecolor=dead_phase_color,
+                    markersize=9,
+                    markeredgewidth=0.8,
+                    lw=0,
+                    label="First dead event (dead=True)",
+                )
+            ]
+            leg_dead = ax.legend(
+                handles=dead_handle,
+                title="Overlay",
+                loc="upper left",
+                bbox_to_anchor=(1.01, 0.40),
+                borderaxespad=0,
+                prop={"size": 8},
+                frameon=True,
+            )
+            ax.add_artist(leg_dead)
+
+        if disappearance_t_map:
+            dis_handle = [
+                Line2D(
+                    [0], [0],
+                    marker="x",
+                    color=disappearance_marker_color,
+                    lw=0,
+                    markersize=7,
+                    markeredgewidth=1.6,
+                    label="Track disappears (flat tail kept)",
+                )
+            ]
+            leg_dis = ax.legend(
+                handles=dis_handle,
+                title="Markers",
+                loc="upper left",
+                bbox_to_anchor=(1.01, 0.20),
+                borderaxespad=0,
+                prop={"size": 8},
+                frameon=True,
+            )
+            ax.add_artist(leg_dis)
     
     # Backwards-compatible defaults (keep old title/ylabel unless caller overrides)
     if title is None:
@@ -772,11 +883,17 @@ def plot_dead_signal_per_organoid(
     ax.set_ylabel(ylabel, fontsize=12)
     ax.grid(True, linestyle=":", alpha=0.5)
     
-    # Ensure it starts at 0 on X axis
-    ax.set_xlim(0, dfp["position_t"].max())
+    # X-axis: give a small breathing room at the start and end of the data range.
+    t_vals = pd.to_numeric(dfp["position_t"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(t_vals) > 0:
+        t_min = float(t_vals.min())
+        t_max = float(t_vals.max())
+        x_pad = 0.03 * (t_max - t_min) if t_max > t_min else 1.0
+        ax.set_xlim(t_min - x_pad, t_max + x_pad)
+    else:
+        ax.set_xlim(left=0)
 
-    # Y scaling: robust autoscale so small death signals are visible
-    ax.set_ylim(bottom=0)
+    # Y scaling: small pad below 0 and above the top so traces don't touch the axes.
     if autoscale_y:
         y = pd.to_numeric(dfp[feature], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
         if len(y) > 0:
@@ -785,25 +902,207 @@ def plot_dead_signal_per_organoid(
                 ymax = max(ymax, float(min_ymax))
             if ymax <= 0:
                 ymax = 1.0 if "percentage" in feature else 10.0
-            ax.set_ylim(0, ymax * 1.1)
+            y_pad = 0.05 * ymax
+            ax.set_ylim(-y_pad, ymax + y_pad)
         else:
-            ax.set_ylim(0, 1.05 if "percentage" in feature else 1.0)
+            ax.set_ylim(-0.05, 1.05 if "percentage" in feature else 1.0)
     else:
         if "percentage" in feature:
-            ax.set_ylim(0, 1.05)
+            ax.set_ylim(-0.05, 1.05)
         else:
-            ax.set_ylim(0)
+            ax.set_ylim(bottom=-0.05)
 
-    fig.subplots_adjust(right=0.76)
-    plt.tight_layout()
+    # Keep right margin for the stacked legends; tight_layout can clip outside legends.
+    # Reserve a dedicated right gutter for legends (screen + PDF), no overlap with data.
+    fig.subplots_adjust(right=0.64)
+    # Screen-only downscaling for notebook display; keep original size for PDF saving.
+    # Use DPI scaling so labels/legends shrink together with the plot area.
+    orig_dpi = fig.get_dpi()
+    if screen_show_scale != 1.0:
+        fig.set_dpi(orig_dpi * screen_show_scale)
     plt.show()
+    if screen_show_scale != 1.0:
+        fig.set_dpi(orig_dpi)
+    return fig
+
+
+def plot_grouped_dead_signal(
+    df_processed,
+    feature,
+    figsize,
+    color_key,
+    style_key,
+    condition_color_map,
+    type_style_map,
+    threshold_annotation,
+    counts_annotation,
+    screen_show_scale=1.0,
+    band_alpha=0.18,
+):
+    """Plot grouped mean +/- SEM dead-signal dynamics (used for Plot 5a/5b).
+
+    Tracks are pooled across samples within each (condition, organoid_type)
+    group, so n at each timepoint is the number of contributing tracks and
+    SEM = std / sqrt(n). This matches the uncertainty convention used by the
+    interaction analysis, so bands are comparable across BEHAV3D plots.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    nice_feat = "% Dead Mask" if "percentage" in feature else "# Dead Pixels"
+
+    # Pool all tracks across samples within each (condition [x organoid_type], timepoint)
+    # group. n is therefore the number of tracks contributing at that timepoint,
+    # which is large and roughly constant over time (flat-tail extension keeps
+    # disappearing tracks in the cohort), giving a stable, visually uniform band.
+    # If color_key == style_key (e.g., fallback to organoid_type), avoid duplicate labels.
+    group_keys = [color_key] if color_key == style_key else [color_key, style_key]
+    group_cols = group_keys + ["position_t"]
+
+    agg = (
+        df_processed
+        .groupby(group_cols)[feature]
+        .agg(mean_val="mean", std_val="std", n_val="count")
+        .reset_index()
+    )
+
+    agg["sem_val"] = agg["std_val"] / np.sqrt(agg["n_val"].clip(lower=1))
+
+    for group_val, grp in agg.groupby(group_keys):
+        grp = grp.sort_values("position_t")
+        t = grp["position_t"].values
+        mean = grp["mean_val"].values
+        band_vals = grp["sem_val"].to_numpy()
+
+        if color_key == style_key:
+            cond_val = str(group_val)
+            org_val = str(group_val)
+        else:
+            cond_val, org_val = group_val
+            cond_val = str(cond_val)
+            org_val = str(org_val)
+
+        color = condition_color_map.get(cond_val, "C0")
+        ls = type_style_map.get(str(org_val), "-")
+
+        label = f"{cond_val} | {org_val}" if cond_val != org_val else cond_val
+        ax.plot(t, mean, linewidth=2.8, label=label, color=color, linestyle=ls, zorder=3)
+        ax.fill_between(
+            t,
+            mean - band_vals,
+            mean + band_vals,
+            alpha=band_alpha,
+            color=color,
+            linewidth=0,
+            zorder=1,
+        )
+
+    ax.axhline(0, color="black", linewidth=1, alpha=0.35, zorder=0)
+
+    # X-axis: give a small breathing room at the start and end of the data range.
+    t_all = pd.to_numeric(agg["position_t"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(t_all) > 0:
+        t_min = float(t_all.min())
+        t_max = float(t_all.max())
+        x_pad = 0.03 * (t_max - t_min) if t_max > t_min else 1.0
+        ax.set_xlim(t_min - x_pad, t_max + x_pad)
+    else:
+        ax.set_xlim(left=0)
+    ax.set_xlabel("Timepoint")
+    ax.set_ylabel(f"Change from baseline ({nice_feat})")
+    ax.set_title(
+        f"Mean +/- SEM per Condition & Organoid Type (tracks pooled across samples)\n"
+        f"({nice_feat}, baseline-normalized, non-decreasing, disappearing tracks kept as flat tails)"
+    )
+    ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.28)
+
+    ax.text(
+        0.02, 0.97,
+        threshold_annotation,
+        transform=ax.transAxes,
+        fontsize=8,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="lavender", alpha=0.8),
+    )
+
+    ax.text(
+        0.02, 0.89,
+        counts_annotation,
+        transform=ax.transAxes,
+        fontsize=8,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="honeydew", alpha=0.85),
+    )
+
+    # Y-axis: small pad below 0 and above the upper edge of the SEM band so the
+    # traces don't touch the axes on either side.
+    band_high = []
+    for _, grp in agg.groupby(group_keys):
+        mean = grp["mean_val"].to_numpy()
+        band_vals = grp["sem_val"].to_numpy()
+        high = mean + band_vals
+        if np.isfinite(high).any():
+            band_high.append(np.nanmax(high))
+    if band_high:
+        y_max = max(band_high)
+        y_pad = 0.05 * (y_max if y_max > 0 else 1.0)
+        ax.set_ylim(-y_pad, y_max + y_pad)
+    else:
+        ax.set_ylim(-0.05, 1.0)
+
+    # Dual legends matching plots 3/4.
+    color_handles = [
+        Line2D([0], [0], color=condition_color_map[lvl], lw=3, linestyle="-", label=str(lvl))
+        for lvl in sorted(condition_color_map.keys())
+    ]
+    leg1 = ax.legend(
+        handles=color_handles,
+        title=color_key.replace("_", " ").title(),
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.00),
+        borderaxespad=0,
+        prop={"size": 8},
+        frameon=True,
+    )
+    ax.add_artist(leg1)
+
+    style_handles = [
+        Line2D([0], [0], color="black", lw=3, linestyle=type_style_map[lvl], label=str(lvl))
+        for lvl in sorted(type_style_map.keys())
+    ]
+    leg_style = ax.legend(
+        handles=style_handles,
+        title=style_key.replace("_", " ").title(),
+        loc="upper left",
+        bbox_to_anchor=(1.01, 0.68),
+        borderaxespad=0,
+        prop={"size": 8},
+        frameon=True,
+        handlelength=3.5,
+        handletextpad=0.8,
+    )
+    ax.add_artist(leg_style)
+
+    fig.subplots_adjust(right=0.64)
+
+    # Screen-only downscaling for notebook display; keep original size for PDF saving.
+    # Use DPI scaling so labels/legends shrink together with the plot area.
+    fig_orig_dpi = fig.get_dpi()
+    if screen_show_scale != 1.0:
+        fig.set_dpi(fig_orig_dpi * screen_show_scale)
+    plt.show()
+    if screen_show_scale != 1.0:
+        fig.set_dpi(fig_orig_dpi)
+
     return fig
 
 
 def plot_multi_organoid_death_dynamics(
     output_dir,
     organoid_types,
-    figsize=(12, 10)
+    figsize=(12, 10),
+    dead_perc_threshold_map=None,
     ):
     """
     Generate comparison plots for death dynamics across multiple organoid types.
@@ -825,6 +1124,23 @@ def plot_multi_organoid_death_dynamics(
     print(f"--------------- Multi-Organoid Death Dynamics Comparison ---------------")
     
     output_dir = Path(output_dir)
+
+    # Threshold text for Plot 4a/4b annotations (from pipeline settings).
+    threshold_annotation = "Dead threshold (% mask): not provided"
+    if isinstance(dead_perc_threshold_map, dict) and dead_perc_threshold_map:
+        cleaned_thr = {}
+        for k, v in dead_perc_threshold_map.items():
+            try:
+                cleaned_thr[str(k)] = float(v)
+            except Exception:
+                continue
+        if cleaned_thr:
+            uniq_thr = sorted(set(cleaned_thr.values()))
+            if len(uniq_thr) == 1:
+                threshold_annotation = f"Dead threshold (% mask): {uniq_thr[0]:.4g}"
+            else:
+                parts = [f"{k}={cleaned_thr[k]:.4g}" for k in sorted(cleaned_thr.keys())]
+                threshold_annotation = "Dead threshold (% mask): " + "; ".join(parts)
     
     # Check which organoid types have death dynamics data available
     available_data = {}
@@ -960,6 +1276,8 @@ def plot_multi_organoid_death_dynamics(
     
     color_map = dict(zip(unique_combinations, colors))
     
+    screen_show_scale = 0.72  # Display only: smaller notebook rendering for plots 3/4/5.
+
     with PdfPages(pdf_path) as pdf:
         # Plot 1: Line plot - Percentage Dead per sample + organoid_type
         fig1, ax1 = plt.subplots(1, 1, figsize=figsize)
@@ -1090,6 +1408,7 @@ def plot_multi_organoid_death_dynamics(
                 linewidth=2.6,
                 color_map=condition_color_map,
                 linestyle_map=type_style_map,
+                screen_show_scale=screen_show_scale,
             )
             pdf.savefig(fig3a, bbox_inches="tight")
             plt.close(fig3a)
@@ -1107,78 +1426,101 @@ def plot_multi_organoid_death_dynamics(
                 linewidth=2.6,
                 color_map=condition_color_map,
                 linestyle_map=type_style_map,
+                screen_show_scale=screen_show_scale,
             )
             pdf.savefig(fig3b, bbox_inches="tight")
             plt.close(fig3b)
 
-            # --- Plots 4a & 4b: same as 3a/3b but baseline-normalized and disappearing tracks excluded ---
+            # --- Plots 4a & 4b: baseline-normalized tracks with flat extension after disappearance ---
 
             # Identify tracks that disappear: a track "disappears" if its last recorded
             # timepoint is earlier than the last timepoint of its sample.
             track_groups = ["TrackID", "sample_name", "organoid_type"]
 
-            # Heuristic: track ends before the global last timepoint of its sample
-            sample_max_t = df_indiv.groupby("sample_name")["position_t"].transform("max")
-            track_max_t  = df_indiv.groupby(track_groups)["position_t"].transform("max")
-            disappeared_mask = track_max_t < sample_max_t
+            # True sample endpoints must be computed on all tracks (before any filtering).
+            sample_end_by_sample = (
+                df_indiv.groupby("sample_name")["position_t"].max().to_dict()
+            )
 
-            n_total      = df_indiv.groupby(track_groups).ngroups
-            df_no_disapp = df_indiv[~disappeared_mask].copy()
-            n_kept       = df_no_disapp.groupby(track_groups).ngroups
-            n_skipped    = n_total - n_kept
+            n_total = df_indiv.groupby(track_groups).ngroups
 
-            skip_annotation = f"Skipped (disappeared): {n_skipped} / {n_total} tracks"
-            print(f"\n[Plot 4] {skip_annotation}")
+            # Disappearance information for marker overlays (both dead and non-dead disappearing tracks).
+            df_track_endpoints = (
+                df_indiv.groupby(track_groups, as_index=False)["position_t"]
+                .max()
+                .rename(columns={"position_t": "disappearance_t"})
+            )
+            df_track_endpoints["sample_end_t"] = df_track_endpoints["sample_name"].map(sample_end_by_sample)
+            df_track_endpoints["disappeared"] = df_track_endpoints["disappearance_t"] < df_track_endpoints["sample_end_t"]
+            df_disappearance_markers = df_track_endpoints[df_track_endpoints["disappeared"]].copy()
+            if not df_disappearance_markers.empty:
+                df_disappearance_markers["organoid_id"] = (
+                    df_disappearance_markers["sample_name"].astype(str)
+                    + "_"
+                    + df_disappearance_markers["organoid_type"].astype(str)
+                    + "_"
+                    + df_disappearance_markers["TrackID"].astype(str)
+                )
+                df_disappearance_markers = df_disappearance_markers[["organoid_id", "disappearance_t"]].rename(
+                    columns={"disappearance_t": "position_t"}
+                )
 
-            def extend_dead_tracks_to_sample_end(df, group_cols, time_column="position_t"):
+            def extend_disappearing_tracks_to_sample_end(df, group_cols, sample_end_map, time_column="position_t"):
                 """
-                For tracks marked as dead that end before their sample's final timepoint,
-                extend the track by duplicating the last row for each missing timepoint.
-                This preserves real death events where tracking was lost late in the experiment.
+                Extend ALL disappearing tracks by repeating their last value until sample end.
+                Keeps disappearing tracks in the cohort and avoids silently dropping them.
                 """
                 df = df.copy()
                 extended_rows = []
-                
-                # Get the max timepoint per sample
-                sample_max_t = df.groupby("sample_name")[time_column].transform("max")
-                df["__sample_max_t"] = sample_max_t
-                
-                for track_id, track_group in df.groupby(group_cols):
-                    # Check if track is marked as dead
-                    if ("dead" in track_group.columns) and track_group["dead"].any():
-                        track_max_t = track_group[time_column].max()
-                        sample_max_t_val = track_group["__sample_max_t"].iloc[0]
-                        
-                        # If track ends before sample end, extend it
-                        if track_max_t < sample_max_t_val:
-                            last_row = track_group.sort_values(time_column).iloc[-1].copy()
-                            missing_times = np.arange(track_max_t + 1, sample_max_t_val + 1)
-                            
-                            for t in missing_times:
-                                extended_row = last_row.copy()
-                                extended_row[time_column] = t
-                                extended_rows.append(extended_row)
+
+                for _, track_group in df.groupby(group_cols):
+                    track_max_t = track_group[time_column].max()
+                    sample_name_val = str(track_group["sample_name"].iloc[0])
+                    sample_max_t_val = sample_end_map.get(sample_name_val, track_max_t)
+
+                    if track_max_t < sample_max_t_val:
+                        last_row = track_group.sort_values(time_column).iloc[-1].copy()
+                        missing_times = np.arange(track_max_t + 1, sample_max_t_val + 1)
+
+                        for t in missing_times:
+                            extended_row = last_row.copy()
+                            extended_row[time_column] = t
+                            extended_rows.append(extended_row)
                 
                 if extended_rows:
-                    df_extended = pd.concat([df, pd.DataFrame(extended_rows)], ignore_index=True)
-                    df_extended = df_extended.drop(columns=["__sample_max_t"])
-                    
-                    n_original_rows = len(df) - len(extended_rows)  # rows before extension
+                    n_original_rows = len(df)
                     n_extended_rows = len(extended_rows)
-                    print(f"  [Dead track extension] Extended {n_extended_rows} timepoint(s) for dead tracks")
+                    df_extended = pd.concat([df, pd.DataFrame(extended_rows)], ignore_index=True)
+
+                    print(f"  [Track extension] Extended {n_extended_rows} timepoint(s) for disappearing tracks")
                     print(f"    Original rows: {n_original_rows}, Extended rows: {n_extended_rows}, Total: {len(df_extended)}")
                     
                     return df_extended
                 else:
-                    df = df.drop(columns=["__sample_max_t"])
-                    print(f"  [Dead track extension] No dead tracks to extend")
+                    print(f"  [Track extension] No disappearing tracks to extend")
                     return df
 
-            # Extend dead tracks to sample end to preserve real death events
-            print(f"\n[Dead track extension] Processing tracks marked as dead...")
-            df_no_disapp = extend_dead_tracks_to_sample_end(df_no_disapp, track_groups, time_column="position_t")
-            n_after_extension = df_no_disapp.groupby(track_groups).ngroups
-            print(f"  Track count after extension: {n_after_extension} unique tracks")
+            print(f"\n[Track extension] Processing all disappearing tracks...")
+            df_no_disapp = extend_disappearing_tracks_to_sample_end(
+                df_indiv,
+                track_groups,
+                sample_end_by_sample,
+                time_column="position_t",
+            )
+            n_disapp_total = int(df_disappearance_markers.shape[0])
+            print(f"[Plot 4/5] Tracks with disappearance markers: {n_disapp_total}/{n_total}")
+
+            if "dead" in df_no_disapp.columns:
+                n_dead_tracks = int(
+                    df_no_disapp.groupby(track_groups)["dead"].any().sum()
+                )
+            else:
+                n_dead_tracks = 0
+
+            counts_annotation = (
+                f"Tracks: {n_total} | Dead: {n_dead_tracks} | Disappeared: {n_disapp_total}\n"
+                f"(dead + non-dead; flat tail kept)"
+            )
 
             def normalize_to_zero(df, feature, group_cols):
                 """Subtract the first value of *feature* within each track group."""
@@ -1215,6 +1557,64 @@ def plot_multi_organoid_death_dynamics(
                 time_col="position_t",
             )
 
+            # Absolute-value counterpart of plots 4a/4b: same extension + cummax
+            # pipeline but WITHOUT baseline normalization, so the raw dead-signal
+            # scale of each track is visible. Drawn right before plots 4a/4b.
+            df_absolute = enforce_monotone_non_decreasing(
+                df_no_disapp.copy(),
+                features=processed_feats,
+                group_cols=track_groups,
+                time_col="position_t",
+            )
+
+            for feat, label in [
+                ("smoothed_percentage_dead_mask", "4a_abs"),
+                ("smoothed_nr_dead_mask_pixels",  "4b_abs"),
+            ]:
+                nice_feat = "% Dead Mask" if "percentage" in feat else "# Dead Pixels"
+
+                fig_abs = plot_dead_signal_per_organoid(
+                    df_absolute,
+                    figsize=figsize,
+                    feature=feat,
+                    color_by=color_key,
+                    style_by=style_key,
+                    autoscale_y=True,
+                    title=(
+                        f"Dead Signal Absolute ({nice_feat})\n"
+                        f"(non-decreasing, disappearing tracks kept as flat tails)"
+                    ),
+                    ylabel=f"Absolute ({nice_feat})",
+                    linewidth=2.6,
+                    color_map=condition_color_map,
+                    linestyle_map=type_style_map,
+                    highlight_dead_phase=True,
+                    dead_phase_color="red",
+                    disappearance_markers=df_disappearance_markers,
+                    screen_show_scale=screen_show_scale,
+                )
+
+                fig_abs.axes[0].text(
+                    0.02, 0.98,
+                    threshold_annotation,
+                    transform=fig_abs.axes[0].transAxes,
+                    fontsize=8,
+                    verticalalignment="top",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lavender", alpha=0.9),
+                )
+
+                fig_abs.axes[0].text(
+                    0.02, 0.94,
+                    counts_annotation,
+                    transform=fig_abs.axes[0].transAxes,
+                    fontsize=8,
+                    verticalalignment="top",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="honeydew", alpha=0.9),
+                )
+
+                pdf.savefig(fig_abs, bbox_inches="tight")
+                plt.close(fig_abs)
+
             for feat, label in [
                 ("smoothed_percentage_dead_mask",  "4a"),
                 ("smoothed_nr_dead_mask_pixels",   "4b"),
@@ -1232,127 +1632,63 @@ def plot_multi_organoid_death_dynamics(
                     autoscale_y=True,
                     title=(
                         f"Dead Signal Change from Baseline ({nice_feat})\n"
-                        f"(baseline-normalized, non-decreasing, disappeared excluded)"
+                        f"(baseline-normalized, non-decreasing, disappearing tracks kept as flat tails)"
                     ),
                     ylabel=f"Change from baseline ({nice_feat})",
                     linewidth=2.6,
                     color_map=condition_color_map,
                     linestyle_map=type_style_map,
+                    highlight_dead_phase=True,
+                    dead_phase_color="red",
+                    disappearance_markers=df_disappearance_markers,
+                    screen_show_scale=screen_show_scale,
                 )
 
                 # Baseline reference line (0 = no change from baseline)
                 fig_tmp.axes[0].axhline(0, color="black", linewidth=1, alpha=0.35, zorder=0)
 
-                # Add skipped-tracks annotation inside the plot (upper-left corner)
                 fig_tmp.axes[0].text(
-                    0.02, 0.97,
-                    skip_annotation,
+                    0.02, 0.98,
+                    threshold_annotation,
                     transform=fig_tmp.axes[0].transAxes,
                     fontsize=8,
                     verticalalignment="top",
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8),
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lavender", alpha=0.9),
+                )
+
+                fig_tmp.axes[0].text(
+                    0.02, 0.94,
+                    counts_annotation,
+                    transform=fig_tmp.axes[0].transAxes,
+                    fontsize=8,
+                    verticalalignment="top",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="honeydew", alpha=0.9),
                 )
 
                 pdf.savefig(fig_tmp, bbox_inches="tight")
                 plt.close(fig_tmp)
 
 
-            # --- Plots 5a & 5b: mean ± std per condition + organoid type (baseline-normalized, disappeared excluded) ---
-            # Uses the same fully-processed data as plot 4 (normalize → cummax).
-            # Groups by BOTH color_key (line_condition) and organoid_type so color
-            # and linestyle match plots 3 & 4.
-
+            # --- Plots 5a & 5b: mean +/- SEM per condition + organoid type ---
+            # Uses the same fully-processed data as plot 4 (extend -> normalize -> cummax),
+            # but aggregates by pooling all tracks across samples at each timepoint
+            # (no per-sample averaging step), so n = number of contributing tracks.
             for feat, plot_label in [
                 ("smoothed_percentage_dead_mask", "5a"),
-                ("smoothed_nr_dead_mask_pixels",  "5b"),
+                ("smoothed_nr_dead_mask_pixels", "5b"),
             ]:
-                fig5, ax5 = plt.subplots(figsize=figsize)
-                nice_feat = "% Dead Mask" if "percentage" in feat else "# Dead Pixels"
-
-                # Aggregate: mean and std per color_key x organoid_type x timepoint
-                group_cols_5 = [color_key, style_key, "position_t"]
-                agg = (
-                    df_processed
-                    .groupby(group_cols_5)[feat]
-                    .agg(mean_val="mean", std_val="std")
-                    .reset_index()
+                fig5 = plot_grouped_dead_signal(
+                    df_processed=df_processed,
+                    feature=feat,
+                    figsize=figsize,
+                    color_key=color_key,
+                    style_key=style_key,
+                    condition_color_map=condition_color_map,
+                    type_style_map=type_style_map,
+                    threshold_annotation=threshold_annotation,
+                    counts_annotation=counts_annotation,
+                    screen_show_scale=screen_show_scale,
                 )
-
-                for (cond_val, org_val), grp in agg.groupby([color_key, style_key]):
-                    grp   = grp.sort_values("position_t")
-                    t     = grp["position_t"].values
-                    mean  = grp["mean_val"].values
-                    std   = grp["std_val"].fillna(0).values
-                    color = condition_color_map.get(str(cond_val), "C0")
-                    ls    = type_style_map.get(str(org_val), "-")
-
-                    label = f"{cond_val} | {org_val}" if str(cond_val) != str(org_val) else str(cond_val)
-                    ax5.plot(t, mean, linewidth=2.6, label=label, color=color, linestyle=ls)
-                    # Fill uncertainty band (no clipping applied; mean ±  std after cummax is naturally >= 0)
-                    ax5.fill_between(
-                        t,
-                        mean - std,
-                        mean + std,
-                        alpha=0.18,
-                        color=color,
-                    )
-
-                # Baseline reference line (0 = no change from baseline)
-                ax5.axhline(0, color="black", linewidth=1, alpha=0.35, zorder=0)
-
-                ax5.set_xlim(left=0)
-                ax5.set_ylim(bottom=0)  # death increase can only be >= 0
-                ax5.set_xlabel("Timepoint")
-                ax5.set_ylabel(f"Change from baseline ({nice_feat})")
-                ax5.set_title(
-                    f"Mean ± Std per Condition & Organoid Type\n"
-                    f"({nice_feat}, baseline-normalized, non-decreasing, disappeared excluded)"
-                )
-                ax5.grid(True, linestyle=":", linewidth=1, alpha=0.5)
-
-                ax5.text(
-                    0.02, 0.97,
-                    skip_annotation,
-                    transform=ax5.transAxes,
-                    fontsize=8,
-                    verticalalignment="top",
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8),
-                )
-
-                # Dual legends matching plots 3/4
-                color_handles = [
-                    Line2D([0], [0], color=condition_color_map[lvl], lw=3, linestyle="-", label=str(lvl))
-                    for lvl in sorted(condition_color_map.keys())
-                ]
-                leg1 = ax5.legend(
-                    handles=color_handles,
-                    title=color_key.replace("_", " ").title(),
-                    loc="upper left",
-                    bbox_to_anchor=(1.02, 1.0),
-                    borderaxespad=0,
-                    prop={"size": 8},
-                    frameon=True,
-                )
-                ax5.add_artist(leg1)
-
-                style_handles = [
-                    Line2D([0], [0], color="black", lw=3, linestyle=type_style_map[lvl], label=str(lvl))
-                    for lvl in sorted(type_style_map.keys())
-                ]
-                ax5.legend(
-                    handles=style_handles,
-                    title=style_key.replace("_", " ").title(),
-                    loc="upper left",
-                    bbox_to_anchor=(1.02, 0.55),
-                    borderaxespad=0,
-                    prop={"size": 8},
-                    frameon=True,
-                    handlelength=3.5,
-                    handletextpad=0.8,
-                )
-
-                plt.tight_layout()
-                plt.show()
                 pdf.savefig(fig5, bbox_inches="tight")
                 plt.close(fig5)
 
