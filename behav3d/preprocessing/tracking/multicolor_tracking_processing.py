@@ -7,6 +7,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from behav3d.io.images import load_zarr, write_zarr_parallel
+from behav3d.core.metadata import expand_multicolor_celltype_names
 
 
 def _remove_output(path):
@@ -379,3 +380,24 @@ def combine_multicolor_tracked_outputs(
         metadata.at[row_idx, csv_col] = str(outputs["csv"])
 
     return metadata
+
+
+def combine_multicolor_tracked_outputs_for_base(
+    metadata,
+    output_dir,
+    base_cell_type,
+    n_channels,
+    overwrite=False,
+    n_workers=1,
+):
+    """Convenience wrapper that combines a numbered multicolor set for one base cell type."""
+    source_cell_types = expand_multicolor_celltype_names(base_cell_type, n_channels)
+    combined_cell_type = f"{str(base_cell_type).strip()}_merged"
+    return combine_multicolor_tracked_outputs(
+        metadata=metadata,
+        output_dir=output_dir,
+        source_cell_types=source_cell_types,
+        combined_cell_type=combined_cell_type,
+        overwrite=overwrite,
+        n_workers=n_workers,
+    )

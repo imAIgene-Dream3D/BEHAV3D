@@ -12,6 +12,7 @@ from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_organoid_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    expand_multicolor_celltype_names,
     load_behav3d_metadata,
 )
 from behav3d.io.images import load_zarr, write_zarr_parallel
@@ -571,6 +572,31 @@ def _coerce_metadata(metadata):
         return metadata
     return load_behav3d_metadata(metadata)
 
+
+
+def apply_multicolor_segment_correction_for_base(
+    metadata,
+    output_dir,
+    base_cell_type,
+    n_channels,
+    overwrite=False,
+    show_progress=True,
+    n_workers=1,
+):
+    """Convenience wrapper for a numbered multicolor cell type family.
+
+    This is a top-level helper so other modules (e.g., the widgets package)
+    can import it directly.
+    """
+    cell_types = expand_multicolor_celltype_names(base_cell_type, n_channels)
+    return apply_multicolor_segment_correction(
+        metadata=metadata,
+        output_dir=output_dir,
+        cell_types=cell_types,
+        overwrite=overwrite,
+        show_progress=show_progress,
+        n_workers=n_workers,
+    )
 
 def _resolve_output_dir(metadata, output_dir=None):
     if output_dir is not None:

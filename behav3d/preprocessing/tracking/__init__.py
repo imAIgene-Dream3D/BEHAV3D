@@ -10,6 +10,10 @@ from tqdm import tqdm
 from skimage.measure import regionprops_table
 
 from behav3d.io.images import append_to_zarr, save_as_zarr, load_image, load_zarr, write_zarr_parallel
+from .multicolor_tracking_processing import (
+    combine_multicolor_tracked_outputs,
+    combine_multicolor_tracked_outputs_for_base,
+)
 
 def convert_segments_to_tracks(
     df_tracks,

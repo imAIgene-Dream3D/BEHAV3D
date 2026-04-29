@@ -40,6 +40,8 @@ from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    is_multicolor_celltype,
+    multicolor_base_name,
 )
 
 # Cellpose channel config: extra raw C indices with no analyzed label
@@ -440,6 +442,42 @@ class PixelClassifierPanel:
         self.other_types = detect_other_cell_types_from_metadata(metadata)
         self.has_death = has_dead_channel(metadata)
         self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
+
+    def _apply_multicolor_segment_cleanup(self, metadata, output_dir):
+        """Clean multicolor segmentation outputs after the full batch has finished."""
+        families = {}
+        for cell_type in self.organoid_types + self.immune_types + self.other_types:
+            if not is_multicolor_celltype(cell_type):
+                continue
+            base_name = multicolor_base_name(cell_type)
+            families.setdefault(base_name, []).append(cell_type)
+
+        if not families:
+            return metadata
+
+        from behav3d.preprocessing.segmentation.multicolor_segment_processing import (
+            apply_multicolor_segment_correction_for_base,
+        )
+
+        cleaned_metadata = metadata
+        for base_name, family_cell_types in sorted(families.items()):
+            if len(family_cell_types) < 2:
+                continue
+            print(
+                f"Running multicolor cleanup for '{base_name}' after batch segmentation: "
+                f"{sorted(family_cell_types)}"
+            )
+            cleaned_metadata = apply_multicolor_segment_correction_for_base(
+                metadata=cleaned_metadata,
+                output_dir=str(output_dir),
+                base_cell_type=base_name,
+                n_channels=len(family_cell_types),
+                overwrite=bool(self.overwrite_existing.value),
+                show_progress=True,
+                n_workers=max(1, int(self.n_workers.value)),
+            )
+
+        return cleaned_metadata
     
     def _create_clf_path_pickers(self):
         for cell_type in self.all_cell_types:
@@ -973,6 +1011,7 @@ class PixelClassifierPanel:
                         n_workers=int(self.n_workers.value),
                     )
                 if new_md is not None:
+                    new_md = self._apply_multicolor_segment_cleanup(new_md, odir)
                     self.metadata_loader.metadata = new_md
                     new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
                 print("Apply finished.")

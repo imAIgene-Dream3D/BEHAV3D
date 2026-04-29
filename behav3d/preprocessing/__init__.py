@@ -130,6 +130,50 @@ def close_mask(image, use_dimensions=2, nr_pixels=1):
     data_expanded = closing(image=image, footprint=k)
     return(data_expanded)
 
+
+def run_multicolor_post_tracking_merge(
+    metadata,
+    output_dir,
+    base_cell_type,
+    n_channels,
+    overwrite=False,
+    segmentation_kwargs=None,
+    tracking_kwargs=None,
+):
+    """Run the multicolor cleanup and merged-output step for one base cell type.
+
+    This helper keeps the multicolor-specific flow in one place:
+    1. Normalize/correct the per-channel segmentations.
+    2. Combine the per-channel tracked outputs into a merged tracked image and CSV.
+    """
+    segmentation_kwargs = dict(segmentation_kwargs or {})
+    tracking_kwargs = dict(tracking_kwargs or {})
+
+    from behav3d.preprocessing.segmentation.multicolor_segment_processing import (
+        apply_multicolor_segment_correction_for_base,
+    )
+    from behav3d.preprocessing.tracking.multicolor_tracking_processing import (
+        combine_multicolor_tracked_outputs_for_base,
+    )
+
+    metadata = apply_multicolor_segment_correction_for_base(
+        metadata=metadata,
+        output_dir=output_dir,
+        base_cell_type=base_cell_type,
+        n_channels=n_channels,
+        overwrite=overwrite,
+        **segmentation_kwargs,
+    )
+    metadata = combine_multicolor_tracked_outputs_for_base(
+        metadata=metadata,
+        output_dir=output_dir,
+        base_cell_type=base_cell_type,
+        n_channels=n_channels,
+        overwrite=overwrite,
+        **tracking_kwargs,
+    )
+    return metadata
+
 def filter_median(image, use_dimensions=3, radius=None, filter_shape=None, elsize=None):
     """
     Perform median filtering for each pixel/voxel in the image based on a certain shape and radius

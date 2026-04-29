@@ -7,6 +7,7 @@ from .multicolor_segment_processing import (
     calculate_multicolor_overlap,
     process_multicolor_segments,
     visualize_multicolor_overlap,
+    apply_multicolor_segment_correction_for_base,
 )
 
 def keep_largest_connected_components(segments):

@@ -2,6 +2,94 @@ import pandas as pd
 from pathlib import Path
 import re
 
+
+def is_multicolor_celltype(cell_type_name: str) -> bool:
+    """Return True if a cell type name matches the per-channel multicolor pattern.
+
+    Pattern used by the metadata builder: <base>_<index>_multicolor (e.g., tcells_1_multicolor)
+    """
+    if not isinstance(cell_type_name, str):
+        return False
+    return re.search(r'_[0-9]+_multicolor$', cell_type_name) is not None
+
+
+def multicolor_base_name(cell_type_name: str) -> str:
+    """If `cell_type_name` is a multicolor per-channel name, return the base name.
+
+    Example: tcells_2_multicolor -> tcells
+    If not multicolor, return the original name.
+    """
+    m = re.search(r'^(.*)_([0-9]+)_multicolor$', str(cell_type_name))
+    if m:
+        return m.group(1)
+    return cell_type_name
+
+
+def is_merged_celltype(cell_type_name: str) -> bool:
+    """Return True if the cell type name looks like a merged multicolor output.
+
+    We use the suffix `_merged` for the merged output (e.g., tcells_merged).
+    """
+    if not isinstance(cell_type_name, str):
+        return False
+    return cell_type_name.endswith('_merged')
+
+
+def filter_multicolor_inputs(celltype_list):
+    """Filter out per-channel multicolor entries from a list of cell type names.
+
+    Keeps merged names (ending with `_merged`) and non-multicolor names.
+    """
+    out = []
+    for ct in celltype_list:
+        if is_multicolor_celltype(ct):
+            continue
+        out.append(ct)
+    return out
+
+
+def detect_merged_cell_types_from_metadata(metadata):
+    """Detect merged multicolor outputs from metadata columns.
+
+    Looks for standalone columns like ``tcells_merged_tracks_image_path`` or
+    ``tcells_merged_tracks_csv_path`` that are not prefixed with ``or_``, ``im_``,
+    or ``ot_``.
+    """
+    if metadata is None:
+        return []
+
+    merged_types = set()
+    suffixes = ("_tracks_image_path", "_tracks_csv_path", "_segments_image_path")
+    for col in metadata.columns:
+        if not col.endswith(suffixes):
+            continue
+        if col.startswith(("or_", "im_", "ot_")):
+            continue
+        base = col
+        for suffix in suffixes:
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        if is_merged_celltype(base):
+            merged_types.add(base)
+
+    return sorted(list(merged_types))
+
+
+def expand_multicolor_celltype_names(base_name, n_channels):
+    """Expand a base cell type into per-channel multicolor names.
+
+    Example: expand_multicolor_celltype_names("tcells", 3) ->
+    ["tcells_1_multicolor", "tcells_2_multicolor", "tcells_3_multicolor"]
+    """
+    base_name = str(base_name).strip()
+    n_channels = int(n_channels)
+    if not base_name:
+        raise ValueError("base_name must be a non-empty string")
+    if n_channels < 1:
+        raise ValueError("n_channels must be at least 1")
+    return [f"{base_name}_{idx}_multicolor" for idx in range(1, n_channels + 1)]
+
 def detect_organoid_types_from_metadata(metadata):
     """
     Detect organoid types from metadata column names.

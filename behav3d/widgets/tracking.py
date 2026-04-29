@@ -14,7 +14,15 @@ from behav3d.preprocessing.tracking.laptracking import run_laptracking
 from behav3d.preprocessing.tracking.trackpy_tracking import run_trackpy_tracking_generic
 from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
 from behav3d.preprocessing.tracking.btrack_tracking import run_btracking
-from behav3d.preprocessing.tracking import visualize_tracks
+from behav3d.preprocessing.tracking import visualize_tracks, combine_multicolor_tracked_outputs_for_base
+from behav3d.core.metadata import (
+    detect_merged_cell_types_from_metadata,
+    is_multicolor_celltype,
+    multicolor_base_name,
+    detect_organoid_types_from_metadata,
+    detect_immune_cell_types_from_metadata,
+    detect_other_cell_types_from_metadata,
+)
 
 
 _TRACKING_PROFILE_DEFAULTS = {
@@ -456,13 +464,14 @@ class TrackingPanel:
         from behav3d.core.metadata import (
             detect_organoid_types_from_metadata,
             detect_immune_cell_types_from_metadata,
-            detect_other_cell_types_from_metadata
+            detect_other_cell_types_from_metadata,
         )
         metadata = self.metadata_loader.metadata
         if metadata is None: raise ValueError("Metadata not loaded.")
         self.organoid_types = detect_organoid_types_from_metadata(metadata)
         self.immune_types = detect_immune_cell_types_from_metadata(metadata)
         self.other_types = detect_other_cell_types_from_metadata(metadata)
+        self.merged_types = detect_merged_cell_types_from_metadata(metadata)
 
     def _detect_category(self):
         self.category = detect_cell_type_category(self.cell_type, self.metadata_loader.metadata)
@@ -817,7 +826,35 @@ class TrackingPanel:
                     )
 
                 self.metadata_loader.metadata = new_md
-                new_md.to_csv(csv_path, sep=",", index=False)
+
+                if is_multicolor_celltype(self.cell_type):
+                    base_cell_type = multicolor_base_name(self.cell_type)
+                    family_cell_types = [
+                        ct for ct in (self.organoid_types + self.immune_types + self.other_types)
+                        if is_multicolor_celltype(ct) and multicolor_base_name(ct) == base_cell_type
+                    ]
+                    if family_cell_types:
+                        parsed = []
+                        for ct in family_cell_types:
+                            match = None
+                            import re
+                            match = re.search(r'_(\d+)_multicolor$', ct)
+                            if match:
+                                parsed.append((int(match.group(1)), ct))
+                        family_cell_types = [ct for _, ct in sorted(parsed, key=lambda item: item[0])]
+                        try:
+                            self.metadata_loader.metadata = combine_multicolor_tracked_outputs_for_base(
+                                metadata=self.metadata_loader.metadata,
+                                output_dir=str(out_dir),
+                                base_cell_type=base_cell_type,
+                                n_channels=len(family_cell_types),
+                                overwrite=bool(self.overwrite.value),
+                                n_workers=1,
+                            )
+                        except FileNotFoundError:
+                            pass
+
+                self.metadata_loader.metadata.to_csv(csv_path, sep=",", index=False)
                 print("✅ Tracking finished.")
             except Exception: traceback.print_exc()
             finally:
