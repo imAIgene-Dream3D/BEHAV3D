@@ -101,13 +101,16 @@ def detect_organoid_types_from_metadata(metadata):
     
     organoid_types = set()
     # Pattern: columns starting with 'or_' prefix
+    suffixes = ("_line_condition", "_segments_image_path", "_tracks_image_path", "_tracks_csv_path")
     for col in metadata.columns:
         if col.startswith('or_'):
-            # Extract cell type name: or_organoid1_line_condition -> organoid1
-            parts = col[3:].split('_', 1)  # Remove 'or_' prefix and split
-            if parts:
-                cell_type = parts[0]
-                organoid_types.add(cell_type)
+            base = col[3:]
+            for suffix in suffixes:
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            if base:
+                organoid_types.add(base)
     
     return sorted(list(organoid_types))
 
@@ -122,13 +125,16 @@ def detect_immune_cell_types_from_metadata(metadata):
     
     immune_types = set()
     # Pattern: columns starting with 'im_' prefix
+    suffixes = ("_line_condition", "_segments_image_path", "_tracks_image_path", "_tracks_csv_path")
     for col in metadata.columns:
         if col.startswith('im_'):
-            # Extract cell type name: im_tcell_line_condition -> tcell
-            parts = col[3:].split('_', 1)  # Remove 'im_' prefix and split
-            if parts:
-                cell_type = parts[0]
-                immune_types.add(cell_type)
+            base = col[3:]
+            for suffix in suffixes:
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            if base:
+                immune_types.add(base)
     
     return sorted(list(immune_types))
 
@@ -143,13 +149,16 @@ def detect_other_cell_types_from_metadata(metadata):
     
     other_types = set()
     # Pattern: columns starting with 'ot_' prefix
+    suffixes = ("_line_condition", "_segments_image_path", "_tracks_image_path", "_tracks_csv_path")
     for col in metadata.columns:
         if col.startswith('ot_'):
-            # Extract cell type name: ot_tumor1_line_condition -> tumor1
-            parts = col[3:].split('_', 1)  # Remove 'ot_' prefix and split
-            if parts:
-                cell_type = parts[0]
-                other_types.add(cell_type)
+            base = col[3:]
+            for suffix in suffixes:
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            if base:
+                other_types.add(base)
     
     return sorted(list(other_types))
 
@@ -230,10 +239,25 @@ def check_behav3d_metadata(
     Validate metadata with dynamic cell type support.
     Uses prefixed columns: or_*, im_*, ot_* for organoid, immune, and other cell types.
     """
-    # Detect cell types dynamically
+    # Detect cell types dynamically.
+    # Organoid and other types keep the existing schema, while immune types may
+    # appear either in legacy form (im_tcell_...) or as multicolor-expanded
+    # entries (im_tcell_1_multicolor_...).
     organoid_types = detect_organoid_types_from_metadata(metadata)
     immune_types = detect_immune_cell_types_from_metadata(metadata)
     other_types = detect_other_cell_types_from_metadata(metadata)
+
+    immune_columns = [col for col in metadata.columns if col.startswith("im_")]
+    immune_validation_types = sorted(
+        {
+            col[3 : -len(suffix)]
+            for col in immune_columns
+            for suffix in ("_line_condition", "_segments_image_path", "_tracks_image_path", "_tracks_csv_path")
+            if col.endswith(suffix)
+        }
+    )
+    if immune_validation_types:
+        immune_types = immune_validation_types
     
     # Basic required columns (always needed)
     required_columns = [
