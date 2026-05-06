@@ -712,6 +712,9 @@ def calculate_image_based_track_features(
         # Calculate contacts dynamically for all cell types found in metadata
         # The resulting DataFrame will have columns for ALL cell types (e.g., organoid1_contact, macro_contact, etc.)
         
+        # Determine if invasiveness should be calculated (immune cells + invasiveness feature requested)
+        should_calculate_invasiveness = "invasiveness" in features_choice and cell_type in immune_segments_paths.keys()
+        
         if df_contacts_outpath.exists() and not overwrite:
             print("Contact .csv already exists. Loading in contact information...")
             df_contacts = pd.read_csv(df_contacts_outpath)
@@ -727,7 +730,8 @@ def calculate_image_based_track_features(
                 element_size_z=element_size_z,
                 contact_threshold=contact_threshold,
                 calculate_from=cell_type,
-                n_workers=n_workers
+                n_workers=n_workers,
+                calculate_invasiveness=should_calculate_invasiveness
             )
             if df_contacts_outpath != "":
                 df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
@@ -1177,6 +1181,7 @@ def _calculate_contact_single_timepoint(args):
     """
     Calculate contacts between current cell type and ALL other cell types.
     Fully flexible - works with any combination of cell types.
+    Optionally also calculates invasiveness (for immune cells against organoids).
     """
     (
         t,
@@ -1188,7 +1193,8 @@ def _calculate_contact_single_timepoint(args):
         element_size_y,
         element_size_z,
         contact_threshold,
-        calculate_from
+        calculate_from,
+        calculate_invasiveness
     ) = args
 
     # Validate element sizes before any division
@@ -1346,6 +1352,43 @@ def _calculate_contact_single_timepoint(args):
         contact_data['any_organoid_contact_on_distance'] = any(any_org_contact_on_distance)
         contact_data['any_immune_cell_contact'] = any(any_immune_contact)
         contact_data['any_immune_cell_contact_on_distance'] = any(any_immune_contact_on_distance)
+        
+        # Calculate invasiveness for immune cells (only if requested and organoids exist)
+        if calculate_invasiveness and organoid_segments_dict:
+            # Define "surface" as pixels within 2 µm of cell boundary
+            surface_threshold = 2.0  # µm
+            surface_mask = real_distances <= surface_threshold
+            total_surface_pixels = np.sum(surface_mask)
+            
+            if total_surface_pixels > 0:
+                any_invasiveness_list = []
+                
+                # Calculate invasiveness for each organoid type
+                for org_type, org_segments in organoid_segments_dict.items():
+                    org_cutout = org_segments[slicer]
+                    
+                    # Count surface pixels in contact with this organoid type
+                    org_contact_mask = (real_distances <= contact_threshold) & (org_cutout != 0)
+                    contacted_surface_pixels = np.sum(org_contact_mask)
+                    
+                    # Calculate percentage
+                    invasiveness_perc = (contacted_surface_pixels / total_surface_pixels) * 100.0
+                    
+                    # Boolean: invasive if >= 50% of surface is in contact
+                    invasiveness_bool = invasiveness_perc >= 50.0
+                    
+                    contact_data[f'org_invasiveness_{org_type}'] = invasiveness_bool
+                    contact_data[f'org_invasiveness_perc_{org_type}'] = invasiveness_perc
+                    any_invasiveness_list.append(invasiveness_bool)
+                
+                # Add aggregate: True if invasive against ANY organoid type
+                contact_data['any_org_invasiveness'] = any(any_invasiveness_list)
+            else:
+                # No surface detected, set invasiveness to False/0
+                for org_type in organoid_segments_dict.keys():
+                    contact_data[f'org_invasiveness_{org_type}'] = False
+                    contact_data[f'org_invasiveness_perc_{org_type}'] = 0.0
+                contact_data['any_org_invasiveness'] = False
 
         df_contacts.append(pd.DataFrame([contact_data]))
 
@@ -1366,7 +1409,8 @@ def calculate_contact_features(
     element_size_y=None,
     element_size_z=None,
     calculate_from=None,
-    n_workers=1
+    n_workers=1,
+    calculate_invasiveness=False
     ):
     """
     Flexible contact calculation - works with any cell types from metadata.
@@ -1377,9 +1421,11 @@ def calculate_contact_features(
         immune_segments_paths: Dict of {immune_type: path} for all immune types
         other_segments_paths: Dict of {other_type: path} for all other types
         calculate_from: The cell type we're calculating features for (required for self-contact exclusion)
+        calculate_invasiveness: If True, calculate invasiveness features for immune cells against organoids
         
     Returns:
         DataFrame of contact annotations for the current cell type with ALL other cell types.
+        If calculate_invasiveness=True, also includes org_invasiveness_* and org_invasiveness_perc_* columns.
     """
     current_segments = load_image(current_cell_segments_path)
     timepoints = current_segments.shape[0]
@@ -1395,7 +1441,8 @@ def calculate_contact_features(
             element_size_y,
             element_size_z,
             contact_threshold,
-            calculate_from
+            calculate_from,
+            calculate_invasiveness
         )
         for t in range(timepoints)
     ]

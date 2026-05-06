@@ -246,13 +246,16 @@ class _CellTypeFeatureExtractionPanel:
         else:
             self.dead_mask_threshold = self.shared_threshold_widget
 
-        self._all_features = ["movement", "intensity", "morphology", "contact", "death"]
+        self._all_features = ["movement", "intensity", "morphology", "contact", "invasiveness", "death"]
         self._mandatory_features = {"intensity", "contact"}
         if self.category in {"immune", "other"}:
             self._mandatory_features.add("movement")
         if self.has_dead:
             self._mandatory_features.add("death")
         self._optional_features = {"movement", "morphology"} if self.category == "organoid" else {"morphology"}
+        # Add invasiveness as optional feature for immune cells only
+        if self.category == "immune":
+            self._optional_features.add("invasiveness")
 
         default_feats = fcfg.get("features_choice", self._all_features)
         if not isinstance(default_feats, (list, tuple)):
@@ -279,10 +282,27 @@ class _CellTypeFeatureExtractionPanel:
         )
 
         self.contact_threshold.description = "Contact Threshold (\u00B5m)"
-        contact_row = widgets.HBox([self.feature_checks["contact"], self.contact_threshold], layout=widgets.Layout(align_items="center", gap="12px"))
+        
+        # Build contact_row with contact checkbox and threshold
+        contact_row_items = [self.feature_checks["contact"], self.contact_threshold]
+        
+        # Add invasiveness checkbox inline for immune cells only
+        if self.category == "immune":
+            invasiveness_label = "Organoid Invasiveness (Advanced)"
+            self.feature_checks["invasiveness"].description = invasiveness_label
+            contact_row_items.append(self.feature_checks["invasiveness"])
+        else:
+            # Hide invasiveness checkbox for non-immune cell types
+            if "invasiveness" in self.feature_checks:
+                self.feature_checks["invasiveness"].layout.display = "none"
+        
+        contact_row = widgets.HBox(contact_row_items, layout=widgets.Layout(align_items="center", gap="12px"))
 
         def _toggle_contact_threshold(change=None):
             self.contact_threshold.layout.display = None if self.feature_checks["contact"].value else "none"
+            # Also toggle invasiveness visibility with contact
+            if "invasiveness" in self.feature_checks and self.category == "immune":
+                self.feature_checks["invasiveness"].layout.display = None if self.feature_checks["contact"].value else "none"
 
         _toggle_contact_threshold()
         self.feature_checks["contact"].observe(_toggle_contact_threshold, names="value")
@@ -291,6 +311,9 @@ class _CellTypeFeatureExtractionPanel:
         for f in self._all_features:
             if f == "contact":
                 feat_rows.append(contact_row)
+            elif f == "invasiveness":
+                # Skip invasiveness here - it's already in contact_row for immune cells
+                continue
             elif f == "death" and not self.has_dead:
                 continue
             else:
