@@ -22,7 +22,10 @@ from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    detect_merged_cell_types_from_metadata,
+    filter_multicolor_inputs,
     has_dead_channel,
+    is_multicolor_celltype,
 )
 from behav3d.core.utils import expand_column_patterns
 from behav3d.io.formats.zarr import load_zarr
@@ -72,6 +75,31 @@ def _csv_has_columns(csv_path, required_columns):
     except Exception:
         return False
     return set(required_columns).issubset(columns)
+
+
+def _detect_downstream_cell_types(metadata):
+    """Return (organoid, immune, other) excluding per-channel multicolor and keeping merged/grouped outputs."""
+    organoid_types = filter_multicolor_inputs(detect_organoid_types_from_metadata(metadata))
+    immune_types = filter_multicolor_inputs(detect_immune_cell_types_from_metadata(metadata))
+    other_types = filter_multicolor_inputs(detect_other_cell_types_from_metadata(metadata))
+
+    merged_or_grouped_types = detect_merged_cell_types_from_metadata(metadata)
+    for ct in merged_or_grouped_types:
+        try:
+            category = detect_cell_type_category(ct, metadata)
+        except Exception:
+            category = "immune"
+        if category == "organoid":
+            if ct not in organoid_types:
+                organoid_types.append(ct)
+        elif category == "other":
+            if ct not in other_types:
+                other_types.append(ct)
+        else:
+            if ct not in immune_types:
+                immune_types.append(ct)
+
+    return organoid_types, immune_types, other_types
 
 
 def _get_channel_labels_for_sample(metadata_loader, sample_name=None):
@@ -650,9 +678,7 @@ class FeatureExtractionPanel:
             self.run_buttons = [self.btn_run]
             return
 
-        organoid_types = detect_organoid_types_from_metadata(self.metadata)
-        immune_types = detect_immune_cell_types_from_metadata(self.metadata)
-        other_types = detect_other_cell_types_from_metadata(self.metadata)
+        organoid_types, immune_types, other_types = _detect_downstream_cell_types(self.metadata)
 
         self.cell_panels = {}
         self.run_buttons = []
@@ -908,18 +934,10 @@ class ActiveKillingPanel:
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
         self.killing_results = None
         
-        from behav3d.core.metadata import (
-            detect_immune_cell_types_from_metadata,
-            detect_organoid_types_from_metadata,
-            detect_other_cell_types_from_metadata,
-            has_dead_channel
-        )
         md = self.metadata_loader.metadata
         if md is None: raise RuntimeError("Metadata not loaded.")
-        
-        self.immune_types = detect_immune_cell_types_from_metadata(md)
-        self.organoid_types = detect_organoid_types_from_metadata(md)
-        self.other_types = detect_other_cell_types_from_metadata(md)
+
+        self.organoid_types, self.immune_types, self.other_types = _detect_downstream_cell_types(md)
         self.potential_immune = self.immune_types + self.other_types
         self.target_types = self.organoid_types
         
@@ -2083,10 +2101,8 @@ class MultiOrganoidInteractionComparisonPanel:
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
 
         md = self.metadata_loader.metadata
-        self.immune_types = (
-            detect_immune_cell_types_from_metadata(md)
-            + detect_other_cell_types_from_metadata(md)
-        )
+        _, immune_types, other_types = _detect_downstream_cell_types(md)
+        self.immune_types = immune_types + other_types
 
         # --- widgets ---
         group_options = [
@@ -2427,9 +2443,9 @@ class InteractionAnalysisPanel:
         self.cell_type = str(cell_type).strip()
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
         
-        from behav3d.core.metadata import detect_immune_cell_types_from_metadata, detect_other_cell_types_from_metadata
         md = self.metadata_loader.metadata
-        self.available_types = detect_immune_cell_types_from_metadata(md) + detect_other_cell_types_from_metadata(md)
+        _, immune_types, other_types = _detect_downstream_cell_types(md)
+        self.available_types = immune_types + other_types
         self.df_tracks_path = Path(self.output_dir, "analysis", self.cell_type, "track_features", f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
         
         self.status_html = widgets.HTML("")

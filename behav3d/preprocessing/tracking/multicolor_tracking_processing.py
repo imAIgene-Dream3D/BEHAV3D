@@ -41,7 +41,7 @@ def _resolve_source_tracking_columns(sample, cell_type):
         if pd.notna(csv_value) and str(csv_value).strip():
             csv_col = candidate_csv
         if img_col is not None and csv_col is not None:
-            return img_col, csv_col
+            return img_col, csv_col, prefix
 
     legacy_img = f"{cell_type}_tracks_image_path"
     legacy_csv = f"{cell_type}_tracks_csv_path"
@@ -49,12 +49,12 @@ def _resolve_source_tracking_columns(sample, cell_type):
         img_col = legacy_img
     if csv_col is None and legacy_csv in sample.index:
         csv_col = legacy_csv
-    return img_col, csv_col
+    return img_col, csv_col, None
 
 
 def _resolve_source_tracking_paths(sample, output_dir, cell_type):
     sample_name = str(sample["sample_name"]).strip()
-    img_col, csv_col = _resolve_source_tracking_columns(sample, cell_type)
+    img_col, csv_col, prefix = _resolve_source_tracking_columns(sample, cell_type)
 
     img_path = None
     csv_path = None
@@ -71,7 +71,7 @@ def _resolve_source_tracking_paths(sample, output_dir, cell_type):
         img_path = Path(output_dir, "images", sample_name, f"{sample_name}_{cell_type}_tracked.zarr")
     if csv_path is None:
         csv_path = Path(output_dir, "trackdata", sample_name, cell_type, f"{sample_name}_{cell_type}_tracks.csv")
-    return img_path, csv_path
+    return img_path, csv_path, prefix
 
 
 def _build_combined_tracking_paths(output_dir, sample_name, combined_cell_type):
@@ -89,8 +89,11 @@ def _plan_multicolor_tracking_sample(sample, output_dir, source_cell_types, comb
     sample_name = str(sample["sample_name"]).strip()
     sources = []
     missing = []
+    output_prefix = None
     for cell_type in source_cell_types:
-        img_path, csv_path = _resolve_source_tracking_paths(sample, output_dir, cell_type)
+        img_path, csv_path, source_prefix = _resolve_source_tracking_paths(sample, output_dir, cell_type)
+        if output_prefix is None and source_prefix in {"or", "im", "ot"}:
+            output_prefix = source_prefix
         if not img_path.exists():
             missing.append(
                 {
@@ -123,6 +126,7 @@ def _plan_multicolor_tracking_sample(sample, output_dir, source_cell_types, comb
         "sources": sources,
         "outputs": outputs,
         "missing": missing,
+        "output_prefix": output_prefix,
     }
 
 
@@ -374,10 +378,24 @@ def combine_multicolor_tracked_outputs(
 
         img_col = f"{combined_cell_type}_tracks_image_path"
         csv_col = f"{combined_cell_type}_tracks_csv_path"
-        _ensure_metadata_output_columns(metadata, img_col, csv_col)
+        prefixed_img_col = None
+        prefixed_csv_col = None
+        output_prefix = sample_plan.get("output_prefix")
+        if output_prefix in {"or", "im", "ot"}:
+            prefixed_img_col = f"{output_prefix}_{combined_cell_type}_tracks_image_path"
+            prefixed_csv_col = f"{output_prefix}_{combined_cell_type}_tracks_csv_path"
+
+        cols_to_ensure = [img_col, csv_col]
+        if prefixed_img_col is not None and prefixed_csv_col is not None:
+            cols_to_ensure.extend([prefixed_img_col, prefixed_csv_col])
+        _ensure_metadata_output_columns(metadata, *cols_to_ensure)
+
         row_idx = metadata.index[metadata["sample_name"].astype("string").str.strip() == sample_name][0]
         metadata.at[row_idx, img_col] = str(outputs["img"])
         metadata.at[row_idx, csv_col] = str(outputs["csv"])
+        if prefixed_img_col is not None and prefixed_csv_col is not None:
+            metadata.at[row_idx, prefixed_img_col] = str(outputs["img"])
+            metadata.at[row_idx, prefixed_csv_col] = str(outputs["csv"])
 
     return metadata
 
