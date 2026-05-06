@@ -40,6 +40,8 @@ from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    is_multicolor_celltype,
+    multicolor_base_name,
 )
 
 # Cellpose channel config: extra raw C indices with no analyzed label
@@ -325,6 +327,7 @@ class PixelClassifierPanel:
 
         self.clf_paths_box = widgets.VBox()
         self._build_clf_paths_box()
+        self._build_clf_paths_box()
         
         self.manual_clf_paths.observe(self._toggle_clf_path_section, names='value')
         self._toggle_clf_path_section()
@@ -427,19 +430,90 @@ class PixelClassifierPanel:
         self._viewer = None
 
     def _detect_cell_types(self):
+        import re
         from behav3d.io.images import load_image, load_zarr, save_as_zarr
         from behav3d.core.metadata import (
             detect_organoid_types_from_metadata,
             detect_immune_cell_types_from_metadata,
             detect_other_cell_types_from_metadata,
-            has_dead_channel
+            has_dead_channel,
         )
+
         metadata = self.metadata_loader.metadata
-        self.organoid_types = detect_organoid_types_from_metadata(metadata)
-        self.immune_types = detect_immune_cell_types_from_metadata(metadata)
-        self.other_types = detect_other_cell_types_from_metadata(metadata)
+
+        # Prefer explicit cell-type columns found in metadata (this preserves
+        # per-channel multicolor names such as 'tcells_1_multicolor').
+        def _extract_types_for_prefix(prefix):
+            types = set()
+            if metadata is None:
+                return []
+            suffixes = (
+                "_line_condition",
+                "_segments_image_path",
+                "_tracks_image_path",
+                "_tracks_csv_path",
+            )
+            for col in metadata.columns:
+                if not col.startswith(f"{prefix}_"):
+                    continue
+                for suf in suffixes:
+                    if col.endswith(suf):
+                        # strip prefix + trailing suffix to get the full cell-type token
+                        ct = col[len(prefix) + 1 : -len(suf)]
+                        types.add(ct)
+                        break
+            return sorted(types)
+
+        # Extract explicit names (will include per-channel multicolor names)
+        self.organoid_types = _extract_types_for_prefix('or') or detect_organoid_types_from_metadata(metadata)
+        self.immune_types = _extract_types_for_prefix('im') or detect_immune_cell_types_from_metadata(metadata)
+        self.other_types = _extract_types_for_prefix('ot') or detect_other_cell_types_from_metadata(metadata)
+
+        # Backwards-compatible: if explicit columns not present, fall back to detectors
+        # Determine death channel presence
         self.has_death = has_dead_channel(metadata)
+
+        # Combine all detected types; keep order organoid -> immune -> other
         self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
+
+    def _apply_multicolor_segment_cleanup(self, metadata, output_dir):
+        """Run multicolor redundancy cleanup after segmentation.
+
+        This keeps per-channel segmentations separate while removing shared
+        voxels that would otherwise be duplicated across multicolor channels.
+        """
+        families = {}
+        for cell_type in self.organoid_types + self.immune_types + self.other_types:
+            if not is_multicolor_celltype(cell_type):
+                continue
+            base_name = multicolor_base_name(cell_type)
+            families.setdefault(base_name, []).append(cell_type)
+
+        if not families:
+            return metadata
+
+        from behav3d.preprocessing.segmentation.multicolor_segment_processing import (
+            apply_multicolor_segment_correction_for_base,
+        )
+
+        cleaned_metadata = metadata
+        for base_name, family_cell_types in sorted(families.items()):
+            if len(family_cell_types) < 2:
+                continue
+            print(
+                f"Running multicolor cleanup for '{base_name}' after batch segmentation: "
+                f"{sorted(family_cell_types)}"
+            )
+            cleaned_metadata = apply_multicolor_segment_correction_for_base(
+                metadata=cleaned_metadata,
+                output_dir=str(output_dir),
+                base_cell_type=base_name,
+                n_channels=len(family_cell_types),
+                overwrite=bool(self.overwrite_existing.value),
+                n_workers=max(1, int(self.n_workers.value)),
+            )
+
+        return cleaned_metadata
     
     def _create_clf_path_pickers(self):
         for cell_type in self.all_cell_types:
@@ -697,6 +771,7 @@ class PixelClassifierPanel:
             children.append(widgets.HTML("<i>Death mask:</i>"))
             children.append(self.clf_death_path)
         self.clf_paths_box.children = children
+
 
     def display(self):
         widgets.display(self.ui)
@@ -973,6 +1048,10 @@ class PixelClassifierPanel:
                         n_workers=int(self.n_workers.value),
                     )
                 if new_md is not None:
+                    new_md = self._apply_multicolor_segment_cleanup(new_md, odir)
+                    if isinstance(new_md, dict):
+                        # Multicolor cleanup helpers can return path maps; keep metadata as DataFrame.
+                        new_md = self.metadata_loader.metadata
                     self.metadata_loader.metadata = new_md
                     new_md.to_csv(self.metadata_loader.metadata_csv_path, index=False)
                 print("Apply finished.")

@@ -180,6 +180,7 @@ import math
 import time
 import traceback
 from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
+from behav3d.core.metadata import is_multicolor_celltype
 from behav3d.io.images import load_image, convert_raw_file_to_zarr
 from tqdm import tqdm
 from datetime import datetime
@@ -232,6 +233,12 @@ def run_feature_extraction(
     for _, sample_metadata in metadata.iterrows():
     
         print(f"--------------- Processing {cell_type}: {sample_metadata['sample_name']} ---------------")
+        if is_multicolor_celltype(cell_type):
+            raise ValueError(
+                f"Feature extraction does not run on per-channel multicolor type '{cell_type}'. "
+                "Please run it on the merged/grouped output (for example '*_merged' or '*_grouped')."
+            )
+
         start_time = time.time()
 
         sample_name = sample_metadata['sample_name']

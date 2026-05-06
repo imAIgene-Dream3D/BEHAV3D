@@ -31,6 +31,8 @@ from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_organoid_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    detect_merged_cell_types_from_metadata,
+    filter_multicolor_inputs,
 )
 from behav3d.widgets.utils import spinning_loader
 
@@ -466,9 +468,10 @@ class TrackClassificationPanel:
         cell_types = []
         if md is not None:
             try:
-                cell_types.extend(detect_organoid_types_from_metadata(md))
-                cell_types.extend(detect_immune_cell_types_from_metadata(md))
-                cell_types.extend(detect_other_cell_types_from_metadata(md))
+                cell_types.extend(filter_multicolor_inputs(detect_organoid_types_from_metadata(md)))
+                cell_types.extend(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
+                cell_types.extend(filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)))
+                cell_types.extend(detect_merged_cell_types_from_metadata(md))
             except Exception:
                 pass
 

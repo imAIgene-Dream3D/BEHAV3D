@@ -41,14 +41,18 @@ class BackprojectionPanel:
             detect_immune_cell_types_from_metadata,
             detect_organoid_types_from_metadata,
             detect_other_cell_types_from_metadata,
+            detect_merged_cell_types_from_metadata,
+            filter_multicolor_inputs,
             has_dead_channel
         )
         md = self.metadata_loader.metadata
         if md is None: raise RuntimeError("Metadata not loaded.")
         
-        self.all_cell_types = detect_immune_cell_types_from_metadata(md) + \
-                              detect_organoid_types_from_metadata(md) + \
-                              detect_other_cell_types_from_metadata(md)
+        self.all_cell_types = filter_multicolor_inputs(
+            detect_immune_cell_types_from_metadata(md) +
+            detect_organoid_types_from_metadata(md) +
+            detect_other_cell_types_from_metadata(md)
+        ) + detect_merged_cell_types_from_metadata(md)
         if not self.all_cell_types: raise RuntimeError("No cell types detected.")
         if cell_type is None: cell_type = self.all_cell_types[0]
         

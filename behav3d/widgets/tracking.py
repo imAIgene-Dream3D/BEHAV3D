@@ -14,7 +14,28 @@ from behav3d.preprocessing.tracking.laptracking import run_laptracking
 from behav3d.preprocessing.tracking.trackpy_tracking import run_trackpy_tracking_generic
 from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
 from behav3d.preprocessing.tracking.btrack_tracking import run_btracking
-from behav3d.preprocessing.tracking import visualize_tracks
+from behav3d.preprocessing.tracking import visualize_tracks, combine_multicolor_tracked_outputs_for_base
+from behav3d.core.metadata import (
+    detect_merged_cell_types_from_metadata,
+    is_multicolor_celltype,
+    multicolor_base_name,
+    detect_organoid_types_from_metadata,
+    detect_immune_cell_types_from_metadata,
+    detect_other_cell_types_from_metadata,
+)
+
+
+_TRACKING_PANEL_REGISTRY = {}
+
+
+def _multicolor_suffix_index(cell_type):
+    import re
+    match = re.search(r'_(\d+)_multicolor$', str(cell_type))
+    return int(match.group(1)) if match else 0
+
+
+def _sorted_multicolor_family(cell_types):
+    return sorted({str(ct).strip() for ct in cell_types}, key=_multicolor_suffix_index)
 
 
 _TRACKING_PROFILE_DEFAULTS = {
@@ -128,7 +149,7 @@ class TrackingPanel:
     - Updates metadata_loader.metadata and always saves CSV
     - cell_type is supplied in __init__
     """
-    def __init__(self, metadata_loader, cell_type, organoid_group_context=None, organoid_panel_index=None):
+    def __init__(self, metadata_loader, cell_type, organoid_group_context=None, organoid_panel_index=None, multicolor_group_context=None):
         self.metadata_loader = metadata_loader
         self.cell_type = str(cell_type).strip()
 
@@ -138,6 +159,10 @@ class TrackingPanel:
         self.organoid_panel_index = organoid_panel_index
         self.organoid_group_context = self._prepare_organoid_group_context(organoid_group_context)
         self._syncing_organoid_toggle = False
+        self.multicolor_group_context = self._prepare_multicolor_group_context(multicolor_group_context)
+        self._syncing_multicolor_toggle = False
+        self._family_group_widgets = None
+        self._family_group_run_button = None
         
         params = dict(self.metadata_loader.behav3d_parameters or {})
         tcfg = self._get_config_for_cell_type(params)
@@ -391,6 +416,8 @@ class TrackingPanel:
 
         self._build_import_section()
 
+        _TRACKING_PANEL_REGISTRY[self.cell_type] = self
+
         self.ui = widgets.VBox([
             self.title_html,
             self.track_organoids_together_box,
@@ -410,6 +437,9 @@ class TrackingPanel:
             self._apply_organoid_group_mode(load_from_config=True)
         else:
             self._render_individual_panel(load_from_config=True)
+
+        self._register_multicolor_group_panel()
+        self._apply_multicolor_group_mode(load_from_config=True)
 
     def display(self):
         widgets.display(self.ui)
@@ -451,18 +481,138 @@ class TrackingPanel:
         self._import_accordion.set_title(0, "Import external tracking")
         self._import_accordion.selected_index = None
 
+    def _prepare_multicolor_group_context(self, multicolor_group_context):
+        if not is_multicolor_celltype(self.cell_type):
+            return None
+
+        base_cell_type = multicolor_base_name(self.cell_type)
+        context = dict(multicolor_group_context or {})
+        context.setdefault("base_cell_type", base_cell_type)
+        context.setdefault("enabled", True)
+        context.setdefault("panels", [])
+
+        members = list(context.get("members") or [])
+        if not members:
+            candidates = list(self.organoid_types) + list(self.immune_types) + list(self.other_types)
+            members = [ct for ct in candidates if is_multicolor_celltype(ct) and multicolor_base_name(ct) == base_cell_type]
+        context["members"] = _sorted_multicolor_family(members)
+        return context
+
+    def _register_multicolor_group_panel(self):
+        if self.multicolor_group_context is None:
+            return
+        panels = self.multicolor_group_context.setdefault("panels", [])
+        if self not in panels:
+            panels.append(self)
+
+    def _has_linked_multicolor_mode(self):
+        if self.multicolor_group_context is None:
+            return False
+        return len(self.multicolor_group_context.get("members", [])) >= 2
+
+    def _is_first_multicolor_panel(self):
+        if not self._has_linked_multicolor_mode():
+            return False
+        members = self.multicolor_group_context.get("members", [])
+        return bool(members) and self.cell_type == members[0]
+
+    def _multicolor_group_panels(self):
+        if not self._has_linked_multicolor_mode():
+            return []
+        return [
+            _TRACKING_PANEL_REGISTRY.get(ct)
+            for ct in self.multicolor_group_context.get("members", [])
+        ]
+
+    def _apply_multicolor_group_mode(self, load_from_config=True):
+        if not self._has_linked_multicolor_mode():
+            return
+        
+        if not self._is_first_multicolor_panel():
+            self.ui.layout.display = "none"
+            return
+        
+        # Hide individual run button and replace with consolidated multicolor run button
+        self.run_row.layout.display = "none"
+        
+        if self._family_group_widgets is None:
+            self._family_group_widgets = widgets.Checkbox(
+                description=f"Track {self.multicolor_group_context['base_cell_type']} multicolor together",
+                value=True,
+                disabled=True,
+                indent=False,
+            )
+            self._family_group_run_button = widgets.Button(
+                description=f"Run {self.multicolor_group_context['base_cell_type']} multicolor tracking",
+                button_style="warning",
+                layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+            )
+            self._family_group_run_button.on_click(self._on_multicolor_group_run_clicked)
+
+            group_info = widgets.HTML(
+                "<div style='color:#555;font-size:13px;'>"
+                f"Multicolor family: <b>{', '.join(self.multicolor_group_context.get('members', []))}</b>"
+                "</div>"
+            )
+            group_row = widgets.HBox([
+                self._family_group_widgets,
+                self._family_group_run_button,
+            ], layout=widgets.Layout(align_items="center", gap="8px"))
+            group_box = widgets.VBox([group_info, group_row])
+
+            children = list(self.ui.children)
+            children.insert(1, group_box)
+            self.ui.children = tuple(children)
+            self.ui.layout.display = "flex"
+
+    def _on_multicolor_group_run_clicked(self, _):
+        if not self._has_linked_multicolor_mode() or not self._is_first_multicolor_panel():
+            return
+
+        members = self.multicolor_group_context.get("members", [])
+        base_cell_type = self.multicolor_group_context.get("base_cell_type", multicolor_base_name(self.cell_type))
+        panels = [panel for panel in self._multicolor_group_panels() if panel is not None]
+
+        self._lock(True)
+        self.spinner_run.layout.display = None
+        with self.out:
+            self.out.clear_output()
+            try:
+                self._force_commit_pending_changes()
+                for panel in panels:
+                    panel._run_tracking_internal(merge_multicolor=False)
+                self.metadata_loader.metadata = combine_multicolor_tracked_outputs_for_base(
+                    metadata=self.metadata_loader.metadata,
+                    output_dir=str(Path(self.metadata_loader.output_dir).expanduser()),
+                    base_cell_type=base_cell_type,
+                    n_channels=len(members),
+                    overwrite=bool(self.overwrite.value),
+                    n_workers=1,
+                )
+                csv_path = Path(self.metadata_loader.metadata_csv_path).expanduser()
+                self.metadata_loader.metadata.to_csv(csv_path, sep=",", index=False)
+                print("✅ Multicolor tracking finished.")
+            except FileNotFoundError:
+                print("⚠️ Multicolor merge skipped: expected output files were not found.")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_run.layout.display = "none"
+                self._lock(False)
+
     def _detect_all_cell_types(self):
         from behav3d.io.images import load_image, load_zarr, save_as_zarr
         from behav3d.core.metadata import (
             detect_organoid_types_from_metadata,
             detect_immune_cell_types_from_metadata,
-            detect_other_cell_types_from_metadata
+            detect_other_cell_types_from_metadata,
         )
         metadata = self.metadata_loader.metadata
         if metadata is None: raise ValueError("Metadata not loaded.")
         self.organoid_types = detect_organoid_types_from_metadata(metadata)
         self.immune_types = detect_immune_cell_types_from_metadata(metadata)
         self.other_types = detect_other_cell_types_from_metadata(metadata)
+        self.merged_types = detect_merged_cell_types_from_metadata(metadata)
 
     def _detect_category(self):
         self.category = detect_cell_type_category(self.cell_type, self.metadata_loader.metadata)
@@ -681,7 +831,8 @@ class TrackingPanel:
                   self.bt_config_preset, self.bt_config_path, self.bt_use_visual_features,
                   self.bt_max_search_radius,
                   self.bt_update_method, self.bt_step_size, self.bt_n_workers, self.bt_use_optimize,
-                  self.bt_dist_thresh, self.bt_time_thresh, self.track_organoids_together,
+                self.bt_dist_thresh, self.bt_time_thresh, self.track_organoids_together,
+                self._family_group_run_button,
                   self.btn_run]:
             if hasattr(w, "disabled"): w.disabled = state
         for cb in self.bt_hyp_checks.values():
@@ -764,7 +915,7 @@ class TrackingPanel:
     def _persist_params(self):
         self._persist_current_mode(write_file=True)
 
-    def _on_run_clicked(self, _):
+    def _run_tracking_internal(self, merge_multicolor=True):
         self._lock(True)
         self.spinner_run.layout.display = None
         with self.out:
@@ -817,12 +968,43 @@ class TrackingPanel:
                     )
 
                 self.metadata_loader.metadata = new_md
-                new_md.to_csv(csv_path, sep=",", index=False)
+
+                if merge_multicolor and is_multicolor_celltype(self.cell_type):
+                    base_cell_type = multicolor_base_name(self.cell_type)
+                    family_cell_types = [
+                        ct for ct in (self.organoid_types + self.immune_types + self.other_types)
+                        if is_multicolor_celltype(ct) and multicolor_base_name(ct) == base_cell_type
+                    ]
+                    if family_cell_types:
+                        parsed = []
+                        for ct in family_cell_types:
+                            match = None
+                            import re
+                            match = re.search(r'_(\d+)_multicolor$', ct)
+                            if match:
+                                parsed.append((int(match.group(1)), ct))
+                        family_cell_types = [ct for _, ct in sorted(parsed, key=lambda item: item[0])]
+                        try:
+                            self.metadata_loader.metadata = combine_multicolor_tracked_outputs_for_base(
+                                metadata=self.metadata_loader.metadata,
+                                output_dir=str(out_dir),
+                                base_cell_type=base_cell_type,
+                                n_channels=len(family_cell_types),
+                                overwrite=bool(self.overwrite.value),
+                                n_workers=1,
+                            )
+                        except FileNotFoundError:
+                            pass
+
+                self.metadata_loader.metadata.to_csv(csv_path, sep=",", index=False)
                 print("✅ Tracking finished.")
             except Exception: traceback.print_exc()
             finally:
                 self.spinner_run.layout.display = "none"
                 self._lock(False)
+
+    def _on_run_clicked(self, _):
+        self._run_tracking_internal(merge_multicolor=True)
 
 class TrackingVisualizationPanel:
     def __init__(self, metadata_loader, default_time_range=None, channel_colors=None):

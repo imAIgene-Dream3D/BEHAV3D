@@ -257,6 +257,9 @@ class MetadataBuilder(widgets.VBox):
         naming_widgets = []
         self.organoid_name_inputs = []
         self.immune_name_inputs = []
+        # Temporarily store multicolor controls for immune types
+        self.immune_multicolor_flags = []
+        self.immune_multicolor_counts = []
         self.other_name_inputs = []
         
         if self.n_organoid_types > 0:
@@ -283,7 +286,24 @@ class MetadataBuilder(widgets.VBox):
                     style={'description_width': '100px'}
                 )
                 self.immune_name_inputs.append(w)
+                # Multicolor option: checkbox + number of channels
+                mult_chk = widgets.Checkbox(description='Multicolor', value=False)
+                mult_n = widgets.BoundedIntText(value=2, min=2, max=10, description='Channels', style={'description_width': '80px'})
+                # hide the channel-count input until the checkbox is toggled
+                mult_n.layout.display = 'none'
+
+                def _on_mult_toggle(change, mbox=mult_n):
+                    try:
+                        mbox.layout.display = 'flex' if change.get('new') else 'none'
+                    except Exception:
+                        pass
+
+                mult_chk.observe(_on_mult_toggle, names='value')
+
+                self.immune_multicolor_flags.append(mult_chk)
+                self.immune_multicolor_counts.append(mult_n)
                 naming_widgets.append(w)
+                naming_widgets.append(widgets.HBox([mult_chk, mult_n]))
         
         if self.n_other_types > 0:
             naming_widgets.append(widgets.HTML('<h4>Name Your Other Cell Types</h4>'))
@@ -307,7 +327,22 @@ class MetadataBuilder(widgets.VBox):
     def _on_names_confirmed(self, btn):
         """Collect names and build data entry form"""
         self.organoid_names = [w.value.strip() for w in self.organoid_name_inputs]
-        self.immune_names = [w.value.strip() for w in self.immune_name_inputs]
+        # Expand immune names if multicolor selected
+        immune_raw = [w.value.strip() for w in self.immune_name_inputs]
+        immune_expanded = []
+        for idx, base in enumerate(immune_raw):
+            if idx < len(self.immune_multicolor_flags) and self.immune_multicolor_flags[idx].value:
+                n = 2
+                if idx < len(self.immune_multicolor_counts):
+                    try:
+                        n = int(self.immune_multicolor_counts[idx].value)
+                    except Exception:
+                        n = 2
+                for j in range(n):
+                    immune_expanded.append(f"{base}_{j+1}_multicolor")
+            else:
+                immune_expanded.append(base)
+        self.immune_names = immune_expanded
         self.other_names = [w.value.strip() for w in self.other_name_inputs]
         
         self._build_data_entry_form()
