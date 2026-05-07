@@ -815,6 +815,8 @@ class StateClassificationPanel:
 
         for c in col_set:
             lc = str(c).lower()
+            if lc.startswith("touching_"):
+                excluded.add(c)
             if lc.endswith("_line_condition"):
                 excluded.add(c)
             if lc.endswith("_tracks_csv_path"):

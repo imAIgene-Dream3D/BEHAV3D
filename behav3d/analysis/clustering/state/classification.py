@@ -581,9 +581,32 @@ def prepare_state_classification_dataset(
             _vinfo(verbose, "state-clustering", f"Prepared cache load failed; recomputing windows ({exc})")
 
     if not loaded_from_cache:
+        safe_features = []
+        dropped_features = []
+        for col in features:
+            if col not in df_positions.columns:
+                continue
+            series = df_positions[col]
+            if pd.api.types.is_numeric_dtype(series):
+                safe_features.append(col)
+                continue
+            coerced = pd.to_numeric(series, errors="coerce")
+            if coerced.notna().any():
+                df_positions[col] = coerced
+                safe_features.append(col)
+            else:
+                dropped_features.append(col)
+        if dropped_features:
+            _vinfo(
+                verbose,
+                "state-clustering",
+                f"Dropping non-numeric features from windowing: {dropped_features[:10]}"
+                + (" ..." if len(dropped_features) > 10 else ""),
+            )
+
         df_windows_descriptive = create_descriptive_track_dataset(
             df_tracks=df_positions,
-            columns_to_summarize=features,
+            columns_to_summarize=safe_features,
             window_size=window_size,
             step_size=1,
             time_col="position_t",
