@@ -860,7 +860,7 @@ def calculate_invasiveness_single_timepoint(args):
     Returns
     -------
     pd.DataFrame
-        Columns: TrackID, position_t, org_invasiveness_<type>, org_invasiveness_perc_<type>
+        Columns: TrackID, position_t, <type>_invasiveness, <type>_invasiveness_perc, any_org_invasiveness_perc
     """
     from scipy.ndimage import distance_transform_edt
     import math
@@ -931,6 +931,7 @@ def calculate_invasiveness_single_timepoint(args):
         }
         
         any_invasiveness_list = []
+        invasiveness_perc_list = []
         
         # Calculate invasiveness for each organoid type
         for org_type, org_segments in organoid_segments_dict.items():
@@ -946,13 +947,15 @@ def calculate_invasiveness_single_timepoint(args):
             # Boolean: invasive if >= 50% of surface is in contact
             invasiveness_bool = invasiveness_perc >= 50.0
             
-            invasiveness_data[f'org_invasiveness_{org_type}'] = invasiveness_bool
-            invasiveness_data[f'org_invasiveness_perc_{org_type}'] = invasiveness_perc
+            invasiveness_data[f'{org_type}_invasiveness'] = invasiveness_bool
+            invasiveness_data[f'{org_type}_invasiveness_perc'] = invasiveness_perc
             
             any_invasiveness_list.append(invasiveness_bool)
+            invasiveness_perc_list.append(invasiveness_perc)
         
         # Add aggregate: True if invasive against ANY organoid type
         invasiveness_data['any_org_invasiveness'] = any(any_invasiveness_list)
+        invasiveness_data['any_org_invasiveness_perc'] = max(invasiveness_perc_list) if invasiveness_perc_list else 0.0
         
         df_invasiveness.append(pd.DataFrame([invasiveness_data]))
     

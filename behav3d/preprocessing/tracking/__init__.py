@@ -255,7 +255,7 @@ def visualize_tracks(
     # Define base colors for different categories
     category_base_colors = {
         'or': ['magenta', 'red', 'orange'],      # organoids
-        'im': ['cyan', 'blue', 'turquoise'],     # immune cells
+        'im': ['cyan', 'blue', 'darkblue'],     # immune cells
         'ot': ['yellow', 'green', 'lime']        # other cells
     }
     

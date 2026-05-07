@@ -46,6 +46,12 @@ DYNAMIC CONTACT FEATURES (generated for ALL cell types in metadata):
 - any_immune_cell_contact_on_distance (bool) - Any immune-type real distance-based contact
 - active_{cell_type}_contact        (bool) - Active interaction (works for any cell type)
 
+INVASIVENESS FEATURES (immune vs organoids):
+- {org_type}_invasiveness           (bool) - True if >= 50% surface in contact
+- {org_type}_invasiveness_perc      (float) - Percentage (0-100) of surface in contact
+- any_org_invasiveness              (bool) - True if invasive against any organoid type
+- any_org_invasiveness_perc         (float) - Max invasiveness percentage across organoid types
+
 MORPHOLOGY FEATURES:
 - nr_pixels, volume, bbox_volume, elongation, extent, equivalent_diameter
 - major_axis_length, minor_axis_length, surface_area, sphericity
@@ -313,6 +319,8 @@ def run_feature_extraction(
                     parts = col.split('_')
                     if len(parts) >= 4:
                         organoid_type = '_'.join(parts[1:-3])
+                        if is_multicolor_celltype(organoid_type):
+                            continue
                         if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
                             organoid_segments_paths[organoid_type] = sample_metadata[col]
             
@@ -323,6 +331,8 @@ def run_feature_extraction(
                     parts = col.split('_')
                     if len(parts) >= 4:
                         immune_type = '_'.join(parts[1:-3])
+                        if is_multicolor_celltype(immune_type):
+                            continue
                         if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
                             immune_segments_paths[immune_type] = sample_metadata[col]
             
@@ -333,6 +343,8 @@ def run_feature_extraction(
                     parts = col.split('_')
                     if len(parts) >= 4:
                         other_type = '_'.join(parts[1:-3])
+                        if is_multicolor_celltype(other_type):
+                            continue
                         if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
                             other_segments_paths[other_type] = sample_metadata[col]
 
@@ -736,6 +748,37 @@ def calculate_image_based_track_features(
             if df_contacts_outpath != "":
                 df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
         df_tracks = pd.merge(df_tracks, df_contacts, how="left")
+        if "invasiveness" in features_choice:
+            perc_cols = [
+                c for c in df_tracks.columns
+                if c.endswith("_invasiveness_perc") and c != "any_org_invasiveness_perc"
+            ]
+            if perc_cols:
+                bases = [c[: -len("_invasiveness_perc")] for c in perc_cols]
+                for base, perc_col in zip(bases, perc_cols):
+                    bool_col = f"{base}_invasiveness"
+                    if bool_col not in df_tracks.columns:
+                        df_tracks[bool_col] = np.nan
+                    mask = df_tracks[perc_col].notna()
+                    df_tracks.loc[mask, bool_col] = (
+                        df_tracks.loc[mask, bool_col]
+                        .fillna(df_tracks.loc[mask, perc_col] >= 50.0)
+                        .astype(bool)
+                    )
+                if "any_org_invasiveness_perc" not in df_tracks.columns:
+                    df_tracks["any_org_invasiveness_perc"] = df_tracks[perc_cols].max(axis=1, skipna=True)
+                bool_cols = [
+                    f"{base}_invasiveness"
+                    for base in bases
+                    if f"{base}_invasiveness" in df_tracks.columns
+                ]
+                if bool_cols:
+                    if "any_org_invasiveness" not in df_tracks.columns:
+                        df_tracks["any_org_invasiveness"] = np.nan
+                    any_mask = df_tracks["any_org_invasiveness"].isna()
+                    df_tracks.loc[any_mask, "any_org_invasiveness"] = (
+                        df_tracks.loc[any_mask, bool_cols].fillna(False).any(axis=1)
+                    )
     else:
         print(f"{get_current_time()} - Skipping contact calculations as not requested in features_choice")
         
@@ -1362,6 +1405,7 @@ def _calculate_contact_single_timepoint(args):
             
             if total_surface_pixels > 0:
                 any_invasiveness_list = []
+                invasiveness_perc_list = []
                 
                 # Calculate invasiveness for each organoid type
                 for org_type, org_segments in organoid_segments_dict.items():
@@ -1377,18 +1421,21 @@ def _calculate_contact_single_timepoint(args):
                     # Boolean: invasive if >= 50% of surface is in contact
                     invasiveness_bool = invasiveness_perc >= 50.0
                     
-                    contact_data[f'org_invasiveness_{org_type}'] = invasiveness_bool
-                    contact_data[f'org_invasiveness_perc_{org_type}'] = invasiveness_perc
+                    contact_data[f'{org_type}_invasiveness'] = invasiveness_bool
+                    contact_data[f'{org_type}_invasiveness_perc'] = invasiveness_perc
                     any_invasiveness_list.append(invasiveness_bool)
+                    invasiveness_perc_list.append(invasiveness_perc)
                 
                 # Add aggregate: True if invasive against ANY organoid type
                 contact_data['any_org_invasiveness'] = any(any_invasiveness_list)
+                contact_data['any_org_invasiveness_perc'] = max(invasiveness_perc_list) if invasiveness_perc_list else 0.0
             else:
                 # No surface detected, set invasiveness to False/0
                 for org_type in organoid_segments_dict.keys():
-                    contact_data[f'org_invasiveness_{org_type}'] = False
-                    contact_data[f'org_invasiveness_perc_{org_type}'] = 0.0
+                    contact_data[f'{org_type}_invasiveness'] = False
+                    contact_data[f'{org_type}_invasiveness_perc'] = 0.0
                 contact_data['any_org_invasiveness'] = False
+                contact_data['any_org_invasiveness_perc'] = 0.0
 
         df_contacts.append(pd.DataFrame([contact_data]))
 
@@ -1425,7 +1472,7 @@ def calculate_contact_features(
         
     Returns:
         DataFrame of contact annotations for the current cell type with ALL other cell types.
-        If calculate_invasiveness=True, also includes org_invasiveness_* and org_invasiveness_perc_* columns.
+        If calculate_invasiveness=True, also includes *_invasiveness and *_invasiveness_perc columns.
     """
     current_segments = load_image(current_cell_segments_path)
     timepoints = current_segments.shape[0]

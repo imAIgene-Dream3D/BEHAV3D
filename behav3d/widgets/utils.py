@@ -332,7 +332,7 @@ behav3d_calculated_features = {
         "*_contact", "*_contact_pixels", "touching_*", "active_*_contact",
     ],
     "invasiveness": [
-        "org_invasiveness_*", "org_invasiveness_perc_*", "any_org_invasiveness",
+        "*_invasiveness", "*_invasiveness_perc", "any_org_invasiveness", "any_org_invasiveness_perc",
     ],
     "active_killing": [
         "is_active_killing", "killing_efficiency",
