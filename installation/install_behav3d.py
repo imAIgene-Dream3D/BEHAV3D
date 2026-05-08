@@ -396,10 +396,21 @@ def create_conda_environment(conda_path, env_file="environment.yml"):
         installer_name = Path(pkg_mgr).stem
         print_info(f"Using {installer_name} for environment creation")
         
+        # Clean package cache first to avoid SafetyError from corrupted downloads
+        print_info("Cleaning package cache to avoid corrupted-package errors...")
+        run_command(f'"{pkg_mgr}" clean --packages --tarballs -y', check=False)
+        
+        # Set conda config to tolerate ClobberError / SafetyError from broken
+        # upstream builds (e.g. scikit-image 0.26.0 bundling duplicate .pyc files).
+        # These are environment-variable overrides so they don't persist.
+        env_overrides = os.environ.copy()
+        env_overrides["CONDA_SAFETY_CHECKS"] = "warn"        # downgrade SafetyError to warning
+        env_overrides["CONDA_PATH_CONFLICT"]  = "warn"       # downgrade ClobberError to warning
+        
         # Use -n flag to override the name in the YAML file
         cmd = f'"{pkg_mgr}" env create -f "{env_path}" -n {ENV_NAME} -y'
         print_info(f"Running: {cmd}")
-        run_command(cmd)
+        subprocess.run(cmd, shell=True, check=True, env=env_overrides)
         print_success(f"Environment '{ENV_NAME}' created successfully")
         return True
     except subprocess.CalledProcessError as e:
