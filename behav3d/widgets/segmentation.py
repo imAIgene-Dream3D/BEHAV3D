@@ -28,6 +28,15 @@ from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
 )
 import numpy as np
 import napari
+
+
+def _filter_merge_types(cell_types):
+    """Remove derived output cell types (*_merged, *_grouped) from training lists.
+    Keeps *_N_multicolor types since those are real per-channel inputs that
+    need segmentation and tracking before being merged."""
+    from behav3d.core.metadata import is_combined_multicolor_celltype
+    return [ct for ct in cell_types
+            if not is_combined_multicolor_celltype(ct)]
 from ipyfilechooser import FileChooser
 from behav3d.preprocessing.segmentation.cellpose_prediction import (
     run_cellpose_and_sync_metadata,
@@ -112,13 +121,21 @@ class PixelClassifierPanel:
             APOC_AVAILABLE = False
             _gpu_devices = []
 
-        _engine_options = (
-            ["Scikit-Learn (CPU)", "APOC (GPU-Accelerated)"] if APOC_AVAILABLE
-            else ["Scikit-Learn (CPU)"]
-        )
+        # Check for ConvPaint availability
+        try:
+            from napari_convpaint import ConvpaintModel as _CP  # noqa: F401
+            CONVPAINT_AVAILABLE = True
+        except Exception:
+            CONVPAINT_AVAILABLE = False
+
+        _engine_options = ["Scikit-Learn (CPU)"]
+        if APOC_AVAILABLE:
+            _engine_options.append("APOC (GPU-Accelerated)")
+        if CONVPAINT_AVAILABLE:
+            _engine_options.append("ConvPaint")
+
         _saved_engine = pc.get("classifier_engine", "Scikit-Learn (CPU)")
-        # Guard: if the saved engine is no longer available (e.g. APOC not installed),
-        # fall back to the first available option instead of crashing with TraitError.
+        # Guard: if the saved engine is no longer available, fall back.
         if _saved_engine not in _engine_options:
             _saved_engine = _engine_options[0]
 
@@ -129,6 +146,8 @@ class PixelClassifierPanel:
         )
         if not APOC_AVAILABLE:
             self.classifier_engine.tooltip = "APOC (GPU) disabled: 'apoc' and 'pyopencl' required."
+        if not CONVPAINT_AVAILABLE:
+            self.classifier_engine.tooltip = (self.classifier_engine.tooltip or "") + " ConvPaint disabled: 'napari-convpaint' required."
 
         self.gpu_device = widgets.Dropdown(
             options=_gpu_devices,
@@ -150,6 +169,19 @@ class PixelClassifierPanel:
             layout=widgets.Layout(width="auto", display="none")
         )
         self.apoc_strategy.observe(self._toggle_engine_widgets, names="value")
+
+        self.convpaint_strategy = widgets.Dropdown(
+            options=[
+                "ConvPaint (Direct Segmentation)",
+                "ConvPaint Mask + EDT/Watershed Resegmentation",
+                "ConvPaint Probability Map + Watershed"
+            ],
+            value=pc.get("convpaint_strategy", "ConvPaint (Direct Segmentation)"),
+            description="Strategy:",
+            style={'description_width': 'initial'},
+            layout=widgets.Layout(width="auto", display="none")
+        )
+        self.convpaint_strategy.observe(self._toggle_engine_widgets, names="value")
 
 
         self.examples_per_sample = widgets.IntText(
@@ -400,7 +432,7 @@ class PixelClassifierPanel:
         self.ui = widgets.VBox([
             widgets.VBox([
                 widgets.HTML("<b>Train pixel classifier</b>"),
-                widgets.HBox([self.classifier_engine, self.gpu_device, self.apoc_strategy]),
+                widgets.HBox([self.classifier_engine, self.gpu_device, self.apoc_strategy, self.convpaint_strategy]),
                 widgets.HBox([self.examples_per_sample, self.overwrite_sample_images, self.n_workers]),
                 #self.sample_specific_classifier,
                 self.train_row,
@@ -468,6 +500,12 @@ class PixelClassifierPanel:
         self.organoid_types = _extract_types_for_prefix('or') or detect_organoid_types_from_metadata(metadata)
         self.immune_types = _extract_types_for_prefix('im') or detect_immune_cell_types_from_metadata(metadata)
         self.other_types = _extract_types_for_prefix('ot') or detect_other_cell_types_from_metadata(metadata)
+
+        # Remove derived output types (*_merged, *_grouped) — they are generated
+        # downstream and should not appear in training or segmentation parameter UI.
+        self.organoid_types = _filter_merge_types(self.organoid_types)
+        self.immune_types = _filter_merge_types(self.immune_types)
+        self.other_types = _filter_merge_types(self.other_types)
 
         # Backwards-compatible: if explicit columns not present, fall back to detectors
         # Determine death channel presence
@@ -638,6 +676,7 @@ class PixelClassifierPanel:
         pc["overwrite_existing"] = bool(self.overwrite_existing.value)
         pc["gpu_device_name"] = str(self.gpu_device.value)
         pc["apoc_strategy"] = str(self.apoc_strategy.value)
+        pc["convpaint_strategy"] = str(self.convpaint_strategy.value)
         
         for ct, w in self.apoc_min_size_inputs.items():
             pc[f"apoc_{ct}_min_size_voxels"] = int(w.value)
@@ -672,41 +711,57 @@ class PixelClassifierPanel:
 
     def _toggle_engine_widgets(self, change=None):
         """Show/hide widgets depending on engine and strategy."""
-        is_apoc = str(self.classifier_engine.value) == "APOC (GPU-Accelerated)"
-        strategy = str(self.apoc_strategy.value)
-        is_edt = is_apoc and strategy == "APOC Mask + EDT/Watershed Resegmentation"
-        is_prob = is_apoc and strategy == "APOC Probability Map + Watershed"
-        is_cpu_like = not is_apoc or is_edt
-        
+        engine = str(self.classifier_engine.value)
+        is_apoc = engine == "APOC (GPU-Accelerated)"
+        is_convpaint = engine == "ConvPaint"
+
+        # APOC strategy
+        apoc_strategy = str(self.apoc_strategy.value)
+        is_apoc_edt = is_apoc and apoc_strategy == "APOC Mask + EDT/Watershed Resegmentation"
+        is_apoc_prob = is_apoc and apoc_strategy == "APOC Probability Map + Watershed"
+
+        # ConvPaint strategy
+        cp_strategy = str(self.convpaint_strategy.value)
+        is_cp_edt = is_convpaint and cp_strategy == "ConvPaint Mask + EDT/Watershed Resegmentation"
+        is_cp_prob = is_convpaint and cp_strategy == "ConvPaint Probability Map + Watershed"
+        is_cp_direct = is_convpaint and not is_cp_edt and not is_cp_prob
+
+        # CPU-like = needs EDT/postprocessing params
+        is_cpu_like = (not is_apoc and not is_convpaint) or is_apoc_edt or is_cp_edt
+        # Probability params needed?
+        needs_prob = is_apoc_prob or is_cp_prob
+
         hide_cpu = None if is_cpu_like else 'none'
 
         # CPU segmentation parameters (EDT, min size, opening, fill holes)
         self._cpu_seg_params_box.layout.display = hide_cpu
-        self.n_workers.layout.display = hide_cpu
+        self.n_workers.layout.display = (None if not is_apoc and not is_convpaint else 'none')
 
-        # Probability Map parameters (only visible for prob strategy)
-        self._prob_params_box.layout.display = (None if is_prob else 'none')
-        
+        # Probability Map parameters
+        self._prob_params_box.layout.display = (None if needs_prob else 'none')
+
         # GPU Device and APOC Strategy selection
         self.gpu_device.layout.display = (None if is_apoc else 'none')
         self.apoc_strategy.layout.display = (None if is_apoc else 'none')
-        
+        self.convpaint_strategy.layout.display = (None if is_convpaint else 'none')
+
         if is_apoc:
             self._apply_gpu_selection()
 
         # 'Only resegment' button (available for EDT and Probability strategies)
-        show_reseg = is_cpu_like or is_prob
+        show_reseg = is_cpu_like or needs_prob
         self.btn_resegment.layout.display = (None if show_reseg else 'none')
         self.only_resegment_warning.layout.display = (None if show_reseg else 'none')
 
-        # Manual classifier paths (APOC uses .cl files from training dir)
-        self.manual_clf_paths.layout.display = ('none' if is_apoc else None)
-        if is_apoc:
+        # Manual classifier paths (hidden for APOC and ConvPaint)
+        self.manual_clf_paths.layout.display = ('none' if (is_apoc or is_convpaint) else None)
+        if is_apoc or is_convpaint:
             self.clf_paths_box.layout.display = 'none'
 
         # Post-processing (Size Filtering via standalone button)
-        # Shown only for Direct APOC strategy
-        self.post_processing_box.layout.display = (None if is_apoc and not is_cpu_like and not is_prob else 'none')
+        # Shown for Direct APOC or Direct ConvPaint strategies
+        show_post = (is_apoc and not is_apoc_edt and not is_apoc_prob) or is_cp_direct
+        self.post_processing_box.layout.display = (None if show_post else 'none')
 
     def _on_gpu_changed(self, change):
         if change['new']:
@@ -791,7 +846,7 @@ class PixelClassifierPanel:
         to_lock.extend(self.fill_holes.values())
         to_lock.extend(self.prob_mask_thresholds.values())
         to_lock.extend(self.prob_seed_thresholds.values())
-        to_lock.extend([self.gpu_device, self.apoc_strategy])
+        to_lock.extend([self.gpu_device, self.apoc_strategy, self.convpaint_strategy])
         for w in self.apoc_min_size_inputs.values(): w.disabled = state
         for w in [self.btn_size_filter]: w.disabled = state
         for w in to_lock: w.disabled = state
@@ -841,6 +896,7 @@ class PixelClassifierPanel:
         # Include global GPU selection
         params["gpu_device_name"] = str(self.gpu_device.value)
         params["apoc_strategy"] = str(self.apoc_strategy.value)
+        params["convpaint_strategy"] = str(self.convpaint_strategy.value)
 
         # Include saved APOC per-cell-type params from config YAML
         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
@@ -884,12 +940,13 @@ class PixelClassifierPanel:
                 self.prob_seed_thresholds[cell_type].value = float(params[f"{cell_type}_prob_seed_threshold"])
         if "apoc_strategy" in params:
             self.apoc_strategy.value = str(params["apoc_strategy"])
+        if "convpaint_strategy" in params:
+            self.convpaint_strategy.value = str(params["convpaint_strategy"])
 
-        # Cache APOC per-cell-type params into the YAML config dict
-        # (they will be written to disk by _persist_params below)
+        # Cache APOC and ConvPaint per-cell-type params into the YAML config dict
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
         for key, value in params.items():
-            if key.startswith("apoc_"):
+            if key.startswith("apoc_") or key.startswith("convpaint_"):
                 pc[key] = value
 
         # Persist updated values to config file
@@ -921,9 +978,24 @@ class PixelClassifierPanel:
                         metadata=self.metadata_loader.metadata,
                         examples_per_sample=int(self.examples_per_sample.value),
                         overwrite_images=bool(self.overwrite_sample_images.value),
-                        organoid_types=self.organoid_types,
-                        immune_types=self.immune_types,
-                        other_types=self.other_types,
+                        organoid_types=_filter_merge_types(self.organoid_types),
+                        immune_types=_filter_merge_types(self.immune_types),
+                        other_types=_filter_merge_types(self.other_types),
+                        initial_params=initial_params,
+                        on_params_changed=self._update_widgets_from_params,
+                    )
+                elif engine == "ConvPaint":
+                    from behav3d.preprocessing.segmentation.convpaint_train import train_pixel_classifier_convpaint
+                    print("Starting ConvPaint pixel classifier training...")
+                    print("Napari viewer will open with the ConvPaint widget.")
+                    ret = train_pixel_classifier_convpaint(
+                        output_dir=str(odir),
+                        metadata=self.metadata_loader.metadata,
+                        examples_per_sample=int(self.examples_per_sample.value),
+                        overwrite_images=bool(self.overwrite_sample_images.value),
+                        organoid_types=_filter_merge_types(self.organoid_types),
+                        immune_types=_filter_merge_types(self.immune_types),
+                        other_types=_filter_merge_types(self.other_types),
                         initial_params=initial_params,
                         on_params_changed=self._update_widgets_from_params,
                     )
@@ -948,9 +1020,9 @@ class PixelClassifierPanel:
                         overwrite_images=bool(self.overwrite_sample_images.value),
                         #sample_specific_classifier=bool(self.sample_specific_classifier.value),
                         n_workers=int(self.n_workers.value),
-                        organoid_types=self.organoid_types,
-                        immune_types=self.immune_types,
-                        other_types=self.other_types,
+                        organoid_types=_filter_merge_types(self.organoid_types),
+                        immune_types=_filter_merge_types(self.immune_types),
+                        other_types=_filter_merge_types(self.other_types),
                         initial_params=initial_params,
                         on_params_changed=self._update_widgets_from_params,
                     )
@@ -1011,6 +1083,27 @@ class PixelClassifierPanel:
                         n_workers=int(self.n_workers.value),
                         gpu_device=str(self.gpu_device.value),
                         apoc_strategy=str(self.apoc_strategy.value),
+                    )
+                elif str(self.classifier_engine.value) == "ConvPaint":
+                    from behav3d.preprocessing.segmentation.convpaint_segment import run_convpaint_segmentation
+                    pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+                    new_md = run_convpaint_segmentation(
+                        output_dir=str(odir),
+                        metadata=self.metadata_loader.metadata,
+                        metadata_csv_path=str(self.metadata_loader.metadata_csv_path),
+                        convpaint_config=pc,
+                        organoid_types=self.organoid_types,
+                        immune_types=self.immune_types,
+                        other_types=self.other_types,
+                        timepoint_range=tpr,
+                        clf_organoid_paths=clf_organoid_paths,
+                        clf_immune_paths=clf_immune_paths,
+                        clf_other_paths=clf_other_paths,
+                        clf_death_path=clf_death_path,
+                        only_segment=bool(only_segment),
+                        overwrite_existing=bool(self.overwrite_existing.value),
+                        n_workers=int(self.n_workers.value),
+                        convpaint_strategy=str(self.convpaint_strategy.value),
                     )
                 else:
                     # Original scikit-learn pixel classifier

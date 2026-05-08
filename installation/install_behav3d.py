@@ -481,6 +481,23 @@ def install_cellpose(conda_path, gpu_info, force_cpu=False):
         return False
 
 
+def install_convpaint(conda_path):
+    """Install napari-convpaint"""
+    print_step("Installing napari-convpaint (ConvPaint segmentation engine)...")
+
+    run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+
+    try:
+        cmd = f'{run_prefix} pip install "napari-convpaint[all]"'
+        print_info(f"Running: {cmd}")
+        run_command(cmd)
+        print_success("napari-convpaint installed successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        print_error(f"Failed to install napari-convpaint: {e}")
+        return False
+
+
 # =============================================================================
 # OPENCL BACKEND (for APOC / pyopencl)
 # =============================================================================
@@ -589,6 +606,7 @@ def verify_installation(conda_path):
         ("PyTorch", 'python -c "import torch; print(f\'PyTorch {torch.__version__}\')"'),
         ("CUDA Available", 'python -c "import torch; print(f\'CUDA: {torch.cuda.is_available()}\')"'),
         ("Cellpose", 'python -c "from importlib.metadata import version; print(f\'Cellpose {version(\\\"cellpose\\\")}\')"'),
+        ("ConvPaint", 'python -c "from importlib.metadata import version; print(f\'ConvPaint {version(\\\"napari-convpaint\\\")}\')"'),
         ("Napari", 'python -c "import napari; print(f\'Napari {napari.__version__}\')"'),
     ]
     
@@ -802,6 +820,11 @@ Examples:
     if not install_cellpose(conda_path, gpu_info, force_cpu=args.cpu_only):
         print_error("Failed to install Cellpose.")
         return 1
+    
+    # Install napari-convpaint (uses existing PyTorch and Cellpose)
+    print_header("CONVPAINT INSTALLATION")
+    if not install_convpaint(conda_path):
+        print_warning("napari-convpaint installation failed (ConvPaint engine will be disabled)")
     
     # Install BEHAV3D package
     if not args.skip_behav3d and not args.pytorch_only:
