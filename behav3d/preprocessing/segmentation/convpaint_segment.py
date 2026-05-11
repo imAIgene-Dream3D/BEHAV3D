@@ -1,35 +1,107 @@
 """
-ConvPaint batch inference queue.
+ConvPaint batch inference queue (UNIFIED MULTI-CLASS MODE).
 
-Standalone module that loads trained ConvpaintModel .pkl files,
-runs them on every sample × timepoint, and writes segments / masks to .zarr
-in the same directory layout that the rest of the BEHAV3D pipeline expects.
+Loads the trained unified ConvPaint model + label-map sidecar, runs it on
+every sample × timepoint exactly **once**, and writes per-cell-type
+``segments`` / ``mask`` zarrs in the same directory layout that the rest of
+the BEHAV3D pipeline expects.
 
-Output layout (identical to APOC):
+Output layout (unchanged from before)::
+
     images/{sample_name}/{sample_name}_{cell_type}_segments.zarr
     images/{sample_name}/{sample_name}_{cell_type}_mask.zarr
     images/{sample_name}/{sample_name}_mask_dead.zarr
+
+Two strategies are supported:
+
+* ``ConvPaint Mask + EDT/Watershed`` (default) — uses ``segment`` to obtain
+  multi-class labels per voxel, then ``mask = labels == k`` per cell type
+  and EDT/watershed.
+* ``ConvPaint Probability + Watershed`` — uses ``predict_probas`` to obtain a
+  ``(n_classes, Z, Y, X)`` volume per frame, slices ``probas[k-1]`` for each
+  cell type, and runs the seeded watershed.
+
+Death stays a separate binary ConvPaint model (``ConvPaintModel_Dead.pkl``)
+because death is a state, not a cell-type identity.
 """
 
-import os
 import sys
 import time
 import shutil
+import warnings
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
 import zarr
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor
 
-from behav3d.io.images import _ensure_zarr, load_image, save_as_zarr
+from behav3d.io.images import _ensure_zarr, load_image
 from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
     has_dead_channel,
 )
+from behav3d.preprocessing.segmentation.convpaint_postprocess import (
+    segment_per_z,
+    predict_probas_per_z,
+    mask_to_instances,
+    probability_to_instances,
+)
+from behav3d.preprocessing.segmentation.convpaint_label_map import (
+    BACKGROUND_LABEL,
+    cell_type_order,
+    death_input_channels_path,
+    load_input_channels,
+    load_label_map,
+    unified_input_channels_path,
+    unified_label_map_path,
+    unified_model_path,
+)
+
+
+STRATEGY_EDT = "ConvPaint Mask + EDT/Watershed"
+STRATEGY_PEAK_EDT = "ConvPaint Mask + Peak EDT/Watershed"
+STRATEGY_PROB = "ConvPaint Probability + Watershed"
+DEFAULT_STRATEGY = STRATEGY_EDT
+
+
+def _normalize_strategy(value):
+    val = str(value or "").strip()
+    if val == STRATEGY_PROB:
+        return STRATEGY_PROB
+    if val == STRATEGY_PEAK_EDT:
+        return STRATEGY_PEAK_EDT
+    if val and val != STRATEGY_EDT:
+        print(
+            f"  \u26a0\ufe0f Unknown convpaint_strategy '{val}' "
+            f"\u2014 falling back to '{STRATEGY_EDT}'."
+        )
+    return STRATEGY_EDT
+
+
+def _normalize_class_weights(value):
+    val = str(value or "").strip()
+    if val.lower() in ("", "none", "null"):
+        return None
+    if val.lower() == "balanced":
+        return "Balanced"
+    if val.lower() == "sqrtbalanced":
+        return "SqrtBalanced"
+    return val
+
+
+def _default_device():
+    """Return ``'cuda:0'`` when an NVIDIA GPU is present, otherwise ``'auto'``."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda:0"
+    except Exception:
+        pass
+    return "auto"
 
 
 def _set_torch_device(device_str):
@@ -41,64 +113,139 @@ def _set_torch_device(device_str):
         if device_str.startswith("cuda:"):
             idx = int(device_str.split(":")[1])
             torch.cuda.set_device(idx)
-            print(f"ConvPaint: Selected GPU device {idx} ({torch.cuda.get_device_name(idx)})")
+            print(
+                f"ConvPaint: Selected GPU device {idx} ({torch.cuda.get_device_name(idx)})"
+            )
     except Exception as e:
         print(f"\u26a0\ufe0f Could not set CUDA device '{device_str}': {e}")
 
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Loading helpers
 # ---------------------------------------------------------------------------
 
-def _load_convpaint_model(pixelclass_dir, cell_type, provided_path=None):
-    """Load a trained ConvpaintModel .pkl file."""
+def _load_unified_model(pixelclass_dir, provided_path=None):
+    """Load the trained unified ConvPaint model.
+
+    ``provided_path`` overrides the default location when supplied. Returns
+    ``None`` if no model can be loaded.
+    """
     from napari_convpaint import ConvpaintModel
 
-    pixelclass_dir = Path(pixelclass_dir)
-
-    # 1. Manually provided path
     if provided_path:
         p = Path(provided_path)
-        if p.exists() and p.suffix.lower() == '.pkl':
-            print(f"  ✅ {cell_type}: using provided ConvPaint model → {p.name}")
+        if p.exists() and p.suffix.lower() == ".pkl":
+            print(f"  \u2705 Using provided unified ConvPaint model \u2192 {p.name}")
             return ConvpaintModel(model_path=str(p))
 
-    # 2. Well-known filenames
-    filenames_to_try = [
-        f'ConvPaintModel_{cell_type}.pkl',
-        f'ConvPaintModel_{cell_type.capitalize()}.pkl',
-        f'ConvPaintModel_{cell_type.lower()}.pkl',
+    p = unified_model_path(pixelclass_dir)
+    if p.exists():
+        print(f"  \u2705 Found unified ConvPaint model \u2192 {p.name}")
+        return ConvpaintModel(model_path=str(p))
+
+    print(f"  \u274c No unified ConvPaint model found in {pixelclass_dir}")
+    return None
+
+
+def _load_unified_label_map(pixelclass_dir, provided_path=None):
+    """Load the unified label-map sidecar (next to the .pkl by default)."""
+    if provided_path:
+        p = Path(provided_path)
+        if p.exists():
+            return load_label_map(p)
+
+    p = unified_label_map_path(pixelclass_dir)
+    if p.exists():
+        return load_label_map(p)
+    raise FileNotFoundError(
+        f"Could not find unified label-map sidecar at {p}. "
+        "Train the unified ConvPaint classifier before running batch inference."
+    )
+
+
+def _load_death_model(pixelclass_dir, provided_path=None):
+    """Load the binary death ConvPaint model (separate from the unified one)."""
+    from napari_convpaint import ConvpaintModel
+
+    if provided_path:
+        p = Path(provided_path)
+        if p.exists() and p.suffix.lower() == ".pkl":
+            print(f"  \u2705 Using provided death ConvPaint model \u2192 {p.name}")
+            return ConvpaintModel(model_path=str(p))
+
+    pixelclass_dir = Path(pixelclass_dir)
+    candidates = [
+        "ConvPaintModel_Dead.pkl",
+        "ConvPaintModel_dead.pkl",
     ]
-    for fname in filenames_to_try:
+    for fname in candidates:
         p = pixelclass_dir / fname
         if p.exists():
-            print(f"  ✅ {cell_type}: found ConvPaint model → {p.name}")
+            print(f"  \u2705 Found death ConvPaint model \u2192 {p.name}")
             return ConvpaintModel(model_path=str(p))
 
-    # 3. Scan directory for .pkl containing cell type name
-    if pixelclass_dir.is_dir():
-        ct_lower = cell_type.lower()
-        for pkl_file in pixelclass_dir.glob('*.pkl'):
-            if ct_lower in pkl_file.stem.lower() and 'convpaint' in pkl_file.stem.lower():
-                print(f"  ✅ {cell_type}: found ConvPaint model (scan) → {pkl_file.name}")
-                return ConvpaintModel(model_path=str(pkl_file))
-
-    print(f"  ❌ {cell_type}: no ConvPaint .pkl model found in {pixelclass_dir}")
+    print(f"  \u26a0\ufe0f No death ConvPaint model found in {pixelclass_dir}")
     return None
 
 
 def _open_zarr_output(path, dtype, shape, overwrite):
-    """Open a zarr array for output, creating/recreating as needed."""
     path = Path(path)
     if overwrite and path.exists():
         shutil.rmtree(path)
     if path.exists():
         return zarr.open(str(path), mode="r+")
-    else:
-        return zarr.open(
-            str(path), mode="w", shape=shape, dtype=dtype,
-            chunks=(1,) + shape[1:],
-        )
+    return zarr.open(
+        str(path), mode="w", shape=shape, dtype=dtype,
+        chunks=(1,) + shape[1:],
+    )
 
+
+def _resolve_unified_clf_path(*legacy_dicts, unified_path=None):
+    """Pick the unified model path, prioritising explicit user input.
+
+    The legacy per-cell-type ``clf_*_paths`` dicts are accepted only to keep
+    older notebooks/configs from breaking; if any of them point to existing
+    .pkl files we surface a one-time deprecation warning.
+    """
+    if unified_path:
+        return str(unified_path)
+
+    for d in legacy_dicts:
+        if not d:
+            continue
+        for v in d.values():
+            if v and Path(v).exists() and str(v).lower().endswith(".pkl"):
+                warnings.warn(
+                    "Per-cell-type ConvPaint classifier paths are no longer "
+                    "supported in unified mode; supply a single "
+                    "'clf_unified_path' instead. Ignoring legacy entry.",
+                    DeprecationWarning,
+                    stacklevel=3,
+                )
+                break
+    return None
+
+
+def _slice_frame_channels(frame, channel_indices, *, label):
+    """Slice ``(C, Z, Y, X)`` frames by sidecar channels with safe fallback."""
+    if not channel_indices:
+        return frame
+    valid = []
+    n_channels = int(frame.shape[0])
+    for idx in channel_indices:
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < n_channels and idx not in valid:
+            valid.append(idx)
+    if not valid:
+        print(
+            f"  \u26a0\ufe0f {label}: input-channel sidecar has no valid indices "
+            f"for frame with {n_channels} channels; using all channels."
+        )
+        return frame
+    return frame[valid]
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +257,10 @@ def run_convpaint_segmentation(
     metadata,
     metadata_csv_path,
     timepoint_range=None,
-    clf_organoid_paths=None,
-    clf_immune_paths=None,
-    clf_other_paths=None,
+    clf_unified_path=None,
+    clf_organoid_paths=None,  # legacy, ignored except for deprecation warning
+    clf_immune_paths=None,    # legacy
+    clf_other_paths=None,     # legacy
     clf_death_path=None,
     convpaint_config=None,
     organoid_types=None,
@@ -121,71 +269,122 @@ def run_convpaint_segmentation(
     only_segment=False,
     overwrite_existing=False,
     n_workers=1,
-    convpaint_strategy="ConvPaint (Direct Segmentation)",
+    convpaint_strategy=DEFAULT_STRATEGY,
     **_kwargs,
 ):
-    """
-    Fully independent ConvPaint inference queue.
+    """Unified-mode ConvPaint inference queue.
 
-    Writes output .zarr files to the same directory layout as the APOC/CPU
-    pipeline so downstream tracking works seamlessly.
+    Runs the unified multi-class classifier exactly once per timepoint and
+    writes per-cell-type ``segments`` / ``mask`` zarrs alongside the
+    optional binary ``mask_dead.zarr``. Drop-in replacement for the legacy
+    per-cell-type queue: the on-disk output layout is unchanged so
+    downstream tracking/analysis works without modification.
     """
-    print("Running ConvPaint segmentation pipeline...")
+    convpaint_strategy = _normalize_strategy(convpaint_strategy)
+    print(f"Running ConvPaint segmentation pipeline (strategy: {convpaint_strategy})")
 
     output_dir = Path(output_dir)
     pixelclass_dir = output_dir / "images" / "PixelClassification"
 
-    # --- Discover cell types ---
     organoid_types = organoid_types or detect_organoid_types_from_metadata(metadata)
     immune_types = immune_types or detect_immune_cell_types_from_metadata(metadata)
     other_types = other_types or detect_other_cell_types_from_metadata(metadata)
     all_cell_types = organoid_types + immune_types + other_types
     _has_death = has_dead_channel(metadata)
 
-    # --- Load models ---
-    models = {}
-    clf_organoid_paths = clf_organoid_paths or {}
-    for ct in organoid_types:
-        m = _load_convpaint_model(pixelclass_dir, ct, clf_organoid_paths.get(ct))
-        if m:
-            models[ct] = m
+    # Resolve the unified model path (with a friendly fallback that warns on
+    # legacy per-cell-type clf path dicts).
+    resolved_unified = _resolve_unified_clf_path(
+        clf_organoid_paths, clf_immune_paths, clf_other_paths,
+        unified_path=clf_unified_path,
+    )
 
-    clf_immune_paths = clf_immune_paths or {}
-    for ct in immune_types:
-        m = _load_convpaint_model(pixelclass_dir, ct, clf_immune_paths.get(ct))
-        if m:
-            models[ct] = m
+    # Load unified model + label map up-front.
+    unified_model = None
+    label_map = None
+    if not only_segment:
+        unified_model = _load_unified_model(pixelclass_dir, resolved_unified)
+    try:
+        label_map = _load_unified_label_map(pixelclass_dir)
+    except FileNotFoundError as exc:
+        if not only_segment:
+            print(f"  \u274c {exc}")
+            return metadata
+        else:
+            label_map = None  # only_segment mode tolerates a missing map
 
-    clf_other_paths = clf_other_paths or {}
-    for ct in other_types:
-        m = _load_convpaint_model(pixelclass_dir, ct, clf_other_paths.get(ct))
-        if m:
-            models[ct] = m
+    # Determine which cell types to process: must be in metadata AND in label map.
+    if label_map is not None:
+        active_cell_types = [
+            ct for ct in all_cell_types
+            if ct in label_map.get("celltype_to_label", {})
+        ]
+        skipped = [ct for ct in all_cell_types if ct not in active_cell_types]
+        if skipped:
+            print(
+                f"  \u26a0\ufe0f Skipping (not in label map): {skipped}"
+            )
+    else:
+        # only_segment mode without a label map: process everything that has a
+        # cached mask on disk (per-sample check happens later).
+        active_cell_types = list(all_cell_types)
 
-    active_cell_types = [ct for ct in all_cell_types if ct in models]
-
+    # Death model is independent.
     model_death = None
-    if _has_death:
-        model_death = _load_convpaint_model(pixelclass_dir, "dead", clf_death_path)
+    if _has_death and not only_segment:
+        model_death = _load_death_model(pixelclass_dir, clf_death_path)
 
-    print(f"  Loaded ConvPaint models for: {list(models.keys())}"
-          + (f" + Death" if model_death else ""))
+    unified_input_channels = load_input_channels(
+        unified_input_channels_path(pixelclass_dir)
+    )
+    death_input_channels = load_input_channels(
+        death_input_channels_path(pixelclass_dir)
+    )
+    if unified_input_channels:
+        print(f"  Unified ConvPaint input channels: {unified_input_channels}")
+    if death_input_channels:
+        print(f"  Death ConvPaint input channels: {death_input_channels}")
 
-    if not active_cell_types and not model_death:
-        print("  ⚠️ No ConvPaint models found. Nothing to do.")
+    if not only_segment and unified_model is None and model_death is None:
+        print("  \u26a0\ufe0f No ConvPaint models found. Nothing to do.")
         return metadata
 
-    # --- Read config for per-cell-type params ---
+    if not active_cell_types and not model_death:
+        print("  \u26a0\ufe0f No active cell types to process.")
+        return metadata
+
     cfg = convpaint_config or {}
 
-    # --- Process each sample ---
+    # Allow config to override tile_image / use_dask on loaded models.
+    use_dask = bool(cfg.get("convpaint_use_dask", False))
+    tile_image = bool(cfg.get("convpaint_tile_image", False))
+    if use_dask and not tile_image:
+        print(
+            "  \u2139\ufe0f 'use_dask' enabled but 'tile_image' is not \u2014 "
+            "Dask only parallelizes tiled predictions, so it will be a no-op."
+        )
+    for model in (unified_model, model_death):
+        if model is None:
+            continue
+        if tile_image:
+            try:
+                model.set_params(tile_image=True)
+            except Exception:
+                pass
+        if use_dask:
+            try:
+                model.set_params(use_dask=True)
+            except Exception as exc:
+                print(
+                    f"  \u26a0\ufe0f Could not set use_dask on a ConvPaint model: {exc}"
+                )
+
     sample_names = metadata['sample_name'].unique()
 
     for sample_name in sample_names:
         t0 = time.time()
         img_outdir = output_dir / "images" / sample_name
 
-        # Skip if all outputs exist
         if not overwrite_existing:
             all_done = True
             for ct in active_cell_types:
@@ -196,14 +395,13 @@ def run_convpaint_segmentation(
                 if not (img_outdir / f"{sample_name}_mask_dead.zarr").exists():
                     all_done = False
             if all_done and active_cell_types:
-                print(f"  ⏭️ Skipping {sample_name} (all outputs already exist)")
+                print(f"  \u23ED\uFE0F Skipping {sample_name} (all outputs already exist)")
                 continue
 
-        # Load raw image
         sample_row = metadata[metadata['sample_name'] == sample_name].iloc[0]
         raw_image_path = sample_row.get('raw_image_path')
         if not raw_image_path or not Path(raw_image_path).exists():
-            print(f"  ⚠️ Raw image not found for {sample_name}")
+            print(f"  \u26a0\ufe0f Raw image not found for {sample_name}")
             continue
 
         raw_image_path = Path(raw_image_path)
@@ -213,14 +411,13 @@ def run_convpaint_segmentation(
         if not isinstance(axis_order, str) or not axis_order:
             axis_order = "TCZYX"
 
-        img = load_image(raw_image_path, axis_order=axis_order)  # (T, C, Z, Y, X)
+        img = load_image(raw_image_path, axis_order=axis_order)
         n_timepoints = img.shape[0]
 
         img_outdir.mkdir(parents=True, exist_ok=True)
-        spatial_shape = img.shape[2:]  # (Z, Y, X)
+        spatial_shape = img.shape[2:]
         out_shape = (n_timepoints,) + spatial_shape
 
-        # Create output zarr arrays
         zarr_segs = {}
         zarr_masks = {}
         for ct in active_cell_types:
@@ -232,7 +429,7 @@ def run_convpaint_segmentation(
                 mask_path = img_outdir / f"{sample_name}_{ct}_mask.zarr"
                 if not mask_path.exists():
                     raise FileNotFoundError(
-                        f"Cannot 'Only Resegment' — mask not found: {mask_path}"
+                        f"Cannot 'Only Resegment' \u2014 mask not found: {mask_path}"
                     )
                 zarr_masks[ct] = zarr.open(str(mask_path), mode="r")
             else:
@@ -248,7 +445,6 @@ def run_convpaint_segmentation(
                 "uint16", out_shape, overwrite_existing,
             )
 
-        # Timepoint range
         if timepoint_range is not None:
             if isinstance(timepoint_range, (range, list)):
                 t_range = list(timepoint_range)
@@ -263,7 +459,7 @@ def run_convpaint_segmentation(
 
         pbar = tqdm(
             t_range,
-            desc=f"  ⏱️ {sample_name}",
+            desc=f"  \u23F1\uFE0F {sample_name}",
             leave=True, unit="tp",
             file=sys.stdout, dynamic_ncols=True,
         )
@@ -271,15 +467,14 @@ def run_convpaint_segmentation(
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_load_tp, img, t_range[0])
 
-            # Apply GPU device selection once (global setting)
-            saved_device = cfg.get("convpaint_device", "auto")
+            saved_device = cfg.get("convpaint_device", _default_device())
             if saved_device and saved_device not in ("auto", "cpu"):
                 _set_torch_device(saved_device)
                 fe_device = "gpu"
             elif saved_device == "cpu":
                 fe_device = "cpu"
             else:
-                fe_device = None
+                fe_device = "auto"
 
             for i, t in enumerate(pbar):
                 t_img = future.result()  # (C, Z, Y, X)
@@ -287,44 +482,53 @@ def run_convpaint_segmentation(
                 if i + 1 < len(t_range):
                     future = executor.submit(_load_tp, img, t_range[i + 1])
 
-                for ct in active_cell_types:
-                    cp_model = models[ct]
-
-                    # Use all channels (no filtering)
-                    frame = t_img
-
-                    # Strategy routing
-                    if convpaint_strategy == "ConvPaint Probability Map + Watershed":
-                        _process_probability_strategy(
-                            cp_model, frame, t, ct, cfg,
-                            zarr_masks, zarr_segs, only_segment,
-                            fe_device=fe_device,
-                            diag=(i == 0),
-                        )
-                    elif convpaint_strategy == "ConvPaint Mask + EDT/Watershed Resegmentation":
-                        _process_edt_strategy(
-                            cp_model, frame, t, ct, cfg,
-                            zarr_masks, zarr_segs, only_segment,
-                            fe_device=fe_device,
-                        )
-                    else:
-                        # Direct segmentation
-                        _process_direct_strategy(
-                            cp_model, frame, t, ct,
-                            zarr_masks, zarr_segs, only_segment,
-                            fe_device=fe_device,
-                        )
-
-                # Death channel
-                if zarr_death is not None and model_death is not None:
-                    death_frame = t_img  # use all channels
-                    death_seg = np.asarray(
-                        model_death.segment(death_frame)
+                if only_segment:
+                    # Re-run only the post-processing using cached masks.
+                    _resegment_timepoint(
+                        t, t_img, active_cell_types, cfg, label_map,
+                        zarr_masks, zarr_segs, convpaint_strategy,
                     )
-                    death_mask = (death_seg > 0).astype(np.uint16)
-                    zarr_death[t] = death_mask
+                elif convpaint_strategy == STRATEGY_PROB:
+                    unified_frame = _slice_frame_channels(
+                        t_img, unified_input_channels, label="Unified ConvPaint"
+                    )
+                    _process_probability_timepoint(
+                        unified_model, unified_frame, t, active_cell_types,
+                        label_map, cfg, zarr_masks, zarr_segs,
+                        fe_device=fe_device, diag=(i == 0),
+                    )
+                else:
+                    unified_frame = _slice_frame_channels(
+                        t_img, unified_input_channels, label="Unified ConvPaint"
+                    )
+                    _process_edt_timepoint(
+                        unified_model, unified_frame, t, active_cell_types,
+                        label_map, cfg, zarr_masks, zarr_segs,
+                        fe_device=fe_device,
+                        diag=(i == 0),
+                        marker_strategy=(
+                            "peak" if convpaint_strategy == STRATEGY_PEAK_EDT
+                            else "threshold"
+                        ),
+                    )
 
-        # Update metadata
+                if zarr_death is not None and model_death is not None:
+                    _t0_death = time.time()
+                    death_frame = _slice_frame_channels(
+                        t_img, death_input_channels, label="Death ConvPaint"
+                    )
+                    death_seg = segment_per_z(
+                        model_death, death_frame, fe_use_device=fe_device,
+                    )
+                    death_mask = (death_seg >= 2).astype(np.uint16)
+                    zarr_death[t] = death_mask
+                    if i == 0:
+                        print(
+                            f"    \u23F1 death segment_per_z + write: "
+                            f"{time.time() - _t0_death:.2f}s"
+                        )
+
+        # Write paths back into the metadata table.
         row_idx = metadata.index[
             metadata['sample_name'] == sample_name
         ].tolist()[0]
@@ -358,9 +562,10 @@ def run_convpaint_segmentation(
                 metadata.at[row_idx, 'dead_mask_path'] = str(death_path)
 
         elapsed = time.time() - t0
-        print(f"  ✅ {sample_name} done in {elapsed:.1f}s")
+        print(f"  \u2705 {sample_name} done in {elapsed:.1f}s")
 
-    print("\n✅ ConvPaint queue finished successfully.")
+    print("\n\u2705 ConvPaint queue finished successfully. "
+          "Updated *_segments_image_path columns in metadata.")
 
     new_md = metadata.copy()
     new_md['preprocess_pixelclass_done'] = True
@@ -369,161 +574,138 @@ def run_convpaint_segmentation(
 
 
 # ---------------------------------------------------------------------------
-# Strategy implementations
+# Strategy implementations (one inference call per timepoint).
 # ---------------------------------------------------------------------------
 
-def _process_direct_strategy(
-    cp_model, frame, t, ct, zarr_masks, zarr_segs, only_segment, fe_device=None,
+def _process_edt_timepoint(
+    unified_model, frame, t, active_cell_types, label_map, cfg,
+    zarr_masks, zarr_segs, fe_device=None, diag=False,
+    marker_strategy="threshold",
 ):
-    """Direct segmentation: ConvPaint class labels become instance labels."""
-    if not only_segment:
-        seg_out = np.asarray(cp_model.segment(frame, fe_use_device=fe_device)).astype(np.uint16)
-        # ConvPaint labels: 1=background, 2=foreground (matching our annotation)
-        # Convert to mask: foreground = class 2
-        mask_out = (seg_out >= 2).astype(np.uint16)
-        zarr_masks[ct][t] = mask_out
-    else:
-        mask_out = np.asarray(zarr_masks[ct][t])
-        seg_out = mask_out
+    """One ``segment`` call → derive per-cell-type binary masks → EDT/watershed."""
+    _t0 = time.time()
+    multi_labels = segment_per_z(unified_model, frame, fe_use_device=fe_device)
+    multi_labels = np.asarray(multi_labels)
+    if diag:
+        print(
+            f"    \u23F1 unified segment_per_z: {time.time() - _t0:.2f}s  "
+            f"shape={multi_labels.shape}"
+        )
 
-    # For direct strategy, use connected components as instances
-    from skimage.measure import label as sk_label
-    instances = sk_label(mask_out.astype(bool)).astype(np.uint16)
-    zarr_segs[ct][t] = instances
-
-
-def _process_edt_strategy(
-    cp_model, frame, t, ct, cfg, zarr_masks, zarr_segs, only_segment, fe_device=None,
-):
-    """Mask + EDT/Watershed resegmentation."""
-    from behav3d.preprocessing.segmentation.segmentation_utils import (
-        postprocess_mask, segment_mask,
-    )
-
-    if not only_segment:
-        seg_out = np.asarray(cp_model.segment(frame, fe_use_device=fe_device)).astype(np.uint16)
-        mask_out = (seg_out >= 2).astype(np.uint16)
-        zarr_masks[ct][t] = mask_out
-    else:
-        mask_out = np.asarray(zarr_masks[ct][t])
-
-    fill_holes = cfg.get(f"{ct}_fill_holes", True)
-    opening_nr_pixels = int(cfg.get(f"{ct}_opening_nr_pixels", 0))
-    proc_mask = postprocess_mask(
-        mask_out, fill_holes=fill_holes, opening_nr_pixels=opening_nr_pixels,
-    )
-
-    edt_thr = float(cfg.get(f"{ct}_edt_threshold", 1.0))
-    segment_size_min = int(cfg.get(f"{ct}_segment_size_min", 10))
-    seg_refined = segment_mask(
-        proc_mask, edt_thr=edt_thr, edt_thr_refined=None,
-        segment_size_min=segment_size_min, use_dims=3, n_workers=1,
-    )
-    zarr_segs[ct][t] = np.asarray(seg_refined).astype(np.uint16)
-
-
-def _process_probability_strategy(
-    cp_model, frame, t, ct, cfg,
-    zarr_masks, zarr_segs, only_segment, fe_device=None, diag=False,
-):
-    """Probability Map + Watershed strategy."""
-    from scipy import ndimage as ndi
-    from skimage.measure import label as sk_label
-    from skimage.segmentation import watershed
-    from behav3d.preprocessing.segmentation import (
-        segment_size_filter, segment_2d_filter,
-    )
-    from behav3d.preprocessing.segmentation.segmentation_utils import (
-        postprocess_mask, segment_mask,
-    )
-
-    opening_nr_pixels = int(cfg.get(f"{ct}_opening_nr_pixels", 0))
-
-    if not only_segment:
+    for ct in active_cell_types:
         _t0 = time.time()
-        # predict_probas returns (n_classes, Z, Y, X) — we want class index 1
-        # (foreground probability, since class 0=background in ConvPaint output)
-        probas = cp_model.predict_probas(frame, fe_use_device=fe_device)
-        # probas shape: (n_classes, Z, Y, X) for single image
-        probas = np.asarray(probas)
-        # The foreground class is the last class (index -1, i.e. class 2 in binary)
-        # ConvPaint class 1=BG, class 2=FG, so index 1 in probas (0-indexed)
-        if probas.ndim == 3:
-            # Single-class edge case — treat as foreground probability
-            prob_map = probas.astype(np.float32)
-        else:
-            # Multi-class: take the foreground class probability
-            prob_map = probas[-1].astype(np.float32)
+        k = int(label_map["celltype_to_label"][ct])
+        mask_out = (multi_labels == k).astype(np.uint16)
+        zarr_masks[ct][t] = mask_out
+
+        fill_holes = bool(cfg.get(f"{ct}_fill_holes", True))
+        opening_nr_pixels = int(cfg.get(f"{ct}_opening_nr_pixels", 0))
+        edt_thr = float(cfg.get(f"{ct}_edt_threshold", 1.0))
+        segment_size_min = int(cfg.get(f"{ct}_segment_size_min", 10))
+
+        instances = mask_to_instances(
+            mask_out,
+            edt_thr=edt_thr,
+            opening_nr_pixels=opening_nr_pixels,
+            fill_holes=fill_holes,
+            segment_size_min=segment_size_min,
+            marker_strategy=marker_strategy,
+        )
+        zarr_segs[ct][t] = instances.astype(np.uint16)
+        if diag:
+            print(f"    \u23F1 {ct} mask->instances + writes: {time.time() - _t0:.2f}s")
+
+
+def _process_probability_timepoint(
+    unified_model, frame, t, active_cell_types, label_map, cfg,
+    zarr_masks, zarr_segs, fe_device=None, diag=False,
+):
+    """One ``predict_probas`` call → slice per cell type → seeded watershed."""
+    from behav3d.preprocessing.segmentation.segmentation_utils import postprocess_mask
+
+    _t0 = time.time()
+    probas = predict_probas_per_z(unified_model, frame, fe_use_device=fe_device)
+    probas = np.asarray(probas)
+    if diag:
+        print(
+            f"    \u23F1 unified predict_probas: {time.time() - _t0:.2f}s  "
+            f"shape={probas.shape}"
+        )
+
+    for ct in active_cell_types:
+        k = int(label_map["celltype_to_label"][ct])
+        prob_axis = k - 1  # class indices [1..N+1] -> axis [0..N]
+        if not (0 <= prob_axis < probas.shape[0]):
+            # Should not happen with a correctly trained model + label map.
+            print(
+                f"    \u26a0\ufe0f Probability slice missing for {ct} "
+                f"(class {k}, axis {prob_axis} out of {probas.shape[0]}). "
+                "Skipping."
+            )
+            continue
+
+        prob_map = probas[prob_axis].astype(np.float32)
+        opening_nr_pixels = int(cfg.get(f"{ct}_opening_nr_pixels", 0))
+        mask_thr = float(cfg.get(f"{ct}_prob_mask_threshold", 0.5))
+        seed_thr = float(cfg.get(f"{ct}_prob_seed_threshold", 0.8))
+        segment_size_min = int(cfg.get(f"{ct}_segment_size_min", 10))
 
         if diag:
             print(
-                f"    ⏱ {ct} predict (prob): {time.time()-_t0:.2f}s  "
-                f"range=[{prob_map.min():.3f}, {prob_map.max():.3f}]"
+                f"    \u23F1 {ct} prob slice range="
+                f"[{prob_map.min():.3f}, {prob_map.max():.3f}]"
             )
 
-        _t0 = time.time()
-        mask_thr = float(cfg.get(f"{ct}_prob_mask_threshold", 0.5))
         mask_out = postprocess_mask(
             prob_map > mask_thr,
             fill_holes=False,
             opening_nr_pixels=opening_nr_pixels,
         ).astype(np.uint16)
         zarr_masks[ct][t] = mask_out
-        if diag:
-            print(
-                f"    ⏱ {ct} mask threshold + write: {time.time()-_t0:.2f}s"
-            )
-    else:
-        mask_out = np.asarray(zarr_masks[ct][t])
-        prob_map = None
 
-    seed_thr = float(cfg.get(f"{ct}_prob_seed_threshold", 0.8))
-    segment_size_min = int(cfg.get(f"{ct}_segment_size_min", 10))
-
-    if prob_map is not None:
-        _t0 = time.time()
-        mask_bool = mask_out.astype(bool)
-        cc_labels = sk_label(mask_bool)
-        seed_mask = (prob_map > seed_thr) & mask_bool
-        segments = np.zeros_like(cc_labels, dtype=np.uint16)
-        next_id = 0
-
-        obj_slices = ndi.find_objects(cc_labels)
-        for comp_idx, slc in enumerate(obj_slices, start=1):
-            if slc is None:
-                continue
-            comp_mask = cc_labels[slc] == comp_idx
-            sub_seeds = sk_label(seed_mask[slc] & comp_mask)
-            n_seeds = int(sub_seeds.max())
-
-            if n_seeds <= 1:
-                next_id += 1
-                segments[slc][comp_mask] = next_id
-            else:
-                sub_result = watershed(
-                    -prob_map[slc], markers=sub_seeds, mask=comp_mask,
-                )
-                for s in range(1, int(sub_result.max()) + 1):
-                    next_id += 1
-                    segments[slc][sub_result == s] = next_id
-
-        if diag:
-            print(
-                f"    ⏱ {ct} per-component watershed: "
-                f"{time.time()-_t0:.2f}s"
-            )
-    else:
-        segments = segment_mask(
-            mask_out.astype(bool),
-            edt_thr=seed_thr,
+        instances = probability_to_instances(
+            prob_map,
+            mask_thr=mask_thr,
+            seed_thr=seed_thr,
+            opening_nr_pixels=opening_nr_pixels,
             segment_size_min=segment_size_min,
-            use_dims=3, n_workers=1,
         )
+        zarr_segs[ct][t] = instances.astype(np.uint16)
 
-    _t0 = time.time()
-    segments = segment_size_filter(segments, size_min=segment_size_min)
-    segments = segment_2d_filter(segments)
-    if diag:
-        print(f"    ⏱ {ct} size+2d filter: {time.time()-_t0:.2f}s")
 
-    zarr_segs[ct][t] = np.asarray(segments).astype(np.uint16)
+def _resegment_timepoint(
+    t, _frame, active_cell_types, cfg, label_map,
+    zarr_masks, zarr_segs, strategy,
+):
+    """Resegment from cached masks (no feature extraction).
+
+    For probability strategy we don't have the original probability map cached
+    on disk, so we fall back to EDT-style reseeding using the cached binary
+    mask. This matches the previous behaviour for the legacy queue.
+    """
+    for ct in active_cell_types:
+        mask_out = np.asarray(zarr_masks[ct][t])
+        opening_nr_pixels = int(cfg.get(f"{ct}_opening_nr_pixels", 0))
+        segment_size_min = int(cfg.get(f"{ct}_segment_size_min", 10))
+
+        if strategy == STRATEGY_PROB:
+            seed_thr = float(cfg.get(f"{ct}_prob_seed_threshold", 0.8))
+            instances = mask_to_instances(
+                mask_out,
+                edt_thr=seed_thr,
+                opening_nr_pixels=opening_nr_pixels,
+                fill_holes=False,
+                segment_size_min=segment_size_min,
+            )
+        else:
+            edt_thr = float(cfg.get(f"{ct}_edt_threshold", 1.0))
+            fill_holes = bool(cfg.get(f"{ct}_fill_holes", True))
+            instances = mask_to_instances(
+                mask_out,
+                edt_thr=edt_thr,
+                opening_nr_pixels=opening_nr_pixels,
+                fill_holes=fill_holes,
+                segment_size_min=segment_size_min,
+                marker_strategy="peak" if strategy == STRATEGY_PEAK_EDT else "threshold",
+            )
+        zarr_segs[ct][t] = instances.astype(np.uint16)

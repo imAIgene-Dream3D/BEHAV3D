@@ -157,26 +157,38 @@ class PixelClassifierPanel:
         )
         self.gpu_device.observe(self._on_gpu_changed, names="value")
 
+        _apoc_strategy_options = [
+            "APOC (Direct Instance Segmentation)",
+            "APOC Mask + EDT/Watershed Resegmentation",
+            "APOC Mask + Peak EDT/Watershed Resegmentation",
+            "APOC Probability Map + Watershed",
+        ]
+        _saved_apoc_strategy = pc.get("apoc_strategy", "APOC (Direct Instance Segmentation)")
+        if _saved_apoc_strategy not in _apoc_strategy_options:
+            _saved_apoc_strategy = "APOC (Direct Instance Segmentation)"
         self.apoc_strategy = widgets.Dropdown(
-            options=[
-                "APOC (Direct Instance Segmentation)",
-                "APOC Mask + EDT/Watershed Resegmentation",
-                "APOC Probability Map + Watershed"
-            ],
-            value=pc.get("apoc_strategy", "APOC (Direct Instance Segmentation)"),
+            options=_apoc_strategy_options,
+            value=_saved_apoc_strategy,
             description="Strategy:",
             style={'description_width': 'initial'},
             layout=widgets.Layout(width="auto", display="none")
         )
         self.apoc_strategy.observe(self._toggle_engine_widgets, names="value")
 
+        # Migrate legacy Direct value (no longer offered) to the EDT default.
+        _convpaint_strategy_options = [
+            "ConvPaint Mask + EDT/Watershed",
+            "ConvPaint Mask + Peak EDT/Watershed",
+            "ConvPaint Probability + Watershed",
+        ]
+        _saved_cp_strategy = pc.get(
+            "convpaint_strategy", "ConvPaint Mask + EDT/Watershed"
+        )
+        if _saved_cp_strategy not in _convpaint_strategy_options:
+            _saved_cp_strategy = "ConvPaint Mask + EDT/Watershed"
         self.convpaint_strategy = widgets.Dropdown(
-            options=[
-                "ConvPaint (Direct Segmentation)",
-                "ConvPaint Mask + EDT/Watershed Resegmentation",
-                "ConvPaint Probability Map + Watershed"
-            ],
-            value=pc.get("convpaint_strategy", "ConvPaint (Direct Segmentation)"),
+            options=_convpaint_strategy_options,
+            value=_saved_cp_strategy,
             description="Strategy:",
             style={'description_width': 'initial'},
             layout=widgets.Layout(width="auto", display="none")
@@ -235,10 +247,34 @@ class PixelClassifierPanel:
             description_width='160px',
             width='100%',
         )
-        
+
+        # Unified ConvPaint model picker (single .pkl for all cell types).
+        # Only shown when the engine is ConvPaint.
+        self.clf_unified_path = PathPicker(
+            mode='file',
+            description='Unified ConvPaint clf:',
+            default="",
+            filter_pattern='*.pkl',
+            description_width='160px',
+            width='100%',
+        )
+        # ConvPaint death model is also a .pkl (separate binary classifier).
+        self.clf_death_convpaint_path = PathPicker(
+            mode='file',
+            description='Death ConvPaint clf:',
+            default="",
+            filter_pattern='*.pkl',
+            description_width='160px',
+            width='100%',
+        )
+
         if self.manual_clf_paths.value:
             self.clf_dir.value = str(pc.get("clf_dir", "") or "")
             self.clf_death_path.value = str(pc.get("clf_death_path", "") or "")
+            self.clf_unified_path.value = str(pc.get("clf_unified_path", "") or "")
+            self.clf_death_convpaint_path.value = str(
+                pc.get("clf_death_convpaint_path", "") or ""
+            )
             for cell_type in self.all_cell_types:
                 if cell_type in self.clf_paths:
                     saved_path = pc.get(f"clf_{cell_type}_path", "")
@@ -519,7 +555,18 @@ class PixelClassifierPanel:
 
         This keeps per-channel segmentations separate while removing shared
         voxels that would otherwise be duplicated across multicolor channels.
+
+        Unified-mode ConvPaint already guarantees mutual exclusivity between
+        cell-type masks (a voxel can carry only one class), so the cleanup is
+        a no-op there and we skip it for performance.
         """
+        if str(self.classifier_engine.value) == "ConvPaint":
+            print(
+                "Skipping multicolor cleanup: unified ConvPaint already "
+                "produces mutually-exclusive per-cell-type masks."
+            )
+            return metadata
+
         families = {}
         for cell_type in self.organoid_types + self.immune_types + self.other_types:
             if not is_multicolor_celltype(cell_type):
@@ -699,6 +746,10 @@ class PixelClassifierPanel:
         if self.manual_clf_paths.value:
             pc["clf_dir"] = str(self.clf_dir.value or "")
             pc["clf_death_path"] = str(self.clf_death_path.value or "")
+            pc["clf_unified_path"] = str(self.clf_unified_path.value or "")
+            pc["clf_death_convpaint_path"] = str(
+                self.clf_death_convpaint_path.value or ""
+            )
             for cell_type, path_picker in self.clf_paths.items():
                 pc[f"clf_{cell_type}_path"] = str(path_picker.value or "")
 
@@ -718,16 +769,21 @@ class PixelClassifierPanel:
         # APOC strategy
         apoc_strategy = str(self.apoc_strategy.value)
         is_apoc_edt = is_apoc and apoc_strategy == "APOC Mask + EDT/Watershed Resegmentation"
+        is_apoc_peak = is_apoc and apoc_strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
         is_apoc_prob = is_apoc and apoc_strategy == "APOC Probability Map + Watershed"
 
         # ConvPaint strategy
         cp_strategy = str(self.convpaint_strategy.value)
-        is_cp_edt = is_convpaint and cp_strategy == "ConvPaint Mask + EDT/Watershed Resegmentation"
-        is_cp_prob = is_convpaint and cp_strategy == "ConvPaint Probability Map + Watershed"
-        is_cp_direct = is_convpaint and not is_cp_edt and not is_cp_prob
+        is_cp_edt = is_convpaint and cp_strategy == "ConvPaint Mask + EDT/Watershed"
+        is_cp_peak = is_convpaint and cp_strategy == "ConvPaint Mask + Peak EDT/Watershed"
+        is_cp_prob = is_convpaint and cp_strategy == "ConvPaint Probability + Watershed"
 
         # CPU-like = needs EDT/postprocessing params
-        is_cpu_like = (not is_apoc and not is_convpaint) or is_apoc_edt or is_cp_edt
+        is_cpu_like = (
+            (not is_apoc and not is_convpaint)
+            or is_apoc_edt or is_apoc_peak
+            or is_cp_edt or is_cp_peak
+        )
         # Probability params needed?
         needs_prob = is_apoc_prob or is_cp_prob
 
@@ -753,14 +809,22 @@ class PixelClassifierPanel:
         self.btn_resegment.layout.display = (None if show_reseg else 'none')
         self.only_resegment_warning.layout.display = (None if show_reseg else 'none')
 
-        # Manual classifier paths (hidden for APOC and ConvPaint)
-        self.manual_clf_paths.layout.display = ('none' if (is_apoc or is_convpaint) else None)
-        if is_apoc or is_convpaint:
+        # Manual classifier paths: hidden for APOC (no manual override supported);
+        # visible for ConvPaint (single unified .pkl) and CPU (per-cell-type).
+        self.manual_clf_paths.layout.display = ('none' if is_apoc else None)
+        if is_apoc:
             self.clf_paths_box.layout.display = 'none'
+        else:
+            # Rebuild so the picker set matches the active engine.
+            self._build_clf_paths_box()
+            self.clf_paths_box.layout.display = (
+                None if bool(self.manual_clf_paths.value) else 'none'
+            )
 
         # Post-processing (Size Filtering via standalone button)
-        # Shown for Direct APOC or Direct ConvPaint strategies
-        show_post = (is_apoc and not is_apoc_edt and not is_apoc_prob) or is_cp_direct
+        # Shown only for Direct APOC; ConvPaint strategies (EDT / Probability)
+        # already include size filtering inside their resegmentation pipeline.
+        show_post = is_apoc and not is_apoc_edt and not is_apoc_peak and not is_apoc_prob
         self.post_processing_box.layout.display = (None if show_post else 'none')
 
     def _on_gpu_changed(self, change):
@@ -806,25 +870,47 @@ class PixelClassifierPanel:
         if not manual:
             self.clf_dir.value = ""
             self.clf_death_path.value = ""
+            self.clf_unified_path.value = ""
+            self.clf_death_convpaint_path.value = ""
             for picker in self.clf_paths.values(): picker.value = ""
+        else:
+            # Refresh the visible pickers in case the engine changed while hidden.
+            self._build_clf_paths_box()
 
     def _build_clf_paths_box(self):
-        children = [widgets.HTML("<b>Classifier paths</b>"), self.clf_dir]
-        if self.organoid_types:
-            children.append(widgets.HTML("<i>Organoids:</i>"))
-            for org_type in self.organoid_types:
-                if org_type in self.clf_paths: children.append(self.clf_paths[org_type])
-        if self.immune_types:
-            children.append(widgets.HTML("<i>Immune cells:</i>"))
-            for immune_type in self.immune_types:
-                if immune_type in self.clf_paths: children.append(self.clf_paths[immune_type])
-        if self.other_types:
-            children.append(widgets.HTML("<i>Other cells:</i>"))
-            for other_type in self.other_types:
-                if other_type in self.clf_paths: children.append(self.clf_paths[other_type])
-        if self.has_death:
-            children.append(widgets.HTML("<i>Death mask:</i>"))
-            children.append(self.clf_death_path)
+        engine = str(self.classifier_engine.value)
+        is_convpaint = engine == "ConvPaint"
+
+        children = [widgets.HTML("<b>Classifier paths</b>")]
+
+        if is_convpaint:
+            children.append(widgets.HTML(
+                "<span style='color:#666;font-size:0.9em;'>"
+                "ConvPaint uses a single unified multi-class classifier. "
+                "Death is a separate binary ConvPaint model.</span>"
+            ))
+            children.append(self.clf_unified_path)
+            if self.has_death:
+                children.append(widgets.HTML("<i>Death mask:</i>"))
+                children.append(self.clf_death_convpaint_path)
+        else:
+            children.append(self.clf_dir)
+            if self.organoid_types:
+                children.append(widgets.HTML("<i>Organoids:</i>"))
+                for org_type in self.organoid_types:
+                    if org_type in self.clf_paths: children.append(self.clf_paths[org_type])
+            if self.immune_types:
+                children.append(widgets.HTML("<i>Immune cells:</i>"))
+                for immune_type in self.immune_types:
+                    if immune_type in self.clf_paths: children.append(self.clf_paths[immune_type])
+            if self.other_types:
+                children.append(widgets.HTML("<i>Other cells:</i>"))
+                for other_type in self.other_types:
+                    if other_type in self.clf_paths: children.append(self.clf_paths[other_type])
+            if self.has_death:
+                children.append(widgets.HTML("<i>Death mask:</i>"))
+                children.append(self.clf_death_path)
+
         self.clf_paths_box.children = children
 
 
@@ -856,6 +942,10 @@ class PixelClassifierPanel:
             if self.has_death:
                 self.clf_death_path.text.disabled = state
                 self.clf_death_path.btn.disabled = state
+                self.clf_death_convpaint_path.text.disabled = state
+                self.clf_death_convpaint_path.btn.disabled = state
+            self.clf_unified_path.text.disabled = state
+            self.clf_unified_path.btn.disabled = state
             for picker in self.clf_paths.values():
                 picker.text.disabled = state
                 picker.btn.disabled = state
@@ -939,9 +1029,13 @@ class PixelClassifierPanel:
             if f"{cell_type}_prob_seed_threshold" in params and cell_type in self.prob_seed_thresholds:
                 self.prob_seed_thresholds[cell_type].value = float(params[f"{cell_type}_prob_seed_threshold"])
         if "apoc_strategy" in params:
-            self.apoc_strategy.value = str(params["apoc_strategy"])
+            apoc_val = str(params["apoc_strategy"])
+            if apoc_val in self.apoc_strategy.options:
+                self.apoc_strategy.value = apoc_val
         if "convpaint_strategy" in params:
-            self.convpaint_strategy.value = str(params["convpaint_strategy"])
+            cp_val = str(params["convpaint_strategy"])
+            if cp_val in self.convpaint_strategy.options:
+                self.convpaint_strategy.value = cp_val
 
         # Cache APOC and ConvPaint per-cell-type params into the YAML config dict
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
@@ -1087,6 +1181,20 @@ class PixelClassifierPanel:
                 elif str(self.classifier_engine.value) == "ConvPaint":
                     from behav3d.preprocessing.segmentation.convpaint_segment import run_convpaint_segmentation
                     pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+
+                    # Unified ConvPaint mode: a single .pkl drives every cell type.
+                    clf_unified_path = (
+                        str(self.clf_unified_path.value)
+                        if self.manual_clf_paths.value and self.clf_unified_path.value
+                        else None
+                    )
+                    clf_death_convpaint_path = (
+                        str(self.clf_death_convpaint_path.value)
+                        if (self.manual_clf_paths.value and self.has_death
+                            and self.clf_death_convpaint_path.value)
+                        else None
+                    )
+
                     new_md = run_convpaint_segmentation(
                         output_dir=str(odir),
                         metadata=self.metadata_loader.metadata,
@@ -1096,10 +1204,8 @@ class PixelClassifierPanel:
                         immune_types=self.immune_types,
                         other_types=self.other_types,
                         timepoint_range=tpr,
-                        clf_organoid_paths=clf_organoid_paths,
-                        clf_immune_paths=clf_immune_paths,
-                        clf_other_paths=clf_other_paths,
-                        clf_death_path=clf_death_path,
+                        clf_unified_path=clf_unified_path,
+                        clf_death_path=clf_death_convpaint_path,
                         only_segment=bool(only_segment),
                         overwrite_existing=bool(self.overwrite_existing.value),
                         n_workers=int(self.n_workers.value),

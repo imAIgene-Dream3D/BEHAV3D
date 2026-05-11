@@ -569,7 +569,10 @@ def run_apoc_segmentation(
                         if _diag: print(f"    ⏱ {ct} 2d_filter: {time.time()-_t0:.2f}s")
                         zarr_segs[ct][t] = np.asarray(segments).astype(np.uint16)
 
-                    elif apoc_strategy == "APOC Mask + EDT/Watershed Resegmentation":
+                    elif apoc_strategy in {
+                        "APOC Mask + EDT/Watershed Resegmentation",
+                        "APOC Mask + Peak EDT/Watershed Resegmentation",
+                    }:
                         # ── EDT/Watershed strategy ────────────────────────
                         from behav3d.preprocessing.segmentation.segmentation_utils import (
                             postprocess_mask, segment_mask
@@ -587,7 +590,19 @@ def run_apoc_segmentation(
 
                         edt_thr = cfg.get(f"{ct}_edt_threshold", 1.0)
                         segment_size_min = cfg.get(f"{ct}_segment_size_min", 10)
-                        seg_refined = segment_mask(proc_mask, edt_thr=edt_thr, edt_thr_refined=None, segment_size_min=segment_size_min, use_dims=3, n_workers=1)
+                        seg_refined = segment_mask(
+                            proc_mask,
+                            edt_thr=edt_thr,
+                            edt_thr_refined=None,
+                            segment_size_min=segment_size_min,
+                            use_dims=3,
+                            n_workers=1,
+                            marker_strategy=(
+                                "peak"
+                                if apoc_strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
+                                else "threshold"
+                            ),
+                        )
                         zarr_segs[ct][t] = np.asarray(seg_refined).astype(np.uint16)
 
                     else:

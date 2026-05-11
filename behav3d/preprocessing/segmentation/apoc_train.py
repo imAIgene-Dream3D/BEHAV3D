@@ -546,7 +546,14 @@ def _probability_array_to_segments(prob_map, mask_thr, seed_thr, opening_nr_pixe
     return _probability_volume_to_segments(prob_map, mask_thr, seed_thr, opening_nr_pixels, segment_size_min)
 
 
-def _mask_array_to_segments(mask, edt_thr, opening_nr_pixels, segment_size_min, fill_holes):
+def _mask_array_to_segments(
+    mask,
+    edt_thr,
+    opening_nr_pixels,
+    segment_size_min,
+    fill_holes,
+    marker_strategy="threshold",
+):
     """Convert a binary mask array to instances using the EDT workflow."""
     from behav3d.preprocessing.segmentation.segmentation_utils import postprocess_mask, segment_mask
 
@@ -566,6 +573,7 @@ def _mask_array_to_segments(mask, edt_thr, opening_nr_pixels, segment_size_min, 
                 segment_size_min=segment_size_min,
                 use_dims=3,
                 n_workers=1,
+                marker_strategy=marker_strategy,
             )
         ).astype(np.uint16)
 
@@ -944,7 +952,10 @@ class CellTypeTab(QWidget):
             row2.addWidget(self.segment_size_min_spin)
             group_layout.addLayout(row2)
 
-        elif self._apoc_strategy == "APOC Mask + EDT/Watershed Resegmentation":
+        elif self._apoc_strategy in {
+            "APOC Mask + EDT/Watershed Resegmentation",
+            "APOC Mask + Peak EDT/Watershed Resegmentation",
+        }:
             row1 = QHBoxLayout()
             row2 = QHBoxLayout()
             self.edt_threshold_spin = QDoubleSpinBox()
@@ -1627,12 +1638,18 @@ class APOCTrainingWidget(QWidget):
                 segment_size_min=int(tab.segment_size_min_spin.value()),
             )
 
+        marker_strategy = (
+            "peak"
+            if self._apoc_strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
+            else "threshold"
+        )
         return _mask_array_to_segments(
             raw_prediction > 0,
             edt_thr=float(tab.edt_threshold_spin.value()),
             opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
             segment_size_min=int(tab.segment_size_min_spin.value()),
             fill_holes=bool(tab.fill_holes_cb.isChecked()),
+            marker_strategy=marker_strategy,
         )
 
     def _run_instance_preview(self, ct):
@@ -1669,12 +1686,18 @@ class APOCTrainingWidget(QWidget):
                 )
             else:
                 raw_prediction, prob_prediction = self._predict_classifier_outputs(ct)
+                marker_strategy = (
+                    "peak"
+                    if strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
+                    else "threshold"
+                )
                 instance_preview = _mask_array_to_segments(
                     raw_prediction > 0,
                     edt_thr=float(tab.edt_threshold_spin.value()),
                     opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
                     segment_size_min=int(tab.segment_size_min_spin.value()),
                     fill_holes=bool(tab.fill_holes_cb.isChecked()),
+                    marker_strategy=marker_strategy,
                 )
 
             self._update_prediction_layers(ct, instance_preview, prob_prediction)
