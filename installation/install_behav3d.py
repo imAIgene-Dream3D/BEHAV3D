@@ -27,6 +27,7 @@ import shutil
 import tempfile
 import urllib.request
 import argparse
+import json
 from pathlib import Path
 
 # =============================================================================
@@ -619,6 +620,7 @@ def verify_installation(conda_path):
         ("Cellpose", 'python -c "from importlib.metadata import version; print(f\'Cellpose {version(\\\"cellpose\\\")}\')"'),
         ("ConvPaint", 'python -c "from importlib.metadata import version; print(f\'ConvPaint {version(\\\"napari-convpaint\\\")}\')"'),
         ("Napari", 'python -c "import napari; print(f\'Napari {napari.__version__}\')"'),
+        ("BEHAV3D Plugin", 'python -c "from behav3d.napari._widget import BEHAV3DWidget; print(\'Plugin OK\')"'),
     ]
     
     all_passed = True
@@ -635,6 +637,69 @@ def verify_installation(conda_path):
             all_passed = False
     
     return all_passed
+
+# =============================================================================
+# ENVIRONMENT CONFIG PERSISTENCE & NAPARI LAUNCH
+# =============================================================================
+
+def save_env_config(conda_path):
+    """Save the package manager path and env name to napari/behav3d_env.json."""
+    project_root = find_project_root()
+    napari_dir = project_root / "napari"
+    napari_dir.mkdir(exist_ok=True)
+    
+    # Use the best available package manager (same one used during install)
+    pkg_mgr = get_package_manager()
+    if not pkg_mgr:
+        pkg_mgr = conda_path
+    
+    config_path = napari_dir / "behav3d_env.json"
+    config = {
+        "pkg_manager": str(pkg_mgr),
+        "env_name": ENV_NAME,
+    }
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    
+    print_success(f"Environment config saved to: {config_path}")
+    print_info(f"  Package manager: {pkg_mgr}")
+    print_info(f"  Environment name: {ENV_NAME}")
+    return config_path
+
+
+def launch_napari(conda_path):
+    """Launch napari with the BEHAV3D plugin."""
+    project_root = find_project_root()
+    script_path = project_root / "napari" / "launch_napari.py"
+    
+    if not script_path.exists():
+        print_warning(f"Startup script not found at {script_path}")
+        print_info("Falling back to standard napari launch...")
+        cmd = f'{get_conda_run_prefix(conda_path, ENV_NAME)} napari'
+    else:
+        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+        # Use --internal to run the payload mode directly since we are already constructing the run command
+        cmd = f'{run_prefix} python "{script_path}" --internal'
+        
+    print_info(f"Running: {cmd}")
+    try:
+        kwargs = {}
+        if platform.system() == "Windows":
+            # Open in a new console window
+            kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
+        else:
+            # On Linux/macOS, detach the process so it survives when we exit
+            kwargs['start_new_session'] = True
+            # Redirect output to devnull if creating a new session to avoid clutter/hanging
+            kwargs['stdout'] = subprocess.DEVNULL
+            kwargs['stderr'] = subprocess.DEVNULL
+        
+        subprocess.Popen(cmd, shell=True, **kwargs)
+        print_success("Napari is starting with BEHAV3D plugin...")
+        print_info("Closing installation window...")
+        sys.exit(0)
+    except Exception as e:
+        print_error(f"Failed to launch napari: {e}")
 
 # =============================================================================
 # MAIN INSTALLATION FLOW
@@ -837,48 +902,85 @@ Examples:
     if not install_convpaint(conda_path):
         print_warning("napari-convpaint installation failed (ConvPaint engine will be disabled)")
     
-    # Install BEHAV3D package
+    # Install BEHAV3D package (includes napari plugin via setup.py entry points)
     if not args.skip_behav3d and not args.pytorch_only:
         print_header("BEHAV3D PACKAGE INSTALLATION")
         if not install_behav3d_package(conda_path):
             print_warning("BEHAV3D package installation failed (non-critical)")
+        else:
+            # Verify the napari plugin was registered (using npe2 discovery)
+            print_step("Verifying napari plugin registration...")
+            run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+            try:
+                # Check 1: Import the widget class
+                cmd_import = f'{run_prefix} python -c "from behav3d.napari._widget import BEHAV3DWidget"'
+                run_command(cmd_import, capture=True)
+                
+                # Check 2: Check npe2 manifest discovery
+                cmd_npe2 = f'{run_prefix} python -c "import npe2; pm=npe2.PluginManager.instance(); pm.discover(); found=\'behav3d\' in pm._manifests; print(\'FOUND\' if found else \'NOT_FOUND\')"'
+                result = run_command(cmd_npe2, capture=True)
+                
+                if result and "FOUND" in result:
+                    print_success("BEHAV3D napari plugin installed and registered successfully")
+                else:
+                    print_warning("Plugin package installed, but npe2 did not discover the manifest. 'pip install -e .' might need to be run again manually.")
+            except Exception as e:
+                print_warning(f"Plugin verification warning: {e}")
     
     # Verify installation
     print_header("VERIFICATION")
     verify_installation(conda_path)
     
+    # Save environment config for launchers
+    print_header("LAUNCHER CONFIGURATION")
+    config_path = save_env_config(conda_path)
+    
+    project_root = find_project_root()
+    napari_dir = project_root / "napari"
+    
     # Final message
     print_header("INSTALLATION COMPLETE")
     print_success("BEHAV3D has been installed successfully!")
     print()
-    # Ask user if they want to run the BEHAV3D notebook now
-    try:
-        response = input("\nWould you like to open the BEHAV3D notebook now? [1] Yes  [2] No: ").strip()
-    except EOFError:
-        response = "2"
-    if response == "1" or response.lower() == "yes":
-        # Try to open the notebook directly
-        print_info("Attempting to launch the BEHAV3D notebook...")
-        notebooks_path = os.path.join(find_project_root(), "notebooks", "run_behav3d.ipynb")
-        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
-        # Use jupyter notebook command to open the notebook
-        try:
-            cmd = f'{run_prefix} jupyter notebook "{notebooks_path}"'
-            print_info(f"Running: {cmd}")
-            run_command(cmd)
-        except Exception as e:
-            print_warning(f"Could not open notebook automatically: {e}")
-            print("You can open it manually as described below.")
+    
+    # Show launcher info
+    if get_platform() == "Windows":
+        launcher = napari_dir / "run_behav3d.bat"
+    elif get_platform() == "Darwin":
+        launcher = napari_dir / "run_behav3d.command"
     else:
-        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
-        notebooks_path = os.path.join(find_project_root(), "notebooks", "run_behav3d.ipynb")
-        cmd = f'{run_prefix} jupyter notebook "{notebooks_path}"'
-
-        print("\nStart using BEHAV3D!")
-        print()
-        print("To run the Jupyter notebook, open a Command Line Interface (CMD/Terminal) and run this code:")
-        print(cmd)
+        launcher = napari_dir / "run_behav3d.sh"
+    
+    print(f"  Napari launcher:  {launcher}")
+    print(f"  Manual command:   conda activate {ENV_NAME} && napari")
     print()
+    
+    # Offer options
+    print("Would you like to launch napari now?")
+    print("  [1] Yes")
+    print("  [2] No")
+    print()
+    
+    try:
+        response = input("Choose [1/2]: ").strip()
+        if response == '1':
+            print()
+            launch_napari(conda_path)
+        else:
+            print()
+            print_header("ALTERNATIVES")
+            print("To open the Jupyter Notebook interface:")
+            print(f"  conda activate {ENV_NAME}")
+            print("  jupyter notebook")
+            print()
+            print("To launch napari later:")
+            print(f"  Double-click: {launcher}")
+            print()
+            input("Press Enter to exit...")
+            
+    except (EOFError, KeyboardInterrupt):
+        pass
+    
     return 0
 
 if __name__ == "__main__":
