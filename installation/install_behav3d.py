@@ -500,7 +500,7 @@ def install_convpaint(conda_path):
     run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
 
     try:
-        cmd = f'{run_prefix} pip install "napari-convpaint[all]"'
+        cmd = f'{run_prefix} pip install "napari-convpaint"'
         print_info(f"Running: {cmd}")
         run_command(cmd)
         print_success("napari-convpaint installed successfully")

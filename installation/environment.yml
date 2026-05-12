@@ -35,7 +35,7 @@ dependencies:
   # -------------------------------------------------------------------------
   # Visualization
   # -------------------------------------------------------------------------
-  - matplotlib>=3.9
+  - matplotlib-base>=3.9   # use -base to avoid pulling pyside6/qt6 (the meta `matplotlib` does)
   - seaborn>=0.13
   - plotly>=5.0
 
@@ -64,8 +64,7 @@ dependencies:
   - umap-learn>=0.5
   - hmmlearn>=0.3
   - dtaidistance>=2.3
-  - pyopencl>=2026.1    # OpenCL backend for APOC GPU classifier
-
+  - pyopencl>=2024.1,<2026.1    # 2026.1.1 conda-forge build has SafetyError on win-64
   # -------------------------------------------------------------------------
   # Graph Analysis & Single-Cell
   # -------------------------------------------------------------------------
@@ -81,7 +80,8 @@ dependencies:
   - napari-svg>=0.2
   - magicgui>=0.8
   - qtpy>=2.4
-  - pyqt>=5.15
+  - pyqt>=5.15.1,<6.0   # Older version of PyQt5
+  # - pyqt6>=6.5,<7.0   # Newer version of PyQt6
   - ipywidgets>=8.1
   - ipyfilechooser>=0.6
   - traitlets>=5.14
