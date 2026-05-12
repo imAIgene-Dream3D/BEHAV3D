@@ -82,6 +82,15 @@ def _normalize_strategy(value):
     return STRATEGY_EDT
 
 
+def _resolve_effective_strategy(cell_type, global_strategy, per_ct_strategies):
+    """Return the effective ConvPaint strategy for *cell_type*."""
+    if per_ct_strategies:
+        explicit = per_ct_strategies.get(cell_type)
+        if explicit:
+            return _normalize_strategy(explicit)
+    return _normalize_strategy(global_strategy)
+
+
 def _normalize_class_weights(value):
     val = str(value or "").strip()
     if val.lower() in ("", "none", "null"):
@@ -270,6 +279,8 @@ def run_convpaint_segmentation(
     overwrite_existing=False,
     n_workers=1,
     convpaint_strategy=DEFAULT_STRATEGY,
+    per_ct_convpaint_strategies=None,
+    only_cell_types=None,
     **_kwargs,
 ):
     """Unified-mode ConvPaint inference queue.
@@ -279,9 +290,26 @@ def run_convpaint_segmentation(
     optional binary ``mask_dead.zarr``. Drop-in replacement for the legacy
     per-cell-type queue: the on-disk output layout is unchanged so
     downstream tracking/analysis works without modification.
+
+    ``per_ct_convpaint_strategies`` (plugin only): optional
+    ``{cell_type: strategy}`` mapping. When set, each cell type uses its own
+    strategy regardless of the global one. Mirrors APOC's
+    ``per_ct_strategies`` parameter. Cell types missing from the mapping
+    fall back to ``convpaint_strategy``.
     """
     convpaint_strategy = _normalize_strategy(convpaint_strategy)
-    print(f"Running ConvPaint segmentation pipeline (strategy: {convpaint_strategy})")
+    per_ct_norm = {
+        str(ct): _normalize_strategy(strat)
+        for ct, strat in (per_ct_convpaint_strategies or {}).items()
+    }
+    if per_ct_norm:
+        summary = ", ".join(f"{k}:{v}" for k, v in per_ct_norm.items())
+        print(
+            f"Running ConvPaint segmentation pipeline (global strategy: {convpaint_strategy};"
+            f" per-cell-type: {summary})"
+        )
+    else:
+        print(f"Running ConvPaint segmentation pipeline (strategy: {convpaint_strategy})")
 
     output_dir = Path(output_dir)
     pixelclass_dir = output_dir / "images" / "PixelClassification"
@@ -328,6 +356,11 @@ def run_convpaint_segmentation(
         # only_segment mode without a label map: process everything that has a
         # cached mask on disk (per-sample check happens later).
         active_cell_types = list(all_cell_types)
+
+    # Optional plugin-supplied filter: restrict to a subset (e.g. Run [CT]).
+    if only_cell_types:
+        only_set = {str(c) for c in only_cell_types}
+        active_cell_types = [ct for ct in active_cell_types if ct in only_set]
 
     # Death model is independent.
     model_death = None
@@ -482,35 +515,44 @@ def run_convpaint_segmentation(
                 if i + 1 < len(t_range):
                     future = executor.submit(_load_tp, img, t_range[i + 1])
 
+                # Bucket cell types by their effective strategy so each
+                # strategy can run in its own (single) inference call.
+                strat_buckets = {}
+                for ct in active_cell_types:
+                    eff = _resolve_effective_strategy(
+                        ct, convpaint_strategy, per_ct_norm,
+                    )
+                    strat_buckets.setdefault(eff, []).append(ct)
+
                 if only_segment:
                     # Re-run only the post-processing using cached masks.
-                    _resegment_timepoint(
-                        t, t_img, active_cell_types, cfg, label_map,
-                        zarr_masks, zarr_segs, convpaint_strategy,
-                    )
-                elif convpaint_strategy == STRATEGY_PROB:
-                    unified_frame = _slice_frame_channels(
-                        t_img, unified_input_channels, label="Unified ConvPaint"
-                    )
-                    _process_probability_timepoint(
-                        unified_model, unified_frame, t, active_cell_types,
-                        label_map, cfg, zarr_masks, zarr_segs,
-                        fe_device=fe_device, diag=(i == 0),
-                    )
+                    for eff_strategy, cts in strat_buckets.items():
+                        _resegment_timepoint(
+                            t, t_img, cts, cfg, label_map,
+                            zarr_masks, zarr_segs, eff_strategy,
+                        )
                 else:
                     unified_frame = _slice_frame_channels(
                         t_img, unified_input_channels, label="Unified ConvPaint"
                     )
-                    _process_edt_timepoint(
-                        unified_model, unified_frame, t, active_cell_types,
-                        label_map, cfg, zarr_masks, zarr_segs,
-                        fe_device=fe_device,
-                        diag=(i == 0),
-                        marker_strategy=(
-                            "peak" if convpaint_strategy == STRATEGY_PEAK_EDT
-                            else "threshold"
-                        ),
-                    )
+                    for eff_strategy, cts in strat_buckets.items():
+                        if eff_strategy == STRATEGY_PROB:
+                            _process_probability_timepoint(
+                                unified_model, unified_frame, t, cts,
+                                label_map, cfg, zarr_masks, zarr_segs,
+                                fe_device=fe_device, diag=(i == 0),
+                            )
+                        else:
+                            _process_edt_timepoint(
+                                unified_model, unified_frame, t, cts,
+                                label_map, cfg, zarr_masks, zarr_segs,
+                                fe_device=fe_device,
+                                diag=(i == 0),
+                                marker_strategy=(
+                                    "peak" if eff_strategy == STRATEGY_PEAK_EDT
+                                    else "threshold"
+                                ),
+                            )
 
                 if zarr_death is not None and model_death is not None:
                     _t0_death = time.time()

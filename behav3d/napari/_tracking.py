@@ -1394,6 +1394,134 @@ class AllOrganoidsPropagationPanel(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# MulticolorTrackingPanel — single combined tab for multicolor cell types
+# ═══════════════════════════════════════════════════════════════════════════
+class MulticolorTrackingPanel(QWidget):
+    """Combined tracking tab for a multicolor cell type group.
+
+    Groups per-channel types (e.g. tcell_1_multicolor, tcell_2_multicolor)
+    under a single UI.  Parameters are shared across all channels; after
+    tracking each channel individually the outputs are automatically merged
+    into ``<base_name>_merged``.
+    """
+
+    def __init__(self, base_name: str, channel_types: list, category: str,
+                 metadata_loader, log_callback=None, viewer=None, parent=None):
+        super().__init__(parent)
+        self.base_name = base_name
+        self.channel_types = sorted(channel_types)
+        self.category = category
+        self.metadata_loader = metadata_loader
+        self.log = log_callback or print
+        self.viewer = viewer
+
+        # Inner panel drives the shared parameter UI; keyed to first channel
+        # so saved config is stored/loaded under that channel name.
+        first_channel = self.channel_types[0]
+        self._inner_panel = CellTypeTrackingPanel(
+            cell_type=first_channel,
+            category=category,
+            metadata_loader=metadata_loader,
+            all_cell_types=list(channel_types),
+            category_types=list(channel_types),
+            log_callback=log_callback,
+            viewer=viewer,
+        )
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        # ── Warning banner ────────────────────────────────────────────
+        channels_str = ", ".join(self.channel_types)
+        merged_name = f"{self.base_name}_merged"
+        warning = QLabel(
+            f"⚠️  Multicolor cell type detected.  Tracking will be applied "
+            f"independently to each channel ({channels_str}) using the shared "
+            f"parameters below, then the outputs will be automatically merged "
+            f"into <b>{merged_name}</b>."
+        )
+        warning.setWordWrap(True)
+        warning.setTextFormat(Qt.RichText)
+        warning.setStyleSheet(
+            "color: #e65100; background: #fff3e0; border: 1px solid #ffcc80; "
+            "border-radius: 4px; padding: 8px; font-size: 11px; margin: 2px 0;"
+        )
+        layout.addWidget(warning)
+
+        # ── Channel summary ───────────────────────────────────────────
+        channels_group = QGroupBox("Channels to track (same parameters applied to all)")
+        ch_lay = QVBoxLayout(channels_group)
+        ch_lay.setContentsMargins(6, 4, 6, 4)
+        ch_lay.setSpacing(2)
+        for i, ch in enumerate(self.channel_types, 1):
+            lbl = QLabel(f"  {i}. {ch}  →  {self.base_name}_merged")
+            lbl.setStyleSheet("font-size: 11px; color: #555;")
+            ch_lay.addWidget(lbl)
+        layout.addWidget(channels_group)
+
+        # ── Shared parameters (inner CellTypeTrackingPanel) ───────────
+        layout.addWidget(self._inner_panel)
+
+    # ------------------------------------------------------------------
+    def _persist(self):
+        """Persist shared parameters for all channels."""
+        params = self.metadata_loader.behav3d_parameters
+        tracking = params.setdefault("tracking", {})
+        shared_cfg = self._inner_panel._collect_params()
+        for ch in self.channel_types:
+            tracking[ch] = shared_cfg
+
+        out_dir = self.metadata_loader.output_dir
+        if out_dir:
+            params_path = Path(out_dir) / "behav3d_parameters.yml"
+            try:
+                with open(params_path, "w") as f:
+                    yaml.safe_dump(params, f, sort_keys=False)
+            except Exception as e:
+                self.log(f"Warning: Could not save parameters: {e}")
+
+    def run_tracking(self, overwrite: bool = False):
+        """Track each channel then merge into <base_name>_merged."""
+        n = len(self.channel_types)
+        merged_name = f"{self.base_name}_merged"
+
+        for i, ch in enumerate(self.channel_types, 1):
+            self.log(f"  Multicolor [{i}/{n}] Tracking channel: {ch}…")
+            print(f"\n  Multicolor [{i}/{n}] Tracking: {ch}", file=sys.stderr)
+            self._inner_panel._run_tracking_for(ch, overwrite=overwrite)
+            self.log(f"  Done: {ch}")
+
+        self.log(f"  Merging {n} channels → {merged_name}…")
+        print(f"\n  Merging multicolor channels → {merged_name}", file=sys.stderr)
+        try:
+            from behav3d.preprocessing.tracking.multicolor_tracking_processing import (
+                combine_multicolor_tracked_outputs,
+            )
+            new_md = combine_multicolor_tracked_outputs(
+                metadata=self.metadata_loader.metadata,
+                output_dir=str(Path(self.metadata_loader.output_dir).expanduser()),
+                source_cell_types=self.channel_types,
+                combined_cell_type=merged_name,
+                overwrite=overwrite,
+            )
+            self.metadata_loader.metadata = new_md
+            csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
+            if csv_path:
+                new_md.to_csv(csv_path, sep=",", index=False)
+            self.log(f"  ✅ Merged → {merged_name}")
+            print(f"  ✅ Merged → {merged_name}", file=sys.stderr)
+        except Exception as e:
+            traceback.print_exc()
+            self.log(f"  ❌ Merge failed: {e}")
+            raise
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # TrackingTab — main tab with per-cell-type sub-tabs
 # ═══════════════════════════════════════════════════════════════════════════
 class TrackingTab(QWidget):
@@ -1402,6 +1530,7 @@ class TrackingTab(QWidget):
         self.viewer = viewer
         self.metadata_loader = metadata_loader
         self.panels: dict[str, CellTypeTrackingPanel] = {}
+        self._multicolor_panels: dict[str, MulticolorTrackingPanel] = {}
 
         self._init_ui()
 
@@ -1493,27 +1622,51 @@ class TrackingTab(QWidget):
             detect_organoid_types_from_metadata,
             detect_immune_cell_types_from_metadata,
             detect_other_cell_types_from_metadata,
+            is_combined_multicolor_celltype,
         )
         md = self.metadata_loader.metadata
         if md is None:
             return [], [], []
+        # Filter out *_merged / *_grouped types — these are tracking outputs,
+        # not inputs.  Per-channel *_N_multicolor types are kept and later
+        # grouped into a single MulticolorTrackingPanel per base name.
         return (
-            detect_organoid_types_from_metadata(md),
-            detect_immune_cell_types_from_metadata(md),
-            detect_other_cell_types_from_metadata(md),
+            [ct for ct in detect_organoid_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)],
+            [ct for ct in detect_immune_cell_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)],
+            [ct for ct in detect_other_cell_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)],
         )
 
     def _rebuild_tabs(self):
         # Clear old tabs
         self.cell_tabs.clear()
         self.panels.clear()
+        self._multicolor_panels.clear()
         self._all_organoids_panel = None
 
         org, imm, oth = self._detect_cell_types()
-        all_types = org + imm + oth
-        self._organoid_types = list(org)
 
-        if not all_types:
+        # ── Partition each category into standalone and multicolor groups ─
+        from behav3d.core.metadata import is_multicolor_celltype, multicolor_base_name
+
+        def _partition(types):
+            standalone, mc_groups = [], {}
+            for ct in types:
+                if is_multicolor_celltype(ct):
+                    base = multicolor_base_name(ct)
+                    mc_groups.setdefault(base, []).append(ct)
+                else:
+                    standalone.append(ct)
+            return standalone, mc_groups
+
+        org_standalone, org_mc = _partition(org)
+        imm_standalone, imm_mc = _partition(imm)
+        oth_standalone, oth_mc = _partition(oth)
+
+        all_standalone = org_standalone + imm_standalone + oth_standalone
+        all_types = all_standalone  # context list for CellTypeTrackingPanel
+
+        has_anything = all_standalone or org_mc or imm_mc or oth_mc
+        if not has_anything:
             self.cell_tabs.addTab(self._placeholder, "—")
             self.btn_run_batch.setVisible(False)
             self.btn_queue_track.setVisible(False)
@@ -1522,16 +1675,17 @@ class TrackingTab(QWidget):
         self.btn_run_batch.setVisible(True)
         self.btn_queue_track.setVisible(True)
 
-        # Determine organoid tracking mode (default True when organoids present)
+        # ── Organoid standalone ───────────────────────────────────────
+        self._organoid_types = list(org_standalone)
+
         track_together = False
-        if org:
+        if org_standalone:
             tcfg = _cfg_get(self.metadata_loader.behav3d_parameters, "tracking", {}) or {}
             track_together = tcfg.get("track_organoids_together", True)
 
-        if track_together and org:
-            # ── Single combined "All Organoids" tab ───────────────────
+        if track_together and org_standalone:
             self._all_organoids_panel = AllOrganoidsPropagationPanel(
-                organoid_types=org,
+                organoid_types=org_standalone,
                 metadata_loader=self.metadata_loader,
                 log_callback=self._log,
                 viewer=self.viewer,
@@ -1539,12 +1693,11 @@ class TrackingTab(QWidget):
             )
             self.cell_tabs.addTab(self._all_organoids_panel, "🟣 All Organoids")
         else:
-            # ── Individual tab per organoid ───────────────────────────
-            for ct in org:
+            for ct in org_standalone:
                 panel = CellTypeTrackingPanel(
                     cell_type=ct, category="organoid",
                     metadata_loader=self.metadata_loader,
-                    all_cell_types=all_types, category_types=org,
+                    all_cell_types=all_types, category_types=org_standalone,
                     log_callback=self._log,
                     viewer=self.viewer,
                 )
@@ -1552,27 +1705,59 @@ class TrackingTab(QWidget):
                 self.panels[ct] = panel
                 self.cell_tabs.addTab(panel, f"🟣 {ct.capitalize()}")
 
-        for ct in imm:
+        # ── Organoid multicolor groups ────────────────────────────────
+        for base, channels in org_mc.items():
+            panel = MulticolorTrackingPanel(
+                base_name=base, channel_types=channels, category="organoid",
+                metadata_loader=self.metadata_loader,
+                log_callback=self._log, viewer=self.viewer,
+            )
+            self._multicolor_panels[base] = panel
+            self.cell_tabs.addTab(panel, f"🟣 {base.capitalize()} (multicolor)")
+
+        # ── Immune standalone ─────────────────────────────────────────
+        for ct in imm_standalone:
             panel = CellTypeTrackingPanel(
                 cell_type=ct, category="immune",
                 metadata_loader=self.metadata_loader,
-                all_cell_types=all_types, category_types=imm,
+                all_cell_types=all_types, category_types=imm_standalone,
                 log_callback=self._log,
                 viewer=self.viewer,
             )
             self.panels[ct] = panel
             self.cell_tabs.addTab(panel, f"🔵 {ct.capitalize()}")
 
-        for ct in oth:
+        # ── Immune multicolor groups ──────────────────────────────────
+        for base, channels in imm_mc.items():
+            panel = MulticolorTrackingPanel(
+                base_name=base, channel_types=channels, category="immune",
+                metadata_loader=self.metadata_loader,
+                log_callback=self._log, viewer=self.viewer,
+            )
+            self._multicolor_panels[base] = panel
+            self.cell_tabs.addTab(panel, f"🔵 {base.capitalize()} (multicolor)")
+
+        # ── Other standalone ──────────────────────────────────────────
+        for ct in oth_standalone:
             panel = CellTypeTrackingPanel(
                 cell_type=ct, category="other",
                 metadata_loader=self.metadata_loader,
-                all_cell_types=all_types, category_types=oth,
+                all_cell_types=all_types, category_types=oth_standalone,
                 log_callback=self._log,
                 viewer=self.viewer,
             )
             self.panels[ct] = panel
             self.cell_tabs.addTab(panel, f"🟡 {ct.capitalize()}")
+
+        # ── Other multicolor groups ───────────────────────────────────
+        for base, channels in oth_mc.items():
+            panel = MulticolorTrackingPanel(
+                base_name=base, channel_types=channels, category="other",
+                metadata_loader=self.metadata_loader,
+                log_callback=self._log, viewer=self.viewer,
+            )
+            self._multicolor_panels[base] = panel
+            self.cell_tabs.addTab(panel, f"🟡 {base.capitalize()} (multicolor)")
 
     # ------------------------------------------------------------------
     def _on_all_organoids_toggled(self, checked):
@@ -1596,21 +1781,31 @@ class TrackingTab(QWidget):
     def run_batch_tracking(self, interactive=True, skip_existing=False):
         """Sequential run for all configured cell type panels.
         When interactive=False, skips overwrite and visualization dialogs."""
-        if not self.panels:
+        if not self.panels and not self._multicolor_panels and not self._all_organoids_panel:
             self._log("No cell type panels to track.")
             return
 
-        total = len(self.panels) + (len(self._organoid_types) if self._all_organoids_panel else 0)
         all_organoids_mode = self._all_organoids_panel is not None
+        total = (
+            len(self.panels)
+            + (len(self._organoid_types) if all_organoids_mode else 0)
+            + len(self._multicolor_panels)
+        )
         self._log(f"Starting batch tracking for {total} cell types...")
         if all_organoids_mode:
             self._log("  Mode: All organoids tracked together (propagation)")
+        if self._multicolor_panels:
+            mc_names = ", ".join(
+                f"{b} ({len(p.channel_types)} channels)"
+                for b, p in self._multicolor_panels.items()
+            )
+            self._log(f"  Multicolor groups: {mc_names}")
 
         print(f"\n{'='*60}", file=sys.stderr)
         print(f"  Running batch tracking for {total} cell types", file=sys.stderr)
         print(f"{'='*60}", file=sys.stderr)
 
-        # Check for existing tracking data across all cell types
+        # Check for existing tracking data across all standalone cell types
         all_cts = list(self.panels.keys())
         existing = []
         existing_cts = set()
@@ -1651,6 +1846,8 @@ class TrackingTab(QWidget):
         # Persist all panel params before starting so config is saved even if an error occurs
         for ct, panel in self.panels.items():
             panel._persist()
+        for base, mc_panel in self._multicolor_panels.items():
+            mc_panel._persist()
 
         try:
             # ── All-organoids propagation (single step) ─────────────
@@ -1713,6 +1910,18 @@ class TrackingTab(QWidget):
                     )
                 self._log(f"Done: {ct}")
 
+            # ── Multicolor groups (track channels + auto-merge) ───────
+            for base, mc_panel in self._multicolor_panels.items():
+                step += 1
+                merged_name = f"{base}_merged"
+                print(f"\n▶ [{step}/{total}] Multicolor tracking: {base} "
+                      f"({len(mc_panel.channel_types)} channels + merge)…",
+                      file=sys.stderr)
+                self._log(f"--- [{step}/{total}] Multicolor tracking: {base} "
+                          f"({', '.join(mc_panel.channel_types)}) → {merged_name} ---")
+                mc_panel.run_tracking(overwrite=overwrite)
+                self._log(f"Done: {base} (channels tracked + merged → {merged_name})")
+
             # Persist final metadata state after full batch execution.
             csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
             if csv_path:
@@ -1735,8 +1944,15 @@ class TrackingTab(QWidget):
                     QMessageBox.Yes | QMessageBox.No
                 )
                 if res == QMessageBox.Yes:
-                    first_panel = next(iter(self.panels.values()))
-                    first_panel._switch_to_viz_and_show_tracks()
+                    first_panel = (
+                        next(iter(self.panels.values()), None)
+                        or next(
+                            (p._inner_panel for p in self._multicolor_panels.values()),
+                            None,
+                        )
+                    )
+                    if first_panel is not None:
+                        first_panel._switch_to_viz_and_show_tracks()
 
         except Exception as e:
             traceback.print_exc()

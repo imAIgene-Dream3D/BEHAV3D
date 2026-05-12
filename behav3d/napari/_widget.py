@@ -15,6 +15,26 @@ class BEHAV3DWidget(QWidget):
         self.viewer = napari_viewer
         self.setMinimumWidth(300)
 
+        # --- Global QGroupBox styling -----------------------------------------
+        # Qt's default QGroupBox leaves no room between the title and the top
+        # border, so content rendered near the top of the box clips into the
+        # title text.  margin-top reserves space *above* the border for the
+        # title; padding-top pushes the content away from the border beneath it.
+        self.setStyleSheet("""
+            QGroupBox {
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+                margin-top: 1ex;
+                padding-top: 8px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 8px;
+                padding: 0 4px;
+            }
+        """)
+
         # --- Outer layout -------------------------------------------------
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
@@ -103,6 +123,10 @@ class BEHAV3DWidget(QWidget):
         apoc = self.segmentation_tab.apoc_page
         apoc.btn_queue_apoc_segment.clicked.connect(self._add_apoc_segment_to_queue)
 
+        # ConvPaint +🛒 buttons
+        convpaint = self.segmentation_tab.convpaint_page
+        convpaint.btn_queue_segment.clicked.connect(self._add_convpaint_segment_to_queue)
+
         # --- Tab Switch Logic ---------------------------------------------
         self._last_tab_index = self.tabs.currentIndex()
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -122,6 +146,11 @@ class BEHAV3DWidget(QWidget):
         """Snapshot APOC segmentation params and add an APOC_SEGMENT step."""
         params = self.segmentation_tab.apoc_page.get_queue_params()
         self.queue_panel.add_step(StepType.APOC_SEGMENT, params=params)
+
+    def _add_convpaint_segment_to_queue(self):
+        """Snapshot ConvPaint segmentation params and add a CONVPAINT_SEGMENT step."""
+        params = self.segmentation_tab.convpaint_page.get_queue_params()
+        self.queue_panel.add_step(StepType.CONVPAINT_SEGMENT, params=params)
 
     def _on_tab_changed(self, index):
         """Intercept tab switches to handle exit warnings and missing output dir."""

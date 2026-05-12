@@ -17,7 +17,7 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtCore import Qt
 
-from behav3d.napari._segmentation import make_help_row
+from behav3d.core.qt_help import make_help_row
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -439,14 +439,15 @@ class FilteringTab(QWidget):
             detect_organoid_types_from_metadata,
             detect_immune_cell_types_from_metadata,
             detect_other_cell_types_from_metadata,
+            filter_multicolor_inputs,
         )
         md = self.metadata_loader.metadata
         if md is None:
             return [], [], []
         return (
-            detect_organoid_types_from_metadata(md),
-            detect_immune_cell_types_from_metadata(md),
-            detect_other_cell_types_from_metadata(md),
+            filter_multicolor_inputs(detect_organoid_types_from_metadata(md)),
+            filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)),
+            filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)),
         )
 
     def _rebuild_tabs(self):

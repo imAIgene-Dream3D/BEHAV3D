@@ -82,6 +82,7 @@ class SegmentationTab(QWidget):
         self.method_combo = QComboBox()
         self.method_combo.addItems([
             "APOC (GPU)",
+            "ConvPaint (DL pixel classifier)",
             "Pixel Classifier (Random Forest)",
             "Cellpose (Deep Learning)",
             "Import segmentation",
@@ -96,18 +97,32 @@ class SegmentationTab(QWidget):
         self.param_stack = QStackedWidget()
         
         # 0. APOC (GPU) Page  ← matches combo index 0
-        self.apoc_page = APOCWidget(self.viewer, self.metadata_loader, log_callback=self._log)
+        self.apoc_page = APOCWidget(
+            self.viewer,
+            self.metadata_loader,
+            log_callback=self._log,
+            switch_to_visualization_callback=self._switch_to_visualization,
+        )
         self.param_stack.addWidget(self.apoc_page)
 
-        # 1. Pixel Classifier Page  ← matches combo index 1
+        # 1. ConvPaint Page  ← matches combo index 1
+        self.convpaint_page = ConvPaintWidget(
+            self.viewer,
+            self.metadata_loader,
+            log_callback=self._log,
+            switch_to_visualization_callback=self._switch_to_visualization,
+        )
+        self.param_stack.addWidget(self.convpaint_page)
+
+        # 2. Pixel Classifier Page  ← matches combo index 2
         self.pixel_classifier_page = PixelClassifierWidget(self.viewer, self.metadata_loader, log_callback=self._log)
         self.param_stack.addWidget(self.pixel_classifier_page)
 
-        # 2. Cellpose Page  ← matches combo index 2
+        # 3. Cellpose Page  ← matches combo index 3
         self.cellpose_page = CellposeWidget(self.viewer, self.metadata_loader, log_callback=self._log)
         self.param_stack.addWidget(self.cellpose_page)
 
-        # 3. Import Page  ← matches combo index 3
+        # 4. Import Page  ← matches combo index 4
         self.import_page = ImportWidget(self.viewer, self.metadata_loader, log_callback=self._log)
         self.param_stack.addWidget(self.import_page)
 
@@ -151,6 +166,8 @@ class SegmentationTab(QWidget):
         self.import_page._on_metadata_updated()
         if hasattr(self, 'apoc_page'):
             self.apoc_page._on_metadata_updated()
+        if hasattr(self, 'convpaint_page'):
+            self.convpaint_page._on_metadata_updated()
 
     def _log(self, msg):
         import datetime
@@ -160,11 +177,30 @@ class SegmentationTab(QWidget):
             self.log.verticalScrollBar().maximum()
         )
 
+    def _switch_to_visualization(self):
+        """Switch the main window to the Visualization tab and load the first sample.
+
+        Used by sub-widgets (e.g. APOCWidget) to ask the host window to
+        navigate without walking the parent chain.
+        """
+        parent = self.parent()
+        while parent and not hasattr(parent, 'tabs'):
+            parent = parent.parent()
+        if parent and hasattr(parent, 'tabs'):
+            parent.tabs.setCurrentIndex(1)
+            if hasattr(parent, 'visualization_tab'):
+                self._log("  Loading first sample in Visualization Tab...")
+                parent.visualization_tab.sample_combo.setCurrentIndex(0)
+                parent.visualization_tab._on_load_dataset()
+                for layer in self.viewer.layers:
+                    if "Segments" in layer.name:
+                        layer.visible = True
+
     def _on_method_changed(self, index):
         current_idx = self.param_stack.currentIndex()
 
-        # If switching away from Pixel Classifier (index 1), check session
-        if current_idx == 1 and self.pixel_classifier_page.is_session_active:
+        # If switching away from Pixel Classifier (index 2), check session
+        if current_idx == 2 and self.pixel_classifier_page.is_session_active:
             from qtpy.QtWidgets import QMessageBox
             res = QMessageBox.question(
                 self,
@@ -198,13 +234,32 @@ class SegmentationTab(QWidget):
             else:
                 self.apoc_page.cleanup_session()
 
+        # If switching away from ConvPaint tab (index 1), remove training layers
+        elif current_idx == 1 and getattr(self.convpaint_page, "_is_session_active", False):
+            from qtpy.QtWidgets import QMessageBox
+            res = QMessageBox.question(
+                self,
+                "Switch Method?",
+                "ConvPaint training layers are loaded in the viewer. Switching methods will remove them.\n\nDo you want to proceed?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if res == QMessageBox.No:
+                self.method_combo.blockSignals(True)
+                self.method_combo.setCurrentIndex(current_idx)
+                self.method_combo.blockSignals(False)
+                return
+            else:
+                self.convpaint_page.cleanup_session()
+
         self.param_stack.setCurrentIndex(index)
 
         # If switching to APOC tab (index 0), refresh it
         if index == 0:
             self.apoc_page._on_metadata_updated()
-        # If switching to Import tab (index 3), refresh it to avoid outdated info
-        elif index == 3:
+        elif index == 1:
+            self.convpaint_page._on_metadata_updated()
+        # If switching to Import tab (index 4), refresh it to avoid outdated info
+        elif index == 4:
             self.import_page._on_metadata_updated()
 
     def request_tab_exit(self):
@@ -240,12 +295,28 @@ class SegmentationTab(QWidget):
                 self.apoc_page.cleanup_session()
                 return True
 
+        # 3. ConvPaint Page
+        if getattr(self.convpaint_page, "_is_session_active", False):
+            res = QMessageBox.question(
+                self,
+                "Leave Segmentation Tab?",
+                "ConvPaint training layers are loaded in the viewer. Leaving this tab will remove them.\n\nDo you want to leave?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if res == QMessageBox.No:
+                return False
+            else:
+                self.convpaint_page.cleanup_session()
+                return True
+
         return True
 
     def cleanup_session(self):
-        """Clear viewer and reset tab state (both Pixel Classifier and APOC)."""
+        """Clear viewer and reset tab state (Pixel Classifier, APOC, ConvPaint)."""
         self.pixel_classifier_page.reset_ui()
         self.apoc_page.cleanup_session()
+        if hasattr(self, "convpaint_page"):
+            self.convpaint_page.cleanup_session()
 
 def _cfg_get(cfg: dict, dotted_key: str, default=None):
     """Get a value from a nested dict using dotted key notation."""
@@ -274,7 +345,8 @@ class PixelClassifierWidget(QWidget):
             detect_organoid_types_from_metadata,
             detect_immune_cell_types_from_metadata,
             detect_other_cell_types_from_metadata,
-            has_dead_channel
+            has_dead_channel,
+            is_combined_multicolor_celltype,
         )
         metadata = self.metadata_loader.metadata
         
@@ -286,9 +358,9 @@ class PixelClassifierWidget(QWidget):
             self.all_cell_types = []
             return
 
-        self.organoid_types = detect_organoid_types_from_metadata(metadata)
-        self.immune_types = detect_immune_cell_types_from_metadata(metadata)
-        self.other_types = detect_other_cell_types_from_metadata(metadata)
+        self.organoid_types = [ct for ct in detect_organoid_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
+        self.immune_types = [ct for ct in detect_immune_cell_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
+        self.other_types = [ct for ct in detect_other_cell_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
         self.has_death = has_dead_channel(metadata)
         self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
 
@@ -1733,6 +1805,7 @@ class CellposeWidget(QWidget):
             detect_immune_cell_types_from_metadata,
             detect_other_cell_types_from_metadata,
             has_dead_channel,
+            is_combined_multicolor_celltype,
         )
         metadata = self.metadata_loader.metadata
         if metadata is None:
@@ -1742,9 +1815,9 @@ class CellposeWidget(QWidget):
             self.has_death = False
             self.all_cell_types = []
             return
-        self.organoid_types = detect_organoid_types_from_metadata(metadata)
-        self.immune_types = detect_immune_cell_types_from_metadata(metadata)
-        self.other_types = detect_other_cell_types_from_metadata(metadata)
+        self.organoid_types = [ct for ct in detect_organoid_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
+        self.immune_types = [ct for ct in detect_immune_cell_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
+        self.other_types = [ct for ct in detect_other_cell_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
         self.has_death = has_dead_channel(metadata)
         self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
 
@@ -2474,13 +2547,14 @@ class ImportWidget(QWidget):
             detect_organoid_types_from_metadata,
             detect_immune_cell_types_from_metadata,
             detect_other_cell_types_from_metadata,
+            is_combined_multicolor_celltype,
         )
         md = self.metadata_loader.metadata
         if md is None:
             return
-        self.organoid_types = detect_organoid_types_from_metadata(md)
-        self.immune_types = detect_immune_cell_types_from_metadata(md)
-        self.other_types = detect_other_cell_types_from_metadata(md)
+        self.organoid_types = [ct for ct in detect_organoid_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
+        self.immune_types = [ct for ct in detect_immune_cell_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
+        self.other_types = [ct for ct in detect_other_cell_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
         self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
         self._rebuild_table()
 
@@ -2857,32 +2931,45 @@ class ImportWidget(QWidget):
 # APOC Segmentation Widget — GPU-accelerated pixel classification
 # ═══════════════════════════════════════════════════════════════════════════
 class APOCWidget(QWidget):
-    """APOC (GPU) segmentation page with embedded training and batch inference."""
+    """APOC (GPU) segmentation page with embedded training and batch inference.
 
-    STRATEGIES = [
-        "APOC (Direct Instance Segmentation)",
-        "APOC Mask + EDT/Watershed Resegmentation",
-        "APOC Probability Map + Watershed",
-        "Advanced (per cell type)",
-    ]
+    All training UI (per-cell-type tabs, strategy combo, instance controls,
+    per-tab strategy combos) is provided natively by
+    :class:`behav3d.preprocessing.segmentation.apoc_train.APOCTrainingWidget`
+    through its ``per_cell_type_strategy=True`` / ``instance_controls_mode="inline"``
+    constructor flags. The plugin only wires GPU/device selection, batch run
+    options, queueing, and metadata interactions on top of that widget.
+    """
 
-    # Strategies available inside individual cell-type tabs (no 'Advanced' recursion)
-    _PER_TAB_STRATEGIES = [
-        "APOC (Direct Instance Segmentation)",
-        "APOC Mask + EDT/Watershed Resegmentation",
-        "APOC Probability Map + Watershed",
-    ]
+    # The training widget exposes its canonical list as ``APOCTrainingWidget.STRATEGIES``
+    # plus the ``ADVANCED_STRATEGY`` constant. We compose both here for convenience
+    # so other modules (e.g. queue helpers) keep working unchanged.
+    @classmethod
+    def all_strategies(cls):
+        from behav3d.preprocessing.segmentation.apoc_train import APOCTrainingWidget as _ATW
+        return list(_ATW.STRATEGIES) + [_ATW.ADVANCED_STRATEGY]
 
-    def __init__(self, viewer, metadata_loader, log_callback=None, parent=None):
+    @classmethod
+    def per_tab_strategies(cls):
+        from behav3d.preprocessing.segmentation.apoc_train import APOCTrainingWidget as _ATW
+        return list(_ATW.STRATEGIES)
+
+    def __init__(
+        self,
+        viewer,
+        metadata_loader,
+        log_callback=None,
+        parent=None,
+        switch_to_visualization_callback=None,
+    ):
         super().__init__(parent)
         self.viewer = viewer
         self.metadata_loader = metadata_loader
         self.log = log_callback or print
+        self._switch_to_visualization = switch_to_visualization_callback
         self._training_widget = None
-        self._strategy_help_button = None
         self._is_session_active = False
         self._organoid_types = []          # set when metadata loaded
-        self._per_ct_strategies = {}       # ct -> strategy string (Advanced mode)
         self._unify_organoids = False      # state of the unified-organoid checkbox
         self._syncing_organoids = False    # recursion guard for continuous organoid sync
         self._init_ui()
@@ -3101,23 +3188,24 @@ class APOCWidget(QWidget):
             return False
 
     def _update_training_controls_state(self):
-        """Lock/unlock APOC training controls based on whether training data is loaded."""
+        """Lock/unlock APOC training controls based on whether training data is loaded.
+
+        Delegates to the training widget's native
+        :meth:`APOCTrainingWidget.set_training_enabled`. Per-tab tuning
+        widgets (feature presets, RF params, etc.) are also toggled here
+        because the training widget only flips the high-impact controls.
+        """
         if self._training_widget is None:
             return
 
         can_train = bool(self._is_session_active)
         tw = self._training_widget
+        tw.set_training_enabled(can_train)
 
-        # Global train buttons in APOCTrainingWidget
-        for name in ("apply_all_btn", "train_current_btn", "train_all_btn"):
-            w = getattr(tw, name, None)
-            if w is not None:
-                w.setEnabled(can_train)
-
-        # Per-tab training controls
+        # Lock the tuning controls that are not part of the training widget's
+        # public "training-enabled" set so users can't tweak presets/RF params
+        # before data is loaded but can still tune post-processing spinners.
         for tab in getattr(tw, "tabs", {}).values():
-            for cb in getattr(tab, "channel_checkboxes", []):
-                cb.setEnabled(can_train)
             for name in (
                 "feature_combo",
                 "tune_group",
@@ -3129,24 +3217,6 @@ class APOCWidget(QWidget):
                 w = getattr(tab, name, None)
                 if w is not None:
                     w.setEnabled(can_train)
-
-            # Keep preview parameter widgets editable for segmentation tuning.
-            for name in (
-                "prob_mask_threshold_spin",
-                "prob_seed_threshold_spin",
-                "edt_threshold_spin",
-                "segment_size_min_spin",
-                "opening_nr_pixels_spin",
-                "fill_holes_cb",
-            ):
-                w = getattr(tab, name, None)
-                if w is not None:
-                    w.setEnabled(True)
-
-            # Preview button requires training data to be loaded.
-            run_btn = getattr(tab, "run_instance_btn", None)
-            if run_btn is not None:
-                run_btn.setEnabled(can_train)
 
         if can_train:
             self.log("APOC training controls unlocked (training data loaded).")
@@ -3198,26 +3268,27 @@ class APOCWidget(QWidget):
                 cfg[key[len(prefix):]] = value
         return cfg
 
-    def _patch_tab_channel_refresh(self, ct, tab):
-        if getattr(tab, "_channel_restore_patch_applied", False):
+    def _on_training_channels_refreshed(self, ct):
+        """Slot: APOCTrainingWidget rebuilt the channel checkboxes for *ct*.
+
+        Restores saved channel selections from the persisted tab config and
+        re-wires the organoid-mirroring signal handlers. Used instead of
+        monkey-patching ``tab.refresh_channel_checkboxes``.
+        """
+        if self._training_widget is None:
             return
-
-        original_refresh = tab.refresh_channel_checkboxes
-
-        def wrapped_refresh(*args, **kwargs):
-            original_refresh(*args, **kwargs)
-            # Keep channel inputs locked until training data is loaded.
-            can_train = bool(self._is_session_active)
-            for cb in getattr(tab, "channel_checkboxes", []):
-                cb.setEnabled(can_train)
-            cfg = getattr(tab, "_saved_config_for_restore", None)
-            if isinstance(cfg, dict) and cfg.get("channels"):
-                self._restore_tab_channels_fallback(tab, cfg.get("channels", []))
-            # Channel checkboxes are recreated by refresh; re-wire sync handlers.
-            self._wire_organoid_tab_sync_signals(ct, tab, include_channels=True, include_rf=False)
-
-        tab.refresh_channel_checkboxes = wrapped_refresh
-        tab._channel_restore_patch_applied = True
+        tab = self._training_widget.tabs.get(ct)
+        if tab is None:
+            return
+        # Keep channel inputs locked until training data is loaded.
+        can_train = bool(self._is_session_active)
+        for cb in getattr(tab, "channel_checkboxes", []):
+            cb.setEnabled(can_train)
+        cfg = getattr(tab, "_saved_config_for_restore", None)
+        if isinstance(cfg, dict) and cfg.get("channels"):
+            self._restore_tab_channels_fallback(tab, cfg.get("channels", []))
+        # Channel checkboxes are recreated by refresh; re-wire sync handlers.
+        self._wire_organoid_tab_sync_signals(ct, tab, include_channels=True, include_rf=False)
 
     def _collect_apoc_tab_config(self):
         """Collect flattened per-cell-type APOC config from training tabs."""
@@ -3283,8 +3354,9 @@ class APOCWidget(QWidget):
             cfg = self._extract_tab_config(apoc_params, ct)
             if not cfg:
                 continue
+            # Stash so :meth:`_on_training_channels_refreshed` can re-apply
+            # channel selections every time the checkboxes get rebuilt.
             tab._saved_config_for_restore = dict(cfg)
-            self._patch_tab_channel_refresh(ct, tab)
             try:
                 tab.apply_config(cfg)
             except Exception as e:
@@ -3327,7 +3399,12 @@ class APOCWidget(QWidget):
             self.log(f"⚠️ Could not reorder APOC training layers: {e}")
 
     def _prompt_visualize_after_apoc_segmentation(self):
-        """Prompt user to switch to Visualization tab and load first sample."""
+        """Prompt user to switch to Visualization tab and load first sample.
+
+        Delegates the actual tab switch to the host-supplied callback
+        (``switch_to_visualization_callback``) so we don't walk the parent
+        chain at runtime.
+        """
         res = QMessageBox.question(
             self,
             "Segmentation Finished",
@@ -3338,20 +3415,10 @@ class APOCWidget(QWidget):
         if res != QMessageBox.Yes:
             return
 
-        parent = self.parent()
-        while parent and not hasattr(parent, 'tabs'):
-            parent = parent.parent()
-
-        if parent and hasattr(parent, 'tabs'):
-            parent.tabs.setCurrentIndex(1)
-            if hasattr(parent, 'visualization_tab'):
-                self.log("  Loading first sample in Visualization Tab...")
-                parent.visualization_tab.sample_combo.setCurrentIndex(0)
-                parent.visualization_tab._on_load_dataset()
-
-                for layer in self.viewer.layers:
-                    if "Segments" in layer.name:
-                        layer.visible = True
+        if callable(self._switch_to_visualization):
+            self._switch_to_visualization()
+        else:
+            self.log("  Visualization tab callback unavailable.")
 
     # ── Load Training Data ──────────────────────────────────────
     def _on_load_training_clicked(self, interactive=True):
@@ -3384,10 +3451,11 @@ class APOCWidget(QWidget):
                 detect_organoid_types_from_metadata,
                 detect_immune_cell_types_from_metadata,
                 detect_other_cell_types_from_metadata,
+                is_combined_multicolor_celltype,
             )
-            organoid_types = detect_organoid_types_from_metadata(md)
-            immune_types = detect_immune_cell_types_from_metadata(md)
-            other_types = detect_other_cell_types_from_metadata(md)
+            organoid_types = [ct for ct in detect_organoid_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
+            immune_types = [ct for ct in detect_immune_cell_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
+            other_types = [ct for ct in detect_other_cell_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
             
             # Use apoc_train helper to fetch and process images
             from behav3d.preprocessing.segmentation.apoc_train import _load_training_images
@@ -3577,12 +3645,10 @@ class APOCWidget(QWidget):
         self._update_training_controls_state()
 
     # ── Strategy changed ───────────────────────────────────────────
-    def _on_strategy_changed(self, _idx=None):
-        """Rebuild training widget when strategy changes so each tab shows
-        the correct instance-segmentation controls for the new strategy."""
-        # Persist strategy choice immediately
+    def _on_training_widget_strategy_changed(self, strategy):
+        """Persist the new APOC strategy when the training widget signals a change."""
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
-        pc["apoc_strategy"] = self.STRATEGIES[self.combo_strategy.currentIndex()]
+        pc["apoc_strategy"] = str(strategy)
         out_dir = self.metadata_loader.output_dir
         if out_dir:
             params_path = Path(out_dir) / "behav3d_parameters.yml"
@@ -3591,59 +3657,57 @@ class APOCWidget(QWidget):
                     yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
             except Exception:
                 pass
-        # Rebuild deferred to avoid destroying the widget during its own signal
-        from qtpy.QtCore import QTimer
-        QTimer.singleShot(0, self._on_metadata_updated)
 
-    def _apoc_strategy_help_content(self, strategy_name: str):
-        """Return strategy-specific help text for instance-preview parameters."""
-        if strategy_name == "Advanced (per cell type)":
-            return (
-                "APOC Preview Parameters (Advanced — per cell type)",
-                "In Advanced mode each cell-type tab has its own strategy selector.\n\n"
-                "Select a strategy inside each tab to show the matching post-processing controls:\n"
-                "  \u2022 EDT threshold, Opening, Min size, Fill holes  (EDT/Watershed)\n"
-                "  \u2022 Mask threshold, Seed threshold, Opening, Min size  (Probability Map)\n"
-                "  \u2022 No extra controls  (Direct)\n\n"
-                "The '\u25b6 Run [Cell Type] Segmentation' button previews using that tab's strategy."
-            )
-        if strategy_name == "APOC Mask + EDT/Watershed Resegmentation":
-            return (
-                "APOC Preview Parameters (Mask + EDT/Watershed)",
-                "This strategy uses classifier mask output, then refines instances with EDT + watershed.\n\n"
-                "Parameters for preview:\n"
-                "  • EDT threshold: controls split sensitivity for touching objects.\n"
-                "    Lower -> more aggressive splitting. Higher -> more merged objects.\n"
-                "  • Opening px: smooths boundaries and removes small protrusions/noise.\n"
-                "  • Min size: removes tiny segments below this size threshold.\n"
-                "  • Fill holes: fills internal gaps inside segmented objects."
-            )
-        if strategy_name == "APOC Probability Map + Watershed":
-            return (
-                "APOC Preview Parameters (Probability Map + Watershed)",
-                "This strategy uses probability maps and watershed for instance splitting.\n\n"
-                "Parameters for preview:\n"
-                "  • Mask threshold: foreground cutoff used to build the watershed mask.\n"
-                "  • Seed threshold: seed cutoff used to place watershed seeds.\n"
-                "    Lower -> more seeds and more splits. Higher -> fewer seeds and larger merged regions.\n"
-                "  • Opening px: smooths boundaries and removes small protrusions/noise.\n"
-                "  • Min size: removes tiny segments below this size threshold."
-            )
-        return (
-            "APOC Preview Parameters (Direct Instance Segmentation)",
-            "This strategy predicts instances directly from the classifier output.\n\n"
-            "There are no additional watershed post-processing controls in preview mode for this strategy.\n"
-            "If you need explicit split control, use one of the watershed-based strategies."
+    # ── Training widget signal slots ───────────────────────────────
+    def _on_training_started(self, cell_types_to_train):
+        """Log + GPU select when the training widget starts a run."""
+        self._apply_apoc_gpu_selection(log_message=False)
+        gpu_name = self._selected_gpu_device_name() or "default OpenCL device"
+        tw = self._training_widget
+        strategy_name = (
+            tw.strategy_combo.currentText()
+            if tw is not None and tw.strategy_combo is not None
+            else ""
+        )
+        self.log(f"\U0001f5a5\ufe0f APOC training device: {gpu_name}")
+        self.log(f"\u25b6 Starting APOC training for: {cell_types_to_train}")
+        self._apoc_cli_info(
+            f"training start | strategy={strategy_name} | gpu={gpu_name} | cell_types={cell_types_to_train}"
         )
 
-    def _refresh_apoc_strategy_help(self, strategy_name=None):
-        """Update the strategy help popup content for the current selection."""
-        if self._strategy_help_button is None:
-            return
-        strategy = strategy_name or self.combo_strategy.currentText()
-        title, description = self._apoc_strategy_help_content(strategy)
-        self._strategy_help_button._title = title
-        self._strategy_help_button._description = description
+    def _on_training_finished(self, cell_types_to_train, successes):
+        """Reorder layers + normalize classifier headers after training."""
+        self._reorder_apoc_training_layers()
+        try:
+            pixel_class_outdir = Path(self.metadata_loader.output_dir) / "images" / "PixelClassification"
+            for ct in cell_types_to_train:
+                ok, msg = self._apoc_try_migrate_from_tab_config(pixel_class_outdir, ct)
+                if not ok:
+                    self.log(f"  \u26a0\ufe0f {ct}: could not normalize classifier header after training ({msg})")
+                    self._apoc_cli_info(f"warning | {ct}: could not normalize classifier header ({msg})")
+        except Exception as e:
+            self.log(f"  \u26a0\ufe0f Could not normalize classifier headers after training: {e}")
+            self._apoc_cli_info(f"warning | classifier-header normalization failed: {e}")
+        self.log("\u2705 APOC training process completed.")
+        self._apoc_cli_info("training complete")
+
+    def _on_instance_preview_started(self, ct):
+        """Clear stale preview layers + select GPU when the preview starts."""
+        self._apply_apoc_gpu_selection(log_message=False)
+        tw = self._training_widget
+        strategy = tw._resolve_strategy(ct) if tw is not None else ""
+        self._clear_apoc_preview_layers_for_cell_type(ct)
+        if strategy == "APOC (Direct Instance Segmentation)":
+            self._apoc_cli_info(
+                f"instance preview skipped (direct strategy) | stale layers cleared | cell_type={ct}"
+            )
+        self.log(f"\U0001f50d Running instance segmentation preview for '{ct}' (strategy: {strategy})...")
+        self._apoc_cli_info(f"instance preview start | cell_type={ct} | strategy={strategy}")
+
+    def _on_instance_preview_finished(self, ct):
+        """Reorder layers after a preview completes."""
+        self._reorder_apoc_training_layers()
+        self._apoc_cli_info(f"instance preview complete | cell_type={ct}")
 
     def _clear_apoc_preview_layers_for_cell_type(self, ct: str):
         """Remove stale APOC preview output layers for one cell type (GUI-side only)."""
@@ -3680,11 +3744,12 @@ class APOCWidget(QWidget):
             detect_immune_cell_types_from_metadata,
             detect_other_cell_types_from_metadata,
             has_dead_channel,
+            is_combined_multicolor_celltype,
         )
 
-        org = detect_organoid_types_from_metadata(md)
-        imm = detect_immune_cell_types_from_metadata(md)
-        oth = detect_other_cell_types_from_metadata(md)
+        org = [ct for ct in detect_organoid_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
+        imm = [ct for ct in detect_immune_cell_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
+        oth = [ct for ct in detect_other_cell_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
         all_types = org + imm + oth
         has_death = has_dead_channel(md)
         self._organoid_types = list(org)  # keep for unified-organoid checkbox
@@ -3692,26 +3757,24 @@ class APOCWidget(QWidget):
         if not all_types:
             return
 
-        # Remove old training widget if present
+        # Remove the previous training widget cleanly: ``cleanup()`` is the
+        # native disconnect method exposed by APOCTrainingWidget so napari
+        # layer event handlers never outlive this object.
         if self._training_widget is not None:
-            # Disarm the dangling napari layer event callbacks that the backend set up
-            # Since the backend used lambdas closing over `self`, the napari viewer keeps
-            # a strong reference to this widget. If we delete it without this, it segfaults.
-            self._training_widget._refresh_all_channels = lambda *args, **kwargs: None
-
-            # Safely disconnect and hide before marking for deletion
-            if hasattr(self, 'combo_strategy') and self.combo_strategy is not None:
-                self.combo_strategy.blockSignals(True)
-            
+            try:
+                self._training_widget.cleanup()
+            except Exception:
+                pass
             self.training_layout.removeWidget(self._training_widget)
             self._training_widget.hide()
             self._training_widget.deleteLater()
             self._training_widget = None
+
         if self.training_placeholder.parent() is not None:
             self.training_layout.removeWidget(self.training_placeholder)
             self.training_placeholder.hide()
 
-        # Create and embed APOCTrainingWidget
+        # Create and embed APOCTrainingWidget.
         output_dir = Path(self.metadata_loader.output_dir)
         pixel_class_outdir = output_dir / "images" / "PixelClassification"
         pixel_class_outdir.mkdir(parents=True, exist_ok=True)
@@ -3721,9 +3784,28 @@ class APOCWidget(QWidget):
         apoc_params = dict(params.get("apoc", {}) or {})
         pc = params.get("pixel_classifier", {}) or {}
 
-        # The strategy is handled by APOCTrainingWidget, we just ensure it gets initialized correctly.
-        current_strategy = pc.get("apoc_strategy", self.STRATEGIES[0])
+        all_strats = self.all_strategies()
+        current_strategy = pc.get("apoc_strategy", all_strats[0])
+        if current_strategy not in all_strats:
+            current_strategy = all_strats[0]
         apoc_params["apoc_strategy"] = current_strategy
+
+        # Optional "Unify all organoids" toolbar checkbox shown above the tab
+        # widget. Built first so we can pass it via ``extra_toolbar_widgets``.
+        toolbar_widgets = []
+        self._check_unify_organoids = None
+        if len(org) >= 2:
+            self._check_unify_organoids = QCheckBox(
+                "\u26d3 Apply same settings to all organoids"
+            )
+            self._check_unify_organoids.setChecked(self._unify_organoids)
+            self._check_unify_organoids.setToolTip(
+                "When checked, clicking will immediately mirror the first organoid tab's\n"
+                "config (features, strategy, params) to all other organoid tabs.\n"
+                "Toggle again to re-sync after making further changes."
+            )
+            self._check_unify_organoids.stateChanged.connect(self._on_unify_organoids_changed)
+            toolbar_widgets.append(self._check_unify_organoids)
 
         self._training_widget = APOCTrainingWidget(
             viewer=self.viewer,
@@ -3732,213 +3814,33 @@ class APOCWidget(QWidget):
             has_death=has_death,
             initial_params=apoc_params,
             on_params_changed=self._save_apoc_params_to_yaml,
+            instance_controls_mode="inline",
+            per_cell_type_strategy=True,
+            extra_toolbar_widgets=toolbar_widgets,
         )
-        # Redirect backend internal logs to our GUI log
+        # Pre-select the saved global strategy via the widget's combo (this
+        # also propagates per-tab visibility for ``Advanced`` mode).
+        if self._training_widget.strategy_combo is not None:
+            self._training_widget.strategy_combo.setCurrentText(current_strategy)
+        # Redirect backend internal logs to our GUI log.
         self._training_widget.set_log_fn(self.log)
         self._restore_training_tab_configs(apoc_params)
 
-        # ── Informative Logging Patches (Frontend-only strategy) ──────────
-        # Wrap _run_training to add verbose progress logs
-        orig_run_training = self._training_widget._run_training
-        def wrapped_run_training(cell_types_to_train):
-            self._apply_apoc_gpu_selection(log_message=False)
-            gpu_name = self._selected_gpu_device_name() or "default OpenCL device"
-            strategy_name = self.combo_strategy.currentText() if hasattr(self, 'combo_strategy') else self.STRATEGIES[0]
-            self.log(f"🖥️ APOC training device: {gpu_name}")
-            self.log(f"▶ Starting APOC training for: {cell_types_to_train}")
-            self._apoc_cli_info(f"training start | strategy={strategy_name} | gpu={gpu_name} | cell_types={cell_types_to_train}")
-            res = orig_run_training(cell_types_to_train)
-            self._reorder_apoc_training_layers()
-            try:
-                pixel_class_outdir = Path(self.metadata_loader.output_dir) / "images" / "PixelClassification"
-                for ct in cell_types_to_train:
-                    ok, msg = self._apoc_try_migrate_from_tab_config(pixel_class_outdir, ct)
-                    if not ok:
-                        self.log(f"  ⚠️ {ct}: could not normalize classifier header after training ({msg})")
-                        self._apoc_cli_info(f"warning | {ct}: could not normalize classifier header ({msg})")
-            except Exception as e:
-                self.log(f"  ⚠️ Could not normalize classifier headers after training: {e}")
-                self._apoc_cli_info(f"warning | classifier-header normalization failed: {e}")
-            self.log("✅ APOC training process completed.")
-            self._apoc_cli_info("training complete")
-            return res
-        self._training_widget._run_training = wrapped_run_training
+        # Wire signals: channel rebuilds restore saved channels & re-wire
+        # organoid mirroring; training / preview hooks add logging, GPU
+        # selection and layer reordering without monkey-patching backend
+        # methods.
+        tw = self._training_widget
+        tw.channels_refreshed.connect(self._on_training_channels_refreshed)
+        tw.training_started.connect(self._on_training_started)
+        tw.training_finished.connect(self._on_training_finished)
+        tw.instance_preview_started.connect(self._on_instance_preview_started)
+        tw.instance_preview_finished.connect(self._on_instance_preview_finished)
+        tw.strategy_changed.connect(self._on_training_widget_strategy_changed)
 
-        # Wrap _run_instance_preview to log and, in Advanced mode, temporarily set per-tab strategy
-        orig_run_instance = self._training_widget._run_instance_preview
-        def wrapped_run_instance(ct):
-            self._apply_apoc_gpu_selection(log_message=False)
-            strategy_name = self.combo_strategy.currentText() if hasattr(self, 'combo_strategy') else ""
-            self._clear_apoc_preview_layers_for_cell_type(ct)
-
-            # In Advanced mode: temporarily override the training widget's global strategy
-            # with this tab's per-tab combo value before calling the inner preview.
-            tw = self._training_widget
-            orig_tw_strat = getattr(tw, "_apoc_strategy", strategy_name)
-            if strategy_name == "Advanced (per cell type)" and tw is not None:
-                tab = tw.tabs.get(ct) if tw.tabs else None
-                per_tab_combo = getattr(tab, "_per_tab_strategy_combo", None) if tab else None
-                effective = per_tab_combo.currentText() if per_tab_combo is not None else self._PER_TAB_STRATEGIES[0]
-                tw._apoc_strategy = effective
-            else:
-                effective = strategy_name
-
-            if effective == "APOC (Direct Instance Segmentation)":
-                self._apoc_cli_info(f"instance preview skipped (direct strategy) | stale layers cleared | cell_type={ct}")
-            self.log(f"🔍 Running instance segmentation preview for '{ct}' (strategy: {effective})...")
-            self._apoc_cli_info(f"instance preview start | cell_type={ct} | strategy={effective}")
-            res = orig_run_instance(ct)
-            # Restore training widget strategy after Advanced-mode override
-            if strategy_name == "Advanced (per cell type)":
-                tw._apoc_strategy = orig_tw_strat
-            self._reorder_apoc_training_layers()
-            self._apoc_cli_info(f"instance preview complete | cell_type={ct}")
-            return res
-        self._training_widget._run_instance_preview = wrapped_run_instance
-
-        # Wrap _predict_classifier_outputs to log specific inference steps
-        orig_predict = self._training_widget._predict_classifier_outputs
-        def wrapped_predict(ct, clf=None):
-            self._apply_apoc_gpu_selection(log_message=False)
-            self.log(f"🧪 Running classifier inference (pixel classification) for '{ct}'...")
-            self._apoc_cli_info(f"inference start | cell_type={ct}")
-            return orig_predict(ct, clf=clf)
-        self._training_widget._predict_classifier_outputs = wrapped_predict
-
-        # Wrap _build_display_segments to resolve per-tab strategy in Advanced mode.
-        # Without this, "Advanced (per cell type)" falls through to the EDT path
-        # in the backend, crashing on None spinboxes for tabs using a different strategy.
-        orig_build_display = self._training_widget._build_display_segments
-        def wrapped_build_display(ct, raw_prediction, prob_prediction):
-            tw = self._training_widget
-            strategy_name = self.combo_strategy.currentText() if hasattr(self, 'combo_strategy') else ""
-            orig_tw_strat = getattr(tw, "_apoc_strategy", strategy_name)
-            if strategy_name == "Advanced (per cell type)" and tw is not None:
-                tab = tw.tabs.get(ct) if tw.tabs else None
-                per_tab_combo = getattr(tab, "_per_tab_strategy_combo", None) if tab else None
-                effective = per_tab_combo.currentText() if per_tab_combo is not None else self._PER_TAB_STRATEGIES[0]
-                tw._apoc_strategy = effective
-            try:
-                return orig_build_display(ct, raw_prediction, prob_prediction)
-            finally:
-                tw._apoc_strategy = orig_tw_strat
-        self._training_widget._build_display_segments = wrapped_build_display
-
-        # ── Inject Strategy selector into APOCTrainingWidget layout ──────────────
-        strat_row = QHBoxLayout()
-        strat_row.addWidget(QLabel("Strategy:"))
-        self.combo_strategy = QComboBox()
-        self.combo_strategy.addItems(self.STRATEGIES)
-        if current_strategy in self.STRATEGIES:
-            self.combo_strategy.setCurrentText(current_strategy)
-        strat_row.addWidget(self.combo_strategy, stretch=1)
-        
-        strat_desc = QLabel(
-            "Strategy determines how the APOC classifier output is"
-            " converted to instance segmentation labels."
-            " Post-processing parameters appear in each cell-type tab."
-        )
-        strat_desc.setWordWrap(True)
-        strat_desc.setStyleSheet("color:#888; font-size:10px; padding: 0 0 4px 0;")
-
-        strategy_help_label = QLabel("Instance preview parameters")
-        strategy_help_label.setStyleSheet("color:#888; font-size:10px;")
-        self._strategy_help_button = HelpButton("", "")
-        self._refresh_apoc_strategy_help(current_strategy)
-        strategy_help_row = QHBoxLayout()
-        strategy_help_row.setContentsMargins(0, 0, 0, 0)
-        strategy_help_row.addWidget(strategy_help_label)
-        strategy_help_row.addWidget(self._strategy_help_button)
-        strategy_help_row.addStretch()
-        
-        # Insert them right above global_row1 (after the QFrame separator)
-        t_layout = self._training_widget.layout()
-        insert_idx = 3 # fallback
-        for i in range(t_layout.count()):
-            item = t_layout.itemAt(i)
-            if item.widget() and isinstance(item.widget(), QFrame):
-                insert_idx = i + 1
-                break
-
-        t_layout.insertLayout(insert_idx, strat_row)
-        t_layout.insertWidget(insert_idx + 1, strat_desc)
-        t_layout.insertLayout(insert_idx + 2, strategy_help_row)
-
-        self.combo_strategy.currentIndexChanged.connect(self._on_strategy_changed)
-        self.combo_strategy.currentTextChanged.connect(self._refresh_apoc_strategy_help)
-
-        # ── Post-construction tab setup ──────────────────────────────────────
-        # 1. Disable the default reparenting mechanism — instance controls live inside each tab.
-        self._training_widget._refresh_instance_controls = lambda: None
-        self._training_widget.instance_controls_widget.setVisible(False)
-
-        # 2. Rebuild each tab's instance controls inside the tab layout.
-        is_advanced = (current_strategy == "Advanced (per cell type)")
-        for ct, tab in self._training_widget.tabs.items():
-            saved_ct_strat = apoc_params.get(f"per_ct_strategy_{ct}", self._PER_TAB_STRATEGIES[0])
-            if saved_ct_strat not in self._PER_TAB_STRATEGIES:
-                saved_ct_strat = self._PER_TAB_STRATEGIES[0]
-            effective_initial = saved_ct_strat if is_advanced else current_strategy
-            self._rebuild_tab_instance_controls(tab, effective_initial, apoc_params)
-
-        # 3. Inject per-tab strategy combo into each non-dead tab (visible only in Advanced mode).
-        for ct, tab in self._training_widget.tabs.items():
-            if ct == "dead":
-                continue
-            saved_ct_strat = apoc_params.get(f"per_ct_strategy_{ct}", self._PER_TAB_STRATEGIES[0])
-            if saved_ct_strat not in self._PER_TAB_STRATEGIES:
-                saved_ct_strat = self._PER_TAB_STRATEGIES[0]
-
-            per_tab_strat_w = QWidget()
-            per_tab_strat_lay = QHBoxLayout(per_tab_strat_w)
-            per_tab_strat_lay.setContentsMargins(0, 2, 0, 4)
-            per_tab_strat_lay.addWidget(QLabel("↳ Cell type strategy:"))
-            per_tab_combo = QComboBox()
-            per_tab_combo.addItems(self._PER_TAB_STRATEGIES)
-            per_tab_combo.setCurrentText(saved_ct_strat)
-            per_tab_strat_lay.addWidget(per_tab_combo, stretch=1)
-            per_tab_strat_w.setVisible(is_advanced)
-            tab._per_tab_strategy_widget = per_tab_strat_w
-            tab._per_tab_strategy_combo = per_tab_combo
-
-            def _make_strat_handler(t):
-                def _on_per_tab_strat_changed(new_strat):
-                    params_snap = self.metadata_loader.behav3d_parameters.get("apoc", {})
-                    self._rebuild_tab_instance_controls(t, new_strat, params_snap)
-                    apoc_dict = self.metadata_loader.behav3d_parameters.setdefault("apoc", {})
-                    apoc_dict[f"per_ct_strategy_{t.cell_type}"] = new_strat
-                    self._save_apoc_params_to_yaml()
-                return _on_per_tab_strat_changed
-            per_tab_combo.currentTextChanged.connect(_make_strat_handler(tab))
-
-            # Insert at top of tab layout (index 0), above everything else.
-            tab.layout().insertWidget(0, per_tab_strat_w)
-
-        # 4. Add "Unify all organoids" checkbox if ≥2 organoid types.
-        if hasattr(self, '_check_unify_organoids') and self._check_unify_organoids is not None:
-            try:
-                self._check_unify_organoids.setParent(None)
-            except Exception:
-                pass
-        self._check_unify_organoids = None
-        if len(org) >= 2:
-            self._check_unify_organoids = QCheckBox("⛓ Apply same settings to all organoids")
-            self._check_unify_organoids.setChecked(self._unify_organoids)
-            self._check_unify_organoids.setToolTip(
-                "When checked, clicking will immediately mirror the first organoid tab's\n"
-                "config (features, strategy, params) to all other organoid tabs.\n"
-                "Toggle again to re-sync after making further changes."
-            )
-            self._check_unify_organoids.stateChanged.connect(self._on_unify_organoids_changed)
-            tw_layout = self._training_widget.layout()
-            for i in range(tw_layout.count()):
-                item = tw_layout.itemAt(i)
-                if item and item.widget() and type(item.widget()).__name__ == "QTabWidget":
-                    tw_layout.insertWidget(i, self._check_unify_organoids)
-                    break
-
-        # 5. Add global "▶ Run [CellType] Segmentation" button below Train buttons.
-        first_ct = self._training_widget._tab_cell_types[0] if self._training_widget._tab_cell_types else "?"
+        # Add global "▶ Run [CellType] Segmentation" button below the
+        # train buttons. Lives in the same APOC layout as the Train buttons.
+        first_ct = tw._tab_cell_types[0] if tw._tab_cell_types else "?"
         self._global_run_instance_btn = QPushButton(f"▶ Run {first_ct.capitalize()} Segmentation")
         self._global_run_instance_btn.setStyleSheet(
             "background-color:#1976D2; color:white; font-weight:bold; padding:6px 12px;"
@@ -3948,43 +3850,32 @@ class APOCWidget(QWidget):
             "Uses the strategy and parameters configured in that tab."
         )
         self._global_run_instance_btn.clicked.connect(self._on_global_run_instance)
-
-        # Insert after Train ALL button row (find train_all_btn's parent layout)
-        tw_main = self._training_widget.layout()
-        # Find the layout item containing train_all_btn and insert after it
-        inserted_global = False
-        for i in range(tw_main.count()):
-            item = tw_main.itemAt(i)
-            if item and item.layout():
-                sub = item.layout()
-                for j in range(sub.count()):
-                    sub_item = sub.itemAt(j)
-                    if sub_item and sub_item.widget() is self._training_widget.train_all_btn:
-                        tw_main.insertWidget(i + 1, self._global_run_instance_btn)
-                        inserted_global = True
-                        break
-            if inserted_global:
-                break
-        if not inserted_global:
-            tw_main.addWidget(self._global_run_instance_btn)
-
-        # Update button label when tab changes
-        self._training_widget.tab_widget.currentChanged.connect(self._update_global_run_btn_label)
+        tw._main_layout.addWidget(self._global_run_instance_btn)
+        tw.tab_widget.currentChanged.connect(self._update_global_run_btn_label)
 
         # Wire reactive organoid mirroring for channels + RF controls.
-        for ct, tab in self._training_widget.tabs.items():
+        for ct, tab in tw.tabs.items():
             self._wire_organoid_tab_sync_signals(ct, tab)
 
         self.training_layout.addWidget(self._training_widget)
         self._update_training_controls_state()
 
     # ── Queue param snapshot ────────────────────────────────────
+    def _current_global_strategy(self):
+        """Return the current global strategy from the training widget's combo."""
+        if (
+            self._training_widget is not None
+            and self._training_widget.strategy_combo is not None
+        ):
+            return self._training_widget.strategy_combo.currentText()
+        return self.all_strategies()[0]
+
     def get_queue_params(self) -> dict:
         """Snapshot current widget state for use by the processing queue."""
-        strategy = self.combo_strategy.currentText()
-        idx = self.combo_strategy.currentIndex()
+        strategy = self._current_global_strategy()
+        all_strats = self.all_strategies()
         params = {
-            "strategy_index": idx,
+            "strategy_index": all_strats.index(strategy) if strategy in all_strats else 0,
             "strategy_name": strategy,
             "gpu_device_name": self._selected_gpu_device_name(),
             "overwrite": self.check_overwrite.isChecked(),
@@ -4004,7 +3895,8 @@ class APOCWidget(QWidget):
                 if per_tab_combo is not None:
                     per_ct_strategies[ct] = per_tab_combo.currentText()
             params["per_ct_params"] = per_ct_params
-            if strategy == "Advanced (per cell type)":
+            from behav3d.preprocessing.segmentation.apoc_train import APOCTrainingWidget as _ATW
+            if strategy == _ATW.ADVANCED_STRATEGY:
                 params["per_ct_strategies"] = per_ct_strategies
         return params
 
@@ -4026,8 +3918,8 @@ class APOCWidget(QWidget):
             
         # Collect top-level parameters from the GUI
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
-        if hasattr(self, 'combo_strategy') and self.combo_strategy is not None:
-            pc["apoc_strategy"] = self.combo_strategy.currentText()
+        if self._training_widget is not None and self._training_widget.strategy_combo is not None:
+            pc["apoc_strategy"] = self._training_widget.strategy_combo.currentText()
         if hasattr(self, 'spin_examples') and self.spin_examples is not None:
             pc["examples_per_sample"] = self.spin_examples.value()
         if hasattr(self, 'combo_gpu_device') and self.combo_gpu_device is not None:
@@ -4275,150 +4167,6 @@ class APOCWidget(QWidget):
         ct = tw._tab_cell_types[tab_index] if tab_index < len(tw._tab_cell_types) else "?"
         btn.setText(f"▶ Run {ct.capitalize()} Segmentation")
 
-    # ── Helper: rebuild instance controls inside a tab ──────────
-    def _rebuild_tab_instance_controls(self, tab, strategy, initial_params):
-        """Create (or replace) the instance-segmentation preview controls inside a tab.
-
-        Called after APOCTrainingWidget construction so controls always live inside
-        the tab itself rather than being reparented by _refresh_instance_controls.
-        Also called when the per-tab strategy combo changes.
-        """
-        from qtpy.QtWidgets import (
-            QGroupBox, QVBoxLayout, QHBoxLayout, QLabel,
-            QPushButton, QDoubleSpinBox, QSpinBox, QCheckBox,
-        )
-        ct = tab.cell_type
-
-        # Remove previous instance_group from the tab layout (if it was already injected).
-        old_group = getattr(tab, "instance_group", None)
-        if old_group is not None:
-            old_group.setParent(None)
-            old_group.deleteLater()
-
-        # Reset all spinbox / button references on the tab object.
-        tab.run_instance_btn = None
-        tab.instance_group = None
-        tab.prob_mask_threshold_spin = None
-        tab.prob_seed_threshold_spin = None
-        tab.edt_threshold_spin = None
-        tab.segment_size_min_spin = None
-        tab.opening_nr_pixels_spin = None
-        tab.fill_holes_cb = None
-
-        # Dead cell type and Direct strategy have no instance controls.
-        if ct == "dead" or strategy == "APOC (Direct Instance Segmentation)":
-            return
-
-        group = QGroupBox("Instance Segmentation Parameters")
-        group_layout = QVBoxLayout()
-        group_layout.setContentsMargins(4, 4, 4, 4)
-        group_layout.setSpacing(4)
-
-        if strategy == "APOC Probability Map + Watershed":
-            row1 = QHBoxLayout()
-            row2 = QHBoxLayout()
-            tab.prob_mask_threshold_spin = QDoubleSpinBox()
-            tab.prob_mask_threshold_spin.setRange(0.0, 1.0)
-            tab.prob_mask_threshold_spin.setSingleStep(0.05)
-            tab.prob_mask_threshold_spin.setValue(
-                float(initial_params.get(f"{ct}_prob_mask_threshold", 0.5)))
-            row1.addWidget(QLabel("Mask threshold:"))
-            row1.addWidget(tab.prob_mask_threshold_spin)
-
-            tab.prob_seed_threshold_spin = QDoubleSpinBox()
-            tab.prob_seed_threshold_spin.setRange(0.0, 1.0)
-            tab.prob_seed_threshold_spin.setSingleStep(0.05)
-            tab.prob_seed_threshold_spin.setValue(
-                float(initial_params.get(f"{ct}_prob_seed_threshold", 0.8)))
-            row1.addWidget(QLabel("Seed threshold:"))
-            row1.addWidget(tab.prob_seed_threshold_spin)
-            group_layout.addLayout(row1)
-
-            tab.opening_nr_pixels_spin = QSpinBox()
-            tab.opening_nr_pixels_spin.setRange(0, 10)
-            tab.opening_nr_pixels_spin.setValue(
-                int(initial_params.get(f"{ct}_opening_nr_pixels", 0)))
-            row2.addWidget(QLabel("Opening px:"))
-            row2.addWidget(tab.opening_nr_pixels_spin)
-
-            tab.segment_size_min_spin = QSpinBox()
-            tab.segment_size_min_spin.setRange(0, 100000)
-            tab.segment_size_min_spin.setSingleStep(10)
-            tab.segment_size_min_spin.setValue(
-                int(initial_params.get(f"{ct}_segment_size_min", 10)))
-            row2.addWidget(QLabel("Min size:"))
-            row2.addWidget(tab.segment_size_min_spin)
-            group_layout.addLayout(row2)
-
-        elif strategy == "APOC Mask + EDT/Watershed Resegmentation":
-            row1 = QHBoxLayout()
-            row2 = QHBoxLayout()
-            tab.edt_threshold_spin = QDoubleSpinBox()
-            tab.edt_threshold_spin.setRange(0.0, 50.0)
-            tab.edt_threshold_spin.setSingleStep(0.5)
-            tab.edt_threshold_spin.setValue(
-                float(initial_params.get(f"{ct}_edt_threshold", 1.0)))
-            row1.addWidget(QLabel("EDT threshold:"))
-            row1.addWidget(tab.edt_threshold_spin)
-
-            tab.opening_nr_pixels_spin = QSpinBox()
-            tab.opening_nr_pixels_spin.setRange(0, 10)
-            tab.opening_nr_pixels_spin.setValue(
-                int(initial_params.get(f"{ct}_opening_nr_pixels", 0)))
-            row1.addWidget(QLabel("Opening px:"))
-            row1.addWidget(tab.opening_nr_pixels_spin)
-            group_layout.addLayout(row1)
-
-            tab.segment_size_min_spin = QSpinBox()
-            tab.segment_size_min_spin.setRange(0, 100000)
-            tab.segment_size_min_spin.setSingleStep(10)
-            tab.segment_size_min_spin.setValue(
-                int(initial_params.get(f"{ct}_segment_size_min", 10)))
-            row2.addWidget(QLabel("Min size:"))
-            row2.addWidget(tab.segment_size_min_spin)
-
-            tab.fill_holes_cb = QCheckBox("Fill holes")
-            tab.fill_holes_cb.setChecked(
-                bool(initial_params.get(f"{ct}_fill_holes", True)))
-            row2.addWidget(tab.fill_holes_cb)
-            group_layout.addLayout(row2)
-
-        # Preview button inside the tab — for tuning parameters with training data
-        tab.run_instance_btn = QPushButton("Run instance segmentation preview")
-        tab.run_instance_btn.setStyleSheet("padding:4px 8px;")
-        tab.run_instance_btn.setEnabled(self._is_session_active)  # disabled until training data loaded
-        tab.run_instance_btn.clicked.connect(
-            lambda _checked=False, _ct=ct: (
-                self._training_widget._run_instance_preview(_ct)
-                if self._training_widget else None
-            )
-        )
-        group_layout.addWidget(tab.run_instance_btn)
-        group.setLayout(group_layout)
-        tab.instance_group = group
-
-        # Wire value-changed signals to auto-save params
-        for widget in [
-            tab.prob_mask_threshold_spin, tab.prob_seed_threshold_spin,
-            tab.edt_threshold_spin, tab.segment_size_min_spin, tab.opening_nr_pixels_spin,
-        ]:
-            if widget is not None:
-                widget.valueChanged.connect(self._save_apoc_params_to_yaml)
-        if tab.fill_holes_cb is not None:
-            tab.fill_holes_cb.stateChanged.connect(self._save_apoc_params_to_yaml)
-
-        # Inject into the tab's own layout (before the final stretch item).
-        tab_layout = tab.layout()
-        inserted = False
-        for i in range(tab_layout.count() - 1, -1, -1):
-            item = tab_layout.itemAt(i)
-            if item and item.spacerItem():
-                tab_layout.insertWidget(i, group)
-                inserted = True
-                break
-        if not inserted:
-            tab_layout.addWidget(group)
-
     # ── Helper: unify organoid settings ────────────────────────
     def _on_unify_organoids_changed(self, state):
         """When toggled ON, do an initial full sync from the first organoid tab."""
@@ -4467,17 +4215,18 @@ class APOCWidget(QWidget):
                 getattr(source_tab, "_per_tab_strategy_combo", None),
                 "currentText", lambda: None
             )()
+            per_tab_strategies = self.per_tab_strategies()
             for tab in other_org_tabs:
                 if tab is None:
                     continue
                 tab.apply_config(src_cfg)
                 per_combo = getattr(tab, "_per_tab_strategy_combo", None)
-                if per_combo is not None and src_strat and src_strat in self._PER_TAB_STRATEGIES:
+                if per_combo is not None and src_strat and src_strat in per_tab_strategies:
                     per_combo.blockSignals(True)
                     per_combo.setCurrentText(src_strat)
                     per_combo.blockSignals(False)
                     params_snap = self.metadata_loader.behav3d_parameters.get("apoc", {})
-                    self._rebuild_tab_instance_controls(tab, src_strat, params_snap)
+                    tab.rebuild_instance_controls(strategy=src_strat, initial_params=params_snap)
                 # Mirror instance segmentation parameter values from source
                 for attr in (
                     "prob_mask_threshold_spin", "prob_seed_threshold_spin",
@@ -4517,7 +4266,7 @@ class APOCWidget(QWidget):
             from behav3d.preprocessing.segmentation.apoc_segment import run_apoc_segmentation
 
             output_dir = Path(self.metadata_loader.output_dir)
-            strategy = self.combo_strategy.currentText()
+            strategy = self._current_global_strategy()
 
             # Timepoint range
             if self.check_process_all.isChecked():
@@ -4579,13 +4328,14 @@ class APOCWidget(QWidget):
 
             # Collect per-cell-type strategies when in Advanced mode
             per_ct_strategies = None
-            if strategy == "Advanced (per cell type)" and self._training_widget is not None:
+            from behav3d.preprocessing.segmentation.apoc_train import APOCTrainingWidget as _ATW
+            if strategy == _ATW.ADVANCED_STRATEGY and self._training_widget is not None:
                 per_ct_strategies = {}
                 for ct, tab in self._training_widget.tabs.items():
                     per_tab_combo = getattr(tab, "_per_tab_strategy_combo", None)
                     per_ct_strategies[ct] = (
                         per_tab_combo.currentText() if per_tab_combo is not None
-                        else self._PER_TAB_STRATEGIES[0]
+                        else self.per_tab_strategies()[0]
                     )
                 # Persist so batch segmentation can recover after session restart
                 apoc_dict = self.metadata_loader.behav3d_parameters.setdefault("apoc", {})
@@ -4627,3 +4377,914 @@ class APOCWidget(QWidget):
             self.log(f"❌ Error during APOC segmentation: {e}")
 
 
+class ConvPaintWidget(QWidget):
+    """ConvPaint (DL pixel classifier) segmentation page.
+
+    Mirrors :class:`APOCWidget` for the unified ConvPaint backbone:
+    a single multi-class model annotated through the legend tab inside the
+    embedded :class:`ConvPaintTrainingWidget` (which is built lazily after
+    the user generates training data because it needs ``all_images``).
+
+    The plugin wraps device selection, batch run options, per-cell-type
+    strategy snapshots and queueing on top of the training widget — the
+    training widget itself handles all label/strategy UI through its
+    ``per_cell_type_strategy=True`` constructor flag.
+    """
+
+    @classmethod
+    def all_strategies(cls):
+        from behav3d.preprocessing.segmentation.convpaint_train import (
+            ConvPaintTrainingWidget as _CTW,
+        )
+        return list(_CTW.STRATEGIES) + [_CTW.ADVANCED_STRATEGY]
+
+    @classmethod
+    def per_tab_strategies(cls):
+        from behav3d.preprocessing.segmentation.convpaint_train import (
+            ConvPaintTrainingWidget as _CTW,
+        )
+        return list(_CTW.STRATEGIES)
+
+    def __init__(
+        self,
+        viewer,
+        metadata_loader,
+        log_callback=None,
+        parent=None,
+        switch_to_visualization_callback=None,
+    ):
+        super().__init__(parent)
+        self.viewer = viewer
+        self.metadata_loader = metadata_loader
+        self.log = log_callback or print
+        self._switch_to_visualization = switch_to_visualization_callback
+        self._training_widget = None
+        self._is_session_active = False
+        self._all_images_cache = None
+        self._init_ui()
+
+    # ── UI construction ──────────────────────────────────────────
+    def _init_ui(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        info = QLabel(
+            "<b>ConvPaint Pixel Classifier</b><br>"
+            "Uses <tt>napari-convpaint</tt> + a deep feature extractor (VGG/DINOv2/...)<br>"
+            "to train a single multi-class classifier for all cell types at once."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #888; font-size: 11px; padding: 4px 0 6px 0;")
+        layout.addWidget(info)
+
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {}) or {}
+
+        # ── Device selection (PyTorch / CUDA) ─────────────────────
+        from behav3d.preprocessing.segmentation.convpaint_train import (
+            _detect_torch_devices, _default_device,
+        )
+        self._convpaint_devices = _detect_torch_devices()  # list of (label, value)
+        gpu_row = QHBoxLayout()
+        gpu_row.addWidget(QLabel("Device:"))
+        self.combo_gpu_device = QComboBox()
+        self.combo_gpu_device.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        for label, value in self._convpaint_devices:
+            self.combo_gpu_device.addItem(label, value)
+
+        saved_device = str(pc.get("convpaint_device", "")).strip() or _default_device()
+        idx = self.combo_gpu_device.findData(saved_device)
+        if idx >= 0:
+            self.combo_gpu_device.setCurrentIndex(idx)
+        gpu_row.addWidget(self.combo_gpu_device, stretch=1)
+        gpu_row.addStretch()
+        layout.addLayout(gpu_row)
+
+        # ── Training section (embedded ConvPaintTrainingWidget) ──
+        self.training_group = QGroupBox("🎯 ConvPaint Classifier Training")
+        self.training_layout = QVBoxLayout(self.training_group)
+        self.training_layout.setContentsMargins(4, 4, 4, 4)
+
+        train_ctrl_lay = QHBoxLayout()
+        train_ctrl_lay.addWidget(QLabel("Examples/sample:"))
+        self.spin_examples = QSpinBox()
+        self.spin_examples.setValue(int(pc.get("examples_per_sample", 3)))
+        self.spin_examples.setRange(1, 10)
+        self.spin_examples.setMaximumWidth(70)
+        train_ctrl_lay.addWidget(self.spin_examples)
+
+        self.btn_load_training = QPushButton("Generate Training Data")
+        self.btn_load_training.setToolTip(
+            "Clears viewer and loads selected timepoints for unified ConvPaint labeling"
+        )
+        self.btn_load_training.setStyleSheet(
+            "background-color: #007bff; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px;"
+        )
+        self.btn_load_training.clicked.connect(
+            lambda _: self._on_load_training_clicked(interactive=True)
+        )
+        train_ctrl_lay.addWidget(self.btn_load_training)
+        train_ctrl_lay.addStretch()
+        self.training_layout.addLayout(train_ctrl_lay)
+
+        self.training_placeholder = QLabel(
+            "Load metadata and click <b>Generate Training Data</b> to enable "
+            "ConvPaint classifier training."
+        )
+        self.training_placeholder.setWordWrap(True)
+        self.training_placeholder.setStyleSheet("color:#888; font-style:italic; padding:10px;")
+        self.training_layout.addWidget(self.training_placeholder)
+
+        layout.addWidget(self.training_group)
+
+        # ── Batch controls ───────────────────────────────────────
+        batch_group = QGroupBox("🚀 Batch Segmentation")
+        batch_lay = QVBoxLayout(batch_group)
+        batch_lay.setSpacing(4)
+
+        self.check_process_all = QCheckBox("Process ALL timepoints")
+        self.check_process_all.setChecked(True)
+        batch_lay.addWidget(self.check_process_all)
+
+        tp_row = QHBoxLayout()
+        tp_row.addWidget(QLabel("From t:"))
+        self.spin_t_start = QSpinBox()
+        self.spin_t_start.setRange(0, 99999)
+        self.spin_t_start.setValue(0)
+        self.spin_t_start.setMaximumWidth(70)
+        tp_row.addWidget(self.spin_t_start)
+        tp_row.addWidget(QLabel("to t:"))
+        self.spin_t_end = QSpinBox()
+        self.spin_t_end.setRange(0, 99999)
+        self.spin_t_end.setValue(100)
+        self.spin_t_end.setMaximumWidth(70)
+        tp_row.addWidget(self.spin_t_end)
+        tp_row.addStretch()
+        self.tp_widget = QWidget()
+        self.tp_widget.setLayout(tp_row)
+        batch_lay.addWidget(self.tp_widget)
+
+        def _toggle_tp(_state):
+            self.tp_widget.setVisible(not self.check_process_all.isChecked())
+        self.check_process_all.stateChanged.connect(_toggle_tp)
+        _toggle_tp(None)
+
+        n_cores = os.cpu_count() or 4
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(1, max(1, n_cores - 1))
+        self.spin_workers.setValue(1)
+        self.spin_workers.setMaximumWidth(60)
+        w_form = QFormLayout()
+        w_form.setContentsMargins(0, 0, 0, 0)
+        w_form.addRow("Workers:", self.spin_workers)
+        batch_lay.addLayout(w_form)
+
+        self.check_overwrite = QCheckBox("Overwrite existing results")
+        self.check_overwrite.setChecked(False)
+        batch_lay.addWidget(self.check_overwrite)
+
+        self.btn_run_segmentation = QPushButton("▶ Run ConvPaint Batch Segmentation")
+        self.btn_run_segmentation.setStyleSheet(
+            "QPushButton { background: #007bff; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 10px; font-size: 13px; } "
+            "QPushButton:hover { background: #0069d9; }"
+        )
+        self.btn_run_segmentation.clicked.connect(lambda _: self._on_run_segmentation(interactive=True))
+
+        self.btn_queue_segment = QPushButton("+🛒")
+        self.btn_queue_segment.setFixedSize(36, 36)
+        self.btn_queue_segment.setToolTip("Add ConvPaint Segmentation to Queue")
+        self.btn_queue_segment.setStyleSheet(
+            "QPushButton { background: #1a1a2e; color: #ffc107; border: 1px solid #ffc107; "
+            "border-radius: 4px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
+        )
+
+        batch_btn_row = QHBoxLayout()
+        batch_btn_row.setSpacing(4)
+        batch_btn_row.addWidget(self.btn_run_segmentation, stretch=1)
+        batch_btn_row.addWidget(self.btn_queue_segment)
+        batch_lay.addLayout(batch_btn_row)
+
+        layout.addWidget(batch_group)
+        layout.addStretch()
+        scroll.setWidget(content)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+        # ── Auto-save bindings ───────────────────────────────────
+        self.spin_examples.valueChanged.connect(lambda _: self._save_params_to_yaml())
+        self.spin_workers.valueChanged.connect(lambda _: self._save_params_to_yaml())
+        self.combo_gpu_device.currentTextChanged.connect(lambda _: self._save_params_to_yaml())
+        self.check_process_all.stateChanged.connect(lambda _: self._save_params_to_yaml())
+        self.spin_t_start.valueChanged.connect(lambda _: self._save_params_to_yaml())
+        self.spin_t_end.valueChanged.connect(lambda _: self._save_params_to_yaml())
+
+    # ── Helpers ──────────────────────────────────────────────────
+    def _selected_device(self):
+        return str(self.combo_gpu_device.currentData() or "auto")
+
+    def _prompt_visualize_after_segmentation(self):
+        res = QMessageBox.question(
+            self,
+            "Segmentation Finished",
+            "Batch segmentation finished successfully! \n\n"
+            "Do you want to switch to the Visualization Tab and see the segments?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if res != QMessageBox.Yes:
+            return
+        if callable(self._switch_to_visualization):
+            self._switch_to_visualization()
+        else:
+            self.log("  Visualization tab callback unavailable.")
+
+    # ── Training widget signal slots ─────────────────────────────
+    def _on_training_started(self, cell_types_to_train):
+        device = self._selected_device()
+        self.log(f"🖥️ ConvPaint training device: {device}")
+        self.log(f"▶ Starting ConvPaint training for: {cell_types_to_train}")
+
+    def _on_training_finished(self, cell_types_to_train, _result):
+        self._reorder_training_layers()
+        self.log("✅ ConvPaint training process completed.")
+
+    def _on_instance_preview_started(self, ct):
+        tw = self._training_widget
+        strategy = tw._resolve_strategy(ct) if tw is not None else ""
+        self.log(f"🔍 Running instance segmentation preview for '{ct}' (strategy: {strategy})...")
+
+    def _on_instance_preview_finished(self, ct):
+        self._reorder_training_layers()
+
+    def _on_training_widget_strategy_changed(self, strategy):
+        pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        pc["convpaint_strategy"] = str(strategy)
+        self._save_params_to_yaml()
+
+    def _reorder_training_layers(self):
+        if self._training_widget is None:
+            return
+        try:
+            from behav3d.preprocessing.segmentation.convpaint_train import (
+                _reorder_convpaint_layers,
+            )
+            tw = self._training_widget
+            _reorder_convpaint_layers(
+                self.viewer,
+                [ct for ct in tw._tab_cell_types if ct != "dead"],
+                has_death=tw.has_death,
+            )
+        except Exception as e:
+            self.log(f"⚠️ Could not reorder ConvPaint training layers: {e}")
+
+    # ── Metadata update (rebuilds nothing until training data is loaded) ──
+    def _on_metadata_updated(self):
+        """Called when metadata is loaded/updated.
+
+        Mirrors the APOC behaviour: build a parameter-only
+        :class:`ConvPaintTrainingWidget` with ``all_images=[]`` immediately so
+        the user can tune every segmentation parameter (strategy, EDT
+        threshold, min segment size, …) even before training data is loaded.
+        Training and preview buttons are disabled in this mode; they become
+        fully active once the user clicks *Generate Training Data*.
+        """
+        # Tear down any existing widget (stale session or previous metadata).
+        if self._training_widget is not None:
+            try:
+                self._training_widget.cleanup()
+            except Exception:
+                pass
+            self.training_layout.removeWidget(self._training_widget)
+            self._training_widget.hide()
+            self._training_widget.deleteLater()
+            self._training_widget = None
+
+        self._is_session_active = False
+        self._all_images_cache = None
+
+        md = self.metadata_loader.metadata
+        if md is None:
+            if self.training_placeholder.parent() is None:
+                self.training_layout.addWidget(self.training_placeholder)
+            self.training_placeholder.show()
+            return
+
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel,
+        )
+        from behav3d.preprocessing.segmentation.convpaint_train import (
+            _filter_merge_types,
+            ConvPaintTrainingWidget,
+            DEFAULT_STRATEGY,
+            _normalize_strategy,
+        )
+
+        organoid_types = _filter_merge_types(detect_organoid_types_from_metadata(md))
+        immune_types   = _filter_merge_types(detect_immune_cell_types_from_metadata(md))
+        other_types    = _filter_merge_types(detect_other_cell_types_from_metadata(md))
+        all_cell_types = organoid_types + immune_types + other_types
+        has_death      = has_dead_channel(md)
+
+        if not all_cell_types:
+            if self.training_placeholder.parent() is None:
+                self.training_layout.addWidget(self.training_placeholder)
+            self.training_placeholder.show()
+            return
+
+        # Hide the placeholder now that we will embed the real widget.
+        if self.training_placeholder.parent() is not None:
+            self.training_layout.removeWidget(self.training_placeholder)
+            self.training_placeholder.hide()
+
+        output_dir = Path(self.metadata_loader.output_dir)
+        pixel_class_outdir = output_dir / "images" / "PixelClassification"
+        pixel_class_outdir.mkdir(parents=True, exist_ok=True)
+
+        params      = self.metadata_loader.behav3d_parameters
+        ip          = dict(params.get("pixel_classifier", {}) or {})
+        ip["convpaint_device"] = self._selected_device()
+        cp_strategy = _normalize_strategy(ip.get("convpaint_strategy", DEFAULT_STRATEGY))
+
+        self._training_widget = ConvPaintTrainingWidget(
+            viewer=self.viewer,
+            all_images=[],          # no training data yet — parameter-only mode
+            pixel_class_outdir=str(pixel_class_outdir),
+            all_cell_types=all_cell_types,
+            has_death=has_death,
+            initial_params=ip,
+            on_params_changed=self._save_params_to_yaml,
+            convpaint_strategy=cp_strategy,
+            unified_input_channels=[],
+            death_input_channels=[],
+            per_cell_type_strategy=True,
+            show_device=False,
+            external_log=self.log,
+        )
+        if self._training_widget.strategy_combo is not None:
+            self._training_widget.strategy_combo.setCurrentText(cp_strategy)
+
+        # Disable training/preview controls — images are not loaded yet.
+        _no_data_tip = (
+            "Training data not loaded. Click 'Generate Training Data' above to enable."
+        )
+        self._training_widget.btn_train.setEnabled(False)
+        self._training_widget.btn_train.setToolTip(_no_data_tip)
+        self._training_widget.btn_rerun_preview.setEnabled(False)
+        self._training_widget.btn_rerun_preview.setToolTip(_no_data_tip)
+        for tab in self._training_widget.tabs.values():
+            if hasattr(tab, "btn_preview") and tab.btn_preview is not None:
+                tab.btn_preview.setEnabled(False)
+                tab.btn_preview.setToolTip(_no_data_tip)
+
+        # Disable training-specific parameter groups (Feature Extractor,
+        # Classifier, tiling) — the user only needs the segmentation
+        # post-processing parameters (EDT, probability, watershed) here.
+        self._training_widget.disable_training_params()
+
+        # Wire only the parameter-persistence signal (training signals are
+        # connected later in _on_load_training_clicked when images are loaded).
+        self._training_widget.strategy_changed.connect(
+            self._on_training_widget_strategy_changed
+        )
+
+        self.training_layout.addWidget(self._training_widget)
+
+    # ── Generate Training Data ───────────────────────────────────
+    def _on_load_training_clicked(self, interactive=True):
+        try:
+            md = self.metadata_loader.metadata
+            if md is None:
+                self.log("⚠️ Cannot generate training data: No metadata loaded.")
+                return
+
+            self.log("Loading ConvPaint training data...")
+
+            from behav3d.core.metadata import (
+                detect_organoid_types_from_metadata,
+                detect_immune_cell_types_from_metadata,
+                detect_other_cell_types_from_metadata,
+                has_dead_channel,
+            )
+            from behav3d.preprocessing.segmentation.convpaint_train import (
+                _load_training_images,
+                _filter_merge_types,
+                _derive_convpaint_input_channels,
+                _reorder_convpaint_layers,
+                UNIFIED_LABELS_LAYER_NAME,
+                DEAD_LABELS_LAYER_NAME,
+                UNIFIED_PREDICTED_LAYER_NAME,
+                DEAD_PREDICTED_LAYER_NAME,
+                _predicted_labels_path,
+                _probability_map_path,
+                _segments_layer_name,
+                _probability_layer_name,
+                CHANNEL_COLORS,
+                ConvPaintTrainingWidget,
+                DEFAULT_STRATEGY,
+                _normalize_strategy,
+            )
+            from behav3d.preprocessing.segmentation.convpaint_label_map import (
+                build_label_map, label_map_matches, load_label_map,
+                unified_label_map_path, unified_user_labels_path,
+                unified_predicted_labels_path,
+            )
+
+            output_dir = Path(self.metadata_loader.output_dir)
+
+            organoid_types = _filter_merge_types(
+                detect_organoid_types_from_metadata(md)
+            )
+            immune_types = _filter_merge_types(
+                detect_immune_cell_types_from_metadata(md)
+            )
+            other_types = _filter_merge_types(
+                detect_other_cell_types_from_metadata(md)
+            )
+
+            # Persist examples/sample before loading.
+            pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+            pc["examples_per_sample"] = int(self.spin_examples.value())
+            self._save_params_to_yaml()
+
+            # Decide load-existing vs regenerate via interactive prompt.
+            pixel_class_outdir = output_dir / "images" / "PixelClassification"
+            image_outpath = pixel_class_outdir / "PixelClassifier_Images.zarr"
+
+            overwrite_images = False
+            if image_outpath.exists():
+                if interactive:
+                    n_samples = len(md["sample_name"].unique())
+                    msg = (
+                        "Training data already exists.\n\n"
+                        f"Currently selected: {n_samples} sample(s) × "
+                        f"{self.spin_examples.value()} examples/sample.\n\n"
+                        "Overwrite with new training data, or load the existing data?"
+                    )
+                    box = QMessageBox(self)
+                    box.setWindowTitle("Training Data Detected")
+                    box.setText(msg)
+                    btn_generate = box.addButton("Generate New", QMessageBox.AcceptRole)
+                    btn_load = box.addButton("Load Existing", QMessageBox.YesRole)
+                    btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+                    box.exec_()
+                    clicked = box.clickedButton()
+                    if clicked is btn_cancel:
+                        self.log("Action cancelled.")
+                        return
+                    overwrite_images = (clicked is btn_generate)
+                else:
+                    overwrite_images = False
+
+            self.viewer.layers.clear()
+
+            all_images, pixel_class_outdir, has_death, all_cell_types = _load_training_images(
+                metadata=md,
+                output_dir=str(output_dir),
+                examples_per_sample=int(self.spin_examples.value()),
+                organoid_types=organoid_types,
+                immune_types=immune_types,
+                other_types=other_types,
+                overwrite_images=overwrite_images,
+            )
+            all_cell_types = _filter_merge_types(all_cell_types)
+
+            if not all_images:
+                self.log("⚠️ No training images loaded.")
+                return
+            if not all_cell_types:
+                self.log("⚠️ No cell types detected — nothing to train.")
+                return
+
+            n_channels = all_images[0].shape[0]
+            unified_input_channels, death_input_channels = _derive_convpaint_input_channels(
+                md, n_channels
+            )
+            self.log(
+                f"Loaded {len(all_images)} training images with {n_channels} channels."
+            )
+            self.log(f"  Unified input channels: {unified_input_channels}")
+            if has_death:
+                self.log(f"  Death input channels: {death_input_channels}")
+
+            stacked = np.stack(all_images, axis=0)  # (T_total, C, Z, Y, X)
+            T_total = stacked.shape[0]
+            label_shape = (T_total,) + stacked.shape[2:]
+
+            for ch in range(n_channels):
+                ch_data = stacked[:, ch, :, :, :]
+                nonzero = ch_data[ch_data > 0]
+                clim = (
+                    (0, float(np.percentile(nonzero, 99.8)))
+                    if nonzero.size > 0 else (0, 1e-3)
+                )
+                img_layer = self.viewer.add_image(
+                    ch_data,
+                    name=f"Channel {ch}",
+                    contrast_limits=clim,
+                    colormap=CHANNEL_COLORS[ch % len(CHANNEL_COLORS)],
+                    blending="additive",
+                    opacity=0.8,
+                )
+                img_layer.contrast_limits_range = (0, float(ch_data.max()))
+
+            # Build (or rebuild) the active label map.
+            label_map = build_label_map(all_cell_types)
+
+            # Restore/create unified User Provided Labels.
+            unified_path = unified_user_labels_path(pixel_class_outdir)
+            saved_map_path = unified_label_map_path(pixel_class_outdir)
+            unified_data = np.zeros(label_shape, dtype=np.int16)
+            if unified_path.exists():
+                try:
+                    existing = np.asarray(load_zarr(unified_path))
+                    if existing.shape == label_shape:
+                        if saved_map_path.exists():
+                            saved_map = load_label_map(saved_map_path)
+                            if label_map_matches(saved_map, all_cell_types):
+                                unified_data = existing
+                                self.log(
+                                    f"  ↩ Restored unified labels ({unified_path.name})"
+                                )
+                            else:
+                                self.log(
+                                    "  ⚠️ Cached unified labels were trained with a "
+                                    "different cell-type set — starting fresh."
+                                )
+                        else:
+                            unified_data = existing
+                            self.log(
+                                f"  ↩ Restored unified labels (no map sidecar)."
+                            )
+                    else:
+                        self.log(
+                            f"  ⚠️ Unified labels shape mismatch ({existing.shape} vs "
+                            f"{label_shape}); starting fresh."
+                        )
+                except Exception as exc:
+                    self.log(f"  ⚠️ Could not restore unified labels: {exc}")
+
+            self.viewer.add_labels(
+                unified_data, name=UNIFIED_LABELS_LAYER_NAME, opacity=0.5,
+            )
+
+            if has_death:
+                dead_path = Path(pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
+                dead_data = np.zeros(label_shape, dtype=np.int16)
+                if dead_path.exists():
+                    try:
+                        existing = np.asarray(load_zarr(dead_path))
+                        if existing.shape == label_shape:
+                            dead_data = existing
+                            self.log(f"  ↩ Restored death labels ({dead_path.name})")
+                    except Exception as exc:
+                        self.log(f"  ⚠️ Could not restore death labels: {exc}")
+                self.viewer.add_labels(dead_data, name=DEAD_LABELS_LAYER_NAME, opacity=0.5)
+
+            # Restore cached previews (unified predicted + per-cell-type seg/prob).
+            pred_path = unified_predicted_labels_path(pixel_class_outdir)
+            if pred_path.exists():
+                try:
+                    pred = np.asarray(load_zarr(pred_path))
+                    if pred.shape == label_shape:
+                        self.viewer.add_labels(
+                            pred, name=UNIFIED_PREDICTED_LAYER_NAME, opacity=0.6, visible=False,
+                        )
+                except Exception as exc:
+                    self.log(f"  ⚠️ Could not restore unified predicted labels: {exc}")
+
+            for ct in all_cell_types:
+                seg_p = _predicted_labels_path(pixel_class_outdir, ct)
+                if seg_p and seg_p.exists():
+                    try:
+                        pred = np.asarray(load_zarr(seg_p))
+                        if pred.shape == label_shape:
+                            self.viewer.add_labels(
+                                pred, name=_segments_layer_name(ct),
+                                opacity=0.8, visible=False,
+                            )
+                    except Exception:
+                        pass
+                prob_p = _probability_map_path(pixel_class_outdir, ct)
+                if prob_p and prob_p.exists():
+                    try:
+                        prob = np.asarray(load_zarr(prob_p))
+                        if prob.shape == label_shape:
+                            self.viewer.add_image(
+                                prob, name=_probability_layer_name(ct),
+                                opacity=0.6, blending="additive", colormap="magma",
+                                contrast_limits=(0.0, 1.0), visible=False,
+                            )
+                    except Exception:
+                        pass
+
+            if has_death:
+                seg_p = _predicted_labels_path(pixel_class_outdir, "dead")
+                if seg_p and seg_p.exists():
+                    try:
+                        pred = np.asarray(load_zarr(seg_p))
+                        if pred.shape == label_shape:
+                            self.viewer.add_labels(
+                                pred, name=DEAD_PREDICTED_LAYER_NAME,
+                                opacity=0.8, visible=False,
+                            )
+                    except Exception:
+                        pass
+
+            # Build (or rebuild) the training widget itself.
+            if self._training_widget is not None:
+                try:
+                    self._training_widget.cleanup()
+                except Exception:
+                    pass
+                self.training_layout.removeWidget(self._training_widget)
+                self._training_widget.hide()
+                self._training_widget.deleteLater()
+                self._training_widget = None
+
+            if self.training_placeholder.parent() is not None:
+                self.training_layout.removeWidget(self.training_placeholder)
+                self.training_placeholder.hide()
+
+            params = self.metadata_loader.behav3d_parameters
+            ip = dict(params.get("pixel_classifier", {}) or {})
+            # Keep the user-selected device in the initial params so the
+            # training widget picks the same one.
+            ip["convpaint_device"] = self._selected_device()
+            cp_strategy = _normalize_strategy(
+                ip.get("convpaint_strategy", DEFAULT_STRATEGY)
+            )
+
+            self._training_widget = ConvPaintTrainingWidget(
+                viewer=self.viewer,
+                all_images=all_images,
+                pixel_class_outdir=str(pixel_class_outdir),
+                all_cell_types=all_cell_types,
+                has_death=has_death,
+                initial_params=ip,
+                on_params_changed=self._save_params_to_yaml,
+                convpaint_strategy=cp_strategy,
+                unified_input_channels=unified_input_channels,
+                death_input_channels=death_input_channels,
+                per_cell_type_strategy=True,
+                show_device=False,
+                external_log=self.log,
+            )
+            if self._training_widget.strategy_combo is not None:
+                self._training_widget.strategy_combo.setCurrentText(cp_strategy)
+
+            # Wire signals.
+            tw = self._training_widget
+            tw.training_started.connect(self._on_training_started)
+            tw.training_finished.connect(self._on_training_finished)
+            tw.instance_preview_started.connect(self._on_instance_preview_started)
+            tw.instance_preview_finished.connect(self._on_instance_preview_finished)
+            tw.strategy_changed.connect(self._on_training_widget_strategy_changed)
+
+            self.training_layout.addWidget(self._training_widget)
+
+            self._all_images_cache = all_images
+            self._is_session_active = True
+
+            _reorder_convpaint_layers(self.viewer, all_cell_types, has_death=has_death)
+            self.log("✅ ConvPaint training data generated/loaded in viewer!")
+
+        except Exception as e:
+            traceback.print_exc()
+            self.log(f"❌ Error during ConvPaint training data generation: {e}")
+
+    def cleanup_session(self):
+        """Remove ConvPaint training layers and tear down the training widget.
+
+        After clearing the viewer layers the parameter-only widget is restored
+        (via :meth:`_on_metadata_updated`) so the user can still tune
+        segmentation parameters without reloading training data.
+        """
+        names_to_remove = []
+        for layer in list(self.viewer.layers):
+            n = layer.name
+            if (
+                n.startswith("Channel ")
+                or "User Provided Labels" in n
+                or "Pixel Classification" in n
+                or " Segments" in n
+                or "Probability Map" in n
+            ):
+                names_to_remove.append(n)
+        for n in names_to_remove:
+            if n in [l.name for l in self.viewer.layers]:
+                try:
+                    self.viewer.layers.remove(self.viewer.layers[n])
+                except Exception:
+                    pass
+
+        self._all_images_cache = None
+        self._is_session_active = False
+
+        # Rebuild the parameter-only widget so parameters remain tunable.
+        self._on_metadata_updated()
+        self.log("ConvPaint training session cleared.")
+
+    # ── Queue parameter snapshot ─────────────────────────────────
+    def _current_global_strategy(self):
+        if (
+            self._training_widget is not None
+            and self._training_widget.strategy_combo is not None
+        ):
+            return self._training_widget.strategy_combo.currentText()
+        return self.all_strategies()[0]
+
+    def get_queue_params(self) -> dict:
+        """Snapshot current widget state for use by the processing queue."""
+        strategy = self._current_global_strategy()
+        all_strats = self.all_strategies()
+        params = {
+            "strategy_index": all_strats.index(strategy) if strategy in all_strats else 0,
+            "strategy_name": strategy,
+            "device": self._selected_device(),
+            "overwrite": self.check_overwrite.isChecked(),
+            "workers": self.spin_workers.value(),
+            "process_all": self.check_process_all.isChecked(),
+            "t_start": self.spin_t_start.value(),
+            "t_end": self.spin_t_end.value(),
+        }
+        if self._training_widget is not None:
+            per_ct_params = {}
+            per_ct_strategies = {}
+            for ct, tab in self._training_widget.tabs.items():
+                try:
+                    per_ct_params[ct] = tab.collect_params()
+                except Exception:
+                    pass
+                per_combo = getattr(tab, "_per_tab_strategy_combo", None)
+                if per_combo is not None:
+                    per_ct_strategies[ct] = per_combo.currentText()
+            params["per_ct_params"] = per_ct_params
+            from behav3d.preprocessing.segmentation.convpaint_train import (
+                ConvPaintTrainingWidget as _CTW,
+            )
+            if strategy == _CTW.ADVANCED_STRATEGY:
+                params["per_ct_strategies"] = per_ct_strategies
+        return params
+
+    # ── Parameter persistence ────────────────────────────────────
+    def _save_params_to_yaml(self, updated_params=None):
+        """Save ConvPaint-related parameters into ``behav3d_parameters.yml``.
+
+        Accepts an optional ``updated_params`` dict from the training widget
+        (``on_params_changed`` callback) — those are merged into the
+        ``pixel_classifier`` section since ConvPaint uses ``convpaint_*``
+        keys at that level.
+        """
+        out_dir = self.metadata_loader.output_dir
+        if not out_dir:
+            return
+
+        pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        if isinstance(updated_params, dict):
+            pc.update(updated_params)
+
+        if hasattr(self, "spin_examples") and self.spin_examples is not None:
+            pc["examples_per_sample"] = self.spin_examples.value()
+        if hasattr(self, "combo_gpu_device") and self.combo_gpu_device is not None:
+            pc["convpaint_device"] = self._selected_device()
+        if (
+            self._training_widget is not None
+            and self._training_widget.strategy_combo is not None
+        ):
+            pc["convpaint_strategy"] = self._training_widget.strategy_combo.currentText()
+        if hasattr(self, "spin_workers") and hasattr(self, "check_process_all"):
+            pc["convpaint_workers"] = self.spin_workers.value()
+            pc["convpaint_process_all"] = self.check_process_all.isChecked()
+            pc["convpaint_t_start"] = self.spin_t_start.value()
+            pc["convpaint_t_end"] = self.spin_t_end.value()
+
+        params_path = Path(out_dir) / "behav3d_parameters.yml"
+        try:
+            with open(params_path, "w") as f:
+                yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
+        except Exception as e:
+            self.log(f"Warning: Could not save parameters: {e}")
+
+    # ── Run batch segmentation ───────────────────────────────────
+    def _on_run_segmentation(self, interactive=True, only_cell_types=None):
+        try:
+            md = self.metadata_loader.metadata
+            if md is None:
+                self.log("⚠️ No metadata loaded.")
+                return
+
+            from behav3d.preprocessing.segmentation.convpaint_segment import (
+                run_convpaint_segmentation,
+            )
+
+            output_dir = Path(self.metadata_loader.output_dir)
+            pixel_class_outdir = output_dir / "images" / "PixelClassification"
+
+            # Quick preflight: a unified ConvPaint model must exist.
+            from behav3d.preprocessing.segmentation.convpaint_label_map import (
+                unified_model_path,
+            )
+            if not unified_model_path(pixel_class_outdir).exists():
+                self.log(
+                    "❌ No trained unified ConvPaint model found at "
+                    f"{unified_model_path(pixel_class_outdir)}. Train the classifier first."
+                )
+                return
+
+            strategy = self._current_global_strategy()
+
+            if self.check_process_all.isChecked():
+                timepoint_range = None
+            else:
+                t_start = self.spin_t_start.value()
+                t_end = self.spin_t_end.value()
+                if t_start > t_end:
+                    self.log("Error: Start timepoint must be <= End timepoint.")
+                    return
+                timepoint_range = (t_start, t_end)
+
+            # Collect convpaint_config from training widget tabs (flat dict
+            # of post-processing keys like ``{ct}_edt_threshold``).
+            convpaint_config = {}
+            if self._training_widget is not None:
+                for tab in self._training_widget.tabs.values():
+                    try:
+                        convpaint_config.update(tab.collect_params() or {})
+                    except Exception:
+                        pass
+
+            self._save_params_to_yaml()
+
+            per_ct_convpaint_strategies = None
+            from behav3d.preprocessing.segmentation.convpaint_train import (
+                ConvPaintTrainingWidget as _CTW,
+            )
+            if strategy == _CTW.ADVANCED_STRATEGY and self._training_widget is not None:
+                per_ct_convpaint_strategies = {}
+                for ct, tab in self._training_widget.tabs.items():
+                    per_combo = getattr(tab, "_per_tab_strategy_combo", None)
+                    per_ct_convpaint_strategies[ct] = (
+                        per_combo.currentText() if per_combo is not None
+                        else self.per_tab_strategies()[0]
+                    )
+                pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+                pc["per_ct_convpaint_strategies"] = per_ct_convpaint_strategies
+                self._save_params_to_yaml()
+                self.log(
+                    "  Advanced strategies: "
+                    + ", ".join(
+                        f"{k}:{v[:4]}" for k, v in per_ct_convpaint_strategies.items()
+                    )
+                )
+
+            self.log(f"Starting ConvPaint batch segmentation ({strategy})...")
+
+            metadata_csv = self.metadata_loader.behav3d_parameters.get("paths", {}).get(
+                "metadata_csv", ""
+            )
+
+            # Provide the selected torch device via convpaint_config so the
+            # backend uses the same one as the training widget.
+            convpaint_config["convpaint_device"] = self._selected_device()
+
+            updated_metadata = run_convpaint_segmentation(
+                output_dir=str(output_dir),
+                metadata=md,
+                metadata_csv_path=metadata_csv,
+                timepoint_range=timepoint_range,
+                convpaint_config=convpaint_config,
+                overwrite_existing=self.check_overwrite.isChecked(),
+                n_workers=self.spin_workers.value(),
+                convpaint_strategy=strategy,
+                per_ct_convpaint_strategies=per_ct_convpaint_strategies,
+                only_cell_types=only_cell_types,
+            )
+
+            if updated_metadata is not None:
+                self.metadata_loader.metadata = updated_metadata
+                if metadata_csv:
+                    try:
+                        updated_metadata.to_csv(metadata_csv, index=False)
+                    except Exception as e:
+                        self.log(f"Warning: Could not save metadata: {e}")
+
+            self.log("✅ ConvPaint batch segmentation finished!")
+
+            if interactive:
+                self._prompt_visualize_after_segmentation()
+
+        except Exception as e:
+            traceback.print_exc()
+            self.log(f"❌ Error during ConvPaint segmentation: {e}")

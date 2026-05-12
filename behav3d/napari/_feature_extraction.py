@@ -31,7 +31,7 @@ from qtpy.QtWidgets import (
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QCursor
 
-from behav3d.napari._segmentation import make_help_row
+from behav3d.core.qt_help import HelpButton, make_help_row
 
 # Colormaps for raw channel layers (same order as the Visualization tab)
 _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
@@ -598,7 +598,7 @@ class CellTypeFeaturePanel(QWidget):
         feat_lay = QVBoxLayout(feat_group)
         feat_lay.setSpacing(2)
 
-        all_feats = ["movement", "intensity", "morphology", "contact", "death"]
+        all_feats = ["movement", "intensity", "morphology", "contact", "invasiveness", "death"]
 
         # ── Mandatory features (same logic as the notebook widget) ─────────
         # intensity + contact are mandatory for all types.
@@ -624,7 +624,15 @@ class CellTypeFeaturePanel(QWidget):
         for f in all_feats:
             if f == "death" and not self._has_dead:
                 continue
-            cb = QCheckBox(f.capitalize())
+            if f == "invasiveness" and self.category != "immune":
+                # Invasiveness only makes sense for immune cells (counts immune
+                # voxels inside organoid masks). Mirrors the notebook widget.
+                continue
+            label = (
+                "Organoid Invasiveness (Advanced)"
+                if f == "invasiveness" else f.capitalize()
+            )
+            cb = QCheckBox(label)
             cb.setChecked(f in default_feats)
             self.feature_checks[f] = cb
 
@@ -664,12 +672,32 @@ class CellTypeFeaturePanel(QWidget):
             "Segments closer than this will be checked for contact signal.",
         )
         contact_row.addLayout(contact_help)
+
+        # Group the optional 'Organoid Invasiveness' checkbox inline with the
+        # contact row (immune cells only, mirroring the notebook widget).
+        if self.category == "immune" and "invasiveness" in self.feature_checks:
+            inv_cb = self.feature_checks["invasiveness"]
+            inv_cb.setToolTip(
+                "Count how many immune voxels lie inside organoid masks at each "
+                "timepoint. Requires both immune segments and organoid masks; "
+                "automatically aggregated downstream."
+            )
+            contact_row.addWidget(inv_cb)
+            contact_row.addWidget(HelpButton(
+                "Organoid Invasiveness (Advanced)",
+                "Per-timepoint count of voxels of this immune cell type that fall "
+                "inside any organoid mask.\n\n"
+                "Helps quantify how aggressively immune cells penetrate organoids. "
+                "Only available when Contact is enabled."
+            ))
         contact_row.addStretch()
 
         def _toggle_ct(state=None):
-            self.contact_threshold.setEnabled(
-                self.feature_checks.get("contact", QCheckBox()).isChecked()
-            )
+            contact_on = self.feature_checks.get("contact", QCheckBox()).isChecked()
+            self.contact_threshold.setEnabled(contact_on)
+            # Invasiveness depends on contact (notebook parity).
+            if self.category == "immune" and "invasiveness" in self.feature_checks:
+                self.feature_checks["invasiveness"].setVisible(contact_on)
 
         _toggle_ct()
         if "contact" in self.feature_checks:
@@ -678,6 +706,10 @@ class CellTypeFeaturePanel(QWidget):
         for f in all_feats:
             if f == "contact":
                 feat_lay.addLayout(contact_row)
+            elif f == "invasiveness":
+                # Already rendered inline within contact_row (or skipped entirely
+                # for non-immune cell types above).
+                continue
             elif f in self.feature_checks:
                 feat_lay.addWidget(self.feature_checks[f])
 
@@ -2018,6 +2050,27 @@ class FeatureExtractionTab(QWidget):
 
         # ── Global Death Classification group (Organoids only) ─────────────
 
+        # ── Cell type grouping ─────────────────────────────────────────────
+        grouping_row = QHBoxLayout()
+        grouping_row.setContentsMargins(0, 0, 0, 4)
+        self.btn_open_grouping = QPushButton("🧬  Cell type grouping…")
+        self.btn_open_grouping.setToolTip(
+            "Group several detected cell types under a single '{name}_merged' "
+            "label.\nThe new group is added as metadata columns and processed "
+            "downstream alongside the original cell types."
+        )
+        self.btn_open_grouping.setStyleSheet(
+            "QPushButton { background:#1f3a5f; color:#bbdefb; font-weight:bold; "
+            "border:1px solid #64b5f6; border-radius:4px; padding:6px 12px; } "
+            "QPushButton:hover { background:#2c4f7f; }"
+            "QPushButton:disabled { color:#666; border-color:#444; }"
+        )
+        self.btn_open_grouping.clicked.connect(self._on_open_grouping_dialog)
+        self.btn_open_grouping.setEnabled(False)
+        grouping_row.addWidget(self.btn_open_grouping)
+        grouping_row.addStretch()
+        layout.addLayout(grouping_row)
+
         # ── Per-cell-type sub-tabs ─────────────────────────────────────────
         self.cell_tabs = QTabWidget()
         self.cell_tabs.setTabPosition(QTabWidget.West)
@@ -2113,18 +2166,27 @@ class FeatureExtractionTab(QWidget):
         self._rebuild_tabs()
 
     def _detect_cell_types(self):
+        """Return (organoid, immune, other) suitable for feature extraction.
+
+        Mirrors :func:`behav3d.widgets.analysis._detect_downstream_cell_types`:
+        per-channel multicolor inputs (``*_N_multicolor``) are stripped because
+        feature extraction operates on the aggregated outputs (``*_merged`` or
+        ``*_grouped``) emitted by the multicolor merging step. Merged /
+        grouped names returned by the metadata helpers are preserved as-is.
+        """
         from behav3d.core.metadata import (
             detect_organoid_types_from_metadata,
             detect_immune_cell_types_from_metadata,
             detect_other_cell_types_from_metadata,
+            filter_multicolor_inputs,
         )
         md = self.metadata_loader.metadata
         if md is None:
             return [], [], []
         return (
-            detect_organoid_types_from_metadata(md),
-            detect_immune_cell_types_from_metadata(md),
-            detect_other_cell_types_from_metadata(md),
+            filter_multicolor_inputs(detect_organoid_types_from_metadata(md)),
+            filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)),
+            filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)),
         )
 
     def _rebuild_tabs(self):
@@ -2142,6 +2204,8 @@ class FeatureExtractionTab(QWidget):
             self.cell_tabs.addTab(self._placeholder, "—")
             self.btn_run_batch.setVisible(False)
             self.btn_queue_feature.setVisible(False)
+            if hasattr(self, "btn_open_grouping"):
+                self.btn_open_grouping.setEnabled(False)
             self._ak_toggle_btn.setVisible(False)
             self._ak_toggle_btn.blockSignals(True)
             self._ak_toggle_btn.setChecked(False)
@@ -2151,6 +2215,8 @@ class FeatureExtractionTab(QWidget):
 
         self.btn_run_batch.setVisible(True)
         self.btn_queue_feature.setVisible(True)
+        if hasattr(self, "btn_open_grouping"):
+            self.btn_open_grouping.setEnabled(True)
 
         color_map = {"organoid": "🟣", "immune": "🔵", "other": "🟡"}
         for ct in org:
@@ -2206,6 +2272,50 @@ class FeatureExtractionTab(QWidget):
         self.panels[ct] = panel
         icon = color_map.get(category, "")
         self.cell_tabs.addTab(panel, f"{icon} {ct}")
+
+    def _on_open_grouping_dialog(self):
+        """Open the cell-type grouping dialog and rebuild tabs on success."""
+        from behav3d.napari._grouping_dialog import GroupBuilderDialog
+
+        if self.metadata_loader is None or self.metadata_loader.metadata is None:
+            self._log("\u26a0\ufe0f Load metadata before creating groups.")
+            return
+
+        dlg = GroupBuilderDialog(self.metadata_loader, parent=self)
+        dlg.group_created.connect(self._on_group_created)
+        dlg.group_removed.connect(self._on_group_removed)
+        dlg.exec_()
+
+    def _on_group_created(self, merged_name: str):
+        """Slot: rebuild feature extraction tabs after a new group is added."""
+        self._log(
+            f"\U0001f9ec New cell-type group '{merged_name}' added \u2014 "
+            "rebuilding feature extraction tabs."
+        )
+        # Notify other tabs (segmentation / tracking / filtering) when wired.
+        loader = self.metadata_loader
+        if loader is not None and hasattr(loader, "metadata_loaded"):
+            try:
+                loader.metadata_loaded.emit(loader.metadata)
+            except Exception:
+                pass
+        else:
+            self._rebuild_tabs()
+
+    def _on_group_removed(self, merged_name: str):
+        """Slot: rebuild feature extraction tabs after a *_merged group is removed."""
+        self._log(
+            f"\U0001f9f9 Cell-type group '{merged_name}' removed \u2014 "
+            "rebuilding feature extraction tabs."
+        )
+        loader = self.metadata_loader
+        if loader is not None and hasattr(loader, "metadata_loaded"):
+            try:
+                loader.metadata_loaded.emit(loader.metadata)
+            except Exception:
+                pass
+        else:
+            self._rebuild_tabs()
 
     def set_queue_panel(self, queue_panel):
         """Attach the processing queue so Active Killing can enqueue itself."""

@@ -30,6 +30,7 @@ class StepType(Enum):
     CELLPOSE_SEGMENT = "cellpose_segment"
     DEAD_MASK = "dead_mask"
     APOC_SEGMENT = "apoc_segment"
+    CONVPAINT_SEGMENT = "convpaint_segment"
     TRACK = "track"
     FEATURE_EXTRACT = "feature_extract"
     ACTIVE_KILLING = "active_killing"
@@ -43,6 +44,7 @@ class StepType(Enum):
             StepType.CELLPOSE_SEGMENT: "🔬 Cellpose Segmentation",
             StepType.DEAD_MASK: "☠ Dead Mask (Otsu)",
             StepType.APOC_SEGMENT: "⚡ APOC",
+            StepType.CONVPAINT_SEGMENT: "🎨 ConvPaint",
             StepType.TRACK: "📍 Batch Tracking",
             StepType.FEATURE_EXTRACT: "🧪 Feature Extraction",
             StepType.ACTIVE_KILLING: "🔥 Active Killing",
@@ -57,6 +59,7 @@ class StepType(Enum):
             StepType.CELLPOSE_SEGMENT: 1.5,
             StepType.DEAD_MASK: 1.6,
             StepType.APOC_SEGMENT: 1.5,
+            StepType.CONVPAINT_SEGMENT: 1.5,
             StepType.TRACK: 2,
             StepType.FEATURE_EXTRACT: 3,
             StepType.ACTIVE_KILLING: 3.5,
@@ -88,6 +91,9 @@ class QueueStep:
         if self.step_type == StepType.APOC_SEGMENT:
             strat = self.params.get("strategy_name", "")
             return f"⚡ APOC — {strat}" if strat else self.step_type.label
+        if self.step_type == StepType.CONVPAINT_SEGMENT:
+            strat = self.params.get("strategy_name", "")
+            return f"🎨 ConvPaint — {strat}" if strat else self.step_type.label
         if self.step_type == StepType.ACTIVE_KILLING:
             immune = self.params.get("immune_type", "")
             return f"🔥 Active Killing — {immune}" if immune else self.step_type.label
@@ -826,6 +832,8 @@ class ProcessingQueuePanel(QWidget):
             self._run_track(skip_existing=skip_existing)
         elif step.step_type == StepType.APOC_SEGMENT:
             self._run_apoc_segment(step, skip_existing=skip_existing)
+        elif step.step_type == StepType.CONVPAINT_SEGMENT:
+            self._run_convpaint_segment(step, skip_existing=skip_existing)
         elif step.step_type == StepType.FEATURE_EXTRACT:
             self._run_feature_extract(skip_existing=skip_existing)
         elif step.step_type == StepType.ACTIVE_KILLING:
@@ -904,39 +912,169 @@ class ProcessingQueuePanel(QWidget):
             raise RuntimeError("Filtering tab not wired to queue.")
 
     def _run_apoc_segment(self, step: QueueStep, skip_existing: bool = False):
-        """Run APOC GPU batch segmentation, restoring snapshotted params first."""
+        """Run APOC GPU batch segmentation from a queued params snapshot.
+
+        ``step.params`` is the dict produced by :meth:`APOCWidget.get_queue_params`.
+        The values are restored into the widget so the existing
+        ``_on_run_segmentation`` code path can run unchanged; only attributes
+        that actually exist on :class:`APOCWidget` are touched.
+        """
         apoc_widget = self.segmentation_tab.apoc_page
-        p = step.params
-        # Restore snapshot into widgets so _on_run_segmentation reads the right values
-        if "gpu_device_name" in p and hasattr(apoc_widget, "combo_gpu_device"):
-            idx = apoc_widget.combo_gpu_device.findText(str(p["gpu_device_name"]))
+        p = step.params or {}
+        tw = getattr(apoc_widget, "_training_widget", None)
+
+        # GPU device
+        gpu_name = p.get("gpu_device_name")
+        if gpu_name and hasattr(apoc_widget, "combo_gpu_device"):
+            idx = apoc_widget.combo_gpu_device.findText(str(gpu_name))
             if idx >= 0:
                 apoc_widget.combo_gpu_device.setCurrentIndex(idx)
-        if "strategy_index" in p:
-            apoc_widget.combo_strategy.setCurrentIndex(p["strategy_index"])
-        if "edt_threshold" in p:
-            apoc_widget.spin_edt_threshold.setValue(p["edt_threshold"])
-        if "edt_min_size" in p:
-            apoc_widget.spin_edt_min_size.setValue(p["edt_min_size"])
-        if "prob_threshold" in p:
-            apoc_widget.spin_prob_threshold.setValue(p["prob_threshold"])
-        if "prob_min_size" in p:
-            apoc_widget.spin_prob_min_size.setValue(p["prob_min_size"])
-        # Restore per-CT size filter thresholds (Direct APOC strategy)
-        if "min_sizes" in p:
-            for ct, val in p["min_sizes"].items():
-                spin = apoc_widget._size_filter_spins.get(ct)
-                if spin is not None:
-                    spin.setValue(val)
-        if "workers" in p:
-            apoc_widget.spin_workers.setValue(p["workers"])
-        # Timepoint range
-        if p.get("process_all", True):
-            apoc_widget.check_process_all.setChecked(True)
-        else:
-            apoc_widget.check_process_all.setChecked(False)
-            apoc_widget.spin_t_start.setValue(p.get("t_start", 0))
-            apoc_widget.spin_t_end.setValue(p.get("t_end", 100))
-        # skip_existing overrides the stored overwrite flag
-        apoc_widget.check_overwrite.setChecked(not skip_existing)
+
+        # Strategy: snapshot stored ``strategy_name`` / ``strategy_index``.
+        if tw is not None and tw.strategy_combo is not None:
+            strat_name = p.get("strategy_name")
+            if strat_name and tw.strategy_combo.findText(strat_name) >= 0:
+                tw.strategy_combo.setCurrentText(strat_name)
+            elif "strategy_index" in p:
+                idx = int(p["strategy_index"])
+                if 0 <= idx < tw.strategy_combo.count():
+                    tw.strategy_combo.setCurrentIndex(idx)
+
+        # Per-cell-type strategies in Advanced mode.
+        per_ct_strategies = p.get("per_ct_strategies") or {}
+        if tw is not None and per_ct_strategies:
+            for ct, strat in per_ct_strategies.items():
+                tab = tw.tabs.get(ct)
+                if tab is None:
+                    continue
+                combo = getattr(tab, "_per_tab_strategy_combo", None)
+                if combo is not None and combo.findText(str(strat)) >= 0:
+                    combo.setCurrentText(str(strat))
+
+        # Per-tab post-processing values.
+        per_ct_params = p.get("per_ct_params") or {}
+        if tw is not None and per_ct_params:
+            for ct, cfg in per_ct_params.items():
+                tab = tw.tabs.get(ct)
+                if tab is None:
+                    continue
+                try:
+                    tab.apply_config(cfg)
+                except Exception:
+                    pass
+
+        # Worker / overwrite / timepoint settings.
+        if "workers" in p and hasattr(apoc_widget, "spin_workers"):
+            apoc_widget.spin_workers.setValue(int(p["workers"]))
+        if hasattr(apoc_widget, "check_process_all"):
+            if p.get("process_all", True):
+                apoc_widget.check_process_all.setChecked(True)
+            else:
+                apoc_widget.check_process_all.setChecked(False)
+                if hasattr(apoc_widget, "spin_t_start"):
+                    apoc_widget.spin_t_start.setValue(int(p.get("t_start", 0)))
+                if hasattr(apoc_widget, "spin_t_end"):
+                    apoc_widget.spin_t_end.setValue(int(p.get("t_end", 100)))
+        if hasattr(apoc_widget, "check_overwrite"):
+            # skip_existing overrides any stored overwrite flag.
+            apoc_widget.check_overwrite.setChecked(not skip_existing)
+
         apoc_widget._on_run_segmentation(interactive=False)
+
+    def _run_convpaint_segment(self, step: QueueStep, skip_existing: bool = False):
+        """Run ConvPaint batch segmentation from a queued params snapshot.
+
+        ``step.params`` is the dict produced by :meth:`ConvPaintWidget.get_queue_params`.
+        Mirrors :meth:`_run_apoc_segment`: values are restored into the widget so
+        the existing ``_on_run_segmentation`` code path runs unchanged.
+        """
+        convpaint_widget = self.segmentation_tab.convpaint_page
+        p = step.params or {}
+        tw = getattr(convpaint_widget, "_training_widget", None)
+
+        # Torch device
+        device = p.get("device")
+        if device and hasattr(convpaint_widget, "combo_gpu_device"):
+            idx = convpaint_widget.combo_gpu_device.findData(str(device))
+            if idx >= 0:
+                convpaint_widget.combo_gpu_device.setCurrentIndex(idx)
+
+        # Strategy
+        if tw is not None and tw.strategy_combo is not None:
+            strat_name = p.get("strategy_name")
+            if strat_name and tw.strategy_combo.findText(strat_name) >= 0:
+                tw.strategy_combo.setCurrentText(strat_name)
+            elif "strategy_index" in p:
+                idx = int(p["strategy_index"])
+                if 0 <= idx < tw.strategy_combo.count():
+                    tw.strategy_combo.setCurrentIndex(idx)
+
+        # Per-cell-type strategies (Advanced mode)
+        per_ct_strategies = p.get("per_ct_strategies") or {}
+        if tw is not None and per_ct_strategies:
+            for ct, strat in per_ct_strategies.items():
+                tab = tw.tabs.get(ct)
+                if tab is None:
+                    continue
+                combo = getattr(tab, "_per_tab_strategy_combo", None)
+                if combo is not None and combo.findText(str(strat)) >= 0:
+                    combo.setCurrentText(str(strat))
+
+        # Per-tab post-processing values (apply via collect_params reverse path is
+        # not available, so we apply individual widget values where present).
+        per_ct_params = p.get("per_ct_params") or {}
+        if tw is not None and per_ct_params:
+            for ct, cfg in per_ct_params.items():
+                tab = tw.tabs.get(ct)
+                if tab is None or not isinstance(cfg, dict):
+                    continue
+                # ConvPaint per-tab keys are flat ``{ct}_<name>`` entries; the
+                # tab itself exposes spinners/checkboxes named after the keys
+                # it produced. Reverse-apply by looking for the corresponding
+                # attribute on the tab.
+                for key, value in cfg.items():
+                    # Strip leading "{ct}_" prefix if present
+                    short = key
+                    prefix = f"{ct}_"
+                    if short.startswith(prefix):
+                        short = short[len(prefix):]
+                    attr_map = {
+                        "edt_threshold": "edt_threshold_spin",
+                        "opening_nr_pixels": "opening_nr_pixels_spin",
+                        "fill_holes": "fill_holes_cb",
+                        "segment_size_min": "segment_size_min_spin",
+                        "peak_min_distance": "peak_min_distance_spin",
+                        "peak_min_ratio": "peak_min_ratio_spin",
+                        "prob_mask_threshold": "prob_mask_threshold_spin",
+                        "prob_seed_threshold": "prob_seed_threshold_spin",
+                    }
+                    attr_name = attr_map.get(short)
+                    if attr_name is None:
+                        continue
+                    w = getattr(tab, attr_name, None)
+                    if w is None:
+                        continue
+                    try:
+                        if attr_name.endswith("_cb"):
+                            w.setChecked(bool(value))
+                        else:
+                            w.setValue(float(value) if "threshold" in short or "ratio" in short or "distance" in short else int(value))
+                    except Exception:
+                        pass
+
+        # Worker / overwrite / timepoint settings.
+        if "workers" in p and hasattr(convpaint_widget, "spin_workers"):
+            convpaint_widget.spin_workers.setValue(int(p["workers"]))
+        if hasattr(convpaint_widget, "check_process_all"):
+            if p.get("process_all", True):
+                convpaint_widget.check_process_all.setChecked(True)
+            else:
+                convpaint_widget.check_process_all.setChecked(False)
+                if hasattr(convpaint_widget, "spin_t_start"):
+                    convpaint_widget.spin_t_start.setValue(int(p.get("t_start", 0)))
+                if hasattr(convpaint_widget, "spin_t_end"):
+                    convpaint_widget.spin_t_end.setValue(int(p.get("t_end", 100)))
+        if hasattr(convpaint_widget, "check_overwrite"):
+            convpaint_widget.check_overwrite.setChecked(not skip_existing)
+
+        convpaint_widget._on_run_segmentation(interactive=False)

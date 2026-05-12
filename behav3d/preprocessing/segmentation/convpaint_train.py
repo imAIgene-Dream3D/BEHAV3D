@@ -45,15 +45,16 @@ import napari
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QSpinBox, QDoubleSpinBox, QPushButton as QtPushButton,
-    QGroupBox, QPlainTextEdit, QApplication, QScrollArea,
+    QGroupBox, QGridLayout, QPlainTextEdit, QApplication, QScrollArea,
     QTabWidget, QFrame, QCheckBox, QSizePolicy, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QColor
 
 from behav3d.io.images import load_image, load_zarr, save_as_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
+from behav3d.core.qt_help import HelpButton, make_help_row
 from behav3d.preprocessing.segmentation.convpaint_postprocess import (
     segment_per_z,
     predict_probas_per_z,
@@ -583,35 +584,55 @@ class AnnotationLegendTab(QWidget):
 # ---------------------------------------------------------------------------
 
 class CellTypeConvPaintTab(QWidget):
-    """One tab per cell type with strategy-specific spinners + preview button."""
+    """One tab per cell type with strategy-specific spinners + preview button.
+
+    Constructor flags ``show_strategy_combo`` and ``per_tab_strategies``
+    (used by the napari GUI plugin) attach a ``\u21b3 Cell type strategy:``
+    combo to the top of the tab so each cell type can override the global
+    ConvPaint strategy. When changed, the post-processing controls are
+    rebuilt to match the new strategy. The notebook entry point never sets
+    these flags, so its UI is unchanged.
+    """
 
     def __init__(self, cell_type, strategy, initial_params=None,
                  on_params_changed=None, run_preview_callback=None,
-                 parent=None):
+                 parent=None,
+                 show_strategy_combo=False,
+                 per_tab_strategies=None,
+                 on_per_tab_strategy_changed=None):
         super().__init__(parent)
         self.cell_type = cell_type
         self.strategy = _normalize_strategy(strategy)
         self._on_params_changed = on_params_changed
         self._run_preview_callback = run_preview_callback
         self._is_dead = (cell_type == "dead")
+        self._show_strategy_combo = bool(show_strategy_combo) and not self._is_dead
+        self._per_tab_strategies = list(per_tab_strategies or [])
+        self._on_per_tab_strategy_changed = on_per_tab_strategy_changed
+        self._per_tab_strategy_combo = None
+        self._per_tab_strategy_widget = None
 
-        ip = initial_params or {}
+        # Cached so future strategy switches reuse persisted values.
+        self._initial_params_cache = dict(initial_params or {})
+        ip = self._initial_params_cache
 
-        layout = QVBoxLayout()
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        self._root_layout = QVBoxLayout()
+        self._root_layout.setContentsMargins(8, 8, 8, 8)
+        self._root_layout.setSpacing(6)
 
         if self._is_dead:
-            layout.addWidget(QLabel(
+            _dead_lbl = QLabel(
                 "<i>Death classifier is a separate binary ConvPaint model. "
                 "Use the <b>User Provided Labels (Dead)</b> layer to annotate it. "
                 "No instance-segmentation parameters required.</i>"
-            ))
+            )
+            _dead_lbl.setWordWrap(True)
+            self._root_layout.addWidget(_dead_lbl)
             self.btn_preview = QtPushButton("Run preview (death mask)")
             self.btn_preview.clicked.connect(self._on_run_preview)
-            layout.addWidget(self.btn_preview)
-            layout.addStretch()
-            self.setLayout(layout)
+            self._root_layout.addWidget(self.btn_preview)
+            self._root_layout.addStretch()
+            self.setLayout(self._root_layout)
             self.edt_threshold_spin = None
             self.opening_nr_pixels_spin = None
             self.segment_size_min_spin = None
@@ -622,9 +643,38 @@ class CellTypeConvPaintTab(QWidget):
             self.peak_min_ratio_spin = None
             return
 
-        strategy_lbl = QLabel(f"<i>Strategy:</i> <b>{self.strategy}</b>")
-        strategy_lbl.setWordWrap(True)
-        layout.addWidget(strategy_lbl)
+        # Optional per-tab strategy combo at the very top of the tab.
+        if self._show_strategy_combo and self._per_tab_strategies:
+            saved_per_tab = ip.get(
+                f"per_ct_convpaint_strategy_{cell_type}", self.strategy
+            )
+            saved_per_tab = _normalize_strategy(saved_per_tab)
+            if saved_per_tab not in self._per_tab_strategies:
+                saved_per_tab = self._per_tab_strategies[0]
+            self.strategy = saved_per_tab
+            self._per_tab_strategy_widget = QWidget()
+            per_tab_lay = QHBoxLayout(self._per_tab_strategy_widget)
+            per_tab_lay.setContentsMargins(0, 2, 0, 4)
+            per_tab_lay.addWidget(QLabel("\u21b3 Cell type strategy:"))
+            self._per_tab_strategy_combo = QComboBox()
+            self._per_tab_strategy_combo.addItems(self._per_tab_strategies)
+            self._per_tab_strategy_combo.setCurrentText(saved_per_tab)
+            self._per_tab_strategy_combo.currentTextChanged.connect(
+                self._on_per_tab_strategy_combo_changed
+            )
+            per_tab_lay.addWidget(self._per_tab_strategy_combo, stretch=1)
+            self._root_layout.addWidget(self._per_tab_strategy_widget)
+
+        # Placeholder layout where the strategy-dependent controls are
+        # inserted. Lets us swap the controls on strategy change without
+        # rebuilding the whole tab.
+        self._controls_widget = QWidget()
+        self._controls_layout = QVBoxLayout(self._controls_widget)
+        self._controls_layout.setContentsMargins(0, 0, 0, 0)
+        self._controls_layout.setSpacing(6)
+        self._root_layout.addWidget(self._controls_widget)
+        self._root_layout.addStretch()
+        self.setLayout(self._root_layout)
 
         self.edt_threshold_spin = None
         self.opening_nr_pixels_spin = None
@@ -634,10 +684,90 @@ class CellTypeConvPaintTab(QWidget):
         self.prob_seed_threshold_spin = None
         self.peak_min_distance_spin = None
         self.peak_min_ratio_spin = None
+        self._build_controls(self.strategy)
 
-        if self.strategy == STRATEGY_PROB:
-            row1 = QHBoxLayout()
-            row1.addWidget(QLabel("Mask threshold:"))
+    @staticmethod
+    def _purge_layout(layout):
+        """Recursively remove every item (widget or sub-layout) from *layout*.
+
+        ``QLayout.takeAt`` removes the item from the layout but leaves
+        sub-layout widgets orphaned on the parent widget, causing them to
+        paint as ghost overlays.  This helper walks into nested layouts and
+        calls ``setParent(None)`` + ``deleteLater()`` on every widget it
+        finds so they are fully destroyed.
+        """
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+            else:
+                child = item.layout()
+                if child is not None:
+                    CellTypeConvPaintTab._purge_layout(child)
+
+    def _clear_controls_layout(self):
+        self._purge_layout(self._controls_layout)
+
+    @staticmethod
+    def _pair_row(lbl1, w1, h1, lbl2, w2, h2):
+        """Two label+widget+help groups on one row with a gap between them.
+
+        No stretch on the widgets — they keep their natural size. A trailing
+        stretch absorbs any extra panel width so the row never expands.
+        """
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        row.addWidget(lbl1)
+        row.addWidget(w1)
+        row.addWidget(h1)
+        row.addSpacing(10)
+        row.addWidget(lbl2)
+        row.addWidget(w2)
+        row.addWidget(h2)
+        row.addStretch()
+        return row
+
+    @staticmethod
+    def _solo_row(*widgets):
+        """Single group of widgets on one row with a trailing stretch."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        for w in widgets:
+            row.addWidget(w)
+        row.addStretch()
+        return row
+
+    def _build_controls(self, strategy):
+        """(Re)create the strategy-dependent spinners + preview button."""
+        self._clear_controls_layout()
+
+        ip = self._initial_params_cache
+        cell_type = self.cell_type
+
+        # Reset references before rebuilding.
+        self.edt_threshold_spin = None
+        self.opening_nr_pixels_spin = None
+        self.segment_size_min_spin = None
+        self.fill_holes_cb = None
+        self.prob_mask_threshold_spin = None
+        self.prob_seed_threshold_spin = None
+        self.peak_min_distance_spin = None
+        self.peak_min_ratio_spin = None
+
+        strategy = _normalize_strategy(strategy)
+        self.strategy = strategy
+
+        layout = self._controls_layout
+
+        strategy_lbl = QLabel(f"<i>Strategy:</i> <b>{strategy}</b>")
+        strategy_lbl.setWordWrap(True)
+        layout.addWidget(strategy_lbl)
+
+        if strategy == STRATEGY_PROB:
             self.prob_mask_threshold_spin = QDoubleSpinBox()
             self.prob_mask_threshold_spin.setRange(0.0, 1.0)
             self.prob_mask_threshold_spin.setSingleStep(0.05)
@@ -645,9 +775,7 @@ class CellTypeConvPaintTab(QWidget):
             self.prob_mask_threshold_spin.setValue(
                 float(ip.get(f"{cell_type}_prob_mask_threshold", 0.5))
             )
-            row1.addWidget(self.prob_mask_threshold_spin)
 
-            row1.addWidget(QLabel("Seed threshold:"))
             self.prob_seed_threshold_spin = QDoubleSpinBox()
             self.prob_seed_threshold_spin.setRange(0.0, 1.0)
             self.prob_seed_threshold_spin.setSingleStep(0.05)
@@ -655,30 +783,40 @@ class CellTypeConvPaintTab(QWidget):
             self.prob_seed_threshold_spin.setValue(
                 float(ip.get(f"{cell_type}_prob_seed_threshold", 0.8))
             )
-            row1.addWidget(self.prob_seed_threshold_spin)
-            layout.addLayout(row1)
+            layout.addLayout(self._pair_row(
+                QLabel("Mask threshold:"), self.prob_mask_threshold_spin,
+                HelpButton("Mask threshold",
+                    "Foreground cutoff applied to the per-cell-type probability map.\n"
+                    "Pixels above this value are kept as foreground (typical: 0.5)."),
+                QLabel("Seed threshold:"), self.prob_seed_threshold_spin,
+                HelpButton("Seed threshold",
+                    "Higher cutoff used to place watershed seeds (≥ Mask threshold).\n"
+                    "Lower values produce more seeds and split more touching objects."),
+            ))
 
-            row2 = QHBoxLayout()
-            row2.addWidget(QLabel("Opening px:"))
             self.opening_nr_pixels_spin = QSpinBox()
             self.opening_nr_pixels_spin.setRange(0, 50)
             self.opening_nr_pixels_spin.setValue(
                 int(ip.get(f"{cell_type}_opening_nr_pixels", 0))
             )
-            row2.addWidget(self.opening_nr_pixels_spin)
 
-            row2.addWidget(QLabel("Min size:"))
             self.segment_size_min_spin = QSpinBox()
             self.segment_size_min_spin.setRange(0, 100000)
             self.segment_size_min_spin.setSingleStep(10)
             self.segment_size_min_spin.setValue(
                 int(ip.get(f"{cell_type}_segment_size_min", 10))
             )
-            row2.addWidget(self.segment_size_min_spin)
-            layout.addLayout(row2)
+            layout.addLayout(self._pair_row(
+                QLabel("Opening px:"), self.opening_nr_pixels_spin,
+                HelpButton("Morphological opening",
+                    "Number of erosion-then-dilation iterations applied to the mask.\n"
+                    "Smooths boundaries and removes small speckles. Set to 0 to disable."),
+                QLabel("Min size:"), self.segment_size_min_spin,
+                HelpButton("Minimum segment size",
+                    "Segments with fewer voxels than this are discarded after watershed.\n"
+                    "Use to filter out noise / debris."),
+            ))
         else:
-            row1 = QHBoxLayout()
-            row1.addWidget(QLabel("EDT threshold:"))
             self.edt_threshold_spin = QDoubleSpinBox()
             self.edt_threshold_spin.setRange(0.0, 50.0)
             self.edt_threshold_spin.setSingleStep(0.5)
@@ -686,37 +824,46 @@ class CellTypeConvPaintTab(QWidget):
             self.edt_threshold_spin.setValue(
                 float(ip.get(f"{cell_type}_edt_threshold", 1.0))
             )
-            row1.addWidget(self.edt_threshold_spin)
 
-            row1.addWidget(QLabel("Opening px:"))
             self.opening_nr_pixels_spin = QSpinBox()
             self.opening_nr_pixels_spin.setRange(0, 50)
             self.opening_nr_pixels_spin.setValue(
                 int(ip.get(f"{cell_type}_opening_nr_pixels", 0))
             )
-            row1.addWidget(self.opening_nr_pixels_spin)
-            layout.addLayout(row1)
+            layout.addLayout(self._pair_row(
+                QLabel("EDT threshold:"), self.edt_threshold_spin,
+                HelpButton("EDT threshold",
+                    "Euclidean-distance-transform threshold used to derive seeds inside "
+                    "the binary mask.\n"
+                    "Lower values give more aggressive splitting of touching objects."),
+                QLabel("Opening px:"), self.opening_nr_pixels_spin,
+                HelpButton("Morphological opening",
+                    "Number of erosion-then-dilation iterations applied to the mask.\n"
+                    "Smooths boundaries and removes small speckles. Set to 0 to disable."),
+            ))
 
-            row2 = QHBoxLayout()
-            row2.addWidget(QLabel("Min size:"))
             self.segment_size_min_spin = QSpinBox()
             self.segment_size_min_spin.setRange(0, 100000)
             self.segment_size_min_spin.setSingleStep(10)
             self.segment_size_min_spin.setValue(
                 int(ip.get(f"{cell_type}_segment_size_min", 10))
             )
-            row2.addWidget(self.segment_size_min_spin)
-
             self.fill_holes_cb = QCheckBox("Fill holes")
             self.fill_holes_cb.setChecked(
                 bool(ip.get(f"{cell_type}_fill_holes", True))
             )
-            row2.addWidget(self.fill_holes_cb)
-            layout.addLayout(row2)
+            layout.addLayout(self._solo_row(
+                QLabel("Min size:"), self.segment_size_min_spin,
+                HelpButton("Minimum segment size",
+                    "Segments with fewer voxels than this are discarded after watershed.\n"
+                    "Use to filter out noise / debris."),
+                self.fill_holes_cb,
+                HelpButton("Fill holes",
+                    "Fill internal gaps in segmented objects before watershed.\n"
+                    "Useful for hollow nuclei or partial-volume effects."),
+            ))
 
-            if self.strategy == STRATEGY_PEAK_EDT:
-                row3 = QHBoxLayout()
-                row3.addWidget(QLabel("Peak min dist:"))
+            if strategy == STRATEGY_PEAK_EDT:
                 self.peak_min_distance_spin = QDoubleSpinBox()
                 self.peak_min_distance_spin.setRange(0.0, 50.0)
                 self.peak_min_distance_spin.setSingleStep(0.5)
@@ -727,9 +874,7 @@ class CellTypeConvPaintTab(QWidget):
                 self.peak_min_distance_spin.setToolTip(
                     "Minimum distance (µm) between local EDT peaks used as watershed seeds"
                 )
-                row3.addWidget(self.peak_min_distance_spin)
 
-                row3.addWidget(QLabel("Peak min ratio:"))
                 self.peak_min_ratio_spin = QDoubleSpinBox()
                 self.peak_min_ratio_spin.setRange(0.0, 1.0)
                 self.peak_min_ratio_spin.setSingleStep(0.05)
@@ -740,8 +885,16 @@ class CellTypeConvPaintTab(QWidget):
                 self.peak_min_ratio_spin.setToolTip(
                     "Minimum EDT peak height as a fraction of the local maximum (0–1)"
                 )
-                row3.addWidget(self.peak_min_ratio_spin)
-                layout.addLayout(row3)
+                layout.addLayout(self._pair_row(
+                    QLabel("Peak min dist:"), self.peak_min_distance_spin,
+                    HelpButton("Peak minimum distance",
+                        "Minimum distance (µm) between local EDT peaks used as watershed seeds.\n"
+                        "Larger values yield fewer, more separated seeds."),
+                    QLabel("Peak min ratio:"), self.peak_min_ratio_spin,
+                    HelpButton("Peak minimum ratio",
+                        "Minimum EDT peak height as a fraction of the local maximum (0–1).\n"
+                        "Higher values suppress weak peaks (fewer seeds)."),
+                ))
 
         hint = QLabel(
             "<i>Re-runs only post-processing on the cached classifier output "
@@ -757,8 +910,6 @@ class CellTypeConvPaintTab(QWidget):
         )
         self.btn_preview.clicked.connect(self._on_run_preview)
         layout.addWidget(self.btn_preview)
-        layout.addStretch()
-        self.setLayout(layout)
 
         for spin in [
             self.edt_threshold_spin, self.opening_nr_pixels_spin,
@@ -770,6 +921,24 @@ class CellTypeConvPaintTab(QWidget):
                 spin.valueChanged.connect(self._emit_params_changed)
         if self.fill_holes_cb is not None:
             self.fill_holes_cb.stateChanged.connect(self._emit_params_changed)
+
+    def rebuild_instance_controls(self, strategy=None, initial_params=None):
+        """Discard and rebuild the post-processing controls for *strategy*."""
+        if initial_params is None:
+            initial_params = self._initial_params_cache
+        else:
+            self._initial_params_cache = dict(initial_params)
+        target = _normalize_strategy(strategy or self.strategy)
+        if self._is_dead:
+            self.strategy = target
+            return
+        self._build_controls(target)
+
+    def _on_per_tab_strategy_combo_changed(self, new_strategy):
+        new_strategy = _normalize_strategy(new_strategy)
+        self.rebuild_instance_controls(strategy=new_strategy)
+        if callable(self._on_per_tab_strategy_changed):
+            self._on_per_tab_strategy_changed(self.cell_type, new_strategy)
 
     def _on_run_preview(self):
         if callable(self._run_preview_callback):
@@ -815,11 +984,49 @@ class CellTypeConvPaintTab(QWidget):
 # ---------------------------------------------------------------------------
 
 class ConvPaintTrainingWidget(QWidget):
+    """Unified ConvPaint training widget with optional plugin extensions.
+
+    Constructor flags
+    -----------------
+    ``per_cell_type_strategy`` (default ``False``)
+        When ``True``, adds a global "Strategy" combo (with an
+        ``Advanced (per cell type)`` option) and a per-tab ``↳ Cell type
+        strategy:`` combo on each non-dead tab. The notebook entry point
+        never sets this flag.
+    ``strategy_resolver`` (default ``None``)
+        Optional ``Callable[[str], str]`` that returns the effective strategy
+        for a cell type. Takes precedence over the built-in resolution.
+    ``extra_toolbar_widgets`` (default ``None``)
+        Iterable of ``QWidget`` / ``QLayout`` instances inserted near the
+        top of the widget, between the configuration groups and the tabs.
+        Used by the plugin to surface session-level controls.
+    ``show_device`` (default ``True``)
+        When ``False``, the Device combo is built but not added to the
+        layout. Pass ``False`` when embedding inside a plugin page that
+        already provides its own device selector, to avoid duplication.
+    """
+
+    # ── Signals ─────────────────────────────────────────────────────────────
+    channels_refreshed = Signal(str)
+    training_started = Signal(list)
+    training_finished = Signal(list, object)
+    instance_preview_started = Signal(str)
+    instance_preview_finished = Signal(str)
+    strategy_changed = Signal(str)
+
+    STRATEGIES = [STRATEGY_EDT, STRATEGY_PEAK_EDT, STRATEGY_PROB]
+    ADVANCED_STRATEGY = "Advanced (per cell type)"
+
     def __init__(self, viewer, all_images, pixel_class_outdir,
                  all_cell_types, has_death, initial_params=None,
                  on_params_changed=None, convpaint_strategy=None,
                  unified_input_channels=None, death_input_channels=None,
-                 parent=None):
+                 parent=None,
+                 per_cell_type_strategy=False,
+                 strategy_resolver=None,
+                 extra_toolbar_widgets=None,
+                 show_device=True,
+                 external_log=None):
         super().__init__(parent)
         self.viewer = viewer
         self.all_images = all_images
@@ -833,6 +1040,13 @@ class ConvPaintTrainingWidget(QWidget):
         self.convpaint_strategy = _normalize_strategy(
             convpaint_strategy or self.ip.get("convpaint_strategy", DEFAULT_STRATEGY)
         )
+        self._per_cell_type_strategy = bool(per_cell_type_strategy)
+        self._strategy_resolver = strategy_resolver
+        self._extra_toolbar_widgets = list(extra_toolbar_widgets or [])
+        self._show_device = bool(show_device)
+        # When provided, log messages are forwarded here instead of the
+        # internal log_box (which is then hidden to reclaim vertical space).
+        self._external_log = external_log if callable(external_log) else None
 
         # Active label map (always built fresh from the current cell-type set).
         self.label_map = build_label_map(self.all_cell_types)
@@ -844,13 +1058,22 @@ class ConvPaintTrainingWidget(QWidget):
 
         self.tabs = {}
         self.legend_tab = None
+        self.strategy_combo = None
+        self.strategy_help_button = None
         self._build_ui()
+        if self._external_log is not None and hasattr(self, "log_box"):
+            self.log_box.hide()
+        if self.strategy_combo is not None:
+            self._apply_strategy_to_tabs(
+                self.strategy_combo.currentText(), emit_signal=False
+            )
 
     # ── UI construction ─────────────────────────────────────────────
 
     def _build_ui(self):
         root = QVBoxLayout()
         root.setContentsMargins(4, 4, 4, 4)
+        self._main_layout = root
         root.addWidget(QLabel("<h3>ConvPaint Training (unified)</h3>"))
 
         legend_intro = QLabel(
@@ -861,6 +1084,41 @@ class ConvPaintTrainingWidget(QWidget):
         legend_intro.setWordWrap(True)
         legend_intro.setStyleSheet("color: #444; margin-bottom: 4px;")
         root.addWidget(legend_intro)
+
+        # Optional global Strategy combo (plugin only).
+        if self._per_cell_type_strategy:
+            strat_row = QHBoxLayout()
+            strat_row.addWidget(QLabel("Strategy:"))
+            self.strategy_combo = QComboBox()
+            options = list(self.STRATEGIES) + [self.ADVANCED_STRATEGY]
+            self.strategy_combo.addItems(options)
+            initial = self.convpaint_strategy if self.convpaint_strategy in options else options[0]
+            self.strategy_combo.setCurrentText(initial)
+            strat_row.addWidget(self.strategy_combo, stretch=1)
+            root.addLayout(strat_row)
+
+            strat_desc = QLabel(
+                "Strategy determines how the ConvPaint classifier output is"
+                " converted to instance segmentation labels. Post-processing"
+                " parameters appear inside each cell-type tab."
+            )
+            strat_desc.setWordWrap(True)
+            strat_desc.setStyleSheet("color:#888; font-size:10px; padding: 0 0 4px 0;")
+            root.addWidget(strat_desc)
+
+            help_row = QHBoxLayout()
+            help_row.setContentsMargins(0, 0, 0, 0)
+            help_lbl = QLabel("Instance preview parameters")
+            help_lbl.setStyleSheet("color:#888; font-size:10px;")
+            self.strategy_help_button = HelpButton(
+                *self._strategy_help_content(initial)
+            )
+            help_row.addWidget(help_lbl)
+            help_row.addWidget(self.strategy_help_button)
+            help_row.addStretch()
+            root.addLayout(help_row)
+
+            self.strategy_combo.currentTextChanged.connect(self._on_global_strategy_changed)
 
         # Feature Extractor (global)
         fe_group = QGroupBox("Feature Extractor")
@@ -875,6 +1133,15 @@ class ConvPaintTrainingWidget(QWidget):
             self.fe_combo.setCurrentIndex(idx)
         _compact_combo(self.fe_combo, min_chars=10)
         r.addWidget(self.fe_combo)
+        r.addWidget(HelpButton(
+            "Feature extractor model",
+            "Pre-trained deep network used to extract per-pixel features.\n"
+            "  • VGG-16 (default): fast and lightweight; good general baseline.\n"
+            "  • DINOv2 / DINOv3: stronger feature representations from "
+            "self-supervised vision transformers; slower but often more accurate.\n"
+            "Switching models invalidates the trained CatBoost classifier — "
+            "retrain after changing this."
+        ))
         fe_layout.addLayout(r)
 
         r = QHBoxLayout()
@@ -889,6 +1156,14 @@ class ConvPaintTrainingWidget(QWidget):
             self.channel_mode_combo.setCurrentIndex(idx)
         _compact_combo(self.channel_mode_combo, min_chars=8)
         r.addWidget(self.channel_mode_combo)
+        r.addWidget(HelpButton(
+            "Channel mode",
+            "How the input channels are fed to the feature extractor:\n"
+            "  • multi: each channel processed separately and concatenated "
+            "(more features, more memory).\n"
+            "  • single (mean) / RGB: channels are mixed before extraction.\n"
+            "When in doubt keep 'multi' for multi-channel fluorescence."
+        ))
         fe_layout.addLayout(r)
 
         r = QHBoxLayout()
@@ -909,13 +1184,27 @@ class ConvPaintTrainingWidget(QWidget):
         self.downsample_spin.setRange(-4, 16)
         self.downsample_spin.setValue(int(self.ip.get("convpaint_image_downsample", 1)))
         r.addWidget(self.downsample_spin)
+        r.addWidget(HelpButton(
+            "Image downsample",
+            "Spatial downsampling factor applied before feature extraction.\n"
+            "  • 1 = native resolution.\n"
+            "  • >1 = smaller image → faster but coarser predictions.\n"
+            "  • <0 = upsample (rarely useful)."
+        ))
         r.addWidget(QLabel("Smoothen:"))
         self.smooth_spin = QSpinBox()
         self.smooth_spin.setRange(0, 20)
         self.smooth_spin.setValue(int(self.ip.get("convpaint_seg_smoothening", 1)))
         r.addWidget(self.smooth_spin)
+        r.addWidget(HelpButton(
+            "Segmentation smoothening",
+            "Number of post-classification smoothing iterations applied to the "
+            "predicted label map.\n"
+            "Reduces single-pixel noise but can erode thin structures."
+        ))
         fe_layout.addLayout(r)
         fe_group.setLayout(fe_layout)
+        self.fe_group = fe_group
         root.addWidget(fe_group)
 
         # Classifier (global)
@@ -927,11 +1216,23 @@ class ConvPaintTrainingWidget(QWidget):
         self.iterations_spin.setRange(10, 2000)
         self.iterations_spin.setValue(int(self.ip.get("convpaint_clf_iterations", 100)))
         r.addWidget(self.iterations_spin)
+        r.addWidget(HelpButton(
+            "CatBoost — iterations",
+            "Number of boosting iterations (trees) trained by CatBoost.\n"
+            "More iterations → richer model but slower training and risk of overfit.\n"
+            "Default (100) is usually a good starting point."
+        ))
         r.addWidget(QLabel("Depth:"))
         self.depth_spin = QSpinBox()
         self.depth_spin.setRange(1, 16)
         self.depth_spin.setValue(int(self.ip.get("convpaint_clf_depth", 5)))
         r.addWidget(self.depth_spin)
+        r.addWidget(HelpButton(
+            "CatBoost — tree depth",
+            "Maximum depth of each CatBoost decision tree.\n"
+            "Shallow trees (3–6) generalise better; deeper trees fit more "
+            "complex decision boundaries."
+        ))
         clf_layout.addLayout(r)
         r = QHBoxLayout()
         r.addWidget(QLabel("Learning rate:"))
@@ -941,6 +1242,12 @@ class ConvPaintTrainingWidget(QWidget):
         self.lr_spin.setDecimals(3)
         self.lr_spin.setValue(float(self.ip.get("convpaint_clf_learning_rate", 0.1)))
         r.addWidget(self.lr_spin)
+        r.addWidget(HelpButton(
+            "CatBoost — learning rate",
+            "Shrinkage applied to each new tree's contribution.\n"
+            "Lower values (e.g. 0.03) need more iterations but often generalise "
+            "better; higher values train faster but may overshoot."
+        ))
         clf_layout.addLayout(r)
         r = QHBoxLayout()
         r.addWidget(QLabel("Class weights:"))
@@ -955,13 +1262,21 @@ class ConvPaintTrainingWidget(QWidget):
             self.class_weights_combo.setCurrentIndex(idx)
         _compact_combo(self.class_weights_combo, min_chars=10)
         r.addWidget(self.class_weights_combo)
+        r.addWidget(HelpButton(
+            "Class weights",
+            "Re-weighting strategy when some classes have far fewer annotations:\n"
+            "  • None: train as-is (best when classes are balanced).\n"
+            "  • Balanced: inverse-frequency weights (boost rare classes).\n"
+            "  • SqrtBalanced: square root of Balanced, milder adjustment."
+        ))
         clf_layout.addLayout(r)
         clf_group.setLayout(clf_layout)
+        self.clf_group = clf_group
         root.addWidget(clf_group)
 
-        # Device (global)
-        r = QHBoxLayout()
-        r.addWidget(QLabel("Device:"))
+        # Device (global) — build always so _fe_device() is safe, but only
+        # add to the layout when the widget is used standalone (not embedded
+        # inside a plugin page that already exposes its own device selector).
         self.device_combo = QComboBox()
         for label, dev_str in _detect_torch_devices():
             self.device_combo.addItem(label, dev_str)
@@ -971,8 +1286,11 @@ class ConvPaintTrainingWidget(QWidget):
         if idx >= 0:
             self.device_combo.setCurrentIndex(idx)
         _compact_combo(self.device_combo, min_chars=10)
-        r.addWidget(self.device_combo)
-        root.addLayout(r)
+        if self._show_device:
+            r = QHBoxLayout()
+            r.addWidget(QLabel("Device:"))
+            r.addWidget(self.device_combo)
+            root.addLayout(r)
 
         # Tiling options (global)
         tile_row = QHBoxLayout()
@@ -1006,6 +1324,14 @@ class ConvPaintTrainingWidget(QWidget):
         tile_row.addWidget(self.use_dask_cb)
         root.addLayout(tile_row)
 
+        # Extra toolbar widgets (plugin can inject session-level controls
+        # before the tabs).
+        for item in self._extra_toolbar_widgets:
+            if isinstance(item, QWidget):
+                root.addWidget(item)
+            elif isinstance(item, (QHBoxLayout, QVBoxLayout, QGridLayout)):
+                root.addLayout(item)
+
         # Tabs: legend first, then per-cell-type segmentation params, then Dead.
         seg_group = QGroupBox("Annotation & Segmentation")
         seg_layout = QVBoxLayout()
@@ -1016,6 +1342,7 @@ class ConvPaintTrainingWidget(QWidget):
         )
         self.tab_widget.addTab(self.legend_tab, "Legend")
 
+        per_tab_strategies = list(self.STRATEGIES) if self._per_cell_type_strategy else None
         for ct in self._tab_cell_types:
             tab = CellTypeConvPaintTab(
                 cell_type=ct,
@@ -1023,6 +1350,9 @@ class ConvPaintTrainingWidget(QWidget):
                 initial_params=self.ip,
                 on_params_changed=self._on_tab_params_changed,
                 run_preview_callback=self._run_instance_preview,
+                show_strategy_combo=self._per_cell_type_strategy,
+                per_tab_strategies=per_tab_strategies,
+                on_per_tab_strategy_changed=self._on_per_tab_strategy_changed,
             )
             self.tabs[ct] = tab
             self.tab_widget.addTab(tab, ct.capitalize())
@@ -1083,19 +1413,16 @@ class ConvPaintTrainingWidget(QWidget):
 
         scroll_content = QWidget()
         scroll_content.setLayout(root)
-        scroll_content.setMaximumWidth(420)
 
         scroll = QScrollArea()
         scroll.setWidget(scroll_content)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMaximumWidth(420)
 
         outer = QVBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
         self.setLayout(outer)
-        self.setMaximumWidth(420)
 
     # ── Callbacks ───────────────────────────────────────────────────
 
@@ -1104,11 +1431,149 @@ class ConvPaintTrainingWidget(QWidget):
         if self._on_params_changed:
             self._on_params_changed(params)
 
+    # ── Strategy resolution / per-cell-type plumbing ─────────────────
+    def _resolve_strategy(self, ct):
+        """Return the effective ConvPaint strategy for *ct*."""
+        if callable(self._strategy_resolver):
+            try:
+                resolved = self._strategy_resolver(ct)
+                if resolved:
+                    return _normalize_strategy(resolved)
+            except Exception:
+                pass
+        if self.strategy_combo is not None:
+            global_choice = self.strategy_combo.currentText()
+            if global_choice == self.ADVANCED_STRATEGY:
+                tab = self.tabs.get(ct)
+                per_combo = getattr(tab, "_per_tab_strategy_combo", None) if tab else None
+                if per_combo is not None:
+                    return _normalize_strategy(per_combo.currentText())
+                return self.STRATEGIES[0]
+            return _normalize_strategy(global_choice)
+        return self.convpaint_strategy
+
+    def _strategy_help_content(self, strategy_name):
+        if strategy_name == self.ADVANCED_STRATEGY:
+            return (
+                "ConvPaint Preview Parameters (Advanced \u2014 per cell type)",
+                "In Advanced mode each cell-type tab has its own strategy selector.\n\n"
+                "Select a strategy inside each tab to show the matching post-processing controls:\n"
+                "  \u2022 EDT threshold, Opening, Min size, Fill holes  (EDT/Watershed)\n"
+                "  \u2022 Peak min dist/ratio                          (Peak EDT/Watershed)\n"
+                "  \u2022 Mask threshold, Seed threshold, Opening, Min size  (Probability + Watershed)"
+            )
+        if strategy_name == STRATEGY_EDT:
+            return (
+                "ConvPaint Preview Parameters (Mask + EDT/Watershed)",
+                "Use the unified classifier mask, then refine instances with EDT + watershed.\n\n"
+                "  \u2022 EDT threshold: splits touching objects (lower = more aggressive).\n"
+                "  \u2022 Opening px: smooths boundaries and removes noise.\n"
+                "  \u2022 Min size: drops tiny segments below this size threshold.\n"
+                "  \u2022 Fill holes: fills internal gaps inside segmented objects."
+            )
+        if strategy_name == STRATEGY_PEAK_EDT:
+            return (
+                "ConvPaint Preview Parameters (Mask + Peak EDT/Watershed)",
+                "Same mask -> EDT pipeline, but watershed is seeded at local EDT peaks.\n\n"
+                "  \u2022 Peak min dist: minimum distance between seed peaks.\n"
+                "  \u2022 Peak min ratio: peak height vs. local max (0\u20131)."
+            )
+        if strategy_name == STRATEGY_PROB:
+            return (
+                "ConvPaint Preview Parameters (Probability + Watershed)",
+                "Use the per-cell-type probability map for watershed seeding.\n\n"
+                "  \u2022 Mask threshold: foreground cutoff for the watershed mask.\n"
+                "  \u2022 Seed threshold: seed cutoff for watershed seeds.\n"
+                "  \u2022 Opening px: smooths boundaries and removes noise.\n"
+                "  \u2022 Min size: drops tiny segments below this size threshold."
+            )
+        return (
+            "ConvPaint Preview Parameters",
+            "Select a strategy to see its post-processing parameters.",
+        )
+
+    def _apply_strategy_to_tabs(self, strategy, emit_signal=True):
+        strategy = str(strategy)
+        if strategy != self.ADVANCED_STRATEGY:
+            self.convpaint_strategy = _normalize_strategy(strategy)
+        if self.strategy_help_button is not None:
+            t, d = self._strategy_help_content(strategy)
+            self.strategy_help_button.set_help(t, d)
+
+        is_advanced = strategy == self.ADVANCED_STRATEGY
+        for ct, tab in self.tabs.items():
+            per_w = getattr(tab, "_per_tab_strategy_widget", None)
+            if per_w is not None:
+                per_w.setVisible(is_advanced and ct != "dead")
+            effective = self._resolve_strategy(ct)
+            tab.rebuild_instance_controls(strategy=effective)
+
+        if emit_signal:
+            try:
+                self.strategy_changed.emit(strategy)
+            except Exception:
+                pass
+
+    def _on_global_strategy_changed(self, new_strategy):
+        self._apply_strategy_to_tabs(new_strategy, emit_signal=True)
+        self._persist_all_params()
+
+    def _on_per_tab_strategy_changed(self, cell_type, new_strategy):
+        self.ip[f"per_ct_convpaint_strategy_{cell_type}"] = new_strategy
+        self._persist_all_params()
+
+    # ── Enable/disable + teardown helpers ────────────────────────────
+    def set_training_enabled(self, enabled):
+        enabled = bool(enabled)
+        for name in ("btn_train", "btn_rerun_preview", "btn_save_labels"):
+            w = getattr(self, name, None)
+            if w is not None:
+                w.setEnabled(enabled)
+        for tab in self.tabs.values():
+            btn = getattr(tab, "btn_preview", None)
+            if btn is not None:
+                btn.setEnabled(enabled)
+
+    def disable_training_params(self):
+        """Disable all training-specific controls in the plugin context.
+
+        Leaves segmentation post-processing parameters (EDT threshold,
+        probability thresholds, watershed settings, etc.) and their preview
+        buttons fully interactive.  Only the feature-extractor settings,
+        classifier hyper-parameters, tiling options, Train and Save-Labels
+        buttons are disabled.
+
+        Also hides the training log box (it would remain empty since no
+        training runs here) to avoid a large blank area in the widget.
+        """
+        for group_attr in ("fe_group", "clf_group"):
+            g = getattr(self, group_attr, None)
+            if g is not None:
+                g.setEnabled(False)
+        for attr in ("tile_annotations_cb", "tile_image_cb", "use_dask_cb"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.setEnabled(False)
+        for attr in ("btn_train", "btn_save_labels"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.setEnabled(False)
+
+    def cleanup(self):
+        """No persistent napari event handlers to disconnect for ConvPaint.
+
+        Provided for API symmetry with :class:`APOCTrainingWidget` so the
+        plugin can always call ``cleanup()`` before deleting the widget.
+        """
+
     def _on_save_labels(self):
         self.save_user_labels()
 
     def _log(self, msg):
-        self.log_box.appendPlainText(str(msg))
+        if self._external_log is not None:
+            self._external_log(str(msg))
+        else:
+            self.log_box.appendPlainText(str(msg))
         QApplication.processEvents()
 
     # ── Model building ──────────────────────────────────────────────
@@ -1191,14 +1656,25 @@ class ConvPaintTrainingWidget(QWidget):
     # ── Training ────────────────────────────────────────────────────
 
     def _on_train_clicked(self):
-        self._log("Auto-saving user labels before training...")
-        self.save_user_labels()
-        self._train_unified_classifier()
-        if self.has_death:
-            self._train_death_classifier()
-        self._persist_all_params()
-        if self.legend_tab is not None:
-            self.legend_tab.refresh()
+        cell_types = list(self._tab_cell_types)
+        try:
+            self.training_started.emit(cell_types)
+        except Exception:
+            pass
+        try:
+            self._log("Auto-saving user labels before training...")
+            self.save_user_labels()
+            self._train_unified_classifier()
+            if self.has_death:
+                self._train_death_classifier()
+            self._persist_all_params()
+            if self.legend_tab is not None:
+                self.legend_tab.refresh()
+        finally:
+            try:
+                self.training_finished.emit(cell_types, None)
+            except Exception:
+                pass
 
     def _train_unified_classifier(self):
         """Train the single multi-class ConvPaint model."""
@@ -1454,6 +1930,10 @@ class ConvPaintTrainingWidget(QWidget):
     def _run_instance_preview(self, cell_type):
         """Re-run post-processing for ``cell_type`` from cached classifier output."""
         try:
+            self.instance_preview_started.emit(cell_type)
+        except Exception:
+            pass
+        try:
             if cell_type == "dead":
                 self._rerun_death_preview()
                 return
@@ -1472,10 +1952,13 @@ class ConvPaintTrainingWidget(QWidget):
 
             self._log(f"Running instance segmentation for {cell_type}...")
 
-            if self.convpaint_strategy == STRATEGY_PROB:
+            effective = self._resolve_strategy(cell_type)
+            if effective == STRATEGY_PROB:
                 self._preview_probability(cell_type, tab)
             else:
-                self._preview_edt(cell_type, tab)
+                # Pass the per-cell-type strategy so EDT/Peak-EDT branching
+                # is honored when in Advanced mode.
+                self._preview_edt(cell_type, tab, strategy=effective)
 
             _reorder_convpaint_layers(
                 self.viewer, self.all_cell_types, has_death=self.has_death,
@@ -1484,6 +1967,11 @@ class ConvPaintTrainingWidget(QWidget):
         except Exception as e:
             self._log(f"\u274c Preview failed for {cell_type}: {e}")
             traceback.print_exc()
+        finally:
+            try:
+                self.instance_preview_finished.emit(cell_type)
+            except Exception:
+                pass
 
     def _load_unified_predicted_labels(self):
         """Load the cached multi-class label volume for the training stack."""
@@ -1509,7 +1997,7 @@ class ConvPaintTrainingWidget(QWidget):
             )
             return None
 
-    def _preview_edt(self, cell_type, tab):
+    def _preview_edt(self, cell_type, tab, strategy=None):
         unified = self._load_unified_predicted_labels()
         if unified is None:
             self._log(
@@ -1519,6 +2007,7 @@ class ConvPaintTrainingWidget(QWidget):
         k = int(self.label_map["celltype_to_label"][cell_type])
         mask_stack = (unified == k).astype(np.uint8)
 
+        effective_strategy = _normalize_strategy(strategy or self.convpaint_strategy)
         instances = mask_to_instances(
             mask_stack,
             edt_thr=float(tab.edt_threshold_spin.value()),
@@ -1527,7 +2016,7 @@ class ConvPaintTrainingWidget(QWidget):
             if tab.fill_holes_cb is not None else True,
             segment_size_min=int(tab.segment_size_min_spin.value()),
             marker_strategy=(
-                "peak" if self.convpaint_strategy == STRATEGY_PEAK_EDT
+                "peak" if effective_strategy == STRATEGY_PEAK_EDT
                 else "threshold"
             ),
             peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,

@@ -286,6 +286,9 @@ class DataPreparationTab(QWidget):
 
         self._organoid_name_edits = []
         self._immune_name_edits = []
+        # Multicolor controls parallel to ``_immune_name_edits``.
+        self._immune_multicolor_flags: list[QCheckBox] = []
+        self._immune_multicolor_counts: list[QSpinBox] = []
         self._other_name_edits = []
 
         for i in range(self.n_organoid_spin.value()):
@@ -302,6 +305,34 @@ class DataPreparationTab(QWidget):
             self.cell_type_naming_container.addWidget(QLabel(f"Immune {i + 1}:"))
             self.cell_type_naming_container.addWidget(e)
             self._immune_name_edits.append(e)
+
+            # ── Multicolor controls (one row per immune type) ─────────
+            multi_row = QHBoxLayout()
+            multi_row.setContentsMargins(0, 0, 0, 0)
+            multi_chk = QCheckBox("Multicolor")
+            multi_chk.setToolTip(
+                "Tick when this immune cell type is split across multiple fluorescent\n"
+                "channels (e.g. red/green T cells). Each channel becomes its own\n"
+                "intermediate cell type named '{base}_{n}_multicolor', and feature\n"
+                "extraction operates on the aggregated '{base}_merged' output."
+            )
+            multi_n = QSpinBox()
+            multi_n.setRange(2, 10)
+            multi_n.setValue(2)
+            multi_n.setMaximumWidth(70)
+            multi_n.setSuffix(" ch")
+            multi_n.setEnabled(False)
+
+            def _toggle_multi(state, spin=multi_n):
+                spin.setEnabled(bool(state))
+
+            multi_chk.stateChanged.connect(_toggle_multi)
+            multi_row.addWidget(multi_chk)
+            multi_row.addWidget(multi_n)
+            multi_row.addStretch()
+            self.cell_type_naming_container.addLayout(multi_row)
+            self._immune_multicolor_flags.append(multi_chk)
+            self._immune_multicolor_counts.append(multi_n)
 
         for i in range(self.n_other_spin.value()):
             e = QLineEdit(f"other{i + 1}")
@@ -320,7 +351,7 @@ class DataPreparationTab(QWidget):
         self._sample_forms = []
 
         org_names = [e.text().strip() for e in self._organoid_name_edits]
-        imm_names = [e.text().strip() for e in self._immune_name_edits]
+        imm_names = self._expanded_immune_names()
         oth_names = [e.text().strip() for e in self._other_name_edits]
         include_dead = self.include_dead_cb.isChecked()
 
@@ -328,6 +359,38 @@ class DataPreparationTab(QWidget):
             form = self._create_sample_form(idx, org_names, imm_names, oth_names, include_dead)
             self._sample_forms.append(form)
             self.sample_form_container.addWidget(form["group"])
+
+    def _expanded_immune_names(self) -> list[str]:
+        """Return immune cell type names with multicolor expansion applied.
+
+        Mirrors :meth:`behav3d.widgets.metadata._on_names_confirmed`: when the
+        Multicolor checkbox is ticked next to an immune name, that base name is
+        expanded into N entries of the form ``{base}_{n}_multicolor`` (one per
+        configured channel). Untouched names pass through unchanged.
+        """
+        flags = getattr(self, "_immune_multicolor_flags", [])
+        counts = getattr(self, "_immune_multicolor_counts", [])
+        out: list[str] = []
+        for idx, edit in enumerate(self._immune_name_edits):
+            base = edit.text().strip()
+            if not base:
+                continue
+            is_multi = (
+                idx < len(flags)
+                and flags[idx] is not None
+                and flags[idx].isChecked()
+            )
+            if is_multi:
+                try:
+                    n = int(counts[idx].value()) if idx < len(counts) else 2
+                except Exception:
+                    n = 2
+                n = max(2, n)
+                for j in range(n):
+                    out.append(f"{base}_{j+1}_multicolor")
+            else:
+                out.append(base)
+        return out
 
     def _create_sample_form(self, idx: int, org_names, imm_names, oth_names, include_dead) -> dict:
         grp = QGroupBox(f"Sample {idx + 1}")
@@ -560,10 +623,15 @@ class DataPreparationTab(QWidget):
         oth_types = detect_other_cell_types_from_metadata(md)
         include_dead = "dead_channel" in md.columns
 
+        # Collapse multicolor channel entries (``{base}_{n}_multicolor``) into
+        # a base name + channel count so the UI can re-show the checkbox+spin
+        # row instead of N separate naming edits.
+        imm_bases, imm_multicolor = self._collapse_multicolor_immune_names(imm_types)
+
         # Set spinners
         self.n_samples_spin.setValue(len(md))
         self.n_organoid_spin.setValue(len(org_types))
-        self.n_immune_spin.setValue(len(imm_types))
+        self.n_immune_spin.setValue(len(imm_bases))
         self.n_other_spin.setValue(len(oth_types))
         self.include_dead_cb.setChecked(include_dead)
 
@@ -574,15 +642,52 @@ class DataPreparationTab(QWidget):
         for i, name in enumerate(org_types):
             if i < len(self._organoid_name_edits):
                 self._organoid_name_edits[i].setText(name)
-        for i, name in enumerate(imm_types):
+        for i, name in enumerate(imm_bases):
             if i < len(self._immune_name_edits):
                 self._immune_name_edits[i].setText(name)
+        for i, n_channels in enumerate(imm_multicolor):
+            if n_channels and n_channels > 1 and i < len(self._immune_multicolor_flags):
+                self._immune_multicolor_flags[i].setChecked(True)
+                if i < len(self._immune_multicolor_counts):
+                    self._immune_multicolor_counts[i].setValue(int(n_channels))
         for i, name in enumerate(oth_types):
             if i < len(self._other_name_edits):
                 self._other_name_edits[i].setText(name)
 
         # Build sample forms
         self._build_sample_forms()
+
+    @staticmethod
+    def _collapse_multicolor_immune_names(imm_types):
+        """Collapse ``base_N_multicolor`` siblings into ``(bases, n_channels)``.
+
+        Mirrors the notebook builder's expansion logic in reverse so that when
+        the user opens an existing CSV containing per-channel multicolor names
+        (e.g. ``tcell_1_multicolor`` + ``tcell_2_multicolor``), the builder
+        re-shows a single ``tcell`` row with the Multicolor checkbox ticked.
+
+        Non-multicolor names pass through unchanged with ``n_channels=0``.
+        """
+        import re
+        pattern = re.compile(r"^(?P<base>.+)_(?P<idx>\d+)_multicolor$")
+        bases: list[str] = []
+        counts: dict[str, int] = {}
+        order: list[str] = []
+        for name in imm_types:
+            m = pattern.match(str(name))
+            if m:
+                base = m.group("base")
+                if base not in counts:
+                    counts[base] = 0
+                    order.append(base)
+                counts[base] += 1
+            else:
+                if name not in counts:
+                    counts[name] = 0
+                    order.append(name)
+
+        n_channels_per_base = [counts[name] for name in order]
+        return order, n_channels_per_base
 
         # Populate each sample form from the DataFrame row
         for row_idx, (_, row) in enumerate(md.iterrows()):
@@ -666,7 +771,7 @@ class DataPreparationTab(QWidget):
             csv_path = Path(out_dir) / "metadata.csv"
 
         org_names = [e.text().strip() for e in self._organoid_name_edits]
-        imm_names = [e.text().strip() for e in self._immune_name_edits]
+        imm_names = self._expanded_immune_names()
         oth_names = [e.text().strip() for e in self._other_name_edits]
         include_dead = self.include_dead_cb.isChecked()
 
