@@ -284,6 +284,7 @@ class PixelClassifierPanel:
         self.edt_thresholds = {}
         self._create_edt_threshold_inputs()
         self._create_postprocessing_inputs()
+        self._create_peak_inputs()
         self._create_probability_threshold_inputs()
         self.use_all_timepoints = widgets.Checkbox(
             description="Process ALL timepoints",
@@ -410,43 +411,36 @@ class PixelClassifierPanel:
 
         # Build segmentation parameter widgets organized by cell type
         segmentation_widgets = [widgets.HTML("<b>Segmentation parameters per cell type</b>")]
-        
+
+        def _add_cell_type_rows(ct_list):
+            for ct in ct_list:
+                if ct not in self.edt_thresholds:
+                    continue
+                segmentation_widgets.append(widgets.HBox([
+                    self.edt_thresholds[ct],
+                    self.segment_size_mins[ct],
+                ]))
+                segmentation_widgets.append(widgets.HBox([
+                    self.opening_nr_pixels[ct],
+                    self.fill_holes[ct],
+                ]))
+                # Peak EDT params (shown/hidden via _toggle_engine_widgets)
+                peak_row = widgets.HBox([
+                    self.peak_min_distances[ct],
+                    self.peak_min_ratios[ct],
+                ])
+                peak_row._behav3d_peak_row = True
+                segmentation_widgets.append(peak_row)
+
         if self.organoid_types:
             segmentation_widgets.append(widgets.HTML("<i>Organoids:</i>"))
-            for org_type in self.organoid_types:
-                if org_type in self.edt_thresholds:
-                    segmentation_widgets.append(widgets.HBox([
-                        self.edt_thresholds[org_type],
-                        self.segment_size_mins[org_type],
-                    ]))
-                    segmentation_widgets.append(widgets.HBox([
-                        self.opening_nr_pixels[org_type],
-                        self.fill_holes[org_type],
-                    ]))
+            _add_cell_type_rows(self.organoid_types)
         if self.immune_types:
             segmentation_widgets.append(widgets.HTML("<i>Immune cells:</i>"))
-            for immune_type in self.immune_types:
-                if immune_type in self.edt_thresholds:
-                    segmentation_widgets.append(widgets.HBox([
-                        self.edt_thresholds[immune_type],
-                        self.segment_size_mins[immune_type],
-                    ]))
-                    segmentation_widgets.append(widgets.HBox([
-                        self.opening_nr_pixels[immune_type],
-                        self.fill_holes[immune_type],
-                    ]))
+            _add_cell_type_rows(self.immune_types)
         if self.other_types:
             segmentation_widgets.append(widgets.HTML("<i>Other cells:</i>"))
-            for other_type in self.other_types:
-                if other_type in self.edt_thresholds:
-                    segmentation_widgets.append(widgets.HBox([
-                        self.edt_thresholds[other_type],
-                        self.segment_size_mins[other_type],
-                    ]))
-                    segmentation_widgets.append(widgets.HBox([
-                        self.opening_nr_pixels[other_type],
-                        self.fill_holes[other_type],
-                    ]))
+            _add_cell_type_rows(self.other_types)
 
         # Store CPU/EDT widget group so it can be reused for CPU and APOC EDT workflows
         self._cpu_seg_params_box = widgets.VBox(segmentation_widgets)
@@ -680,6 +674,36 @@ class PixelClassifierPanel:
                 indent=False,
             )
 
+    def _create_peak_inputs(self):
+        """Create per-cell-type peak_min_distance and peak_min_ratio inputs (Peak EDT strategy)."""
+        pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
+
+        self.peak_min_distances = {}
+        self.peak_min_ratios = {}
+
+        for cell_type in self.all_cell_types:
+            saved_dist = pc.get(f"{cell_type}_peak_min_distance", 0.0)
+            self.peak_min_distances[cell_type] = widgets.BoundedFloatText(
+                description=f"{cell_type.capitalize()} peak dist:",
+                value=float(saved_dist),
+                min=0.0,
+                max=50.0,
+                step=0.5,
+                style={'description_width': '160px'},
+            )
+            self.peak_min_distances[cell_type].layout.width = 'auto'
+
+            saved_ratio = pc.get(f"{cell_type}_peak_min_ratio", 0.35)
+            self.peak_min_ratios[cell_type] = widgets.BoundedFloatText(
+                description=f"{cell_type.capitalize()} peak ratio:",
+                value=float(saved_ratio),
+                min=0.0,
+                max=1.0,
+                step=0.05,
+                style={'description_width': '160px'},
+            )
+            self.peak_min_ratios[cell_type].layout.width = 'auto'
+
     def _create_probability_threshold_inputs(self):
         """Create per-cell-type mask and seed threshold inputs for probability map strategy."""
         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
@@ -714,7 +738,6 @@ class PixelClassifierPanel:
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
         pc["classifier_engine"] = str(self.classifier_engine.value)
         pc["examples_per_sample"] = int(self.examples_per_sample.value)
-        #pc["sample_specific_classifier"] = bool(self.sample_specific_classifier.value)
         pc["workers"] = int(self.n_workers.value)
         pc["use_all_timepoints"] = bool(self.use_all_timepoints.value)
         pc["tp_start"] = int(self.tp_start.value)
@@ -742,6 +765,10 @@ class PixelClassifierPanel:
                 pc[f"{cell_type}_prob_mask_threshold"] = float(self.prob_mask_thresholds[cell_type].value)
             if cell_type in self.prob_seed_thresholds:
                 pc[f"{cell_type}_prob_seed_threshold"] = float(self.prob_seed_thresholds[cell_type].value)
+            if cell_type in self.peak_min_distances:
+                pc[f"{cell_type}_peak_min_distance"] = float(self.peak_min_distances[cell_type].value)
+            if cell_type in self.peak_min_ratios:
+                pc[f"{cell_type}_peak_min_ratio"] = float(self.peak_min_ratios[cell_type].value)
         
         if self.manual_clf_paths.value:
             pc["clf_dir"] = str(self.clf_dir.value or "")
@@ -792,6 +819,13 @@ class PixelClassifierPanel:
         # CPU segmentation parameters (EDT, min size, opening, fill holes)
         self._cpu_seg_params_box.layout.display = hide_cpu
         self.n_workers.layout.display = (None if not is_apoc and not is_convpaint else 'none')
+
+        # Peak EDT rows: visible only for APOC Peak or ConvPaint Peak
+        show_peak = is_apoc_peak or is_cp_peak
+        peak_display = None if show_peak else 'none'
+        for w in self._cpu_seg_params_box.children:
+            if getattr(w, '_behav3d_peak_row', False):
+                w.layout.display = peak_display
 
         # Probability Map parameters
         self._prob_params_box.layout.display = (None if needs_prob else 'none')
@@ -932,6 +966,8 @@ class PixelClassifierPanel:
         to_lock.extend(self.fill_holes.values())
         to_lock.extend(self.prob_mask_thresholds.values())
         to_lock.extend(self.prob_seed_thresholds.values())
+        to_lock.extend(self.peak_min_distances.values())
+        to_lock.extend(self.peak_min_ratios.values())
         to_lock.extend([self.gpu_device, self.apoc_strategy, self.convpaint_strategy])
         for w in self.apoc_min_size_inputs.values(): w.disabled = state
         for w in [self.btn_size_filter]: w.disabled = state
@@ -988,6 +1024,12 @@ class PixelClassifierPanel:
         params["apoc_strategy"] = str(self.apoc_strategy.value)
         params["convpaint_strategy"] = str(self.convpaint_strategy.value)
 
+        for cell_type in self.all_cell_types:
+            if cell_type in self.peak_min_distances:
+                params[f"{cell_type}_peak_min_distance"] = float(self.peak_min_distances[cell_type].value)
+            if cell_type in self.peak_min_ratios:
+                params[f"{cell_type}_peak_min_ratio"] = float(self.peak_min_ratios[cell_type].value)
+
         # Include saved APOC per-cell-type params from config YAML
         pc = _cfg_get(self.metadata_loader.behav3d_parameters, "pixel_classifier", {})
         all_apoc_types = list(self.all_cell_types)
@@ -1036,6 +1078,11 @@ class PixelClassifierPanel:
             cp_val = str(params["convpaint_strategy"])
             if cp_val in self.convpaint_strategy.options:
                 self.convpaint_strategy.value = cp_val
+        for cell_type in self.all_cell_types:
+            if f"{cell_type}_peak_min_distance" in params and cell_type in self.peak_min_distances:
+                self.peak_min_distances[cell_type].value = float(params[f"{cell_type}_peak_min_distance"])
+            if f"{cell_type}_peak_min_ratio" in params and cell_type in self.peak_min_ratios:
+                self.peak_min_ratios[cell_type].value = float(params[f"{cell_type}_peak_min_ratio"])
 
         # Cache APOC and ConvPaint per-cell-type params into the YAML config dict
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})

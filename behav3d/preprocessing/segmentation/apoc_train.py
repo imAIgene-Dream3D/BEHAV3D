@@ -553,6 +553,8 @@ def _mask_array_to_segments(
     segment_size_min,
     fill_holes,
     marker_strategy="threshold",
+    peak_min_distance=None,
+    peak_min_ratio=0.35,
 ):
     """Convert a binary mask array to instances using the EDT workflow."""
     from behav3d.preprocessing.segmentation.segmentation_utils import postprocess_mask, segment_mask
@@ -574,6 +576,8 @@ def _mask_array_to_segments(
                 use_dims=3,
                 n_workers=1,
                 marker_strategy=marker_strategy,
+                peak_min_distance=peak_min_distance,
+                peak_min_ratio=peak_min_ratio,
             )
         ).astype(np.uint16)
 
@@ -858,6 +862,8 @@ class CellTypeTab(QWidget):
         self.segment_size_min_spin = None
         self.opening_nr_pixels_spin = None
         self.fill_holes_cb = None
+        self.peak_min_distance_spin = None
+        self.peak_min_ratio_spin = None
         self._build_instance_controls(root_params)
 
         layout.addStretch()
@@ -984,6 +990,25 @@ class CellTypeTab(QWidget):
             row2.addWidget(self.fill_holes_cb)
             group_layout.addLayout(row2)
 
+            if self._apoc_strategy == "APOC Mask + Peak EDT/Watershed Resegmentation":
+                row3 = QHBoxLayout()
+                self.peak_min_distance_spin = QDoubleSpinBox()
+                self.peak_min_distance_spin.setRange(0.0, 50.0)
+                self.peak_min_distance_spin.setSingleStep(0.5)
+                self.peak_min_distance_spin.setValue(float(initial_params.get(f"{self.cell_type}_peak_min_distance", 0.0)))
+                self.peak_min_distance_spin.setToolTip("Minimum distance (µm) between local EDT peaks used as watershed seeds")
+                row3.addWidget(QLabel("Peak min dist:"))
+                row3.addWidget(self.peak_min_distance_spin)
+
+                self.peak_min_ratio_spin = QDoubleSpinBox()
+                self.peak_min_ratio_spin.setRange(0.0, 1.0)
+                self.peak_min_ratio_spin.setSingleStep(0.05)
+                self.peak_min_ratio_spin.setValue(float(initial_params.get(f"{self.cell_type}_peak_min_ratio", 0.35)))
+                self.peak_min_ratio_spin.setToolTip("Minimum EDT peak height as a fraction of the local maximum (0–1)")
+                row3.addWidget(QLabel("Peak min ratio:"))
+                row3.addWidget(self.peak_min_ratio_spin)
+                group_layout.addLayout(row3)
+
         self.run_instance_btn = QtPushButton("Run instance segmentation")
         self.run_instance_btn.clicked.connect(self._on_run_instance_segmentation)
         group_layout.addWidget(self.run_instance_btn)
@@ -996,6 +1021,8 @@ class CellTypeTab(QWidget):
             self.edt_threshold_spin,
             self.segment_size_min_spin,
             self.opening_nr_pixels_spin,
+            self.peak_min_distance_spin,
+            self.peak_min_ratio_spin,
         ]:
             if widget is not None:
                 widget.valueChanged.connect(self._emit_params_changed)
@@ -1238,6 +1265,12 @@ class CellTypeTab(QWidget):
             "fill_holes": (
                 bool(self.fill_holes_cb.isChecked()) if self.fill_holes_cb is not None else None
             ),
+            "peak_min_distance": (
+                float(self.peak_min_distance_spin.value()) if self.peak_min_distance_spin is not None else None
+            ),
+            "peak_min_ratio": (
+                float(self.peak_min_ratio_spin.value()) if self.peak_min_ratio_spin is not None else None
+            ),
         }
 
     def apply_config(self, cfg):
@@ -1277,6 +1310,10 @@ class CellTypeTab(QWidget):
             self.opening_nr_pixels_spin.setValue(int(cfg["opening_nr_pixels"]))
         if "fill_holes" in cfg and self.fill_holes_cb is not None and cfg["fill_holes"] is not None:
             self.fill_holes_cb.setChecked(bool(cfg["fill_holes"]))
+        if "peak_min_distance" in cfg and self.peak_min_distance_spin is not None and cfg["peak_min_distance"] is not None:
+            self.peak_min_distance_spin.setValue(float(cfg["peak_min_distance"]))
+        if "peak_min_ratio" in cfg and self.peak_min_ratio_spin is not None and cfg["peak_min_ratio"] is not None:
+            self.peak_min_ratio_spin.setValue(float(cfg["peak_min_ratio"]))
         self._update_preview()
 
 
@@ -1340,6 +1377,8 @@ class APOCTrainingWidget(QWidget):
             self._log_fn(text)
 
     def _build_ui(self):
+        # Content widget (scrollable)
+        content_widget = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
@@ -1410,7 +1449,19 @@ class APOCTrainingWidget(QWidget):
         layout.addWidget(self.status_label)
 
         layout.addStretch()
-        self.setLayout(layout)
+        content_widget.setLayout(layout)
+
+        # Wrap everything in a scroll area so the full widget is reachable
+        scroll = QScrollArea()
+        scroll.setWidget(content_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        outer_layout = QVBoxLayout()
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.addWidget(scroll)
+        self.setLayout(outer_layout)
 
     def _connect_signals(self):
         self.apply_all_btn.clicked.connect(self._on_apply_to_all)
@@ -1650,6 +1701,8 @@ class APOCTrainingWidget(QWidget):
             segment_size_min=int(tab.segment_size_min_spin.value()),
             fill_holes=bool(tab.fill_holes_cb.isChecked()),
             marker_strategy=marker_strategy,
+            peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
+            peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
         )
 
     def _run_instance_preview(self, ct):
@@ -1698,6 +1751,8 @@ class APOCTrainingWidget(QWidget):
                     segment_size_min=int(tab.segment_size_min_spin.value()),
                     fill_holes=bool(tab.fill_holes_cb.isChecked()),
                     marker_strategy=marker_strategy,
+                    peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
+                    peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
                 )
 
             self._update_prediction_layers(ct, instance_preview, prob_prediction)
@@ -1945,6 +2000,10 @@ class APOCTrainingWidget(QWidget):
                 params[f"{ct}_opening_nr_pixels"] = cfg["opening_nr_pixels"]
             if cfg["fill_holes"] is not None:
                 params[f"{ct}_fill_holes"] = cfg["fill_holes"]
+            if cfg["peak_min_distance"] is not None:
+                params[f"{ct}_peak_min_distance"] = cfg["peak_min_distance"]
+            if cfg["peak_min_ratio"] is not None:
+                params[f"{ct}_peak_min_ratio"] = cfg["peak_min_ratio"]
         return params
 
     def _persist_params(self):

@@ -590,6 +590,9 @@ def run_apoc_segmentation(
 
                         edt_thr = cfg.get(f"{ct}_edt_threshold", 1.0)
                         segment_size_min = cfg.get(f"{ct}_segment_size_min", 10)
+                        _raw_peak_dist = cfg.get(f"{ct}_peak_min_distance", 0)
+                        peak_min_distance = None if (not _raw_peak_dist or float(_raw_peak_dist) <= 0) else float(_raw_peak_dist)
+                        peak_min_ratio = float(cfg.get(f"{ct}_peak_min_ratio", 0.35))
                         seg_refined = segment_mask(
                             proc_mask,
                             edt_thr=edt_thr,
@@ -602,6 +605,8 @@ def run_apoc_segmentation(
                                 if apoc_strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
                                 else "threshold"
                             ),
+                            peak_min_distance=peak_min_distance,
+                            peak_min_ratio=peak_min_ratio,
                         )
                         zarr_segs[ct][t] = np.asarray(seg_refined).astype(np.uint16)
 

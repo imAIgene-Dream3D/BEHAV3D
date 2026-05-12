@@ -602,6 +602,9 @@ def _process_edt_timepoint(
         opening_nr_pixels = int(cfg.get(f"{ct}_opening_nr_pixels", 0))
         edt_thr = float(cfg.get(f"{ct}_edt_threshold", 1.0))
         segment_size_min = int(cfg.get(f"{ct}_segment_size_min", 10))
+        _raw_peak_dist = cfg.get(f"{ct}_peak_min_distance", 0)
+        peak_min_distance = None if (not _raw_peak_dist or float(_raw_peak_dist) <= 0) else float(_raw_peak_dist)
+        peak_min_ratio = float(cfg.get(f"{ct}_peak_min_ratio", 0.35))
 
         instances = mask_to_instances(
             mask_out,
@@ -610,6 +613,8 @@ def _process_edt_timepoint(
             fill_holes=fill_holes,
             segment_size_min=segment_size_min,
             marker_strategy=marker_strategy,
+            peak_min_distance=peak_min_distance,
+            peak_min_ratio=peak_min_ratio,
         )
         zarr_segs[ct][t] = instances.astype(np.uint16)
         if diag:
@@ -688,6 +693,9 @@ def _resegment_timepoint(
         opening_nr_pixels = int(cfg.get(f"{ct}_opening_nr_pixels", 0))
         segment_size_min = int(cfg.get(f"{ct}_segment_size_min", 10))
 
+        _raw_peak_dist = cfg.get(f"{ct}_peak_min_distance", 0)
+        peak_min_distance = None if (not _raw_peak_dist or float(_raw_peak_dist) <= 0) else float(_raw_peak_dist)
+        peak_min_ratio = float(cfg.get(f"{ct}_peak_min_ratio", 0.35))
         if strategy == STRATEGY_PROB:
             seed_thr = float(cfg.get(f"{ct}_prob_seed_threshold", 0.8))
             instances = mask_to_instances(
@@ -707,5 +715,7 @@ def _resegment_timepoint(
                 fill_holes=fill_holes,
                 segment_size_min=segment_size_min,
                 marker_strategy="peak" if strategy == STRATEGY_PEAK_EDT else "threshold",
+                peak_min_distance=peak_min_distance,
+                peak_min_ratio=peak_min_ratio,
             )
         zarr_segs[ct][t] = instances.astype(np.uint16)

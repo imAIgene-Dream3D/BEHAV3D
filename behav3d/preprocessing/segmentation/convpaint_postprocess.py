@@ -136,7 +136,8 @@ def _finalize_segments(segments, segment_size_min):
 
 
 def _mask_volume_to_instances(mask, edt_thr, opening_nr_pixels, fill_holes,
-                              segment_size_min, marker_strategy="threshold"):
+                              segment_size_min, marker_strategy="threshold",
+                              peak_min_distance=None, peak_min_ratio=0.35):
     from behav3d.preprocessing.segmentation.segmentation_utils import (
         postprocess_mask,
         segment_mask,
@@ -155,17 +156,24 @@ def _mask_volume_to_instances(mask, edt_thr, opening_nr_pixels, fill_holes,
         use_dims=3,
         n_workers=1,
         marker_strategy=marker_strategy,
+        peak_min_distance=peak_min_distance,
+        peak_min_ratio=peak_min_ratio,
     )
     return _finalize_segments(instances, segment_size_min)
 
 
 def mask_to_instances(mask, *, edt_thr, opening_nr_pixels, fill_holes,
-                      segment_size_min, marker_strategy="threshold"):
+                      segment_size_min, marker_strategy="threshold",
+                      peak_min_distance=None, peak_min_ratio=0.35):
     """EDT/watershed instance segmentation of a binary mask.
 
     Parameters mirror the per-cell-type spinners in the napari widget /
     notebook controls.  ``mask`` may be 3-D ``(Z, Y, X)`` or 4-D
     ``(T, Z, Y, X)``.
+
+    ``peak_min_distance`` and ``peak_min_ratio`` are only used when
+    ``marker_strategy="peak"``.  Pass ``peak_min_distance=None`` (or ``0``) to
+    use the automatic default of ``2 × edt_thr``.
     """
     mask = np.asarray(mask)
     if mask.ndim == 4:
@@ -174,6 +182,7 @@ def mask_to_instances(mask, *, edt_thr, opening_nr_pixels, fill_holes,
                 _mask_volume_to_instances(
                     mask[t], edt_thr, opening_nr_pixels, fill_holes,
                     segment_size_min, marker_strategy,
+                    peak_min_distance, peak_min_ratio,
                 )
                 for t in range(mask.shape[0])
             ],
@@ -181,7 +190,7 @@ def mask_to_instances(mask, *, edt_thr, opening_nr_pixels, fill_holes,
         )
     return _mask_volume_to_instances(
         mask, edt_thr, opening_nr_pixels, fill_holes, segment_size_min,
-        marker_strategy,
+        marker_strategy, peak_min_distance, peak_min_ratio,
     )
 
 

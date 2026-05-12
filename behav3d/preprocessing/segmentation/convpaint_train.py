@@ -618,6 +618,8 @@ class CellTypeConvPaintTab(QWidget):
             self.fill_holes_cb = None
             self.prob_mask_threshold_spin = None
             self.prob_seed_threshold_spin = None
+            self.peak_min_distance_spin = None
+            self.peak_min_ratio_spin = None
             return
 
         strategy_lbl = QLabel(f"<i>Strategy:</i> <b>{self.strategy}</b>")
@@ -630,6 +632,8 @@ class CellTypeConvPaintTab(QWidget):
         self.fill_holes_cb = None
         self.prob_mask_threshold_spin = None
         self.prob_seed_threshold_spin = None
+        self.peak_min_distance_spin = None
+        self.peak_min_ratio_spin = None
 
         if self.strategy == STRATEGY_PROB:
             row1 = QHBoxLayout()
@@ -710,6 +714,35 @@ class CellTypeConvPaintTab(QWidget):
             row2.addWidget(self.fill_holes_cb)
             layout.addLayout(row2)
 
+            if self.strategy == STRATEGY_PEAK_EDT:
+                row3 = QHBoxLayout()
+                row3.addWidget(QLabel("Peak min dist:"))
+                self.peak_min_distance_spin = QDoubleSpinBox()
+                self.peak_min_distance_spin.setRange(0.0, 50.0)
+                self.peak_min_distance_spin.setSingleStep(0.5)
+                self.peak_min_distance_spin.setDecimals(2)
+                self.peak_min_distance_spin.setValue(
+                    float(ip.get(f"{cell_type}_peak_min_distance", 0.0))
+                )
+                self.peak_min_distance_spin.setToolTip(
+                    "Minimum distance (µm) between local EDT peaks used as watershed seeds"
+                )
+                row3.addWidget(self.peak_min_distance_spin)
+
+                row3.addWidget(QLabel("Peak min ratio:"))
+                self.peak_min_ratio_spin = QDoubleSpinBox()
+                self.peak_min_ratio_spin.setRange(0.0, 1.0)
+                self.peak_min_ratio_spin.setSingleStep(0.05)
+                self.peak_min_ratio_spin.setDecimals(2)
+                self.peak_min_ratio_spin.setValue(
+                    float(ip.get(f"{cell_type}_peak_min_ratio", 0.35))
+                )
+                self.peak_min_ratio_spin.setToolTip(
+                    "Minimum EDT peak height as a fraction of the local maximum (0–1)"
+                )
+                row3.addWidget(self.peak_min_ratio_spin)
+                layout.addLayout(row3)
+
         hint = QLabel(
             "<i>Re-runs only post-processing on the cached classifier output "
             "(no feature extraction).</i>"
@@ -731,6 +764,7 @@ class CellTypeConvPaintTab(QWidget):
             self.edt_threshold_spin, self.opening_nr_pixels_spin,
             self.segment_size_min_spin,
             self.prob_mask_threshold_spin, self.prob_seed_threshold_spin,
+            self.peak_min_distance_spin, self.peak_min_ratio_spin,
         ]:
             if spin is not None:
                 spin.valueChanged.connect(self._emit_params_changed)
@@ -764,6 +798,14 @@ class CellTypeConvPaintTab(QWidget):
         if self.prob_seed_threshold_spin is not None:
             params[f"{ct}_prob_seed_threshold"] = float(
                 self.prob_seed_threshold_spin.value()
+            )
+        if self.peak_min_distance_spin is not None:
+            params[f"{ct}_peak_min_distance"] = float(
+                self.peak_min_distance_spin.value()
+            )
+        if self.peak_min_ratio_spin is not None:
+            params[f"{ct}_peak_min_ratio"] = float(
+                self.peak_min_ratio_spin.value()
             )
         return params
 
@@ -1488,6 +1530,8 @@ class ConvPaintTrainingWidget(QWidget):
                 "peak" if self.convpaint_strategy == STRATEGY_PEAK_EDT
                 else "threshold"
             ),
+            peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
+            peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
         )
         self._set_labels_layer(_segments_layer_name(cell_type), instances)
 
