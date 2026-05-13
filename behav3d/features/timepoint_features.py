@@ -162,9 +162,8 @@ import warnings
 
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial.distance import cdist
-from scipy.spatial import ConvexHull
 
-from skimage.measure import regionprops_table, marching_cubes, mesh_surface_area
+from skimage.measure import regionprops_table
 import argparse
 import yaml
 from pathlib import Path
@@ -179,6 +178,7 @@ import ast
 import math
 import time
 import traceback
+from behav3d.analysis import smooth_value_over_time
 from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
 from behav3d.io.images import load_image, convert_raw_file_to_zarr
 from tqdm import tqdm
@@ -204,6 +204,131 @@ def _run_parallel_with_fallback(fn, args_list, n_workers):
             f"(likely out of memory). Please lower the number of workers "
             f"and try again."
         )
+
+
+def _normalize_merge_keys(df, keys=("TrackID", "position_t")):
+    """Normalize merge keys to nullable integer dtype for robust joins."""
+    for key in keys:
+        if key in df.columns:
+            df[key] = pd.to_numeric(df[key], errors="coerce").astype("Int64")
+    return df
+
+
+def _segment_touches_border(mask):
+    """Return True when any foreground voxel touches the 3D image border."""
+    if mask.ndim != 3:
+        return False
+    return bool(
+        np.any(mask[0, :, :])
+        or np.any(mask[-1, :, :])
+        or np.any(mask[:, 0, :])
+        or np.any(mask[:, -1, :])
+        or np.any(mask[:, :, 0])
+        or np.any(mask[:, :, -1])
+    )
+
+
+def _voxel_surface_area(mask, voxel_spacing):
+    """Estimate surface area from exposed voxel faces in physical units."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 3 or not np.any(mask):
+        return np.nan
+
+    vz, vy, vx = map(float, voxel_spacing)
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+
+    z_faces = np.count_nonzero(padded[1:, :, :] != padded[:-1, :, :])
+    y_faces = np.count_nonzero(padded[:, 1:, :] != padded[:, :-1, :])
+    x_faces = np.count_nonzero(padded[:, :, 1:] != padded[:, :, :-1])
+
+    return float((z_faces * vy * vx) + (y_faces * vz * vx) + (x_faces * vz * vy))
+
+
+def _principal_axis_metrics(coords, voxel_spacing):
+    """Compute spacing-aware principal-axis lengths and orientation from voxel centers."""
+    coords = np.asarray(coords, dtype=float)
+    if coords.size == 0:
+        nan_vec = [np.nan, np.nan, np.nan]
+        return {
+            "axis_lengths": np.array([np.nan, np.nan, np.nan], dtype=float),
+            "orientation_vector": nan_vec,
+            "oblateness": np.nan,
+            "prolateness": np.nan,
+        }
+
+    spacing = np.asarray(voxel_spacing, dtype=float)
+    pts = coords * spacing
+
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        center = pts.mean(axis=0, keepdims=True)
+        X = pts - center
+        _, _, Vt = np.linalg.svd(X, full_matrices=True)
+        V = Vt.T
+        proj = X @ V
+        center_lengths = np.ptp(proj, axis=0)
+        support_widths = np.abs(V).T @ spacing
+        lengths = center_lengths + support_widths
+
+        if (
+            V.shape != (3, 3)
+            or lengths.shape != (3,)
+            or (not np.all(np.isfinite(V)))
+            or (not np.all(np.isfinite(lengths)))
+        ):
+            raise FloatingPointError("invalid principal-axis geometry")
+
+        order = np.argsort(lengths)[::-1]
+        axis_lengths = lengths[order]
+        V_sorted = V[:, order]
+
+        a, b, c = axis_lengths
+        major_vec = V_sorted[:, 0]
+        major_norm = float(np.linalg.norm(major_vec))
+        orientation_vector = [np.nan, np.nan, np.nan]
+        if np.isfinite(major_norm) and major_norm > 0:
+            orientation_vector = (major_vec / major_norm).tolist()
+
+        oblateness = np.nan
+        prolateness = np.nan
+        if np.isfinite(a) and a > 0:
+            if np.isfinite(c):
+                oblateness = float(1.0 - (c / a))
+            if np.isfinite(b):
+                prolateness = float(1.0 - (b / a))
+
+    return {
+        "axis_lengths": axis_lengths.astype(float),
+        "orientation_vector": orientation_vector,
+        "oblateness": oblateness,
+        "prolateness": prolateness,
+    }
+
+
+def calculate_smoothed_death_columns(df_tracks, window_size):
+    death_columns = [
+        "percentage_dead_mask",
+        "nr_dead_mask_pixels",
+        "increase_dead_mask",
+    ]
+    
+    for column in death_columns:
+        smoothed_column = f"smoothed_{column}"
+        if column not in df_tracks.columns:
+            df_tracks[smoothed_column] = np.nan
+            continue
+
+        if window_size is None:
+            df_tracks[smoothed_column] = df_tracks[column]
+        else:
+            df_tracks[smoothed_column] = smooth_value_over_time(
+                df_tracks,
+                column=column,
+                window_size=window_size,
+                min_periods=1,
+                groupby=["TrackID", "sample_name"],
+            )
+
+    return df_tracks
 
 
 def run_feature_extraction(
@@ -489,6 +614,19 @@ def run_feature_extraction(
                 df_tracks = df_tracks.sort_values(['TrackID', 'position_t'])
             else:
                 print(f"{get_current_time()} - Skipping movement features as not requested in features_choice")
+            
+            if "death" in features_choice:
+                print("Smoothing death features with a rolling window of 10 minutes...")
+                def get_death_smoothing_window_size(time_interval, time_unit, smoothing_minutes=10):
+                    interval_minutes = convert_time(time_interval, time_unit, convert_to="m")
+                    if interval_minutes <= 0 or interval_minutes > smoothing_minutes:
+                        return None
+                    return max(1, int(round(smoothing_minutes / interval_minutes)))
+                death_smoothing_window_size = get_death_smoothing_window_size(time_interval, time_unit)
+                df_tracks = calculate_smoothed_death_columns(
+                    df_tracks,
+                    window_size=death_smoothing_window_size,
+                )
                 
             if "death" in features_choice:
                 # Calculate death features if threshold specified and dead_channel exists
@@ -573,37 +711,17 @@ def calculate_image_based_track_features(
     - A .csv file containing all timepoints of all TrackIDs and their time-related 
       features
     """
-
-    # Load the current cell type's segments
-    segments = load_image(current_cell_segments_path)
     segments_path = current_cell_segments_path
-    
-    # Load dead mask (only if path is provided)
-    dead_mask = None
-    if dead_mask_path is not None:
-        dead_mask = load_image(dead_mask_path)
-    
-    # Load all organoid types' segments (for contact calculation)
-    organoid_segments_dict = {}
-    for org_type, org_path in organoid_segments_paths.items():
-        organoid_segments_dict[org_type] = load_image(org_path)
-    
-    # Load all immune cell types' segments (for contact calculation)
-    immune_segments_dict = {}
-    for immune_type, immune_path in immune_segments_paths.items():
-        immune_segments_dict[immune_type] = load_image(immune_path)
-    
-    # Load all other cell types' segments (for contact calculation)
-    other_segments_dict = {}
-    for other_type, other_path in other_segments_paths.items():
-        other_segments_dict[other_type] = load_image(other_path)
+    has_dead_mask = dead_mask_path is not None
+    merge_keys = ["TrackID", "position_t"]
+    df_tracks = _normalize_merge_keys(df_tracks, keys=merge_keys)
     
     if "morphology" in features_choice:
         print(f"{get_current_time()} - Calculating morphology features...")
         morph_dtypes = {
-            "TrackID": int,
-            "position_t": int,
-            "nr_pixels": int,
+            "TrackID": "Int64",
+            "position_t": "Int64",
+            "nr_pixels": "Int64",
             "volume": float,
             "bbox_volume": float,
             "elongation": float,
@@ -619,24 +737,36 @@ def calculate_image_based_track_features(
             "surface_area": float,
             "sphericity": float,
             "convex_volume": float,
+            "surface_to_volume_ratio": float,
             "orientation_vector": object,
+            "border_touching_segment": "boolean",
         }
         
         if df_morphology_outpath.exists() and not overwrite:
             print("Morphology calculation .csv already exists. Loading in morphology information...")
-            df_morphology = pd.read_csv(df_morphology_outpath, dtype=morph_dtypes)
-            df_morphology["orientation_vector"] = df_morphology["orientation_vector"].apply(ast.literal_eval)
+            df_morphology = pd.read_csv(df_morphology_outpath)
+            if "orientation_vector" in df_morphology.columns:
+                df_morphology["orientation_vector"] = df_morphology["orientation_vector"].apply(
+                    lambda v: ast.literal_eval(v) if isinstance(v, str) and v.startswith("[") else v
+                )
         else:
             df_morphology=calculate_morphology_features(
                 segments_path=segments_path,
                 n_workers=n_workers,
                 voxel_spacing=(element_size_z, element_size_y, element_size_x)
             )
-            df_morphology = df_morphology.astype(morph_dtypes)
-            
             if df_morphology_outpath != "":
                 df_morphology.to_csv(df_morphology_outpath, sep=",", index=False)  
-        df_tracks = pd.merge(df_tracks, df_morphology, how="left")
+
+        for col, dtype in morph_dtypes.items():
+            if col in df_morphology.columns:
+                try:
+                    df_morphology[col] = df_morphology[col].astype(dtype)
+                except Exception:
+                    pass
+
+        df_morphology = _normalize_merge_keys(df_morphology, keys=merge_keys)
+        df_tracks = pd.merge(df_tracks, df_morphology, how="left", on=merge_keys)
     
     else:
         print(f"{get_current_time()} - Skipping full morphology features, only computing fast nr_pixels & volume")
@@ -647,52 +777,55 @@ def calculate_image_based_track_features(
         )
 
         basic_dtypes = {
-            "TrackID": int,
-            "position_t": int,
-            "nr_pixels": int,
+            "TrackID": "Int64",
+            "position_t": "Int64",
+            "nr_pixels": "Int64",
             "volume": float,
         }
         df_basic = df_basic.astype(basic_dtypes, copy=False)
-        df_tracks = pd.merge(df_tracks, df_basic, how="left")
+        df_basic = _normalize_merge_keys(df_basic, keys=merge_keys)
+        df_tracks = pd.merge(df_tracks, df_basic, how="left", on=merge_keys)
 
     if "intensity" in features_choice:
         print(f"{get_current_time()} - Calculating channel and especially death dye intensities...")
-        
-        intensity_image = load_image(raw_image_path)
-        
+
         if df_intensity_outpath.exists() and not overwrite:
             print("Intensity calculation .csv already exists. Loading in intensity information...")
             df_intensity = pd.read_csv(df_intensity_outpath)
         else:
             df_intensity=calculate_segment_intensity(
-                segments=segments,
-                intensity_image=intensity_image
+                segments=segments_path,
+                intensity_image=raw_image_path,
+                n_workers=n_workers,
             )
             if dead_channel is not None and pd.notna(dead_channel):
                 df_intensity = df_intensity.rename(columns={f"mean_intensity_ch{dead_channel}":"mean_dead_dye"})
             
             if df_intensity_outpath != "":
                 df_intensity.to_csv(df_intensity_outpath, sep=",", index=False)
-        df_tracks = pd.merge(df_tracks, df_intensity, how="left")
+        df_intensity = _normalize_merge_keys(df_intensity, keys=merge_keys)
+        df_tracks = pd.merge(df_tracks, df_intensity, how="left", on=merge_keys)
     else:
         print(f"{get_current_time()} - Skipping intensity features as not requested in features_choice")
     
     if "death" in features_choice:
-        if dead_channel is not None and pd.notna(dead_channel) and dead_mask is not None:
+        if dead_channel is not None and pd.notna(dead_channel) and has_dead_mask:
             print(f"{get_current_time()} - Calculating number of dead mask pixels...")
             if df_dead_mask_outpath.exists() and not overwrite:
                 print("Dead mask calculation .csv already exists. Loading in dead mask calculation information...")
                 df_dead_mask = pd.read_csv(df_dead_mask_outpath)
             else:
                 df_dead_mask=calculate_dead_mask(
-                    segments=segments,
-                    dead_mask=dead_mask
+                    segments=segments_path,
+                    dead_mask=dead_mask_path,
+                    n_workers=n_workers,
                 )
                 if df_dead_mask_outpath != "":
                     df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
-            df_tracks = pd.merge(df_tracks, df_dead_mask, how="left")
+            df_dead_mask = _normalize_merge_keys(df_dead_mask, keys=merge_keys)
+            df_tracks = pd.merge(df_tracks, df_dead_mask, how="left", on=merge_keys)
         else:
-            if dead_mask is None and dead_channel is not None:
+            if not has_dead_mask and dead_channel is not None:
                 print(f"{get_current_time()} - Skipping death mask calculations: dead_mask_path not found in metadata or file doesn't exist")
             else:
                 print(f"{get_current_time()} - Skipping death mask calculations: no dead_channel specified in metadata")
@@ -724,7 +857,8 @@ def calculate_image_based_track_features(
             )
             if df_contacts_outpath != "":
                 df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
-        df_tracks = pd.merge(df_tracks, df_contacts, how="left")
+        df_contacts = _normalize_merge_keys(df_contacts, keys=merge_keys)
+        df_tracks = pd.merge(df_tracks, df_contacts, how="left", on=merge_keys)
     else:
         print(f"{get_current_time()} - Skipping contact calculations as not requested in features_choice")
         
@@ -950,77 +1084,155 @@ def interpolate_missing_positions(
     -   Interpolates the numerical columns of [cols_to_interpolate] such as speed using linear
         interpolation
     -   Copies the columns of [cols_to_copy] using a forward fill from the last non-interpolated
-        row of each TrackID (includes all *_contact, *_contact_on_distance, touching_* columns)
+        row of each TrackID. Binary columns are always copied from the previous timepoint,
+        which keeps dynamically added contact/death/border flags stable across gaps.
     -   Puts None in any column not specified, such as SegmentID, as no actual segment exists
     """
-    
-    # Auto-detect contact columns if not specified
-    if cols_to_copy is None:
-        cols_to_copy = ["sample_name", "TrackID", "distance_unit", "time_unit", "orientation_vector", "principal_axes"]
-        
-        # Add metadata string columns that should be forward-filled, not interpolated
-        for col in df_tracks.columns:
-            # Add line_condition columns (organoid1_line_condition, tcell_line_condition, etc.)
-            if col.endswith('_line_condition'):
-                if col not in cols_to_copy:
-                    cols_to_copy.append(col)
-            # Add well and exp_nr columns
-            if col in ['well', 'exp_nr']:
-                if col not in cols_to_copy:
-                    cols_to_copy.append(col)
-        
-        # Add all dynamically-generated contact columns
-        for col in df_tracks.columns:
-            if (col.endswith('_contact') or 
-                col.endswith('_contact_on_distance') or 
-                col.startswith('touching_')):
-                if col not in cols_to_copy:
-                    cols_to_copy.append(col)
-    
-    # Interpolate missing timepoints so each calculation takes the same intervals
-    if  cols_to_interpolate is None or cols_to_interpolate == []:
-        # Select all columns that are not in cols_to_copy
-        cols_to_interpolate = df_tracks.columns.difference(cols_to_copy).tolist()
-        cols_to_interpolate = [col for col in cols_to_interpolate if col not in col_to_none]
-    
-    # Filter to only numeric columns - np.interp cannot handle object/string dtypes
-    numeric_cols = df_tracks.select_dtypes(include=[np.number]).columns.tolist()
-    cols_to_interpolate = [col for col in cols_to_interpolate if col in numeric_cols]
 
     # Nothing to interpolate – return as-is to avoid empty-concat errors downstream.
     if df_tracks.empty:
         return df_tracks
 
-    grouped_df = df_tracks.groupby('TrackID')
-    def interpolate_group(group, cols_to_interpolate, cols_to_copy):
-        # group=group.set_index('time', drop=False)
-        group["interpolated"]=False
-        min_time = group['position_t'].min()
-        max_time = group['position_t'].max()
-        all_times = [time for time in list(np.arange(min_time, max_time, 1))]+[max_time]
-        missing_times = pd.DataFrame({'position_t':[x for x in all_times if x not in group['position_t'].tolist()]})
-        missing_times["TrackID"]=group['TrackID'].unique()[0]
-        
-        df_interpolated=group.copy()
-        df_interpolated = pd.concat([group, missing_times], ignore_index=True).sort_values(by="position_t")
+    base_copy_cols = set(cols_to_copy or [])
+    base_copy_cols.update(
+        {
+            "sample_name",
+            "TrackID",
+            "distance_unit",
+            "time_unit",
+            "orientation_vector",
+            "principal_axes",
+            "well",
+            "exp_nr",
+        }
+    )
+    base_copy_cols.update(
+        {
+            col
+            for col in df_tracks.columns
+            if col.endswith("_line_condition")
+        }
+    )
 
-        for col in cols_to_interpolate:
-            df_interpolated[col] = np.interp(df_interpolated['position_t'], group['position_t'], group[col])
-        
-        cols_to_copy = [col for col in cols_to_copy if col in df_interpolated.columns]
-        # Apply forward-fill only to the newly added rows
-        newly_added_rows = df_interpolated.loc[df_interpolated['interpolated'].isna()]
-        for col in cols_to_copy:
-            for idx in newly_added_rows.index:
-                previous_idx = idx - 1
-                while previous_idx >= 0 and df_interpolated.loc[previous_idx, 'interpolated']:
-                    previous_idx -= 1
-                if previous_idx >= 0:
-                    df_interpolated.at[idx, col] = df_interpolated.at[previous_idx, col]
-        df_interpolated["interpolated"] = df_interpolated["interpolated"].astype("boolean").fillna(True)
-        assert(len(all_times)==len(df_interpolated)), f"Length of expected nr of timepoints ({len(all_times)}) is not the same as resulting timepoints ({df_interpolated})"
+    def _is_binary_series(series):
+        if pd.api.types.is_bool_dtype(series):
+            return True
+
+        numeric = pd.to_numeric(series.dropna(), errors="coerce")
+        numeric = numeric[np.isfinite(numeric)]
+        if numeric.empty:
+            return False
+
+        unique_values = set(pd.unique(numeric.astype(float)))
+        return unique_values.issubset({0.0, 1.0})
+
+    def _should_copy_series(series):
+        if series.name in base_copy_cols:
+            return True
+        if not pd.api.types.is_numeric_dtype(series):
+            return True
+        non_na = series.dropna()
+        if non_na.nunique(dropna=True) <= 1:
+            return True
+        return _is_binary_series(series)
+
+    def _copy_previous_values(series, missing_mask):
+        values = series.copy()
+        previous_value = pd.NA
+        has_previous = False
+
+        def _has_observed_value(value):
+            if value is pd.NA or value is None:
+                return False
+            if isinstance(value, (list, tuple, dict, set, np.ndarray)):
+                return True
+            try:
+                return not bool(pd.isna(value))
+            except TypeError:
+                return True
+
+        for idx, value in values.items():
+            if _has_observed_value(value):
+                previous_value = value
+                has_previous = True
+            elif bool(missing_mask.loc[idx]) and has_previous:
+                values.at[idx] = previous_value
+
+        return values
+
+    grouped_df = df_tracks.groupby('TrackID')
+
+    def interpolate_group(group):
+        group = group.sort_values("position_t").copy()
+        group["interpolated"] = False
+
+        min_time = int(group["position_t"].min())
+        max_time = int(group["position_t"].max())
+        all_times = pd.Index(np.arange(min_time, max_time + 1), name="position_t")
+
+        if group["position_t"].duplicated().any():
+            group = group.drop_duplicates(subset="position_t", keep="first")
+
+        df_interpolated = group.set_index("position_t").reindex(all_times).reset_index()
+        existing_rows = df_interpolated["TrackID"].notna()
+        missing_rows = ~existing_rows
+        df_interpolated["interpolated"] = ~existing_rows
+
+        explicit_interpolate_cols = set(cols_to_interpolate or [])
+        none_cols = {col for col in col_to_none if col in df_interpolated.columns}
+        copy_cols = {
+            col
+            for col in group.columns
+            if col not in none_cols and col != "position_t" and _should_copy_series(group[col])
+        }
+        copy_cols.update(
+            {
+                col
+                for col in df_interpolated.columns
+                if col in base_copy_cols and col not in none_cols and col != "position_t"
+            }
+        )
+
+        if explicit_interpolate_cols:
+            interpolate_cols = [
+                col
+                for col in explicit_interpolate_cols
+                if col in df_interpolated.columns
+                and col not in copy_cols
+                and col not in none_cols
+                and col != "position_t"
+                and pd.api.types.is_numeric_dtype(group[col])
+            ]
+        else:
+            interpolate_cols = [
+                col
+                for col in group.columns
+                if col not in copy_cols
+                and col not in none_cols
+                and col != "position_t"
+                and pd.api.types.is_numeric_dtype(group[col])
+            ]
+
+        for col in interpolate_cols:
+            series = pd.to_numeric(group.set_index("position_t")[col], errors="coerce")
+            series = series.reindex(all_times)
+            df_interpolated[col] = series.interpolate(method="index", limit_direction="both").to_numpy()
+
+        for col in copy_cols:
+            filled = _copy_previous_values(df_interpolated[col], missing_rows)
+            df_interpolated.loc[missing_rows, col] = filled.loc[missing_rows]
+
+        for col in none_cols:
+            df_interpolated.loc[missing_rows, col] = pd.NA
+
+        df_interpolated["interpolated"] = df_interpolated["interpolated"].astype("boolean")
+        assert len(all_times) == len(df_interpolated), (
+            f"Length of expected nr of timepoints ({len(all_times)}) is not the same as "
+            f"resulting timepoints ({df_interpolated})"
+        )
         return df_interpolated
-    df_interpolated = pd.concat([interpolate_group(group, cols_to_interpolate, cols_to_copy) for _, group in grouped_df])
+
+    df_interpolated = pd.concat([interpolate_group(group) for _, group in grouped_df])
     df_interpolated = df_interpolated.reset_index(drop=True)
     return(df_interpolated)
         
@@ -1400,22 +1612,62 @@ def calculate_contact_features(
 
     return pd.concat(results, ignore_index=True)
 
-def calculate_segment_intensity(segments, intensity_image, calculation="mean"):
+def _calculate_segment_intensity_single_timepoint(args):
+    t, segments_path, intensity_image_path, calculation = args
+    tcell_stack = np.asarray(load_image(segments_path)[t])
+    intensity_stack = np.asarray(load_image(intensity_image_path)[t]).transpose(1, 2, 3, 0)
+
+    properties = pd.DataFrame(
+        regionprops_table(
+            label_image=tcell_stack,
+            intensity_image=intensity_stack,
+            properties=["label", f"intensity_{calculation}"],
+        )
+    )
+    if properties.empty:
+        return pd.DataFrame(columns=["label", "position_t"])
+
+    properties["position_t"] = t
+    return properties
+
+
+def calculate_segment_intensity(segments, intensity_image, calculation="mean", n_workers=1):
     """
     Calculates the intensity of a specific marker features for each segment.
     The calculation can be the minimum, maximum, mean or median
     """
     assert calculation in ["min", "max", "mean", "median"]
-    intensity_image=np.transpose(intensity_image, axes=[0,2,3,4,1])
-    df_intensity = []
-    # for t, (tcell_stack, intensity_stack) in enumerate(zip(segments, intensity_image)):      
-    for t, (tcell_stack, intensity_stack) in tqdm(enumerate(zip(segments, intensity_image)),total=len(segments)):      
-        tcell_stack = np.asarray(tcell_stack)
-        intensity_stack = np.asarray(intensity_stack)
-        properties=pd.DataFrame(regionprops_table(label_image=tcell_stack, intensity_image=intensity_stack, properties=['label', f'intensity_{calculation}']))
-        properties["position_t"]=t
-        df_intensity.append(properties)
-    df_intensity = pd.concat(df_intensity)
+    if isinstance(segments, (str, Path)) and isinstance(intensity_image, (str, Path)):
+        timepoints = int(load_image(segments).shape[0])
+        args_list = [(t, segments, intensity_image, calculation) for t in range(timepoints)]
+        if n_workers > 1:
+            results = _run_parallel_with_fallback(_calculate_segment_intensity_single_timepoint, args_list, n_workers)
+        else:
+            results = [_calculate_segment_intensity_single_timepoint(args) for args in tqdm(args_list)]
+    else:
+        intensity_image = np.transpose(intensity_image, axes=[0, 2, 3, 4, 1])
+        results = []
+        for t, (tcell_stack, intensity_stack) in tqdm(enumerate(zip(segments, intensity_image)), total=len(segments)):
+            tcell_stack = np.asarray(tcell_stack)
+            intensity_stack = np.asarray(intensity_stack)
+            properties = pd.DataFrame(
+                regionprops_table(
+                    label_image=tcell_stack,
+                    intensity_image=intensity_stack,
+                    properties=["label", f"intensity_{calculation}"],
+                )
+            )
+            if properties.empty:
+                continue
+            properties["position_t"] = t
+            results.append(properties)
+
+    if not results:
+        return pd.DataFrame(columns=["TrackID", "position_t"])
+
+    df_intensity = pd.concat(results, ignore_index=True)
+    if df_intensity.empty:
+        return pd.DataFrame(columns=["TrackID", "position_t"])
     
     # Define a dictionary mapping old column names to new column names using regex
     column_mapping = {}
@@ -1472,36 +1724,65 @@ def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID
 #     return result
 
             
-def calculate_dead_mask(segments, dead_mask):
+def _calculate_dead_mask_single_timepoint(args):
+    t, segments_path, dead_mask_path = args
+    tcell_stack = np.asarray(load_image(segments_path)[t])
+    dead_mask_stack = np.asarray(load_image(dead_mask_path)[t])
+
+    properties = pd.DataFrame(
+        regionprops_table(
+            label_image=tcell_stack,
+            intensity_image=dead_mask_stack,
+            properties=["label", "num_pixels", "intensity_mean"],
+        )
+    )
+    if properties.empty:
+        return pd.DataFrame(
+            columns=["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]
+        )
+
+    properties["position_t"] = t
+    properties.rename(columns={"intensity_mean": "percentage_dead_mask"}, inplace=True)
+    properties["nr_dead_mask_pixels"] = properties["num_pixels"] * properties["percentage_dead_mask"]
+    properties = properties.rename(columns={"label": "TrackID"})
+    return properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]]
+
+
+def calculate_dead_mask(segments, dead_mask, n_workers=1):
     """
     Calculates the intensity of a specific marker features for each segment.
     The calculation can be the minimum, maximum, mean or median
     """
-    df_intensity = []
-    # for t, (tcell_stack, intensity_stack) in enumerate(zip(segments, intensity_image)):
-    for t, (tcell_stack, dead_mask_stack) in tqdm(enumerate(zip(segments, dead_mask)), total=len(segments)):
-        tcell_stack = np.asarray(tcell_stack)
-        dead_mask_stack = np.asarray(dead_mask_stack)
-        properties = pd.DataFrame(
-            regionprops_table(
-                label_image=tcell_stack,
-                intensity_image=dead_mask_stack,
-                properties=["label", "num_pixels", "intensity_mean"],
+    if isinstance(segments, (str, Path)) and isinstance(dead_mask, (str, Path)):
+        timepoints = int(load_image(segments).shape[0])
+        args_list = [(t, segments, dead_mask) for t in range(timepoints)]
+        if n_workers > 1:
+            results = _run_parallel_with_fallback(_calculate_dead_mask_single_timepoint, args_list, n_workers)
+        else:
+            results = [_calculate_dead_mask_single_timepoint(args) for args in tqdm(args_list)]
+    else:
+        results = []
+        for t, (tcell_stack, dead_mask_stack) in tqdm(enumerate(zip(segments, dead_mask)), total=len(segments)):
+            tcell_stack = np.asarray(tcell_stack)
+            dead_mask_stack = np.asarray(dead_mask_stack)
+            properties = pd.DataFrame(
+                regionprops_table(
+                    label_image=tcell_stack,
+                    intensity_image=dead_mask_stack,
+                    properties=["label", "num_pixels", "intensity_mean"],
+                )
             )
-        )
-        # No objects at this timepoint → nothing to append
-        if properties.empty:
-            continue
-        properties["position_t"] = t
-        properties.rename(columns={"intensity_mean": "percentage_dead_mask"}, inplace=True)
-        properties["nr_dead_mask_pixels"] = properties["num_pixels"] * properties["percentage_dead_mask"]
-        properties = properties.rename(columns={"label": "TrackID"})
-        properties = properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]]
-        df_intensity.append(properties)
+            if properties.empty:
+                continue
+            properties["position_t"] = t
+            properties.rename(columns={"intensity_mean": "percentage_dead_mask"}, inplace=True)
+            properties["nr_dead_mask_pixels"] = properties["num_pixels"] * properties["percentage_dead_mask"]
+            properties = properties.rename(columns={"label": "TrackID"})
+            results.append(properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]])
 
     # If no segments/dead-mask pixels were found across all timepoints,
     # return an empty but well-formed DataFrame so downstream code can continue.
-    if not df_intensity:
+    if not results:
         return pd.DataFrame(
             columns=[
                 "TrackID",
@@ -1512,7 +1793,7 @@ def calculate_dead_mask(segments, dead_mask):
             ]
         )
 
-    df_intensity = pd.concat(df_intensity, ignore_index=True)
+    df_intensity = pd.concat(results, ignore_index=True)
     if df_intensity.empty:
         # Should not happen because of the guard above, but keep this
         # as an extra safety net.
@@ -1600,8 +1881,8 @@ def calculate_basic_morphology(segments_path, voxel_spacing=(1.0, 1.0, 1.0), n_w
 
 def _calculate_morphology_single_timepoint(args):
     """
-    Function to compute morphology features for a single timepoint 
-    
+    Function to compute morphology features for a single timepoint.
+
     Features calculated:
     - volume
     - bbox_volume
@@ -1633,10 +1914,14 @@ def _calculate_morphology_single_timepoint(args):
             regionprops_table(
                 label_image=stack,
                 properties=[
-                    "label", "num_pixels", "area", "bbox_area",
-                    "solidity", "equivalent_diameter",
-                    "major_axis_length", "minor_axis_length", "inertia_tensor",
-                    "inertia_tensor_eigvals", "moments_central"
+                    "label",
+                    "num_pixels",
+                    "area",
+                    "bbox_area",
+                    "solidity",
+                    "equivalent_diameter",
+                    "inertia_tensor",
+                    "inertia_tensor_eigvals",
                 ],
                 spacing=voxel_spacing
             )
@@ -1649,165 +1934,118 @@ def _calculate_morphology_single_timepoint(args):
         "num_pixels": "nr_pixels",
     }, inplace=True)
 
-    # Derived scalar features
-    properties["elongation"] = properties["major_axis_length"] / properties["minor_axis_length"]
     properties["position_t"] = t
 
-    # Expensive per-region metrics
+    surface_areas = []
+    sphericities = []
+    convex_volumes = []
+    axis_length_a_list = []
+    axis_length_b_list = []
+    axis_length_c_list = []
+    major_axis_lengths = []
+    minor_axis_lengths = []
+    elongations = []
+    extents = []
+    surface_to_volume_ratios = []
+    orientation_vectors = []
+    oblateness_list = []
+    prolateness_list = []
+    border_touching_segments = []
+
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="divide by zero encountered in scalar divide")
         warnings.filterwarnings("ignore", message=".*convex hull image.*")
 
-        surface_areas = []
-        sphericities = []
-        convex_volumes = []
-
-        # NEW: principal-axis lengths & ellipticity (3D)
-        axis_length_a_list = []
-        axis_length_b_list = []
-        axis_length_c_list = []
-        oblateness_list = []
-        prolateness_list = []
-        principal_axes_list = []  # each entry is 3x3, columns are unit vectors for a,b,c
+        tensor_columns = [f"inertia_tensor-{i}-{j}" for i in range(3) for j in range(3)]
+        properties_by_track = properties.set_index("TrackID", drop=False)
 
         for region_label in properties["TrackID"]:
             mask = (stack == region_label)
             coords = np.argwhere(mask)
-            volume = properties.loc[properties["TrackID"] == region_label, "volume"].values[0]
+            row = properties_by_track.loc[region_label]
+            volume = float(row["volume"]) if np.isfinite(row["volume"]) else np.nan
+            solidity = float(row["solidity"]) if np.isfinite(row["solidity"]) else np.nan
 
-            # Surface area + sphericity via marching cubes (requires 3D support)
-            z_coords = coords[:, 0] if coords.size else np.array([0])
-            if (z_coords.max() - z_coords.min()) >= 1 and np.count_nonzero(mask) >= 4:
-                try:
-                    verts, faces, _, _ = marching_cubes(mask.astype(float), spacing=voxel_spacing)
-                    surface_area = mesh_surface_area(verts, faces)
-                    sphericity = (np.pi ** (1/3)) * ((6 * volume) ** (2/3)) / surface_area
-                except Exception:
-                    surface_area = np.nan
-                    sphericity = np.nan
-            else:
-                surface_area = np.nan
-                sphericity = np.nan
+            border_touching_segments.append(bool(_segment_touches_border(mask)))
 
+            surface_area = _voxel_surface_area(mask, voxel_spacing)
             surface_areas.append(surface_area)
-            sphericities.append(sphericity)
 
-            # Convex hull volume (in physical units)
-            if coords.shape[0] >= 4:
-                try:
-                    scaled_coords = coords * np.array(voxel_spacing)
-                    hull = ConvexHull(scaled_coords, qhull_options='QJ')
-                    convex_volume = hull.volume
-                except Exception:
-                    convex_volume = np.nan
+            if np.isfinite(surface_area) and surface_area > 0 and np.isfinite(volume) and volume > 0:
+                sphericities.append(float((np.pi ** (1.0 / 3.0)) * ((6.0 * volume) ** (2.0 / 3.0)) / surface_area))
+                surface_to_volume_ratios.append(float(surface_area / volume))
             else:
-                convex_volume = np.nan
+                sphericities.append(np.nan)
+                surface_to_volume_ratios.append(np.nan)
 
-            convex_volumes.append(convex_volume)
-
-            if coords.shape[0] >= 3:
-                try:
-                    # Suppress local floating-point warnings and fallback to NaNs on non-finite intermediates.
-                    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
-                        pts = coords.astype(float) * np.array(voxel_spacing, dtype=float)  # (N,3)
-                        if not np.isfinite(pts).all():
-                            raise FloatingPointError("non-finite points")
-
-                        center = pts.mean(axis=0, keepdims=True)
-                        X = pts - center
-                        if not np.isfinite(X).all():
-                            raise FloatingPointError("non-finite centered points")
-
-                        # SVD gives principal directions; Vt rows are unit vectors
-                        _, _, Vt = np.linalg.svd(X, full_matrices=False)
-                        V = Vt.T  # (3,3) columns are principal directions
-                        if not np.isfinite(V).all():
-                            raise FloatingPointError("non-finite principal directions")
-
-                        # Project onto principal directions and get extent along each
-                        proj = X @ V  # (N,3)
-                        if not np.isfinite(proj).all():
-                            raise FloatingPointError("non-finite projections")
-
-                        lengths = np.ptp(proj, axis=0)  # full lengths along each axis (a',b',c')
-                        if not np.isfinite(lengths).all():
-                            raise FloatingPointError("non-finite axis lengths")
-
-                        # Order by descending length: a >= b >= c
-                        order = np.argsort(lengths)[::-1]
-                        a, b, c = lengths[order]
-                        V_sorted = V[:, order]  # columns aligned with (a,b,c)
-                        if not np.isfinite(V_sorted).all():
-                            raise FloatingPointError("non-finite sorted principal directions")
-
-                        # Oblate and prolate ellipticity
-                        e_ob = 1 - (c / a) if a > 0 else np.nan
-                        e_pro = 1 - (b / a) if a > 0 else np.nan
-                    
-                    axis_length_a_list.append(a)
-                    axis_length_b_list.append(b)
-                    axis_length_c_list.append(c)
-                    oblateness_list.append(e_ob)
-                    prolateness_list.append(e_pro)
-                    principal_axes_list.append(V_sorted.tolist())
-                except Exception:
-                    axis_length_a_list.append(np.nan)
-                    axis_length_b_list.append(np.nan)
-                    axis_length_c_list.append(np.nan)
-                    oblateness_list.append(np.nan)
-                    prolateness_list.append(np.nan)
-                    principal_axes_list.append([[np.nan, np.nan, np.nan]] * 3)
+            if np.isfinite(solidity) and solidity > 0 and np.isfinite(volume) and volume > 0:
+                convex_volumes.append(float(volume / solidity))
             else:
-                axis_length_a_list.append(np.nan)
-                axis_length_b_list.append(np.nan)
-                axis_length_c_list.append(np.nan)
-                oblateness_list.append(np.nan)
-                prolateness_list.append(np.nan)
-                principal_axes_list.append([[np.nan, np.nan, np.nan]] * 3)
-            # ----------------------------------------------------------------
+                convex_volumes.append(np.nan)
 
-        properties["surface_area"] = surface_areas
-        properties["sphericity"] = sphericities
-        properties["convex_volume"] = convex_volumes
+            try:
+                metrics = _principal_axis_metrics(coords, voxel_spacing)
+            except Exception:
+                metrics = {
+                    "axis_lengths": np.array([np.nan, np.nan, np.nan], dtype=float),
+                    "orientation_vector": [np.nan, np.nan, np.nan],
+                    "oblateness": np.nan,
+                    "prolateness": np.nan,
+                }
 
-        # Guard against divide-by-zero in solidity calculation
-        with np.errstate(divide='ignore', invalid='ignore'):
-            properties["solidity"] = properties["volume"] / properties["convex_volume"]
-            properties["surface_to_volume_ratio"] = properties["surface_area"] / properties["volume"]
-        properties["axis1_length"] = axis_length_a_list
-        properties["axis2_length"] = axis_length_b_list
-        properties["axis3_length"] = axis_length_c_list
-        with np.errstate(divide='ignore', invalid='ignore'):
-            oriented_bbox_volume = (
-                properties["axis1_length"] * properties["axis2_length"] * properties["axis3_length"]
-            )
-            valid_oriented_bbox = (
-                np.isfinite(oriented_bbox_volume)
-                & (oriented_bbox_volume > 0)
-            )
-            properties["extent"] = np.where(
-                valid_oriented_bbox,
-                properties["volume"] / oriented_bbox_volume,
-                np.nan,
-            )
-        properties["oblateness"] = oblateness_list
-        properties["prolateness"] = prolateness_list
-        # properties["principal_axes"] = principal_axes_list  # columns: a,b,c
+            axis_lengths = np.asarray(metrics["axis_lengths"], dtype=float)
+            axis1 = float(axis_lengths[0]) if axis_lengths.shape == (3,) else np.nan
+            axis2 = float(axis_lengths[1]) if axis_lengths.shape == (3,) else np.nan
+            axis3 = float(axis_lengths[2]) if axis_lengths.shape == (3,) else np.nan
 
-    # ---- FIXED ORIENTATION COMPUTATION (O(R) instead of O(R^2)) ----
-    tensor_columns = [f"inertia_tensor-{i}-{j}" for i in range(3) for j in range(3)]
-    try:
-        T = properties[tensor_columns].to_numpy(dtype=float).reshape(-1, 3, 3)  # (R,3,3)
-        # Eigen-decomposition for all regions at once
-        eigvals, eigvecs = np.linalg.eigh(T)  # eigvecs shape: (R,3,3), columns are eigenvectors
-        max_idx = np.argmax(eigvals, axis=1)  # (R,)
-        # Select major-axis eigenvector per region
-        major_vecs = np.stack([eigvecs[i][:, max_idx[i]] for i in range(eigvecs.shape[0])], axis=0)
-        properties["orientation_vector"] = major_vecs.tolist()
-    except Exception:
-        # Fallback if any tensors are missing/NaN
-        properties["orientation_vector"] = [[np.nan, np.nan, np.nan]] * len(properties)
-    # ----------------------------------------------------------------
+            if (not np.all(np.isfinite(axis_lengths))) or np.any(axis_lengths <= 0):
+                try:
+                    tensor = row[tensor_columns].to_numpy(dtype=float).reshape(3, 3)
+                    if np.all(np.isfinite(tensor)):
+                        eigvals, eigvecs = np.linalg.eigh(tensor)
+                        order = np.argsort(eigvals)[::-1]
+                        major_vec = eigvecs[:, order[0]]
+                        major_norm = float(np.linalg.norm(major_vec))
+                        if np.isfinite(major_norm) and major_norm > 0:
+                            metrics["orientation_vector"] = (major_vec / major_norm).tolist()
+                except Exception:
+                    pass
+
+            axis_length_a_list.append(axis1)
+            axis_length_b_list.append(axis2)
+            axis_length_c_list.append(axis3)
+            major_axis_lengths.append(axis1)
+            minor_axis_lengths.append(axis3)
+            orientation_vectors.append(metrics["orientation_vector"])
+            oblateness_list.append(metrics["oblateness"])
+            prolateness_list.append(metrics["prolateness"])
+
+            if np.isfinite(axis1) and np.isfinite(axis2) and axis2 > 0:
+                elongations.append(float(axis1 / axis2))
+            else:
+                elongations.append(np.nan)
+
+            obb_volume = axis1 * axis2 * axis3
+            if np.isfinite(obb_volume) and obb_volume > 0 and np.isfinite(volume) and volume > 0:
+                extents.append(float(volume / obb_volume))
+            else:
+                extents.append(np.nan)
+
+    properties["surface_area"] = surface_areas
+    properties["sphericity"] = sphericities
+    properties["convex_volume"] = convex_volumes
+    properties["surface_to_volume_ratio"] = surface_to_volume_ratios
+    properties["axis1_length"] = axis_length_a_list
+    properties["axis2_length"] = axis_length_b_list
+    properties["axis3_length"] = axis_length_c_list
+    properties["major_axis_length"] = major_axis_lengths
+    properties["minor_axis_length"] = minor_axis_lengths
+    properties["elongation"] = elongations
+    properties["extent"] = extents
+    properties["orientation_vector"] = orientation_vectors
+    properties["oblateness"] = oblateness_list
+    properties["prolateness"] = prolateness_list
+    properties["border_touching_segment"] = border_touching_segments
 
     # Drop heavy intermediate columns
     columns_to_drop = [col for col in properties.columns

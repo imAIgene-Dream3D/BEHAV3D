@@ -1,5 +1,4 @@
 import copy
-import numbers
 import pickle
 import warnings
 from pathlib import Path
@@ -18,14 +17,12 @@ from behav3d.analysis.clustering.state.hmm import (
     run_hmm_state_classification,
     run_sticky_hmm_state_classification,
 )
-from behav3d.analysis.clustering.state.utils import (
+from behav3d.analysis.clustering.state.classification import (
     A4_LANDSCAPE,
     _apply_log1p_to_feature_matrix,
-    _get_classification_state_colors,
     _infer_binary_group_constraints,
     _invert_log_scaling_in_continuous_matrix,
     _mixed_label_sort_key,
-    _normalize_label_color_map,
     _normalize_log_scale_feature_selectors,
     _rebuild_full_behavioral_cluster_from_intrinsic,
     _require_columns,
@@ -34,18 +31,14 @@ from behav3d.analysis.clustering.state.utils import (
     _resolve_state_paths,
     _save_pdf_page_a4,
     _sanitize_filename_token,
-    _set_classification_state_colors,
     _to_numpy_2d,
     _vdone,
     _vinfo,
     _vsave,
     _vstart,
+    STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION,
     cap_values_to_quantile,
-)
-from behav3d.analysis.clustering.state.visualization.plots.state_composition import (
     save_state_composition_report,
-)
-from behav3d.analysis.clustering.state.visualization.plots.state_transitions import (
     save_state_transition_report,
 )
 
@@ -56,39 +49,9 @@ HMM_OPTIONAL_WINDOW_FEATURES = (
     "mean_square_displacement",
 )
 INTRINSIC_STATE_COL = "hmm_intrinsic_behavioral_state"
-HMM_INTRINSIC_RAW_STATE_COL = "hmm_intrinsic_behavioral_state_raw"
 FULL_STATE_COL = "behavioral_state"
 BINARY_GROUP_COL = "binary_group"
-
-
-def _obs_label_values(adata, col):
-    if adata is None or not hasattr(adata, "obs") or col not in adata.obs.columns:
-        return []
-    labels = pd.Series(adata.obs[col]).dropna().astype("string").str.strip()
-    labels = labels[labels != ""]
-    return sorted([str(v) for v in labels.unique().tolist()], key=_mixed_label_sort_key)
-
-
-def _extract_state_color_mapping(colors, state_col):
-    if not isinstance(colors, dict):
-        return {}
-    nested = colors.get(str(state_col), None)
-    if isinstance(nested, dict):
-        return {str(k): str(v) for k, v in nested.items()}
-    if all(not isinstance(v, dict) for v in colors.values()):
-        return {str(k): str(v) for k, v in colors.items()}
-    return {}
-
-
-def _current_hmm_full_state_colors(adata, state_col=FULL_STATE_COL):
-    labels = _obs_label_values(adata, state_col)
-    colors = _normalize_label_color_map(
-        labels,
-        colors=_get_classification_state_colors(adata, state_col),
-    )
-    if len(colors) > 0:
-        _set_classification_state_colors(adata, state_col, colors)
-    return colors
+HMM_INTRINSIC_RAW_STATE_COL = "intrinsic_hmm_state_id"
 
 
 def _normalize_selection(selection):
@@ -111,57 +74,8 @@ def _dedupe_preserve_order(values):
     return out
 
 
-def _coerce_hmm_raw_state_series(raw_series, *, label):
-    series = pd.Series(raw_series)
-    stringified = series.astype("string").str.strip()
-    empty_mask = stringified.isna() | (stringified == "")
-    numeric = pd.to_numeric(series, errors="coerce")
-    invalid_mask = (~empty_mask) & numeric.isna()
-    if bool(invalid_mask.any()):
-        bad_vals = sorted(set(stringified[invalid_mask].tolist()))
-        raise ValueError(
-            f"{label} contains non-numeric HMM raw state values: {bad_vals[:10]}"
-        )
-    numeric_valid = numeric[~numeric.isna()]
-    if not numeric_valid.empty:
-        fractional = np.mod(numeric_valid.astype(float), 1.0)
-        non_integer_mask = ~np.isclose(fractional, 0.0)
-        if bool(np.any(non_integer_mask)):
-            bad_vals = sorted(set(numeric_valid[non_integer_mask].tolist()))
-            raise ValueError(
-                f"{label} contains non-integer HMM raw state values: {bad_vals[:10]}"
-            )
-    coerced = numeric.round(0).astype("Int64")
-    coerced[empty_mask] = pd.NA
-    coerced.index = series.index
-    return coerced
-
-
-def _format_hmm_raw_state_series_for_key(raw_series, *, label):
-    raw_int = _coerce_hmm_raw_state_series(raw_series, label=label)
-    return raw_int.astype("string").str.strip()
-
-
-def _format_hmm_raw_state_value_for_key(raw_state, *, label):
-    raw_int = _coerce_hmm_raw_state_series(pd.Series([raw_state]), label=label)
-    value = raw_int.iloc[0]
-    if pd.isna(value):
-        return ""
-    return str(int(value))
-
-
-def _validate_hmm_intrinsic_label_mapping_keys(intrinsic_label_mapping, artifact_name):
-    bad_keys = [
-        k
-        for k in intrinsic_label_mapping.keys()
-        if isinstance(k, bool) or not isinstance(k, numbers.Integral)
-    ]
-    if bad_keys:
-        raise ValueError(
-            f"{artifact_name} intrinsic_label_mapping keys must be integers; "
-            f"rebuild the artifact. Invalid keys: {bad_keys[:10]}"
-        )
-    return intrinsic_label_mapping
+def _hmm_deployment_artifact_schema_version():
+    return int(STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION) + 1
 
 
 def _coerce_hmm_log_scaling_params(preprocessing_meta):
@@ -278,41 +192,43 @@ def _build_hmm_intrinsic_label_mapping(
     model_adata,
     *,
     hmm_model=None,
-    intrinsic_state_col=HMM_INTRINSIC_RAW_STATE_COL,
+    raw_state_col=HMM_INTRINSIC_RAW_STATE_COL,
     label_col=INTRINSIC_STATE_COL,
 ):
     if model_adata is None or not hasattr(model_adata, "obs"):
         raise ValueError("model_adata with .obs is required to build an HMM label mapping.")
     if label_col not in model_adata.obs.columns:
         raise ValueError(f"model_adata is missing '{label_col}'.")
-    if intrinsic_state_col == label_col:
-        raise ValueError(
-            "HMM intrinsic label mapping requires distinct raw and curated columns; "
-            f"got intrinsic_state_col='{intrinsic_state_col}' and label_col='{label_col}'."
-        )
 
     obs = model_adata.obs.copy()
     mapping = {}
     n_components = int(getattr(hmm_model, "n_components", 0) or 0)
     if n_components > 0:
-        mapping = {int(idx): str(idx) for idx in range(1, n_components + 1)}
+        mapping = {str(idx): str(idx) for idx in range(1, n_components + 1)}
 
-    if intrinsic_state_col not in obs.columns:
+    if raw_state_col not in obs.columns:
+        labels = (
+            pd.Series(obs[label_col])
+            .dropna()
+            .astype("string")
+            .str.strip()
+        )
+        labels = labels[labels != ""]
+        label_values = sorted(labels.unique().tolist(), key=_mixed_label_sort_key)
+        if len(mapping) > 0 and set(label_values).issubset(set(mapping.keys())):
+            return {str(k): str(v) for k, v in mapping.items()}
         raise ValueError(
-            f"model_adata is missing '{intrinsic_state_col}', so curated intrinsic labels cannot be linked back "
+            f"model_adata is missing '{raw_state_col}', so curated intrinsic labels cannot be linked back "
             "to raw HMM state ids. Re-run HMM clustering with the updated pipeline."
         )
 
-    work = obs[[intrinsic_state_col, label_col]].copy()
+    work = obs[[raw_state_col, label_col]].copy()
+    work[raw_state_col] = work[raw_state_col].astype("string").str.strip().fillna("")
     work[label_col] = work[label_col].astype("string").str.strip().fillna("")
-    work[intrinsic_state_col] = _coerce_hmm_raw_state_series(
-        work[intrinsic_state_col],
-        label=intrinsic_state_col,
-    )
-    work = work[work[intrinsic_state_col].notna() & (work[label_col] != "")]
+    work = work[(work[raw_state_col] != "") & (work[label_col] != "")]
 
     per_raw = (
-        work.groupby(intrinsic_state_col, observed=False)[label_col]
+        work.groupby(raw_state_col, observed=False)[label_col]
         .agg(lambda s: sorted(set(str(v) for v in s if str(v) != ""), key=_mixed_label_sort_key))
     )
     for raw_state_id, labels in per_raw.items():
@@ -321,8 +237,8 @@ def _build_hmm_intrinsic_label_mapping(
                 "Curated intrinsic label mapping is inconsistent for raw HMM state "
                 f"'{raw_state_id}': labels={labels}"
             )
-        mapping[int(raw_state_id)] = str(labels[0])
-    return {int(k): str(v) for k, v in mapping.items()}
+        mapping[str(raw_state_id)] = str(labels[0])
+    return {str(k): str(v) for k, v in mapping.items()}
 
 
 def _build_hmm_full_label_mapping(
@@ -344,14 +260,11 @@ def _build_hmm_full_label_mapping(
 
     work = obs[[binary_group_col, raw_state_col, full_label_col]].copy()
     work[binary_group_col] = work[binary_group_col].astype("string").str.strip().fillna("")
-    work[raw_state_col] = _coerce_hmm_raw_state_series(
-        work[raw_state_col],
-        label=raw_state_col,
-    )
+    work[raw_state_col] = work[raw_state_col].astype("string").str.strip().fillna("")
     work[full_label_col] = work[full_label_col].astype("string").str.strip().fillna("")
     missing_key_mask = (
         (work[full_label_col] != "")
-        & ((work[binary_group_col] == "") | work[raw_state_col].isna())
+        & ((work[binary_group_col] == "") | (work[raw_state_col] == ""))
     )
     if bool(missing_key_mask.any()):
         raise ValueError(
@@ -360,11 +273,12 @@ def _build_hmm_full_label_mapping(
         )
     work = work[
         (work[binary_group_col] != "")
-        & work[raw_state_col].notna()
+        & (work[raw_state_col] != "")
         & (work[full_label_col] != "")
     ].copy()
-    raw_state_key = _format_hmm_raw_state_series_for_key(work[raw_state_col], label=raw_state_col)
-    work["_raw_full_cluster_key"] = work[binary_group_col].astype(str) + "_" + raw_state_key.astype(str)
+    work["_raw_full_cluster_key"] = (
+        work[binary_group_col].astype(str) + "_" + work[raw_state_col].astype(str)
+    )
 
     per_generated = (
         work.groupby("_raw_full_cluster_key", observed=False)[full_label_col]
@@ -393,65 +307,13 @@ def _build_hmm_raw_full_cluster_keys(
         raise ValueError(f"obs is missing '{raw_state_col}'.")
 
     binary_group = pd.Series(obs[binary_group_col], index=obs.index, dtype="string").str.strip()
-    raw_state = _format_hmm_raw_state_series_for_key(
-        pd.Series(obs[raw_state_col], index=obs.index),
-        label=raw_state_col,
-    )
+    raw_state = pd.Series(obs[raw_state_col], index=obs.index, dtype="string").str.strip()
     raw_full_keys = pd.Series(pd.NA, index=obs.index, dtype="string")
     valid = binary_group.notna() & raw_state.notna() & (binary_group != "") & (raw_state != "")
     raw_full_keys.loc[valid] = (
         binary_group.loc[valid].astype(str) + "_" + raw_state.loc[valid].astype(str)
     )
     return raw_full_keys
-
-
-def _expand_hmm_full_label_mapping_with_raw_state_keys(
-    full_label_mapping,
-    intrinsic_label_mapping,
-    binary_groups,
-):
-    mapping = {str(k): str(v) for k, v in dict(full_label_mapping).items()}
-    for binary_group in binary_groups:
-        binary_group = str(binary_group).strip()
-        if binary_group == "":
-            continue
-        for raw_state, intrinsic_label in dict(intrinsic_label_mapping).items():
-            intrinsic_label = str(intrinsic_label).strip()
-            raw_state_key = _format_hmm_raw_state_value_for_key(
-                raw_state,
-                label="intrinsic_label_mapping",
-            )
-            if raw_state_key == "" or intrinsic_label == "":
-                continue
-            raw_key = f"{binary_group}_{raw_state_key}"
-            intrinsic_key = f"{binary_group}_{intrinsic_label}"
-            if raw_key not in mapping and intrinsic_key in mapping:
-                mapping[raw_key] = mapping[intrinsic_key]
-    return mapping
-
-
-def _rebuild_hmm_full_behavioral_state_from_intrinsic(
-    adata,
-    *,
-    binary_cols_to_merge,
-    intrinsic_col=INTRINSIC_STATE_COL,
-    full_state_col=FULL_STATE_COL,
-    binary_group_constraints=None,
-    enforce_binary_group_constraints=False,
-):
-    _rebuild_full_behavioral_cluster_from_intrinsic(
-        adata=adata,
-        binary_cols_to_merge=binary_cols_to_merge,
-        intrinsic_col=intrinsic_col,
-        binary_group_constraints=binary_group_constraints,
-        enforce_binary_group_constraints=enforce_binary_group_constraints,
-    )
-    if "full_behavioral_cluster" not in adata.obs.columns:
-        raise ValueError("Could not rebuild HMM full behavioral state labels.")
-    adata.obs[full_state_col] = pd.Categorical(
-        pd.Series(adata.obs["full_behavioral_cluster"], index=adata.obs.index, dtype="string")
-    )
-    return adata
 
 
 def _build_hmm_deployment_artifact(
@@ -474,6 +336,7 @@ def _build_hmm_deployment_artifact(
         state_paths = _resolve_state_paths(output_dir, cell_type)
 
     pipeline_metadata = {
+        "schema_version": int(_hmm_deployment_artifact_schema_version()),
         "preprocessing": copy.deepcopy(dict(getattr(model_adata, "uns", {}).get("preprocessing", {}))),
         "clustering": copy.deepcopy(dict(getattr(model_adata, "uns", {}).get("clustering", {}))),
         "classification": copy.deepcopy(dict(getattr(model_adata, "uns", {}).get("classification", {}))),
@@ -512,21 +375,9 @@ def _build_hmm_deployment_artifact(
     if len(observation_feature_cols) == 0:
         raise ValueError("Could not determine HMM observation feature columns for deployment artifact.")
 
-    full_state_colors = _current_hmm_full_state_colors(model_adata, state_col=FULL_STATE_COL)
-    classification_meta = pipeline_metadata["classification"]
-    existing_state_colors = classification_meta.get("state_colors", {})
-    if not isinstance(existing_state_colors, dict):
-        existing_state_colors = {}
-    existing_state_colors[str(FULL_STATE_COL)] = dict(full_state_colors)
-    classification_meta["state_colors"] = existing_state_colors
-
-    _coerce_hmm_raw_state_series(
-        model_adata.obs[HMM_INTRINSIC_RAW_STATE_COL],
-        label=HMM_INTRINSIC_RAW_STATE_COL,
-    )
-
     return {
         "artifact_kind": "hmm_state_deployment",
+        "schema_version": int(_hmm_deployment_artifact_schema_version()),
         "model": hmm_model,
         "pipeline_metadata": pipeline_metadata,
         "observation_feature_cols": [str(c) for c in observation_feature_cols],
@@ -536,7 +387,7 @@ def _build_hmm_deployment_artifact(
         "intrinsic_label_mapping": _build_hmm_intrinsic_label_mapping(
             model_adata,
             hmm_model=hmm_model,
-            intrinsic_state_col=HMM_INTRINSIC_RAW_STATE_COL,
+            raw_state_col=HMM_INTRINSIC_RAW_STATE_COL,
             label_col=INTRINSIC_STATE_COL,
         ),
         "full_label_mapping": _build_hmm_full_label_mapping(
@@ -547,7 +398,6 @@ def _build_hmm_deployment_artifact(
         ),
         "full_label_strategy": "binary_group_plus_intrinsic",
         "observed_binary_groups": list(observed_binary_groups),
-        "state_colors": {str(FULL_STATE_COL): dict(full_state_colors)},
         "source_model_adata_path": source_path,
     }
 
@@ -560,6 +410,18 @@ def _validate_hmm_deployment_artifact(artifact, artifact_name="hmm_deployment_ar
             f"{artifact_name} has invalid artifact_kind='{artifact.get('artifact_kind', None)}'; "
             "expected 'hmm_state_deployment'."
         )
+    try:
+        schema_version = int(artifact.get("schema_version", -1))
+    except Exception as exc:
+        raise ValueError(f"{artifact_name} has invalid schema_version.") from exc
+    expected_schema_version = int(_hmm_deployment_artifact_schema_version())
+    if schema_version != expected_schema_version:
+        raise ValueError(
+            f"{artifact_name} has unsupported schema_version={schema_version}; "
+            f"expected {expected_schema_version}. "
+            "Regenerate the HMM deployment artifact with the current code."
+        )
+
     model = artifact.get("model", None)
     if model is None or (not hasattr(model, "predict")) or (not hasattr(model, "predict_proba")):
         raise ValueError(f"{artifact_name} is missing a valid fitted HMM model.")
@@ -585,7 +447,6 @@ def _validate_hmm_deployment_artifact(artifact, artifact_name="hmm_deployment_ar
     intrinsic_label_mapping = artifact.get("intrinsic_label_mapping", None)
     if not isinstance(intrinsic_label_mapping, dict) or len(intrinsic_label_mapping) == 0:
         raise ValueError(f"{artifact_name} intrinsic_label_mapping must be a non-empty dict.")
-    _validate_hmm_intrinsic_label_mapping_keys(intrinsic_label_mapping, artifact_name)
     full_label_mapping = artifact.get("full_label_mapping", None)
     if not isinstance(full_label_mapping, dict) or len(full_label_mapping) == 0:
         raise ValueError(f"{artifact_name} full_label_mapping must be a non-empty dict.")
@@ -597,9 +458,6 @@ def _validate_hmm_deployment_artifact(artifact, artifact_name="hmm_deployment_ar
     observed_binary_groups = artifact.get("observed_binary_groups", None)
     if not isinstance(observed_binary_groups, list):
         raise ValueError(f"{artifact_name} observed_binary_groups must be a list.")
-    state_colors = artifact.get("state_colors", {})
-    if state_colors is not None and not isinstance(state_colors, dict):
-        raise ValueError(f"{artifact_name} state_colors must be a dict when present.")
     return artifact
 
 
@@ -1422,7 +1280,7 @@ def run_hmm_state_clustering(
         random_state=int(random_state),
         verbose=bool(verbose),
         error_on_nans=True,
-        out_col_name=HMM_INTRINSIC_RAW_STATE_COL,
+        out_col_name=INTRINSIC_STATE_COL,
         stickiness_kappa=float(stickiness_kappa),
         transmat_alpha=float(transmat_alpha),
         min_covar=float(min_covar),
@@ -1430,20 +1288,12 @@ def run_hmm_state_clustering(
     _vdone(verbose, "state-hmm", "fit HMM", fit_started)
 
     df_model = df_valid.copy()
-    df_model[HMM_INTRINSIC_RAW_STATE_COL] = pd.Series(pd.NA, index=df_model.index, dtype="Int64")
     df_model[INTRINSIC_STATE_COL] = pd.Series(pd.NA, index=df_model.index, dtype="string")
-    scored_state_map = df_states.set_index(sort_cols)[HMM_INTRINSIC_RAW_STATE_COL]
+    scored_state_map = df_states.set_index(sort_cols)[INTRINSIC_STATE_COL]
     scored_index = pd.MultiIndex.from_frame(df_model[sort_cols])
-    raw_states = pd.Series(
-        pd.to_numeric(
-            scored_state_map.reindex(scored_index).to_numpy(),
-            errors="coerce",
-        ),
-        index=df_model.index,
-        dtype="Int64",
+    df_model.loc[:, INTRINSIC_STATE_COL] = (
+        pd.Series(scored_state_map.reindex(scored_index).to_numpy(), index=df_model.index, dtype="string")
     )
-    df_model.loc[:, HMM_INTRINSIC_RAW_STATE_COL] = raw_states
-    df_model.loc[:, INTRINSIC_STATE_COL] = raw_states.astype("string")
     if start_offset_fill_mode == "backfill" and start_offset > 0:
         for _, group_idx in df_model.groupby(["sample_name", "TrackID"], sort=False, observed=False).groups.items():
             group = df_model.loc[list(group_idx)]
@@ -1451,33 +1301,19 @@ def run_hmm_state_clustering(
             skipped_group = group[group["_start_offset_skipped"]]
             if len(scored_group) == 0 or len(skipped_group) == 0:
                 continue
-            first_raw = scored_group[HMM_INTRINSIC_RAW_STATE_COL].iloc[0]
-            if pd.isna(first_raw):
+            first_value = scored_group[INTRINSIC_STATE_COL].iloc[0]
+            if pd.isna(first_value):
                 continue
-            df_model.loc[skipped_group.index, HMM_INTRINSIC_RAW_STATE_COL] = first_raw
-            first_intrinsic = _format_hmm_raw_state_value_for_key(
-                first_raw,
-                label=HMM_INTRINSIC_RAW_STATE_COL,
-            )
-            if first_intrinsic != "":
-                df_model.loc[skipped_group.index, INTRINSIC_STATE_COL] = first_intrinsic
+            df_model.loc[skipped_group.index, INTRINSIC_STATE_COL] = first_value
 
-    obs_cols = sort_cols + binary_cols_to_merge + [HMM_INTRINSIC_RAW_STATE_COL, INTRINSIC_STATE_COL]
+    obs_cols = sort_cols + binary_cols_to_merge + [INTRINSIC_STATE_COL]
     model_adata = df_to_adata(df_model, feature_cols=kept_features, obs_cols=obs_cols)
-    raw_labels = _coerce_hmm_raw_state_series(
-        model_adata.obs[HMM_INTRINSIC_RAW_STATE_COL],
-        label=HMM_INTRINSIC_RAW_STATE_COL,
-    )
-    intrinsic_labels = pd.Series(
-        model_adata.obs[INTRINSIC_STATE_COL],
-        index=model_adata.obs.index,
-        dtype="string",
-    )
-    model_adata.obs[HMM_INTRINSIC_RAW_STATE_COL] = raw_labels
+    intrinsic_labels = pd.Series(model_adata.obs[INTRINSIC_STATE_COL], index=model_adata.obs.index, dtype="string")
     model_adata.obs[INTRINSIC_STATE_COL] = pd.Categorical(intrinsic_labels)
+    model_adata.obs[HMM_INTRINSIC_RAW_STATE_COL] = pd.Categorical(intrinsic_labels)
 
     binary_group_constraints = _infer_binary_group_constraints(df_model, binary_cols_to_merge)
-    _rebuild_hmm_full_behavioral_state_from_intrinsic(
+    _rebuild_full_behavioral_cluster_from_intrinsic(
         adata=model_adata,
         binary_cols_to_merge=binary_cols_to_merge,
         intrinsic_col=INTRINSIC_STATE_COL,
@@ -1491,12 +1327,7 @@ def run_hmm_state_clustering(
             dtype="string",
         ).isna()
         if bool(unassigned_mask.any()):
-            for col in [
-                INTRINSIC_STATE_COL,
-                "behavioral_clusterid",
-                "full_behavioral_cluster",
-                FULL_STATE_COL,
-            ]:
+            for col in [HMM_INTRINSIC_RAW_STATE_COL, "behavioral_clusterid", FULL_STATE_COL]:
                 if col in model_adata.obs.columns:
                     model_adata.obs[col] = pd.Categorical(
                         pd.Series(model_adata.obs[col], index=model_adata.obs.index, dtype="string").where(
@@ -1712,7 +1543,7 @@ def run_hmm_state_clustering(
     classification_meta = {
         "intrinsic_output_col": INTRINSIC_STATE_COL,
         "full_output_col": FULL_STATE_COL,
-        "intrinsic_intrinsic_state_col": INTRINSIC_STATE_COL,
+        "intrinsic_raw_state_col": HMM_INTRINSIC_RAW_STATE_COL,
         "full_label_strategy": "binary_group_plus_intrinsic",
         "hmm_deployment_artifact_path": str(
             _resolve_hmm_deployment_artifact_path(state_paths=state_paths, cell_type=cell_type)
@@ -1722,7 +1553,6 @@ def run_hmm_state_clustering(
     model_adata.uns["preprocessing"] = preprocessing_meta
     model_adata.uns["clustering"] = clustering_meta
     model_adata.uns["classification"] = classification_meta
-    _current_hmm_full_state_colors(model_adata, state_col=FULL_STATE_COL)
     _vdone(verbose, "state-hmm", "attach HMM preprocessing/clustering metadata", metadata_started)
 
     write_started = _vstart(verbose, "state-hmm", "write model adata")
@@ -1781,15 +1611,6 @@ def _finalize_hmm_apply_outputs(
 
     adata_full.uns["preprocessing"] = dict(preprocessing_meta)
     adata_full.uns["classification"] = dict(classification_meta)
-    report_state_colors = {}
-    if full_output_col in report_adata.obs.columns:
-        report_state_colors = _normalize_label_color_map(
-            _obs_label_values(report_adata, full_output_col),
-            colors=(
-                _extract_state_color_mapping(classification_meta.get("state_colors", {}), full_output_col)
-                or _extract_state_color_mapping(classification_meta.get("state_colors", {}), FULL_STATE_COL)
-            ),
-        )
 
     state_composition_report_pdf = None
     state_composition_report_pdfs = []
@@ -1815,7 +1636,6 @@ def _finalize_hmm_apply_outputs(
                 state_col=str(full_output_col),
                 sample_col="sample_name",
                 include_pooled_summary=True,
-                state_colors=report_state_colors,
                 verbose=verbose,
             )
             pdf_paths = report_out.get("pdf_paths", {})
@@ -1879,7 +1699,6 @@ def _finalize_hmm_apply_outputs(
                 rows_per_page=max(1, int(state_transitions_rows_per_page)),
                 sankey_min_count=int(state_transitions_min_count),
                 sankey_relative_count=float(state_transitions_relative_count),
-                state_colors=report_state_colors,
                 verbose=verbose,
             )
             state_transition_report_dir = str(transition_out.get("output_dir", transitions_outdir))
@@ -2004,35 +1823,19 @@ def apply_hmm_deployment_artifact_to_full_dataset(
     X_query = X_query_all[score_mask, :]
 
     model = artifact["model"]
-    adata_full.obs[HMM_INTRINSIC_RAW_STATE_COL] = pd.Series(
-        pd.NA,
-        index=adata_full.obs.index,
-        dtype="Int64",
-    )
-    adata_full.obs[INTRINSIC_STATE_COL] = pd.Series(
-        pd.NA,
-        index=adata_full.obs.index,
-        dtype="string",
-    )
+    adata_full.obs[HMM_INTRINSIC_RAW_STATE_COL] = pd.Series(pd.NA, index=adata_full.obs.index, dtype="string")
+    adata_full.obs[INTRINSIC_STATE_COL] = pd.Series(pd.NA, index=adata_full.obs.index, dtype="string")
     adata_full.obs["intrinsic_behavioral_cluster_confidence"] = pd.Series(
         np.nan,
         index=adata_full.obs.index,
         dtype=float,
     )
-    _validate_hmm_intrinsic_label_mapping_keys(
-        artifact["intrinsic_label_mapping"],
-        "hmm_deployment_artifact",
-    )
-    label_mapping = {int(k): str(v) for k, v in artifact["intrinsic_label_mapping"].items()}
+    label_mapping = {str(k): str(v) for k, v in artifact["intrinsic_label_mapping"].items()}
     if bool(np.any(score_mask)):
         lengths = _compute_hmm_sequence_lengths(df_scored, id_cols=("sample_name", "TrackID"))
         raw_state_codes = np.asarray(model.predict(X_query, lengths=lengths), dtype=np.int64) + 1
         state_confidence = np.asarray(model.predict_proba(X_query, lengths=lengths), dtype=float).max(axis=1)
-        raw_state_scored = pd.Series(
-            raw_state_codes,
-            index=adata_full.obs.index[score_mask],
-            dtype="Int64",
-        )
+        raw_state_scored = pd.Series(raw_state_codes.astype(str), index=adata_full.obs.index[score_mask], dtype="string")
         intrinsic_scored = raw_state_scored.map(label_mapping)
         if intrinsic_scored.isna().any():
             missing_ids = sorted(set(raw_state_scored[intrinsic_scored.isna()].tolist()))
@@ -2061,15 +1864,14 @@ def apply_hmm_deployment_artifact_to_full_dataset(
                 if np.isfinite(first_conf):
                     adata_full.obs.loc[skipped_group.index, "intrinsic_behavioral_cluster_confidence"] = first_conf
 
-    adata_full.obs[HMM_INTRINSIC_RAW_STATE_COL] = _coerce_hmm_raw_state_series(
-        adata_full.obs[HMM_INTRINSIC_RAW_STATE_COL],
-        label=HMM_INTRINSIC_RAW_STATE_COL,
+    adata_full.obs[HMM_INTRINSIC_RAW_STATE_COL] = pd.Categorical(
+        pd.Series(adata_full.obs[HMM_INTRINSIC_RAW_STATE_COL], index=adata_full.obs.index, dtype="string")
     )
     adata_full.obs[INTRINSIC_STATE_COL] = pd.Categorical(
         pd.Series(adata_full.obs[INTRINSIC_STATE_COL], index=adata_full.obs.index, dtype="string")
     )
 
-    _rebuild_hmm_full_behavioral_state_from_intrinsic(
+    _rebuild_full_behavioral_cluster_from_intrinsic(
         adata=adata_full,
         binary_cols_to_merge=binary_cols_to_merge,
         intrinsic_col=INTRINSIC_STATE_COL,
@@ -2083,7 +1885,7 @@ def apply_hmm_deployment_artifact_to_full_dataset(
             index=adata_full.obs.index,
             dtype="string",
         ).isna()
-        for col in ["behavioral_clusterid", "full_behavioral_cluster", FULL_STATE_COL]:
+        for col in ["behavioral_clusterid", FULL_STATE_COL]:
             if col in adata_full.obs.columns:
                 adata_full.obs[col] = pd.Series(adata_full.obs[col], index=adata_full.obs.index, dtype="string").where(
                     ~unassigned_mask,
@@ -2093,26 +1895,6 @@ def apply_hmm_deployment_artifact_to_full_dataset(
         adata_full.obs,
         binary_group_col=BINARY_GROUP_COL,
         raw_state_col=HMM_INTRINSIC_RAW_STATE_COL,
-    )
-    observed_apply_binary_groups = sorted(
-        [
-            str(v)
-            for v in (
-                pd.Series(adata_full.obs[BINARY_GROUP_COL])
-                .dropna()
-                .astype("string")
-                .str.strip()
-                .unique()
-                .tolist()
-            )
-            if v != ""
-        ],
-        key=_mixed_label_sort_key,
-    )
-    full_label_mapping = _expand_hmm_full_label_mapping_with_raw_state_keys(
-        full_label_mapping,
-        label_mapping,
-        observed_apply_binary_groups,
     )
     curated_full_labels = pd.Series(pd.NA, index=adata_full.obs.index, dtype="string")
     nonmissing_full = raw_full_keys.notna()
@@ -2153,27 +1935,15 @@ def apply_hmm_deployment_artifact_to_full_dataset(
     classification_meta["applied_full_model_variant"] = "hmm_deployment"
     classification_meta["full_label_strategy"] = str(artifact.get("full_label_strategy", "binary_group_plus_intrinsic"))
     classification_meta["hmm_deployment_artifact_kind"] = str(artifact.get("artifact_kind", "hmm_state_deployment"))
+    classification_meta["hmm_deployment_artifact_schema_version"] = int(
+        artifact.get("schema_version", _hmm_deployment_artifact_schema_version())
+    )
     classification_meta["hmm_deployment_artifact_source_type"] = str(artifact_source_type)
     classification_meta["hmm_deployment_artifact_source_path"] = artifact_source_path
     classification_meta["hmm_deployment_source_model_adata_path"] = artifact.get("source_model_adata_path", None)
-    classification_meta["intrinsic_label_mapping"] = {str(k): str(v) for k, v in label_mapping.items()}
+    classification_meta["intrinsic_label_mapping"] = dict(label_mapping)
     classification_meta["full_label_mapping"] = dict(full_label_mapping)
     classification_meta["observed_binary_groups_train"] = list(artifact.get("observed_binary_groups", []))
-    artifact_state_colors = _extract_state_color_mapping(
-        artifact.get("state_colors", {}),
-        FULL_STATE_COL,
-    )
-    full_labels = _obs_label_values(adata_full, FULL_STATE_COL)
-    full_state_colors = _normalize_label_color_map(full_labels, colors=artifact_state_colors)
-    if len(full_state_colors) > 0:
-        state_colors_meta = dict(classification_meta.get("state_colors", {}) or {})
-        state_colors_meta[str(FULL_STATE_COL)] = dict(full_state_colors)
-        if str(full_output_col) != FULL_STATE_COL:
-            state_colors_meta[str(full_output_col)] = dict(full_state_colors)
-        classification_meta["state_colors"] = state_colors_meta
-        _set_classification_state_colors(adata_full, FULL_STATE_COL, full_state_colors)
-        if str(full_output_col) != FULL_STATE_COL:
-            _set_classification_state_colors(adata_full, str(full_output_col), full_state_colors)
 
     adata_full = _finalize_hmm_apply_outputs(
         adata_full,

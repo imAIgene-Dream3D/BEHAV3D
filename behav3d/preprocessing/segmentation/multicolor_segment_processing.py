@@ -1032,7 +1032,7 @@ def main(
     metadata = pd.read_csv(metadata)
     cell_types = ["tcell1", "tcell2", "tcell3"]
     output_dir = "/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/NatureBriefComm/LowDensity_MultiColor"
-    min_size=200
+    min_size=150
     apply_multicolor_segment_correction(
         metadata=metadata,
         cell_types=cell_types,

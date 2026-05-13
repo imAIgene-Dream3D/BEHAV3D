@@ -313,11 +313,14 @@ behav3d_calculated_features = {
     "morphology": [
         "nr_pixels", "volume", "bbox_volume", "extent", "solidity",
         "equivalent_diameter", "major_axis_length", "minor_axis_length",
-        "elongation", "surface_area", "sphericity", "convex_volume", "orientation_vector",
+        "axis1_length", "axis2_length", "axis3_length",
+        "elongation", "surface_area", "sphericity", "convex_volume", "surface_to_volume_ratio",
     ],
     "movement": [
         "displacement", "cumulative_displacement", "displacement_from_origin",
-        "mean_square_displacement", "speed", "mean_speed",
+        "mean_square_displacement", "speed", "mean_speed", "summed_displacement",
+        "net_displacement", "straightness", "directional_persistence",
+        "median_turning_angle", "fraction_reversed_movement",
     ],
     "intensity": [
         "mean_intensity_*", "mean_dead_dye",
@@ -326,7 +329,7 @@ behav3d_calculated_features = {
         "percentage_dead_mask", "nr_dead_mask_pixels", "increase_dead_mask", "dead",
     ],
     "contact": [
-        "*_contact", "*_contact_pixels", "touching_*", "active_*_contact",
+        "*_contact", "*_contact_on_distance", "*_contact_pixels", "active_*_contact",
     ],
     "active_killing": [
         "is_active_killing", "killing_efficiency",

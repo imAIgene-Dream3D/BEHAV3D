@@ -379,3 +379,17 @@ def combine_multicolor_tracked_outputs(
         metadata.at[row_idx, csv_col] = str(outputs["csv"])
 
     return metadata
+
+def test():
+    metadata = "/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/NatureBriefComm/LowDensity_MultiColor/metadata.csv"
+    metadata = pd.read_csv(metadata)
+    cell_types = ["tcell1", "tcell2", "tcell3"]
+    output_dir = "/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/NatureBriefComm/LowDensity_MultiColor"
+    combine_multicolor_tracked_outputs(
+        metadata=metadata,
+        output_dir=output_dir,
+        source_cell_types=cell_types,
+        combined_cell_type="tcell",
+        overwrite=True,
+        n_workers=8,
+    )

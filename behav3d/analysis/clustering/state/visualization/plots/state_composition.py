@@ -5,6 +5,8 @@ from pathlib import Path
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.gridspec import GridSpec
 
+from behav3d.analysis.clustering.state.utils import _normalize_label_color_map
+
 
 A4_PORTRAIT = (8.27, 11.69)
 
@@ -22,6 +24,7 @@ def plot_state_composition_over_time(
     show: bool = True,
     ax=None,
     legend: bool = True,
+    state_colors=None,
     sample_title_fontsize: float = 8,
     sample_title_pad: float = 2,
 ):
@@ -62,6 +65,7 @@ def plot_state_composition_over_time(
             .index
             .tolist()
         )
+    state_color_map = _normalize_label_color_map(state_order, colors=state_colors)
 
     # --- compute per-sample matrices ---
     def _compute(panel_df):
@@ -115,6 +119,7 @@ def plot_state_composition_over_time(
                 width=1.0,
                 align="edge",
                 linewidth=0,
+                color=state_color_map.get(str(s), None),
                 label=str(s),
             )
             bottom += v
@@ -742,6 +747,7 @@ def save_state_composition_report(
     include_pooled_summary=True,
     dpi=300,
     verbose=True,
+    state_colors=None,
     sample_title_fontsize: float = 8,
     sample_title_pad: float = 2,
 ):
@@ -801,7 +807,11 @@ def save_state_composition_report(
     )
     auc_table.to_csv(output_auc_csv_path, index=False)
 
-    state_colors = _build_color_map(state_order, cmap_name="tab20")
+    state_colors = _normalize_label_color_map(
+        state_order,
+        colors=state_colors,
+        cmap_name="tab20",
+    )
     sample_colors = _build_color_map(sample_order, cmap_name="tab20")
     nonstacked_samples_per_page = 4
     per_state_ylim_headroom = 0.10

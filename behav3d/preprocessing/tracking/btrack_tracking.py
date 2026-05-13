@@ -32,9 +32,9 @@ _SUPPORTED_BTRACK_VISUAL_FEATURES = (
 )
 
 _BTRACK_VISUAL_FEATURES = (
-    # "area",
-    # "major_axis_length",
-    # "minor_axis_length",
+    "area",
+    "major_axis_length",
+    "minor_axis_length",
     "intensity_mean",
 )
 

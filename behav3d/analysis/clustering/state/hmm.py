@@ -148,6 +148,7 @@ def run_hmm_state_classification(
             tol=tol,
             random_state=random_state,
             verbose=verbose,
+            min_covar=min_covar,
         )
 
     X_all, lengths, df_sorted = _prep_X_and_lengths(df_features)

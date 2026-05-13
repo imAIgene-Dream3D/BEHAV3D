@@ -9,6 +9,10 @@ import zarr
 
 from behav3d.io.formats.zarr import append_to_zarr
 from behav3d.io.images import load_image
+from behav3d.analysis.clustering.state.utils import (
+    _get_classification_state_colors,
+    _normalize_label_color_map,
+)
 
 
 def _mixed_label_sort_key(value):
@@ -90,6 +94,39 @@ def _build_code_map(obs, state_col):
     return {str(label): int(idx + 1) for idx, label in enumerate(unique_labels)}
 
 
+def _build_state_code_color_map(code_map, state_colors=None):
+    if not isinstance(code_map, dict) or len(code_map) == 0:
+        return {}
+    label_colors = _normalize_label_color_map(code_map.keys(), colors=state_colors)
+    return {
+        str(int(code)): str(label_colors[str(label)])
+        for label, code in code_map.items()
+        if str(label) in label_colors
+    }
+
+
+def _write_state_color_attrs_to_zarr(path, code_map, state_colors=None):
+    label_colors = _normalize_label_color_map(code_map.keys(), colors=state_colors)
+    code_colors = _build_state_code_color_map(code_map, state_colors=state_colors)
+    if len(code_colors) == 0:
+        return {}
+    arr = zarr.open(str(path), mode="a")
+    arr.attrs["state_label_colors"] = dict(label_colors)
+    arr.attrs["state_code_colors"] = dict(code_colors)
+    return code_colors
+
+
+def _apply_state_code_colors_to_layer(layer, code_colors):
+    if layer is None or not isinstance(code_colors, dict) or len(code_colors) == 0:
+        return False
+    try:
+        layer.color = {int(code): str(color) for code, color in code_colors.items()}
+        layer.metadata["state_code_colors"] = dict(code_colors)
+        return True
+    except Exception:
+        return False
+
+
 def _safe_file_mtime(path):
     if path is None:
         return None
@@ -100,15 +137,6 @@ def _safe_file_mtime(path):
     except Exception:
         return None
     return None
-
-
-def _coerce_optional_float(value):
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except Exception:
-        return None
 
 
 def _infer_sample_name_from_obs(sample_obs, fallback="unknown"):
@@ -206,6 +234,7 @@ def backproject_single_sample_behavioral_states(
     sample_name=None,
     policy_hint=None,
     source_h5ad_path=None,
+    state_colors=None,
     require_all_rows_present=False,
     verbose=True,
 ):
@@ -446,6 +475,13 @@ def backproject_single_sample_behavioral_states(
     out_arr.attrs["background_value"] = int(background_value)
     out_arr.attrs["label_map"] = dict(code_to_label)
     out_arr.attrs["label_to_code"] = {str(k): int(v) for k, v in code_map.items()}
+    state_code_colors = _build_state_code_color_map(code_map, state_colors=state_colors)
+    if len(state_code_colors) > 0:
+        out_arr.attrs["state_label_colors"] = _normalize_label_color_map(
+            code_map.keys(),
+            colors=state_colors,
+        )
+        out_arr.attrs["state_code_colors"] = dict(state_code_colors)
     out_arr.attrs["track_image_path"] = str(tracked_img_path)
     out_arr.attrs["source_tracked_path"] = str(tracked_img_path)
     out_arr.attrs["source_tracked_mtime"] = _safe_file_mtime(tracked_img_path)
@@ -493,6 +529,7 @@ def export_behavioral_state_backprojection_zarrs(
     time_col="position_t",
     background_value=0,
     enforce_time_coverage=True,
+    state_colors=None,
     raise_on_error=True,
     require_all_rows_present=False,
     verbose=True,
@@ -515,6 +552,9 @@ def export_behavioral_state_backprojection_zarrs(
         raise ValueError(
             f"Cannot export behavioral states because '{state_col}' has no non-empty labels."
         )
+    if state_colors is None:
+        state_colors = _get_classification_state_colors(adata, state_col)
+    state_color_map = _normalize_label_color_map(code_map.keys(), colors=state_colors)
 
     obs = adata.obs.copy()
     sample_values = (
@@ -532,6 +572,8 @@ def export_behavioral_state_backprojection_zarrs(
         "enforce_time_coverage": bool(enforce_time_coverage),
         "label_map": {str(v): str(k) for k, v in code_map.items()},
         "label_to_code": {str(k): int(v) for k, v in code_map.items()},
+        "state_label_colors": dict(state_color_map),
+        "state_code_colors": _build_state_code_color_map(code_map, state_colors=state_color_map),
         "output_paths": {},
         "skipped_samples": [],
         "errors": [],
@@ -601,6 +643,7 @@ def export_behavioral_state_backprojection_zarrs(
                 sample_name=str(sample_name),
                 policy_hint=policy_hint,
                 source_h5ad_path=getattr(adata, "filename", None),
+                state_colors=state_color_map,
                 require_all_rows_present=bool(require_all_rows_present),
                 verbose=verbose,
             )
@@ -744,63 +787,6 @@ def _resolve_behavioral_states_h5ad_path(output_dir, cell_type):
     )
 
 
-def _is_behavioral_state_zarr_stale(state_path, tracked_path, h5ad_path=None):
-    state_path = Path(state_path)
-    tracked_path = Path(tracked_path)
-    h5ad_path = None if h5ad_path is None else Path(h5ad_path)
-
-    if not state_path.exists():
-        return True, "state image path does not exist"
-
-    attrs = _read_root_zarr_attrs(state_path)
-    reasons = []
-
-    saved_tracked_path = attrs.get("source_tracked_path", attrs.get("track_image_path", None))
-    saved_tracked_mtime = _coerce_optional_float(
-        attrs.get("source_tracked_mtime", None)
-    )
-    current_tracked_mtime = _safe_file_mtime(tracked_path)
-
-    if saved_tracked_path is None:
-        reasons.append("missing source_tracked_path attr")
-    else:
-        try:
-            if str(Path(saved_tracked_path).resolve()) != str(Path(tracked_path).resolve()):
-                reasons.append("tracked path changed")
-        except Exception:
-            if str(saved_tracked_path) != str(tracked_path):
-                reasons.append("tracked path changed")
-
-    if saved_tracked_mtime is None:
-        reasons.append("missing source_tracked_mtime attr")
-    elif current_tracked_mtime is not None and current_tracked_mtime > float(saved_tracked_mtime) + 1e-6:
-        reasons.append("tracked image newer than saved state image")
-
-    if h5ad_path is not None and h5ad_path.exists():
-        saved_h5ad_path = attrs.get("source_h5ad_path", None)
-        saved_h5ad_mtime = _coerce_optional_float(attrs.get("source_h5ad_mtime", None))
-        current_h5ad_mtime = _safe_file_mtime(h5ad_path)
-
-        if saved_h5ad_path is None:
-            reasons.append("missing source_h5ad_path attr")
-        else:
-            try:
-                if str(Path(saved_h5ad_path).resolve()) != str(Path(h5ad_path).resolve()):
-                    reasons.append("h5ad source path changed")
-            except Exception:
-                if str(saved_h5ad_path) != str(h5ad_path):
-                    reasons.append("h5ad source path changed")
-
-        if saved_h5ad_mtime is None:
-            reasons.append("missing source_h5ad_mtime attr")
-        elif current_h5ad_mtime is not None and current_h5ad_mtime > float(saved_h5ad_mtime) + 1e-6:
-            reasons.append("h5ad newer than saved state image")
-
-    if len(reasons) > 0:
-        return True, "; ".join(reasons)
-    return False, "up-to-date"
-
-
 def _ensure_behavioral_state_backprojection_for_sample(
     sample_name,
     output_dir,
@@ -838,23 +824,7 @@ def _ensure_behavioral_state_backprojection_for_sample(
         verbose=verbose,
     )
     if existing_state_path is not None and Path(existing_state_path).exists():
-        is_stale, stale_reason = _is_behavioral_state_zarr_stale(
-            state_path=existing_state_path,
-            tracked_path=tracked_img_path,
-            h5ad_path=h5ad_path if h5ad_path.exists() else None,
-        )
-        if not bool(is_stale):
-            return Path(existing_state_path)
-        if not bool(refresh_if_stale):
-            raise RuntimeError(
-                "Behavioral-state image is stale and refresh_if_stale=False. "
-                f"sample='{sample_name}', reason='{stale_reason}', state_path='{existing_state_path}'."
-            )
-        if verbose:
-            print(
-                "Behavioral-state image is stale; rebuilding sample "
-                f"'{sample_name}'. reason={stale_reason}"
-            )
+        return Path(existing_state_path)
 
     raw_img_path = _resolve_raw_image_path(
         output_dir=output_dir,
@@ -934,6 +904,10 @@ def _ensure_behavioral_state_backprojection_for_sample(
         raise ValueError(
             f"Cannot lazily create behavioral-state backprojection because '{resolved_state_col}' has no labels."
         )
+    state_color_map = _normalize_label_color_map(
+        code_map.keys(),
+        colors=_get_classification_state_colors(adata_full, resolved_state_col),
+    )
 
     output_path = _behavioral_state_backprojection_path(
         output_dir=output_dir,
@@ -955,6 +929,7 @@ def _ensure_behavioral_state_backprojection_for_sample(
         sample_name=sample_name,
         policy_hint=policy_hint,
         source_h5ad_path=h5ad_path,
+        state_colors=state_color_map,
         verbose=verbose,
     )
     return output_path
@@ -984,6 +959,22 @@ def _extract_state_label_map(state_img_path):
         out = {}
         for label, code in label_to_code.items():
             out[str(code)] = str(label)
+        return out
+    return {}
+
+
+def _extract_state_code_color_map(state_img_path):
+    attrs = _read_root_zarr_attrs(state_img_path)
+    code_colors = attrs.get("state_code_colors", None)
+    if isinstance(code_colors, dict) and len(code_colors) > 0:
+        return {str(k): str(v) for k, v in code_colors.items()}
+    label_colors = attrs.get("state_label_colors", None)
+    label_to_code = attrs.get("label_to_code", None)
+    if isinstance(label_colors, dict) and isinstance(label_to_code, dict):
+        out = {}
+        for label, code in label_to_code.items():
+            if str(label) in label_colors:
+                out[str(code)] = str(label_colors[str(label)])
         return out
     return {}
 
@@ -1127,6 +1118,7 @@ def show_behavioral_state_backprojection(
     auto_create_if_missing=True,
     refresh_if_stale=True,
     state_col=None,
+    state_colors=None,
     run=True,
     verbose=True,
 ):
@@ -1241,9 +1233,14 @@ def show_behavioral_state_backprojection(
     viewer = napari.Viewer()
     viewer.add_image(raw_img, name="raw_data")
     viewer.add_labels(tracked_img_view, name="TrackID", visible=False)
-    viewer.add_labels(state_img_view, name="behavioral_state_class", visible=True)
+    state_layer = viewer.add_labels(state_img_view, name="behavioral_state_class", visible=True)
 
     label_map = _extract_state_label_map(state_path)
+    code_colors = _extract_state_code_color_map(state_path)
+    if len(code_colors) == 0 and isinstance(state_colors, dict) and len(state_colors) > 0:
+        code_map = {str(label): int(code) for code, label in label_map.items()}
+        code_colors = _build_state_code_color_map(code_map, state_colors=state_colors)
+    _apply_state_code_colors_to_layer(state_layer, code_colors)
     mapping_text = _build_state_mapping_text(label_map)
     added_dock = _add_mapping_dock_widget(
         viewer=viewer,
