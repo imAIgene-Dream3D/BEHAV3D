@@ -458,18 +458,25 @@ class AnnotationLegendTab(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.table.setMinimumWidth(0)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setStretchLastSection(True)
+        header.setMinimumSectionSize(20)
         self.table.cellClicked.connect(self._on_cell_clicked)
         layout.addWidget(self.table)
 
         button_row = QHBoxLayout()
         self.btn_refresh = QtPushButton("Refresh counts & colors")
+        self.btn_refresh.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.btn_refresh.clicked.connect(self.refresh)
         button_row.addWidget(self.btn_refresh)
+        button_row.addStretch()
         self.note = QLabel(
             "<i>Death is a separate binary classifier — annotate it on the "
             "<b>User Provided Labels (Dead)</b> layer.</i>"
@@ -541,8 +548,6 @@ class AnnotationLegendTab(QWidget):
             self.table.setItem(row, 3, count_item)
 
         self.table.resizeColumnsToContents()
-        # Re-stretch the cell-type column after resizeColumnsToContents reset it.
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
 
     # ── Click handler ───────────────────────────────────────────────
 
@@ -659,6 +664,7 @@ class CellTypeConvPaintTab(QWidget):
             self._per_tab_strategy_combo = QComboBox()
             self._per_tab_strategy_combo.addItems(self._per_tab_strategies)
             self._per_tab_strategy_combo.setCurrentText(saved_per_tab)
+            _compact_combo(self._per_tab_strategy_combo, min_chars=12)
             self._per_tab_strategy_combo.currentTextChanged.connect(
                 self._on_per_tab_strategy_combo_changed
             )
@@ -712,30 +718,44 @@ class CellTypeConvPaintTab(QWidget):
 
     @staticmethod
     def _pair_row(lbl1, w1, h1, lbl2, w2, h2):
-        """Two label+widget+help groups on one row with a gap between them.
+        """Two label+widget+help groups stacked vertically (one per row).
 
-        No stretch on the widgets — they keep their natural size. A trailing
-        stretch absorbs any extra panel width so the row never expands.
+        Previously placed both pairs on a single horizontal row, but the
+        combined width forced a wide minimum on the cell-type tabs (and
+        therefore the whole widget). Stacking them keeps each row narrow
+        so the panel can shrink to the width of a single label+spinner+help.
         """
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
-        row.addWidget(lbl1)
-        row.addWidget(w1)
-        row.addWidget(h1)
-        row.addSpacing(10)
-        row.addWidget(lbl2)
-        row.addWidget(w2)
-        row.addWidget(h2)
-        row.addStretch()
-        return row
+        for w in (w1, w2):
+            if isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                w.setMaximumWidth(70)
+                w.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+
+        for lbl, w, h in ((lbl1, w1, h1), (lbl2, w2, h2)):
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(2)
+            row.addWidget(lbl)
+            row.addWidget(w)
+            row.addWidget(h)
+            row.addStretch()
+            outer.addLayout(row)
+
+        return outer
 
     @staticmethod
     def _solo_row(*widgets):
         """Single group of widgets on one row with a trailing stretch."""
+        for w in widgets:
+            if isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                w.setMaximumWidth(70)
+                w.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
+        row.setSpacing(2)
         for w in widgets:
             row.addWidget(w)
         row.addStretch()
@@ -1094,6 +1114,7 @@ class ConvPaintTrainingWidget(QWidget):
             self.strategy_combo.addItems(options)
             initial = self.convpaint_strategy if self.convpaint_strategy in options else options[0]
             self.strategy_combo.setCurrentText(initial)
+            _compact_combo(self.strategy_combo, min_chars=12)
             strat_row.addWidget(self.strategy_combo, stretch=1)
             root.addLayout(strat_row)
 
@@ -1336,6 +1357,9 @@ class ConvPaintTrainingWidget(QWidget):
         seg_group = QGroupBox("Annotation & Segmentation")
         seg_layout = QVBoxLayout()
         self.tab_widget = QTabWidget()
+        self.tab_widget.setElideMode(Qt.ElideRight)
+        self.tab_widget.tabBar().setExpanding(False)
+        self.tab_widget.tabBar().setUsesScrollButtons(True)
 
         self.legend_tab = AnnotationLegendTab(
             self.viewer, self.label_map, has_death=self.has_death,
@@ -1417,7 +1441,7 @@ class ConvPaintTrainingWidget(QWidget):
         scroll = QScrollArea()
         scroll.setWidget(scroll_content)
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         outer = QVBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)

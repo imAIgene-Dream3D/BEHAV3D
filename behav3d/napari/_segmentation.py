@@ -4427,19 +4427,23 @@ class ConvPaintWidget(QWidget):
     def _init_ui(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setMinimumWidth(0)
 
         content = QWidget()
+        content.setMinimumWidth(0)
         layout = QVBoxLayout(content)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
         info = QLabel(
-            "<b>ConvPaint Pixel Classifier</b><br>"
-            "Uses <tt>napari-convpaint</tt> + a deep feature extractor (VGG/DINOv2/...)<br>"
-            "to train a single multi-class classifier for all cell types at once."
+            "<b>ConvPaint Pixel Classifier.</b> "
+            "Uses <tt>napari-convpaint</tt> + a deep feature extractor "
+            "(VGG/DINOv2/...) to train a single multi-class classifier "
+            "for all cell types at once."
         )
         info.setWordWrap(True)
+        info.setMinimumWidth(0)
         info.setStyleSheet("color: #888; font-size: 11px; padding: 4px 0 6px 0;")
         layout.addWidget(info)
 
@@ -4552,7 +4556,7 @@ class ConvPaintWidget(QWidget):
         self.btn_run_segmentation = QPushButton("▶ Run ConvPaint Batch Segmentation")
         self.btn_run_segmentation.setStyleSheet(
             "QPushButton { background: #007bff; color: white; font-weight: bold; "
-            "border-radius: 4px; padding: 10px; font-size: 13px; } "
+            "border-radius: 4px; padding: 6px; } "
             "QPushButton:hover { background: #0069d9; }"
         )
         self.btn_run_segmentation.clicked.connect(lambda _: self._on_run_segmentation(interactive=True))
@@ -4825,13 +4829,32 @@ class ConvPaintWidget(QWidget):
             overwrite_images = False
             if image_outpath.exists():
                 if interactive:
+                    try:
+                        import zarr as _zarr
+                        _cached = _zarr.open(str(image_outpath), mode="r")
+                        # ConvPaint saves as (C, T, Z, Y, X) → shape[1] = image count
+                        saved_image_count = _cached.shape[1] if len(_cached.shape) > 1 else _cached.shape[0]
+                        del _cached
+                    except Exception:
+                        saved_image_count = None
+
                     n_samples = len(md["sample_name"].unique())
-                    msg = (
-                        "Training data already exists.\n\n"
-                        f"Currently selected: {n_samples} sample(s) × "
-                        f"{self.spin_examples.value()} examples/sample.\n\n"
-                        "Overwrite with new training data, or load the existing data?"
-                    )
+                    examples_per_sample = self.spin_examples.value()
+                    total_new_images = n_samples * examples_per_sample
+                    if saved_image_count is not None:
+                        msg = (
+                            f"Training data already exists with {saved_image_count} images.\n\n"
+                            f"Currently selected: {n_samples} sample(s) × {examples_per_sample} examples/sample "
+                            f"= {total_new_images} images.\n\n"
+                            "Overwrite with new training data, or load the existing data?"
+                        )
+                    else:
+                        msg = (
+                            "Training data already exists.\n\n"
+                            f"Currently selected: {n_samples} sample(s) × {examples_per_sample} examples/sample "
+                            f"= {total_new_images} images.\n\n"
+                            "Overwrite with new training data, or load the existing data?"
+                        )
                     box = QMessageBox(self)
                     box.setWindowTitle("Training Data Detected")
                     box.setText(msg)
