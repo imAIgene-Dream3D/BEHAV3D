@@ -31,6 +31,9 @@ from qtpy.QtWidgets import (
     QStackedWidget,
     QAbstractButton,
     QSizePolicy,
+    QMessageBox,
+    QScrollArea,
+    QFrame,
 )
 
 from behav3d.core.metadata import (
@@ -221,6 +224,41 @@ class VisualizationTab(QWidget):
         
         layout.addWidget(vis_grp)
 
+        # ------------------------------------------------------------------
+        # Manual edition (visible only when a tracked-segments layer exists)
+        # ------------------------------------------------------------------
+        self._editor = None  # active TrackedSegmentEditor instance (or None)
+        self._editor_dock = None  # napari dock holding the editor (notebook only)
+
+        self.edition_grp = QGroupBox("Manual Edition")
+        edit_lay = QVBoxLayout(self.edition_grp)
+        edit_lay.setContentsMargins(6, 4, 6, 4)
+        edit_lay.setSpacing(4)
+
+        ct_row = QHBoxLayout()
+        ct_row.addWidget(QLabel("Tracked segments:"))
+        self.edit_combo = QComboBox()
+        self.edit_combo.setMinimumWidth(220)
+        ct_row.addWidget(self.edit_combo, stretch=1)
+        edit_lay.addLayout(ct_row)
+
+        self.edit_toggle_btn = QPushButton("✏️  Edit tracked segments")
+        self.edit_toggle_btn.setCheckable(True)
+        self._style_edit_toggle(checked=False)
+        self.edit_toggle_btn.toggled.connect(self._on_edit_toggle)
+        edit_lay.addWidget(self.edit_toggle_btn)
+
+        # Slot reserved for the inline TrackedSegmentEditor; populated on
+        # demand and torn down when editing stops.
+        self.edit_container = QWidget()
+        self.edit_container_layout = QVBoxLayout(self.edit_container)
+        self.edit_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.edit_container_layout.setSpacing(0)
+        edit_lay.addWidget(self.edit_container)
+
+        self.edition_grp.setVisible(False)
+        layout.addWidget(self.edition_grp)
+
         # Log
         self.log = QTextEdit()
         self.log.setReadOnly(True)
@@ -229,7 +267,14 @@ class VisualizationTab(QWidget):
         layout.addWidget(QLabel("Log"))
         layout.addWidget(self.log)
 
-        self.stack.addWidget(self.main_content)
+        # Wrap the main content in a scroll area so the manual-correction
+        # editor (which can grow tall) does not push controls out of view.
+        self.main_scroll = QScrollArea()
+        self.main_scroll.setWidgetResizable(True)
+        self.main_scroll.setFrameShape(QFrame.NoFrame)
+        self.main_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.main_scroll.setWidget(self.main_content)
+        self.stack.addWidget(self.main_scroll)
         self.stack.setCurrentIndex(0)
 
     # ------------------------------------------------------------------
@@ -301,6 +346,9 @@ class VisualizationTab(QWidget):
         # ---- 4. Tracks ---------------------------------------------------
         self._load_tracks(sample_name, row)
         self._log(f"✅ Dataset '{sample_name}' loaded into napari")
+
+        # ---- 5. Refresh the Manual Edition selector ---------------------
+        self._refresh_edition_panel()
 
     # ------------------------------------------------------------------
     # Raw image loader
@@ -557,6 +605,187 @@ class VisualizationTab(QWidget):
                     
             if match:
                 layer.visible = visible
+
+    # ------------------------------------------------------------------
+    # Manual Edition section
+    # ------------------------------------------------------------------
+    def _style_edit_toggle(self, checked: bool) -> None:
+        if checked:
+            self.edit_toggle_btn.setText("⏹  Stop editing")
+            self.edit_toggle_btn.setStyleSheet(
+                "background-color:#c62828; color:white; font-weight:bold; padding:6px;"
+            )
+        else:
+            self.edit_toggle_btn.setText("✏️  Edit tracked segments")
+            self.edit_toggle_btn.setStyleSheet(
+                "background-color:#28a745; color:white; font-weight:bold; padding:6px;"
+            )
+
+    def _tracked_layer_names(self) -> list[str]:
+        return [
+            layer.name for layer in self.viewer.layers
+            if isinstance(layer.name, str)
+            and layer.name.endswith(" tracked segments")
+        ]
+
+    def _refresh_edition_panel(self) -> None:
+        """Show the Manual Edition group iff a tracked-segments layer exists."""
+        names = self._tracked_layer_names()
+        # If we changed sample while editing, force-close the editor.
+        if self._editor is not None and self._editor.layer_name not in names:
+            self.edit_toggle_btn.setChecked(False)
+        prev = self.edit_combo.currentText()
+        self.edit_combo.blockSignals(True)
+        self.edit_combo.clear()
+        self.edit_combo.addItems(names)
+        if prev in names:
+            self.edit_combo.setCurrentText(prev)
+        self.edit_combo.blockSignals(False)
+        self.edition_grp.setVisible(bool(names))
+
+    def _on_edit_toggle(self, checked: bool) -> None:
+        if checked:
+            if not self._open_editor():
+                # Failed to open — revert.
+                self.edit_toggle_btn.blockSignals(True)
+                self.edit_toggle_btn.setChecked(False)
+                self.edit_toggle_btn.blockSignals(False)
+                return
+            self._style_edit_toggle(True)
+        else:
+            ok = self._close_editor(prompt=True)
+            if not ok:
+                # User cancelled the close prompt — keep the toggle on.
+                self.edit_toggle_btn.blockSignals(True)
+                self.edit_toggle_btn.setChecked(True)
+                self.edit_toggle_btn.blockSignals(False)
+                return
+            self._style_edit_toggle(False)
+
+    def _open_editor(self) -> bool:
+        from behav3d.napari._segment_editor import (
+            TrackedSegmentEditor,
+            _cell_type_from_layer_name,
+            _sample_from_layer_name,
+        )
+        from behav3d.napari._loaders import (
+            load_raw_into_viewer,
+            load_tracked_segments_into_viewer,
+            load_tracks_into_viewer,
+        )
+
+        layer_name = self.edit_combo.currentText()
+        if not layer_name:
+            self._log("⚠️ No tracked-segments layer to edit.")
+            return False
+        sample_name = _sample_from_layer_name(layer_name)
+        cell_type = _cell_type_from_layer_name(layer_name)
+        if not sample_name or not cell_type or self._metadata is None:
+            self._log("⚠️ Could not infer sample/cell-type from layer name.")
+            return False
+        rows = self._metadata[
+            self._metadata["sample_name"].astype(str) == str(sample_name)
+        ]
+        if rows.empty:
+            self._log(f"⚠️ Sample '{sample_name}' not in metadata.")
+            return False
+        row = rows.iloc[0]
+        output_dir = self.data_prep.output_dir or ""
+
+        # Hard reset the viewer: keep ONLY the raw images, the chosen
+        # tracked-segments layer (loaded as numpy so it is editable in
+        # place) and the matching tracks for that cell type.
+        self._log(
+            f"  Entering edit mode — clearing viewer and reloading "
+            f"raw + '{cell_type} tracked segments' + '{cell_type} tracks' only."
+        )
+        try:
+            qt_dims = self.viewer.window._qt_viewer.dims
+            if hasattr(qt_dims, "_animation_thread") and qt_dims._animation_thread is not None:
+                qt_dims._animation_thread.quit()
+                qt_dims._animation_thread.wait()
+        except Exception:
+            pass
+        self.viewer.layers.clear()
+        load_raw_into_viewer(self.viewer, sample_name, row, output_dir=output_dir, log=self._log)
+        # Load the tracked-segments layer dask-backed (as_numpy=False) so
+        # napari can display it immediately while materialisation happens in
+        # the background.  The editor will kick off a QThread worker that
+        # converts it to a writable numpy array before enabling editing.
+        added = load_tracked_segments_into_viewer(
+            self.viewer, sample_name, row, log=self._log,
+            only_cell_type=cell_type, as_numpy=False,
+        )
+        load_tracks_into_viewer(
+            self.viewer, sample_name, row, visible=True, log=self._log,
+            only_cell_type=cell_type,
+        )
+        # Refresh combo (layer names may have shifted, but the chosen one
+        # is still present if the load succeeded).
+        self._refresh_edition_panel()
+        if not added:
+            self._log("❌ Tracked segments failed to load — editor not opened.")
+            return False
+        # The just-added tracked-segments layer is the one to edit.
+        target = added[0]
+
+        try:
+            editor = TrackedSegmentEditor(
+                viewer=self.viewer,
+                metadata_loader=self.data_prep,
+                layer_name=target,
+                parent=self,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            QMessageBox.critical(
+                self, "Cannot open editor",
+                f"Failed to start the manual-correction editor:\n{exc}",
+            )
+            return False
+        # Hook the editor's "Stop editing" footer button to the toggle.
+        editor.stop_callback = lambda: self.edit_toggle_btn.setChecked(False)
+        self.edit_container_layout.addWidget(editor)
+        self._editor = editor
+        self._log(f"  Editing started on '{target}'.")
+        # Kick off background materialisation now that the editor is shown.
+        editor.start_materialisation()
+        return True
+
+    def _close_editor(self, prompt: bool = True) -> bool:
+        if self._editor is None:
+            return True
+        if prompt:
+            if not self._editor.request_exit():
+                return False
+        else:
+            self._editor._cleanup()
+        # Remove from layout + delete.
+        self.edit_container_layout.removeWidget(self._editor)
+        self._editor.setParent(None)
+        try:
+            self._editor.deleteLater()
+        except Exception:
+            pass
+        self._editor = None
+        self._log("  Editing stopped.")
+        return True
+
+    def request_tab_exit(self) -> bool:
+        """Return False to veto leaving the Visualization tab while edits
+        are pending.  Called by ``BEHAV3DWidget._on_tab_changed``.
+        """
+        if self._editor is None:
+            return True
+        if self._editor.request_exit():
+            # request_exit() already saved/discarded; tear down the editor.
+            self._close_editor(prompt=False)
+            self.edit_toggle_btn.blockSignals(True)
+            self.edit_toggle_btn.setChecked(False)
+            self._style_edit_toggle(False)
+            self.edit_toggle_btn.blockSignals(False)
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Detect cell-type columns from metadata row

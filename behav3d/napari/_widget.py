@@ -182,6 +182,18 @@ class BEHAV3DWidget(QWidget):
                     self.tabs.blockSignals(False)
                     return
 
+        # 3. Handle exit from the Visualization tab while a manual-correction
+        # editor has unsaved changes — prompt Save / Discard / Cancel.
+        if self._last_tab_index == 1:
+            if hasattr(self, 'visualization_tab') and hasattr(
+                self.visualization_tab, 'request_tab_exit'
+            ):
+                if not self.visualization_tab.request_tab_exit():
+                    self.tabs.blockSignals(True)
+                    self.tabs.setCurrentIndex(1)
+                    self.tabs.blockSignals(False)
+                    return
+
         self._last_tab_index = index
 
     def sizeHint(self):

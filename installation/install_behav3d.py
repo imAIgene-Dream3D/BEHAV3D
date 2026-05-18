@@ -603,6 +603,62 @@ def install_behav3d_package(conda_path):
         return False
 
 # =============================================================================
+# FREETYPE DLL FIX (Windows only)
+# =============================================================================
+
+def fix_freetype_windows(conda_path: str) -> None:
+    """Copy freetype.dll as libfreetype.dll into the freetype-py package dir.
+
+    On Windows, conda installs the FreeType C library as
+    ``Library/bin/freetype.dll`` while ``freetype-py`` (the Python wrapper
+    used by vispy/napari) looks for ``libfreetype.dll`` inside its own package
+    directory.  The name mismatch means freetype-py never finds the DLL and
+    any napari feature that renders text (scale bar, axes labels, etc.) crashes
+    with ``RuntimeError: Freetype library not found``.
+
+    This function copies the DLL under the expected name so both names resolve
+    to the same binary.  It is a no-op on macOS/Linux (where the library is
+    found via the standard system path).
+    """
+    if platform.system() != "Windows":
+        return
+
+    print_step("Applying Windows FreeType DLL fix...")
+
+    # Locate the conda environment prefix.
+    try:
+        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+        result = run_command(
+            f'{run_prefix} python -c "import sys; print(sys.prefix)"',
+            capture=True,
+        )
+        if not result:
+            print_warning("Could not determine conda env prefix; skipping FreeType fix.")
+            return
+        env_prefix = Path(result.strip())
+    except Exception as exc:
+        print_warning(f"FreeType fix: could not find env prefix ({exc})")
+        return
+
+    src = env_prefix / "Library" / "bin" / "freetype.dll"
+    if not src.exists():
+        print_warning(f"FreeType fix: source DLL not found at {src}; skipping.")
+        return
+
+    # Destination: freetype-py package directory.
+    dst = env_prefix / "Lib" / "site-packages" / "freetype" / "libfreetype.dll"
+    if dst.exists():
+        print_info(f"FreeType fix: {dst.name} already present — nothing to do.")
+        return
+
+    try:
+        shutil.copy2(str(src), str(dst))
+        print_success(f"FreeType fix applied: {src.name} → {dst}")
+    except Exception as exc:
+        print_warning(f"FreeType fix: could not copy DLL ({exc})")
+
+
+# =============================================================================
 # VERIFICATION
 # =============================================================================
 
@@ -927,6 +983,10 @@ Examples:
             except Exception as e:
                 print_warning(f"Plugin verification warning: {e}")
     
+    # Fix FreeType DLL name mismatch on Windows
+    print_header("PLATFORM FIXES")
+    fix_freetype_windows(conda_path)
+
     # Verify installation
     print_header("VERIFICATION")
     verify_installation(conda_path)
