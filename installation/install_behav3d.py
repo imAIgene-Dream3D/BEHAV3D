@@ -1036,7 +1036,6 @@ Examples:
             print("To launch napari later:")
             print(f"  Double-click: {launcher}")
             print()
-            input("Press Enter to exit...")
             
     except (EOFError, KeyboardInterrupt):
         pass

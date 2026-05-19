@@ -13,6 +13,7 @@ functions — no logic duplication.
 """
 from __future__ import annotations
 
+import os
 import traceback
 from copy import deepcopy
 from pathlib import Path
@@ -106,12 +107,14 @@ class _ZarrWorker(QThread):
     finished = Signal(bool, str)  # (success, message)
 
     def __init__(self, output_dir: str, metadata: pd.DataFrame,
-                 t_start: int = None, t_end: int = None, parent=None):
+                 t_start: int = None, t_end: int = None,
+                 n_workers: int = 1, parent=None):
         super().__init__(parent)
         self.output_dir = output_dir
         self.metadata = metadata
         self.t_start = t_start
         self.t_end = t_end
+        self.n_workers = n_workers
 
     def run(self):
         try:
@@ -123,6 +126,7 @@ class _ZarrWorker(QThread):
                 metadata=self.metadata,
                 t_start=self.t_start,
                 t_end=self.t_end,
+                n_workers=self.n_workers,
             )
             self.finished.emit(True, "✅ Zarr conversion complete!")
         except Exception:
@@ -1079,10 +1083,9 @@ class DataPreparationTab(QWidget):
     def _save_dim_order(self):
         if self.metadata is None:
             return
-        csv_path = self.csv_path_edit.text().strip()
-        if not csv_path:
-            return
 
+        # Always apply UI choices back to the in-memory DataFrame first,
+        # regardless of whether a CSV path is available.
         for i in range(self.dim_table.rowCount()):
             sample = self.dim_table.item(i, 0).text()
             combo = self.dim_table.cellWidget(i, 2)
@@ -1091,8 +1094,16 @@ class DataPreparationTab(QWidget):
                     self.metadata["sample_name"] == sample, "dimension_order"
                 ] = combo.currentText()
 
-        self.metadata.to_csv(csv_path, index=False)
-        self._log(f"✅ Dimension orders saved to {csv_path}")
+        # Persist to CSV only when a path is known.
+        csv_path = self.csv_path_edit.text().strip()
+        if csv_path:
+            self.metadata.to_csv(csv_path, index=False)
+            self._log(f"✅ Dimension orders updated in memory and saved to {csv_path}")
+        else:
+            self._log("✅ Dimension orders updated in memory (no CSV path set — save metadata first to persist)")
+
+        # Refresh the metadata overview table so the user sees the changes.
+        self._populate_metadata_overview()
 
     # ══════════════════════════════════════════════════════════════════════
     # Section 6 – Convert to Zarr
@@ -1131,6 +1142,23 @@ class DataPreparationTab(QWidget):
             self.zarr_t_start.setEnabled(enabled)
             self.zarr_t_end.setEnabled(enabled)
         self.zarr_clip_check.stateChanged.connect(_toggle_clip)
+
+        # Workers
+        n_cores = os.cpu_count() or 2
+        default_workers = max(1, n_cores // 2)
+        workers_row = QHBoxLayout()
+        workers_row.addWidget(QLabel("Workers:"))
+        self.zarr_workers_spin = QSpinBox()
+        self.zarr_workers_spin.setRange(1, max(1, n_cores - 1))
+        self.zarr_workers_spin.setValue(default_workers)
+        self.zarr_workers_spin.setMaximumWidth(70)
+        self.zarr_workers_spin.setToolTip(
+            "Number of parallel worker processes for zarr conversion.\n"
+            f"Defaults to half of available CPU cores ({default_workers}/{n_cores})."
+        )
+        workers_row.addWidget(self.zarr_workers_spin)
+        workers_row.addStretch()
+        lay.addLayout(workers_row)
 
         self.zarr_btn = QPushButton("Convert All Images to Zarr")
         self.zarr_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
@@ -1172,7 +1200,8 @@ class DataPreparationTab(QWidget):
 
         self._zarr_worker = _ZarrWorker(
             out_dir, self.metadata.copy(),
-            t_start=t_start, t_end=t_end, parent=self
+            t_start=t_start, t_end=t_end,
+            n_workers=self.zarr_workers_spin.value(), parent=self
         )
         self._zarr_worker.progress.connect(lambda msg: self._log(msg))
         self._zarr_worker.finished.connect(self._on_zarr_done)

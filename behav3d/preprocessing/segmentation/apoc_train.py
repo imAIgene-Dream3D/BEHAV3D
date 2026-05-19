@@ -1587,7 +1587,7 @@ class APOCTrainingWidget(QWidget):
         self.has_death = has_death
         self._initial_params = initial_params or {}
         self._on_params_changed = on_params_changed
-        self._apoc_strategy = str(self._initial_params.get("apoc_strategy", "APOC (Direct Instance Segmentation)"))
+        self._apoc_strategy = str(self._initial_params.get("apoc_strategy", "APOC Probability Map + Watershed"))
         self._log_fn = print
 
         if instance_controls_mode not in ("docked", "inline"):

@@ -425,6 +425,8 @@ class CellTypeTrackingPanel(QWidget):
         # Determine defaults
         if category == "organoid":
             def_method = "propagation"
+        elif category == "immune":
+            def_method = "btrack"
         else:
             def_method = "lap"
 
