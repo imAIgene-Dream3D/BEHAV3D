@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 import dask.array as da
 import numpy as np
 import pandas as pd
-from qtpy.QtCore import Qt, QObject, QThread, Signal
+from qtpy.QtCore import Qt, QObject, QThread, QTimer, Signal
 from qtpy.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -58,6 +58,11 @@ from behav3d.editing import (
     split_label,
 )
 from behav3d.napari._loaders import tracked_segments_paths_for
+
+try:
+    from napari.utils import progress as _NapariProgress
+except Exception:
+    _NapariProgress = None
 
 
 _SPLIT_SEEDS_LAYER = "__split_seeds__"
@@ -230,6 +235,8 @@ class TrackedSegmentEditor(QWidget):
         # every Apply / Undo / Redo / Discard / tool-switch.
         self._preview_dirty: Dict[int, np.ndarray] = {}
         self._preview_tool: Optional[str] = None
+        # napari activity-dock progress bar (None when no operation is running).
+        self._activity_progress = None
 
         self._build_ui()
         self._bind_to_layer()
@@ -718,6 +725,136 @@ class TrackedSegmentEditor(QWidget):
         if hasattr(self, "lbl_progress"):
             self.lbl_progress.setVisible(True)
 
+    # ------------------------------------------------------------------
+    # napari activity-dock progress helpers
+    # ------------------------------------------------------------------
+    def _make_activity_progress(self, desc: str = "Editing…"):
+        """Create an indeterminate napari activity-dock progress bar.
+
+        ``total=0`` makes Qt render the bar as a spinning busy indicator until
+        we know the real frame count.  The real total is set on the first
+        progress signal via :meth:`_update_activity_progress`.
+        """
+        if _NapariProgress is None:
+            return None
+        try:
+            pbr = _NapariProgress(total=0, desc=desc)
+            # Try to expand the activity panel.  The attribute name for the
+            # activity dock differs across napari versions; try each in turn.
+            self._show_napari_activity_panel()
+            return pbr
+        except Exception:
+            return None
+
+    def _show_napari_activity_panel(self) -> None:
+        """Best-effort attempt to make the napari activity panel visible."""
+        try:
+            win = self.viewer.window._qt_window
+        except Exception:
+            return
+        for attr in (
+            "_activity_dialog",
+            "_qt_activity",
+            "_activity_dock",
+        ):
+            obj = getattr(win, attr, None)
+            if obj is not None and hasattr(obj, "show"):
+                try:
+                    obj.show()
+                    obj.raise_()
+                except Exception:
+                    pass
+                return
+        try:
+            from qtpy.QtWidgets import QDockWidget, QDialog
+            for child in win.findChildren((QDockWidget, QDialog)):
+                if "activity" in (child.objectName() or "").lower():
+                    child.show()
+                    child.raise_()
+                    return
+        except Exception:
+            pass
+
+    def _hide_napari_activity_panel(self) -> None:
+        """Best-effort attempt to hide/collapse the napari activity panel."""
+        try:
+            win = self.viewer.window._qt_window
+        except Exception:
+            return
+        for attr in (
+            "_activity_dialog",
+            "_qt_activity",
+            "_activity_dock",
+        ):
+            obj = getattr(win, attr, None)
+            if obj is not None and hasattr(obj, "hide"):
+                try:
+                    obj.hide()
+                except Exception:
+                    pass
+                return
+        try:
+            from qtpy.QtWidgets import QDockWidget, QDialog
+            for child in win.findChildren((QDockWidget, QDialog)):
+                if "activity" in (child.objectName() or "").lower():
+                    child.hide()
+                    return
+        except Exception:
+            pass
+
+    def _update_activity_progress(self, current: int, total: int) -> None:
+        """Slot connected to the worker progress signal; updates the activity bar.
+
+        On the first call the bar is re-initialised with the correct total via
+        ``reset()`` so the Qt widget's maximum is set properly and the
+        percentage is meaningful.  Subsequent calls use ``update(delta)`` —
+        the canonical tqdm API — which calls ``display()`` internally and
+        guarantees the Qt widget is refreshed.
+        """
+        pbr = self._activity_progress
+        if pbr is None:
+            return
+        try:
+            if total > 0 and pbr.total != total:
+                # reset() sets n=0 and updates total in one shot; this also
+                # updates the Qt progress bar's maximum correctly.
+                try:
+                    pbr.reset(total=total)
+                except Exception:
+                    pbr.total = total
+                    pbr.n = 0
+            delta = current - pbr.n
+            if delta > 0:
+                pbr.update(delta)
+            elif delta < 0:
+                # Shouldn't happen in normal use, but guard anyway.
+                pbr.n = current
+                pbr.refresh()
+        except Exception:
+            pass
+
+    def _close_activity_progress(self) -> None:
+        """Fill the bar to 100 %, wait 1 s, then close the activity entry."""
+        pbr = self._activity_progress
+        self._activity_progress = None
+        if pbr is None:
+            return
+        try:
+            # Drive to 100 % so the bar shows completion before the delay.
+            if pbr.total and pbr.total > 0 and pbr.n < pbr.total:
+                pbr.update(pbr.total - pbr.n)
+        except Exception:
+            pass
+
+        def _do_close():
+            try:
+                pbr.close()
+            except Exception:
+                pass
+            self._hide_napari_activity_panel()
+
+        QTimer.singleShot(1000, _do_close)
+
     def _set_editing_enabled(self, enabled: bool) -> None:
         """Enable or disable all editing action buttons."""
         for btn in (
@@ -769,7 +906,8 @@ class TrackedSegmentEditor(QWidget):
     # ------------------------------------------------------------------
     # Background edit operation management
     # ------------------------------------------------------------------
-    def _run_operation_async(self, fn, args, kwargs=None, on_success=None) -> None:
+    def _run_operation_async(self, fn, args, kwargs=None, on_success=None,
+                             desc: str = "Editing…") -> None:
         """Run ``fn(*args, **kwargs)`` in a background QThread.
 
         Disables all edit buttons while running and re-enables them when the
@@ -787,10 +925,13 @@ class TrackedSegmentEditor(QWidget):
         on_success:
             Optional callable invoked with the result after every
             :meth:`_commit_op` succeeds (e.g. clear split seeds).
+        desc:
+            Short description shown in the napari activity-dock progress bar.
         """
         if kwargs is None:
             kwargs = {}
         self._pending_on_success = on_success
+        self._activity_progress = self._make_activity_progress(desc)
 
         worker = _EditWorker(fn, args, kwargs)
         # Inject progress callback — primitives expose it as an optional kwarg.
@@ -804,6 +945,7 @@ class TrackedSegmentEditor(QWidget):
         worker.failed.connect(self._on_edit_failed)
         worker.finished.connect(thread.quit)
         worker.progress.connect(self._on_operation_progress)
+        worker.progress.connect(self._update_activity_progress)
         thread.finished.connect(self._on_edit_thread_finished)
 
         self._edit_thread = thread
@@ -819,6 +961,7 @@ class TrackedSegmentEditor(QWidget):
         committed here on the Qt thread so that ``EditBuffer`` is never written
         from a background thread.
         """
+        self._close_activity_progress()
         ops = result if isinstance(result, list) else [result]
         any_committed = False
         for op in ops:
@@ -844,6 +987,7 @@ class TrackedSegmentEditor(QWidget):
 
     def _on_edit_failed(self, error: str) -> None:
         """Called on the Qt thread when the operation raised an exception."""
+        self._close_activity_progress()
         self._log_msg(f"  ❌ Operation failed: {error}")
         self._set_editing_enabled(True)
 
@@ -880,6 +1024,9 @@ class TrackedSegmentEditor(QWidget):
         if kwargs is None:
             kwargs = {}
         self._pending_preview_tool = tool_name
+        self._activity_progress = self._make_activity_progress(
+            f"Preview {tool_name}…" if tool_name else "Previewing…"
+        )
         worker = _EditWorker(fn, args, kwargs)
         kwargs['progress_cb'] = worker.progress.emit
         thread = QThread()
@@ -889,6 +1036,7 @@ class TrackedSegmentEditor(QWidget):
         worker.failed.connect(self._on_preview_failed)
         worker.finished.connect(thread.quit)
         worker.progress.connect(self._on_operation_progress)
+        worker.progress.connect(self._update_activity_progress)
         thread.finished.connect(self._on_edit_thread_finished)
         self._edit_thread = thread
         self._edit_worker = worker
@@ -896,6 +1044,7 @@ class TrackedSegmentEditor(QWidget):
         thread.start()
 
     def _on_preview_done(self, result) -> None:
+        self._close_activity_progress()
         tool_name = self._pending_preview_tool or "operation"
         self._pending_preview_tool = None
         self._preview_dirty.clear()
@@ -923,6 +1072,7 @@ class TrackedSegmentEditor(QWidget):
         self._set_editing_enabled(True)
 
     def _on_preview_failed(self, error: str) -> None:
+        self._close_activity_progress()
         self._pending_preview_tool = None
         self._log_msg(f"  ❌ Preview failed: {error}")
         self._set_editing_enabled(True)
@@ -1199,6 +1349,7 @@ class TrackedSegmentEditor(QWidget):
                 keep_first_id=self.cb_keep_first.isChecked(),
             ),
             on_success=_clear_seeds,
+            desc=f"Splitting label {label_id}…",
         )
 
     def _preview_split(self) -> None:
@@ -1247,7 +1398,14 @@ class TrackedSegmentEditor(QWidget):
         target = self.combo_merge_target.currentData()
         if target is None:
             target = min(self._selected_labels)
-        rng = self._selected_t_range(target)
+        # Pass t_range=None when "Full lifetime" is selected so that
+        # merge_labels computes the union of all selected labels' lifetimes.
+        # Using only the target's lifetime misses labels that exist exclusively
+        # in timepoints where the target is absent (e.g. non-overlapping tracks).
+        if self.rb_full.isChecked():
+            rng = None
+        else:
+            rng = (int(self.spin_t0.value()), int(self.spin_t1.value()))
         self._log_msg(f"  Running merge of {self._selected_labels} → {target}…")
         self._run_operation_async(
             merge_labels,
@@ -1257,6 +1415,7 @@ class TrackedSegmentEditor(QWidget):
                 target_id=int(target),
                 t_range=rng,
             ),
+            desc=f"Merging labels → {target}…",
         )
 
     def _preview_merge(self) -> None:
@@ -1320,6 +1479,7 @@ class TrackedSegmentEditor(QWidget):
                 r_z=r_z,
                 t_range=rng,
             ),
+            desc=f"Eroding label {label_id}…",
         )
 
     def _preview_erode(self) -> None:
@@ -1357,6 +1517,7 @@ class TrackedSegmentEditor(QWidget):
                 r_z=r_z,
                 t_range=rng,
             ),
+            desc=f"Dilating label {label_id}…",
         )
 
     def _preview_dilate(self) -> None:
@@ -1413,6 +1574,7 @@ class TrackedSegmentEditor(QWidget):
             _do_delete_all,
             (self.buffer,),
             on_success=_uncheck,
+            desc=f"Deleting label(s) {label_ids}…",
         )
 
     def _preview_delete(self) -> None:
@@ -1448,6 +1610,25 @@ class TrackedSegmentEditor(QWidget):
             return None
         try:
             return np.asarray(self.viewer.layers[layer_name].data[t_ref])
+        except Exception:
+            return None
+
+    def _get_create_image_stack(self):
+        """Return the full T×Z×Y×X channel array for the selected channel, or None.
+
+        Used by :meth:`_apply_create` to pass per-frame intensity guidance to
+        :func:`create_label` so that propagation frames use the same
+        Otsu + negated-image watershed as the reference frame.
+        """
+        layer_name = (
+            self.combo_create_channel.currentData()
+            if hasattr(self, "combo_create_channel")
+            else None
+        )
+        if not layer_name:
+            return None
+        try:
+            return self.viewer.layers[layer_name].data
         except Exception:
             return None
 
@@ -1505,8 +1686,10 @@ class TrackedSegmentEditor(QWidget):
                 t_ref=t_ref,
                 t_range=rng,
                 image_ref=image_ref,
+                image_stack=self._get_create_image_stack(),
             ),
             on_success=_clear_seeds,
+            desc=f"Creating {len(seeds_zyx)} label(s)…",
         )
 
     def _preview_create(self) -> None:
@@ -1548,6 +1731,29 @@ class TrackedSegmentEditor(QWidget):
             ),
             tool_name="create",
         )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _unique_darr(darr: da.Array) -> da.Array:
+        """Return *darr* re-tagged with a unique dask task-graph token.
+
+        Two ``da.from_zarr`` calls on the same zarr path produce arrays with
+        the same auto-generated task-graph keys.  If napari or dask has any
+        per-key slice cache, the second array would reuse results from the
+        first.  Wrapping with ``map_blocks(identity)`` and a UUID name gives
+        the array an unambiguous identity so all caches treat it as fresh.
+        """
+        import uuid
+        try:
+            return darr.map_blocks(
+                lambda b: b,
+                dtype=darr.dtype,
+                name=f"zarr_saved_{uuid.uuid4().hex}",
+            )
+        except Exception:
+            return darr
 
     # ------------------------------------------------------------------
     # Commit / undo / redo / save / discard
@@ -1595,14 +1801,43 @@ class TrackedSegmentEditor(QWidget):
             + (f"; rewrote CSV {csv_path.name}" if csv_path else "")
         )
         # After saving, _dirty is cleared and buffer._darr is reloaded from the
-        # freshly-written zarr.  Point layer.data directly at the clean dask
-        # array so that the stale dirty-frame numpy chunks are freed from the
-        # previous dask task graph.
+        # freshly-written zarr.  We need to:
+        #   1. Give the new dask array a unique token so napari / dask cannot
+        #      mistake it for the pre-save array (same zarr path → same default
+        #      task-graph keys → stale slice cache).
+        #   2. Assign the array to the layer AND force napari's slicer to
+        #      re-fire by doing a brief step-bounce; layer.refresh() alone only
+        #      repaints the current OpenGL frame without re-slicing.
         if self.layer_name in self.viewer.layers:
             try:
-                self.viewer.layers[self.layer_name].data = self.buffer._darr
+                layer = self.viewer.layers[self.layer_name]
+                fresh_darr = self._unique_darr(self.buffer._darr)
+                layer.data = fresh_darr
+                # Step-bounce: move one frame away and back so napari's async
+                # slicer requests a fresh chunk from the new dask graph for
+                # every subsequent frame navigation.
+                try:
+                    axis = 0
+                    T = int(self.buffer.shape[0])
+                    t_now = int(self.viewer.dims.current_step[axis])
+                    t_other = (t_now + 1) % T
+                    self.viewer.dims.set_current_step(axis, t_other)
+                    self.viewer.dims.set_current_step(axis, t_now)
+                except Exception:
+                    pass
+                # Explicit cache-clearing calls (best-effort, API varies).
+                for method in ("_reset_cache", "_reset_labels_cache",
+                               "set_view_slice", "_set_view_slice"):
+                    fn = getattr(layer, method, None)
+                    if callable(fn):
+                        try:
+                            fn()
+                        except Exception:
+                            pass
+                        break
+                layer.refresh()
             except Exception:
-                pass
+                traceback.print_exc()
         self._refresh_buttons()
 
     def _on_discard(self) -> None:

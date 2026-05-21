@@ -244,14 +244,14 @@ class EditBuffer:
         commit = _Commit(name=op.name, summary=op.summary)
         for t, post_frame in op.new_frames.items():
             t = int(t)
+            if not large:
+                # Capture pre-state BEFORE overwriting _dirty so that undo
+                # can restore the frame that existed prior to this operation.
+                commit.pre[t] = self.peek(t).copy()
             # Use copy=False: worker frames are freshly computed and never
             # mutated, so sharing the reference is safe and halves peak RAM.
             commit.post[t] = np.asarray(post_frame).astype(self.dtype, copy=False)
             self._dirty[t] = commit.post[t]
-            if not large:
-                # Store pre-snapshot only for operations that are small enough
-                # to keep in memory for undo.
-                commit.pre[t] = self.peek(t).copy()
         if not large:
             self._undo.append(commit)
             # New action invalidates redo history.
@@ -349,11 +349,32 @@ class EditBuffer:
         """
         if not self._dirty:
             return 0, None
+
+        # Open the zarr array ONCE so all per-frame writes share the same
+        # store handle.  Closing the store at the end flushes any internal
+        # write buffers (important on Windows where per-call open/close can
+        # leave chunks unlocked before the OS has flushed them).
+        import zarr as _zarr
+        try:
+            arr = _zarr.open_array(str(self.zarr_path), mode="r+")
+        except Exception:
+            # Fallback: write frame-by-frame via the helper (pre-existing path).
+            for t in sorted(self._dirty):
+                write_zarr_parallel(self.zarr_path, index=t, data=self._dirty[t])
+            arr = None
+
         n = 0
-        for t in sorted(self._dirty):
-            data = self._dirty[t]
-            write_zarr_parallel(self.zarr_path, index=t, data=data)
-            n += 1
+        if arr is not None:
+            for t in sorted(self._dirty):
+                arr[int(t)] = np.asarray(self._dirty[t])
+                n += 1
+            try:
+                arr.store.close()
+            except Exception:
+                pass
+        else:
+            n = len(self._dirty)
+
         # The dirty data is now on disk: clear in-memory mutations and
         # refresh the underlying dask view so subsequent peek()s read
         # the new bytes.

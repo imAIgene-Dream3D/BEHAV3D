@@ -16,7 +16,7 @@ from pathlib import Path
 import dask.array as da
 import numpy as np
 import pandas as pd
-from qtpy.QtCore import Qt, QPropertyAnimation, QEasingCurve, Property, QRect, QPoint
+from qtpy.QtCore import Qt, QPropertyAnimation, QEasingCurve, Property, QRect, QPoint, QSize
 from qtpy.QtGui import QPainter, QColor
 from qtpy.QtWidgets import (
     QWidget,
@@ -34,6 +34,7 @@ from qtpy.QtWidgets import (
     QMessageBox,
     QScrollArea,
     QFrame,
+    QLayout,
 )
 
 from behav3d.core.metadata import (
@@ -50,6 +51,113 @@ _LABEL_CMAP = {
     "im": "inferno",
     "ot": "plasma",
 }
+# ----------------------------------------------------------------------
+# Dask cache-buster
+# ----------------------------------------------------------------------
+def _bust_dask_cache(arr: "da.Array") -> "da.Array":
+    """Return a dask array with a unique task-graph name.
+
+    ``da.from_zarr`` generates task-graph keys from the store path, so a
+    second call for the same path may yield keys that overlap with results
+    still held in dask's or napari's internal slice cache.  Wrapping with a
+    UUID-based name forces dask (and napari) to treat the result as a brand-
+    new array and re-read every block from disk.
+    """
+    import uuid
+    try:
+        return arr.map_blocks(
+            lambda b: b,
+            dtype=arr.dtype,
+            name=f"zarr_load_{uuid.uuid4().hex}",
+        )
+    except Exception:
+        return arr
+
+
+# ----------------------------------------------------------------------
+# Flow layout — wraps children to a new row when horizontal space is tight
+# ----------------------------------------------------------------------
+class _FlowLayout(QLayout):
+    """Geometry manager that flows items left-to-right and wraps to a new row.
+
+    Drop-in replacement for ``QHBoxLayout`` when you want automatic wrapping:
+    items are placed left-to-right until the row would overflow, at which point
+    a new row is started.  The enclosing widget's height expands automatically
+    because :meth:`hasHeightForWidth` / :meth:`heightForWidth` are implemented.
+    """
+
+    def __init__(self, parent=None, h_spacing: int = 8, v_spacing: int = 4):
+        super().__init__(parent)
+        self._h_spacing = h_spacing
+        self._v_spacing = v_spacing
+        self._items: list = []
+
+    # ------------------------------------------------------------------
+    # QLayout interface
+    # ------------------------------------------------------------------
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), test=True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test=False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        size += QSize(m.left() + m.right(), m.top() + m.bottom())
+        return size
+
+    # ------------------------------------------------------------------
+    # Internal geometry calculation
+    # ------------------------------------------------------------------
+    def _do_layout(self, rect: QRect, test: bool) -> int:
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = eff.x(), eff.y(), 0
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self._h_spacing
+            if next_x - self._h_spacing > eff.right() and line_h > 0:
+                # Wrap to the next row.
+                x = eff.x()
+                y += line_h + self._v_spacing
+                next_x = x + hint.width() + self._h_spacing
+                line_h = 0
+            if not test:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_h = max(line_h, hint.height())
+        return y + line_h - eff.y() + m.bottom()
+
+
 # ----------------------------------------------------------------------
 # Custom Toggle Switch (QSwitch)
 # ----------------------------------------------------------------------
@@ -198,30 +306,33 @@ class VisualizationTab(QWidget):
 
         # Visibility Toggles
         vis_grp = QGroupBox("Visibility Toggles")
-        vis_lay = QHBoxLayout(vis_grp)
-        
+        vis_lay = _FlowLayout(vis_grp, h_spacing=12, v_spacing=4)
+
         def make_switch(label, group_type):
-            container = QHBoxLayout()
+            container_widget = QWidget()
+            container = QHBoxLayout(container_widget)
+            container.setContentsMargins(0, 0, 0, 0)
+            container.setSpacing(4)
             container.addWidget(QLabel(label))
             sw = QSwitch()
             sw.setChecked(True)
             sw.clicked.connect(lambda: self._on_toggle_layer_group(sw.isChecked(), group_type))
             container.addWidget(sw)
-            return container, sw
+            return container_widget, sw
 
-        lay_raw, self.toggle_raw = make_switch("Raw:", "raw")
-        lay_seg, self.toggle_seg = make_switch("Segments:", "segments")
-        lay_tseg, self.toggle_track_seg = make_switch("Tracked Segments:", "tracked_segments")
-        lay_tracks, self.toggle_tracks = make_switch("Tracks:", "tracks")
-        
+        wgt_raw, self.toggle_raw = make_switch("Raw:", "raw")
+        wgt_seg, self.toggle_seg = make_switch("Segments:", "segments")
+        wgt_tseg, self.toggle_track_seg = make_switch("Tracked Segments:", "tracked_segments")
+        wgt_tracks, self.toggle_tracks = make_switch("Tracks:", "tracks")
+
         # Hide tracks by default
         self.toggle_tracks.setChecked(False)
 
-        vis_lay.addLayout(lay_raw)
-        vis_lay.addLayout(lay_seg)
-        vis_lay.addLayout(lay_tseg)
-        vis_lay.addLayout(lay_tracks)
-        
+        vis_lay.addWidget(wgt_raw)
+        vis_lay.addWidget(wgt_seg)
+        vis_lay.addWidget(wgt_tseg)
+        vis_lay.addWidget(wgt_tracks)
+
         layout.addWidget(vis_grp)
 
         # ------------------------------------------------------------------
@@ -465,7 +576,7 @@ class VisualizationTab(QWidget):
             try:
                 seg_p = Path(seg_path)
                 if seg_p.suffix == ".zarr":
-                    seg_data = load_zarr(seg_p)
+                    seg_data = _bust_dask_cache(load_zarr(seg_p))
                 else:
                     from behav3d.io.images import load_image
                     seg_data = load_image(seg_p)
@@ -550,7 +661,7 @@ class VisualizationTab(QWidget):
             try:
                 track_seg_p = Path(track_seg_path)
                 if track_seg_p.suffix == ".zarr":
-                    seg_data = load_zarr(track_seg_p)
+                    seg_data = _bust_dask_cache(load_zarr(track_seg_p))
                 else:
                     from behav3d.io.images import load_image
                     seg_data = load_image(track_seg_p)

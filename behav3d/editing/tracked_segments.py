@@ -373,6 +373,7 @@ def create_label(
     t_range: Optional[Tuple[int, int]] = None,
     new_ids: Optional[Sequence[int]] = None,
     image_ref: Optional[np.ndarray] = None,
+    image_stack=None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> OpResult:
     """Create N new labels in unlabelled background pixels, seeded by user clicks.
@@ -394,9 +395,10 @@ def create_label(
 
     Then, propagating frame-by-frame across ``t_range`` (defaulting to the
     full time axis when omitted), the new sub-labels from the previous frame
-    are used as markers for ``_run_single_timepoint_propagation`` restricted
-    to the *background* pixels of the next frame, so the new labels follow
-    the unlabelled region over time.
+    are used as markers for an intensity-guided watershed (when
+    ``image_stack`` is provided) or a binary watershed restricted to the
+    background pixels of the next frame, so the new labels follow the
+    unlabelled region over time.
 
     Parameters
     ----------
@@ -405,6 +407,13 @@ def create_label(
         (e.g. the selected raw fluorescence channel).  When supplied, the
         watershed is guided by the image and the eligible mask is restricted
         to bright (above-Otsu) voxels.
+    image_stack:
+        Optional 4-D array or dask array of shape ``(T, Z, Y, X)`` for the
+        same fluorescence channel across all timepoints.  When supplied,
+        each propagation frame uses the same Otsu + negated-image watershed
+        strategy as ``t_ref``, preventing the new label from flooding the
+        entire background in frames where no image guidance would otherwise
+        apply.
     """
     n_seeds = len(seeds_zyx)
     if n_seeds < 1:
@@ -493,21 +502,36 @@ def create_label(
             if not bg_mask_t.any():
                 # No background left — stop propagating.
                 break
-            # Keep only the new-label pixels from prev that fall inside the
-            # current background (they are the propagation markers).
-            prev_seg = np.where(np.isin(prev, new_ids), prev, 0).astype(prev.dtype)
-            prev_inside = np.where(bg_mask_t, prev_seg, 0)
-            if not (prev_inside > 0).any():
-                # New labels fully disappeared — stop propagating.
+
+            # When a full image stack is available, apply the same
+            # Otsu + negated-image strategy as the reference frame so that
+            # watershed boundaries form at dim valleys between objects.
+            # This prevents a single marker from flooding the entire
+            # background in frames where no intensity guidance is used.
+            if image_stack is not None:
+                img_t = np.asarray(image_stack[t]).astype(np.float32)
+                otsu_thresh = float(threshold_otsu(img_t))
+                eligible = bg_mask_t & (img_t >= otsu_thresh)
+                ws_image_t = img_t.max() - img_t
+            else:
+                eligible = bg_mask_t
+                ws_image_t = np.zeros(frame.shape, dtype=np.float32)
+
+            if not eligible.any():
                 break
-            t_seg_label = bg_mask_t.astype(prev.dtype)
-            new_sub = _run_single_timepoint_propagation(
-                t_seg_label, prev_inside.copy(),
-                dilation_nr_pixels=2,
-                segment_size_min=0,
-            )
+
+            # Keep only the new-label pixels from prev that fall inside the
+            # eligible mask (they are the propagation markers).
+            prev_seg = np.where(np.isin(prev, new_ids), prev, 0).astype(prev.dtype)
+            prev_inside = np.where(eligible, prev_seg, 0)
+            if not (prev_inside > 0).any():
+                # New labels fully disappeared from the eligible region — stop.
+                break
+
+            # Intensity-guided watershed mirrors the reference-frame logic.
+            new_sub = watershed(ws_image_t, markers=prev_inside, mask=eligible)
             out = frame.copy()
-            out[bg_mask_t] = new_sub[bg_mask_t]
+            out[eligible] = new_sub[eligible]
             new_frames[t] = out
             prev = out
             _done[0] += 1
