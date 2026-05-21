@@ -21,6 +21,7 @@ import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib import colormaps
 from matplotlib.lines import Line2D
+from matplotlib.legend import Legend
 from matplotlib.colors import LinearSegmentedColormap as _LSC
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Rectangle
@@ -176,12 +177,28 @@ def run_organoid_analysis(
         sep=",",
         index=False
     )
-        
+
+    # Per-sample mean +/- SEM dynamics across organoids (raw + smoothed,
+    # baseline-normalized; cummax for percentage_dead_mask). Saved as a
+    # separate CSV; plots are appended as extra pages to the combined PDF.
+    df_meansem = _compute_per_sample_mean_sem_dynamics(df_tracks, org_type=org_type)
+    meansem_value_cols = [
+        c for c in ("mean_dead_dye", "percentage_dead_mask")
+        if c in df_tracks.columns
+    ]
+    df_meansem_outpath = Path(
+        results_outdir, f"combined_mean_sem_{org_type}_dynamics_analysis.csv"
+    )
+    df_meansem.to_csv(df_meansem_outpath, sep=",", index=False)
+
     general_pdf_outpath = Path(results_outdir, f"combined_general_{org_type}_dynamics_analysis.pdf")
     
     plot_general_organoid_analysis(
             df_general=df_general,
             outpath=general_pdf_outpath,
+            df_meansem=df_meansem,
+            value_cols=meansem_value_cols,
+            org_type=org_type,
             figsize=(8.27, 11.69)
             )
     
@@ -482,9 +499,175 @@ def plot_feature_lineplot(
     ).set_title(hue, prop={'size': 6})
     return ax
 
+def _sem(x):
+    """Standard error of the mean: std(ddof=1)/sqrt(n); 0 when n <= 1."""
+    x = x.dropna()
+    n = len(x)
+    if n > 1:
+        return x.std(ddof=1) / np.sqrt(n)
+    return 0.0
+
+
+def _compute_per_sample_mean_sem_dynamics(df_tracks, org_type=None):
+    """
+    Aggregate per-sample mean +/- SEM dynamics across organoid tracks.
+
+    For each value column in {"mean_dead_dye", "percentage_dead_mask"} that
+    is present in ``df_tracks``, the recipe is the simple cohort-level one:
+
+    1. Aggregate across tracks per (sample_name, position_t):
+        ``<col>_mean``  = mean of ``<col>`` across organoids at time t.
+        ``<col>_sem``   = SEM of ``<col>`` across organoids at time t.
+
+    2. Per-sample baseline-subtract (start each curve at 0). The SEM is
+        unchanged by a constant shift, so we just copy it:
+        ``<col>_from0_mean`` = ``<col>_mean`` - per-sample first-timepoint mean.
+        ``<col>_from0_sem``  = ``<col>_sem``.
+
+    3. Smoothed-from-0. Smoothing happens at the COHORT level on the
+        already-baseline-subtracted mean and SEM (same window), so the
+        smoothed line and band are a self-consistent statistical pair:
+        ``<col>_smooth_from0_mean`` = rolling_mean( <col>_from0_mean ).
+        ``<col>_smooth_from0_sem``  = rolling_mean( <col>_from0_sem ).
+        The window used is the same fractional rolling-mean as
+        ``smooth_value_over_time`` (window = max(3, 0.2 * sample_length))
+        but with ``min_periods=1`` so the smoothed curve has no NaN
+        warm-up at t=0.
+
+    Returns a tidy DataFrame keyed on (sample_name, position_t).
+    Returns an empty DataFrame if no value columns are available.
+    """
+    time_col = "position_t"
+    candidate_cols = ["mean_dead_dye", "percentage_dead_mask"]
+    value_cols = [c for c in candidate_cols if c in df_tracks.columns]
+    if not value_cols:
+        return pd.DataFrame(columns=["sample_name", time_col])
+
+    df = df_tracks.copy()
+    df["TrackID"] = df["TrackID"].astype(str)
+
+    # ---- 1. cohort aggregate per (sample, timepoint) -------------------
+    g = (
+        df.groupby(["sample_name", time_col])[value_cols]
+          .agg(["mean", _sem])
+          .reset_index()
+    )
+    g.columns = ["_".join([c for c in col if c]).strip("_") for col in g.columns]
+    # function name "_sem" produces "<col>__sem"; collapse to "<col>_sem"
+    g = g.rename(columns={f"{c}__sem": f"{c}_sem" for c in value_cols})
+    g = g.sort_values(["sample_name", time_col]).reset_index(drop=True)
+
+    # ---- 2. baseline-from-0 (per sample). SEM is constant-shift invariant
+    for col in value_cols:
+        base = g.groupby("sample_name")[f"{col}_mean"].transform("first")
+        g[f"{col}_from0_mean"] = g[f"{col}_mean"] - base
+        g[f"{col}_from0_sem"] = g[f"{col}_sem"]
+
+    # ---- 3. smoothed-from-0 (per sample, COHORT level) -----------------
+    # Smooth both the cohort mean and the cohort SEM with the same fractional
+    # rolling window. Window = max(3, round(0.2 * len(per-sample series))),
+    # min_periods=1 avoids any NaN warm-up at t=0.
+    # No cummax here: smoothing-only keeps "smoothed mean +/- smoothed SEM"
+    # a self-consistent statistical pair (line and band always reflect the
+    # same timepoint).
+    def _frac_rolling_mean(series, window_fraction=0.2, min_window=3):
+        n = len(series)
+        window = max(min_window, int(round(n * window_fraction)))
+        return series.rolling(window=window, min_periods=1).mean()
+
+    for col in value_cols:
+        g[f"{col}_smooth_from0_mean"] = (
+            g.groupby("sample_name")[f"{col}_from0_mean"]
+             .transform(_frac_rolling_mean)
+        )
+        g[f"{col}_smooth_from0_sem"] = (
+            g.groupby("sample_name")[f"{col}_from0_sem"]
+             .transform(_frac_rolling_mean)
+        )
+
+    return g.sort_values(["sample_name", time_col]).reset_index(drop=True)
+
+
+def _plot_per_sample_mean_sem_pages(pdf, df_meansem, value_cols, org_type=None):
+    """
+    Append up to 4 mean +/- SEM pages (one figure per page) to an open
+    ``PdfPages`` object. One line + SEM band per ``sample_name``.
+
+    Figures are constructed with ``matplotlib.figure.Figure`` +
+    ``FigureCanvasAgg`` (NOT through ``pyplot``), so the inline notebook
+    backends never see them. Result: these pages land only in the PDF on
+    every backend (`%matplotlib inline`, `widget`, `notebook`, ...).
+    """
+    if df_meansem is None or len(df_meansem) == 0 or not value_cols:
+        return
+
+    # Local imports keep the PDF-only behaviour scoped to this helper.
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    time_col = "position_t"
+    org_label = f" [{org_type}]" if org_type else ""
+
+    # (mean_col, sem_col, title, ylabel)
+    # Raw pages (1-2): cohort mean +/- SEM, only baseline-subtracted to
+    # start at 0. Allowed to go negative - that's the honest signal.
+    # Smoothed pages (3-4): same series, cohort-level rolling smoothed
+    # (same window for mean and SEM), so line and band remain a
+    # self-consistent statistical pair.
+    pages = []
+    for col in value_cols:
+        mean_c = f"{col}_from0_mean"
+        sem_c = f"{col}_from0_sem"
+        if mean_c in df_meansem.columns and sem_c in df_meansem.columns:
+            pages.append((
+                mean_c, sem_c,
+                f"Mean +/- SEM per Sample ({col}, from 0){org_label}",
+                f"{col} - baseline",
+            ))
+    for col in value_cols:
+        mean_c = f"{col}_smooth_from0_mean"
+        sem_c = f"{col}_smooth_from0_sem"
+        if mean_c in df_meansem.columns and sem_c in df_meansem.columns:
+            pages.append((
+                mean_c, sem_c,
+                f"Mean +/- SEM per Sample ({col}, smoothed from 0){org_label}",
+                f"{col} - baseline (smoothed)",
+            ))
+
+    samples = sorted(df_meansem["sample_name"].dropna().unique().tolist())
+    for ycol_mean, ycol_sem, title, ylabel in pages:
+        fig = Figure(figsize=(12, 6))
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        for sample in samples:
+            s = (df_meansem[df_meansem["sample_name"] == sample]
+                 .sort_values(time_col))
+            if s.empty or s[ycol_mean].dropna().empty:
+                continue
+            line, = ax.plot(s[time_col], s[ycol_mean], linewidth=2, label=sample)
+            ax.fill_between(
+                s[time_col],
+                s[ycol_mean] - s[ycol_sem],
+                s[ycol_mean] + s[ycol_sem],
+                alpha=0.2, color=line.get_color(), linewidth=0,
+            )
+        ax.axhline(0, color="k", linewidth=0.5, alpha=0.4)
+        ax.set_xlabel("Timepoint")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left",
+                  prop={"size": 7}, title="Sample Name", title_fontsize=8)
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+
+
 def plot_general_organoid_analysis(
     df_general,
     outpath,
+    df_meansem=None,
+    value_cols=None,
+    org_type=None,
     figsize=(8.27, 11.69)
     ):
     
@@ -592,10 +775,18 @@ def plot_general_organoid_analysis(
         )
 
         fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
-        
+
         plt.show()
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
+
+        # Append per-sample mean +/- SEM dynamics pages (raw + smoothed) if provided
+        _plot_per_sample_mean_sem_pages(
+            pdf=pdf,
+            df_meansem=df_meansem,
+            value_cols=value_cols,
+            org_type=org_type,
+        )
 
 
 def plot_dead_signal_per_organoid(
@@ -621,6 +812,8 @@ def plot_dead_signal_per_organoid(
     disappearance_marker_color="black",
     disappearance_marker_size=38,
     screen_show_scale=1.0,
+    show_in_notebook=True,
+    target_ax=None,
 ):
     """
     Plot individual organoid dead signal over time.
@@ -631,9 +824,20 @@ def plot_dead_signal_per_organoid(
       using the ``y_quantile`` upper bound so brief spikes do not flatten small signals.
     - `color_map`: optional dict mapping color_key levels to colors.
     - `linestyle_map`: optional dict mapping style_key levels to linestyles.
+    - `show_in_notebook`: when False, skip the inline ``plt.show()`` (PDF saving is
+      unaffected). Ignored when ``target_ax`` is provided (caller owns display).
+    - `target_ax`: when provided, draw into this axis instead of creating a new
+      figure. Figure-level adjustments (subplots_adjust, DPI scaling) and
+      ``plt.show()`` are then the caller's responsibility.
     """
-    fig, ax = plt.subplots(figsize=figsize)
-    
+    if target_ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+        owns_figure = True
+    else:
+        ax = target_ax
+        fig = ax.figure
+        owns_figure = False
+
     dfp = df_combined.copy()
 
     # Allow passing multiple columns for color/style (builds a combined key)
@@ -872,9 +1076,9 @@ def plot_dead_signal_per_organoid(
         title = "Dead Signal Increase Per Individual Organoid"
     if ylabel is None:
         if feature == "smoothed_percentage_dead_mask":
-            ylabel = "Dead Signal (Smoothed % Dead Mask)"
+            ylabel = "% Dead Mask"
         elif feature == "smoothed_nr_dead_mask_pixels":
-            ylabel = "Dead Signal (Smoothed # Dead Mask Pixels)"
+            ylabel = "# Dead Mask Pixels"
         else:
             ylabel = feature
 
@@ -912,17 +1116,22 @@ def plot_dead_signal_per_organoid(
         else:
             ax.set_ylim(bottom=-0.05)
 
-    # Keep right margin for the stacked legends; tight_layout can clip outside legends.
-    # Reserve a dedicated right gutter for legends (screen + PDF), no overlap with data.
-    fig.subplots_adjust(right=0.64)
-    # Screen-only downscaling for notebook display; keep original size for PDF saving.
-    # Use DPI scaling so labels/legends shrink together with the plot area.
-    orig_dpi = fig.get_dpi()
-    if screen_show_scale != 1.0:
-        fig.set_dpi(orig_dpi * screen_show_scale)
-    plt.show()
-    if screen_show_scale != 1.0:
-        fig.set_dpi(orig_dpi)
+    # Figure-level adjustments and inline display are skipped when drawing into
+    # a caller-provided axis: the caller owns the figure and decides when (and
+    # whether) to show it.
+    if owns_figure:
+        # Keep right margin for the stacked legends; tight_layout can clip outside legends.
+        # Reserve a dedicated right gutter for legends (screen + PDF), no overlap with data.
+        fig.subplots_adjust(right=0.64)
+        # Screen-only downscaling for notebook display; keep original size for PDF saving.
+        # Use DPI scaling so labels/legends shrink together with the plot area.
+        orig_dpi = fig.get_dpi()
+        if screen_show_scale != 1.0:
+            fig.set_dpi(orig_dpi * screen_show_scale)
+        if show_in_notebook:
+            plt.show()
+        if screen_show_scale != 1.0:
+            fig.set_dpi(orig_dpi)
     return fig
 
 
@@ -938,6 +1147,7 @@ def plot_grouped_dead_signal(
     counts_annotation,
     screen_show_scale=1.0,
     band_alpha=0.18,
+    show_in_notebook=True,
 ):
     """Plot grouped mean +/- SEM dead-signal dynamics (used for Plot 5a/5b).
 
@@ -1013,7 +1223,7 @@ def plot_grouped_dead_signal(
     ax.set_ylabel(f"Change from baseline ({nice_feat})")
     ax.set_title(
         f"Mean +/- SEM per Condition & Organoid Type (tracks pooled across samples)\n"
-        f"({nice_feat}, baseline-normalized, non-decreasing, disappearing tracks kept as flat tails)"
+        f"({nice_feat}, smoothed, baseline-normalized, non-decreasing, disappearing tracks kept as flat tails)"
     )
     ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.28)
 
@@ -1091,7 +1301,8 @@ def plot_grouped_dead_signal(
     fig_orig_dpi = fig.get_dpi()
     if screen_show_scale != 1.0:
         fig.set_dpi(fig_orig_dpi * screen_show_scale)
-    plt.show()
+    if show_in_notebook:
+        plt.show()
     if screen_show_scale != 1.0:
         fig.set_dpi(fig_orig_dpi)
 
@@ -1152,8 +1363,8 @@ def plot_multi_organoid_death_dynamics(
         else:
             print(f"Missing data for {org_type}: {csv_path}")
     
-    if len(available_data) < 2:
-        print(f"\nNeed at least 2 organoid types with death dynamics data.")
+    if len(available_data) < 1:
+        print(f"\nNeed at least 1 organoid type with death dynamics data.")
         print(f"   Available: {list(available_data.keys())}")
         print(f"   Run death dynamics analysis for each organoid type first.")
         return None
@@ -1257,6 +1468,43 @@ def plot_multi_organoid_death_dynamics(
         print(f"   Run feature extraction and track filtering for these types first to enable individual dead signal plotting.\n")
 
     df_tracks_combined = pd.concat(all_tracks_data, ignore_index=True) if all_tracks_data else None
+
+    # ------------------------------------------------------------------
+    # Per-sample mean cumulative dead fraction per (line_condition x organoid_type).
+    # `percentage_dead` in df_combined is already the per-sample cumulative dead
+    # fraction (nr_dead / nr_organoids_t0, never decreasing). Meaning across
+    # samples within each (line_condition, organoid_type) group keeps the curve
+    # in [0, 1] regardless of group size, so groups are directly comparable.
+    # Used by the small subpanel under Plots 4a/4b.
+    # ------------------------------------------------------------------
+    df_combined["line_condition"] = np.nan
+    if metadata_df is not None and "sample_name" in metadata_df.columns:
+        for org_type in df_combined["organoid_type"].unique():
+            preferred = f"or_{org_type}_line_condition"
+            if preferred in metadata_df.columns:
+                md_col = preferred
+            else:
+                candidates_cols = [
+                    c for c in metadata_df.columns
+                    if c.endswith("_line_condition") and str(org_type).lower() in c.lower()
+                ]
+                md_col = candidates_cols[0] if candidates_cols else None
+            if md_col is None:
+                continue
+            md_map = metadata_df.set_index("sample_name")[md_col].to_dict()
+            mask = df_combined["organoid_type"] == org_type
+            df_combined.loc[mask, "line_condition"] = (
+                df_combined.loc[mask, "sample_name"].map(md_map)
+            )
+
+    df_cumdead = None
+    if df_combined["line_condition"].notna().any():
+        df_cumdead = (
+            df_combined.dropna(subset=["line_condition"])
+            .groupby(["line_condition", "organoid_type", "position_t"])["percentage_dead"]
+            .mean()
+            .reset_index(name="mean_cum_dead_fraction")
+        )
 
     # Plots
     pdf_path = results_outdir / "multi_organoid_death_dynamics_comparison.pdf"
@@ -1403,12 +1651,13 @@ def plot_multi_organoid_death_dynamics(
                 color_by=color_key,
                 style_by=style_key,
                 autoscale_y=True,
-                title=None,
+                title="Dead Signal Per Individual Organoid — smoothed (% Dead Mask)",
                 ylabel=None,
                 linewidth=2.6,
                 color_map=condition_color_map,
                 linestyle_map=type_style_map,
                 screen_show_scale=screen_show_scale,
+                show_in_notebook=False,
             )
             pdf.savefig(fig3a, bbox_inches="tight")
             plt.close(fig3a)
@@ -1421,12 +1670,13 @@ def plot_multi_organoid_death_dynamics(
                 color_by=color_key,
                 style_by=style_key,
                 autoscale_y=True,
-                title=None,
+                title="Dead Signal Per Individual Organoid — smoothed (# Dead Pixels)",
                 ylabel=None,
                 linewidth=2.6,
                 color_map=condition_color_map,
                 linestyle_map=type_style_map,
                 screen_show_scale=screen_show_scale,
+                show_in_notebook=False,
             )
             pdf.savefig(fig3b, bbox_inches="tight")
             plt.close(fig3b)
@@ -1582,7 +1832,7 @@ def plot_multi_organoid_death_dynamics(
                     autoscale_y=True,
                     title=(
                         f"Dead Signal Absolute ({nice_feat})\n"
-                        f"(non-decreasing, disappearing tracks kept as flat tails)"
+                        f"(smoothed, non-decreasing, disappearing tracks kept as flat tails)"
                     ),
                     ylabel=f"Absolute ({nice_feat})",
                     linewidth=2.6,
@@ -1592,6 +1842,7 @@ def plot_multi_organoid_death_dynamics(
                     dead_phase_color="red",
                     disappearance_markers=df_disappearance_markers,
                     screen_show_scale=screen_show_scale,
+                    show_in_notebook=False,
                 )
 
                 fig_abs.axes[0].text(
@@ -1615,58 +1866,356 @@ def plot_multi_organoid_death_dynamics(
                 pdf.savefig(fig_abs, bbox_inches="tight")
                 plt.close(fig_abs)
 
-            for feat, label in [
-                ("smoothed_percentage_dead_mask",  "4a"),
-                ("smoothed_nr_dead_mask_pixels",   "4b"),
-            ]:
-                nice_feat = "% Dead Mask" if "percentage" in feat else "# Dead Pixels"
+            # --- Plots 4a + 4b combined: single multipanel figure ---
+            # Top row: 4a (% Dead Mask) on the left, 4b (# Dead Pixels) on the right.
+            # Bottom row (full width): single cumulative-dead subpanel shared by both
+            # metrics (same data, no point duplicating).
+            # A single combined legend lives in the right gutter, positioned in
+            # figure coordinates so it stays inside the canvas (in-axes
+            # bbox_to_anchor sometimes gets clipped by the inline renderer).
+            has_subpanel = df_cumdead is not None and not df_cumdead.empty
 
-                # Reuse plot_dead_signal_per_organoid by passing the pre-processed df,
-                # then annotate and save the returned figure.
-                fig_tmp = plot_dead_signal_per_organoid(
+            # Sanity-check print: report per-(line_condition, organoid_type)
+            # dead-event counts so the user can verify the dead-event computation.
+            print(
+                "\n[Plot 4 dead-event check] dead-event counts per "
+                "(line_condition, organoid_type):"
+            )
+            if (
+                "dead" in df_indiv.columns
+                and "line_condition" in df_indiv.columns
+                and df_indiv["line_condition"].notna().any()
+            ):
+                _check = df_indiv.copy()
+                _check["dead"] = _check["dead"].fillna(False).astype(bool)
+                _track_summary = (
+                    _check.groupby(["line_condition", "organoid_type", "sample_name", "TrackID"])[
+                        "dead"
+                    ]
+                    .any()
+                    .reset_index(name="track_ever_dead")
+                )
+                _grouping_counts = (
+                    _track_summary.groupby(["line_condition", "organoid_type"])
+                    .agg(
+                        n_tracks=("TrackID", "count"),
+                        n_dead=("track_ever_dead", "sum"),
+                        n_samples=("sample_name", "nunique"),
+                    )
+                    .reset_index()
+                    .sort_values(["line_condition", "organoid_type"])
+                )
+                for _, _row in _grouping_counts.iterrows():
+                    print(
+                        f"  {_row['line_condition']} | {_row['organoid_type']} : "
+                        f"{int(_row['n_dead'])} dead / {int(_row['n_tracks'])} tracks "
+                        f"({int(_row['n_samples'])} sample(s))"
+                    )
+            else:
+                print(
+                    "  (no `dead` column or no metadata-mapped line_condition; "
+                    "skipping check)"
+                )
+
+            # Wide figure: 2 main panels + a dedicated right-side legend gutter
+            # that comfortably fits all stacked legends (including the per-group
+            # subpanel legend so every condition is listed even when its curve
+            # overlaps another at y=0).
+            combo_figsize = (figsize[0] * 1.95, figsize[1] * (1.18 if has_subpanel else 1.0))
+            fig_combo = plt.figure(figsize=combo_figsize)
+            # The axes occupy ~70% of the width; the rest is reserved for the
+            # legends in figure coordinates.
+            legend_gutter_left = 0.73
+            gs_kwargs = dict(
+                hspace=0.14,
+                wspace=0.18,
+                left=0.05,
+                right=legend_gutter_left - 0.02,
+                top=0.92,
+                bottom=0.09,
+            )
+            if has_subpanel:
+                gs = fig_combo.add_gridspec(
+                    2, 2,
+                    height_ratios=[4, 1],
+                    **gs_kwargs,
+                )
+                ax_4a = fig_combo.add_subplot(gs[0, 0])
+                ax_4b = fig_combo.add_subplot(gs[0, 1])
+                ax_sub = fig_combo.add_subplot(gs[1, :])
+            else:
+                gs = fig_combo.add_gridspec(1, 2, **gs_kwargs)
+                ax_4a = fig_combo.add_subplot(gs[0, 0])
+                ax_4b = fig_combo.add_subplot(gs[0, 1])
+                ax_sub = None
+
+            # Common context lives in the figure-level suptitle; each panel
+            # only carries the short metric name as its title.
+            fig_combo.suptitle(
+                "Dead Signal"
+                "(smoothed, baseline-normalized, non-decreasing, flat tails)",
+                fontsize=14,
+                y=0.97,
+            )
+
+            panel_specs = [
+                (ax_4a, "smoothed_percentage_dead_mask", "% Dead Mask"),
+                (ax_4b, "smoothed_nr_dead_mask_pixels",  "# Dead Pixels"),
+            ]
+            for ax_panel, feat, nice_feat in panel_specs:
+                # show_legends=False on both: a single figure-level legend is
+                # added once at the end so legend entries are not duplicated.
+                # ylabel drops the "Change from baseline" prefix because the
+                # figure suptitle already states the data is baseline-normalized
+                # (avoids saying "from baseline" twice).
+                plot_dead_signal_per_organoid(
                     df_processed,
-                    figsize=figsize,
+                    target_ax=ax_panel,
                     feature=feat,
                     color_by=color_key,
                     style_by=style_key,
                     autoscale_y=True,
-                    title=(
-                        f"Dead Signal Change from Baseline ({nice_feat})\n"
-                        f"(baseline-normalized, non-decreasing, disappearing tracks kept as flat tails)"
-                    ),
-                    ylabel=f"Change from baseline ({nice_feat})",
+                    title=nice_feat,
+                    ylabel=f"{nice_feat}",
                     linewidth=2.6,
                     color_map=condition_color_map,
                     linestyle_map=type_style_map,
                     highlight_dead_phase=True,
                     dead_phase_color="red",
                     disappearance_markers=df_disappearance_markers,
-                    screen_show_scale=screen_show_scale,
+                    show_legends=False,
                 )
 
                 # Baseline reference line (0 = no change from baseline)
-                fig_tmp.axes[0].axhline(0, color="black", linewidth=1, alpha=0.35, zorder=0)
+                ax_panel.axhline(0, color="black", linewidth=1, alpha=0.35, zorder=0)
 
-                fig_tmp.axes[0].text(
-                    0.02, 0.98,
-                    threshold_annotation,
-                    transform=fig_tmp.axes[0].transAxes,
-                    fontsize=8,
-                    verticalalignment="top",
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lavender", alpha=0.9),
+            # ----- Subpanel: cumulative dead fraction per group -----
+            if ax_sub is not None:
+                # Order groups so the largest values are drawn LAST (on top).
+                # This way smaller / flatter curves are not hidden underneath
+                # larger ones when several conditions overlap at y=0.
+                group_max = (
+                    df_cumdead.groupby(["line_condition", "organoid_type"])[
+                        "mean_cum_dead_fraction"
+                    ]
+                    .max()
+                    .sort_values()
+                )
+                draw_order = list(group_max.index)
+
+                print(
+                    f"[Plot 4 subpanel] {len(draw_order)} (line_condition x organoid_type) "
+                    f"group(s) in df_cumdead: "
+                    f"{', '.join(f'{c}|{o}' for c, o in draw_order)}"
                 )
 
-                fig_tmp.axes[0].text(
-                    0.02, 0.94,
-                    counts_annotation,
-                    transform=fig_tmp.axes[0].transAxes,
-                    fontsize=8,
-                    verticalalignment="top",
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="honeydew", alpha=0.9),
+                # Pre-compute y-axis scale so we can size the visual offset for
+                # flat-at-zero curves relative to the overall y range.
+                cur_max = float(
+                    pd.to_numeric(df_cumdead["mean_cum_dead_fraction"], errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)
+                    .dropna()
+                    .max()
                 )
+                if not np.isfinite(cur_max) or cur_max <= 0:
+                    cur_max = 1.0
 
-                pdf.savefig(fig_tmp, bbox_inches="tight")
-                plt.close(fig_tmp)
+                # "Flat at zero" means the entire curve sits below 1% of the
+                # overall y-axis max. Each such curve gets a small unique
+                # upward offset so multiple stacked flat lines are visible.
+                flat_zero_threshold = max(cur_max * 0.01, 1e-4)
+                flat_offset_step = max(cur_max * 0.015, 1e-4)
+
+                flat_groups = []
+                for (cond_val, org_val) in draw_order:
+                    grp_max = float(group_max.loc[(cond_val, org_val)])
+                    if grp_max < flat_zero_threshold:
+                        flat_groups.append((cond_val, org_val))
+
+                flat_offsets = {
+                    gk: (i + 1) * flat_offset_step
+                    for i, gk in enumerate(flat_groups)
+                }
+
+                for (cond_val, org_val) in draw_order:
+                    grp = (
+                        df_cumdead[
+                            (df_cumdead["line_condition"] == cond_val)
+                            & (df_cumdead["organoid_type"] == org_val)
+                        ]
+                        .sort_values("position_t")
+                    )
+                    y_values = grp["mean_cum_dead_fraction"].to_numpy()
+                    if (cond_val, org_val) in flat_offsets:
+                        y_values = y_values + flat_offsets[(cond_val, org_val)]
+                    ax_sub.plot(
+                        grp["position_t"].to_numpy(),
+                        y_values,
+                        color=condition_color_map.get(str(cond_val), "C0"),
+                        linestyle=type_style_map.get(str(org_val), "-"),
+                        linewidth=2.2,
+                        alpha=0.85,
+                    )
+
+                # Y range needs to include the largest flat-offset bump if any.
+                max_offset = max(flat_offsets.values()) if flat_offsets else 0.0
+                y_top = max(cur_max, max_offset) * 1.08
+                ax_sub.set_ylim(-0.08 * y_top, y_top)
+
+                ax_sub.set_ylabel(
+                    "Mean cumulative dead fraction",
+                    fontsize=10,
+                )
+                ax_sub.set_xlabel("Timepoint", fontsize=11)
+                ax_sub.grid(True, linestyle=":", alpha=0.5)
+
+                if flat_groups:
+                    ax_sub.text(
+                        0.01, 0.95,
+                        "* flat-zero curves slightly offset for visibility",
+                        transform=ax_sub.transAxes,
+                        fontsize=7,
+                        style="italic",
+                        color="dimgray",
+                        verticalalignment="top",
+                    )
+
+                # Align the subpanel's x-range with the top panels so timepoints
+                # match visually across the full figure.
+                top_xlims = [ax_4a.get_xlim(), ax_4b.get_xlim()]
+                common_xlim = (
+                    min(xl[0] for xl in top_xlims),
+                    max(xl[1] for xl in top_xlims),
+                )
+                ax_4a.set_xlim(common_xlim)
+                ax_4b.set_xlim(common_xlim)
+                ax_sub.set_xlim(common_xlim)
+
+                # When subpanel is present the top panels hand off the x label.
+                ax_4a.set_xlabel("")
+                ax_4b.set_xlabel("")
+                ax_4a.tick_params(axis="x", labelbottom=False)
+                ax_4b.tick_params(axis="x", labelbottom=False)
+
+            # ----- Single combined figure-level legend in the right gutter -----
+            # Anchored to fig.transFigure so legends are guaranteed to live
+            # inside the figure canvas regardless of axes positioning.
+            color_legend_title = (
+                color_key.replace("_", " ").title() if isinstance(color_key, str) else "Color"
+            )
+            style_legend_title = (
+                style_key.replace("_", " ").title() if isinstance(style_key, str) else "Style"
+            )
+
+            color_levels_combo = sorted(condition_color_map.keys())
+            color_handles_combo = [
+                Line2D([0], [0], color=condition_color_map[lvl], lw=3, linestyle="-", label=str(lvl))
+                for lvl in color_levels_combo
+            ]
+            leg_color_combo = Legend(
+                fig_combo,
+                color_handles_combo,
+                [h.get_label() for h in color_handles_combo],
+                title=color_legend_title,
+                loc="upper left",
+                bbox_to_anchor=(legend_gutter_left, 0.92),
+                bbox_transform=fig_combo.transFigure,
+                prop={"size": 8},
+                frameon=True,
+            )
+            fig_combo.add_artist(leg_color_combo)
+
+            style_levels_combo = sorted(type_style_map.keys())
+            style_handles_combo = [
+                Line2D([0], [0], color="black", lw=3, linestyle=type_style_map[lvl], label=str(lvl))
+                for lvl in style_levels_combo
+            ]
+            leg_style_combo = Legend(
+                fig_combo,
+                style_handles_combo,
+                [h.get_label() for h in style_handles_combo],
+                title=style_legend_title,
+                loc="upper left",
+                bbox_to_anchor=(legend_gutter_left, 0.70),
+                bbox_transform=fig_combo.transFigure,
+                prop={"size": 8},
+                frameon=True,
+                handlelength=3.5,
+                handletextpad=0.8,
+            )
+            fig_combo.add_artist(leg_style_combo)
+
+            dead_handle_combo = Line2D(
+                [0], [0],
+                marker="$D$", color="red", lw=0,
+                markersize=9, markerfacecolor="red", markeredgecolor="red",
+                markeredgewidth=0.8,
+                label="First dead event (dead=True)",
+            )
+            leg_dead_combo = Legend(
+                fig_combo,
+                [dead_handle_combo],
+                [dead_handle_combo.get_label()],
+                title="Overlay",
+                loc="upper left",
+                bbox_to_anchor=(legend_gutter_left, 0.50),
+                bbox_transform=fig_combo.transFigure,
+                prop={"size": 8},
+                frameon=True,
+            )
+            fig_combo.add_artist(leg_dead_combo)
+
+            dis_handle_combo = Line2D(
+                [0], [0],
+                marker="x", color="black", lw=0,
+                markersize=7, markeredgewidth=1.6,
+                label="Track disappears (flat tail kept)",
+            )
+            leg_dis_combo = Legend(
+                fig_combo,
+                [dis_handle_combo],
+                [dis_handle_combo.get_label()],
+                title="Markers",
+                loc="upper left",
+                bbox_to_anchor=(legend_gutter_left, 0.38),
+                bbox_transform=fig_combo.transFigure,
+                prop={"size": 8},
+                frameon=True,
+            )
+            fig_combo.add_artist(leg_dis_combo)
+
+            # Single figure-level info box (threshold + track counts) in the
+            # gutter, below all legends. Replaces the per-panel duplicates so
+            # the same info isn't shown twice across the two top panels.
+            # Anchored in figure coordinates and constrained to the gutter
+            # width so it can't overlap legends above or get clipped at the
+            # right edge when bbox_inches="tight" tightens the saved figure.
+            info_text = f"{threshold_annotation}\n{counts_annotation}"
+            fig_combo.text(
+                legend_gutter_left,
+                0.26,
+                info_text,
+                transform=fig_combo.transFigure,
+                fontsize=8,
+                verticalalignment="top",
+                horizontalalignment="left",
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="lavender", alpha=0.9),
+            )
+
+            # (No separate subpanel legend: each subpanel line's identity is
+            # already fully described by the top color (line_condition) and
+            # linestyle (organoid_type) legends above.)
+
+            # Inline display: smaller notebook rendering, full size for PDF.
+            orig_dpi = fig_combo.get_dpi()
+            if screen_show_scale != 1.0:
+                fig_combo.set_dpi(orig_dpi * screen_show_scale)
+            plt.show()
+            if screen_show_scale != 1.0:
+                fig_combo.set_dpi(orig_dpi)
+
+            pdf.savefig(fig_combo, bbox_inches="tight")
+            plt.close(fig_combo)
 
 
             # --- Plots 5a & 5b: mean +/- SEM per condition + organoid type ---
@@ -1688,6 +2237,7 @@ def plot_multi_organoid_death_dynamics(
                     threshold_annotation=threshold_annotation,
                     counts_annotation=counts_annotation,
                     screen_show_scale=screen_show_scale,
+                    show_in_notebook=False,
                 )
                 pdf.savefig(fig5, bbox_inches="tight")
                 plt.close(fig5)

@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import matplotlib.ticker as mticker
 from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
@@ -440,9 +441,9 @@ def plot_cumulative_per_sample(
     
     fig.suptitle(
         f"Cumulative {interacting_type} Interactions with {cell_type}s Per Sample",
-        fontsize=14, y=1.02
+        fontsize=14, y=0.995,
     )
-    plt.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     return fig
 
 
@@ -556,9 +557,9 @@ def plot_alive_vs_dead_per_sample(
     
     fig.suptitle(
         f"Cumulative {interacting_type} Interactions: Surviving vs Dying {cell_type}s (Per Sample)",
-        fontsize=14, y=1.02
+        fontsize=14, y=0.995,
     )
-    plt.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     return fig
 
 
@@ -832,10 +833,11 @@ def plot_interaction_violin_comparison(
         # track_summary column; display labels are set via the legend below.
         # Order is Dead first, Live second (matches dashboard panels C/D).
         hue_order = ["Dying", "Live"]
-        palette = {"Dying": "#e8a0a0", "Live": "#a0c4e8"}
-        # Darker, richer versions for boxes
-        dark_palette = {"Dying": "#b03a3a", "Live": "#2b6a99"}
-        strip_palette = {"Dying": "#c0392b", "Live": "#2471a3"}
+        # Light fills for violins; full-strength shared red/green for box
+        # edges and strip dots so the colour vocabulary matches the dashboard.
+        palette = {k: _FATE_COLORS_LIGHT[k] for k in hue_order}
+        dark_palette = {k: _FATE_COLORS[k] for k in hue_order}
+        strip_palette = {k: _FATE_COLORS[k] for k in hue_order}
     else:
         hue_col = None
         hue_order = None
@@ -855,45 +857,64 @@ def plot_interaction_violin_comparison(
         density_norm="count", cut=0,
     )
 
-    # Use a copy of common_kw with the darker palette + gap for narrow centered box
+    # Boxplot: filled by seaborn with `dark_palette`, then we hollow each box
+    # so the strip points underneath stay visible while the per-fate colour
+    # is preserved on the edges, whiskers and median tick.
     box_kw = common_kw.copy()
     box_kw["palette"] = dark_palette
     sns.boxplot(
         **box_kw,
         gap=0.6,
         fliersize=0, legend=False,
-        boxprops=dict(alpha=0.85, linewidth=0.8),
-        whiskerprops=dict(alpha=0.8, linewidth=0.8),
-        capprops=dict(alpha=0.8, linewidth=0.8),
+        boxprops=dict(linewidth=1.4),
+        whiskerprops=dict(linewidth=1.0),
+        capprops=dict(linewidth=1.0),
         showcaps=True,
-        medianprops=dict(color="white", linewidth=2),
+        medianprops=dict(linewidth=2.2),
     )
 
-    # Stripplot — slightly more muted dots
+    # Hollow out the boxes so the underlying stripplot is visible. Each
+    # PathPatch added by sns.boxplot keeps its palette colour as the
+    # edgecolor; only the face becomes transparent.
+    for patch in ax.patches:
+        if isinstance(patch, mpatches.PathPatch):
+            face = patch.get_facecolor()
+            patch.set_edgecolor(face)
+            patch.set_facecolor("none")
+
+    # Stripplot — slightly larger / punchier dots now that the box is open.
     strip_kw = common_kw.copy()
     strip_kw.pop("width", None)
     if strip_palette:
         strip_kw["palette"] = strip_palette
     sns.stripplot(
         **strip_kw,
-        size=3, alpha=0.45, jitter=True, legend=False,
+        size=3.5, alpha=0.6, jitter=True, legend=False,
         edgecolor="white", linewidth=0.3,
     )
 
-    # Legend -- framed, semi-transparent. Re-label "Dying" -> "Dead" at
-    # display time so internal track_summary values stay unchanged.
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        n_unique = len(hue_order) if hue_order else 1
-        display_labels = [
-            _FATE_DISPLAY.get(l, l) for l in labels[:n_unique]
-        ] if hue_order else labels[:n_unique]
+    # Legend -- framed, semi-transparent. Use full-strength fate colours
+    # for the swatches (rather than the lighter violin fill) so dead = red /
+    # live = green reads at a glance. Re-label "Dying" -> "Dead" at display
+    # time so internal track_summary values stay unchanged.
+    if hue_order:
+        legend_handles = [
+            mpatches.Patch(
+                facecolor=_FATE_COLORS[f],
+                edgecolor="white",
+                label=_FATE_DISPLAY.get(f, f),
+            )
+            for f in hue_order
+        ]
+        existing = ax.get_legend()
+        if existing is not None:
+            existing.remove()
         leg = ax.legend(
-            handles[:n_unique], display_labels,
+            handles=legend_handles,
             fontsize=10, loc="best",
             frameon=True, framealpha=0.85, edgecolor="#cccccc",
             fancybox=True, shadow=False,
-            title="Organoid fate" if hue_order else None,
+            title="Organoid fate",
             title_fontsize=9,
         )
         leg.get_frame().set_linewidth(0.6)
@@ -947,9 +968,12 @@ def plot_interaction_violin_comparison(
     ax.set_xlabel(x_label, fontsize=12, labelpad=8)
     # y-label: cumulative contact timepoints per organoid (integrated over
     # the full observation window; for dead organoids the cumulative stops
-    # at time of death, matching how track features are computed).
+    # at time of death, matching how track features are computed). When
+    # several immune types are selected they are summed -- noted on the
+    # label so the unit is unambiguous.
     ax.set_ylabel(
-        "Cumulative contact timepoints per organoid",
+        "Cumulative contact timepoints per organoid\n"
+        "(sum over selected immune types)",
         fontsize=12, labelpad=8,
     )
     title_detail = (
@@ -1439,7 +1463,18 @@ _FATE_ORDER = ("Dying", "Live")
 _FATE_DISPLAY = {"Dying": "Dead", "Live": "Live"}
 
 _GROUP_SEP = " | "
-_FATE_COLORS = {"Live": "#66BB6A", "Dying": "#EF5350"}
+
+# Shared palettes used by all multi-organoid interaction plots so the same
+# semantic colour appears everywhere:
+#   - fate: dead = red, live = green (full-strength for box edges, strips, bars)
+#   - fate (light): for violin fills behind the per-fate dot clouds
+#   - killing status: purple = active killing event, blue = non-killing event
+_FATE_COLORS = {"Dying": "#E53935", "Live": "#43A047"}
+_FATE_COLORS_LIGHT = {"Dying": "#EF9A9A", "Live": "#A5D6A7"}
+_KILLING_COLORS = {
+    "Active killing event": "#7E57C2",
+    "Non-killing event": "#1976D2",
+}
 
 
 def _build_org_fate_groups(
@@ -1522,11 +1557,18 @@ def plot_interaction_overview_dashboard(
         return None
 
     # Dynamic group count drives figure width: 2 x N_present_org_types.
+    # Panels are now stacked vertically (contact duration on top as the
+    # main view, active-killing efficiency as a smaller sub-panel below),
+    # so the figure no longer needs to stretch horizontally to fit two
+    # side-by-side panels.
     n_groups = max(2 * len(org_types), 4)
-    figwidth = max(14.0, 3.8 * n_groups + 4.0)
+    figwidth = max(11.0, 3.2 * n_groups + 3.0)
 
-    fig, (axC, axD) = plt.subplots(1, 2, figsize=(figwidth, 7), dpi=120)
+    fig = plt.figure(figsize=(figwidth, 12), dpi=120)
     fig.patch.set_facecolor("#fafafa")
+    gs = fig.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.35)
+    axC = fig.add_subplot(gs[0, 0])
+    axD = fig.add_subplot(gs[1, 0])
 
     _panel_contact_duration(axC, df_contact_events, org_types)
     _panel_killing_proportion(
@@ -1534,11 +1576,11 @@ def plot_interaction_overview_dashboard(
     )
 
     fig.suptitle(
-        "Active Killing Dashboard",
+        "Interaction -- Active Killing",
         fontsize=15, fontweight="bold",
         y=0.995,
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     return fig
 
 
@@ -1600,71 +1642,90 @@ def _panel_contact_duration(
     group_order = [_group_label(o, f) for (o, f) in group_pairs]
     group_to_idx = {g: i for i, g in enumerate(group_order)}
 
-    # Per-group violin background color follows fate (soft-red for Dead,
-    # slate for Live) so the fate axis is readable at a glance.
-    fate_violin_color = {"Live": "#90A4AE", "Dying": "#E57373"}
-    fate_violin_dark = {"Live": "#546E7A", "Dying": "#C62828"}
+    # Per-group violin background colour follows fate (light red for Dead,
+    # light green for Live -- pulled from the shared module-level palette
+    # so the fate vocabulary stays consistent across plots). Box edges use
+    # the full-strength fate colour from `_FATE_COLORS`.
     palette = {
-        _group_label(o, f): fate_violin_color[f]
+        _group_label(o, f): _FATE_COLORS_LIGHT[f]
         for (o, f) in group_pairs
     }
     dark_palette = {
-        _group_label(o, f): fate_violin_dark[f]
+        _group_label(o, f): _FATE_COLORS[f]
         for (o, f) in group_pairs
     }
 
     common = dict(
         data=df, x="group", y="contact_duration",
-        order=group_order, ax=ax, width=0.75,
+        order=group_order, ax=ax,
     )
 
     sns.violinplot(
         **common, hue="group", palette=palette, legend=False,
+        width=0.75,
         inner=None, linewidth=0.8, alpha=0.30,
         density_norm="count", cut=0,
     )
     sns.boxplot(
         **common, hue="group", palette=dark_palette, legend=False,
+        width=0.28,
         fliersize=0,
-        boxprops=dict(alpha=0.6, linewidth=0.8),
-        whiskerprops=dict(alpha=0.7, linewidth=0.8),
-        capprops=dict(alpha=0.7, linewidth=0.8),
+        boxprops=dict(linewidth=1.2),
+        whiskerprops=dict(linewidth=1.0),
+        capprops=dict(linewidth=1.0),
         showcaps=True,
-        medianprops=dict(color="white", linewidth=2),
+        medianprops=dict(linewidth=2.0),
     )
 
-    # Manual scatter: color encodes whether this contact event actively
-    # killed its targeted organoid (per-target attribution from
-    # active_killing_per_timepoint_{im}.csv::targeted_track_id).
-    kill_color = {
-        "Active killing event": "#C62828",
-        "Non-killing event": "#1565C0",
-    }
+    # Hollow the centered box so neither point cloud is hidden behind a
+    # solid rectangle; per-fate colour is preserved on the edge / whiskers
+    # / median tick because we re-use the box's own facecolor as edgecolor.
+    for patch in ax.patches:
+        if isinstance(patch, mpatches.PathPatch):
+            face = patch.get_facecolor()
+            patch.set_edgecolor(face)
+            patch.set_facecolor("none")
+
+    # Manual scatter: active-killing points sit on the LEFT half of each
+    # violin (purple), non-killing points on the RIGHT half (blue). One-
+    # sided jitter ranges in (-0.22, -0.03) / (+0.03, +0.22) reserve the
+    # centre for the box without overlapping it.
+    kill_color = _KILLING_COLORS
     rng = np.random.default_rng(1)
     for g_label, sub in df.groupby("group"):
         if g_label not in group_to_idx or len(sub) == 0:
             continue
         xi = group_to_idx[g_label]
-        jitter = rng.uniform(-0.18, 0.18, size=len(sub))
-        colors = [kill_color[lab] for lab in sub["killing_label"]]
-        ax.scatter(
-            xi + jitter, sub["contact_duration"],
-            s=10, c=colors, alpha=0.55,
-            edgecolors="white", linewidths=0.25, zorder=3,
-        )
+        active_mask = sub["killing_label"] == "Active killing event"
+        active = sub[active_mask]
+        non_active = sub[~active_mask]
+        if len(active) > 0:
+            x_left = xi + rng.uniform(-0.22, -0.03, size=len(active))
+            ax.scatter(
+                x_left, active["contact_duration"],
+                s=10, c=kill_color["Active killing event"],
+                alpha=0.55, edgecolors="white", linewidths=0.25, zorder=3,
+            )
+        if len(non_active) > 0:
+            x_right = xi + rng.uniform(0.03, 0.22, size=len(non_active))
+            ax.scatter(
+                x_right, non_active["contact_duration"],
+                s=10, c=kill_color["Non-killing event"],
+                alpha=0.55, edgecolors="white", linewidths=0.25, zorder=3,
+            )
 
     handles = [
         plt.Line2D(
             [0], [0], marker="o", linestyle="", markersize=7,
             markerfacecolor=kill_color["Active killing event"],
             markeredgecolor="white", markeredgewidth=0.5,
-            label="Active killing event",
+            label="Active killing event (left)",
         ),
         plt.Line2D(
             [0], [0], marker="o", linestyle="", markersize=7,
             markerfacecolor=kill_color["Non-killing event"],
             markeredgecolor="white", markeredgewidth=0.5,
-            label="Non-killing event",
+            label="Non-killing event (right)",
         ),
     ]
     ax.legend(

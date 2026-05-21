@@ -2120,7 +2120,7 @@ class MultiOrganoidDeathDynamicsPanel:
             if csv_path.exists():
                 self.available_data[org_type] = csv_path
         
-        if len(self.available_data) < 2:
+        if len(self.available_data) < 1:
             missing = [ot for ot in self.organoid_types if ot not in self.available_data]
             self.status_html.value = f'<div style="color:#b00;">Waiting for death dynamics data from: {", ".join(missing)}</div>'
             self.btn_run.disabled = True
