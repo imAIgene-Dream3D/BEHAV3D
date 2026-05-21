@@ -1268,6 +1268,46 @@ class CellTypeFeaturePanel(QWidget):
             elif dead_stack.ndim == 3:
                 dead_stack = dead_stack[np.newaxis, ...]
             print(f"[{_ts()}] [Preview]   Dead mask stack shape: {dead_stack.shape}")
+
+            # Mirror the feature-extraction-time cleaning: when the previewed
+            # cell type is NOT itself an immune type, zero dead-mask voxels
+            # that fall inside any immune segment available for this sample.
+            from behav3d.core.metadata import detect_immune_cell_types_from_metadata
+            try:
+                all_immune_types = detect_immune_cell_types_from_metadata(
+                    self.metadata_loader.metadata
+                ) or []
+            except Exception:
+                all_immune_types = []
+            immune_types_present = [
+                ct for ct in all_immune_types if ct in segs_dict and ct != self.cell_type
+            ]
+            if self.cell_type not in all_immune_types and immune_types_present:
+                any_immune = np.zeros(dead_stack.shape, dtype=bool)
+                for im_type in immune_types_present:
+                    im_arr = np.asarray(segs_dict[im_type])
+                    if im_arr.ndim == 2:
+                        im_arr = im_arr[np.newaxis, np.newaxis, ...]
+                    elif im_arr.ndim == 3:
+                        im_arr = im_arr[np.newaxis, ...]
+                    if im_arr.shape != dead_stack.shape:
+                        print(
+                            f"[{_ts()}] [Preview]   Skipping immune '{im_type}' for "
+                            f"dead-mask cleaning (shape {im_arr.shape} != {dead_stack.shape})."
+                        )
+                        continue
+                    any_immune |= (im_arr > 0)
+                if any_immune.any():
+                    dead_stack = np.where(any_immune, 0, dead_stack)
+                    self.log(
+                        "  [Preview] Cleaned dead mask: zeroed voxels under immune "
+                        f"segments {immune_types_present}"
+                    )
+                    print(
+                        f"[{_ts()}] [Preview]   Cleaned dead mask: zeroed voxels under "
+                        f"immune segments {immune_types_present}"
+                    )
+
             viewer.add_image(
                 dead_stack.astype(float),
                 name=f"{_PREVIEW_PREFIX} Dead Mask",

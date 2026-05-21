@@ -703,9 +703,26 @@ def calculate_image_based_track_features(
                 print("Dead mask calculation .csv already exists. Loading in dead mask calculation information...")
                 df_dead_mask = pd.read_csv(df_dead_mask_outpath)
             else:
+                # Clean the dead mask by zeroing voxels that fall inside any
+                # immune segment, but only when the current cell type is NOT
+                # itself an immune type. This prevents immune cells trespassing
+                # through organoids (or other passive structures) from inflating
+                # the target's `percentage_dead_mask`.
+                exclude_immune_from_dead = (
+                    cell_type not in immune_segments_paths
+                    and bool(immune_segments_dict)
+                )
+                if exclude_immune_from_dead:
+                    print(
+                        f"{get_current_time()} - Cleaning dead mask: zeroing voxels "
+                        f"inside immune segments {list(immune_segments_dict.keys())} "
+                        f"before computing {cell_type} death features."
+                    )
+
                 df_dead_mask=calculate_dead_mask(
                     segments=segments,
-                    dead_mask=dead_mask
+                    dead_mask=dead_mask,
+                    immune_segments_dict=immune_segments_dict if exclude_immune_from_dead else None,
                 )
                 if df_dead_mask_outpath != "":
                     df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
@@ -1573,16 +1590,65 @@ def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID
 #     return result
 
             
-def calculate_dead_mask(segments, dead_mask):
+def _zero_dead_mask_under_segments(dead_mask_t, immune_arrays_t):
+    """Return a copy of ``dead_mask_t`` with voxels set to 0 wherever any
+    immune segment at the same timepoint is non-zero.
+
+    Parameters
+    ----------
+    dead_mask_t : array-like
+        Binary (0/1) dead mask volume for a single timepoint, shape (Z, Y, X).
+    immune_arrays_t : dict[str, array-like]
+        Mapping of immune cell type name -> immune segment volume for the same
+        timepoint. Shape must match ``dead_mask_t``; mismatched arrays are
+        skipped with a warning.
+
+    Returns
+    -------
+    np.ndarray
+        Cleaned dead mask (same shape and dtype as input).
+    """
+    cleaned = np.asarray(dead_mask_t).copy()
+    for name, im_t in immune_arrays_t.items():
+        im_t = np.asarray(im_t)
+        if im_t.shape != cleaned.shape:
+            warnings.warn(
+                f"[death-mask cleaning] Shape mismatch for immune '{name}' "
+                f"({im_t.shape} vs dead mask {cleaned.shape}) - skipping."
+            )
+            continue
+        cleaned[im_t > 0] = 0
+    return cleaned
+
+
+def calculate_dead_mask(segments, dead_mask, immune_segments_dict=None):
     """
     Calculates the intensity of a specific marker features for each segment.
     The calculation can be the minimum, maximum, mean or median
+
+    Parameters
+    ----------
+    segments : array-like
+        Label image (T, Z, Y, X) for the cell type whose death features are
+        being computed.
+    dead_mask : array-like
+        Binary dead mask (T, Z, Y, X). Each voxel is 1 where the death
+        classifier marked the pixel as positive.
+    immune_segments_dict : dict[str, array-like] | None
+        Optional mapping of immune cell type name -> immune segment array
+        (T, Z, Y, X). When provided, the per-timepoint dead mask is cleaned
+        via :func:`_zero_dead_mask_under_segments` before regionprops, so that
+        immune cells trespassing through ``segments`` do not contribute to the
+        ``percentage_dead_mask`` of the target segment.
     """
     df_intensity = []
     # for t, (tcell_stack, intensity_stack) in enumerate(zip(segments, intensity_image)):
     for t, (tcell_stack, dead_mask_stack) in tqdm(enumerate(zip(segments, dead_mask)), total=len(segments)):
         tcell_stack = np.asarray(tcell_stack)
         dead_mask_stack = np.asarray(dead_mask_stack)
+        if immune_segments_dict:
+            immune_arrays_t = {name: arr[t] for name, arr in immune_segments_dict.items()}
+            dead_mask_stack = _zero_dead_mask_under_segments(dead_mask_stack, immune_arrays_t)
         properties = pd.DataFrame(
             regionprops_table(
                 label_image=tcell_stack,

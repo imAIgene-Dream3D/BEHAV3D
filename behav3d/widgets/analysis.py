@@ -1801,6 +1801,23 @@ class DeathThresholdPreview:
                 "(dead_mask_path is missing in metadata)."
             )
 
+        # Resolve immune tracked image paths so we can subtract immune voxels
+        # from the displayed dead mask (mirrors the feature-extraction-time
+        # cleaning in `calculate_image_based_track_features`). Only relevant
+        # when the previewed cell type is NOT itself an immune type.
+        self.immune_label_paths = {}
+        try:
+            all_immune_types = detect_immune_cell_types_from_metadata(self.metadata_loader.metadata) or []
+        except Exception:
+            all_immune_types = []
+        if cell_type not in all_immune_types:
+            for im_type in all_immune_types:
+                col = f"im_{im_type}_tracks_image_path"
+                if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                    p = Path(row[col])
+                    if p.exists():
+                        self.immune_label_paths[im_type] = p
+
         guessed_channel = _guess_channel_index(self.metadata_loader, sample, cell_type)
         if guessed_channel is not None:
             self.org_ch_input.value = int(guessed_channel)
@@ -1910,6 +1927,27 @@ class DeathThresholdPreview:
 
                 dead_vol = np.asarray(dead_mask_zarr[t])
                 dead_mask = dead_vol.max(axis=0) if dead_vol.ndim == 3 else dead_vol
+
+                # Mirror the feature-extraction-time cleaning: zero dead-mask
+                # voxels that fall inside any immune segment at this timepoint
+                # when the previewed cell type is non-immune.
+                immune_label_paths = getattr(self, "immune_label_paths", {}) or {}
+                if immune_label_paths:
+                    immune_overlap = np.zeros_like(dead_mask, dtype=bool)
+                    for im_type, im_path in immune_label_paths.items():
+                        try:
+                            im_zarr = load_zarr(im_path)
+                            if t >= int(im_zarr.shape[0]):
+                                continue
+                            im_vol = np.asarray(im_zarr[t])
+                            im_proj = im_vol.max(axis=0) if im_vol.ndim == 3 else im_vol
+                            if im_proj.shape != dead_mask.shape:
+                                continue
+                            immune_overlap |= (im_proj > 0)
+                        except Exception:
+                            continue
+                    if immune_overlap.any():
+                        dead_mask = np.where(immune_overlap, 0, dead_mask)
 
                 df_tracks = self._tracks_dataframe(cell_type)
                 class_img = np.zeros((*label_view.shape, 3), dtype=float)
