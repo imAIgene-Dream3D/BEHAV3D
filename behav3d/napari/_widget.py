@@ -6,6 +6,8 @@ from qtpy.QtWidgets import QWidget, QVBoxLayout, QTabWidget
 from qtpy.QtCore import Qt, QSize
 import napari
 
+from behav3d.napari._queue import ProcessingQueuePanel, StepType
+
 
 class BEHAV3DWidget(QWidget):
     """Main BEHAV3D dock widget registered as a napari plugin contribution."""
@@ -83,7 +85,6 @@ class BEHAV3DWidget(QWidget):
         self.tabs.addTab(AnalysisTab(parent=self), "📊 Analysis")
 
         # --- Processing Queue (collapsible bottom panel) ------------------
-        from behav3d.napari._queue import ProcessingQueuePanel, StepType
         self.queue_panel = ProcessingQueuePanel(
             segmentation_tab=self.segmentation_tab,
             tracking_tab=self.tracking_tab,
@@ -143,13 +144,25 @@ class BEHAV3DWidget(QWidget):
         self.queue_panel.add_step(StepType.CELLPOSE_SEGMENT, params=params)
 
     def _add_apoc_segment_to_queue(self):
-        """Snapshot APOC segmentation params and add an APOC_SEGMENT step."""
-        params = self.segmentation_tab.apoc_page.get_queue_params()
+        """Validate APOC config and add an APOC_SEGMENT step to the queue."""
+        apoc = self.segmentation_tab.apoc_page
+        ok, msg = apoc.validate_for_queue()
+        if not ok:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Cannot Add to Queue", msg)
+            return
+        params = apoc.get_queue_params()
         self.queue_panel.add_step(StepType.APOC_SEGMENT, params=params)
 
     def _add_convpaint_segment_to_queue(self):
-        """Snapshot ConvPaint segmentation params and add a CONVPAINT_SEGMENT step."""
-        params = self.segmentation_tab.convpaint_page.get_queue_params()
+        """Validate ConvPaint config and add a CONVPAINT_SEGMENT step to the queue."""
+        convpaint = self.segmentation_tab.convpaint_page
+        ok, msg = convpaint.validate_for_queue()
+        if not ok:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Cannot Add to Queue", msg)
+            return
+        params = convpaint.get_queue_params()
         self.queue_panel.add_step(StepType.CONVPAINT_SEGMENT, params=params)
 
     def _on_tab_changed(self, index):
