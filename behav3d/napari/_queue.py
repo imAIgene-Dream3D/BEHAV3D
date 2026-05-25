@@ -354,8 +354,10 @@ class ProcessingQueuePanel(QWidget):
         if step_type == StepType.TRACK and StepType.SEGMENT not in added_already:
             missing = self._check_input_data_missing(StepType.TRACK)
             if missing:
-                # Check if all missing cell types are covered by cellpose steps
-                if not self._cellpose_covers_all_cell_types():
+                # Check if all missing cell types are covered by another
+                # segmentation step already in the queue (APOC, ConvPaint,
+                # or per-cell-type Cellpose).
+                if not self._segmentation_covers_all_cell_types():
                     res = QMessageBox.question(
                         self, "Missing Segmentation Data",
                         "Segmentation data is missing for some samples/cell types.\n\n"
@@ -433,9 +435,17 @@ class ProcessingQueuePanel(QWidget):
         self.preset_combo.setCurrentIndex(0)
         self.preset_combo.blockSignals(False)
 
-    def _cellpose_covers_all_cell_types(self) -> bool:
-        """Return True if every cell type that needs segmentation is covered
-        by a CELLPOSE_SEGMENT step already in the queue (or has data on disk)."""
+    def _segmentation_covers_all_cell_types(self) -> bool:
+        """Return True if every cell type that needs segmentation is covered.
+
+        A cell type is considered covered when:
+
+        * a non-per-cell-type segmentation step (``APOC_SEGMENT`` or
+          ``CONVPAINT_SEGMENT``) is already queued — those run for every
+          cell type at once, so a single step covers all of them, or
+        * a ``CELLPOSE_SEGMENT`` step with that ``cell_type`` is queued, or
+        * the ``*_segments.zarr`` already exists on disk for every sample.
+        """
         md = self.metadata_loader.metadata
         if md is None:
             return False
@@ -446,6 +456,13 @@ class ProcessingQueuePanel(QWidget):
             all_cts = list(self.tracking_tab.panels.keys())
         if not all_cts:
             return False
+
+        # APOC / ConvPaint segment every cell type in a single batch run.
+        if any(
+            s.step_type in (StepType.APOC_SEGMENT, StepType.CONVPAINT_SEGMENT)
+            for s in self._steps
+        ):
+            return True
 
         queued_cellpose_cts = {
             s.params.get("cell_type")
@@ -685,6 +702,35 @@ class ProcessingQueuePanel(QWidget):
                     dead_zarr = out_dir / "images" / sn / f"{sn}_dead_segments.zarr"
                     if dead_zarr.exists():
                         warnings.append(f"Dead mask for {sn}")
+                        break
+
+            elif step.step_type in (StepType.APOC_SEGMENT, StepType.CONVPAINT_SEGMENT):
+                # APOC and ConvPaint produce *_segments.zarr per cell type.
+                method_label = (
+                    "APOC" if step.step_type == StepType.APOC_SEGMENT else "ConvPaint"
+                )
+                cell_types = []
+                if self.tracking_tab:
+                    cell_types = list(self.tracking_tab.panels.keys())
+                found = False
+                for _, sample in md.iterrows():
+                    sn = sample.get("sample_name", "unknown")
+                    sample_img_dir = out_dir / "images" / sn
+                    if not sample_img_dir.exists():
+                        continue
+                    if cell_types:
+                        for ct in cell_types:
+                            seg_zarr = sample_img_dir / f"{sn}_{ct}_segments.zarr"
+                            if seg_zarr.exists():
+                                warnings.append(f"{method_label} segments for {sn}")
+                                found = True
+                                break
+                    else:
+                        seg_files = list(sample_img_dir.glob("*_segments.zarr"))
+                        if seg_files:
+                            warnings.append(f"{method_label} segments for {sn}")
+                            found = True
+                    if found:
                         break
 
             elif step.step_type == StepType.TRACK:

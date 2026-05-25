@@ -3870,6 +3870,53 @@ class APOCWidget(QWidget):
             return self._training_widget.strategy_combo.currentText()
         return self.all_strategies()[0]
 
+    def validate_for_queue(self):
+        """Return ``(ok, error_msg)`` for the queue-add path.
+
+        Mirrors :meth:`CellposeWidget.validate_for_queue`: refuses to enqueue
+        a step that would immediately fail at run-time because metadata is
+        missing, no output directory is set, or no trained APOC classifier
+        ``.cl`` files exist yet under ``output_dir/images/PixelClassification``.
+        In *Advanced* mode every expected cell type must have its classifier;
+        otherwise at least one is enough since a single classifier still runs.
+        """
+        md = self.metadata_loader.metadata
+        if md is None:
+            return False, "No metadata loaded. Please load metadata first (Data Preparation tab)."
+
+        out_dir = self.metadata_loader.output_dir
+        if not out_dir:
+            return False, "No output directory established. Please set it in the Data Preparation tab."
+
+        pixel_class_outdir = Path(out_dir) / "images" / "PixelClassification"
+        expected_cts = self._apoc_expected_cell_types(md)
+        if not expected_cts:
+            return False, "No cell types detected from metadata. APOC needs at least one cell type to segment."
+
+        existing = [
+            ct for ct in expected_cts
+            if self._apoc_classifier_path(pixel_class_outdir, ct).exists()
+        ]
+        missing = [ct for ct in expected_cts if ct not in existing]
+
+        if not existing:
+            return False, (
+                "No trained APOC classifiers found in\n"
+                f"{pixel_class_outdir}\n\n"
+                "Please train the classifier(s) in the legend tab before queueing."
+            )
+
+        # Advanced strategy runs a separate classifier per cell type.
+        from behav3d.preprocessing.segmentation.apoc_train import APOCTrainingWidget as _ATW
+        strategy = self._current_global_strategy()
+        if strategy == _ATW.ADVANCED_STRATEGY and missing:
+            return False, (
+                "Advanced strategy requires a trained classifier for every cell type.\n\n"
+                f"Missing classifier(s) for: {', '.join(missing)}\n\n"
+                "Please train the missing classifier(s) or switch to a non-Advanced strategy."
+            )
+        return True, ""
+
     def get_queue_params(self) -> dict:
         """Snapshot current widget state for use by the processing queue."""
         strategy = self._current_global_strategy()
@@ -5127,6 +5174,36 @@ class ConvPaintWidget(QWidget):
         ):
             return self._training_widget.strategy_combo.currentText()
         return self.all_strategies()[0]
+
+    def validate_for_queue(self):
+        """Return ``(ok, error_msg)`` for the queue-add path.
+
+        Mirrors :meth:`APOCWidget.validate_for_queue` /
+        :meth:`CellposeWidget.validate_for_queue`: refuses to enqueue a
+        ConvPaint segmentation step that would immediately fail at run-time
+        because metadata is missing, no output directory is set, or the
+        unified ConvPaint model has not been trained yet.
+        """
+        md = self.metadata_loader.metadata
+        if md is None:
+            return False, "No metadata loaded. Please load metadata first (Data Preparation tab)."
+
+        out_dir = self.metadata_loader.output_dir
+        if not out_dir:
+            return False, "No output directory established. Please set it in the Data Preparation tab."
+
+        from behav3d.preprocessing.segmentation.convpaint_label_map import (
+            unified_model_path,
+        )
+        pixel_class_outdir = Path(out_dir) / "images" / "PixelClassification"
+        model_path = unified_model_path(pixel_class_outdir)
+        if not model_path.exists():
+            return False, (
+                "No trained unified ConvPaint model found at\n"
+                f"{model_path}\n\n"
+                "Please train the classifier in the legend tab before queueing."
+            )
+        return True, ""
 
     def get_queue_params(self) -> dict:
         """Snapshot current widget state for use by the processing queue."""

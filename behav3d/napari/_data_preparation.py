@@ -14,6 +14,7 @@ functions — no logic duplication.
 from __future__ import annotations
 
 import os
+import shutil
 import traceback
 from copy import deepcopy
 from pathlib import Path
@@ -104,7 +105,9 @@ def _deep_merge(base: dict, override: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 class _ZarrWorker(QThread):
     progress = Signal(str)
-    finished = Signal(bool, str)  # (success, message)
+    # (success, message, updated_metadata_df_or_None, originals_map_or_None)
+    # originals_map is a list of dicts: {"sample": str, "original": str, "new_zarr": str}
+    finished = Signal(bool, str, object, object)
 
     def __init__(self, output_dir: str, metadata: pd.DataFrame,
                  t_start: int = None, t_end: int = None,
@@ -120,17 +123,47 @@ class _ZarrWorker(QThread):
         try:
             from behav3d.preprocessing import convert_input_files_to_zarr
 
+            # Snapshot of (sample_name, original raw_image_path) BEFORE the call,
+            # because convert_input_files_to_zarr rewrites raw_image_path in place.
+            originals_snapshot = [
+                {
+                    "sample": str(row.get("sample_name", "")),
+                    "original": str(row.get("raw_image_path", "")),
+                }
+                for _, row in self.metadata.iterrows()
+            ]
+
             self.progress.emit("Starting zarr conversion…")
-            convert_input_files_to_zarr(
+            updated_md = convert_input_files_to_zarr(
                 output_dir=self.output_dir,
                 metadata=self.metadata,
                 t_start=self.t_start,
                 t_end=self.t_end,
                 n_workers=self.n_workers,
             )
-            self.finished.emit(True, "✅ Zarr conversion complete!")
+
+            # Pair each original with the new zarr path now stored in raw_image_path.
+            originals_map = []
+            new_paths_by_sample = {
+                str(row.get("sample_name", "")): str(row.get("raw_image_path", ""))
+                for _, row in updated_md.iterrows()
+            }
+            for entry in originals_snapshot:
+                new_zarr = new_paths_by_sample.get(entry["sample"], "")
+                originals_map.append({
+                    "sample": entry["sample"],
+                    "original": entry["original"],
+                    "new_zarr": new_zarr,
+                })
+
+            self.finished.emit(True, "✅ Zarr conversion complete!", updated_md, originals_map)
         except Exception:
-            self.finished.emit(False, f"❌ Conversion failed:\n{traceback.format_exc()}")
+            self.finished.emit(
+                False,
+                f"❌ Conversion failed:\n{traceback.format_exc()}",
+                None,
+                None,
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1207,10 +1240,255 @@ class DataPreparationTab(QWidget):
         self._zarr_worker.finished.connect(self._on_zarr_done)
         self._zarr_worker.start()
 
-    def _on_zarr_done(self, success: bool, message: str):
+    def _on_zarr_done(self, success: bool, message: str,
+                       updated_metadata, originals_map):
         self.zarr_btn.setEnabled(True)
         self.zarr_status.setText(message.split("\n")[0])
         self._log(message)
+
+        if not success or updated_metadata is None:
+            return
+
+        # 1) Persist new zarr paths into in-memory metadata
+        self.metadata = updated_metadata
+        self._log("Updated in-memory metadata with new .zarr paths.")
+
+        # 2) Persist to CSV if a path is known
+        csv_path = ""
+        if hasattr(self, "csv_path_edit"):
+            csv_path = self.csv_path_edit.text().strip()
+        if not csv_path and self._loaded_csv_path:
+            csv_path = self._loaded_csv_path
+        if csv_path:
+            try:
+                self.metadata.to_csv(csv_path, index=False)
+                self._loaded_csv_path = csv_path
+                self._log(f"✅ Metadata CSV updated: {csv_path}")
+            except Exception as e:
+                self._log(f"⚠ Failed to write metadata CSV: {e}")
+        else:
+            self._log("⚠ No CSV path set — metadata changes are in-memory only.")
+
+        # 3) Refresh metadata overview so the table reflects the new paths
+        try:
+            self._populate_metadata_overview()
+        except Exception as e:
+            self._log(f"⚠ Could not refresh metadata overview: {e}")
+
+        # 4) Offer deletion of the now-redundant original files
+        self._offer_delete_originals(originals_map or [])
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Section 6b – Optional cleanup of original raw files post-conversion
+    # ══════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def _path_size_bytes(p: Path) -> int:
+        """Return total size in bytes for a file or a directory tree."""
+        try:
+            if p.is_file():
+                return p.stat().st_size
+            if p.is_dir():
+                total = 0
+                for f in p.rglob("*"):
+                    try:
+                        if f.is_file():
+                            total += f.stat().st_size
+                    except OSError:
+                        continue
+                return total
+        except OSError:
+            return 0
+        return 0
+
+    @staticmethod
+    def _human_bytes(n: int) -> str:
+        """Format a byte count as a human-readable string."""
+        if n is None:
+            return "0 B"
+        n = float(n)
+        if n >= 1024 ** 3:
+            return f"{n / (1024 ** 3):.2f} GB"
+        if n >= 1024 ** 2:
+            return f"{n / (1024 ** 2):.1f} MB"
+        if n >= 1024:
+            return f"{n / 1024:.1f} KB"
+        return f"{int(n)} B"
+
+    def _collect_deletion_candidates(self, originals_map: list) -> list:
+        """Filter originals_map down to entries safe to delete.
+
+        Skips:
+          * entries where the original is already a .zarr (those are not converted)
+          * entries where original and new zarr resolve to the same path
+          * entries where the new zarr does not exist or fails to open
+          * entries where the original no longer exists on disk
+        """
+        candidates: list = []
+        for entry in originals_map:
+            sample = entry.get("sample", "")
+            original = entry.get("original", "")
+            new_zarr = entry.get("new_zarr", "")
+            if not original or not new_zarr:
+                continue
+
+            orig_path = Path(original)
+            zarr_path = Path(new_zarr)
+
+            # Never offer to delete a .zarr — those are not reconverted.
+            if orig_path.suffix == ".zarr" or str(orig_path).endswith(".zarr.zip"):
+                continue
+
+            # Same-path safety: do not delete if original IS the new zarr.
+            try:
+                if orig_path.resolve() == zarr_path.resolve():
+                    continue
+            except OSError:
+                continue
+
+            # Verify the original still exists.
+            if not orig_path.exists():
+                self._log(f"⚠ Original for '{sample}' not found, skipping: {orig_path}")
+                continue
+
+            # Verify the new zarr exists AND can be opened.
+            if not zarr_path.exists():
+                self._log(
+                    f"⚠ New zarr for '{sample}' not found, keeping original: {zarr_path}"
+                )
+                continue
+            try:
+                from behav3d.io.formats.zarr import load_zarr
+                _ = load_zarr(zarr_path)
+            except Exception as e:
+                self._log(
+                    f"⚠ New zarr for '{sample}' could not be opened, keeping original: {e}"
+                )
+                continue
+
+            size_bytes = self._path_size_bytes(orig_path)
+            candidates.append({
+                "sample": sample,
+                "path": orig_path,
+                "size_bytes": size_bytes,
+            })
+        return candidates
+
+    def _offer_delete_originals(self, originals_map: list) -> None:
+        """Run the two-step pop-up flow to offer deletion of original raw files."""
+        candidates = self._collect_deletion_candidates(originals_map)
+        if not candidates:
+            self._log("Nothing to clean up: no deletable originals found.")
+            return
+
+        total_bytes = sum(c["size_bytes"] for c in candidates)
+        human_total = self._human_bytes(total_bytes)
+        n = len(candidates)
+
+        # ───── Pop-up #1: informational offer ─────
+        info = QMessageBox(self)
+        info.setIcon(QMessageBox.Information)
+        info.setWindowTitle("Free up disk space?")
+        info.setTextFormat(Qt.RichText)
+        info.setText(
+            f"<b>Zarr conversion completed successfully.</b><br><br>"
+            f"All {n} image{'s' if n != 1 else ''} have been duplicated as Zarr "
+            f"and the metadata now points to the new <code>.zarr</code> files.<br><br>"
+            f"The original raw files are still on disk and are now redundant. "
+            f"Removing them would free approximately "
+            f"<b>~ {human_total}</b>."
+        )
+        info.setInformativeText(
+            "Would you like to delete the original files?\n"
+            "(You can also keep them and remove them manually later.)"
+        )
+        info.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        info.setDefaultButton(QMessageBox.No)
+        choice = info.exec_()
+        if choice != QMessageBox.Yes:
+            self._log("Originals kept on disk (user declined cleanup).")
+            return
+
+        # ───── Pop-up #2: final irreversible warning ─────
+        warn = QMessageBox(self)
+        warn.setIcon(QMessageBox.Warning)
+        warn.setWindowTitle("Permanently delete original files?")
+        warn.setTextFormat(Qt.RichText)
+        warn.setText(
+            f"You are about to permanently delete <b>{n}</b> original image "
+            f"file{'s' if n != 1 else ''}, freeing approximately "
+            f"<b>~ {human_total}</b>."
+        )
+        warn.setInformativeText(
+            "⚠  This action CANNOT be undone. Files will NOT go to the Recycle Bin.\n"
+            "Make sure the new .zarr files load correctly before continuing."
+        )
+        warn.setDetailedText(
+            "Files to be removed:\n"
+            + "\n".join(
+                f"  • [{c['sample']}] {c['path']}   ({self._human_bytes(c['size_bytes'])})"
+                for c in candidates
+            )
+        )
+        cancel_btn = warn.addButton("Cancel", QMessageBox.RejectRole)
+        delete_btn = warn.addButton("Delete permanently", QMessageBox.DestructiveRole)
+        warn.setDefaultButton(cancel_btn)
+        delete_btn.setStyleSheet(
+            "background-color: #c62828; color: white; font-weight: bold;"
+        )
+        warn.exec_()
+        if warn.clickedButton() is not delete_btn:
+            self._log("Originals kept on disk (deletion cancelled).")
+            return
+
+        # ───── Perform deletion ─────
+        self._delete_originals(candidates)
+
+    def _delete_originals(self, candidates: list) -> None:
+        """Delete each candidate's original file or directory and report results."""
+        freed = 0
+        deleted: list = []
+        errors: list = []
+        for c in candidates:
+            p: Path = c["path"]
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+                freed += int(c["size_bytes"])
+                deleted.append(c)
+                self._log(f"🗑 Deleted: {p}")
+            except Exception as e:
+                errors.append((p, str(e)))
+                self._log(f"⚠ Failed to delete {p}: {e}")
+
+        n_ok = len(deleted)
+        n_err = len(errors)
+        human_freed = self._human_bytes(freed)
+
+        summary = QMessageBox(self)
+        summary.setTextFormat(Qt.RichText)
+        if n_err == 0:
+            summary.setIcon(QMessageBox.Information)
+            summary.setWindowTitle("Originals removed")
+            summary.setText(
+                f"Successfully deleted <b>{n_ok}</b> file"
+                f"{'s' if n_ok != 1 else ''}.<br>"
+                f"Disk space freed: <b>{human_freed}</b>."
+            )
+        else:
+            summary.setIcon(QMessageBox.Warning)
+            summary.setWindowTitle("Cleanup completed with errors")
+            summary.setText(
+                f"Deleted <b>{n_ok}</b> file{'s' if n_ok != 1 else ''} "
+                f"(<b>{human_freed}</b> freed).<br>"
+                f"<b>{n_err}</b> file{'s' if n_err != 1 else ''} could not be removed."
+            )
+            summary.setDetailedText(
+                "\n".join(f"{p}: {msg}" for p, msg in errors)
+            )
+        summary.setStandardButtons(QMessageBox.Ok)
+        summary.exec_()
 
     # ══════════════════════════════════════════════════════════════════════
     # Utility
