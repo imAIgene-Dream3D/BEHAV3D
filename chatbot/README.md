@@ -14,9 +14,10 @@ DeepSeek key stays server-side (Modal secret); clients only ever see the Modal U
 | `embeddings.py` | sentence-transformers embedder + tiny numpy cosine index (persisted to a Modal Volume). |
 | `schema_cards.json` | Decoupled snapshot of the 195 BEHAV3D parameter cards; also the `enum` that constrains `set_parameter.key`. |
 
-Model: DeepSeek `deepseek-chat` by default. Override with the `DEEPSEEK_MODEL`
-env var (e.g. set it to the V4-Flash model id) — add it to the `deepseek-api-key`
-secret or a separate secret.
+Model: DeepSeek **`deepseek-v4-flash`** by default (V4 Flash; tool-calls +
+streaming). Override with the `DEEPSEEK_MODEL` env var — e.g. `deepseek-v4-pro`
+for the stronger/pricier model — by adding it to the `deepseek-api-key` secret.
+(The old `deepseek-chat` alias maps to v4-flash too but is being deprecated.)
 
 ## One-time setup
 ```bash

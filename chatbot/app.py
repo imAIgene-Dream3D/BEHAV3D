@@ -302,7 +302,10 @@ if modal is not None:
             _key_enum = []
 
         expected_token = os.environ.get("BEHAV3D_ASSISTANT_TOKEN", "")
-        deepseek_model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        # deepseek-v4-flash is the explicit V4 Flash id (tool-calls + streaming).
+        # The older `deepseek-chat` alias also maps to it but is being deprecated.
+        # `deepseek-v4-pro` is the stronger/pricier option. Override via DEEPSEEK_MODEL.
+        deepseek_model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
         client = OpenAI(base_url=DEEPSEEK_BASE_URL,
                         api_key=os.environ.get("DEEPSEEK_API_KEY", ""))
 
