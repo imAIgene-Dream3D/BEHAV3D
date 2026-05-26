@@ -327,6 +327,50 @@ def _apply_death(main_widget, dotted: str, value):
 register_group_applier("death_dynamics.", _apply_death)
 
 
+# --- Segmentation tab pages (global, non-cell-type widgets) ----------------
+def _seg_page(main_widget, page_attr):
+    seg = getattr(main_widget, "segmentation_tab", None)
+    return getattr(seg, page_attr, None) if seg is not None else None
+
+
+_PIXCLF_FIELD = {
+    "examples_per_sample": "spin_examples",
+    "workers": "spin_workers",
+    "use_all_timepoints": "check_process_all",
+    "tp_start": "spin_t_start",
+    "tp_end": "spin_t_end",
+}
+
+
+def _apply_pixel_classifier(main_widget, dotted: str, value):
+    parts = dotted.split(".")                  # pixel_classifier.<field>
+    if len(parts) != 2:
+        return None
+    attr = _PIXCLF_FIELD.get(parts[1])
+    page = _seg_page(main_widget, "pixel_classifier_page")
+    w = getattr(page, attr, None) if (page and attr) else None
+    return w if _set_value(w, value) else None
+
+
+register_group_applier("pixel_classifier.", _apply_pixel_classifier)
+
+
+_CELLPOSE_FIELD = {"number_of_channels": "spin_manual_channels"}
+
+
+def _apply_cellpose(main_widget, dotted: str, value):
+    parts = dotted.split(".")                  # cellpose.<field>
+    if len(parts) != 2:
+        return None
+    attr = _CELLPOSE_FIELD.get(parts[1])
+    page = _seg_page(main_widget, "cellpose_page")
+    w = getattr(page, attr, None) if (page and attr) else None
+    return w if _set_value(w, value) else None
+
+
+register_group_applier("cellpose.", _apply_cellpose)
+
+
 def _push_to_widget(widget, value) -> bool:
     """Best-effort set of a Qt widget's value. Returns True on success."""
     try:
