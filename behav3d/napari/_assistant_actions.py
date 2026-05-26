@@ -157,15 +157,196 @@ register_applier("paths.output_dir", _apply_output_dir)
 register_applier("dim_order.default_apply_all", _apply_dim_order)
 
 
+# ---------------------------------------------------------------------------
+# Group appliers: handle a whole dotted-key prefix. Per-cell-category params live
+# in per-cell-type panels (tab.panels[cell_type]); the config is keyed by category
+# (immune/organoid/other), so we fan a category write out to every cell-type panel
+# in that category. Binding is one-way at build time, so we set widgets directly.
+# ---------------------------------------------------------------------------
+_GROUP_APPLIERS: list = []   # (prefix, fn(main_widget, dotted_key, value) -> widget|None)
+
+
+def register_group_applier(prefix: str, fn: Callable) -> None:
+    _GROUP_APPLIERS.append((prefix, fn))
+
+
+def _category_of(main_widget, cell_type: str) -> Optional[str]:
+    dp = _dp(main_widget)
+    md = getattr(dp, "metadata", None) if dp else None
+    if md is None:
+        return None
+    try:
+        from behav3d.widgets.utils import detect_cell_type_category
+        return detect_cell_type_category(cell_type, md)
+    except Exception:
+        return None
+
+
+def _set_value(widget, value) -> bool:
+    return _push_to_widget(widget, value) if widget is not None else False
+
+
+def _category_panels(main_widget, tab_attr: str, category: str):
+    """Yield (cell_type, panel) for every panel in `category`, force-building the
+    tab's per-cell-type panels first if they haven't been created yet (they are
+    built lazily on tab-show / metadata_updated)."""
+    tab = getattr(main_widget, tab_attr, None)
+    if tab is None:
+        return []
+    panels = getattr(tab, "panels", {}) or {}
+    if not panels and hasattr(tab, "_on_metadata_updated"):
+        if getattr(_dp(main_widget), "metadata", None) is not None:
+            try:
+                tab._on_metadata_updated()
+            except Exception:
+                pass
+            panels = getattr(tab, "panels", {}) or {}
+    return [(ct, p) for ct, p in panels.items() if _category_of(main_widget, ct) == category]
+
+
+def _fan_to_panels(main_widget, tab_attr: str, category: str, widget_attr: str, value):
+    """Set `panel.<widget_attr> = value` across all panels in `category`."""
+    last = None
+    for _ct, panel in _category_panels(main_widget, tab_attr, category):
+        w = getattr(panel, widget_attr, None)
+        if _set_value(w, value):
+            last = w
+    return last
+
+
+def _fan_checkset(main_widget, tab_attr, category, dict_attr, selected):
+    """For a dict-of-checkboxes (e.g. feature_checks, bt_hyp_checks): check the
+    boxes whose key is in `selected`, uncheck the rest."""
+    chosen = set(selected) if isinstance(selected, (list, tuple, set)) else set()
+    last = None
+    for _ct, panel in _category_panels(main_widget, tab_attr, category):
+        checks = getattr(panel, dict_attr, None) or {}
+        for key, w in checks.items():
+            try:
+                w.setChecked(key in chosen)
+                last = w
+            except Exception:
+                pass
+    return last
+
+
+# --- Filtering tab (track_filtering.<category>.<field>) --------------------
+_FILTER_FIELD = {
+    "min_track_length": "spin_min_length",
+    "min_track_length_enabled": "en_min_length",
+    "max_track_length": "spin_max_length",
+    "max_track_length_enabled": "en_max_length",
+    "exp_duration": "spin_exp_duration",
+    "exp_duration_enabled": "en_exp_duration",
+}
+
+
+def _apply_filtering(main_widget, dotted: str, value):
+    parts = dotted.split(".")           # track_filtering.<cat>.<field>
+    if len(parts) != 3:
+        return None
+    _, category, field = parts
+    widget_attr = _FILTER_FIELD.get(field)
+    if widget_attr is None:
+        return None
+    return _fan_to_panels(main_widget, "filtering_tab", category, widget_attr, value)
+
+
+register_group_applier("track_filtering.", _apply_filtering)
+
+
+# --- Tracking tab (tracking.<category>.{method | lap.* | trackpy.* | btrack.*}) ---
+_TRACK_FIELD = {
+    "method": "combo_method",
+    "lap.track_cost_px": "lap_track_cost",
+    "lap.gap_close_cost_px": "lap_gap_cost",
+    "lap.gap_close_max_frames": "lap_gap_frames",
+    "lap.merging_cost_px": "lap_merge_cost",
+    "lap.splitting_cost_px": "lap_split_cost",
+    "trackpy.search_range_px": "tp_search_range",
+    "trackpy.memory_frames": "tp_memory",
+    "trackpy.adaptive_stop": "tp_adaptive_stop",
+    "trackpy.adaptive_step": "tp_adaptive_step",
+    "btrack.config_preset": "bt_config_preset",
+    "btrack.config_path": "bt_config_path",
+    "btrack.max_search_radius": "bt_max_search_radius",
+    "btrack.update_method": "bt_update_method",
+    "btrack.step_size": "bt_step_size",
+    "btrack.n_workers": "bt_n_workers",
+    "btrack.use_optimize": "bt_use_optimize",
+    "btrack.dist_thresh": "bt_dist_thresh",
+    "btrack.time_thresh": "bt_time_thresh",
+}
+
+
+def _apply_tracking(main_widget, dotted: str, value):
+    parts = dotted.split(".")                 # tracking.<cat>.<rest...>
+    if len(parts) < 3:
+        return None
+    category, rest = parts[1], ".".join(parts[2:])
+    if rest == "btrack.hypotheses":
+        return _fan_checkset(main_widget, "tracking_tab", category, "bt_hyp_checks", value)
+    widget_attr = _TRACK_FIELD.get(rest)
+    if widget_attr is None:
+        return None
+    return _fan_to_panels(main_widget, "tracking_tab", category, widget_attr, value)
+
+
+register_group_applier("tracking.", _apply_tracking)
+
+
+# --- Feature Extraction tab (features.<category>.<field>) ------------------
+_FEATURE_FIELD = {"contact_threshold": "contact_threshold", "n_workers": "spin_workers"}
+
+
+def _apply_features(main_widget, dotted: str, value):
+    parts = dotted.split(".")                 # features.<cat>.<field>
+    if len(parts) != 3:
+        return None
+    category, field = parts[1], parts[2]
+    if field == "features_choice":
+        return _fan_checkset(main_widget, "feature_extraction_tab", category, "feature_checks", value)
+    widget_attr = _FEATURE_FIELD.get(field)
+    if widget_attr is None:
+        return None
+    return _fan_to_panels(main_widget, "feature_extraction_tab", category, widget_attr, value)
+
+
+register_group_applier("features.", _apply_features)
+
+
+# --- Death dynamics (death_dynamics.<category>.dead_perc_threshold) ---------
+def _apply_death(main_widget, dotted: str, value):
+    parts = dotted.split(".")
+    if len(parts) != 3 or parts[2] != "dead_perc_threshold":
+        return None
+    return _fan_to_panels(main_widget, "feature_extraction_tab", parts[1],
+                          "spin_dead_threshold", value)
+
+
+register_group_applier("death_dynamics.", _apply_death)
+
+
 def _push_to_widget(widget, value) -> bool:
     """Best-effort set of a Qt widget's value. Returns True on success."""
     try:
+        # Combos: items are often labelled (e.g. "btrack (Bayesian)") while the
+        # config value is the bare token ("btrack"). Match exact → starts-with →
+        # contains so labelled options still resolve; fail if none match.
+        from qtpy.QtWidgets import QComboBox
+        if isinstance(widget, QComboBox):
+            from qtpy.QtCore import Qt
+            s = str(value)
+            for flag in (Qt.MatchFixedString, Qt.MatchStartsWith, Qt.MatchContains):
+                idx = widget.findText(s, flag)
+                if idx >= 0:
+                    widget.setCurrentIndex(idx)
+                    return True
+            return False
         if hasattr(widget, "setChecked") and isinstance(value, bool):
             widget.setChecked(value)
         elif hasattr(widget, "setValue") and isinstance(value, (int, float)):
             widget.setValue(value)
-        elif hasattr(widget, "setCurrentText"):
-            widget.setCurrentText(str(value))
         elif hasattr(widget, "setText"):
             widget.setText(str(value))
         else:
@@ -262,7 +443,7 @@ def apply_set_parameter(main_widget, key: str, value: Any):
     # 2. persist to behav3d_parameters.yml (best-effort)
     _persist_params(dp)
 
-    # 3. live UI update + pulse (for keys with a verified applier)
+    # 3. live UI update + pulse — exact-key applier first, then group (prefix) appliers
     widget = None
     applier = _WIDGET_APPLIERS.get(key)
     if applier is not None:
@@ -270,8 +451,16 @@ def apply_set_parameter(main_widget, key: str, value: Any):
             widget = applier(main_widget, value)
         except Exception:
             widget = None
-        if widget is not None:
-            pulse_widget(widget)
+    if widget is None:
+        for prefix, fn in _GROUP_APPLIERS:
+            if key.startswith(prefix):
+                try:
+                    widget = fn(main_widget, key, value)
+                except Exception:
+                    widget = None
+                break
+    if widget is not None:
+        pulse_widget(widget)
 
     # (stored_ok, visible_field_updated)
     return True, (widget is not None)
