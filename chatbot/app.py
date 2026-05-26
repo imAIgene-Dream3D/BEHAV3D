@@ -1,5 +1,10 @@
 """
-BEHAV3D assistant — Modal service (LLM + RAG + tool calling).
+BEHAV3D assistant — Modal service (thin DeepSeek proxy + RAG + tool calling).
+
+Modal is a CPU-only middle layer: it authenticates the napari client, retrieves
+BEHAV3D knowledge (RAG), then calls the **DeepSeek API** with native function
+calling and relays the stream back. The DeepSeek key never leaves the server (it
+lives in a Modal secret); clients only ever see the Modal URL + a shared token.
 
 Deploy:   modal deploy chatbot/app.py
 Dev:      modal serve chatbot/app.py        # hot-reloading local proxy
@@ -10,14 +15,16 @@ Endpoints (FastAPI, behind a Bearer token):
   POST /chat                    -> text/event-stream of:
         {"type":"token","text":...}        streamed assistant text
         {"type":"tool_calls","calls":[...]}  proposed actions (client confirms)
-        {"type":"done"}
+        {"type":"done"} | {"type":"error","message":...}
 
-The LLM is a self-hosted open instruct model on a GPU (vLLM). Tool calls use a
-simple, model-agnostic ``<TOOLCALL>{json}</TOOLCALL>`` protocol that we parse out
-of the generated text — robust across open models and trivial to stream.
+Tool calls use DeepSeek's native function-calling; `set_parameter.key` is
+constrained to the real BEHAV3D parameter keys (enum) so the model can't invent
+them. `parse_tool_calls` is retained only as a fallback for a call accidentally
+embedded in the content text.
 
-The pure helpers (:func:`build_system_prompt`, :func:`parse_tool_calls`,
-:func:`split_streamable`) are unit-tested without Modal/GPU.
+The pure helpers (:func:`build_system_prompt`, :func:`to_openai_tools`,
+:func:`assemble_tool_calls`, :func:`parse_tool_calls`) are unit-tested without
+Modal/network.
 
 NOTE: do **not** add ``from __future__ import annotations`` here. The FastAPI
 ``/chat`` route is defined inside the nested ``web()`` function and relies on the
@@ -28,21 +35,13 @@ import json
 import re
 
 # ===========================================================================
-# Pure logic (no Modal / GPU) — unit-testable
+# Pure logic (no Modal / network) — unit-testable
 # ===========================================================================
 _TOOLCALL_RE = re.compile(r"<TOOLCALL>\s*(\{.*?\})\s*</TOOLCALL>", re.DOTALL)
 
-TOOL_PROTOCOL = (
-    "When you want to PROPOSE a UI action, emit one line per action in the exact "
-    "form <TOOLCALL>{\"name\": <tool>, \"arguments\": {...}}</TOOLCALL> at the end "
-    "of your reply. The user must confirm before anything is applied, so never "
-    "claim you have changed a value — say you are proposing it. Available tools: "
-    "set_parameter{key,value}, navigate_to_step{step}, add_queue_step{step_type,params}."
-)
-
 
 def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict]) -> str:
-    """Assemble the system prompt from persona + context + retrieved docs + tools."""
+    """Assemble the system prompt from persona + context + retrieved docs."""
     parts = [
         "You are the BEHAV3D co-pilot, embedded in a napari plugin for analysing "
         "cell behaviour in 3D fluorescent imaging. Be concise and concrete. Ground "
@@ -51,8 +50,11 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "FORMATTING (responses render as markdown in a narrow side panel): lead "
         "with a one-sentence answer; use short paragraphs separated by blank lines; "
         "use bullet/numbered lists for any set of items or steps; bold key terms "
-        "and parameter names; use `code` for values/keys; avoid dense walls of text.",
-        TOOL_PROTOCOL,
+        "and parameter names; use `code` for values/keys; avoid dense walls of text.\n\n"
+        "To change a setting, CALL the set_parameter / navigate_to_step / "
+        "add_queue_step tools (the user confirms before anything applies, so never "
+        "claim a value is already changed — say you are proposing it). Only use "
+        "parameter keys from PARAMETERS FOR THIS STEP.",
     ]
 
     step = context.get("current_step", "?")
@@ -153,6 +155,57 @@ def split_streamable(text: str) -> str:
     return text[:min(idxs)].rstrip() if idxs else text.rstrip()
 
 
+def to_openai_tools(tool_schema: list[dict], key_enum=None) -> list[dict]:
+    """Wrap our TOOL_SCHEMA (name/description/parameters) into OpenAI `tools`
+    format. If `key_enum` is given, constrain `set_parameter.key` to those values
+    so the model cannot invent parameter keys."""
+    out = []
+    for t in tool_schema or []:
+        params = json.loads(json.dumps(t.get("parameters", {})))  # deep copy
+        if t.get("name") == "set_parameter" and key_enum:
+            props = params.setdefault("properties", {})
+            key_prop = props.setdefault("key", {"type": "string"})
+            key_prop["enum"] = list(key_enum)
+        out.append({
+            "type": "function",
+            "function": {
+                "name": t.get("name"),
+                "description": t.get("description", ""),
+                "parameters": params,
+            },
+        })
+    return out
+
+
+def assemble_tool_calls(fragments: list[dict]) -> list[dict]:
+    """Merge streamed OpenAI `delta.tool_calls` fragments into our
+    `[{name, arguments}]` shape. Each fragment carries an `index`, an optional
+    `name`, and an `arguments` string delta; we concatenate by index and JSON-parse
+    the accumulated arguments."""
+    by_index: dict = {}
+    order: list = []
+    for frag in fragments or []:
+        idx = frag.get("index", 0)
+        if idx not in by_index:
+            by_index[idx] = {"name": None, "args": ""}
+            order.append(idx)
+        if frag.get("name"):
+            by_index[idx]["name"] = frag["name"]
+        if frag.get("arguments"):
+            by_index[idx]["args"] += frag["arguments"]
+    calls = []
+    for idx in order:
+        entry = by_index[idx]
+        if not entry["name"]:
+            continue
+        try:
+            args = json.loads(entry["args"]) if entry["args"].strip() else {}
+        except json.JSONDecodeError:
+            continue
+        calls.append({"name": entry["name"], "arguments": args})
+    return calls
+
+
 # ===========================================================================
 # Modal app (imported lazily so the pure helpers import without modal installed)
 # ===========================================================================
@@ -162,14 +215,11 @@ except Exception:  # allows unit-testing the pure helpers without modal
     modal = None
 
 if modal is not None:
-    MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
-    # Pin a commit for reproducibility (recommended). "main" tracks the latest.
-    MODEL_REVISION = "main"
+    import os as _os
+
     VOLUME_NAME = "behav3d-assistant-index"
     INDEX_DIR = "/index"
-    MODEL_CACHE_DIR = "/models"   # HF cache lives here, on a persistent Volume
-
-    import os as _os
+    DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
     # Source modules whose docstrings seed the knowledge base. Inlined here (NOT
     # imported from ingest) because Modal imports app.py inside *every* container,
@@ -185,13 +235,13 @@ if modal is not None:
         "behav3d/analysis/interaction_analysis.py",
     ]
 
-    # Light image for ingest + web (no vLLM → fast builds). It carries the local
-    # python files and all knowledge sources.
+    # Single CPU image for ingest + web. No GPU, no vLLM, no model weights — Modal
+    # is just a proxy that retrieves docs and calls the DeepSeek API.
     service_image = (
         modal.Image.debian_slim(python_version="3.12")
         .pip_install(
             "fastapi[standard]", "sentence-transformers==3.2.1",
-            "numpy", "huggingface_hub",
+            "numpy", "huggingface_hub", "openai>=1.40",
         )
         .add_local_file("chatbot/embeddings.py", "/root/embeddings.py")
         .add_local_file("chatbot/ingest.py", "/root/ingest.py")
@@ -202,39 +252,16 @@ if modal is not None:
     for _md in ("README.md", "WIKI.md"):
         if _os.path.exists(_md):
             service_image = service_image.add_local_file(_md, f"/root/repo/{_md}")
-    # Source modules whose docstrings seed the knowledge base.
     for _rel in _DOC_PY_MODULES:
         if _os.path.exists(_rel):
             service_image = service_image.add_local_file(_rel, f"/root/repo/{_rel}")
 
-    # Heavy image only for the GPU inference engine. HF_HOME points at the mounted
-    # weights Volume so vLLM reads cached weights instead of re-downloading from
-    # HuggingFace on every cold start. hf_xet accelerates the one-time pull.
-    # vLLM 0.6.3 pins torch 2.4 but leaves transformers unbounded; a too-new
-    # transformers imports `torch.distributed.tensor.device_mesh` (torch >=2.5)
-    # and crashes `import vllm`. Pin transformers to the 0.6.3-compatible 4.45.x
-    # (still supports Qwen2.5). torch is left to vLLM's own pin.
-    inference_image = (
-        modal.Image.debian_slim(python_version="3.12")
-        .pip_install("vllm==0.6.3", "transformers==4.45.2", "huggingface_hub", "hf_xet")
-        .env({"HF_HOME": f"{MODEL_CACHE_DIR}/hf", "HF_XET_HIGH_PERFORMANCE": "1"})
-    )
-
     app = modal.App("behav3d-assistant")
     volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
-    # Persistent cache for the (~15 GB) model weights — downloaded once, then read
-    # from the Volume on every cold start.
-    model_cache = modal.Volume.from_name("behav3d-model-cache", create_if_missing=True)
-    # A shared secret the napari client must present as a Bearer token.
+    # Shared bearer token the napari client must present.
     auth_secret = modal.Secret.from_name("behav3d-assistant-auth")  # {"BEHAV3D_ASSISTANT_TOKEN": "..."}
-
-    # -- One-time weight download (run: modal run chatbot/app.py::download_model) --
-    @app.function(image=inference_image, volumes={MODEL_CACHE_DIR: model_cache}, timeout=1800)
-    def download_model():
-        from huggingface_hub import snapshot_download
-        snapshot_download(MODEL_NAME, revision=MODEL_REVISION)
-        model_cache.commit()
-        print(f"Cached {MODEL_NAME}@{MODEL_REVISION} to the model-cache Volume.")
+    # DeepSeek API key — stays server-side, never sent to the client.
+    deepseek_secret = modal.Secret.from_name("deepseek-api-key")    # {"DEEPSEEK_API_KEY": "..."}
 
     # -- Index build -------------------------------------------------------
     @app.function(image=service_image, volumes={INDEX_DIR: volume}, timeout=900)
@@ -246,37 +273,18 @@ if modal is not None:
         volume.commit()
         print(f"Built RAG index with {n} chunks.")
 
-    # -- Inference engine --------------------------------------------------
-    # Mounts the weights Volume (not the index). scaledown_window keeps a warm
-    # container for 5 min after the last request. For zero cold starts during a
-    # working session, add `min_containers=1` (you pay for an idle L4 while set).
-    @app.cls(image=inference_image, gpu="L4", volumes={MODEL_CACHE_DIR: model_cache},
-             scaledown_window=300, timeout=600)
-    class Engine:
-        @modal.enter()
-        def load(self):
-            # Weights are read from the mounted Volume (HF_HOME), so no network
-            # download happens here — only the disk→GPU load.
-            from vllm import LLM, SamplingParams
-            self.LLM = LLM(model=MODEL_NAME, revision=MODEL_REVISION,
-                           max_model_len=8192, gpu_memory_utilization=0.90)
-            self.SamplingParams = SamplingParams
-
-        @modal.method()
-        def generate(self, messages: list[dict]) -> str:
-            params = self.SamplingParams(temperature=0.3, top_p=0.9, max_tokens=900)
-            # vLLM applies the model's chat template for [{"role","content"}]
-            outputs = self.LLM.chat(messages, params)
-            return outputs[0].outputs[0].text
-
-    # -- Web endpoint ------------------------------------------------------
-    @app.function(image=service_image, volumes={INDEX_DIR: volume}, secrets=[auth_secret],
-                  scaledown_window=300)
+    # -- Web endpoint (CPU) ------------------------------------------------
+    # scaledown_window keeps a warm container 5 min after the last request. For a
+    # zero-cold-start endpoint add `min_containers=1` — cheap on CPU (~$15-45/mo),
+    # vs ~$0 idle with a ~few-second cold start.
+    @app.function(image=service_image, volumes={INDEX_DIR: volume},
+                  secrets=[auth_secret, deepseek_secret], scaledown_window=300)
     @modal.asgi_app()
     def web():
         import os
         from fastapi import FastAPI, Request, HTTPException
         from fastapi.responses import StreamingResponse
+        from openai import OpenAI
         from embeddings import Embedder, VectorIndex
 
         api = FastAPI(title="BEHAV3D Assistant")
@@ -285,18 +293,28 @@ if modal is not None:
             index = VectorIndex.load(INDEX_DIR)
         except Exception:
             index = VectorIndex()
+        # Valid parameter keys → constrain set_parameter so the model can't invent.
+        try:
+            with open("/root/schema_cards.json", encoding="utf-8") as f:
+                _key_enum = [c["key"] for c in json.load(f)
+                             if not c["key"].startswith("calculated_features.")]
+        except Exception:
+            _key_enum = []
+
         expected_token = os.environ.get("BEHAV3D_ASSISTANT_TOKEN", "")
+        deepseek_model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        client = OpenAI(base_url=DEEPSEEK_BASE_URL,
+                        api_key=os.environ.get("DEEPSEEK_API_KEY", ""))
 
         def _auth(request: Request):
             if not expected_token:
                 return
-            auth = request.headers.get("authorization", "")
-            if auth != f"Bearer {expected_token}":
+            if request.headers.get("authorization", "") != f"Bearer {expected_token}":
                 raise HTTPException(status_code=401, detail="bad token")
 
         @api.get("/health")
         def health():
-            return {"ok": True, "chunks": len(index.chunks)}
+            return {"ok": True, "chunks": len(index.chunks), "model": deepseek_model}
 
         @api.post("/chat")
         async def chat(request: Request):
@@ -309,37 +327,52 @@ if modal is not None:
             user_msg = next((m["content"] for m in reversed(messages)
                              if m.get("role") == "user"), "")
             query = f"{context.get('current_step','')} {user_msg}"
-            retrieved = []
             try:
-                qv = embedder.encode([query])[0]
-                retrieved = index.search(qv, k=6)
+                retrieved = index.search(embedder.encode([query])[0], k=6)
             except Exception:
                 retrieved = []
 
             system = build_system_prompt(context, retrieved, tools)
             convo = [{"role": "system", "content": system}]
             convo += [m for m in messages if m.get("role") != "system"]
+            oai_tools = to_openai_tools(tools, key_enum=_key_enum)
+
+            def sse(obj):
+                return "data: " + json.dumps(obj) + "\n\n"
 
             def event_stream():
+                content = ""
+                tool_frags = []
                 try:
-                    full = Engine().generate.remote(convo)
+                    stream = client.chat.completions.create(
+                        model=deepseek_model, messages=convo,
+                        tools=oai_tools or None,
+                        tool_choice="auto" if oai_tools else None,
+                        temperature=0.3, stream=True,
+                    )
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta
+                        if getattr(delta, "content", None):
+                            content += delta.content
+                            yield sse({"type": "token", "text": delta.content})
+                        for tc in (getattr(delta, "tool_calls", None) or []):
+                            fn = getattr(tc, "function", None)
+                            tool_frags.append({
+                                "index": getattr(tc, "index", 0),
+                                "name": getattr(fn, "name", None) if fn else None,
+                                "arguments": getattr(fn, "arguments", None) if fn else None,
+                            })
                 except Exception as e:
-                    # Surface engine failures (crash-loop, OOM, timeout) immediately
-                    # instead of letting the client hang until its own timeout.
-                    yield "data: " + json.dumps(
-                        {"type": "error", "message": f"Inference engine error: {e}"}
-                    ) + "\n\n"
-                    yield "data: " + json.dumps({"type": "done"}) + "\n\n"
+                    yield sse({"type": "error", "message": f"DeepSeek API error: {e}"})
+                    yield sse({"type": "done"})
                     return
-                visible = split_streamable(full)
-                # chunked pseudo-streaming for a responsive feel
-                for i in range(0, len(visible), 24):
-                    piece = visible[i:i + 24]
-                    yield "data: " + json.dumps({"type": "token", "text": piece}) + "\n\n"
-                _, calls = parse_tool_calls(full)
+
+                calls = assemble_tool_calls(tool_frags)
+                if not calls:                       # fallback: call embedded in text
+                    _, calls = parse_tool_calls(content)
                 if calls:
-                    yield "data: " + json.dumps({"type": "tool_calls", "calls": calls}) + "\n\n"
-                yield "data: " + json.dumps({"type": "done"}) + "\n\n"
+                    yield sse({"type": "tool_calls", "calls": calls})
+                yield sse({"type": "done"})
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 

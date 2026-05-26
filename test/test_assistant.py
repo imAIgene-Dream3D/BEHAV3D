@@ -156,6 +156,34 @@ def test_tool_call_parsing_tolerates_malformed_markers():
     assert calls3[0]["arguments"]["value"] == [100, 100, 10]
 
 
+def test_to_openai_tools_injects_key_enum():
+    import app
+    from behav3d.napari._assistant_actions import TOOL_SCHEMA
+    enum = ["paths.metadata_csv", "tracking.immune.method"]
+    tools = app.to_openai_tools(TOOL_SCHEMA, key_enum=enum)
+    assert all(t["type"] == "function" for t in tools)
+    sp = next(t for t in tools if t["function"]["name"] == "set_parameter")
+    assert sp["function"]["parameters"]["properties"]["key"]["enum"] == enum
+    # original schema is not mutated (deep-copied)
+    assert "enum" not in TOOL_SCHEMA[0]["parameters"]["properties"]["key"]
+
+
+def test_assemble_tool_calls_merges_streamed_fragments():
+    import app
+    frags = [
+        {"index": 0, "name": "set_parameter", "arguments": ""},
+        {"index": 0, "name": None, "arguments": '{"key": "tracking.immune'},
+        {"index": 0, "name": None, "arguments": '.trackpy.search_range_px", "value": 40}'},
+    ]
+    calls = app.assemble_tool_calls(frags)
+    assert calls == [{"name": "set_parameter",
+                      "arguments": {"key": "tracking.immune.trackpy.search_range_px",
+                                    "value": 40}}]
+    # incomplete / unparseable arguments are dropped, not crashed on
+    assert app.assemble_tool_calls([{"index": 0, "name": "set_parameter",
+                                     "arguments": "{bad"}]) == []
+
+
 def test_doc_module_lists_in_sync():
     # app.py inlines _DOC_PY_MODULES (can't import ingest at top level in-container);
     # guard against it drifting from ingest's authoritative copy.
