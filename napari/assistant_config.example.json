@@ -1,0 +1,5 @@
+{
+  "endpoint": "https://<your-modal-app>.modal.run",
+  "token": "<shared-secret-token-matching-the-modal-secret>",
+  "timeout": 300
+}
