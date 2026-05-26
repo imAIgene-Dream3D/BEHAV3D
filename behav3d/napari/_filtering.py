@@ -14,10 +14,15 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QCheckBox,
     QSpinBox, QGroupBox, QComboBox, QMessageBox, QScrollArea,
+    QSplitter,
 )
 from qtpy.QtCore import Qt
 
 from behav3d.core.qt_help import make_help_row
+from behav3d.napari._results_panel import (
+    ResultsPanel,
+    notify_results_changed,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -345,6 +350,8 @@ class CellTypeFilterPanel(QWidget):
         except Exception as e:
             traceback.print_exc()
             self.log(f"Error during filtering: {e}")
+        finally:
+            notify_results_changed(self)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -366,15 +373,35 @@ class FilteringTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        # Vertical splitter: tab content on top, shared Results panel
+        # underneath (visible from this tab and re-scanning the same
+        # output directory used by Analysis / Feature Extraction).
+        self.splitter = QSplitter(Qt.Vertical, self)
+        self.splitter.setChildrenCollapsible(True)
+        outer.addWidget(self.splitter)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        outer.addWidget(scroll)
+        self.splitter.addWidget(scroll)
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
         scroll.setWidget(content)
+
+        self.results_panel = ResultsPanel(
+            viewer=self.viewer,
+            metadata_loader=self.metadata_loader,
+            parent=self,
+        )
+        self.splitter.addWidget(self.results_panel)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, True)
+        self.splitter.setSizes([600, 400])
 
         self.cell_tabs = QTabWidget()
         self.cell_tabs.setTabPosition(QTabWidget.West)
@@ -547,3 +574,8 @@ class FilteringTab(QWidget):
         except Exception as e:
             traceback.print_exc()
             self._log(f"❌ Batch filtering error: {e}")
+        finally:
+            try:
+                self.results_panel.refresh()
+            except Exception:
+                traceback.print_exc()

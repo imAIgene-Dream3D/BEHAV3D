@@ -21,17 +21,21 @@ import datetime
 import sys
 import traceback
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import yaml
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QCheckBox, QGroupBox,
     QScrollArea, QSpinBox, QComboBox, QFrame, QSizePolicy,
-    QToolButton, QMessageBox,
+    QToolButton, QMessageBox, QSplitter, QStackedWidget,
+    QTreeWidget, QTreeWidgetItem, QMenu, QHeaderView,
 )
 from qtpy.QtCore import Qt, QUrl
 from qtpy.QtGui import QDesktopServices
+
+from behav3d.napari._pdf_view import open_pdf_in_napari
+from behav3d.napari._results_panel import ResultsPanel
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -222,6 +226,42 @@ class DeathDynamicsTab(QWidget):
                 "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
             )
 
+        # Per-step "View result" buttons. Enabled when the corresponding
+        # result PDF already exists on disk.
+        self.btn_view_dd_single = QPushButton("👁")
+        self.btn_view_dd_combined = QPushButton("👁")
+        self.btn_view_ia_single = QPushButton("👁")
+        self.btn_view_ia_combined = QPushButton("👁")
+        for btn in (
+            self.btn_view_dd_single,
+            self.btn_view_dd_combined,
+            self.btn_view_ia_single,
+            self.btn_view_ia_combined,
+        ):
+            btn.setFixedSize(36, 28)
+            btn.setToolTip("View the corresponding result PDF in napari")
+            btn.setStyleSheet(
+                "QPushButton { background: #1a2e1a; color: #6dd56d; "
+                "border: 1px solid #6dd56d; border-radius: 4px; "
+                "font-size: 12px; font-weight: bold; }"
+                "QPushButton:hover { background: #6dd56d; color: #1a2e1a; }"
+                "QPushButton:disabled { background: #1a1a1a; color: #555; "
+                "border: 1px solid #333; }"
+            )
+            btn.setEnabled(False)
+        self.btn_view_dd_single.clicked.connect(
+            lambda: self._on_view_clicked("dd_single")
+        )
+        self.btn_view_dd_combined.clicked.connect(
+            lambda: self._on_view_clicked("dd_combined")
+        )
+        self.btn_view_ia_single.clicked.connect(
+            lambda: self._on_view_clicked("ia_single")
+        )
+        self.btn_view_ia_combined.clicked.connect(
+            lambda: self._on_view_clicked("ia_combined")
+        )
+
         self._init_ui()
 
         if metadata_loader is not None and hasattr(metadata_loader, "metadata_loaded"):
@@ -279,6 +319,7 @@ class DeathDynamicsTab(QWidget):
         self.btn_run_dd_single.clicked.connect(self._on_run_dd_single)
         dd_btn_row.addWidget(self.btn_run_dd_single, stretch=1)
         dd_btn_row.addWidget(self.btn_queue_dd_single)
+        dd_btn_row.addWidget(self.btn_view_dd_single)
         dd_lay.addLayout(dd_btn_row)
 
         dd_combined_row = QHBoxLayout()
@@ -289,6 +330,7 @@ class DeathDynamicsTab(QWidget):
         self.btn_run_dd_combined.clicked.connect(self._on_run_dd_combined)
         dd_combined_row.addWidget(self.btn_run_dd_combined, stretch=1)
         dd_combined_row.addWidget(self.btn_queue_dd_combined)
+        dd_combined_row.addWidget(self.btn_view_dd_combined)
         dd_lay.addLayout(dd_combined_row)
 
         # ── Missing-death-classification disclaimer ──────────────
@@ -395,6 +437,7 @@ class DeathDynamicsTab(QWidget):
         self.btn_run_ia_single.clicked.connect(self._on_run_ia_single)
         ia_btn_row.addWidget(self.btn_run_ia_single, stretch=1)
         ia_btn_row.addWidget(self.btn_queue_ia_single)
+        ia_btn_row.addWidget(self.btn_view_ia_single)
         ia_lay.addLayout(ia_btn_row)
 
         ia_combined_row = QHBoxLayout()
@@ -405,6 +448,7 @@ class DeathDynamicsTab(QWidget):
         self.btn_run_ia_combined.clicked.connect(self._on_run_ia_combined)
         ia_combined_row.addWidget(self.btn_run_ia_combined, stretch=1)
         ia_combined_row.addWidget(self.btn_queue_ia_combined)
+        ia_combined_row.addWidget(self.btn_view_ia_combined)
         ia_lay.addLayout(ia_combined_row)
 
         # ── Advanced settings (Interaction Analysis) ─────────────
@@ -776,6 +820,121 @@ class DeathDynamicsTab(QWidget):
         else:
             self.ia_disclaimer_label.setVisible(False)
 
+        # Per-step "View result" buttons: enabled only when the matching
+        # PDF already exists on disk.
+        self._update_view_buttons()
+
+    # ── View-result buttons & Results-panel notifications ──────────────
+    def _view_pdf_path(self, kind: str) -> Optional[Path]:
+        """Return the PDF that the per-step View button should open.
+
+        The button is only meaningful for unambiguous single-target /
+        single-interaction selections; multi-selections return ``None``
+        (the user can still browse all outputs through the Results
+        panel).
+        """
+        if self.metadata_loader is None or not self.metadata_loader.output_dir:
+            return None
+        out_dir = Path(self.metadata_loader.output_dir).expanduser()
+        targets = self._selected_targets()
+        interactions = self._selected_interactions()
+
+        if kind == "dd_single":
+            if len(targets) != 1:
+                return None
+            ct = targets[0]
+            return (
+                out_dir / "analysis" / ct / "results"
+                / f"combined_general_{ct}_dynamics_analysis.pdf"
+            )
+        if kind == "dd_combined":
+            return (
+                out_dir / "analysis" / "multi_organoid_comparison"
+                / "multi_organoid_death_dynamics_comparison.pdf"
+            )
+        if kind == "ia_single":
+            if len(targets) != 1 or len(interactions) != 1:
+                return None
+            ct, it = targets[0], interactions[0]
+            return (
+                out_dir / "analysis" / ct / "results"
+                / f"interaction_analysis_{ct}_vs_{it}.pdf"
+            )
+        if kind == "ia_combined":
+            return (
+                out_dir / "analysis" / "multi_organoid_comparison"
+                / "multi_organoid_interaction_comparison.pdf"
+            )
+        return None
+
+    def _update_view_buttons(self):
+        def _set(btn: QPushButton, kind: str, *, ambiguous_tip: str = ""):
+            path = self._view_pdf_path(kind)
+            if path is None:
+                btn.setEnabled(False)
+                btn.setToolTip(ambiguous_tip or
+                               "Use the Results panel below to browse "
+                               "outputs for multiple targets/interactions.")
+                return
+            exists = path.exists()
+            btn.setEnabled(exists)
+            if exists:
+                btn.setToolTip(f"Open in napari:\n{path}")
+            else:
+                btn.setToolTip(
+                    f"Result PDF not found yet (will be enabled once "
+                    f"produced):\n{path}"
+                )
+
+        _set(
+            self.btn_view_dd_single, "dd_single",
+            ambiguous_tip=(
+                "Select exactly one target to view its combined "
+                "death-dynamics PDF (use the Results panel for "
+                "multi-target views)."
+            ),
+        )
+        _set(self.btn_view_dd_combined, "dd_combined")
+        _set(
+            self.btn_view_ia_single, "ia_single",
+            ambiguous_tip=(
+                "Select exactly one target and one interaction cell type "
+                "to view the matching interaction-analysis PDF."
+            ),
+        )
+        _set(self.btn_view_ia_combined, "ia_combined")
+
+    def _on_view_clicked(self, kind: str):
+        path = self._view_pdf_path(kind)
+        if path is None or not path.exists():
+            return
+        try:
+            panel = self._results_panel()
+            dpi = int(panel.spin_dpi.value()) if panel else 150
+            reuse = panel.chk_reuse.isChecked() if panel else True
+            open_pdf_in_napari(path, dpi=dpi, reuse=reuse)
+        except Exception as e:
+            traceback.print_exc()
+            self._log(f"Could not open PDF in napari: {e}")
+
+    def _results_panel(self):
+        """Climb the parent chain to find the shared :class:`ResultsPanel`."""
+        node = self.parent()
+        while node is not None and not hasattr(node, "results_panel"):
+            node = node.parent()
+        return getattr(node, "results_panel", None) if node else None
+
+    def _notify_results_changed(self):
+        """Ask the shared Results panel (if any) to re-scan disk."""
+        panel = self._results_panel()
+        if panel is not None:
+            try:
+                panel.refresh()
+            except Exception:
+                # Never let a UI refresh failure mask an analysis error.
+                traceback.print_exc()
+        self._update_view_buttons()
+
     # ── Param persistence ──────────────────────────────────────────────
     def _persist_advanced(self):
         if self.metadata_loader is None:
@@ -834,36 +993,45 @@ class DeathDynamicsTab(QWidget):
         targets = self._selected_targets()
         if not targets:
             return
-        ok = self.run_death_dynamics_for(targets, interactive=True)
-        if ok:
-            out_dir = Path(self.metadata_loader.output_dir).expanduser()
-            if len(targets) == 1:
-                folder = out_dir / "analysis" / targets[0] / "results"
-            else:
-                folder = out_dir / "analysis"
-            self._offer_open_results_folder(folder, what="Death Dynamics")
+        try:
+            ok = self.run_death_dynamics_for(targets, interactive=True)
+            if ok:
+                out_dir = Path(self.metadata_loader.output_dir).expanduser()
+                if len(targets) == 1:
+                    folder = out_dir / "analysis" / targets[0] / "results"
+                else:
+                    folder = out_dir / "analysis"
+                self._offer_open_results_folder(folder, what="Death Dynamics")
+        finally:
+            self._notify_results_changed()
 
     def _on_run_dd_combined(self):
         targets = self._selected_targets()
         if len(targets) < 2:
             return
-        ok = self.run_multi_organoid_death_for(targets, interactive=True)
-        if ok:
-            folder = (
-                Path(self.metadata_loader.output_dir).expanduser()
-                / "analysis"
-                / "multi_organoid_comparison"
-            )
-            self._offer_open_results_folder(
-                folder, what="Combined Death Dynamics"
-            )
+        try:
+            ok = self.run_multi_organoid_death_for(targets, interactive=True)
+            if ok:
+                folder = (
+                    Path(self.metadata_loader.output_dir).expanduser()
+                    / "analysis"
+                    / "multi_organoid_comparison"
+                )
+                self._offer_open_results_folder(
+                    folder, what="Combined Death Dynamics"
+                )
+        finally:
+            self._notify_results_changed()
 
     def _on_run_ia_single(self):
         targets = self._selected_targets()
         interactions = self._selected_interactions()
         if not targets or not interactions:
             return
-        self.run_interaction_for(targets, interactions, interactive=True)
+        try:
+            self.run_interaction_for(targets, interactions, interactive=True)
+        finally:
+            self._notify_results_changed()
 
     def _on_run_ia_combined(self):
         targets = self._selected_targets()
@@ -871,13 +1039,16 @@ class DeathDynamicsTab(QWidget):
         if len(targets) < 2 or not interactions:
             return
         self._persist_advanced()
-        self.run_multi_organoid_interaction_for(
-            targets,
-            interactions,
-            time_window_min=int(self.spin_time_window.value()),
-            group_by=self.combo_group_by.currentData() or "organoid_type",
-            interactive=True,
-        )
+        try:
+            self.run_multi_organoid_interaction_for(
+                targets,
+                interactions,
+                time_window_min=int(self.spin_time_window.value()),
+                group_by=self.combo_group_by.currentData() or "organoid_type",
+                interactive=True,
+            )
+        finally:
+            self._notify_results_changed()
 
     def _on_run_all_clicked(self):
         targets = self._selected_targets()
@@ -907,6 +1078,7 @@ class DeathDynamicsTab(QWidget):
         if dd_any_ok:
             folder = Path(self.metadata_loader.output_dir).expanduser() / "analysis"
             self._offer_open_results_folder(folder, what="Death Dynamics")
+        self._notify_results_changed()
 
     # ── Public run methods (called by queue) ───────────────────────────
     def run_death_dynamics_for(
@@ -1116,11 +1288,20 @@ class SingleCellTab(QWidget):
         lay.addWidget(sub)
 
 
+# NOTE: ResultsPanel used to be defined here; it now lives in
+# behav3d/napari/_results_panel.py so the Filtering and Feature
+# Extraction tabs can embed an instance without importing the
+# (much heavier) Analysis module.
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Outer Analysis tab
 # ═══════════════════════════════════════════════════════════════════════════
 class AnalysisTab(QWidget):
-    """Outer tab wrapping Death Dynamics + (placeholder) Single Cell."""
+    """Outer tab wrapping Death Dynamics + (placeholder) Single Cell.
+
+    Hosts a shared :class:`ResultsPanel` under a vertical splitter so the
+    panel is visible from both inner sub-tabs.
+    """
 
     def __init__(self, viewer=None, metadata_loader=None, parent=None):
         super().__init__(parent)
@@ -1131,8 +1312,41 @@ class AnalysisTab(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        # The whole Analysis GUI is gated behind a "metadata loaded" check,
+        # mirroring the Segmentation / Filtering / Tracking / Feature
+        # Extraction tabs. Until metadata is loaded we show a single
+        # centered placeholder; after that the inner tabs + Results panel
+        # are revealed.
+        self.stack = QStackedWidget(self)
+        outer.addWidget(self.stack)
+
+        # -- Page 0: Placeholder --
+        self.placeholder_page = QWidget()
+        place_lay = QVBoxLayout(self.placeholder_page)
+        place_lay.setAlignment(Qt.AlignCenter)
+        self.placeholder_label = QLabel(
+            "Load metadata in the Data Preparation tab to see analysis options."
+        )
+        self.placeholder_label.setAlignment(Qt.AlignCenter)
+        self.placeholder_label.setWordWrap(True)
+        self.placeholder_label.setStyleSheet(
+            "color: #888; font-style: italic; font-size: 14px; padding: 20px;"
+        )
+        place_lay.addWidget(self.placeholder_label)
+        self.stack.addWidget(self.placeholder_page)
+
+        # -- Page 1: Main Content --
+        self.main_content = QWidget()
+        main_lay = QVBoxLayout(self.main_content)
+        main_lay.setContentsMargins(0, 0, 0, 0)
+        main_lay.setSpacing(0)
+
+        self.splitter = QSplitter(Qt.Vertical, self.main_content)
+        self.splitter.setChildrenCollapsible(True)
+        main_lay.addWidget(self.splitter)
+
         self.inner_tabs = QTabWidget()
-        outer.addWidget(self.inner_tabs)
+        self.splitter.addWidget(self.inner_tabs)
 
         self.death_dynamics_tab = DeathDynamicsTab(
             viewer=viewer, metadata_loader=metadata_loader, parent=self
@@ -1141,3 +1355,40 @@ class AnalysisTab(QWidget):
 
         self.single_cell_tab = SingleCellTab(parent=self)
         self.inner_tabs.addTab(self.single_cell_tab, "🧬 Single Cell")
+
+        self.results_panel = ResultsPanel(
+            viewer=viewer, metadata_loader=metadata_loader, parent=self
+        )
+        self.splitter.addWidget(self.results_panel)
+
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, True)
+        self.splitter.setSizes([600, 400])
+
+        # Re-scan when the user switches sub-tab so new outputs show up
+        # without an explicit refresh click.
+        self.inner_tabs.currentChanged.connect(
+            lambda _i: self.results_panel.refresh()
+        )
+
+        self.stack.addWidget(self.main_content)
+
+        # Wire metadata signal and initialise the visible page.
+        if metadata_loader is not None and hasattr(
+            metadata_loader, "metadata_loaded"
+        ):
+            metadata_loader.metadata_loaded.connect(self._on_metadata_loaded)
+
+        if (
+            metadata_loader is not None
+            and getattr(metadata_loader, "metadata", None) is not None
+        ):
+            self.stack.setCurrentIndex(1)
+        else:
+            self.stack.setCurrentIndex(0)
+
+    def _on_metadata_loaded(self, *_):
+        """Reveal the analysis GUI once metadata is available."""
+        self.stack.setCurrentIndex(1)

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import os
 import platform
+import shlex
 import shutil
 import tempfile
 import urllib.request
@@ -721,40 +722,138 @@ def save_env_config(conda_path):
     print_success(f"Environment config saved to: {config_path}")
     print_info(f"  Package manager: {pkg_mgr}")
     print_info(f"  Environment name: {ENV_NAME}")
+
+    # Make the platform launcher scripts executable so users can double-click them.
+    # No-op on Windows (.bat files don't need an executable bit).
+    if platform.system() != "Windows":
+        for script_name in ("run_behav3d_linux.sh", "run_behav3d_macos.command"):
+            script_path = napari_dir / script_name
+            if script_path.exists():
+                try:
+                    current = script_path.stat().st_mode
+                    os.chmod(script_path, current | 0o111)  # add +x for user/group/other
+                    print_info(f"  Made executable: {script_path.name}")
+                except Exception as e:
+                    print_warning(f"  Could not chmod {script_path.name}: {e}")
+
     return config_path
 
 
 def launch_napari(conda_path):
-    """Launch napari with the BEHAV3D plugin."""
+    """Launch napari with the BEHAV3D plugin in a new terminal window.
+
+    We invoke the platform-specific launcher script (run_behav3d_*.{bat,command,sh})
+    the same way a user would by double-clicking it. This guarantees a visible
+    terminal window where pipeline log outputs are shown, matching the experience
+    of launching from the napari/ folder. Falls back to a direct subprocess if
+    the launcher script is missing.
+    """
     project_root = find_project_root()
-    script_path = project_root / "napari" / ".config" / "launch_napari.py"
-    
+    napari_dir = project_root / "napari"
+    system = platform.system()
+
+    if system == "Windows":
+        launcher = napari_dir / "run_behav3d_windows.bat"
+    elif system == "Darwin":
+        launcher = napari_dir / "run_behav3d_macos.command"
+    else:
+        launcher = napari_dir / "run_behav3d_linux.sh"
+
+    # Ensure +x on Unix launcher scripts so 'open' / direct exec works.
+    # If chmod fails (e.g. read-only filesystem) we'll fall back to invoking
+    # the script through `bash <script>` which does not need the exec bit.
+    chmod_ok = True
+    if system in ("Darwin", "Linux") and launcher.exists():
+        try:
+            current = launcher.stat().st_mode
+            os.chmod(launcher, current | 0o111)
+        except Exception as e:
+            chmod_ok = False
+            print_warning(f"Could not make launcher executable ({e}); will run via bash instead.")
+
+    if launcher.exists():
+        print_info(f"Launching via: {launcher}")
+        try:
+            if system == "Windows":
+                # os.startfile mimics double-clicking the .bat in Explorer:
+                # Windows opens it in a new CMD window with stdout visible.
+                os.startfile(str(launcher))
+            elif system == "Darwin":
+                if chmod_ok:
+                    # 'open' a .command file launches it in Terminal.app by default.
+                    subprocess.Popen(["open", str(launcher)])
+                else:
+                    # Fallback: ask Terminal.app to run the script through bash,
+                    # which does not require the +x bit on the script file.
+                    osa_script = (
+                        f'tell application "Terminal" to do script '
+                        f'"bash {shlex.quote(str(launcher))}"'
+                    )
+                    subprocess.Popen(["osascript", "-e", osa_script])
+            else:
+                # Try common Linux terminal emulators in order of preference.
+                # Each tuple is (binary_name, args_before_command).
+                # We always invoke via `bash <script>` so missing +x is not fatal.
+                terminals = [
+                    ("x-terminal-emulator", ["-e"]),
+                    ("gnome-terminal", ["--"]),
+                    ("konsole", ["-e"]),
+                    ("xfce4-terminal", ["-e"]),
+                    ("xterm", ["-e"]),
+                ]
+
+                launched = False
+                for term, prefix_args in terminals:
+                    if shutil.which(term):
+                        subprocess.Popen(
+                            [term, *prefix_args, "bash", str(launcher)],
+                            start_new_session=True,
+                        )
+                        launched = True
+                        break
+
+                if not launched:
+                    print_warning("No terminal emulator found on PATH.")
+                    print_info(f"Please launch manually: bash {launcher}")
+                    return
+
+            print_success("Napari is starting with BEHAV3D plugin in a new terminal window...")
+            print_info("Closing installation window...")
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as e:
+            print_error(f"Failed to launch napari via launcher script: {e}")
+            print_info("Falling back to direct launch...")
+
+    # ---------- Fallback: direct launch (launcher script missing or failed) ----------
+    script_path = napari_dir / ".config" / "launch_napari.py"
     if not script_path.exists():
         print_warning(f"Startup script not found at {script_path}")
         print_info("Falling back to standard napari launch...")
         cmd = f'{get_conda_run_prefix(conda_path, ENV_NAME)} napari'
     else:
         run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
-        # Use --internal to run the payload mode directly since we are already constructing the run command
-        cmd = f'{run_prefix} python "{script_path}" --internal'
-        
+        # Use launcher mode (no --internal) so stdout is inherited and logs are visible.
+        cmd = f'{run_prefix} python "{script_path}"'
+
     print_info(f"Running: {cmd}")
     try:
         kwargs = {}
-        if platform.system() == "Windows":
-            # Open in a new console window
+        if system == "Windows":
+            # Open in a new console window so logs are visible
             kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
         else:
-            # On Linux/macOS, detach the process so it survives when we exit
+            # Detach the process so it survives when we exit, but keep stdout/stderr
+            # attached to the current terminal so the user can still see logs.
             kwargs['start_new_session'] = True
-            # Redirect output to devnull if creating a new session to avoid clutter/hanging
-            kwargs['stdout'] = subprocess.DEVNULL
-            kwargs['stderr'] = subprocess.DEVNULL
-        
+
         subprocess.Popen(cmd, shell=True, **kwargs)
         print_success("Napari is starting with BEHAV3D plugin...")
         print_info("Closing installation window...")
         sys.exit(0)
+    except SystemExit:
+        raise
     except Exception as e:
         print_error(f"Failed to launch napari: {e}")
 

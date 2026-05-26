@@ -26,12 +26,16 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QCheckBox,
     QDoubleSpinBox, QSpinBox, QGroupBox, QMessageBox, QScrollArea,
-    QComboBox, QToolTip,
+    QComboBox, QToolTip, QSplitter,
 )
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QCursor
 
 from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.napari._results_panel import (
+    ResultsPanel,
+    notify_results_changed,
+)
 
 # Colormaps for raw channel layers (same order as the Visualization tab)
 _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
@@ -1566,6 +1570,8 @@ class CellTypeFeaturePanel(QWidget):
             except Exception as e:
                 traceback.print_exc()
                 self.log(f"Error during death re-run: {e}")
+            finally:
+                notify_results_changed(self)
             return
 
         try:
@@ -1576,6 +1582,8 @@ class CellTypeFeaturePanel(QWidget):
         except Exception as e:
             traceback.print_exc()
             self.log(f"Error during feature extraction: {e}")
+        finally:
+            notify_results_changed(self)
 
     # ── Non-organoid Dead Threshold Preview ──────────────────────────────────
     # -- Dead Threshold Preview (all panel types) -------------------------
@@ -2362,6 +2370,7 @@ class ActiveKillingPanel(QWidget):
             if hasattr(self, "btn_queue"):
                 self.btn_queue.setEnabled(self._queue_callback is not None and self.btn_run.isEnabled())
             self.btn_run.setText("▶  Run Active Killing Analysis")
+            notify_results_changed(self)
 
     # ── Folder open popup ──────────────────────────────────────────────────────
     def _offer_open_folder(self, results_dir: Path):
@@ -2557,16 +2566,35 @@ class FeatureExtractionTab(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        # Vertical splitter: tab content on top, shared Results panel
+        # underneath (re-scans the same output directory used by the
+        # other BEHAV3D tabs).
+        self.splitter = QSplitter(Qt.Vertical, self)
+        self.splitter.setChildrenCollapsible(True)
+        outer.addWidget(self.splitter)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        outer.addWidget(scroll)
+        self.splitter.addWidget(scroll)
 
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
         scroll.setWidget(content)
+
+        self.results_panel = ResultsPanel(
+            viewer=self.viewer,
+            metadata_loader=self.metadata_loader,
+            parent=self,
+        )
+        self.splitter.addWidget(self.results_panel)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, True)
+        self.splitter.setSizes([600, 400])
 
         # ── Global Death Classification group (Organoids only) ─────────────
 
@@ -3124,6 +3152,11 @@ class FeatureExtractionTab(QWidget):
         except Exception as e:
             traceback.print_exc()
             self._log(f"❌ Batch feature extraction error: {e}")
+        finally:
+            try:
+                self.results_panel.refresh()
+            except Exception:
+                traceback.print_exc()
 
     def _sync_global_threshold_to_params(self):
         """Write the organoid dead threshold into behav3d_parameters
