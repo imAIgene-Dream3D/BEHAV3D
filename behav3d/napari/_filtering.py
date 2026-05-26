@@ -203,7 +203,10 @@ class CellTypeFilterPanel(QWidget):
             "background-color: #28a745; color: white; font-weight: bold; "
             "border-radius: 4px; padding: 6px;"
         )
-        self.btn_run.clicked.connect(self._on_run_clicked)
+        # ``clicked`` emits a ``bool`` (checked state) that would override the
+        # ``interactive=True`` default of ``_on_run_clicked``; wrap in a lambda
+        # so the overwrite prompt is not silently skipped on button presses.
+        self.btn_run.clicked.connect(lambda: self._on_run_clicked(interactive=True))
         layout.addWidget(self.btn_run)
 
         layout.addStretch()
@@ -323,20 +326,13 @@ class CellTypeFilterPanel(QWidget):
         existing = self._check_existing_filtering([self.cell_type])
         if existing:
             if interactive:
-                details = "\n".join(f"  • {w}" for w in existing)
-                box = QMessageBox(self)
-                box.setWindowTitle("Overwrite Existing Filtered Data?")
-                box.setText(
-                    f"The following filtered data already exists:\n\n{details}\n\n"
-                    "What do you want to do?"
+                from behav3d.napari._overwrite_prompt import prompt_overwrite_single
+                choice = prompt_overwrite_single(
+                    self,
+                    "Overwrite Existing Filtered Data?",
+                    existing,
                 )
-                btn_overwrite = box.addButton("Overwrite", QMessageBox.DestructiveRole)
-                btn_skip = box.addButton("Skip", QMessageBox.AcceptRole)
-                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-                box.setDefaultButton(btn_cancel)
-                box.exec_()
-                clicked = box.clickedButton()
-                if clicked != btn_overwrite:
+                if choice != "overwrite":
                     self.log(f"Filtering for {self.cell_type} cancelled.")
                     return
                 overwrite = True
@@ -518,23 +514,16 @@ class FilteringTab(QWidget):
         overwrite = not skip_existing
         if existing:
             if interactive:
-                details = "\n".join(f"  • {w}" for w in existing)
-                box = QMessageBox(self)
-                box.setWindowTitle("Overwrite Existing Filtered Data?")
-                box.setText(
-                    f"The following filtered data already exists:\n\n{details}\n\n"
-                    "What do you want to do?"
+                from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
+                choice = prompt_overwrite_batch(
+                    self,
+                    "Overwrite Existing Filtered Data?",
+                    existing,
                 )
-                btn_overwrite = box.addButton("Overwrite All", QMessageBox.DestructiveRole)
-                btn_skip = box.addButton("Skip Existing", QMessageBox.AcceptRole)
-                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-                box.setDefaultButton(btn_cancel)
-                box.exec_()
-                clicked = box.clickedButton()
-                if clicked == btn_cancel:
+                if choice == "cancel":
                     self._log("Batch filtering cancelled.")
                     return
-                skip_existing_flag = (clicked == btn_skip)
+                skip_existing_flag = (choice == "skip")
                 overwrite = not skip_existing_flag
             else:
                 overwrite = True

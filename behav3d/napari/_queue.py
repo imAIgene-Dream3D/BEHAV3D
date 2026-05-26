@@ -35,6 +35,10 @@ class StepType(Enum):
     FEATURE_EXTRACT = "feature_extract"
     ACTIVE_KILLING = "active_killing"
     FILTER = "filter"
+    DEATH_DYNAMICS = "death_dynamics"
+    MULTI_ORG_DEATH = "multi_org_death"
+    INTERACTION = "interaction"
+    MULTI_ORG_INTERACTION = "multi_org_interaction"
 
     @property
     def label(self):
@@ -49,6 +53,10 @@ class StepType(Enum):
             StepType.FEATURE_EXTRACT: "🧪 Feature Extraction",
             StepType.ACTIVE_KILLING: "🔥 Active Killing",
             StepType.FILTER: "🧹 Filtering",
+            StepType.DEATH_DYNAMICS: "💀 Death Dynamics",
+            StepType.MULTI_ORG_DEATH: "💀 Combined Death Dynamics",
+            StepType.INTERACTION: "🤝 Interaction Analysis",
+            StepType.MULTI_ORG_INTERACTION: "🤝 Combined Interaction Comparison",
         }[self]
 
     @property
@@ -64,6 +72,10 @@ class StepType(Enum):
             StepType.FEATURE_EXTRACT: 3,
             StepType.ACTIVE_KILLING: 3.5,
             StepType.FILTER: 4,
+            StepType.DEATH_DYNAMICS: 5,
+            StepType.MULTI_ORG_DEATH: 5.5,
+            StepType.INTERACTION: 6,
+            StepType.MULTI_ORG_INTERACTION: 6.5,
         }[self]
 
 
@@ -97,6 +109,20 @@ class QueueStep:
         if self.step_type == StepType.ACTIVE_KILLING:
             immune = self.params.get("immune_type", "")
             return f"🔥 Active Killing — {immune}" if immune else self.step_type.label
+        if self.step_type in (
+            StepType.DEATH_DYNAMICS,
+            StepType.INTERACTION,
+        ):
+            cts = self.params.get("cell_types", [])
+            if cts:
+                return f"{self.step_type.label} — {', '.join(cts)}"
+        if self.step_type in (
+            StepType.MULTI_ORG_DEATH,
+            StepType.MULTI_ORG_INTERACTION,
+        ):
+            cts = self.params.get("cell_types", [])
+            if cts:
+                return f"{self.step_type.label} — {', '.join(cts)}"
         return self.step_type.label
 
 
@@ -184,13 +210,15 @@ class ProcessingQueuePanel(QWidget):
     }
 
     def __init__(self, segmentation_tab, tracking_tab, metadata_loader,
-                 feature_extraction_tab=None, filtering_tab=None, parent=None):
+                 feature_extraction_tab=None, filtering_tab=None,
+                 analysis_tab=None, parent=None):
         super().__init__(parent)
         self.segmentation_tab = segmentation_tab
         self.tracking_tab = tracking_tab
         self.metadata_loader = metadata_loader
         self.feature_extraction_tab = feature_extraction_tab
         self.filtering_tab = filtering_tab
+        self.analysis_tab = analysis_tab
 
         self._steps: List[QueueStep] = []
         self._step_rows: List[QueueStepRow] = []
@@ -759,6 +787,36 @@ class ProcessingQueuePanel(QWidget):
                     if ak_dir.exists() and any(ak_dir.rglob("*.csv")):
                         warnings.append(f"Active killing data for {immune_type}")
 
+            elif step.step_type == StepType.DEATH_DYNAMICS:
+                cts = step.params.get("cell_types", []) or []
+                for ct in cts:
+                    res_csv = (
+                        out_dir
+                        / "analysis"
+                        / ct
+                        / "results"
+                        / f"combined_general_{ct}_dynamics_analysis.csv"
+                    )
+                    if res_csv.exists():
+                        warnings.append(f"Death dynamics results for {ct}")
+
+            elif step.step_type == StepType.MULTI_ORG_DEATH:
+                comp_dir = out_dir / "analysis" / "multi_organoid_comparison"
+                if comp_dir.exists() and any(comp_dir.iterdir()):
+                    warnings.append("Multi-organoid death dynamics outputs")
+
+            elif step.step_type == StepType.INTERACTION:
+                cts = step.params.get("cell_types", []) or []
+                for ct in cts:
+                    ia_dir = out_dir / "analysis" / ct / "interaction_analysis"
+                    if ia_dir.exists() and any(ia_dir.iterdir()):
+                        warnings.append(f"Interaction analysis for {ct}")
+
+            elif step.step_type == StepType.MULTI_ORG_INTERACTION:
+                comp_dir = out_dir / "analysis" / "multi_organoid_comparison"
+                if comp_dir.exists() and any(comp_dir.iterdir()):
+                    warnings.append("Multi-organoid interaction comparison outputs")
+
             elif step.step_type == StepType.FILTER:
                 analysis_dir = out_dir / "analysis"
                 if analysis_dir.exists():
@@ -886,6 +944,14 @@ class ProcessingQueuePanel(QWidget):
             self._run_active_killing(step, skip_existing=skip_existing)
         elif step.step_type == StepType.FILTER:
             self._run_filter(skip_existing=skip_existing)
+        elif step.step_type == StepType.DEATH_DYNAMICS:
+            self._run_death_dynamics(step)
+        elif step.step_type == StepType.MULTI_ORG_DEATH:
+            self._run_multi_org_death(step)
+        elif step.step_type == StepType.INTERACTION:
+            self._run_interaction(step)
+        elif step.step_type == StepType.MULTI_ORG_INTERACTION:
+            self._run_multi_org_interaction(step)
 
     # ── Step runners (non-interactive) ─────────────────────────────────
 
@@ -956,6 +1022,41 @@ class ProcessingQueuePanel(QWidget):
             self.filtering_tab.run_batch_filtering(interactive=False, skip_existing=skip_existing)
         else:
             raise RuntimeError("Filtering tab not wired to queue.")
+
+    def _require_death_dynamics_tab(self):
+        if self.analysis_tab is None or not hasattr(self.analysis_tab, "death_dynamics_tab"):
+            raise RuntimeError("Analysis tab not wired to queue.")
+        return self.analysis_tab.death_dynamics_tab
+
+    def _run_death_dynamics(self, step: QueueStep):
+        dd = self._require_death_dynamics_tab()
+        cell_types = step.params.get("cell_types") or []
+        dd.run_death_dynamics_for(cell_types, interactive=False)
+
+    def _run_multi_org_death(self, step: QueueStep):
+        dd = self._require_death_dynamics_tab()
+        cell_types = step.params.get("cell_types") or []
+        dd.run_multi_organoid_death_for(cell_types, interactive=False)
+
+    def _run_interaction(self, step: QueueStep):
+        dd = self._require_death_dynamics_tab()
+        cell_types = step.params.get("cell_types") or []
+        interaction_cts = step.params.get("interaction_cell_types") or []
+        dd.run_interaction_for(cell_types, interaction_cts, interactive=False)
+
+    def _run_multi_org_interaction(self, step: QueueStep):
+        dd = self._require_death_dynamics_tab()
+        cell_types = step.params.get("cell_types") or []
+        interaction_cts = step.params.get("interaction_cell_types") or []
+        time_window_min = float(step.params.get("time_window_min", 60.0))
+        group_by = step.params.get("group_by", "organoid_type")
+        dd.run_multi_organoid_interaction_for(
+            cell_types,
+            interaction_cts,
+            time_window_min=time_window_min,
+            group_by=group_by,
+            interactive=False,
+        )
 
     def _run_apoc_segment(self, step: QueueStep, skip_existing: bool = False):
         """Run APOC GPU batch segmentation from a queued params snapshot.

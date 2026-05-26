@@ -855,9 +855,14 @@ def plot_interaction_violin_comparison(
         density_norm="count", cut=0,
     )
 
-    # Use a copy of common_kw with the darker palette + gap for narrow centered box
+    # Use a copy of common_kw with the darker palette + gap for narrow centered box.
+    # Only override the palette when we actually have a hue mapping; otherwise
+    # seaborn falls back to looking up `x` values in the palette dict and an
+    # empty dict raises "palette is missing keys" (and triggers a FutureWarning
+    # about passing palette without hue).
     box_kw = common_kw.copy()
-    box_kw["palette"] = dark_palette
+    if has_dead_data and dark_palette:
+        box_kw["palette"] = dark_palette
     sns.boxplot(
         **box_kw,
         gap=0.6,

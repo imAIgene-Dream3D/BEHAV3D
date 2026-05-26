@@ -213,6 +213,90 @@ def _run_parallel_with_fallback(fn, args_list, n_workers):
         )
 
 
+def rerun_death_classification(
+    output_dir,
+    cell_type,
+    new_threshold,
+    threshold_column="percentage_dead_mask",
+):
+    """Re-apply :func:`calculate_death` to an existing combined feature CSV
+    with a new ``dead_mask_percentage_threshold``.
+
+    This is a fast operation: it does **not** re-run any image-based
+    feature extraction. It assumes ``percentage_dead_mask`` (or whichever
+    ``threshold_column`` is supplied) is already present in the combined
+    CSV produced by a prior full :func:`run_feature_extraction` call.
+
+    The same file is rewritten in place. The per-sample track CSVs under
+    ``trackdata/<sample>/<cell_type>/`` are left untouched; downstream
+    analysis reads the combined CSV in
+    ``analysis/<cell_type>/track_features/`` only.
+
+    Parameters
+    ----------
+    output_dir : str or pathlib.Path
+        Base output directory used by BEHAV3D.
+    cell_type : str
+        Cell type name (must match the directory used by feature
+        extraction).
+    new_threshold : float
+        New value to threshold ``percentage_dead_mask`` (or
+        ``threshold_column``) against.
+    threshold_column : str, optional
+        Column in the combined CSV used by :func:`calculate_death`.
+        Defaults to ``"percentage_dead_mask"``.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the combined CSV that was rewritten.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the combined CSV does not exist.
+    KeyError
+        If the required ``threshold_column`` is missing from the CSV.
+    """
+    output_dir = Path(output_dir)
+    combined_csv = (
+        output_dir
+        / "analysis"
+        / cell_type
+        / "track_features"
+        / f"BEHAV3D_{cell_type}_combined_track_features.csv"
+    )
+    if not combined_csv.exists():
+        raise FileNotFoundError(
+            f"Combined feature CSV not found for cell type '{cell_type}': "
+            f"{combined_csv}. Run a full feature extraction first."
+        )
+
+    print(
+        f"--------------- Re-running death classification for {cell_type} "
+        f"with threshold={new_threshold} ---------------"
+    )
+    df = pd.read_csv(combined_csv)
+    if threshold_column not in df.columns:
+        raise KeyError(
+            f"Column '{threshold_column}' not present in {combined_csv}. "
+            "Cannot recompute the 'dead' classification without it. "
+            "Re-run full feature extraction (with 'death' selected) first."
+        )
+
+    if "dead" in df.columns:
+        df = df.drop(columns=["dead"])
+
+    df = calculate_death(
+        df,
+        threshold=float(new_threshold),
+        threshold_column=threshold_column,
+    )
+    df.to_csv(combined_csv, index=False)
+    print(f"Re-wrote {combined_csv} with updated 'dead' column.")
+    return combined_csv
+
+
 def run_feature_extraction(
     metadata, 
     config=None,

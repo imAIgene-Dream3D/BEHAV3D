@@ -1157,21 +1157,13 @@ class CellTypeTrackingPanel(QWidget):
 
         overwrite = True
         if existing:
-            from qtpy.QtWidgets import QMessageBox
-            details = "\n".join(f"  \u2022 {w}" for w in existing)
-            box = QMessageBox(self)
-            box.setWindowTitle("Overwrite Existing Tracking?")
-            box.setText(
-                f"The following tracking data already exists:\n\n{details}\n\n"
-                "What do you want to do?"
+            from behav3d.napari._overwrite_prompt import prompt_overwrite_single
+            choice = prompt_overwrite_single(
+                self,
+                "Overwrite Existing Tracking?",
+                existing,
             )
-            btn_overwrite = box.addButton("Overwrite", QMessageBox.DestructiveRole)
-            btn_skip = box.addButton("Skip", QMessageBox.AcceptRole)
-            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-            box.setDefaultButton(btn_cancel)
-            box.exec_()
-            clicked = box.clickedButton()
-            if clicked != btn_overwrite:
+            if choice != "overwrite":
                 self.log(f"Tracking for {self.cell_type} cancelled.")
                 return
             overwrite = True
@@ -1311,7 +1303,6 @@ class AllOrganoidsPropagationPanel(QWidget):
 
     def _on_run_clicked(self):
         """Run propagation tracking for all organoid types at once."""
-        from qtpy.QtWidgets import QMessageBox
         md = self.metadata_loader.metadata
         out_dir = self.metadata_loader.output_dir
         if md is None or not out_dir:
@@ -1330,22 +1321,16 @@ class AllOrganoidsPropagationPanel(QWidget):
 
         overwrite = True
         if existing:
-            details = "\n".join(f"  \u2022 {w}" for w in existing)
-            box = QMessageBox(self)
-            box.setWindowTitle("Overwrite Existing Tracking?")
-            box.setText(
-                f"The following tracking data already exists:\n\n{details}\n\nWhat do you want to do?"
+            from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
+            choice = prompt_overwrite_batch(
+                self,
+                "Overwrite Existing Tracking?",
+                existing,
             )
-            btn_overwrite = box.addButton("Overwrite", QMessageBox.DestructiveRole)
-            box.addButton("Skip", QMessageBox.AcceptRole)
-            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-            box.setDefaultButton(btn_cancel)
-            box.exec_()
-            clicked = box.clickedButton()
-            if clicked == btn_cancel:
+            if choice == "cancel":
                 self.log("All-organoids tracking cancelled.")
                 return
-            overwrite = (clicked == btn_overwrite)
+            overwrite = (choice == "overwrite")
 
         types_str = ", ".join(self.organoid_types)
         self.btn_run.setEnabled(False)
@@ -1825,24 +1810,16 @@ class TrackingTab(QWidget):
         skip_existing_flag = skip_existing
         overwrite = not skip_existing
         if existing and interactive:
-            from qtpy.QtWidgets import QMessageBox
-            details = "\n".join(f"  \u2022 {w}" for w in existing)
-            box = QMessageBox(self)
-            box.setWindowTitle("Overwrite Existing Tracking?")
-            box.setText(
-                f"The following tracking data already exists:\n\n{details}\n\n"
-                "What do you want to do?"
+            from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
+            choice = prompt_overwrite_batch(
+                self,
+                "Overwrite Existing Tracking?",
+                existing,
             )
-            btn_overwrite = box.addButton("Overwrite All", QMessageBox.DestructiveRole)
-            btn_skip = box.addButton("Skip Existing", QMessageBox.AcceptRole)
-            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-            box.setDefaultButton(btn_cancel)
-            box.exec_()
-            clicked = box.clickedButton()
-            if clicked == btn_cancel:
+            if choice == "cancel":
                 self._log("Batch tracking cancelled by user.")
                 return
-            skip_existing_flag = (clicked == btn_skip)
+            skip_existing_flag = (choice == "skip")
             overwrite = not skip_existing_flag
 
         # Persist all panel params before starting so config is saved even if an error occurs

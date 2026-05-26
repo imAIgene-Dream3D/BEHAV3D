@@ -80,9 +80,14 @@ class BEHAV3DWidget(QWidget):
         )
         self.tabs.addTab(self.filtering_tab, "🧹 Filtering")
 
-        # --- Tab 7: Analysis (Stub) ---------------------------------------
-        from behav3d.napari._stubs import AnalysisTab
-        self.tabs.addTab(AnalysisTab(parent=self), "📊 Analysis")
+        # --- Tab 7: Analysis ----------------------------------------------
+        from behav3d.napari._analysis import AnalysisTab
+        self.analysis_tab = AnalysisTab(
+            viewer=self.viewer,
+            metadata_loader=self.data_prep_tab,
+            parent=self,
+        )
+        self.tabs.addTab(self.analysis_tab, "📊 Analysis")
 
         # --- Processing Queue (collapsible bottom panel) ------------------
         self.queue_panel = ProcessingQueuePanel(
@@ -91,6 +96,7 @@ class BEHAV3DWidget(QWidget):
             metadata_loader=self.data_prep_tab,
             feature_extraction_tab=self.feature_extraction_tab,
             filtering_tab=self.filtering_tab,
+            analysis_tab=self.analysis_tab,
         )
         layout.addWidget(self.queue_panel)
         self.feature_extraction_tab.set_queue_panel(self.queue_panel)
@@ -112,6 +118,13 @@ class BEHAV3DWidget(QWidget):
         self.filtering_tab.btn_queue_filter.clicked.connect(
             lambda: self.queue_panel.add_step(StepType.FILTER)
         )
+
+        # Analysis tab +🛒 buttons (Death Dynamics + Interaction)
+        dd = self.analysis_tab.death_dynamics_tab
+        dd.btn_queue_dd_single.clicked.connect(self._add_death_dynamics_to_queue)
+        dd.btn_queue_dd_combined.clicked.connect(self._add_multi_org_death_to_queue)
+        dd.btn_queue_ia_single.clicked.connect(self._add_interaction_to_queue)
+        dd.btn_queue_ia_combined.clicked.connect(self._add_multi_org_interaction_to_queue)
 
         # Cellpose +🛒 button
         cp = self.segmentation_tab.cellpose_page
@@ -164,6 +177,76 @@ class BEHAV3DWidget(QWidget):
             return
         params = convpaint.get_queue_params()
         self.queue_panel.add_step(StepType.CONVPAINT_SEGMENT, params=params)
+
+    # ── Analysis tab queue helpers ─────────────────────────────────────
+    def _add_death_dynamics_to_queue(self):
+        dd = self.analysis_tab.death_dynamics_tab
+        targets = dd._selected_targets()
+        if not targets:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Cannot Add to Queue", "Select at least one target cell type."
+            )
+            return
+        self.queue_panel.add_step(
+            StepType.DEATH_DYNAMICS, params={"cell_types": list(targets)}
+        )
+
+    def _add_multi_org_death_to_queue(self):
+        dd = self.analysis_tab.death_dynamics_tab
+        targets = dd._selected_targets()
+        if len(targets) < 2:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Cannot Add to Queue",
+                "Select at least two targets for combined death dynamics."
+            )
+            return
+        self.queue_panel.add_step(
+            StepType.MULTI_ORG_DEATH, params={"cell_types": list(targets)}
+        )
+
+    def _add_interaction_to_queue(self):
+        dd = self.analysis_tab.death_dynamics_tab
+        targets = dd._selected_targets()
+        interactions = dd._selected_interactions()
+        if not targets or not interactions:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Cannot Add to Queue",
+                "Select at least one target and one interaction cell type."
+            )
+            return
+        self.queue_panel.add_step(
+            StepType.INTERACTION,
+            params={
+                "cell_types": list(targets),
+                "interaction_cell_types": list(interactions),
+            },
+        )
+
+    def _add_multi_org_interaction_to_queue(self):
+        dd = self.analysis_tab.death_dynamics_tab
+        targets = dd._selected_targets()
+        interactions = dd._selected_interactions()
+        if len(targets) < 2 or not interactions:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Cannot Add to Queue",
+                "Select at least two targets and one interaction cell type."
+            )
+            return
+        # Persist advanced settings before queueing
+        dd._persist_advanced()
+        self.queue_panel.add_step(
+            StepType.MULTI_ORG_INTERACTION,
+            params={
+                "cell_types": list(targets),
+                "interaction_cell_types": list(interactions),
+                "time_window_min": int(dd.spin_time_window.value()),
+                "group_by": dd.combo_group_by.currentData() or "organoid_type",
+            },
+        )
 
     def _on_tab_changed(self, index):
         """Intercept tab switches to handle exit warnings and missing output dir."""

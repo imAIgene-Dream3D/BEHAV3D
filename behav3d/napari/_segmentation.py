@@ -912,20 +912,19 @@ class PixelClassifierWidget(QWidget):
         self._persist_params()
         try:
             if interactive:
-                from qtpy.QtWidgets import QMessageBox
-                box = QMessageBox(self)
-                box.setWindowTitle("Existing Segmentation Results")
-                box.setText("Segmentation results may already exist for some timepoints.\n\nWhat do you want to do?")
-                btn_overwrite = box.addButton("Overwrite All", QMessageBox.DestructiveRole)
-                btn_skip = box.addButton("Skip Existing", QMessageBox.AcceptRole)
-                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-                box.setDefaultButton(btn_cancel)
-                box.exec_()
-                clicked = box.clickedButton()
-                if clicked == btn_cancel:
+                from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
+                choice = prompt_overwrite_batch(
+                    self,
+                    "Existing Segmentation Results",
+                    ["existing segmentation results may already be present"],
+                    body_prefix=(
+                        "Segmentation results may already exist for some timepoints."
+                    ),
+                )
+                if choice == "cancel":
                     self.log("Segmentation cancelled.")
                     return
-                overwrite = (clicked == btn_overwrite)
+                overwrite = (choice == "overwrite")
             else:
                 overwrite = not skip_existing
             
@@ -2351,22 +2350,26 @@ class CellposeWidget(QWidget):
         self._persist_channel_config()
 
         if interactive:
-            box = QMessageBox(self)
-            box.setWindowTitle("Existing Cellpose Results")
-            box.setText(
-                f"Cellpose segmentation for '{cell_type}' may already exist.\n\n"
-                "What do you want to do?"
+            from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
+            md = self.metadata_loader.metadata
+            existing = []
+            if md is not None:
+                out_dir = Path(self.metadata_loader.output_dir)
+                for sn in md["sample_name"].unique():
+                    seg_path = out_dir / "images" / sn / f"{sn}_{cell_type}_segments.zarr"
+                    if seg_path.exists():
+                        existing.append(f"{cell_type} segments for {sn}")
+            if not existing:
+                existing = [f"existing {cell_type} Cellpose results"]
+            choice = prompt_overwrite_batch(
+                self,
+                "Existing Cellpose Results",
+                existing,
             )
-            btn_overwrite = box.addButton("Overwrite All", QMessageBox.DestructiveRole)
-            btn_skip = box.addButton("Skip Existing", QMessageBox.AcceptRole)
-            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-            box.setDefaultButton(btn_cancel)
-            box.exec_()
-            clicked = box.clickedButton()
-            if clicked == btn_cancel:
+            if choice == "cancel":
                 self.log("Cellpose segmentation cancelled.")
                 return
-            overwrite = clicked == btn_overwrite
+            overwrite = (choice == "overwrite")
         else:
             overwrite = not skip_existing
 
@@ -2416,6 +2419,29 @@ class CellposeWidget(QWidget):
             return
 
         self._persist_channel_config()
+
+        # ---- Overwrite check ------------------------------------------------
+        out_dir = Path(self.metadata_loader.output_dir)
+        md = self.metadata_loader.metadata
+        existing = []
+        for sn in md["sample_name"].unique():
+            mask_path = out_dir / "images" / sn / f"{sn}_mask_dead.zarr"
+            if mask_path.exists():
+                existing.append(f"{sn} dead mask ({mask_path.name})")
+
+        overwrite_existing = True
+        if existing and interactive:
+            from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
+            choice = prompt_overwrite_batch(
+                self,
+                "Overwrite Existing Dead Masks?",
+                existing,
+            )
+            if choice == "cancel":
+                self.log("Otsu dead mask cancelled.")
+                return
+            overwrite_existing = (choice == "overwrite")
+
         self.log("Starting Otsu dead mask segmentation...")
 
         # Timepoint range
@@ -2423,6 +2449,14 @@ class CellposeWidget(QWidget):
             timepoint_range = None
         else:
             timepoint_range = (self.spin_t_start.value(), self.spin_t_end.value())
+
+        # NOTE: the backend currently always overwrites; the popup choice is
+        # informational here (a "skip" route would require a backend change).
+        if not overwrite_existing:
+            self.log(
+                "\u26a0\ufe0f Backend does not yet support partial skipping; "
+                "existing dead masks will be overwritten."
+            )
 
         try:
             updated_metadata, summary = run_otsu_threshold_segmentation_from_zarr(
@@ -4170,32 +4204,24 @@ class APOCWidget(QWidget):
         output_dir = Path(self.metadata_loader.output_dir)
 
         # Check for pre-existing segments and prompt
-        from qtpy.QtWidgets import QMessageBox
         sample_names = md['sample_name'].unique()
-        existing = []
-        for sn in sample_names:
-            seg_path = output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
-            if seg_path.exists():
-                existing.append(sn)
+        existing = [
+            f"{ct} segments for {sn}"
+            for sn in sample_names
+            if (output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr").exists()
+        ]
 
         overwrite = False
         if existing:
-            msg = (
-                f"Found existing {ct} segments for {len(existing)}/{len(sample_names)} samples.\n\n"
-                f"What would you like to do?"
+            from behav3d.napari._overwrite_prompt import prompt_overwrite_single
+            choice = prompt_overwrite_single(
+                self,
+                f"Run {ct.capitalize()} Segmentation",
+                existing,
             )
-            box = QMessageBox(self)
-            box.setWindowTitle(f"Run {ct.capitalize()} Segmentation")
-            box.setText(msg)
-            btn_overwrite = box.addButton("Overwrite", QMessageBox.DestructiveRole)
-            btn_skip = box.addButton("Skip existing", QMessageBox.AcceptRole)
-            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-            box.setDefaultButton(btn_skip)
-            box.exec_()
-            clicked = box.clickedButton()
-            if clicked is btn_cancel:
+            if choice == "cancel":
                 return
-            overwrite = (clicked is btn_overwrite)
+            overwrite = (choice == "overwrite")
 
         # Run segmentation for this cell type only.
         orig_overwrite = self.check_overwrite.isChecked()
@@ -4314,6 +4340,28 @@ class APOCWidget(QWidget):
 
             output_dir = Path(self.metadata_loader.output_dir)
             strategy = self._current_global_strategy()
+
+            # ---- Overwrite check (batch only — per-cell-type uses its own
+            # prompt in ``_on_global_run_instance``) ----------------------
+            if interactive and only_cell_types is None:
+                check_cts = list(self.all_cell_types or [])
+                existing = []
+                for sn in md["sample_name"].unique():
+                    for ct in check_cts:
+                        seg_path = output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
+                        if seg_path.exists():
+                            existing.append(f"{ct} segments for {sn}")
+                if existing:
+                    from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
+                    choice = prompt_overwrite_batch(
+                        self,
+                        "Overwrite Existing APOC Segmentations?",
+                        existing,
+                    )
+                    if choice == "cancel":
+                        self.log("APOC segmentation cancelled.")
+                        return
+                    self.check_overwrite.setChecked(choice == "overwrite")
 
             # Timepoint range
             if self.check_process_all.isChecked():
@@ -5291,6 +5339,27 @@ class ConvPaintWidget(QWidget):
 
             output_dir = Path(self.metadata_loader.output_dir)
             pixel_class_outdir = output_dir / "images" / "PixelClassification"
+
+            # ---- Overwrite check (batch only) ---------------------------
+            if interactive and only_cell_types is None:
+                check_cts = list(self.all_cell_types or [])
+                existing = []
+                for sn in md["sample_name"].unique():
+                    for ct in check_cts:
+                        seg_path = output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
+                        if seg_path.exists():
+                            existing.append(f"{ct} segments for {sn}")
+                if existing:
+                    from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
+                    choice = prompt_overwrite_batch(
+                        self,
+                        "Overwrite Existing ConvPaint Segmentations?",
+                        existing,
+                    )
+                    if choice == "cancel":
+                        self.log("ConvPaint segmentation cancelled.")
+                        return
+                    self.check_overwrite.setChecked(choice == "overwrite")
 
             # Quick preflight: a unified ConvPaint model must exist.
             from behav3d.preprocessing.segmentation.convpaint_label_map import (

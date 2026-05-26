@@ -699,17 +699,18 @@ def verify_installation(conda_path):
 # =============================================================================
 
 def save_env_config(conda_path):
-    """Save the package manager path and env name to napari/behav3d_env.json."""
+    """Save the package manager path and env name to napari/.conf/behav3d_env.json."""
     project_root = find_project_root()
     napari_dir = project_root / "napari"
-    napari_dir.mkdir(exist_ok=True)
+    conf_dir = napari_dir / ".config"
+    conf_dir.mkdir(parents=True, exist_ok=True)
     
     # Use the best available package manager (same one used during install)
     pkg_mgr = get_package_manager()
     if not pkg_mgr:
         pkg_mgr = conda_path
     
-    config_path = napari_dir / "behav3d_env.json"
+    config_path = conf_dir / "behav3d_env.json"
     config = {
         "pkg_manager": str(pkg_mgr),
         "env_name": ENV_NAME,
@@ -726,7 +727,7 @@ def save_env_config(conda_path):
 def launch_napari(conda_path):
     """Launch napari with the BEHAV3D plugin."""
     project_root = find_project_root()
-    script_path = project_root / "napari" / "launch_napari.py"
+    script_path = project_root / "napari" / ".config" / "launch_napari.py"
     
     if not script_path.exists():
         print_warning(f"Startup script not found at {script_path}")
@@ -1005,11 +1006,11 @@ Examples:
     
     # Show launcher info
     if get_platform() == "Windows":
-        launcher = napari_dir / "run_behav3d.bat"
+        launcher = napari_dir / "run_behav3d_windows.bat"
     elif get_platform() == "Darwin":
-        launcher = napari_dir / "run_behav3d.command"
+        launcher = napari_dir / "run_behav3d_macos.command"
     else:
-        launcher = napari_dir / "run_behav3d.sh"
+        launcher = napari_dir / "run_behav3d_linux.sh"
     
     print(f"  Napari launcher:  {launcher}")
     print(f"  Manual command:   conda activate {ENV_NAME} && napari")
