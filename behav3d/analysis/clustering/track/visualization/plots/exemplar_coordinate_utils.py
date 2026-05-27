@@ -2,14 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-
-def _resolve_output_dir(output_dir):
-    if output_dir is None:
-        raise ValueError("output_dir is required.")
-    output_dir_path = Path(output_dir)
-    output_dir_path.mkdir(parents=True, exist_ok=True)
-    return output_dir_path
+from behav3d.analysis.clustering.utils import _resolve_output_dir
 
 
 def resolve_exemplar_positions_csv_path(output_dir, cell_type):

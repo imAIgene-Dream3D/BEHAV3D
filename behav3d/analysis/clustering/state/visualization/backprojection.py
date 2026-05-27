@@ -9,17 +9,12 @@ import zarr
 
 from behav3d.io.formats.zarr import append_to_zarr
 from behav3d.io.images import load_image
+from behav3d.analysis.clustering.utils import _mixed_label_sort_key
 from behav3d.analysis.clustering.state.utils import (
+    _coerce_hex_color,
     _get_classification_state_colors,
     _normalize_label_color_map,
 )
-
-
-def _mixed_label_sort_key(value):
-    text = str(value)
-    if re.fullmatch(r"-?\d+", text):
-        return (0, int(text))
-    return (1, text)
 
 
 def _resolve_tracked_image_path(output_dir, sample_name, cell_type, verbose=False):
@@ -986,30 +981,60 @@ def _state_code_sort_key(code):
     return (1, code_s)
 
 
-def _build_state_mapping_text(label_map):
+def _build_state_mapping_text(label_map, code_colors=None):
     if not isinstance(label_map, dict) or len(label_map) == 0:
         return "No mapping metadata found in zarr attrs."
 
     normalized = {str(k): str(v) for k, v in label_map.items()}
     if "0" not in normalized:
         normalized["0"] = "background"
+    code_colors = {} if not isinstance(code_colors, dict) else {str(k): str(v) for k, v in code_colors.items()}
 
-    lines = ["State Class Mapping", "idx -> full_name", ""]
+    lines = ["State Class Mapping", "idx - color -> full_name", ""]
     for code in sorted(normalized.keys(), key=_state_code_sort_key):
-        lines.append(f"{code} -> {normalized[code]}")
+        color = code_colors.get(str(code), "#000000" if str(code) == "0" else "#808080")
+        lines.append(f"{code} - {color} -> {normalized[code]}")
     return "\n".join(lines)
 
 
-def _add_mapping_dock_widget(viewer, mapping_text, title="State Class Mapping"):
+def _add_mapping_dock_widget(viewer, mapping_text=None, title="State Class Mapping", label_map=None, code_colors=None):
     try:
-        from qtpy.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout
+        from qtpy.QtWidgets import QLabel, QPlainTextEdit, QHBoxLayout, QWidget, QVBoxLayout
 
-        text_box = QPlainTextEdit()
-        text_box.setReadOnly(True)
-        text_box.setPlainText(str(mapping_text))
         widget = QWidget()
         layout = QVBoxLayout()
-        layout.addWidget(text_box)
+        if isinstance(label_map, dict) and len(label_map) > 0:
+            normalized = {str(k): str(v) for k, v in label_map.items()}
+            if "0" not in normalized:
+                normalized["0"] = "background"
+            code_colors = {} if not isinstance(code_colors, dict) else {str(k): str(v) for k, v in code_colors.items()}
+            header = QLabel("<b>pixel_value - color -> name</b>")
+            layout.addWidget(header)
+            for code in sorted(normalized.keys(), key=_state_code_sort_key):
+                color = _coerce_hex_color(
+                    code_colors.get(str(code), "#000000" if str(code) == "0" else "#808080")
+                )
+                row = QWidget()
+                row_layout = QHBoxLayout()
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                code_label = QLabel(str(code))
+                code_label.setMinimumWidth(48)
+                swatch = QLabel("")
+                swatch.setFixedSize(22, 16)
+                swatch.setStyleSheet(
+                    f"background-color: {color}; border: 1px solid #333;"
+                )
+                arrow_label = QLabel(f"{color} -> {normalized[code]}")
+                row_layout.addWidget(code_label)
+                row_layout.addWidget(swatch)
+                row_layout.addWidget(arrow_label)
+                row.setLayout(row_layout)
+                layout.addWidget(row)
+        else:
+            text_box = QPlainTextEdit()
+            text_box.setReadOnly(True)
+            text_box.setPlainText(str(mapping_text))
+            layout.addWidget(text_box)
         widget.setLayout(layout)
         viewer.window.add_dock_widget(widget, area="right", name=str(title))
         return True
@@ -1241,10 +1266,12 @@ def show_behavioral_state_backprojection(
         code_map = {str(label): int(code) for code, label in label_map.items()}
         code_colors = _build_state_code_color_map(code_map, state_colors=state_colors)
     _apply_state_code_colors_to_layer(state_layer, code_colors)
-    mapping_text = _build_state_mapping_text(label_map)
+    mapping_text = _build_state_mapping_text(label_map, code_colors=code_colors)
     added_dock = _add_mapping_dock_widget(
         viewer=viewer,
         mapping_text=mapping_text,
+        label_map=label_map,
+        code_colors=code_colors,
         title="State Class Mapping",
     )
     if (not added_dock) and verbose:

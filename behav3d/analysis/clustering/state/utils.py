@@ -1,5 +1,3 @@
-import re
-import time
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
@@ -8,6 +6,16 @@ import numpy as np
 import pandas as pd
 from matplotlib import colors as mcolors
 from matplotlib import pyplot as plt
+from behav3d.analysis.clustering.utils import (
+    _mixed_label_sort_key,
+    _resolve_output_dir,
+    _sanitize_filename_token,
+    _to_numpy_2d,
+    _vdone,
+    _vinfo,
+    _vsave,
+    _vstart,
+)
 
 
 A4_PORTRAIT = (8.27, 11.69)
@@ -23,35 +31,6 @@ _GLOBAL_DESCRIPTOR_COLUMNS = {
     "mean_square_displacement": "mean_square_displacement",
 }
 _LOG_SCALING_NEGATIVE_TOL = 1e-12
-
-
-def _vinfo(verbose, prefix, message):
-    if not bool(verbose):
-        return
-    print(f"[{prefix}] INFO {str(message)}")
-
-
-def _vstart(verbose, prefix, step_name):
-    if bool(verbose):
-        print(f"[{prefix}] START {step_name}")
-    return time.perf_counter()
-
-
-def _vdone(verbose, prefix, step_name, t_start):
-    if bool(verbose):
-        dt = time.perf_counter() - float(t_start)
-        print(f"[{prefix}] DONE {step_name} | took {dt:.2f}s")
-
-
-def _vsave(verbose, prefix, label, path):
-    if not bool(verbose):
-        return
-    print(f"[{prefix}] SAVED {str(label)}: {path}")
-
-
-def _mixed_label_sort_key(x):
-    s = str(x)
-    return (0, int(s)) if s.isdigit() else (1, s)
 
 
 def _coerce_hex_color(value, fallback="#808080"):
@@ -123,12 +102,6 @@ def _set_classification_state_colors(adata, state_col, colors):
     classification_meta["state_colors"] = state_colors
     adata.uns["classification"] = classification_meta
     return normalized
-
-
-def _to_numpy_2d(X):
-    if hasattr(X, "toarray"):
-        return X.toarray()
-    return np.asarray(X)
 
 
 def _require_columns(df, required_cols, context):
@@ -658,14 +631,6 @@ def _rebuild_full_behavioral_cluster_from_intrinsic(
     return adata
 
 
-def _resolve_output_dir(output_dir):
-    if output_dir is None:
-        raise ValueError("output_dir is required.")
-    output_dir_path = Path(output_dir)
-    output_dir_path.mkdir(parents=True, exist_ok=True)
-    return output_dir_path
-
-
 @dataclass(frozen=True)
 class StatePaths:
     output_dir: Path
@@ -775,9 +740,3 @@ def _resolve_positions_csv_path(output_dir=None, cell_type=None, state_paths=Non
         f"Run feature extraction for cell_type='{cell_type}' first, or place the CSV in "
         "output_dir/analysis/<cell_type>/track_features."
     )
-
-
-def _sanitize_filename_token(value, fallback="value"):
-    token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
-    token = token.strip("._-")
-    return token if len(token) > 0 else str(fallback)

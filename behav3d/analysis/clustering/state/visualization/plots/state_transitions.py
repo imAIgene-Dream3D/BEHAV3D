@@ -10,6 +10,7 @@ import warnings
 from io import BytesIO
 from pathlib import Path
 from matplotlib.backends.backend_pdf import PdfPages
+from behav3d.analysis.clustering.utils import _sanitize_filename_token
 
 # -----------------------------
 # Plot timepoint>timepoint state transition matrix
@@ -816,12 +817,6 @@ def plot_sankey_diagram_between_states(
 def _natural_sort_key(value):
     parts = re.split(r"(\d+)", str(value))
     return [int(p) if p.isdigit() else p.lower() for p in parts]
-
-
-def _sanitize_filename_token(value, fallback="value"):
-    token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
-    token = token.strip("._-")
-    return token if len(token) > 0 else str(fallback)
 
 
 def _plot_transition_heatmap_page(df_matrix, title, colorbar_label, normalized):

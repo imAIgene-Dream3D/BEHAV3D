@@ -12,26 +12,15 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 import imageio
 
+from behav3d.analysis.clustering.utils import (
+    _mixed_label_sort_key,
+    _sanitize_filename_token,
+)
 from behav3d.analysis.clustering.state.visualization.backprojection import (
     _resolve_tracked_image_path,
 )
 from behav3d.io.images import load_zarr
 from behav3d.preprocessing import calc_z_projection
-
-
-def _mixed_label_sort_key(value):
-    text = str(value)
-    return (0, int(text)) if text.isdigit() else (1, text)
-
-
-def _sanitize_filename_token(value, fallback="cluster"):
-    token = str(value).strip()
-    if token == "":
-        token = str(fallback)
-    token = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in token)
-    token = token.strip("._-")
-    return token if token != "" else str(fallback)
-
 
 def _normalize_segment_style(segment_style):
     style = str(segment_style).strip().lower()

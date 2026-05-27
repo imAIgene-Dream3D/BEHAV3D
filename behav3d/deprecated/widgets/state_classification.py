@@ -34,6 +34,18 @@ def _winfo(prefix, message):
     print(f"[{prefix}] INFO {message}")
 
 
+def _ordered_unique(values):
+    out = []
+    seen = set()
+    for value in list(values or []):
+        text = str(value).strip()
+        if text == "" or text in seen:
+            continue
+        out.append(text)
+        seen.add(text)
+    return out
+
+
 class StateClassificationPanel:
     """
     Compact state-classification panel for notebook usage.
@@ -81,7 +93,7 @@ class StateClassificationPanel:
 
         self.cell_type_dd = widgets.Dropdown(
             description="Cell type",
-            options=sorted(set(self._cell_types)),
+            options=list(self._cell_types),
             value=initial_cell_type,
             layout=widgets.Layout(width="260px"),
             style={"description_width": "90px"},
@@ -571,8 +583,8 @@ class StateClassificationPanel:
         cell_types = []
         if md is not None:
             try:
-                cell_types.extend(detect_organoid_types_from_metadata(md))
                 cell_types.extend(detect_immune_cell_types_from_metadata(md))
+                cell_types.extend(detect_organoid_types_from_metadata(md))
                 cell_types.extend(detect_other_cell_types_from_metadata(md))
             except Exception:
                 pass
@@ -585,7 +597,7 @@ class StateClassificationPanel:
                 for p in analysis_dir.iterdir():
                     if p.is_dir():
                         cell_types.append(p.name)
-        return sorted({str(x).strip() for x in cell_types if str(x).strip() != ""})
+        return _ordered_unique(cell_types)
 
     def _detect_sample_names(self):
         md = getattr(self.metadata_loader, "metadata", None)
@@ -1249,7 +1261,7 @@ class StateClassificationPanel:
             refreshed_types = [current_value or "tcell"]
         if current_value not in refreshed_types:
             refreshed_types.append(current_value)
-        new_options = sorted({str(x).strip() for x in refreshed_types if str(x).strip() != ""})
+        new_options = _ordered_unique(refreshed_types)
         if len(new_options) == 0:
             new_options = ["tcell"]
         if list(self.cell_type_dd.options) != list(new_options):

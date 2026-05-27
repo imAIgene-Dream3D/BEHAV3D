@@ -18,6 +18,7 @@ from behav3d.analysis.clustering.state.classification import (
     apply_hmm_deployment_artifact_to_full_dataset,
     load_hmm_deployment_artifact,
     save_hmm_deployment_artifact,
+    save_hmm_quality_control_outputs,
     _resolve_hmm_deployment_artifact_path,
     run_hmm_state_clustering,
 )
@@ -374,6 +375,11 @@ def _show_intrinsic_hmm_backprojection(
         overwrite=True,
     )
     backprojected["ClusterID"]["type"] = "label"
+    state_colors = _normalize_label_color_map(
+        code_map.keys(),
+        colors=_get_classification_state_colors(adata, INTRINSIC_STATE_COL),
+    )
+    _write_state_color_attrs_to_zarr(state_path, code_map, state_colors=state_colors)
 
     backproject_data = {
         "raw_data": {"img": raw_img, "type": "image"},
@@ -389,12 +395,19 @@ def _show_intrinsic_hmm_backprojection(
         split_raw_channels=True,
         run=False,
     )
+    code_colors = _build_state_code_color_map(code_map, state_colors=state_colors)
+    try:
+        _apply_state_code_colors_to_layer(viewer.layers["ClusterID"], code_colors)
+    except Exception:
+        pass
 
     label_map = {str(code): str(label) for label, code in code_map.items()}
-    mapping_text = _build_state_mapping_text(label_map)
+    mapping_text = _build_state_mapping_text(label_map, code_colors=code_colors)
     added_dock = _add_mapping_dock_widget(
         viewer=viewer,
         mapping_text=mapping_text,
+        label_map=label_map,
+        code_colors=code_colors,
         title="Intrinsic HMM State Mapping",
     )
     if (not added_dock) and verbose:
@@ -544,10 +557,12 @@ def _show_hmm_state_backprojection(
         pass
 
     label_map = {str(code): str(label) for label, code in code_map.items()}
-    mapping_text = _build_state_mapping_text(label_map)
+    mapping_text = _build_state_mapping_text(label_map, code_colors=code_colors)
     added_dock = _add_mapping_dock_widget(
         viewer=viewer,
         mapping_text=mapping_text,
+        label_map=label_map,
+        code_colors=code_colors,
         title="Behavioral State Mapping",
     )
     if (not added_dock) and verbose:
@@ -1504,6 +1519,61 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         self._refresh_apply_default_paths()
         return artifact_path
 
+    def _current_hmm_model_for_quality_control(self):
+        artifact = self._hmm_deployment_artifact
+        artifact_path = self._default_hmm_deployment_artifact_path()
+        if artifact is None and artifact_path.exists():
+            artifact = load_hmm_deployment_artifact(artifact_path)
+            self._hmm_deployment_artifact = artifact
+        if isinstance(artifact, dict):
+            return artifact.get("model", None)
+        return None
+
+    def _regenerate_hmm_quality_control_plots(self, *, verbose=False):
+        if self.model_adata is None:
+            raise ValueError("No model adata loaded.")
+        if INTRINSIC_STATE_COL not in self.model_adata.obs.columns:
+            raise ValueError(f"model_adata is missing '{INTRINSIC_STATE_COL}'.")
+
+        state_paths = _resolve_state_paths(self.output_dir, self._current_cell_type())
+        qc_dir = Path(state_paths.processing_outdir) / "hmm_behavioral_classification" / "quality_control"
+        preprocessing_meta = self.model_adata.uns.get("preprocessing", {})
+        if not isinstance(preprocessing_meta, dict):
+            preprocessing_meta = {}
+        feature_cols = preprocessing_meta.get(
+            "continuous_feature_cols",
+            preprocessing_meta.get("kept_features", list(self.model_adata.var_names)),
+        )
+        feature_cols = [str(col) for col in list(feature_cols or []) if str(col) in self.model_adata.var_names]
+        scaler_meta = preprocessing_meta.get("scaler", {}) if isinstance(preprocessing_meta, dict) else {}
+        hmm_model = self._current_hmm_model_for_quality_control()
+        qc_out = save_hmm_quality_control_outputs(
+            self.model_adata,
+            feature_cols=feature_cols,
+            output_dir=qc_dir,
+            model=hmm_model,
+            selection_df=None,
+            cluster_col=INTRINSIC_STATE_COL,
+            scaler_mean=scaler_meta.get("mean", None) if isinstance(scaler_meta, dict) else None,
+            scaler_scale=scaler_meta.get("scale", None) if isinstance(scaler_meta, dict) else None,
+            title=f"all_data | hmm | curated {INTRINSIC_STATE_COL}",
+            preprocessing_params=preprocessing_meta,
+            verbose=verbose,
+        )
+        clustering_meta = self.model_adata.uns.get("clustering", {})
+        if not isinstance(clustering_meta, dict):
+            clustering_meta = {}
+        clustering_meta["quality_control_dir"] = str(qc_dir)
+        clustering_meta["raw_quality_control_dir"] = str(qc_dir / "raw")
+        clustering_meta["diagnostics_pdf"] = qc_out.get("diagnostics_pdf", None)
+        clustering_meta["diagnostics_csvs"] = dict(qc_out.get("diagnostics_csvs", {}) or {})
+        clustering_meta["feature_distribution_pdf"] = qc_out.get("feature_distribution_pdf", None)
+        clustering_meta["state_counts_csv"] = qc_out.get("state_counts_csv", None)
+        clustering_meta["transition_matrix_csv"] = qc_out.get("transition_matrix_csv", None)
+        clustering_meta["model_selection_csv"] = qc_out.get("model_selection_csv", None)
+        self.model_adata.uns["clustering"] = clustering_meta
+        return qc_out
+
     def _rename_mapping_yaml_path(self, cell_type=None):
         ct = self._current_cell_type() if cell_type is None else str(cell_type).strip()
         state_paths = _resolve_state_paths(self.output_dir, ct)
@@ -1851,6 +1921,16 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
             _winfo("state-hmm-widget", f"Updated HMM deployment artifact: {artifact_path}")
         except Exception as exc:
             deployment_warning = str(exc)
+        qc_warning = None
+        qc_out = {}
+        try:
+            qc_out = self._regenerate_hmm_quality_control_plots(verbose=False)
+            _winfo(
+                "state-hmm-widget",
+                f"Recreated curated HMM quality-control plots: {qc_out.get('diagnostics_pdf', None)}",
+            )
+        except Exception as exc:
+            qc_warning = str(exc)
         self._save_model_adata(compression=save_compression)
         yaml_path = self._write_cluster_name_mappings_yaml(latest_intrinsic_mapping=normalized_mapping)
         self._rebuild_intrinsic_rename_rows()
@@ -1858,6 +1938,8 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         return {
             "changed": True,
             "deployment_warning": deployment_warning,
+            "quality_control_warning": qc_warning,
+            "quality_control_outputs": dict(qc_out),
             "mapping_yaml_path": str(yaml_path),
         }
 
@@ -1916,8 +1998,20 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                 _winfo("state-hmm-widget", f"Updated HMM deployment artifact: {artifact_path}")
             except Exception as exc:
                 deployment_warning = str(exc)
+            qc_warning = None
+            qc_out = {}
+            try:
+                qc_out = self._regenerate_hmm_quality_control_plots(verbose=False)
+                _winfo(
+                    "state-hmm-widget",
+                    f"Recreated curated HMM quality-control plots: {qc_out.get('diagnostics_pdf', None)}",
+                )
+            except Exception as exc:
+                qc_warning = str(exc)
             self._save_model_adata(compression=save_compression)
             result["deployment_warning"] = deployment_warning
+            result["quality_control_warning"] = qc_warning
+            result["quality_control_outputs"] = dict(qc_out)
         return result
 
     def _invalidate_curated_state_reports(self, reason=None):
@@ -2349,6 +2443,12 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                             "Intrinsic rename succeeded, but the HMM deployment artifact was not updated: "
                             f"{result['deployment_warning']}",
                         )
+                    if result.get("quality_control_warning", None):
+                        _winfo(
+                            "state-hmm-widget",
+                            "Intrinsic rename succeeded, but curated quality-control plots were not recreated: "
+                            f"{result['quality_control_warning']}",
+                        )
                 self._open_step(2)
             except Exception:
                 traceback.print_exc()
@@ -2406,6 +2506,12 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                             "state-hmm-widget",
                             "Intrinsic combine succeeded, but the HMM deployment artifact was not updated: "
                             f"{result['deployment_warning']}",
+                        )
+                    if result.get("quality_control_warning", None):
+                        _winfo(
+                            "state-hmm-widget",
+                            "Intrinsic combine succeeded, but curated quality-control plots were not recreated: "
+                            f"{result['quality_control_warning']}",
                         )
             except Exception:
                 traceback.print_exc()

@@ -24,6 +24,7 @@ a heatmap with summarized feature values per cluster
 - 
 """
 import argparse
+import re
 from dtaidistance import dtw, dtw_ndim
 import pandas as pd
 import numpy as np
@@ -134,7 +135,11 @@ def run_tcell_analysis(
     nr_of_clusters=None,
     cluster_percentage_group_by=None,
     plot_results=True,
-    seed=42
+    seed=42,
+    output_subdir_name="results",
+    feature_scaling_preset=None,
+    min_track_length=None,
+    max_track_length=None,
     ):
     print(f"--------------- Performing {cell_type} behavioral analysis ---------------")
     start_time = time.time()
@@ -144,6 +149,8 @@ def run_tcell_analysis(
         
     if output_dir is None:
         output_dir = config['output_dir']
+    if feature_scaling_preset is None and config is not None:
+        feature_scaling_preset = config.get("feature_scaling_preset", None)
         
     analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
@@ -159,23 +166,60 @@ def run_tcell_analysis(
         df_tracks_summarized_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_summarized.csv")
     
     df_tracks = pd.read_csv(df_tracks_path, low_memory=False)
-    df_tracks_summarized = pd.read_csv(df_tracks_summarized_path, low_memory=False)
+    if Path(df_tracks_summarized_path).exists():
+        df_tracks_summarized = pd.read_csv(df_tracks_summarized_path, low_memory=False)
+    else:
+        df_tracks_summarized = summarize_feature_dtw_tracks(df_tracks)
     df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
+
+    if min_track_length is not None or max_track_length is not None:
+        df_tracks = filter_feature_dtw_track_lengths(
+            df_tracks,
+            min_track_length=min_track_length,
+            max_track_length=max_track_length,
+        )
+        df_tracks_summarized = summarize_feature_dtw_tracks(df_tracks)
     
     if df_tracks_summarized["track_length"].nunique() != 1:
         print("Warning: The track lengths are not cut to similar length, this might influence dynamic time warping")
         print("Set 'min_track_length' and 'max_track_length' to the same value to create equal tracks")
 
-    non_wildcard_cols_to_normalize = []
-    for col in columns_to_normalize:
-        non_wildcard_cols_to_normalize += expand_column_patterns(col, df_tracks.columns)
-    # print(f"{get_current_time()} - Perform z-normalization on selected feature columns")
-    df_tracks=normalize_track_features(
-        df_tracks, 
-        columns=non_wildcard_cols_to_normalize
-    )
-    
-    dtw_features = [x if x not in columns_to_normalize else f"z_{x}" for x in columns_to_use]
+    if feature_scaling_preset is None:
+        non_wildcard_cols_to_normalize = []
+        for col in columns_to_normalize:
+            non_wildcard_cols_to_normalize += expand_column_patterns(col, df_tracks.columns)
+        # print(f"{get_current_time()} - Perform z-normalization on selected feature columns")
+        df_tracks=normalize_track_features(
+            df_tracks, 
+            columns=non_wildcard_cols_to_normalize
+        )
+        
+        dtw_features = [x if x not in columns_to_normalize else f"z_{x}" for x in columns_to_use]
+        plot_feature_cols = _resolve_selected_plot_feature_columns(
+            df_tracks_summarized=df_tracks_summarized,
+            df_tracks=df_tracks,
+            selected_features=columns_to_use,
+        )
+    elif feature_scaling_preset == "original_behav3d":
+        df_tracks, dtw_features = apply_original_behav3d_feature_scaling(
+            df_tracks,
+            cell_type=cell_type,
+        )
+        plot_feature_cols = _resolve_selected_plot_feature_columns(
+            df_tracks_summarized=df_tracks_summarized,
+            df_tracks=df_tracks,
+            selected_features=[
+                "mean_square_displacement",
+                "speed",
+                "mean_dead_dye",
+                f"{cell_type}_contact",
+                "organoid_contact",
+            ],
+        )
+    else:
+        raise ValueError(
+            "Invalid feature_scaling_preset. Supported values are None and 'original_behav3d'."
+        )
     
     dtw_distance_matrix = calculate_dtw(
         df_tracks, 
@@ -198,12 +242,189 @@ def run_tcell_analysis(
         cell_type=cell_type,
         cluster_percentage_group_by=cluster_percentage_group_by,
         plot_results=plot_results,
-        random_state=seed
+        random_state=seed,
+        output_subdir_name=output_subdir_name,
+        plot_feature_cols=plot_feature_cols,
     )
     end_time = time.time()
     h,m,s = format_time(start_time, end_time)
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
     return(df_clusters)
+
+
+def filter_feature_dtw_track_lengths(
+    df_tracks,
+    min_track_length=None,
+    max_track_length=None,
+    group_cols=("sample_name", "TrackID"),
+):
+    """Filter tracks by number of timepoints and trim each track from its start."""
+    group_cols = [col for col in group_cols if col in df_tracks.columns]
+    if len(group_cols) == 0:
+        raise ValueError("Track length filtering requires sample_name and/or TrackID columns.")
+
+    time_cols = [col for col in ["relative_time", "position_t", "time"] if col in df_tracks.columns]
+    sort_cols = group_cols + time_cols
+    df_filtered = df_tracks.sort_values(sort_cols).reset_index(drop=True).copy()
+    before_tracks = df_filtered[group_cols].drop_duplicates().shape[0]
+
+    if min_track_length is not None:
+        min_track_length = int(min_track_length)
+        track_lengths = df_filtered.groupby(group_cols, observed=True)[group_cols[0]].transform("size")
+        df_filtered = df_filtered.loc[track_lengths >= min_track_length].reset_index(drop=True)
+
+    if max_track_length is not None:
+        max_track_length = int(max_track_length)
+        if max_track_length < 1:
+            raise ValueError("max_track_length must be at least 1.")
+        df_filtered = (
+            df_filtered
+            .groupby(group_cols, group_keys=False, observed=True)
+            .head(max_track_length)
+            .reset_index(drop=True)
+        )
+
+    after_tracks = df_filtered[group_cols].drop_duplicates().shape[0]
+    print(
+        "- Applied Feature DTW track length filtering: "
+        f"{before_tracks} → {after_tracks} tracks"
+    )
+    if len(df_filtered) == 0:
+        raise ValueError("No tracks remain after Feature DTW track length filtering.")
+    return df_filtered
+
+
+def summarize_feature_dtw_tracks(df_tracks):
+    """Summarize the in-memory tracks used for Feature DTW plotting/clustering."""
+    group_cols = ["sample_name", "TrackID"]
+    missing = [col for col in group_cols if col not in df_tracks.columns]
+    if missing:
+        raise ValueError("Cannot summarize Feature DTW tracks; missing columns: " + ", ".join(missing))
+
+    df_tracks = df_tracks.copy()
+    for col in df_tracks.columns:
+        if col.startswith("touching_"):
+            df_tracks[col] = df_tracks[col].astype(str)
+
+    grouped = df_tracks.groupby(group_cols, observed=True)
+    df_summarized = grouped.size().reset_index(name="track_length")
+
+    num_bool_cols = df_tracks.select_dtypes(include=[np.number, bool]).columns.drop(
+        ["TrackID"], errors="ignore"
+    )
+    if len(num_bool_cols) > 0:
+        means = grouped[num_bool_cols].mean().reset_index()
+        means = means.rename(columns={col: f"mean_{col}" for col in num_bool_cols})
+        df_summarized = pd.merge(df_summarized, means, on=group_cols, how="left")
+
+    if "dead" in df_tracks.columns:
+        df_summarized["dies"] = grouped["dead"].any().reset_index()["dead"]
+    if "displacement_from_origin" in df_tracks.columns:
+        df_summarized["displacement_from_origin"] = (
+            grouped["displacement_from_origin"].max().reset_index()["displacement_from_origin"]
+        )
+    if "cumulative_displacement" in df_tracks.columns:
+        df_summarized["cumulative_displacement"] = (
+            grouped["cumulative_displacement"].last().reset_index()["cumulative_displacement"]
+        )
+
+    contact_cols = [
+        col for col in df_tracks.columns
+        if col.endswith("_contact") and not col.startswith("active_")
+    ]
+    for contact_col in contact_cols:
+        active_col = f"active_{contact_col}"
+        if active_col in df_tracks.columns:
+            def _active_contact_mean(group, contact_col=contact_col, active_col=active_col):
+                mask = group[contact_col].fillna(False).astype(bool)
+                return group.loc[mask, active_col].mean() if mask.any() else 0
+
+            result = grouped.apply(_active_contact_mean, include_groups=False)
+            if isinstance(result, pd.DataFrame):
+                result = result.iloc[:, 0]
+            df_summarized[active_col] = result.values
+
+    metadata_cols = ["TrackID", "sample_name"]
+    for col in ["well", "exp_nr"]:
+        if col in df_tracks.columns:
+            metadata_cols.append(col)
+    metadata_cols.extend([col for col in df_tracks.columns if col.endswith("_line_condition")])
+    metadata_cols = list(dict.fromkeys(metadata_cols))
+
+    df_trackinfo = df_tracks[metadata_cols].drop_duplicates()
+    return pd.merge(df_trackinfo, df_summarized, how="left")
+
+
+def _resolve_selected_plot_feature_columns(
+    df_tracks_summarized,
+    df_tracks,
+    selected_features,
+    summary_match_mode="all",
+):
+    """Resolve user-selected feature names to columns available for result PDFs."""
+    if selected_features is None:
+        selected_features = []
+    elif isinstance(selected_features, str):
+        selected_features = [selected_features]
+    else:
+        selected_features = list(selected_features)
+    summary_cols = [str(c) for c in list(df_tracks_summarized.columns)]
+    summary_set = set(summary_cols)
+    track_cols = set(str(c) for c in list(df_tracks.columns))
+    out = []
+    seen = set()
+
+    def _is_allowed_plot_column(col):
+        return "_on_distance" not in str(col)
+
+    def _add(col):
+        col = str(col)
+        if col in summary_set and col not in seen and _is_allowed_plot_column(col):
+            out.append(col)
+            seen.add(col)
+
+    def _summary_matches_for_feature(raw_feature):
+        token = str(raw_feature).strip()
+        if token == "":
+            return []
+        escaped = re.escape(token)
+        pattern = re.compile(rf"(^|_){escaped}($|_)")
+        matched = [
+            col for col in summary_cols
+            if _is_allowed_plot_column(col) and bool(pattern.search(str(col)))
+        ]
+        if summary_match_mode == "all":
+            return matched
+        return matched[:1]
+
+    for feature in selected_features:
+        feature = str(feature)
+        expanded = expand_column_patterns(feature, df_tracks_summarized.columns)
+        exact_summary_matches = [
+            str(col) for col in expanded
+            if str(col) in summary_set and _is_allowed_plot_column(col)
+        ]
+        for col in exact_summary_matches:
+            _add(col)
+
+        base_feature = feature[2:] if feature.startswith("z_") else feature
+        base_feature = str(base_feature).strip()
+        if base_feature in summary_set:
+            _add(base_feature)
+            continue
+
+        mean_feature = f"mean_{base_feature}"
+        if mean_feature in summary_set:
+            _add(mean_feature)
+            continue
+
+        if len(exact_summary_matches) == 0 and base_feature not in summary_set:
+            for col in _summary_matches_for_feature(base_feature):
+                _add(col)
+            if base_feature in track_cols:
+                for col in _summary_matches_for_feature(base_feature):
+                    _add(col)
+    return out
 
 
 
@@ -257,176 +478,6 @@ def calculate_dtw(
     
     return(dtw_distance_matrix)
 
-def rolling_classification(
-    df_tracks,
-    window_size=20,
-    groupby=["sample_name", "TrackID"],
-    features=[
-        # "elongation",
-        # "sphericity",
-        "percentage_dead_mask",
-        # "nr_dead_mask_pixels",
-        "organoid_contact",
-        "tcell_contact",
-        # "displacement",
-        # "mean_square_displacement",
-        "speed",
-        # # "dead",
-        # "active_tcell_contact",
-        # "position_t"
-    ]
-    ):
-    df_tracks = df_tracks.sort_values(by=groupby + ["position_t"])
-
-    # df_rolling = df_tracks.groupby(groupby)[features].rolling(window=window_size, min_periods=window_size).mean().reset_index().drop(columns='level_2')
-    df_rolling = (
-        df_tracks
-        .groupby(groupby)[features]
-        .rolling(window=window_size, min_periods=window_size)
-        .mean()
-        # .reset_index(drop=True)
-        .reset_index()
-        .drop(columns='level_2')
-        # This gives you sample_name, TrackID, and the original index
-    )
-    df_rolling["position_t"] = df_tracks["position_t"].values
-    # df_rolling = pd.concat([df_tracks[['sample_name', 'TrackID', 'position_t']], df_rolling], axis=1)
-
-    
-    # df_rolling = df_tracks[features].rolling(window=window_size, min_periods=window_size).mean()
-    df_rolling = df_rolling.dropna()
-    
-    df_rolling_features = df_rolling[features]
-    
-    scaler = StandardScaler()
-    scaler = RobustScaler()
-    df_rolling_features = pd.DataFrame(scaler.fit_transform(df_rolling_features), columns=df_rolling_features.columns)
-
-    n_components = 2
-    # Step 3: Dimensionality reductions
-    pca_model = PCA(n_components=n_components)
-    pca_result = pca_model.fit_transform(df_rolling_features)
-
-    tsne_model = TSNE(n_components=n_components, random_state=123, perplexity=30)
-    tsne_result = tsne_model.fit_transform(df_rolling_features)
-
-    umap_model = umap.UMAP(n_components=n_components, n_neighbors=15, min_dist=0.1, init="random", random_state=123)
-    umap_result = umap_model.fit_transform(df_rolling_features)
-    
-    # Step 4: Plot all three embeddings side by side
-    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-    embeddings = [pca_result, umap_result]
-    titles = ["PCA", "UMAP"]
-    
-    if n_components == 2:
-        for ax, emb, title in zip(axs, embeddings, titles):
-            scatter = ax.scatter(emb[:, 0], emb[:, 1], c=np.arange(len(emb)), cmap="viridis", s=2, alpha=0.7)
-            ax.set_title(title)
-            ax.set_xlabel(f'{title} 1')
-            ax.set_ylabel(f'{title} 2')
-        
-        plt.tight_layout()
-        plt.show()
-    else:
-        for i, (emb, title) in enumerate(zip(embeddings, titles), 1):
-            ax = fig.add_subplot(1, 3, i, projection='3d')
-            scatter = ax.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=np.arange(len(emb)), cmap="viridis", s=2, alpha=0.7)
-            ax.set_title(title)
-            ax.set_xlabel(f'{title} 1')
-            ax.set_ylabel(f'{title} 2')
-            ax.set_zlabel(f'{title} 3')
-
-        plt.tight_layout()
-        plt.show()
-
-    n_components=2
-    n_neighbors=15
-    min_dist=0.1
-    
-    umap_model = umap.UMAP(
-        n_components=n_components, 
-        n_neighbors=n_neighbors, 
-        min_dist=min_dist, 
-        init="random", 
-        random_state=123,
-        metric="euclidean", 
-        )
-    
-    pca = PCA(n_components=min(10, len(features)))
-    # pca = PCA(n_components=0.95)
-    X_pca = pca.fit_transform(df_rolling_features[features])
-    umap_result = umap_model.fit_transform(X_pca)
-    
-    umap_result = umap_model.fit_transform(df_rolling_features)
-    
-    fig = plt.figure()
-    if n_components == 1:
-        ax = fig.add_subplot(111)
-        ax.scatter(umap_result[:,0], range(len(umap_result)), c=np.arange(len(umap_result)))
-    if n_components == 2:
-        ax = fig.add_subplot(111)
-        ax.scatter(umap_result[:,0], umap_result[:,1], c=np.arange(len(umap_result)), s=1, alpha=0.5)
-    if n_components == 3:
-        ax = fig.add_subplot(111, projection='3d')
-        ax.scatter(umap_result[:,0], umap_result[:,1], umap_result[:,2], c=np.arange(len(umap_result)), s=1, alpha=0.5)
-
-    clusterer = HDBSCAN(
-        min_cluster_size=100,         # Minimum size of a cluster
-        # min_samples=20,               # Controls outlier sensitivity (higher = stricter)
-        # cluster_selection_epsilon=0.0,# Optional: smooths cluster boundaries
-        # cluster_selection_method='eom',  # Default is good; use 'leaf' if you want more granularity
-        )
-    cluster_labels = clusterer.fit_predict(umap_result)
-
-    ### TODO Do the clustering based straight on the DTW distances
-    ### Miguel suggested clusters are more meaningful before the umap embedding
-    df_rolling_features['cluster'] = cluster_labels
-
-    # Plot UMAP colored by HDBSCAN clusters
-    plt.figure(figsize=(10, 8))
-    unique_labels = np.unique(cluster_labels)
-
-    # Assign a color for each cluster (noise will be colored gray)
-    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_labels)))
-    for i, label in enumerate(unique_labels):
-        mask = cluster_labels == label
-        plt.scatter(
-            umap_result[mask, 0],
-            umap_result[mask, 1],
-            s=5,
-            color='gray' if label == -1 else colors[i],
-            label=f'Noise' if label == -1 else f'Cluster {label}',
-            alpha=0.8
-        )
-
-    plt.title('UMAP Projection with HDBSCAN Clusters')
-    plt.xlabel('UMAP 1')
-    plt.ylabel('UMAP 2')
-    plt.legend(markerscale=4, bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.show()
-    
-    # Plot UMAP colored by each selected feature
-    for feature in df_rolling_features.columns:
-        plt.figure(figsize=(8, 6))
-        plt.scatter(
-            umap_result[:, 0], 
-            umap_result[:, 1], 
-            c=df_rolling_features[feature], 
-            # cmap='viridis', 
-            s=5, 
-            alpha=0.8
-        )
-        plt.colorbar(label=feature)
-        plt.title(f'UMAP colored by {feature}')
-        plt.xlabel('UMAP 1')
-        plt.ylabel('UMAP 2')
-        plt.tight_layout()
-        plt.show()
-    
-    labels = KMeans(n_clusters=5).fit_predict(df_rolling_features)  # on raw 2 features
-    plt.scatter(df_rolling_features.iloc[:,0], df_rolling_features.iloc[:,1], c=labels, cmap="Spectral", s=2)
-    
 def fit_umap(
     dtw_distance_matrix,
     config=None,
@@ -477,7 +528,9 @@ def cluster_umap(
     output_dir = None,
     cell_type="tcell",
     cluster_percentage_group_by=None,
-    plot_results=True
+    plot_results=True,
+    output_subdir_name="results",
+    plot_feature_cols=None,
     ):
     
     assert config is not None or all(
@@ -491,7 +544,7 @@ def cluster_umap(
     
     analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
-    results_outdir = Path(analysis_outdir, "results")
+    results_outdir = Path(analysis_outdir, str(output_subdir_name).strip() or "results")
     if not analysis_outdir.exists():
         analysis_outdir.mkdir(parents=True)
     if not feature_outdir.exists():
@@ -546,7 +599,26 @@ def cluster_umap(
         sample_cols.append("well")
     if "exp_nr" in df_tracks_summarized.columns:
         sample_cols.append("exp_nr")
-    info_cols = df_umap.drop(columns=["TrackID", "UMAP1", "UMAP2", "ClusterID"]).columns
+    if cluster_percentage_group_by is None:
+        cluster_percentage_context_cols = []
+    elif isinstance(cluster_percentage_group_by, str):
+        cluster_percentage_context_cols = [cluster_percentage_group_by]
+    else:
+        cluster_percentage_context_cols = list(cluster_percentage_group_by)
+    metadata_cols = [
+        c for c in sample_cols + cluster_percentage_context_cols
+        if c in df_umap.columns
+    ]
+    if plot_feature_cols is None:
+        info_cols = list(df_umap.drop(columns=["TrackID", "UMAP1", "UMAP2", "ClusterID"]).columns)
+    else:
+        selected_plot_cols = [c for c in list(plot_feature_cols) if c in df_umap.columns]
+        if len(selected_plot_cols) == 0:
+            print(
+                "  ⚠️ Warning: None of the selected DTW features could be resolved to summarized columns for plotting. "
+                "Output PDFs will show metadata/context columns only."
+            )
+        info_cols = list(dict.fromkeys(metadata_cols + selected_plot_cols))
     
     cluster_UMAP_path = Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_clusters.pdf")
     print(f"- Plotting clustered UMAP plots with displayed Track features to {cluster_UMAP_path}")
@@ -589,11 +661,16 @@ def cluster_umap(
     line_cols = this_cell_line_cols + other_line_cols
     
     # Include cluster_percentage_group_by columns (e.g., exp_nr) if they exist
+    if cluster_percentage_group_by is None:
+        cluster_percentage_groups = []
+    elif isinstance(cluster_percentage_group_by, str):
+        cluster_percentage_groups = [cluster_percentage_group_by]
+    else:
+        cluster_percentage_groups = list(cluster_percentage_group_by)
     extra_group_cols = []
-    if cluster_percentage_group_by:
-        for col in cluster_percentage_group_by:
-            if col in df_umap.columns and col not in line_cols:
-                extra_group_cols.append(col)
+    for col in cluster_percentage_groups:
+        if col in df_umap.columns and col not in line_cols:
+            extra_group_cols.append(col)
     
     group_cols_sample = line_cols + extra_group_cols + ["sample_name", "ClusterID"]
     group_cols_sample_only = line_cols + extra_group_cols + ["sample_name"]
@@ -645,6 +722,92 @@ def cluster_umap(
     
     df_tracks.to_csv(df_clust_tracks_out_path, sep=",", index=False)
     return()
+
+def _minmax_scale(series):
+    series = pd.to_numeric(series, errors="coerce").astype("float64")
+    min_value = series.min(skipna=True)
+    max_value = series.max(skipna=True)
+    if pd.isna(min_value) or pd.isna(max_value) or max_value == min_value:
+        return pd.Series(0.0, index=series.index)
+    return (series - min_value) / (max_value - min_value)
+
+def _original_behav3d_quantile_scale(values):
+    values = pd.to_numeric(values, errors="coerce").astype("float64")
+    std = values.std()
+    if pd.isna(std) or std == 0:
+        z_values = pd.Series(0.0, index=values.index)
+    else:
+        z_values = (values - values.mean()) / std
+
+    q75 = z_values.quantile(0.75)
+    min_z = z_values.min(skipna=True)
+    if pd.isna(q75) or pd.isna(min_z):
+        q_values = pd.Series(0.0, index=values.index)
+    else:
+        q_values = z_values.where(z_values > q75, min_z)
+
+    q_values = _minmax_scale(q_values)
+    max_quantile = q_values.quantile(0.9999999)
+    if pd.notna(max_quantile) and max_quantile != 0:
+        q_values = q_values / max_quantile
+
+    return q_values
+
+def apply_original_behav3d_feature_scaling(df_tracks, cell_type="tcell"):
+    """
+    Add the original BEHAV3D/R-style scaled feature columns used for feature DTW.
+    """
+    contact_col = f"{cell_type}_contact"
+    required_cols = [
+        "mean_square_displacement",
+        "speed",
+        "mean_dead_dye",
+        "organoid_contact",
+        contact_col,
+        "exp_nr",
+    ]
+    missing_cols = [col for col in required_cols if col not in df_tracks.columns]
+    if missing_cols:
+        raise ValueError(
+            "feature_scaling_preset='original_behav3d' requires missing columns: "
+            + ", ".join(missing_cols)
+        )
+
+    print("- Applying original BEHAV3D feature scaling preset")
+    df_scaled = df_tracks.copy()
+    quantile_features = {
+        "mean_square_displacement": "q_mean_square_displacement",
+        "speed": "q_speed",
+        "mean_dead_dye": "q_mean_dead_dye",
+    }
+
+    group_key = "exp_nr"
+    for source_col, out_col in quantile_features.items():
+        df_scaled[out_col] = (
+            df_scaled
+            .groupby(group_key, group_keys=False)[source_col]
+            .transform(_original_behav3d_quantile_scale)
+        )
+
+    contact_features = {
+        "organoid_contact": "s_organoid_contact",
+        contact_col: f"s_{contact_col}",
+    }
+    for source_col, out_col in contact_features.items():
+        df_scaled[out_col] = (
+            df_scaled
+            .groupby(group_key, group_keys=False)[source_col]
+            .transform(_minmax_scale)
+        )
+
+    dtw_features = [
+        "q_mean_square_displacement",
+        "q_speed",
+        "q_mean_dead_dye",
+        "s_organoid_contact",
+        f"s_{contact_col}",
+    ]
+    return df_scaled, dtw_features
 
 def normalize_track_features(
     df_tracks,

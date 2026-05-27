@@ -1,3 +1,8 @@
+"""Deprecated legacy module kept for historical reference.
+
+This file is not part of the actively maintained clustering pipeline.
+"""
+
 from pathlib import Path
 import random
 import numpy as np

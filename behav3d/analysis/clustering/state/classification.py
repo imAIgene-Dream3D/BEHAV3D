@@ -952,7 +952,7 @@ def _compute_cluster_correlation_df(adata, cluster_col, feature_cols):
     return corr_df
 
 
-def _compute_hmm_transition_matrix_df(model):
+def _compute_hmm_transition_matrix_df(model, *, raw_to_label=None, raw_weights=None):
     transmat = getattr(model, "transmat_", None)
     if transmat is None:
         return pd.DataFrame()
@@ -960,7 +960,175 @@ def _compute_hmm_transition_matrix_df(model):
     if transmat.ndim != 2 or transmat.shape[0] == 0 or transmat.shape[0] != transmat.shape[1]:
         return pd.DataFrame()
     state_labels = [str(i + 1) for i in range(int(transmat.shape[0]))]
-    return pd.DataFrame(transmat, index=state_labels, columns=state_labels)
+    if not isinstance(raw_to_label, dict) or len(raw_to_label) == 0:
+        return pd.DataFrame(transmat, index=state_labels, columns=state_labels)
+
+    label_map = {str(k): str(v) for k, v in raw_to_label.items()}
+    labels = sorted({label_map.get(label, label) for label in state_labels}, key=_mixed_label_sort_key)
+    weights = {str(k): float(v) for k, v in dict(raw_weights or {}).items()}
+    counts = pd.DataFrame(0.0, index=labels, columns=labels)
+    for i, raw_i in enumerate(state_labels):
+        row_label = label_map.get(raw_i, raw_i)
+        row_weight = weights.get(raw_i, 1.0)
+        for j, raw_j in enumerate(state_labels):
+            col_label = label_map.get(raw_j, raw_j)
+            counts.loc[row_label, col_label] += float(transmat[i, j]) * float(row_weight)
+    row_sums = counts.sum(axis=1).replace(0.0, np.nan)
+    return counts.div(row_sums, axis=0).fillna(0.0)
+
+
+def _build_hmm_transition_label_mapping(adata, *, cluster_col):
+    if (
+        adata is None
+        or not hasattr(adata, "obs")
+        or HMM_INTRINSIC_RAW_STATE_COL not in adata.obs.columns
+        or cluster_col not in adata.obs.columns
+    ):
+        return {}, {}
+
+    work = adata.obs[[HMM_INTRINSIC_RAW_STATE_COL, cluster_col]].copy()
+    work[HMM_INTRINSIC_RAW_STATE_COL] = _format_hmm_raw_state_series_for_key(
+        work[HMM_INTRINSIC_RAW_STATE_COL],
+        label=HMM_INTRINSIC_RAW_STATE_COL,
+    )
+    work[cluster_col] = work[cluster_col].astype("string").str.strip().fillna("")
+    work = work[(work[HMM_INTRINSIC_RAW_STATE_COL] != "") & (work[cluster_col] != "")]
+    if work.empty:
+        return {}, {}
+
+    grouped = work.groupby(HMM_INTRINSIC_RAW_STATE_COL, observed=False)[cluster_col].agg(
+        lambda s: sorted({str(v) for v in s if str(v) != ""}, key=_mixed_label_sort_key)
+    )
+    mapping = {
+        str(raw_state): str(labels[0])
+        for raw_state, labels in grouped.items()
+        if len(labels) == 1
+    }
+    weights = work[HMM_INTRINSIC_RAW_STATE_COL].value_counts().to_dict()
+    return mapping, {str(k): float(v) for k, v in weights.items()}
+
+
+def save_hmm_quality_control_outputs(
+    adata,
+    *,
+    feature_cols,
+    output_dir,
+    model=None,
+    selection_df=None,
+    cluster_col=INTRINSIC_STATE_COL,
+    scaler_mean=None,
+    scaler_scale=None,
+    title=None,
+    preprocessing_params=None,
+    verbose=True,
+):
+    """Write HMM QC PDFs/CSVs for the requested state labels."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    feature_cols = [str(c) for c in list(feature_cols or [])]
+    preprocessing_meta = (
+        dict(preprocessing_params)
+        if isinstance(preprocessing_params, dict)
+        else getattr(adata, "uns", {}).get("preprocessing", {})
+    )
+    if scaler_mean is None and isinstance(preprocessing_meta, dict):
+        scaler_mean = preprocessing_meta.get("scaler", {}).get("mean", None)
+    if scaler_scale is None and isinstance(preprocessing_meta, dict):
+        scaler_scale = preprocessing_meta.get("scaler", {}).get("scale", None)
+    if title is None:
+        n_states = getattr(model, "n_components", None)
+        state_text = f"states={int(n_states)}" if n_states is not None else f"cluster_col={cluster_col}"
+        title = f"all_data | hmm ({state_text})"
+    raw_to_label, raw_weights = _build_hmm_transition_label_mapping(adata, cluster_col=cluster_col)
+    transition_df = _compute_hmm_transition_matrix_df(
+        model,
+        raw_to_label=raw_to_label,
+        raw_weights=raw_weights,
+    )
+
+    diagnostics_pdf = output_dir / "behavioral_clustering_diagnostics.pdf"
+    diagnostics_started = _vstart(verbose, "state-hmm", "write HMM diagnostics PDF")
+    _plot_hmm_state_diagnostics_pdf(
+        adata,
+        cluster_col=cluster_col,
+        feature_cols=feature_cols,
+        pdf_path=diagnostics_pdf,
+        model=model,
+        transition_df=transition_df,
+        selection_df=selection_df,
+        title=title,
+        verbose=verbose,
+    )
+    _vdone(verbose, "state-hmm", "write HMM diagnostics PDF", diagnostics_started)
+    _vsave(verbose, "state-hmm", "diagnostics pdf", diagnostics_pdf)
+
+    diagnostics_csvs_started = _vstart(verbose, "state-hmm", "export HMM diagnostics CSVs")
+    diagnostics_csvs = {}
+    state_means = _compute_state_means(adata, cluster_col, feature_cols)
+    if not state_means.empty:
+        state_means_csv = output_dir / "behavioral_clustering_hmm_state_means.csv"
+        state_means.to_csv(state_means_csv)
+        diagnostics_csvs["state_means_csv"] = str(state_means_csv)
+        _vsave(verbose, "state-hmm", "state means csv", state_means_csv)
+
+    cluster_corr_df = _compute_cluster_correlation_df(adata, cluster_col, feature_cols)
+    if not cluster_corr_df.empty:
+        cluster_corr_csv = output_dir / "behavioral_clustering_hmm_cluster_correlation.csv"
+        cluster_corr_df.to_csv(cluster_corr_csv)
+        diagnostics_csvs["cluster_correlation_csv"] = str(cluster_corr_csv)
+        _vsave(verbose, "state-hmm", "cluster correlation csv", cluster_corr_csv)
+
+    transition_csv = None
+    if not transition_df.empty:
+        transition_csv = output_dir / "behavioral_clustering_hmm_transition_matrix.csv"
+        transition_df.to_csv(transition_csv)
+        diagnostics_csvs["transition_matrix_csv"] = str(transition_csv)
+        _vsave(verbose, "state-hmm", "transition matrix csv", transition_csv)
+    _vdone(verbose, "state-hmm", "export HMM diagnostics CSVs", diagnostics_csvs_started)
+
+    state_counts_csv = output_dir / "behavioral_clustering_hmm_state_counts.csv"
+    (
+        pd.Series(adata.obs[cluster_col], dtype="string")
+        .dropna()
+        .value_counts()
+        .sort_index(key=lambda idx: [_mixed_label_sort_key(v) for v in idx])
+        .rename_axis(cluster_col)
+        .reset_index(name="count")
+        .to_csv(state_counts_csv, index=False)
+    )
+    _vsave(verbose, "state-hmm", "state counts csv", state_counts_csv)
+
+    selection_csv = None
+    if isinstance(selection_df, pd.DataFrame) and (not selection_df.empty):
+        selection_csv = output_dir / "behavioral_clustering_hmm_model_selection.csv"
+        selection_df.to_csv(selection_csv, index=False)
+        diagnostics_csvs["model_selection_csv"] = str(selection_csv)
+        _vsave(verbose, "state-hmm", "HMM model selection csv", selection_csv)
+
+    feature_distribution_pdf = output_dir / "behavioral_clustering_feature_distributions.pdf"
+    _plot_hmm_feature_distribution_pdf(
+        adata,
+        feature_cols=feature_cols,
+        pdf_path=feature_distribution_pdf,
+        scaler_mean=scaler_mean,
+        scaler_scale=scaler_scale,
+        cluster_col=cluster_col,
+        title=title,
+        preprocessing_params=preprocessing_meta,
+        verbose=verbose,
+    )
+    _vsave(verbose, "state-hmm", "feature distribution pdf", feature_distribution_pdf)
+
+    return {
+        "diagnostics_pdf": str(diagnostics_pdf),
+        "diagnostics_csvs": dict(diagnostics_csvs),
+        "feature_distribution_pdf": str(feature_distribution_pdf),
+        "quality_control_dir": str(output_dir),
+        "state_counts_csv": str(state_counts_csv),
+        "transition_matrix_csv": None if transition_csv is None else str(transition_csv),
+        "model_selection_csv": None if selection_csv is None else str(selection_csv),
+    }
 
 def _plot_hmm_feature_distribution_pdf(
     adata,
@@ -1112,6 +1280,7 @@ def _plot_hmm_state_diagnostics_pdf(
     feature_cols,
     pdf_path,
     model=None,
+    transition_df=None,
     sample_col="sample_name",
     selection_df=None,
     title="HMM state diagnostics",
@@ -1121,7 +1290,8 @@ def _plot_hmm_state_diagnostics_pdf(
         return
 
     ad = adata.copy()
-    transition_df = _compute_hmm_transition_matrix_df(model)
+    if transition_df is None:
+        transition_df = _compute_hmm_transition_matrix_df(model)
     cluster_corr_df = _compute_cluster_correlation_df(ad, cluster_col, feature_cols)
 
     pdf_path = Path(pdf_path)
@@ -1284,7 +1454,8 @@ def run_hmm_state_clustering(
 ):
     hmm_started = _vstart(verbose, "state-hmm", "run HMM state clustering")
     state_paths = state_paths or _resolve_state_paths(output_dir, cell_type)
-    state_clustering_outdir = _resolve_hmm_quality_control_outdir(state_paths=state_paths)
+    state_clustering_outdir = _resolve_hmm_quality_control_outdir(state_paths=state_paths) / "raw"
+    state_clustering_outdir.mkdir(parents=True, exist_ok=True)
 
     raw_features = _normalize_selection(features)
     window_features = _dedupe_preserve_order(additional_window_features)
@@ -1688,6 +1859,8 @@ def run_hmm_state_clustering(
         "diagnostics_pdf": str(diagnostics_pdf),
         "diagnostics_csvs": dict(diagnostics_csvs),
         "feature_distribution_pdf": str(feature_distribution_pdf),
+        "quality_control_dir": str(state_clustering_outdir.parent),
+        "raw_quality_control_dir": str(state_clustering_outdir),
         "state_counts_csv": str(state_counts_csv),
         "transition_matrix_csv": None if transition_csv is None else str(transition_csv),
         "sample_state_occupancy_csv": None,

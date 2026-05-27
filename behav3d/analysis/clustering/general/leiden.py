@@ -12,17 +12,36 @@ def run_pca(
     pca_var_selection=0.95, 
     svd_solver="full",
     zero_center=True,
-    random_state=None
+    random_state=None,
+    verbose=False,
     ):
+    n_obs = int(adata.n_obs)
+    n_vars = int(adata.n_vars)
+    if n_obs <= 0 or n_vars <= 0:
+        raise ValueError(
+            f"PCA requires non-empty matrix; received n_obs={n_obs}, n_vars={n_vars}."
+        )
+    max_allowed = int(min(n_obs, n_vars))
+    requested = max_allowed if ncomps is None else int(ncomps)
+    safe_ncomps = max(1, min(requested, max_allowed))
+    if bool(verbose) and requested != safe_ncomps:
+        print(
+            "[track-clustering] INFO "
+            f"PCA ncomps clamped from {requested} to {safe_ncomps} "
+            f"(n_obs={n_obs}, n_vars={n_vars})."
+        )
+
     scanpy.pp.pca(
         adata,
         zero_center=zero_center,
-        n_comps=ncomps,
+        n_comps=safe_ncomps,
         svd_solver=svd_solver,
         random_state=random_state,
     )
     var_ratio = adata.uns["pca"]["variance_ratio"]
     n_pcs = int(np.searchsorted(np.cumsum(var_ratio), pca_var_selection) + 1)
+    available_pcs = int(adata.obsm["X_pca"].shape[1])
+    n_pcs = max(1, min(n_pcs, available_pcs))
     
     # truncate X_pca
     adata.obsm["X_pca"] = adata.obsm["X_pca"][:, :n_pcs]

@@ -1,45 +1,58 @@
+"""One-hot categorical track clustering preview utilities using dtaidistance.
+
+This module mirrors the DTW preview widget, but encodes categorical behavioral
+states as one-hot vectors and computes pairwise distances with dtaidistance.
+"""
+
 from pathlib import Path
+import re
+import time
 import traceback
 
 import anndata as ad
 import ipywidgets as widgets
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scanpy as sc
 import yaml
 from matplotlib.backends.backend_pdf import PdfPages
-import matplotlib.pyplot as plt
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import silhouette_score
+
+try:
+    from dtaidistance import dtw_ndim
+except Exception:
+    dtw_ndim = None
+
+try:
+    import umap
+except Exception:
+    umap = None
 
 from behav3d.analysis.clustering.state.classification import FULL_STATE_COL
 from behav3d.analysis.clustering.track.classification import (
-    _build_identity_cluster_mapping_from_obs,
-    _default_behavioral_states_path,
-    _feature_dtw_clustered_csv_path,
-    _feature_dtw_outdir,
-    _feature_dtw_output_csv_paths,
-    _feature_dtw_rename_mapping_path,
-    _feature_dtw_umap_csv_path,
-    _filter_tracks_for_dtaidistance,
-    _load_feature_dtw_name_mapping,
-    _ordered_unique,
-    _resolve_dtaidistance_paths,
-    _resolve_optional_int,
-    _save_feature_dtw_quality_control,
-    _winfo,
     export_track_cluster_backprojection,
-    get_dtaidistance_track_trajectories_filename,
-    plot_exemplar_tracks_by_cluster,
     rename_track_clusters,
-    run_categorical_dtaidistance_trajectory_clustering,
+    show_track_cluster_backprojection,
+)
+from behav3d.analysis.tcell_analysis import (
+    plot_cluster_percentage_bars,
+    plot_clustering_feature_heatmap,
+    plot_feature_umap,
     run_tcell_analysis,
-    save_dtaidistance_diagnostics,
-    save_dtaidistance_exemplar_plots,
+)
+from behav3d.analysis.clustering.track.visualization.plots.exemplar_coordinate_utils import (
+    ensure_exemplar_coordinate_columns,
+)
+from behav3d.analysis.clustering.track.visualization.plots.exemplar_track_per_cluster import (
+    plot_exemplar_tracks_by_cluster,
     save_exemplar_statebar_backprojection_pdf,
     save_exemplar_statebar_backprojection_video_per_cluster,
     save_exemplar_statebar_track_pdf_per_cluster,
     select_exemplar_tracks_by_cluster,
-    show_track_cluster_backprojection,
 )
+from behav3d.analysis.filtering import filter_and_truncate_tracks_anndata
 from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_organoid_types_from_metadata,
@@ -48,7 +61,1165 @@ from behav3d.core.metadata import (
 from behav3d.widgets.utils import spinning_loader
 
 
-class TrackClassificationPanel:
+def _winfo(prefix, message):
+    print(f"[{prefix}] INFO {message}")
+
+
+def _sanitize_filename_token(value, fallback="track"):
+    token = str(value).strip()
+    if token == "":
+        token = str(fallback)
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", token).strip("._-")
+    return token if token else str(fallback)
+
+
+def _ordered_unique(values):
+    out = []
+    seen = set()
+    for value in list(values or []):
+        text = str(value).strip()
+        if text == "" or text in seen:
+            continue
+        out.append(text)
+        seen.add(text)
+    return out
+
+
+def _resolve_dtaidistance_paths(output_dir, cell_type, output_subdir_name="behavorial_trajectories"):
+    root = Path(output_dir).expanduser()
+    analysis_outdir = root / "analysis" / str(cell_type)
+    state_outdir = analysis_outdir / "behavioral_states"
+    outfolder = analysis_outdir / str(output_subdir_name)
+    clustering_outfolder = outfolder / "clustering"
+    quality_control_outfolder = outfolder / "quality_control"
+    outfolder.mkdir(parents=True, exist_ok=True)
+    clustering_outfolder.mkdir(parents=True, exist_ok=True)
+    quality_control_outfolder.mkdir(parents=True, exist_ok=True)
+    return {
+        "root": root,
+        "analysis_outdir": analysis_outdir,
+        "state_outdir": state_outdir,
+        "outfolder": outfolder,
+        "clustering_outfolder": clustering_outfolder,
+        "quality_control_outfolder": quality_control_outfolder,
+    }
+
+
+def get_dtaidistance_track_trajectories_filename(cell_type):
+    cell_token = _sanitize_filename_token(cell_type, fallback="cell")
+    return f"BEHAV3D_{cell_token}_behavioral_trajectories_dtaidistance.h5ad"
+
+
+def _default_behavioral_states_path(output_dir, cell_type):
+    return (
+        Path(output_dir).expanduser()
+        / "analysis"
+        / str(cell_type)
+        / "behavioral_states"
+        / f"BEHAV3D_{cell_type}_behavioral_states.h5ad"
+    )
+
+
+def _normalize_state_cols(state_cols):
+    if isinstance(state_cols, str):
+        state_cols = [state_cols]
+    out = [str(c).strip() for c in list(state_cols) if str(c).strip() != ""]
+    if len(out) == 0:
+        raise ValueError("At least one categorical state column is required for distance clustering.")
+    return out
+
+
+def _format_state_token(row_values, missing_token="missing"):
+    tokens = []
+    for value in row_values:
+        if pd.isna(value):
+            tokens.append(str(missing_token))
+        else:
+            tokens.append(str(value))
+    return "|".join(tokens)
+
+
+def _local_dissimilarity_name(value):
+    if callable(value):
+        return getattr(value, "__name__", value.__class__.__name__)
+    return str(value)
+
+
+def _resolve_optional_int(value):
+    text = str(value).strip()
+    return None if text == "" else int(text)
+
+
+def _resolve_optional_float(value):
+    text = str(value).strip()
+    return None if text == "" else float(text)
+
+
+def _filter_tracks_for_dtaidistance(
+    adata,
+    *,
+    groupby_cols=("sample_name", "TrackID"),
+    time_col="position_t",
+    trajectory_size=None,
+    min_length=None,
+    trim_mode="last",
+):
+    groupby_cols = [str(c) for c in list(groupby_cols)]
+    missing = [col for col in groupby_cols if col not in adata.obs.columns]
+    if missing:
+        raise KeyError(f"Missing groupby_cols in adata.obs: {missing}")
+    if str(time_col) not in adata.obs.columns:
+        raise KeyError(f"'{time_col}' not found in adata.obs.")
+
+    obs = adata.obs.copy()
+    obs["_orig_idx"] = np.arange(len(obs))
+    obs = obs.sort_values(groupby_cols + [str(time_col), "_orig_idx"])
+
+    if min_length is not None:
+        group_sizes = obs.groupby(groupby_cols, observed=True).size()
+        keep_groups = group_sizes[group_sizes >= int(min_length)].index
+        obs["_keep"] = obs.set_index(groupby_cols).index.isin(keep_groups)
+        obs = obs.loc[obs["_keep"]].copy()
+
+    if trajectory_size is not None:
+        trajectory_size = int(trajectory_size)
+        if trajectory_size <= 0:
+            raise ValueError("trajectory_size must be positive when supplied.")
+        trim_mode = str(trim_mode).strip().lower()
+        if trim_mode not in {"first", "last"}:
+            raise ValueError("trim_mode must be 'first' or 'last'.")
+        obs["_rank"] = obs.groupby(groupby_cols, observed=True).cumcount()
+        sizes = obs.groupby(groupby_cols, observed=True)["_rank"].transform("max") + 1
+        if trim_mode == "first":
+            obs = obs.loc[obs["_rank"] < trajectory_size]
+        else:
+            obs = obs.loc[obs["_rank"] >= (sizes - trajectory_size)]
+
+    idx = obs.index
+    adata_out = adata[idx].copy()
+    for col in ["_orig_idx", "_keep", "_rank"]:
+        if col in adata_out.obs.columns:
+            adata_out.obs.drop(columns=[col], inplace=True)
+    return adata_out
+
+
+def extract_categorical_track_sequences(
+    adata,
+    *,
+    state_cols=(FULL_STATE_COL,),
+    groupby_cols=("sample_name", "TrackID"),
+    time_col="position_t",
+    missing_policy="keep",
+    missing_token="missing",
+):
+    """Return per-track categorical state sequences and track-level metadata."""
+    state_cols = _normalize_state_cols(state_cols)
+    groupby_cols = [str(c) for c in list(groupby_cols)]
+    required_cols = list(groupby_cols) + [str(time_col)] + list(state_cols)
+    missing = [c for c in required_cols if c not in adata.obs.columns]
+    if missing:
+        raise KeyError(f"Missing required columns for distance clustering: {missing}")
+
+    obs = adata.obs[required_cols].copy()
+    obs["_orig_idx"] = np.arange(len(obs))
+    obs = obs.sort_values(groupby_cols + [str(time_col), "_orig_idx"])
+
+    missing_policy = str(missing_policy).strip().lower()
+    if missing_policy not in {"keep", "drop"}:
+        raise ValueError("missing_policy must be 'keep' or 'drop'.")
+
+    sequences = []
+    meta_rows = []
+    grouped = obs.groupby(groupby_cols, sort=False, observed=True)
+    for track_id, df_track in grouped:
+        if missing_policy == "drop":
+            df_seq = df_track.dropna(subset=state_cols).copy()
+        else:
+            df_seq = df_track.copy()
+        if len(df_seq) == 0:
+            continue
+
+        if len(state_cols) == 1:
+            series = df_seq[state_cols[0]]
+            seq = [str(missing_token) if pd.isna(value) else str(value) for value in series.tolist()]
+        else:
+            seq = [
+                _format_state_token(row, missing_token=missing_token)
+                for row in df_seq[state_cols].itertuples(index=False, name=None)
+            ]
+
+        if len(groupby_cols) == 1:
+            track_values = [track_id]
+        else:
+            track_values = list(track_id)
+        meta = {col: track_values[i] for i, col in enumerate(groupby_cols)}
+        meta["position_t_min"] = df_seq[str(time_col)].min()
+        meta["position_t_max"] = df_seq[str(time_col)].max()
+        meta["n_timepoints"] = int(len(df_seq))
+        meta["distance_sequence"] = " ".join(seq)
+        meta_rows.append(meta)
+        sequences.append(seq)
+
+    if len(sequences) == 0:
+        raise ValueError("No valid track sequences were available for clustering.")
+    return sequences, pd.DataFrame(meta_rows)
+
+
+def _one_hot_encode_sequences(sequences, *, dtype=np.double):
+    n_tracks = len(sequences)
+    if n_tracks == 0:
+        raise ValueError("No sequences available for distance computation.")
+
+    categories = sorted({str(value) for seq in sequences for value in seq})
+    if len(categories) == 0:
+        raise ValueError("No categorical labels available for distance computation.")
+
+    category_to_index = {label: index for index, label in enumerate(categories)}
+    encoded = []
+    for seq in sequences:
+        seq_values = [str(value) for value in seq]
+        arr = np.zeros((len(seq_values), len(categories)), dtype=dtype)
+        for row_index, label in enumerate(seq_values):
+            arr[row_index, category_to_index[label]] = 1.0
+        encoded.append(arr)
+    return encoded, categories
+
+
+def _validate_distance_matrix(distances, n_expected):
+    distances = np.asarray(distances, dtype=float)
+    if distances.shape != (int(n_expected), int(n_expected)):
+        raise ValueError(
+            f"Distance matrix has shape {distances.shape}, expected {(int(n_expected), int(n_expected))}."
+        )
+    if not np.isfinite(distances).all():
+        raise ValueError("Distance matrix contains non-finite values.")
+    distances = 0.5 * (distances + distances.T)
+    np.fill_diagonal(distances, 0.0)
+    return distances
+
+
+def compute_dtaidistance_onehot_distance_matrix(
+    sequences,
+    *,
+    window=None,
+    max_dist=None,
+    max_length_diff=None,
+    penalty=None,
+    psi=None,
+    parallel=True,
+    inner_dist="squared euclidean",
+    verbose=True,
+):
+    """Compute a DTW distance matrix using dtaidistance over one-hot vectors."""
+    if dtw_ndim is None:
+        raise ImportError(
+            "dtaidistance is required for behavioral trajectory classification. "
+            "Install the BEHAV3D requirements in the active notebook kernel."
+        )
+    encoded_sequences, categories = _one_hot_encode_sequences(sequences)
+    if bool(verbose):
+        _winfo(
+            "trajectory-dtai",
+            "dtaidistance distance matrix | "
+            f"tracks={len(encoded_sequences)} | states={len(categories)} | "
+            f"inner_dist={inner_dist} | window={window} | parallel={bool(parallel)}",
+        )
+    distances = dtw_ndim.distance_matrix_fast(
+        encoded_sequences,
+        compact=False,
+        parallel=bool(parallel),
+        inner_dist=str(inner_dist),
+        window=None if window is None else int(window),
+        max_dist=max_dist,
+        max_length_diff=max_length_diff,
+        penalty=penalty,
+        psi=psi,
+    )
+    return _validate_distance_matrix(distances, len(encoded_sequences)), categories
+
+
+def _cluster_precomputed_distances(distances, *, n_clusters=6, linkage="average"):
+    n_clusters = int(n_clusters)
+    if n_clusters < 2:
+        raise ValueError("n_clusters must be at least 2.")
+    if distances.shape[0] < n_clusters:
+        raise ValueError(
+            f"n_clusters={n_clusters} exceeds the number of available tracks ({distances.shape[0]})."
+        )
+    if str(linkage).strip().lower() == "ward":
+        raise ValueError("Ward linkage is not valid for precomputed DTAI/DTW distances. Use average, complete, or single.")
+    try:
+        model = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            metric="precomputed",
+            linkage=str(linkage),
+        )
+    except TypeError:
+        model = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            affinity="precomputed",
+            linkage=str(linkage),
+        )
+    raw_labels = model.fit_predict(distances)
+    return raw_labels, model
+
+
+def _ensure_dtaidistance_umap(adata_tracks, distances, *, random_state=123, n_neighbors=15, min_dist=0.1):
+    if "X_umap" in adata_tracks.obsm:
+        return np.asarray(adata_tracks.obsm["X_umap"], dtype=float)
+    if umap is None:
+        raise ImportError("umap-learn is required to create DTAI UMAP quality-control plots.")
+    n_obs = int(adata_tracks.n_obs)
+    if n_obs < 2:
+        raise ValueError("At least two tracks are required for UMAP.")
+    reducer = umap.UMAP(
+        n_components=2,
+        metric="precomputed",
+        n_neighbors=max(2, min(int(n_neighbors), n_obs - 1)),
+        min_dist=float(min_dist),
+        random_state=int(random_state),
+    )
+    embedding = reducer.fit_transform(np.asarray(distances, dtype=float))
+    adata_tracks.obsm["X_umap"] = np.asarray(embedding, dtype=float)
+    return adata_tracks.obsm["X_umap"]
+
+
+def _relabel_by_cluster_size(raw_labels):
+    labels = pd.Series(raw_labels).astype(str)
+    ranked = labels.value_counts().sort_values(ascending=False)
+    mapping = {old: str(i + 1) for i, old in enumerate(ranked.index.tolist())}
+    return labels.map(mapping).astype(str).tolist(), mapping
+
+
+def _add_cluster_medoids(adata_tracks, distances, cluster_key="ClusterID"):
+    labels = pd.Series(adata_tracks.obs[cluster_key], index=adata_tracks.obs.index).astype(str)
+    medoid_flags = pd.Series(False, index=adata_tracks.obs.index)
+    medoid_rank = pd.Series(pd.NA, index=adata_tracks.obs.index, dtype="Int64")
+    for cluster in sorted(labels.unique(), key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x))):
+        idx = np.flatnonzero(labels.to_numpy() == cluster)
+        if len(idx) == 0:
+            continue
+        within = distances[np.ix_(idx, idx)]
+        order = np.argsort(within.mean(axis=1))
+        for rank, local_idx in enumerate(order, start=1):
+            obs_idx = adata_tracks.obs.index[idx[local_idx]]
+            medoid_rank.loc[obs_idx] = int(rank)
+        medoid_flags.loc[adata_tracks.obs.index[idx[order[0]]]] = True
+    adata_tracks.obs[f"{cluster_key}_medoid"] = medoid_flags
+    adata_tracks.obs[f"{cluster_key}_medoid_rank"] = medoid_rank
+    return adata_tracks
+
+
+def _save_diagnostics(
+    adata_tracks,
+    distances,
+    outfolder,
+    *,
+    cluster_key="ClusterID",
+    max_heatmap_tracks=200,
+    random_state=123,
+):
+    outfolder = Path(outfolder)
+    outfolder.mkdir(parents=True, exist_ok=True)
+    pdf_path = outfolder / "dtaidistance_clustering_diagnostics.pdf"
+    counts_csv = outfolder / "dtaidistance_cluster_counts.csv"
+    medoids_csv = outfolder / "dtaidistance_cluster_medoids.csv"
+    umap_csv = outfolder / "dtaidistance_umap_clusters.csv"
+
+    labels = pd.Series(adata_tracks.obs[cluster_key]).astype(str)
+    counts = labels.value_counts().rename_axis(cluster_key).reset_index(name="n_tracks")
+    counts.to_csv(counts_csv, index=False)
+
+    medoid_cols = [
+        c
+        for c in ["sample_name", "TrackID", cluster_key, f"{cluster_key}_medoid", f"{cluster_key}_medoid_rank"]
+        if c in adata_tracks.obs.columns
+    ]
+    adata_tracks.obs.loc[adata_tracks.obs[f"{cluster_key}_medoid"].astype(bool), medoid_cols].to_csv(
+        medoids_csv,
+        index=False,
+    )
+    umap_embedding = None
+    umap_error = None
+    try:
+        umap_embedding = _ensure_dtaidistance_umap(
+            adata_tracks,
+            distances,
+            random_state=int(random_state),
+        )
+        umap_df = adata_tracks.obs.copy()
+        umap_df["UMAP1"] = umap_embedding[:, 0]
+        umap_df["UMAP2"] = umap_embedding[:, 1]
+        umap_df.to_csv(umap_csv, index=False)
+    except Exception as exc:
+        umap_error = str(exc)
+
+    with PdfPages(pdf_path) as pdf:
+        if umap_embedding is not None:
+            fig, ax = plt.subplots(figsize=(7, 6))
+            cluster_order = sorted(labels.unique().tolist(), key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x)))
+            cmap = plt.get_cmap("tab20")
+            color_map = {cluster: cmap(i % cmap.N) for i, cluster in enumerate(cluster_order)}
+            for cluster in cluster_order:
+                mask = labels.to_numpy() == str(cluster)
+                ax.scatter(
+                    umap_embedding[mask, 0],
+                    umap_embedding[mask, 1],
+                    s=18,
+                    alpha=0.8,
+                    color=color_map[cluster],
+                    label=str(cluster),
+                    linewidths=0,
+                )
+            ax.set_xlabel("UMAP1")
+            ax.set_ylabel("UMAP2")
+            ax.set_title("One-hot dtaidistance UMAP by cluster")
+            ax.legend(title=str(cluster_key), loc="best", frameon=False, markerscale=1.4)
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+        elif umap_error is not None:
+            fig, ax = plt.subplots(figsize=(8, 3))
+            ax.axis("off")
+            ax.text(0.02, 0.6, f"UMAP plot skipped: {umap_error}", ha="left", va="center", wrap=True)
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(8, max(4, 0.4 * len(counts) + 1.5)))
+        ax.barh(counts[cluster_key].astype(str), counts["n_tracks"], color="#2E6FBA")
+        ax.invert_yaxis()
+        ax.set_xlabel("N tracks")
+        ax.set_ylabel(str(cluster_key))
+        ax.set_title("One-hot dtaidistance cluster counts")
+        ax.grid(axis="x", alpha=0.2)
+        fig.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        n = distances.shape[0]
+        if n > 0:
+            rng = np.random.default_rng(int(random_state))
+            if n > int(max_heatmap_tracks):
+                keep = np.sort(rng.choice(n, size=int(max_heatmap_tracks), replace=False))
+                heat = distances[np.ix_(keep, keep)]
+                title_suffix = f"random {int(max_heatmap_tracks)}/{n} tracks"
+            else:
+                heat = distances
+                title_suffix = f"{n} tracks"
+            fig, ax = plt.subplots(figsize=(8, 7))
+            im = ax.imshow(heat, aspect="auto", interpolation="nearest", cmap="viridis")
+            ax.set_title(f"One-hot dtaidistance matrix ({title_suffix})")
+            ax.set_xlabel("Track")
+            ax.set_ylabel("Track")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+    return {
+        "diagnostics_pdf": str(pdf_path),
+        "cluster_counts_csv": str(counts_csv),
+        "cluster_medoids_csv": str(medoids_csv),
+        "umap_csv": str(umap_csv) if umap_embedding is not None else None,
+        "umap_error": umap_error,
+    }
+
+
+def _dtai_meta(adata_tracks):
+    meta = adata_tracks.uns.get("dtai_trajectory_clustering", {})
+    return meta if isinstance(meta, dict) else {}
+
+
+def _resolve_cluster_key(adata_tracks, cluster_key=None):
+    if cluster_key is not None:
+        return str(cluster_key)
+    return str(_dtai_meta(adata_tracks).get("cluster_key", "ClusterID"))
+
+
+def _write_model_if_requested(adata_tracks, output_dir, cell_type, *, save_outputs=True):
+    output_path = (
+        _resolve_dtaidistance_paths(output_dir, cell_type)["outfolder"]
+        / get_dtaidistance_track_trajectories_filename(cell_type)
+    )
+    if bool(save_outputs):
+        adata_tracks.write(output_path, compression="gzip")
+    return output_path
+
+
+def _build_identity_cluster_mapping_from_obs(obs, cluster_col="ClusterID"):
+    if cluster_col not in obs.columns:
+        return {}
+    values = pd.Series(obs[cluster_col]).dropna().astype(str).unique().tolist()
+    values = sorted(values, key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x)))
+    return {str(value): str(value) for value in values}
+
+
+def _feature_dtw_outdir(output_dir, cell_type):
+    return Path(output_dir).expanduser() / "analysis" / str(cell_type) / "timepoint_feature_dtw"
+
+
+def _feature_dtw_clustered_csv_path(output_dir, cell_type):
+    return _feature_dtw_outdir(output_dir, cell_type) / f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv"
+
+
+def _feature_dtw_umap_csv_path(output_dir, cell_type):
+    return _feature_dtw_outdir(output_dir, cell_type) / f"BEHAV3D_{cell_type}_UMAP_clusters.csv"
+
+
+def _feature_dtw_output_csv_paths(output_dir, cell_type):
+    outdir = _feature_dtw_outdir(output_dir, cell_type)
+    return [
+        outdir / f"BEHAV3D_{cell_type}_UMAP_clusters.csv",
+        outdir / f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv",
+        outdir / f"BEHAV3D_{cell_type}_UMAP_cluster_percentages.csv",
+    ]
+
+
+def _feature_dtw_rename_mapping_path(output_dir, cell_type):
+    return _feature_dtw_outdir(output_dir, cell_type) / f"feature_dtw_cluster_names_{cell_type}.yml"
+
+
+def _load_feature_dtw_name_mapping(output_dir, cell_type):
+    mapping_path = _feature_dtw_rename_mapping_path(output_dir, cell_type)
+    if not mapping_path.exists():
+        return {}
+    try:
+        with mapping_path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        mapping = data.get("cluster_names", data)
+        if not isinstance(mapping, dict):
+            return {}
+        return {str(k): str(v) for k, v in mapping.items()}
+    except Exception:
+        return {}
+
+
+def _feature_dtw_plot_info_cols(df):
+    preferred = ["sample_name", "TrackID", "ClusterID", "ClusterName", "UMAP1", "UMAP2"]
+    return [col for col in preferred if col in df.columns]
+
+
+def _feature_dtw_sample_cols(df):
+    sample_cols = [col for col in ["sample_name"] if col in df.columns]
+    return sample_cols if len(sample_cols) > 0 else None
+
+
+def _feature_dtw_cluster_percentage_groups(df):
+    if "ClusterID" not in df.columns:
+        return None
+    group_cols = [col for col in ["sample_name", "condition", "treatment", "well"] if col in df.columns]
+    if len(group_cols) == 0:
+        counts = df["ClusterID"].astype(str).value_counts().rename_axis("ClusterID").reset_index(name="count")
+        total = counts["count"].sum()
+        counts["percentage"] = counts["count"] / total if total else 0.0
+        return counts
+    counts = df.groupby(group_cols + ["ClusterID"], observed=True).size().reset_index(name="count")
+    totals = counts.groupby(group_cols, observed=True)["count"].transform("sum")
+    counts["percentage"] = np.where(totals > 0, counts["count"] / totals, 0.0)
+    return counts
+
+
+def _save_feature_dtw_quality_control(output_dir, cell_type, *, outfolder=None):
+    outdir = _feature_dtw_outdir(output_dir, cell_type)
+    qc_outdir = outdir / "quality_control" if outfolder is None else Path(outfolder)
+    qc_outdir.mkdir(parents=True, exist_ok=True)
+    umap_csv = _feature_dtw_umap_csv_path(output_dir, cell_type)
+    if not umap_csv.exists():
+        raise FileNotFoundError(f"Original BEHAV3D UMAP CSV not found: {umap_csv}")
+
+    df_umap = pd.read_csv(umap_csv, low_memory=False)
+    df_plot = df_umap.copy()
+    if "ClusterName" in df_plot.columns:
+        df_plot["ClusterID"] = pd.Categorical(df_plot["ClusterName"].astype(str))
+    elif "ClusterID" in df_plot.columns:
+        df_plot["ClusterID"] = pd.Categorical(df_plot["ClusterID"].astype(str))
+    else:
+        raise ValueError("Original BEHAV3D UMAP CSV is missing ClusterID.")
+
+    sample_cols = _feature_dtw_sample_cols(df_plot)
+    info_cols = _feature_dtw_plot_info_cols(df_plot)
+    cluster_umap_path = qc_outdir / f"BEHAV3D_{cell_type}_UMAP_clusters.pdf"
+    heatmap_path = qc_outdir / f"BEHAV3D_{cell_type}_UMAP_cluster_feature_heatmap.pdf"
+    perc_prefix = qc_outdir / f"BEHAV3D_{cell_type}_UMAP_cluster_percentages"
+
+    plot_feature_umap(
+        df_umap=df_plot,
+        info_cols=info_cols,
+        sample_cols=sample_cols,
+        outpath=cluster_umap_path,
+        rows_per_page=4,
+        nr_cols=2,
+        rows_first_img=2,
+        figsize=(8.27, 11.69),
+        plot_results=True,
+    )
+    plot_clustering_feature_heatmap(
+        df_plot,
+        info_cols,
+        sample_cols,
+        heatmap_path,
+        rows_per_page=7,
+        nr_cols=2,
+        figsize=(8.27, 11.69),
+        plot_results=True,
+    )
+    df_clust_perc = _feature_dtw_cluster_percentage_groups(df_plot)
+    if df_clust_perc is not None:
+        df_clust_perc.to_csv(perc_prefix.with_suffix(".csv"), index=False)
+        plot_cluster_percentage_bars(df_clust_perc, perc_prefix, group_by_columns=None, plot_results=True)
+
+    return {
+        "umap_pdf": str(cluster_umap_path),
+        "heatmap_pdf": str(heatmap_path),
+        "percentages_pdf": str(perc_prefix.with_suffix(".pdf")),
+    }
+
+
+def save_dtaidistance_diagnostics(
+    adata_tracks,
+    output_dir,
+    cell_type,
+    *,
+    cluster_key=None,
+    outfolder=None,
+    max_heatmap_tracks=200,
+    random_state=123,
+    save_outputs=True,
+    verbose=True,
+):
+    """Write diagnostics for a saved one-hot dtaidistance clustering model."""
+    paths = _resolve_dtaidistance_paths(output_dir, cell_type)
+    resolved_cluster_key = _resolve_cluster_key(adata_tracks, cluster_key=cluster_key)
+    distances = _validate_distance_matrix(adata_tracks.X, adata_tracks.n_obs)
+    plot_paths = _save_diagnostics(
+        adata_tracks,
+        distances,
+        paths["quality_control_outfolder"] if outfolder is None else outfolder,
+        cluster_key=resolved_cluster_key,
+        max_heatmap_tracks=int(max_heatmap_tracks),
+        random_state=int(random_state),
+    )
+    adata_tracks.uns.setdefault("visualization", {})
+    adata_tracks.uns["visualization"].update(plot_paths)
+    output_path = _write_model_if_requested(
+        adata_tracks,
+        output_dir,
+        cell_type,
+        save_outputs=save_outputs,
+    )
+    if bool(verbose):
+        _winfo("trajectory-dtai", f"saved diagnostics: {plot_paths.get('diagnostics_pdf')}")
+        if bool(save_outputs):
+            _winfo("trajectory-dtai", f"updated one-hot dtaidistance model: {output_path}")
+    return plot_paths
+
+
+def _load_filtered_state_adata_for_model(
+    adata_tracks,
+    output_dir,
+    cell_type,
+    *,
+    adata_full_path=None,
+    verbose=True,
+):
+    meta = _dtai_meta(adata_tracks)
+    if adata_full_path is None:
+        adata_full_path = meta.get("source_adata_full_path", None)
+    if adata_full_path is None:
+        adata_full_path = _default_behavioral_states_path(output_dir, cell_type)
+    adata_full_path = Path(adata_full_path).expanduser()
+    if not adata_full_path.exists():
+        raise FileNotFoundError(f"Could not find behavioral-state h5ad: {adata_full_path}")
+
+    groupby_cols = list(meta.get("groupby_cols", ["sample_name", "TrackID"]))
+    time_col = str(meta.get("time_col", "position_t"))
+    behavioral_trajectory_size = meta.get("behavioral_trajectory_size", 100)
+    if behavioral_trajectory_size is not None:
+        behavioral_trajectory_size = int(behavioral_trajectory_size)
+    min_track_length = meta.get("min_track_length", behavioral_trajectory_size)
+    if min_track_length is not None:
+        min_track_length = int(min_track_length)
+    trim_mode = str(meta.get("trajectory_trim_mode", "last"))
+    if bool(verbose):
+        _winfo("trajectory-dtai", f"loading behavioral states for exemplar plots: {adata_full_path}")
+    adata_full = sc.read_h5ad(adata_full_path)
+    return _filter_tracks_for_dtaidistance(
+        adata_full,
+        groupby_cols=groupby_cols,
+        time_col=time_col,
+        trajectory_size=behavioral_trajectory_size,
+        min_length=min_track_length,
+        trim_mode=trim_mode,
+    )
+
+
+def save_dtaidistance_exemplar_plots(
+    adata_tracks,
+    output_dir,
+    cell_type,
+    *,
+    adata_full_path=None,
+    cluster_key=None,
+    n_per_cluster=None,
+    exemplar_pdf_rows_per_page=6,
+    exemplar_layout_mode="both",
+    exemplar_num_example_ranks=5,
+    make_overview_statebars=True,
+    make_backprojection_pdf=False,
+    make_backprojection_mp4=False,
+    random_state=None,
+    save_outputs=True,
+    verbose=True,
+):
+    """Write exemplar overview and per-cluster statebar PDFs for a DTAI model."""
+    paths = _resolve_dtaidistance_paths(output_dir, cell_type)
+    meta = _dtai_meta(adata_tracks)
+    resolved_cluster_key = _resolve_cluster_key(adata_tracks, cluster_key=cluster_key)
+    state_col = str(meta.get("state_col", FULL_STATE_COL))
+    time_col = str(meta.get("time_col", "position_t"))
+    if n_per_cluster is None:
+        n_per_cluster = int(meta.get("n_per_cluster", 10))
+    if random_state is None:
+        random_state = int(meta.get("random_state", 123))
+
+    adata_filt = _load_filtered_state_adata_for_model(
+        adata_tracks,
+        output_dir,
+        cell_type,
+        adata_full_path=adata_full_path,
+        verbose=verbose,
+    )
+    exemplar_root = paths["clustering_outfolder"] / "example_tracks"
+    exemplar_root.mkdir(parents=True, exist_ok=True)
+
+    coord_enrichment = ensure_exemplar_coordinate_columns(
+        adata_filt,
+        output_dir=output_dir,
+        cell_type=cell_type,
+        require_pixel_for_video=False,
+    )
+    chosen_exemplars, _ = select_exemplar_tracks_by_cluster(
+        adata_tracks=adata_tracks,
+        n_per_cluster=int(n_per_cluster),
+        sample_key="sample_name",
+        track_key="TrackID",
+        cluster_key=resolved_cluster_key,
+        tmin_key="position_t_min",
+        tmax_key="position_t_max",
+        seed=int(random_state),
+    )
+    exemplar_selection_csv = exemplar_root / (
+        f"example_track_selection_cluster_{_sanitize_filename_token(resolved_cluster_key, fallback='cluster')}_"
+        f"state_{_sanitize_filename_token(state_col, fallback='state')}_dtai.csv"
+    )
+    chosen_exemplars.to_csv(exemplar_selection_csv, index=False)
+
+    overview_pdf = None
+    per_cluster_pdf_out = {}
+    backprojection_pdf_out = {}
+    backprojection_mp4_out = {}
+    if bool(make_overview_statebars):
+        fig_exemplar, _, _ = plot_exemplar_tracks_by_cluster(
+            adata_filt,
+            adata_tracks,
+            n_per_cluster=int(n_per_cluster),
+            sample_key="sample_name",
+            track_key="TrackID",
+            time_key=time_col,
+            state_key=state_col,
+            cluster_key=resolved_cluster_key,
+            tmin_key="position_t_min",
+            tmax_key="position_t_max",
+            seed=int(random_state),
+        )
+        overview_pdf = exemplar_root / "example_tracks_overview.pdf"
+        with PdfPages(overview_pdf) as pdf:
+            pdf.savefig(fig_exemplar, bbox_inches="tight", dpi=300)
+        plt.close(fig_exemplar)
+
+        per_cluster_pdf_out = save_exemplar_statebar_track_pdf_per_cluster(
+            adata_full=adata_filt,
+            out_dir=exemplar_root,
+            chosen_df=chosen_exemplars,
+            adata_tracks=None,
+            n_per_cluster=int(n_per_cluster),
+            sample_key="sample_name",
+            track_key="TrackID",
+            time_key=time_col,
+            state_key=state_col,
+            cluster_key=resolved_cluster_key,
+            tmin_key="position_t_min",
+            tmax_key="position_t_max",
+            rows_per_page=int(exemplar_pdf_rows_per_page),
+            plot_dpi=300,
+            seed=int(random_state),
+            cmap_name="tab20",
+            layout_mode=str(exemplar_layout_mode),
+            num_example_ranks=int(exemplar_num_example_ranks),
+        )
+
+    if bool(make_backprojection_pdf):
+        backprojection_pdf_out = save_exemplar_statebar_backprojection_pdf(
+            adata_full=adata_filt,
+            output_dir=output_dir,
+            cell_type=cell_type,
+            out_dir=exemplar_root / "backprojection",
+            chosen_df=chosen_exemplars,
+            n_per_cluster=int(n_per_cluster),
+            sample_key="sample_name",
+            track_key="TrackID",
+            time_key=time_col,
+            state_key=state_col,
+            cluster_key=resolved_cluster_key,
+            tmin_key="position_t_min",
+            tmax_key="position_t_max",
+            plot_dpi=220,
+            seed=int(random_state),
+            examples_per_cluster=int(n_per_cluster),
+            num_example_ranks=int(exemplar_num_example_ranks),
+            verbose=verbose,
+        )
+
+    if bool(make_backprojection_mp4):
+        backprojection_mp4_out = save_exemplar_statebar_backprojection_video_per_cluster(
+            adata_full=adata_filt,
+            output_dir=output_dir,
+            cell_type=cell_type,
+            out_dir=exemplar_root / "backprojection",
+            chosen_df=chosen_exemplars,
+            n_per_cluster=int(n_per_cluster),
+            sample_key="sample_name",
+            track_key="TrackID",
+            time_key=time_col,
+            state_key=state_col,
+            cluster_key=resolved_cluster_key,
+            tmin_key="position_t_min",
+            tmax_key="position_t_max",
+            dpi=180,
+            seed=int(random_state),
+            examples_per_cluster=int(n_per_cluster),
+            num_example_ranks=int(exemplar_num_example_ranks),
+            verbose=verbose,
+        )
+
+    plot_paths = {
+        "exemplar_selection_csv": str(exemplar_selection_csv),
+        "exemplar_tracks_overview_pdf": str(overview_pdf) if overview_pdf is not None else None,
+        "exemplar_statebar_track_pdf_by_cluster": dict(per_cluster_pdf_out.get("pdf_paths_by_cluster", {})),
+        "exemplar_statebar_track_pdf_by_example_rank": dict(
+            per_cluster_pdf_out.get("pdf_paths_by_example_rank", {})
+        ),
+        "exemplar_backprojection_pdf_by_cluster": dict(backprojection_pdf_out.get("pdf_paths_by_cluster", {})),
+        "exemplar_backprojection_pdf_by_example_rank": dict(
+            backprojection_pdf_out.get("pdf_paths_by_example_rank", {})
+        ),
+        "exemplar_backprojection_mp4_by_cluster": dict(backprojection_mp4_out.get("video_paths_by_cluster", {})),
+        "exemplar_backprojection_mp4_by_example_rank": dict(
+            backprojection_mp4_out.get("video_paths_by_example_rank", {})
+        ),
+        "exemplar_render_config": {
+            "stage": "after_clustering",
+            "cluster_key": resolved_cluster_key,
+            "state_key": state_col,
+            "n_per_cluster": int(n_per_cluster),
+            "coordinate_enrichment": dict(coord_enrichment),
+            "overview_statebars_enabled": bool(make_overview_statebars),
+            "backprojection_pdfs_enabled": bool(make_backprojection_pdf),
+            "backprojection_videos_enabled": bool(make_backprojection_mp4),
+        },
+    }
+    adata_tracks.uns.setdefault("visualization", {})
+    adata_tracks.uns["visualization"].update(plot_paths)
+    output_path = _write_model_if_requested(
+        adata_tracks,
+        output_dir,
+        cell_type,
+        save_outputs=save_outputs,
+    )
+    if bool(verbose):
+        _winfo("trajectory-dtai", f"saved exemplar track PDFs: {exemplar_root}")
+        if bool(save_outputs):
+            _winfo("trajectory-dtai", f"updated one-hot dtaidistance model: {output_path}")
+    return plot_paths
+
+
+def run_categorical_dtaidistance_trajectory_clustering(
+    output_dir,
+    cell_type="tcell",
+    *,
+    adata_full_path=None,
+    groupby_cols=("sample_name", "TrackID"),
+    time_col="position_t",
+    behavioral_trajectory_size=100,
+    min_track_length=None,
+    trajectory_trim_mode="last",
+    max_tracks=None,
+    n_clusters=6,
+    window=None,
+    max_dist=None,
+    max_length_diff=None,
+    penalty=None,
+    psi=None,
+    parallel=True,
+    linkage="average",
+    missing_policy="keep",
+    cluster_key="ClusterID",
+    save_outputs=True,
+    save_distance_matrix=False,
+    plot_results=False,
+    max_heatmap_tracks=200,
+    plot_exemplars=False,
+    n_per_cluster=10,
+    exemplar_pdf_rows_per_page=6,
+    exemplar_layout_mode="both",
+    exemplar_num_example_ranks=5,
+    output_subdir_name="behavorial_trajectories",
+    random_state=123,
+    verbose=True,
+):
+    """Cluster categorical state trajectories with dtaidistance over one-hot encodings."""
+    started = time.perf_counter()
+    paths = _resolve_dtaidistance_paths(output_dir, cell_type, output_subdir_name=output_subdir_name)
+    if adata_full_path is None:
+        adata_full_path = _default_behavioral_states_path(output_dir, cell_type)
+    adata_full_path = Path(adata_full_path).expanduser()
+    if not adata_full_path.exists():
+        raise FileNotFoundError(f"Could not find behavioral-state h5ad: {adata_full_path}")
+
+    state_cols = [str(FULL_STATE_COL)]
+    trajectory_size = None if behavioral_trajectory_size is None else int(behavioral_trajectory_size)
+    min_length = trajectory_size if min_track_length is None else int(min_track_length)
+    trim_mode = str(trajectory_trim_mode).strip().lower()
+
+    if bool(verbose):
+        _winfo("trajectory-dtai", f"loading behavioral states: {adata_full_path}")
+    adata_full = sc.read_h5ad(adata_full_path)
+
+    if bool(verbose):
+        length_text = "all timepoints" if trajectory_size is None else f"{trim_mode} {trajectory_size} timepoints"
+        _winfo(
+            "trajectory-dtai",
+            f"filtering tracks with min_length={min_length}, keeping {length_text} | "
+            f"state_col={FULL_STATE_COL}",
+        )
+    adata_filt = _filter_tracks_for_dtaidistance(
+        adata_full,
+        groupby_cols=list(groupby_cols),
+        time_col=str(time_col),
+        trajectory_size=trajectory_size,
+        min_length=min_length,
+        trim_mode=trim_mode,
+    )
+
+    sequences, track_obs = extract_categorical_track_sequences(
+        adata_filt,
+        state_cols=state_cols,
+        groupby_cols=groupby_cols,
+        time_col=time_col,
+        missing_policy=missing_policy,
+    )
+
+    if max_tracks is not None and int(max_tracks) > 0 and len(sequences) > int(max_tracks):
+        rng = np.random.default_rng(int(random_state))
+        keep = np.sort(rng.choice(len(sequences), size=int(max_tracks), replace=False))
+        sequences = [sequences[i] for i in keep]
+        track_obs = track_obs.iloc[keep].reset_index(drop=True)
+        if bool(verbose):
+            _winfo("trajectory-dtai", f"sampled {len(sequences)} tracks for distance clustering")
+
+    if bool(verbose):
+        _winfo(
+            "trajectory-dtai",
+            f"computing pairwise one-hot dtaidistance distances for {len(sequences)} tracks",
+        )
+    distances, categories = compute_dtaidistance_onehot_distance_matrix(
+        sequences,
+        window=window,
+        max_dist=max_dist,
+        max_length_diff=max_length_diff,
+        penalty=penalty,
+        psi=psi,
+        parallel=parallel,
+        verbose=verbose,
+    )
+    dtw_backend = "dtaidistance"
+
+    if bool(verbose):
+        _winfo("trajectory-dtai", f"clustering precomputed distances with n_clusters={int(n_clusters)}")
+    raw_labels, _ = _cluster_precomputed_distances(
+        distances,
+        n_clusters=int(n_clusters),
+        linkage=str(linkage),
+    )
+    labels, size_mapping = _relabel_by_cluster_size(raw_labels)
+    track_obs[cluster_key] = pd.Categorical(labels)
+
+    var_names = [f"distance_to_track_{i}" for i in range(distances.shape[0])]
+    adata_tracks = ad.AnnData(
+        X=distances,
+        obs=track_obs.copy(),
+        var=pd.DataFrame(index=pd.Index(var_names, name="distance_target")),
+    )
+    adata_tracks = _add_cluster_medoids(adata_tracks, distances, cluster_key=cluster_key)
+
+    silhouette = None
+    try:
+        if len(set(labels)) > 1 and len(set(labels)) < len(labels):
+            silhouette = float(silhouette_score(distances, labels, metric="precomputed"))
+    except Exception:
+        silhouette = None
+
+    adata_tracks.uns["dtai_trajectory_clustering"] = {
+        "method": "categorical_onehot_dtaidistance_agglomerative",
+        "dtw_backend": str(dtw_backend),
+        "local_encoding": "one_hot",
+        "inner_dist": "squared euclidean",
+        "one_hot_categories": [str(c) for c in categories],
+        "groupby_cols": [str(c) for c in list(groupby_cols)],
+        "time_col": str(time_col),
+        "state_col": str(FULL_STATE_COL),
+        "state_cols": list(state_cols),
+        "behavioral_trajectory_size": None if trajectory_size is None else int(trajectory_size),
+        "min_track_length": None if min_length is None else int(min_length),
+        "trajectory_trim_mode": trim_mode,
+        "max_tracks": None if max_tracks is None else int(max_tracks),
+        "n_clusters": int(n_clusters),
+        "window": None if window is None else int(window),
+        "max_dist": None if max_dist is None else float(max_dist),
+        "max_length_diff": None if max_length_diff is None else int(max_length_diff),
+        "penalty": None if penalty is None else float(penalty),
+        "psi": None if psi is None else int(psi),
+        "parallel": bool(parallel),
+        "linkage": str(linkage),
+        "missing_policy": str(missing_policy),
+        "cluster_key": str(cluster_key),
+        "raw_label_size_mapping": dict(size_mapping),
+        "silhouette_score_precomputed": silhouette,
+        "n_per_cluster": int(n_per_cluster),
+        "random_state": int(random_state),
+        "source_adata_full_path": str(adata_full_path),
+    }
+
+    if bool(plot_results):
+        plot_paths = _save_diagnostics(
+            adata_tracks,
+            distances,
+            paths["quality_control_outfolder"],
+            cluster_key=cluster_key,
+            max_heatmap_tracks=int(max_heatmap_tracks),
+            random_state=int(random_state),
+        )
+        adata_tracks.uns.setdefault("visualization", {})
+        adata_tracks.uns["visualization"].update(plot_paths)
+
+    if bool(plot_exemplars):
+        exemplar_root = paths["clustering_outfolder"] / "example_tracks"
+        exemplar_root.mkdir(parents=True, exist_ok=True)
+        try:
+            ensure_exemplar_coordinate_columns(
+                adata_filt,
+                output_dir=output_dir,
+                cell_type=cell_type,
+                require_pixel_for_video=False,
+            )
+            chosen_exemplars, _ = select_exemplar_tracks_by_cluster(
+                adata_tracks=adata_tracks,
+                n_per_cluster=int(n_per_cluster),
+                sample_key="sample_name",
+                track_key="TrackID",
+                cluster_key=str(cluster_key),
+                tmin_key="position_t_min",
+                tmax_key="position_t_max",
+                seed=int(random_state),
+            )
+            exemplar_selection_csv = exemplar_root / (
+                f"example_track_selection_cluster_{_sanitize_filename_token(cluster_key, fallback='cluster')}_"
+                f"state_{_sanitize_filename_token(state_cols[0], fallback='state')}_dtai.csv"
+            )
+            chosen_exemplars.to_csv(exemplar_selection_csv, index=False)
+
+            fig_exemplar, _, _ = plot_exemplar_tracks_by_cluster(
+                adata_filt,
+                adata_tracks,
+                n_per_cluster=int(n_per_cluster),
+                sample_key="sample_name",
+                track_key="TrackID",
+                time_key=str(time_col),
+                state_key=str(state_cols[0]),
+                cluster_key=str(cluster_key),
+                tmin_key="position_t_min",
+                tmax_key="position_t_max",
+                seed=int(random_state),
+            )
+            overview_pdf = exemplar_root / "example_tracks_overview.pdf"
+            with PdfPages(overview_pdf) as pdf:
+                pdf.savefig(fig_exemplar, bbox_inches="tight", dpi=300)
+            plt.close(fig_exemplar)
+
+            try:
+                per_cluster_pdf_out = save_exemplar_statebar_track_pdf_per_cluster(
+                    adata_full=adata_filt,
+                    out_dir=exemplar_root,
+                    chosen_df=chosen_exemplars,
+                    adata_tracks=None,
+                    n_per_cluster=int(n_per_cluster),
+                    sample_key="sample_name",
+                    track_key="TrackID",
+                    time_key=str(time_col),
+                    state_key=str(state_cols[0]),
+                    cluster_key=str(cluster_key),
+                    tmin_key="position_t_min",
+                    tmax_key="position_t_max",
+                    rows_per_page=int(exemplar_pdf_rows_per_page),
+                    plot_dpi=300,
+                    seed=int(random_state),
+                    cmap_name="tab20",
+                    layout_mode=str(exemplar_layout_mode),
+                    num_example_ranks=int(exemplar_num_example_ranks),
+                )
+                pdf_paths_by_cluster = dict(per_cluster_pdf_out.get("pdf_paths_by_cluster", {}))
+                pdf_paths_by_example_rank = dict(per_cluster_pdf_out.get("pdf_paths_by_example_rank", {}))
+                exemplar_warning = None
+            except Exception as exc:
+                raise RuntimeError(f"Failed to save exemplar PDFs: {exc}") from exc
+            adata_tracks.uns.setdefault("visualization", {})
+            adata_tracks.uns["visualization"].update(
+                {
+                    "exemplar_selection_csv": str(exemplar_selection_csv),
+                    "exemplar_tracks_overview_pdf": str(overview_pdf),
+                    "exemplar_statebar_track_pdf_by_cluster": dict(pdf_paths_by_cluster),
+                    "exemplar_statebar_track_pdf_by_example_rank": dict(pdf_paths_by_example_rank),
+                    "exemplar_statebar_warning": exemplar_warning,
+                }
+            )
+            if bool(verbose):
+                _winfo("trajectory-dtai", f"saved exemplar track PDFs: {exemplar_root}")
+        except Exception as exc:
+            adata_tracks.uns.setdefault("visualization", {})
+            adata_tracks.uns["visualization"]["exemplar_error"] = str(exc)
+            if bool(verbose):
+                _winfo("trajectory-dtai", f"skipping exemplar PDFs due to error: {exc}")
+
+    if bool(save_distance_matrix):
+        distance_csv = paths["clustering_outfolder"] / "categorical_dtai_distance_matrix.csv"
+        pd.DataFrame(distances, index=adata_tracks.obs.index, columns=adata_tracks.obs.index).to_csv(distance_csv)
+        adata_tracks.uns.setdefault("dtai_trajectory_clustering", {})
+        adata_tracks.uns["dtai_trajectory_clustering"]["distance_matrix_csv"] = str(distance_csv)
+
+    output_path = paths["outfolder"] / get_dtaidistance_track_trajectories_filename(cell_type)
+    if bool(save_outputs):
+        adata_tracks.write(output_path, compression="gzip")
+        if bool(verbose):
+            _winfo("trajectory-dtai", f"saved one-hot dtaidistance model: {output_path}")
+
+    elapsed = time.perf_counter() - started
+    if bool(verbose):
+        _winfo("trajectory-dtai", f"finished in {elapsed:.2f}s")
+    return adata_tracks
+
+
+class TrajectoryDTAIClassificationPanel:
     """Notebook widget for one-hot categorical track clustering."""
 
     def __init__(self, metadata_loader, cell_type=None):

@@ -1,3 +1,8 @@
+"""Deprecated legacy module kept for historical reference.
+
+This file is not part of the actively maintained clustering pipeline.
+"""
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt

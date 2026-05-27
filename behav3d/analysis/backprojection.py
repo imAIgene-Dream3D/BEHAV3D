@@ -1258,18 +1258,60 @@ def view_napari(
     targeted_ids_per_tp = backproject_data.get("Targeted_IDs", {})
     
     raw_layer_names = []
+    label_reference = None
+    if "TrackID" in backproject_data:
+        label_reference = backproject_data["TrackID"].get("img")
+    elif "ClusterID" in backproject_data:
+        label_reference = backproject_data["ClusterID"].get("img")
+
+    expected_timepoints = None
+    if "position_t" in df_tracks_full.columns and len(df_tracks_full) > 0:
+        time_values = pd.to_numeric(df_tracks_full["position_t"], errors="coerce")
+        if time_values.notna().any():
+            expected_timepoints = int(time_values.max()) + 1
+
+    def _raw_to_tczyx(raw_img):
+        if getattr(raw_img, "ndim", 0) != 5:
+            return raw_img
+
+        label_shape = tuple(int(v) for v in getattr(label_reference, "shape", ()) or ())
+        raw_shape = tuple(int(v) for v in raw_img.shape)
+        if len(label_shape) == 4:
+            label_time = label_shape[0]
+            label_spatial = label_shape[1:]
+            if raw_shape[2:] == label_spatial:
+                if raw_shape[0] == label_time:
+                    return raw_img
+                if raw_shape[1] == label_time:
+                    return np.transpose(raw_img, (1, 0, 2, 3, 4))
+
+        if expected_timepoints is not None:
+            if raw_shape[0] == expected_timepoints:
+                return raw_img
+            if raw_shape[1] == expected_timepoints:
+                return np.transpose(raw_img, (1, 0, 2, 3, 4))
+
+        if raw_shape[0] <= 16 and raw_shape[1] > raw_shape[0]:
+            return np.transpose(raw_img, (1, 0, 2, 3, 4))
+        return raw_img
 
     # Add all image/label layers
-    for k, v in backproject_data.items():
+    layer_items = []
+    if "raw_data" in backproject_data:
+        layer_items.append(("raw_data", backproject_data["raw_data"]))
+    layer_items.extend((k, v) for k, v in backproject_data.items() if k != "raw_data")
+    for k, v in layer_items:
         if k == "Targeted_IDs": continue
         try:
             # Handle transposition if not already correct
-            if v["img"].ndim == 5 and v["img"].shape[0] != df_tracks_full["position_t"].max() + 1:
+            if k == "raw_data":
+                v["img"] = _raw_to_tczyx(v["img"])
+            elif v["img"].ndim == 5 and v["img"].shape[0] != df_tracks_full["position_t"].max() + 1:
                 try:
                     v["img"] = np.transpose(v["img"], (1, 0, 2, 3, 4))
                 except Exception: pass
 
-            if k == "raw_data" and bool(split_raw_channels) and getattr(v["img"], "ndim", 0) == 5 and int(v["img"].shape[1]) > 1:
+            if k == "raw_data" and bool(split_raw_channels) and getattr(v["img"], "ndim", 0) == 5 and int(v["img"].shape[1]) >= 1:
                 channel_count = int(v["img"].shape[1])
                 layers = viewer.add_image(
                     v["img"],

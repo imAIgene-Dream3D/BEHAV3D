@@ -1313,8 +1313,8 @@ def calculate_movement_features(
 
         df_result['speed'] = df_result["displacement"]/time_interval
         # Calculate the mean speed (default um/h) over the last {rolling_meanspeed_window} timepoints
-        df_result['mean_speed'] = df_result.groupby('TrackID')['speed'].apply(lambda x: x.iloc[1:].rolling(window=rolling_meanspeed_window, min_periods=1).mean()).reset_index(0, drop=True)
-        df_result['mean_speed'] = df_result['mean_speed'].fillna(0)
+        # df_result['mean_speed'] = df_result.groupby('TrackID')['speed'].apply(lambda x: x.iloc[1:].rolling(window=rolling_meanspeed_window, min_periods=1).mean()).reset_index(0, drop=True)
+        # df_result['mean_speed'] = df_result['mean_speed'].fillna(0)
    
         df_tracks_processed.append(df_result)
     df_tracks_processed = pd.concat(df_tracks_processed)

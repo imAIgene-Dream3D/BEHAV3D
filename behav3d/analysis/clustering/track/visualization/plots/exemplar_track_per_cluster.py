@@ -12,6 +12,10 @@ from matplotlib import colormaps
 from matplotlib.collections import LineCollection
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_pdf import PdfPages
+from behav3d.analysis.clustering.utils import (
+    _mixed_label_sort_key,
+    _sanitize_filename_token,
+)
 
 from behav3d.analysis.clustering.state.visualization.videos.track_max_projection import (
     create_fulltrack_max_projection_stacks_with_track,
@@ -19,21 +23,6 @@ from behav3d.analysis.clustering.state.visualization.videos.track_max_projection
     resolve_tracked_zarr_path,
 )
 from behav3d.io.images import load_zarr
-
-
-def _mixed_label_sort_key(value):
-    text = str(value)
-    return (0, int(text)) if text.isdigit() else (1, text)
-
-
-def _sanitize_filename_token(value, fallback="plot"):
-    token = str(value).strip()
-    if token == "":
-        token = str(fallback)
-    token = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in token)
-    token = token.strip("._-")
-    return token if token != "" else str(fallback)
-
 
 def _validate_required_columns(df_like, required_cols, name):
     missing = [str(c) for c in required_cols if str(c) not in df_like.columns]
