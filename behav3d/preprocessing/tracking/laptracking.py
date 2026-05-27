@@ -103,6 +103,7 @@ def run_laptracking(
     n_workers=1,
     return_trackimg=True,
     overwrite=False,
+    progress_cb=None,
     **kwargs
     ):
     """Run LAP tracking on any cell type.
@@ -129,10 +130,20 @@ def run_laptracking(
         Whether to save tracked image
     overwrite : bool
         Whether to overwrite existing tracking results
+    progress_cb : callable, optional
+        Called as ``progress_cb(current, total, label)`` from inside the
+        per-sample loop so a GUI can drive a progress bar.  ``None`` is a
+        no-op (default).  Notebook callers omit this kwarg.
     **kwargs : dict
      """
-    for idx, sample in metadata.iterrows():
+    total_samples = len(metadata)
+    for i, (idx, sample) in enumerate(metadata.iterrows()):
         sample_name=sample['sample_name']
+        if progress_cb is not None:
+            try:
+                progress_cb(i, total_samples, f"{cell_type} / {sample_name}")
+            except Exception:
+                pass
         print(f"Tracking sample: {sample_name}")
         
         tracked_img_outdir = Path(output_dir, "images", sample_name)
@@ -202,5 +213,10 @@ def run_laptracking(
                 
         metadata.at[idx, img_col] = str(tracked_img_outpath)
         metadata.at[idx, csv_col] = str(tracked_csv_outpath)
-        
+
+    if progress_cb is not None:
+        try:
+            progress_cb(total_samples, total_samples, f"{cell_type} done")
+        except Exception:
+            pass
     return metadata

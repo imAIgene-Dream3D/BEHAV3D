@@ -253,6 +253,7 @@ def run_cellpose_segmentation(
     label_name: str = "tcell", 
     timepoint_range: Optional[Tuple[int, int]] = None,
     channel_labels_config: Optional[dict] = None,
+    progress_cb=None,
     **cellpose_kwargs,
 ):
     """Batch run Cellpose segmentation for all samples in *metadata*.
@@ -350,8 +351,14 @@ def run_cellpose_segmentation(
         metadata[path_col] = pd.NA
     metadata[path_col] = metadata[path_col].astype('object')
 
-    for idx, sample in metadata.iterrows():
+    _total_samples = len(metadata)
+    for _i, (idx, sample) in enumerate(metadata.iterrows()):
         sample_name = sample['sample_name']
+        if progress_cb is not None:
+            try:
+                progress_cb(_i, _total_samples, f"cellpose {label_name} / {sample_name}")
+            except Exception:
+                pass
 
         print(f"Segmenting '{label_name}' ({category_name}) with Cellpose for: {sample_name}")
         cellpose_dir = output_dir / "images" / f"{sample_name}"
@@ -438,6 +445,11 @@ def run_cellpose_segmentation(
         metadata.at[idx, path_col] = str(masks_outpath)
         summary["processed"].append(sample_name)
 
+    if progress_cb is not None:
+        try:
+            progress_cb(_total_samples, _total_samples, f"cellpose {label_name} done")
+        except Exception:
+            pass
     return metadata, summary
 
 
@@ -448,6 +460,7 @@ def run_cellpose_and_sync_metadata(
     input_channels,
     label_name,
     timepoint_range=None,
+    progress_cb=None,
     **cellpose_kwargs,
 ):
     """
@@ -462,6 +475,7 @@ def run_cellpose_and_sync_metadata(
         input_channels=input_channels,
         label_name=label_name,
         timepoint_range=timepoint_range,
+        progress_cb=progress_cb,
         **cellpose_kwargs,
     )
 
@@ -479,6 +493,7 @@ def run_otsu_threshold_segmentation_from_zarr(
     metadata,
     mask_suffix: str = "_mask_dead",
     timepoint_range: tuple[int, int] | None = None,
+    progress_cb=None,
 ):
     """Run Otsu thresholding segmentation on the dead channel for all samples.
     
@@ -526,8 +541,14 @@ def run_otsu_threshold_segmentation_from_zarr(
 
     summary = {"processed": [], "skipped": []}
 
-    for idx, sample in metadata.iterrows():
+    _total_samples = len(metadata)
+    for _i, (idx, sample) in enumerate(metadata.iterrows()):
         sample_name = sample['sample_name']
+        if progress_cb is not None:
+            try:
+                progress_cb(_i, _total_samples, f"dead mask / {sample_name}")
+            except Exception:
+                pass
         print(f"\nProcessing dead mask for {sample_name}...")
         
         # Find the death channel from config file
@@ -616,7 +637,12 @@ def run_otsu_threshold_segmentation_from_zarr(
         # Update metadata with the path
         metadata.at[idx, 'dead_mask_path'] = str(masks_outpath)
         summary["processed"].append(sample_name)
-    
+
+    if progress_cb is not None:
+        try:
+            progress_cb(_total_samples, _total_samples, "dead mask done")
+        except Exception:
+            pass
     return metadata, summary
 
 def run_otsu_and_sync_metadata(
@@ -624,6 +650,7 @@ def run_otsu_and_sync_metadata(
     metadata_loader,
     mask_suffix="_mask_dead",
     timepoint_range=None,
+    progress_cb=None,
 ):
     """
     Wrapper around run_otsu_threshold_segmentation_from_zarr that automatically handles
@@ -635,6 +662,7 @@ def run_otsu_and_sync_metadata(
         metadata=metadata_loader.metadata,
         mask_suffix=mask_suffix,
         timepoint_range=timepoint_range,
+        progress_cb=progress_cb,
     )
 
     # 2. Update the in-memory metadata

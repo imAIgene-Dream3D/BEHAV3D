@@ -1477,6 +1477,7 @@ def run_pixel_classifier_segmentation(
     overwrite_existing=False,
     n_workers=4,
     log_callback=print,
+    progress_cb=None,
     ):
 
     """
@@ -1655,7 +1656,13 @@ def run_pixel_classifier_segmentation(
             metadata.to_csv(metadata_csv_path, index=False)
     
     # Process each sample
-    for idx, sample in metadata.iterrows():
+    _total_samples = len(metadata)
+    for _i, (idx, sample) in enumerate(metadata.iterrows()):
+        if progress_cb is not None:
+            try:
+                progress_cb(_i, _total_samples, f"{sample['sample_name']}")
+            except Exception:
+                pass
         print(f"Processing sample: {sample['sample_name']}")
         _log_mem(f"sample {sample['sample_name']} START")
         start_time = time.time()
@@ -2347,6 +2354,11 @@ def run_pixel_classifier_segmentation(
         
         _log_mem(f"sample {sample_name} END")
         print(f"  Sample {sample_name} completed in {time.time() - start_time:.1f}s")
-    
+
+    if progress_cb is not None:
+        try:
+            progress_cb(_total_samples, _total_samples, "segmentation done")
+        except Exception:
+            pass
     _log_mem("run_pixel_classifier_segmentation END")
     return metadata

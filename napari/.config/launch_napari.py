@@ -38,7 +38,7 @@ def run_napari_payload():
     
     # Add our dock widget
     widget = BEHAV3DWidget(viewer)
-    viewer.window.add_dock_widget(widget, name="BEHAV3D Pipeline", area="right")
+    viewer.window.add_dock_widget(widget, name="BEHAV3D Explorer", area="right")
     
     # Start the event loop
     napari.run()

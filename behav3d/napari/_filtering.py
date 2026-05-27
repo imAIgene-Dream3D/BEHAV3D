@@ -4,6 +4,14 @@ BEHAV3D napari plugin – Filtering Tab.
 Provides per-cell-type sub-tabs with track-length filters, dead-at-t0 filter,
 time-unit toggle, and batch-run capability including summarization.
 Mirrors the architecture of _tracking.py / _feature_extraction.py.
+
+Run buttons execute the backend in a background ``QThread`` (via
+:class:`behav3d.napari._background_runner.BackgroundOperation`) so napari
+stays responsive.  ``filter_tracks`` / ``summarize_track_features`` have
+no per-sample loop accessible, so the per-cell-type Run uses an
+indeterminate (busy) progress bar.  The batch Run shows determinate
+progress at cell-type granularity.  Queue compatibility is preserved by
+defaulting ``block=True``.
 """
 import sys
 import traceback
@@ -14,10 +22,20 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QCheckBox,
     QSpinBox, QGroupBox, QComboBox, QMessageBox, QScrollArea,
+    QSplitter,
 )
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, Signal
 
 from behav3d.core.qt_help import make_help_row
+from behav3d.napari._results_panel import (
+    ResultsPanel,
+    notify_results_changed,
+)
+from behav3d.napari._background_runner import (
+    BackgroundOperation,
+    ProgressBarRow,
+    fire_extra_callback,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -35,6 +53,8 @@ class CellTypeFilterPanel(QWidget):
         category_types: list,
         log_callback=None,
         parent=None,
+        tab_progress_row=None,
+        viewer=None,
     ):
         super().__init__(parent)
         self.cell_type = cell_type
@@ -43,6 +63,11 @@ class CellTypeFilterPanel(QWidget):
         self.all_cell_types = all_cell_types
         self.category_types = category_types
         self.log = log_callback or (lambda m: None)
+        self.viewer = viewer
+
+        # Background-execution infrastructure.
+        self.tab_progress_row = tab_progress_row
+        self._bg = BackgroundOperation(self)
 
         # Detect dead channel
         md = metadata_loader.metadata
@@ -203,7 +228,10 @@ class CellTypeFilterPanel(QWidget):
             "background-color: #28a745; color: white; font-weight: bold; "
             "border-radius: 4px; padding: 6px;"
         )
-        self.btn_run.clicked.connect(self._on_run_clicked)
+        # ``clicked`` emits a ``bool`` (checked state) that would override the
+        # ``interactive=True`` default of ``_on_run_clicked``; wrap in a lambda
+        # so the overwrite prompt is not silently skipped on button presses.
+        self.btn_run.clicked.connect(lambda: self._on_run_clicked(interactive=True))
         layout.addWidget(self.btn_run)
 
         layout.addStretch()
@@ -267,10 +295,34 @@ class CellTypeFilterPanel(QWidget):
             except Exception as e:
                 self.log(f"Warning: Could not save parameters: {e}")
 
-    def _run_filtering_for(self, cell_type: str, overwrite: bool = False):
-        """Run track filtering + summarization for one cell type."""
+    def collect_runtime_params(self) -> dict:
+        """Snapshot Qt widget values for thread-safe handoff to a worker."""
+        return {
+            "exp_duration_enabled": bool(self.en_exp_duration.isChecked()),
+            "exp_duration": int(self.spin_exp_duration.value()),
+            "min_length_enabled": bool(self.en_min_length.isChecked()),
+            "min_track_length": int(self.spin_min_length.value()),
+            "max_length_enabled": bool(self.en_max_length.isChecked()),
+            "max_track_length": int(self.spin_max_length.value()),
+            "filter_min_size": bool(self.check_filter_min_size.isChecked()),
+            "min_size_t1": int(self.spin_min_size_t1.value()),
+            "filter_t0_dead": bool(self.check_filter_dead_t0.isChecked()),
+            "time_type": self.combo_time_type.currentText(),
+        }
+
+    def _run_filtering_for(self, cell_type: str, overwrite: bool = False,
+                           params: dict = None):
+        """Run track filtering + summarization for one cell type.
+
+        Pass ``params`` when calling from a background worker (must be
+        a snapshot from :meth:`collect_runtime_params`).  When ``None``,
+        widget values are read directly — only safe on the Qt thread.
+        """
         from behav3d.analysis.filtering import filter_tracks
         from behav3d.analysis import summarize_track_features
+
+        if params is None:
+            params = self.collect_runtime_params()
 
         print(f"\n{'='*50}", file=sys.stderr)
         print(f"  Filtering: {cell_type}", file=sys.stderr)
@@ -287,17 +339,17 @@ class CellTypeFilterPanel(QWidget):
             "metadata": self.metadata_loader.metadata,
             "output_dir": out_dir,
             "cell_type": cell_type,
-            "exp_duration": (int(self.spin_exp_duration.value()) if self.en_exp_duration.isChecked() else None),
-            "min_track_length": (int(self.spin_min_length.value()) if self.en_min_length.isChecked() else None),
-            "max_track_length": (int(self.spin_max_length.value()) if self.en_max_length.isChecked() else None),
+            "exp_duration": (int(params["exp_duration"]) if params["exp_duration_enabled"] else None),
+            "min_track_length": (int(params["min_track_length"]) if params["min_length_enabled"] else None),
+            "max_track_length": (int(params["max_track_length"]) if params["max_length_enabled"] else None),
             "df_input_path": df_input_path,
-            "time_type": self.combo_time_type.currentText(),
+            "time_type": params["time_type"],
             "plot_results": True,
-            "filter_t0_dead": bool(self.check_filter_dead_t0.isChecked()),
+            "filter_t0_dead": bool(params["filter_t0_dead"]),
         }
 
-        if self.check_filter_min_size.isChecked():
-            filter_kwargs["min_size"] = int(self.spin_min_size_t1.value())
+        if params["filter_min_size"]:
+            filter_kwargs["min_size"] = int(params["min_size_t1"])
 
         filter_tracks(**filter_kwargs)
 
@@ -316,6 +368,16 @@ class CellTypeFilterPanel(QWidget):
         return warnings
 
     def _on_run_clicked(self, interactive=True):
+        """Run filtering for this cell type in the background.
+
+        ``filter_tracks`` has no per-sample loop accessible from the
+        top-level call, so the in-tab progress row stays in indeterminate
+        (busy) mode for the duration of the run.
+        """
+        if self._bg.is_running():
+            self.log("⚠️ A filtering run is already in progress for this panel.")
+            return
+
         self._persist()
         self.log(f"Running filtering for: {self.cell_type}")
 
@@ -323,45 +385,74 @@ class CellTypeFilterPanel(QWidget):
         existing = self._check_existing_filtering([self.cell_type])
         if existing:
             if interactive:
-                details = "\n".join(f"  • {w}" for w in existing)
-                box = QMessageBox(self)
-                box.setWindowTitle("Overwrite Existing Filtered Data?")
-                box.setText(
-                    f"The following filtered data already exists:\n\n{details}\n\n"
-                    "What do you want to do?"
+                from behav3d.napari._overwrite_prompt import prompt_overwrite_single
+                choice = prompt_overwrite_single(
+                    self,
+                    "Overwrite Existing Filtered Data?",
+                    existing,
                 )
-                btn_overwrite = box.addButton("Overwrite", QMessageBox.DestructiveRole)
-                btn_skip = box.addButton("Skip", QMessageBox.AcceptRole)
-                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-                box.setDefaultButton(btn_cancel)
-                box.exec_()
-                clicked = box.clickedButton()
-                if clicked != btn_overwrite:
+                if choice != "overwrite":
                     self.log(f"Filtering for {self.cell_type} cancelled.")
                     return
                 overwrite = True
             else:
                 overwrite = True
 
-        try:
-            self._run_filtering_for(self.cell_type, overwrite=overwrite)
-            self.log(f"✅ {self.cell_type} filtering finished.")
-        except Exception as e:
-            traceback.print_exc()
-            self.log(f"Error during filtering: {e}")
+        params_snapshot = self.collect_runtime_params()
+        cell_type = self.cell_type
+
+        def _do_filtering(progress_cb=None):
+            # filter_tracks has no per-sample loop, so we don't drive
+            # progress_cb here — the in-tab bar remains indeterminate.
+            return self._run_filtering_for(
+                cell_type, overwrite=overwrite, params=params_snapshot,
+            )
+
+        def _on_done(_result):
+            self.log(f"✅ {cell_type} filtering finished.")
+            notify_results_changed(self)
+
+        def _on_failed(err: str):
+            self.log(f"Error during filtering: {err}")
+            notify_results_changed(self)
+
+        self._bg.run(
+            fn=_do_filtering,
+            desc=f"Filtering {cell_type}\u2026",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_run],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+            inject_progress=False,
+            indeterminate=True,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FilteringTab — main tab with per-cell-type sub-tabs
 # ═══════════════════════════════════════════════════════════════════════════
 class FilteringTab(QWidget):
+    # Worker threads call ``self._log(...)`` during batch filtering; QTextEdit
+    # is not thread-safe and direct ``append`` calls from a non-GUI thread
+    # raise the "Cannot queue arguments of type 'QTextCursor'" warning.  We
+    # route every log message through this queue-connected signal so the
+    # actual ``QTextEdit.append`` always runs on the GUI thread.
+    _log_message = Signal(str)
+
     def __init__(self, viewer=None, metadata_loader=None, parent=None):
         super().__init__(parent)
         self.viewer = viewer
         self.metadata_loader = metadata_loader
         self.panels: dict[str, CellTypeFilterPanel] = {}
 
+        # Background-execution infrastructure for batch runs.
+        self._bg = BackgroundOperation(self)
+
         self._init_ui()
+
+        # Queue-connect so cross-thread emits get marshalled to the GUI thread.
+        self._log_message.connect(self._append_log_line, Qt.QueuedConnection)
 
         if hasattr(self.metadata_loader, "metadata_loaded"):
             self.metadata_loader.metadata_loaded.connect(self._on_metadata_updated)
@@ -370,15 +461,35 @@ class FilteringTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        # Vertical splitter: tab content on top, shared Results panel
+        # underneath (visible from this tab and re-scanning the same
+        # output directory used by Analysis / Feature Extraction).
+        self.splitter = QSplitter(Qt.Vertical, self)
+        self.splitter.setChildrenCollapsible(True)
+        outer.addWidget(self.splitter)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        outer.addWidget(scroll)
+        self.splitter.addWidget(scroll)
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
         scroll.setWidget(content)
+
+        self.results_panel = ResultsPanel(
+            viewer=self.viewer,
+            metadata_loader=self.metadata_loader,
+            parent=self,
+        )
+        self.splitter.addWidget(self.results_panel)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, True)
+        self.splitter.setSizes([600, 400])
 
         self.cell_tabs = QTabWidget()
         self.cell_tabs.setTabPosition(QTabWidget.West)
@@ -410,6 +521,10 @@ class FilteringTab(QWidget):
         self.btn_run_batch.setVisible(False)
         self.btn_queue_filter.setVisible(False)
 
+        # Shared progress row — fed by every Run button on this tab.
+        self.progress_row = ProgressBarRow()
+        layout.addWidget(self.progress_row)
+
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumHeight(120)
@@ -423,6 +538,26 @@ class FilteringTab(QWidget):
         self.cell_tabs.addTab(self._placeholder, "—")
 
     def _log(self, msg):
+        """Thread-safe log entrypoint.
+
+        Emits via ``_log_message`` (queue-connected) so calls from worker
+        threads — e.g. ``_do_batch`` running on a ``QThread`` — never touch
+        the ``QTextEdit`` directly.  Calls from the GUI thread still work
+        because Qt processes queued events between worker steps.
+        """
+        try:
+            self._log_message.emit(str(msg))
+        except Exception:
+            # As a last resort, fall back to a direct write; this only
+            # matters on the GUI thread and avoids losing log lines if the
+            # signal infrastructure is somehow torn down.
+            try:
+                self._append_log_line(str(msg))
+            except Exception:
+                pass
+
+    def _append_log_line(self, msg: str):
+        """Slot — always invoked on the GUI thread."""
         import datetime
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         self.log_box.append(f"[{ts}] {msg}")
@@ -433,6 +568,30 @@ class FilteringTab(QWidget):
     def _on_metadata_updated(self):
         self._log("Metadata updated — refreshing filtering tabs…")
         self._rebuild_tabs()
+
+    def request_tab_exit(self) -> bool:
+        """Block tab switching while a background filtering run is in flight."""
+        from qtpy.QtWidgets import QMessageBox
+
+        if self._bg.is_running():
+            QMessageBox.information(
+                self,
+                "Operation in progress",
+                "A filtering run is still in progress. Please wait for "
+                "it to finish before switching tabs.",
+            )
+            return False
+        for panel in self.panels.values():
+            bg = getattr(panel, "_bg", None)
+            if bg is not None and bg.is_running():
+                QMessageBox.information(
+                    self,
+                    "Operation in progress",
+                    "A filtering run is still in progress. Please wait "
+                    "for it to finish before switching tabs.",
+                )
+                return False
+        return True
 
     def _detect_cell_types(self):
         from behav3d.core.metadata import (
@@ -481,18 +640,36 @@ class FilteringTab(QWidget):
             metadata_loader=self.metadata_loader,
             all_cell_types=all_types, category_types=cat_types,
             log_callback=self._log,
+            tab_progress_row=self.progress_row,
+            viewer=self.viewer,
         )
         self.panels[ct] = panel
         icon = color_map.get(category, "")
         self.cell_tabs.addTab(panel, f"{icon} {ct}")
 
     def _on_run_batch_clicked(self):
-        self.run_batch_filtering(interactive=True)
+        """User-triggered batch run — asynchronous."""
+        self.run_batch_filtering(interactive=True, block=False)
 
-    def run_batch_filtering(self, interactive=True, skip_existing=False):
-        """Run filtering for all cell types sequentially."""
+    def run_batch_filtering(self, interactive=True, skip_existing=False, block=True,
+                            extra_callbacks=None):
+        """Run filtering for all cell types sequentially.
+
+        ``block=True`` (default, queue path) runs synchronously on the
+        caller's thread.  ``block=False`` (GUI button) runs in a background
+        worker with a determinate progress bar at cell-type granularity.
+
+        ``extra_callbacks`` is the queue's chaining hook
+        (``{"on_done": cb, "on_failed": cb}``).
+        """
         if not self.panels:
             self._log("No cell type panels available.")
+            fire_extra_callback(extra_callbacks, "on_failed", "no cell type panels")
+            return
+
+        if not block and self._bg.is_running():
+            self._log("⚠️ A batch filtering run is already in progress.")
+            fire_extra_callback(extra_callbacks, "on_failed", "already running")
             return
 
         total = len(self.panels)
@@ -518,43 +695,93 @@ class FilteringTab(QWidget):
         overwrite = not skip_existing
         if existing:
             if interactive:
-                details = "\n".join(f"  • {w}" for w in existing)
-                box = QMessageBox(self)
-                box.setWindowTitle("Overwrite Existing Filtered Data?")
-                box.setText(
-                    f"The following filtered data already exists:\n\n{details}\n\n"
-                    "What do you want to do?"
+                from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
+                choice = prompt_overwrite_batch(
+                    self,
+                    "Overwrite Existing Filtered Data?",
+                    existing,
                 )
-                btn_overwrite = box.addButton("Overwrite All", QMessageBox.DestructiveRole)
-                btn_skip = box.addButton("Skip Existing", QMessageBox.AcceptRole)
-                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-                box.setDefaultButton(btn_cancel)
-                box.exec_()
-                clicked = box.clickedButton()
-                if clicked == btn_cancel:
+                if choice == "cancel":
                     self._log("Batch filtering cancelled.")
+                    fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
                     return
-                skip_existing_flag = (clicked == btn_skip)
+                skip_existing_flag = (choice == "skip")
                 overwrite = not skip_existing_flag
             else:
                 overwrite = True
 
-        try:
-            for i, (ct, panel) in enumerate(self.panels.items(), 1):
+        # Persist + snapshot every panel's Qt widget state on the Qt
+        # thread — the worker must not read widgets.
+        panel_params: dict[str, dict] = {}
+        for ct, panel in self.panels.items():
+            panel._persist()
+            panel_params[ct] = panel.collect_runtime_params()
+
+        def _do_batch(progress_cb=None):
+            for i, (ct, panel) in enumerate(self.panels.items()):
+                if progress_cb is not None:
+                    try:
+                        progress_cb(i, total, f"Filtering: {ct}")
+                    except Exception:
+                        pass
                 if skip_existing_flag and ct in existing_cts:
-                    self._log(f"--- [{i}/{total}] Skipping {ct} (existing data) ---")
+                    self._log(f"--- [{i + 1}/{total}] Skipping {ct} (existing data) ---")
                     continue
-                print(f"\n▶ [{i}/{total}] Filtering: {ct}…", file=sys.stderr)
-                self._log(f"--- [{i}/{total}] Filtering: {ct} ---")
-                panel._persist()
-                panel._run_filtering_for(ct, overwrite=overwrite)
+                print(f"\n▶ [{i + 1}/{total}] Filtering: {ct}…", file=sys.stderr)
+                self._log(f"--- [{i + 1}/{total}] Filtering: {ct} ---")
+                panel._run_filtering_for(
+                    ct, overwrite=overwrite,
+                    params=panel_params[ct],
+                )
                 self._log(f"Done: {ct}")
+            if progress_cb is not None:
+                try:
+                    progress_cb(total, total, "done")
+                except Exception:
+                    pass
 
             self._log("✅ Batch filtering finished.")
             print(f"\n{'='*60}", file=sys.stderr)
             print(f"  ✅ Batch filtering complete", file=sys.stderr)
             print(f"{'='*60}\n", file=sys.stderr)
+            return None
 
-        except Exception as e:
-            traceback.print_exc()
-            self._log(f"❌ Batch filtering error: {e}")
+        if block:
+            try:
+                result = _do_batch(progress_cb=None)
+                fire_extra_callback(extra_callbacks, "on_done", result)
+            except Exception as e:
+                traceback.print_exc()
+                self._log(f"❌ Batch filtering error: {e}")
+                fire_extra_callback(extra_callbacks, "on_failed", str(e))
+            finally:
+                try:
+                    self.results_panel.refresh()
+                except Exception:
+                    traceback.print_exc()
+            return
+
+        def _on_done(result):
+            try:
+                self.results_panel.refresh()
+            except Exception:
+                traceback.print_exc()
+            fire_extra_callback(extra_callbacks, "on_done", result)
+
+        def _on_failed(err: str):
+            self._log(f"❌ Batch filtering error: {err}")
+            try:
+                self.results_panel.refresh()
+            except Exception:
+                traceback.print_exc()
+            fire_extra_callback(extra_callbacks, "on_failed", err)
+
+        self._bg.run(
+            fn=_do_batch,
+            desc=f"Batch filtering ({total} cell types)\u2026",
+            progress_row=self.progress_row,
+            buttons=[self.btn_run_batch],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )
