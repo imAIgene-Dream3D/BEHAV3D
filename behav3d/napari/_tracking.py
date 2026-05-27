@@ -3,6 +3,13 @@ BEHAV3D napari plugin – Tracking Tab.
 
 Provides per-cell-type sub-tabs with method selection (LAP / TrackPy / Propagation),
 method-specific parameters, and batch-tracking options.
+
+Run buttons execute backend tracking in a background ``QThread`` (via
+:class:`behav3d.napari._background_runner.BackgroundOperation`) so napari
+stays responsive.  Progress is forwarded to the per-tab
+:class:`ProgressBarRow` and the napari activity dock.  The queue keeps
+its existing synchronous behaviour by calling
+``run_batch_tracking(block=True)``.
 """
 import os
 import sys
@@ -17,11 +24,17 @@ from qtpy.QtWidgets import (
     QTabWidget, QGroupBox, QLabel, QPushButton,
     QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox,
     QScrollArea, QTextEdit, QStackedWidget,
-    QLineEdit, QFileDialog,
+    QLineEdit, QFileDialog, QMessageBox,
 )
 from qtpy.QtCore import Qt
 
 from behav3d.napari._widgets import make_help_row
+from behav3d.napari._background_runner import (
+    BackgroundOperation,
+    ProgressBarRow,
+    ThreadSafeLogger,
+    fire_extra_callback,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -411,7 +424,8 @@ class CellTypeTrackingPanel(QWidget):
 
     def __init__(self, cell_type: str, category: str, metadata_loader,
                  all_cell_types: list, category_types: list,
-                 log_callback=None, viewer=None, parent=None):
+                 log_callback=None, viewer=None, parent=None,
+                 tab_progress_row=None):
         super().__init__(parent)
         self.cell_type = cell_type
         self.category = category          # "organoid" / "immune" / "other"
@@ -421,6 +435,13 @@ class CellTypeTrackingPanel(QWidget):
         self.log = log_callback or print
         self.viewer = viewer
         self._toggle_all_organoids_callback = None  # set by TrackingTab for organoid panels
+
+        # Background-execution infrastructure (mirrors editing-mode pattern).
+        # The tab supplies a shared ProgressBarRow so all panels feed the
+        # same visual widget, but each panel owns its own BackgroundOperation
+        # so an in-progress run is tracked per-panel.
+        self.tab_progress_row = tab_progress_row
+        self._bg = BackgroundOperation(self)
 
         # Determine defaults
         if category == "organoid":
@@ -1056,9 +1077,73 @@ class CellTypeTrackingPanel(QWidget):
             return list(self.category_types)
         return [self.cell_type]
 
-    def _run_tracking_for(self, cell_type: str, overwrite: bool = False):
-        """Run tracking for a single cell type using current panel settings."""
-        method = self._get_method_key()
+    def collect_runtime_params(self) -> dict:
+        """Snapshot all per-method widget values into a thread-safe dict.
+
+        Called on the Qt thread before kicking off a background worker so
+        the worker never needs to touch a Qt widget.  Returns a plain
+        ``dict`` of primitive types that fully describes the tracking
+        configuration.
+        """
+        return {
+            "method": self._get_method_key(),
+            "lap": {
+                "track_cost": int(self.lap_track_cost.value()),
+                "gap_cost": int(self.lap_gap_cost.value()),
+                "gap_frames": int(self.lap_gap_frames.value()),
+                "merge_cost": int(self.lap_merge_cost.value()),
+                "split_cost": int(self.lap_split_cost.value()),
+            },
+            "trackpy": {
+                "search_range": int(self.tp_search_range.value()),
+                "memory": int(self.tp_memory.value()),
+                "adaptive_stop": float(self.tp_adaptive_stop.value()),
+                "adaptive_step": float(self.tp_adaptive_step.value()),
+            },
+            "btrack": {
+                "config_preset": self._bt_get_config_preset(),
+                "update_method_idx": int(self.bt_update_method.currentIndex()),
+                "use_visual_features": bool(self.bt_use_visual_features.isChecked()),
+                "max_search_radius": int(self.bt_max_search_radius.value()),
+                "step_size": int(self.bt_step_size.value()),
+                "n_workers": max(1, int(self.bt_n_workers.value())),
+                "use_optimize": bool(self.bt_use_optimize.isChecked()),
+                "hypotheses": list(self._bt_get_hypotheses()),
+                "dist_thresh": int(self.bt_dist_thresh.value()),
+                "time_thresh": int(self.bt_time_thresh.value()),
+            },
+        }
+
+    def _run_tracking_for(self, cell_type: str, overwrite: bool = False,
+                          params: dict = None, progress_cb=None):
+        """Run tracking for a single cell type.
+
+        Parameters
+        ----------
+        cell_type:
+            Cell type to track.
+        overwrite:
+            Whether to overwrite existing tracking outputs.
+        params:
+            Optional pre-collected snapshot from
+            :meth:`collect_runtime_params`.  When ``None`` (queue /
+            legacy path) the values are read from the Qt widgets — this
+            requires the call to happen on the Qt thread.  Pass a
+            snapshot when invoking from a background worker.
+        progress_cb:
+            Optional ``progress_cb(current, total, label)`` forwarded
+            to the backend so a GUI can drive a progress bar.
+
+        Returns
+        -------
+        pandas.DataFrame
+            The updated metadata frame.  Also assigned to
+            ``self.metadata_loader.metadata`` for compatibility with
+            existing synchronous callers (the queue path).
+        """
+        if params is None:
+            params = self.collect_runtime_params()
+        method = params["method"]
         metadata = self.metadata_loader.metadata
         out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
 
@@ -1068,68 +1153,79 @@ class CellTypeTrackingPanel(QWidget):
 
         if method == "lap":
             from behav3d.preprocessing.tracking.laptracking import run_laptracking
-            tc = int(self.lap_track_cost.value()) ** 2
-            gc = int(self.lap_gap_cost.value()) ** 2
-            mc = int(self.lap_merge_cost.value())
-            sc = int(self.lap_split_cost.value())
+            lap = params["lap"]
+            tc = int(lap["track_cost"]) ** 2
+            gc = int(lap["gap_cost"]) ** 2
+            mc = int(lap["merge_cost"])
+            sc = int(lap["split_cost"])
             new_md = run_laptracking(
                 metadata=metadata, output_dir=out_dir, cell_type=cell_type,
                 track_cost_cutoff=tc,
                 gap_closing_cost_cutoff=gc,
-                gap_closing_max_frame_count=int(self.lap_gap_frames.value()),
+                gap_closing_max_frame_count=int(lap["gap_frames"]),
                 merging_cost_cutoff=(mc ** 2 if mc > 0 else False),
                 splitting_cost_cutoff=(sc ** 2 if sc > 0 else False),
                 overwrite=overwrite,
+                progress_cb=progress_cb,
             )
 
         elif method == "trackpy":
             from behav3d.preprocessing.tracking.trackpy_tracking import run_trackpy_tracking_generic
+            tp = params["trackpy"]
             new_md = run_trackpy_tracking_generic(
                 metadata=metadata, output_dir=out_dir, cell_type=cell_type,
                 overwrite=overwrite,
-                search_range=int(self.tp_search_range.value()),
-                memory=int(self.tp_memory.value()),
-                adaptive_stop=float(self.tp_adaptive_stop.value()),
-                adaptive_step=float(self.tp_adaptive_step.value()),
-                log_callback=self.log,
+                search_range=int(tp["search_range"]),
+                memory=int(tp["memory"]),
+                adaptive_stop=float(tp["adaptive_stop"]),
+                adaptive_step=float(tp["adaptive_step"]),
+                log_callback=ThreadSafeLogger(self.log),
+                progress_cb=progress_cb,
             )
 
         elif method == "btrack":
             from behav3d.preprocessing.tracking.btrack_tracking import run_btracking
-            config_preset = self._bt_get_config_preset()
-            update_method = "APPROXIMATE" if self.bt_update_method.currentIndex() == 1 else "EXACT"
-            use_opt = self.bt_use_optimize.isChecked()
+            bt = params["btrack"]
+            update_method = "APPROXIMATE" if int(bt["update_method_idx"]) == 1 else "EXACT"
+            use_opt = bool(bt["use_optimize"])
             new_md = run_btracking(
                 metadata=metadata, output_dir=out_dir, cell_type=cell_type,
                 overwrite=overwrite,
-                config_preset=config_preset,
-                use_visual_features=bool(self.bt_use_visual_features.isChecked()),
-                max_search_radius=int(self.bt_max_search_radius.value()),
+                config_preset=bt["config_preset"],
+                use_visual_features=bool(bt["use_visual_features"]),
+                max_search_radius=int(bt["max_search_radius"]),
                 update_method=update_method,
-                step_size=int(self.bt_step_size.value()),
-                n_workers=max(1, int(self.bt_n_workers.value())),
+                step_size=int(bt["step_size"]),
+                n_workers=int(bt["n_workers"]),
                 use_optimize=use_opt,
-                hypotheses=self._bt_get_hypotheses() if use_opt else None,
-                dist_thresh=int(self.bt_dist_thresh.value()) if use_opt else None,
-                time_thresh=int(self.bt_time_thresh.value()) if use_opt else None,
-                log_callback=self.log,
+                hypotheses=list(bt["hypotheses"]) if use_opt else None,
+                dist_thresh=int(bt["dist_thresh"]) if use_opt else None,
+                time_thresh=int(bt["time_thresh"]) if use_opt else None,
+                log_callback=ThreadSafeLogger(self.log),
+                progress_cb=progress_cb,
             )
 
         else:  # propagation
             from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
             new_md = run_propagation_tracking(
                 metadata=metadata, output_dir=out_dir, cell_type=cell_type,
-                overwrite=overwrite
+                overwrite=overwrite,
+                progress_cb=progress_cb,
             )
 
         print(f"\u2705 {cell_type} tracking finished.", file=sys.stderr)
 
-        # Update shared metadata
+        # Update shared metadata.  Plain attribute assignment on a
+        # DataFrame holder is GIL-protected and the only writer is the
+        # active tracking call, so this is safe from the worker.  The
+        # caller's ``on_done`` may still re-assign on the Qt thread for
+        # parity with downstream code that observes the change there.
         self.metadata_loader.metadata = new_md
-        # Save updated metadata CSV
+        # Save updated metadata CSV (file I/O — safe off the Qt thread).
         csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
         if csv_path:
             new_md.to_csv(csv_path, sep=",", index=False)
+        return new_md
 
     def _check_existing_tracking(self, cell_types: list) -> list:
         """Return descriptions of existing tracking data that would be overwritten."""
@@ -1148,6 +1244,17 @@ class CellTypeTrackingPanel(QWidget):
         return warnings
 
     def _on_run_clicked(self):
+        """Run tracking for this cell type in the background.
+
+        The Qt-thread phase persists params, prompts for overwrite, and
+        snapshots the runtime params; the worker then runs the backend
+        with sample-level progress feedback; the ``on_done`` callback
+        fires the "switch to visualisation" prompt back on the Qt thread.
+        """
+        if self._bg.is_running():
+            self.log("⚠️ A tracking run is already in progress for this panel.")
+            return
+
         self._persist()
         method = self._get_method_key()
         self.log(f"Running {method.upper()} tracking for: {self.cell_type}")
@@ -1155,7 +1262,6 @@ class CellTypeTrackingPanel(QWidget):
         # Check for existing data across all samples
         existing = self._check_existing_tracking([self.cell_type])
 
-        overwrite = True
         if existing:
             from behav3d.napari._overwrite_prompt import prompt_overwrite_single
             choice = prompt_overwrite_single(
@@ -1166,25 +1272,43 @@ class CellTypeTrackingPanel(QWidget):
             if choice != "overwrite":
                 self.log(f"Tracking for {self.cell_type} cancelled.")
                 return
-            overwrite = True
+        overwrite = True
 
-        try:
-            self._run_tracking_for(self.cell_type, overwrite=overwrite)
+        # Snapshot all Qt widget values now — the worker must not touch them.
+        params = self.collect_runtime_params()
+        cell_type = self.cell_type
+
+        def _do_tracking(progress_cb=None):
+            return self._run_tracking_for(
+                cell_type, overwrite=overwrite,
+                params=params, progress_cb=progress_cb,
+            )
+
+        def _on_done(new_md):
+            # Metadata already updated inside _run_tracking_for; this
+            # callback is responsible for the post-run dialog only.
             self.log(f"\u2705 {self.cell_type} tracking finished.")
-            
-            # Show visualizer prompt
-            from qtpy.QtWidgets import QMessageBox
             res = QMessageBox.question(
                 self, "Tracking Finished",
-                f"Tracking for {self.cell_type} finished! \n\nDo you want to switch to the Visualization Tab and see the tracks?",
-                QMessageBox.Yes | QMessageBox.No
+                f"Tracking for {self.cell_type} finished! \n\n"
+                "Do you want to switch to the Visualization Tab and see the tracks?",
+                QMessageBox.Yes | QMessageBox.No,
             )
             if res == QMessageBox.Yes:
                 self._switch_to_viz_and_show_tracks()
 
-        except Exception as e:
-            traceback.print_exc()
-            self.log(f"Error during tracking: {e}")
+        def _on_failed(err: str):
+            self.log(f"Error during tracking: {err}")
+
+        self._bg.run(
+            fn=_do_tracking,
+            desc=f"Tracking {self.cell_type}…",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_run],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )
 
     def _switch_to_viz_and_show_tracks(self):
         """Utility to switch to visualization tab and enable track layers."""
@@ -1226,13 +1350,15 @@ class AllOrganoidsPropagationPanel(QWidget):
     """
 
     def __init__(self, organoid_types, metadata_loader, log_callback,
-                 viewer, toggle_callback, parent=None):
+                 viewer, toggle_callback, parent=None, tab_progress_row=None):
         super().__init__(parent)
         self.organoid_types = list(organoid_types)
         self.metadata_loader = metadata_loader
         self.log = log_callback or print
         self.viewer = viewer
         self._toggle_callback = toggle_callback
+        self.tab_progress_row = tab_progress_row
+        self._bg = BackgroundOperation(self)
         self._build_ui()
 
     def _build_ui(self):
@@ -1302,7 +1428,11 @@ class AllOrganoidsPropagationPanel(QWidget):
             self._toggle_callback(checked)
 
     def _on_run_clicked(self):
-        """Run propagation tracking for all organoid types at once."""
+        """Run propagation tracking for all organoid types in the background."""
+        if self._bg.is_running():
+            self.log("⚠️ All-organoids tracking is already in progress.")
+            return
+
         md = self.metadata_loader.metadata
         out_dir = self.metadata_loader.output_dir
         if md is None or not out_dir:
@@ -1333,24 +1463,34 @@ class AllOrganoidsPropagationPanel(QWidget):
             overwrite = (choice == "overwrite")
 
         types_str = ", ".join(self.organoid_types)
-        self.btn_run.setEnabled(False)
         self.btn_run.setText("\u23f3 Running\u2026")
-        try:
-            self.log(f"\u25b6 Propagation tracking \u2014 all organoids: {types_str}\u2026")
+        self.log(f"\u25b6 Propagation tracking \u2014 all organoids: {types_str}\u2026")
+
+        out_dir_str = str(out_path.expanduser())
+        first_ct = self.organoid_types[0]
+
+        def _do_all_organoids(progress_cb=None):
             from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
             new_md = run_propagation_tracking(
                 metadata=md,
-                output_dir=str(out_path.expanduser()),
-                cell_type=self.organoid_types[0],
+                output_dir=out_dir_str,
+                cell_type=first_ct,
                 overwrite=overwrite,
                 all_organoids=True,
+                progress_cb=progress_cb,
             )
-            self.metadata_loader.metadata = new_md
+            # Persist to CSV from the worker — file I/O is safe off the
+            # Qt thread.  metadata_loader.metadata is reassigned in
+            # _on_done so the change is observed on the Qt thread.
             csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
             if csv_path:
                 new_md.to_csv(csv_path, sep=",", index=False)
-            self.log("\u2705 All organoids propagation tracking finished.")
+            return new_md
 
+        def _on_done(new_md):
+            self.metadata_loader.metadata = new_md
+            self.log("\u2705 All organoids propagation tracking finished.")
+            self.btn_run.setText(f"\u25b6  Run All Organoids Tracking  ({types_str})")
             res = QMessageBox.question(
                 self, "Tracking Finished",
                 "All organoid types tracked successfully!\n\n"
@@ -1359,12 +1499,20 @@ class AllOrganoidsPropagationPanel(QWidget):
             )
             if res == QMessageBox.Yes:
                 self._switch_to_viz()
-        except Exception as e:
-            traceback.print_exc()
-            self.log(f"\u274c Error during all-organoids tracking: {e}")
-        finally:
-            self.btn_run.setEnabled(True)
+
+        def _on_failed(err: str):
+            self.log(f"\u274c Error during all-organoids tracking: {err}")
             self.btn_run.setText(f"\u25b6  Run All Organoids Tracking  ({types_str})")
+
+        self._bg.run(
+            fn=_do_all_organoids,
+            desc="Tracking all organoids\u2026",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_run],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )
 
     def _switch_to_viz(self):
         parent = self.parent()
@@ -1393,7 +1541,8 @@ class MulticolorTrackingPanel(QWidget):
     """
 
     def __init__(self, base_name: str, channel_types: list, category: str,
-                 metadata_loader, log_callback=None, viewer=None, parent=None):
+                 metadata_loader, log_callback=None, viewer=None, parent=None,
+                 tab_progress_row=None):
         super().__init__(parent)
         self.base_name = base_name
         self.channel_types = sorted(channel_types)
@@ -1401,6 +1550,7 @@ class MulticolorTrackingPanel(QWidget):
         self.metadata_loader = metadata_loader
         self.log = log_callback or print
         self.viewer = viewer
+        self.tab_progress_row = tab_progress_row
 
         # Inner panel drives the shared parameter UI; keyed to first channel
         # so saved config is stored/loaded under that channel name.
@@ -1413,6 +1563,7 @@ class MulticolorTrackingPanel(QWidget):
             category_types=list(channel_types),
             log_callback=log_callback,
             viewer=viewer,
+            tab_progress_row=tab_progress_row,
         )
 
         self._build_ui()
@@ -1472,15 +1623,53 @@ class MulticolorTrackingPanel(QWidget):
             except Exception as e:
                 self.log(f"Warning: Could not save parameters: {e}")
 
-    def run_tracking(self, overwrite: bool = False):
-        """Track each channel then merge into <base_name>_merged."""
+    def run_tracking(self, overwrite: bool = False, params: dict = None,
+                     progress_cb=None):
+        """Track each channel then merge into ``<base_name>_merged``.
+
+        ``params`` is an optional Qt-thread-safe snapshot from
+        :meth:`CellTypeTrackingPanel.collect_runtime_params`.  When
+        ``None`` the inner panel's widget values are read directly (only
+        safe on the Qt thread).  ``progress_cb`` drives a global
+        per-channel-per-sample progress bar.
+        """
         n = len(self.channel_types)
         merged_name = f"{self.base_name}_merged"
 
-        for i, ch in enumerate(self.channel_types, 1):
-            self.log(f"  Multicolor [{i}/{n}] Tracking channel: {ch}…")
-            print(f"\n  Multicolor [{i}/{n}] Tracking: {ch}", file=sys.stderr)
-            self._inner_panel._run_tracking_for(ch, overwrite=overwrite)
+        # Wrap per-channel progress into a global counter so the bar runs
+        # linearly across all channels rather than restarting.
+        per_channel_total = [0] * n  # filled in lazily by the first tick
+        completed = [0]
+
+        def _make_channel_cb(channel_idx, channel_name):
+            def _cb(curr, total, label):
+                per_channel_total[channel_idx] = max(per_channel_total[channel_idx], int(total))
+                # Estimated grand total assumes equal samples per channel;
+                # we refine as new channels report their totals.
+                if all(t > 0 for t in per_channel_total[: channel_idx + 1]):
+                    avg_per_ch = sum(per_channel_total[: channel_idx + 1]) / (channel_idx + 1)
+                    grand_total = int(round(avg_per_ch * n))
+                else:
+                    grand_total = max(int(total) * n, 1)
+                global_curr = completed[0] + int(curr)
+                if progress_cb is not None:
+                    try:
+                        progress_cb(global_curr, grand_total,
+                                    f"{channel_name} ({channel_idx + 1}/{n}): {label}")
+                    except Exception:
+                        pass
+            return _cb
+
+        for i, ch in enumerate(self.channel_types):
+            self.log(f"  Multicolor [{i + 1}/{n}] Tracking channel: {ch}…")
+            print(f"\n  Multicolor [{i + 1}/{n}] Tracking: {ch}", file=sys.stderr)
+            self._inner_panel._run_tracking_for(
+                ch,
+                overwrite=overwrite,
+                params=params,
+                progress_cb=_make_channel_cb(i, ch),
+            )
+            completed[0] += per_channel_total[i] if per_channel_total[i] else 0
             self.log(f"  Done: {ch}")
 
         self.log(f"  Merging {n} channels → {merged_name}…")
@@ -1506,6 +1695,7 @@ class MulticolorTrackingPanel(QWidget):
             traceback.print_exc()
             self.log(f"  ❌ Merge failed: {e}")
             raise
+        return self.metadata_loader.metadata
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1518,6 +1708,9 @@ class TrackingTab(QWidget):
         self.metadata_loader = metadata_loader
         self.panels: dict[str, CellTypeTrackingPanel] = {}
         self._multicolor_panels: dict[str, MulticolorTrackingPanel] = {}
+
+        # Background-execution infrastructure for the batch-run button.
+        self._bg = BackgroundOperation(self)
 
         self._init_ui()
 
@@ -1576,6 +1769,11 @@ class TrackingTab(QWidget):
         self.btn_run_batch.setVisible(False)
         self.btn_queue_track.setVisible(False)
 
+        # Shared progress row — every Run button on this tab feeds this
+        # single widget.  Hidden until a run is active.
+        self.progress_row = ProgressBarRow()
+        layout.addWidget(self.progress_row)
+
         # Log window
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -1603,6 +1801,42 @@ class TrackingTab(QWidget):
     def _on_metadata_updated(self):
         self._log("Metadata updated — refreshing tracking tabs…")
         self._rebuild_tabs()
+
+    # ------------------------------------------------------------------
+    def request_tab_exit(self) -> bool:
+        """Block tab switching while a background tracking run is in flight."""
+        from qtpy.QtWidgets import QMessageBox
+
+        if self._bg.is_running():
+            QMessageBox.information(
+                self,
+                "Operation in progress",
+                "A tracking run is still in progress. Please wait for it "
+                "to finish before switching tabs.",
+            )
+            return False
+        for panel in list(self.panels.values()) + list(self._multicolor_panels.values()):
+            bg = getattr(panel, "_bg", None)
+            if bg is not None and bg.is_running():
+                QMessageBox.information(
+                    self,
+                    "Operation in progress",
+                    "A tracking run is still in progress. Please wait for "
+                    "it to finish before switching tabs.",
+                )
+                return False
+        all_org = getattr(self, "_all_organoids_panel", None)
+        if all_org is not None:
+            bg = getattr(all_org, "_bg", None)
+            if bg is not None and bg.is_running():
+                QMessageBox.information(
+                    self,
+                    "Operation in progress",
+                    "A tracking run is still in progress. Please wait for "
+                    "it to finish before switching tabs.",
+                )
+                return False
+        return True
 
     def _detect_cell_types(self):
         from behav3d.core.metadata import (
@@ -1677,6 +1911,7 @@ class TrackingTab(QWidget):
                 log_callback=self._log,
                 viewer=self.viewer,
                 toggle_callback=self._on_all_organoids_toggled,
+                tab_progress_row=self.progress_row,
             )
             self.cell_tabs.addTab(self._all_organoids_panel, "🟣 All Organoids")
         else:
@@ -1687,6 +1922,7 @@ class TrackingTab(QWidget):
                     all_cell_types=all_types, category_types=org_standalone,
                     log_callback=self._log,
                     viewer=self.viewer,
+                    tab_progress_row=self.progress_row,
                 )
                 panel._toggle_all_organoids_callback = self._on_all_organoids_toggled
                 self.panels[ct] = panel
@@ -1698,6 +1934,7 @@ class TrackingTab(QWidget):
                 base_name=base, channel_types=channels, category="organoid",
                 metadata_loader=self.metadata_loader,
                 log_callback=self._log, viewer=self.viewer,
+                tab_progress_row=self.progress_row,
             )
             self._multicolor_panels[base] = panel
             self.cell_tabs.addTab(panel, f"🟣 {base.capitalize()} (multicolor)")
@@ -1710,6 +1947,7 @@ class TrackingTab(QWidget):
                 all_cell_types=all_types, category_types=imm_standalone,
                 log_callback=self._log,
                 viewer=self.viewer,
+                tab_progress_row=self.progress_row,
             )
             self.panels[ct] = panel
             self.cell_tabs.addTab(panel, f"🔵 {ct.capitalize()}")
@@ -1720,6 +1958,7 @@ class TrackingTab(QWidget):
                 base_name=base, channel_types=channels, category="immune",
                 metadata_loader=self.metadata_loader,
                 log_callback=self._log, viewer=self.viewer,
+                tab_progress_row=self.progress_row,
             )
             self._multicolor_panels[base] = panel
             self.cell_tabs.addTab(panel, f"🔵 {base.capitalize()} (multicolor)")
@@ -1732,6 +1971,7 @@ class TrackingTab(QWidget):
                 all_cell_types=all_types, category_types=oth_standalone,
                 log_callback=self._log,
                 viewer=self.viewer,
+                tab_progress_row=self.progress_row,
             )
             self.panels[ct] = panel
             self.cell_tabs.addTab(panel, f"🟡 {ct.capitalize()}")
@@ -1742,6 +1982,7 @@ class TrackingTab(QWidget):
                 base_name=base, channel_types=channels, category="other",
                 metadata_loader=self.metadata_loader,
                 log_callback=self._log, viewer=self.viewer,
+                tab_progress_row=self.progress_row,
             )
             self._multicolor_panels[base] = panel
             self.cell_tabs.addTab(panel, f"🟡 {base.capitalize()} (multicolor)")
@@ -1763,13 +2004,33 @@ class TrackingTab(QWidget):
         self._rebuild_tabs()
 
     def _on_run_batch_clicked(self):
-        self.run_batch_tracking(interactive=True)
+        """User-triggered batch run — runs asynchronously."""
+        self.run_batch_tracking(interactive=True, block=False)
 
-    def run_batch_tracking(self, interactive=True, skip_existing=False):
+    def run_batch_tracking(self, interactive=True, skip_existing=False, block=True,
+                           extra_callbacks=None):
         """Sequential run for all configured cell type panels.
-        When interactive=False, skips overwrite and visualization dialogs."""
+
+        When ``interactive=False``, skips overwrite and visualization
+        dialogs (this is what the processing queue uses).
+
+        When ``block=True`` (default) everything runs synchronously on
+        the caller's thread — required by the processing queue which
+        iterates steps sequentially.  When ``block=False`` the heavy
+        work is moved to a background worker (used by the GUI batch
+        button) so napari stays interactive and a progress bar is shown.
+
+        ``extra_callbacks`` is the queue's chaining hook
+        (``{"on_done": cb, "on_failed": cb}``).
+        """
         if not self.panels and not self._multicolor_panels and not self._all_organoids_panel:
             self._log("No cell type panels to track.")
+            fire_extra_callback(extra_callbacks, "on_failed", "no cell type panels")
+            return
+
+        if not block and self._bg.is_running():
+            self._log("⚠️ A batch tracking run is already in progress.")
+            fire_extra_callback(extra_callbacks, "on_failed", "already running")
             return
 
         all_organoids_mode = self._all_organoids_panel is not None
@@ -1818,6 +2079,7 @@ class TrackingTab(QWidget):
             )
             if choice == "cancel":
                 self._log("Batch tracking cancelled by user.")
+                fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
                 return
             skip_existing_flag = (choice == "skip")
             overwrite = not skip_existing_flag
@@ -1828,7 +2090,50 @@ class TrackingTab(QWidget):
         for base, mc_panel in self._multicolor_panels.items():
             mc_panel._persist()
 
-        try:
+        # Snapshot every panel's Qt widget state so the worker thread
+        # never has to read from Qt (only safe to read widgets here).
+        panel_params: dict[str, dict] = {
+            ct: panel.collect_runtime_params() for ct, panel in self.panels.items()
+        }
+        mc_params: dict[str, dict] = {
+            base: mc_panel._inner_panel.collect_runtime_params()
+            for base, mc_panel in self._multicolor_panels.items()
+        }
+
+        # Cell-type-level progress: one "step" per cell-type panel.  We
+        # scale each step into 100 sub-units so the activity dock can
+        # estimate ETA from sample-level ticks within a step.
+        steps_total = total  # noqa: F841 (kept for readability / future use)
+        steps_done = [0]
+
+        def _do_batch(progress_cb=None):
+            """Worker function.  ``progress_cb`` is None in block=True mode."""
+
+            def _step_progress(step_idx, label_prefix):
+                """Make a per-step progress wrapper that scales to the
+                global bar.  ``step_idx`` is 0-based for the current
+                step that's executing."""
+                def _cb(curr, sub_total, label):
+                    if progress_cb is None:
+                        return
+                    full_label = f"{label_prefix}: {label}" if label else label_prefix
+                    # Per-step sub-progress contributes a fractional
+                    # advance on top of completed steps.
+                    if sub_total and sub_total > 0:
+                        frac = min(max(curr / sub_total, 0.0), 1.0)
+                    else:
+                        frac = 0.0
+                    # Scale: each step is one "unit"; show progress in
+                    # 100ths to surface ETA via the activity dock.
+                    SCALE = 100
+                    grand = steps_total * SCALE
+                    val = step_idx * SCALE + int(frac * SCALE)
+                    try:
+                        progress_cb(val, grand, full_label)
+                    except Exception:
+                        pass
+                return _cb
+
             # ── All-organoids propagation (single step) ─────────────
             organoids_done = set()
             if all_organoids_mode and self._organoid_types:
@@ -1848,6 +2153,9 @@ class TrackingTab(QWidget):
                         cell_type=first_org_ct,
                         overwrite=overwrite,
                         all_organoids=True,
+                        progress_cb=_step_progress(
+                            steps_done[0], "all organoids"
+                        ) if progress_cb is not None else None,
                     )
                     self.metadata_loader.metadata = new_md
                     csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
@@ -1856,22 +2164,28 @@ class TrackingTab(QWidget):
 
                     self._log(f"Done: all organoids propagation tracking")
                     organoids_done = set(self._organoid_types)
+                    steps_done[0] += len(self._organoid_types)
                 else:
                     self._log("All organoid tracking data already exists — skipping.")
                     organoids_done = set(self._organoid_types)
+                    steps_done[0] += len(self._organoid_types)
 
-            # ── Per-cell-type tracking (non-organoids or individual organoids) ──
-            step = len(organoids_done)
+            # ── Per-cell-type tracking ──────────────────────────────
             for i, (ct, panel) in enumerate(self.panels.items(), 1):
                 if ct in organoids_done:
                     continue
                 if skip_existing_flag and ct in existing_cts:
-                    self._log(f"--- [{i}/{total}] Skipping {ct} (existing data) ---")
+                    self._log(f"--- Skipping {ct} (existing data) ---")
+                    steps_done[0] += 1
                     continue
-                step += 1
-                print(f"\n▶ [{step}/{total}] Tracking {ct}...", file=sys.stderr)
-                self._log(f"--- [{step}/{total}] Tracking {ct} ---")
-                panel._run_tracking_for(ct, overwrite=overwrite)
+                print(f"\n▶ [{steps_done[0] + 1}/{total}] Tracking {ct}...", file=sys.stderr)
+                self._log(f"--- [{steps_done[0] + 1}/{total}] Tracking {ct} ---")
+                panel._run_tracking_for(
+                    ct, overwrite=overwrite,
+                    params=panel_params.get(ct),
+                    progress_cb=_step_progress(steps_done[0], ct)
+                    if progress_cb is not None else None,
+                )
 
                 # Verify tracked outputs exist for this cell type after tracking.
                 missing_outputs = []
@@ -1888,18 +2202,24 @@ class TrackingTab(QWidget):
                         + ", ".join(missing_outputs)
                     )
                 self._log(f"Done: {ct}")
+                steps_done[0] += 1
 
             # ── Multicolor groups (track channels + auto-merge) ───────
             for base, mc_panel in self._multicolor_panels.items():
-                step += 1
                 merged_name = f"{base}_merged"
-                print(f"\n▶ [{step}/{total}] Multicolor tracking: {base} "
+                print(f"\n▶ [{steps_done[0] + 1}/{total}] Multicolor tracking: {base} "
                       f"({len(mc_panel.channel_types)} channels + merge)…",
                       file=sys.stderr)
-                self._log(f"--- [{step}/{total}] Multicolor tracking: {base} "
+                self._log(f"--- [{steps_done[0] + 1}/{total}] Multicolor tracking: {base} "
                           f"({', '.join(mc_panel.channel_types)}) → {merged_name} ---")
-                mc_panel.run_tracking(overwrite=overwrite)
+                mc_panel.run_tracking(
+                    overwrite=overwrite,
+                    params=mc_params.get(base),
+                    progress_cb=_step_progress(steps_done[0], f"multicolor {base}")
+                    if progress_cb is not None else None,
+                )
                 self._log(f"Done: {base} (channels tracked + merged → {merged_name})")
+                steps_done[0] += 1
 
             # Persist final metadata state after full batch execution.
             csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
@@ -1909,30 +2229,60 @@ class TrackingTab(QWidget):
                     self._log("Saved metadata CSV after batch tracking.")
                 except Exception as e:
                     self._log(f"⚠️ Could not save metadata CSV after batch tracking: {e}")
-            
+
             self._log("\u2705 Batch tracking finished.")
             print(f"\n{'='*60}", file=sys.stderr)
             print(f"  \u2705 Batch tracking complete", file=sys.stderr)
             print(f"{'='*60}\n", file=sys.stderr)
+            return self.metadata_loader.metadata
 
+        # ── Dispatch: synchronous (queue) or async (GUI button) ─────
+        if block:
+            try:
+                result = _do_batch(progress_cb=None)
+                if interactive:
+                    self._prompt_switch_to_viz_after_batch()
+                fire_extra_callback(extra_callbacks, "on_done", result)
+            except Exception as e:
+                traceback.print_exc()
+                self._log(f"\u274c Batch tracking error: {e}")
+                fire_extra_callback(extra_callbacks, "on_failed", str(e))
+            return
+
+        def _on_done(result):
             if interactive:
-                from qtpy.QtWidgets import QMessageBox
-                res = QMessageBox.question(
-                    self, "Batch Tracking Finished",
-                    "Successfully tracked all cell types! \n\nDo you want to switch to the Visualization Tab and see the tracks?",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                if res == QMessageBox.Yes:
-                    first_panel = (
-                        next(iter(self.panels.values()), None)
-                        or next(
-                            (p._inner_panel for p in self._multicolor_panels.values()),
-                            None,
-                        )
-                    )
-                    if first_panel is not None:
-                        first_panel._switch_to_viz_and_show_tracks()
+                self._prompt_switch_to_viz_after_batch()
+            fire_extra_callback(extra_callbacks, "on_done", result)
 
-        except Exception as e:
-            traceback.print_exc()
-            self._log(f"\u274c Batch tracking error: {e}")
+        def _on_failed(err: str):
+            self._log(f"\u274c Batch tracking error: {err}")
+            fire_extra_callback(extra_callbacks, "on_failed", err)
+
+        self._bg.run(
+            fn=_do_batch,
+            desc=f"Batch tracking ({total} cell types)\u2026",
+            progress_row=self.progress_row,
+            buttons=[self.btn_run_batch],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )
+
+    def _prompt_switch_to_viz_after_batch(self):
+        """Post-batch dialog: offer to jump to the Visualization tab."""
+        res = QMessageBox.question(
+            self, "Batch Tracking Finished",
+            "Successfully tracked all cell types! \n\n"
+            "Do you want to switch to the Visualization Tab and see the tracks?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if res == QMessageBox.Yes:
+            first_panel = (
+                next(iter(self.panels.values()), None)
+                or next(
+                    (p._inner_panel for p in self._multicolor_panels.values()),
+                    None,
+                )
+            )
+            if first_panel is not None:
+                first_panel._switch_to_viz_and_show_tracks()

@@ -36,6 +36,11 @@ from behav3d.napari._results_panel import (
     ResultsPanel,
     notify_results_changed,
 )
+from behav3d.napari._background_runner import (
+    BackgroundOperation,
+    ProgressBarRow,
+    fire_extra_callback,
+)
 
 # Colormaps for raw channel layers (same order as the Visualization tab)
 _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
@@ -691,6 +696,7 @@ class CellTypeFeaturePanel(QWidget):
         is_organoid: bool = False,
         threshold_getter=None,
         parent=None,
+        tab_progress_row=None,
     ):
         super().__init__(parent)
         self.cell_type = cell_type
@@ -703,6 +709,9 @@ class CellTypeFeaturePanel(QWidget):
         self._is_organoid = is_organoid
         self._threshold_getter = threshold_getter  # kept for backward compat
         self._preview_connected = False
+        # Background-execution infrastructure.
+        self.tab_progress_row = tab_progress_row
+        self._bg = BackgroundOperation(self)
         # List of organoid cell types (set by FeatureExtractionTab for org panels)
         self._org_cell_types: list = []
 
@@ -1473,31 +1482,46 @@ class CellTypeFeaturePanel(QWidget):
             traceback.print_exc()
             self.log(f"Error during death re-run: {e}")
 
-    def _run_feature_extraction_for(self, cell_type: str, overwrite: bool = False):
-        """Run feature extraction for a single cell type."""
+    def _run_feature_extraction_for(self, cell_type: str, overwrite: bool = False,
+                                    params: dict = None, progress_cb=None):
+        """Run feature extraction for a single cell type.
+
+        ``params`` is an optional Qt-thread-safe snapshot from
+        :meth:`_collect_params`; when supplied the widget values are not
+        re-read (required when called from a background worker).
+        ``progress_cb`` is forwarded to ``run_feature_extraction``.
+        """
         from behav3d.features.timepoint_features import run_feature_extraction
 
         out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
-        dead_thr = self._get_threshold()
-        dead_mask_pct = dead_thr if dead_thr > 0 else None
+        if params is None:
+            params = self._collect_params()
 
         run_feature_extraction(
             metadata=self.metadata_loader.metadata,
             output_dir=out_dir,
             cell_type=cell_type,
-            features_choice=self._selected_features(),
-            contact_threshold=float(self.contact_threshold.value()),
-            dead_mask_percentage_threshold=dead_mask_pct,
-            n_workers=int(self.spin_workers.value()),
+            features_choice=list(params["features_choice"]),
+            contact_threshold=float(params["contact_threshold"]),
+            dead_mask_percentage_threshold=params["dead_mask_percentage_threshold"],
+            n_workers=int(params["n_workers"]),
             overwrite=overwrite,
+            progress_cb=progress_cb,
         )
 
-    def _run_death_only_for(self, cell_type: str):
-        """Re-apply only the death classification without recomputing features."""
+    def _run_death_only_for(self, cell_type: str, params: dict = None):
+        """Re-apply only the death classification without recomputing features.
+
+        ``params`` is an optional snapshot from :meth:`_collect_params`;
+        when supplied the threshold widget is not re-read.
+        """
         from behav3d.features.timepoint_features import rerun_death_classification
 
         out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
-        new_thr = self._get_threshold()
+        if params is not None:
+            new_thr = params["dead_mask_percentage_threshold"] or 0.0
+        else:
+            new_thr = self._get_threshold()
         if new_thr <= 0:
             self.log(
                 f"\u26a0\ufe0f Skipping death-only re-run for {cell_type}: "
@@ -1522,8 +1546,18 @@ class CellTypeFeaturePanel(QWidget):
 
     # ── Click handler ────────────────────────────────────────────────────────
     def _on_run_clicked(self, interactive=True):
+        """Background-execute feature extraction for this cell type.
+
+        Sample-level progress is forwarded from ``run_feature_extraction``.
+        The death-only re-run path uses indeterminate progress because
+        ``rerun_death_classification`` has no top-level sample loop.
+        """
         from behav3d.napari._overwrite_prompt import prompt_overwrite_single
         from qtpy.QtWidgets import QMessageBox as _QMB
+
+        if self._bg.is_running():
+            self.log("⚠️ A feature-extraction run is already in progress for this panel.")
+            return
 
         self.log(f"Running feature extraction for: {self.cell_type}")
 
@@ -1559,31 +1593,61 @@ class CellTypeFeaturePanel(QWidget):
             else:
                 overwrite = True
 
+        # Persist + snapshot widget state on the Qt thread.
+        self._persist()
+        params_snapshot = self._collect_params()
+        cell_type = self.cell_type
+
         if death_only:
-            try:
-                self._persist()
-                self._run_death_only_for(self.cell_type)
-                self.log(
-                    f"\u2705 {self.cell_type} death re-run finished."
-                )
+            def _do_death_only(progress_cb=None):
+                return self._run_death_only_for(cell_type, params=params_snapshot)
+
+            def _on_done(_r):
+                self.log(f"\u2705 {cell_type} death re-run finished.")
                 _notify_post_extraction(self)
-            except Exception as e:
-                traceback.print_exc()
-                self.log(f"Error during death re-run: {e}")
-            finally:
                 notify_results_changed(self)
+
+            def _on_failed(err: str):
+                self.log(f"Error during death re-run: {err}")
+                notify_results_changed(self)
+
+            self._bg.run(
+                fn=_do_death_only,
+                desc=f"Death re-run \u2014 {cell_type}\u2026",
+                progress_row=self.tab_progress_row,
+                buttons=[self.btn_run],
+                viewer=self.viewer,
+                on_done=_on_done,
+                on_failed=_on_failed,
+                inject_progress=False,
+                indeterminate=True,
+            )
             return
 
-        try:
-            self._persist()
-            self._run_feature_extraction_for(self.cell_type, overwrite=overwrite)
-            self.log(f"✅ {self.cell_type} feature extraction finished.")
+        def _do_extraction(progress_cb=None):
+            return self._run_feature_extraction_for(
+                cell_type, overwrite=overwrite,
+                params=params_snapshot, progress_cb=progress_cb,
+            )
+
+        def _on_done(_r):
+            self.log(f"✅ {cell_type} feature extraction finished.")
             _notify_post_extraction(self)
-        except Exception as e:
-            traceback.print_exc()
-            self.log(f"Error during feature extraction: {e}")
-        finally:
             notify_results_changed(self)
+
+        def _on_failed(err: str):
+            self.log(f"Error during feature extraction: {err}")
+            notify_results_changed(self)
+
+        self._bg.run(
+            fn=_do_extraction,
+            desc=f"Feature extraction \u2014 {cell_type}\u2026",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_run],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )
 
     # ── Non-organoid Dead Threshold Preview ──────────────────────────────────
     # -- Dead Threshold Preview (all panel types) -------------------------
@@ -1924,6 +1988,7 @@ class ActiveKillingPanel(QWidget):
         log_callback=None,
         queue_callback=None,
         parent=None,
+        tab_progress_row=None,
     ):
         super().__init__(parent)
         self.immune_types = list(immune_types)
@@ -1931,6 +1996,9 @@ class ActiveKillingPanel(QWidget):
         self.viewer = viewer
         self.log = log_callback or (lambda m: None)
         self._queue_callback = queue_callback
+        # Background-execution infrastructure.
+        self.tab_progress_row = tab_progress_row
+        self._bg = BackgroundOperation(self)
         self._init_ui()
 
     # ── UI ──────────────────────────────────────────────────────────────────
@@ -2217,8 +2285,12 @@ class ActiveKillingPanel(QWidget):
 
     # ── Run ──────────────────────────────────────────────────────────────────
     def _on_run_clicked(self):
+        """Run Active Killing Analysis in the background (indeterminate)."""
         self._validate()
         if not self.btn_run.isEnabled():
+            return
+        if self._bg.is_running():
+            self.log("\u26a0\ufe0f An active killing run is already in progress.")
             return
 
         from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
@@ -2232,18 +2304,20 @@ class ActiveKillingPanel(QWidget):
             self.log("\u26a0\ufe0f No organoid target types detected \u2014 cannot run active killing analysis.")
             return
 
-        self.btn_run.setEnabled(False)
         self.btn_run.setText("\u23f3 Running\u2026")
-        try:
-            self.log(
-                f"\u25b6 Active Killing Analysis: {immune} vs {target_types}  "
-                f"(window={params['observation_window']}, "
-                f"signal={params['death_signal_column']}, "
-                f"multiplier={params['killing_threshold_multiplier']})\u2026"
-            )
+        self.log(
+            f"\u25b6 Active Killing Analysis: {immune} vs {target_types}  "
+            f"(window={params['observation_window']}, "
+            f"signal={params['death_signal_column']}, "
+            f"multiplier={params['killing_threshold_multiplier']})\u2026"
+        )
+
+        output_dir_str = str(self.metadata_loader.output_dir)
+
+        def _do_active_killing(progress_cb=None):
             df_killing, df_summary, stats = run_active_killing_analysis(
                 metadata=md,
-                output_dir=str(self.metadata_loader.output_dir),
+                output_dir=output_dir_str,
                 immune_cell_type=immune,
                 target_cell_types=target_types,
                 observation_window=params["observation_window"],
@@ -2253,6 +2327,10 @@ class ActiveKillingPanel(QWidget):
                 min_contact_duration=params["min_contact_duration"],
                 save_results=True,
             )
+            return (df_killing, df_summary, stats)
+
+        def _on_done(result):
+            df_killing, _df_summary, stats = result
             results_dir = self._active_killing_dir(immune)
             self._save_plots(df_killing, immune, results_dir)
             n_active = int(stats.get("total_active_killing_timepoints", 0))
@@ -2261,14 +2339,24 @@ class ActiveKillingPanel(QWidget):
                 f"\u2705 Active Killing Analysis complete \u2014 "
                 f"{n_active} active killing timepoints ({rate:.1%} of contact timepoints)."
             )
-            self._offer_open_folder(results_dir)
-        except Exception as e:
-            import traceback as _tb
-            _tb.print_exc()
-            self.log(f"\u274c Active Killing Analysis error: {e}")
-        finally:
-            self.btn_run.setEnabled(True)
             self.btn_run.setText("\u25b6  Run Active Killing Analysis")
+            self._offer_open_folder(results_dir)
+
+        def _on_failed(err: str):
+            self.log(f"\u274c Active Killing Analysis error: {err}")
+            self.btn_run.setText("\u25b6  Run Active Killing Analysis")
+
+        self._bg.run(
+            fn=_do_active_killing,
+            desc=f"Active Killing \u2014 {immune}\u2026",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_run],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+            inject_progress=False,
+            indeterminate=True,
+        )
 
     # ── Plot saving ───────────────────────────────────────────────────────────
     def _save_plots(self, df_killing, immune: str, results_dir: Path):
@@ -2311,10 +2399,20 @@ class ActiveKillingPanel(QWidget):
             except ValueError:
                 self.log(f"  📊 Saved: {combined_path}")
 
-    def run_analysis(self, interactive: bool = True):
-        """Run Active Killing analysis, optionally suppressing completion prompts."""
+    def run_analysis(self, interactive: bool = True, extra_callbacks=None):
+        """Synchronous Active Killing analysis used by the processing queue.
+
+        Kept blocking on purpose: the queue iterates steps serially and
+        relies on each step completing before moving on.  GUI button
+        clicks go through :meth:`_on_run_clicked` instead, which routes
+        through ``BackgroundOperation`` for napari responsiveness.
+
+        ``extra_callbacks`` is the queue's chaining hook fired once the
+        synchronous analysis finishes.
+        """
         self._validate()
         if not self.btn_run.isEnabled():
+            fire_extra_callback(extra_callbacks, "on_failed", "run button disabled")
             return
 
         from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
@@ -2326,6 +2424,7 @@ class ActiveKillingPanel(QWidget):
         target_types = detect_organoid_types_from_metadata(md)
         if not target_types:
             self.log("⚠️ No organoid target types detected — cannot run active killing analysis.")
+            fire_extra_callback(extra_callbacks, "on_failed", "no organoid target types")
             return
 
         self.btn_run.setEnabled(False)
@@ -2361,10 +2460,12 @@ class ActiveKillingPanel(QWidget):
             )
             if interactive:
                 self._offer_open_folder(results_dir)
+            fire_extra_callback(extra_callbacks, "on_done", (df_killing, df_summary, stats))
         except Exception as e:
             import traceback as _tb
             _tb.print_exc()
             self.log(f"❌ Active Killing Analysis error: {e}")
+            fire_extra_callback(extra_callbacks, "on_failed", str(e))
         finally:
             self.btn_run.setEnabled(True)
             if hasattr(self, "btn_queue"):
@@ -2534,6 +2635,9 @@ class FeatureExtractionTab(QWidget):
         self.panels: dict[str, CellTypeFeaturePanel] = {}
         self._queue_panel = None
 
+        # Background-execution infrastructure for batch + active-killing.
+        self._bg = BackgroundOperation(self)
+
         # Track which cell types are organoids (needed for sync)
         self._org_types: list = []
 
@@ -2652,6 +2756,10 @@ class FeatureExtractionTab(QWidget):
         self.btn_run_batch.setVisible(False)
         self.btn_queue_feature.setVisible(False)
 
+        # Shared progress row fed by every Run button on this tab.
+        self.progress_row = ProgressBarRow()
+        layout.addWidget(self.progress_row)
+
         # -- Active Killing Extended Analysis (collapsible) --------------------------
         # Panel body is hidden by default; user clicks the toggle to expand.
         self._ak_toggle_label_base = (
@@ -2712,6 +2820,41 @@ class FeatureExtractionTab(QWidget):
     def _on_metadata_updated(self):
         self._log("Metadata updated — refreshing feature extraction tabs…")
         self._rebuild_tabs()
+
+    def request_tab_exit(self) -> bool:
+        """Block tab switching while a background feature run is in flight."""
+        from qtpy.QtWidgets import QMessageBox
+
+        if self._bg.is_running():
+            QMessageBox.information(
+                self,
+                "Operation in progress",
+                "A feature extraction run is still in progress. Please "
+                "wait for it to finish before switching tabs.",
+            )
+            return False
+        for panel in self.panels.values():
+            bg = getattr(panel, "_bg", None)
+            if bg is not None and bg.is_running():
+                QMessageBox.information(
+                    self,
+                    "Operation in progress",
+                    "A feature extraction run is still in progress. "
+                    "Please wait for it to finish before switching tabs.",
+                )
+                return False
+        ak = getattr(self, "active_killing_panel", None)
+        if ak is not None:
+            bg = getattr(ak, "_bg", None)
+            if bg is not None and bg.is_running():
+                QMessageBox.information(
+                    self,
+                    "Operation in progress",
+                    "An active-killing analysis is still in progress. "
+                    "Please wait for it to finish before switching tabs.",
+                )
+                return False
+        return True
 
     def _detect_cell_types(self):
         """Return (organoid, immune, other) suitable for feature extraction.
@@ -2783,6 +2926,7 @@ class FeatureExtractionTab(QWidget):
                     metadata_loader=self.metadata_loader,
                     viewer=self.viewer,
                     log_callback=self._log,
+                    tab_progress_row=self.progress_row,
                 )
                 self._ak_inner_layout.addWidget(self.active_killing_panel)
             else:
@@ -2812,6 +2956,7 @@ class FeatureExtractionTab(QWidget):
             log_callback=self._log,
             is_organoid=is_organoid,
             threshold_getter=None,
+            tab_progress_row=self.progress_row,
         )
         panel.viewer = self.viewer
         if is_organoid:
@@ -3053,14 +3198,32 @@ class FeatureExtractionTab(QWidget):
             self._refresh_org_preview_for_current_frame(float(value))
 
     def _on_run_batch_clicked(self):
-        self.run_batch_feature_extraction(interactive=True)
-    def run_batch_feature_extraction(self, interactive=True, skip_existing=False):
-        """Run feature extraction for all cell types sequentially."""
+        """User-triggered batch run — asynchronous."""
+        self.run_batch_feature_extraction(interactive=True, block=False)
+
+    def run_batch_feature_extraction(self, interactive=True, skip_existing=False,
+                                     block=True, extra_callbacks=None):
+        """Run feature extraction for all cell types sequentially.
+
+        ``block=True`` (default, queue) runs synchronously.  ``block=False``
+        (GUI) moves the per-cell-type loop to a background worker and
+        shows a determinate progress bar scaled at cell-type granularity
+        with sample-level updates rendered as labels.
+
+        ``extra_callbacks`` is the queue's chaining hook
+        (``{"on_done": cb, "on_failed": cb}``).
+        """
         from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
         from qtpy.QtWidgets import QMessageBox as _QMB
 
         if not self.panels:
             self._log("No cell type panels available.")
+            fire_extra_callback(extra_callbacks, "on_failed", "no cell type panels")
+            return
+
+        if not block and self._bg.is_running():
+            self._log("⚠️ A batch feature-extraction run is already in progress.")
+            fire_extra_callback(extra_callbacks, "on_failed", "already running")
             return
 
         # Persist global organoid threshold before any panel runs
@@ -3112,6 +3275,7 @@ class FeatureExtractionTab(QWidget):
                 )
                 if choice == "cancel":
                     self._log("Batch feature extraction cancelled.")
+                    fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
                     return
                 if choice == "death_only":
                     death_only_cts = set(changed_cts)
@@ -3123,40 +3287,115 @@ class FeatureExtractionTab(QWidget):
             else:
                 overwrite = True
 
-        try:
-            for i, (ct, panel) in enumerate(self.panels.items(), 1):
+        # Persist + snapshot every panel's Qt widget state on the Qt
+        # thread — the worker must not read widgets.
+        panel_params: dict[str, dict] = {}
+        for ct, panel in self.panels.items():
+            panel._persist()
+            panel_params[ct] = panel._collect_params()
+
+        SCALE = 100  # sub-units per cell-type step (for ETA granularity)
+
+        def _do_batch(progress_cb=None):
+            for i, (ct, panel) in enumerate(self.panels.items()):
+                step_label_prefix = f"[{i + 1}/{total}] {ct}"
+
+                def _make_step_cb(step_idx, label_prefix):
+                    def _cb(curr, sub_total, label):
+                        if progress_cb is None:
+                            return
+                        if sub_total and sub_total > 0:
+                            frac = min(max(curr / sub_total, 0.0), 1.0)
+                        else:
+                            frac = 0.0
+                        try:
+                            progress_cb(
+                                step_idx * SCALE + int(frac * SCALE),
+                                total * SCALE,
+                                f"{label_prefix}: {label}" if label else label_prefix,
+                            )
+                        except Exception:
+                            pass
+                    return _cb
+
                 if death_only_cts:
                     if ct in death_only_cts:
-                        self._log(f"--- [{i}/{total}] Death-only re-run: {ct} ---")
-                        panel._persist()
-                        panel._run_death_only_for(ct)
+                        self._log(f"--- [{i + 1}/{total}] Death-only re-run: {ct} ---")
+                        panel._run_death_only_for(ct, params=panel_params[ct])
                         self._log(f"Done (death only): {ct}")
                     else:
                         self._log(
-                            f"--- [{i}/{total}] Skipping {ct} "
+                            f"--- [{i + 1}/{total}] Skipping {ct} "
                             "(threshold unchanged) ---"
                         )
+                    if progress_cb is not None:
+                        try:
+                            progress_cb((i + 1) * SCALE, total * SCALE, step_label_prefix)
+                        except Exception:
+                            pass
                     continue
                 if skip_existing_flag and ct in existing_cts:
-                    self._log(f"--- [{i}/{total}] Skipping {ct} (existing data) ---")
+                    self._log(f"--- [{i + 1}/{total}] Skipping {ct} (existing data) ---")
+                    if progress_cb is not None:
+                        try:
+                            progress_cb((i + 1) * SCALE, total * SCALE, step_label_prefix)
+                        except Exception:
+                            pass
                     continue
-                self._log(f"--- [{i}/{total}] Feature extraction: {ct} ---")
-                panel._persist()
-                panel._run_feature_extraction_for(ct, overwrite=overwrite)
+                self._log(f"--- [{i + 1}/{total}] Feature extraction: {ct} ---")
+                panel._run_feature_extraction_for(
+                    ct,
+                    overwrite=overwrite,
+                    params=panel_params[ct],
+                    progress_cb=_make_step_cb(i, step_label_prefix),
+                )
                 self._log(f"Done: {ct}")
 
             self._log("✅ Batch feature extraction finished.")
+
+        if block:
+            try:
+                _do_batch(progress_cb=None)
+                if interactive:
+                    _notify_post_extraction(self)
+                fire_extra_callback(extra_callbacks, "on_done", None)
+            except Exception as e:
+                traceback.print_exc()
+                self._log(f"❌ Batch feature extraction error: {e}")
+                fire_extra_callback(extra_callbacks, "on_failed", str(e))
+            finally:
+                try:
+                    self.results_panel.refresh()
+                except Exception:
+                    traceback.print_exc()
+            return
+
+        def _on_done(result):
             if interactive:
                 _notify_post_extraction(self)
-
-        except Exception as e:
-            traceback.print_exc()
-            self._log(f"❌ Batch feature extraction error: {e}")
-        finally:
             try:
                 self.results_panel.refresh()
             except Exception:
                 traceback.print_exc()
+            fire_extra_callback(extra_callbacks, "on_done", result)
+
+        def _on_failed(err: str):
+            self._log(f"❌ Batch feature extraction error: {err}")
+            try:
+                self.results_panel.refresh()
+            except Exception:
+                traceback.print_exc()
+            fire_extra_callback(extra_callbacks, "on_failed", err)
+
+        self._bg.run(
+            fn=_do_batch,
+            desc=f"Batch feature extraction ({total} cell types)\u2026",
+            progress_row=self.progress_row,
+            buttons=[self.btn_run_batch],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )
 
     def _sync_global_threshold_to_params(self):
         """Write the organoid dead threshold into behav3d_parameters

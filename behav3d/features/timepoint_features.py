@@ -308,7 +308,8 @@ def run_feature_extraction(
     contact_threshold=None,
     rolling_meanspeed_window=10,
     overwrite=False,
-    n_workers=1
+    n_workers=1,
+    progress_cb=None,
     ):
     assert config is not None or output_dir is not None, "Either 'config' or 'output_dir' must be supplied"
     
@@ -319,9 +320,15 @@ def run_feature_extraction(
 
     analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
-    
-    for _, sample_metadata in metadata.iterrows():
-    
+
+    _total_samples = len(metadata)
+    for _i, (_, sample_metadata) in enumerate(metadata.iterrows()):
+        if progress_cb is not None:
+            try:
+                progress_cb(_i, _total_samples, f"{cell_type} / {sample_metadata['sample_name']}")
+            except Exception:
+                pass
+
         print(f"--------------- Processing {cell_type}: {sample_metadata['sample_name']} ---------------")
         if is_multicolor_celltype(cell_type):
             raise ValueError(
@@ -634,7 +641,12 @@ def run_feature_extraction(
         
     feature_outdir.mkdir(parents=True, exist_ok=True)
     all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
-    df_all_tracks.to_csv(all_tracks_out_path, index=False) 
+    df_all_tracks.to_csv(all_tracks_out_path, index=False)
+    if progress_cb is not None:
+        try:
+            progress_cb(_total_samples, _total_samples, f"{cell_type} done")
+        except Exception:
+            pass
     return(df_all_tracks)       
 
 def calculate_image_based_track_features(

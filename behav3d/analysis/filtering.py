@@ -1,5 +1,8 @@
 
+import threading
+
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -8,6 +11,48 @@ from pathlib import Path
 import time
 from behav3d.core.utils import format_time
 import numpy as np
+
+
+def _on_main_thread() -> bool:
+    """True when the caller is running on the process main thread.
+
+    The napari plugin runs ``filter_tracks`` and friends in a background
+    ``QThread``.  ``pyplot.figure()`` builds a Qt figure manager which
+    Qt only allows from the main GUI thread; off-thread it emits the
+    "Starting a Matplotlib GUI outside of the main thread will likely
+    fail" UserWarning even though our writes are PDF-only.  We bypass
+    pyplot when off-thread and use the plain :class:`matplotlib.figure.Figure`
+    constructor instead, which never touches the GUI backend.
+    """
+    return threading.current_thread() is threading.main_thread()
+
+
+def _make_figure(figsize=None):
+    """Create a Figure suitable for the current thread.
+
+    On the main thread we keep the historical ``plt.figure(...)`` path so
+    notebook callers (e.g. :func:`preview_track_length_before_filtering`)
+    can still display the result with ``plt.show()``.  On worker threads
+    we return a bare :class:`matplotlib.figure.Figure` so no Qt figure
+    manager is constructed; the figure is still fully usable for
+    ``PdfPages.savefig`` since that routes through a PDF canvas.
+    """
+    if _on_main_thread():
+        return plt.figure(figsize=figsize)
+    return Figure(figsize=figsize)
+
+
+def _maybe_show():
+    """Call ``plt.show()`` only when on the main thread.
+
+    Worker threads cannot meaningfully display GUI windows and would
+    instead trigger Matplotlib's main-thread warning.
+    """
+    if _on_main_thread():
+        try:
+            plt.show()
+        except Exception:
+            pass
 
 def _require_columns(df: pd.DataFrame, columns, context: str):
     missing = [col for col in columns if col not in df.columns]
@@ -118,7 +163,7 @@ def _figures_track_length_histogram_pages(
     figs = []
     plot_idx = 0
     for _page in range(nr_pages):
-        fig = plt.figure(figsize=figsize)
+        fig = _make_figure(figsize=figsize)
         gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.6, hspace=0.5)
         axes_grid = [
             fig.add_subplot(gs[i, j])
@@ -177,7 +222,7 @@ def _append_track_length_histogram_pages(
         return
     for fig in figs:
         if show_inline:
-            plt.show()
+            _maybe_show()
         pdf.savefig(fig, bbox_inches="tight", dpi=hist_dpi)
         plt.close(fig)
 
@@ -229,7 +274,7 @@ def preview_track_length_before_filtering(
         print(f"Track length preview: skipped ({err}).")
         return
     for fig in figs:
-        plt.show()
+        _maybe_show()
         plt.close(fig)
 
 
@@ -258,7 +303,7 @@ def plot_filter_count(
     def _write_pages(pdf_writer):
         plot_idx = 0
         for _page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
+            fig = _make_figure(figsize=figsize)
             gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.5, hspace=0.3)
             remaining_axes = [
                 fig.add_subplot(gs[i, j])
@@ -292,7 +337,7 @@ def plot_filter_count(
 
             fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
             if plot_results:
-                plt.show()
+                _maybe_show()
             pdf_writer.savefig(fig, bbox_inches='tight', dpi=600)
             plt.close(fig)
 
@@ -428,8 +473,13 @@ def filter_tracks(
         c for c in requested_group_cols
         if c not in df_all_tracks.columns and c in metadata.columns and c != "sample_name"
     ]
+    # ``metadata_info`` is reused later to enrich the freshly re-read
+    # ``df_before_raw`` for the QC histogram.  Define it unconditionally
+    # (empty when nothing is missing) so the downstream merge stays safe
+    # on the advanced-features path where every grouping column is
+    # already present in the input CSV.
+    metadata_info = metadata.loc[:, ['sample_name'] + missing_group_cols].copy()
     if missing_group_cols:
-        metadata_info = metadata.loc[:, ['sample_name'] + missing_group_cols].copy()
         df_all_tracks_filt = pd.merge(df_all_tracks, metadata_info, how="left", on="sample_name")
     else:
         df_all_tracks_filt = df_all_tracks.copy()
@@ -610,7 +660,12 @@ def filter_tracks(
 
     df_before_raw = pd.read_csv(df_all_tracks_path)
     df_before_raw["sample_name"] = df_before_raw["sample_name"].astype(str)
-    df_before_for_hist = pd.merge(df_before_raw, metadata_info, how="left", on="sample_name")
+    if missing_group_cols:
+        df_before_for_hist = pd.merge(
+            df_before_raw, metadata_info, how="left", on="sample_name"
+        )
+    else:
+        df_before_for_hist = df_before_raw
 
     df_after_for_hist = pd.read_csv(filt_tracks_out_path)
     df_after_for_hist["sample_name"] = df_after_for_hist["sample_name"].astype(str)
@@ -733,7 +788,7 @@ def plot_dead_dye_distribution(
         # df_time1 = df_tracks[df_tracks["relative_time"]==1]
         plot_idx = 0  # Track which plot we are adding
         for page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
+            fig = _make_figure(figsize=figsize)
             gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.3, hspace=0.1)
             remaining_axes = [
                 fig.add_subplot(gs[i, j]) 
@@ -775,7 +830,7 @@ def plot_dead_dye_distribution(
                 ax.set_xlabel("")
                 ax.set_ylabel("Mean Dead Dye")
                 ax.grid(True, linestyle="--", alpha=0.7)
-                sns.despine()
+                sns.despine(fig=fig)
                 plot_idx += 1
                 
             # plt.show(fig)
@@ -807,7 +862,7 @@ def plot_touching_nontouching_distribution(
         # organoid_lines = df_tracks["organoid_line"].unique()
         plot_idx = 0  # Track which plot we are adding
         for page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
+            fig = _make_figure(figsize=figsize)
             gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.5, hspace=0.3)
 
             remaining_axes = [

@@ -21,7 +21,7 @@ import datetime
 import sys
 import traceback
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable
 
 import yaml
 from qtpy.QtWidgets import (
@@ -193,7 +193,7 @@ class DeathDynamicsTab(QWidget):
     - Step 1 — Death Dynamics: Run (per target) + Run Combined + advanced
     - Step 2 — Interaction Analysis: Interaction cells multi-select +
       Run (per target) + Run Combined + advanced
-    - Run All Selected + log
+    - Run All Available + log
     """
 
     def __init__(self, viewer=None, metadata_loader=None, parent=None):
@@ -211,11 +211,13 @@ class DeathDynamicsTab(QWidget):
         self.btn_queue_dd_combined = QPushButton("+🛒")
         self.btn_queue_ia_single = QPushButton("+🛒")
         self.btn_queue_ia_combined = QPushButton("+🛒")
+        self.btn_queue_all = QPushButton("+🛒")
         for btn in (
             self.btn_queue_dd_single,
             self.btn_queue_dd_combined,
             self.btn_queue_ia_single,
             self.btn_queue_ia_combined,
+            self.btn_queue_all,
         ):
             btn.setFixedSize(36, 28)
             btn.setToolTip("Add to Processing Queue")
@@ -225,6 +227,13 @@ class DeathDynamicsTab(QWidget):
                 "font-size: 11px; font-weight: bold; }"
                 "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
             )
+        # Slightly taller queue button for the Run-All row so it visually
+        # matches the larger primary "Run All Available" button below.
+        self.btn_queue_all.setFixedSize(44, 38)
+        self.btn_queue_all.setToolTip(
+            "Add every applicable Death Dynamics / Interaction step for the "
+            "current selection to the Processing Queue."
+        )
 
         # Per-step "View result" buttons. Enabled when the corresponding
         # result PDF already exists on disk.
@@ -478,14 +487,17 @@ class DeathDynamicsTab(QWidget):
 
         layout.addWidget(self.ia_group)
 
-        # ── Run All Selected + Log ───────────────────────────────
-        self.btn_run_all = QPushButton("▶▶  Run All Selected")
+        # ── Run All Available + Log ───────────────────────────────
+        run_all_row = QHBoxLayout()
+        self.btn_run_all = QPushButton("▶▶  Run All Available")
         self.btn_run_all.setStyleSheet(
             "background-color: #007bff; color: white; font-weight: bold; "
             "border-radius: 4px; padding: 10px; font-size: 14px;"
         )
         self.btn_run_all.clicked.connect(self._on_run_all_clicked)
-        layout.addWidget(self.btn_run_all)
+        run_all_row.addWidget(self.btn_run_all, stretch=1)
+        run_all_row.addWidget(self.btn_queue_all)
+        layout.addLayout(run_all_row)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -820,102 +832,206 @@ class DeathDynamicsTab(QWidget):
         else:
             self.ia_disclaimer_label.setVisible(False)
 
+        # "Run All Available" is *strict*: it runs immediately so its
+        # inputs (filtered CSV with 'dead' column, contact columns, …)
+        # must already be on disk. Enabled only when at least one
+        # analysis step is runnable right now.
+        run_all_ready = bool(targets) and (
+            bool(targets_with_dead) or bool(interactions)
+        )
+        self.btn_run_all.setEnabled(run_all_ready)
+        if not targets:
+            run_all_tip = "Select at least one target above."
+        elif not (targets_with_dead or interactions):
+            run_all_tip = (
+                "Nothing to run for the current selection — either pick at "
+                "least one interaction cell type, or select targets that "
+                "have a 'dead' column in their filtered CSV."
+            )
+        else:
+            run_all_tip = ""
+        self.btn_run_all.setToolTip(run_all_tip)
+
+        # "+🛒" next to Run All Available is *lenient*: the steps it
+        # queues run later, by which time Filter / Feature Extraction
+        # steps earlier in the queue may have produced the missing
+        # inputs. So we only require static conditions (dead channel in
+        # metadata OR at least one interaction selected) — per-step
+        # runners skip individual targets gracefully if their filtered
+        # CSV / dead column / contact column is still missing at
+        # execution time.
+        queue_all_ready = bool(targets) and (has_dead or bool(interactions))
+        self.btn_queue_all.setEnabled(queue_all_ready)
+        if not targets:
+            queue_all_tip = "Select at least one target above."
+        elif not (has_dead or interactions):
+            queue_all_tip = (
+                "Nothing to queue for the current selection — either "
+                "configure a dead channel in metadata, or pick at least "
+                "one interaction cell type."
+            )
+        else:
+            queue_all_tip = (
+                "Add every applicable Death Dynamics / Interaction step "
+                "for the current selection to the Processing Queue.\n"
+                "Individual steps will skip themselves at run time if "
+                "their inputs (filtered CSV, 'dead' column, contact "
+                "columns) are still missing."
+            )
+        self.btn_queue_all.setToolTip(queue_all_tip)
+
         # Per-step "View result" buttons: enabled only when the matching
         # PDF already exists on disk.
         self._update_view_buttons()
 
     # ── View-result buttons & Results-panel notifications ──────────────
-    def _view_pdf_path(self, kind: str) -> Optional[Path]:
-        """Return the PDF that the per-step View button should open.
+    def _view_pdf_candidates(self, kind: str) -> list[tuple[str, Path]]:
+        """Return ``(label, path)`` tuples for every PDF the View button
+        for *kind* could open given the current selection.
 
-        The button is only meaningful for unambiguous single-target /
-        single-interaction selections; multi-selections return ``None``
-        (the user can still browse all outputs through the Results
-        panel).
+        For single-target / single-interaction selections this yields one
+        entry, matching the original behaviour. For multi-selections we
+        return one entry per (target) or (target, interaction) pair so
+        the click handler can offer a chooser menu.
         """
         if self.metadata_loader is None or not self.metadata_loader.output_dir:
-            return None
+            return []
         out_dir = Path(self.metadata_loader.output_dir).expanduser()
         targets = self._selected_targets()
         interactions = self._selected_interactions()
 
         if kind == "dd_single":
-            if len(targets) != 1:
-                return None
-            ct = targets[0]
-            return (
-                out_dir / "analysis" / ct / "results"
-                / f"combined_general_{ct}_dynamics_analysis.pdf"
-            )
+            return [
+                (
+                    ct,
+                    out_dir / "analysis" / ct / "results"
+                    / f"combined_general_{ct}_dynamics_analysis.pdf",
+                )
+                for ct in targets
+            ]
         if kind == "dd_combined":
-            return (
-                out_dir / "analysis" / "multi_organoid_comparison"
-                / "multi_organoid_death_dynamics_comparison.pdf"
-            )
+            return [
+                (
+                    "Combined Death Dynamics",
+                    out_dir / "analysis" / "multi_organoid_comparison"
+                    / "multi_organoid_death_dynamics_comparison.pdf",
+                )
+            ]
         if kind == "ia_single":
-            if len(targets) != 1 or len(interactions) != 1:
-                return None
-            ct, it = targets[0], interactions[0]
-            return (
-                out_dir / "analysis" / ct / "results"
-                / f"interaction_analysis_{ct}_vs_{it}.pdf"
-            )
+            # Per-target interaction PDFs land in
+            # ``analysis/{ct}/interaction_analysis/`` (see
+            # ``run_interaction_analysis`` in
+            # ``behav3d/analysis/interaction_analysis.py``), NOT in the
+            # ``results`` sub-folder used for Death Dynamics.
+            return [
+                (
+                    f"{ct} ↔ {it}",
+                    out_dir / "analysis" / ct / "interaction_analysis"
+                    / f"interaction_analysis_{ct}_vs_{it}.pdf",
+                )
+                for ct in targets
+                for it in interactions
+            ]
         if kind == "ia_combined":
-            return (
-                out_dir / "analysis" / "multi_organoid_comparison"
-                / "multi_organoid_interaction_comparison.pdf"
-            )
-        return None
+            return [
+                (
+                    "Combined Interaction Comparison",
+                    out_dir / "analysis" / "multi_organoid_comparison"
+                    / "multi_organoid_interaction_comparison.pdf",
+                )
+            ]
+        return []
 
     def _update_view_buttons(self):
-        def _set(btn: QPushButton, kind: str, *, ambiguous_tip: str = ""):
-            path = self._view_pdf_path(kind)
-            if path is None:
+        def _set(btn: QPushButton, kind: str, *, empty_tip: str = ""):
+            candidates = self._view_pdf_candidates(kind)
+            if not candidates:
                 btn.setEnabled(False)
-                btn.setToolTip(ambiguous_tip or
-                               "Use the Results panel below to browse "
-                               "outputs for multiple targets/interactions.")
-                return
-            exists = path.exists()
-            btn.setEnabled(exists)
-            if exists:
-                btn.setToolTip(f"Open in napari:\n{path}")
-            else:
                 btn.setToolTip(
-                    f"Result PDF not found yet (will be enabled once "
-                    f"produced):\n{path}"
+                    empty_tip
+                    or "Use the Results panel below to browse outputs."
+                )
+                return
+            existing = [(lbl, p) for (lbl, p) in candidates if p.exists()]
+            btn.setEnabled(bool(existing))
+            if existing:
+                if len(existing) == 1:
+                    btn.setToolTip(f"Open in napari:\n{existing[0][1]}")
+                else:
+                    listed = "\n".join(
+                        f"  • {lbl}" for lbl, _p in existing
+                    )
+                    btn.setToolTip(
+                        "Click to choose which PDF to open in napari:\n"
+                        f"{listed}"
+                    )
+            else:
+                missing_paths = "\n".join(str(p) for _lbl, p in candidates)
+                btn.setToolTip(
+                    "Result PDF not found yet (will be enabled once "
+                    f"produced):\n{missing_paths}"
                 )
 
         _set(
             self.btn_view_dd_single, "dd_single",
-            ambiguous_tip=(
-                "Select exactly one target to view its combined "
-                "death-dynamics PDF (use the Results panel for "
-                "multi-target views)."
+            empty_tip=(
+                "Select at least one target to view its combined "
+                "death-dynamics PDF."
             ),
         )
         _set(self.btn_view_dd_combined, "dd_combined")
         _set(
             self.btn_view_ia_single, "ia_single",
-            ambiguous_tip=(
-                "Select exactly one target and one interaction cell type "
-                "to view the matching interaction-analysis PDF."
+            empty_tip=(
+                "Select at least one target and one interaction cell type "
+                "to view the matching interaction-analysis PDF(s)."
             ),
         )
         _set(self.btn_view_ia_combined, "ia_combined")
 
-    def _on_view_clicked(self, kind: str):
-        path = self._view_pdf_path(kind)
-        if path is None or not path.exists():
-            return
+    def _open_pdf_in_napari(self, path: Path):
+        """Open *path* in napari using the shared Results panel's settings.
+
+        Centralised so all View buttons (including the chooser menu) share
+        the same DPI / reuse-layer behaviour.
+        """
         try:
             panel = self._results_panel()
             dpi = int(panel.spin_dpi.value()) if panel else 150
-            reuse = panel.chk_reuse.isChecked() if panel else True
+            chk_reuse = getattr(panel, "chk_reuse", None) if panel else None
+            reuse = chk_reuse.isChecked() if chk_reuse is not None else True
             open_pdf_in_napari(path, dpi=dpi, reuse=reuse)
         except Exception as e:
             traceback.print_exc()
             self._log(f"Could not open PDF in napari: {e}")
+
+    def _on_view_clicked(self, kind: str):
+        candidates = self._view_pdf_candidates(kind)
+        existing = [(lbl, p) for (lbl, p) in candidates if p.exists()]
+        if not existing:
+            return
+        if len(existing) == 1:
+            self._open_pdf_in_napari(existing[0][1])
+            return
+
+        # Multiple PDFs available — show a chooser menu anchored under the
+        # clicked button so the user can pick which one to open.
+        btn = {
+            "dd_single": self.btn_view_dd_single,
+            "dd_combined": self.btn_view_dd_combined,
+            "ia_single": self.btn_view_ia_single,
+            "ia_combined": self.btn_view_ia_combined,
+        }.get(kind)
+        menu = QMenu(self)
+        for lbl, path in existing:
+            act = menu.addAction(f"👁  {lbl}")
+            act.triggered.connect(
+                lambda _checked=False, _p=path: self._open_pdf_in_napari(_p)
+            )
+        if btn is not None:
+            menu.exec_(btn.mapToGlobal(btn.rect().bottomLeft()))
+        else:
+            menu.exec_()
 
     def _results_panel(self):
         """Climb the parent chain to find the shared :class:`ResultsPanel`."""
@@ -1088,7 +1204,14 @@ class DeathDynamicsTab(QWidget):
         interactive: bool = True,
     ) -> bool:
         """Run per-target Death Dynamics. Returns True if at least one
-        target completed successfully."""
+        target completed successfully.
+
+        Skips any target whose filtered CSV is missing or lacks the
+        ``dead`` column with a friendly log message, so the queue can
+        continue with the next step instead of erroring out when
+        upstream Filter / Feature Extraction steps have not produced the
+        expected outputs yet.
+        """
         from behav3d.analysis.organoid_analysis import run_organoid_analysis
 
         cts = list(cell_types)
@@ -1097,9 +1220,25 @@ class DeathDynamicsTab(QWidget):
         if not _has_dead_channel(self.metadata_loader.metadata):
             self._log("⚠ Cannot run Death Dynamics: no dead channel configured.")
             return False
-        out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+        out_dir_path = Path(self.metadata_loader.output_dir).expanduser()
+        out_dir = str(out_dir_path)
         any_ok = False
         for ct in cts:
+            csv = _filtered_csv(out_dir_path, ct)
+            if not csv.exists():
+                self._log(
+                    f"⏭ Skipping Death Dynamics for {ct}: filtered CSV "
+                    f"not found ({csv.name}). Run Filtering for this "
+                    f"cell type first."
+                )
+                continue
+            if not _csv_has_column(csv, "dead"):
+                self._log(
+                    f"⏭ Skipping Death Dynamics for {ct}: 'dead' column "
+                    f"missing in {csv.name}. Re-run Feature Extraction "
+                    f"with a Dead-mask % threshold > 0."
+                )
+                continue
             try:
                 self._log(f"Death Dynamics for {ct}…")
                 print(f"\n▶ Death Dynamics: {ct}", file=sys.stderr)
@@ -1124,7 +1263,15 @@ class DeathDynamicsTab(QWidget):
         *,
         interactive: bool = True,
     ) -> bool:
-        """Run Combined Death Dynamics. Returns True on success."""
+        """Run Combined Death Dynamics. Returns True on success.
+
+        Pre-filters *cell_types* to those whose filtered CSV exists and
+        contains a ``dead`` column. If fewer than 2 usable targets
+        remain we log a skip message and return ``False`` instead of
+        raising — that way the queue can continue with the next step
+        when an earlier Filter / Feature Extraction step has not yet
+        produced the expected outputs.
+        """
         from behav3d.analysis.organoid_analysis import (
             plot_multi_organoid_death_dynamics,
         )
@@ -1138,12 +1285,37 @@ class DeathDynamicsTab(QWidget):
                 "⚠ Cannot run Combined Death Dynamics: no dead channel configured."
             )
             return False
-        out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+        out_dir_path = Path(self.metadata_loader.output_dir).expanduser()
+        out_dir = str(out_dir_path)
+
+        # Pre-flight: only keep targets that have a usable filtered CSV
+        # with a 'dead' column.
+        usable: list[str] = []
+        skipped: list[str] = []
+        for ct in cts:
+            csv = _filtered_csv(out_dir_path, ct)
+            if csv.exists() and _csv_has_column(csv, "dead"):
+                usable.append(ct)
+            else:
+                skipped.append(ct)
+        if skipped:
+            self._log(
+                f"⏭ Combined Death Dynamics: skipping {', '.join(skipped)} "
+                f"(missing filtered CSV or 'dead' column)."
+            )
+        if len(usable) < 2:
+            self._log(
+                f"⏭ Skipping Combined Death Dynamics: only "
+                f"{len(usable)} target(s) with usable data — need at "
+                f"least 2."
+            )
+            return False
+
         # Build threshold map from feature-extraction config
         params = self.metadata_loader.behav3d_parameters or {}
         feat = params.get("features", {}) or {}
         thr_map = {}
-        for ct in cts:
+        for ct in usable:
             v = feat.get(ct, {}).get("dead_mask_percentage_threshold")
             if v is not None:
                 try:
@@ -1151,10 +1323,10 @@ class DeathDynamicsTab(QWidget):
                 except Exception:
                     pass
         try:
-            self._log(f"Combined Death Dynamics for {', '.join(cts)}…")
+            self._log(f"Combined Death Dynamics for {', '.join(usable)}…")
             plot_multi_organoid_death_dynamics(
                 output_dir=out_dir,
-                organoid_types=cts,
+                organoid_types=usable,
                 dead_perc_threshold_map=thr_map,
             )
             self._log("✅ Combined Death Dynamics complete.")
@@ -1220,6 +1392,15 @@ class DeathDynamicsTab(QWidget):
         group_by: str = "organoid_type",
         interactive: bool = True,
     ):
+        """Run Combined Interaction Comparison.
+
+        Pre-filters *cell_types* to those whose filtered CSV exists and
+        carries a contact column for at least one of the selected
+        interaction cell types. If fewer than 2 usable targets remain we
+        log a skip message and return without raising, so the queue can
+        continue when an earlier Filter step has not yet produced the
+        expected outputs.
+        """
         from behav3d.analysis.interaction_analysis import (
             run_multi_organoid_interaction_comparison,
         )
@@ -1234,15 +1415,45 @@ class DeathDynamicsTab(QWidget):
                 "data — alive/dead split, cumulative-to-death curves and "
                 "active-killing dashboard will be skipped."
             )
-        out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+        out_dir_path = Path(self.metadata_loader.output_dir).expanduser()
+        out_dir = str(out_dir_path)
+
+        # Pre-flight: only keep targets whose filtered CSV exists AND
+        # carries a contact column for at least one selected interaction
+        # cell type.
+        usable: list[str] = []
+        skipped: list[str] = []
+        for ct in cts:
+            csv = _filtered_csv(out_dir_path, ct)
+            if not csv.exists():
+                skipped.append(f"{ct} (no filtered CSV)")
+                continue
+            contacts = _contact_cols_in_csv(csv)
+            if not any(it in contacts for it in ints):
+                skipped.append(f"{ct} (no matching contact columns)")
+                continue
+            usable.append(ct)
+        if skipped:
+            self._log(
+                "⏭ Combined Interaction Comparison: skipping "
+                f"{', '.join(skipped)}."
+            )
+        if len(usable) < 2:
+            self._log(
+                f"⏭ Skipping Combined Interaction Comparison: only "
+                f"{len(usable)} target(s) with usable data — need at "
+                f"least 2."
+            )
+            return
+
         try:
             self._log(
-                f"Combined Interaction Comparison: {', '.join(cts)} "
+                f"Combined Interaction Comparison: {', '.join(usable)} "
                 f"× {', '.join(ints)}…"
             )
             run_multi_organoid_interaction_comparison(
                 output_dir=out_dir,
-                organoid_types=cts,
+                organoid_types=usable,
                 immune_types=ints,
                 metadata=self.metadata_loader.metadata,
                 group_by=group_by,
