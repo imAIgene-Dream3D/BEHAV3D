@@ -9,8 +9,8 @@ import scanpy as sc
 import yaml
 
 from behav3d.analysis.backprojection import backproject_columns, view_napari
-from behav3d.analysis.clustering.general import relabel_cluster_ids
-from behav3d.analysis.clustering.state.classification import (
+from behav3d.analysis.behavior.general import relabel_cluster_ids
+from behav3d.analysis.behavior.state.classification import (
     BINARY_GROUP_COL,
     FULL_STATE_COL,
     HMM_INTRINSIC_RAW_STATE_COL,
@@ -22,7 +22,7 @@ from behav3d.analysis.clustering.state.classification import (
     _resolve_hmm_deployment_artifact_path,
     run_hmm_state_clustering,
 )
-from behav3d.analysis.clustering.state.utils import (
+from behav3d.analysis.behavior.state.utils import (
     _coerce_hex_color,
     _get_classification_state_colors,
     _mixed_label_sort_key,
@@ -31,10 +31,10 @@ from behav3d.analysis.clustering.state.utils import (
     _resolve_state_paths,
     _set_classification_state_colors,
 )
-from behav3d.analysis.clustering.state.visualization.plots.state_composition import (
+from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
     save_state_composition_report,
 )
-from behav3d.analysis.clustering.state.visualization.plots.state_transitions import (
+from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
     save_state_transition_report,
 )
 from behav3d.deprecated.state_classification_clustering import (
@@ -46,7 +46,7 @@ from behav3d.deprecated.widgets.state_classification import (
     StateClassificationPanel as _LegacyStateClassificationPanel,
     _winfo,
 )
-from behav3d.analysis.clustering.state.visualization.backprojection import (
+from behav3d.analysis.behavior.state.visualization.backprojection import (
     _add_mapping_dock_widget,
     _apply_state_code_colors_to_layer,
     _behavioral_state_backprojection_path,
@@ -640,41 +640,75 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         children = list(self.ui.children)
         if len(children) > 0:
             children[-1] = self.steps
+            self.ui.children = tuple(children)
         self.hmm_n_states_mode.observe(self._on_hmm_n_states_mode_changed, names="value")
         self.apply_hmm_artifact_picker.text.observe(self._on_apply_path_changed, names="value")
         self._sync_hmm_state_controls()
         self._load_existing_hmm_deployment_artifact_if_available()
+        self.apply_existing_state_classification = widgets.Checkbox(
+            description="Apply existing behavioral state classification",
+            value=False,
+            indent=False,
+        )
+        self.apply_existing_state_classification.observe(
+            self._on_apply_existing_changed, names="value"
+        )
+        self.output_dir_html.layout.display = "none"
         children = list(self.ui.children)
         if len(children) > 0:
             children[0] = widgets.HTML(
-                '<div style="font-size:20px;font-weight:700;">State Classification HMM</div>'
+                '<div style="font-size:20px;font-weight:700;">Behavioral state classification</div>'
             )
+            children.insert(2, self.apply_existing_state_classification)
             self.ui.children = tuple(children)
 
     def _panel_cfg(self):
         params = getattr(self.metadata_loader, "behav3d_parameters", None)
         if not isinstance(params, dict):
             return {}
-        panel = params.setdefault("state_classification_hmm", {})
-        return panel.setdefault(self._current_cell_type(), {})
+        section = params.setdefault("behavioral_state_classification", {})
+        cell_type = self._current_cell_type()
+        if cell_type not in section:
+            section[cell_type] = {}
+        return section[cell_type]
+
+    def _effective_panel_cfg(self):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if not isinstance(params, dict):
+            return {}
+        section = params.get("behavioral_state_classification", {})
+        defaults = section.get("defaults", {})
+        cell_cfg = section.get(self._current_cell_type(), {})
+        return {**defaults, **cell_cfg}
+
 
     def _build_steps(self):
         analysis_plots_section = getattr(self, "analysis_plots_section", widgets.VBox([]))
-        step_defs = [
-            ("Assign HMM intrinsic behavioral states", self.clustering_section),
-            ("Combine / rename intrinsic clusters", self.rename_intrinsic_section),
-            ("Rename clusters assigned to binary groups", self.rename_full_section),
-            ("Create analysis plots", analysis_plots_section),
-            ("Train user-defined classifier", self.train_section),
-            ("Apply classification", self.apply_section),
-            ("Backprojection", self.backprojection_section),
-        ]
-        self._step_accordions = []
-        for title, section in step_defs:
-            acc = widgets.Accordion(children=[section], selected_index=None)
-            acc.set_title(0, title)
-            self._step_accordions.append(acc)
-        self.steps = widgets.VBox(self._step_accordions)
+        self._rename_full_with_description = widgets.VBox(
+            [
+                widgets.HTML(
+                    "<span style='color:#555;'>Rename HMM intrinsic clusters combined with binary group "
+                    "values (e.g. organoid_contact)</span>"
+                ),
+                self.rename_full_section,
+            ],
+            layout=widgets.Layout(gap="6px"),
+        )
+        self.steps = widgets.Accordion(
+            children=[
+                self.clustering_section,
+                self.rename_intrinsic_section,
+                self._rename_full_with_description,
+                analysis_plots_section,
+                self.backprojection_section,
+            ],
+            selected_index=None,
+        )
+        self.steps.set_title(0, "Assign HMM intrinsic behavioral states")
+        self.steps.set_title(1, "Rename intrinsic states")
+        self.steps.set_title(2, "Rename full states")
+        self.steps.set_title(3, "Create plots")
+        self.steps.set_title(4, "Backprojection")
 
     def _build_apply_section(self):
         super()._build_apply_section()
@@ -690,6 +724,16 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         self.apply_hmm_spinner = widgets.HTML(value=spinning_loader)
         self.apply_hmm_spinner.layout.display = "none"
         self.out_apply_hmm = widgets.Output()
+        self.hmm_artifact_section = widgets.VBox(
+            [
+                widgets.HTML("<hr style='margin:10px 0;'>"),
+                widgets.HTML("<b>Apply saved HMM deployment artifact</b>"),
+                self.apply_hmm_artifact_picker,
+                self.apply_hmm_default_paths_html,
+                widgets.HBox([self.btn_apply_hmm_artifact, self.apply_hmm_spinner]),
+                self.out_apply_hmm,
+            ]
+        )
         self.apply_section = widgets.VBox(
             [
                 widgets.HTML("<b>Apply saved classifier artifacts</b>"),
@@ -698,12 +742,6 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                 self.apply_default_paths_html,
                 widgets.HBox([self.btn_apply, self.apply_spinner]),
                 self.out_apply,
-                widgets.HTML("<hr style='margin:10px 0;'>"),
-                widgets.HTML("<b>Apply saved HMM deployment artifact</b>"),
-                self.apply_hmm_artifact_picker,
-                self.apply_hmm_default_paths_html,
-                widgets.HBox([self.btn_apply_hmm_artifact, self.apply_hmm_spinner]),
-                self.out_apply_hmm,
             ]
         )
 
@@ -866,6 +904,12 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         }
         for cb in self.additional_window_feature_cbs.values():
             cb.observe(self._on_feature_checkbox_changed, names="value")
+        self.hmm_window_features_window = widgets.IntText(
+            description="Window size",
+            value=5,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="190px"),
+        )
 
         self.hmm_n_states_mode = widgets.Dropdown(
             description="State selection",
@@ -968,18 +1012,22 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
             style={"description_width": "initial"},
             layout=widgets.Layout(width="240px"),
         )
-        self.lower_quantile_cap = widgets.Text(
-            description="Lower quantile",
+        self.feature_quantile_capping_low_percentile = widgets.Text(
+            description="Low percentile cap",
             value="",
             style={"description_width": "initial"},
             layout=widgets.Layout(width="220px"),
         )
-        self.upper_quantile_cap = widgets.Text(
-            description="Upper quantile",
+        self.feature_quantile_capping_high_percentile = widgets.Text(
+            description="High percentile cap",
             value="0.99",
             style={"description_width": "initial"},
             layout=widgets.Layout(width="220px"),
         )
+        # Aliases so legacy base-class methods (_apply_cfg_defaults, _persist_current_settings)
+        # that still reference the old names continue to work against the same widget objects.
+        self.lower_quantile_cap = self.feature_quantile_capping_low_percentile
+        self.upper_quantile_cap = self.feature_quantile_capping_high_percentile
         self.random_state = widgets.IntText(
             description="Seed",
             value=123,
@@ -1006,6 +1054,7 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         window_features_block = widgets.VBox(
             [
                 widgets.HTML("<b>window features</b>"),
+                self.hmm_window_features_window,
                 widgets.VBox(list(self.additional_window_feature_cbs.values())),
             ]
         )
@@ -1036,14 +1085,19 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
             selected_index=None,
         )
         self.hmm_log_scale_accordion.set_title(0, "Log scaling")
+        self.hmm_quantile_row = widgets.HBox(
+            [self.feature_quantile_capping_low_percentile, self.feature_quantile_capping_high_percentile],
+            layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
+        )
         feature_processing_block = widgets.VBox(
             [
                 self.hmm_log_scale_accordion,
                 widgets.HTML("<b>feature processing</b>"),
                 widgets.HBox(
-                    [self.hmm_feature_smoothing_window, self.lower_quantile_cap, self.upper_quantile_cap],
+                    [self.hmm_feature_smoothing_window],
                     layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
                 ),
+                self.hmm_quantile_row,
             ]
         )
         binary_group_block = widgets.VBox(
@@ -1212,6 +1266,13 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         self.btn_create_state_composition_plots.on_click(self._on_create_state_composition_plots_clicked)
         self.state_composition_spinner = widgets.HTML(value=spinning_loader)
         self.state_composition_spinner.layout.display = "none"
+        self.composition_group_cols_select = widgets.SelectMultiple(
+            options=[],
+            value=[],
+            description="",
+            layout=widgets.Layout(width="360px", height="80px"),
+            disabled=True,
+        )
         self.btn_create_state_transition_plots = widgets.Button(
             description="Create state transition plots",
             button_style="info",
@@ -1233,6 +1294,13 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                     [self.btn_create_state_composition_plots, self.state_composition_spinner],
                     layout=widgets.Layout(align_items="center", gap="8px"),
                 ),
+                widgets.HTML(
+                    "<b>Group composition plots by:</b><br>"
+                    "<span style='color:#555;'>Select metadata columns to pool samples into groups for an "
+                    "additional grouped-composition page in the PDF. "
+                    "Hold Ctrl/Cmd to select multiple.</span>"
+                ),
+                self.composition_group_cols_select,
                 widgets.HTML(
                     "<b>State transition plots</b><br>"
                     "<span style='color:#555;'>Builds transition matrices and transition summaries between full "
@@ -1270,6 +1338,13 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         self.selected_features_box.options = self._selected_hmm_feature_columns()
 
     def _build_feature_groups(self):
+        cell_cfg = self._panel_cfg()
+        if isinstance(cell_cfg, dict):
+            effective = self._effective_panel_cfg()
+            if not cell_cfg.get("selected_features") and effective.get("selected_features"):
+                cell_cfg["selected_features"] = list(effective["selected_features"])
+            if not cell_cfg.get("binary_features_to_group") and effective.get("binary_features_to_group"):
+                cell_cfg["binary_features_to_group"] = list(effective["binary_features_to_group"])
         super()._build_feature_groups()
         grouped = getattr(self, "_feature_groups", {}) or {}
         if len(grouped) > 0:
@@ -1310,7 +1385,7 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
 
     def _rebuild_log_scale_feature_controls(self):
         selected_features = self._selected_hmm_feature_columns()
-        cfg = self._panel_cfg()
+        cfg = self._effective_panel_cfg()
         saved_log = set(cfg.get("hmm_log_scale_features", [])) if isinstance(cfg, dict) else set()
         previous_log = {
             str(col)
@@ -1354,6 +1429,8 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
             self.hmm_sticky_params_row.layout.display = (
                 None if (advanced and bool(self.hmm_sticky.value)) else "none"
             )
+        if hasattr(self, "hmm_quantile_row"):
+            self.hmm_quantile_row.layout.display = None if advanced else "none"
 
     def _on_use_pca_changed(self, _):
         return
@@ -1367,18 +1444,60 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
     def _on_hmm_sticky_changed(self, _):
         self._sync_hmm_state_controls()
 
+    def _on_apply_existing_changed(self, _):
+        self._sync_apply_existing_mode()
+
+    def _sync_apply_existing_mode(self):
+        if not hasattr(self, "steps"):
+            return
+        analysis_plots_section = getattr(self, "analysis_plots_section", widgets.VBox([]))
+        if self.apply_existing_state_classification.value:
+            self.steps.children = [
+                self.hmm_artifact_section,
+                analysis_plots_section,
+                self.backprojection_section,
+            ]
+            self.steps.set_title(0, "Apply existing classification")
+            self.steps.set_title(1, "Create plots")
+            self.steps.set_title(2, "Backprojection")
+            self.steps.selected_index = 0
+        else:
+            rename_full = getattr(self, "_rename_full_with_description", self.rename_full_section)
+            self.steps.children = [
+                self.clustering_section,
+                self.rename_intrinsic_section,
+                rename_full,
+                analysis_plots_section,
+                self.backprojection_section,
+            ]
+            self.steps.set_title(0, "Assign HMM intrinsic behavioral states")
+            self.steps.set_title(1, "Rename intrinsic states")
+            self.steps.set_title(2, "Rename full states")
+            self.steps.set_title(3, "Create plots")
+            self.steps.set_title(4, "Backprojection")
+
+    def _collapse_all_steps(self):
+        if hasattr(self, "steps") and isinstance(self.steps, widgets.Accordion):
+            self.steps.selected_index = None
+
+    def _open_step(self, index):
+        if hasattr(self, "steps") and isinstance(self.steps, widgets.Accordion):
+            n = len(self.steps.children)
+            if index is not None and 0 <= index < n:
+                self.steps.selected_index = index
+
     def _on_feature_checkbox_changed(self, _):
         super()._on_feature_checkbox_changed(_)
         self._rebuild_log_scale_feature_controls()
 
     def _apply_cfg_defaults(self):
         super()._apply_cfg_defaults()
-        cfg = self._panel_cfg()
+        cfg = self._effective_panel_cfg()
         if not isinstance(cfg, dict):
             return
-        self.apply_hmm_artifact_picker.value = str(
-            cfg.get("apply_hmm_deployment_artifact_path", self.apply_hmm_artifact_picker.value)
-        )
+        saved_artifact_path = str(cfg.get("apply_hmm_deployment_artifact_path", "")).strip()
+        if saved_artifact_path:
+            self.apply_hmm_artifact_picker.value = saved_artifact_path
         self.hmm_n_states_mode.value = str(cfg.get("hmm_n_states_mode", self.hmm_n_states_mode.value))
         self.hmm_advanced.value = bool(cfg.get("hmm_advanced", self.hmm_advanced.value))
         self.hmm_n_states.value = int(cfg.get("hmm_n_states", self.hmm_n_states.value))
@@ -1406,6 +1525,15 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         self.hmm_backprojection_workers.value = int(
             cfg.get("hmm_backprojection_workers", self.hmm_backprojection_workers.value)
         )
+        self.hmm_window_features_window.value = int(
+            cfg.get("hmm_window_features_window", self.hmm_window_features_window.value)
+        )
+        self.feature_quantile_capping_low_percentile.value = str(
+            cfg.get("feature_quantile_capping_low_percentile", self.feature_quantile_capping_low_percentile.value)
+        )
+        self.feature_quantile_capping_high_percentile.value = str(
+            cfg.get("feature_quantile_capping_high_percentile", self.feature_quantile_capping_high_percentile.value)
+        )
         saved_window_features = set(cfg.get("hmm_window_features", []))
         for feature_name, cb in self.additional_window_feature_cbs.items():
             cb.value = str(feature_name) in saved_window_features
@@ -1414,10 +1542,14 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         self._sync_hmm_state_controls()
 
     def _persist_current_settings(self):
-        super()._persist_current_settings()
         cfg = self._panel_cfg()
         if not isinstance(cfg, dict):
             return
+        cfg.update({
+            "selected_features": self._selected_feature_columns(),
+            "binary_features_to_group": self._selected_binary_columns(),
+            "random_state": int(self.random_state.value),
+        })
         cfg.update(
             {
                 "apply_hmm_deployment_artifact_path": str(self.apply_hmm_artifact_picker.value),
@@ -1439,6 +1571,9 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                 "hmm_start_offset_fill_mode": str(self.hmm_start_offset_fill_mode.value),
                 "hmm_backprojection_workers": int(self.hmm_backprojection_workers.value),
                 "hmm_window_features": self._selected_window_feature_columns(),
+                "hmm_window_features_window": int(self.hmm_window_features_window.value),
+                "feature_quantile_capping_low_percentile": str(self.feature_quantile_capping_low_percentile.value),
+                "feature_quantile_capping_high_percentile": str(self.feature_quantile_capping_high_percentile.value),
                 "hmm_log_scale_features": self._selected_log_scale_features(),
             }
         )
@@ -1995,7 +2130,12 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
             deployment_warning = None
             try:
                 artifact_path = self._save_current_hmm_deployment_artifact(verbose=False)
-                _winfo("state-hmm-widget", f"Updated HMM deployment artifact: {artifact_path}")
+                _winfo(
+                    "state-hmm-widget",
+                    f"Full classification pipeline and settings saved to:\n  {artifact_path}\n"
+                    "You can apply this directly to new data by ticking "
+                    "'Apply existing behavioral state classification'.",
+                )
             except Exception as exc:
                 deployment_warning = str(exc)
             qc_warning = None
@@ -2029,6 +2169,22 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
             transition_error=None,
             pending_reason=reason,
         )
+
+    _METADATA_TECHNICAL_PATTERNS = (
+        "_path", "_dir", "pixel_distance", "time_interval", "unit_",
+        "channel_", "dead_channel", "zarr", "dimension_order",
+    )
+
+    def _metadata_grouping_columns(self):
+        md = getattr(self.metadata_loader, "metadata", None)
+        if md is None or not hasattr(md, "columns"):
+            return []
+        exclude = self._METADATA_TECHNICAL_PATTERNS
+        cols = [
+            c for c in md.columns
+            if not any(pat in c.lower() for pat in exclude)
+        ]
+        return cols
 
     def _refresh_analysis_plots_status(self):
         if not hasattr(self, "analysis_plots_status"):
@@ -2068,12 +2224,21 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                 else "<i>Analysis plots have not been created yet.</i>"
             )
 
+        if hasattr(self, "composition_group_cols_select"):
+            candidate_cols = self._metadata_grouping_columns()
+            if candidate_cols != list(self.composition_group_cols_select.options):
+                prev = set(self.composition_group_cols_select.value)
+                self.composition_group_cols_select.options = candidate_cols
+                self.composition_group_cols_select.value = [c for c in candidate_cols if c in prev]
+            self.composition_group_cols_select.disabled = len(candidate_cols) == 0
+
     def _regenerate_curated_state_reports(
         self,
         verbose=False,
         *,
         create_composition=True,
         create_transition=True,
+        group_cols=None,
     ):
         if self.model_adata is None:
             raise ValueError("No model adata loaded.")
@@ -2110,6 +2275,7 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                     include_pooled_summary=True,
                     state_colors=full_state_colors,
                     verbose=verbose,
+                    group_cols=group_cols if group_cols else None,
                 )
                 composition_pdf = str(composition_out.get("pdf_path", report_pdf_path))
                 composition_auc_csv = str(composition_out.get("csv_path", report_csv_path))
@@ -2174,10 +2340,12 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         self.out_analysis_plots.clear_output()
         with self.out_analysis_plots:
             try:
+                group_cols = list(self.composition_group_cols_select.value) or None
                 report_out = self._regenerate_curated_state_reports(
                     verbose=True,
                     create_composition=True,
                     create_transition=False,
+                    group_cols=group_cols,
                 )
                 self._save_model_adata(compression="lzf")
                 _winfo(
@@ -2266,8 +2434,9 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                     smoothing_min_periods=int(self.hmm_smoothing_min_periods.value),
                     start_offset=int(self.hmm_start_offset.value),
                     start_offset_fill_mode=str(self.hmm_start_offset_fill_mode.value),
-                    lower_quantile_cap=self._parse_optional_float(self.lower_quantile_cap.value),
-                    upper_quantile_cap=self._parse_optional_float(self.upper_quantile_cap.value),
+                    window_features_window=int(self.hmm_window_features_window.value),
+                    lower_quantile_cap=self._parse_optional_float(self.feature_quantile_capping_low_percentile.value),
+                    upper_quantile_cap=self._parse_optional_float(self.feature_quantile_capping_high_percentile.value),
                     log_scale_features=self._selected_log_scale_features(),
                     random_state=int(self.random_state.value),
                     return_details=True,
@@ -2617,12 +2786,6 @@ class StateClassificationHMMDeploymentPanel(StateClassificationHMMPanel):
 
     def __init__(self, metadata_loader, cell_type=None):
         super().__init__(metadata_loader=metadata_loader, cell_type=cell_type)
-        children = list(self.ui.children)
-        if len(children) > 0:
-            children[0] = widgets.HTML(
-                '<div style="font-size:20px;font-weight:700;">State Classification HMM Deployment</div>'
-            )
-            self.ui.children = tuple(children)
         if hasattr(self, "train_section"):
             self.train_section.layout.display = "none"
         if hasattr(self, "btn_train"):
@@ -2632,25 +2795,79 @@ class StateClassificationHMMDeploymentPanel(StateClassificationHMMPanel):
         params = getattr(self.metadata_loader, "behav3d_parameters", None)
         if not isinstance(params, dict):
             return {}
-        panel = params.setdefault("state_classification_hmm_deployment", {})
-        return panel.setdefault(self._current_cell_type(), {})
+        section = params.setdefault("behavioral_state_classification", {})
+        cell_type = self._current_cell_type()
+        if cell_type not in section:
+            section[cell_type] = {}
+        return section[cell_type]
+
+    def _effective_panel_cfg(self):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if not isinstance(params, dict):
+            return {}
+        section = params.get("behavioral_state_classification", {})
+        defaults = section.get("defaults", {})
+        cell_cfg = section.get(self._current_cell_type(), {})
+        return {**defaults, **cell_cfg}
+
 
     def _build_steps(self):
         analysis_plots_section = getattr(self, "analysis_plots_section", widgets.VBox([]))
-        step_defs = [
-            ("Assign HMM intrinsic behavioral states", self.clustering_section),
-            ("Combine / rename intrinsic clusters", self.rename_intrinsic_section),
-            ("Rename clusters assigned to binary groups", self.rename_full_section),
-            ("Create analysis plots", analysis_plots_section),
-            ("Apply HMM deployment artifact", self.apply_section),
-            ("Backprojection", self.backprojection_section),
-        ]
-        self._step_accordions = []
-        for title, section in step_defs:
-            acc = widgets.Accordion(children=[section], selected_index=None)
-            acc.set_title(0, title)
-            self._step_accordions.append(acc)
-        self.steps = widgets.VBox(self._step_accordions)
+        self._rename_full_with_description = widgets.VBox(
+            [
+                widgets.HTML(
+                    "<span style='color:#555;'>Rename HMM intrinsic clusters combined with binary group "
+                    "values (e.g. organoid_contact)</span>"
+                ),
+                self.rename_full_section,
+            ],
+            layout=widgets.Layout(gap="6px"),
+        )
+        self.steps = widgets.Accordion(
+            children=[
+                self.clustering_section,
+                self.rename_intrinsic_section,
+                self._rename_full_with_description,
+                analysis_plots_section,
+                self.backprojection_section,
+            ],
+            selected_index=None,
+        )
+        self.steps.set_title(0, "Assign HMM intrinsic behavioral states")
+        self.steps.set_title(1, "Rename intrinsic states")
+        self.steps.set_title(2, "Rename full states")
+        self.steps.set_title(3, "Create plots")
+        self.steps.set_title(4, "Backprojection")
+
+    def _sync_apply_existing_mode(self):
+        if not hasattr(self, "steps"):
+            return
+        analysis_plots_section = getattr(self, "analysis_plots_section", widgets.VBox([]))
+        if self.apply_existing_state_classification.value:
+            self.steps.children = [
+                self.apply_section,
+                analysis_plots_section,
+                self.backprojection_section,
+            ]
+            self.steps.set_title(0, "Apply existing classification")
+            self.steps.set_title(1, "Create plots")
+            self.steps.set_title(2, "Backprojection")
+            self.steps.selected_index = 0
+        else:
+            rename_full = getattr(self, "_rename_full_with_description", self.rename_full_section)
+            self.steps.children = [
+                self.clustering_section,
+                self.rename_intrinsic_section,
+                rename_full,
+                analysis_plots_section,
+                self.backprojection_section,
+            ]
+            self.steps.set_title(0, "Assign HMM intrinsic behavioral states")
+            self.steps.set_title(1, "Rename intrinsic states")
+            self.steps.set_title(2, "Rename full states")
+            self.steps.set_title(3, "Create plots")
+            self.steps.set_title(4, "Backprojection")
+            self.steps.selected_index = None
 
     def _build_apply_section(self):
         _LegacyStateClassificationPanel._build_apply_section(self)

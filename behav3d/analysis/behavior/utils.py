@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 
 def _vinfo(verbose, prefix, message):
@@ -48,6 +49,34 @@ def _sanitize_filename_token(value, fallback="value"):
     token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
     token = token.strip("._-")
     return token if len(token) > 0 else str(fallback)
+
+
+def _handle_nan_in_distance_matrix(distance_matrix, context="distance matrix"):
+    is_dataframe = isinstance(distance_matrix, pd.DataFrame)
+    if is_dataframe:
+        nan_count = distance_matrix.isna().sum().sum()
+        if nan_count == 0:
+            return distance_matrix
+        print(f"  ⚠️ Warning: {context} contains {nan_count} NaN values")
+        print(f"  → Replacing with maximum finite value")
+        max_val = distance_matrix.max().max()
+        if pd.isna(max_val):
+            print(f"  ⚠️ Warning: All values in {context} are NaN.")
+            print("     → Falling back to 0 for all distances. Please check input data and DTW configuration.")
+            return distance_matrix.fillna(0)
+        return distance_matrix.fillna(max_val)
+    else:
+        if not np.isnan(distance_matrix).any():
+            return distance_matrix
+        nan_count = np.isnan(distance_matrix).sum()
+        print(f"  ⚠️ Warning: {context} contains {nan_count} NaN values")
+        print(f"  → Replacing with maximum finite value")
+        max_val = np.nanmax(distance_matrix)
+        if np.isnan(max_val):
+            print(f"  ⚠️ Warning: All values in {context} are NaN.")
+            print("     → Falling back to 0 for all distances. Please check input data and DTW configuration.")
+            return np.nan_to_num(distance_matrix, nan=0)
+        return np.nan_to_num(distance_matrix, nan=max_val)
 
 
 def _to_numpy_2d(X):

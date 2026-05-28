@@ -12,11 +12,11 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 import imageio
 
-from behav3d.analysis.clustering.utils import (
+from behav3d.analysis.behavior.utils import (
     _mixed_label_sort_key,
     _sanitize_filename_token,
 )
-from behav3d.analysis.clustering.state.visualization.backprojection import (
+from behav3d.analysis.behavior.state.visualization.backprojection import (
     _resolve_tracked_image_path,
 )
 from behav3d.io.images import load_zarr

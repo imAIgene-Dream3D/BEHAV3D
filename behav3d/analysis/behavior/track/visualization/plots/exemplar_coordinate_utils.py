@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from behav3d.analysis.clustering.utils import _resolve_output_dir
+from behav3d.analysis.behavior.utils import _resolve_output_dir
 
 
 def resolve_exemplar_positions_csv_path(output_dir, cell_type):

@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -183,6 +185,13 @@ def run_hmm_state_classification(
             for k in range(int(k_min), int(k_max) + 1):
                 m = _build_model(k)
                 m.fit(X_all, lengths=lengths)
+                if hasattr(m, "monitor_") and not m.monitor_.converged:
+                    warnings.warn(
+                        f"HMM (n_states={k}) stopped after reaching n_iter={n_iter} without converging. "
+                        "The result may be suboptimal — consider increasing n_iter or relaxing tol.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
 
                 # if sticky=True and startprob fixed, don't count startprob params in BIC
                 count_startprob = not sticky
@@ -200,6 +209,13 @@ def run_hmm_state_classification(
         else:
             model = _build_model(int(n_states))
             model.fit(X_all, lengths=lengths)
+            if hasattr(model, "monitor_") and not model.monitor_.converged:
+                warnings.warn(
+                    f"HMM (n_states={n_states}) stopped after reaching n_iter={n_iter} without converging. "
+                    "The result may be suboptimal — consider increasing n_iter or relaxing tol.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
     # ---------- decode ----------
     states_all = model.predict(X_all, lengths=lengths) + 1  # 1-based

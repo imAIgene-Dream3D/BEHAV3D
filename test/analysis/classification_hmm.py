@@ -13,11 +13,11 @@ from sklearn.preprocessing import StandardScaler
 
 from behav3d.core.anndata import df_to_adata
 from behav3d.features.rolling_window_features import create_descriptive_track_dataset
-from behav3d.analysis.clustering.state.hmm import (
+from behav3d.analysis.behavior.state.hmm import (
     run_hmm_state_classification,
     run_sticky_hmm_state_classification,
 )
-from behav3d.analysis.clustering.state.classification import (
+from behav3d.analysis.behavior.state.classification import (
     A4_LANDSCAPE,
     _apply_log1p_to_feature_matrix,
     _infer_binary_group_constraints,

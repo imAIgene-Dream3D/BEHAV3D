@@ -26,8 +26,8 @@ from sklearn.preprocessing import StandardScaler
 
 from behav3d.core.anndata import df_to_adata
 from behav3d.features.rolling_window_features import create_descriptive_track_dataset
-from behav3d.analysis.clustering.general import relabel_cluster_ids
-from behav3d.analysis.clustering.general.leiden import run_pca, run_leiden_clustering
+from behav3d.analysis.behavior.general import relabel_cluster_ids
+from behav3d.analysis.behavior.general.leiden import run_pca, run_leiden_clustering
 
 A4_PORTRAIT = (8.27, 11.69)
 A4_LANDSCAPE = (11.69, 8.27)

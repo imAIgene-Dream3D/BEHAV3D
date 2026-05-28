@@ -12,12 +12,12 @@ from matplotlib import colormaps
 from matplotlib.collections import LineCollection
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_pdf import PdfPages
-from behav3d.analysis.clustering.utils import (
+from behav3d.analysis.behavior.utils import (
     _mixed_label_sort_key,
     _sanitize_filename_token,
 )
 
-from behav3d.analysis.clustering.state.visualization.videos.track_max_projection import (
+from behav3d.analysis.behavior.state.visualization.videos.track_max_projection import (
     create_fulltrack_max_projection_stacks_with_track,
     prepare_fulltrack_max_projection_bundle,
     resolve_tracked_zarr_path,

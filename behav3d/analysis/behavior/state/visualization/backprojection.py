@@ -9,8 +9,8 @@ import zarr
 
 from behav3d.io.formats.zarr import append_to_zarr
 from behav3d.io.images import load_image
-from behav3d.analysis.clustering.utils import _mixed_label_sort_key
-from behav3d.analysis.clustering.state.utils import (
+from behav3d.analysis.behavior.utils import _mixed_label_sort_key
+from behav3d.analysis.behavior.state.utils import (
     _coerce_hex_color,
     _get_classification_state_colors,
     _normalize_label_color_map,

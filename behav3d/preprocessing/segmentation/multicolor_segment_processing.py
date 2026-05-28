@@ -759,7 +759,7 @@ def _preserve_original_segment_path(path):
 
 
 def _resolve_raw_image_path(metadata, output_dir, sample_name):
-    from behav3d.analysis.clustering.state.visualization.backprojection import (
+    from behav3d.analysis.behavior.state.visualization.backprojection import (
         _resolve_raw_image_path as _shared_resolve_raw_image_path,
     )
 

@@ -10,7 +10,7 @@ import warnings
 from io import BytesIO
 from pathlib import Path
 from matplotlib.backends.backend_pdf import PdfPages
-from behav3d.analysis.clustering.utils import _sanitize_filename_token
+from behav3d.analysis.behavior.utils import _sanitize_filename_token
 
 # -----------------------------
 # Plot timepoint>timepoint state transition matrix

@@ -27,12 +27,12 @@ from behav3d.features.state_descriptive_features import (
     drop_highly_correlated_features
 )
 
-from behav3d.analysis.clustering.state.visualization.plots.state_transitions import compute_cluster_transition_matrix
-from behav3d.analysis.clustering.general import relabel_cluster_ids
+from behav3d.analysis.behavior.state.visualization.plots.state_transitions import compute_cluster_transition_matrix
+from behav3d.analysis.behavior.general import relabel_cluster_ids
 from behav3d.analysis.filtering import filter_and_truncate_tracks_anndata
-from behav3d.analysis.clustering.general.leiden import run_pca, run_leiden_clustering
-from behav3d.analysis.clustering.track.visualization.plots.exemplar_track_per_cluster import plot_exemplar_tracks_by_cluster
-from behav3d.analysis.clustering.general.visualization.plots import plot_top_ranking_features
+from behav3d.analysis.behavior.general.leiden import run_pca, run_leiden_clustering
+from behav3d.analysis.behavior.track.visualization.plots.exemplar_track_per_cluster import plot_exemplar_tracks_by_cluster
+from behav3d.analysis.behavior.general.visualization.plots import plot_top_ranking_features
 
 import numpy as np
 #%matplotlib inline

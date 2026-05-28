@@ -13,11 +13,6 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 
-# from test.state_classification_hmm_widget import (
-#     _show_hmm_state_backprojection,
-#     _show_intrinsic_hmm_backprojection,
-# )
-
 
 # %%
 # Interactive configuration

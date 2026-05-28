@@ -25,22 +25,22 @@ from sklearn.preprocessing import StandardScaler
 
 from behav3d.core.anndata import df_to_adata
 from behav3d.features.rolling_window_features import create_descriptive_track_dataset
-from behav3d.analysis.clustering.general import relabel_cluster_ids
-from behav3d.analysis.clustering.general.leiden import run_pca, run_leiden_clustering
-from behav3d.analysis.clustering.state.visualization.plots.state_composition import (
+from behav3d.analysis.behavior.general import relabel_cluster_ids
+from behav3d.analysis.behavior.general.leiden import run_pca, run_leiden_clustering
+from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
     save_state_composition_report,
 )
-from behav3d.analysis.clustering.state.visualization.plots.state_transitions import (
+from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
     save_state_transition_report,
 )
-from behav3d.analysis.clustering.state.visualization.backprojection import (
+from behav3d.analysis.behavior.state.visualization.backprojection import (
     export_behavioral_state_backprojection_zarrs,
     show_behavioral_state_backprojection,
 )
-from behav3d.analysis.clustering.state.visualization.videos.track_max_projection import (
+from behav3d.analysis.behavior.state.visualization.videos.track_max_projection import (
     save_selected_fulltrack_cluster_videos,
 )
-from behav3d.analysis.clustering.state.utils import (
+from behav3d.analysis.behavior.state.utils import (
     A4_LANDSCAPE,
     _apply_log1p_to_feature_matrix,
     _apply_log_scaling_to_continuous_matrix,

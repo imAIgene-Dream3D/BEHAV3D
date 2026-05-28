@@ -30,13 +30,13 @@ from behav3d.io.formats.zarr import load_zarr
 from behav3d.io.images import load_image
 from behav3d.features.timepoint_features import run_feature_extraction
 from behav3d.analysis.backprojection import backproject_columns, view_napari
-from behav3d.analysis.tcell_analysis import (
+from behav3d.analysis.behavior.track.feature_dtw import run_tcell_analysis
+from behav3d.analysis.behavior.track.visualization.plots.feature_dtw import (
     plot_cluster_percentage_bars,
     plot_clustering_feature_heatmap,
     plot_feature_umap,
-    run_tcell_analysis,
 )
-from behav3d.analysis.clustering.track.visualization.plots.exemplar_track_per_cluster import (
+from behav3d.analysis.behavior.track.visualization.plots.exemplar_track_per_cluster import (
     save_exemplar_statebar_backprojection_pdf,
     save_exemplar_statebar_backprojection_video_per_cluster,
 )
@@ -46,7 +46,7 @@ from behav3d.analysis.organoid_analysis import (
     run_organoid_morphology_dead_analysis
 )
 from behav3d.analysis.filtering import filter_tracks, preview_track_length_before_filtering
-from behav3d.analysis.clustering.state.visualization.backprojection import (
+from behav3d.analysis.behavior.state.visualization.backprojection import (
     _resolve_raw_image_path,
     _resolve_tracked_image_path,
 )

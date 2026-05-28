@@ -9,7 +9,7 @@ import pandas as pd
 import scanpy as sc
 import yaml
 
-from behav3d.analysis.clustering.general import relabel_cluster_ids
+from behav3d.analysis.behavior.general import relabel_cluster_ids
 from behav3d.deprecated.state_classification_clustering import (
     apply_state_classifiers_to_full_dataset,
     build_identity_cluster_mapping,
@@ -18,7 +18,7 @@ from behav3d.deprecated.state_classification_clustering import (
     run_state_clustering,
     train_state_classifiers,
 )
-from behav3d.analysis.clustering.state.visualization.backprojection import (
+from behav3d.analysis.behavior.state.visualization.backprojection import (
     show_behavioral_state_backprojection,
 )
 from behav3d.core.metadata import (

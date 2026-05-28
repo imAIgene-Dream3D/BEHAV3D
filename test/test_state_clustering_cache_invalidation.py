@@ -8,16 +8,16 @@ import pytest
 import scanpy as sc
 import yaml
 
-import behav3d.analysis.clustering.state.classification as state_classification
+import behav3d.analysis.behavior.state.classification as state_classification
 import behav3d.widgets.state_classification as state_classification_widget
-from behav3d.analysis.clustering.state.visualization import backprojection as state_backprojection
+from behav3d.analysis.behavior.state.visualization import backprojection as state_backprojection
 from behav3d.features import rolling_window_features
-from behav3d.analysis.clustering.state.classification import (
+from behav3d.analysis.behavior.state.classification import (
     _resolve_state_paths,
     prepare_state_classification_dataset,
     run_state_clustering,
 )
-from behav3d.analysis.clustering.state.classification import run_hmm_state_clustering
+from behav3d.analysis.behavior.state.classification import run_hmm_state_clustering
 
 
 def _load_hmm_widget_module():
@@ -556,8 +556,8 @@ def test_run_hmm_state_clustering_writes_grouped_binary_constraints_and_enforces
 
 
 def test_classification_module_exposes_hmm_without_legacy_classifier_schema():
-    assert "behav3d.analysis.clustering.state.classification" in sys.modules
-    hmm_module = sys.modules["behav3d.analysis.clustering.state.classification"]
+    assert "behav3d.analysis.behavior.state.classification" in sys.modules
+    hmm_module = sys.modules["behav3d.analysis.behavior.state.classification"]
     assert not hasattr(hmm_module, "STATE_CLASSIFIER_PIPELINE_SCHEMA_VERSION")
 
 

@@ -1283,8 +1283,9 @@ def plot_clustering_feature_heatmap(
             return float(np.ceil(max_val / magnitude) * magnitude)
 
     # ---- Cluster means ----
+    _cols_for_means = list(dict.fromkeys(list(info_cols) + ["ClusterID"]))
     df_for_means = (
-        df_umap[list(info_cols) + ["ClusterID"]]
+        df_umap[_cols_for_means]
         .drop(columns=sample_cols, errors="ignore")
     )
     cluster_means = (

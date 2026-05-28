@@ -10,35 +10,47 @@ import yaml
 from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.pyplot as plt
 
-from behav3d.analysis.clustering.state.classification import FULL_STATE_COL
-from behav3d.analysis.clustering.track.classification import (
-    _build_identity_cluster_mapping_from_obs,
-    _default_behavioral_states_path,
+from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+from behav3d.analysis.behavior.track.bouts import (
+    apply_track_classifier_to_subtracks,
+    rename_track_clusters,
+)
+from behav3d.analysis.behavior.track.visualization.backprojection import (
+    export_track_cluster_backprojection,
+    show_track_cluster_backprojection,
+)
+from behav3d.analysis.behavior.track.visualization.plots.exemplar_track_per_cluster import (
+    plot_exemplar_tracks_by_cluster,
+    save_exemplar_statebar_backprojection_pdf,
+    save_exemplar_statebar_backprojection_video_per_cluster,
+    save_exemplar_statebar_track_pdf_per_cluster,
+    select_exemplar_tracks_by_cluster,
+)
+from behav3d.analysis.behavior.track.feature_dtw import (
     _feature_dtw_clustered_csv_path,
     _feature_dtw_outdir,
     _feature_dtw_output_csv_paths,
     _feature_dtw_rename_mapping_path,
     _feature_dtw_umap_csv_path,
-    _filter_tracks_for_dtaidistance,
     _load_feature_dtw_name_mapping,
+    _save_feature_dtw_quality_control,
+    run_tcell_analysis,
+)
+from behav3d.analysis.behavior.track.state_dtw import (
+    run_categorical_dtaidistance_trajectory_clustering,
+    save_dtaidistance_diagnostics,
+    save_dtaidistance_exemplar_plots,
+    train_dtaidistance_trajectory_classifier,
+)
+from behav3d.analysis.behavior.track.utils import (
+    _build_identity_cluster_mapping_from_obs,
+    _default_behavioral_states_path,
+    _filter_tracks_for_dtaidistance,
     _ordered_unique,
     _resolve_dtaidistance_paths,
     _resolve_optional_int,
-    _save_feature_dtw_quality_control,
     _winfo,
-    export_track_cluster_backprojection,
     get_dtaidistance_track_trajectories_filename,
-    plot_exemplar_tracks_by_cluster,
-    rename_track_clusters,
-    run_categorical_dtaidistance_trajectory_clustering,
-    run_tcell_analysis,
-    save_dtaidistance_diagnostics,
-    save_dtaidistance_exemplar_plots,
-    save_exemplar_statebar_backprojection_pdf,
-    save_exemplar_statebar_backprojection_video_per_cluster,
-    save_exemplar_statebar_track_pdf_per_cluster,
-    select_exemplar_tracks_by_cluster,
-    show_track_cluster_backprojection,
 )
 from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
@@ -82,6 +94,13 @@ class TrackClassificationPanel:
             layout=widgets.Layout(width="420px"),
         )
         self.use_original_behav3d.observe(self._on_use_original_behav3d_changed, names="value")
+        self.apply_pretrained_classifier = widgets.Checkbox(
+            description="Apply pretrained trajectory classifier",
+            value=False,
+            indent=False,
+            layout=widgets.Layout(width="380px"),
+        )
+        self.apply_pretrained_classifier.observe(self._on_apply_pretrained_classifier_changed, names="value")
 
         self.state_col_html = widgets.HTML("")
         self.behavioral_trajectory_size = widgets.Text(
@@ -335,6 +354,130 @@ class TrackClassificationPanel:
             ],
             layout=widgets.Layout(gap="8px"),
         )
+        # --- Classify tracks section (dtaidistance mode only) ---
+        self.classifier_n_estimators = widgets.IntText(
+            description="Number of trees",
+            value=100,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="190px"),
+        )
+        self.classifier_min_samples_leaf = widgets.IntText(
+            description="Min samples leaf",
+            value=1,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="200px"),
+        )
+        self.classifier_test_size = widgets.Text(
+            description="Test holdout %",
+            value="0.2",
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="180px"),
+        )
+        self.classifier_advanced = widgets.Checkbox(
+            description="Advanced",
+            value=False,
+            indent=False,
+        )
+        self.classifier_advanced.observe(self._on_classifier_advanced_changed, names="value")
+        self.classifier_max_depth = widgets.Text(
+            description="Max depth",
+            value="",
+            placeholder="None",
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="170px"),
+        )
+        self.classifier_min_samples_split = widgets.IntText(
+            description="Min samples split",
+            value=2,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="210px"),
+        )
+        self.classifier_max_features = widgets.Dropdown(
+            description="Max features",
+            options=["sqrt", "log2", "None"],
+            value="sqrt",
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="190px"),
+        )
+        self.classifier_n_jobs = widgets.IntText(
+            description="n_jobs",
+            value=-1,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="140px"),
+        )
+        self.classifier_advanced_row = widgets.HBox(
+            [
+                self.classifier_min_samples_leaf,
+                self.classifier_min_samples_split,
+                self.classifier_max_features,
+                self.classifier_n_jobs,
+            ],
+            layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
+        )
+        self.classifier_advanced_row.layout.display = "none"
+
+        self.btn_train_classifier = widgets.Button(
+            description="Train RF classifier",
+            button_style="success",
+            layout=widgets.Layout(width="200px"),
+        )
+        self.train_classifier_spinner = widgets.HTML(value=spinning_loader)
+        self.train_classifier_spinner.layout.display = "none"
+        self.out_train_classifier = widgets.Output()
+
+        self.classifier_artifact_path = widgets.Text(
+            description="Classifier path",
+            value="",
+            placeholder="auto-filled after training",
+            style={"description_width": "120px"},
+            layout=widgets.Layout(width="560px"),
+        )
+        self.classifier_apply_states_path = widgets.Text(
+            description="States h5ad path",
+            value="",
+            placeholder="defaults to project behavioral states",
+            style={"description_width": "120px"},
+            layout=widgets.Layout(width="560px"),
+        )
+        self.btn_apply_classifier = widgets.Button(
+            description="Apply classifier",
+            button_style="info",
+            layout=widgets.Layout(width="200px"),
+        )
+        self.apply_classifier_spinner = widgets.HTML(value=spinning_loader)
+        self.apply_classifier_spinner.layout.display = "none"
+        self.out_apply_classifier = widgets.Output()
+
+        self.classifier_section = widgets.VBox(
+            [
+                widgets.HTML("<b>Train RF classifier on named clusters</b>"),
+                widgets.HBox(
+                    [self.classifier_n_estimators, self.classifier_max_depth, self.classifier_test_size, self.classifier_advanced],
+                    layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
+                ),
+                self.classifier_advanced_row,
+                widgets.HBox([self.btn_train_classifier, self.train_classifier_spinner], layout=widgets.Layout(gap="8px")),
+                self.out_train_classifier,
+                widgets.HTML("<b>Apply classifier to new data</b>"),
+                self.classifier_artifact_path,
+                self.classifier_apply_states_path,
+                widgets.HBox([self.btn_apply_classifier, self.apply_classifier_spinner], layout=widgets.Layout(gap="8px")),
+                self.out_apply_classifier,
+            ],
+            layout=widgets.Layout(gap="8px"),
+        )
+
+        self.apply_pretrained_section = widgets.VBox(
+            [
+                widgets.HTML("<b>Apply pretrained classifier</b>"),
+                self.classifier_artifact_path,
+                self.classifier_apply_states_path,
+                widgets.HBox([self.btn_apply_classifier, self.apply_classifier_spinner], layout=widgets.Layout(gap="8px")),
+                self.out_apply_classifier,
+            ],
+            layout=widgets.Layout(gap="8px"),
+        )
+
         self.steps = widgets.Accordion(
             children=[self.run_section, self.rename_section, self.plot_section, self.backprojection_section],
             selected_index=0,
@@ -417,6 +560,7 @@ class TrackClassificationPanel:
                     "based on state transitions and proportions</span>"
                 ),
                 widgets.HBox([self.cell_type_dd, self.refresh_btn, self.refresh_spinner], layout=widgets.Layout(gap="8px")),
+                self.apply_pretrained_classifier,
                 self.status_html,
                 self.mode_body,
             ],
@@ -435,9 +579,106 @@ class TrackClassificationPanel:
         self.make_backprojection_pdf.observe(self._on_exemplar_output_changed, names="value")
         self.make_backprojection_mp4.observe(self._on_exemplar_output_changed, names="value")
         self.btn_backproject.on_click(self._on_backproject_clicked)
+        self.btn_train_classifier.on_click(self._on_train_classifier_clicked)
+        self.btn_apply_classifier.on_click(self._on_apply_classifier_clicked)
         self._refresh_context()
         self._sync_advanced_visibility()
         self._sync_mode()
+
+    def _panel_cfg(self):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if not isinstance(params, dict):
+            return {}
+        section = params.setdefault("behavioral_track_classification", {})
+        cell_type = self._current_cell_type()
+        if cell_type not in section:
+            section[cell_type] = {}
+        return section[cell_type]
+
+    def _effective_panel_cfg(self):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if not isinstance(params, dict):
+            return {}
+        section = params.get("behavioral_track_classification", {})
+        defaults = section.get("defaults", {})
+        cell_cfg = section.get(self._current_cell_type(), {})
+        return {**defaults, **cell_cfg}
+
+    def _save_panel_cfg(self):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        cfg_path = getattr(self.metadata_loader, "behav3d_parameters_path", None)
+        if not isinstance(params, dict) or cfg_path is None:
+            return
+        try:
+            with Path(cfg_path).open("w", encoding="utf-8") as f:
+                yaml.safe_dump(params, f, sort_keys=False)
+        except Exception:
+            pass
+
+    def _apply_cfg_defaults(self):
+        cfg = self._effective_panel_cfg()
+        if not isinstance(cfg, dict):
+            return
+        self.behavioral_trajectory_size.value = str(cfg.get("behavioral_trajectory_size", self.behavioral_trajectory_size.value))
+        self.n_clusters.value = int(cfg.get("n_clusters", self.n_clusters.value))
+        self.n_per_cluster.value = int(cfg.get("n_per_cluster", self.n_per_cluster.value))
+        self.random_state.value = int(cfg.get("random_state", self.random_state.value))
+        self.trajectory_trim_mode.value = str(cfg.get("trajectory_trim_mode", self.trajectory_trim_mode.value))
+        self.linkage.value = str(cfg.get("linkage", self.linkage.value))
+        self.missing_policy.value = str(cfg.get("missing_policy", self.missing_policy.value))
+        self.parallel.value = bool(cfg.get("parallel", self.parallel.value))
+        self.save_distance_matrix.value = bool(cfg.get("save_distance_matrix", self.save_distance_matrix.value))
+        self.window.value = str(cfg.get("window", self.window.value))
+        self.max_dist.value = str(cfg.get("max_dist", self.max_dist.value))
+        self.max_length_diff.value = str(cfg.get("max_length_diff", self.max_length_diff.value))
+        self.penalty.value = str(cfg.get("penalty", self.penalty.value))
+        self.psi.value = str(cfg.get("psi", self.psi.value))
+        self.make_overview_statebars.value = bool(cfg.get("make_overview_statebars", self.make_overview_statebars.value))
+        self.make_backprojection_pdf.value = bool(cfg.get("make_backprojection_pdf", self.make_backprojection_pdf.value))
+        self.make_backprojection_mp4.value = bool(cfg.get("make_backprojection_mp4", self.make_backprojection_mp4.value))
+        self.classifier_n_estimators.value = int(cfg.get("classifier_n_estimators", self.classifier_n_estimators.value))
+        self.classifier_min_samples_leaf.value = int(cfg.get("classifier_min_samples_leaf", self.classifier_min_samples_leaf.value))
+        self.classifier_min_samples_split.value = int(cfg.get("classifier_min_samples_split", self.classifier_min_samples_split.value))
+        self.classifier_max_features.value = str(cfg.get("classifier_max_features", self.classifier_max_features.value))
+        self.classifier_max_depth.value = str(cfg.get("classifier_max_depth", self.classifier_max_depth.value))
+        self.classifier_test_size.value = str(cfg.get("classifier_test_size", self.classifier_test_size.value))
+        self.classifier_n_jobs.value = int(cfg.get("classifier_n_jobs", self.classifier_n_jobs.value))
+        saved_artifact = str(cfg.get("classifier_artifact_path", "")).strip()
+        if saved_artifact and not str(self.classifier_artifact_path.value).strip():
+            self.classifier_artifact_path.value = saved_artifact
+
+    def _persist_current_settings(self):
+        cfg = self._panel_cfg()
+        if not isinstance(cfg, dict):
+            return
+        cfg.update({
+            "behavioral_trajectory_size": str(self.behavioral_trajectory_size.value),
+            "n_clusters": int(self.n_clusters.value),
+            "n_per_cluster": int(self.n_per_cluster.value),
+            "random_state": int(self.random_state.value),
+            "trajectory_trim_mode": str(self.trajectory_trim_mode.value),
+            "linkage": str(self.linkage.value),
+            "missing_policy": str(self.missing_policy.value),
+            "parallel": bool(self.parallel.value),
+            "save_distance_matrix": bool(self.save_distance_matrix.value),
+            "window": str(self.window.value),
+            "max_dist": str(self.max_dist.value),
+            "max_length_diff": str(self.max_length_diff.value),
+            "penalty": str(self.penalty.value),
+            "psi": str(self.psi.value),
+            "make_overview_statebars": bool(self.make_overview_statebars.value),
+            "make_backprojection_pdf": bool(self.make_backprojection_pdf.value),
+            "make_backprojection_mp4": bool(self.make_backprojection_mp4.value),
+            "classifier_n_estimators": int(self.classifier_n_estimators.value),
+            "classifier_min_samples_leaf": int(self.classifier_min_samples_leaf.value),
+            "classifier_min_samples_split": int(self.classifier_min_samples_split.value),
+            "classifier_max_features": str(self.classifier_max_features.value),
+            "classifier_max_depth": str(self.classifier_max_depth.value),
+            "classifier_test_size": str(self.classifier_test_size.value),
+            "classifier_n_jobs": int(self.classifier_n_jobs.value),
+            "classifier_artifact_path": str(self.classifier_artifact_path.value),
+        })
+        self._save_panel_cfg()
 
     def _detect_cell_types(self):
         md = getattr(self.metadata_loader, "metadata", None)
@@ -530,7 +771,25 @@ class TrackClassificationPanel:
     def _on_advanced_changed(self, _):
         self._sync_advanced_visibility()
 
+    def _on_classifier_advanced_changed(self, _):
+        display = None if bool(self.classifier_advanced.value) else "none"
+        self.classifier_advanced_row.layout.display = display
+
+    def _on_apply_pretrained_classifier_changed(self, _):
+        self._sync_mode()
+
     def _sync_mode(self):
+        if bool(self.apply_pretrained_classifier.value):
+            self.steps.children = [
+                self.apply_pretrained_section,
+                self.plot_section,
+                self.backprojection_section,
+            ]
+            self.steps.set_title(0, "Apply classifier")
+            self.steps.set_title(1, "Create plots")
+            self.steps.set_title(2, "Backprojection")
+            self.steps.selected_index = 0
+            return
         if bool(self.use_original_behav3d.value):
             self.advanced_row_2.children = [
                 self.trajectory_trim_mode,
@@ -580,11 +839,18 @@ class TrackClassificationPanel:
                 self.original_run_row,
                 self.out_original,
             ]
-            self.steps.children = [self.run_section, self.rename_section, self.plot_section, self.backprojection_section]
+            self.steps.children = [
+                self.run_section,
+                self.rename_section,
+                self.classifier_section,
+                self.plot_section,
+                self.backprojection_section,
+            ]
             self.steps.set_title(0, "Run clustering")
             self.steps.set_title(1, "Rename clusters")
-            self.steps.set_title(2, "Create plots")
-            self.steps.set_title(3, "Backprojection")
+            self.steps.set_title(2, "Classify tracks")
+            self.steps.set_title(3, "Create plots")
+            self.steps.set_title(4, "Backprojection")
             self._refresh_context()
 
     def _on_use_original_behav3d_changed(self, _):
@@ -632,6 +898,14 @@ class TrackClassificationPanel:
             self._sync_exemplar_state_controls()
         else:
             self._sync_exemplar_state_controls()
+        self._apply_cfg_defaults()
+        # Pre-fill classifier paths with defaults if the fields are empty
+        if not str(self.classifier_apply_states_path.value).strip():
+            self.classifier_apply_states_path.value = str(self._state_adata_path())
+        if not str(self.classifier_artifact_path.value).strip():
+            clf_path = self._classifier_artifact_path()
+            if clf_path.exists():
+                self.classifier_artifact_path.value = str(clf_path)
 
     def _on_refresh_clicked(self, _):
         self._set_busy(self.refresh_btn, self.refresh_spinner, busy=True)
@@ -747,6 +1021,7 @@ class TrackClassificationPanel:
                 else:
                     self._rename_dtaidistance_clusters(mapping)
                 self._rebuild_rename_rows()
+                self._persist_current_settings()
                 self.steps.selected_index = 2
             except Exception:
                 traceback.print_exc()
@@ -1039,6 +1314,7 @@ class TrackClassificationPanel:
                 self._rebuild_rename_rows()
                 self._refresh_backprojection_samples()
                 self._sync_exemplar_state_controls()
+                self._persist_current_settings()
                 self.steps.selected_index = 1
             except Exception:
                 traceback.print_exc()
@@ -1077,7 +1353,7 @@ class TrackClassificationPanel:
                     umap_minimal_distance=float(self.original_umap_min_dist.value),
                     umap_n_neighbors=int(self.original_umap_n_neighbors.value),
                     nr_of_clusters=int(self.original_n_clusters.value),
-                    plot_results=True,
+                    plot_results=False,
                     seed=int(self.random_state.value),
                     output_subdir_name="timepoint_feature_dtw",
                     feature_scaling_preset="original_behav3d",
@@ -1223,3 +1499,91 @@ class TrackClassificationPanel:
             finally:
                 self._set_busy(self.btn_backproject, self.backprojection_spinner, busy=False)
                 self._refresh_backprojection_samples()
+
+    def _classifier_artifact_path(self):
+        from behav3d.analysis.behavior.track.bouts import (
+            _resolve_track_classifier_path,
+        )
+        return _resolve_track_classifier_path(
+            self.output_dir,
+            self._current_cell_type(),
+            output_subdir_name="behavorial_trajectories",
+        )
+
+    def _on_train_classifier_clicked(self, _):
+        self._set_busy(self.btn_train_classifier, self.train_classifier_spinner, busy=True)
+        self.out_train_classifier.clear_output()
+        with self.out_train_classifier:
+            try:
+                if self.model_adata is None:
+                    self.model_adata = self._load_model_adata()
+                test_size_text = str(self.classifier_test_size.value).strip()
+                test_size = float(test_size_text) if test_size_text else 0.2
+                max_depth_text = str(self.classifier_max_depth.value).strip()
+                max_depth = None if max_depth_text in ("", "None") else int(max_depth_text)
+                max_features_val = str(self.classifier_max_features.value)
+                max_features = None if max_features_val == "None" else max_features_val
+                result = train_dtaidistance_trajectory_classifier(
+                    output_dir=self.output_dir,
+                    cell_type=self._current_cell_type(),
+                    model_adata=self.model_adata,
+                    classifier_n_estimators=int(self.classifier_n_estimators.value),
+                    classifier_min_samples_leaf=int(self.classifier_min_samples_leaf.value),
+                    classifier_min_samples_split=int(self.classifier_min_samples_split.value),
+                    classifier_max_features=max_features,
+                    classifier_max_depth=max_depth,
+                    classifier_n_jobs=int(self.classifier_n_jobs.value),
+                    validation_test_size=test_size,
+                    random_state=int(self.random_state.value),
+                    verbose=True,
+                )
+                saved_path = result.get("classifier_path", "")
+                self.classifier_artifact_path.value = str(saved_path)
+                _winfo("trajectory-dtai-widget", f"RF classifier saved: {saved_path}")
+                fit_info = result.get("fit_info", {})
+                _winfo(
+                    "trajectory-dtai-widget",
+                    f"Train accuracy: {fit_info.get('train_accuracy', 'n/a'):.3f} | "
+                    f"n_train: {fit_info.get('n_train_rows', 'n/a')} | "
+                    f"classes: {fit_info.get('classes', [])}",
+                )
+                val = result.get("classifier_validation", {})
+                if val:
+                    _winfo(
+                        "trajectory-dtai-widget",
+                        f"Holdout accuracy: {val.get('accuracy', 'n/a'):.3f} | "
+                        f"balanced: {val.get('balanced_accuracy', 'n/a'):.3f}",
+                    )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_train_classifier, self.train_classifier_spinner, busy=False)
+
+    def _on_apply_classifier_clicked(self, _):
+        self._set_busy(self.btn_apply_classifier, self.apply_classifier_spinner, busy=True)
+        self.out_apply_classifier.clear_output()
+        with self.out_apply_classifier:
+            try:
+                clf_path = str(self.classifier_artifact_path.value).strip() or str(self._classifier_artifact_path())
+                states_path_text = str(self.classifier_apply_states_path.value).strip()
+                states_path = states_path_text if states_path_text else str(self._state_adata_path())
+                if not Path(clf_path).exists():
+                    raise FileNotFoundError(f"Classifier artifact not found: {clf_path}")
+                if not Path(states_path).exists():
+                    raise FileNotFoundError(f"Behavioral states file not found: {states_path}")
+                ct = self._current_cell_type()
+                _winfo("trajectory-dtai-widget", f"Applying classifier: {clf_path}")
+                apply_result = apply_track_classifier_to_subtracks(
+                    output_dir=self.output_dir,
+                    cell_type=ct,
+                    classifier_artifact_or_path=clf_path,
+                    adata_full_path=states_path,
+                    output_subdir_name="behavorial_trajectories",
+                    verbose=True,
+                )
+                out_path = apply_result.get("output_path", "")
+                _winfo("trajectory-dtai-widget", f"Applied classifier, output: {out_path}")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_apply_classifier, self.apply_classifier_spinner, busy=False)

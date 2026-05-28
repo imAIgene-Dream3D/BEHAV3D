@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from matplotlib import colors as mcolors
 from matplotlib import pyplot as plt
-from behav3d.analysis.clustering.utils import (
+from behav3d.analysis.behavior.utils import (
     _mixed_label_sort_key,
     _resolve_output_dir,
     _sanitize_filename_token,

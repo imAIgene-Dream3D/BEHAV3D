@@ -14,11 +14,11 @@ from sklearn.preprocessing import StandardScaler
 
 from behav3d.core.anndata import df_to_adata
 from behav3d.features.rolling_window_features import create_descriptive_track_dataset
-from behav3d.analysis.clustering.state.hmm import (
+from behav3d.analysis.behavior.state.hmm import (
     run_hmm_state_classification,
     run_sticky_hmm_state_classification,
 )
-from behav3d.analysis.clustering.state.utils import (
+from behav3d.analysis.behavior.state.utils import (
     A4_LANDSCAPE,
     _apply_log1p_to_feature_matrix,
     _get_classification_state_colors,
@@ -42,10 +42,10 @@ from behav3d.analysis.clustering.state.utils import (
     _vstart,
     cap_values_to_quantile,
 )
-from behav3d.analysis.clustering.state.visualization.plots.state_composition import (
+from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
     save_state_composition_report,
 )
-from behav3d.analysis.clustering.state.visualization.plots.state_transitions import (
+from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
     save_state_transition_report,
 )
 
@@ -1443,6 +1443,7 @@ def run_hmm_state_clustering(
     start_offset=0,
     start_offset_fill_mode="backfill",
     additional_window_features=None,
+    window_features_window=5,
     lower_quantile_cap=None,
     upper_quantile_cap=0.99,
     log_scale_features=None,
@@ -1496,7 +1497,7 @@ def run_hmm_state_clustering(
             window_features=window_features,
             time_col="position_t",
             id_cols=("sample_name", "TrackID"),
-            window_size=feature_smoothing_window,
+            window_size=window_features_window,
             verbose=verbose,
         )
         df_base = df_base.merge(
