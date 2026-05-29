@@ -66,7 +66,7 @@ def _intrinsic_hmm_backprojection_path(output_dir, sample_name, cell_type):
         output_dir,
         "analysis",
         str(cell_type),
-        "behavioral_state_trajectories",
+        "behavioral_states",
         "backprojection",
         f"{sample_name}_{cell_type}_{INTRINSIC_STATE_COL}.zarr",
     )
@@ -757,6 +757,10 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
             width="100%",
         )
 
+    def _model_adata_path(self, cell_type=None):
+        ct = self._current_cell_type() if cell_type is None else str(cell_type)
+        return _resolve_state_paths(self.output_dir, ct).full_output_adata_path
+
     def _default_hmm_deployment_artifact_path(self, cell_type=None):
         ct = self._current_cell_type() if cell_type is None else str(cell_type)
         return _resolve_hmm_deployment_artifact_path(output_dir=self.output_dir, cell_type=ct)
@@ -844,6 +848,7 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                 self.model_adata = sc.read_h5ad(p)
                 normalize_result = self._normalize_loaded_hmm_model_adata()
                 if INTRINSIC_STATE_COL in getattr(self.model_adata, "obs", {}).columns:
+                    self.model_adata = self._merge_metadata_into_obs(self.model_adata)
                     message = None
                     if bool(normalize_result.get("normalized", False)):
                         message = "Normalized older HMM model columns: " + ", ".join(normalize_result["changes"])
@@ -2175,6 +2180,23 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         "channel_", "dead_channel", "zarr", "dimension_order",
     )
 
+    def _merge_metadata_into_obs(self, adata):
+        if adata is None or not hasattr(adata, "obs"):
+            return adata
+        md = getattr(self.metadata_loader, "metadata", None)
+        if md is None or "sample_name" not in getattr(md, "columns", []):
+            return adata
+        meta_cols = self._metadata_grouping_columns()
+        cols_to_add = [c for c in meta_cols if c not in adata.obs.columns and c in md.columns]
+        if not cols_to_add:
+            return adata
+        meta_subset = md[["sample_name"] + cols_to_add].drop_duplicates(subset=["sample_name"])
+        orig_index = adata.obs.index
+        merged = adata.obs.merge(meta_subset, on="sample_name", how="left")
+        merged.index = orig_index
+        adata.obs = merged
+        return adata
+
     def _metadata_grouping_columns(self):
         md = getattr(self.metadata_loader, "metadata", None)
         if md is None or not hasattr(md, "columns"):
@@ -2245,6 +2267,17 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
         if FULL_STATE_COL not in self.model_adata.obs.columns:
             raise ValueError(f"model_adata is missing '{FULL_STATE_COL}'.")
 
+        # Use the full applied dataset when available — it covers all samples and timepoints.
+        # Fall back to the training model adata when no artifact has been applied yet.
+        adata_for_plots = (
+            self.adata_full
+            if (
+                getattr(self, "adata_full", None) is not None
+                and FULL_STATE_COL in getattr(self.adata_full, "obs", {}).columns
+            )
+            else self.model_adata
+        )
+
         state_paths = _resolve_state_paths(self.output_dir, self._current_cell_type())
         clustering_meta = self.model_adata.uns.get("clustering", {})
         if not isinstance(clustering_meta, dict):
@@ -2266,7 +2299,7 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                 report_pdf_path = composition_dir / f"state_composition_report_{FULL_STATE_COL}.pdf"
                 report_csv_path = composition_dir / f"state_composition_report_{FULL_STATE_COL}.csv"
                 composition_out = save_state_composition_report(
-                    adata=self.model_adata,
+                    adata=adata_for_plots,
                     output_pdf_path=report_pdf_path,
                     output_csv_path=report_csv_path,
                     time_col="position_t",
@@ -2298,7 +2331,7 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                 transitions_outdir = Path(state_paths.state_transitions_outdir)
                 transitions_outdir.mkdir(parents=True, exist_ok=True)
                 transition_out = save_state_transition_report(
-                    adata=self.model_adata,
+                    adata=adata_for_plots,
                     output_dir=transitions_outdir,
                     state_col=FULL_STATE_COL,
                     id_cols=("sample_name", "TrackID"),
@@ -2443,6 +2476,7 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                     verbose=True,
                 )
                 self.model_adata = cluster_out["model_adata"]
+                self.model_adata = self._merge_metadata_into_obs(self.model_adata)
                 self._hmm_model_load_status = {
                     "status": "loaded",
                     "path": str(self._model_adata_path()),
@@ -2521,6 +2555,7 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                 self.adata_full = self._apply_hmm_deployment_artifact_to_full_dataset(
                     hmm_artifact=hmm_artifact,
                 )
+                self.adata_full = self._merge_metadata_into_obs(self.adata_full)
                 self._hmm_deployment_artifact = hmm_artifact
 
                 n_rows = int(self.adata_full.n_obs)

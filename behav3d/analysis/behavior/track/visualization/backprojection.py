@@ -150,6 +150,7 @@ def export_track_cluster_backprojection(
     sample_col="sample_name",
     track_col="TrackID",
     time_col="position_t",
+    n_workers=1,
     verbose=True,
 ):
     """
@@ -287,6 +288,7 @@ def export_track_cluster_backprojection(
         track_col=track_col,
         time_col=time_col,
         enforce_time_coverage=False,
+        n_workers=n_workers,
         verbose=verbose,
     )
     manifest["window_backprojection_rows"] = int(len(backproj_obs))

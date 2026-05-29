@@ -411,7 +411,7 @@ def plot_clustering_feature_heatmap(
     else:
         overall_heatmap_data = pd.DataFrame()
 
-    value_cols = [c for c in info_cols if c not in set(sample_cols)]
+    value_cols = [c for c in info_cols if c not in set(sample_cols) and c != "ClusterID"]
     df_values = df_umap[["ClusterID"] + value_cols].copy()
     df_values[value_cols] = df_values[value_cols].apply(pd.to_numeric, errors="coerce")
     df_values.replace([np.inf, -np.inf], np.nan, inplace=True)

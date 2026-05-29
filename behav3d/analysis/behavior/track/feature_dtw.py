@@ -670,7 +670,7 @@ def run_tcell_analysis(
 # ---------------------------------------------------------------------------
 
 def _feature_dtw_outdir(output_dir, cell_type):
-    return Path(output_dir).expanduser() / "analysis" / str(cell_type) / "timepoint_feature_dtw"
+    return Path(output_dir).expanduser() / "analysis" / str(cell_type) / "behavorial_trajectories"
 
 
 def _feature_dtw_clustered_csv_path(output_dir, cell_type):

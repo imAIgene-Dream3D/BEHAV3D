@@ -433,7 +433,7 @@ def _plot_page_count_stacked_grid(
     for i, sample in enumerate(samples):
         inner = outer[i].subgridspec(1, 2, width_ratios=[8, 1], wspace=0.10)
         ax = fig.add_subplot(inner[0, 0])
-        ax_bar = fig.add_subplot(inner[0, 1], sharey=ax)
+        ax_bar = fig.add_subplot(inner[0, 1])
         mat = count_by_sample[sample]
         x = mat.index.to_numpy(dtype=float)
         if len(x) == 0:
@@ -951,6 +951,36 @@ def _compute_grouped_relative_matrices(
     return relative_by_group, overall_by_group
 
 
+def _compute_grouped_count_matrices(
+    df,
+    *,
+    group_cols,
+    time_col,
+    state_col,
+    state_order,
+):
+    """Compute raw count matrices per unique group label."""
+    group_labels = _make_group_label(df, group_cols)
+    tmp = df.copy()
+    tmp["_group_label"] = group_labels.values
+    unique_groups = tmp["_group_label"].dropna().unique().tolist()
+
+    count_by_group = {}
+    overall_count_by_group = {}
+    for grp in unique_groups:
+        panel = tmp[tmp["_group_label"] == grp]
+        count_by_group[str(grp)] = _compute_count_matrix(
+            panel,
+            time_col=time_col,
+            state_col=state_col,
+            state_order=state_order,
+        )
+        counts = panel[state_col].value_counts().reindex(state_order, fill_value=0).astype(int)
+        overall_count_by_group[str(grp)] = counts
+
+    return count_by_group, overall_count_by_group
+
+
 def _plot_page_grouped_stacked_grid(
     relative_by_group,
     *,
@@ -1018,6 +1048,88 @@ def _plot_page_grouped_stacked_grid(
         fig.tight_layout()
     fig.suptitle(
         f"Grouped Relative State Composition — grouped by: {group_label_title}",
+        y=0.998,
+        fontsize=12,
+    )
+    return fig
+
+
+def _plot_page_grouped_count_stacked_grid(
+    count_by_group,
+    *,
+    overall_count_by_group,
+    state_order,
+    time_col,
+    group_label_title,
+    grid_ncols,
+    figsize_per_panel,
+    state_colors,
+    sample_title_fontsize=8,
+    sample_title_pad=2,
+):
+    """One page: absolute cell count stacked composition per group."""
+    groups = list(count_by_group.keys())
+    ncols = max(1, int(grid_ncols))
+    nrows = max(1, int(np.ceil(float(len(groups)) / float(ncols))))
+
+    all_maxes = []
+    for mat in count_by_group.values():
+        if mat is not None and len(mat) > 0:
+            row_totals = mat.sum(axis=1)
+            if len(row_totals) > 0:
+                all_maxes.append(float(row_totals.max()))
+    global_ymax = max(all_maxes) * 1.1 if all_maxes else 1.0
+
+    fig = plt.figure(figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows))
+    outer = GridSpec(nrows=nrows, ncols=ncols, figure=fig)
+    first_handles = []
+    first_labels = []
+
+    for i, grp in enumerate(groups):
+        inner = outer[i].subgridspec(1, 2, width_ratios=[8, 1], wspace=0.10)
+        ax = fig.add_subplot(inner[0, 0])
+        ax_bar = fig.add_subplot(inner[0, 1])
+        mat = count_by_group[grp]
+        x = mat.index.to_numpy(dtype=float)
+        if len(x) == 0:
+            ax.set_title(f"{grp} (empty)", fontsize=sample_title_fontsize, pad=sample_title_pad)
+            ax.axis("off")
+            ax_bar.axis("off")
+            continue
+        y_arrays = [mat[state].to_numpy(dtype=float) for state in state_order]
+        colors = [state_colors[state] for state in state_order]
+        ax.stackplot(x, *y_arrays, labels=[str(s) for s in state_order], colors=colors, alpha=0.9)
+        ax.set_ylim(0.0, global_ymax)
+        ax.set_title(grp, fontsize=sample_title_fontsize, pad=sample_title_pad)
+        ax.set_xlabel(time_col)
+        ax.set_ylabel("Cell count")
+        _plot_overall_count_bar(
+            ax_bar,
+            overall_count_by_group[grp],
+            state_order=state_order,
+            state_colors=state_colors,
+        )
+        if len(first_labels) == 0:
+            first_handles, first_labels = ax.get_legend_handles_labels()
+
+    for i in range(len(groups), nrows * ncols):
+        ax_empty = fig.add_subplot(outer[i])
+        ax_empty.axis("off")
+
+    fig.subplots_adjust(hspace=0.35)
+    if len(first_labels) > 0:
+        fig.legend(
+            first_handles,
+            first_labels,
+            loc="lower center",
+            ncol=min(len(first_labels), 8),
+            frameon=False,
+        )
+        fig.tight_layout(rect=(0, 0.06, 1, 1))
+    else:
+        fig.tight_layout()
+    fig.suptitle(
+        f"Grouped Absolute Cell Count — grouped by: {group_label_title}",
         y=0.998,
         fontsize=12,
     )
@@ -1136,8 +1248,63 @@ def save_state_composition_report(
     per_state_ylim_headroom = 0.10
 
     nonstacked_pages = _paginate_samples(sample_order, samples_per_page=nonstacked_samples_per_page)
+
+    relative_by_group = {}
+    overall_by_group = {}
+    count_by_group = {}
+    overall_count_by_group = {}
+    group_label_title = ""
+    if len(valid_group_cols) > 0:
+        group_label_title = ", ".join(valid_group_cols)
+        relative_by_group, overall_by_group = _compute_grouped_relative_matrices(
+            df,
+            group_cols=valid_group_cols,
+            time_col=time_col,
+            state_col=state_col,
+            state_order=state_order,
+        )
+        count_by_group, overall_count_by_group = _compute_grouped_count_matrices(
+            df,
+            group_cols=valid_group_cols,
+            time_col=time_col,
+            state_col=state_col,
+            state_order=state_order,
+        )
+
     with PdfPages(merged_pdf_path) as pdf:
-        # Page 1: relative stacked grid
+        # Grouped pages first (when group_cols provided)
+        if len(valid_group_cols) > 0:
+            fig_grouped = _plot_page_grouped_stacked_grid(
+                relative_by_group,
+                overall_by_group=overall_by_group,
+                state_order=state_order,
+                time_col=time_col,
+                group_label_title=group_label_title,
+                grid_ncols=grid_ncols,
+                figsize_per_panel=figsize_per_panel,
+                state_colors=state_colors,
+                sample_title_fontsize=sample_title_fontsize,
+                sample_title_pad=sample_title_pad,
+            )
+            pdf.savefig(fig_grouped, dpi=dpi, bbox_inches="tight")
+            plt.close(fig_grouped)
+
+            fig_grouped_counts = _plot_page_grouped_count_stacked_grid(
+                count_by_group,
+                overall_count_by_group=overall_count_by_group,
+                state_order=state_order,
+                time_col=time_col,
+                group_label_title=group_label_title,
+                grid_ncols=grid_ncols,
+                figsize_per_panel=figsize_per_panel,
+                state_colors=state_colors,
+                sample_title_fontsize=sample_title_fontsize,
+                sample_title_pad=sample_title_pad,
+            )
+            pdf.savefig(fig_grouped_counts, dpi=dpi, bbox_inches="tight")
+            plt.close(fig_grouped_counts)
+
+        # Per-sample relative stacked grid
         fig1 = _plot_page_relative_stacked_grid(
             relative_by_sample,
             overall_by_sample=overall_by_sample,
@@ -1153,7 +1320,7 @@ def save_state_composition_report(
         pdf.savefig(fig1, dpi=dpi, bbox_inches="tight")
         plt.close(fig1)
 
-        # Page 2 (new): absolute count stacked grid
+        # Per-sample absolute count stacked grid
         fig_counts = _plot_page_count_stacked_grid(
             count_by_sample,
             overall_count_by_sample=overall_count_by_sample,
@@ -1169,7 +1336,7 @@ def save_state_composition_report(
         pdf.savefig(fig_counts, dpi=dpi, bbox_inches="tight")
         plt.close(fig_counts)
 
-        # Pages 3+: non-stacked per-sample line plots
+        # Non-stacked per-sample line plots
         for page_samples in nonstacked_pages:
             page_relative = {
                 sample: relative_by_sample[sample]
@@ -1193,31 +1360,6 @@ def save_state_composition_report(
             )
             pdf.savefig(fig2, dpi=dpi, bbox_inches="tight")
             plt.close(fig2)
-
-        # Grouped pages (new): one page per group_cols combination
-        if len(valid_group_cols) > 0:
-            group_label_title = ", ".join(valid_group_cols)
-            relative_by_group, overall_by_group = _compute_grouped_relative_matrices(
-                df,
-                group_cols=valid_group_cols,
-                time_col=time_col,
-                state_col=state_col,
-                state_order=state_order,
-            )
-            fig_grouped = _plot_page_grouped_stacked_grid(
-                relative_by_group,
-                overall_by_group=overall_by_group,
-                state_order=state_order,
-                time_col=time_col,
-                group_label_title=group_label_title,
-                grid_ncols=grid_ncols,
-                figsize_per_panel=figsize_per_panel,
-                state_colors=state_colors,
-                sample_title_fontsize=sample_title_fontsize,
-                sample_title_pad=sample_title_pad,
-            )
-            pdf.savefig(fig_grouped, dpi=dpi, bbox_inches="tight")
-            plt.close(fig_grouped)
 
         # Last page: per-state lines colored by sample
         state_ylims = _compute_state_panel_ylims(

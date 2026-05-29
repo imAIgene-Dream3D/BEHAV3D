@@ -1,6 +1,7 @@
 import re
 import shutil
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -56,7 +57,7 @@ def _behavioral_state_backprojection_dir(output_dir, cell_type):
         output_dir,
         "analysis",
         str(cell_type),
-        "behavioral_state_trajectories",
+        "behavioral_states",
         "backprojection",
     )
 
@@ -527,11 +528,12 @@ def export_behavioral_state_backprojection_zarrs(
     state_colors=None,
     raise_on_error=True,
     require_all_rows_present=False,
+    n_workers=1,
     verbose=True,
 ):
     """
     Export one behavioral-state label image per sample under:
-    output_dir/analysis/<cell_type>/behavioral_state_trajectories/backprojection/<sample>_<cell_type>_behavioral_states.zarr
+    output_dir/analysis/<cell_type>/behavioral_states/backprojection/<sample>_<cell_type>_behavioral_states.zarr
     """
     if adata is None or not hasattr(adata, "obs"):
         raise ValueError("adata with .obs is required for behavioral-state backprojection.")
@@ -574,16 +576,18 @@ def export_behavioral_state_backprojection_zarrs(
         "errors": [],
     }
 
-    for sample_name in sample_names:
-        sample_obs = obs[obs[sample_col].astype("string") == str(sample_name)].copy()
+    source_h5ad_path = getattr(adata, "filename", None)
+    policy_hint = None
+    try:
+        pre_meta = adata.uns.get("preprocessing", {}) if isinstance(getattr(adata, "uns", {}), dict) else {}
+        windowing_meta = pre_meta.get("windowing", {}) if isinstance(pre_meta, dict) else {}
+        if isinstance(windowing_meta, dict):
+            policy_hint = windowing_meta.get("incomplete_window_policy", None)
+    except Exception:
         policy_hint = None
-        try:
-            pre_meta = adata.uns.get("preprocessing", {}) if isinstance(getattr(adata, "uns", {}), dict) else {}
-            windowing_meta = pre_meta.get("windowing", {}) if isinstance(pre_meta, dict) else {}
-            if isinstance(windowing_meta, dict):
-                policy_hint = windowing_meta.get("incomplete_window_policy", None)
-        except Exception:
-            policy_hint = None
+
+    def _process_sample(sample_name):
+        sample_obs = obs[obs[sample_col].astype("string") == str(sample_name)].copy()
 
         tracked_img_path = _resolve_tracked_image_path(
             output_dir=output_dir,
@@ -596,11 +600,9 @@ def export_behavioral_state_backprojection_zarrs(
                 "Could not resolve tracked image path from expected names or fallback glob for sample "
                 f"'{sample_name}' and cell_type '{cell_type}'."
             )
-            manifest["skipped_samples"].append(
-                {"sample_name": str(sample_name), "reason": reason}
-            )
             warnings.warn(reason, RuntimeWarning)
-            continue
+            return {"kind": "skip", "sample_name": str(sample_name), "reason": reason}
+
         raw_img_path = _resolve_raw_image_path(
             output_dir=output_dir,
             sample_name=sample_name,
@@ -611,11 +613,8 @@ def export_behavioral_state_backprojection_zarrs(
                 "Could not resolve raw image path from sample folder structure or metadata.csv for sample "
                 f"'{sample_name}'."
             )
-            manifest["skipped_samples"].append(
-                {"sample_name": str(sample_name), "reason": reason}
-            )
             warnings.warn(reason, RuntimeWarning)
-            continue
+            return {"kind": "skip", "sample_name": str(sample_name), "reason": reason}
 
         output_path = _behavioral_state_backprojection_path(
             output_dir=output_dir,
@@ -637,23 +636,34 @@ def export_behavioral_state_backprojection_zarrs(
                 coverage_check_max_missing_leading_frames=0,
                 sample_name=str(sample_name),
                 policy_hint=policy_hint,
-                source_h5ad_path=getattr(adata, "filename", None),
+                source_h5ad_path=source_h5ad_path,
                 state_colors=state_color_map,
                 require_all_rows_present=bool(require_all_rows_present),
                 verbose=verbose,
             )
-            manifest["output_paths"][str(sample_name)] = str(sample_result["output_path"])
+            return {"kind": "success", "sample_name": str(sample_name), "output_path": str(sample_result["output_path"])}
         except Exception as exc:
-            error_entry = {
-                "sample_name": str(sample_name),
-                "error": str(exc),
-            }
-            manifest["errors"].append(error_entry)
             warnings.warn(
                 "Behavioral-state backprojection failed for sample "
                 f"'{sample_name}': {exc}",
                 RuntimeWarning,
             )
+            return {"kind": "error", "sample_name": str(sample_name), "error": str(exc)}
+
+    n_workers = max(1, int(n_workers))
+    if n_workers > 1 and len(sample_names) > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            results = list(executor.map(_process_sample, sample_names))
+    else:
+        results = [_process_sample(s) for s in sample_names]
+
+    for r in results:
+        if r["kind"] == "success":
+            manifest["output_paths"][r["sample_name"]] = r["output_path"]
+        elif r["kind"] == "skip":
+            manifest["skipped_samples"].append({"sample_name": r["sample_name"], "reason": r["reason"]})
+        else:
+            manifest["errors"].append({"sample_name": r["sample_name"], "error": r["error"]})
 
     if verbose:
         print(

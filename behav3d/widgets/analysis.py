@@ -3163,7 +3163,6 @@ class MotileCellAnalysisPanel:
                     "analysis",
                     self.cell_type,
                     "timepoint_feature_dtw",
-                    "clustering",
                     "example_tracks",
                     "backprojection",
                 )

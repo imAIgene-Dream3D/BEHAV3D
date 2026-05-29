@@ -106,10 +106,11 @@ class TrackClassificationPanel:
         self.behavioral_trajectory_size = widgets.Text(
             description="Trajectory size",
             value="100",
-            placeholder="blank = all timepoints",
+            placeholder="blank = variable-length DTW",
             layout=widgets.Layout(width="230px"),
             style={"description_width": "110px"},
         )
+        self.behavioral_trajectory_size.observe(self._on_trajectory_size_changed, names="value")
         self.n_clusters = widgets.IntText(
             description="Clusters",
             value=6,
@@ -257,6 +258,14 @@ class TrackClassificationPanel:
             layout=widgets.Layout(width="360px"),
             style={"description_width": "90px"},
         )
+        self.backprojection_workers = widgets.BoundedIntText(
+            description="Workers",
+            value=4,
+            min=1,
+            max=32,
+            style={"description_width": "90px"},
+            layout=widgets.Layout(width="170px"),
+        )
         self.btn_backproject = widgets.Button(
             description="Open backprojection",
             button_style="success",
@@ -348,7 +357,7 @@ class TrackClassificationPanel:
         self.backprojection_section = widgets.VBox(
             [
                 self.backprojection_status,
-                self.backproj_sample_dd,
+                widgets.HBox([self.backproj_sample_dd, self.backprojection_workers], layout=widgets.Layout(gap="8px")),
                 widgets.HBox([self.btn_backproject, self.backprojection_spinner], layout=widgets.Layout(gap="8px")),
                 self.out_backprojection,
             ],
@@ -636,6 +645,7 @@ class TrackClassificationPanel:
         self.make_overview_statebars.value = bool(cfg.get("make_overview_statebars", self.make_overview_statebars.value))
         self.make_backprojection_pdf.value = bool(cfg.get("make_backprojection_pdf", self.make_backprojection_pdf.value))
         self.make_backprojection_mp4.value = bool(cfg.get("make_backprojection_mp4", self.make_backprojection_mp4.value))
+        self.backprojection_workers.value = int(cfg.get("backprojection_workers", self.backprojection_workers.value))
         self.classifier_n_estimators.value = int(cfg.get("classifier_n_estimators", self.classifier_n_estimators.value))
         self.classifier_min_samples_leaf.value = int(cfg.get("classifier_min_samples_leaf", self.classifier_min_samples_leaf.value))
         self.classifier_min_samples_split.value = int(cfg.get("classifier_min_samples_split", self.classifier_min_samples_split.value))
@@ -646,6 +656,7 @@ class TrackClassificationPanel:
         saved_artifact = str(cfg.get("classifier_artifact_path", "")).strip()
         if saved_artifact and not str(self.classifier_artifact_path.value).strip():
             self.classifier_artifact_path.value = saved_artifact
+        self._sync_trim_mode_visibility()
 
     def _persist_current_settings(self):
         cfg = self._panel_cfg()
@@ -669,6 +680,7 @@ class TrackClassificationPanel:
             "make_overview_statebars": bool(self.make_overview_statebars.value),
             "make_backprojection_pdf": bool(self.make_backprojection_pdf.value),
             "make_backprojection_mp4": bool(self.make_backprojection_mp4.value),
+            "backprojection_workers": int(self.backprojection_workers.value),
             "classifier_n_estimators": int(self.classifier_n_estimators.value),
             "classifier_min_samples_leaf": int(self.classifier_min_samples_leaf.value),
             "classifier_min_samples_split": int(self.classifier_min_samples_split.value),
@@ -762,11 +774,19 @@ class TrackClassificationPanel:
     def _on_exemplar_output_changed(self, _):
         self._sync_exemplar_state_controls()
 
+    def _sync_trim_mode_visibility(self):
+        has_size = str(self.behavioral_trajectory_size.value).strip() != ""
+        self.trajectory_trim_mode.layout.display = None if has_size else "none"
+
+    def _on_trajectory_size_changed(self, _):
+        self._sync_trim_mode_visibility()
+
     def _sync_advanced_visibility(self):
         display = None if bool(self.advanced.value) else "none"
         self.advanced_row_1.layout.display = "none"
         self.advanced_row_2.layout.display = display
         self.backend_summary_html.layout.display = "none"
+        self._sync_trim_mode_visibility()
 
     def _on_advanced_changed(self, _):
         self._sync_advanced_visibility()
@@ -1151,7 +1171,7 @@ class TrackClassificationPanel:
     def _save_original_exemplar_plots(self):
         adata_filt, adata_tracks = self._load_original_exemplar_data()
         ct = self._current_cell_type()
-        outdir = _feature_dtw_outdir(self.output_dir, ct) / "clustering" / "example_tracks"
+        outdir = _feature_dtw_outdir(self.output_dir, ct) / "example_tracks"
         outdir.mkdir(parents=True, exist_ok=True)
         n_per_cluster = int(self.n_per_cluster.value)
         num_example_ranks = 5
@@ -1355,7 +1375,7 @@ class TrackClassificationPanel:
                     nr_of_clusters=int(self.original_n_clusters.value),
                     plot_results=False,
                     seed=int(self.random_state.value),
-                    output_subdir_name="timepoint_feature_dtw",
+                    output_subdir_name="behavorial_trajectories",
                     feature_scaling_preset="original_behav3d",
                     min_track_length=int(self.original_trajectory_size.value),
                     max_track_length=int(self.original_trajectory_size.value),
@@ -1468,6 +1488,7 @@ class TrackClassificationPanel:
                     cluster_col="ClusterID",
                     output_col=output_col,
                     sample_name=str(sample_name),
+                    n_workers=max(1, int(self.backprojection_workers.value)),
                     verbose=True,
                 )
                 sample_key = str(sample_name).strip()
@@ -1541,18 +1562,24 @@ class TrackClassificationPanel:
                 self.classifier_artifact_path.value = str(saved_path)
                 _winfo("trajectory-dtai-widget", f"RF classifier saved: {saved_path}")
                 fit_info = result.get("fit_info", {})
+                tr_acc = fit_info.get("train_accuracy", "n/a")
+                tr_acc_str = f"{tr_acc:.3f}" if isinstance(tr_acc, (int, float)) else str(tr_acc)
                 _winfo(
                     "trajectory-dtai-widget",
-                    f"Train accuracy: {fit_info.get('train_accuracy', 'n/a'):.3f} | "
+                    f"Train accuracy: {tr_acc_str} | "
                     f"n_train: {fit_info.get('n_train_rows', 'n/a')} | "
                     f"classes: {fit_info.get('classes', [])}",
                 )
                 val = result.get("classifier_validation", {})
-                if val:
+                test_metrics = (val.get("test_metrics") or {}) if val else {}
+                if test_metrics:
+                    acc = test_metrics.get("accuracy", "n/a")
+                    bal = test_metrics.get("balanced_accuracy", "n/a")
+                    acc_str = f"{acc:.3f}" if isinstance(acc, (int, float)) else str(acc)
+                    bal_str = f"{bal:.3f}" if isinstance(bal, (int, float)) else str(bal)
                     _winfo(
                         "trajectory-dtai-widget",
-                        f"Holdout accuracy: {val.get('accuracy', 'n/a'):.3f} | "
-                        f"balanced: {val.get('balanced_accuracy', 'n/a'):.3f}",
+                        f"Holdout accuracy: {acc_str} | balanced: {bal_str}",
                     )
             except Exception:
                 traceback.print_exc()

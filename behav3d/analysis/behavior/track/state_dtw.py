@@ -296,7 +296,7 @@ def save_dtaidistance_exemplar_plots(
         adata_full_path=adata_full_path,
         verbose=verbose,
     )
-    exemplar_root = paths["clustering_outfolder"] / "example_tracks"
+    exemplar_root = paths["outfolder"] / "example_tracks"
     exemplar_root.mkdir(parents=True, exist_ok=True)
 
     coord_enrichment = _ensure_exemplar_coordinate_columns(
@@ -627,7 +627,7 @@ def run_categorical_dtaidistance_trajectory_clustering(
         adata_tracks.uns["visualization"].update(plot_paths)
 
     if bool(plot_exemplars):
-        exemplar_root = paths["clustering_outfolder"] / "example_tracks"
+        exemplar_root = paths["outfolder"] / "example_tracks"
         exemplar_root.mkdir(parents=True, exist_ok=True)
         try:
             _ensure_exemplar_coordinate_columns(

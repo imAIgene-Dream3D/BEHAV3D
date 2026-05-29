@@ -432,10 +432,18 @@ def _build_track_preprocessing_spec(*, state_col, filter_cfg, feat_cfg):
 def _resolve_apply_state_col(artifact, requested_state_col):
     """
     Resolve state column for apply.
-    If artifact provides training state column, enforce exact match.
+    If requested_state_col is None, auto-use the artifact's trained column.
+    If both are provided, enforce exact match.
     """
-    requested = str(requested_state_col)
     artifact_state_col = str(artifact.get("state_col_used_for_training", "")).strip()
+    if requested_state_col is None:
+        if artifact_state_col == "":
+            raise ValueError(
+                "Cannot apply classifier: no state_col provided and the classifier artifact "
+                "does not record 'state_col_used_for_training'. Pass state_col explicitly."
+            )
+        return artifact_state_col, None
+    requested = str(requested_state_col)
     if artifact_state_col == "":
         return requested, None
     if requested != artifact_state_col:
@@ -907,12 +915,12 @@ def apply_track_classifier_to_subtracks(
     classifier_artifact_or_path=None,
     adata_full=None,
     adata_full_path=None,
-    state_col="full_behavioral_cluster",
+    state_col=None,
     output_col="ClusterID",
     confidence_col=None,
     output_subdir_name="behavioral_state_trajectories",
-    plot_exemplars=True,
-    plot_exemplar_backprojection_videos=True,
+    plot_exemplars=False,
+    plot_exemplar_backprojection_videos=False,
     plot_exemplar_backprojection_pdfs=False,
     n_per_cluster=10,
     plot_dpi=300,
@@ -1150,7 +1158,7 @@ def apply_track_classifier_to_subtracks(
             f"backprojection_videos={bool(plot_exemplar_backprojection_videos)} | "
             f"backprojection_pdfs={bool(plot_exemplar_backprojection_pdfs)}",
         )
-        exemplar_root = outfolder / "classification" / "example_tracks"
+        exemplar_root = outfolder / "example_tracks"
         exemplar_root.mkdir(parents=True, exist_ok=True)
 
         adata_plot = filter_and_truncate_tracks_anndata(
@@ -1530,10 +1538,10 @@ def run_state_based_analysis(
     umap_alpha=0.5,
 
     # Exemplar track plotting
-    plot_exemplars=True,
+    plot_exemplars=False,
     n_per_cluster=10,
     exemplar_state_keys=("full_behavioral_cluster",),
-    plot_exemplar_backprojection_videos=True,
+    plot_exemplar_backprojection_videos=False,
     plot_exemplar_backprojection_pdfs=False,
     exemplar_video_fps=6,
     exemplar_video_dpi=180,
@@ -1570,7 +1578,7 @@ def run_state_based_analysis(
     )
     outfolder = resolved_paths["outfolder"]
     clustering_outfolder = outfolder / "clustering"
-    exemplar_root = outfolder / "clustering" / "example_tracks"
+    exemplar_root = outfolder / "example_tracks"
     state_folder = resolved_paths["state_outdir"]
     
     if adata_full_path is None:

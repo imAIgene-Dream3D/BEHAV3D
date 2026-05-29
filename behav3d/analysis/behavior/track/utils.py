@@ -44,7 +44,7 @@ def _resolve_dtaidistance_paths(output_dir, cell_type, output_subdir_name="behav
 
 def get_dtaidistance_track_trajectories_filename(cell_type):
     cell_token = _sanitize_filename_token(cell_type, fallback="cell")
-    return f"BEHAV3D_{cell_token}_behavioral_trajectories_dtaidistance.h5ad"
+    return f"BEHAV3D_{cell_token}_behavioral_trajectories.h5ad"
 
 
 def _default_behavioral_states_path(output_dir, cell_type):
