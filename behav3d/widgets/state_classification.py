@@ -31,6 +31,18 @@ from behav3d.analysis.behavior.state.utils import (
     _resolve_state_paths,
     _set_classification_state_colors,
 )
+
+from behav3d.analysis.behavior.state.visualization.backprojection import (
+    show_behavioral_state_backprojection,
+)
+from behav3d.core.metadata import (
+    detect_immune_cell_types_from_metadata,
+    detect_organoid_types_from_metadata,
+    detect_other_cell_types_from_metadata,
+    detect_merged_cell_types_from_metadata,
+    filter_multicolor_inputs,
+)
+
 from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
     save_state_composition_report,
 )
@@ -1258,6 +1270,57 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
                 self.out_backprojection,
             ]
         )
+
+    # def _detect_cell_types(self):
+    #     md = getattr(self.metadata_loader, "metadata", None)
+    #     cell_types = []
+    #     if md is not None:
+    #         try:
+    #             cell_types.extend(filter_multicolor_inputs(detect_organoid_types_from_metadata(md)))
+    #             cell_types.extend(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
+    #             cell_types.extend(filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)))
+    #             cell_types.extend(detect_merged_cell_types_from_metadata(md))
+    #         except Exception:
+    #             pass
+
+    #     # Filesystem fallback
+    #     out_dir = Path(self.output_dir) if self.output_dir else None
+    #     if out_dir is not None:
+    #         analysis_dir = out_dir / "analysis"
+    #         if analysis_dir.exists():
+    #             for p in analysis_dir.iterdir():
+    #                 if p.is_dir():
+    #                     cell_types.append(p.name)
+    #     return sorted({str(x).strip() for x in cell_types if str(x).strip() != ""})
+
+    # def _detect_sample_names(self):
+    #     md = getattr(self.metadata_loader, "metadata", None)
+    #     if isinstance(md, pd.DataFrame) and "sample_name" in md.columns:
+    #         meta_names = sorted(
+    #             {
+    #                 str(x).strip()
+    #                 for x in md["sample_name"].astype(str).dropna().unique().tolist()
+    #                 if str(x).strip() != ""
+    #             }
+    #         )
+    #         if len(meta_names) > 0:
+    #             return meta_names
+
+    #     sample_names = []
+    #     if self.model_adata is not None and hasattr(self.model_adata, "obs"):
+    #         if "sample_name" in self.model_adata.obs.columns:
+    #             sample_names.extend(
+    #                 self.model_adata.obs["sample_name"].astype(str).dropna().unique().tolist()
+    #             )
+
+    #     out_dir = Path(self.output_dir) if self.output_dir else None
+    #     images_dir = (out_dir / "images") if out_dir is not None else None
+    #     if images_dir is not None and images_dir.exists():
+    #         for p in images_dir.iterdir():
+    #             if p.is_dir():
+    #                 sample_names.append(str(p.name))
+
+    #     return sorted({str(x).strip() for x in sample_names if str(x).strip() != ""})
 
     def _build_analysis_plots_section(self):
         self.analysis_plots_status = widgets.HTML(

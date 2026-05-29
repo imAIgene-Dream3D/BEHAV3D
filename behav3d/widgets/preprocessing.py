@@ -348,6 +348,15 @@ class DimOrderTable:
                     mask = df[self.sample_col].astype(str) == str(sample_name)
                     df.loc[mask, self.dim_col] = self._order_to_str(new_val)
 
+                    # Also persist to CSV when a path is available so the change
+                    # survives a notebook restart without requiring a conversion run.
+                    csv_path = getattr(self.metadata_loader, "metadata_csv_path", None)
+                    if csv_path:
+                        try:
+                            df.to_csv(csv_path, index=False)
+                        except Exception:
+                            pass
+
     def _probe_image_shape(self, path):
         path = Path(path)
         if not path.exists():

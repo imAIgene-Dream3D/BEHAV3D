@@ -45,7 +45,17 @@ def postprocess_mask(mask, fill_holes=True, opening_nr_pixels=1):
     return mask.astype(bool)
 
 
-def segment_mask(mask, edt_thr=1.5, edt_thr_refined=None, segment_size_min=15, use_dims=2, n_workers=1):
+def segment_mask(
+    mask,
+    edt_thr=1.5,
+    edt_thr_refined=None,
+    segment_size_min=15,
+    use_dims=2,
+    n_workers=1,
+    marker_strategy="threshold",
+    peak_min_distance=None,
+    peak_min_ratio=0.35,
+):
     """
     Instance-segment a binary mask using EDT + watershed refinement.
 
@@ -76,4 +86,6 @@ def segment_mask(mask, edt_thr=1.5, edt_thr_refined=None, segment_size_min=15, u
     return _original_segment_mask(
         mask, edt_thr=edt_thr, edt_thr_refined=edt_thr_refined,
         segment_size_min=segment_size_min, use_dims=use_dims, n_workers=n_workers,
+        marker_strategy=marker_strategy, peak_min_distance=peak_min_distance,
+        peak_min_ratio=peak_min_ratio,
     )

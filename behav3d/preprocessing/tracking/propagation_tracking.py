@@ -104,6 +104,7 @@ def run_propagation_tracking(
     dilation_nr_pixels=2,
     segment_size_min=100,
     all_organoids=False,
+    progress_cb=None,
     **kwargs
     ):
     """Run propagation-based tracking on any cell type.
@@ -126,6 +127,11 @@ def run_propagation_tracking(
         Number of pixels to dilate the mask for watershed propagation
     segment_size_min : int
         Minimum segment size in voxels (smaller segments are filtered out)
+    progress_cb : callable, optional
+        Called as ``progress_cb(current, total, label)`` from inside the
+        per-sample loop so a GUI can drive a progress bar.  ``None`` is
+        a no-op (default).  Notebook / queue callers omit this kwarg and
+        the function behaves identically to its pre-existing version.
     **kwargs : dict
     """
     if all_organoids:
@@ -139,11 +145,18 @@ def run_propagation_tracking(
             overwrite=overwrite,
             dilation_nr_pixels=dilation_nr_pixels,
             segment_size_min=segment_size_min,
+            progress_cb=progress_cb,
             **kwargs,
         )
 
-    for idx, sample in metadata.iterrows():
+    total_samples = len(metadata)
+    for i, (idx, sample) in enumerate(metadata.iterrows()):
         sample_name=sample['sample_name']
+        if progress_cb is not None:
+            try:
+                progress_cb(i, total_samples, f"{cell_type} / {sample_name}")
+            except Exception:
+                pass
         print(f"Tracking sample: {sample_name}")
 
         element_size_x = sample["pixel_distance_xy"]
@@ -195,5 +208,10 @@ def run_propagation_tracking(
         _ensure_metadata_output_columns(metadata, img_col, csv_col)
         metadata.at[idx, img_col] = str(tracked_img_outpath)
         metadata.at[idx, csv_col] = str(tracked_csv_outpath)
-        
+
+    if progress_cb is not None:
+        try:
+            progress_cb(total_samples, total_samples, f"{cell_type} done")
+        except Exception:
+            pass
     return metadata

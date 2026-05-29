@@ -1,0 +1,10 @@
+name: BEHAV3D
+display_name: BEHAV3D
+contributions:
+  commands:
+    - id: BEHAV3D.make_behav3d_widget
+      python_name: behav3d.napari._widget:BEHAV3DWidget
+      title: Open BEHAV3D Explorer
+  widgets:
+    - command: BEHAV3D.make_behav3d_widget
+      display_name: BEHAV3D Explorer

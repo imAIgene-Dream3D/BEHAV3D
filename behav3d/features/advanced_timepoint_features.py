@@ -1,4 +1,4 @@
-"""
+﻿"""
 Advanced Feature Extraction for BEHAV3D
 
 This module provides advanced analysis features that go beyond basic track feature extraction.
@@ -18,7 +18,7 @@ Key concepts:
 - Per-timepoint calculation: Active killing is evaluated at EACH timepoint during contact
 - Observation window: N timepoints after each contact timepoint to measure death signal change
 - Background death rate: Average death signal increase per sample (accounts for batch effects)
-- Active killing: Death signal increase exceeds background rate × threshold multiplier
+- Active killing: Death signal increase exceeds background rate Ã— threshold multiplier
 
 -------------------------------------
 --------------- OUTPUT --------------
@@ -35,7 +35,7 @@ Key concepts:
 - killing_efficiency = 0.0
 
 # Summary statistics per sample
-- total_contact_events: Number of qualifying contact events (≥ min_duration)
+- total_contact_events: Number of qualifying contact events (â‰¥ min_duration)
 - active_killing_events: Number of timepoints classified as active killing
 - active_killing_rate: Proportion of contact timepoints with active killing
 """
@@ -834,3 +834,133 @@ def calculate_killing_dynamics_over_time(
     df_dynamics["killing_rate"] = df_dynamics["n_active_killing"] / df_dynamics["n_contact_timepoints"]
     
     return df_dynamics
+
+
+
+
+def calculate_invasiveness_single_timepoint(args):
+    """
+    Calculate organoid invasiveness features for immune cells at a single timepoint.
+    
+    Invasiveness measures what percentage of an immune cell's surface is in contact
+    with organoid surfaces. A cell is considered invasive if >50% of its surface
+    is in contact.
+    
+    Parameters
+    ----------
+    args : tuple
+        Contains:
+        - t: timepoint index
+        - current_cell_segments_path: path to immune cell segments
+        - organoid_segments_paths: dict of organoid segment paths
+        - element_size_x, element_size_y, element_size_z: voxel spacing (um)
+        - contact_threshold: distance threshold (um) for determining contact
+        - calculate_from: cell type being analyzed (should be immune type)
+    
+    Returns
+    -------
+    pd.DataFrame
+        Columns: TrackID, position_t, <type>_invasiveness, <type>_invasiveness_perc, any_org_invasiveness_perc
+    """
+    from scipy.ndimage import distance_transform_edt
+    import math
+    
+    (
+        t,
+        current_cell_segments_path,
+        organoid_segments_paths,
+        element_size_x,
+        element_size_y,
+        element_size_z,
+        contact_threshold,
+        calculate_from
+    ) = args
+
+    # Load current cell type's segments for this timepoint
+    current_segments = np.asarray(load_image(current_cell_segments_path)[t])
+    
+    # Load all organoid types' segments
+    organoid_segments_dict = {}
+    for org_type, org_path in organoid_segments_paths.items():
+        organoid_segments_dict[org_type] = np.asarray(load_image(org_path)[t])
+    
+    df_invasiveness = []
+    segment_ids = np.unique(current_segments)
+    
+    # If there are no foreground segments at this timepoint, return an empty DataFrame
+    foreground_ids = [sid for sid in segment_ids if sid != 0]
+    if not foreground_ids:
+        return pd.DataFrame(columns=["TrackID", "position_t"])
+    
+    for segment_id in foreground_ids:
+        stack_max_z, stack_max_y, stack_max_x = current_segments.shape
+        seg_locs = np.argwhere(current_segments == segment_id)
+        min_z, min_y, min_x = seg_locs.min(axis=0)
+        max_z, max_y, max_x = seg_locs.max(axis=0)
+        
+        z_ext = 2 * math.ceil(contact_threshold / element_size_z)
+        y_ext = 2 * math.ceil(contact_threshold / element_size_y)
+        x_ext = 2 * math.ceil(contact_threshold / element_size_x)
+        
+        slicer = (
+            slice(max(0, min_z - z_ext), min(stack_max_z, max_z + z_ext + 1)),
+            slice(max(0, min_y - y_ext), min(stack_max_y, max_y + y_ext + 1)),
+            slice(max(0, min_x - x_ext), min(stack_max_x, max_x + x_ext + 1))
+        )
+        
+        seg_cutout = current_segments[slicer]
+        
+        # Calculate distance transform from current cell boundary
+        real_distances = distance_transform_edt(
+            seg_cutout != segment_id,
+            sampling=[element_size_z, element_size_y, element_size_x]
+        )
+        
+        # Define "surface" as pixels within 2 um of cell boundary
+        surface_threshold = 2.0  # um
+        surface_mask = real_distances <= surface_threshold
+        total_surface_pixels = np.sum(surface_mask)
+        
+        if total_surface_pixels == 0:
+            # Cell has no surface (single pixel?), skip
+            continue
+        
+        invasiveness_data = {
+            'TrackID': segment_id,
+            'position_t': t,
+        }
+        
+        any_invasiveness_list = []
+        invasiveness_perc_list = []
+        
+        # Calculate invasiveness for each organoid type
+        for org_type, org_segments in organoid_segments_dict.items():
+            org_cutout = org_segments[slicer]
+            
+            # Count surface pixels in contact with this organoid type
+            org_contact_mask = (real_distances <= contact_threshold) & (org_cutout != 0)
+            contacted_surface_pixels = np.sum(org_contact_mask)
+            
+            # Calculate percentage
+            invasiveness_perc = (contacted_surface_pixels / total_surface_pixels) * 100.0
+            
+            # Boolean: invasive if >= 50% of surface is in contact
+            invasiveness_bool = invasiveness_perc >= 50.0
+            
+            invasiveness_data[f'{org_type}_invasiveness'] = invasiveness_bool
+            invasiveness_data[f'{org_type}_invasiveness_perc'] = invasiveness_perc
+            
+            any_invasiveness_list.append(invasiveness_bool)
+            invasiveness_perc_list.append(invasiveness_perc)
+        
+        # Add aggregate: True if invasive against ANY organoid type
+        invasiveness_data['any_org_invasiveness'] = any(any_invasiveness_list)
+        invasiveness_data['any_org_invasiveness_perc'] = max(invasiveness_perc_list) if invasiveness_perc_list else 0.0
+        
+        df_invasiveness.append(pd.DataFrame([invasiveness_data]))
+    
+    if df_invasiveness:
+        return pd.concat(df_invasiveness, ignore_index=True)
+    else:
+        return pd.DataFrame(columns=["TrackID", "position_t"])
+

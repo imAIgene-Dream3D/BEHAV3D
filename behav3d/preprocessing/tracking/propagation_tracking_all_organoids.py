@@ -159,6 +159,7 @@ def run_propagation_tracking_all_organoids(
     dilation_nr_pixels=2,
     segment_size_min=100,
     organoid_types=None,
+    progress_cb=None,
     **kwargs,
 ):
     organoid_types = list(organoid_types or detect_organoid_types_from_metadata(metadata))
@@ -166,8 +167,14 @@ def run_propagation_tracking_all_organoids(
         print("Warning: No organoid types detected in metadata. Skipping all-organoids propagation tracking.")
         return metadata
 
-    for idx, sample in metadata.iterrows():
+    total_samples = len(metadata)
+    for i, (idx, sample) in enumerate(metadata.iterrows()):
         sample_name = sample["sample_name"]
+        if progress_cb is not None:
+            try:
+                progress_cb(i, total_samples, f"all organoids / {sample_name}")
+            except Exception:
+                pass
         print(f"Tracking sample with all organoids: {sample_name}")
 
         segments_paths = _resolve_organoid_segments(sample, organoid_types)
@@ -255,4 +262,9 @@ def run_propagation_tracking_all_organoids(
             metadata.at[idx, img_col] = str(paths["split"][organoid_type]["img"])
             metadata.at[idx, csv_col] = str(paths["split"][organoid_type]["csv"])
 
+    if progress_cb is not None:
+        try:
+            progress_cb(total_samples, total_samples, "all organoids done")
+        except Exception:
+            pass
     return metadata

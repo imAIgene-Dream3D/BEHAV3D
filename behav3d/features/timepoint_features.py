@@ -46,6 +46,12 @@ DYNAMIC CONTACT FEATURES (generated for ALL cell types in metadata):
 - any_immune_cell_contact_on_distance (bool) - Any immune-type real distance-based contact
 - active_{cell_type}_contact        (bool) - Active interaction (works for any cell type)
 
+INVASIVENESS FEATURES (immune vs organoids):
+- {org_type}_invasiveness           (bool) - True if >= 50% surface in contact
+- {org_type}_invasiveness_perc      (float) - Percentage (0-100) of surface in contact
+- any_org_invasiveness              (bool) - True if invasive against any organoid type
+- any_org_invasiveness_perc         (float) - Max invasiveness percentage across organoid types
+
 MORPHOLOGY FEATURES:
 - nr_pixels, volume, bbox_volume, elongation, extent, equivalent_diameter
 - major_axis_length, minor_axis_length, surface_area, sphericity
@@ -180,6 +186,7 @@ import time
 import traceback
 from behav3d.analysis import smooth_value_over_time
 from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
+from behav3d.core.metadata import is_multicolor_celltype
 from behav3d.io.images import load_image, convert_raw_file_to_zarr
 from tqdm import tqdm
 from datetime import datetime
@@ -331,6 +338,90 @@ def calculate_smoothed_death_columns(df_tracks, window_size):
     return df_tracks
 
 
+def rerun_death_classification(
+    output_dir,
+    cell_type,
+    new_threshold,
+    threshold_column="percentage_dead_mask",
+):
+    """Re-apply :func:`calculate_death` to an existing combined feature CSV
+    with a new ``dead_mask_percentage_threshold``.
+
+    This is a fast operation: it does **not** re-run any image-based
+    feature extraction. It assumes ``percentage_dead_mask`` (or whichever
+    ``threshold_column`` is supplied) is already present in the combined
+    CSV produced by a prior full :func:`run_feature_extraction` call.
+
+    The same file is rewritten in place. The per-sample track CSVs under
+    ``trackdata/<sample>/<cell_type>/`` are left untouched; downstream
+    analysis reads the combined CSV in
+    ``analysis/<cell_type>/track_features/`` only.
+
+    Parameters
+    ----------
+    output_dir : str or pathlib.Path
+        Base output directory used by BEHAV3D.
+    cell_type : str
+        Cell type name (must match the directory used by feature
+        extraction).
+    new_threshold : float
+        New value to threshold ``percentage_dead_mask`` (or
+        ``threshold_column``) against.
+    threshold_column : str, optional
+        Column in the combined CSV used by :func:`calculate_death`.
+        Defaults to ``"percentage_dead_mask"``.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the combined CSV that was rewritten.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the combined CSV does not exist.
+    KeyError
+        If the required ``threshold_column`` is missing from the CSV.
+    """
+    output_dir = Path(output_dir)
+    combined_csv = (
+        output_dir
+        / "analysis"
+        / cell_type
+        / "track_features"
+        / f"BEHAV3D_{cell_type}_combined_track_features.csv"
+    )
+    if not combined_csv.exists():
+        raise FileNotFoundError(
+            f"Combined feature CSV not found for cell type '{cell_type}': "
+            f"{combined_csv}. Run a full feature extraction first."
+        )
+
+    print(
+        f"--------------- Re-running death classification for {cell_type} "
+        f"with threshold={new_threshold} ---------------"
+    )
+    df = pd.read_csv(combined_csv)
+    if threshold_column not in df.columns:
+        raise KeyError(
+            f"Column '{threshold_column}' not present in {combined_csv}. "
+            "Cannot recompute the 'dead' classification without it. "
+            "Re-run full feature extraction (with 'death' selected) first."
+        )
+
+    if "dead" in df.columns:
+        df = df.drop(columns=["dead"])
+
+    df = calculate_death(
+        df,
+        threshold=float(new_threshold),
+        threshold_column=threshold_column,
+    )
+    df.to_csv(combined_csv, index=False)
+    print(f"Re-wrote {combined_csv} with updated 'dead' column.")
+    return combined_csv
+
+
 def run_feature_extraction(
     metadata, 
     config=None,
@@ -342,7 +433,8 @@ def run_feature_extraction(
     contact_threshold=None,
     rolling_meanspeed_window=10,
     overwrite=False,
-    n_workers=1
+    n_workers=1,
+    progress_cb=None,
     ):
     assert config is not None or output_dir is not None, "Either 'config' or 'output_dir' must be supplied"
     
@@ -353,10 +445,22 @@ def run_feature_extraction(
 
     analysis_outdir = Path(output_dir, "analysis", cell_type)
     feature_outdir = Path(analysis_outdir, "track_features")
-    
-    for _, sample_metadata in metadata.iterrows():
-    
+
+    _total_samples = len(metadata)
+    for _i, (_, sample_metadata) in enumerate(metadata.iterrows()):
+        if progress_cb is not None:
+            try:
+                progress_cb(_i, _total_samples, f"{cell_type} / {sample_metadata['sample_name']}")
+            except Exception:
+                pass
+
         print(f"--------------- Processing {cell_type}: {sample_metadata['sample_name']} ---------------")
+        if is_multicolor_celltype(cell_type):
+            raise ValueError(
+                f"Feature extraction does not run on per-channel multicolor type '{cell_type}'. "
+                "Please run it on the merged/grouped output (for example '*_merged' or '*_grouped')."
+            )
+
         start_time = time.time()
 
         sample_name = sample_metadata['sample_name']
@@ -431,6 +535,8 @@ def run_feature_extraction(
                     parts = col.split('_')
                     if len(parts) >= 4:
                         organoid_type = '_'.join(parts[1:-3])
+                        if is_multicolor_celltype(organoid_type):
+                            continue
                         if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
                             organoid_segments_paths[organoid_type] = sample_metadata[col]
             
@@ -441,6 +547,8 @@ def run_feature_extraction(
                     parts = col.split('_')
                     if len(parts) >= 4:
                         immune_type = '_'.join(parts[1:-3])
+                        if is_multicolor_celltype(immune_type):
+                            continue
                         if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
                             immune_segments_paths[immune_type] = sample_metadata[col]
             
@@ -451,6 +559,8 @@ def run_feature_extraction(
                     parts = col.split('_')
                     if len(parts) >= 4:
                         other_type = '_'.join(parts[1:-3])
+                        if is_multicolor_celltype(other_type):
+                            continue
                         if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
                             other_segments_paths[other_type] = sample_metadata[col]
 
@@ -669,7 +779,12 @@ def run_feature_extraction(
         
     feature_outdir.mkdir(parents=True, exist_ok=True)
     all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
-    df_all_tracks.to_csv(all_tracks_out_path, index=False) 
+    df_all_tracks.to_csv(all_tracks_out_path, index=False)
+    if progress_cb is not None:
+        try:
+            progress_cb(_total_samples, _total_samples, f"{cell_type} done")
+        except Exception:
+            pass
     return(df_all_tracks)       
 
 def calculate_image_based_track_features(
@@ -815,10 +930,27 @@ def calculate_image_based_track_features(
                 print("Dead mask calculation .csv already exists. Loading in dead mask calculation information...")
                 df_dead_mask = pd.read_csv(df_dead_mask_outpath)
             else:
+                # Clean the dead mask by zeroing voxels that fall inside any
+                # immune segment, but only when the current cell type is NOT
+                # itself an immune type. This prevents immune cells trespassing
+                # through organoids (or other passive structures) from inflating
+                # the target's `percentage_dead_mask`.
+                exclude_immune_from_dead = (
+                    cell_type not in immune_segments_paths
+                    and bool(immune_segments_dict)
+                )
+                if exclude_immune_from_dead:
+                    print(
+                        f"{get_current_time()} - Cleaning dead mask: zeroing voxels "
+                        f"inside immune segments {list(immune_segments_dict.keys())} "
+                        f"before computing {cell_type} death features."
+                    )
+
                 df_dead_mask=calculate_dead_mask(
                     segments=segments_path,
                     dead_mask=dead_mask_path,
                     n_workers=n_workers,
+                    immune_segments_dict=immune_segments_dict if exclude_immune_from_dead else None,
                 )
                 if df_dead_mask_outpath != "":
                     df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
@@ -838,6 +970,9 @@ def calculate_image_based_track_features(
         # Calculate contacts dynamically for all cell types found in metadata
         # The resulting DataFrame will have columns for ALL cell types (e.g., organoid1_contact, macro_contact, etc.)
         
+        # Determine if invasiveness should be calculated (immune cells + invasiveness feature requested)
+        should_calculate_invasiveness = "invasiveness" in features_choice and cell_type in immune_segments_paths.keys()
+        
         if df_contacts_outpath.exists() and not overwrite:
             print("Contact .csv already exists. Loading in contact information...")
             df_contacts = pd.read_csv(df_contacts_outpath)
@@ -853,12 +988,44 @@ def calculate_image_based_track_features(
                 element_size_z=element_size_z,
                 contact_threshold=contact_threshold,
                 calculate_from=cell_type,
-                n_workers=n_workers
+                n_workers=n_workers,
+                calculate_invasiveness=should_calculate_invasiveness
             )
             if df_contacts_outpath != "":
                 df_contacts.to_csv(df_contacts_outpath, sep=",", index=False)
         df_contacts = _normalize_merge_keys(df_contacts, keys=merge_keys)
         df_tracks = pd.merge(df_tracks, df_contacts, how="left", on=merge_keys)
+        if "invasiveness" in features_choice:
+            perc_cols = [
+                c for c in df_tracks.columns
+                if c.endswith("_invasiveness_perc") and c != "any_org_invasiveness_perc"
+            ]
+            if perc_cols:
+                bases = [c[: -len("_invasiveness_perc")] for c in perc_cols]
+                for base, perc_col in zip(bases, perc_cols):
+                    bool_col = f"{base}_invasiveness"
+                    if bool_col not in df_tracks.columns:
+                        df_tracks[bool_col] = np.nan
+                    mask = df_tracks[perc_col].notna()
+                    df_tracks.loc[mask, bool_col] = (
+                        df_tracks.loc[mask, bool_col]
+                        .fillna(df_tracks.loc[mask, perc_col] >= 50.0)
+                        .astype(bool)
+                    )
+                if "any_org_invasiveness_perc" not in df_tracks.columns:
+                    df_tracks["any_org_invasiveness_perc"] = df_tracks[perc_cols].max(axis=1, skipna=True)
+                bool_cols = [
+                    f"{base}_invasiveness"
+                    for base in bases
+                    if f"{base}_invasiveness" in df_tracks.columns
+                ]
+                if bool_cols:
+                    if "any_org_invasiveness" not in df_tracks.columns:
+                        df_tracks["any_org_invasiveness"] = np.nan
+                    any_mask = df_tracks["any_org_invasiveness"].isna()
+                    df_tracks.loc[any_mask, "any_org_invasiveness"] = (
+                        df_tracks.loc[any_mask, bool_cols].fillna(False).any(axis=1)
+                    )
     else:
         print(f"{get_current_time()} - Skipping contact calculations as not requested in features_choice")
         
@@ -1382,6 +1549,7 @@ def _calculate_contact_single_timepoint(args):
     """
     Calculate contacts between current cell type and ALL other cell types.
     Fully flexible - works with any combination of cell types.
+    Optionally also calculates invasiveness (for immune cells against organoids).
     """
     (
         t,
@@ -1393,7 +1561,8 @@ def _calculate_contact_single_timepoint(args):
         element_size_y,
         element_size_z,
         contact_threshold,
-        calculate_from
+        calculate_from,
+        calculate_invasiveness
     ) = args
 
     # Validate element sizes before any division
@@ -1551,6 +1720,47 @@ def _calculate_contact_single_timepoint(args):
         contact_data['any_organoid_contact_on_distance'] = any(any_org_contact_on_distance)
         contact_data['any_immune_cell_contact'] = any(any_immune_contact)
         contact_data['any_immune_cell_contact_on_distance'] = any(any_immune_contact_on_distance)
+        
+        # Calculate invasiveness for immune cells (only if requested and organoids exist)
+        if calculate_invasiveness and organoid_segments_dict:
+            # Define "surface" as pixels within 2 µm of cell boundary
+            surface_threshold = 2.0  # µm
+            surface_mask = real_distances <= surface_threshold
+            total_surface_pixels = np.sum(surface_mask)
+            
+            if total_surface_pixels > 0:
+                any_invasiveness_list = []
+                invasiveness_perc_list = []
+                
+                # Calculate invasiveness for each organoid type
+                for org_type, org_segments in organoid_segments_dict.items():
+                    org_cutout = org_segments[slicer]
+                    
+                    # Count surface pixels in contact with this organoid type
+                    org_contact_mask = (real_distances <= contact_threshold) & (org_cutout != 0)
+                    contacted_surface_pixels = np.sum(org_contact_mask)
+                    
+                    # Calculate percentage
+                    invasiveness_perc = (contacted_surface_pixels / total_surface_pixels) * 100.0
+                    
+                    # Boolean: invasive if >= 50% of surface is in contact
+                    invasiveness_bool = invasiveness_perc >= 50.0
+                    
+                    contact_data[f'{org_type}_invasiveness'] = invasiveness_bool
+                    contact_data[f'{org_type}_invasiveness_perc'] = invasiveness_perc
+                    any_invasiveness_list.append(invasiveness_bool)
+                    invasiveness_perc_list.append(invasiveness_perc)
+                
+                # Add aggregate: True if invasive against ANY organoid type
+                contact_data['any_org_invasiveness'] = any(any_invasiveness_list)
+                contact_data['any_org_invasiveness_perc'] = max(invasiveness_perc_list) if invasiveness_perc_list else 0.0
+            else:
+                # No surface detected, set invasiveness to False/0
+                for org_type in organoid_segments_dict.keys():
+                    contact_data[f'{org_type}_invasiveness'] = False
+                    contact_data[f'{org_type}_invasiveness_perc'] = 0.0
+                contact_data['any_org_invasiveness'] = False
+                contact_data['any_org_invasiveness_perc'] = 0.0
 
         df_contacts.append(pd.DataFrame([contact_data]))
 
@@ -1571,7 +1781,8 @@ def calculate_contact_features(
     element_size_y=None,
     element_size_z=None,
     calculate_from=None,
-    n_workers=1
+    n_workers=1,
+    calculate_invasiveness=False
     ):
     """
     Flexible contact calculation - works with any cell types from metadata.
@@ -1582,9 +1793,11 @@ def calculate_contact_features(
         immune_segments_paths: Dict of {immune_type: path} for all immune types
         other_segments_paths: Dict of {other_type: path} for all other types
         calculate_from: The cell type we're calculating features for (required for self-contact exclusion)
+        calculate_invasiveness: If True, calculate invasiveness features for immune cells against organoids
         
     Returns:
         DataFrame of contact annotations for the current cell type with ALL other cell types.
+        If calculate_invasiveness=True, also includes *_invasiveness and *_invasiveness_perc columns.
     """
     current_segments = load_image(current_cell_segments_path)
     timepoints = current_segments.shape[0]
@@ -1600,7 +1813,8 @@ def calculate_contact_features(
             element_size_y,
             element_size_z,
             contact_threshold,
-            calculate_from
+            calculate_from,
+            calculate_invasiveness
         )
         for t in range(timepoints)
     ]
@@ -1723,9 +1937,42 @@ def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID
 
 #     return result
 
+def _zero_dead_mask_under_segments(dead_mask_t, immune_arrays_t):
+    """Return a copy of ``dead_mask_t`` with voxels set to 0 wherever any
+    immune segment at the same timepoint is non-zero.
+
+    Parameters
+    ----------
+    dead_mask_t : array-like
+        Binary (0/1) dead mask volume for a single timepoint, shape (Z, Y, X).
+    immune_arrays_t : dict[str, array-like]
+        Mapping of immune cell type name -> immune segment volume for the same
+        timepoint. Shape must match ``dead_mask_t``; mismatched arrays are
+        skipped with a warning.
+
+    Returns
+    -------
+    np.ndarray
+        Cleaned dead mask (same shape and dtype as input).
+    """
+    cleaned = np.asarray(dead_mask_t).copy()
+    for name, im_t in immune_arrays_t.items():
+        im_t = np.asarray(im_t)
+        if im_t.shape != cleaned.shape:
+            warnings.warn(
+                f"[death-mask cleaning] Shape mismatch for immune '{name}' "
+                f"({im_t.shape} vs dead mask {cleaned.shape}) - skipping."
+            )
+            continue
+        cleaned[im_t > 0] = 0
+    return cleaned
             
 def _calculate_dead_mask_single_timepoint(args):
-    t, segments_path, dead_mask_path = args
+    t, segments_path, dead_mask_path, immune_segments_dict = args
+    if immune_segments_dict:
+        immune_arrays_t = {name: arr[t] for name, arr in immune_segments_dict.items()}
+        dead_mask_stack = _zero_dead_mask_under_segments(dead_mask_stack, immune_arrays_t)
+
     tcell_stack = np.asarray(load_image(segments_path)[t])
     dead_mask_stack = np.asarray(load_image(dead_mask_path)[t])
 
@@ -1748,14 +1995,29 @@ def _calculate_dead_mask_single_timepoint(args):
     return properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]]
 
 
-def calculate_dead_mask(segments, dead_mask, n_workers=1):
+def calculate_dead_mask(segments, dead_mask, n_workers=1, immune_segments_dict=None):
     """
     Calculates the intensity of a specific marker features for each segment.
     The calculation can be the minimum, maximum, mean or median
+
+    Parameters
+    ----------
+    segments : array-like
+        Label image (T, Z, Y, X) for the cell type whose death features are
+        being computed.
+    dead_mask : array-like
+        Binary dead mask (T, Z, Y, X). Each voxel is 1 where the death
+        classifier marked the pixel as positive.
+    immune_segments_dict : dict[str, array-like] | None
+        Optional mapping of immune cell type name -> immune segment array
+        (T, Z, Y, X). When provided, the per-timepoint dead mask is cleaned
+        via :func:`_zero_dead_mask_under_segments` before regionprops, so that
+        immune cells trespassing through ``segments`` do not contribute to the
+        ``percentage_dead_mask`` of the target segment.
     """
     if isinstance(segments, (str, Path)) and isinstance(dead_mask, (str, Path)):
         timepoints = int(load_image(segments).shape[0])
-        args_list = [(t, segments, dead_mask) for t in range(timepoints)]
+        args_list = [(t, segments, dead_mask, immune_segments_dict) for t in range(timepoints)]
         if n_workers > 1:
             results = _run_parallel_with_fallback(_calculate_dead_mask_single_timepoint, args_list, n_workers)
         else:

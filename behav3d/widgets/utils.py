@@ -14,9 +14,12 @@ from traitlets import Any, Unicode, Bool
 
 from behav3d.core.metadata import (
     check_behav3d_metadata,
+    detect_merged_cell_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_organoid_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    is_merged_celltype,
+    multicolor_base_name,
     load_behav3d_metadata,
 )
 from behav3d.io.formats.zarr import save_as_zarr
@@ -407,6 +410,9 @@ behav3d_calculated_features = {
     "contact": [
         "*_contact", "*_contact_on_distance", "*_contact_pixels", "active_*_contact",
     ],
+    "invasiveness": [
+        "*_invasiveness", "*_invasiveness_perc", "any_org_invasiveness", "any_org_invasiveness_perc",
+    ],
     "active_killing": [
         "is_active_killing", "killing_efficiency",
     ],
@@ -469,6 +475,20 @@ def detect_cell_type_category(cell_type, metadata):
     organoid_types = detect_organoid_types_from_metadata(metadata)
     immune_types = detect_immune_cell_types_from_metadata(metadata)
     other_types = detect_other_cell_types_from_metadata(metadata)
+    merged_types = detect_merged_cell_types_from_metadata(metadata)
+
+    if cell_type in merged_types:
+        base_name = multicolor_base_name(cell_type)
+        for candidate in organoid_types:
+            if multicolor_base_name(candidate) == base_name:
+                return 'organoid'
+        for candidate in immune_types:
+            if multicolor_base_name(candidate) == base_name:
+                return 'immune'
+        for candidate in other_types:
+            if multicolor_base_name(candidate) == base_name:
+                return 'other'
+        return 'immune'
     
     if cell_type in organoid_types:
         return 'organoid'
@@ -476,6 +496,17 @@ def detect_cell_type_category(cell_type, metadata):
         return 'immune'
     elif cell_type in other_types:
         return 'other'
+    base_name = multicolor_base_name(cell_type)
+    if base_name != cell_type:
+        for candidate in organoid_types:
+            if multicolor_base_name(candidate) == base_name:
+                return 'organoid'
+        for candidate in immune_types:
+            if multicolor_base_name(candidate) == base_name:
+                return 'immune'
+        for candidate in other_types:
+            if multicolor_base_name(candidate) == base_name:
+                return 'other'
     else:
         if 'organoid' in cell_type.lower():
             return 'organoid'

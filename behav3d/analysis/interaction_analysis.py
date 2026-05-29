@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import matplotlib.ticker as mticker
 from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
@@ -440,9 +441,9 @@ def plot_cumulative_per_sample(
     
     fig.suptitle(
         f"Cumulative {interacting_type} Interactions with {cell_type}s Per Sample",
-        fontsize=14, y=1.02
+        fontsize=14, y=0.995,
     )
-    plt.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     return fig
 
 
@@ -556,9 +557,9 @@ def plot_alive_vs_dead_per_sample(
     
     fig.suptitle(
         f"Cumulative {interacting_type} Interactions: Surviving vs Dying {cell_type}s (Per Sample)",
-        fontsize=14, y=1.02
+        fontsize=14, y=0.995,
     )
-    plt.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     return fig
 
 
@@ -704,6 +705,30 @@ def run_multi_organoid_interaction_comparison(
     print(f"   Summary saved: {summary_csv.name}")
 
     # ------------------------------------------------------------------
+    # 2b. Load active killing data (if available)
+    # ------------------------------------------------------------------
+    df_contact_events = _load_active_killing_data(
+        output_dir, active_immune, organoid_types,
+        track_summary=track_summary,
+    )
+    has_killing_data = not df_contact_events.empty
+    if has_killing_data:
+        _n_ev = df_contact_events["contact_event_id"].nunique()
+        _n_targeted = int(df_contact_events["has_active_killing"].sum())
+        _n_kill_events = (
+            df_contact_events.loc[
+                df_contact_events["has_active_killing"],
+                "contact_event_id",
+            ].nunique()
+        )
+        print(f"   Active killing data loaded: {_n_ev} contact events "
+              f"({_n_kill_events} with active killing, "
+              f"{_n_targeted} targeted organoid hits)")
+    else:
+        print("   \u2139\ufe0f  No active killing data found \u2014 "
+              "panels C & D require running Active Killing analysis first")
+
+    # ------------------------------------------------------------------
     # 3. Generate plots
     # ------------------------------------------------------------------
     figs = {}
@@ -715,18 +740,42 @@ def run_multi_organoid_interaction_comparison(
     )
     figs["violin"] = fig_violin
 
+    curve_data_container = []
     fig_curve = plot_cumulative_to_death_curves(
-        df_all, group_by, active_immune, time_window_min, track_summary,
+        df_all,
+        group_by,
+        active_immune,
+        time_window_min,
+        track_summary,
+        curve_data_out=curve_data_container,
     )
     if fig_curve is not None:
         figs["cumulative_to_death"] = fig_curve
 
-    # Save PDF
+    if curve_data_container:
+        curve_csv = results_dir / "multi_organoid_cumulative_to_death_curves_min.csv"
+        curve_df = curve_data_container[0]
+        curve_df.to_csv(curve_csv, index=False)
+        print(f"   Curve data saved (time in minutes): {curve_csv.name}")
+
+    # Active killing dashboard (only generated when killing data exists)
+    fig_dashboard = plot_interaction_overview_dashboard(
+        track_summary, df_contact_events, active_immune, has_dead_data,
+    )
+    if fig_dashboard is not None:
+        figs["dashboard"] = fig_dashboard
+
+    # Save PDF. Order matches the notebook display order (violin and
+    # cumulative-to-death first, active-killing dashboard last).
     pdf_path = results_dir / "multi_organoid_interaction_comparison.pdf"
     with PdfPages(pdf_path) as pdf:
-        for key in ["violin", "cumulative_to_death"]:
+        for key in ["violin", "cumulative_to_death", "dashboard"]:
             if key in figs:
-                pdf.savefig(figs[key])
+                pdf.savefig(
+                    figs[key],
+                    bbox_inches="tight",
+                    pad_inches=0.25,
+                )
     print(f"   PDF saved: {pdf_path.name}")
 
     if show_plots:
@@ -772,21 +821,29 @@ def plot_interaction_violin_comparison(
     conditions = df_plot["condition"].unique()
     n_conditions = len(conditions)
 
-    fig, ax = plt.subplots(figsize=(max(6, 3 * n_conditions), 7))
+    fig, ax = plt.subplots(figsize=(max(6, 3.5 * n_conditions), 7), dpi=120)
+    fig.patch.set_facecolor("#fafafa")
+    ax.set_facecolor("#fafafa")
 
     order = sorted(conditions)
 
     if has_dead_data:
         hue_col = "fate"
+        # Internal fate labels ("Dying" / "Live") stay as-is to match the
+        # track_summary column; display labels are set via the legend below.
+        # Order is Dead first, Live second (matches dashboard panels C/D).
         hue_order = ["Dying", "Live"]
-        palette = {"Dying": "#e74c3c", "Live": "#3498db"}
-        # Darker versions for boxes
-        dark_palette = {"Dying": "#922b21", "Live": "#1a5276"}
+        # Light fills for violins; full-strength shared red/green for box
+        # edges and strip dots so the colour vocabulary matches the dashboard.
+        palette = {k: _FATE_COLORS_LIGHT[k] for k in hue_order}
+        dark_palette = {k: _FATE_COLORS[k] for k in hue_order}
+        strip_palette = {k: _FATE_COLORS[k] for k in hue_order}
     else:
         hue_col = None
         hue_order = None
         palette = None
         dark_palette = {}
+        strip_palette = None
 
     common_kw = dict(
         data=df_plot, x="condition", y="cumulative_interactions",
@@ -796,83 +853,189 @@ def plot_interaction_violin_comparison(
 
     sns.violinplot(
         **common_kw,
-        inner=None, linewidth=1, alpha=0.35,
+        inner=None, linewidth=0.8, alpha=0.30,
         density_norm="count", cut=0,
     )
 
-    # Use a copy of common_kw with the darker palette + gap for narrow centered box
+    # Boxplot: filled by seaborn with `dark_palette`, then we hollow each box
+    # so the strip points underneath stay visible while the per-fate colour
+    # is preserved on the edges, whiskers and median tick.
+    # Use a copy of common_kw with the darker palette + gap for narrow centered box.
+    # Only override the palette when we actually have a hue mapping; otherwise
+    # seaborn falls back to looking up `x` values in the palette dict and an
+    # empty dict raises "palette is missing keys" (and triggers a FutureWarning
+    # about passing palette without hue).
     box_kw = common_kw.copy()
-    box_kw["palette"] = dark_palette
+    if has_dead_data and dark_palette:
+        box_kw["palette"] = dark_palette
     sns.boxplot(
         **box_kw,
-        gap=0.6,          # Large gap makes the box narrow
+        gap=0.6,
         fliersize=0, legend=False,
-        boxprops=dict(alpha=0.8),
-        whiskerprops=dict(alpha=0.8),
-        capprops=dict(alpha=0.8),
+        boxprops=dict(linewidth=1.4),
+        whiskerprops=dict(linewidth=1.0),
+        capprops=dict(linewidth=1.0),
         showcaps=True,
-        medianprops=dict(color="white", linewidth=2),
+        medianprops=dict(linewidth=2.2),
     )
 
-    # Stripplot doesn't support width; remove it to avoid crash
+    # Hollow out the boxes so the underlying stripplot is visible. Each
+    # PathPatch added by sns.boxplot keeps its palette colour as the
+    # edgecolor; only the face becomes transparent.
+    for patch in ax.patches:
+        if isinstance(patch, mpatches.PathPatch):
+            face = patch.get_facecolor()
+            patch.set_edgecolor(face)
+            patch.set_facecolor("none")
+
+    # Stripplot — slightly larger / punchier dots now that the box is open.
     strip_kw = common_kw.copy()
     strip_kw.pop("width", None)
+    if strip_palette:
+        strip_kw["palette"] = strip_palette
     sns.stripplot(
         **strip_kw,
-        size=3, alpha=0.5, jitter=True, legend=False,
+        size=3.5, alpha=0.6, jitter=True, legend=False,
+        edgecolor="white", linewidth=0.3,
     )
 
-    # Legend
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        n_unique = len(hue_order) if hue_order else 1
-        ax.legend(handles[:n_unique], labels[:n_unique], fontsize=11, loc="best")
+    # Legend -- framed, semi-transparent. Use full-strength fate colours
+    # for the swatches (rather than the lighter violin fill) so dead = red /
+    # live = green reads at a glance. Re-label "Dying" -> "Dead" at display
+    # time so internal track_summary values stay unchanged.
+    if hue_order:
+        legend_handles = [
+            mpatches.Patch(
+                facecolor=_FATE_COLORS[f],
+                edgecolor="white",
+                label=_FATE_DISPLAY.get(f, f),
+            )
+            for f in hue_order
+        ]
+        existing = ax.get_legend()
+        if existing is not None:
+            existing.remove()
+        leg = ax.legend(
+            handles=legend_handles,
+            fontsize=10, loc="best",
+            frameon=True, framealpha=0.85, edgecolor="#cccccc",
+            fancybox=True, shadow=False,
+            title="Organoid fate",
+            title_fontsize=9,
+        )
+        leg.get_frame().set_linewidth(0.6)
 
-    # Annotate zero counts
+    # Annotate organoids with zero contacts with a subtle badge.
     if has_dead_data:
         y_range = ax.get_ylim()[1] - max(ax.get_ylim()[0], 0)
-        annot_y = y_range * 0.02
+        annot_y = y_range * 0.015
         for cond in order:
             for fate_val in ["Dying", "Live"]:
-                sub = df_plot[(df_plot["condition"] == cond) & (df_plot["fate"] == fate_val)]
+                sub = df_plot[
+                    (df_plot["condition"] == cond)
+                    & (df_plot["fate"] == fate_val)
+                ]
                 n_zeros = (sub["cumulative_interactions"] == 0).sum()
                 if n_zeros > 0:
                     x_idx = list(order).index(cond)
                     offset = -0.2 if fate_val == "Dying" else 0.2
+                    badge_color = dark_palette.get(fate_val, "#555555")
                     ax.annotate(
-                        f"{n_zeros} zeros",
+                        f" {n_zeros} no contacts ",
                         xy=(x_idx + offset, annot_y),
-                        fontsize=9, ha="center", va="bottom",
-                        color="#000000", # Pure black for maximum visibility
-                        fontweight="normal",
-                        fontstyle="italic",
+                        fontsize=7.5, ha="center", va="bottom",
+                        color="white",
+                        fontweight="bold",
+                        bbox=dict(
+                            boxstyle="round,pad=0.25",
+                            facecolor=badge_color,
+                            edgecolor="none",
+                            alpha=0.75,
+                        ),
                     )
 
-    # X-axis
+    # X-axis tick labels: show dead / total per condition.
     tick_labels = []
     for c in order:
         cond_data = df_plot[df_plot["condition"] == c]
         n_total = len(cond_data)
         if has_dead_data:
-            n_dying = (cond_data["fate"] == "Dying").sum()
-            pct = (n_dying / n_total * 100) if n_total > 0 else 0
-            tick_labels.append(f"{c}\n({n_dying}/{n_total} dying, {pct:.0f}%)")
+            n_dead = (cond_data["fate"] == "Dying").sum()
+            pct = (n_dead / n_total * 100) if n_total > 0 else 0
+            tick_labels.append(
+                f"{c}\n({n_dead}/{n_total} dead, {pct:.0f}%)",
+            )
         else:
             tick_labels.append(f"{c}\n(n={n_total})")
     ax.set_xticks(range(len(order)))
-    ax.set_xticklabels(tick_labels)
+    ax.set_xticklabels(tick_labels, fontsize=10)
 
     ax.set_ylim(bottom=0)
-    ax.set_xlabel(x_label, fontsize=12)
-    ax.set_ylabel("Cumulative interactions before death / end", fontsize=12)
-    title_detail = " + ".join(immune_types) if group_by == "organoid_type" else "all organoid types"
-    ax.set_title(
-        f"Interaction Distribution ({title_detail})",
-        fontsize=14,
+    ax.set_xlabel(x_label, fontsize=12, labelpad=8)
+    # y-label: cumulative contact timepoints per organoid (integrated over
+    # the full observation window; for dead organoids the cumulative stops
+    # at time of death, matching how track features are computed). When
+    # several immune types are selected they are summed -- noted on the
+    # label so the unit is unambiguous.
+    ax.set_ylabel(
+        "Cumulative contact timepoints per organoid\n"
+        "(sum over selected immune types)",
+        fontsize=12, labelpad=8,
     )
-    ax.grid(True, axis="y", alpha=0.3)
+    title_detail = (
+        " + ".join(immune_types) if group_by == "organoid_type"
+        else "all organoid types"
+    )
+    # Title makes the unit of observation explicit: one point = one
+    # organoid, not one immune cell.
+    ax.set_title(
+        f"Cumulative interactions per organoid -- contacts with "
+        f"{title_detail}",
+        fontsize=14, fontweight="semibold", pad=12,
+    )
+
+    # Clean up spines
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_linewidth(0.6)
+    ax.spines["left"].set_color("#888888")
+    ax.spines["bottom"].set_linewidth(0.6)
+    ax.spines["bottom"].set_color("#888888")
+    ax.tick_params(axis="both", which="both", length=4, width=0.6, colors="#555555")
+
+    ax.grid(True, axis="y", alpha=0.25, linewidth=0.5, color="#cccccc")
+    ax.set_axisbelow(True)
+
     plt.tight_layout()
     return fig
+
+
+def _time_unit_to_minutes_factor(df: pd.DataFrame) -> float:
+    """
+    Return the multiplier that converts values in the ``time`` column to minutes.
+
+    Reads the ``time_unit`` column if present (expected "s", "m" or "h").
+    Falls back to ``"h"`` (the legacy default of ``generalize_units_of_track_features``)
+    if the column is missing, so upstream CSVs without an explicit unit keep
+    working.
+    """
+    unit = "h"
+    if "time_unit" in df.columns:
+        vals = df["time_unit"].dropna().astype(str).str.lower().unique()
+        if len(vals) == 1:
+            unit = vals[0]
+        elif len(vals) > 1:
+            # Mixed units across tracks: refuse to guess silently.
+            raise ValueError(
+                f"Mixed time_unit values in data: {sorted(vals)}. "
+                "Re-run feature extraction with a consistent time unit."
+            )
+    factors = {"s": 1.0 / 60.0, "m": 1.0, "h": 60.0}
+    if unit not in factors:
+        raise ValueError(
+            f"Unsupported time_unit '{unit}'. Expected one of {sorted(factors)}."
+        )
+    return factors[unit]
 
 
 def plot_cumulative_to_death_curves(
@@ -881,6 +1044,7 @@ def plot_cumulative_to_death_curves(
     immune_types: list,
     time_window_min: float,
     track_summary: pd.DataFrame = None,
+    curve_data_out: list = None,
 ) -> plt.Figure:
     """
     Mean +/- SEM cumulative interaction curves aligned to time of death.
@@ -893,7 +1057,10 @@ def plot_cumulative_to_death_curves(
     ----------
     df_all : pd.DataFrame
         Combined timepoint-level data with ``organoid_type``, ``t_dead``,
-        ``survives``, ``time`` (hours), and ``cumulative_{ct}_contact`` columns.
+        ``survives``, ``time`` and ``cumulative_{ct}_contact`` columns. The
+        ``time`` column may be in seconds, minutes or hours; its unit is
+        detected from the ``time_unit`` column (defaults to ``"h"`` for
+        backward compatibility) and converted to minutes internally.
     group_by : str
         "organoid_type" or "treatment".
     immune_types : list
@@ -903,6 +1070,10 @@ def plot_cumulative_to_death_curves(
     track_summary : pd.DataFrame, optional
         Per-track summary (one row per organoid) used to compute total counts
         for the legend labels.
+    curve_data_out : list, optional
+        If provided, the per-condition aggregated curve (time in minutes,
+        mean, sem, n) is appended as a single DataFrame to this list so the
+        caller can persist it to disk.
     """
     if "survives" not in df_all.columns:
         print("   No death data -- skipping cumulative-to-death curves.")
@@ -914,12 +1085,14 @@ def plot_cumulative_to_death_curves(
         return None
 
     if "time" not in df_dying.columns:
-        print("   No 'time' column (hours) -- skipping cumulative-to-death curves.")
+        print("   No 'time' column -- skipping cumulative-to-death curves.")
         return None
 
     track_keys = ["organoid_type", "sample_name", "TrackID"]
 
-    # Compute the real time at death for each track
+    to_min = _time_unit_to_minutes_factor(df_dying)
+
+    # Compute the real time at death for each track (in minutes)
     t_dead_time = (
         df_dying[df_dying["dead"]]
         .groupby(track_keys)["time"]
@@ -928,8 +1101,9 @@ def plot_cumulative_to_death_curves(
     )
     df_dying = df_dying.merge(t_dead_time.reset_index(), on=track_keys, how="left")
 
-    # Filter to window before death
-    df_dying["relative_time_min"] = (df_dying["time"] - df_dying["time_at_death"]) * 60.0
+    # Time relative to each track's time-of-death, in minutes, regardless of
+    # the upstream ``time_unit``. ``to_min`` maps s/m/h onto a minutes scale.
+    df_dying["relative_time_min"] = (df_dying["time"] - df_dying["time_at_death"]) * to_min
     df_dying = df_dying[
         (df_dying["relative_time_min"] >= -time_window_min)
         & (df_dying["relative_time_min"] <= 0)
@@ -978,15 +1152,26 @@ def plot_cumulative_to_death_curves(
     time_grid = np.linspace(-time_window_min, 0, n_grid)
 
     interp_rows = []
+    skipped_tracks = 0
     for (cond, sn, tid), grp in df_curve.groupby(["condition", "sample_name", "TrackID"]):
         grp = grp.sort_values("relative_time_min")
         t_vals = grp["relative_time_min"].values
         y_vals = grp["cumulative_interactions"].values
-        if len(t_vals) < 2:
-            continue
-        y_interp = np.interp(time_grid, t_vals, y_vals, left=0.0, right=y_vals[-1])
+        if len(t_vals) == 0:
+            # No observations in window -- still contribute a flat zero curve so
+            # this dying organoid is counted in the legend, consistent with the
+            # violin plot.
+            y_interp = np.zeros_like(time_grid)
+        elif len(t_vals) == 1:
+            # Single observation inside the window: flat step at y_vals[0] from
+            # that timepoint onward; 0 before it.
+            y_interp = np.where(time_grid < t_vals[0], 0.0, float(y_vals[0]))
+        else:
+            y_interp = np.interp(time_grid, t_vals, y_vals, left=0.0, right=y_vals[-1])
         for t, y in zip(time_grid, y_interp):
             interp_rows.append({"condition": cond, "time_grid": t, "cumulative_interactions": y})
+    if skipped_tracks:
+        print(f"   Skipped {skipped_tracks} track(s) with no timepoints in window.")
 
     if not interp_rows:
         print("   Not enough data for interpolation -- skipping curve.")
@@ -996,13 +1181,18 @@ def plot_cumulative_to_death_curves(
 
     # ---- Compute totals for legend ----
     total_per_cond = {}
+    dying_per_cond = {}
     if track_summary is not None:
+        dying_mask = track_summary["fate"] == "Dying" if "fate" in track_summary.columns else ~track_summary["survives"].fillna(True)
         if group_by == "treatment":
             for ct in immune_types:
                 total_per_cond[ct] = len(track_summary)
+                dying_per_cond[ct] = int(dying_mask.sum())
         else:
             for org in track_summary["organoid_type"].unique():
-                total_per_cond[org] = (track_summary["organoid_type"] == org).sum()
+                org_mask = track_summary["organoid_type"] == org
+                total_per_cond[org] = int(org_mask.sum())
+                dying_per_cond[org] = int((org_mask & dying_mask).sum())
 
     # ---- Plot ----
     conditions = sorted(df_interp["condition"].unique())
@@ -1011,6 +1201,8 @@ def plot_cumulative_to_death_curves(
     color_map = dict(zip(conditions, palette))
 
     fig, ax = plt.subplots(figsize=(10, 6))
+
+    aggregated_frames = []
 
     for cond in conditions:
         sub = df_interp[df_interp["condition"] == cond]
@@ -1022,7 +1214,8 @@ def plot_cumulative_to_death_curves(
         stats["sem"] = stats["std"] / np.sqrt(stats["count"])
         stats = stats.sort_values("time_grid")
 
-        n_dying = int(stats["count"].iloc[0]) if len(stats) else 0
+        curve_count = int(stats["count"].iloc[0]) if len(stats) else 0
+        n_dying = dying_per_cond.get(cond, curve_count)
         n_total = total_per_cond.get(cond, n_dying)
         pct = (n_dying / n_total * 100) if n_total > 0 else 0
         label = f"{cond} ({n_dying}/{n_total} dying, {pct:.0f}%)"
@@ -1039,6 +1232,17 @@ def plot_cumulative_to_death_curves(
             alpha=0.2, color=color,
         )
 
+        out = stats.rename(
+            columns={"time_grid": "relative_time_min", "count": "n_tracks"}
+        ).copy()
+        out.insert(0, "condition", cond)
+        out["n_dying_total"] = n_dying
+        out["n_organoids_total"] = n_total
+        aggregated_frames.append(out)
+
+    if curve_data_out is not None and aggregated_frames:
+        curve_data_out.append(pd.concat(aggregated_frames, ignore_index=True))
+
     ax.set_ylim(bottom=0)
     ax.set_xticks([-time_window_min, -time_window_min / 2, 0])
     ax.xaxis.set_major_formatter(mticker.FuncFormatter(
@@ -1054,3 +1258,620 @@ def plot_cumulative_to_death_curves(
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Interaction Overview Dashboard
+# ---------------------------------------------------------------------------
+
+def _load_active_killing_data(
+    output_dir: Path,
+    immune_types: list,
+    organoid_types: list,
+    track_summary: pd.DataFrame = None,
+) -> pd.DataFrame:
+    """
+    Load contact events from active-killing CSVs and link each event to
+    its target organoid type (and fate, when ``track_summary`` is given).
+
+    For each immune type whose active-killing output exists, reads
+    ``contact_events_{im}.csv`` and ``active_killing_per_timepoint_{im}.csv``,
+    determines which events contain active killing, and explodes the
+    ``target_track_ids`` field so that each row represents one
+    (contact_event \u00d7 target_organoid) pair.
+
+    Parameters
+    ----------
+    track_summary : pd.DataFrame, optional
+        Per-organoid summary with columns ``sample_name``, ``TrackID`` and
+        ``fate`` (``"Live"`` / ``"Dying"``). When provided, the returned
+        DataFrame gains a ``fate`` column per (event, target-organoid) row
+        used by the dashboard panels to split by fate. When missing, ``fate``
+        defaults to ``"Live"`` so downstream plotting still works.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: contact_event_id, sample_name, immune_track_id,
+        immune_type, target_track_id, organoid_type, contact_duration,
+        has_active_killing, n_killing_tp, fate.
+        Empty DataFrame if no active-killing data is found.
+    """
+    # Build (sample_name, TrackID-str) -> organoid_type lookup
+    track_type_map: dict = {}
+    for org_type in organoid_types:
+        csv_path = (
+            output_dir / "analysis" / org_type / "track_features"
+            / f"BEHAV3D_{org_type}_combined_track_features_filtered.csv"
+        )
+        if not csv_path.exists():
+            continue
+        df_org = pd.read_csv(csv_path, usecols=["sample_name", "TrackID"])
+        for _, row in (
+            df_org[["sample_name", "TrackID"]].drop_duplicates().iterrows()
+        ):
+            key = (str(row["sample_name"]), str(row["TrackID"]))
+            track_type_map.setdefault(key, org_type)
+
+    all_events: list = []
+
+    for im_type in immune_types:
+        ak_dir = output_dir / "analysis" / im_type / "active_killing"
+        events_path = ak_dir / f"contact_events_{im_type}.csv"
+        killing_path = ak_dir / f"active_killing_per_timepoint_{im_type}.csv"
+
+        if not events_path.exists():
+            continue
+
+        df_ev = pd.read_csv(events_path)
+        if df_ev.empty:
+            continue
+        df_ev["immune_type"] = im_type
+
+        # Per-target active-killing attribution from the per-timepoint CSV.
+        #
+        # ``advanced_timepoint_features.analyze_active_killing_per_timepoint``
+        # writes ``targeted_track_id`` only on timepoints where
+        # ``is_active_killing=True`` (it is the specific organoid whose
+        # death signal increase triggered the classification; see
+        # behav3d/features/advanced_timepoint_features.py line 437). So
+        # each killing event is attributable to exactly one target.
+        per_target_kill = None
+        if killing_path.exists():
+            df_tp = pd.read_csv(killing_path)
+            required_cols = {
+                "is_active_killing", "contact_event_id", "sample_name",
+                "targeted_track_id",
+            }
+            if not df_tp.empty and required_cols.issubset(df_tp.columns):
+                kill_mask = df_tp["is_active_killing"].astype(bool)
+                df_tp_kill = df_tp.loc[
+                    kill_mask
+                    & df_tp["targeted_track_id"].notna(),
+                    ["contact_event_id", "sample_name",
+                     "targeted_track_id"],
+                ].copy()
+                if not df_tp_kill.empty:
+                    df_tp_kill["targeted_track_id"] = (
+                        df_tp_kill["targeted_track_id"]
+                        .astype(float).astype("Int64").astype(str)
+                    )
+                    per_target_kill = (
+                        df_tp_kill.groupby(
+                            ["sample_name", "contact_event_id",
+                             "targeted_track_id"],
+                        ).size().rename("n_killing_tp").reset_index()
+                    )
+
+        # Explode target_track_ids -> one row per (event, target organoid)
+        if "target_track_ids" not in df_ev.columns:
+            continue
+        df_ev["_targets"] = (
+            df_ev["target_track_ids"].astype(str).str.split(",")
+        )
+        df_ex = df_ev.explode("_targets")
+        df_ex["target_track_id"] = df_ex["_targets"].str.strip()
+        df_ex = df_ex[
+            df_ex["target_track_id"].ne("")
+            & df_ex["target_track_id"].ne("nan")
+        ]
+
+        # Attach per-target killing (True only for the actual targeted
+        # organoid, not for co-contacted organoids during the same event).
+        df_ex["sample_name"] = df_ex["sample_name"].astype(str)
+        df_ex["target_track_id"] = df_ex["target_track_id"].astype(str)
+        if per_target_kill is not None and not per_target_kill.empty:
+            df_ex = df_ex.merge(
+                per_target_kill.rename(
+                    columns={"targeted_track_id": "target_track_id"},
+                ),
+                on=["sample_name", "contact_event_id", "target_track_id"],
+                how="left",
+            )
+        else:
+            df_ex["n_killing_tp"] = np.nan
+        df_ex["n_killing_tp"] = (
+            df_ex["n_killing_tp"].fillna(0).astype(int)
+        )
+        df_ex["has_active_killing"] = df_ex["n_killing_tp"] > 0
+
+        # Map to organoid type
+        df_ex["organoid_type"] = [
+            track_type_map.get(
+                (str(sn), str(tid)), "unknown"
+            )
+            for sn, tid in zip(df_ex["sample_name"], df_ex["target_track_id"])
+        ]
+        df_ex = df_ex[df_ex["organoid_type"] != "unknown"]
+
+        all_events.append(df_ex)
+
+    if not all_events:
+        return pd.DataFrame()
+
+    df_all = pd.concat(all_events, ignore_index=True)
+
+    # Attach fate of the target organoid from track_summary when available.
+    # Default to "Live" for any organoid missing from track_summary (e.g. when
+    # death data is not present) so downstream grouping still works.
+    if (
+        track_summary is not None
+        and not track_summary.empty
+        and "fate" in track_summary.columns
+    ):
+        ts = track_summary[["sample_name", "TrackID", "fate"]].copy()
+        ts["sample_name"] = ts["sample_name"].astype(str)
+        ts["TrackID"] = ts["TrackID"].astype(str)
+        df_all["sample_name"] = df_all["sample_name"].astype(str)
+        df_all["target_track_id"] = df_all["target_track_id"].astype(str)
+        df_all = df_all.merge(
+            ts.rename(columns={"TrackID": "target_track_id"}),
+            on=["sample_name", "target_track_id"],
+            how="left",
+        )
+        df_all["fate"] = df_all["fate"].fillna("Live")
+    else:
+        df_all["fate"] = "Live"
+
+    keep = [
+        "contact_event_id", "sample_name", "immune_track_id", "immune_type",
+        "target_track_id", "organoid_type", "fate", "contact_duration",
+        "has_active_killing", "n_killing_tp",
+    ]
+    return df_all[[c for c in keep if c in df_all.columns]]
+
+
+def _style_dashboard_ax(ax: plt.Axes):
+    """Apply consistent styling to a dashboard subplot."""
+    ax.set_facecolor("#fafafa")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_linewidth(0.6)
+        ax.spines[spine].set_color("#888888")
+    ax.tick_params(
+        axis="both", which="both", length=4, width=0.6, colors="#555555",
+    )
+    ax.grid(True, axis="y", alpha=0.25, linewidth=0.5, color="#cccccc")
+    ax.set_axisbelow(True)
+
+
+# -- Dashboard group-axis helpers (dynamic 2 x N_org_types layout) ----------
+
+# Internal fate labels match the values written into ``track_summary["fate"]``
+# by run_multi_organoid_interaction_comparison (``"Live"`` / ``"Dying"``).
+# Order is Dead-then-Live so every group appears Dead -> Live -> Dead -> Live.
+_FATE_ORDER = ("Dying", "Live")
+
+# Display labels used on axes, legends and tick text. We show "Dead" rather
+# than "Dying" since these organoids have crossed the death threshold by the
+# end of the experiment.
+_FATE_DISPLAY = {"Dying": "Dead", "Live": "Live"}
+
+_GROUP_SEP = " | "
+
+# Shared palettes used by all multi-organoid interaction plots so the same
+# semantic colour appears everywhere:
+#   - fate: dead = red, live = green (full-strength for box edges, strips, bars)
+#   - fate (light): for violin fills behind the per-fate dot clouds
+#   - killing status: purple = active killing event, blue = non-killing event
+_FATE_COLORS = {"Dying": "#E53935", "Live": "#43A047"}
+_FATE_COLORS_LIGHT = {"Dying": "#EF9A9A", "Live": "#A5D6A7"}
+_KILLING_COLORS = {
+    "Active killing event": "#7E57C2",
+    "Non-killing event": "#1976D2",
+}
+
+
+def _build_org_fate_groups(
+    org_types: list, fates: tuple = _FATE_ORDER,
+) -> list:
+    """Return the canonical ordered list of (organoid_type, fate) groups.
+
+    Used by Panels C and D so axis positions are consistent regardless of
+    which (org, fate) combinations actually contain data. Scales to
+    ``2 * len(org_types)`` groups (N organoid types -> 2N slots). Fate
+    order within each organoid type is Dead then Live.
+    """
+    return [(org, fate) for org in org_types for fate in fates]
+
+
+def _group_label(org: str, fate: str) -> str:
+    """Compose a unique categorical label for an (org, fate) group."""
+    return f"{org}{_GROUP_SEP}{fate}"
+
+
+def _apply_org_fate_xticks(
+    ax: plt.Axes,
+    group_order: list,
+    *,
+    show_separators: bool = True,
+):
+    """
+    Set two-line x-tick labels (``organoid_type`` on top, display fate
+    below) and draw faint vertical separators between successive organoid
+    types. Fate is re-labeled via ``_FATE_DISPLAY`` (Dying -> Dead).
+    """
+    xticks = list(range(len(group_order)))
+    xlabels = [
+        f"{org}\n{_FATE_DISPLAY.get(fate, fate)}"
+        for (org, fate) in group_order
+    ]
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xlabels, fontsize=10)
+
+    if show_separators and len(group_order) >= 2:
+        for i in range(1, len(group_order)):
+            prev_org = group_order[i - 1][0]
+            this_org = group_order[i][0]
+            if this_org != prev_org:
+                ax.axvline(
+                    i - 0.5, color="#bbbbbb", linewidth=0.7,
+                    linestyle=(0, (2, 2)), alpha=0.8, zorder=0,
+                )
+
+
+def plot_interaction_overview_dashboard(
+    track_summary: pd.DataFrame,
+    df_contact_events: pd.DataFrame,
+    immune_types: list,
+    has_dead_data: bool,
+):
+    """
+    Active-killing dashboard: two panels derived from the per-event / per-
+    timepoint active-killing CSVs written by ``advanced_timepoint_features``
+    (``contact_events_{im}.csv`` and ``active_killing_per_timepoint_{im}.csv``).
+
+    Panels
+    ------
+    Left  -- Contact Event Duration per (organoid_type x fate); one point
+             per immune-cell <-> organoid contact event, colored by whether
+             that event actively killed the targeted organoid.
+    Right -- Active Killing Efficiency per (organoid_type x fate); for each
+             (organoid_type, fate) group, the % of its contact events that
+             actively killed the targeted organoid, aggregated across all
+             selected immune types.
+
+    Returns ``None`` when no active-killing data is available -- the
+    dashboard has nothing to show without it.
+    """
+    if df_contact_events.empty:
+        return None
+
+    org_types = sorted(df_contact_events["organoid_type"].unique())
+    if not org_types:
+        return None
+
+    # Dynamic group count drives figure width: 2 x N_present_org_types.
+    # Panels are now stacked vertically (contact duration on top as the
+    # main view, active-killing efficiency as a smaller sub-panel below),
+    # so the figure no longer needs to stretch horizontally to fit two
+    # side-by-side panels.
+    n_groups = max(2 * len(org_types), 4)
+    figwidth = max(11.0, 3.2 * n_groups + 3.0)
+
+    fig = plt.figure(figsize=(figwidth, 12), dpi=120)
+    fig.patch.set_facecolor("#fafafa")
+    gs = fig.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.35)
+    axC = fig.add_subplot(gs[0, 0])
+    axD = fig.add_subplot(gs[1, 0])
+
+    _panel_contact_duration(axC, df_contact_events, org_types)
+    _panel_killing_proportion(
+        axD, df_contact_events, org_types, immune_types,
+    )
+
+    fig.suptitle(
+        "Interaction -- Active Killing",
+        fontsize=15, fontweight="bold",
+        y=0.995,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
+# -- Dashboard sub-panels ---------------------------------------------------
+
+def _panel_contact_duration(
+    ax: plt.Axes,
+    df_contact_events: pd.DataFrame,
+    org_types: list,
+):
+    """
+    Contact Event Duration panel.
+
+    Each point = one immune-cell <-> organoid contact event (as written to
+    ``contact_events_{im}.csv`` by the active-killing feature step). Points
+    are grouped on the x-axis by (organoid_type, fate of the contacted
+    organoid) and colored by whether that event actively killed the
+    targeted organoid. x-axis scales dynamically to ``2 * len(org_types)``
+    slots; fate order is Dead then Live per organoid type.
+    """
+    _style_dashboard_ax(ax)
+
+    panel_title = "Contact event duration per organoid fate"
+
+    if (
+        df_contact_events.empty
+        or "contact_duration" not in df_contact_events.columns
+    ):
+        ax.text(
+            0.5, 0.5, "No contact event data",
+            transform=ax.transAxes, ha="center", va="center",
+            fontsize=12, color="#999999",
+        )
+        ax.set_title(panel_title, fontsize=13, fontweight="semibold", pad=10)
+        return
+
+    df = df_contact_events.copy()
+    if "fate" not in df.columns:
+        df["fate"] = "Live"
+    df = df[df["fate"].isin(_FATE_ORDER)].copy()
+    if df.empty:
+        ax.text(
+            0.5, 0.5, "No matched organoid data",
+            transform=ax.transAxes, ha="center", va="center",
+            fontsize=12, color="#999999",
+        )
+        ax.set_title(panel_title, fontsize=13, fontweight="semibold", pad=10)
+        return
+
+    df["killing_label"] = df["has_active_killing"].map(
+        {True: "Active killing event", False: "Non-killing event"},
+    )
+    df["group"] = [
+        _group_label(org, fate)
+        for org, fate in zip(df["organoid_type"], df["fate"])
+    ]
+
+    group_pairs = _build_org_fate_groups(org_types)
+    group_order = [_group_label(o, f) for (o, f) in group_pairs]
+    group_to_idx = {g: i for i, g in enumerate(group_order)}
+
+    # Per-group violin background colour follows fate (light red for Dead,
+    # light green for Live -- pulled from the shared module-level palette
+    # so the fate vocabulary stays consistent across plots). Box edges use
+    # the full-strength fate colour from `_FATE_COLORS`.
+    palette = {
+        _group_label(o, f): _FATE_COLORS_LIGHT[f]
+        for (o, f) in group_pairs
+    }
+    dark_palette = {
+        _group_label(o, f): _FATE_COLORS[f]
+        for (o, f) in group_pairs
+    }
+
+    common = dict(
+        data=df, x="group", y="contact_duration",
+        order=group_order, ax=ax,
+    )
+
+    sns.violinplot(
+        **common, hue="group", palette=palette, legend=False,
+        width=0.75,
+        inner=None, linewidth=0.8, alpha=0.30,
+        density_norm="count", cut=0,
+    )
+    sns.boxplot(
+        **common, hue="group", palette=dark_palette, legend=False,
+        width=0.28,
+        fliersize=0,
+        boxprops=dict(linewidth=1.2),
+        whiskerprops=dict(linewidth=1.0),
+        capprops=dict(linewidth=1.0),
+        showcaps=True,
+        medianprops=dict(linewidth=2.0),
+    )
+
+    # Hollow the centered box so neither point cloud is hidden behind a
+    # solid rectangle; per-fate colour is preserved on the edge / whiskers
+    # / median tick because we re-use the box's own facecolor as edgecolor.
+    for patch in ax.patches:
+        if isinstance(patch, mpatches.PathPatch):
+            face = patch.get_facecolor()
+            patch.set_edgecolor(face)
+            patch.set_facecolor("none")
+
+    # Manual scatter: active-killing points sit on the LEFT half of each
+    # violin (purple), non-killing points on the RIGHT half (blue). One-
+    # sided jitter ranges in (-0.22, -0.03) / (+0.03, +0.22) reserve the
+    # centre for the box without overlapping it.
+    kill_color = _KILLING_COLORS
+    rng = np.random.default_rng(1)
+    for g_label, sub in df.groupby("group"):
+        if g_label not in group_to_idx or len(sub) == 0:
+            continue
+        xi = group_to_idx[g_label]
+        active_mask = sub["killing_label"] == "Active killing event"
+        active = sub[active_mask]
+        non_active = sub[~active_mask]
+        if len(active) > 0:
+            x_left = xi + rng.uniform(-0.22, -0.03, size=len(active))
+            ax.scatter(
+                x_left, active["contact_duration"],
+                s=10, c=kill_color["Active killing event"],
+                alpha=0.55, edgecolors="white", linewidths=0.25, zorder=3,
+            )
+        if len(non_active) > 0:
+            x_right = xi + rng.uniform(0.03, 0.22, size=len(non_active))
+            ax.scatter(
+                x_right, non_active["contact_duration"],
+                s=10, c=kill_color["Non-killing event"],
+                alpha=0.55, edgecolors="white", linewidths=0.25, zorder=3,
+            )
+
+    handles = [
+        plt.Line2D(
+            [0], [0], marker="o", linestyle="", markersize=7,
+            markerfacecolor=kill_color["Active killing event"],
+            markeredgecolor="white", markeredgewidth=0.5,
+            label="Active killing event (left)",
+        ),
+        plt.Line2D(
+            [0], [0], marker="o", linestyle="", markersize=7,
+            markerfacecolor=kill_color["Non-killing event"],
+            markeredgecolor="white", markeredgewidth=0.5,
+            label="Non-killing event (right)",
+        ),
+    ]
+    ax.legend(
+        handles=handles, fontsize=9,
+        frameon=True, framealpha=0.85, edgecolor="#cccccc",
+        title="Each point = one contact event",
+        title_fontsize=9, loc="upper right",
+    )
+
+    _apply_org_fate_xticks(ax, group_pairs)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("Organoid type / fate", fontsize=11, labelpad=8)
+    ax.set_ylabel(
+        "Contact duration (timepoints)",
+        fontsize=11, labelpad=8,
+    )
+    ax.set_title(panel_title, fontsize=13, fontweight="semibold", pad=10)
+
+
+def _panel_killing_proportion(
+    ax: plt.Axes,
+    df_contact_events: pd.DataFrame,
+    org_types: list,
+    immune_types: list,
+):
+    """
+    Active Killing Efficiency panel.
+
+    One bar per (organoid_type, fate): the percentage of that group's
+    contact events that actively killed the targeted organoid. Numerator
+    and denominator count contact events (not organoids, not immune cells);
+    killing attribution uses the per-target ``targeted_track_id`` column of
+    ``active_killing_per_timepoint_{im}.csv``. Aggregates across all
+    selected immune types (per-immune breakdown already lives in
+    ``active_killing_summary_{im}.csv``).
+    """
+    _style_dashboard_ax(ax)
+
+    panel_title = "Active killing efficiency per organoid fate"
+
+    if df_contact_events.empty:
+        ax.text(
+            0.5, 0.5, "No active killing data",
+            transform=ax.transAxes, ha="center", va="center",
+            fontsize=12, color="#999999",
+        )
+        ax.set_title(panel_title, fontsize=13, fontweight="semibold", pad=10)
+        return
+
+    df = df_contact_events.copy()
+    if "fate" not in df.columns:
+        df["fate"] = "Live"
+    df = df[df["fate"].isin(_FATE_ORDER)].copy()
+    if df.empty:
+        ax.text(
+            0.5, 0.5, "No matched organoid data",
+            transform=ax.transAxes, ha="center", va="center",
+            fontsize=12, color="#999999",
+        )
+        ax.set_title(panel_title, fontsize=13, fontweight="semibold", pad=10)
+        return
+
+    # Aggregate across all selected immune types. ``has_active_killing`` is
+    # per (event, target) thanks to the per-target attribution done in
+    # _load_active_killing_data, so summing gives the number of contact
+    # events that killed this specific targeted organoid without double
+    # counting co-contacted organoids.
+    summary = (
+        df.groupby(["organoid_type", "fate"])
+          .agg(
+              n_events=("contact_event_id", "count"),
+              n_killing=("has_active_killing", "sum"),
+          )
+          .reset_index()
+    )
+    summary["killing_pct"] = np.where(
+        summary["n_events"] > 0,
+        summary["n_killing"] / summary["n_events"] * 100,
+        0.0,
+    )
+
+    group_pairs = _build_org_fate_groups(org_types)
+
+    x = np.arange(len(group_pairs))
+    vals = []
+    n_events_list = []
+    n_kill_list = []
+    colors = []
+    for (org, fate) in group_pairs:
+        row = summary[
+            (summary["organoid_type"] == org) & (summary["fate"] == fate)
+        ]
+        if len(row):
+            vals.append(float(row["killing_pct"].iloc[0]))
+            n_events_list.append(int(row["n_events"].iloc[0]))
+            n_kill_list.append(int(row["n_killing"].iloc[0]))
+        else:
+            vals.append(0.0)
+            n_events_list.append(0)
+            n_kill_list.append(0)
+        colors.append(_FATE_COLORS[fate])
+
+    bar_w = 0.6
+    ax.bar(
+        x, vals, bar_w, color=colors, edgecolor="white",
+        linewidth=0.8, alpha=0.88,
+    )
+
+    # Annotate each bar with killing_events / total_events.
+    for xi, v, ne, nk in zip(x, vals, n_events_list, n_kill_list):
+        txt = f"{nk}/{ne} events" if ne > 0 else "0/0 events"
+        ax.text(
+            xi, v + 1.2, txt,
+            ha="center", va="bottom", fontsize=8.5,
+            color="#444444",
+        )
+
+    # Legend for fate colors (Dead first, Live second).
+    handles = [
+        plt.Rectangle(
+            (0, 0), 1, 1, facecolor=_FATE_COLORS["Dying"],
+            edgecolor="white", label="Dead",
+        ),
+        plt.Rectangle(
+            (0, 0), 1, 1, facecolor=_FATE_COLORS["Live"],
+            edgecolor="white", label="Live",
+        ),
+    ]
+    ax.legend(
+        handles=handles, fontsize=9,
+        frameon=True, framealpha=0.85, edgecolor="#cccccc",
+        title="Organoid fate", title_fontsize=9, loc="upper right",
+    )
+
+    _apply_org_fate_xticks(ax, group_pairs)
+    top = max(max(vals) * 1.25 if vals else 10, 10)
+    ax.set_ylim(bottom=0, top=min(top, 105))
+    ax.set_xlabel("Organoid type / fate", fontsize=11, labelpad=8)
+    ax.set_ylabel(
+        "Contact events that actively killed (%)",
+        fontsize=11, labelpad=8,
+    )
+    ax.set_title(panel_title, fontsize=13, fontweight="semibold", pad=10)

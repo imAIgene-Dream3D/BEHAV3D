@@ -7,16 +7,16 @@ This folder contains all the necessary files to install BEHAV3D and its dependen
 | File | Description |
 |------|-------------|
 | `install_behav3d.py` | Main Python installation script (cross-platform) |
-| `install_behav3d.bat` | Windows batch wrapper (double-click to run) |
-| `install_behav3d.sh` | macOS/Linux shell wrapper |
-| `install_behav3d.command` | macOS double-click launcher |
+| `install_behav3d_windows.bat` | Windows batch wrapper (double-click to run) |
+| `install_behav3d_linux.sh` | macOS/Linux shell wrapper |
+| `install_behav3d_macOS.command` | macOS double-click launcher |
 | `environment.yml` | Conda environment specification |
 | `requirements.txt` | Pip requirements (alternative to conda) |
 
 ## 🚀 Quick Start
 
 ### Windows
-**Option 1 (Recommended):** Double-click `install_behav3d.bat`
+**Option 1 (Recommended):** Double-click `install_behav3d_windows.bat`
 
 **Option 2:** Open Command Prompt and run:
 ```cmd
@@ -25,19 +25,19 @@ python install_behav3d.py
 ```
 
 ### macOS
-**Option 1:** Double-click `install_behav3d.command`
+**Option 1:** Double-click `install_behav3d_macOS.command`
 
 **Option 2:** Open Terminal and run:
 ```bash
 cd path/to/BEHAV3D/installation
-chmod +x install_behav3d.sh
+chmod +x install_behav3d_linux.sh
 ./install_behav3d.sh
 ```
 
 ### Linux
 ```bash
 cd path/to/BEHAV3D/installation
-chmod +x install_behav3d.sh
+chmod +x install_behav3d_linux.sh
 ./install_behav3d.sh
 ```
 

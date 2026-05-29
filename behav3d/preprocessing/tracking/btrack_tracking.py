@@ -631,6 +631,7 @@ def run_btracking(
     return_trackimg=True,
     overwrite=False,
     log_callback=None,
+    progress_cb=None,
     **kwargs,
 ):
     """Run btrack (Bayesian tracking) on all samples for a given cell type.
@@ -672,11 +673,21 @@ def run_btracking(
         Whether to overwrite existing results.
     log_callback : callable, optional
         Function to log messages (for GUI integration).
+    progress_cb : callable, optional
+        Called as ``progress_cb(current, total, label)`` from inside the
+        per-sample loop so a GUI can drive a progress bar.  ``None`` is a
+        no-op (default).  Notebook callers omit this kwarg.
     """
     _log = log_callback or print
 
-    for idx, sample in metadata.iterrows():
+    total_samples = len(metadata)
+    for i, (idx, sample) in enumerate(metadata.iterrows()):
         sample_name = sample["sample_name"]
+        if progress_cb is not None:
+            try:
+                progress_cb(i, total_samples, f"{cell_type} / {sample_name}")
+            except Exception:
+                pass
         _log(f"Tracking sample: {sample_name}")
 
         tracked_img_outdir = Path(output_dir, "images", sample_name)
@@ -763,4 +774,9 @@ def run_btracking(
         metadata.at[idx, img_col] = str(tracked_img_outpath)
         metadata.at[idx, csv_col] = str(tracked_csv_outpath)
 
+    if progress_cb is not None:
+        try:
+            progress_cb(total_samples, total_samples, f"{cell_type} done")
+        except Exception:
+            pass
     return metadata

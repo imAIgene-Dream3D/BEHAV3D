@@ -23,10 +23,12 @@ import subprocess
 import sys
 import os
 import platform
+import shlex
 import shutil
 import tempfile
 import urllib.request
 import argparse
+import json
 from pathlib import Path
 
 # =============================================================================
@@ -396,10 +398,21 @@ def create_conda_environment(conda_path, env_file="environment.yml"):
         installer_name = Path(pkg_mgr).stem
         print_info(f"Using {installer_name} for environment creation")
         
+        # Clean package cache first to avoid SafetyError from corrupted downloads
+        print_info("Cleaning package cache to avoid corrupted-package errors...")
+        run_command(f'"{pkg_mgr}" clean --packages --tarballs -y', check=False)
+        
+        # Set conda config to tolerate ClobberError / SafetyError from broken
+        # upstream builds (e.g. scikit-image 0.26.0 bundling duplicate .pyc files).
+        # These are environment-variable overrides so they don't persist.
+        env_overrides = os.environ.copy()
+        env_overrides["CONDA_SAFETY_CHECKS"] = "warn"        # downgrade SafetyError to warning
+        env_overrides["CONDA_PATH_CONFLICT"]  = "warn"       # downgrade ClobberError to warning
+        
         # Use -n flag to override the name in the YAML file
         cmd = f'"{pkg_mgr}" env create -f "{env_path}" -n {ENV_NAME} -y'
         print_info(f"Running: {cmd}")
-        run_command(cmd)
+        subprocess.run(cmd, shell=True, check=True, env=env_overrides)
         print_success(f"Environment '{ENV_NAME}' created successfully")
         return True
     except subprocess.CalledProcessError as e:
@@ -478,6 +491,23 @@ def install_cellpose(conda_path, gpu_info, force_cpu=False):
         return True
     except subprocess.CalledProcessError as e:
         print_error(f"Failed to install Cellpose: {e}")
+        return False
+
+
+def install_convpaint(conda_path):
+    """Install napari-convpaint"""
+    print_step("Installing napari-convpaint (ConvPaint segmentation engine)...")
+
+    run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+
+    try:
+        cmd = f'{run_prefix} pip install "napari-convpaint"'
+        print_info(f"Running: {cmd}")
+        run_command(cmd)
+        print_success("napari-convpaint installed successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        print_error(f"Failed to install napari-convpaint: {e}")
         return False
 
 
@@ -574,6 +604,62 @@ def install_behav3d_package(conda_path):
         return False
 
 # =============================================================================
+# FREETYPE DLL FIX (Windows only)
+# =============================================================================
+
+def fix_freetype_windows(conda_path: str) -> None:
+    """Copy freetype.dll as libfreetype.dll into the freetype-py package dir.
+
+    On Windows, conda installs the FreeType C library as
+    ``Library/bin/freetype.dll`` while ``freetype-py`` (the Python wrapper
+    used by vispy/napari) looks for ``libfreetype.dll`` inside its own package
+    directory.  The name mismatch means freetype-py never finds the DLL and
+    any napari feature that renders text (scale bar, axes labels, etc.) crashes
+    with ``RuntimeError: Freetype library not found``.
+
+    This function copies the DLL under the expected name so both names resolve
+    to the same binary.  It is a no-op on macOS/Linux (where the library is
+    found via the standard system path).
+    """
+    if platform.system() != "Windows":
+        return
+
+    print_step("Applying Windows FreeType DLL fix...")
+
+    # Locate the conda environment prefix.
+    try:
+        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+        result = run_command(
+            f'{run_prefix} python -c "import sys; print(sys.prefix)"',
+            capture=True,
+        )
+        if not result:
+            print_warning("Could not determine conda env prefix; skipping FreeType fix.")
+            return
+        env_prefix = Path(result.strip())
+    except Exception as exc:
+        print_warning(f"FreeType fix: could not find env prefix ({exc})")
+        return
+
+    src = env_prefix / "Library" / "bin" / "freetype.dll"
+    if not src.exists():
+        print_warning(f"FreeType fix: source DLL not found at {src}; skipping.")
+        return
+
+    # Destination: freetype-py package directory.
+    dst = env_prefix / "Lib" / "site-packages" / "freetype" / "libfreetype.dll"
+    if dst.exists():
+        print_info(f"FreeType fix: {dst.name} already present — nothing to do.")
+        return
+
+    try:
+        shutil.copy2(str(src), str(dst))
+        print_success(f"FreeType fix applied: {src.name} → {dst}")
+    except Exception as exc:
+        print_warning(f"FreeType fix: could not copy DLL ({exc})")
+
+
+# =============================================================================
 # VERIFICATION
 # =============================================================================
 
@@ -589,7 +675,9 @@ def verify_installation(conda_path):
         ("PyTorch", 'python -c "import torch; print(f\'PyTorch {torch.__version__}\')"'),
         ("CUDA Available", 'python -c "import torch; print(f\'CUDA: {torch.cuda.is_available()}\')"'),
         ("Cellpose", 'python -c "from importlib.metadata import version; print(f\'Cellpose {version(\\\"cellpose\\\")}\')"'),
+        ("ConvPaint", 'python -c "from importlib.metadata import version; print(f\'ConvPaint {version(\\\"napari-convpaint\\\")}\')"'),
         ("Napari", 'python -c "import napari; print(f\'Napari {napari.__version__}\')"'),
+        ("BEHAV3D Plugin", 'python -c "from behav3d.napari._widget import BEHAV3DWidget; print(\'Plugin OK\')"'),
     ]
     
     all_passed = True
@@ -606,6 +694,168 @@ def verify_installation(conda_path):
             all_passed = False
     
     return all_passed
+
+# =============================================================================
+# ENVIRONMENT CONFIG PERSISTENCE & NAPARI LAUNCH
+# =============================================================================
+
+def save_env_config(conda_path):
+    """Save the package manager path and env name to napari/.conf/behav3d_env.json."""
+    project_root = find_project_root()
+    napari_dir = project_root / "napari"
+    conf_dir = napari_dir / ".config"
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Use the best available package manager (same one used during install)
+    pkg_mgr = get_package_manager()
+    if not pkg_mgr:
+        pkg_mgr = conda_path
+    
+    config_path = conf_dir / "behav3d_env.json"
+    config = {
+        "pkg_manager": str(pkg_mgr),
+        "env_name": ENV_NAME,
+    }
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    
+    print_success(f"Environment config saved to: {config_path}")
+    print_info(f"  Package manager: {pkg_mgr}")
+    print_info(f"  Environment name: {ENV_NAME}")
+
+    # Make the platform launcher scripts executable so users can double-click them.
+    # No-op on Windows (.bat files don't need an executable bit).
+    if platform.system() != "Windows":
+        for script_name in ("run_behav3d_linux.sh", "run_behav3d_macos.command"):
+            script_path = napari_dir / script_name
+            if script_path.exists():
+                try:
+                    current = script_path.stat().st_mode
+                    os.chmod(script_path, current | 0o111)  # add +x for user/group/other
+                    print_info(f"  Made executable: {script_path.name}")
+                except Exception as e:
+                    print_warning(f"  Could not chmod {script_path.name}: {e}")
+
+    return config_path
+
+
+def launch_napari(conda_path):
+    """Launch napari with the BEHAV3D plugin in a new terminal window.
+
+    We invoke the platform-specific launcher script (run_behav3d_*.{bat,command,sh})
+    the same way a user would by double-clicking it. This guarantees a visible
+    terminal window where pipeline log outputs are shown, matching the experience
+    of launching from the napari/ folder. Falls back to a direct subprocess if
+    the launcher script is missing.
+    """
+    project_root = find_project_root()
+    napari_dir = project_root / "napari"
+    system = platform.system()
+
+    if system == "Windows":
+        launcher = napari_dir / "run_behav3d_windows.bat"
+    elif system == "Darwin":
+        launcher = napari_dir / "run_behav3d_macos.command"
+    else:
+        launcher = napari_dir / "run_behav3d_linux.sh"
+
+    # Ensure +x on Unix launcher scripts so 'open' / direct exec works.
+    # If chmod fails (e.g. read-only filesystem) we'll fall back to invoking
+    # the script through `bash <script>` which does not need the exec bit.
+    chmod_ok = True
+    if system in ("Darwin", "Linux") and launcher.exists():
+        try:
+            current = launcher.stat().st_mode
+            os.chmod(launcher, current | 0o111)
+        except Exception as e:
+            chmod_ok = False
+            print_warning(f"Could not make launcher executable ({e}); will run via bash instead.")
+
+    if launcher.exists():
+        print_info(f"Launching via: {launcher}")
+        try:
+            if system == "Windows":
+                # os.startfile mimics double-clicking the .bat in Explorer:
+                # Windows opens it in a new CMD window with stdout visible.
+                os.startfile(str(launcher))
+            elif system == "Darwin":
+                if chmod_ok:
+                    # 'open' a .command file launches it in Terminal.app by default.
+                    subprocess.Popen(["open", str(launcher)])
+                else:
+                    # Fallback: ask Terminal.app to run the script through bash,
+                    # which does not require the +x bit on the script file.
+                    osa_script = (
+                        f'tell application "Terminal" to do script '
+                        f'"bash {shlex.quote(str(launcher))}"'
+                    )
+                    subprocess.Popen(["osascript", "-e", osa_script])
+            else:
+                # Try common Linux terminal emulators in order of preference.
+                # Each tuple is (binary_name, args_before_command).
+                # We always invoke via `bash <script>` so missing +x is not fatal.
+                terminals = [
+                    ("x-terminal-emulator", ["-e"]),
+                    ("gnome-terminal", ["--"]),
+                    ("konsole", ["-e"]),
+                    ("xfce4-terminal", ["-e"]),
+                    ("xterm", ["-e"]),
+                ]
+
+                launched = False
+                for term, prefix_args in terminals:
+                    if shutil.which(term):
+                        subprocess.Popen(
+                            [term, *prefix_args, "bash", str(launcher)],
+                            start_new_session=True,
+                        )
+                        launched = True
+                        break
+
+                if not launched:
+                    print_warning("No terminal emulator found on PATH.")
+                    print_info(f"Please launch manually: bash {launcher}")
+                    return
+
+            print_success("Napari is starting with BEHAV3D plugin in a new terminal window...")
+            print_info("Closing installation window...")
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as e:
+            print_error(f"Failed to launch napari via launcher script: {e}")
+            print_info("Falling back to direct launch...")
+
+    # ---------- Fallback: direct launch (launcher script missing or failed) ----------
+    script_path = napari_dir / ".config" / "launch_napari.py"
+    if not script_path.exists():
+        print_warning(f"Startup script not found at {script_path}")
+        print_info("Falling back to standard napari launch...")
+        cmd = f'{get_conda_run_prefix(conda_path, ENV_NAME)} napari'
+    else:
+        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+        # Use launcher mode (no --internal) so stdout is inherited and logs are visible.
+        cmd = f'{run_prefix} python "{script_path}"'
+
+    print_info(f"Running: {cmd}")
+    try:
+        kwargs = {}
+        if system == "Windows":
+            # Open in a new console window so logs are visible
+            kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
+        else:
+            # Detach the process so it survives when we exit, but keep stdout/stderr
+            # attached to the current terminal so the user can still see logs.
+            kwargs['start_new_session'] = True
+
+        subprocess.Popen(cmd, shell=True, **kwargs)
+        print_success("Napari is starting with BEHAV3D plugin...")
+        print_info("Closing installation window...")
+        sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print_error(f"Failed to launch napari: {e}")
 
 # =============================================================================
 # MAIN INSTALLATION FLOW
@@ -803,48 +1053,93 @@ Examples:
         print_error("Failed to install Cellpose.")
         return 1
     
-    # Install BEHAV3D package
+    # Install napari-convpaint (uses existing PyTorch and Cellpose)
+    print_header("CONVPAINT INSTALLATION")
+    if not install_convpaint(conda_path):
+        print_warning("napari-convpaint installation failed (ConvPaint engine will be disabled)")
+    
+    # Install BEHAV3D package (includes napari plugin via setup.py entry points)
     if not args.skip_behav3d and not args.pytorch_only:
         print_header("BEHAV3D PACKAGE INSTALLATION")
         if not install_behav3d_package(conda_path):
             print_warning("BEHAV3D package installation failed (non-critical)")
+        else:
+            # Verify the napari plugin was registered (using npe2 discovery)
+            print_step("Verifying napari plugin registration...")
+            run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+            try:
+                # Check 1: Import the widget class
+                cmd_import = f'{run_prefix} python -c "from behav3d.napari._widget import BEHAV3DWidget"'
+                run_command(cmd_import, capture=True)
+                
+                # Check 2: Check npe2 manifest discovery
+                cmd_npe2 = f'{run_prefix} python -c "import npe2; pm=npe2.PluginManager.instance(); pm.discover(); found=\'behav3d\' in pm._manifests; print(\'FOUND\' if found else \'NOT_FOUND\')"'
+                result = run_command(cmd_npe2, capture=True)
+                
+                if result and "FOUND" in result:
+                    print_success("BEHAV3D napari plugin installed and registered successfully")
+                else:
+                    print_warning("Plugin package installed, but npe2 did not discover the manifest. 'pip install -e .' might need to be run again manually.")
+            except Exception as e:
+                print_warning(f"Plugin verification warning: {e}")
     
+    # Fix FreeType DLL name mismatch on Windows
+    print_header("PLATFORM FIXES")
+    fix_freetype_windows(conda_path)
+
     # Verify installation
     print_header("VERIFICATION")
     verify_installation(conda_path)
+    
+    # Save environment config for launchers
+    print_header("LAUNCHER CONFIGURATION")
+    config_path = save_env_config(conda_path)
+    
+    project_root = find_project_root()
+    napari_dir = project_root / "napari"
     
     # Final message
     print_header("INSTALLATION COMPLETE")
     print_success("BEHAV3D has been installed successfully!")
     print()
-    # Ask user if they want to run the BEHAV3D notebook now
-    try:
-        response = input("\nWould you like to open the BEHAV3D notebook now? [1] Yes  [2] No: ").strip()
-    except EOFError:
-        response = "2"
-    if response == "1" or response.lower() == "yes":
-        # Try to open the notebook directly
-        print_info("Attempting to launch the BEHAV3D notebook...")
-        notebooks_path = os.path.join(find_project_root(), "notebooks", "run_behav3d.ipynb")
-        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
-        # Use jupyter notebook command to open the notebook
-        try:
-            cmd = f'{run_prefix} jupyter notebook "{notebooks_path}"'
-            print_info(f"Running: {cmd}")
-            run_command(cmd)
-        except Exception as e:
-            print_warning(f"Could not open notebook automatically: {e}")
-            print("You can open it manually as described below.")
+    
+    # Show launcher info
+    if get_platform() == "Windows":
+        launcher = napari_dir / "run_behav3d_windows.bat"
+    elif get_platform() == "Darwin":
+        launcher = napari_dir / "run_behav3d_macos.command"
     else:
-        run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
-        notebooks_path = os.path.join(find_project_root(), "notebooks", "run_behav3d.ipynb")
-        cmd = f'{run_prefix} jupyter notebook "{notebooks_path}"'
-
-        print("\nStart using BEHAV3D!")
-        print()
-        print("To run the Jupyter notebook, open a Command Line Interface (CMD/Terminal) and run this code:")
-        print(cmd)
+        launcher = napari_dir / "run_behav3d_linux.sh"
+    
+    print(f"  Napari launcher:  {launcher}")
+    print(f"  Manual command:   conda activate {ENV_NAME} && napari")
     print()
+    
+    # Offer options
+    print("Would you like to launch napari now?")
+    print("  [1] Yes")
+    print("  [2] No")
+    print()
+    
+    try:
+        response = input("Choose [1/2]: ").strip()
+        if response == '1':
+            print()
+            launch_napari(conda_path)
+        else:
+            print()
+            print_header("ALTERNATIVES")
+            print("To open the Jupyter Notebook interface:")
+            print(f"  conda activate {ENV_NAME}")
+            print("  jupyter notebook")
+            print()
+            print("To launch napari later:")
+            print(f"  Double-click: {launcher}")
+            print()
+            
+    except (EOFError, KeyboardInterrupt):
+        pass
+    
     return 0
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ seaborn>=0.13
 plotly>=5.0
 kaleido>=1.2
 pypdf>=6.7
+pypdfium2>=4,<5  # In-napari PDF preview (Results panel)
 
 # -----------------------------------------------------------------------------
 # Image Processing & File I/O

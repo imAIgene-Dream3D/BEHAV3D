@@ -12,6 +12,7 @@ from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_organoid_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    expand_multicolor_celltype_names,
     load_behav3d_metadata,
 )
 from behav3d.io.images import load_zarr, write_zarr_parallel
@@ -117,14 +118,6 @@ def _infer_segment_name(path):
     return stem
 
 
-def _original_segment_backup_path(path):
-    path = Path(path)
-    if str(path).endswith(".zarr.zip"):
-        stem = path.name[:-9]
-        return path.with_name(f"{stem}_original.zarr.zip")
-    if path.suffix == ".zarr":
-        return path.with_name(f"{path.stem}_original.zarr")
-    return path.with_name(f"{path.name}_original")
 
 
 def _resolve_output_paths(segment_paths, output_paths, overwrite):
@@ -296,39 +289,35 @@ def _apply_group_resolution(volumes, processed_volumes, group_nodes, erosion_pix
         node: volumes[node[0]] == node[1]
         for node in group_nodes
     }
+    if not node_masks:
+        return
+
     full_union = np.zeros(volumes[0].shape, dtype=bool)
     for mask in node_masks.values():
         full_union |= mask
 
-    survivors = _drop_contained_nodes(node_masks)
-    if not survivors:
-        assignments = {}
-    elif len(survivors) == 1:
-        winner = next(iter(survivors))
-        assignments = {winner: full_union}
+    # Keep exactly one copy of shared voxels per conflict group.
+    # This removes redundant overlap but does not merge the labels into a
+    # combined object or transfer union voxels between channels.
+    overlap_degree = np.zeros(full_union.shape, dtype=np.uint8)
+    for mask in node_masks.values():
+        overlap_degree += mask.astype(np.uint8)
+    shared_voxels = overlap_degree >= 2
+
+    if not np.any(shared_voxels):
+        assignments = dict(node_masks)
     else:
-        overlap_degree = np.zeros(full_union.shape, dtype=np.uint8)
-        for mask in survivors.values():
-            overlap_degree += mask.astype(np.uint8)
-        shared_voxels = overlap_degree >= 2
+        sizes = {node: int(mask.sum()) for node, mask in node_masks.items()}
+        winner = max(sizes, key=lambda node: (sizes[node], -node[0], -node[1]))
 
-        if not np.any(shared_voxels):
-            assignments = survivors
-        else:
-            candidate_masks = {}
-            for node, mask in survivors.items():
-                candidate = mask & ~shared_voxels
-                candidate = _erode_candidate(candidate, erosion_pixels)
-                if np.any(candidate):
-                    candidate_masks[node] = candidate
-
-            if len(candidate_masks) == 1:
-                winner = next(iter(candidate_masks))
-                assignments = {winner: full_union}
-            elif len(candidate_masks) > 1:
-                assignments = _partition_union_by_nearest_seeds(candidate_masks, full_union)
-            else:
-                assignments = {}
+        assignments = {winner: node_masks[winner]}
+        for node, mask in node_masks.items():
+            if node == winner:
+                continue
+            cleaned = mask & ~shared_voxels
+            cleaned = _erode_candidate(cleaned, erosion_pixels)
+            if np.any(cleaned):
+                assignments[node] = cleaned
 
     for image_idx in sorted({node[0] for node in group_nodes}):
         processed_volumes[image_idx][full_union] = 0
@@ -348,7 +337,11 @@ def process_multicolor_segments(
     n_workers=1,
 ):
     """
-    Resolve overlaps across multiple labeled segmentation volumes.
+    Remove redundant overlap across multiple labeled segmentation volumes.
+
+    The cleanup keeps per-channel segmentations separate and only removes the
+    shared voxels that would otherwise be duplicated across multicolor channels.
+    It does not merge the labels into a single combined segmentation.
     """
     from behav3d.preprocessing.segmentation import segment_size_filter
 
@@ -572,6 +565,80 @@ def _coerce_metadata(metadata):
     return load_behav3d_metadata(metadata)
 
 
+
+def apply_multicolor_segment_correction_for_base(
+    metadata,
+    output_dir,
+    base_cell_type,
+    n_channels,
+    overwrite=False,
+    show_progress=True,
+    n_workers=1,
+):
+    """Convenience wrapper for a numbered multicolor cell type family.
+
+    This is a top-level helper so other modules (e.g., the widgets package)
+    can import it directly.
+    """
+    metadata_df = _coerce_metadata(metadata)
+    cell_types = expand_multicolor_celltype_names(base_cell_type, n_channels)
+    corrected_paths_by_sample = apply_multicolor_segment_correction(
+        metadata=metadata,
+        output_dir=output_dir,
+        cell_types=cell_types,
+        overwrite=overwrite,
+        n_workers=n_workers,
+    )
+    
+    # Update metadata DataFrame with corrected segment paths
+    if metadata_df is not None and corrected_paths_by_sample:
+        metadata_df = _update_metadata_with_corrected_paths(
+            metadata_df,
+            corrected_paths_by_sample,
+            cell_types,
+        )
+    
+    return metadata_df if metadata_df is not None else metadata
+
+
+def _update_metadata_with_corrected_paths(metadata_df, corrected_paths_by_sample, cell_types):
+    """Update metadata DataFrame columns with corrected segment paths.
+    
+    Parameters
+    ----------
+    metadata_df : pd.DataFrame
+        The metadata DataFrame to update.
+    corrected_paths_by_sample : dict
+        Dict mapping sample_name -> list of corrected paths (one per cell_type, in order).
+    cell_types : list
+        List of cell types in the same order as the corrected paths.
+    
+    Returns
+    -------
+    pd.DataFrame
+        Updated metadata DataFrame with corrected segment paths.
+    """
+    metadata_df = metadata_df.copy()
+    sample_name_col = metadata_df["sample_name"].astype("string").str.strip()
+    
+    for sample_name, corrected_paths in corrected_paths_by_sample.items():
+        sample_rows = sample_name_col == sample_name
+        if not sample_rows.any():
+            continue
+        
+        # Update each cell type's segment path column
+        for cell_type, corrected_path in zip(cell_types, corrected_paths):
+            # Find the appropriate column for this cell type
+            # Column names follow pattern: <prefix>_<cell_type>_segments_image_path
+            for col in metadata_df.columns:
+                if col.endswith("_segments_image_path"):
+                    col_cell_type = col[col.find("_") + 1 : -len("_segments_image_path")]
+                    if col_cell_type == cell_type:
+                        metadata_df.loc[sample_rows, col] = str(corrected_path)
+                        break
+    
+    return metadata_df
+
 def _resolve_output_dir(metadata, output_dir=None):
     if output_dir is not None:
         return Path(output_dir).expanduser()
@@ -603,9 +670,10 @@ def _available_cell_types_from_metadata(metadata):
     for col in metadata.columns:
         if col.endswith("_segments_image_path"):
             if col.startswith(("or_", "im_", "ot_")):
-                parts = col.split("_", 2)
-                if len(parts) >= 2:
-                    cell_types.add(parts[1])
+                prefix = col[:2]
+                cell_type = col[len(prefix) + 1 : -len("_segments_image_path")]
+                if cell_type:
+                    cell_types.add(cell_type)
             else:
                 cell_types.add(col[: -len("_segments_image_path")])
     return cell_types
@@ -629,8 +697,7 @@ def _default_segment_path(output_dir, sample_name, cell_type):
 def _resolve_sample_segment_path(sample, output_dir, cell_type):
     sample_name = str(sample["sample_name"]).strip()
     default_path = _default_segment_path(output_dir, sample_name, cell_type)
-    default_backup = _original_segment_backup_path(default_path)
-    if default_path.exists() or default_backup.exists():
+    if default_path.exists():
         return default_path
 
     col = _resolve_segment_column(sample, cell_type)
@@ -649,12 +716,14 @@ def _build_sample_correction_plan(sample, output_dir, cell_types):
 
     for cell_type in cell_types:
         output_path = _resolve_sample_segment_path(sample, output_dir, cell_type)
-        backup_path = _original_segment_backup_path(output_path)
 
-        if backup_path.exists():
-            input_path = backup_path
-        elif output_path.exists():
-            input_path = output_path
+        if output_path.exists():
+            segment_items.append(
+                {
+                    "cell_type": cell_type,
+                    "output_path": output_path,
+                }
+            )
         else:
             missing_items.append(
                 {
@@ -663,16 +732,6 @@ def _build_sample_correction_plan(sample, output_dir, cell_types):
                     "expected_path": output_path,
                 }
             )
-            continue
-
-        segment_items.append(
-            {
-                "cell_type": cell_type,
-                "input_path": input_path,
-                "output_path": output_path,
-                "backup_path": backup_path,
-            }
-        )
 
     return {
         "sample_name": sample_name,
@@ -697,7 +756,6 @@ def _plan_multicolor_segment_correction(metadata, output_dir, cell_types, overwr
 
     sample_plans = []
     missing_items = []
-    overwrite_conflicts = []
     sample_name_col = metadata["sample_name"].astype("string").str.strip()
 
     for sample_name in sample_names:
@@ -707,55 +765,28 @@ def _plan_multicolor_segment_correction(metadata, output_dir, cell_types, overwr
         sample_plans.append(sample_plan)
         missing_items.extend(sample_plan["missing"])
 
-        if overwrite:
-            continue
-
-        for item in sample_plan["segments"]:
-            if item["input_path"] == item["backup_path"] and item["output_path"].exists():
-                overwrite_conflicts.append(
-                    {
-                        "sample_name": sample_name,
-                        "cell_type": item["cell_type"],
-                        "output_path": item["output_path"],
-                    }
-                )
-
     if missing_items:
         details = "\n".join(
             f"sample='{item['sample_name']}', cell_type='{item['cell_type']}', expected_path='{item['expected_path']}'"
             for item in missing_items
         )
-        raise FileNotFoundError(
-            "Missing required segmentations for multicolor correction:\n"
+        print(
+            "⚠️ Missing required segmentations for multicolor correction. "
+            "Those samples will be skipped:\n"
             f"{details}"
         )
 
-    if overwrite_conflicts:
-        details = "\n".join(
-            f"sample='{item['sample_name']}', cell_type='{item['cell_type']}', output_path='{item['output_path']}'"
-            for item in overwrite_conflicts
-        )
-        raise FileExistsError(
-            "Corrected outputs already exist for one or more samples. "
-            "Use overwrite=True to recompute them from the preserved originals:\n"
-            f"{details}"
-        )
+    blocked_samples = {item["sample_name"] for item in missing_items}
+    if blocked_samples:
+        sample_plans = [
+            plan for plan in sample_plans
+            if plan["sample_name"] not in blocked_samples
+        ]
 
     return sample_plans
 
 
-def _preserve_original_segment_path(path):
-    path = Path(path)
-    backup_path = _original_segment_backup_path(path)
-    if backup_path.exists():
-        return backup_path
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Could not find segmentation to preserve for '{path}'. "
-            f"Expected either '{path}' or existing backup '{backup_path}'."
-        )
-    path.rename(backup_path)
-    return backup_path
+
 
 
 def _resolve_raw_image_path(metadata, output_dir, sample_name):
@@ -877,10 +908,11 @@ def apply_multicolor_segment_correction(
 
     Segmentations are resolved from the default BEHAV3D output layout when possible:
     ``images/{sample_name}/{sample_name}_{cell_type}_segments.zarr``.
-    The original segmentation is preserved once as ``*_segments_original.zarr`` and the
-    corrected output is written back to the standard ``*_segments.zarr`` path.
+    Corrected output is written directly to the standard path, overwriting the original.
     Samples are processed sequentially. ``n_workers`` controls timepoint-level
     parallelism within each sample.
+    
+    If no overlap is detected across all samples, returns early without processing.
     """
     metadata_df = _coerce_metadata(metadata)
     if metadata_df is None:
@@ -907,6 +939,35 @@ def apply_multicolor_segment_correction(
     )
     n_workers = max(1, int(n_workers or 1))
 
+    if not sample_plans:
+        print("No samples to process (all missing required segmentations).")
+        return {}
+
+    # Quick check: calculate global overlap across all samples before processing
+    all_segment_paths = []
+    sample_to_paths_idx = {}
+    for sample_plan in sample_plans:
+        sample_to_paths_idx[sample_plan["sample_name"]] = len(all_segment_paths)
+        output_paths = [item["output_path"] for item in sample_plan["segments"]]
+        all_segment_paths.extend(output_paths)
+
+    if all_segment_paths:
+        global_stats = calculate_multicolor_overlap(
+            all_segment_paths,
+            show_progress=False,
+            n_workers=n_workers,
+        )
+        if global_stats["overlap_any_count"] == 0:
+            print(
+                f"ℹ️ No overlap detected across {len(sample_plans)} sample(s). "
+                "Skipping multicolor correction."
+            )
+            corrected_paths_by_sample = {}
+            for sample_plan in sample_plans:
+                output_paths = [item["output_path"] for item in sample_plan["segments"]]
+                corrected_paths_by_sample[sample_plan["sample_name"]] = output_paths
+            return corrected_paths_by_sample
+
     print(
         f"Applying multicolor segment correction to {len(sample_plans)} sample(s) "
         f"sequentially with {n_workers} worker(s) per sample"
@@ -915,9 +976,8 @@ def apply_multicolor_segment_correction(
     corrected_paths_by_sample = {}
     for sample_plan in sample_plans:
         output_paths = [item["output_path"] for item in sample_plan["segments"]]
-        input_paths = [_preserve_original_segment_path(path) for path in output_paths]
         input_stats = calculate_multicolor_overlap(
-            input_paths,
+            output_paths,
             n_workers=n_workers,
         )
         _print_overlap_summary(
@@ -926,9 +986,9 @@ def apply_multicolor_segment_correction(
         )
 
         corrected_paths = process_multicolor_segments(
-            segment_paths=input_paths,
+            segment_paths=output_paths,
             output_paths=output_paths,
-            overwrite=overwrite,
+            overwrite=True,
             erosion_pixels=erosion_pixels,
             min_size=min_size,
             max_size=max_size,

@@ -2,6 +2,109 @@ import pandas as pd
 from pathlib import Path
 import re
 
+
+def is_multicolor_celltype(cell_type_name: str) -> bool:
+    """Return True if a cell type name matches the per-channel multicolor pattern.
+
+    Pattern used by the metadata builder: <base>_<index>_multicolor (e.g., tcells_1_multicolor)
+    """
+    if not isinstance(cell_type_name, str):
+        return False
+    return re.search(r'_[0-9]+_multicolor$', cell_type_name) is not None
+
+
+def multicolor_base_name(cell_type_name: str) -> str:
+    """If `cell_type_name` is a multicolor per-channel name, return the base name.
+
+    Example: tcells_2_multicolor -> tcells
+    If not multicolor, return the original name.
+    """
+    m = re.search(r'^(.*)_([0-9]+)_multicolor$', str(cell_type_name))
+    if m:
+        return m.group(1)
+    return cell_type_name
+
+
+def is_merged_celltype(cell_type_name: str) -> bool:
+    """Return True if the cell type name looks like a merged multicolor output.
+
+    We use the suffix `_merged` for the merged output (e.g., tcells_merged).
+    """
+    if not isinstance(cell_type_name, str):
+        return False
+    return cell_type_name.endswith('_merged')
+
+
+def is_grouped_celltype(cell_type_name: str) -> bool:
+    """Return True if the cell type name looks like a grouped multicolor output.
+
+    We also support the suffix `_grouped` (e.g., tcells_grouped).
+    """
+    if not isinstance(cell_type_name, str):
+        return False
+    return cell_type_name.endswith('_grouped')
+
+
+def is_combined_multicolor_celltype(cell_type_name: str) -> bool:
+    """Return True for derived multicolor outputs (`*_merged` or `*_grouped`)."""
+    return is_merged_celltype(cell_type_name) or is_grouped_celltype(cell_type_name)
+
+
+def filter_multicolor_inputs(celltype_list):
+    """Filter out per-channel multicolor entries from a list of cell type names.
+
+    Keeps merged names (ending with `_merged`) and non-multicolor names.
+    """
+    out = []
+    for ct in celltype_list:
+        if is_multicolor_celltype(ct):
+            continue
+        out.append(ct)
+    return out
+
+
+def detect_merged_cell_types_from_metadata(metadata):
+    """Detect derived multicolor outputs from metadata columns.
+
+    Looks for standalone columns like ``tcells_merged_tracks_image_path`` /
+    ``tcells_grouped_tracks_image_path`` or matching ``*_tracks_csv_path`` columns
+    that are not prefixed with ``or_``, ``im_``, or ``ot_``.
+    """
+    if metadata is None:
+        return []
+
+    merged_types = set()
+    suffixes = ("_tracks_image_path", "_tracks_csv_path", "_segments_image_path")
+    for col in metadata.columns:
+        if not col.endswith(suffixes):
+            continue
+        if col.startswith(("or_", "im_", "ot_")):
+            continue
+        base = col
+        for suffix in suffixes:
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        if is_combined_multicolor_celltype(base):
+            merged_types.add(base)
+
+    return sorted(list(merged_types))
+
+
+def expand_multicolor_celltype_names(base_name, n_channels):
+    """Expand a base cell type into per-channel multicolor names.
+
+    Example: expand_multicolor_celltype_names("tcells", 3) ->
+    ["tcells_1_multicolor", "tcells_2_multicolor", "tcells_3_multicolor"]
+    """
+    base_name = str(base_name).strip()
+    n_channels = int(n_channels)
+    if not base_name:
+        raise ValueError("base_name must be a non-empty string")
+    if n_channels < 1:
+        raise ValueError("n_channels must be at least 1")
+    return [f"{base_name}_{idx}_multicolor" for idx in range(1, n_channels + 1)]
+
 def detect_organoid_types_from_metadata(metadata):
     """
     Detect organoid types from metadata column names.
@@ -13,13 +116,16 @@ def detect_organoid_types_from_metadata(metadata):
     
     organoid_types = set()
     # Pattern: columns starting with 'or_' prefix
+    suffixes = ("_line_condition", "_segments_image_path", "_tracks_image_path", "_tracks_csv_path")
     for col in metadata.columns:
         if col.startswith('or_'):
-            # Extract cell type name: or_organoid1_line_condition -> organoid1
-            parts = col[3:].split('_', 1)  # Remove 'or_' prefix and split
-            if parts:
-                cell_type = parts[0]
-                organoid_types.add(cell_type)
+            base = col[3:]
+            for suffix in suffixes:
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            if base:
+                organoid_types.add(base)
     
     return sorted(list(organoid_types))
 
@@ -34,13 +140,16 @@ def detect_immune_cell_types_from_metadata(metadata):
     
     immune_types = set()
     # Pattern: columns starting with 'im_' prefix
+    suffixes = ("_line_condition", "_segments_image_path", "_tracks_image_path", "_tracks_csv_path")
     for col in metadata.columns:
         if col.startswith('im_'):
-            # Extract cell type name: im_tcell_line_condition -> tcell
-            parts = col[3:].split('_', 1)  # Remove 'im_' prefix and split
-            if parts:
-                cell_type = parts[0]
-                immune_types.add(cell_type)
+            base = col[3:]
+            for suffix in suffixes:
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            if base:
+                immune_types.add(base)
     
     return sorted(list(immune_types))
 
@@ -55,13 +164,16 @@ def detect_other_cell_types_from_metadata(metadata):
     
     other_types = set()
     # Pattern: columns starting with 'ot_' prefix
+    suffixes = ("_line_condition", "_segments_image_path", "_tracks_image_path", "_tracks_csv_path")
     for col in metadata.columns:
         if col.startswith('ot_'):
-            # Extract cell type name: ot_tumor1_line_condition -> tumor1
-            parts = col[3:].split('_', 1)  # Remove 'ot_' prefix and split
-            if parts:
-                cell_type = parts[0]
-                other_types.add(cell_type)
+            base = col[3:]
+            for suffix in suffixes:
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            if base:
+                other_types.add(base)
     
     return sorted(list(other_types))
 
@@ -142,10 +254,25 @@ def check_behav3d_metadata(
     Validate metadata with dynamic cell type support.
     Uses prefixed columns: or_*, im_*, ot_* for organoid, immune, and other cell types.
     """
-    # Detect cell types dynamically
+    # Detect cell types dynamically.
+    # Organoid and other types keep the existing schema, while immune types may
+    # appear either in legacy form (im_tcell_...) or as multicolor-expanded
+    # entries (im_tcell_1_multicolor_...).
     organoid_types = detect_organoid_types_from_metadata(metadata)
     immune_types = detect_immune_cell_types_from_metadata(metadata)
     other_types = detect_other_cell_types_from_metadata(metadata)
+
+    immune_columns = [col for col in metadata.columns if col.startswith("im_")]
+    immune_validation_types = sorted(
+        {
+            col[3 : -len(suffix)]
+            for col in immune_columns
+            for suffix in ("_line_condition", "_segments_image_path", "_tracks_image_path", "_tracks_csv_path")
+            if col.endswith(suffix)
+        }
+    )
+    if immune_validation_types:
+        immune_types = immune_validation_types
     
     # Basic required columns (always needed)
     required_columns = [
@@ -164,6 +291,8 @@ def check_behav3d_metadata(
     path_columns = []  # Columns that can be empty (filled by pipeline)
     
     for org_type in organoid_types:
+        if is_combined_multicolor_celltype(org_type):
+            continue
         required_columns.append(f"or_{org_type}_line_condition")
         path_columns.extend([
             f"or_{org_type}_segments_image_path",
@@ -172,6 +301,8 @@ def check_behav3d_metadata(
         ])
     
     for immune_type in immune_types:
+        if is_combined_multicolor_celltype(immune_type):
+            continue
         required_columns.append(f"im_{immune_type}_line_condition")
         path_columns.extend([
             f"im_{immune_type}_segments_image_path",
@@ -180,6 +311,8 @@ def check_behav3d_metadata(
         ])
     
     for other_type in other_types:
+        if is_combined_multicolor_celltype(other_type):
+            continue
         required_columns.append(f"ot_{other_type}_line_condition")
         path_columns.extend([
             f"ot_{other_type}_segments_image_path",
@@ -269,9 +402,9 @@ def check_behav3d_metadata(
             # Build list of valid channel labels from detected cell types FIRST
             # to calculate expected number of channels
             valid_channel_labels = set()
-            valid_channel_labels.update(organoid_types)  # e.g., "organoid1", "organoid2"
-            valid_channel_labels.update(immune_types)    # e.g., "tcell", "macro"
-            valid_channel_labels.update(other_types)     # e.g., "tumor1"
+            valid_channel_labels.update([ct for ct in organoid_types if not is_combined_multicolor_celltype(ct)])
+            valid_channel_labels.update([ct for ct in immune_types if not is_combined_multicolor_celltype(ct)])
+            valid_channel_labels.update([ct for ct in other_types if not is_combined_multicolor_celltype(ct)])
             
             # Check if dead_channel is used (add "dead" to valid labels if any row has dead_channel set)
             has_dead_in_metadata = (
@@ -391,9 +524,9 @@ def check_behav3d_metadata(
     
     # Validate paths per row
     ok = True
-    all_cell_types = [(f"or_{t}", t) for t in organoid_types] + \
-                     [(f"im_{t}", t) for t in immune_types] + \
-                     [(f"ot_{t}", t) for t in other_types]
+    all_cell_types = [(f"or_{t}", t) for t in organoid_types if not is_combined_multicolor_celltype(t)] + \
+                     [(f"im_{t}", t) for t in immune_types if not is_combined_multicolor_celltype(t)] + \
+                     [(f"ot_{t}", t) for t in other_types if not is_combined_multicolor_celltype(t)]
     
     for rowidx, sample_metadata in metadata.iterrows():
         print(f"Row {rowidx+1}: {sample_metadata['sample_name']}")

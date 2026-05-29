@@ -23,7 +23,10 @@ from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    detect_merged_cell_types_from_metadata,
+    filter_multicolor_inputs,
     has_dead_channel,
+    is_multicolor_celltype,
 )
 from behav3d.core.utils import expand_column_patterns
 from behav3d.io.formats.zarr import load_zarr
@@ -110,6 +113,31 @@ def _csv_has_columns(csv_path, required_columns):
     except Exception:
         return False
     return set(required_columns).issubset(columns)
+
+
+def _detect_downstream_cell_types(metadata):
+    """Return (organoid, immune, other) excluding per-channel multicolor and keeping merged/grouped outputs."""
+    organoid_types = filter_multicolor_inputs(detect_organoid_types_from_metadata(metadata))
+    immune_types = filter_multicolor_inputs(detect_immune_cell_types_from_metadata(metadata))
+    other_types = filter_multicolor_inputs(detect_other_cell_types_from_metadata(metadata))
+
+    merged_or_grouped_types = detect_merged_cell_types_from_metadata(metadata)
+    for ct in merged_or_grouped_types:
+        try:
+            category = detect_cell_type_category(ct, metadata)
+        except Exception:
+            category = "immune"
+        if category == "organoid":
+            if ct not in organoid_types:
+                organoid_types.append(ct)
+        elif category == "other":
+            if ct not in other_types:
+                other_types.append(ct)
+        else:
+            if ct not in immune_types:
+                immune_types.append(ct)
+
+    return organoid_types, immune_types, other_types
 
 
 def _get_channel_labels_for_sample(metadata_loader, sample_name=None):
@@ -256,13 +284,16 @@ class _CellTypeFeatureExtractionPanel:
         else:
             self.dead_mask_threshold = self.shared_threshold_widget
 
-        self._all_features = ["movement", "intensity", "morphology", "contact", "death"]
+        self._all_features = ["movement", "intensity", "morphology", "contact", "invasiveness", "death"]
         self._mandatory_features = {"intensity", "contact"}
         if self.category in {"immune", "other"}:
             self._mandatory_features.add("movement")
         if self.has_dead:
             self._mandatory_features.add("death")
         self._optional_features = {"movement", "morphology"} if self.category == "organoid" else {"morphology"}
+        # Add invasiveness as optional feature for immune cells only
+        if self.category == "immune":
+            self._optional_features.add("invasiveness")
 
         default_feats = fcfg.get("features_choice", self._all_features)
         if not isinstance(default_feats, (list, tuple)):
@@ -289,10 +320,27 @@ class _CellTypeFeatureExtractionPanel:
         )
 
         self.contact_threshold.description = "Contact Threshold (\u00B5m)"
-        contact_row = widgets.HBox([self.feature_checks["contact"], self.contact_threshold], layout=widgets.Layout(align_items="center", gap="12px"))
+        
+        # Build contact_row with contact checkbox and threshold
+        contact_row_items = [self.feature_checks["contact"], self.contact_threshold]
+        
+        # Add invasiveness checkbox inline for immune cells only
+        if self.category == "immune":
+            invasiveness_label = "Organoid Invasiveness (Advanced)"
+            self.feature_checks["invasiveness"].description = invasiveness_label
+            contact_row_items.append(self.feature_checks["invasiveness"])
+        else:
+            # Hide invasiveness checkbox for non-immune cell types
+            if "invasiveness" in self.feature_checks:
+                self.feature_checks["invasiveness"].layout.display = "none"
+        
+        contact_row = widgets.HBox(contact_row_items, layout=widgets.Layout(align_items="center", gap="12px"))
 
         def _toggle_contact_threshold(change=None):
             self.contact_threshold.layout.display = None if self.feature_checks["contact"].value else "none"
+            # Also toggle invasiveness visibility with contact
+            if "invasiveness" in self.feature_checks and self.category == "immune":
+                self.feature_checks["invasiveness"].layout.display = None if self.feature_checks["contact"].value else "none"
 
         _toggle_contact_threshold()
         self.feature_checks["contact"].observe(_toggle_contact_threshold, names="value")
@@ -301,6 +349,9 @@ class _CellTypeFeatureExtractionPanel:
         for f in self._all_features:
             if f == "contact":
                 feat_rows.append(contact_row)
+            elif f == "invasiveness":
+                # Skip invasiveness here - it's already in contact_row for immune cells
+                continue
             elif f == "death" and not self.has_dead:
                 continue
             else:
@@ -688,9 +739,7 @@ class FeatureExtractionPanel:
             self.run_buttons = [self.btn_run]
             return
 
-        organoid_types = detect_organoid_types_from_metadata(self.metadata)
-        immune_types = detect_immune_cell_types_from_metadata(self.metadata)
-        other_types = detect_other_cell_types_from_metadata(self.metadata)
+        organoid_types, immune_types, other_types = _detect_downstream_cell_types(self.metadata)
 
         self.cell_panels = {}
         self.run_buttons = []
@@ -946,18 +995,10 @@ class ActiveKillingPanel:
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
         self.killing_results = None
         
-        from behav3d.core.metadata import (
-            detect_immune_cell_types_from_metadata,
-            detect_organoid_types_from_metadata,
-            detect_other_cell_types_from_metadata,
-            has_dead_channel
-        )
         md = self.metadata_loader.metadata
         if md is None: raise RuntimeError("Metadata not loaded.")
-        
-        self.immune_types = detect_immune_cell_types_from_metadata(md)
-        self.organoid_types = detect_organoid_types_from_metadata(md)
-        self.other_types = detect_other_cell_types_from_metadata(md)
+
+        self.organoid_types, self.immune_types, self.other_types = _detect_downstream_cell_types(md)
         self.potential_immune = self.immune_types + self.other_types
         self.target_types = self.organoid_types
         
@@ -1798,6 +1839,23 @@ class DeathThresholdPreview:
                 "(dead_mask_path is missing in metadata)."
             )
 
+        # Resolve immune tracked image paths so we can subtract immune voxels
+        # from the displayed dead mask (mirrors the feature-extraction-time
+        # cleaning in `calculate_image_based_track_features`). Only relevant
+        # when the previewed cell type is NOT itself an immune type.
+        self.immune_label_paths = {}
+        try:
+            all_immune_types = detect_immune_cell_types_from_metadata(self.metadata_loader.metadata) or []
+        except Exception:
+            all_immune_types = []
+        if cell_type not in all_immune_types:
+            for im_type in all_immune_types:
+                col = f"im_{im_type}_tracks_image_path"
+                if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                    p = Path(row[col])
+                    if p.exists():
+                        self.immune_label_paths[im_type] = p
+
         guessed_channel = _guess_channel_index(self.metadata_loader, sample, cell_type)
         if guessed_channel is not None:
             self.org_ch_input.value = int(guessed_channel)
@@ -1907,6 +1965,27 @@ class DeathThresholdPreview:
 
                 dead_vol = np.asarray(dead_mask_zarr[t])
                 dead_mask = dead_vol.max(axis=0) if dead_vol.ndim == 3 else dead_vol
+
+                # Mirror the feature-extraction-time cleaning: zero dead-mask
+                # voxels that fall inside any immune segment at this timepoint
+                # when the previewed cell type is non-immune.
+                immune_label_paths = getattr(self, "immune_label_paths", {}) or {}
+                if immune_label_paths:
+                    immune_overlap = np.zeros_like(dead_mask, dtype=bool)
+                    for im_type, im_path in immune_label_paths.items():
+                        try:
+                            im_zarr = load_zarr(im_path)
+                            if t >= int(im_zarr.shape[0]):
+                                continue
+                            im_vol = np.asarray(im_zarr[t])
+                            im_proj = im_vol.max(axis=0) if im_vol.ndim == 3 else im_vol
+                            if im_proj.shape != dead_mask.shape:
+                                continue
+                            immune_overlap |= (im_proj > 0)
+                        except Exception:
+                            continue
+                    if immune_overlap.any():
+                        dead_mask = np.where(immune_overlap, 0, dead_mask)
 
                 df_tracks = self._tracks_dataframe(cell_type)
                 class_img = np.zeros((*label_view.shape, 3), dtype=float)
@@ -2079,7 +2158,7 @@ class MultiOrganoidDeathDynamicsPanel:
             if csv_path.exists():
                 self.available_data[org_type] = csv_path
         
-        if len(self.available_data) < 2:
+        if len(self.available_data) < 1:
             missing = [ot for ot in self.organoid_types if ot not in self.available_data]
             self.status_html.value = f'<div style="color:#b00;">Waiting for death dynamics data from: {", ".join(missing)}</div>'
             self.btn_run.disabled = True
@@ -2097,10 +2176,26 @@ class MultiOrganoidDeathDynamicsPanel:
         
         with self.out:
             try:
+                params = getattr(self.metadata_loader, "behav3d_parameters", {}) or {}
+                feat_cfg = params.get("features", {}) or {}
+                default_thr = float(
+                    _DEFAULT_CONFIG.get("death_dynamics", {})
+                    .get("organoid", {})
+                    .get("dead_perc_threshold", 0.02)
+                )
+                dead_perc_threshold_map = {}
+                for org_type in self.organoid_types:
+                    raw_thr = feat_cfg.get(org_type, {}).get("dead_mask_percentage_threshold", default_thr)
+                    try:
+                        dead_perc_threshold_map[str(org_type)] = float(raw_thr)
+                    except Exception:
+                        dead_perc_threshold_map[str(org_type)] = default_thr
+
                 # Call the analysis function from organoid_analysis module
                 plot_multi_organoid_death_dynamics(
                     output_dir=self.output_dir,
-                    organoid_types=self.organoid_types
+                    organoid_types=self.organoid_types,
+                    dead_perc_threshold_map=dead_perc_threshold_map,
                 )
                 print("✅ Multi-organoid comparison complete!")
             except Exception:
@@ -2121,10 +2216,8 @@ class MultiOrganoidInteractionComparisonPanel:
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
 
         md = self.metadata_loader.metadata
-        self.immune_types = (
-            detect_immune_cell_types_from_metadata(md)
-            + detect_other_cell_types_from_metadata(md)
-        )
+        _, immune_types, other_types = _detect_downstream_cell_types(md)
+        self.immune_types = immune_types + other_types
 
         # --- widgets ---
         group_options = [
@@ -2465,9 +2558,9 @@ class InteractionAnalysisPanel:
         self.cell_type = str(cell_type).strip()
         self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
         
-        from behav3d.core.metadata import detect_immune_cell_types_from_metadata, detect_other_cell_types_from_metadata
         md = self.metadata_loader.metadata
-        self.available_types = detect_immune_cell_types_from_metadata(md) + detect_other_cell_types_from_metadata(md)
+        _, immune_types, other_types = _detect_downstream_cell_types(md)
+        self.available_types = immune_types + other_types
         self.df_tracks_path = Path(self.output_dir, "analysis", self.cell_type, "track_features", f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
         
         self.status_html = widgets.HTML("")

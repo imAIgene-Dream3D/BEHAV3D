@@ -23,7 +23,7 @@ from qtpy.QtWidgets import (
     QSizePolicy, QTabWidget, QFrame, QMessageBox,
     QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
 )
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QColor
 
 import dask.array as da
@@ -31,6 +31,7 @@ import pyclesperanto_prototype as cle
 
 from behav3d.io.images import load_image, load_zarr, save_as_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
+from behav3d.core.qt_help import HelpButton, make_help_row
 
 # ---------------------------------------------------------------------------
 # Feature grid constants (matching the official napari-apoc widget)
@@ -546,7 +547,16 @@ def _probability_array_to_segments(prob_map, mask_thr, seed_thr, opening_nr_pixe
     return _probability_volume_to_segments(prob_map, mask_thr, seed_thr, opening_nr_pixels, segment_size_min)
 
 
-def _mask_array_to_segments(mask, edt_thr, opening_nr_pixels, segment_size_min, fill_holes):
+def _mask_array_to_segments(
+    mask,
+    edt_thr,
+    opening_nr_pixels,
+    segment_size_min,
+    fill_holes,
+    marker_strategy="threshold",
+    peak_min_distance=None,
+    peak_min_ratio=0.35,
+):
     """Convert a binary mask array to instances using the EDT workflow."""
     from behav3d.preprocessing.segmentation.segmentation_utils import postprocess_mask, segment_mask
 
@@ -566,6 +576,9 @@ def _mask_array_to_segments(mask, edt_thr, opening_nr_pixels, segment_size_min, 
                 segment_size_min=segment_size_min,
                 use_dims=3,
                 n_workers=1,
+                marker_strategy=marker_strategy,
+                peak_min_distance=peak_min_distance,
+                peak_min_ratio=peak_min_ratio,
             )
         ).astype(np.uint16)
 
@@ -720,6 +733,10 @@ class CellTypeTab(QWidget):
         on_params_changed=None,
         run_instance_callback=None,
         parent=None,
+        instance_controls_inline=False,
+        show_strategy_combo=False,
+        per_tab_strategies=None,
+        on_per_tab_strategy_changed=None,
     ):
         super().__init__(parent)
         self.cell_type = cell_type
@@ -728,6 +745,14 @@ class CellTypeTab(QWidget):
         self._on_params_changed = on_params_changed
         self._run_instance_callback = run_instance_callback
         self._apoc_strategy = str(apoc_strategy)
+        # Inline mode: keep the instance-controls group inside this tab instead
+        # of letting the parent training widget reparent it into a shared dock.
+        self._instance_controls_inline = bool(instance_controls_inline)
+        self._show_strategy_combo = bool(show_strategy_combo) and cell_type != "dead"
+        self._per_tab_strategies = list(per_tab_strategies or [])
+        self._on_per_tab_strategy_changed = on_per_tab_strategy_changed
+        self._per_tab_strategy_combo = None
+        self._per_tab_strategy_widget = None
         root_params = initial_params or {}
         saved_cfg = _extract_cell_type_config(initial_params, cell_type)
         trained_cfg = _load_classifier_restore_config(pixel_class_outdir, cell_type)
@@ -758,6 +783,29 @@ class CellTypeTab(QWidget):
         chan_group.setLayout(chan_layout)
         layout.addWidget(chan_group)
 
+        # ── Optional per-tab strategy combo ──────────────────────────────────
+        # Only shown in the napari GUI plugin (per_cell_type_strategy=True). The
+        # notebook entry point does not set this flag, so the combo never
+        # appears there and the notebook behaviour is identical to before.
+        if self._show_strategy_combo and self._per_tab_strategies:
+            saved_per_tab = root_params.get(
+                f"per_ct_strategy_{cell_type}", self._apoc_strategy
+            )
+            if saved_per_tab not in self._per_tab_strategies:
+                saved_per_tab = self._per_tab_strategies[0]
+            self._per_tab_strategy_widget = QWidget()
+            per_tab_lay = QHBoxLayout(self._per_tab_strategy_widget)
+            per_tab_lay.setContentsMargins(0, 2, 0, 4)
+            per_tab_lay.addWidget(QLabel("\u21b3 Cell type strategy:"))
+            self._per_tab_strategy_combo = QComboBox()
+            self._per_tab_strategy_combo.addItems(self._per_tab_strategies)
+            self._per_tab_strategy_combo.setCurrentText(saved_per_tab)
+            self._per_tab_strategy_combo.currentTextChanged.connect(
+                self._on_per_tab_strategy_combo_changed
+            )
+            per_tab_lay.addWidget(self._per_tab_strategy_combo, stretch=1)
+            layout.addWidget(self._per_tab_strategy_widget)
+
         # Labeling hint
         hint = QLabel("Labels: <b>1</b> = background&nbsp;&nbsp; <b>2</b> = foreground")
         hint.setStyleSheet("color: #666; font-style: italic;")
@@ -773,6 +821,15 @@ class CellTypeTab(QWidget):
             saved_preset = "medium_quick"
         self.feature_combo.setCurrentText(saved_preset)
         feat_row.addWidget(self.feature_combo)
+        feat_row.addWidget(HelpButton(
+            "Feature preset",
+            "Pre-configured combination of feature filters and sigmas.\n"
+            "  • quick: small sigma grid, fastest training.\n"
+            "  • medium_quick: balanced default for most cell types.\n"
+            "  • medium: more sigmas, better small/large coexistence.\n"
+            "  • thorough: large grid, best quality but slow.\n"
+            "Open 'Tune Features' below to customise the grid."
+        ))
         feat_row.addStretch()
         layout.addLayout(feat_row)
 
@@ -793,6 +850,13 @@ class CellTypeTab(QWidget):
         self.update_grid_btn = QtPushButton("Update Grid")
         self.update_grid_btn.clicked.connect(self._on_update_grid)
         sigma_row.addWidget(self.update_grid_btn)
+        sigma_row.addWidget(HelpButton(
+            "Custom sigmas",
+            "Sigma values (in pixels) used to build the multiscale feature grid.\n"
+            "Each sigma is combined with each enabled feature filter (Gaussian, DoG, "
+            "Laplacian, ...) to form one column of the feature matrix.\n"
+            "Common sets: '1, 2, 4' (small structures), '2, 4, 8, 16' (medium-large)."
+        ))
         self.tune_layout.addLayout(sigma_row)
 
         self.current_sigmas = list(APOC_SIGMAS)
@@ -803,11 +867,20 @@ class CellTypeTab(QWidget):
         layout.addWidget(self.tune_group)
 
         # ── Consider original image checkbox ─────────────────────────────────
+        orig_row = QHBoxLayout()
         self.consider_original_cb = QCheckBox("Consider original image as well")
         saved_orig = bool(ip.get(f"apoc_{cell_type}_consider_original", False))
         self.consider_original_cb.setChecked(saved_orig)
         self.consider_original_cb.stateChanged.connect(self._update_preview)
-        layout.addWidget(self.consider_original_cb)
+        orig_row.addWidget(self.consider_original_cb)
+        orig_row.addWidget(HelpButton(
+            "Consider original image",
+            "When enabled, raw pixel intensity is added as an extra feature column "
+            "alongside the multiscale filters.\n"
+            "Useful when intensity alone is a strong cue (e.g. very bright nuclei)."
+        ))
+        orig_row.addStretch()
+        layout.addLayout(orig_row)
 
         # ── Feature string preview ───────────────────────────────────────────
         self.preview_label = QLabel("")
@@ -833,12 +906,24 @@ class CellTypeTab(QWidget):
         self.max_depth_spin.setRange(1, 20)
         self.max_depth_spin.setValue(int(ip.get(f"apoc_{cell_type}_max_depth", 2)))
         rf_row.addWidget(self.max_depth_spin)
+        rf_row.addWidget(HelpButton(
+            "Random Forest — max depth",
+            "Maximum depth of each decision tree in the APOC random forest.\n"
+            "Shallow trees (2–5) train fast and generalise well; deeper trees "
+            "(10+) can overfit on small label sets."
+        ))
         rf_row.addWidget(QLabel("Trees:"))
         self.num_ensembles_spin = QSpinBox()
         self.num_ensembles_spin.setRange(10, 1000)
         self.num_ensembles_spin.setSingleStep(10)
         self.num_ensembles_spin.setValue(int(ip.get(f"apoc_{cell_type}_num_ensembles", 100)))
         rf_row.addWidget(self.num_ensembles_spin)
+        rf_row.addWidget(HelpButton(
+            "Random Forest — number of trees",
+            "Number of decision trees in the random forest ensemble.\n"
+            "More trees → smoother predictions but slower training and inference.\n"
+            "Default (100) is a good starting point."
+        ))
         rf_row.addStretch()
         layout.addLayout(rf_row)
 
@@ -850,7 +935,24 @@ class CellTypeTab(QWidget):
         self.segment_size_min_spin = None
         self.opening_nr_pixels_spin = None
         self.fill_holes_cb = None
+        self.peak_min_distance_spin = None
+        self.peak_min_ratio_spin = None
+        # Cached so future rebuilds (e.g. on strategy change) can pick up the
+        # same persisted post-processing parameters.
+        self._initial_params_cache = dict(root_params)
+        # Placeholder where the instance group is inserted in inline mode.
+        # In docked mode this placeholder is unused; the group is reparented
+        # into the parent training widget's shared dock area.
+        self._instance_group_anchor = QWidget()
+        self._instance_group_anchor.setVisible(False)
+        self._instance_group_anchor_layout = QVBoxLayout(self._instance_group_anchor)
+        self._instance_group_anchor_layout.setContentsMargins(0, 0, 0, 0)
+        self._instance_group_anchor_layout.setSpacing(0)
         self._build_instance_controls(root_params)
+        if self._instance_controls_inline and self.instance_group is not None:
+            self._instance_group_anchor_layout.addWidget(self.instance_group)
+            self._instance_group_anchor.setVisible(True)
+        layout.addWidget(self._instance_group_anchor)
 
         layout.addStretch()
         self.setLayout(layout)
@@ -901,18 +1003,37 @@ class CellTypeTab(QWidget):
         """Return the set of (feat_key, sigma_str) currently checked in the grid."""
         return {key for key, cb in self._feat_sigma_checks.items() if cb.isChecked()}
 
-    def _build_instance_controls(self, initial_params):
-        """Create per-tab instance-segmentation preview controls."""
-        if self.cell_type == "dead" or self._apoc_strategy == "APOC (Direct Instance Segmentation)":
+    def _build_instance_controls(self, initial_params, strategy=None):
+        """Create per-tab instance-segmentation preview controls.
+
+        When *strategy* is provided it overrides ``self._apoc_strategy`` for
+        this build (used by :meth:`rebuild_instance_controls` after a strategy
+        change). Spinbox/checkbox attributes are reset to ``None`` upfront so
+        callers can always rely on ``getattr(tab, "<attr>_spin", None)``.
+        """
+        # Reset references to controls that depend on the chosen strategy.
+        self.run_instance_btn = None
+        self.instance_group = None
+        self.prob_mask_threshold_spin = None
+        self.prob_seed_threshold_spin = None
+        self.edt_threshold_spin = None
+        self.segment_size_min_spin = None
+        self.opening_nr_pixels_spin = None
+        self.fill_holes_cb = None
+        self.peak_min_distance_spin = None
+        self.peak_min_ratio_spin = None
+
+        effective_strategy = str(strategy or self._apoc_strategy)
+
+        if self.cell_type == "dead" or effective_strategy == "APOC (Direct Instance Segmentation)":
             return
 
         group = QGroupBox("Instance Segmentation Preview")
         group_layout = QVBoxLayout()
         group_layout.setContentsMargins(4, 4, 4, 4)
         group_layout.setSpacing(4)
-        group_layout.addWidget(QLabel(f"Uses notebook strategy: {self._apoc_strategy}"))
 
-        if self._apoc_strategy == "APOC Probability Map + Watershed":
+        if effective_strategy == "APOC Probability Map + Watershed":
             row1 = QHBoxLayout()
             row2 = QHBoxLayout()
             self.prob_mask_threshold_spin = QDoubleSpinBox()
@@ -921,6 +1042,11 @@ class CellTypeTab(QWidget):
             self.prob_mask_threshold_spin.setValue(float(initial_params.get(f"{self.cell_type}_prob_mask_threshold", 0.5)))
             row1.addWidget(QLabel("Mask threshold:"))
             row1.addWidget(self.prob_mask_threshold_spin)
+            row1.addWidget(HelpButton(
+                "Mask threshold",
+                "Foreground cutoff applied to the probability map.\n"
+                "Pixels with probability above this value are kept as foreground."
+            ))
 
             self.prob_seed_threshold_spin = QDoubleSpinBox()
             self.prob_seed_threshold_spin.setRange(0.0, 1.0)
@@ -928,6 +1054,12 @@ class CellTypeTab(QWidget):
             self.prob_seed_threshold_spin.setValue(float(initial_params.get(f"{self.cell_type}_prob_seed_threshold", 0.8)))
             row1.addWidget(QLabel("Seed threshold:"))
             row1.addWidget(self.prob_seed_threshold_spin)
+            row1.addWidget(HelpButton(
+                "Seed threshold",
+                "Higher cutoff used to place watershed seeds.\n"
+                "Should be ≥ Mask threshold (typical: 0.8).\n"
+                "Lower values produce more seeds (split more touching objects)."
+            ))
             group_layout.addLayout(row1)
 
             self.opening_nr_pixels_spin = QSpinBox()
@@ -935,6 +1067,11 @@ class CellTypeTab(QWidget):
             self.opening_nr_pixels_spin.setValue(int(initial_params.get(f"{self.cell_type}_opening_nr_pixels", 0)))
             row2.addWidget(QLabel("Opening px:"))
             row2.addWidget(self.opening_nr_pixels_spin)
+            row2.addWidget(HelpButton(
+                "Morphological opening",
+                "Number of erosion-then-dilation iterations applied to the mask.\n"
+                "Smooths boundaries and removes small speckles. Set to 0 to disable."
+            ))
 
             self.segment_size_min_spin = QSpinBox()
             self.segment_size_min_spin.setRange(0, 100000)
@@ -942,9 +1079,17 @@ class CellTypeTab(QWidget):
             self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 10)))
             row2.addWidget(QLabel("Min size:"))
             row2.addWidget(self.segment_size_min_spin)
+            row2.addWidget(HelpButton(
+                "Minimum segment size",
+                "Segments with fewer voxels than this are discarded after watershed.\n"
+                "Use to filter out noise / debris."
+            ))
             group_layout.addLayout(row2)
 
-        elif self._apoc_strategy == "APOC Mask + EDT/Watershed Resegmentation":
+        elif effective_strategy in {
+            "APOC Mask + EDT/Watershed Resegmentation",
+            "APOC Mask + Peak EDT/Watershed Resegmentation",
+        }:
             row1 = QHBoxLayout()
             row2 = QHBoxLayout()
             self.edt_threshold_spin = QDoubleSpinBox()
@@ -953,12 +1098,23 @@ class CellTypeTab(QWidget):
             self.edt_threshold_spin.setValue(float(initial_params.get(f"{self.cell_type}_edt_threshold", 1.0)))
             row1.addWidget(QLabel("EDT threshold:"))
             row1.addWidget(self.edt_threshold_spin)
+            row1.addWidget(HelpButton(
+                "EDT threshold",
+                "Euclidean-distance-transform threshold used to derive seeds inside "
+                "the binary mask.\n"
+                "Lower values give more aggressive splitting of touching objects."
+            ))
 
             self.opening_nr_pixels_spin = QSpinBox()
             self.opening_nr_pixels_spin.setRange(0, 10)
             self.opening_nr_pixels_spin.setValue(int(initial_params.get(f"{self.cell_type}_opening_nr_pixels", 0)))
             row1.addWidget(QLabel("Opening px:"))
             row1.addWidget(self.opening_nr_pixels_spin)
+            row1.addWidget(HelpButton(
+                "Morphological opening",
+                "Number of erosion-then-dilation iterations applied to the mask.\n"
+                "Smooths boundaries and removes small speckles. Set to 0 to disable."
+            ))
             group_layout.addLayout(row1)
 
             self.segment_size_min_spin = QSpinBox()
@@ -967,11 +1123,50 @@ class CellTypeTab(QWidget):
             self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 10)))
             row2.addWidget(QLabel("Min size:"))
             row2.addWidget(self.segment_size_min_spin)
+            row2.addWidget(HelpButton(
+                "Minimum segment size",
+                "Segments with fewer voxels than this are discarded after watershed.\n"
+                "Use to filter out noise / debris."
+            ))
 
             self.fill_holes_cb = QCheckBox("Fill holes")
             self.fill_holes_cb.setChecked(bool(initial_params.get(f"{self.cell_type}_fill_holes", True)))
             row2.addWidget(self.fill_holes_cb)
+            row2.addWidget(HelpButton(
+                "Fill holes",
+                "Fill internal gaps in segmented objects before watershed.\n"
+                "Useful for hollow nuclei or partial-volume effects."
+            ))
             group_layout.addLayout(row2)
+
+            if effective_strategy == "APOC Mask + Peak EDT/Watershed Resegmentation":
+                row3 = QHBoxLayout()
+                self.peak_min_distance_spin = QDoubleSpinBox()
+                self.peak_min_distance_spin.setRange(0.0, 50.0)
+                self.peak_min_distance_spin.setSingleStep(0.5)
+                self.peak_min_distance_spin.setValue(float(initial_params.get(f"{self.cell_type}_peak_min_distance", 0.0)))
+                self.peak_min_distance_spin.setToolTip("Minimum distance (µm) between local EDT peaks used as watershed seeds")
+                row3.addWidget(QLabel("Peak min dist:"))
+                row3.addWidget(self.peak_min_distance_spin)
+                row3.addWidget(HelpButton(
+                    "Peak minimum distance",
+                    "Minimum distance (µm) between local EDT peaks used as watershed seeds.\n"
+                    "Larger values yield fewer, more separated seeds."
+                ))
+
+                self.peak_min_ratio_spin = QDoubleSpinBox()
+                self.peak_min_ratio_spin.setRange(0.0, 1.0)
+                self.peak_min_ratio_spin.setSingleStep(0.05)
+                self.peak_min_ratio_spin.setValue(float(initial_params.get(f"{self.cell_type}_peak_min_ratio", 0.35)))
+                self.peak_min_ratio_spin.setToolTip("Minimum EDT peak height as a fraction of the local maximum (0–1)")
+                row3.addWidget(QLabel("Peak min ratio:"))
+                row3.addWidget(self.peak_min_ratio_spin)
+                row3.addWidget(HelpButton(
+                    "Peak minimum ratio",
+                    "Minimum EDT peak height as a fraction of the local maximum (0–1).\n"
+                    "Higher values suppress weak peaks (fewer seeds)."
+                ))
+                group_layout.addLayout(row3)
 
         self.run_instance_btn = QtPushButton("Run instance segmentation")
         self.run_instance_btn.clicked.connect(self._on_run_instance_segmentation)
@@ -985,11 +1180,54 @@ class CellTypeTab(QWidget):
             self.edt_threshold_spin,
             self.segment_size_min_spin,
             self.opening_nr_pixels_spin,
+            self.peak_min_distance_spin,
+            self.peak_min_ratio_spin,
         ]:
             if widget is not None:
                 widget.valueChanged.connect(self._emit_params_changed)
         if self.fill_holes_cb is not None:
             self.fill_holes_cb.stateChanged.connect(self._emit_params_changed)
+
+    def rebuild_instance_controls(self, strategy=None, initial_params=None):
+        """Discard the current ``instance_group`` and rebuild it for *strategy*.
+
+        Used when the per-tab strategy changes (plugin Advanced mode) or when
+        the global strategy combo switches and the tab is in inline mode.
+        """
+        if initial_params is None:
+            initial_params = self._initial_params_cache
+        else:
+            self._initial_params_cache = dict(initial_params)
+
+        # Remove the old group widget from the anchor layout (if attached).
+        old_group = self.instance_group
+        if old_group is not None:
+            try:
+                self._instance_group_anchor_layout.removeWidget(old_group)
+            except Exception:
+                pass
+            old_group.setParent(None)
+            old_group.deleteLater()
+
+        target_strategy = str(strategy or self._apoc_strategy)
+        # Persist the new strategy on the tab so backend helpers that read
+        # ``tab._apoc_strategy`` see the up-to-date value.
+        self._apoc_strategy = target_strategy
+        self._build_instance_controls(initial_params, strategy=target_strategy)
+
+        if self._instance_controls_inline:
+            if self.instance_group is not None:
+                self._instance_group_anchor_layout.addWidget(self.instance_group)
+                self._instance_group_anchor.setVisible(True)
+            else:
+                self._instance_group_anchor.setVisible(False)
+
+    def _on_per_tab_strategy_combo_changed(self, new_strategy):
+        """Handle the user changing the per-tab strategy combo."""
+        if self._instance_controls_inline:
+            self.rebuild_instance_controls(strategy=str(new_strategy))
+        if callable(self._on_per_tab_strategy_changed):
+            self._on_per_tab_strategy_changed(self.cell_type, str(new_strategy))
 
     def _emit_params_changed(self, *_args):
         """Notify the notebook widget that Napari-side params changed."""
@@ -1227,6 +1465,12 @@ class CellTypeTab(QWidget):
             "fill_holes": (
                 bool(self.fill_holes_cb.isChecked()) if self.fill_holes_cb is not None else None
             ),
+            "peak_min_distance": (
+                float(self.peak_min_distance_spin.value()) if self.peak_min_distance_spin is not None else None
+            ),
+            "peak_min_ratio": (
+                float(self.peak_min_ratio_spin.value()) if self.peak_min_ratio_spin is not None else None
+            ),
         }
 
     def apply_config(self, cfg):
@@ -1266,6 +1510,10 @@ class CellTypeTab(QWidget):
             self.opening_nr_pixels_spin.setValue(int(cfg["opening_nr_pixels"]))
         if "fill_holes" in cfg and self.fill_holes_cb is not None and cfg["fill_holes"] is not None:
             self.fill_holes_cb.setChecked(bool(cfg["fill_holes"]))
+        if "peak_min_distance" in cfg and self.peak_min_distance_spin is not None and cfg["peak_min_distance"] is not None:
+            self.peak_min_distance_spin.setValue(float(cfg["peak_min_distance"]))
+        if "peak_min_ratio" in cfg and self.peak_min_ratio_spin is not None and cfg["peak_min_ratio"] is not None:
+            self.peak_min_ratio_spin.setValue(float(cfg["peak_min_ratio"]))
         self._update_preview()
 
 
@@ -1281,7 +1529,42 @@ class APOCTrainingWidget(QWidget):
       - feature preset + sigma values + auto-preview
       - max_depth / num_ensembles
     Global controls: Apply-to-All, Train Current, Train-All, Save Labels.
+
+    The widget supports two modes selected via constructor flags:
+
+    * ``instance_controls_mode='docked'`` (default, used by the notebook):
+      a single shared instance-controls dock below the tab list is shown for
+      the currently active tab, identical to the original notebook layout.
+    * ``instance_controls_mode='inline'`` (used by the napari plugin):
+      each tab owns its own instance-controls group inline, so switching
+      tabs does not reparent widgets.
+
+    ``per_cell_type_strategy=True`` (plugin only) adds a global "Strategy"
+    combo (including an ``"Advanced (per cell type)"`` option) plus a
+    ``\u21b3 Cell type strategy:`` combo on each non-dead tab. In ``"Advanced"``
+    mode each tab uses its own strategy; otherwise every tab follows the
+    global selection.
     """
+
+    # ── Signals ─────────────────────────────────────────────────────────────
+    # Emitted on every successful refresh of one tab's channel checkboxes.
+    channels_refreshed = Signal(str)
+    # Emitted when a training run starts/finishes (cell types involved).
+    training_started = Signal(list)
+    training_finished = Signal(list, object)
+    # Emitted around per-tab instance preview runs.
+    instance_preview_started = Signal(str)
+    instance_preview_finished = Signal(str)
+    # Emitted when the global strategy combo value changes (plugin mode).
+    strategy_changed = Signal(str)
+
+    STRATEGIES = [
+        "APOC (Direct Instance Segmentation)",
+        "APOC Mask + EDT/Watershed Resegmentation",
+        "APOC Mask + Peak EDT/Watershed Resegmentation",
+        "APOC Probability Map + Watershed",
+    ]
+    ADVANCED_STRATEGY = "Advanced (per cell type)"
 
     def __init__(
         self,
@@ -1292,6 +1575,10 @@ class APOCTrainingWidget(QWidget):
         initial_params=None,
         on_params_changed=None,
         parent=None,
+        instance_controls_mode="docked",
+        per_cell_type_strategy=False,
+        strategy_resolver=None,
+        extra_toolbar_widgets=None,
     ):
         super().__init__(parent)
         self.viewer = viewer
@@ -1300,8 +1587,22 @@ class APOCTrainingWidget(QWidget):
         self.has_death = has_death
         self._initial_params = initial_params or {}
         self._on_params_changed = on_params_changed
-        self._apoc_strategy = str(self._initial_params.get("apoc_strategy", "APOC (Direct Instance Segmentation)"))
+        self._apoc_strategy = str(self._initial_params.get("apoc_strategy", "APOC Probability Map + Watershed"))
         self._log_fn = print
+
+        if instance_controls_mode not in ("docked", "inline"):
+            raise ValueError(
+                "instance_controls_mode must be 'docked' or 'inline', "
+                f"got {instance_controls_mode!r}"
+            )
+        self._instance_controls_mode = instance_controls_mode
+        self._per_cell_type_strategy = bool(per_cell_type_strategy)
+        # Optional caller-provided resolver; takes precedence over the
+        # built-in Advanced mode logic when set.
+        self._strategy_resolver = strategy_resolver
+        self._extra_toolbar_widgets = list(extra_toolbar_widgets or [])
+        # Recorded so ``cleanup()`` can disconnect them deterministically.
+        self._layer_event_handles = []
 
         # All tab labels = cell types + optional Death
         self._tab_cell_types = list(all_cell_types)
@@ -1310,12 +1611,30 @@ class APOCTrainingWidget(QWidget):
 
         self._build_ui()
         self._connect_signals()
-        self._refresh_instance_controls()
+        if self._instance_controls_mode == "docked":
+            self._refresh_instance_controls()
+        else:
+            # Inline mode: never reparent; keep the shared dock hidden.
+            self.instance_controls_widget.setVisible(False)
         self._refresh_all_channels()
+        # Apply the initial strategy combo state (plugin Advanced mode).
+        if self.strategy_combo is not None:
+            self._apply_strategy_to_tabs(
+                self.strategy_combo.currentText(),
+                emit_signal=False,
+            )
 
-        # Listen for layer changes
-        self.viewer.layers.events.inserted.connect(lambda _: self._refresh_all_channels())
-        self.viewer.layers.events.removed.connect(lambda _: self._refresh_all_channels())
+        # Listen for layer changes (recorded so cleanup() can disconnect).
+        ins_cb = lambda _evt=None: self._refresh_all_channels()
+        rem_cb = lambda _evt=None: self._refresh_all_channels()
+        self.viewer.layers.events.inserted.connect(ins_cb)
+        self.viewer.layers.events.removed.connect(rem_cb)
+        self._layer_event_handles.append(
+            (self.viewer.layers.events.inserted, ins_cb)
+        )
+        self._layer_event_handles.append(
+            (self.viewer.layers.events.removed, rem_cb)
+        )
 
     def set_log_fn(self, log_fn):
         """Attach an optional GUI log sink."""
@@ -1329,16 +1648,56 @@ class APOCTrainingWidget(QWidget):
             self._log_fn(text)
 
     def _build_ui(self):
+        # Content widget (scrollable)
+        content_widget = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
+        self._main_layout = layout
 
         title = QLabel("<h3>APOC Pixel Classification</h3>")
         layout.addWidget(title)
 
+        # Strategy combo (only when per-cell-type strategy is enabled). Lives
+        # above the tab widget so users see it before drilling into a tab.
+        self.strategy_combo = None
+        self.strategy_help_button = None
+        if self._per_cell_type_strategy:
+            strat_row = QHBoxLayout()
+            strat_row.addWidget(QLabel("Strategy:"))
+            self.strategy_combo = QComboBox()
+            strategies = list(self.STRATEGIES) + [self.ADVANCED_STRATEGY]
+            self.strategy_combo.addItems(strategies)
+            initial_strategy = self._apoc_strategy if self._apoc_strategy in strategies else strategies[0]
+            self.strategy_combo.setCurrentText(initial_strategy)
+            strat_row.addWidget(self.strategy_combo, stretch=1)
+            layout.addLayout(strat_row)
+
+            strat_desc = QLabel(
+                "Strategy determines how the APOC classifier output is converted to"
+                " instance segmentation labels. Post-processing parameters appear in"
+                " each cell-type tab."
+            )
+            strat_desc.setWordWrap(True)
+            strat_desc.setStyleSheet("color:#888; font-size:10px; padding: 0 0 4px 0;")
+            layout.addWidget(strat_desc)
+
+            help_row = QHBoxLayout()
+            help_row.setContentsMargins(0, 0, 0, 0)
+            help_lbl = QLabel("Instance preview parameters")
+            help_lbl.setStyleSheet("color:#888; font-size:10px;")
+            self.strategy_help_button = HelpButton(
+                *self._strategy_help_content(initial_strategy)
+            )
+            help_row.addWidget(help_lbl)
+            help_row.addWidget(self.strategy_help_button)
+            help_row.addStretch()
+            layout.addLayout(help_row)
+
         # --- Tab widget ---
         self.tab_widget = QTabWidget()
         self.tabs = {}  # cell_type -> CellTypeTab
+        per_tab_strategies = list(self.STRATEGIES) if self._per_cell_type_strategy else None
 
         for ct in self._tab_cell_types:
             tab = CellTypeTab(
@@ -1349,6 +1708,10 @@ class APOCTrainingWidget(QWidget):
                 apoc_strategy=self._apoc_strategy,
                 on_params_changed=self._persist_params,
                 run_instance_callback=self._run_instance_preview,
+                instance_controls_inline=(self._instance_controls_mode == "inline"),
+                show_strategy_combo=self._per_cell_type_strategy,
+                per_tab_strategies=per_tab_strategies,
+                on_per_tab_strategy_changed=self._on_per_tab_strategy_changed,
             )
             self.tabs[ct] = tab
             self.tab_widget.addTab(tab, ct.capitalize())
@@ -1360,6 +1723,14 @@ class APOCTrainingWidget(QWidget):
         line.setFrameShape(QFrame.HLine)
         line.setFrameShadow(QFrame.Sunken)
         layout.addWidget(line)
+
+        # Extra toolbar widgets/layouts from the host plugin (e.g. GPU device,
+        # workers, run-batch buttons). They appear above the global button row.
+        for item in self._extra_toolbar_widgets:
+            if isinstance(item, QWidget):
+                layout.addWidget(item)
+            elif isinstance(item, (QHBoxLayout, QVBoxLayout, QGridLayout)):
+                layout.addLayout(item)
 
         # --- Global buttons ---
         global_row1 = QHBoxLayout()
@@ -1399,16 +1770,38 @@ class APOCTrainingWidget(QWidget):
         layout.addWidget(self.status_label)
 
         layout.addStretch()
-        self.setLayout(layout)
+        content_widget.setLayout(layout)
+
+        # Wrap everything in a scroll area so the full widget is reachable
+        scroll = QScrollArea()
+        scroll.setWidget(content_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        outer_layout = QVBoxLayout()
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.addWidget(scroll)
+        self.setLayout(outer_layout)
 
     def _connect_signals(self):
         self.apply_all_btn.clicked.connect(self._on_apply_to_all)
         self.train_current_btn.clicked.connect(self._on_train_current)
         self.train_all_btn.clicked.connect(self._on_train_all)
-        self.tab_widget.currentChanged.connect(lambda _idx: self._refresh_instance_controls())
+        # In docked mode, switching tabs reparents the instance group; in
+        # inline mode the group already lives in the tab so we do nothing.
+        if self._instance_controls_mode == "docked":
+            self.tab_widget.currentChanged.connect(lambda _idx: self._refresh_instance_controls())
+        if self.strategy_combo is not None:
+            self.strategy_combo.currentTextChanged.connect(self._on_global_strategy_changed)
 
     def _refresh_instance_controls(self):
-        """Show the current tab's instance-segmentation controls in the main dock."""
+        """Show the current tab's instance-segmentation controls in the main dock.
+
+        In inline mode this is a no-op because each tab owns its own group.
+        """
+        if self._instance_controls_mode != "docked":
+            return
         while self.instance_controls_layout.count():
             item = self.instance_controls_layout.takeAt(0)
             widget = item.widget()
@@ -1428,8 +1821,170 @@ class APOCTrainingWidget(QWidget):
 
     def _refresh_all_channels(self):
         """Refresh channel checkboxes in all tabs."""
-        for tab in self.tabs.values():
+        for ct, tab in self.tabs.items():
             tab.refresh_channel_checkboxes()
+            try:
+                self.channels_refreshed.emit(ct)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Strategy resolution / per-cell-type plumbing
+    # ------------------------------------------------------------------
+
+    def _resolve_strategy(self, ct):
+        """Return the effective APOC strategy for *ct*.
+
+        Resolution order:
+
+        1. Caller-provided ``strategy_resolver(ct)`` (highest precedence).
+        2. ``Advanced (per cell type)`` -> per-tab combo value.
+        3. The global combo value when the combo exists.
+        4. The constructor-supplied ``apoc_strategy`` value.
+        """
+        if callable(self._strategy_resolver):
+            try:
+                resolved = self._strategy_resolver(ct)
+                if resolved:
+                    return str(resolved)
+            except Exception:
+                pass
+
+        if self.strategy_combo is not None:
+            global_choice = self.strategy_combo.currentText()
+            if global_choice == self.ADVANCED_STRATEGY:
+                tab = self.tabs.get(ct)
+                per_combo = getattr(tab, "_per_tab_strategy_combo", None) if tab else None
+                if per_combo is not None:
+                    return per_combo.currentText()
+                return self.STRATEGIES[0]
+            return global_choice
+
+        return self._apoc_strategy
+
+    def _strategy_help_content(self, strategy_name):
+        """Return ``(title, description)`` for the strategy help popup."""
+        if strategy_name == self.ADVANCED_STRATEGY:
+            return (
+                "APOC Preview Parameters (Advanced \u2014 per cell type)",
+                "In Advanced mode each cell-type tab has its own strategy selector.\n\n"
+                "Select a strategy inside each tab to show the matching post-processing controls:\n"
+                "  \u2022 EDT threshold, Opening, Min size, Fill holes  (EDT/Watershed)\n"
+                "  \u2022 Mask threshold, Seed threshold, Opening, Min size  (Probability Map)\n"
+                "  \u2022 No extra controls  (Direct)"
+            )
+        if strategy_name == "APOC Mask + EDT/Watershed Resegmentation":
+            return (
+                "APOC Preview Parameters (Mask + EDT/Watershed)",
+                "Use the classifier mask, then refine instances with EDT + watershed.\n\n"
+                "  \u2022 EDT threshold: controls split sensitivity for touching objects.\n"
+                "  \u2022 Opening px: smooths boundaries and removes noise.\n"
+                "  \u2022 Min size: removes tiny segments below this size.\n"
+                "  \u2022 Fill holes: fills internal gaps inside segmented objects."
+            )
+        if strategy_name == "APOC Mask + Peak EDT/Watershed Resegmentation":
+            return (
+                "APOC Preview Parameters (Mask + Peak EDT/Watershed)",
+                "Same as Mask + EDT/Watershed, but seeds the watershed at local EDT peaks.\n\n"
+                "  \u2022 Peak min dist: minimum distance between seed peaks.\n"
+                "  \u2022 Peak min ratio: minimum peak height vs. local max (0\u20131)."
+            )
+        if strategy_name == "APOC Probability Map + Watershed":
+            return (
+                "APOC Preview Parameters (Probability Map + Watershed)",
+                "Use the probability map and watershed for instance splitting.\n\n"
+                "  \u2022 Mask threshold: foreground cutoff for the watershed mask.\n"
+                "  \u2022 Seed threshold: seed cutoff for watershed seeds.\n"
+                "  \u2022 Opening px: smooths boundaries and removes noise.\n"
+                "  \u2022 Min size: removes tiny segments below this size."
+            )
+        return (
+            "APOC Preview Parameters (Direct Instance Segmentation)",
+            "Direct strategy predicts instances directly from the classifier output."
+            " No post-processing parameters are available in preview mode."
+        )
+
+    def _apply_strategy_to_tabs(self, strategy, emit_signal=True):
+        """Propagate a strategy change to all tabs (inline mode rebuilds)."""
+        strategy = str(strategy)
+        self._apoc_strategy = (
+            strategy
+            if strategy != self.ADVANCED_STRATEGY
+            else self._apoc_strategy
+        )
+
+        if self.strategy_help_button is not None:
+            title, desc = self._strategy_help_content(strategy)
+            self.strategy_help_button.set_help(title, desc)
+
+        is_advanced = strategy == self.ADVANCED_STRATEGY
+
+        for ct, tab in self.tabs.items():
+            per_widget = getattr(tab, "_per_tab_strategy_widget", None)
+            if per_widget is not None:
+                per_widget.setVisible(is_advanced and ct != "dead")
+            if self._instance_controls_mode == "inline":
+                effective = self._resolve_strategy(ct)
+                tab.rebuild_instance_controls(strategy=effective)
+
+        if self._instance_controls_mode == "docked":
+            self._refresh_instance_controls()
+
+        if emit_signal:
+            try:
+                self.strategy_changed.emit(strategy)
+            except Exception:
+                pass
+
+    def _on_global_strategy_changed(self, new_strategy):
+        """Handle the global strategy combo changing."""
+        self._apply_strategy_to_tabs(new_strategy, emit_signal=True)
+        self._persist_params()
+
+    def _on_per_tab_strategy_changed(self, cell_type, new_strategy):
+        """Handle a per-tab strategy combo changing.
+
+        Triggered by ``CellTypeTab`` when ``per_cell_type_strategy=True``.
+        Persists the per-tab choice so it survives a reload.
+        """
+        self._initial_params[f"per_ct_strategy_{cell_type}"] = new_strategy
+        self._persist_params()
+
+    # ------------------------------------------------------------------
+    # Enable/disable + teardown helpers
+    # ------------------------------------------------------------------
+
+    def set_training_enabled(self, enabled):
+        """Enable or disable the training-related controls in one call.
+
+        The plugin uses this to lock the widget until training data has
+        been loaded.
+        """
+        enabled = bool(enabled)
+        self.apply_all_btn.setEnabled(enabled)
+        self.train_current_btn.setEnabled(enabled)
+        self.train_all_btn.setEnabled(enabled)
+        for tab in self.tabs.values():
+            for cb in getattr(tab, "channel_checkboxes", []):
+                cb.setEnabled(enabled)
+            btn = getattr(tab, "run_instance_btn", None)
+            if btn is not None:
+                btn.setEnabled(enabled)
+
+    def cleanup(self):
+        """Disconnect viewer-layer callbacks before the widget is destroyed.
+
+        The widget connects to ``viewer.layers.events.inserted`` and
+        ``removed`` for live channel refresh; if those callbacks remain
+        connected after the widget is hidden/deleted, napari can crash when
+        layers change later. Call this from the host before ``deleteLater``.
+        """
+        for emitter, callback in list(self._layer_event_handles):
+            try:
+                emitter.disconnect(callback)
+            except Exception:
+                pass
+        self._layer_event_handles = []
 
     # ------------------------------------------------------------------
     # Button handlers
@@ -1614,11 +2169,12 @@ class APOCTrainingWidget(QWidget):
 
     def _build_display_segments(self, ct, raw_prediction, prob_prediction):
         """Convert raw classifier outputs into the segment layer shown in Napari."""
-        if ct == "dead" or self._apoc_strategy == "APOC (Direct Instance Segmentation)":
+        strategy = self._resolve_strategy(ct)
+        if ct == "dead" or strategy == "APOC (Direct Instance Segmentation)":
             return np.asarray(raw_prediction).astype(np.int16)
 
         tab = self.tabs[ct]
-        if self._apoc_strategy == "APOC Probability Map + Watershed":
+        if strategy == "APOC Probability Map + Watershed":
             return _probability_array_to_segments(
                 prob_prediction,
                 mask_thr=float(tab.prob_mask_threshold_spin.value()),
@@ -1627,12 +2183,20 @@ class APOCTrainingWidget(QWidget):
                 segment_size_min=int(tab.segment_size_min_spin.value()),
             )
 
+        marker_strategy = (
+            "peak"
+            if strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
+            else "threshold"
+        )
         return _mask_array_to_segments(
             raw_prediction > 0,
             edt_thr=float(tab.edt_threshold_spin.value()),
             opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
             segment_size_min=int(tab.segment_size_min_spin.value()),
             fill_holes=bool(tab.fill_holes_cb.isChecked()),
+            marker_strategy=marker_strategy,
+            peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
+            peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
         )
 
     def _run_instance_preview(self, ct):
@@ -1641,10 +2205,15 @@ class APOCTrainingWidget(QWidget):
             return
 
         tab = self.tabs[ct]
-        strategy = self._apoc_strategy
+        strategy = self._resolve_strategy(ct)
         if strategy == "APOC (Direct Instance Segmentation)":
             self.status_label.setText("Direct APOC does not use instance resegmentation preview.")
             return
+
+        try:
+            self.instance_preview_started.emit(ct)
+        except Exception:
+            pass
 
         try:
             self.status_label.setText(f"Running instance preview for {ct}...")
@@ -1669,12 +2238,20 @@ class APOCTrainingWidget(QWidget):
                 )
             else:
                 raw_prediction, prob_prediction = self._predict_classifier_outputs(ct)
+                marker_strategy = (
+                    "peak"
+                    if strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
+                    else "threshold"
+                )
                 instance_preview = _mask_array_to_segments(
                     raw_prediction > 0,
                     edt_thr=float(tab.edt_threshold_spin.value()),
                     opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
                     segment_size_min=int(tab.segment_size_min_spin.value()),
                     fill_holes=bool(tab.fill_holes_cb.isChecked()),
+                    marker_strategy=marker_strategy,
+                    peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
+                    peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
                 )
 
             self._update_prediction_layers(ct, instance_preview, prob_prediction)
@@ -1688,6 +2265,11 @@ class APOCTrainingWidget(QWidget):
             self.status_label.setText(f"✅ Instance preview updated for {ct}")
         except Exception as exc:
             self.status_label.setText(f"❌ Instance preview failed for {ct}: {exc}")
+        finally:
+            try:
+                self.instance_preview_finished.emit(ct)
+            except Exception:
+                pass
 
     def save_user_labels(self, log=print):
         """Save all user-provided labels for all cell types and Dead (if present)."""
@@ -1718,6 +2300,11 @@ class APOCTrainingWidget(QWidget):
         """Train (and apply) APOC classifiers for the given list of cell types."""
         import apoc
         training_start = time.time()
+
+        try:
+            self.training_started.emit(list(cell_types_to_train))
+        except Exception:
+            pass
 
         # Auto-save labels before training
         self._log("Auto-saving user labels before training...")
@@ -1889,6 +2476,11 @@ class APOCTrainingWidget(QWidget):
             self.status_label.setText(f"❌ Error: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            try:
+                self.training_finished.emit(list(cell_types_to_train), list(successes))
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Config persistence
@@ -1922,6 +2514,10 @@ class APOCTrainingWidget(QWidget):
                 params[f"{ct}_opening_nr_pixels"] = cfg["opening_nr_pixels"]
             if cfg["fill_holes"] is not None:
                 params[f"{ct}_fill_holes"] = cfg["fill_holes"]
+            if cfg["peak_min_distance"] is not None:
+                params[f"{ct}_peak_min_distance"] = cfg["peak_min_distance"]
+            if cfg["peak_min_ratio"] is not None:
+                params[f"{ct}_peak_min_ratio"] = cfg["peak_min_ratio"]
         return params
 
     def _persist_params(self):

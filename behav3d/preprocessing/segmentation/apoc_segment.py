@@ -299,6 +299,8 @@ def run_apoc_segmentation(
     n_workers=1,
     gpu_device=None,
     apoc_strategy="APOC (Direct Instance Segmentation)",
+    per_ct_strategies=None,  # dict {cell_type: strategy_string} for Advanced mode; None = use global apoc_strategy
+    only_cell_types=None,    # list of cell-type strings to process; None = process all
     **_kwargs,  # absorb unused CPU-specific params (EDT, opening, fill_holes etc.)
 ):
     """
@@ -345,6 +347,10 @@ def run_apoc_segmentation(
         if clf: classifiers[ct] = clf
 
     active_cell_types = [ct for ct in all_cell_types if ct in classifiers]
+
+    # Optional cell-type filter (used by per-cell-type Run button in the GUI)
+    if only_cell_types is not None:
+        active_cell_types = [ct for ct in active_cell_types if ct in only_cell_types]
 
     clf_death = None
     if has_death:
@@ -494,7 +500,10 @@ def run_apoc_segmentation(
                     imgs = [t_img[i_ch] for i_ch in indices]
                     imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
 
-                    if apoc_strategy == "APOC Probability Map + Watershed":
+                    # Resolve effective strategy: per-cell-type override takes precedence when provided
+                    effective_strategy = (per_ct_strategies or {}).get(ct, apoc_strategy)
+
+                    if effective_strategy == "APOC Probability Map + Watershed":
                         # ── Probability Map strategy ──────────────────────
                         from skimage.measure import label as sk_label
                         from skimage.segmentation import watershed
@@ -569,7 +578,10 @@ def run_apoc_segmentation(
                         if _diag: print(f"    ⏱ {ct} 2d_filter: {time.time()-_t0:.2f}s")
                         zarr_segs[ct][t] = np.asarray(segments).astype(np.uint16)
 
-                    elif apoc_strategy == "APOC Mask + EDT/Watershed Resegmentation":
+                    elif effective_strategy in {
+                        "APOC Mask + EDT/Watershed Resegmentation",
+                        "APOC Mask + Peak EDT/Watershed Resegmentation",
+                    }:
                         # ── EDT/Watershed strategy ────────────────────────
                         from behav3d.preprocessing.segmentation.segmentation_utils import (
                             postprocess_mask, segment_mask
@@ -587,11 +599,28 @@ def run_apoc_segmentation(
 
                         edt_thr = cfg.get(f"{ct}_edt_threshold", 1.0)
                         segment_size_min = cfg.get(f"{ct}_segment_size_min", 10)
-                        seg_refined = segment_mask(proc_mask, edt_thr=edt_thr, edt_thr_refined=None, segment_size_min=segment_size_min, use_dims=3, n_workers=1)
+                        _raw_peak_dist = cfg.get(f"{ct}_peak_min_distance", 0)
+                        peak_min_distance = None if (not _raw_peak_dist or float(_raw_peak_dist) <= 0) else float(_raw_peak_dist)
+                        peak_min_ratio = float(cfg.get(f"{ct}_peak_min_ratio", 0.35))
+                        seg_refined = segment_mask(
+                            proc_mask,
+                            edt_thr=edt_thr,
+                            edt_thr_refined=None,
+                            segment_size_min=segment_size_min,
+                            use_dims=3,
+                            n_workers=1,
+                            marker_strategy=(
+                                "peak"
+                                if apoc_strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
+                                else "threshold"
+                            ),
+                            peak_min_distance=peak_min_distance,
+                            peak_min_ratio=peak_min_ratio,
+                        )
                         zarr_segs[ct][t] = np.asarray(seg_refined).astype(np.uint16)
 
                     else:
-                        # ── Default: Direct APOC ──────────────────────────
+                        # ── Default: Direct APOC (or unknown strategy) ────
                         if not only_segment:
                             seg_out = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
                             mask_out = (seg_out > 0).astype(np.uint16)

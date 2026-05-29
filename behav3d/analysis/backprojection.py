@@ -15,7 +15,9 @@ from behav3d.io.formats.zarr import write_zarr_parallel
 from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_organoid_types_from_metadata,
-    detect_other_cell_types_from_metadata
+    detect_other_cell_types_from_metadata,
+    detect_merged_cell_types_from_metadata,
+    filter_multicolor_inputs,
 )
 
 
@@ -1032,9 +1034,12 @@ def _load_other_cell_tracks(trackid_data, metadata, df_sample, cell_type, raw_im
     """Load tracks from other cell types for visualization context."""
     
     
-    all_cell_types = (detect_immune_cell_types_from_metadata(metadata) + 
-                      detect_organoid_types_from_metadata(metadata) + 
-                      detect_other_cell_types_from_metadata(metadata))
+    all_cell_types = (
+        filter_multicolor_inputs(detect_immune_cell_types_from_metadata(metadata)) +
+        filter_multicolor_inputs(detect_organoid_types_from_metadata(metadata)) +
+        filter_multicolor_inputs(detect_other_cell_types_from_metadata(metadata)) +
+        detect_merged_cell_types_from_metadata(metadata)
+    )
     
     for other_ct in all_cell_types:
         if other_ct == cell_type:

@@ -350,7 +350,148 @@ def _refine_segment(args):
     # print("###", label_id, "refine_segment time elapsed: ", time.time() - start_time)
     return (new_seg, tuple(minc))
 
-def segment_mask(mask, edt_thr=1.5, edt_thr_refined=None, segment_size_min=15, use_dims=2, n_workers=1):
+
+def _peak_refine_segment(args):
+    """Refine one component with peak-based EDT markers."""
+    (
+        local_mask,
+        local_edt,
+        min_peak_height,
+        min_seed_distance,
+        min_peak_ratio,
+        segment_size_min,
+        minc,
+    ) = args
+
+    local_mask = local_mask.astype(bool, copy=False)
+    if not np.any(local_mask):
+        return (np.zeros_like(local_mask, dtype=np.int32), tuple(minc))
+
+    local_edt = np.asarray(local_edt, dtype=np.float32)
+    max_edt = float(local_edt[local_mask].max()) if np.any(local_mask) else 0.0
+    if max_edt <= 0:
+        return (local_mask.astype(np.int32), tuple(minc))
+
+    min_seed_distance = max(1, int(round(min_seed_distance)))
+    min_peak_height = max(0.0, float(min_peak_height))
+    min_peak_ratio = max(0.0, min(1.0, float(min_peak_ratio)))
+    height_cutoff = max(min_peak_height, max_edt * min_peak_ratio)
+
+    size = tuple([2 * min_seed_distance + 1] * local_edt.ndim)
+    local_max = ndimage.maximum_filter(local_edt, size=size, mode="constant") == local_edt
+    peak_mask = local_max & local_mask & (local_edt >= height_cutoff)
+
+    peak_labels, n_peaks = ndimage.label(peak_mask)
+    if n_peaks < 2:
+        return (local_mask.astype(np.int32), tuple(minc))
+
+    # Collapse plateaus to one marker voxel each, avoiding over-seeding flat EDT tops.
+    markers = np.zeros_like(local_mask, dtype=np.int32)
+    for peak_id in range(1, n_peaks + 1):
+        coords = np.argwhere(peak_labels == peak_id)
+        if coords.size == 0:
+            continue
+        values = local_edt[tuple(coords.T)]
+        coord = coords[int(np.argmax(values))]
+        markers[tuple(coord)] = peak_id
+
+    if int(markers.max()) < 2:
+        return (local_mask.astype(np.int32), tuple(minc))
+
+    new_seg = watershed(-local_edt, markers=markers, mask=local_mask)
+    new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
+    if np.max(new_seg) == 0:
+        return (local_mask.astype(np.int32), tuple(minc))
+
+    new_seg = watershed(-local_edt, markers=new_seg, mask=local_mask)
+    new_seg, _, _ = relabel_sequential(new_seg)
+    return (new_seg, tuple(minc))
+
+
+def refine_segments_peak(
+    segments: np.ndarray,
+    edt: np.ndarray,
+    mask: np.ndarray,
+    min_peak_height: float,
+    min_seed_distance: int | None,
+    min_peak_ratio: float,
+    segment_size_min: int,
+    n_workers: int | None = 1,
+    out_dtype=np.uint16,
+):
+    """One refinement pass using one local EDT peak marker per putative cell."""
+    segments, _, _ = relabel_sequential(segments)
+    slices = find_objects(segments)
+    args_list = []
+
+    if min_seed_distance is None:
+        min_seed_distance = max(1, int(round(min_peak_height * 2)))
+
+    for i, slc in enumerate(slices):
+        if slc is None:
+            continue
+        label_id = i + 1
+        local_mask = (segments[slc] == label_id)
+        if not np.any(local_mask):
+            continue
+        minc = [s.start for s in slc]
+        args_list.append((
+            local_mask,
+            edt[slc],
+            min_peak_height,
+            min_seed_distance,
+            min_peak_ratio,
+            segment_size_min,
+            minc,
+        ))
+
+    if n_workers is None:
+        n_workers = multiprocessing.cpu_count()
+    if len(args_list) == 0:
+        return np.zeros_like(mask, dtype=out_dtype)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        results = list(executor.map(_peak_refine_segment, args_list))
+
+    new_segments = np.zeros_like(mask, dtype=np.uint32)
+    current_label = 0
+    for local_segment, minc in results:
+        nonzero = local_segment > 0
+        if not np.any(nonzero):
+            continue
+        local_segment = local_segment.astype(np.uint32, copy=False)
+        local_max = int(local_segment.max())
+        local_segment[nonzero] += current_label
+
+        slc = tuple(
+            slice(start, start + size)
+            for start, size in zip(minc, local_segment.shape)
+        )
+        out_view = new_segments[slc]
+        out_view[nonzero] = local_segment[nonzero]
+        current_label += local_max
+
+    if out_dtype is not None:
+        if np.iinfo(out_dtype).max < new_segments.max():
+            raise ValueError(
+                f"Label overflow: max label {new_segments.max()} exceeds dtype {out_dtype}"
+            )
+        new_segments = new_segments.astype(out_dtype, copy=False)
+
+    return new_segments
+
+
+def segment_mask(
+    mask,
+    edt_thr=1.5,
+    edt_thr_refined=None,
+    segment_size_min=15,
+    use_dims=2,
+    n_workers=1,
+    marker_strategy="threshold",
+    peak_min_distance=None,
+    peak_min_ratio=0.35,
+):
     edt = calculate_edt(mask, use_dims=use_dims)
 
     # Normalize refined thresholds
@@ -360,19 +501,33 @@ def segment_mask(mask, edt_thr=1.5, edt_thr_refined=None, segment_size_min=15, u
     # Start from connected components as initial segments
     segments = label(mask)
 
-    # Pass 1: use edt_thr
-    segments = refine_segments(
-        segments=segments,
-        edt=edt,
-        mask=mask,
-        thr=edt_thr,
-        segment_size_min=segment_size_min,
-        n_workers=n_workers,
-        out_dtype=np.uint16,
-    )
+    marker_strategy = str(marker_strategy or "threshold").lower()
+    if marker_strategy in {"peak", "peak_edt", "peaks"}:
+        segments = refine_segments_peak(
+            segments=segments,
+            edt=edt,
+            mask=mask,
+            min_peak_height=edt_thr,
+            min_seed_distance=peak_min_distance,
+            min_peak_ratio=peak_min_ratio,
+            segment_size_min=segment_size_min,
+            n_workers=n_workers,
+            out_dtype=np.uint16,
+        )
+    else:
+        # Pass 1: use edt_thr
+        segments = refine_segments(
+            segments=segments,
+            edt=edt,
+            mask=mask,
+            thr=edt_thr,
+            segment_size_min=segment_size_min,
+            n_workers=n_workers,
+            out_dtype=np.uint16,
+        )
 
     # Pass 2..N: refined thresholds
-    if edt_thr_refined is not None:
+    if edt_thr_refined is not None and marker_strategy not in {"peak", "peak_edt", "peaks"}:
         for thr in edt_thr_refined:
             segments = refine_segments(
                 segments=segments,
@@ -1322,6 +1477,7 @@ def run_pixel_classifier_segmentation(
     overwrite_existing=False,
     n_workers=4,
     log_callback=print,
+    progress_cb=None,
     ):
 
     """
@@ -1500,7 +1656,13 @@ def run_pixel_classifier_segmentation(
             metadata.to_csv(metadata_csv_path, index=False)
     
     # Process each sample
-    for idx, sample in metadata.iterrows():
+    _total_samples = len(metadata)
+    for _i, (idx, sample) in enumerate(metadata.iterrows()):
+        if progress_cb is not None:
+            try:
+                progress_cb(_i, _total_samples, f"{sample['sample_name']}")
+            except Exception:
+                pass
         print(f"Processing sample: {sample['sample_name']}")
         _log_mem(f"sample {sample['sample_name']} START")
         start_time = time.time()
@@ -2192,6 +2354,11 @@ def run_pixel_classifier_segmentation(
         
         _log_mem(f"sample {sample_name} END")
         print(f"  Sample {sample_name} completed in {time.time() - start_time:.1f}s")
-    
+
+    if progress_cb is not None:
+        try:
+            progress_cb(_total_samples, _total_samples, "segmentation done")
+        except Exception:
+            pass
     _log_mem("run_pixel_classifier_segmentation END")
     return metadata
