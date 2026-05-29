@@ -227,6 +227,35 @@ def _append_track_length_histogram_pages(
         plt.close(fig)
 
 
+def _prepare_track_dataframe_for_grouping(
+    metadata: pd.DataFrame,
+    track_csv_path,
+):
+    """
+    Load a track CSV and merge only the grouping metadata columns that are
+    still missing from the file.
+    """
+    df_tracks = pd.read_csv(track_csv_path, low_memory=False)
+    df_tracks["sample_name"] = df_tracks["sample_name"].astype(str)
+
+    md = metadata.copy()
+    md["sample_name"] = md["sample_name"].astype(str)
+
+    line_condition_cols = [c for c in md.columns if c.endswith("_line_condition")]
+    requested_group_cols = ["TrackID", "sample_name"] + line_condition_cols + ["exp_nr", "well"]
+    missing_group_cols = [
+        c for c in requested_group_cols
+        if c not in df_tracks.columns and c in md.columns and c != "sample_name"
+    ]
+
+    if missing_group_cols:
+        metadata_info = md.loc[:, ["sample_name"] + missing_group_cols].copy()
+        df_tracks = pd.merge(df_tracks, metadata_info, how="left", on="sample_name")
+
+    resolved_group_cols = [c for c in requested_group_cols if c in df_tracks.columns]
+    return df_tracks, resolved_group_cols
+
+
 def preview_track_length_before_filtering(
     metadata: pd.DataFrame,
     output_dir,
@@ -253,20 +282,11 @@ def preview_track_length_before_filtering(
             f"Run feature extraction for {cell_type} first."
         )
 
-    md = metadata.copy()
-    df_raw = pd.read_csv(df_all_tracks_path)
-    df_raw["sample_name"] = df_raw["sample_name"].astype(str)
-    md["sample_name"] = md["sample_name"].astype(str)
-
-    line_condition_cols = [c for c in md.columns if c.endswith("_line_condition")]
-    group_cols = ["TrackID", "sample_name"] + line_condition_cols + ["exp_nr", "well"]
-    cols_present = [c for c in group_cols if c in md.columns]
-    metadata_info = md.loc[:, cols_present].copy()
-    df_merged = pd.merge(df_raw, metadata_info, how="left", on="sample_name")
+    df_merged, resolved_group_cols = _prepare_track_dataframe_for_grouping(metadata, df_all_tracks_path)
 
     figs, err = _figures_track_length_histogram_pages(
         df_merged,
-        group_cols,
+        resolved_group_cols,
         suptitle="Before filtering (from combined track-features CSV)",
         cell_type=str(cell_type),
     )
@@ -674,7 +694,7 @@ def filter_tracks(
         _append_track_length_histogram_pages(
             pdf,
             df_before_for_hist,
-            resolved_group_cols,
+            before_group_cols,
             suptitle="Track length — before filtering (input track-features CSV)",
             cell_type=cell_type,
             nr_cols=3,
@@ -692,7 +712,7 @@ def filter_tracks(
         _append_track_length_histogram_pages(
             pdf,
             df_after_for_hist,
-            resolved_group_cols,
+            after_group_cols,
             suptitle="Track length — after filtering (combined_track_features_filtered.csv)",
             cell_type=cell_type,
             nr_cols=3,

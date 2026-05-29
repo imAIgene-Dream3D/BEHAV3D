@@ -1051,8 +1051,23 @@ class TrackingVisualizationPanel:
         with self.msg:
             self.msg.clear_output()
             try:
-                self._viewer = visualize_tracks(metadata_row=row, timepoint_range=time_range, channel_colors=self.channel_colors)
-            except Exception as e: print(f"Error: {e}")
+                if self._viewer is not None:
+                    try:
+                        self._viewer.close()
+                    except Exception:
+                        pass
+                    finally:
+                        self._viewer = None
+
+                viewer = visualize_tracks(
+                    metadata_row=row,
+                    timepoint_range=time_range,
+                    channel_colors=self.channel_colors,
+                )
+                self._viewer = viewer
+            except Exception as e:
+                self._viewer = None
+                print(f"Error: {e}")
             self.close_button.layout.display = "inline-block" if self._viewer is not None else "none"
 
     def _maybe_build_from_loader(self):

@@ -7,6 +7,7 @@ import numpy as np
 from behav3d.io.formats.zarr import save_as_zarr
 from behav3d.io.images import load_zarr
 from behav3d.preprocessing.segmentation.multicolor_segment_processing import (
+    _erode_candidate,
     _normalize_segmentation_labels_for_view,
     calculate_multicolor_overlap,
     process_multicolor_segments,
@@ -102,6 +103,77 @@ def test_partial_overlap_multiple_survivors_repartition_without_overlap():
 
         assert not np.any((res1 > 0) & (res2 > 0))
         assert np.array_equal(processed_union, original_union)
+    finally:
+        _cleanup_case_dir(case_dir)
+
+
+def test_seed_erosion_does_not_apply_min_size_filter():
+    case_dir = _make_case_dir("seed_stage_no_size_filter")
+    try:
+        img1 = _make_empty(shape=(1, 8, 10, 10))
+        img2 = _make_empty(shape=(1, 8, 10, 10))
+
+        img1[:, 1:7, 1:8, 1:8] = 5
+        img2[:, 1:7, 4:9, 4:9] = 6
+
+        shared = (img1[0] > 0) & (img2[0] > 0)
+        seed1 = _erode_candidate((img1[0] > 0) & ~shared, 1)
+        seed2 = _erode_candidate((img2[0] > 0) & ~shared, 1)
+
+        seed1_size = int(np.count_nonzero(seed1))
+        seed2_size = int(np.count_nonzero(seed2))
+        assert seed1_size > seed2_size > 0
+
+        min_size = seed2_size + 1
+        assert int(np.count_nonzero(img2[0])) > min_size
+
+        in1 = _write_zarr(case_dir / "img1_segments.zarr", img1)
+        in2 = _write_zarr(case_dir / "img2_segments.zarr", img2)
+
+        out1, out2 = process_multicolor_segments(
+            [in1, in2],
+            erosion_pixels=1,
+            min_size=min_size,
+        )
+
+        res1 = np.asarray(load_zarr(out1))
+        res2 = np.asarray(load_zarr(out2))
+        processed_union = (res1 > 0) | (res2 > 0)
+        original_union = (img1 > 0) | (img2 > 0)
+
+        assert np.count_nonzero(res1) > 0
+        assert np.count_nonzero(res2) > 0
+        assert not np.any((res1 > 0) & (res2 > 0))
+        assert np.array_equal(processed_union, original_union)
+    finally:
+        _cleanup_case_dir(case_dir)
+
+
+def test_final_size_filter_removes_small_resolved_segment():
+    case_dir = _make_case_dir("final_size_filter")
+    try:
+        img1 = _make_empty(shape=(1, 6, 8, 8))
+        img2 = _make_empty(shape=(1, 6, 8, 8))
+
+        img1[:, 1:5, 1:6, 1:6] = 10
+        img2[:, 1:5, 4:6, 4:6] = 20
+
+        min_size = int(np.count_nonzero(img2[0])) + 1
+
+        in1 = _write_zarr(case_dir / "img1_segments.zarr", img1)
+        in2 = _write_zarr(case_dir / "img2_segments.zarr", img2)
+
+        out1, out2 = process_multicolor_segments(
+            [in1, in2],
+            erosion_pixels=0,
+            min_size=min_size,
+        )
+
+        res1 = np.asarray(load_zarr(out1))
+        res2 = np.asarray(load_zarr(out2))
+
+        assert np.count_nonzero(res1) > 0
+        assert np.count_nonzero(res2) == 0
     finally:
         _cleanup_case_dir(case_dir)
 

@@ -399,7 +399,6 @@ def combine_multicolor_tracked_outputs(
 
     return metadata
 
-
 def combine_multicolor_tracked_outputs_for_base(
     metadata,
     output_dir,
@@ -418,4 +417,18 @@ def combine_multicolor_tracked_outputs_for_base(
         combined_cell_type=combined_cell_type,
         overwrite=overwrite,
         n_workers=n_workers,
+    )
+    
+def test():
+    metadata = "/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/NatureBriefComm/LowDensity_MultiColor/metadata.csv"
+    metadata = pd.read_csv(metadata)
+    cell_types = ["tcell1", "tcell2", "tcell3"]
+    output_dir = "/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/NatureBriefComm/LowDensity_MultiColor"
+    combine_multicolor_tracked_outputs(
+        metadata=metadata,
+        output_dir=output_dir,
+        source_cell_types=cell_types,
+        combined_cell_type="tcell",
+        overwrite=True,
+        n_workers=8,
     )

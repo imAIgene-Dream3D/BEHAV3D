@@ -7,18 +7,27 @@ from behav3d.core.utils import format_time
 def smooth_value_over_time(
     df,
     column,
-    rolling_meanspeed_window=None,  # kept for backward compatibility, unused
-    window_fraction=0.2,
+    window_size=5,
+    window_fraction=None,         # optional fractional mode
     min_window=3,
     min_periods=None,
     groupby=["TrackID", "sample_name"]
-    ):
-    def _fractional_rolling_mean(x):
-        window = max(min_window, round(len(x) * window_fraction))
-        effective_min = min_periods if min_periods is not None else max(1, window // 2)
+):
+    def _rolling_mean(x):
+        # Decide window type
+        if window_fraction is not None:
+            window = max(min_window, round(len(x) * window_fraction))
+        else:
+            window = window_size
+
+        # Determine min_periods
+        effective_min = (
+            min_periods if min_periods is not None else max(1, window // 2)
+        )
+
         return x.rolling(window=window, min_periods=effective_min).mean()
 
-    smoothed_column = df.groupby(groupby)[column].transform(_fractional_rolling_mean)
+    smoothed_column = df.groupby(groupby)[column].transform(_rolling_mean)
     return smoothed_column
 
 
