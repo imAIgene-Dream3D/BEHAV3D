@@ -1,0 +1,95 @@
+name: Docs
+
+on:
+  push:
+    branches:
+      - dev
+  pull_request:
+    branches:
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Sphinx docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install documentation dependencies
+        # We rely on `autodoc_mock_imports` in docs/source/conf.py to mock the
+        # heavy runtime deps (napari, cellpose, torch, …). That means the docs
+        # build does NOT require the full behav3d env, which keeps CI under a
+        # minute. If autodoc starts failing because a new module isn't mocked,
+        # add it to `autodoc_mock_imports` in docs/source/conf.py.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r docs/requirements-docs.txt
+
+      - name: Install BEHAV3D (no-deps, for autodoc imports)
+        run: pip install --no-deps -e .
+
+      - name: Build HTML
+        # Note: not using -W initially while content is still being written.
+        # Tighten to -W --keep-going once the wiki is stable.
+        run: |
+          sphinx-build -b html docs/source docs/build/html
+
+      # github.ref_name is "123/merge" on pull_request runs — "/" is invalid in artifact names.
+      - name: Set preview artifact name
+        id: artifact
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            raw="${{ github.head_ref }}"
+            if [ -z "$raw" ]; then
+              raw="pr-${{ github.event.pull_request.number }}"
+            fi
+          else
+            raw="${{ github.ref_name }}"
+          fi
+          safe="${raw//\//-}"
+          echo "name=sphinx-docs-${safe}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact (preview)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: docs/build/html
+          retention-days: 14
+
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/dev' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/build/html
+
+  deploy:
+    name: Deploy to GitHub Pages
+    # Must match github-pages environment deployment branches (Settings → Environments).
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/dev'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
