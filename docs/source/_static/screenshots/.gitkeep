@@ -1,0 +1,19 @@
+# Placeholder so the screenshots/ directory is checked in even while empty.
+# Drop your napari plugin screenshots here:
+#
+#   - dock_widget_overview.png
+#   - data_preparation_tab.png
+#   - visualization_tab.png
+#   - segmentation_tab_apoc.png
+#   - segmentation_tab_cellpose.png
+#   - segmentation_tab_convpaint.png
+#   - segmentation_tab_pixel_classifier.png
+#   - segmentation_tab_import.png
+#   - segmentation_tab_manual_editing.png
+#   - tracking_tab_methods.png
+#   - tracking_tab_subtabs.png
+#   - feature_extraction_tab.png
+#   - filtering_tab.png
+#   - processing_queue.png
+#
+# Reference them in pages as: ![alt text](../_static/screenshots/dock_widget_overview.png)

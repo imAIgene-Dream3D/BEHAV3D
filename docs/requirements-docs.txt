@@ -1,0 +1,15 @@
+# Documentation build requirements for BEHAV3D Sphinx wiki.
+#
+# Install into your existing behav3d env:
+#     mamba activate behav3d
+#     pip install -r docs/requirements-docs.txt
+#
+# These are the same packages the GitHub Pages CI uses, so what you preview
+# locally is exactly what the live site renders.
+
+sphinx>=7.0
+sphinx-rtd-theme>=2.0
+myst-parser>=2.0
+sphinx-copybutton>=0.5
+sphinx-design>=0.5
+sphinxcontrib-mermaid>=0.9

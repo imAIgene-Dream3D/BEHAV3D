@@ -7,6 +7,7 @@
 *.tiff
 test.py
 build/
+docs/build/
 **/.DS_Store
 **/.egg-info
 *.egg-info
