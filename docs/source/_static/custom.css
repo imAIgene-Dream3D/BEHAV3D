@@ -1,0 +1,43 @@
+/* BEHAV3D wiki — small overrides on top of sphinx_rtd_theme */
+
+/* Slightly wider content area to fit parameter tables nicely. */
+.wy-nav-content {
+    max-width: 1100px;
+}
+
+/* Tabs from sphinx-design — keep them compact in the parameter pages. */
+.sd-tab-set > input:checked + label {
+    font-weight: 600;
+}
+
+/* Inline code in tables shouldn't wrap awkwardly. */
+table code,
+table tt {
+    white-space: nowrap;
+}
+
+/* sphinx-design cards — tighten internal padding on the welcome page. */
+.sd-card-body {
+    padding: 0.75rem 1rem;
+}
+
+/* Make sphinx-design "note" / "tip" admonitions a touch more compact. */
+.admonition.note,
+.admonition.tip,
+.admonition.warning,
+.admonition.important {
+    margin-top: 0.6em;
+    margin-bottom: 0.6em;
+}
+
+/* Status callout used by skeleton pages. */
+.behav3d-status {
+    border-left: 4px solid #f0ad4e;
+    background: #fff8e8;
+    padding: 0.6em 1em;
+    margin: 1em 0;
+}
+
+.behav3d-status strong {
+    color: #b07a00;
+}
