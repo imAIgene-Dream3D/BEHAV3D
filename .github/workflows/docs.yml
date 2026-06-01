@@ -52,10 +52,26 @@ jobs:
         run: |
           sphinx-build -b html docs/source docs/build/html
 
+      # github.ref_name is "123/merge" on pull_request runs — "/" is invalid in artifact names.
+      - name: Set preview artifact name
+        id: artifact
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            raw="${{ github.head_ref }}"
+            if [ -z "$raw" ]; then
+              raw="pr-${{ github.event.pull_request.number }}"
+            fi
+          else
+            raw="${{ github.ref_name }}"
+          fi
+          safe="${raw//\//-}"
+          echo "name=sphinx-docs-${safe}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
       - name: Upload artifact (preview)
         uses: actions/upload-artifact@v4
         with:
-          name: sphinx-docs-${{ github.ref_name }}
+          name: ${{ steps.artifact.outputs.name }}
           path: docs/build/html
           retention-days: 14
 
