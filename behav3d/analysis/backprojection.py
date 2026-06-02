@@ -7,9 +7,11 @@ import time
 import argparse
 from tqdm import tqdm
 import dask.array as da
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from behav3d.core.utils import format_time
 from behav3d.io.images import _ensure_zarr, get_filepath_stem, load_image, load_zarr, save_as_zarr
+from behav3d.io.formats.zarr import write_zarr_parallel
 from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_organoid_types_from_metadata,
@@ -17,6 +19,498 @@ from behav3d.core.metadata import (
     detect_merged_cell_types_from_metadata,
     filter_multicolor_inputs,
 )
+
+
+STRUCTURAL_FEATURE_COLUMNS = {
+    "sample_name",
+    "TrackID",
+    "track_id",
+    "position_t",
+}
+
+TRACKED_CSV_FALLBACK_COLUMNS = {
+    "SegmentID",
+    "position_x",
+    "position_y",
+    "position_z",
+    "pixel_position_x",
+    "pixel_position_y",
+    "pixel_position_z",
+    "source_cell_type",
+}
+
+
+def _normalize_backprojection_mode(mode):
+    mode = str(mode).strip().lower()
+    if mode in {"mean", "summary", "summarized", "track"}:
+        return "summary"
+    if mode in {"time", "timepoint", "per_timepoint", "per-timepoint"}:
+        return "timepoint"
+    raise ValueError(
+        "mode must be one of {'summary', 'timepoint'} "
+        f"(also accepts 'mean' and 'time'), got '{mode}'."
+    )
+
+
+def _read_csv_header(path):
+    path = Path(path)
+    if not path.exists():
+        return []
+    header_df = pd.read_csv(path, nrows=0)
+    return [str(col).lstrip("\ufeff") for col in header_df.columns]
+
+
+def _find_track_csv_column(df_sample, cell_type):
+    track_csv_col = f"{cell_type}_tracks_csv_path"
+    if track_csv_col in df_sample.columns:
+        return track_csv_col
+
+    for prefix in ["im_", "or_", "ot_"]:
+        alt_col = f"{prefix}{cell_type}_tracks_csv_path"
+        if alt_col in df_sample.columns:
+            return alt_col
+    return None
+
+
+def _resolve_tracked_csv_path(df_sample, output_dir, sample_name, cell_type):
+    track_csv_col = _find_track_csv_column(df_sample, cell_type)
+    if track_csv_col is not None:
+        track_csv_value = df_sample[track_csv_col].values[0]
+        if pd.notna(track_csv_value) and str(track_csv_value).strip():
+            track_csv_path = Path(str(track_csv_value).strip()).expanduser()
+            if track_csv_path.exists():
+                return track_csv_path
+
+    sample_dir = Path(output_dir) / "trackdata" / str(sample_name) / str(cell_type)
+    candidates = [
+        sample_dir / f"{sample_name}_{cell_type}_tracks.csv",
+        sample_dir / f"{sample_name}_{cell_type}_track.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    fallback = sorted(list(sample_dir.glob("*_tracks.csv")) + list(sample_dir.glob("*_track.csv")))
+    if fallback:
+        return fallback[0]
+
+    return None
+
+
+def _get_excluded_backprojection_columns(
+    df_tracks_clustered,
+    metadata_columns=None,
+    tracked_csv_path=None,
+):
+    excluded = set()
+    if metadata_columns is not None:
+        excluded.update(str(col) for col in metadata_columns)
+
+    excluded.update(col for col in STRUCTURAL_FEATURE_COLUMNS if col in df_tracks_clustered.columns)
+
+    if tracked_csv_path is not None:
+        excluded.update(_read_csv_header(tracked_csv_path))
+    else:
+        excluded.update(col for col in TRACKED_CSV_FALLBACK_COLUMNS if col in df_tracks_clustered.columns)
+
+    return excluded
+
+
+def _select_backprojection_columns(
+    df_tracks_clustered,
+    columns,
+    metadata_columns=None,
+    tracked_csv_path=None,
+    extra_excluded=None,
+):
+    excluded = _get_excluded_backprojection_columns(
+        df_tracks_clustered=df_tracks_clustered,
+        metadata_columns=metadata_columns,
+        tracked_csv_path=tracked_csv_path,
+    )
+    if extra_excluded is not None:
+        excluded.update(extra_excluded)
+
+    if columns == []:
+        return [col for col in df_tracks_clustered.columns if col not in excluded]
+
+    filtered = []
+    skipped = []
+    missing = []
+    for col in columns:
+        if col not in df_tracks_clustered.columns:
+            missing.append(col)
+            continue
+        if col in excluded:
+            skipped.append(col)
+            continue
+        filtered.append(col)
+
+    if missing:
+        print(f"  Skipping missing columns: {missing}")
+    if skipped:
+        print(f"  Skipping excluded non-feature columns: {skipped}")
+    return filtered
+
+
+def _infer_backprojection_dtype(series, background_value=0):
+    non_null = pd.Series(series).dropna()
+    if non_null.empty:
+        return np.float32
+
+    if pd.api.types.is_bool_dtype(non_null):
+        return np.uint8
+
+    if pd.api.types.is_integer_dtype(non_null):
+        min_val = int(min(int(background_value), int(non_null.min())))
+        max_val = int(max(int(background_value), int(non_null.max())))
+        if min_val >= 0 and max_val <= int(np.iinfo(np.uint16).max):
+            return np.uint16
+        if min_val >= int(np.iinfo(np.int16).min) and max_val <= int(np.iinfo(np.int16).max):
+            return np.int16
+        if min_val >= 0 and max_val <= int(np.iinfo(np.uint32).max):
+            return np.uint32
+        return np.int32
+
+    return np.float32
+
+
+def _prepare_feature_series(df, column):
+    if column not in df.columns:
+        raise ValueError(f"Column '{column}' not found in feature dataframe.")
+
+    series = df[column]
+    if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
+        return series
+
+    coerced = pd.to_numeric(series, errors="coerce")
+    if coerced.notna().sum() == series.notna().sum():
+        return coerced
+
+    raise ValueError(
+        f"Column '{column}' is not numeric. Encode categorical values before backprojection."
+    )
+
+
+def _build_summary_lookup(lookup_df, track_col, value_col, background_value=0):
+    values = _prepare_feature_series(lookup_df, value_col)
+    work = lookup_df[[track_col]].copy()
+    work["_value"] = values
+    work[track_col] = pd.to_numeric(work[track_col], errors="coerce")
+    work = work.dropna(subset=[track_col, "_value"]).copy()
+
+    out_dtype = _infer_backprojection_dtype(work["_value"], background_value=background_value)
+    if work.empty:
+        return {
+            "dtype": np.dtype(out_dtype),
+            "frame_lookup": {},
+        }
+
+    work[track_col] = work[track_col].astype(np.int64)
+    work = work.drop_duplicates(subset=[track_col], keep="last")
+    work = work.sort_values(track_col)
+    ids = work[track_col].to_numpy(dtype=np.int64, copy=False)
+    vals = work["_value"].astype(out_dtype, copy=False).to_numpy(copy=False)
+
+    return {
+        "dtype": np.dtype(out_dtype),
+        "frame_lookup": {
+            -1: {
+                "ids": ids,
+                "values": vals,
+                "max_label": int(ids.max()) if ids.size > 0 else 0,
+            }
+        },
+    }
+
+
+def _build_timepoint_lookup(lookup_df, track_col, time_col, value_col, background_value=0):
+    values = _prepare_feature_series(lookup_df, value_col)
+    work = lookup_df[[track_col, time_col]].copy()
+    work["_value"] = values
+    work[track_col] = pd.to_numeric(work[track_col], errors="coerce")
+    work[time_col] = pd.to_numeric(work[time_col], errors="coerce")
+    work = work.dropna(subset=[track_col, time_col, "_value"]).copy()
+
+    out_dtype = _infer_backprojection_dtype(work["_value"], background_value=background_value)
+    if work.empty:
+        return {
+            "dtype": np.dtype(out_dtype),
+            "frame_lookup": {},
+        }
+
+    work[track_col] = work[track_col].astype(np.int64)
+    work[time_col] = work[time_col].astype(np.int64)
+    work = work.sort_values([time_col, track_col]).drop_duplicates(
+        subset=[time_col, track_col],
+        keep="last",
+    )
+
+    per_time_lookup = {}
+    for time_id, group in work.groupby(time_col, observed=False):
+        ids = group[track_col].to_numpy(dtype=np.int64, copy=False)
+        vals = group["_value"].astype(out_dtype, copy=False).to_numpy(copy=False)
+        order = np.argsort(ids, kind="mergesort")
+        per_time_lookup[int(time_id)] = {
+            "ids": ids[order],
+            "values": vals[order],
+            "max_label": int(ids.max()) if ids.size > 0 else 0,
+        }
+
+    return {
+        "dtype": np.dtype(out_dtype),
+        "frame_lookup": per_time_lookup,
+    }
+
+
+def _should_use_dense_lut(max_label, ids, out_dtype):
+    max_label = int(max_label)
+    if max_label < 0:
+        return False
+
+    approx_bytes = (max_label + 1) * np.dtype(out_dtype).itemsize
+    if approx_bytes > 256 * 1024 * 1024:
+        return False
+
+    n_ids = int(len(ids))
+    if n_ids <= 0:
+        return True
+
+    return max_label <= max(16384, n_ids * 64)
+
+
+def _map_labels_frame_sparse(labels_t, ids, values, out_dtype, background_value=0):
+    labels_t = np.asarray(labels_t, dtype=np.int64)
+    unique_labels, inverse = np.unique(labels_t, return_inverse=True)
+    mapped_unique = np.full(unique_labels.shape, background_value, dtype=out_dtype)
+    if ids.size > 0 and unique_labels.size > 0:
+        positive_index = np.flatnonzero(unique_labels > 0)
+        positive_labels = unique_labels[positive_index]
+        if positive_labels.size > 0:
+            positions = np.searchsorted(ids, positive_labels)
+            valid = (positions < ids.size) & (ids[positions] == positive_labels)
+            if np.any(valid):
+                mapped_unique[positive_index[valid]] = values[positions[valid]]
+    return mapped_unique[inverse].reshape(labels_t.shape)
+
+
+def _map_labels_frame(labels_t, ids, values, out_dtype, background_value=0, max_label=None):
+    labels_t = np.asarray(labels_t, dtype=np.int64)
+    ids = np.asarray(ids, dtype=np.int64)
+    values = np.asarray(values, dtype=out_dtype)
+
+    if max_label is None:
+        max_label = int(ids.max()) if ids.size > 0 else 0
+
+    if _should_use_dense_lut(max_label=max_label, ids=ids, out_dtype=out_dtype):
+        lut = np.full(int(max_label) + 1, background_value, dtype=out_dtype)
+        positive_ids = ids[(ids >= 0) & (ids <= int(max_label))]
+        if positive_ids.size > 0:
+            lut[positive_ids] = values[(ids >= 0) & (ids <= int(max_label))]
+
+        mapped = np.full(labels_t.shape, background_value, dtype=out_dtype)
+        valid = (labels_t >= 0) & (labels_t <= int(max_label))
+        if np.any(valid):
+            mapped[valid] = lut[labels_t[valid]]
+        return mapped
+
+    return _map_labels_frame_sparse(
+        labels_t=labels_t,
+        ids=ids,
+        values=values,
+        out_dtype=out_dtype,
+        background_value=background_value,
+    )
+
+
+def _resolve_frame_lookup(frame_lookup, time_index, mode):
+    if mode == "summary":
+        return frame_lookup.get(-1, None)
+    return frame_lookup.get(int(time_index), None)
+
+
+def _read_tracked_frame(tracked_source, time_index):
+    if isinstance(tracked_source, (str, Path)):
+        tracked_img = load_image(tracked_source)
+        return np.asarray(tracked_img[int(time_index)])
+    return np.asarray(tracked_source[int(time_index)])
+
+
+def _process_backprojection_frame(
+    *,
+    tracked_source,
+    time_index,
+    frame_lookup,
+    mode,
+    out_dtype,
+    background_value,
+    verbose=False,
+):
+    labels_t = _read_tracked_frame(tracked_source=tracked_source, time_index=time_index)
+    lookup = _resolve_frame_lookup(frame_lookup=frame_lookup, time_index=time_index, mode=mode)
+    if lookup is None:
+        return np.full(labels_t.shape, background_value, dtype=out_dtype)
+    mapped = _map_labels_frame(
+        labels_t=labels_t,
+        ids=np.asarray(lookup["ids"], dtype=np.int64),
+        values=np.asarray(lookup["values"], dtype=out_dtype),
+        out_dtype=out_dtype,
+        background_value=background_value,
+        max_label=lookup.get("max_label", None),
+    )
+    if bool(verbose) and int(time_index) < 2:
+        non_background = int(np.count_nonzero(mapped != background_value))
+        print(
+            f"    frame={int(time_index)} rows={int(len(lookup['ids']))} "
+            f"non_background_voxels={non_background}"
+        )
+    return mapped
+
+
+def _write_backprojection_frame_worker(
+    *,
+    tracked_img_path,
+    outpath,
+    group,
+    time_index,
+    lookup_ids,
+    lookup_values,
+    max_label,
+    out_dtype_str,
+    background_value,
+):
+    out_dtype = np.dtype(out_dtype_str)
+    labels_t = _read_tracked_frame(tracked_source=tracked_img_path, time_index=time_index)
+    if lookup_ids is None or lookup_values is None:
+        mapped_t = np.full(labels_t.shape, background_value, dtype=out_dtype)
+    else:
+        mapped_t = _map_labels_frame(
+            labels_t=labels_t,
+            ids=np.asarray(lookup_ids, dtype=np.int64),
+            values=np.asarray(lookup_values, dtype=out_dtype),
+            out_dtype=out_dtype,
+            background_value=background_value,
+            max_label=max_label,
+        )
+    write_zarr_parallel(
+        outpath=outpath,
+        group=group,
+        index=int(time_index),
+        data=mapped_t,
+    )
+    return int(time_index)
+
+
+def _compute_and_store_feature_backprojection(
+    *,
+    track_img,
+    tracked_img_path,
+    zarr_outpath,
+    group,
+    lookup_payload,
+    mode,
+    background_value,
+    n_workers=1,
+    prefer_parallel=True,
+    verbose=False,
+):
+    out_dtype = np.dtype(lookup_payload["dtype"])
+    frame_lookup = lookup_payload["frame_lookup"]
+    output_shape = tuple(int(v) for v in track_img.shape)
+    frame_shape = output_shape[1:]
+
+    write_zarr_parallel(
+        outpath=zarr_outpath,
+        group=group,
+        shape=output_shape,
+        dtype=out_dtype,
+        chunks=frame_shape,
+        overwrite=True,
+    )
+
+    n_timepoints = int(output_shape[0])
+    can_parallel = (
+        bool(prefer_parallel)
+        and int(n_workers) > 1
+        and tracked_img_path is not None
+        and Path(zarr_outpath).suffix == ".zarr"
+    )
+    if bool(prefer_parallel) and int(n_workers) > 1 and Path(zarr_outpath).suffix != ".zarr":
+        print("  Parallel backprojection only supports directory-backed .zarr outputs; falling back to sequential.")
+
+    exec_mode = "parallel" if can_parallel else "sequential"
+    print(
+        f"    frames={n_timepoints} workers={int(n_workers)} mode={mode} execution={exec_mode}"
+    )
+
+    frame_desc = tqdm(
+        range(n_timepoints),
+        total=n_timepoints,
+        desc="Frames",
+        position=1,
+        leave=False,
+    )
+    if can_parallel:
+        frame_desc.close()
+        try:
+            with ProcessPoolExecutor(max_workers=int(n_workers)) as ex:
+                futures = []
+                for t in range(n_timepoints):
+                    lookup = _resolve_frame_lookup(frame_lookup=frame_lookup, time_index=t, mode=mode)
+                    futures.append(
+                        ex.submit(
+                            _write_backprojection_frame_worker,
+                            tracked_img_path=str(tracked_img_path),
+                            outpath=str(zarr_outpath),
+                            group=str(group),
+                            time_index=t,
+                            lookup_ids=None if lookup is None else lookup["ids"],
+                            lookup_values=None if lookup is None else lookup["values"],
+                            max_label=None if lookup is None else lookup.get("max_label", None),
+                            out_dtype_str=out_dtype.str,
+                            background_value=background_value,
+                        )
+                    )
+                progress = tqdm(total=n_timepoints, desc="Frames", position=1, leave=False)
+                try:
+                    for fut in as_completed(futures):
+                        fut.result()
+                        progress.update(1)
+                finally:
+                    progress.close()
+            return load_image(zarr_outpath, group=group)
+        except (PermissionError, OSError) as exc:
+            print(f"  Parallel backprojection unavailable ({exc}); falling back to sequential.")
+            can_parallel = False
+            frame_desc = tqdm(
+                range(n_timepoints),
+                total=n_timepoints,
+                desc="Frames",
+                position=1,
+                leave=False,
+            )
+
+    try:
+        for t in frame_desc:
+            mapped_t = _process_backprojection_frame(
+                tracked_source=track_img,
+                time_index=t,
+                frame_lookup=frame_lookup,
+                    mode=mode,
+                    out_dtype=out_dtype,
+                    background_value=background_value,
+                    verbose=verbose,
+                )
+            write_zarr_parallel(
+                outpath=zarr_outpath,
+                group=group,
+                index=t,
+                data=mapped_t,
+            )
+    finally:
+        frame_desc.close()
+
+    return load_image(zarr_outpath, group=group)
 
 
 def _load_active_killing_data(
@@ -170,7 +664,8 @@ def backproject_mean_features_behav3d(
     output_dir=None,
     cell_type="tcell",
     columns=[],
-    save=False
+    save=False,
+    overwrite=False,
     ):
     """
     Backproject mean (summarized) features onto tracked segments.
@@ -275,10 +770,16 @@ def backproject_mean_features_behav3d(
     # Load dead mask if available
     trackid_data = _load_dead_mask(trackid_data, df_sample, img_outdir, sample_name, raw_img)
     
+    tracked_csv_path = _resolve_tracked_csv_path(df_sample, output_dir, sample_name, cell_type)
+
     # Select columns to backproject
-    if columns == []:
-        columns = [x for x in df_tracks_clustered.columns 
-                   if x not in metadata.columns.tolist() + ["TrackID", "UMAP1", "UMAP2"]]
+    columns = _select_backprojection_columns(
+        df_tracks_clustered=df_tracks_clustered,
+        columns=columns,
+        metadata_columns=metadata.columns,
+        tracked_csv_path=tracked_csv_path,
+        extra_excluded={"UMAP1", "UMAP2"},
+    )
     
     # Always ensure ClusterID is included
     if "ClusterID" not in columns and "ClusterID" in df_tracks_clustered.columns:
@@ -292,7 +793,10 @@ def backproject_mean_features_behav3d(
         track_img=filt_track_img,
         df_tracks_clustered=df_tracks_clustered,
         zarr_outpath=backproj_out_path,
-        columns=columns
+        columns=columns,
+        mode="summary",
+        tracked_img_path=track_img_path,
+        overwrite=overwrite,
     )
     
     label_columns = ["ClusterID"]
@@ -338,7 +842,8 @@ def backproject_time_features_behav3d(
     output_dir=None,
     cell_type="tcell",
     columns=[],
-    save=False
+    save=False,
+    overwrite=False,
     ):
     """
     Backproject time-varying features onto tracked segments.
@@ -448,10 +953,16 @@ def backproject_time_features_behav3d(
     # Load dead mask if available
     trackid_data = _load_dead_mask(trackid_data, df_sample, img_outdir, sample_name, raw_img)
     
+    tracked_csv_path = _resolve_tracked_csv_path(df_sample, output_dir, sample_name, cell_type)
+
     # Select columns to backproject
-    if columns == []:
-        columns = [x for x in df_tracks_clustered.columns 
-                   if x not in metadata.columns.tolist() + ["TrackID", "UMAP1", "UMAP2"]]
+    columns = _select_backprojection_columns(
+        df_tracks_clustered=df_tracks_clustered,
+        columns=columns,
+        metadata_columns=metadata.columns,
+        tracked_csv_path=tracked_csv_path,
+        extra_excluded={"UMAP1", "UMAP2"},
+    )
     
     # Always ensure ClusterID is included
     if "ClusterID" not in columns and "ClusterID" in df_tracks_clustered.columns:
@@ -465,7 +976,10 @@ def backproject_time_features_behav3d(
         track_img=filt_track_img,
         df_tracks_clustered=df_tracks_clustered,
         zarr_outpath=backproj_out_path,
-        columns=columns
+        columns=columns,
+        mode="timepoint",
+        tracked_img_path=track_img_path,
+        overwrite=overwrite,
     )
     
     label_columns = ["ClusterID"]
@@ -597,74 +1111,132 @@ def backproject_columns(
     track_img,
     zarr_outpath,
     df_tracks_clustered,
-    columns=["ClusterID", "mean_speed"]
+    columns=["ClusterID", "mean_speed"],
+    mode="summary",
+    track_col="TrackID",
+    time_col="position_t",
+    background_value=0,
+    n_workers=1,
+    prefer_parallel=True,
+    tracked_img_path=None,
+    verbose=False,
+    overwrite=False,
     ):
     """
     Map column values onto track image pixels.
     Each pixel value (TrackID) is replaced with the corresponding column value.
+
+    Parameters
+    ----------
+    mode : {"summary", "timepoint"}
+        "summary" maps one value per TrackID across all timepoints.
+        "timepoint" maps values using both TrackID and position_t.
+    overwrite : bool
+        If True, recompute requested feature groups even when they already exist
+        in the backprojection zarr store.
     """
-    import zarr
-    
-    zarr_outpath = Path(zarr_outpath)
-    if Path(f"{zarr_outpath}.zip").exists():
+    mode = _normalize_backprojection_mode(mode)
+    zarr_outpath = None if zarr_outpath is None else Path(zarr_outpath)
+    if zarr_outpath is not None and Path(f"{zarr_outpath}.zip").exists():
         zarr_outpath = Path(f"{zarr_outpath}.zip")
-        
+
     mapped_imgs = {col: {"img": None, "type": "image"} for col in columns}
-    
-    if zarr_outpath is not None:
-        if zarr_outpath.exists():
-            # Check which columns already exist in zarr
-            try:
-                zarr_store = zarr.open(str(zarr_outpath), mode='r')
-                existing_groups = list(zarr_store.keys()) if hasattr(zarr_store, 'keys') else []
-            except Exception:
-                existing_groups = []
-            
-            cols_to_load = [c for c in columns if c in existing_groups]
-            cols_to_compute = [c for c in columns if c not in existing_groups]
-            
-            if cols_to_load:
-                print(f"  Loading {len(cols_to_load)} features from existing .zarr")
-                for col in cols_to_load:
-                    mapped_imgs[col]["img"] = load_image(zarr_outpath, group=col)
-            
-            if cols_to_compute:
-                print(f"  Computing {len(cols_to_compute)} new features")
-                zarr_path_for_save = zarr_outpath.stem if zarr_outpath.suffix == ".zip" else zarr_outpath
-                for col in tqdm(cols_to_compute, total=len(cols_to_compute)):
-                    mapped_img = np.asarray(track_img.copy())
-                    col_dict = dict(zip(df_tracks_clustered['TrackID'], df_tracks_clustered[col]))
-                    mask = np.isin(mapped_img, list(col_dict.keys()))
-                    mapped_img[~mask] = 0
-                    col_values = np.array([col_dict.get(k, 0) for k in mapped_img[mask]])
-                    col_values = np.nan_to_num(col_values, nan=0.0)
-                    mapped_img[mask] = col_values
-                    mapped_imgs[col]["img"] = mapped_img
-                    save_as_zarr(
-                        img=mapped_img,
-                        path=zarr_path_for_save,
-                        chunks=(1,) + mapped_img.shape[1:],
-                        group=col
-                    )
-        else:
+
+    existing_groups = []
+    if zarr_outpath is not None and zarr_outpath.exists() and not overwrite:
+        import zarr
+        try:
             if zarr_outpath.suffix == ".zip":
-                zarr_outpath = zarr_outpath.stem
-            for col in tqdm(columns, total=len(columns)):
-                mapped_img = np.asarray(track_img.copy())
-                col_dict = dict(zip(df_tracks_clustered['TrackID'], df_tracks_clustered[col]))
-                mask = np.isin(mapped_img, list(col_dict.keys()))
-                mapped_img[~mask] = 0
-                col_values = np.array([col_dict.get(k, 0) for k in mapped_img[mask]])
-                col_values = np.nan_to_num(col_values, nan=0.0)
-                mapped_img[mask] = col_values
-                mapped_imgs[col]["img"] = mapped_img
-                save_as_zarr(
-                    img=mapped_img,
-                    path=zarr_outpath,
-                    chunks=(1,) + mapped_img.shape[1:],
-                    group=col
+                store = zarr.storage.ZipStore(zarr_outpath, mode="r")
+                try:
+                    zarr_store = zarr.open_group(store=store, mode="r")
+                    existing_groups = list(zarr_store.keys()) if hasattr(zarr_store, "keys") else []
+                finally:
+                    store.close()
+            else:
+                zarr_store = zarr.open_group(str(zarr_outpath), mode="r")
+                existing_groups = list(zarr_store.keys()) if hasattr(zarr_store, "keys") else []
+        except Exception:
+            existing_groups = []
+
+    cols_to_load = [c for c in columns if c in existing_groups] if not overwrite else []
+    cols_to_compute = [c for c in columns if overwrite or c not in existing_groups]
+
+    if cols_to_load:
+        print(f"  Loading {len(cols_to_load)} backprojection layer(s) from existing .zarr")
+        for col in cols_to_load:
+            mapped_imgs[col]["img"] = load_image(zarr_outpath, group=col)
+
+    if cols_to_compute:
+        print(f"  Computing backprojection layers from existing CSV values ({mode})")
+        for col in cols_to_compute:
+            print(f"  Computing feature: {col} ({mode})")
+            if mode == "summary":
+                lookup_payload = _build_summary_lookup(
+                    lookup_df=df_tracks_clustered[[track_col, col]].copy(),
+                    track_col=track_col,
+                    value_col=col,
+                    background_value=background_value,
                 )
-        return mapped_imgs
+            else:
+                required_cols = [track_col, time_col, col]
+                missing_cols = [c for c in required_cols if c not in df_tracks_clustered.columns]
+                if missing_cols:
+                    raise ValueError(
+                        f"Timepoint backprojection for '{col}' requires columns {required_cols}, "
+                        f"missing {missing_cols}."
+                    )
+                if bool(verbose):
+                    non_null_rows = df_tracks_clustered[required_cols].dropna(subset=[track_col, time_col, col])
+                    if not non_null_rows.empty:
+                        print(
+                            f"  feature={col} timepoints={int(non_null_rows[time_col].min())}.."
+                            f"{int(non_null_rows[time_col].max())} "
+                            f"tracks={int(non_null_rows[track_col].nunique())}"
+                        )
+                lookup_payload = _build_timepoint_lookup(
+                    lookup_df=df_tracks_clustered[required_cols].copy(),
+                    track_col=track_col,
+                    time_col=time_col,
+                    value_col=col,
+                    background_value=background_value,
+                )
+            if zarr_outpath is None:
+                output_shape = tuple(int(v) for v in np.asarray(track_img).shape)
+                mapped_img = np.full(output_shape, background_value, dtype=lookup_payload["dtype"])
+                frame_progress = tqdm(range(output_shape[0]), total=output_shape[0], desc="Frames", leave=False)
+                try:
+                    for t in frame_progress:
+                        mapped_img[t] = _process_backprojection_frame(
+                            tracked_source=track_img,
+                            time_index=t,
+                            frame_lookup=lookup_payload["frame_lookup"],
+                            mode=mode,
+                            out_dtype=np.dtype(lookup_payload["dtype"]),
+                            background_value=background_value,
+                            verbose=verbose,
+                        )
+                finally:
+                    frame_progress.close()
+                mapped_imgs[col]["img"] = mapped_img
+            else:
+                zarr_path_for_save = zarr_outpath.stem if zarr_outpath.suffix == ".zip" else zarr_outpath
+                if bool(prefer_parallel) and int(n_workers) > 1 and zarr_outpath.suffix == ".zip":
+                    print("  Parallel backprojection only supports directory-backed .zarr outputs; falling back to sequential.")
+                mapped_imgs[col]["img"] = _compute_and_store_feature_backprojection(
+                    track_img=track_img,
+                    tracked_img_path=tracked_img_path,
+                    zarr_outpath=zarr_path_for_save,
+                    group=col,
+                    lookup_payload=lookup_payload,
+                    mode=mode,
+                    background_value=background_value,
+                    n_workers=n_workers,
+                    prefer_parallel=bool(prefer_parallel) and zarr_outpath.suffix != ".zip",
+                    verbose=verbose,
+                )
+
+    return mapped_imgs
 
 
 def view_napari(
@@ -672,7 +1244,9 @@ def view_napari(
     df_tracks_full,
     df_tracks_clustered,
     cell_type,
-    elsize
+    elsize,
+    split_raw_channels=False,
+    run=True,
     ):
     """
     Visualize backprojection in napari.
@@ -688,17 +1262,75 @@ def view_napari(
     # Collect targeted IDs if available
     targeted_ids_per_tp = backproject_data.get("Targeted_IDs", {})
     
+    raw_layer_names = []
+    label_reference = None
+    if "TrackID" in backproject_data:
+        label_reference = backproject_data["TrackID"].get("img")
+    elif "ClusterID" in backproject_data:
+        label_reference = backproject_data["ClusterID"].get("img")
+
+    expected_timepoints = None
+    if "position_t" in df_tracks_full.columns and len(df_tracks_full) > 0:
+        time_values = pd.to_numeric(df_tracks_full["position_t"], errors="coerce")
+        if time_values.notna().any():
+            expected_timepoints = int(time_values.max()) + 1
+
+    def _raw_to_tczyx(raw_img):
+        if getattr(raw_img, "ndim", 0) != 5:
+            return raw_img
+
+        label_shape = tuple(int(v) for v in getattr(label_reference, "shape", ()) or ())
+        raw_shape = tuple(int(v) for v in raw_img.shape)
+        if len(label_shape) == 4:
+            label_time = label_shape[0]
+            label_spatial = label_shape[1:]
+            if raw_shape[2:] == label_spatial:
+                if raw_shape[0] == label_time:
+                    return raw_img
+                if raw_shape[1] == label_time:
+                    return np.transpose(raw_img, (1, 0, 2, 3, 4))
+
+        if expected_timepoints is not None:
+            if raw_shape[0] == expected_timepoints:
+                return raw_img
+            if raw_shape[1] == expected_timepoints:
+                return np.transpose(raw_img, (1, 0, 2, 3, 4))
+
+        if raw_shape[0] <= 16 and raw_shape[1] > raw_shape[0]:
+            return np.transpose(raw_img, (1, 0, 2, 3, 4))
+        return raw_img
+
     # Add all image/label layers
-    for k, v in backproject_data.items():
+    layer_items = []
+    if "raw_data" in backproject_data:
+        layer_items.append(("raw_data", backproject_data["raw_data"]))
+    layer_items.extend((k, v) for k, v in backproject_data.items() if k != "raw_data")
+    for k, v in layer_items:
         if k == "Targeted_IDs": continue
         try:
             # Handle transposition if not already correct
-            if v["img"].ndim == 5 and v["img"].shape[0] != df_tracks_full["position_t"].max() + 1:
+            if k == "raw_data":
+                v["img"] = _raw_to_tczyx(v["img"])
+            elif v["img"].ndim == 5 and v["img"].shape[0] != df_tracks_full["position_t"].max() + 1:
                 try:
                     v["img"] = np.transpose(v["img"], (1, 0, 2, 3, 4))
                 except Exception: pass
 
-            if k == "Active_Killing":
+            if k == "raw_data" and bool(split_raw_channels) and getattr(v["img"], "ndim", 0) == 5 and int(v["img"].shape[1]) >= 1:
+                channel_count = int(v["img"].shape[1])
+                layers = viewer.add_image(
+                    v["img"],
+                    name=[f"raw_ch{idx + 1}" for idx in range(channel_count)],
+                    channel_axis=1,
+                    scale=elsize,
+                    opacity=0.5,
+                )
+                for idx, layer in enumerate(layers):
+                    layer.visible = (idx == 0)
+                    layer.opacity = 0.5
+                    raw_layer_names.append(layer.name)
+
+            elif k == "Active_Killing":
                 layer = viewer.add_labels(v["img"], name="Killing T-cells", scale=elsize, opacity=0.8)
                 layer.contour = 2
                 layer.visible = True
@@ -740,27 +1372,15 @@ def view_napari(
         print(f"  Skipping {cell_type} tracks layer: {e}")
     
     # Add raw data
-    if 'raw_data' in backproject_data:
+    if raw_layer_names:
+        for layer_name in raw_layer_names:
+            if layer_name in viewer.layers:
+                viewer.layers[layer_name].visible = (layer_name == raw_layer_names[0])
+                viewer.layers[layer_name].opacity = 0.5
+    elif 'raw_data' in backproject_data:
         viewer.layers['raw_data'].visible = True
         viewer.layers['raw_data'].opacity = 0.5
 
-    napari.run()
+    if bool(run):
+        napari.run()
     return viewer
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Backproject features onto tracked segments.')
-    parser.add_argument('-c', '--config', type=str, help='path to a config.yml file', required=False)
-    parser.add_argument('--cell_type', type=str, default='tcell', help='cell type to backproject')
-    parser.add_argument('--mode', type=str, default='mean', choices=['mean', 'time'], help='backprojection mode')
-    args = parser.parse_args()
-    
-    with open(args.config, "r") as parameters:
-        config = yaml.load(parameters, Loader=yaml.SafeLoader)
-    
-    metadata = pd.read_csv(config["metadata_csv_path"])
-    
-    if args.mode == 'mean':
-        backproject_mean_features_behav3d(config=config, cell_type=args.cell_type)
-    else:
-        backproject_time_features_behav3d(config=config, cell_type=args.cell_type)

@@ -790,7 +790,7 @@ def _plan_multicolor_segment_correction(metadata, output_dir, cell_types, overwr
 
 
 def _resolve_raw_image_path(metadata, output_dir, sample_name):
-    from behav3d.analysis.clustering.state.visualization.backprojection import (
+    from behav3d.analysis.behavior.state.visualization.backprojection import (
         _resolve_raw_image_path as _shared_resolve_raw_image_path,
     )
 
@@ -1092,7 +1092,7 @@ def main(
     metadata = pd.read_csv(metadata)
     cell_types = ["tcell1", "tcell2", "tcell3"]
     output_dir = "/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/NatureBriefComm/LowDensity_MultiColor"
-    min_size=200
+    min_size=150
     apply_multicolor_segment_correction(
         metadata=metadata,
         cell_types=cell_types,

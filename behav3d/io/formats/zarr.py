@@ -80,6 +80,7 @@ def write_zarr_parallel(
     index=None,
     data=None,
     *,
+    group=None,
     shape=None,
     dtype=None,
     chunks=None,
@@ -119,31 +120,58 @@ def write_zarr_parallel(
 
     dtype_obj = np.dtype(dtype) if dtype is not None else None
 
-    if shape is not None and dtype_obj is not None and (not outpath.exists() or overwrite):
-        if outpath.exists():
-            if outpath.is_dir():
-                shutil.rmtree(outpath)
-            else:
-                outpath.unlink()
-        arr = zarr.open(
-            str(outpath),
-            mode="w",
-            shape=shape,
-            chunks=_normalize_chunks(shape, chunks),
-            dtype=dtype_obj,
-        )
-        if attrs:
-            arr.attrs.update(attrs)
+    normalized_chunks = None if shape is None else _normalize_chunks(shape, chunks)
+
+    if group is not None:
+        root = zarr.open_group(str(outpath), mode="a")
+        if shape is not None and dtype_obj is not None and (overwrite or group not in root):
+            if group in root:
+                del root[group]
+            arr = root.create_dataset(
+                str(group),
+                shape=shape,
+                chunks=normalized_chunks,
+                dtype=dtype_obj,
+                overwrite=True,
+            )
+            if attrs:
+                arr.attrs.update(attrs)
+        else:
+            if group not in root:
+                raise ValueError(f"Zarr group '{group}' must be initialized before fixed-index writes")
+            arr = root[str(group)]
+            if shape is not None and tuple(arr.shape) != shape:
+                raise ValueError(f"Existing zarr shape {tuple(arr.shape)} does not match requested shape {shape}")
+            if dtype_obj is not None and np.dtype(arr.dtype) != dtype_obj:
+                raise ValueError(f"Existing zarr dtype {arr.dtype} does not match requested dtype {dtype_obj}")
+            if attrs:
+                arr.attrs.update(attrs)
     else:
-        if not outpath.exists():
-            raise ValueError("Zarr array must be initialized before fixed-index writes")
-        arr = zarr.open(str(outpath), mode="r+")
-        if shape is not None and tuple(arr.shape) != shape:
-            raise ValueError(f"Existing zarr shape {tuple(arr.shape)} does not match requested shape {shape}")
-        if dtype_obj is not None and np.dtype(arr.dtype) != dtype_obj:
-            raise ValueError(f"Existing zarr dtype {arr.dtype} does not match requested dtype {dtype_obj}")
-        if attrs:
-            arr.attrs.update(attrs)
+        if shape is not None and dtype_obj is not None and (not outpath.exists() or overwrite):
+            if outpath.exists():
+                if outpath.is_dir():
+                    shutil.rmtree(outpath)
+                else:
+                    outpath.unlink()
+            arr = zarr.open(
+                str(outpath),
+                mode="w",
+                shape=shape,
+                chunks=normalized_chunks,
+                dtype=dtype_obj,
+            )
+            if attrs:
+                arr.attrs.update(attrs)
+        else:
+            if not outpath.exists():
+                raise ValueError("Zarr array must be initialized before fixed-index writes")
+            arr = zarr.open(str(outpath), mode="r+")
+            if shape is not None and tuple(arr.shape) != shape:
+                raise ValueError(f"Existing zarr shape {tuple(arr.shape)} does not match requested shape {shape}")
+            if dtype_obj is not None and np.dtype(arr.dtype) != dtype_obj:
+                raise ValueError(f"Existing zarr dtype {arr.dtype} does not match requested dtype {dtype_obj}")
+            if attrs:
+                arr.attrs.update(attrs)
 
     if index is None:
         return arr

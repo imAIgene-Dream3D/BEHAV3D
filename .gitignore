@@ -7,9 +7,10 @@
 *.tiff
 test.py
 build/
+docs/build/
 **/.DS_Store
 **/.egg-info
 *.egg-info
 .ipynb_checkpoints/
-napari/behav3d_env.json
+napari/.config/behav3d_env.json
 assistant_log.md

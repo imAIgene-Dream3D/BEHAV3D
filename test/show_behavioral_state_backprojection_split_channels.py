@@ -10,7 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import napari
 
-from behav3d.analysis.clustering.state.visualization.backprojection import (
+from behav3d.analysis.behavior.state.visualization.backprojection import (
     _add_mapping_dock_widget,
     _align_labels_to_raw_shape_for_view,
     _build_state_mapping_text,

@@ -4,6 +4,7 @@ import numpy as np
 from skimage.measure import label
 from scipy import ndimage
 from .multicolor_segment_processing import (
+    apply_multicolor_segment_correction,
     calculate_multicolor_overlap,
     process_multicolor_segments,
     visualize_multicolor_overlap,

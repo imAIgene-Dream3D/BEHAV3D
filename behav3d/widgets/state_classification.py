@@ -1,24 +1,38 @@
+import shutil
 import traceback
-from copy import deepcopy
-import math
 from pathlib import Path
-from time import perf_counter
 
 import ipywidgets as widgets
+import numpy as np
 import pandas as pd
 import scanpy as sc
 import yaml
 
-from behav3d.analysis.clustering.general import relabel_cluster_ids
-from behav3d.analysis.clustering.state.classification import (
-    apply_state_classifiers_to_full_dataset,
-    build_identity_cluster_mapping,
-    load_state_classifier_artifact,
-    rename_intrinsic_behavioral_clusters,
-    run_state_clustering,
-    train_state_classifiers,
+from behav3d.analysis.backprojection import backproject_columns, view_napari
+from behav3d.analysis.behavior.general import relabel_cluster_ids
+from behav3d.analysis.behavior.state.classification import (
+    BINARY_GROUP_COL,
+    FULL_STATE_COL,
+    HMM_INTRINSIC_RAW_STATE_COL,
+    INTRINSIC_STATE_COL,
+    apply_hmm_deployment_artifact_to_full_dataset,
+    load_hmm_deployment_artifact,
+    save_hmm_deployment_artifact,
+    save_hmm_quality_control_outputs,
+    _resolve_hmm_deployment_artifact_path,
+    run_hmm_state_clustering,
 )
-from behav3d.analysis.clustering.state.visualization.backprojection import (
+from behav3d.analysis.behavior.state.utils import (
+    _coerce_hex_color,
+    _get_classification_state_colors,
+    _mixed_label_sort_key,
+    _normalize_label_color_map,
+    _rebuild_full_behavioral_cluster_from_intrinsic,
+    _resolve_state_paths,
+    _set_classification_state_colors,
+)
+
+from behav3d.analysis.behavior.state.visualization.backprojection import (
     show_behavioral_state_backprojection,
 )
 from behav3d.core.metadata import (
@@ -28,162 +42,713 @@ from behav3d.core.metadata import (
     detect_merged_cell_types_from_metadata,
     filter_multicolor_inputs,
 )
-from behav3d.core.utils import expand_column_patterns
-from behav3d.widgets.utils import PathPicker, behav3d_calculated_features, spinning_loader
+
+from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
+    save_state_composition_report,
+)
+from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
+    save_state_transition_report,
+)
+from behav3d.deprecated.state_classification_clustering import (
+    apply_state_classifiers_to_full_dataset,
+    build_identity_cluster_mapping,
+    load_state_classifier_artifact,
+)
+from behav3d.deprecated.widgets.state_classification import (
+    StateClassificationPanel as _LegacyStateClassificationPanel,
+    _winfo,
+)
+from behav3d.analysis.behavior.state.visualization.backprojection import (
+    _add_mapping_dock_widget,
+    _apply_state_code_colors_to_layer,
+    _behavioral_state_backprojection_path,
+    _build_code_map,
+    _build_state_code_color_map,
+    _build_state_mapping_text,
+    _write_state_color_attrs_to_zarr,
+    _resolve_raw_image_path,
+    _resolve_tracked_image_path,
+)
+from behav3d.io.images import load_image
+from behav3d.widgets.utils import spinning_loader
 
 
-def _winfo(prefix, message):
-    print(f"[{prefix}] INFO {message}")
+def _intrinsic_hmm_backprojection_path(output_dir, sample_name, cell_type):
+    return Path(
+        output_dir,
+        "analysis",
+        str(cell_type),
+        "behavioral_states",
+        "backprojection",
+        f"{sample_name}_{cell_type}_{INTRINSIC_STATE_COL}.zarr",
+    )
 
 
-class StateClassificationPanel:
-    """
-    Compact state-classification panel for notebook usage.
+def _remove_path_if_exists(path):
+    path = Path(path)
+    if not path.exists():
+        return False
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    return True
 
-    Workflow (accordion sections):
-    1) Apply
-    2) Clustering
-    3) Rename primary dynamic state clusters
-    4) Rename clusters assigned to binary groups
-    5) Train
-    """
+
+def _clear_behavioral_state_backprojection_cache(output_dir, sample_name, cell_type, verbose=True):
+    state_path = _behavioral_state_backprojection_path(
+        output_dir=output_dir,
+        sample_name=sample_name,
+        cell_type=cell_type,
+    )
+    removed = []
+    for candidate in (state_path, Path(f"{state_path}.zip")):
+        if _remove_path_if_exists(candidate):
+            removed.append(candidate)
+    if verbose and len(removed) > 0:
+        print(
+            "Removed existing behavioral-state backprojection cache: "
+            + ", ".join(str(path) for path in removed)
+        )
+    return removed
+
+
+def _clear_intrinsic_hmm_backprojection_cache(output_dir, sample_name, cell_type, verbose=True):
+    state_path = _intrinsic_hmm_backprojection_path(
+        output_dir=output_dir,
+        sample_name=sample_name,
+        cell_type=cell_type,
+    )
+    removed = []
+    for candidate in (state_path, Path(f"{state_path}.zip")):
+        if _remove_path_if_exists(candidate):
+            removed.append(candidate)
+    if verbose and len(removed) > 0:
+        print(
+            "Removed existing intrinsic HMM backprojection cache: "
+            + ", ".join(str(path) for path in removed)
+        )
+    return removed
+
+def _filter_track_image_to_ids(track_img, track_ids):
+    track_ids = np.asarray(list(track_ids), dtype=np.int64)
+    if hasattr(track_img, "chunks"):
+        import dask.array as da
+
+        return da.where(da.isin(track_img, track_ids), track_img, 0)
+    return np.where(np.isin(track_img, track_ids), track_img, 0)
+
+
+def _sample_voxel_size(metadata, sample_name):
+    if not isinstance(metadata, pd.DataFrame) or "sample_name" not in metadata.columns:
+        return [1.0, 1.0, 1.0]
+    sample_rows = metadata[metadata["sample_name"].astype(str) == str(sample_name)]
+    if len(sample_rows) == 0:
+        return [1.0, 1.0, 1.0]
+    row = sample_rows.iloc[0]
+    try:
+        return [
+            float(row.get("pixel_distance_z", 1.0)),
+            float(row.get("pixel_distance_xy", 1.0)),
+            float(row.get("pixel_distance_xy", 1.0)),
+        ]
+    except Exception:
+        return [1.0, 1.0, 1.0]
+
+
+def _report_intrinsic_hmm_backprojection_overlap(
+    *,
+    sample_name,
+    sample_obs,
+    df_tracks_full,
+    verbose=True,
+):
+    key_cols = ["TrackID", "position_t"]
+    sample_obs = sample_obs.copy()
+    df_tracks_full = df_tracks_full.copy()
+
+    hmm_rows = int(len(sample_obs))
+    hmm_tracks = int(sample_obs["TrackID"].dropna().nunique()) if "TrackID" in sample_obs.columns else 0
+    track_rows = int(len(df_tracks_full))
+    track_lookup_full = df_tracks_full[key_cols].copy()
+    track_rows_unique = (
+        df_tracks_full.drop_duplicates(subset=key_cols)
+        if all(col in df_tracks_full.columns for col in key_cols)
+        else df_tracks_full.copy()
+    )
+    track_tracks = int(df_tracks_full["TrackID"].dropna().nunique()) if "TrackID" in df_tracks_full.columns else 0
+
+    state_lookup = sample_obs[key_cols + [INTRINSIC_STATE_COL]].copy()
+    state_lookup_unique = state_lookup.drop_duplicates(subset=key_cols).copy()
+    track_lookup = track_rows_unique[key_cols].copy()
+
+    overlap = track_lookup_full.merge(
+        state_lookup_unique[key_cols],
+        on=key_cols,
+        how="inner",
+        validate="many_to_one",
+    )
+    track_vs_hmm = track_lookup_full.merge(
+        state_lookup_unique[key_cols],
+        on=key_cols,
+        how="left",
+        indicator=True,
+        validate="many_to_one",
+    )
+    hmm_vs_track = state_lookup_unique[key_cols].merge(
+        track_lookup,
+        on=key_cols,
+        how="left",
+        indicator=True,
+        validate="one_to_one",
+    )
+
+    stats = {
+        "sample_name": str(sample_name),
+        "hmm_rows": hmm_rows,
+        "hmm_tracks": hmm_tracks,
+        "track_feature_rows": track_rows,
+        "track_feature_tracks": track_tracks,
+        "overlap_rows": int(len(overlap)),
+        "overlap_tracks": int(overlap["TrackID"].dropna().nunique()) if "TrackID" in overlap.columns else 0,
+        "hmm_rows_without_track_match": int((hmm_vs_track["_merge"] == "left_only").sum()),
+        "track_rows_without_hmm_match": int((track_vs_hmm["_merge"] == "left_only").sum()),
+        "preprocessing": {},
+    }
+
+    if verbose:
+        print(
+            "Intrinsic HMM backprojection diagnostics | "
+            f"sample='{sample_name}' | "
+            f"hmm_rows={stats['hmm_rows']} | hmm_tracks={stats['hmm_tracks']} | "
+            f"track_feature_rows={stats['track_feature_rows']} | track_feature_tracks={stats['track_feature_tracks']} | "
+            f"overlap_rows={stats['overlap_rows']} | overlap_tracks={stats['overlap_tracks']} | "
+            f"hmm_rows_without_track_match={stats['hmm_rows_without_track_match']} | "
+            f"track_rows_without_hmm_match={stats['track_rows_without_hmm_match']}"
+        )
+    return stats
+
+
+def _show_intrinsic_hmm_backprojection(
+    *,
+    adata,
+    sample_name,
+    output_dir,
+    cell_type,
+    track_features_csv_path,
+    metadata=None,
+    n_workers=4,
+    run=True,
+    verbose=True,
+):
+    if adata is None or not hasattr(adata, "obs"):
+        raise ValueError("model_adata with intrinsic HMM states is required for intrinsic backprojection.")
+    if INTRINSIC_STATE_COL not in adata.obs.columns:
+        raise ValueError(f"model_adata is missing '{INTRINSIC_STATE_COL}'.")
+
+    sample_name = str(sample_name).strip()
+    cell_type = str(cell_type).strip()
+    output_dir = Path(output_dir)
+
+    sample_obs = adata.obs[adata.obs["sample_name"].astype(str) == sample_name].copy()
+    if len(sample_obs) == 0:
+        raise ValueError(f"No rows found for sample '{sample_name}' in model_adata.")
+
+    raw_path = _resolve_raw_image_path(output_dir=output_dir, sample_name=sample_name, verbose=verbose)
+    if raw_path is None or not Path(raw_path).exists():
+        raise FileNotFoundError(f"Could not find raw image for sample '{sample_name}'.")
+
+    tracked_path = _resolve_tracked_image_path(
+        output_dir=output_dir,
+        sample_name=sample_name,
+        cell_type=cell_type,
+        verbose=verbose,
+    )
+    if tracked_path is None or not Path(tracked_path).exists():
+        raise FileNotFoundError(
+            f"Could not find tracked image for sample '{sample_name}' and cell_type '{cell_type}'."
+        )
+
+    state_path = _intrinsic_hmm_backprojection_path(
+        output_dir=output_dir,
+        sample_name=sample_name,
+        cell_type=cell_type,
+    )
+    code_map = _build_code_map(adata.obs, state_col=INTRINSIC_STATE_COL)
+    if track_features_csv_path is None or not Path(track_features_csv_path).exists():
+        raise FileNotFoundError("Track-features CSV is required for intrinsic HMM backprojection.")
+
+    df_tracks_full = pd.read_csv(track_features_csv_path, low_memory=False)
+    df_tracks_full = df_tracks_full[df_tracks_full["sample_name"].astype(str) == sample_name].copy()
+    if len(df_tracks_full) == 0:
+        raise ValueError(f"No track-feature rows found for sample '{sample_name}'.")
+
+    required_pos_cols = ["TrackID", "position_t", "position_z", "position_y", "position_x"]
+    missing_pos_cols = [c for c in required_pos_cols if c not in df_tracks_full.columns]
+    if missing_pos_cols:
+        raise ValueError(
+            "Track-features CSV is missing required position columns for backprojection: "
+            f"{missing_pos_cols}"
+        )
+
+    preprocessing_meta = getattr(adata, "uns", {}).get("preprocessing", {})
+    diag_stats = _report_intrinsic_hmm_backprojection_overlap(
+        sample_name=sample_name,
+        sample_obs=sample_obs,
+        df_tracks_full=df_tracks_full,
+        verbose=verbose,
+    )
+    if isinstance(preprocessing_meta, dict):
+        diag_stats["preprocessing"] = {
+            "n_timepoints_input": preprocessing_meta.get("n_timepoints_input"),
+            "n_timepoints_kept": preprocessing_meta.get("n_timepoints_kept"),
+            "n_timepoints_dropped_nan": preprocessing_meta.get("n_timepoints_dropped_nan"),
+            "n_tracks_with_dropped_timepoints": preprocessing_meta.get("n_tracks_with_dropped_timepoints"),
+            "dropped_track_preview": preprocessing_meta.get("dropped_track_preview", []),
+            "dropped_track_preview_omitted": preprocessing_meta.get("dropped_track_preview_omitted", 0),
+        }
+        if verbose and any(v is not None for v in diag_stats["preprocessing"].values()):
+            print(
+                "HMM preprocessing counts | "
+                f"n_timepoints_input={diag_stats['preprocessing'].get('n_timepoints_input')} | "
+                f"n_timepoints_kept={diag_stats['preprocessing'].get('n_timepoints_kept')} | "
+                f"n_timepoints_dropped_nan={diag_stats['preprocessing'].get('n_timepoints_dropped_nan')}"
+            )
+        if verbose and int(preprocessing_meta.get("n_timepoints_dropped_nan", 0) or 0) > 0:
+            dropped_rows = int(preprocessing_meta.get("n_timepoints_dropped_nan", 0) or 0)
+            input_rows = int(preprocessing_meta.get("n_timepoints_input", 0) or 0)
+            dropped_tracks = int(preprocessing_meta.get("n_tracks_with_dropped_timepoints", 0) or 0)
+            preview = list(preprocessing_meta.get("dropped_track_preview", []) or [])
+            preview_text = ", ".join(str(v) for v in preview) if len(preview) > 0 else "none"
+            omitted = int(preprocessing_meta.get("dropped_track_preview_omitted", 0) or 0)
+            if omitted > 0:
+                preview_text = f"{preview_text} (+{omitted} more)"
+            print(
+                f"Warning: {dropped_rows}/{input_rows} rows were removed during HMM apply before "
+                "state assignment because required HMM observation features became NaN after "
+                "smoothing, optional window-feature construction, or numeric coercion."
+            )
+            print(f"Affected tracks: {dropped_tracks}. Preview: {preview_text}")
+            print(
+                "This can lead to missing segments in TrackID/ClusterID volumes even when "
+                "track lines still appear."
+            )
+    if verbose and diag_stats["overlap_rows"] < min(diag_stats["hmm_rows"], diag_stats["track_feature_rows"]):
+        print(
+            "Warning: track-features CSV and HMM-labeled rows do not overlap on exact "
+            "(TrackID, position_t) pairs."
+        )
+
+    state_lookup = sample_obs[["TrackID", "position_t", INTRINSIC_STATE_COL]].copy()
+    state_lookup["ClusterID"] = (
+        state_lookup[INTRINSIC_STATE_COL]
+        .astype(str)
+        .map({str(label): int(code) for label, code in code_map.items()})
+    )
+    state_lookup = state_lookup.drop(columns=[INTRINSIC_STATE_COL])
+
+    df_tracks_clustered = df_tracks_full.merge(
+        state_lookup,
+        on=["TrackID", "position_t"],
+        how="inner",
+        validate="many_to_one",
+    )
+    if len(df_tracks_clustered) == 0:
+        raise ValueError(
+            "No overlapping rows found between track features and HMM states for sample "
+            f"'{sample_name}'. "
+            f"hmm_rows={diag_stats['hmm_rows']}, "
+            f"hmm_tracks={diag_stats['hmm_tracks']}, "
+            f"track_feature_rows={diag_stats['track_feature_rows']}, "
+            f"track_feature_tracks={diag_stats['track_feature_tracks']}, "
+            f"overlap_rows={diag_stats['overlap_rows']}, "
+            f"overlap_tracks={diag_stats['overlap_tracks']}."
+        )
+
+    raw_img = load_image(raw_path)
+    tracked_img = load_image(tracked_path)
+    filtered_track_img = _filter_track_image_to_ids(
+        tracked_img,
+        df_tracks_clustered["TrackID"].dropna().unique(),
+    )
+    backprojected = backproject_columns(
+        track_img=filtered_track_img,
+        zarr_outpath=state_path,
+        df_tracks_clustered=df_tracks_clustered,
+        columns=["ClusterID"],
+        mode="timepoint",
+        track_col="TrackID",
+        time_col="position_t",
+        background_value=0,
+        n_workers=max(1, int(n_workers)),
+        prefer_parallel=True,
+        tracked_img_path=tracked_path,
+        verbose=verbose,
+        overwrite=True,
+    )
+    backprojected["ClusterID"]["type"] = "label"
+    state_colors = _normalize_label_color_map(
+        code_map.keys(),
+        colors=_get_classification_state_colors(adata, INTRINSIC_STATE_COL),
+    )
+    _write_state_color_attrs_to_zarr(state_path, code_map, state_colors=state_colors)
+
+    backproject_data = {
+        "raw_data": {"img": raw_img, "type": "image"},
+        "TrackID": {"img": filtered_track_img, "type": "label"},
+        "ClusterID": backprojected["ClusterID"],
+    }
+    viewer = view_napari(
+        backproject_data=backproject_data,
+        df_tracks_full=df_tracks_full,
+        df_tracks_clustered=df_tracks_clustered,
+        cell_type=cell_type,
+        elsize=_sample_voxel_size(metadata, sample_name),
+        split_raw_channels=True,
+        run=False,
+    )
+    code_colors = _build_state_code_color_map(code_map, state_colors=state_colors)
+    try:
+        _apply_state_code_colors_to_layer(viewer.layers["ClusterID"], code_colors)
+    except Exception:
+        pass
+
+    label_map = {str(code): str(label) for label, code in code_map.items()}
+    mapping_text = _build_state_mapping_text(label_map, code_colors=code_colors)
+    added_dock = _add_mapping_dock_widget(
+        viewer=viewer,
+        mapping_text=mapping_text,
+        label_map=label_map,
+        code_colors=code_colors,
+        title="Intrinsic HMM State Mapping",
+    )
+    if (not added_dock) and verbose:
+        print(mapping_text)
+
+    if verbose:
+        print(
+            "Opened intrinsic HMM backprojection for sample "
+            f"'{sample_name}' with raw='{Path(raw_path).name}' shape={tuple(int(v) for v in raw_img.shape)}, "
+            f"tracked='{Path(tracked_path).name}' shape={tuple(int(v) for v in filtered_track_img.shape)}, "
+            f"states='{Path(state_path).name}'."
+        )
+
+    if bool(run):
+        import napari
+
+        napari.run()
+    return viewer
+
+
+def _show_hmm_state_backprojection(
+    *,
+    adata,
+    sample_name,
+    output_dir,
+    cell_type,
+    state_col,
+    track_features_csv_path,
+    metadata=None,
+    state_colors=None,
+    n_workers=4,
+    run=True,
+    verbose=True,
+):
+    if adata is None or not hasattr(adata, "obs"):
+        raise ValueError("model_adata with HMM states is required for backprojection.")
+    if state_col not in adata.obs.columns:
+        raise ValueError(f"model_adata is missing '{state_col}'.")
+
+    sample_name = str(sample_name).strip()
+    cell_type = str(cell_type).strip()
+    output_dir = Path(output_dir)
+
+    sample_obs = adata.obs[adata.obs["sample_name"].astype(str) == sample_name].copy()
+    if len(sample_obs) == 0:
+        raise ValueError(f"No rows found for sample '{sample_name}' in model_adata.")
+
+    raw_path = _resolve_raw_image_path(output_dir=output_dir, sample_name=sample_name, verbose=verbose)
+    if raw_path is None or not Path(raw_path).exists():
+        raise FileNotFoundError(f"Could not find raw image for sample '{sample_name}'.")
+
+    tracked_path = _resolve_tracked_image_path(
+        output_dir=output_dir,
+        sample_name=sample_name,
+        cell_type=cell_type,
+        verbose=verbose,
+    )
+    if tracked_path is None or not Path(tracked_path).exists():
+        raise FileNotFoundError(
+            f"Could not find tracked image for sample '{sample_name}' and cell_type '{cell_type}'."
+        )
+
+    state_path = _behavioral_state_backprojection_path(
+        output_dir=output_dir,
+        sample_name=sample_name,
+        cell_type=cell_type,
+    )
+    code_map = _build_code_map(adata.obs, state_col=state_col)
+    if track_features_csv_path is None or not Path(track_features_csv_path).exists():
+        raise FileNotFoundError("Track-features CSV is required for HMM backprojection.")
+
+    df_tracks_full = pd.read_csv(track_features_csv_path, low_memory=False)
+    df_tracks_full = df_tracks_full[df_tracks_full["sample_name"].astype(str) == sample_name].copy()
+    if len(df_tracks_full) == 0:
+        raise ValueError(f"No track-feature rows found for sample '{sample_name}'.")
+
+    required_pos_cols = ["TrackID", "position_t", "position_z", "position_y", "position_x"]
+    missing_pos_cols = [c for c in required_pos_cols if c not in df_tracks_full.columns]
+    if missing_pos_cols:
+        raise ValueError(
+            "Track-features CSV is missing required position columns for backprojection: "
+            f"{missing_pos_cols}"
+        )
+
+    state_lookup = sample_obs[["TrackID", "position_t", state_col]].copy()
+    state_lookup["ClusterID"] = (
+        state_lookup[state_col]
+        .astype(str)
+        .map({str(label): int(code) for label, code in code_map.items()})
+    )
+    state_lookup = state_lookup.drop(columns=[state_col])
+
+    df_tracks_clustered = df_tracks_full.merge(
+        state_lookup,
+        on=["TrackID", "position_t"],
+        how="inner",
+        validate="many_to_one",
+    )
+    if len(df_tracks_clustered) == 0:
+        raise ValueError(
+            "No overlapping rows found between track features and HMM states for sample "
+            f"'{sample_name}'."
+        )
+
+    raw_img = load_image(raw_path)
+    tracked_img = load_image(tracked_path)
+    filtered_track_img = _filter_track_image_to_ids(
+        tracked_img,
+        df_tracks_clustered["TrackID"].dropna().unique(),
+    )
+    backprojected = backproject_columns(
+        track_img=filtered_track_img,
+        zarr_outpath=state_path,
+        df_tracks_clustered=df_tracks_clustered,
+        columns=["ClusterID"],
+        mode="timepoint",
+        track_col="TrackID",
+        time_col="position_t",
+        background_value=0,
+        n_workers=max(1, int(n_workers)),
+        prefer_parallel=True,
+        tracked_img_path=tracked_path,
+        verbose=verbose,
+        overwrite=True,
+    )
+    backprojected["ClusterID"]["type"] = "label"
+    _write_state_color_attrs_to_zarr(state_path, code_map, state_colors=state_colors)
+
+    backproject_data = {
+        "raw_data": {"img": raw_img, "type": "image"},
+        "TrackID": {"img": filtered_track_img, "type": "label"},
+        "ClusterID": backprojected["ClusterID"],
+    }
+    viewer = view_napari(
+        backproject_data=backproject_data,
+        df_tracks_full=df_tracks_full,
+        df_tracks_clustered=df_tracks_clustered,
+        cell_type=cell_type,
+        elsize=_sample_voxel_size(metadata, sample_name),
+        split_raw_channels=True,
+        run=False,
+    )
+    code_colors = _build_state_code_color_map(code_map, state_colors=state_colors)
+    try:
+        _apply_state_code_colors_to_layer(viewer.layers["ClusterID"], code_colors)
+    except Exception:
+        pass
+
+    label_map = {str(code): str(label) for label, code in code_map.items()}
+    mapping_text = _build_state_mapping_text(label_map, code_colors=code_colors)
+    added_dock = _add_mapping_dock_widget(
+        viewer=viewer,
+        mapping_text=mapping_text,
+        label_map=label_map,
+        code_colors=code_colors,
+        title="Behavioral State Mapping",
+    )
+    if (not added_dock) and verbose:
+        print(mapping_text)
+
+    if verbose:
+        print(
+            "Opened HMM behavioral-state backprojection for sample "
+            f"'{sample_name}' with raw='{Path(raw_path).name}' shape={tuple(int(v) for v in raw_img.shape)}, "
+            f"tracked='{Path(tracked_path).name}' shape={tuple(int(v) for v in filtered_track_img.shape)}, "
+            f"states='{Path(state_path).name}'."
+        )
+
+    if bool(run):
+        import napari
+
+        napari.run()
+    return viewer
+
+
+def _update_hmm_report_metadata(
+    adata,
+    *,
+    composition_pdf=None,
+    composition_auc_csv=None,
+    composition_plot_csvs=None,
+    composition_error=None,
+    transition_dir=None,
+    transition_counts_csv=None,
+    transition_probs_csv=None,
+    transition_error=None,
+    pending_reason=None,
+):
+    if adata is None:
+        return
+    clustering_meta = adata.uns.get("clustering", {})
+    if not isinstance(clustering_meta, dict):
+        clustering_meta = {}
+    clustering_meta["state_composition_report_pdf"] = composition_pdf
+    clustering_meta["state_composition_report_auc_csv"] = composition_auc_csv
+    clustering_meta["state_composition_report_plot_csvs"] = list(composition_plot_csvs or [])
+    clustering_meta["state_composition_report_error"] = composition_error
+    clustering_meta["state_transition_report_dir"] = transition_dir
+    clustering_meta["state_transition_matrix_counts_csv"] = transition_counts_csv
+    clustering_meta["state_transition_matrix_probs_csv"] = transition_probs_csv
+    clustering_meta["state_transition_report_error"] = transition_error
+    clustering_meta["state_reports_ready"] = bool(
+        (composition_pdf is not None or transition_dir is not None)
+        and (composition_error is None)
+        and (transition_error is None)
+    )
+    clustering_meta["state_reports_reason"] = (
+        None
+        if bool(clustering_meta["state_reports_ready"])
+        else (
+            str(pending_reason).strip()
+            if pending_reason is not None and len(str(pending_reason).strip()) > 0
+            else "State reports have not been created yet. Use 'Create analysis plots' in the HMM widget."
+        )
+    )
+    adata.uns["clustering"] = clustering_meta
+
+
+class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
+    """Widget for HMM state discovery, relabeling, deployment, and backprojection."""
 
     def __init__(self, metadata_loader, cell_type=None):
-        self.metadata_loader = metadata_loader
-        self.output_dir = str(Path(getattr(metadata_loader, "output_dir", "")).expanduser())
-        self.model_adata = None
-        self.adata_full = None
-        self._available_columns = []
-        self._feature_groups = {}
-        self._group_rows = {}
-        self._intrinsic_name_boxes = {}
-        self._full_name_boxes = {}
-        self._full_select_boxes = {}
-        self._binary_detection_cache = None
-
-        self._descriptive_feature_options = (
-            "mean",
-            "median",
-            "std",
-            "net_displacement",
-            "straightness",
-            "mean_square_displacement",
-        )
-
-        self._cell_types = self._detect_cell_types()
-        if len(self._cell_types) == 0:
-            self._cell_types = ["tcell"]
-        initial_cell_type = (
-            str(cell_type)
-            if cell_type is not None
-            else (self._cell_types[0] if len(self._cell_types) > 0 else "tcell")
-        )
-        if initial_cell_type not in self._cell_types:
-            self._cell_types.append(initial_cell_type)
-
-        self.cell_type_dd = widgets.Dropdown(
-            description="Cell type",
-            options=sorted(set(self._cell_types)),
-            value=initial_cell_type,
-            layout=widgets.Layout(width="260px"),
-            style={"description_width": "90px"},
-        )
-        self.refresh_btn = widgets.Button(
-            description="Refresh",
-            icon="refresh",
-            layout=widgets.Layout(width="110px"),
-        )
-        self.refresh_spinner = widgets.HTML(value=spinning_loader)
-        self.refresh_spinner.layout.display = "none"
-        self.status_html = widgets.HTML("")
-        self.output_dir_html = widgets.HTML("")
-
-        self._build_apply_section()
-        self._build_clustering_section()
-        self._build_intrinsic_rename_section()
-        self._build_full_rename_section()
-        self._build_backprojection_section()
-        self._build_train_section()
-
+        self._hmm_model_load_status = {"status": "not_checked", "path": None, "message": None}
+        self._full_color_pickers = {}
+        self._build_analysis_plots_section()
+        super().__init__(metadata_loader=metadata_loader, cell_type=cell_type)
+        if not hasattr(self, "_hmm_deployment_artifact"):
+            self._hmm_deployment_artifact = None
         self._build_steps()
-
-        self.ui = widgets.VBox(
-            [
-                widgets.HTML('<div style="font-size:20px;font-weight:700;">State Classification</div>'),
-                widgets.HBox(
-                    [self.cell_type_dd, self.refresh_btn, self.refresh_spinner],
-                    layout=widgets.Layout(align_items="center", gap="8px"),
-                ),
-                self.output_dir_html,
-                self.status_html,
-                self.steps,
-            ]
+        children = list(self.ui.children)
+        if len(children) > 0:
+            children[-1] = self.steps
+            self.ui.children = tuple(children)
+        self.hmm_n_states_mode.observe(self._on_hmm_n_states_mode_changed, names="value")
+        self.apply_hmm_artifact_picker.text.observe(self._on_apply_path_changed, names="value")
+        self._sync_hmm_state_controls()
+        self._load_existing_hmm_deployment_artifact_if_available()
+        self.apply_existing_state_classification = widgets.Checkbox(
+            description="Apply existing behavioral state classification",
+            value=False,
+            indent=False,
         )
+        self.apply_existing_state_classification.observe(
+            self._on_apply_existing_changed, names="value"
+        )
+        self.output_dir_html.layout.display = "none"
+        children = list(self.ui.children)
+        if len(children) > 0:
+            children[0] = widgets.HTML(
+                '<div style="font-size:20px;font-weight:700;">Behavioral state classification</div>'
+            )
+            children.insert(2, self.apply_existing_state_classification)
+            self.ui.children = tuple(children)
 
-        self.cell_type_dd.observe(self._on_cell_type_changed, names="value")
-        self.refresh_btn.on_click(self._on_refresh_clicked)
-        self.apply_full_pkl_picker.text.observe(self._on_apply_path_changed, names="value")
-        self.apply_intrinsic_pkl_picker.text.observe(self._on_apply_path_changed, names="value")
-        self._refresh_context()
+    def _panel_cfg(self):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if not isinstance(params, dict):
+            return {}
+        section = params.setdefault("behavioral_state_classification", {})
+        cell_type = self._current_cell_type()
+        if cell_type not in section:
+            section[cell_type] = {}
+        return section[cell_type]
+
+    def _effective_panel_cfg(self):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if not isinstance(params, dict):
+            return {}
+        section = params.get("behavioral_state_classification", {})
+        defaults = section.get("defaults", {})
+        cell_cfg = section.get(self._current_cell_type(), {})
+        return {**defaults, **cell_cfg}
+
 
     def _build_steps(self):
-        step_defs = [
-            ("Primary dynamic state clustering (based on continuous features)", self.clustering_section),
-            ("Rename primary dynamic state clusters", self.rename_intrinsic_section),
-            ("Rename clusters assigned to binary groups", self.rename_full_section),
-            ("Train classification", self.train_section),
-            ("Apply classification", self.apply_section),
-            ("Backprojection", self.backprojection_section),
-        ]
-        self._step_accordions = []
-        for title, section in step_defs:
-            acc = widgets.Accordion(children=[section], selected_index=None)
-            acc.set_title(0, title)
-            self._step_accordions.append(acc)
-        self.steps = widgets.VBox(self._step_accordions)
-
-    def _collapse_all_steps(self):
-        for acc in self._step_accordions:
-            acc.selected_index = None
-
-    def _open_step(self, index):
-        if index is None:
-            return
-        if index < 0 or index >= len(self._step_accordions):
-            return
-        self._step_accordions[index].selected_index = 0
+        analysis_plots_section = getattr(self, "analysis_plots_section", widgets.VBox([]))
+        self._rename_full_with_description = widgets.VBox(
+            [
+                widgets.HTML(
+                    "<span style='color:#555;'>Rename HMM intrinsic clusters combined with binary group "
+                    "values (e.g. organoid_contact)</span>"
+                ),
+                self.rename_full_section,
+            ],
+            layout=widgets.Layout(gap="6px"),
+        )
+        self.steps = widgets.Accordion(
+            children=[
+                self.clustering_section,
+                self.rename_intrinsic_section,
+                self._rename_full_with_description,
+                analysis_plots_section,
+                self.backprojection_section,
+            ],
+            selected_index=None,
+        )
+        self.steps.set_title(0, "Assign HMM intrinsic behavioral states")
+        self.steps.set_title(1, "Rename intrinsic states")
+        self.steps.set_title(2, "Rename full states")
+        self.steps.set_title(3, "Create plots")
+        self.steps.set_title(4, "Backprojection")
 
     def _build_apply_section(self):
-        self.apply_full_pkl_picker = PathPicker(
-            mode="file",
-            start_dir=self.output_dir or ".",
-            default="",
-            description="Full PKL",
-            placeholder="Path to full classification .pkl (required)",
-            width="100%",
-        )
-        self.apply_intrinsic_pkl_picker = PathPicker(
-            mode="file",
-            start_dir=self.output_dir or ".",
-            default="",
-            description="Intrinsic PKL",
-            placeholder="Path to intrinsic classification .pkl (optional)",
-            width="100%",
-        )
-        self.apply_full_pkl_picker.filter_pattern = "*.pkl"
-        self.apply_intrinsic_pkl_picker.filter_pattern = "*.pkl"
-        self.apply_default_paths_html = widgets.HTML("")
-        self.btn_apply = widgets.Button(
-            description="Apply classification",
+        super()._build_apply_section()
+        self.apply_hmm_artifact_picker = self._make_hmm_artifact_picker()
+        self.apply_hmm_artifact_picker.filter_pattern = "*.pkl"
+        self.apply_hmm_default_paths_html = widgets.HTML("")
+        self.btn_apply_hmm_artifact = widgets.Button(
+            description="Apply saved HMM artifact",
             button_style="success",
-            layout=widgets.Layout(width="170px"),
+            layout=widgets.Layout(width="220px"),
         )
-        self.btn_apply.on_click(self._on_apply_clicked)
-        self.apply_spinner = widgets.HTML(value=spinning_loader)
-        self.apply_spinner.layout.display = "none"
-        self.out_apply = widgets.Output()
+        self.btn_apply_hmm_artifact.on_click(self._on_apply_hmm_artifact_clicked)
+        self.apply_hmm_spinner = widgets.HTML(value=spinning_loader)
+        self.apply_hmm_spinner.layout.display = "none"
+        self.out_apply_hmm = widgets.Output()
+        self.hmm_artifact_section = widgets.VBox(
+            [
+                widgets.HTML("<hr style='margin:10px 0;'>"),
+                widgets.HTML("<b>Apply saved HMM deployment artifact</b>"),
+                self.apply_hmm_artifact_picker,
+                self.apply_hmm_default_paths_html,
+                widgets.HBox([self.btn_apply_hmm_artifact, self.apply_hmm_spinner]),
+                self.out_apply_hmm,
+            ]
+        )
         self.apply_section = widgets.VBox(
             [
+                widgets.HTML("<b>Apply saved classifier artifacts</b>"),
                 self.apply_full_pkl_picker,
                 self.apply_intrinsic_pkl_picker,
                 self.apply_default_paths_html,
@@ -191,6 +756,131 @@ class StateClassificationPanel:
                 self.out_apply,
             ]
         )
+
+    def _make_hmm_artifact_picker(self):
+        from behav3d.widgets.utils import PathPicker
+
+        return PathPicker(
+            mode="file",
+            start_dir=self.output_dir or ".",
+            default="",
+            description="HMM PKL",
+            placeholder="Path to saved HMM deployment artifact .pkl",
+            width="100%",
+        )
+
+    def _model_adata_path(self, cell_type=None):
+        ct = self._current_cell_type() if cell_type is None else str(cell_type)
+        return _resolve_state_paths(self.output_dir, ct).full_output_adata_path
+
+    def _default_hmm_deployment_artifact_path(self, cell_type=None):
+        ct = self._current_cell_type() if cell_type is None else str(cell_type)
+        return _resolve_hmm_deployment_artifact_path(output_dir=self.output_dir, cell_type=ct)
+
+    def _load_existing_hmm_deployment_artifact_if_available(self):
+        self._hmm_deployment_artifact = None
+        candidates = []
+        picker_value = str(getattr(self, "apply_hmm_artifact_picker", widgets.Text(value="")).value).strip()
+        if picker_value != "":
+            candidates.append(Path(picker_value))
+        candidates.append(self._default_hmm_deployment_artifact_path())
+        seen = set()
+        for candidate in candidates:
+            candidate = Path(candidate)
+            candidate_key = str(candidate)
+            if candidate_key in seen or not candidate.exists():
+                continue
+            seen.add(candidate_key)
+            try:
+                self._hmm_deployment_artifact = load_hmm_deployment_artifact(candidate)
+                return
+            except Exception:
+                self._hmm_deployment_artifact = None
+
+    def _is_hmm_model_adata(self, adata):
+        if adata is None or not hasattr(adata, "uns"):
+            return False
+        clustering_meta = adata.uns.get("clustering", {})
+        preprocessing_meta = adata.uns.get("preprocessing", {})
+        classification_meta = adata.uns.get("classification", {})
+        return (
+            (isinstance(clustering_meta, dict) and str(clustering_meta.get("clustering_method", "")).lower() == "hmm")
+            or (
+                isinstance(preprocessing_meta, dict)
+                and str(preprocessing_meta.get("observation_mode", "")).lower() == "timepoint_hmm"
+            )
+            or (
+                isinstance(classification_meta, dict)
+                and str(classification_meta.get("intrinsic_output_col", "")) == INTRINSIC_STATE_COL
+            )
+        )
+
+    def _labels_look_like_raw_hmm_states(self, labels):
+        values = pd.Series(labels, dtype="string").dropna().astype(str).str.strip()
+        values = values[values != ""]
+        if len(values) == 0:
+            return False
+        return bool(values.map(lambda v: v.isdigit()).all())
+
+    def _normalize_loaded_hmm_model_adata(self):
+        if self.model_adata is None or not hasattr(self.model_adata, "obs"):
+            return {"normalized": False, "reason": "no_model"}
+        if not self._is_hmm_model_adata(self.model_adata):
+            return {"normalized": False, "reason": "not_hmm"}
+
+        obs = self.model_adata.obs
+        changes = []
+        if INTRINSIC_STATE_COL not in obs.columns and "intrinsic_behavioral_cluster" in obs.columns:
+            obs[INTRINSIC_STATE_COL] = pd.Categorical(
+                pd.Series(obs["intrinsic_behavioral_cluster"], index=obs.index, dtype="string")
+            )
+            changes.append(INTRINSIC_STATE_COL)
+        if FULL_STATE_COL not in obs.columns and "full_behavioral_cluster" in obs.columns:
+            obs[FULL_STATE_COL] = pd.Categorical(
+                pd.Series(obs["full_behavioral_cluster"], index=obs.index, dtype="string")
+            )
+            changes.append(FULL_STATE_COL)
+        if (
+            HMM_INTRINSIC_RAW_STATE_COL not in obs.columns
+            and INTRINSIC_STATE_COL in obs.columns
+            and self._labels_look_like_raw_hmm_states(obs[INTRINSIC_STATE_COL])
+        ):
+            obs[HMM_INTRINSIC_RAW_STATE_COL] = pd.Categorical(
+                pd.Series(obs[INTRINSIC_STATE_COL], index=obs.index, dtype="string")
+            )
+            changes.append(HMM_INTRINSIC_RAW_STATE_COL)
+        return {"normalized": len(changes) > 0, "changes": list(changes)}
+
+    def _load_existing_model_if_available(self):
+        self.model_adata = None
+        p = self._model_adata_path()
+        self._hmm_model_load_status = {"status": "missing", "path": str(p), "message": None}
+        if p.exists():
+            try:
+                self.model_adata = sc.read_h5ad(p)
+                normalize_result = self._normalize_loaded_hmm_model_adata()
+                if INTRINSIC_STATE_COL in getattr(self.model_adata, "obs", {}).columns:
+                    self.model_adata = self._merge_metadata_into_obs(self.model_adata)
+                    message = None
+                    if bool(normalize_result.get("normalized", False)):
+                        message = "Normalized older HMM model columns: " + ", ".join(normalize_result["changes"])
+                    self._hmm_model_load_status = {"status": "loaded", "path": str(p), "message": message}
+                elif self._is_hmm_model_adata(self.model_adata):
+                    self._hmm_model_load_status = {
+                        "status": "missing_intrinsic_col",
+                        "path": str(p),
+                        "message": f"Loaded HMM model is missing '{INTRINSIC_STATE_COL}'.",
+                    }
+                else:
+                    self._hmm_model_load_status = {
+                        "status": "not_hmm",
+                        "path": str(p),
+                        "message": "Loaded model adata does not look like an HMM model.",
+                    }
+            except Exception as exc:
+                self.model_adata = None
+                self._hmm_model_load_status = {"status": "failed", "path": str(p), "message": str(exc)}
+        self._load_existing_hmm_deployment_artifact_if_available()
 
     def _build_clustering_section(self):
         self.feature_groups_status = widgets.HTML("<i>No features loaded yet.</i>")
@@ -200,107 +890,170 @@ class StateClassificationPanel:
             rows=10,
             layout=widgets.Layout(width="520px", height="180px"),
         )
+        self.hmm_log_scale_status = widgets.HTML("<i>Select features to choose optional log1p scaling.</i>")
+        self.hmm_log_scale_box = widgets.VBox([])
+        self._hmm_log_scale_checkboxes = {}
         self.binary_group_status = widgets.HTML("<i>No binary columns detected yet.</i>")
         self.binary_group_checks_box = widgets.VBox([])
-
         self._binary_group_checkboxes = {}
 
-        self.window_size = widgets.IntText(
-            description="Trailing window",
+        # Keep hidden compatibility widgets so the parent class can initialize cleanly.
+        self.window_size = widgets.IntText(value=1)
+        self.min_spacing = widgets.Text(value="")
+        self.max_samples = widgets.Text(value="")
+        self.n_neighbors = widgets.IntText(value=30)
+        self.min_dist = widgets.FloatText(value=0.1)
+        self.resolution = widgets.FloatText(value=0.2)
+        self.pca_var_selection = widgets.FloatText(value=0.95)
+        self.use_pca = widgets.Checkbox(value=False, indent=False)
+        self.clustering_method = widgets.Dropdown(options=["hmm"], value="hmm")
+        self.incomplete_window_policy = widgets.Dropdown(options=["timepoint"], value="timepoint")
+        self.reuse_prepared_dataset = widgets.Checkbox(value=False, indent=False)
+        self.describe_window_feature_cbs = {}
+        self.additional_window_feature_cbs = {
+            "net_displacement": widgets.Checkbox(description="net_displacement", value=False, indent=False),
+            "straightness": widgets.Checkbox(description="straightness", value=False, indent=False),
+            "mean_square_displacement": widgets.Checkbox(
+                description="mean_square_displacement",
+                value=False,
+                indent=False,
+            ),
+        }
+        for cb in self.additional_window_feature_cbs.values():
+            cb.observe(self._on_feature_checkbox_changed, names="value")
+        self.hmm_window_features_window = widgets.IntText(
+            description="Window size",
             value=5,
             style={"description_width": "initial"},
-            layout=widgets.Layout(width="220px"),
+            layout=widgets.Layout(width="190px"),
         )
-        self.min_spacing = widgets.Text(
-            description="Min spacing between choses timepoints",
-            value="",
-            style={"description_width": "initial"},
-            layout=widgets.Layout(width="360px"),
-        )
-        self.max_samples = widgets.Text(
-            description="Max samples",
-            value="",
+
+        self.hmm_n_states_mode = widgets.Dropdown(
+            description="State selection",
+            options=[("Fixed", "fixed"), ("Auto (BIC)", "auto")],
+            value="fixed",
             style={"description_width": "initial"},
             layout=widgets.Layout(width="220px"),
         )
-        self.n_neighbors = widgets.IntText(
-            description="Neighbors",
-            value=60,
+        self.hmm_advanced = widgets.Checkbox(
+            description="Advanced",
+            value=False,
+            indent=False,
+        )
+        self.hmm_advanced.observe(self._on_hmm_advanced_changed, names="value")
+        self.hmm_n_states = widgets.IntText(
+            description="n_states",
+            value=4,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="170px"),
+        )
+        self.hmm_k_min = widgets.IntText(
+            description="k_min",
+            value=2,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="150px"),
+        )
+        self.hmm_k_max = widgets.IntText(
+            description="k_max",
+            value=8,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="150px"),
+        )
+        self.hmm_covariance_type = widgets.Dropdown(
+            description="Covariance",
+            options=["full", "diag", "spherical", "tied"],
+            value="full",
             style={"description_width": "initial"},
             layout=widgets.Layout(width="190px"),
         )
-        self.min_dist = widgets.FloatText(
-            description="UMAP min_dist",
-            value=0.1,
+        self.hmm_n_iter = widgets.IntText(
+            description="n_iter",
+            value=200,
             style={"description_width": "initial"},
-            layout=widgets.Layout(width="220px"),
+            layout=widgets.Layout(width="160px"),
         )
-        self.resolution = widgets.FloatText(
-            description="Resolution",
-            value=0.2,
+        self.hmm_tol = widgets.FloatText(
+            description="tol",
+            value=1e-3,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="150px"),
+        )
+        self.hmm_sticky = widgets.Checkbox(
+            description="Sticky HMM",
+            value=False,
+            indent=False,
+        )
+        self.hmm_sticky.observe(self._on_hmm_sticky_changed, names="value")
+        self.hmm_stickiness_kappa = widgets.FloatText(
+            description="kappa",
+            value=8.0,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="150px"),
+        )
+        self.hmm_transmat_alpha = widgets.FloatText(
+            description="alpha",
+            value=1.0,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="150px"),
+        )
+        self.hmm_min_covar = widgets.FloatText(
+            description="min_covar",
+            value=1e-3,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="170px"),
+        )
+        self.hmm_feature_smoothing_window = widgets.IntText(
+            description="Smooth window",
+            value=1,
             style={"description_width": "initial"},
             layout=widgets.Layout(width="190px"),
         )
-        self.pca_var_selection = widgets.FloatText(
-            description="PCA var",
-            value=0.95,
+        self.hmm_smoothing_min_periods = widgets.IntText(
+            description="Min periods",
+            value=1,
             style={"description_width": "initial"},
             layout=widgets.Layout(width="180px"),
         )
-        self.clustering_method = widgets.Dropdown(
-            description="Method",
-            options=["leiden", "kmeans"],
-            value="leiden",
+        self.hmm_start_offset = widgets.BoundedIntText(
+            description="Start offset",
+            value=0,
+            min=0,
+            max=100000,
             style={"description_width": "initial"},
             layout=widgets.Layout(width="190px"),
         )
-        self.lower_quantile_cap = widgets.Text(
-            description="Lower quantile",
+        self.hmm_start_offset_fill_mode = widgets.Dropdown(
+            description="Skipped frames",
+            options=[("Backfill", "backfill"), ("Leave unassigned", "leave_unassigned")],
+            value="backfill",
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="240px"),
+        )
+        self.feature_quantile_capping_low_percentile = widgets.Text(
+            description="Low percentile cap",
             value="",
             style={"description_width": "initial"},
             layout=widgets.Layout(width="220px"),
         )
-        self.upper_quantile_cap = widgets.Text(
-            description="Upper quantile",
+        self.feature_quantile_capping_high_percentile = widgets.Text(
+            description="High percentile cap",
             value="0.99",
             style={"description_width": "initial"},
             layout=widgets.Layout(width="220px"),
         )
-        self.incomplete_window_policy = widgets.Dropdown(
-            description="Partial window policy",
-            options=["partial", "drop"],
-            value="partial",
-            style={"description_width": "initial"},
-            layout=widgets.Layout(width="320px"),
-        )
+        # Aliases so legacy base-class methods (_apply_cfg_defaults, _persist_current_settings)
+        # that still reference the old names continue to work against the same widget objects.
+        self.lower_quantile_cap = self.feature_quantile_capping_low_percentile
+        self.upper_quantile_cap = self.feature_quantile_capping_high_percentile
         self.random_state = widgets.IntText(
             description="Seed",
             value=123,
             style={"description_width": "initial"},
             layout=widgets.Layout(width="150px"),
         )
-        self.reuse_prepared_dataset = widgets.Checkbox(
-            description="Reuse prepared dataset",
-            value=True,
-            indent=False,
-        )
-        self.describe_window_feature_cbs = {
-            "mean": widgets.Checkbox(description="mean", value=True, indent=False),
-            "median": widgets.Checkbox(description="median", value=True, indent=False),
-            "std": widgets.Checkbox(description="std", value=True, indent=False),
-        }
-        self.additional_window_feature_cbs = {
-            "net_displacement": widgets.Checkbox(description="net_displacement", value=True, indent=False),
-            "straightness": widgets.Checkbox(description="straightness", value=True, indent=False),
-            "mean_square_displacement": widgets.Checkbox(
-                description="mean_square_displacement",
-                value=True,
-                indent=False,
-            ),
-        }
 
         self.btn_cluster = widgets.Button(
-            description="Run primary dynamic state clustering",
+            description="Run intrinsic HMM clustering",
             button_style="success",
             layout=widgets.Layout(width="240px"),
         )
@@ -313,110 +1066,147 @@ class StateClassificationPanel:
             [
                 self.feature_groups_status,
                 self.feature_groups_box,
+            ]
+        )
+        window_features_block = widgets.VBox(
+            [
+                widgets.HTML("<b>window features</b>"),
+                self.hmm_window_features_window,
+                widgets.VBox(list(self.additional_window_feature_cbs.values())),
+            ]
+        )
+        feature_selection_children = widgets.Accordion(
+            children=[feature_select_block, window_features_block],
+            selected_index=None,
+        )
+        feature_selection_children.set_title(0, "timepoint features")
+        feature_selection_children.set_title(1, "window features")
+        feature_selection_block = widgets.VBox(
+            [
+                feature_selection_children,
                 widgets.HTML("<b>selected features</b>"),
                 self.selected_features_box,
+            ],
+            layout=widgets.Layout(gap="8px"),
+        )
+        self.hmm_log_scale_accordion = widgets.Accordion(
+            children=[
+                widgets.VBox(
+                    [
+                        self.hmm_log_scale_status,
+                        self.hmm_log_scale_box,
+                    ],
+                    layout=widgets.Layout(gap="6px"),
+                )
+            ],
+            selected_index=None,
+        )
+        self.hmm_log_scale_accordion.set_title(0, "Log scaling")
+        self.hmm_quantile_row = widgets.HBox(
+            [self.feature_quantile_capping_low_percentile, self.feature_quantile_capping_high_percentile],
+            layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
+        )
+        feature_processing_block = widgets.VBox(
+            [
+                self.hmm_log_scale_accordion,
+                widgets.HTML("<b>feature processing</b>"),
+                widgets.HBox(
+                    [self.hmm_feature_smoothing_window],
+                    layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
+                ),
+                self.hmm_quantile_row,
             ]
         )
         binary_group_block = widgets.VBox(
             [
-                widgets.HTML("<b>assign binary group labels</b>"),
+                widgets.HTML("<b>binary group selection</b>"),
                 self.binary_group_status,
                 self.binary_group_checks_box,
             ]
         )
         self.feature_selection_subaccordion = widgets.Accordion(
-            children=[feature_select_block, binary_group_block],
+            children=[feature_selection_block, feature_processing_block, binary_group_block],
             selected_index=None,
         )
-        self.feature_selection_subaccordion.set_title(0, "available features")
-        self.feature_selection_subaccordion.set_title(1, "assign binary group labels")
-        feature_selection_main_block = widgets.VBox([self.feature_selection_subaccordion])
+        self.feature_selection_subaccordion.set_title(0, "Feature selection")
+        self.feature_selection_subaccordion.set_title(1, "Feature processing")
+        self.feature_selection_subaccordion.set_title(2, "Binary group selection")
 
-        describe_window_features_block = widgets.VBox(
+        self.hmm_primary_row = widgets.HBox(
+            [self.hmm_n_states, self.random_state, self.hmm_advanced],
+            layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
+        )
+        self.hmm_state_mode_row = widgets.HBox(
+            [self.hmm_n_states_mode, self.hmm_k_min, self.hmm_k_max],
+            layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
+        )
+        self.hmm_advanced_row = widgets.HBox(
             [
-                widgets.HTML("<b>window descriptors</b>"),
-                widgets.VBox(list(self.describe_window_feature_cbs.values())),
-            ]
+                self.hmm_start_offset,
+                self.hmm_start_offset_fill_mode,
+                self.hmm_covariance_type,
+                self.hmm_n_iter,
+                self.hmm_tol,
+                self.hmm_min_covar,
+                self.hmm_sticky,
+            ],
+            layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
         )
-        additional_window_features_block = widgets.VBox(
+        self.hmm_sticky_params_row = widgets.HBox(
+            [self.hmm_stickiness_kappa, self.hmm_transmat_alpha],
+            layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
+        )
+        self.hmm_controls_block = widgets.VBox(
             [
-                widgets.HTML("<b>window_based additional features</b>"),
-                widgets.VBox(list(self.additional_window_feature_cbs.values())),
-            ]
+                self.hmm_primary_row,
+                self.hmm_state_mode_row,
+                self.hmm_advanced_row,
+                self.hmm_sticky_params_row,
+            ],
+            layout=widgets.Layout(gap="8px"),
         )
-
-        windowed_timepoint_processing_block = widgets.VBox(
-            [
-                describe_window_features_block,
-                additional_window_features_block,
-                widgets.HTML("<b>window processing parameters</b>"),
-                widgets.HBox(
-                    [self.window_size, self.incomplete_window_policy],
-                    layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
-                ),
-                widgets.HTML("<b>feature value capping</b>"),
-                widgets.HBox(
-                    [self.lower_quantile_cap, self.upper_quantile_cap],
-                    layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
-                ),
-            ]
-        )
-
-        clustering_block = widgets.VBox(
-            [
-                widgets.HBox(
-                    [self.min_spacing, self.max_samples, self.n_neighbors, self.min_dist],
-                    layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
-                ),
-                widgets.HBox(
-                    [self.resolution, self.pca_var_selection, self.clustering_method],
-                    layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
-                ),
-                widgets.HBox([self.random_state], layout=widgets.Layout(flex_flow="row wrap", gap="8px")),
-                self.reuse_prepared_dataset,
-            ]
-        )
-
-        self.clustering_subaccordion = widgets.Accordion(
-            children=[windowed_timepoint_processing_block, clustering_block],
-            selected_index=None,
-        )
-        self.clustering_subaccordion.set_title(0, "Windowed timepoint processing")
-        self.clustering_subaccordion.set_title(1, "Clustering")
-        clustering_main_block = widgets.VBox([self.clustering_subaccordion])
-
-        self.clustering_main_accordion = widgets.Accordion(
-            children=[feature_selection_main_block, clustering_main_block],
-            selected_index=None,
-        )
-        self.clustering_main_accordion.set_title(0, "Feature selection")
-        self.clustering_main_accordion.set_title(1, "Clustering")
 
         self.clustering_section = widgets.VBox(
             [
-                self.clustering_main_accordion,
+                self.feature_selection_subaccordion,
+                widgets.HTML("<b>Intrinsic HMM clustering</b>"),
+                self.hmm_controls_block,
                 widgets.HBox([self.btn_cluster, self.cluster_spinner]),
                 self.out_cluster,
             ]
         )
 
-    def _selected_descriptive_features(self):
-        selected = []
-        for feature_name, cb in self.describe_window_feature_cbs.items():
-            if bool(cb.value):
-                selected.append(str(feature_name))
-        for feature_name, cb in self.additional_window_feature_cbs.items():
-            if bool(cb.value):
-                selected.append(str(feature_name))
-        return selected
-
     def _build_intrinsic_rename_section(self):
-        self.rename_intrinsic_status = widgets.HTML("<i>Run clustering or load existing model first.</i>")
+        self.rename_intrinsic_status = widgets.HTML("<i>Run HMM clustering or load existing model first.</i>")
         self.rename_intrinsic_rows = widgets.VBox([])
+        self.rename_intrinsic_rows.layout = widgets.Layout(width="560px")
+        self.intrinsic_combine_name = widgets.Text(
+            description="Combine to",
+            value="",
+            placeholder="New intrinsic state name",
+            style={"description_width": "90px"},
+            layout=widgets.Layout(width="360px"),
+        )
+        self.btn_combine_intrinsic = widgets.Button(
+            description="combine",
+            button_style="info",
+            layout=widgets.Layout(width="110px"),
+        )
+        self.btn_combine_intrinsic.on_click(self._on_combine_intrinsic_clicked)
+        self.combine_intrinsic_spinner = widgets.HTML(value=spinning_loader)
+        self.combine_intrinsic_spinner.layout.display = "none"
+        self.intrinsic_combine_box = widgets.VBox(
+            [
+                widgets.HTML("<b>Combine selected</b>"),
+                self.intrinsic_combine_name,
+                widgets.HBox([self.btn_combine_intrinsic, self.combine_intrinsic_spinner]),
+            ],
+            layout=widgets.Layout(width="390px", align_items="flex-start"),
+        )
         self.btn_rename_intrinsic = widgets.Button(
-            description="Rename primary dynamic state clusters",
+            description="Rename intrinsic clusters",
             button_style="warning",
-            layout=widgets.Layout(width="320px"),
+            layout=widgets.Layout(width="240px"),
         )
         self.btn_rename_intrinsic.on_click(self._on_rename_intrinsic_clicked)
         self.rename_intrinsic_spinner = widgets.HTML(value=spinning_loader)
@@ -425,119 +1215,12 @@ class StateClassificationPanel:
         self.rename_intrinsic_section = widgets.VBox(
             [
                 self.rename_intrinsic_status,
-                self.rename_intrinsic_rows,
-                widgets.HBox([self.btn_rename_intrinsic, self.rename_intrinsic_spinner]),
-                self.out_rename_intrinsic,
-            ]
-        )
-
-    def _build_full_rename_section(self):
-        self.rename_full_status = widgets.HTML("<i>Rename primary dynamic state clusters first.</i>")
-        self.rename_full_rows = widgets.VBox([])
-        self.rename_full_rows.layout = widgets.Layout(width="560px")
-        self.full_combine_name = widgets.Text(
-            description="Combine to",
-            value="",
-            placeholder="New combined name",
-            style={"description_width": "90px"},
-            layout=widgets.Layout(width="360px"),
-        )
-        self.btn_combine_full = widgets.Button(
-            description="combine",
-            button_style="info",
-            layout=widgets.Layout(width="110px"),
-        )
-        self.btn_combine_full.on_click(self._on_combine_full_clicked)
-        self.combine_full_spinner = widgets.HTML(value=spinning_loader)
-        self.combine_full_spinner.layout.display = "none"
-        self.full_combine_box = widgets.VBox(
-            [
-                widgets.HTML("<b>Combine selected</b>"),
-                self.full_combine_name,
-                widgets.HBox([self.btn_combine_full, self.combine_full_spinner]),
-            ],
-            layout=widgets.Layout(width="390px", align_items="flex-start"),
-        )
-        self.btn_rename_full = widgets.Button(
-            description="Rename clusters assigned to binary groups",
-            button_style="warning",
-            layout=widgets.Layout(width="320px"),
-        )
-        self.btn_rename_full.on_click(self._on_rename_full_clicked)
-        self.rename_full_spinner = widgets.HTML(value=spinning_loader)
-        self.rename_full_spinner.layout.display = "none"
-        self.out_rename_full = widgets.Output()
-        self.rename_full_section = widgets.VBox(
-            [
-                self.rename_full_status,
                 widgets.HBox(
-                    [self.rename_full_rows, self.full_combine_box],
+                    [self.rename_intrinsic_rows, self.intrinsic_combine_box],
                     layout=widgets.Layout(align_items="flex-start", gap="14px"),
                 ),
-                widgets.HBox([self.btn_rename_full, self.rename_full_spinner]),
-                self.out_rename_full,
-            ]
-        )
-
-    def _build_train_section(self):
-        self.train_status = widgets.HTML("<i>Load or create model adata first.</i>")
-        self.n_estimators = widgets.IntText(description="Trees", value=300, style={"description_width": "130px"})
-        self.min_samples_leaf = widgets.IntText(description="Min leaf", value=2, style={"description_width": "130px"})
-        self.n_jobs = widgets.IntText(description="n_jobs", value=-1, style={"description_width": "130px"})
-        self.max_depth = widgets.Text(description="Max depth", value="", style={"description_width": "130px"})
-        self.min_samples_split = widgets.IntText(
-            description="Min split",
-            value=2,
-            style={"description_width": "130px"},
-        )
-        self.max_features = widgets.Text(description="Max feat", value="sqrt", style={"description_width": "130px"})
-        self.class_weight = widgets.Text(description="Class weight", value="", style={"description_width": "130px"})
-        self.validation_test_size = widgets.FloatText(
-            description="Val size",
-            value=0.05,
-            style={"description_width": "130px"},
-        )
-        self.validation_random_state = widgets.Text(
-            description="Val seed",
-            value="",
-            style={"description_width": "130px"},
-        )
-        self.validation_stratify = widgets.Checkbox(
-            description="Stratify validation",
-            value=True,
-            indent=False,
-        )
-
-        self.btn_train = widgets.Button(
-            description="Train classification",
-            button_style="success",
-            layout=widgets.Layout(width="170px"),
-        )
-        self.btn_train.on_click(self._on_train_clicked)
-        self.train_spinner = widgets.HTML(value=spinning_loader)
-        self.train_spinner.layout.display = "none"
-        self.out_train = widgets.Output()
-
-        classifier_params_box = widgets.VBox(
-            [
-                widgets.HBox([self.n_estimators, self.min_samples_leaf, self.n_jobs]),
-                widgets.HBox([self.max_depth, self.min_samples_split, self.max_features]),
-                widgets.HBox([self.class_weight, self.validation_test_size, self.validation_random_state]),
-                self.validation_stratify,
-            ]
-        )
-        self.classifier_params_accordion = widgets.Accordion(
-            children=[classifier_params_box],
-            selected_index=None,
-        )
-        self.classifier_params_accordion.set_title(0, "classifier parameters")
-
-        self.train_section = widgets.VBox(
-            [
-                self.train_status,
-                self.classifier_params_accordion,
-                widgets.HBox([self.btn_train, self.train_spinner]),
-                self.out_train,
+                widgets.HBox([self.btn_rename_intrinsic, self.rename_intrinsic_spinner]),
+                self.out_rename_intrinsic,
             ]
         )
 
@@ -550,6 +1233,20 @@ class StateClassificationPanel:
             layout=widgets.Layout(width="360px"),
             style={"description_width": "90px"},
         )
+        self.hmm_backprojection_workers = widgets.BoundedIntText(
+            description="Workers",
+            value=4,
+            min=1,
+            max=32,
+            style={"description_width": "90px"},
+            layout=widgets.Layout(width="170px"),
+        )
+        self.btn_open_intrinsic_backprojection = widgets.Button(
+            description="Open intrinsic HMM backprojection",
+            button_style="success",
+            layout=widgets.Layout(width="270px"),
+        )
+        self.btn_open_intrinsic_backprojection.on_click(self._on_open_intrinsic_backprojection_clicked)
         self.btn_open_backprojection = widgets.Button(
             description="Open full cluster backprojection",
             button_style="success",
@@ -562,627 +1259,726 @@ class StateClassificationPanel:
         self.backprojection_section = widgets.VBox(
             [
                 self.backprojection_status,
-                self.backproj_sample_dd,
-                widgets.HBox([self.btn_open_backprojection, self.backprojection_spinner]),
+                widgets.HBox([self.backproj_sample_dd, self.hmm_backprojection_workers]),
+                widgets.HBox(
+                    [
+                        self.btn_open_intrinsic_backprojection,
+                        self.btn_open_backprojection,
+                        self.backprojection_spinner,
+                    ]
+                ),
                 self.out_backprojection,
             ]
         )
 
-    def _detect_cell_types(self):
-        md = getattr(self.metadata_loader, "metadata", None)
-        cell_types = []
-        if md is not None:
-            try:
-                cell_types.extend(filter_multicolor_inputs(detect_organoid_types_from_metadata(md)))
-                cell_types.extend(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
-                cell_types.extend(filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)))
-                cell_types.extend(detect_merged_cell_types_from_metadata(md))
-            except Exception:
-                pass
+    # def _detect_cell_types(self):
+    #     md = getattr(self.metadata_loader, "metadata", None)
+    #     cell_types = []
+    #     if md is not None:
+    #         try:
+    #             cell_types.extend(filter_multicolor_inputs(detect_organoid_types_from_metadata(md)))
+    #             cell_types.extend(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
+    #             cell_types.extend(filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)))
+    #             cell_types.extend(detect_merged_cell_types_from_metadata(md))
+    #         except Exception:
+    #             pass
 
-        # Filesystem fallback
-        out_dir = Path(self.output_dir) if self.output_dir else None
-        if out_dir is not None:
-            analysis_dir = out_dir / "analysis"
-            if analysis_dir.exists():
-                for p in analysis_dir.iterdir():
-                    if p.is_dir():
-                        cell_types.append(p.name)
-        return sorted({str(x).strip() for x in cell_types if str(x).strip() != ""})
+    #     # Filesystem fallback
+    #     out_dir = Path(self.output_dir) if self.output_dir else None
+    #     if out_dir is not None:
+    #         analysis_dir = out_dir / "analysis"
+    #         if analysis_dir.exists():
+    #             for p in analysis_dir.iterdir():
+    #                 if p.is_dir():
+    #                     cell_types.append(p.name)
+    #     return sorted({str(x).strip() for x in cell_types if str(x).strip() != ""})
 
-    def _detect_sample_names(self):
-        md = getattr(self.metadata_loader, "metadata", None)
-        if isinstance(md, pd.DataFrame) and "sample_name" in md.columns:
-            meta_names = sorted(
-                {
-                    str(x).strip()
-                    for x in md["sample_name"].astype(str).dropna().unique().tolist()
-                    if str(x).strip() != ""
-                }
-            )
-            if len(meta_names) > 0:
-                return meta_names
+    # def _detect_sample_names(self):
+    #     md = getattr(self.metadata_loader, "metadata", None)
+    #     if isinstance(md, pd.DataFrame) and "sample_name" in md.columns:
+    #         meta_names = sorted(
+    #             {
+    #                 str(x).strip()
+    #                 for x in md["sample_name"].astype(str).dropna().unique().tolist()
+    #                 if str(x).strip() != ""
+    #             }
+    #         )
+    #         if len(meta_names) > 0:
+    #             return meta_names
 
-        sample_names = []
-        if self.model_adata is not None and hasattr(self.model_adata, "obs"):
-            if "sample_name" in self.model_adata.obs.columns:
-                sample_names.extend(
-                    self.model_adata.obs["sample_name"].astype(str).dropna().unique().tolist()
-                )
+    #     sample_names = []
+    #     if self.model_adata is not None and hasattr(self.model_adata, "obs"):
+    #         if "sample_name" in self.model_adata.obs.columns:
+    #             sample_names.extend(
+    #                 self.model_adata.obs["sample_name"].astype(str).dropna().unique().tolist()
+    #             )
 
-        out_dir = Path(self.output_dir) if self.output_dir else None
-        images_dir = (out_dir / "images") if out_dir is not None else None
-        if images_dir is not None and images_dir.exists():
-            for p in images_dir.iterdir():
-                if p.is_dir():
-                    sample_names.append(str(p.name))
+    #     out_dir = Path(self.output_dir) if self.output_dir else None
+    #     images_dir = (out_dir / "images") if out_dir is not None else None
+    #     if images_dir is not None and images_dir.exists():
+    #         for p in images_dir.iterdir():
+    #             if p.is_dir():
+    #                 sample_names.append(str(p.name))
 
-        return sorted({str(x).strip() for x in sample_names if str(x).strip() != ""})
+    #     return sorted({str(x).strip() for x in sample_names if str(x).strip() != ""})
 
-    def _refresh_backprojection_samples(self):
-        current = self.backproj_sample_dd.value
-        sample_names = self._detect_sample_names()
-        if len(sample_names) == 0:
-            self.backproj_sample_dd.options = []
-            self.backproj_sample_dd.value = None
-            self.backprojection_status.value = "<i>No samples detected for backprojection.</i>"
-            return
-
-        self.backproj_sample_dd.options = sample_names
-        if current in sample_names:
-            self.backproj_sample_dd.value = current
-        else:
-            self.backproj_sample_dd.value = sample_names[0]
-        self.backprojection_status.value = f"<b>Available samples:</b> {len(sample_names)}"
-
-    def _current_cell_type(self):
-        return str(self.cell_type_dd.value).strip()
-
-    def _state_root(self, cell_type=None):
-        ct = self._current_cell_type() if cell_type is None else str(cell_type)
-        return Path(self.output_dir, "analysis", ct, "behavioral_states")
-
-    def _model_adata_path(self, cell_type=None):
-        ct = self._current_cell_type() if cell_type is None else str(cell_type)
-        return Path(
-            self.output_dir,
-            "analysis",
-            ct,
-            "behavioral_states",
-            "processing",
-            f"BEHAV3D_{ct}_behavioral_states_modeldata.h5ad",
+    def _build_analysis_plots_section(self):
+        self.analysis_plots_status = widgets.HTML(
+            "<i>Run HMM clustering and finish curated renaming first, then create plots manually.</i>"
         )
-
-    def _default_classifier_paths(self, cell_type=None):
-        ct = self._current_cell_type() if cell_type is None else str(cell_type)
-        base = Path(self.output_dir, "analysis", ct, "behavioral_states", "processing")
-        return {
-            "intrinsic": base
-            / "intrinsic_behavioral_classification"
-            / f"intrinsic_state_classification_random_forest_{ct}.pkl",
-            "full": base
-            / "full_behavioral_classification"
-            / f"state_classification_random_forest_{ct}.pkl",
-        }
-
-    def _refresh_apply_default_paths(self):
-        if self.output_dir is None or str(self.output_dir).strip() == "":
-            self.apply_default_paths_html.value = ""
-            return
-
-        paths = self._default_classifier_paths()
-        full_path = paths["full"]
-        intrinsic_path = paths["intrinsic"]
-        full_exists = full_path.exists()
-        intrinsic_exists = intrinsic_path.exists()
-
-        if str(self.apply_full_pkl_picker.value).strip() == "" and full_exists:
-            self.apply_full_pkl_picker.value = str(full_path)
-        if str(self.apply_intrinsic_pkl_picker.value).strip() == "" and intrinsic_exists:
-            self.apply_intrinsic_pkl_picker.value = str(intrinsic_path)
-
-        if full_exists or intrinsic_exists:
-            self.apply_default_paths_html.value = (
-                "<b style='color:#080;'>Default classifier path(s) detected and prefilled.</b>"
-            )
-        else:
-            self.apply_default_paths_html.value = ""
-
-    def _resolve_track_features_csv(self, cell_type=None):
-        ct = self._current_cell_type() if cell_type is None else str(cell_type)
-        base = Path(self.output_dir, "analysis", ct, "track_features")
-        filtered_csv = base / f"BEHAV3D_{ct}_combined_track_features_filtered.csv"
-        combined_csv = base / f"BEHAV3D_{ct}_combined_track_features.csv"
-        if filtered_csv.exists():
-            return filtered_csv
-        if combined_csv.exists():
-            return combined_csv
-        return None
-
-    def _set_widgets_disabled(self, widgets_list, state):
-        for w in widgets_list:
-            if hasattr(w, "disabled"):
-                w.disabled = bool(state)
-
-    def _parse_optional_int(self, text_value):
-        value = str(text_value).strip()
-        if value == "":
-            return None
-        return int(value)
-
-    def _parse_optional_float(self, text_value):
-        value = str(text_value).strip()
-        if value == "":
-            return None
-        return float(value)
-
-    def _normalize_binary_value(self, value, tol=1e-9):
-        if isinstance(value, (bool, pd.BooleanDtype)):
-            return 1 if bool(value) else 0
-        if isinstance(value, str):
-            sval = value.strip().lower()
-            if sval in {"true", "t"}:
-                return 1
-            if sval in {"false", "f"}:
-                return 0
-            try:
-                value = float(sval)
-            except Exception:
-                return None
-        try:
-            fval = float(value)
-        except Exception:
-            return None
-        if not math.isfinite(fval):
-            return None
-        if abs(fval - 0.0) <= tol:
-            return 0
-        if abs(fval - 1.0) <= tol:
-            return 1
-        return None
-
-    def _detect_binary_columns_from_csv(self, csv_path, cols, chunksize=50000):
-        if csv_path is None or len(cols) == 0:
-            return []
-
-        cache_key = (
-            str(csv_path),
-            float(csv_path.stat().st_mtime) if Path(csv_path).exists() else -1.0,
-            tuple(cols),
+        self.btn_create_state_composition_plots = widgets.Button(
+            description="Create state composition plots",
+            button_style="info",
+            layout=widgets.Layout(width="260px"),
         )
-        if isinstance(self._binary_detection_cache, dict):
-            if self._binary_detection_cache.get("key", None) == cache_key:
-                return list(self._binary_detection_cache.get("binary_cols", []))
-
-        states = {str(c): {"seen": set(), "invalid": False} for c in cols}
-        try:
-            for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=chunksize, low_memory=False):
-                for col in cols:
-                    st = states[str(col)]
-                    if st["invalid"]:
-                        continue
-                    series = chunk[col].dropna()
-                    if len(series) == 0:
-                        continue
-                    unique_vals = pd.unique(series)
-                    for raw in unique_vals:
-                        norm = self._normalize_binary_value(raw)
-                        if norm is None:
-                            st["invalid"] = True
-                            break
-                        st["seen"].add(int(norm))
-                        if len(st["seen"]) > 2:
-                            st["invalid"] = True
-                            break
-        except Exception:
-            return []
-
-        binary_cols = sorted(
+        self.btn_create_state_composition_plots.on_click(self._on_create_state_composition_plots_clicked)
+        self.state_composition_spinner = widgets.HTML(value=spinning_loader)
+        self.state_composition_spinner.layout.display = "none"
+        self.composition_group_cols_select = widgets.SelectMultiple(
+            options=[],
+            value=[],
+            description="",
+            layout=widgets.Layout(width="360px", height="80px"),
+            disabled=True,
+        )
+        self.btn_create_state_transition_plots = widgets.Button(
+            description="Create state transition plots",
+            button_style="info",
+            layout=widgets.Layout(width="250px"),
+        )
+        self.btn_create_state_transition_plots.on_click(self._on_create_state_transition_plots_clicked)
+        self.state_transition_spinner = widgets.HTML(value=spinning_loader)
+        self.state_transition_spinner.layout.display = "none"
+        self.out_analysis_plots = widgets.Output()
+        self.analysis_plots_section = widgets.VBox(
             [
-                c
-                for c in cols
-                if (not states[str(c)]["invalid"]) and (len(states[str(c)]["seen"]) > 0)
+                self.analysis_plots_status,
+                widgets.HTML(
+                    "<b>State composition plots</b><br>"
+                    "<span style='color:#555;'>Summarizes how full behavioral clusters are distributed per sample "
+                    "and in pooled overviews across time.</span>"
+                ),
+                widgets.HBox(
+                    [self.btn_create_state_composition_plots, self.state_composition_spinner],
+                    layout=widgets.Layout(align_items="center", gap="8px"),
+                ),
+                widgets.HTML(
+                    "<b>Group composition plots by:</b><br>"
+                    "<span style='color:#555;'>Select metadata columns to pool samples into groups for an "
+                    "additional grouped-composition page in the PDF. "
+                    "Hold Ctrl/Cmd to select multiple.</span>"
+                ),
+                self.composition_group_cols_select,
+                widgets.HTML(
+                    "<b>State transition plots</b><br>"
+                    "<span style='color:#555;'>Builds transition matrices and transition summaries between full "
+                    "behavioral clusters along tracks.</span>"
+                ),
+                widgets.HBox(
+                    [self.btn_create_state_transition_plots, self.state_transition_spinner],
+                    layout=widgets.Layout(align_items="center", gap="8px"),
+                ),
+                self.out_analysis_plots,
             ]
         )
-        self._binary_detection_cache = {
-            "key": cache_key,
-            "binary_cols": list(binary_cols),
+
+    def _selected_descriptive_features(self):
+        return ["timepoint_hmm"]
+
+    def _selected_window_feature_columns(self):
+        return [
+            str(col)
+            for col, cb in self.additional_window_feature_cbs.items()
+            if bool(cb.value)
+        ]
+
+    def _selected_hmm_feature_columns(self):
+        out = []
+        seen = set()
+        for feature_name in list(self._selected_feature_columns()) + list(self._selected_window_feature_columns()):
+            if feature_name in seen:
+                continue
+            out.append(str(feature_name))
+            seen.add(feature_name)
+        return out
+
+    def _update_selected_features_box(self):
+        self.selected_features_box.options = self._selected_hmm_feature_columns()
+
+    def _build_feature_groups(self):
+        cell_cfg = self._panel_cfg()
+        if isinstance(cell_cfg, dict):
+            effective = self._effective_panel_cfg()
+            if not cell_cfg.get("selected_features") and effective.get("selected_features"):
+                cell_cfg["selected_features"] = list(effective["selected_features"])
+            if not cell_cfg.get("binary_features_to_group") and effective.get("binary_features_to_group"):
+                cell_cfg["binary_features_to_group"] = list(effective["binary_features_to_group"])
+        super()._build_feature_groups()
+        grouped = getattr(self, "_feature_groups", {}) or {}
+        if len(grouped) > 0:
+            children = []
+            titles = []
+            for group_name, feats in grouped.items():
+                row = self._group_rows.get(group_name, {})
+                child_cbs = list(row.get("child_cbs", []))
+                if len(child_cbs) == 0:
+                    continue
+                grid = widgets.GridBox(
+                    child_cbs,
+                    layout=widgets.Layout(
+                        grid_template_columns="repeat(3, max-content)",
+                        grid_gap="2px 10px",
+                    ),
+                )
+                children.append(grid)
+                titles.append(group_name)
+
+            if len(children) > 0:
+                fg_acc = widgets.Accordion(children=children, selected_index=None)
+                for idx, title in enumerate(titles):
+                    fg_acc.set_title(idx, title)
+                self.feature_groups_box.children = [fg_acc]
+        self._update_selected_features_box()
+        self._rebuild_log_scale_feature_controls()
+
+    def _sync_pca_controls(self):
+        return
+
+    def _selected_log_scale_features(self):
+        return [
+            str(col)
+            for col, cb in self._hmm_log_scale_checkboxes.items()
+            if bool(cb.value)
+        ]
+
+    def _rebuild_log_scale_feature_controls(self):
+        selected_features = self._selected_hmm_feature_columns()
+        cfg = self._effective_panel_cfg()
+        saved_log = set(cfg.get("hmm_log_scale_features", [])) if isinstance(cfg, dict) else set()
+        previous_log = {
+            str(col)
+            for col, cb in getattr(self, "_hmm_log_scale_checkboxes", {}).items()
+            if bool(cb.value)
         }
-        return binary_cols
+        effective_selected = saved_log.union(previous_log)
 
-    def _excluded_non_behavior_columns(self, cols):
-        col_set = {str(c) for c in cols}
-        excluded = {
-            "sample_name",
-            "TrackID",
-            "sub_TrackID",
-            "position_t",
-            "position_x",
-            "position_y",
-            "position_z",
-            "segment_id",
-            "lineage_id",
-            "frame",
-            "t",
-            "interpolated",
-            "exp_nr",
-            "well",
-        }
-
-        md = getattr(self.metadata_loader, "metadata", None)
-        if isinstance(md, pd.DataFrame):
-            excluded.update({str(c) for c in md.columns})
-
-        for c in col_set:
-            lc = str(c).lower()
-            if lc.startswith("touching_"):
-                excluded.add(c)
-            if lc.endswith("_line_condition"):
-                excluded.add(c)
-            if lc.endswith("_tracks_csv_path"):
-                excluded.add(c)
-            if lc.endswith("_segments_image_path"):
-                excluded.add(c)
-            if lc.endswith("_tracks_image_path"):
-                excluded.add(c)
-            if lc.endswith("_raw_image_path"):
-                excluded.add(c)
-            if lc.endswith("_dead_mask_path"):
-                excluded.add(c)
-            if lc.startswith("channel_") and lc.endswith("_label"):
-                excluded.add(c)
-
-        return excluded.intersection(col_set)
-
-    def _panel_cfg(self):
-        params = getattr(self.metadata_loader, "behav3d_parameters", None)
-        if not isinstance(params, dict):
-            return {}
-        panel = params.setdefault("state_classification", {})
-        return panel.setdefault(self._current_cell_type(), {})
-
-    def _save_panel_cfg(self):
-        params = getattr(self.metadata_loader, "behav3d_parameters", None)
-        cfg_path = getattr(self.metadata_loader, "behav3d_parameters_path", None)
-        if not isinstance(params, dict) or cfg_path is None:
+        self._hmm_log_scale_checkboxes = {}
+        if len(selected_features) == 0:
+            self.hmm_log_scale_status.value = "<i>Select features to choose optional log1p scaling.</i>"
+            self.hmm_log_scale_box.children = []
             return
-        try:
-            with Path(cfg_path).open("w", encoding="utf-8") as f:
-                yaml.safe_dump(params, f, sort_keys=False)
-        except Exception:
-            pass
+
+        children = []
+        for feature_name in selected_features:
+            cb = widgets.Checkbox(
+                description=str(feature_name),
+                value=(str(feature_name) in effective_selected),
+                indent=False,
+                layout=widgets.Layout(width="360px"),
+            )
+            self._hmm_log_scale_checkboxes[str(feature_name)] = cb
+            children.append(cb)
+        self.hmm_log_scale_status.value = (
+            f"<b>Selected features available for log1p scaling:</b> {len(selected_features)}"
+        )
+        self.hmm_log_scale_box.children = children
+
+    def _sync_hmm_state_controls(self):
+        advanced = bool(self.hmm_advanced.value)
+        auto_mode = str(self.hmm_n_states_mode.value) == "auto"
+        self.hmm_n_states.disabled = auto_mode
+        self.hmm_k_min.disabled = not auto_mode
+        self.hmm_k_max.disabled = not auto_mode
+        if hasattr(self, "hmm_state_mode_row"):
+            self.hmm_state_mode_row.layout.display = None if advanced else "none"
+        if hasattr(self, "hmm_advanced_row"):
+            self.hmm_advanced_row.layout.display = None if advanced else "none"
+        if hasattr(self, "hmm_sticky_params_row"):
+            self.hmm_sticky_params_row.layout.display = (
+                None if (advanced and bool(self.hmm_sticky.value)) else "none"
+            )
+        if hasattr(self, "hmm_quantile_row"):
+            self.hmm_quantile_row.layout.display = None if advanced else "none"
+
+    def _on_use_pca_changed(self, _):
+        return
+
+    def _on_hmm_n_states_mode_changed(self, _):
+        self._sync_hmm_state_controls()
+
+    def _on_hmm_advanced_changed(self, _):
+        self._sync_hmm_state_controls()
+
+    def _on_hmm_sticky_changed(self, _):
+        self._sync_hmm_state_controls()
+
+    def _on_apply_existing_changed(self, _):
+        self._sync_apply_existing_mode()
+
+    def _sync_apply_existing_mode(self):
+        if not hasattr(self, "steps"):
+            return
+        analysis_plots_section = getattr(self, "analysis_plots_section", widgets.VBox([]))
+        if self.apply_existing_state_classification.value:
+            self.steps.children = [
+                self.hmm_artifact_section,
+                analysis_plots_section,
+                self.backprojection_section,
+            ]
+            self.steps.set_title(0, "Apply existing classification")
+            self.steps.set_title(1, "Create plots")
+            self.steps.set_title(2, "Backprojection")
+            self.steps.selected_index = 0
+        else:
+            rename_full = getattr(self, "_rename_full_with_description", self.rename_full_section)
+            self.steps.children = [
+                self.clustering_section,
+                self.rename_intrinsic_section,
+                rename_full,
+                analysis_plots_section,
+                self.backprojection_section,
+            ]
+            self.steps.set_title(0, "Assign HMM intrinsic behavioral states")
+            self.steps.set_title(1, "Rename intrinsic states")
+            self.steps.set_title(2, "Rename full states")
+            self.steps.set_title(3, "Create plots")
+            self.steps.set_title(4, "Backprojection")
+
+    def _collapse_all_steps(self):
+        if hasattr(self, "steps") and isinstance(self.steps, widgets.Accordion):
+            self.steps.selected_index = None
+
+    def _open_step(self, index):
+        if hasattr(self, "steps") and isinstance(self.steps, widgets.Accordion):
+            n = len(self.steps.children)
+            if index is not None and 0 <= index < n:
+                self.steps.selected_index = index
+
+    def _on_feature_checkbox_changed(self, _):
+        super()._on_feature_checkbox_changed(_)
+        self._rebuild_log_scale_feature_controls()
 
     def _apply_cfg_defaults(self):
-        cfg = self._panel_cfg()
+        super()._apply_cfg_defaults()
+        cfg = self._effective_panel_cfg()
         if not isinstance(cfg, dict):
             return
-        self.window_size.value = int(cfg.get("window_size", self.window_size.value))
-        self.min_spacing.value = str(cfg.get("min_spacing", self.min_spacing.value or ""))
-        self.max_samples.value = str(cfg.get("max_samples", self.max_samples.value or ""))
-        self.n_neighbors.value = int(cfg.get("n_neighbors", self.n_neighbors.value))
-        self.min_dist.value = float(cfg.get("min_dist", self.min_dist.value))
-        self.resolution.value = float(cfg.get("resolution", self.resolution.value))
-        self.pca_var_selection.value = float(cfg.get("pca_var_selection", self.pca_var_selection.value))
-        self.clustering_method.value = str(cfg.get("clustering_method", self.clustering_method.value))
-        self.lower_quantile_cap.value = str(cfg.get("lower_quantile_cap", self.lower_quantile_cap.value or ""))
-        self.upper_quantile_cap.value = str(cfg.get("upper_quantile_cap", self.upper_quantile_cap.value or "0.99"))
-        self.incomplete_window_policy.value = str(
-            cfg.get("incomplete_window_policy", self.incomplete_window_policy.value)
+        saved_artifact_path = str(cfg.get("apply_hmm_deployment_artifact_path", "")).strip()
+        if saved_artifact_path:
+            self.apply_hmm_artifact_picker.value = saved_artifact_path
+        self.hmm_n_states_mode.value = str(cfg.get("hmm_n_states_mode", self.hmm_n_states_mode.value))
+        self.hmm_advanced.value = bool(cfg.get("hmm_advanced", self.hmm_advanced.value))
+        self.hmm_n_states.value = int(cfg.get("hmm_n_states", self.hmm_n_states.value))
+        self.hmm_k_min.value = int(cfg.get("hmm_k_min", self.hmm_k_min.value))
+        self.hmm_k_max.value = int(cfg.get("hmm_k_max", self.hmm_k_max.value))
+        self.hmm_covariance_type.value = str(cfg.get("hmm_covariance_type", self.hmm_covariance_type.value))
+        self.hmm_n_iter.value = int(cfg.get("hmm_n_iter", self.hmm_n_iter.value))
+        self.hmm_tol.value = float(cfg.get("hmm_tol", self.hmm_tol.value))
+        self.hmm_sticky.value = bool(cfg.get("hmm_sticky", self.hmm_sticky.value))
+        self.hmm_stickiness_kappa.value = float(
+            cfg.get("hmm_stickiness_kappa", self.hmm_stickiness_kappa.value)
         )
-        self.random_state.value = int(cfg.get("random_state", self.random_state.value))
-        self.reuse_prepared_dataset.value = bool(cfg.get("reuse_prepared_dataset", self.reuse_prepared_dataset.value))
-        self.apply_full_pkl_picker.value = str(cfg.get("apply_full_classifier_path", self.apply_full_pkl_picker.value))
-        self.apply_intrinsic_pkl_picker.value = str(
-            cfg.get("apply_intrinsic_classifier_path", self.apply_intrinsic_pkl_picker.value)
+        self.hmm_transmat_alpha.value = float(cfg.get("hmm_transmat_alpha", self.hmm_transmat_alpha.value))
+        self.hmm_min_covar.value = float(cfg.get("hmm_min_covar", self.hmm_min_covar.value))
+        self.hmm_feature_smoothing_window.value = int(
+            cfg.get("hmm_feature_smoothing_window", self.hmm_feature_smoothing_window.value)
         )
-        saved_desc = cfg.get("descriptive_features", None)
-        if isinstance(saved_desc, (list, tuple)) and len(saved_desc) > 0:
-            for cb in self.describe_window_feature_cbs.values():
-                cb.value = False
-            for cb in self.additional_window_feature_cbs.values():
-                cb.value = False
-            for feat in saved_desc:
-                if feat in self.describe_window_feature_cbs:
-                    self.describe_window_feature_cbs[str(feat)].value = True
-                if feat in self.additional_window_feature_cbs:
-                    self.additional_window_feature_cbs[str(feat)].value = True
-
-        self.n_estimators.value = int(cfg.get("classifier_n_estimators", self.n_estimators.value))
-        self.min_samples_leaf.value = int(cfg.get("classifier_min_samples_leaf", self.min_samples_leaf.value))
-        self.n_jobs.value = int(cfg.get("classifier_n_jobs", self.n_jobs.value))
-        self.max_depth.value = str(cfg.get("classifier_max_depth", self.max_depth.value))
-        self.min_samples_split.value = int(cfg.get("classifier_min_samples_split", self.min_samples_split.value))
-        self.max_features.value = str(cfg.get("classifier_max_features", self.max_features.value))
-        self.class_weight.value = str(cfg.get("classifier_class_weight", self.class_weight.value))
-        self.validation_test_size.value = float(cfg.get("validation_test_size", self.validation_test_size.value))
-        self.validation_random_state.value = str(
-            cfg.get("validation_random_state", self.validation_random_state.value)
+        self.hmm_smoothing_min_periods.value = int(
+            cfg.get("hmm_smoothing_min_periods", self.hmm_smoothing_min_periods.value)
         )
-        self.validation_stratify.value = bool(cfg.get("validation_stratify", self.validation_stratify.value))
+        self.hmm_start_offset.value = int(cfg.get("hmm_start_offset", self.hmm_start_offset.value))
+        self.hmm_start_offset_fill_mode.value = str(
+            cfg.get("hmm_start_offset_fill_mode", self.hmm_start_offset_fill_mode.value)
+        )
+        self.hmm_backprojection_workers.value = int(
+            cfg.get("hmm_backprojection_workers", self.hmm_backprojection_workers.value)
+        )
+        self.hmm_window_features_window.value = int(
+            cfg.get("hmm_window_features_window", self.hmm_window_features_window.value)
+        )
+        self.feature_quantile_capping_low_percentile.value = str(
+            cfg.get("feature_quantile_capping_low_percentile", self.feature_quantile_capping_low_percentile.value)
+        )
+        self.feature_quantile_capping_high_percentile.value = str(
+            cfg.get("feature_quantile_capping_high_percentile", self.feature_quantile_capping_high_percentile.value)
+        )
+        saved_window_features = set(cfg.get("hmm_window_features", []))
+        for feature_name, cb in self.additional_window_feature_cbs.items():
+            cb.value = str(feature_name) in saved_window_features
+        self._update_selected_features_box()
+        self._rebuild_log_scale_feature_controls()
+        self._sync_hmm_state_controls()
 
     def _persist_current_settings(self):
         cfg = self._panel_cfg()
         if not isinstance(cfg, dict):
             return
+        cfg.update({
+            "selected_features": self._selected_feature_columns(),
+            "binary_features_to_group": self._selected_binary_columns(),
+            "random_state": int(self.random_state.value),
+        })
         cfg.update(
             {
-                "window_size": int(self.window_size.value),
-                "min_spacing": str(self.min_spacing.value),
-                "max_samples": str(self.max_samples.value),
-                "n_neighbors": int(self.n_neighbors.value),
-                "min_dist": float(self.min_dist.value),
-                "resolution": float(self.resolution.value),
-                "pca_var_selection": float(self.pca_var_selection.value),
-                "clustering_method": str(self.clustering_method.value),
-                "lower_quantile_cap": str(self.lower_quantile_cap.value),
-                "upper_quantile_cap": str(self.upper_quantile_cap.value),
-                "incomplete_window_policy": str(self.incomplete_window_policy.value),
-                "random_state": int(self.random_state.value),
-                "reuse_prepared_dataset": bool(self.reuse_prepared_dataset.value),
-                "apply_full_classifier_path": str(self.apply_full_pkl_picker.value),
-                "apply_intrinsic_classifier_path": str(self.apply_intrinsic_pkl_picker.value),
-                "descriptive_features": list(self._selected_descriptive_features()),
-                "selected_features": self._selected_feature_columns(),
-                "binary_features_to_group": self._selected_binary_columns(),
-                "classifier_n_estimators": int(self.n_estimators.value),
-                "classifier_min_samples_leaf": int(self.min_samples_leaf.value),
-                "classifier_n_jobs": int(self.n_jobs.value),
-                "classifier_max_depth": str(self.max_depth.value),
-                "classifier_min_samples_split": int(self.min_samples_split.value),
-                "classifier_max_features": str(self.max_features.value),
-                "classifier_class_weight": str(self.class_weight.value),
-                "validation_test_size": float(self.validation_test_size.value),
-                "validation_random_state": str(self.validation_random_state.value),
-                "validation_stratify": bool(self.validation_stratify.value),
-                "save_label_classifier": True,
-                "save_full_label_classifier": True,
-                "train_continuous_classifier": True,
-                "train_full_classifier": True,
+                "apply_hmm_deployment_artifact_path": str(self.apply_hmm_artifact_picker.value),
+                "hmm_n_states_mode": str(self.hmm_n_states_mode.value),
+                "hmm_advanced": bool(self.hmm_advanced.value),
+                "hmm_n_states": int(self.hmm_n_states.value),
+                "hmm_k_min": int(self.hmm_k_min.value),
+                "hmm_k_max": int(self.hmm_k_max.value),
+                "hmm_covariance_type": str(self.hmm_covariance_type.value),
+                "hmm_n_iter": int(self.hmm_n_iter.value),
+                "hmm_tol": float(self.hmm_tol.value),
+                "hmm_sticky": bool(self.hmm_sticky.value),
+                "hmm_stickiness_kappa": float(self.hmm_stickiness_kappa.value),
+                "hmm_transmat_alpha": float(self.hmm_transmat_alpha.value),
+                "hmm_min_covar": float(self.hmm_min_covar.value),
+                "hmm_feature_smoothing_window": int(self.hmm_feature_smoothing_window.value),
+                "hmm_smoothing_min_periods": int(self.hmm_smoothing_min_periods.value),
+                "hmm_start_offset": int(self.hmm_start_offset.value),
+                "hmm_start_offset_fill_mode": str(self.hmm_start_offset_fill_mode.value),
+                "hmm_backprojection_workers": int(self.hmm_backprojection_workers.value),
+                "hmm_window_features": self._selected_window_feature_columns(),
+                "hmm_window_features_window": int(self.hmm_window_features_window.value),
+                "feature_quantile_capping_low_percentile": str(self.feature_quantile_capping_low_percentile.value),
+                "feature_quantile_capping_high_percentile": str(self.feature_quantile_capping_high_percentile.value),
+                "hmm_log_scale_features": self._selected_log_scale_features(),
             }
         )
         self._save_panel_cfg()
 
-    def _build_feature_groups(self):
-        self._group_rows = {}
-        self._feature_groups = {}
-        self._binary_group_checkboxes = {}
-        cols = list(self._available_columns)
-        if len(cols) == 0:
-            self.feature_groups_status.value = (
-                "<i>No track-features CSV found for this cell type. "
-                "Run feature extraction first.</i>"
-            )
-            self.feature_groups_box.children = []
-            self.selected_features_box.options = []
-            self.binary_group_status.value = "<i>No binary columns detected yet.</i>"
-            self.binary_group_checks_box.children = []
+    def _refresh_apply_default_paths(self):
+        super()._refresh_apply_default_paths()
+        if self.output_dir is None or str(self.output_dir).strip() == "":
+            self.apply_hmm_default_paths_html.value = ""
             return
 
-        excluded = self._excluded_non_behavior_columns(cols)
-        usable_cols = [c for c in cols if c not in excluded]
-        base_groups = deepcopy(behav3d_calculated_features)
-        matched = set()
-        grouped = {}
-        for group_name, patterns in base_groups.items():
-            vals = []
-            for pat in patterns:
-                vals.extend(expand_column_patterns(pat, usable_cols))
-            clean_vals = sorted({x for x in vals if x in usable_cols})
-            if len(clean_vals) > 0:
-                grouped[group_name] = clean_vals
-                matched.update(clean_vals)
+        hmm_path = self._default_hmm_deployment_artifact_path()
+        hmm_exists = hmm_path.exists()
+        if str(self.apply_hmm_artifact_picker.value).strip() == "" and hmm_exists:
+            self.apply_hmm_artifact_picker.value = str(hmm_path)
 
-        other = sorted([c for c in usable_cols if c not in matched])
-        if len(other) > 0:
-            grouped["other"] = other
-
-        self._feature_groups = grouped
-        cfg = self._panel_cfg()
-        preselected = set(cfg.get("selected_features", [])) if isinstance(cfg, dict) else set()
-        if len(preselected) == 0:
-            # fallback to basic sensible defaults when present
-            for f in ["percentage_dead_mask", "speed", "extent", "elongation", "sphericity", "solidity"]:
-                if f in usable_cols:
-                    preselected.add(f)
-
-        children = []
-        titles = []
-        for group_name, feats in grouped.items():
-            child_cbs = [
-                widgets.Checkbox(
-                    description=f,
-                    value=(f in preselected),
-                    indent=False,
-                    layout=widgets.Layout(width="230px"),
-                )
-                for f in feats
-            ]
-            for cb in child_cbs:
-                cb.observe(self._on_feature_checkbox_changed, names="value")
-            group_cb = widgets.Checkbox(
-                description=f"Select {group_name}",
-                value=all(cb.value for cb in child_cbs) if len(child_cbs) > 0 else False,
-                indent=False,
+        if hmm_exists:
+            self.apply_hmm_default_paths_html.value = (
+                "<b style='color:#080;'>Default HMM deployment artifact path detected and prefilled.</b>"
             )
-
-            def _make_group_handler(cbs):
-                def _handler(change):
-                    new_val = bool(change["new"])
-                    for cb in cbs:
-                        cb.value = new_val
-
-                return _handler
-
-            group_cb.observe(_make_group_handler(child_cbs), names="value")
-            grid = widgets.GridBox(
-                child_cbs,
-                layout=widgets.Layout(
-                    grid_template_columns="repeat(3, max-content)",
-                    grid_gap="2px 10px",
-                ),
-            )
-            box = widgets.VBox([group_cb, grid])
-            children.append(box)
-            titles.append(group_name)
-            self._group_rows[group_name] = {"group_cb": group_cb, "child_cbs": child_cbs}
-
-        if len(children) == 0:
-            self.feature_groups_status.value = "<i>No usable feature columns detected.</i>"
-            self.feature_groups_box.children = []
         else:
-            fg_acc = widgets.Accordion(children=children, selected_index=None)
-            for idx, title in enumerate(titles):
-                fg_acc.set_title(idx, title)
-            self.feature_groups_status.value = (
-                f"<b>Available features:</b> {len(usable_cols)} usable columns "
-                f"(excluded metadata/technical: {len(excluded)})"
-            )
-            self.feature_groups_box.children = [fg_acc]
-        self._update_selected_features_box()
+            self.apply_hmm_default_paths_html.value = ""
 
-        csv_path = self._resolve_track_features_csv()
-        binary_input_cols = [c for c in usable_cols if c not in {"interpolated"}]
-        binary_candidates = self._detect_binary_columns_from_csv(
-            csv_path=csv_path,
-            cols=binary_input_cols,
-        )
-        saved_binary = tuple(cfg.get("binary_features_to_group", [])) if isinstance(cfg, dict) else tuple()
-        safe_binary = tuple([x for x in saved_binary if x in binary_candidates])
-        if len(safe_binary) == 0:
-            safe_binary = tuple(binary_candidates)
-        binary_checks = []
-        for col in binary_candidates:
-            cb = widgets.Checkbox(
-                description=str(col),
-                value=(str(col) in safe_binary),
-                indent=False,
-                layout=widgets.Layout(width="500px"),
-            )
-            cb.observe(self._on_binary_checkbox_changed, names="value")
-            self._binary_group_checkboxes[str(col)] = cb
-            binary_checks.append(cb)
+    def _refresh_context(self):
+        super()._refresh_context()
+        if hasattr(self.apply_hmm_artifact_picker, "_start_dir"):
+            self.apply_hmm_artifact_picker._start_dir = self.output_dir or "."
+        self._load_existing_hmm_deployment_artifact_if_available()
 
-        if len(binary_checks) == 0:
-            self.binary_group_status.value = "<i>No binary columns detected from values (0/1 or true/false).</i>"
-            self.binary_group_checks_box.children = []
-        else:
-            self.binary_group_status.value = (
-                f"<b>Detected binary columns:</b> {len(binary_checks)} "
-                "(each selected column is treated as an independent binary group; "
-                "full labels show observed training combinations only)"
-            )
-            self.binary_group_checks_box.children = binary_checks
+    def _refresh_enablement(self):
+        super()._refresh_enablement()
+        has_cell_type = self._current_cell_type() != ""
+        has_features = len(self._selected_hmm_feature_columns()) > 0
+        has_model = self.model_adata is not None
+        has_intrinsic = has_model and (INTRINSIC_STATE_COL in self.model_adata.obs.columns)
+        has_full = has_model and (FULL_STATE_COL in self.model_adata.obs.columns)
+        has_backproj_sample = self.backproj_sample_dd.value is not None and len(str(self.backproj_sample_dd.value)) > 0
+        has_hmm_artifact_input = str(self.apply_hmm_artifact_picker.value).strip() != ""
+        self.btn_cluster.disabled = not (has_cell_type and has_features)
+        self.btn_rename_intrinsic.disabled = not has_intrinsic
+        self.btn_combine_intrinsic.disabled = not has_intrinsic
+        self.intrinsic_combine_name.disabled = not has_intrinsic
+        self.btn_rename_full.disabled = not has_full
+        self.btn_combine_full.disabled = not has_full
+        self.full_combine_name.disabled = not has_full
+        self.btn_open_intrinsic_backprojection.disabled = not (has_cell_type and has_backproj_sample and has_intrinsic)
+        self.btn_apply_hmm_artifact.disabled = not (has_cell_type and has_hmm_artifact_input)
+        self.btn_create_state_composition_plots.disabled = not has_full
+        self.btn_create_state_transition_plots.disabled = not has_full
+        self._refresh_analysis_plots_status()
 
-    def _selected_feature_columns(self):
-        out = []
-        for row in self._group_rows.values():
-            for cb in row["child_cbs"]:
-                if cb.value:
-                    out.append(str(cb.description))
-        # preserve order + de-dup
-        seen = set()
-        uniq = []
-        for x in out:
-            if x not in seen:
-                uniq.append(x)
-                seen.add(x)
-        return uniq
-
-    def _selected_binary_columns(self):
-        return [
-            str(col)
-            for col, cb in self._binary_group_checkboxes.items()
-            if bool(cb.value)
-        ]
-
-    def _update_selected_features_box(self):
-        self.selected_features_box.options = self._selected_feature_columns()
-
-    def _on_feature_checkbox_changed(self, _):
-        self._update_selected_features_box()
-        self._refresh_enablement()
-
-    def _on_binary_checkbox_changed(self, _):
-        self._refresh_enablement()
-
-    def _load_columns(self):
-        csv_path = self._resolve_track_features_csv()
-        if csv_path is None:
-            self._available_columns = []
-            return
-        try:
-            self._available_columns = pd.read_csv(csv_path, nrows=0).columns.tolist()
-        except Exception:
-            self._available_columns = []
-
-    def _load_existing_model_if_available(self):
-        self.model_adata = None
-        p = self._model_adata_path()
-        if p.exists():
-            try:
-                self.model_adata = sc.read_h5ad(p)
-            except Exception:
-                self.model_adata = None
-
-    def _save_model_adata(self, compression="gzip"):
+    def _save_current_hmm_deployment_artifact(self, verbose=True):
         if self.model_adata is None:
-            return
-        p = self._model_adata_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        self.model_adata.write(p, compression=compression)
+            raise ValueError("No model adata loaded.")
+        self._ensure_full_state_colors(write=True)
+        state_paths = _resolve_state_paths(self.output_dir, self._current_cell_type())
+        artifact_path = self._default_hmm_deployment_artifact_path()
+        current_artifact = self._hmm_deployment_artifact
+        if current_artifact is None and artifact_path.exists():
+            current_artifact = load_hmm_deployment_artifact(artifact_path)
+        if current_artifact is None:
+            raise ValueError(
+                "No fitted HMM deployment artifact is available in memory or on disk for updating. "
+                "Run intrinsic HMM clustering first."
+            )
 
-    def _set_busy(self, button, spinner, busy=True, disable_buttons=None):
-        state = bool(busy)
-        if button is not None and hasattr(button, "disabled"):
-            button.disabled = state
-        if spinner is not None:
-            spinner.layout.display = None if state else "none"
-        if disable_buttons is not None:
-            for b in disable_buttons:
-                if b is not None and hasattr(b, "disabled"):
-                    b.disabled = state
+        saved_artifact = save_hmm_deployment_artifact(
+            output_path=artifact_path,
+            model_adata=self.model_adata,
+            hmm_model=current_artifact["model"],
+            state_paths=state_paths,
+            source_model_adata_path=self._model_adata_path(),
+            verbose=verbose,
+        )
+        self._hmm_deployment_artifact = saved_artifact
+        if str(self.apply_hmm_artifact_picker.value).strip() == "":
+            self.apply_hmm_artifact_picker.value = str(artifact_path)
+        self._refresh_apply_default_paths()
+        return artifact_path
+
+    def _current_hmm_model_for_quality_control(self):
+        artifact = self._hmm_deployment_artifact
+        artifact_path = self._default_hmm_deployment_artifact_path()
+        if artifact is None and artifact_path.exists():
+            artifact = load_hmm_deployment_artifact(artifact_path)
+            self._hmm_deployment_artifact = artifact
+        if isinstance(artifact, dict):
+            return artifact.get("model", None)
+        return None
+
+    def _regenerate_hmm_quality_control_plots(self, *, verbose=False):
+        if self.model_adata is None:
+            raise ValueError("No model adata loaded.")
+        if INTRINSIC_STATE_COL not in self.model_adata.obs.columns:
+            raise ValueError(f"model_adata is missing '{INTRINSIC_STATE_COL}'.")
+
+        state_paths = _resolve_state_paths(self.output_dir, self._current_cell_type())
+        qc_dir = Path(state_paths.processing_outdir) / "hmm_behavioral_classification" / "quality_control"
+        preprocessing_meta = self.model_adata.uns.get("preprocessing", {})
+        if not isinstance(preprocessing_meta, dict):
+            preprocessing_meta = {}
+        feature_cols = preprocessing_meta.get(
+            "continuous_feature_cols",
+            preprocessing_meta.get("kept_features", list(self.model_adata.var_names)),
+        )
+        feature_cols = [str(col) for col in list(feature_cols or []) if str(col) in self.model_adata.var_names]
+        scaler_meta = preprocessing_meta.get("scaler", {}) if isinstance(preprocessing_meta, dict) else {}
+        hmm_model = self._current_hmm_model_for_quality_control()
+        qc_out = save_hmm_quality_control_outputs(
+            self.model_adata,
+            feature_cols=feature_cols,
+            output_dir=qc_dir,
+            model=hmm_model,
+            selection_df=None,
+            cluster_col=INTRINSIC_STATE_COL,
+            scaler_mean=scaler_meta.get("mean", None) if isinstance(scaler_meta, dict) else None,
+            scaler_scale=scaler_meta.get("scale", None) if isinstance(scaler_meta, dict) else None,
+            title=f"all_data | hmm | curated {INTRINSIC_STATE_COL}",
+            preprocessing_params=preprocessing_meta,
+            verbose=verbose,
+        )
+        clustering_meta = self.model_adata.uns.get("clustering", {})
+        if not isinstance(clustering_meta, dict):
+            clustering_meta = {}
+        clustering_meta["quality_control_dir"] = str(qc_dir)
+        clustering_meta["raw_quality_control_dir"] = str(qc_dir / "raw")
+        clustering_meta["diagnostics_pdf"] = qc_out.get("diagnostics_pdf", None)
+        clustering_meta["diagnostics_csvs"] = dict(qc_out.get("diagnostics_csvs", {}) or {})
+        clustering_meta["feature_distribution_pdf"] = qc_out.get("feature_distribution_pdf", None)
+        clustering_meta["state_counts_csv"] = qc_out.get("state_counts_csv", None)
+        clustering_meta["transition_matrix_csv"] = qc_out.get("transition_matrix_csv", None)
+        clustering_meta["model_selection_csv"] = qc_out.get("model_selection_csv", None)
+        self.model_adata.uns["clustering"] = clustering_meta
+        return qc_out
+
+    def _rename_mapping_yaml_path(self, cell_type=None):
+        ct = self._current_cell_type() if cell_type is None else str(cell_type).strip()
+        state_paths = _resolve_state_paths(self.output_dir, ct)
+        return (
+            Path(state_paths.processing_outdir)
+            / "hmm_behavioral_classification"
+            / f"hmm_cluster_name_mappings_{ct}.yml"
+        )
+
+    def _full_state_labels(self):
+        if self.model_adata is None or FULL_STATE_COL not in getattr(self.model_adata, "obs", {}).columns:
+            return []
+        labels = pd.Series(self.model_adata.obs[FULL_STATE_COL]).dropna().astype("string").str.strip()
+        labels = labels[labels != ""]
+        return sorted([str(v) for v in labels.unique().tolist()], key=_mixed_label_sort_key)
+
+    def _current_full_state_color_mapping(self, labels=None, *, prefer_pickers=True, write=False):
+        labels = self._full_state_labels() if labels is None else [str(v) for v in list(labels or [])]
+        saved_colors = _get_classification_state_colors(self.model_adata, FULL_STATE_COL)
+        if bool(prefer_pickers):
+            for label, picker in getattr(self, "_full_color_pickers", {}).items():
+                if label in labels:
+                    saved_colors[str(label)] = _coerce_hex_color(getattr(picker, "value", None))
+        colors = _normalize_label_color_map(labels, colors=saved_colors)
+        if bool(write) and len(colors) > 0:
+            _set_classification_state_colors(self.model_adata, FULL_STATE_COL, colors)
+        return colors
+
+    def _ensure_full_state_colors(self, labels=None, write=False):
+        return self._current_full_state_color_mapping(
+            labels=labels,
+            prefer_pickers=False,
+            write=write,
+        )
+
+    def _remap_full_state_colors(self, mapping, existing_labels):
+        old_labels = sorted([str(v) for v in list(existing_labels or [])], key=_mixed_label_sort_key)
+        old_colors = self._current_full_state_color_mapping(labels=old_labels, prefer_pickers=True)
+        new_colors = {}
+        for old_label in old_labels:
+            new_label = str(mapping.get(old_label, old_label)).strip() or old_label
+            if new_label not in new_colors:
+                new_colors[new_label] = old_colors.get(old_label)
+        return _normalize_label_color_map(
+            sorted(new_colors.keys(), key=_mixed_label_sort_key),
+            colors=new_colors,
+        )
+
+    def _mapping_dict_from_obs(self, source_col, target_col):
+        if self.model_adata is None or not hasattr(self.model_adata, "obs"):
+            return {}
+        if source_col not in self.model_adata.obs.columns or target_col not in self.model_adata.obs.columns:
+            return {}
+
+        mapping_obs = self.model_adata.obs[[source_col, target_col]].copy()
+        mapping_obs[source_col] = mapping_obs[source_col].astype("string").str.strip().fillna("")
+        mapping_obs[target_col] = mapping_obs[target_col].astype("string").str.strip().fillna("")
+        mapping_obs = mapping_obs[(mapping_obs[source_col] != "") & (mapping_obs[target_col] != "")]
+        if len(mapping_obs) == 0:
+            return {}
+
+        grouped = mapping_obs.groupby(source_col, observed=False)[target_col].agg(
+            lambda s: sorted({str(v) for v in s if str(v) != ""}, key=_mixed_label_sort_key)
+        )
+        mapping = {}
+        for source_value, targets in grouped.items():
+            source_key = str(source_value).strip()
+            if source_key == "":
+                continue
+            mapping[source_key] = targets[0] if len(targets) == 1 else list(targets)
+        return mapping
+
+    def _write_cluster_name_mappings_yaml(self, *, latest_intrinsic_mapping=None, latest_full_mapping=None):
+        if self.model_adata is None:
+            raise ValueError("No model adata loaded.")
+
+        current_intrinsic_mapping = self._mapping_dict_from_obs(
+            HMM_INTRINSIC_RAW_STATE_COL,
+            INTRINSIC_STATE_COL,
+        )
+        current_full_mapping = {}
+        current_full_mapping_from_intrinsic = {}
+        if all(
+            col in self.model_adata.obs.columns
+            for col in [BINARY_GROUP_COL, HMM_INTRINSIC_RAW_STATE_COL, FULL_STATE_COL]
+        ):
+            full_obs = self.model_adata.obs[
+                [BINARY_GROUP_COL, HMM_INTRINSIC_RAW_STATE_COL, FULL_STATE_COL]
+            ].copy()
+            full_obs[BINARY_GROUP_COL] = full_obs[BINARY_GROUP_COL].astype("string").str.strip().fillna("")
+            full_obs[HMM_INTRINSIC_RAW_STATE_COL] = (
+                pd.to_numeric(full_obs[HMM_INTRINSIC_RAW_STATE_COL], errors="coerce")
+                .astype("Int64")
+                .astype("string")
+                .str.strip()
+                .fillna("")
+            )
+            full_obs[FULL_STATE_COL] = full_obs[FULL_STATE_COL].astype("string").str.strip().fillna("")
+            full_obs = full_obs[
+                (full_obs[BINARY_GROUP_COL] != "")
+                & (full_obs[HMM_INTRINSIC_RAW_STATE_COL] != "")
+                & (full_obs[FULL_STATE_COL] != "")
+            ].copy()
+            if len(full_obs) > 0:
+                full_obs["_generated_full_label"] = (
+                    full_obs[BINARY_GROUP_COL].astype(str)
+                    + "_"
+                    + full_obs[HMM_INTRINSIC_RAW_STATE_COL].astype(str)
+                )
+                grouped = full_obs.groupby("_generated_full_label", observed=False)[FULL_STATE_COL].agg(
+                    lambda s: sorted({str(v) for v in s if str(v) != ""})
+                )
+                for key, values in grouped.items():
+                    current_full_mapping[str(key)] = values[0] if len(values) == 1 else list(values)
+
+        if all(
+            col in self.model_adata.obs.columns
+            for col in [BINARY_GROUP_COL, INTRINSIC_STATE_COL, FULL_STATE_COL]
+        ):
+            intrinsic_obs = self.model_adata.obs[
+                [BINARY_GROUP_COL, INTRINSIC_STATE_COL, FULL_STATE_COL]
+            ].copy()
+            intrinsic_obs[BINARY_GROUP_COL] = intrinsic_obs[BINARY_GROUP_COL].astype("string").str.strip().fillna("")
+            intrinsic_obs[INTRINSIC_STATE_COL] = (
+                intrinsic_obs[INTRINSIC_STATE_COL].astype("string").str.strip().fillna("")
+            )
+            intrinsic_obs[FULL_STATE_COL] = intrinsic_obs[FULL_STATE_COL].astype("string").str.strip().fillna("")
+            intrinsic_obs = intrinsic_obs[
+                (intrinsic_obs[BINARY_GROUP_COL] != "")
+                & (intrinsic_obs[INTRINSIC_STATE_COL] != "")
+                & (intrinsic_obs[FULL_STATE_COL] != "")
+            ].copy()
+            if len(intrinsic_obs) > 0:
+                intrinsic_obs["_generated_full_label"] = (
+                    intrinsic_obs[BINARY_GROUP_COL].astype(str)
+                    + "_"
+                    + intrinsic_obs[INTRINSIC_STATE_COL].astype(str)
+                )
+                grouped = intrinsic_obs.groupby("_generated_full_label", observed=False)[FULL_STATE_COL].agg(
+                    lambda s: sorted({str(v) for v in s if str(v) != ""})
+                )
+                for key, values in grouped.items():
+                    current_full_mapping_from_intrinsic[str(key)] = (
+                        values[0] if len(values) == 1 else list(values)
+                    )
+
+        payload = {
+            "cell_type": str(self._current_cell_type()),
+            "model_adata_path": str(self._model_adata_path()),
+            "latest_intrinsic_rename_mapping": None if latest_intrinsic_mapping is None else dict(latest_intrinsic_mapping),
+            "latest_full_rename_mapping": None if latest_full_mapping is None else dict(latest_full_mapping),
+            "current_mappings": {
+                f"{HMM_INTRINSIC_RAW_STATE_COL}_to_{INTRINSIC_STATE_COL}": dict(current_intrinsic_mapping),
+                f"generated_{FULL_STATE_COL}_to_{FULL_STATE_COL}": dict(current_full_mapping),
+                f"generated_{FULL_STATE_COL}_from_intrinsic_to_{FULL_STATE_COL}": dict(
+                    current_full_mapping_from_intrinsic
+                ),
+            },
+            "current_colors": {
+                FULL_STATE_COL: dict(self._current_full_state_color_mapping(write=True)),
+            },
+        }
+        yaml_path = self._rename_mapping_yaml_path()
+        yaml_path.parent.mkdir(parents=True, exist_ok=True)
+        with yaml_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+        return yaml_path
 
     def _rebuild_intrinsic_rename_rows(self):
         self._intrinsic_name_boxes = {}
-        if self.model_adata is None or "intrinsic_behavioral_cluster" not in self.model_adata.obs.columns:
+        self._intrinsic_select_boxes = {}
+        self.intrinsic_combine_name.value = ""
+        if self.model_adata is None or INTRINSIC_STATE_COL not in self.model_adata.obs.columns:
             self.rename_intrinsic_rows.children = []
-            self.rename_intrinsic_status.value = "<i>Run clustering or load existing model first.</i>"
-            self.btn_rename_intrinsic.disabled = True
-            return
-
-        mapping = build_identity_cluster_mapping(
-            self.model_adata,
-            cluster_col="intrinsic_behavioral_cluster",
-        )
-        rows = []
-        for old_name in mapping.keys():
-            txt = widgets.Text(value=str(old_name), layout=widgets.Layout(width="280px"))
-            self._intrinsic_name_boxes[str(old_name)] = txt
-            rows.append(
-                widgets.HBox(
-                    [widgets.Label(str(old_name), layout=widgets.Layout(width="230px")), txt],
-                    layout=widgets.Layout(align_items="center", gap="8px"),
+            load_status = getattr(self, "_hmm_model_load_status", {}) or {}
+            status = str(load_status.get("status", "not_checked"))
+            path = load_status.get("path", None)
+            message = load_status.get("message", None)
+            if status == "failed":
+                self.rename_intrinsic_status.value = (
+                    "<i>Could not load HMM model adata"
+                    + (f" from {path}" if path else "")
+                    + f": {message}</i>"
                 )
-            )
-        self.rename_intrinsic_rows.children = rows
-        self.rename_intrinsic_status.value = f"<b>Primary dynamic state clusters:</b> {len(rows)}"
-        self.btn_rename_intrinsic.disabled = False
-
-    def _rebuild_full_rename_rows(self):
-        self._full_select_boxes = {}
-        self._full_name_boxes = {}
-        self.full_combine_name.value = ""
-        if self.model_adata is None or "full_behavioral_cluster" not in self.model_adata.obs.columns:
-            self.rename_full_rows.children = []
-            self.rename_full_status.value = "<i>Run primary dynamic state cluster rename first.</i>"
-            self.btn_rename_full.disabled = True
-            self.btn_combine_full.disabled = True
-            self.full_combine_name.disabled = True
+            elif status == "missing_intrinsic_col":
+                self.rename_intrinsic_status.value = f"<i>{message}</i>"
+            elif status == "not_hmm":
+                self.rename_intrinsic_status.value = f"<i>{message}</i>"
+            elif status == "missing":
+                self.rename_intrinsic_status.value = (
+                    "<i>No saved HMM model adata found. Run HMM clustering first.</i>"
+                )
+            else:
+                self.rename_intrinsic_status.value = "<i>Run HMM clustering or load existing model first.</i>"
+            self.btn_rename_intrinsic.disabled = True
+            self.btn_combine_intrinsic.disabled = True
+            self.intrinsic_combine_name.disabled = True
             return
 
         mapping = build_identity_cluster_mapping(
             self.model_adata,
-            cluster_col="full_behavioral_cluster",
+            cluster_col=INTRINSIC_STATE_COL,
         )
         rows = []
         for old_name in mapping.keys():
@@ -1193,301 +1989,162 @@ class StateClassificationPanel:
                 layout=widgets.Layout(width="26px"),
             )
             txt = widgets.Text(value=str(old_name), layout=widgets.Layout(width="280px"))
-            self._full_select_boxes[str(old_name)] = sel
-            self._full_name_boxes[str(old_name)] = txt
+            self._intrinsic_select_boxes[str(old_name)] = sel
+            self._intrinsic_name_boxes[str(old_name)] = txt
             rows.append(
                 widgets.HBox(
                     [sel, widgets.Label(str(old_name), layout=widgets.Layout(width="200px")), txt],
                     layout=widgets.Layout(align_items="center", gap="8px"),
                 )
             )
+        self.rename_intrinsic_rows.children = rows
+        self.rename_intrinsic_status.value = f"<b>Intrinsic HMM states:</b> {len(rows)}"
+        self.btn_rename_intrinsic.disabled = False
+        self.btn_combine_intrinsic.disabled = False
+        self.intrinsic_combine_name.disabled = False
+
+    def _rebuild_full_rename_rows(self):
+        self._full_select_boxes = {}
+        self._full_name_boxes = {}
+        self._full_color_pickers = {}
+        self.rename_full_rows.layout = widgets.Layout(width="660px")
+        self.full_combine_name.value = ""
+        if self.model_adata is None or FULL_STATE_COL not in self.model_adata.obs.columns:
+            self.rename_full_rows.children = []
+            self.rename_full_status.value = "<i>Run intrinsic HMM clustering and rename intrinsic states first.</i>"
+            self.btn_rename_full.disabled = True
+            self.btn_combine_full.disabled = True
+            self.full_combine_name.disabled = True
+            return
+
+        mapping = build_identity_cluster_mapping(
+            self.model_adata,
+            cluster_col=FULL_STATE_COL,
+        )
+        state_colors = self._ensure_full_state_colors(labels=list(mapping.keys()), write=True)
+        rows = []
+        for old_name in mapping.keys():
+            sel = widgets.Checkbox(
+                value=False,
+                description="",
+                indent=False,
+                layout=widgets.Layout(width="26px"),
+            )
+            txt = widgets.Text(value=str(old_name), layout=widgets.Layout(width="280px"))
+            color = widgets.ColorPicker(
+                value=str(state_colors.get(str(old_name), "#808080")),
+                concise=True,
+                layout=widgets.Layout(width="70px"),
+            )
+            self._full_select_boxes[str(old_name)] = sel
+            self._full_name_boxes[str(old_name)] = txt
+            self._full_color_pickers[str(old_name)] = color
+            rows.append(
+                widgets.HBox(
+                    [
+                        sel,
+                        widgets.Label(str(old_name), layout=widgets.Layout(width="200px")),
+                        txt,
+                        color,
+                    ],
+                    layout=widgets.Layout(align_items="center", gap="8px"),
+                )
+            )
         self.rename_full_rows.children = rows
         self.rename_full_status.value = (
-            f"<b>Clusters assigned to binary groups:</b> {len(rows)} "
+            f"<b>HMM states assigned to binary groups:</b> {len(rows)} "
             "(observed combinations from training data)"
         )
         self.btn_rename_full.disabled = False
+        self.btn_combine_full.disabled = False
+        self.full_combine_name.disabled = False
 
-    def _refresh_enablement(self):
-        has_cell_type = self._current_cell_type() != ""
-        has_features = len(self._selected_feature_columns()) > 0
-        has_model = self.model_adata is not None
-        has_intrinsic = has_model and ("intrinsic_behavioral_cluster" in self.model_adata.obs.columns)
-        has_full = has_model and ("full_behavioral_cluster" in self.model_adata.obs.columns)
-        has_full_classifier_input = str(self.apply_full_pkl_picker.value).strip() != ""
-        has_backproj_sample = self.backproj_sample_dd.value is not None and len(str(self.backproj_sample_dd.value)) > 0
+    def _apply_intrinsic_rename_mapping(self, mapping, save_compression="lzf"):
+        if self.model_adata is None:
+            raise ValueError("No model adata loaded.")
 
-        self.btn_apply.disabled = not (has_cell_type and has_full_classifier_input)
-        self.btn_cluster.disabled = not (has_cell_type and has_features)
-        self.btn_rename_intrinsic.disabled = not has_intrinsic
-        self.btn_rename_full.disabled = not has_full
-        self.btn_combine_full.disabled = not has_full
-        self.full_combine_name.disabled = not has_full
-        self.btn_open_backprojection.disabled = not (has_cell_type and has_backproj_sample)
-        self.btn_train.disabled = not has_model
+        normalized_mapping = {}
+        for old_name, new_name in mapping.items():
+            old_s = str(old_name)
+            new_s = str(new_name).strip()
+            normalized_mapping[old_s] = new_s if new_s != "" else old_s
 
-        if has_model:
-            self.train_status.value = (
-                f"<b>Model loaded:</b> {self._model_adata_path().name} "
-                f"({self.model_adata.n_obs} rows)"
+        existing_labels = {
+            str(x)
+            for x in self.model_adata.obs.get(INTRINSIC_STATE_COL, pd.Series(dtype="object")).astype(str)
+        }
+        has_changes = any(
+            str(normalized_mapping.get(label, label)) != str(label)
+            for label in existing_labels
+        )
+        if not has_changes:
+            return {"changed": False}
+
+        relabel_cluster_ids(
+            adata=self.model_adata,
+            mapping=normalized_mapping,
+            cluster_key=INTRINSIC_STATE_COL,
+            new_key=INTRINSIC_STATE_COL,
+            keep_unmapped=True,
+            overwrite_original=True,
+        )
+        clustering_meta = self.model_adata.uns.get("clustering", {})
+        binary_group_constraints = None
+        enforce_binary_group_constraints = False
+        if isinstance(clustering_meta, dict):
+            binary_group_constraints = clustering_meta.get("binary_group_constraints", None)
+            enforce_binary_group_constraints = (
+                isinstance(binary_group_constraints, dict)
+                and ("forbidden_binary_combinations" in binary_group_constraints)
             )
-        else:
-            self.train_status.value = "<i>Load or create model adata first.</i>"
-
-        if has_cell_type:
-            self.status_html.value = f"<b>Ready:</b> cell_type='{self._current_cell_type()}'"
-        else:
-            self.status_html.value = "<b>Select a cell type to continue.</b>"
-
-    def _refresh_context(self):
-        self.output_dir = str(Path(getattr(self.metadata_loader, "output_dir", "")).expanduser())
-        self.output_dir_html.value = f"<b>Output dir:</b> {self.output_dir}"
-        if hasattr(self.apply_full_pkl_picker, "_start_dir"):
-            self.apply_full_pkl_picker._start_dir = self.output_dir or "."
-        if hasattr(self.apply_intrinsic_pkl_picker, "_start_dir"):
-            self.apply_intrinsic_pkl_picker._start_dir = self.output_dir or "."
-
-        # Refresh cell-type options from metadata/filesystem while preserving current selection.
-        current_value = self._current_cell_type()
-        refreshed_types = self._detect_cell_types()
-        if len(refreshed_types) == 0:
-            refreshed_types = [current_value or "tcell"]
-        if current_value not in refreshed_types:
-            refreshed_types.append(current_value)
-        new_options = sorted({str(x).strip() for x in refreshed_types if str(x).strip() != ""})
-        if len(new_options) == 0:
-            new_options = ["tcell"]
-        if list(self.cell_type_dd.options) != list(new_options):
-            self.cell_type_dd.options = new_options
-        if self.cell_type_dd.value not in self.cell_type_dd.options:
-            self.cell_type_dd.value = self.cell_type_dd.options[0]
-
-        self._refresh_apply_default_paths()
-        self._apply_cfg_defaults()
-        self._load_columns()
-        self._build_feature_groups()
-        self._load_existing_model_if_available()
-        self._refresh_backprojection_samples()
+        binary_cols_to_merge = self._selected_binary_columns()
+        if len(binary_cols_to_merge) == 0 and isinstance(clustering_meta, dict):
+            binary_cols_to_merge = [str(c) for c in list(clustering_meta.get("binary_cols_to_merge", []) or [])]
+        _rebuild_full_behavioral_cluster_from_intrinsic(
+            adata=self.model_adata,
+            binary_cols_to_merge=binary_cols_to_merge,
+            intrinsic_col=INTRINSIC_STATE_COL,
+            binary_group_constraints=binary_group_constraints,
+            enforce_binary_group_constraints=enforce_binary_group_constraints,
+        )
+        self.model_adata.obs[FULL_STATE_COL] = pd.Categorical(
+            pd.Series(
+                self.model_adata.obs["full_behavioral_cluster"],
+                index=self.model_adata.obs.index,
+                dtype="string",
+            )
+        )
+        self._ensure_full_state_colors(write=True)
+        self._invalidate_curated_state_reports(
+            reason="State reports were cleared after curated HMM renaming. Recreate them from 'Create analysis plots'."
+        )
+        deployment_warning = None
+        try:
+            artifact_path = self._save_current_hmm_deployment_artifact(verbose=False)
+            _winfo("state-hmm-widget", f"Updated HMM deployment artifact: {artifact_path}")
+        except Exception as exc:
+            deployment_warning = str(exc)
+        qc_warning = None
+        qc_out = {}
+        try:
+            qc_out = self._regenerate_hmm_quality_control_plots(verbose=False)
+            _winfo(
+                "state-hmm-widget",
+                f"Recreated curated HMM quality-control plots: {qc_out.get('diagnostics_pdf', None)}",
+            )
+        except Exception as exc:
+            qc_warning = str(exc)
+        self._save_model_adata(compression=save_compression)
+        yaml_path = self._write_cluster_name_mappings_yaml(latest_intrinsic_mapping=normalized_mapping)
         self._rebuild_intrinsic_rename_rows()
         self._rebuild_full_rename_rows()
-        self._collapse_all_steps()
-        self._refresh_enablement()
-
-    def _on_refresh_clicked(self, _):
-        self._set_busy(self.refresh_btn, self.refresh_spinner, busy=True)
-        try:
-            self._refresh_context()
-        finally:
-            self._set_busy(self.refresh_btn, self.refresh_spinner, busy=False)
-
-    def _on_cell_type_changed(self, _):
-        self._refresh_context()
-
-    def _on_apply_path_changed(self, _):
-        self._refresh_enablement()
-
-    def _on_open_backprojection_clicked(self, _):
-        self._set_busy(self.btn_open_backprojection, self.backprojection_spinner, busy=True)
-        self.out_backprojection.clear_output()
-        with self.out_backprojection:
-            try:
-                sample_name = self.backproj_sample_dd.value
-                if sample_name is None or len(str(sample_name).strip()) == 0:
-                    raise ValueError("Please select a sample name.")
-                _winfo(
-                    "state-widget",
-                    (
-                        "Opening full-cluster backprojection for "
-                        f"sample '{sample_name}' and cell_type '{self._current_cell_type()}'"
-                    ),
-                )
-                show_behavioral_state_backprojection(
-                    sample_name=str(sample_name),
-                    output_dir=self.output_dir,
-                    cell_type=self._current_cell_type(),
-                    state_col="full_behavioral_cluster",
-                    auto_create_if_missing=True,
-                    refresh_if_stale=True,
-                    run=True,
-                    verbose=True,
-                )
-            except Exception:
-                traceback.print_exc()
-            finally:
-                self._set_busy(self.btn_open_backprojection, self.backprojection_spinner, busy=False)
-                self._refresh_enablement()
-
-    def _on_apply_clicked(self, _):
-        self._set_busy(self.btn_apply, self.apply_spinner, busy=True)
-        self.out_apply.clear_output()
-        with self.out_apply:
-            try:
-                self._persist_current_settings()
-                full_pkl_path = str(self.apply_full_pkl_picker.value).strip()
-                intrinsic_pkl_path = str(self.apply_intrinsic_pkl_picker.value).strip()
-                if full_pkl_path == "":
-                    raise ValueError("Please provide a full classification .pkl path.")
-                if not Path(full_pkl_path).exists():
-                    raise FileNotFoundError(f"Full classifier file not found: {full_pkl_path}")
-
-                full_artifact = load_state_classifier_artifact(full_pkl_path)
-                if not (isinstance(full_artifact, dict) and ("continuous_feature_cols" in full_artifact)):
-                    raise ValueError(
-                        "The supplied full classifier path is not a full-classifier artifact. "
-                        "Please provide the full classifier .pkl."
-                    )
-                intrinsic_artifact = None
-                if intrinsic_pkl_path != "":
-                    if not Path(intrinsic_pkl_path).exists():
-                        raise FileNotFoundError(f"Intrinsic classifier file not found: {intrinsic_pkl_path}")
-                    intrinsic_artifact = load_state_classifier_artifact(intrinsic_pkl_path)
-                    if isinstance(intrinsic_artifact, dict) and ("continuous_feature_cols" in intrinsic_artifact):
-                        raise ValueError(
-                            "The supplied intrinsic classifier path appears to be a full-classifier artifact. "
-                            "Provide an intrinsic classifier .pkl or leave intrinsic empty."
-                        )
-
-                ct = self._current_cell_type()
-                self.adata_full = apply_state_classifiers_to_full_dataset(
-                    output_dir=self.output_dir,
-                    cell_type=ct,
-                    label_classifier_artifact=intrinsic_artifact,
-                    full_label_classifier_artifact=full_artifact,
-                    combine_binary_with_continuous=False,
-                    verbose=True,
-                )
-
-                n_rows = int(self.adata_full.n_obs)
-                n_intrinsic = (
-                    int(self.adata_full.obs["intrinsic_behavioral_cluster"].astype(str).nunique())
-                    if "intrinsic_behavioral_cluster" in self.adata_full.obs.columns
-                    else 0
-                )
-                n_full = (
-                    int(self.adata_full.obs["full_behavioral_cluster"].astype(str).nunique())
-                    if "full_behavioral_cluster" in self.adata_full.obs.columns
-                    else 0
-                )
-                _winfo(
-                    "state-widget",
-                    (
-                        "Apply finished: "
-                        f"rows={n_rows}, intrinsic_clusters={n_intrinsic}, full_clusters={n_full}"
-                    ),
-                )
-            except Exception:
-                traceback.print_exc()
-            finally:
-                self._set_busy(self.btn_apply, self.apply_spinner, busy=False)
-                self._refresh_enablement()
-
-    def _on_cluster_clicked(self, _):
-        self._set_busy(self.btn_cluster, self.cluster_spinner, busy=True)
-        self.out_cluster.clear_output()
-        with self.out_cluster:
-            try:
-                self._persist_current_settings()
-                selected_features = self._selected_feature_columns()
-                if len(selected_features) == 0:
-                    raise ValueError("Select at least one feature before clustering.")
-                selected_descriptive_features = self._selected_descriptive_features()
-                if len(selected_descriptive_features) == 0:
-                    raise ValueError("Select at least one window descriptive feature before clustering.")
-                ct = self._current_cell_type()
-                self.model_adata = run_state_clustering(
-                    features=selected_features,
-                    binary_features_to_group=self._selected_binary_columns(),
-                    output_dir=self.output_dir,
-                    cell_type=ct,
-                    window_size=int(self.window_size.value),
-                    min_spacing=self._parse_optional_int(self.min_spacing.value),
-                    max_samples=self._parse_optional_int(self.max_samples.value),
-                    n_neighbors=int(self.n_neighbors.value),
-                    min_dist=float(self.min_dist.value),
-                    resolution=float(self.resolution.value),
-                    descriptive_features=selected_descriptive_features,
-                    pca_var_selection=float(self.pca_var_selection.value),
-                    clustering_method=str(self.clustering_method.value),
-                    lower_quantile_cap=self._parse_optional_float(self.lower_quantile_cap.value),
-                    upper_quantile_cap=self._parse_optional_float(self.upper_quantile_cap.value),
-                    incomplete_window_policy=str(self.incomplete_window_policy.value),
-                    random_state=int(self.random_state.value),
-                    reuse_prepared_dataset=bool(self.reuse_prepared_dataset.value),
-                    verbose=True,
-                )
-                self._save_model_adata()
-                _winfo("state-widget", f"Saved model adata: {self._model_adata_path()}")
-                self._rebuild_intrinsic_rename_rows()
-                self._rebuild_full_rename_rows()
-                # Keep compact behavior: open rename-intrinsic section next.
-                self._open_step(1)
-            except Exception:
-                traceback.print_exc()
-            finally:
-                self._set_busy(self.btn_cluster, self.cluster_spinner, busy=False)
-                self._refresh_enablement()
-
-    def _on_rename_intrinsic_clicked(self, _):
-        self._set_busy(self.btn_rename_intrinsic, self.rename_intrinsic_spinner, busy=True)
-        self.out_rename_intrinsic.clear_output()
-        with self.out_rename_intrinsic:
-            try:
-                if self.model_adata is None:
-                    raise ValueError("No model adata loaded.")
-                mapping = {}
-                for old_name, txt in self._intrinsic_name_boxes.items():
-                    new_name = str(txt.value).strip()
-                    mapping[str(old_name)] = new_name if new_name != "" else str(old_name)
-
-                rename_intrinsic_behavioral_clusters(
-                    adata=self.model_adata,
-                    mapping=mapping,
-                    binary_cols_to_merge=self._selected_binary_columns(),
-                )
-                self._save_model_adata(compression="lzf")
-                self._rebuild_intrinsic_rename_rows()
-                self._rebuild_full_rename_rows()
-                _winfo("state-widget", f"Renamed intrinsic clusters and saved: {self._model_adata_path()}")
-                # Open full mapping next.
-                self._open_step(2)
-            except Exception:
-                traceback.print_exc()
-            finally:
-                self._set_busy(self.btn_rename_intrinsic, self.rename_intrinsic_spinner, busy=False)
-                self._refresh_enablement()
-
-    def _on_rename_full_clicked(self, _):
-        self._set_busy(
-            self.btn_rename_full,
-            self.rename_full_spinner,
-            busy=True,
-            disable_buttons=[self.btn_combine_full],
-        )
-        self.out_rename_full.clear_output()
-        with self.out_rename_full:
-            try:
-                if self.model_adata is None:
-                    raise ValueError("No model adata loaded.")
-                mapping = {}
-                for old_name, txt in self._full_name_boxes.items():
-                    new_name = str(txt.value).strip()
-                    mapping[str(old_name)] = new_name if new_name != "" else str(old_name)
-
-                result = self._apply_full_rename_mapping(mapping, save_compression="lzf")
-                if not bool(result.get("changed", False)):
-                    _winfo("state-widget", "No full-mapping changes to apply.")
-                else:
-                    _winfo("state-widget", f"Renamed full-mapping clusters and saved: {self._model_adata_path()}")
-            except Exception:
-                traceback.print_exc()
-            finally:
-                self._set_busy(
-                    self.btn_rename_full,
-                    self.rename_full_spinner,
-                    busy=False,
-                    disable_buttons=[self.btn_combine_full],
-                )
-                self._refresh_enablement()
+        return {
+            "changed": True,
+            "deployment_warning": deployment_warning,
+            "quality_control_warning": qc_warning,
+            "quality_control_outputs": dict(qc_out),
+            "mapping_yaml_path": str(yaml_path),
+        }
 
     def _apply_full_rename_mapping(self, mapping, save_compression="lzf"):
         if self.model_adata is None:
@@ -1501,138 +2158,848 @@ class StateClassificationPanel:
 
         existing_labels = {
             str(x)
-            for x in self.model_adata.obs.get("full_behavioral_cluster", pd.Series(dtype="object")).astype(str)
+            for x in self.model_adata.obs.get(FULL_STATE_COL, pd.Series(dtype="object")).astype(str)
         }
+        existing_labels = {label for label in existing_labels if label.strip() != ""}
+        saved_colors = self._current_full_state_color_mapping(
+            labels=sorted(existing_labels, key=_mixed_label_sort_key),
+            prefer_pickers=False,
+        )
+        remapped_colors = self._remap_full_state_colors(normalized_mapping, existing_labels)
         has_changes = any(
             str(normalized_mapping.get(label, label)) != str(label)
             for label in existing_labels
         )
+        color_changes = dict(saved_colors) != dict(remapped_colors)
         if not has_changes:
-            return {"changed": False, "relabel_s": 0.0, "save_s": 0.0, "rebuild_s": 0.0, "total_s": 0.0}
+            if color_changes:
+                _set_classification_state_colors(self.model_adata, FULL_STATE_COL, remapped_colors)
+                yaml_path = self._write_cluster_name_mappings_yaml(latest_full_mapping=normalized_mapping)
+                self._rebuild_full_rename_rows()
+                result = {"changed": True, "colors_changed": True, "mapping_yaml_path": str(yaml_path)}
+            else:
+                result = {"changed": False}
+        else:
+            relabel_cluster_ids(
+                adata=self.model_adata,
+                mapping=normalized_mapping,
+                cluster_key=FULL_STATE_COL,
+                overwrite_original=True,
+                keep_unmapped=True,
+            )
+            _set_classification_state_colors(self.model_adata, FULL_STATE_COL, remapped_colors)
+            yaml_path = self._write_cluster_name_mappings_yaml(latest_full_mapping=normalized_mapping)
+            self._rebuild_full_rename_rows()
+            result = {"changed": True, "colors_changed": bool(color_changes), "mapping_yaml_path": str(yaml_path)}
+        if bool(result.get("changed", False)):
+            self._invalidate_curated_state_reports(
+                reason="State reports were cleared after curated HMM renaming. Recreate them from 'Create analysis plots'."
+            )
+            deployment_warning = None
+            try:
+                artifact_path = self._save_current_hmm_deployment_artifact(verbose=False)
+                _winfo(
+                    "state-hmm-widget",
+                    f"Full classification pipeline and settings saved to:\n  {artifact_path}\n"
+                    "You can apply this directly to new data by ticking "
+                    "'Apply existing behavioral state classification'.",
+                )
+            except Exception as exc:
+                deployment_warning = str(exc)
+            qc_warning = None
+            qc_out = {}
+            try:
+                qc_out = self._regenerate_hmm_quality_control_plots(verbose=False)
+                _winfo(
+                    "state-hmm-widget",
+                    f"Recreated curated HMM quality-control plots: {qc_out.get('diagnostics_pdf', None)}",
+                )
+            except Exception as exc:
+                qc_warning = str(exc)
+            self._save_model_adata(compression=save_compression)
+            result["deployment_warning"] = deployment_warning
+            result["quality_control_warning"] = qc_warning
+            result["quality_control_outputs"] = dict(qc_out)
+        return result
 
-        t0 = perf_counter()
-        t_relabel0 = perf_counter()
-        relabel_cluster_ids(
-            adata=self.model_adata,
-            mapping=normalized_mapping,
-            cluster_key="full_behavioral_cluster",
-            overwrite_original=True,
-            keep_unmapped=True,
+    def _invalidate_curated_state_reports(self, reason=None):
+        if self.model_adata is None:
+            return
+        _update_hmm_report_metadata(
+            self.model_adata,
+            composition_pdf=None,
+            composition_auc_csv=None,
+            composition_plot_csvs=[],
+            composition_error=None,
+            transition_dir=None,
+            transition_counts_csv=None,
+            transition_probs_csv=None,
+            transition_error=None,
+            pending_reason=reason,
         )
-        t_relabel = perf_counter() - t_relabel0
 
-        t_save0 = perf_counter()
-        self._save_model_adata(compression=save_compression)
-        t_save = perf_counter() - t_save0
+    _METADATA_TECHNICAL_PATTERNS = (
+        "_path", "_dir", "pixel_distance", "time_interval", "unit_",
+        "channel_", "dead_channel", "zarr", "dimension_order",
+    )
 
-        t_rebuild0 = perf_counter()
-        self._rebuild_full_rename_rows()
-        t_rebuild = perf_counter() - t_rebuild0
-        t_total = perf_counter() - t0
+    def _merge_metadata_into_obs(self, adata):
+        if adata is None or not hasattr(adata, "obs"):
+            return adata
+        md = getattr(self.metadata_loader, "metadata", None)
+        if md is None or "sample_name" not in getattr(md, "columns", []):
+            return adata
+        meta_cols = self._metadata_grouping_columns()
+        cols_to_add = [c for c in meta_cols if c not in adata.obs.columns and c in md.columns]
+        if not cols_to_add:
+            return adata
+        meta_subset = md[["sample_name"] + cols_to_add].drop_duplicates(subset=["sample_name"])
+        orig_index = adata.obs.index
+        merged = adata.obs.merge(meta_subset, on="sample_name", how="left")
+        merged.index = orig_index
+        adata.obs = merged
+        return adata
+
+    def _metadata_grouping_columns(self):
+        md = getattr(self.metadata_loader, "metadata", None)
+        if md is None or not hasattr(md, "columns"):
+            return []
+        exclude = self._METADATA_TECHNICAL_PATTERNS
+        cols = [
+            c for c in md.columns
+            if not any(pat in c.lower() for pat in exclude)
+        ]
+        return cols
+
+    def _refresh_analysis_plots_status(self):
+        if not hasattr(self, "analysis_plots_status"):
+            return
+        if self.model_adata is None or FULL_STATE_COL not in getattr(self.model_adata, "obs", {}).columns:
+            self.analysis_plots_status.value = (
+                "<i>Run HMM clustering and finish curated renaming first, then create plots manually.</i>"
+            )
+            return
+
+        clustering_meta = self.model_adata.uns.get("clustering", {})
+        if not isinstance(clustering_meta, dict):
+            clustering_meta = {}
+        has_composition = clustering_meta.get("state_composition_report_pdf", None) is not None
+        has_transition = clustering_meta.get("state_transition_report_dir", None) is not None
+        pending_reason = clustering_meta.get("state_reports_reason", None)
+
+        if has_composition and has_transition:
+            self.analysis_plots_status.value = (
+                "<b>Analysis plots ready:</b> state composition and state transition outputs have been created."
+            )
+        elif has_composition or has_transition:
+            ready = []
+            if has_composition:
+                ready.append("state composition")
+            if has_transition:
+                ready.append("state transition")
+            self.analysis_plots_status.value = (
+                "<b>Analysis plots partially ready:</b> created "
+                + ", ".join(ready)
+                + "."
+            )
+        else:
+            self.analysis_plots_status.value = (
+                f"<i>{pending_reason}</i>"
+                if pending_reason is not None and len(str(pending_reason).strip()) > 0
+                else "<i>Analysis plots have not been created yet.</i>"
+            )
+
+        if hasattr(self, "composition_group_cols_select"):
+            candidate_cols = self._metadata_grouping_columns()
+            if candidate_cols != list(self.composition_group_cols_select.options):
+                prev = set(self.composition_group_cols_select.value)
+                self.composition_group_cols_select.options = candidate_cols
+                self.composition_group_cols_select.value = [c for c in candidate_cols if c in prev]
+            self.composition_group_cols_select.disabled = len(candidate_cols) == 0
+
+    def _regenerate_curated_state_reports(
+        self,
+        verbose=False,
+        *,
+        create_composition=True,
+        create_transition=True,
+        group_cols=None,
+    ):
+        if self.model_adata is None:
+            raise ValueError("No model adata loaded.")
+        if FULL_STATE_COL not in self.model_adata.obs.columns:
+            raise ValueError(f"model_adata is missing '{FULL_STATE_COL}'.")
+
+        # Use the full applied dataset when available — it covers all samples and timepoints.
+        # Fall back to the training model adata when no artifact has been applied yet.
+        adata_for_plots = (
+            self.adata_full
+            if (
+                getattr(self, "adata_full", None) is not None
+                and FULL_STATE_COL in getattr(self.adata_full, "obs", {}).columns
+            )
+            else self.model_adata
+        )
+
+        state_paths = _resolve_state_paths(self.output_dir, self._current_cell_type())
+        clustering_meta = self.model_adata.uns.get("clustering", {})
+        if not isinstance(clustering_meta, dict):
+            clustering_meta = {}
+        full_state_colors = self._current_full_state_color_mapping(write=True)
+
+        composition_pdf = clustering_meta.get("state_composition_report_pdf", None)
+        composition_auc_csv = clustering_meta.get("state_composition_report_auc_csv", None)
+        composition_plot_csvs = list(clustering_meta.get("state_composition_report_plot_csvs", []) or [])
+        composition_error = clustering_meta.get("state_composition_report_error", None)
+        if bool(create_composition):
+            composition_pdf = None
+            composition_auc_csv = None
+            composition_plot_csvs = []
+            composition_error = None
+            try:
+                composition_dir = Path(state_paths.state_composition_outdir)
+                composition_dir.mkdir(parents=True, exist_ok=True)
+                report_pdf_path = composition_dir / f"state_composition_report_{FULL_STATE_COL}.pdf"
+                report_csv_path = composition_dir / f"state_composition_report_{FULL_STATE_COL}.csv"
+                composition_out = save_state_composition_report(
+                    adata=adata_for_plots,
+                    output_pdf_path=report_pdf_path,
+                    output_csv_path=report_csv_path,
+                    time_col="position_t",
+                    state_col=FULL_STATE_COL,
+                    sample_col="sample_name",
+                    include_pooled_summary=True,
+                    state_colors=full_state_colors,
+                    verbose=verbose,
+                    group_cols=group_cols if group_cols else None,
+                )
+                composition_pdf = str(composition_out.get("pdf_path", report_pdf_path))
+                composition_auc_csv = str(composition_out.get("csv_path", report_csv_path))
+                plot_csv_paths = composition_out.get("plot_data_csv_paths", {})
+                if isinstance(plot_csv_paths, dict):
+                    composition_plot_csvs = [str(v) for v in plot_csv_paths.values()]
+            except Exception as exc:
+                composition_error = str(exc)
+
+        transition_dir = clustering_meta.get("state_transition_report_dir", None)
+        transition_counts_csv = clustering_meta.get("state_transition_matrix_counts_csv", None)
+        transition_probs_csv = clustering_meta.get("state_transition_matrix_probs_csv", None)
+        transition_error = clustering_meta.get("state_transition_report_error", None)
+        if bool(create_transition):
+            transition_dir = None
+            transition_counts_csv = None
+            transition_probs_csv = None
+            transition_error = None
+            try:
+                transitions_outdir = Path(state_paths.state_transitions_outdir)
+                transitions_outdir.mkdir(parents=True, exist_ok=True)
+                transition_out = save_state_transition_report(
+                    adata=adata_for_plots,
+                    output_dir=transitions_outdir,
+                    state_col=FULL_STATE_COL,
+                    id_cols=("sample_name", "TrackID"),
+                    time_col="position_t",
+                    state_colors=full_state_colors,
+                    verbose=verbose,
+                )
+                transition_dir = str(transition_out.get("output_dir", transitions_outdir))
+                transition_counts_csv = transition_out.get("transition_matrix_counts_csv", None)
+                transition_probs_csv = transition_out.get("transition_matrix_probs_csv", None)
+            except Exception as exc:
+                transition_error = str(exc)
+
+        _update_hmm_report_metadata(
+            self.model_adata,
+            composition_pdf=composition_pdf,
+            composition_auc_csv=composition_auc_csv,
+            composition_plot_csvs=composition_plot_csvs,
+            composition_error=composition_error,
+            transition_dir=transition_dir,
+            transition_counts_csv=transition_counts_csv,
+            transition_probs_csv=transition_probs_csv,
+            transition_error=transition_error,
+            pending_reason="State reports have not been created yet. Use 'Create analysis plots' in the HMM widget.",
+        )
         return {
-            "changed": True,
-            "relabel_s": float(t_relabel),
-            "save_s": float(t_save),
-            "rebuild_s": float(t_rebuild),
-            "total_s": float(t_total),
+            "composition_pdf": composition_pdf,
+            "composition_auc_csv": composition_auc_csv,
+            "composition_plot_csvs": list(composition_plot_csvs),
+            "composition_error": composition_error,
+            "transition_dir": transition_dir,
+            "transition_counts_csv": transition_counts_csv,
+            "transition_probs_csv": transition_probs_csv,
+            "transition_error": transition_error,
         }
 
-    def _on_combine_full_clicked(self, _):
-        self._set_busy(
-            self.btn_combine_full,
-            self.combine_full_spinner,
-            busy=True,
-            disable_buttons=[self.btn_rename_full],
+    def _on_create_state_composition_plots_clicked(self, _):
+        self._set_busy(self.btn_create_state_composition_plots, self.state_composition_spinner, busy=True)
+        self.out_analysis_plots.clear_output()
+        with self.out_analysis_plots:
+            try:
+                group_cols = list(self.composition_group_cols_select.value) or None
+                report_out = self._regenerate_curated_state_reports(
+                    verbose=True,
+                    create_composition=True,
+                    create_transition=False,
+                    group_cols=group_cols,
+                )
+                self._save_model_adata(compression="lzf")
+                _winfo(
+                    "state-hmm-widget",
+                    "Created state composition plots: "
+                    f"{report_out.get('composition_pdf', None)}",
+                )
+                if report_out.get("composition_error", None):
+                    _winfo(
+                        "state-hmm-widget",
+                        f"State composition plot generation reported an error: {report_out['composition_error']}",
+                    )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_create_state_composition_plots, self.state_composition_spinner, busy=False)
+                self._refresh_enablement()
+
+    def _on_create_state_transition_plots_clicked(self, _):
+        self._set_busy(self.btn_create_state_transition_plots, self.state_transition_spinner, busy=True)
+        self.out_analysis_plots.clear_output()
+        with self.out_analysis_plots:
+            try:
+                report_out = self._regenerate_curated_state_reports(
+                    verbose=True,
+                    create_composition=False,
+                    create_transition=True,
+                )
+                self._save_model_adata(compression="lzf")
+                _winfo(
+                    "state-hmm-widget",
+                    "Created state transition plots: "
+                    f"{report_out.get('transition_dir', None)}",
+                )
+                if report_out.get("transition_error", None):
+                    _winfo(
+                        "state-hmm-widget",
+                        f"State transition plot generation reported an error: {report_out['transition_error']}",
+                    )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_create_state_transition_plots, self.state_transition_spinner, busy=False)
+                self._refresh_enablement()
+
+    def _on_cluster_clicked(self, _):
+        self._set_busy(self.btn_cluster, self.cluster_spinner, busy=True)
+        self.out_cluster.clear_output()
+        with self.out_cluster:
+            try:
+                self._persist_current_settings()
+                selected_features = self._selected_feature_columns()
+                selected_window_features = self._selected_window_feature_columns()
+                selected_hmm_features = self._selected_hmm_feature_columns()
+                if len(selected_hmm_features) == 0:
+                    raise ValueError("Select at least one feature before HMM clustering.")
+                n_states_value = (
+                    "auto"
+                    if str(self.hmm_n_states_mode.value) == "auto"
+                    else int(self.hmm_n_states.value)
+                )
+                _winfo(
+                    "state-hmm-widget",
+                    (
+                        "Running intrinsic HMM clustering with "
+                        f"n_states={n_states_value}, features={selected_hmm_features}"
+                    ),
+                )
+                cluster_out = run_hmm_state_clustering(
+                    features=selected_features,
+                    additional_window_features=selected_window_features,
+                    binary_features_to_group=self._selected_binary_columns(),
+                    output_dir=self.output_dir,
+                    cell_type=self._current_cell_type(),
+                    n_states=n_states_value,
+                    k_min=int(self.hmm_k_min.value),
+                    k_max=int(self.hmm_k_max.value),
+                    covariance_type=str(self.hmm_covariance_type.value),
+                    n_iter=int(self.hmm_n_iter.value),
+                    tol=float(self.hmm_tol.value),
+                    sticky=bool(self.hmm_sticky.value),
+                    stickiness_kappa=float(self.hmm_stickiness_kappa.value),
+                    transmat_alpha=float(self.hmm_transmat_alpha.value),
+                    min_covar=float(self.hmm_min_covar.value),
+                    feature_smoothing_window=int(self.hmm_feature_smoothing_window.value),
+                    smoothing_min_periods=int(self.hmm_smoothing_min_periods.value),
+                    start_offset=int(self.hmm_start_offset.value),
+                    start_offset_fill_mode=str(self.hmm_start_offset_fill_mode.value),
+                    window_features_window=int(self.hmm_window_features_window.value),
+                    lower_quantile_cap=self._parse_optional_float(self.feature_quantile_capping_low_percentile.value),
+                    upper_quantile_cap=self._parse_optional_float(self.feature_quantile_capping_high_percentile.value),
+                    log_scale_features=self._selected_log_scale_features(),
+                    random_state=int(self.random_state.value),
+                    return_details=True,
+                    verbose=True,
+                )
+                self.model_adata = cluster_out["model_adata"]
+                self.model_adata = self._merge_metadata_into_obs(self.model_adata)
+                self._hmm_model_load_status = {
+                    "status": "loaded",
+                    "path": str(self._model_adata_path()),
+                    "message": None,
+                }
+                self._hmm_deployment_artifact = cluster_out.get("hmm_deployment_artifact", None)
+                artifact_path = self._save_current_hmm_deployment_artifact(verbose=True)
+                self._save_model_adata()
+                _winfo("state-hmm-widget", f"Saved model adata: {self._model_adata_path()}")
+                _winfo("state-hmm-widget", f"Saved HMM deployment artifact: {artifact_path}")
+                self._rebuild_intrinsic_rename_rows()
+                self._rebuild_full_rename_rows()
+                self._open_step(1)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_cluster, self.cluster_spinner, busy=False)
+                self._refresh_enablement()
+
+    def _on_apply_clicked(self, _):
+        self._set_busy(self.btn_apply, self.apply_spinner, busy=True)
+        self.out_apply.clear_output()
+        with self.out_apply:
+            try:
+                self._persist_current_settings()
+                full_pkl_path = str(self.apply_full_pkl_picker.value).strip()
+                intrinsic_pkl_path = str(self.apply_intrinsic_pkl_picker.value).strip()
+                if full_pkl_path == "":
+                    raise ValueError("Please provide a full classification .pkl path.")
+
+                full_artifact = self._coerce_classifier_artifact(full_pkl_path, "Full")
+                intrinsic_artifact = None
+                if intrinsic_pkl_path != "":
+                    intrinsic_artifact = self._coerce_classifier_artifact(intrinsic_pkl_path, "Intrinsic")
+
+                self.adata_full = self._apply_classifiers_to_full_dataset(
+                    intrinsic_artifact=intrinsic_artifact,
+                    full_artifact=full_artifact,
+                )
+
+                n_rows = int(self.adata_full.n_obs)
+                n_intrinsic = (
+                    int(self.adata_full.obs[INTRINSIC_STATE_COL].astype(str).nunique())
+                    if INTRINSIC_STATE_COL in self.adata_full.obs.columns
+                    else 0
+                )
+                n_full = (
+                    int(self.adata_full.obs[FULL_STATE_COL].astype(str).nunique())
+                    if FULL_STATE_COL in self.adata_full.obs.columns
+                    else 0
+                )
+                _winfo(
+                    "state-hmm-widget",
+                    (
+                        "Apply finished: "
+                        f"rows={n_rows}, intrinsic_clusters={n_intrinsic}, full_clusters={n_full}"
+                    ),
+                )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_apply, self.apply_spinner, busy=False)
+                self._refresh_enablement()
+
+    def _on_apply_hmm_artifact_clicked(self, _):
+        self._set_busy(self.btn_apply_hmm_artifact, self.apply_hmm_spinner, busy=True)
+        self.out_apply_hmm.clear_output()
+        with self.out_apply_hmm:
+            try:
+                self._persist_current_settings()
+                hmm_pkl_path = str(self.apply_hmm_artifact_picker.value).strip()
+                if hmm_pkl_path == "":
+                    raise ValueError("Please provide an HMM deployment artifact .pkl path.")
+
+                hmm_artifact = self._coerce_hmm_deployment_artifact(hmm_pkl_path)
+                self.adata_full = self._apply_hmm_deployment_artifact_to_full_dataset(
+                    hmm_artifact=hmm_artifact,
+                )
+                self.adata_full = self._merge_metadata_into_obs(self.adata_full)
+                self._hmm_deployment_artifact = hmm_artifact
+
+                n_rows = int(self.adata_full.n_obs)
+                n_intrinsic = (
+                    int(self.adata_full.obs[INTRINSIC_STATE_COL].astype(str).nunique())
+                    if INTRINSIC_STATE_COL in self.adata_full.obs.columns
+                    else 0
+                )
+                n_full = (
+                    int(self.adata_full.obs[FULL_STATE_COL].astype(str).nunique())
+                    if FULL_STATE_COL in self.adata_full.obs.columns
+                    else 0
+                )
+                _winfo(
+                    "state-hmm-widget",
+                    (
+                        "HMM deployment apply finished: "
+                        f"rows={n_rows}, intrinsic_clusters={n_intrinsic}, full_clusters={n_full}"
+                    ),
+                )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_apply_hmm_artifact, self.apply_hmm_spinner, busy=False)
+                self._refresh_enablement()
+
+    def _coerce_classifier_artifact(self, path, label):
+        if path == "":
+            raise ValueError(f"Please provide a {label.lower()} classification .pkl path.")
+        if not Path(path).exists():
+            raise FileNotFoundError(f"{label} classifier file not found: {path}")
+        return load_state_classifier_artifact(path)
+
+    def _coerce_hmm_deployment_artifact(self, path):
+        if path == "":
+            raise ValueError("Please provide an HMM deployment artifact .pkl path.")
+        if not Path(path).exists():
+            raise FileNotFoundError(f"HMM deployment artifact file not found: {path}")
+        return load_hmm_deployment_artifact(path)
+
+    def _apply_classifiers_to_full_dataset(self, *, intrinsic_artifact, full_artifact):
+        return apply_state_classifiers_to_full_dataset(
+            output_dir=self.output_dir,
+            cell_type=self._current_cell_type(),
+            label_classifier_artifact=intrinsic_artifact,
+            full_label_classifier_artifact=full_artifact,
+            combine_binary_with_continuous=False,
+            verbose=True,
         )
-        self.out_rename_full.clear_output()
-        with self.out_rename_full:
+
+    def _apply_hmm_deployment_artifact_to_full_dataset(self, *, hmm_artifact):
+        return apply_hmm_deployment_artifact_to_full_dataset(
+            output_dir=self.output_dir,
+            cell_type=self._current_cell_type(),
+            hmm_deployment_artifact=hmm_artifact,
+            start_offset=int(self.hmm_start_offset.value),
+            start_offset_fill_mode=str(self.hmm_start_offset_fill_mode.value),
+            verbose=True,
+        )
+
+    def _on_rename_intrinsic_clicked(self, _):
+        self._set_busy(self.btn_rename_intrinsic, self.rename_intrinsic_spinner, busy=True)
+        self.out_rename_intrinsic.clear_output()
+        with self.out_rename_intrinsic:
             try:
                 if self.model_adata is None:
                     raise ValueError("No model adata loaded.")
-                if len(self._full_name_boxes) == 0:
-                    raise ValueError("No full-state rows are available to combine.")
-
-                target = str(self.full_combine_name.value).strip()
-                if target == "":
-                    raise ValueError("Cannot rename to empty.")
-
-                selected = [name for name, cb in self._full_select_boxes.items() if bool(cb.value)]
-                if len(selected) == 0:
-                    raise ValueError("Select at least one full state to combine.")
-
-                # Apply combined name to selected rows first.
-                for old_name in selected:
-                    if old_name in self._full_name_boxes:
-                        self._full_name_boxes[old_name].value = target
-
                 mapping = {}
-                for old_name, txt in self._full_name_boxes.items():
+                for old_name, txt in self._intrinsic_name_boxes.items():
                     new_name = str(txt.value).strip()
                     mapping[str(old_name)] = new_name if new_name != "" else str(old_name)
 
-                result = self._apply_full_rename_mapping(mapping, save_compression="lzf")
+                result = self._apply_intrinsic_rename_mapping(mapping, save_compression="lzf")
                 if not bool(result.get("changed", False)):
-                    _winfo("state-widget", "No full-state combine changes to apply.")
+                    _winfo("state-hmm-widget", "No intrinsic-mapping changes to apply.")
                 else:
-                    _winfo("state-widget", f"Combined {len(selected)} full states into '{target}'.")
+                    _winfo(
+                        "state-hmm-widget",
+                        f"Renamed intrinsic states and saved: {self._model_adata_path()}",
+                    )
+                    if result.get("mapping_yaml_path", None):
+                        _winfo(
+                            "state-hmm-widget",
+                            f"Saved cluster name mappings YAML: {result['mapping_yaml_path']}",
+                        )
+                    if result.get("deployment_warning", None):
+                        _winfo(
+                            "state-hmm-widget",
+                            "Intrinsic rename succeeded, but the HMM deployment artifact was not updated: "
+                            f"{result['deployment_warning']}",
+                        )
+                    if result.get("quality_control_warning", None):
+                        _winfo(
+                            "state-hmm-widget",
+                            "Intrinsic rename succeeded, but curated quality-control plots were not recreated: "
+                            f"{result['quality_control_warning']}",
+                        )
+                self._open_step(2)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_rename_intrinsic, self.rename_intrinsic_spinner, busy=False)
+                self._refresh_enablement()
+
+    def _on_combine_intrinsic_clicked(self, _):
+        self._set_busy(
+            self.btn_combine_intrinsic,
+            self.combine_intrinsic_spinner,
+            busy=True,
+            disable_buttons=[self.btn_rename_intrinsic],
+        )
+        self.out_rename_intrinsic.clear_output()
+        with self.out_rename_intrinsic:
+            try:
+                if self.model_adata is None:
+                    raise ValueError("No model adata loaded.")
+                if len(self._intrinsic_name_boxes) == 0:
+                    raise ValueError("No intrinsic-state rows are available to combine.")
+
+                target = str(self.intrinsic_combine_name.value).strip()
+                if target == "":
+                    raise ValueError("Cannot rename to empty.")
+
+                selected = [name for name, cb in self._intrinsic_select_boxes.items() if bool(cb.value)]
+                if len(selected) == 0:
+                    raise ValueError("Select at least one intrinsic state to combine.")
+
+                for old_name in selected:
+                    if old_name in self._intrinsic_name_boxes:
+                        self._intrinsic_name_boxes[old_name].value = target
+
+                mapping = {}
+                for old_name, txt in self._intrinsic_name_boxes.items():
+                    new_name = str(txt.value).strip()
+                    mapping[str(old_name)] = new_name if new_name != "" else str(old_name)
+
+                result = self._apply_intrinsic_rename_mapping(mapping, save_compression="lzf")
+                if not bool(result.get("changed", False)):
+                    _winfo("state-hmm-widget", "No intrinsic-state combine changes to apply.")
+                else:
+                    _winfo(
+                        "state-hmm-widget",
+                        f"Combined {len(selected)} intrinsic states into '{target}' and saved.",
+                    )
+                    if result.get("mapping_yaml_path", None):
+                        _winfo(
+                            "state-hmm-widget",
+                            f"Saved cluster name mappings YAML: {result['mapping_yaml_path']}",
+                        )
+                    if result.get("deployment_warning", None):
+                        _winfo(
+                            "state-hmm-widget",
+                            "Intrinsic combine succeeded, but the HMM deployment artifact was not updated: "
+                            f"{result['deployment_warning']}",
+                        )
+                    if result.get("quality_control_warning", None):
+                        _winfo(
+                            "state-hmm-widget",
+                            "Intrinsic combine succeeded, but curated quality-control plots were not recreated: "
+                            f"{result['quality_control_warning']}",
+                        )
             except Exception:
                 traceback.print_exc()
             finally:
                 self._set_busy(
-                    self.btn_combine_full,
-                    self.combine_full_spinner,
+                    self.btn_combine_intrinsic,
+                    self.combine_intrinsic_spinner,
                     busy=False,
-                    disable_buttons=[self.btn_rename_full],
+                    disable_buttons=[self.btn_rename_intrinsic],
                 )
                 self._refresh_enablement()
 
-    def _on_train_clicked(self, _):
-        self._set_busy(self.btn_train, self.train_spinner, busy=True)
-        self.out_train.clear_output()
-        with self.out_train:
+    def _open_backprojection_for_state_col(self, state_col):
+        active_button = (
+            self.btn_open_intrinsic_backprojection
+            if str(state_col) == INTRINSIC_STATE_COL
+            else self.btn_open_backprojection
+        )
+        other_button = (
+            self.btn_open_backprojection
+            if active_button is self.btn_open_intrinsic_backprojection
+            else self.btn_open_intrinsic_backprojection
+        )
+        self._set_busy(
+            active_button,
+            self.backprojection_spinner,
+            busy=True,
+            disable_buttons=[other_button],
+        )
+        self.out_backprojection.clear_output()
+        with self.out_backprojection:
             try:
-                self._persist_current_settings()
-                if self.model_adata is None:
-                    self._load_existing_model_if_available()
-                if self.model_adata is None:
-                    raise ValueError(
-                        f"No model adata found at: {self._model_adata_path()}. "
-                        "Run clustering first."
-                    )
-
-                max_depth = self._parse_optional_int(self.max_depth.value)
-                class_weight_raw = str(self.class_weight.value).strip()
-                class_weight = None if class_weight_raw == "" else class_weight_raw
-                val_seed = self._parse_optional_int(self.validation_random_state.value)
-
-                out = train_state_classifiers(
-                    output_dir=self.output_dir,
-                    cell_type=self._current_cell_type(),
-                    model_adata=self.model_adata,
-                    label_transfer_method="classifier",
-                    classifier_backend="random_forest",
-                    classifier_n_estimators=int(self.n_estimators.value),
-                    classifier_min_samples_leaf=int(self.min_samples_leaf.value),
-                    classifier_n_jobs=int(self.n_jobs.value),
-                    classifier_max_depth=max_depth,
-                    classifier_min_samples_split=int(self.min_samples_split.value),
-                    classifier_max_features=str(self.max_features.value).strip(),
-                    classifier_class_weight=class_weight,
-                    save_label_classifier=True,
-                    train_continuous_classifier=True,
-                    train_full_classifier=True,
-                    save_full_label_classifier=True,
-                    validation_test_size=float(self.validation_test_size.value),
-                    validation_random_state=val_seed,
-                    validation_stratify=bool(self.validation_stratify.value),
-                    verbose=True,
+                sample_name = self.backproj_sample_dd.value
+                if sample_name is None or len(str(sample_name).strip()) == 0:
+                    raise ValueError("Please select a sample name.")
+                _winfo(
+                    "state-hmm-widget",
+                    (
+                        f"Opening backprojection for state_col='{state_col}', "
+                        f"sample '{sample_name}', cell_type '{self._current_cell_type()}'"
+                    ),
                 )
-                self._save_model_adata()
-                _winfo("state-widget", "Training finished.")
-                _winfo("state-widget", f"Intrinsic classifier: {out.get('partial_classifier_path', None)}")
-                _winfo("state-widget", f"Full classifier: {out.get('full_classifier_path', None)}")
+                if str(state_col) == INTRINSIC_STATE_COL:
+                    track_features_csv = self._resolve_track_features_csv()
+                    _clear_intrinsic_hmm_backprojection_cache(
+                        output_dir=self.output_dir,
+                        sample_name=str(sample_name),
+                        cell_type=self._current_cell_type(),
+                        verbose=True,
+                    )
+                    _show_intrinsic_hmm_backprojection(
+                        adata=self.model_adata,
+                        sample_name=str(sample_name),
+                        output_dir=self.output_dir,
+                        cell_type=self._current_cell_type(),
+                        track_features_csv_path=track_features_csv,
+                        metadata=getattr(self.metadata_loader, "metadata", None),
+                        n_workers=int(self.hmm_backprojection_workers.value),
+                        run=True,
+                        verbose=True,
+                    )
+                else:
+                    track_features_csv = self._resolve_track_features_csv()
+                    _clear_behavioral_state_backprojection_cache(
+                        output_dir=self.output_dir,
+                        sample_name=str(sample_name),
+                        cell_type=self._current_cell_type(),
+                        verbose=True,
+                    )
+                    _show_hmm_state_backprojection(
+                        adata=self.model_adata,
+                        sample_name=str(sample_name),
+                        output_dir=self.output_dir,
+                        cell_type=self._current_cell_type(),
+                        state_col=str(state_col),
+                        track_features_csv_path=track_features_csv,
+                        metadata=getattr(self.metadata_loader, "metadata", None),
+                        state_colors=self._current_full_state_color_mapping(write=True),
+                        n_workers=int(self.hmm_backprojection_workers.value),
+                        run=True,
+                        verbose=True,
+                    )
             except Exception:
                 traceback.print_exc()
             finally:
-                self._set_busy(self.btn_train, self.train_spinner, busy=False)
+                self._set_busy(
+                    active_button,
+                    self.backprojection_spinner,
+                    busy=False,
+                    disable_buttons=[other_button],
+                )
                 self._refresh_enablement()
+
+    def _on_open_backprojection_clicked(self, _):
+        self._open_backprojection_for_state_col(FULL_STATE_COL)
+
+    def _on_open_intrinsic_backprojection_clicked(self, _):
+        self._open_backprojection_for_state_col(INTRINSIC_STATE_COL)
+
+
+class StateClassificationHMMDeploymentPanel(StateClassificationHMMPanel):
+    """HMM-only deployment panel that saves and applies a single deployment artifact."""
+
+    def __init__(self, metadata_loader, cell_type=None):
+        super().__init__(metadata_loader=metadata_loader, cell_type=cell_type)
+        if hasattr(self, "train_section"):
+            self.train_section.layout.display = "none"
+        if hasattr(self, "btn_train"):
+            self.btn_train.layout.display = "none"
+
+    def _panel_cfg(self):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if not isinstance(params, dict):
+            return {}
+        section = params.setdefault("behavioral_state_classification", {})
+        cell_type = self._current_cell_type()
+        if cell_type not in section:
+            section[cell_type] = {}
+        return section[cell_type]
+
+    def _effective_panel_cfg(self):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if not isinstance(params, dict):
+            return {}
+        section = params.get("behavioral_state_classification", {})
+        defaults = section.get("defaults", {})
+        cell_cfg = section.get(self._current_cell_type(), {})
+        return {**defaults, **cell_cfg}
+
+
+    def _build_steps(self):
+        analysis_plots_section = getattr(self, "analysis_plots_section", widgets.VBox([]))
+        self._rename_full_with_description = widgets.VBox(
+            [
+                widgets.HTML(
+                    "<span style='color:#555;'>Rename HMM intrinsic clusters combined with binary group "
+                    "values (e.g. organoid_contact)</span>"
+                ),
+                self.rename_full_section,
+            ],
+            layout=widgets.Layout(gap="6px"),
+        )
+        self.steps = widgets.Accordion(
+            children=[
+                self.clustering_section,
+                self.rename_intrinsic_section,
+                self._rename_full_with_description,
+                analysis_plots_section,
+                self.backprojection_section,
+            ],
+            selected_index=None,
+        )
+        self.steps.set_title(0, "Assign HMM intrinsic behavioral states")
+        self.steps.set_title(1, "Rename intrinsic states")
+        self.steps.set_title(2, "Rename full states")
+        self.steps.set_title(3, "Create plots")
+        self.steps.set_title(4, "Backprojection")
+
+    def _sync_apply_existing_mode(self):
+        if not hasattr(self, "steps"):
+            return
+        analysis_plots_section = getattr(self, "analysis_plots_section", widgets.VBox([]))
+        if self.apply_existing_state_classification.value:
+            self.steps.children = [
+                self.apply_section,
+                analysis_plots_section,
+                self.backprojection_section,
+            ]
+            self.steps.set_title(0, "Apply existing classification")
+            self.steps.set_title(1, "Create plots")
+            self.steps.set_title(2, "Backprojection")
+            self.steps.selected_index = 0
+        else:
+            rename_full = getattr(self, "_rename_full_with_description", self.rename_full_section)
+            self.steps.children = [
+                self.clustering_section,
+                self.rename_intrinsic_section,
+                rename_full,
+                analysis_plots_section,
+                self.backprojection_section,
+            ]
+            self.steps.set_title(0, "Assign HMM intrinsic behavioral states")
+            self.steps.set_title(1, "Rename intrinsic states")
+            self.steps.set_title(2, "Rename full states")
+            self.steps.set_title(3, "Create plots")
+            self.steps.set_title(4, "Backprojection")
+            self.steps.selected_index = None
+
+    def _build_apply_section(self):
+        _LegacyStateClassificationPanel._build_apply_section(self)
+        self.apply_hmm_artifact_picker = self._make_hmm_artifact_picker()
+        self.apply_hmm_artifact_picker.filter_pattern = "*.pkl"
+        self.apply_hmm_default_paths_html = widgets.HTML("")
+        self.btn_apply_hmm_artifact = widgets.Button(
+            description="Apply saved HMM artifact",
+            button_style="success",
+            layout=widgets.Layout(width="220px"),
+        )
+        self.btn_apply_hmm_artifact.on_click(self._on_apply_hmm_artifact_clicked)
+        self.apply_hmm_spinner = widgets.HTML(value=spinning_loader)
+        self.apply_hmm_spinner.layout.display = "none"
+        self.out_apply_hmm = widgets.Output()
+        self.apply_section = widgets.VBox(
+            [
+                widgets.HTML(
+                    "<i>This deployment workflow skips downstream classifier training and uses only the saved HMM deployment artifact.</i>"
+                ),
+                self.apply_hmm_artifact_picker,
+                self.apply_hmm_default_paths_html,
+                widgets.HBox([self.btn_apply_hmm_artifact, self.apply_hmm_spinner]),
+                self.out_apply_hmm,
+            ]
+        )
+
+    def _refresh_enablement(self):
+        super()._refresh_enablement()
+        has_cell_type = self._current_cell_type() != ""
+        has_hmm_artifact_input = str(self.apply_hmm_artifact_picker.value).strip() != ""
+        self.btn_apply.disabled = True
+        self.btn_train.disabled = True
+        self.btn_apply_hmm_artifact.disabled = not (has_cell_type and has_hmm_artifact_input)
+
+
+StateClassificationPanel = StateClassificationHMMDeploymentPanel

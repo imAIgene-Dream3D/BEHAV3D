@@ -2,6 +2,7 @@ import ipywidgets as widgets
 from pathlib import Path
 import fnmatch 
 import os
+import shutil
 import yaml
 import traceback
 import pandas as pd
@@ -31,8 +32,16 @@ from behav3d.core.utils import expand_column_patterns
 from behav3d.io.formats.zarr import load_zarr
 from behav3d.io.images import load_image
 from behav3d.features.timepoint_features import run_feature_extraction
-from behav3d.analysis.tcell_analysis import (
-    run_tcell_analysis
+from behav3d.analysis.backprojection import backproject_columns, view_napari
+from behav3d.analysis.behavior.track.feature_dtw import run_tcell_analysis
+from behav3d.analysis.behavior.track.visualization.plots.feature_dtw import (
+    plot_cluster_percentage_bars,
+    plot_clustering_feature_heatmap,
+    plot_feature_umap,
+)
+from behav3d.analysis.behavior.track.visualization.plots.exemplar_track_per_cluster import (
+    save_exemplar_statebar_backprojection_pdf,
+    save_exemplar_statebar_backprojection_video_per_cluster,
 )
 from behav3d.analysis.organoid_analysis import (
     run_organoid_analysis,
@@ -40,6 +49,10 @@ from behav3d.analysis.organoid_analysis import (
     run_organoid_morphology_dead_analysis
 )
 from behav3d.analysis.filtering import filter_tracks, preview_track_length_before_filtering
+from behav3d.analysis.behavior.state.visualization.backprojection import (
+    _resolve_raw_image_path,
+    _resolve_tracked_image_path,
+)
 
 from behav3d.io.images import load_zarr
 from behav3d.analysis import summarize_track_features
@@ -61,6 +74,31 @@ except ImportError:
         "death": ["mean_dead_dye", "percentage_dead_mask"],
         "active_killing": ["is_active_killing", "killing_efficiency"]
     }'''
+
+def _filter_track_image_to_ids(track_img, track_ids):
+    track_ids = np.asarray(list(track_ids), dtype=np.int64)
+    if hasattr(track_img, "chunks"):
+        import dask.array as da
+
+        return da.where(da.isin(track_img, track_ids), track_img, 0)
+    return np.where(np.isin(track_img, track_ids), track_img, 0)
+
+
+def _sample_voxel_size(metadata, sample_name):
+    if not isinstance(metadata, pd.DataFrame) or "sample_name" not in metadata.columns:
+        return [1.0, 1.0, 1.0]
+    sample_rows = metadata[metadata["sample_name"].astype(str) == str(sample_name)]
+    if len(sample_rows) == 0:
+        return [1.0, 1.0, 1.0]
+    row = sample_rows.iloc[0]
+    try:
+        return [
+            float(row.get("pixel_distance_z", 1.0)),
+            float(row.get("pixel_distance_xy", 1.0)),
+            float(row.get("pixel_distance_xy", 1.0)),
+        ]
+    except Exception:
+        return [1.0, 1.0, 1.0]
 
 def _feature_output_csv_path(output_dir, cell_type):
     return Path(output_dir, "analysis", cell_type, "track_features", f"BEHAV3D_{cell_type}_combined_track_features.csv")
@@ -2586,6 +2624,7 @@ class MotileCellAnalysisPanel:
         feature_outdir = Path(self.output_dir, "analysis", self.cell_type, "track_features")
         df_p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
         if not df_p.exists(): df_p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features.csv")
+        self.df_tracks_path = df_p
         
         self._no_csv = False
         valid_cols = []
@@ -2621,10 +2660,30 @@ class MotileCellAnalysisPanel:
             self._no_csv = True
 
         self.seed_widget = widgets.IntText(description="Seed", value=int(self._panel_cfg.get("seed", 42)), style={"description_width": "80px"})
+        saved_scaling_preset = self._panel_cfg.get("feature_scaling_preset", None)
+        scaling_mode = "original_behav3d" if saved_scaling_preset == "original_behav3d" else "custom"
+        self.feature_scaling_preset = widgets.Dropdown(
+            description="Feature scaling",
+            options=[
+                ("Custom selected features", "custom"),
+                ("Original BEHAV3D", "original_behav3d"),
+            ],
+            value=scaling_mode,
+            style={"description_width": "110px"},
+            layout=widgets.Layout(width="360px"),
+        )
         
         self._group_rows = {}
         sel_boxes = []
         preset_set = set(self._panel_cfg.get("dtw_features_input", []))
+        if not preset_set and self.category == "immune":
+            preset_set = {
+                "mean_square_displacement",
+                "speed",
+                "mean_dead_dye",
+                f"{self.cell_type}_contact",
+                "organoid_contact",
+            }
         
         for g, feats in groups.items():
             child_cbs = [widgets.Checkbox(value=(f in preset_set), description=f, indent=True) for f in feats]
@@ -2640,15 +2699,128 @@ class MotileCellAnalysisPanel:
                 return _h
             gcb.observe(make_h(g), names="value")
 
+        self.feature_scaling_preset.observe(self._on_feature_scaling_preset_changed, names="value")
+
         self.umap_dist = widgets.FloatText(description="UMAP min_dist", value=float(self._panel_cfg.get("umap_min_dist", 0.1)))
         self.umap_neigh = widgets.IntText(description="UMAP n_neighbors", value=int(self._panel_cfg.get("umap_n_neighbors", 15)))
         self.clusters = widgets.IntText(description="# clusters", value=int(self._panel_cfg.get("nr_of_clusters", 5)))
+        self.en_min_track_length = widgets.Checkbox(
+            description="Min track length",
+            value=bool(self._panel_cfg.get("min_track_length_enabled", False)),
+            indent=False,
+            layout=widgets.Layout(width="160px"),
+        )
+        self.min_track_length = widgets.BoundedIntText(
+            description="timepoints",
+            value=max(1, int(self._panel_cfg.get("min_track_length", 1))),
+            min=1,
+            max=999999,
+            style={"description_width": "80px"},
+            layout=widgets.Layout(width="190px"),
+        )
+        self.en_max_track_length = widgets.Checkbox(
+            description="Max track length",
+            value=bool(self._panel_cfg.get("max_track_length_enabled", False)),
+            indent=False,
+            layout=widgets.Layout(width="160px"),
+        )
+        self.max_track_length = widgets.BoundedIntText(
+            description="timepoints",
+            value=max(1, int(self._panel_cfg.get("max_track_length", 999999))),
+            min=1,
+            max=999999,
+            style={"description_width": "80px"},
+            layout=widgets.Layout(width="190px"),
+        )
         
         self.btn_run = widgets.Button(description=f"Run {cell_type} analysis", button_style="success", layout=widgets.Layout(width="300px"))
         self.btn_run.on_click(self._on_run_clicked)
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
         self.out = widgets.Output()
+
+        self.backproj_pdf = widgets.Checkbox(
+            description="Backprojection PDFs",
+            value=bool(self._panel_cfg.get("feature_dtw_backprojection_pdf", True)),
+            indent=False,
+            layout=widgets.Layout(width="190px"),
+        )
+        self.backproj_mp4 = widgets.Checkbox(
+            description="Backprojection MP4",
+            value=bool(self._panel_cfg.get("feature_dtw_backprojection_mp4", False)),
+            indent=False,
+            layout=widgets.Layout(width="190px"),
+        )
+        self.backproj_examples_per_cluster = widgets.BoundedIntText(
+            description="Examples / cluster",
+            value=int(self._panel_cfg.get("feature_dtw_backprojection_examples_per_cluster", 5)),
+            min=1,
+            max=100,
+            style={"description_width": "120px"},
+            layout=widgets.Layout(width="230px"),
+        )
+        self.backproj_num_example_ranks = widgets.BoundedIntText(
+            description="Example ranks",
+            value=int(self._panel_cfg.get("feature_dtw_backprojection_num_example_ranks", 5)),
+            min=1,
+            max=100,
+            style={"description_width": "100px"},
+            layout=widgets.Layout(width="200px"),
+        )
+        self.btn_backproject = widgets.Button(
+            description="Generate track backprojection",
+            button_style="success",
+            layout=widgets.Layout(width="260px"),
+        )
+        self.btn_backproject.on_click(self._on_backprojection_clicked)
+        self.backprojection_spinner = widgets.HTML(value=spinning_loader)
+        self.backprojection_spinner.layout.display = "none"
+        self.out_backprojection = widgets.Output()
+        self.rename_status = widgets.HTML("<i>Run Feature DTW first to rename clusters.</i>")
+        self.rename_rows = widgets.VBox([])
+        self.btn_refresh_rename = widgets.Button(
+            description="Refresh clusters",
+            layout=widgets.Layout(width="150px"),
+        )
+        self.btn_refresh_rename.on_click(self._on_refresh_feature_dtw_rename_clicked)
+        self.btn_rename_feature_dtw = widgets.Button(
+            description="Apply cluster names",
+            button_style="success",
+            layout=widgets.Layout(width="190px"),
+        )
+        self.btn_rename_feature_dtw.on_click(self._on_rename_feature_dtw_clicked)
+        self.rename_spinner = widgets.HTML(value=spinning_loader)
+        self.rename_spinner.layout.display = "none"
+        self.out_rename_feature_dtw = widgets.Output()
+        self.napari_sample_dd = widgets.Dropdown(
+            description="Sample",
+            options=[],
+            value=None,
+            layout=widgets.Layout(width="360px"),
+            style={"description_width": "80px"},
+        )
+        self.napari_workers = widgets.BoundedIntText(
+            description="Workers",
+            value=int(self._panel_cfg.get("feature_dtw_napari_backprojection_workers", 4)),
+            min=1,
+            max=32,
+            style={"description_width": "80px"},
+            layout=widgets.Layout(width="170px"),
+        )
+        self.btn_refresh_napari_samples = widgets.Button(
+            description="Refresh samples",
+            layout=widgets.Layout(width="150px"),
+        )
+        self.btn_refresh_napari_samples.on_click(self._on_refresh_napari_samples_clicked)
+        self.btn_open_napari_backprojection = widgets.Button(
+            description="Open napari backprojection",
+            button_style="success",
+            layout=widgets.Layout(width="240px"),
+        )
+        self.btn_open_napari_backprojection.on_click(self._on_open_napari_backprojection_clicked)
+        self.napari_spinner = widgets.HTML(value=spinning_loader)
+        self.napari_spinner.layout.display = "none"
+        self.out_napari_backprojection = widgets.Output()
         
         # Build feature selector or warning
         if self._no_csv:
@@ -2667,21 +2839,631 @@ class MotileCellAnalysisPanel:
 
         self.ui = widgets.VBox([
             widgets.HTML(f'<div style="font-size:22px;font-weight:700;">{self.cell_type} behavioral analysis</div>'),
-            self.seed_widget, widgets.HTML('<b>Select features for DTW:</b>'),
+            self.seed_widget,
+            self.feature_scaling_preset,
+            widgets.HTML('<b>Select features for DTW:</b>'),
             feature_section,
             widgets.HBox([self.umap_dist, self.umap_neigh, self.clusters]),
-            widgets.HBox([self.btn_run, self.spinner_html]), self.out
+            widgets.HBox([self.en_min_track_length, self.min_track_length, self.en_max_track_length, self.max_track_length]),
+            widgets.HBox([self.btn_run, self.spinner_html]),
+            self.out,
+            widgets.HTML("<b>Track backprojection:</b>"),
+            widgets.HBox([self.backproj_pdf, self.backproj_mp4]),
+            widgets.HBox([self.backproj_examples_per_cluster, self.backproj_num_example_ranks]),
+            widgets.HBox([self.btn_backproject, self.backprojection_spinner]),
+            self.out_backprojection,
+            widgets.HTML("<b>Rename Feature DTW clusters:</b>"),
+            self.rename_status,
+            self.rename_rows,
+            widgets.HBox([self.btn_refresh_rename, self.btn_rename_feature_dtw, self.rename_spinner]),
+            self.out_rename_feature_dtw,
+            widgets.HTML("<b>Napari backprojection:</b>"),
+            widgets.HBox([self.napari_sample_dd, self.napari_workers, self.btn_refresh_napari_samples]),
+            widgets.HBox([self.btn_open_napari_backprojection, self.napari_spinner]),
+            self.out_napari_backprojection,
         ])
+        self._on_feature_scaling_preset_changed()
+        self._rebuild_feature_dtw_rename_rows()
+        self._refresh_feature_dtw_napari_samples()
+
+    def _on_feature_scaling_preset_changed(self, *_):
+        enabled = self.feature_scaling_preset.value == "custom"
+        for row in self._group_rows.values():
+            row["group_cb"].disabled = not enabled
+            for cb in row["child_cbs"]:
+                cb.disabled = not enabled
+
+    def _feature_dtw_clustered_csv_path(self):
+        return Path(
+            self.output_dir,
+            "analysis",
+            self.cell_type,
+            "timepoint_feature_dtw",
+            f"BEHAV3D_{self.cell_type}_combined_track_features_clustered.csv",
+        )
+
+    def _feature_dtw_backprojection_path(self, sample_name):
+        return Path(
+            self.output_dir,
+            "analysis",
+            self.cell_type,
+            "timepoint_feature_dtw",
+            "backprojection",
+            f"{sample_name}_{self.cell_type}_feature_dtw_clusters.zarr",
+        )
+
+    def _refresh_feature_dtw_napari_samples(self):
+        previous = self.napari_sample_dd.value
+        samples = []
+        clustered_path = self._feature_dtw_clustered_csv_path()
+        if clustered_path.exists():
+            try:
+                df = pd.read_csv(clustered_path, usecols=["sample_name"], low_memory=False)
+                samples = sorted(df["sample_name"].dropna().astype(str).unique().tolist())
+            except Exception:
+                samples = []
+        self.napari_sample_dd.options = samples
+        if previous in samples:
+            self.napari_sample_dd.value = previous
+        elif samples:
+            self.napari_sample_dd.value = samples[0]
+        else:
+            self.napari_sample_dd.value = None
+        self.btn_open_napari_backprojection.disabled = self.napari_sample_dd.value is None
+
+    def _on_refresh_napari_samples_clicked(self, *_):
+        self._refresh_feature_dtw_napari_samples()
+
+    def _feature_dtw_rename_mapping_path(self):
+        return Path(
+            self.output_dir,
+            "analysis",
+            self.cell_type,
+            "timepoint_feature_dtw",
+            f"feature_dtw_cluster_names_{self.cell_type}.yml",
+        )
+
+    def _load_feature_dtw_name_mapping(self):
+        mapping_path = self._feature_dtw_rename_mapping_path()
+        if not mapping_path.exists():
+            return {}
+        try:
+            with mapping_path.open("r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            mapping = data.get("cluster_names", data)
+            if not isinstance(mapping, dict):
+                return {}
+            return {str(k): str(v) for k, v in mapping.items()}
+        except Exception:
+            return {}
+
+    def _feature_dtw_output_csv_paths(self):
+        outdir = Path(self.output_dir, "analysis", self.cell_type, "timepoint_feature_dtw")
+        return [
+            outdir / f"BEHAV3D_{self.cell_type}_UMAP_clusters.csv",
+            outdir / f"BEHAV3D_{self.cell_type}_combined_track_features_clustered.csv",
+            outdir / f"BEHAV3D_{self.cell_type}_UMAP_cluster_percentages.csv",
+        ]
+
+    def _feature_dtw_outdir(self):
+        return Path(self.output_dir, "analysis", self.cell_type, "timepoint_feature_dtw")
+
+    def _snapshot_feature_dtw_before_renaming(self):
+        outdir = self._feature_dtw_outdir()
+        before_dir = outdir / "before_renaming"
+        before_dir.mkdir(parents=True, exist_ok=True)
+        copied = []
+        patterns = [
+            f"BEHAV3D_{self.cell_type}_UMAP_clusters*",
+            f"BEHAV3D_{self.cell_type}_UMAP_cluster_feature_heatmap*",
+            f"BEHAV3D_{self.cell_type}_UMAP_cluster_percentages*",
+            f"BEHAV3D_{self.cell_type}_combined_track_features_clustered*",
+        ]
+        for pattern in patterns:
+            for src in outdir.glob(pattern):
+                if not src.is_file():
+                    continue
+                dst = before_dir / src.name
+                if dst.exists():
+                    continue
+                shutil.copy2(src, dst)
+                copied.append(dst)
+        return copied
+
+    def _feature_dtw_plot_info_cols(self, df_umap):
+        excluded = {"TrackID", "UMAP1", "UMAP2", "ClusterID", "ClusterName"}
+        metadata_cols = [
+            c for c in df_umap.columns
+            if c.endswith("_line_condition") or c in {"sample_name", "well", "exp_nr"}
+        ]
+        feature_cols = [
+            c for c in df_umap.columns
+            if c not in excluded and c not in metadata_cols
+        ]
+        return list(dict.fromkeys(metadata_cols + feature_cols))
+
+    def _feature_dtw_sample_cols(self, df_umap):
+        sample_cols = [c for c in df_umap.columns if c.endswith("_line_condition")]
+        for col in ["sample_name", "well", "exp_nr"]:
+            if col in df_umap.columns:
+                sample_cols.append(col)
+        return list(dict.fromkeys(sample_cols))
+
+    def _feature_dtw_cluster_percentage_groups(self, df_umap):
+        line_cols = [c for c in df_umap.columns if c.endswith("_line_condition")]
+        group_cols_sample = line_cols + ["sample_name", "ClusterID"]
+        group_cols_sample_only = line_cols + ["sample_name"]
+        missing = [c for c in group_cols_sample if c not in df_umap.columns]
+        if missing:
+            return None
+
+        df_clust_perc = (
+            df_umap
+            .groupby(group_cols_sample, observed=True)
+            .size()
+            .reset_index(name="count")
+        )
+        sample_totals = (
+            df_clust_perc
+            .groupby(group_cols_sample_only, observed=True)["count"]
+            .sum()
+            .reset_index(name="sample_total")
+        )
+        df_clust_perc = df_clust_perc.merge(sample_totals, how="left", on=group_cols_sample_only)
+        if line_cols:
+            combo_totals = (
+                df_clust_perc
+                .groupby(line_cols, observed=True)["count"]
+                .sum()
+                .reset_index(name="combo_total")
+            )
+            df_clust_perc = df_clust_perc.merge(combo_totals, how="left", on=line_cols)
+        df_clust_perc["percentage"] = df_clust_perc["count"] / df_clust_perc["sample_total"]
+        return df_clust_perc
+
+    def _regenerate_feature_dtw_renamed_plots(self):
+        outdir = self._feature_dtw_outdir()
+        umap_csv = outdir / f"BEHAV3D_{self.cell_type}_UMAP_clusters.csv"
+        if not umap_csv.exists():
+            raise FileNotFoundError(f"Feature DTW UMAP CSV not found: {umap_csv}")
+
+        df_umap = pd.read_csv(umap_csv, low_memory=False)
+        if "ClusterName" not in df_umap.columns:
+            raise ValueError("Cannot regenerate renamed plots without a ClusterName column.")
+        df_plot = df_umap.copy()
+        df_plot["ClusterID"] = pd.Categorical(df_plot["ClusterName"].astype(str))
+
+        sample_cols = self._feature_dtw_sample_cols(df_plot)
+        info_cols = self._feature_dtw_plot_info_cols(df_plot)
+
+        cluster_UMAP_path = outdir / f"BEHAV3D_{self.cell_type}_UMAP_clusters.pdf"
+        plot_feature_umap(
+            df_umap=df_plot,
+            info_cols=info_cols,
+            sample_cols=sample_cols,
+            outpath=cluster_UMAP_path,
+            rows_per_page=4,
+            nr_cols=2,
+            rows_first_img=2,
+            figsize=(8.27, 11.69),
+            plot_results=True,
+        )
+
+        heatmap_path = outdir / f"BEHAV3D_{self.cell_type}_UMAP_cluster_feature_heatmap.pdf"
+        plot_clustering_feature_heatmap(
+            df_plot,
+            info_cols,
+            sample_cols,
+            heatmap_path,
+            rows_per_page=7,
+            nr_cols=2,
+            figsize=(8.27, 11.69),
+            plot_results=True,
+        )
+
+        df_clust_perc = self._feature_dtw_cluster_percentage_groups(df_plot)
+        perc_prefix = outdir / f"BEHAV3D_{self.cell_type}_UMAP_cluster_percentages"
+        if df_clust_perc is not None:
+            perc_csv = perc_prefix.with_suffix(".csv")
+            df_clust_perc.to_csv(perc_csv, index=False)
+            plot_cluster_percentage_bars(
+                df_clust_perc,
+                perc_prefix,
+                group_by_columns=None,
+                plot_results=True,
+            )
+
+        return {
+            "umap_pdf": cluster_UMAP_path,
+            "heatmap_pdf": heatmap_path,
+            "percentages_pdf": perc_prefix.with_suffix(".pdf"),
+        }
+
+    def _rebuild_feature_dtw_rename_rows(self):
+        self._feature_dtw_name_boxes = {}
+        clustered_path = self._feature_dtw_clustered_csv_path()
+        if not clustered_path.exists():
+            self.rename_rows.children = []
+            self.rename_status.value = "<i>Run Feature DTW first to rename clusters.</i>"
+            self.btn_rename_feature_dtw.disabled = True
+            return
+
+        try:
+            df = pd.read_csv(clustered_path, usecols=["ClusterID"], low_memory=False)
+        except Exception as exc:
+            self.rename_rows.children = []
+            self.rename_status.value = f"<i>Could not load Feature DTW clusters: {exc}</i>"
+            self.btn_rename_feature_dtw.disabled = True
+            return
+
+        clusters = sorted(df["ClusterID"].dropna().astype(str).unique().tolist())
+        saved_mapping = self._load_feature_dtw_name_mapping()
+        rows = []
+        for cluster_id in clusters:
+            current_name = saved_mapping.get(str(cluster_id), str(cluster_id))
+            txt = widgets.Text(value=current_name, layout=widgets.Layout(width="300px"))
+            self._feature_dtw_name_boxes[str(cluster_id)] = txt
+            rows.append(
+                widgets.HBox(
+                    [widgets.Label(str(cluster_id), layout=widgets.Layout(width="110px")), txt],
+                    layout=widgets.Layout(align_items="center", gap="8px"),
+                )
+            )
+
+        self.rename_rows.children = rows
+        self.rename_status.value = f"<b>Feature DTW clusters:</b> {len(rows)}"
+        self.btn_rename_feature_dtw.disabled = len(rows) == 0
+
+    def _on_refresh_feature_dtw_rename_clicked(self, *_):
+        self._rebuild_feature_dtw_rename_rows()
+
+    def _on_rename_feature_dtw_clicked(self, *_):
+        self.btn_rename_feature_dtw.disabled = True
+        self.rename_spinner.layout.display = None
+        self.out_rename_feature_dtw.clear_output()
+        with self.out_rename_feature_dtw:
+            try:
+                mapping = {}
+                for cluster_id, txt in self._feature_dtw_name_boxes.items():
+                    name = str(txt.value).strip()
+                    mapping[str(cluster_id)] = name if name != "" else str(cluster_id)
+
+                copied = self._snapshot_feature_dtw_before_renaming()
+                mapping_path = self._feature_dtw_rename_mapping_path()
+                mapping_path.parent.mkdir(parents=True, exist_ok=True)
+                with mapping_path.open("w", encoding="utf-8") as f:
+                    yaml.safe_dump(
+                        {
+                            "cell_type": self.cell_type,
+                            "cluster_id_column": "ClusterID",
+                            "cluster_name_column": "ClusterName",
+                            "cluster_names": mapping,
+                        },
+                        f,
+                        sort_keys=False,
+                    )
+
+                updated = []
+                for csv_path in self._feature_dtw_output_csv_paths():
+                    if not csv_path.exists():
+                        continue
+                    df = pd.read_csv(csv_path, low_memory=False)
+                    if "ClusterID" not in df.columns:
+                        continue
+                    df["ClusterName"] = df["ClusterID"].astype(str).map(mapping).fillna(df["ClusterID"].astype(str))
+                    df.to_csv(csv_path, index=False)
+                    updated.append(csv_path)
+
+                regenerated = self._regenerate_feature_dtw_renamed_plots()
+                self._panel_cfg.update({"feature_dtw_cluster_names": dict(mapping)})
+                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+                    yaml.safe_dump(self._params, f, sort_keys=False)
+                before_dir = self._feature_dtw_outdir() / "before_renaming"
+                if copied:
+                    print(f"Saved original Feature DTW outputs to: {before_dir}")
+                else:
+                    print(f"Original Feature DTW outputs already present in: {before_dir}")
+                print(f"Saved Feature DTW cluster names: {mapping_path}")
+                if updated:
+                    print("Updated CSVs:")
+                    for path in updated:
+                        print(f"  - {path}")
+                print("Regenerated renamed plots:")
+                for path in regenerated.values():
+                    print(f"  - {path}")
+                self._rebuild_feature_dtw_rename_rows()
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.rename_spinner.layout.display = "none"
+                self.btn_rename_feature_dtw.disabled = False
+
+    @staticmethod
+    def _adata_like_from_obs(obs):
+        class _AdataLike:
+            pass
+
+        adata_like = _AdataLike()
+        adata_like.obs = obs
+        return adata_like
+
+    def _load_feature_dtw_backprojection_data(self):
+        clustered_path = self._feature_dtw_clustered_csv_path()
+        if not clustered_path.exists():
+            raise FileNotFoundError(
+                "Feature-DTW clustered tracks were not found. Run the timepoint feature DTW analysis first: "
+                f"{clustered_path}"
+            )
+
+        df = pd.read_csv(clustered_path, low_memory=False)
+        required = [
+            "sample_name",
+            "TrackID",
+            "position_t",
+            "ClusterID",
+            "pixel_position_x",
+            "pixel_position_y",
+            "pixel_position_z",
+        ]
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise ValueError(
+                "Feature-DTW track backprojection requires missing columns in clustered tracks CSV: "
+                + ", ".join(missing)
+            )
+
+        df = df.dropna(subset=["sample_name", "TrackID", "position_t", "ClusterID"]).copy()
+        if len(df) == 0:
+            raise ValueError("Feature-DTW clustered tracks CSV has no usable rows.")
+        df["position_t"] = pd.to_numeric(df["position_t"], errors="coerce")
+        df = df.dropna(subset=["position_t"])
+        df["position_t"] = df["position_t"].astype(int)
+
+        chosen_df = (
+            df.groupby(["sample_name", "TrackID"], observed=True)
+            .agg(
+                ClusterID=("ClusterID", "first"),
+                position_t_min=("position_t", "min"),
+                position_t_max=("position_t", "max"),
+            )
+            .reset_index()
+        )
+        chosen_df = chosen_df.dropna(subset=["ClusterID"]).reset_index(drop=True)
+        if len(chosen_df) == 0:
+            raise ValueError("No Feature-DTW clustered tracks were available for backprojection.")
+        return self._adata_like_from_obs(df), chosen_df
+
+    def _on_backprojection_clicked(self, *_):
+        if not bool(self.backproj_pdf.value) and not bool(self.backproj_mp4.value):
+            return
+        self.btn_backproject.disabled = True
+        self.backprojection_spinner.layout.display = None
+        self.out_backprojection.clear_output()
+        with self.out_backprojection:
+            try:
+                self._panel_cfg.update({
+                    "feature_dtw_backprojection_pdf": bool(self.backproj_pdf.value),
+                    "feature_dtw_backprojection_mp4": bool(self.backproj_mp4.value),
+                    "feature_dtw_backprojection_examples_per_cluster": int(self.backproj_examples_per_cluster.value),
+                    "feature_dtw_backprojection_num_example_ranks": int(self.backproj_num_example_ranks.value),
+                })
+                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+                    yaml.safe_dump(self._params, f, sort_keys=False)
+
+                adata_like, chosen_df = self._load_feature_dtw_backprojection_data()
+                out_dir = Path(
+                    self.output_dir,
+                    "analysis",
+                    self.cell_type,
+                    "timepoint_feature_dtw",
+                    "example_tracks",
+                    "backprojection",
+                )
+                n_per_cluster = int(self.backproj_examples_per_cluster.value)
+                num_example_ranks = int(self.backproj_num_example_ranks.value)
+
+                if bool(self.backproj_pdf.value):
+                    out_pdf = save_exemplar_statebar_backprojection_pdf(
+                        adata_full=adata_like,
+                        output_dir=self.output_dir,
+                        cell_type=self.cell_type,
+                        out_dir=out_dir,
+                        chosen_df=chosen_df,
+                        n_per_cluster=n_per_cluster,
+                        sample_key="sample_name",
+                        track_key="TrackID",
+                        time_key="position_t",
+                        state_key="ClusterID",
+                        cluster_key="ClusterID",
+                        tmin_key="position_t_min",
+                        tmax_key="position_t_max",
+                        seed=int(self.seed_widget.value),
+                        examples_per_cluster=n_per_cluster,
+                        num_example_ranks=num_example_ranks,
+                        verbose=True,
+                    )
+                    print(
+                        "Saved backprojection PDFs: "
+                        f"clusters={len(out_pdf.get('pdf_paths_by_cluster', {}))}, "
+                        f"examples={len(out_pdf.get('pdf_paths_by_example_rank', {}))}"
+                    )
+
+                if bool(self.backproj_mp4.value):
+                    out_mp4 = save_exemplar_statebar_backprojection_video_per_cluster(
+                        adata_full=adata_like,
+                        output_dir=self.output_dir,
+                        cell_type=self.cell_type,
+                        out_dir=out_dir,
+                        chosen_df=chosen_df,
+                        n_per_cluster=n_per_cluster,
+                        sample_key="sample_name",
+                        track_key="TrackID",
+                        time_key="position_t",
+                        state_key="ClusterID",
+                        cluster_key="ClusterID",
+                        tmin_key="position_t_min",
+                        tmax_key="position_t_max",
+                        seed=int(self.seed_widget.value),
+                        examples_per_cluster=n_per_cluster,
+                        num_example_ranks=num_example_ranks,
+                        verbose=True,
+                    )
+                    print(
+                        "Saved backprojection MP4: "
+                        f"clusters={len(out_mp4.get('video_paths_by_cluster', {}))}, "
+                        f"examples={len(out_mp4.get('video_paths_by_example_rank', {}))}"
+                    )
+                print(f"Output: {out_dir}")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.backprojection_spinner.layout.display = "none"
+                self.btn_backproject.disabled = False
+
+    def _show_feature_dtw_napari_backprojection(self, sample_name):
+        sample_name = str(sample_name).strip()
+        if sample_name == "":
+            raise ValueError("Please select a sample name.")
+
+        clustered_path = self._feature_dtw_clustered_csv_path()
+        if not clustered_path.exists():
+            raise FileNotFoundError(
+                "Feature-DTW clustered tracks were not found. Run Feature DTW first: "
+                f"{clustered_path}"
+            )
+
+        df_tracks = pd.read_csv(clustered_path, low_memory=False)
+        df_tracks = df_tracks[df_tracks["sample_name"].astype(str) == sample_name].copy()
+        if len(df_tracks) == 0:
+            raise ValueError(f"No Feature-DTW clustered rows found for sample '{sample_name}'.")
+
+        required = [
+            "sample_name",
+            "TrackID",
+            "position_t",
+            "position_z",
+            "position_y",
+            "position_x",
+            "ClusterID",
+        ]
+        missing = [col for col in required if col not in df_tracks.columns]
+        if missing:
+            raise ValueError(
+                "Feature-DTW napari backprojection requires missing columns: "
+                + ", ".join(missing)
+            )
+
+        raw_path = _resolve_raw_image_path(
+            output_dir=self.output_dir,
+            sample_name=sample_name,
+            verbose=True,
+        )
+        if raw_path is None or not Path(raw_path).exists():
+            raise FileNotFoundError(f"Could not find raw image for sample '{sample_name}'.")
+
+        tracked_path = _resolve_tracked_image_path(
+            output_dir=self.output_dir,
+            sample_name=sample_name,
+            cell_type=self.cell_type,
+            verbose=True,
+        )
+        if tracked_path is None or not Path(tracked_path).exists():
+            raise FileNotFoundError(
+                f"Could not find tracked image for sample '{sample_name}' and cell_type '{self.cell_type}'."
+            )
+
+        raw_img = load_image(raw_path)
+        tracked_img = load_image(tracked_path)
+        df_tracks = df_tracks.dropna(subset=["TrackID", "position_t", "ClusterID"]).copy()
+        df_tracks["TrackID"] = pd.to_numeric(df_tracks["TrackID"], errors="coerce")
+        df_tracks["position_t"] = pd.to_numeric(df_tracks["position_t"], errors="coerce")
+        df_tracks["ClusterID"] = pd.to_numeric(df_tracks["ClusterID"], errors="coerce")
+        df_tracks = df_tracks.dropna(subset=["TrackID", "position_t", "ClusterID"]).copy()
+        if len(df_tracks) == 0:
+            raise ValueError(f"No usable Feature-DTW clustered rows found for sample '{sample_name}'.")
+        df_tracks["TrackID"] = df_tracks["TrackID"].astype(np.int64)
+        df_tracks["position_t"] = df_tracks["position_t"].astype(np.int64)
+        df_tracks["ClusterID"] = df_tracks["ClusterID"].astype(np.int64)
+
+        filtered_track_img = _filter_track_image_to_ids(
+            tracked_img,
+            df_tracks["TrackID"].dropna().unique(),
+        )
+        backproj_path = self._feature_dtw_backprojection_path(sample_name)
+        backproj_path.parent.mkdir(parents=True, exist_ok=True)
+        backprojected = backproject_columns(
+            track_img=filtered_track_img,
+            zarr_outpath=backproj_path,
+            df_tracks_clustered=df_tracks,
+            columns=["ClusterID"],
+            mode="summary",
+            track_col="TrackID",
+            time_col="position_t",
+            background_value=0,
+            n_workers=max(1, int(self.napari_workers.value)),
+            prefer_parallel=True,
+            tracked_img_path=tracked_path,
+            verbose=True,
+            overwrite=True,
+        )
+        backprojected["ClusterID"]["type"] = "label"
+
+        backproject_data = {
+            "raw_data": {"img": raw_img, "type": "image"},
+            "TrackID": {"img": filtered_track_img, "type": "label"},
+            "ClusterID": backprojected["ClusterID"],
+        }
+        viewer = view_napari(
+            backproject_data=backproject_data,
+            df_tracks_full=df_tracks,
+            df_tracks_clustered=df_tracks,
+            cell_type=self.cell_type,
+            elsize=_sample_voxel_size(getattr(self.metadata_loader, "metadata", None), sample_name),
+            split_raw_channels=True,
+            run=False,
+        )
+        print(
+            "Opened Feature-DTW napari backprojection for sample "
+            f"'{sample_name}' with raw='{Path(raw_path).name}', tracked='{Path(tracked_path).name}', "
+            f"clusters='{backproj_path.name}'."
+        )
+        import napari
+
+        napari.run()
+        return viewer
+
+    def _on_open_napari_backprojection_clicked(self, *_):
+        self.btn_open_napari_backprojection.disabled = True
+        self.napari_spinner.layout.display = None
+        self.out_napari_backprojection.clear_output()
+        with self.out_napari_backprojection:
+            try:
+                self._panel_cfg.update({
+                    "feature_dtw_napari_backprojection_workers": int(self.napari_workers.value),
+                })
+                with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
+                    yaml.safe_dump(self._params, f, sort_keys=False)
+                self._show_feature_dtw_napari_backprojection(self.napari_sample_dd.value)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.napari_spinner.layout.display = "none"
+                self.btn_open_napari_backprojection.disabled = self.napari_sample_dd.value is None
         
     def _on_run_clicked(self, *_):
         sel = [cb.description for r in self._group_rows.values() for cb in r["child_cbs"] if cb.value]
-        if not sel: return
+        scaling_preset = None if self.feature_scaling_preset.value == "custom" else self.feature_scaling_preset.value
+        if scaling_preset is None and not sel: return
+        min_track_length = int(self.min_track_length.value) if self.en_min_track_length.value else None
+        max_track_length = int(self.max_track_length.value) if self.en_max_track_length.value else None
         self.btn_run.disabled = True; self.spinner_html.layout.display = None; self.out.clear_output()
         with self.out:
             try:
-                self._panel_cfg.update({"seed": int(self.seed_widget.value), "umap_min_dist": float(self.umap_dist.value), "umap_n_neighbors": int(self.umap_neigh.value), "nr_of_clusters": int(self.clusters.value), "dtw_features_input": sel})
+                self._panel_cfg.update({"seed": int(self.seed_widget.value), "umap_min_dist": float(self.umap_dist.value), "umap_n_neighbors": int(self.umap_neigh.value), "nr_of_clusters": int(self.clusters.value), "dtw_features_input": sel, "feature_scaling_preset": scaling_preset, "min_track_length_enabled": bool(self.en_min_track_length.value), "min_track_length": int(self.min_track_length.value), "max_track_length_enabled": bool(self.en_max_track_length.value), "max_track_length": int(self.max_track_length.value)})
                 with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self._params, f, sort_keys=False)
-                run_tcell_analysis(cell_type=self.cell_type, output_dir=self.output_dir, df_tracks_path=str(Path(self.output_dir, "analysis", self.cell_type, "track_features", f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")), columns_to_use=sel, columns_to_normalize=sel, umap_minimal_distance=float(self.umap_dist.value), umap_n_neighbors=int(self.umap_neigh.value), nr_of_clusters=int(self.clusters.value), plot_results=True, seed=int(self.seed_widget.value))
+                run_tcell_analysis(cell_type=self.cell_type, output_dir=self.output_dir, df_tracks_path=str(self.df_tracks_path), columns_to_use=sel, columns_to_normalize=sel, umap_minimal_distance=float(self.umap_dist.value), umap_n_neighbors=int(self.umap_neigh.value), nr_of_clusters=int(self.clusters.value), plot_results=True, seed=int(self.seed_widget.value), output_subdir_name="timepoint_feature_dtw", feature_scaling_preset=scaling_preset, min_track_length=min_track_length, max_track_length=max_track_length)
+                self._rebuild_feature_dtw_rename_rows()
+                self._refresh_feature_dtw_napari_samples()
                 print(f"✅ {self.cell_type} analysis complete!")
             except Exception: traceback.print_exc()
             finally: self.spinner_html.layout.display = "none"; self.btn_run.disabled = False

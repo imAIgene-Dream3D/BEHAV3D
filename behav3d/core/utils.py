@@ -12,14 +12,16 @@ def format_time(
     seconds = int(elapsed_time % 60)
     return(hours, minutes, seconds)
 
-def convert_time(time_interval, time_unit):
-        time_conversions={
-            "s": 3600,
+def convert_time(time_interval, time_unit, convert_to="h"):
+        time_conversions = {
+            "s": 1,
             "m": 60,
-            "h": 1
+            "h": 3600,
         }
         assert time_unit in time_conversions.keys(), f"time unit needs to be one of: {time_conversions.keys()}, is {time_unit}"
-        time_interval = time_interval/time_conversions[time_unit]
+        assert convert_to in time_conversions.keys(), f"convert_to needs to be one of: {time_conversions.keys()}, is {convert_to}"
+        time_interval = time_interval * time_conversions[time_unit]
+        time_interval = time_interval / time_conversions[convert_to]
         return(time_interval)
 
 def get_current_time():

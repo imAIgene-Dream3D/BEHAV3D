@@ -177,6 +177,7 @@ def visualize_tracks(
     print(f"Sample selected: {sample_name}")
     
     raw_image_zarr = Path(metadata_row['raw_image_path'])
+    print(f"Loading raw image: {raw_image_zarr}")
     
     # Dynamically collect ALL cell types with tracks
     all_cell_tracks = {}
@@ -209,6 +210,8 @@ def visualize_tracks(
     # Load all cell type tracks
     cell_data = {}
     for cell_type, paths in all_cell_tracks.items():
+        print(f"Loading tracked labels for {cell_type}: {paths['image']}")
+        print(f"Loading track table for {cell_type}: {paths['csv']}")
         cell_data[cell_type] = {
             'tracks': load_zarr(paths['image']),
             'df': pd.read_csv(paths['csv']),
@@ -273,7 +276,12 @@ def visualize_tracks(
         category_counts[prefix] += 1
         
         try:
-            viewer.add_labels(data['tracks'], name=f"{cell_type} segments (tracked)", scale=elsizes)
+            tracked_labels = np.asarray(data['tracks'])
+            viewer.add_labels(
+                tracked_labels,
+                name=f"{cell_type} segments (tracked)",
+                scale=elsizes,
+            )
         except Exception as e:
             print(f"  Skipping {cell_type} segments layer: {e}")
 

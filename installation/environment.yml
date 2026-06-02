@@ -123,6 +123,7 @@ dependencies:
     - btrack>=0.6
     - kaleido>=1.2
     - pypdf>=6.7
+    - pypdfium2>=4,<5  # In-napari PDF preview (Results panel)
     - imageio-ffmpeg>=0.5.1
     - torchsummary>=1.5.1
     - apoc>=0.12  # GPU-accelerated pixel classifier (optional, requires OpenCL)

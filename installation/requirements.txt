@@ -30,6 +30,7 @@ seaborn>=0.13
 plotly>=5.0
 kaleido>=1.2
 pypdf>=6.7
+pypdfium2>=4,<5  # In-napari PDF preview (Results panel)
 
 # -----------------------------------------------------------------------------
 # Image Processing & File I/O
@@ -66,6 +67,7 @@ scikit-learn>=1.5
 umap-learn>=0.5
 hmmlearn>=0.3
 dtaidistance>=2.3
+dtwParallel>=0.9.35
 apoc>=0.12        # GPU-accelerated pixel classifier (optional, requires OpenCL)
 pyopencl>=2026.1    # OpenCL backend for APOC
 pyclesperanto>=0.21,<0.22       # 0.21.x is compatible with pyclesperanto_prototype<0.24
