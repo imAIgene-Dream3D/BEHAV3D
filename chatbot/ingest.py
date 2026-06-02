@@ -121,6 +121,13 @@ def collect_chunks(repo_root: Path, schema_cards_path: Path) -> list[Chunk]:
         if p.exists():
             chunks += chunk_markdown(p.read_text(encoding="utf-8"), md_name)
 
+    # Wiki docs: all .md files under docs/source/ (skips _static binaries).
+    docs_dir = repo_root / "docs" / "source"
+    if docs_dir.exists():
+        for md_path in sorted(docs_dir.rglob("*.md")):
+            rel = md_path.relative_to(repo_root).as_posix()
+            chunks += chunk_markdown(md_path.read_text(encoding="utf-8"), rel)
+
     if schema_cards_path.exists():
         cards = json.loads(schema_cards_path.read_text(encoding="utf-8"))
         chunks += cards_to_chunks(cards)

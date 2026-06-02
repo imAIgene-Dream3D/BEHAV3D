@@ -483,6 +483,7 @@ except Exception:  # allows unit-testing the pure helpers without modal
     modal = None
 
 if modal is not None:
+    import glob as _glob
     import os as _os
 
     VOLUME_NAME = "behav3d-assistant-index"
@@ -515,11 +516,13 @@ if modal is not None:
         .add_local_file("chatbot/ingest.py", "/root/ingest.py")
         .add_local_file("chatbot/schema_cards.json", "/root/schema_cards.json")
     )
-    # Knowledge sources — paths are relative to CWD, so run modal from the repo
-    # root. README is required; WIKI.md is optional (indexed if present).
+    # Knowledge sources — paths are relative to CWD, so run modal from the repo root.
     for _md in ("README.md", "WIKI.md"):
         if _os.path.exists(_md):
             service_image = service_image.add_local_file(_md, f"/root/repo/{_md}")
+    # Wiki docs: all .md files under docs/source/ (skip _static).
+    for _doc in sorted(_glob.glob("docs/source/**/*.md", recursive=True)):
+        service_image = service_image.add_local_file(_doc, f"/root/repo/{_doc}")
     for _rel in _DOC_PY_MODULES:
         if _os.path.exists(_rel):
             service_image = service_image.add_local_file(_rel, f"/root/repo/{_rel}")
