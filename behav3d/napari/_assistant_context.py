@@ -138,6 +138,210 @@ def serialize_queue(queue_panel) -> list[dict]:
     return out
 
 
+def _widget_value(widget):
+    """Best-effort JSON-friendly value for a Qt input widget."""
+    if widget is None:
+        return None
+    try:
+        from qtpy.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLineEdit, QSpinBox
+        if isinstance(widget, QLineEdit):
+            return widget.text()
+        if isinstance(widget, QComboBox):
+            return widget.currentText()
+        if isinstance(widget, QCheckBox):
+            return widget.isChecked()
+        if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+            return widget.value()
+    except Exception:
+        pass
+    if hasattr(widget, "currentText"):
+        return _safe(lambda: widget.currentText(), _MISSING)
+    if hasattr(widget, "value"):
+        return _safe(lambda: widget.value(), _MISSING)
+    if hasattr(widget, "isChecked"):
+        return _safe(lambda: widget.isChecked(), _MISSING)
+    if hasattr(widget, "text"):
+        return _safe(lambda: widget.text(), _MISSING)
+    return None
+
+
+def _clean_widget_values(values: dict) -> dict:
+    return {k: v for k, v in values.items() if v is not _MISSING}
+
+
+def _metadata_builder_state(dp) -> dict:
+    """Snapshot the current state of the Metadata Builder form widgets."""
+    if dp is None:
+        return {"open": False}
+    try:
+        n_org = len(getattr(dp, "_organoid_name_edits", []))
+        n_imm = len(getattr(dp, "_immune_name_edits", []))
+        n_oth = len(getattr(dp, "_other_name_edits", []))
+        forms = getattr(dp, "_sample_forms", []) or []
+        sample_forms = []
+        for idx, form in enumerate(forms[:5]):
+            basic = _clean_widget_values({
+                k: _widget_value(w) for k, w in (form.get("basic") or {}).items()
+            })
+            dead = _clean_widget_values({
+                k: _widget_value(w) for k, w in (form.get("dead_channel") or {}).items()
+            })
+            cell_types = {}
+            for cell_type, fields in (form.get("cell_types") or {}).items():
+                cell_types[cell_type] = _clean_widget_values({
+                    k: _widget_value(w) for k, w in fields.items()
+                })
+            sample_forms.append({
+                "index": idx,
+                "label": _safe(lambda f=form: f["group"].title(), f"Sample {idx + 1}"),
+                "basic": basic,
+                "dead_channel": dead,
+                "cell_types": cell_types,
+            })
+
+        return {
+            "open": bool(getattr(dp, "builder_grp", None) and dp.builder_grp.isChecked()),
+            "n_samples": _safe(lambda: dp.n_samples_spin.value(), 1),
+            "n_organoids": _safe(lambda: dp.n_organoid_spin.value(), 0),
+            "n_immune": _safe(lambda: dp.n_immune_spin.value(), 0),
+            "n_other": _safe(lambda: dp.n_other_spin.value(), 0),
+            "include_dead": _safe(lambda: dp.include_dead_cb.isChecked(), False),
+            "cell_types_configured": n_org + n_imm + n_oth > 0,
+            "sample_forms_created": bool(forms),
+            "sample_form_count": len(forms),
+            "organoid_names": [e.text() for e in getattr(dp, "_organoid_name_edits", [])],
+            "immune_names": [e.text() for e in getattr(dp, "_immune_name_edits", [])],
+            "other_names": [e.text() for e in getattr(dp, "_other_name_edits", [])],
+            "sample_forms": sample_forms,
+        }
+    except Exception:
+        return {"open": False}
+
+
+def _step_readiness(main_widget, ctx: dict) -> dict:
+    """Return {step: {ready, blockers}} for every workflow step."""
+    md = ctx.get("metadata", {})
+    md_loaded = md.get("loaded", False)
+    out_set = ctx.get("output_dir_set", False)
+    output_dir = ctx.get("output_dir", "")
+
+    def _has_outputs(pattern: str) -> bool:
+        """Check if any file matching glob pattern exists in output_dir."""
+        import glob
+        if not output_dir:
+            return False
+        return bool(glob.glob(pattern, recursive=True))
+
+    seg_done = _safe(
+        lambda: _has_outputs(f"{output_dir}/images/*/*_segments.zarr"), False)
+    track_done = _safe(
+        lambda: _has_outputs(f"{output_dir}/images/*/*_tracked.zarr"), False)
+    feat_done = _safe(
+        lambda: _has_outputs(
+            f"{output_dir}/analysis/*/track_features/BEHAV3D_*_combined_track_features.csv"),
+        False)
+
+    steps = {
+        "data_preparation": {"ready": True, "blockers": []},
+        "visualization": {
+            "ready": md_loaded,
+            "blockers": [] if md_loaded else ["metadata not loaded"],
+        },
+        "segmentation": {
+            "ready": md_loaded and out_set,
+            "blockers": ([("metadata not loaded" if not md_loaded else None),
+                          ("output directory not set" if not out_set else None)])
+        },
+        "tracking": {
+            "ready": md_loaded and out_set and seg_done,
+            "blockers": ([("metadata not loaded" if not md_loaded else None),
+                          ("output directory not set" if not out_set else None),
+                          ("segmentation outputs not found" if not seg_done else None)])
+        },
+        "feature_extraction": {
+            "ready": md_loaded and out_set and track_done,
+            "blockers": ([("metadata not loaded" if not md_loaded else None),
+                          ("output directory not set" if not out_set else None),
+                          ("tracking outputs not found" if not track_done else None)])
+        },
+        "filtering": {
+            "ready": feat_done,
+            "blockers": [] if feat_done else ["feature extraction outputs not found"],
+        },
+        "analysis": {
+            "ready": feat_done,
+            "blockers": [] if feat_done else ["feature extraction outputs not found"],
+        },
+    }
+    # Clean up None entries in blockers lists
+    for v in steps.values():
+        v["blockers"] = [b for b in v["blockers"] if b]
+    return steps
+
+
+def _active_cell_type_tab(main_widget, step: str) -> str | None:
+    """Return 'immune', 'organoid', or 'other' for the active cell-type sub-tab."""
+    tab_attr = {
+        "tracking": "tracking_tab",
+        "feature_extraction": "feature_extraction_tab",
+        "filtering": "filtering_tab",
+    }.get(step)
+    if tab_attr is None:
+        return None
+    tab_widget = _safe(lambda: getattr(main_widget, tab_attr, None))
+    if tab_widget is None:
+        return None
+    panels_tab = _safe(lambda: getattr(tab_widget, "panels_tab", None) or
+                       getattr(tab_widget, "tab_widget", None))
+    if panels_tab is None:
+        return None
+    idx = _safe(lambda: panels_tab.currentIndex(), 0)
+    label = _safe(lambda: panels_tab.tabText(idx).lower(), "")
+    for ct in ("immune", "organoid", "other"):
+        if ct in label:
+            return ct
+    return None
+
+
+def _segmentation_state(main_widget) -> dict:
+    """Snapshot the visible segmentation method selector."""
+    seg = _safe(lambda: getattr(main_widget, "segmentation_tab", None))
+    combo = _safe(lambda: getattr(seg, "method_combo", None))
+    if combo is None:
+        return {}
+    try:
+        methods = [combo.itemText(i) for i in range(combo.count())]
+    except Exception:
+        methods = []
+    return {
+        "method": _safe(lambda: combo.currentText(), ""),
+        "method_index": _safe(lambda: combo.currentIndex(), 0),
+        "available_methods": methods,
+    }
+
+
+def _required_params_at_default(
+        step: str, step_schema: list, params: dict) -> list:
+    """Return up to 6 schema cards for the current step whose value equals the default."""
+    from behav3d.napari._assistant_actions import get_by_dotted
+    result = []
+    for card in (step_schema or []):
+        if card.get("type") == "none":
+            continue
+        key = card.get("key", "")
+        default = card.get("default")
+        current = get_by_dotted(params, key, None)
+        if current is None or current == default:
+            result.append({
+                "key": key,
+                "default": default,
+                "description": card.get("description", ""),
+            })
+        if len(result) >= 6:
+            break
+    return result
+
+
 def build_context(main_widget) -> dict:
     """Build the full workflow context dict from a live ``BEHAV3DWidget``."""
     from behav3d.napari._assistant_schema import cards_for_step
@@ -166,6 +370,18 @@ def build_context(main_widget) -> dict:
         "parameters": _safe(lambda: _diff_from_defaults(params), {}) or {},
         "step_schema": _safe(lambda: cards_for_step(step), []) or [],
     }
+    # Include metadata builder state only when on the data_preparation tab.
+    if step == "data_preparation":
+        ctx["metadata_builder"] = _metadata_builder_state(dp)
+    if step == "segmentation":
+        ctx["segmentation"] = _safe(lambda: _segmentation_state(main_widget), {})
+
+    # Guided-flow enrichments.
+    ctx["step_readiness"] = _safe(lambda: _step_readiness(main_widget, ctx), {})
+    ctx["active_cell_type_tab"] = _safe(
+        lambda: _active_cell_type_tab(main_widget, step), None)
+    ctx["required_params_at_default"] = _safe(
+        lambda: _required_params_at_default(step, ctx["step_schema"], params), [])
     return ctx
 
 

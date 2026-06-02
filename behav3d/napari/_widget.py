@@ -141,7 +141,7 @@ class BEHAV3DWidget(QWidget):
             from behav3d.napari._assistant import AssistantDock
             self.assistant = AssistantDock(main_widget=self)
             self._assistant_dock = self.viewer.window.add_dock_widget(
-                self.assistant, area="right", name="🤖 BEHAV3D Assistant"
+                self.assistant, area="right", name="BEHAV3D Assistant"
             )
             # Both this pipeline and the assistant dock to the "right" area, so Qt
             # stacks them vertically by default. Defer to the next event-loop tick

@@ -30,6 +30,116 @@ class _Missing:
 _MISSING = _Missing()
 
 
+_CATEGORY_LABELS = {
+    "immune": "immune cells",
+    "organoid": "organoids",
+    "other": "other cells",
+    "all_organoids": "all organoids",
+}
+
+_LEAF_LABELS = {
+    "metadata_csv": "metadata CSV",
+    "output_dir": "output directory",
+    "default_apply_all": "dimension order",
+    "examples_per_sample": "examples per sample",
+    "sample_specific_classifier": "sample-specific classifier",
+    "workers": "worker count",
+    "use_all_timepoints": "use all timepoints",
+    "tp_start": "first timepoint",
+    "tp_end": "last timepoint",
+    "number_of_channels": "number of channels",
+    "labels_mode": "channel-label setup",
+    "channel_labels": "channel labels",
+    "per_sample_channel_labels": "per-sample channel labels",
+    "track_organoids_together": "track organoids together",
+    "method": "method",
+    "overwrite": "overwrite existing outputs",
+    "search_range_px": "search range",
+    "memory_frames": "memory frames",
+    "track_cost_px": "frame-to-frame linking distance",
+    "gap_close_cost_px": "gap-closing distance",
+    "gap_close_max_frames": "maximum gap length",
+    "merging_cost_px": "merging distance",
+    "splitting_cost_px": "splitting distance",
+    "config_preset": "btrack preset",
+    "config_path": "btrack config path",
+    "max_search_radius": "maximum search radius",
+    "update_method": "btrack update method",
+    "step_size": "btrack step size",
+    "n_workers": "worker count",
+    "use_optimize": "global optimization",
+    "hypotheses": "btrack hypotheses",
+    "dist_thresh": "distance threshold",
+    "time_thresh": "time threshold",
+    "features_choice": "feature groups",
+    "contact_threshold": "contact distance",
+    "dead_perc_threshold": "dead-pixel threshold",
+    "exp_duration": "experiment duration",
+    "exp_duration_enabled": "use experiment-duration filter",
+    "min_track_length": "minimum track length",
+    "min_track_length_enabled": "use minimum-track-length filter",
+    "max_track_length": "maximum track length",
+    "max_track_length_enabled": "use maximum-track-length filter",
+    "umap_min_dist": "UMAP minimum distance",
+    "umap_n_neighbors": "UMAP neighbors",
+    "nr_of_clusters": "number of clusters",
+    "observation_window": "observation window",
+    "death_signal_column": "death-signal column",
+    "killing_threshold_multiplier": "killing threshold multiplier",
+    "min_contact_duration": "minimum contact duration",
+    "use_absolute_threshold": "use absolute killing threshold",
+    "absolute_killing_threshold": "absolute killing threshold",
+    "save_results": "save results",
+}
+
+_METHOD_GROUP_LABELS = {
+    "lap": "LAP",
+    "trackpy": "TrackPy",
+    "btrack": "btrack",
+}
+
+
+def humanize_parameter_key(key: str | None) -> str:
+    """Return a researcher-facing label for an internal dotted parameter key."""
+    if not key:
+        return "Parameter"
+    parts = str(key).split(".")
+    leaf = parts[-1]
+    label = _LEAF_LABELS.get(leaf, leaf.replace("_", " "))
+
+    category = next((p for p in parts if p in _CATEGORY_LABELS), None)
+    method = next((p for p in parts if p in _METHOD_GROUP_LABELS), None)
+    top = parts[0] if parts else ""
+
+    prefixes: list[str] = []
+    if category:
+        prefixes.append(_CATEGORY_LABELS[category])
+    if method and leaf != "method":
+        prefixes.append(_METHOD_GROUP_LABELS[method])
+    elif top == "pixel_classifier":
+        prefixes.append("pixel classifier")
+    elif top == "cellpose":
+        prefixes.append("Cellpose")
+    elif top == "features":
+        prefixes.append("feature extraction")
+    elif top == "track_filtering":
+        prefixes.append("track filtering")
+    elif top == "analysis":
+        prefixes.append("analysis")
+    elif top == "active_killing":
+        prefixes.append("active killing")
+    elif top == "death_dynamics":
+        prefixes.append("death dynamics")
+
+    return ": ".join(prefixes + [label]) if prefixes else label.capitalize()
+
+
+def _display_value(value: Any) -> str:
+    if isinstance(value, str):
+        return f'"{value}"'
+    return repr(value)
+
+
 # ---------------------------------------------------------------------------
 # Pure dotted-key helpers (no Qt, fully unit-testable)
 # ---------------------------------------------------------------------------
@@ -82,17 +192,21 @@ def validate_value(card: dict, value: Any) -> tuple[bool, Any, str]:
     try:
         coerced = _coerce(card, value)
     except (ValueError, TypeError):
-        return False, value, f"'{value}' is not a valid {card.get('type')} for {card['key']}."
+        label = humanize_parameter_key(card.get("key"))
+        return False, value, f"'{value}' is not a valid {card.get('type')} for {label}."
 
     choices = card.get("choices")
     if choices is not None and coerced not in choices:
-        return False, coerced, f"{card['key']} must be one of {choices}; got {coerced!r}."
+        label = humanize_parameter_key(card.get("key"))
+        return False, coerced, f"{label} must be one of {choices}; got {coerced!r}."
 
     lo, hi = card.get("min"), card.get("max")
     if lo is not None and coerced < lo:
-        return False, coerced, f"{card['key']} must be ≥ {lo}; got {coerced}."
+        label = humanize_parameter_key(card.get("key"))
+        return False, coerced, f"{label} must be at least {lo}; got {coerced}."
     if hi is not None and coerced > hi:
-        return False, coerced, f"{card['key']} must be ≤ {hi}; got {coerced}."
+        label = humanize_parameter_key(card.get("key"))
+        return False, coerced, f"{label} must be at most {hi}; got {coerced}."
 
     return True, coerced, ""
 
@@ -377,7 +491,7 @@ def _push_to_widget(widget, value) -> bool:
         # Combos: items are often labelled (e.g. "btrack (Bayesian)") while the
         # config value is the bare token ("btrack"). Match exact → starts-with →
         # contains so labelled options still resolve; fail if none match.
-        from qtpy.QtWidgets import QComboBox
+        from qtpy.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QSpinBox
         if isinstance(widget, QComboBox):
             from qtpy.QtCore import Qt
             s = str(value)
@@ -387,8 +501,12 @@ def _push_to_widget(widget, value) -> bool:
                     widget.setCurrentIndex(idx)
                     return True
             return False
-        if hasattr(widget, "setChecked") and isinstance(value, bool):
-            widget.setChecked(value)
+        if isinstance(widget, QCheckBox):
+            widget.setChecked(_coerce_bool(value))
+        elif isinstance(widget, QSpinBox):
+            widget.setValue(int(value))
+        elif isinstance(widget, QDoubleSpinBox):
+            widget.setValue(float(value))
         elif hasattr(widget, "setValue") and isinstance(value, (int, float)):
             widget.setValue(value)
         elif hasattr(widget, "setText"):
@@ -429,6 +547,13 @@ def _card_index(cards: list[dict]) -> dict[str, dict]:
     return {c["key"]: c for c in cards}
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def build_actions(raw_tool_calls: list[dict], cards: list[dict], params: dict) -> list[ProposedAction]:
     """Turn raw model tool-calls into validated ProposedAction objects with previews."""
     idx = _card_index(cards)
@@ -447,12 +572,17 @@ def build_actions(raw_tool_calls: list[dict], cards: list[dict], params: dict) -
                 ok, coerced, msg = validate_value(card, args.get("value"))
                 act.ok, act.message = ok, msg
                 act.data["value"] = coerced
+                act.data["label"] = humanize_parameter_key(key)
                 old = get_by_dotted(params, key, card.get("default"))
-                act.preview = f"{key}:  {old!r}  →  {coerced!r}"
+                act.preview = (
+                    f"{humanize_parameter_key(key)}: "
+                    f"{_display_value(old)} -> {_display_value(coerced)}"
+                )
                 if ok and coerced == old:
                     # No-op: proposed value already equals the current value
                     # (e.g. an empty placeholder '' -> ''). Don't offer to apply.
                     act.ok = False
+                    act.data["no_op"] = True
                     act.message = f"Already set to {coerced!r} — no change needed."
                 elif ok and isinstance(coerced, str) and coerced.strip() == "":
                     # Empty string proposal for a value the model doesn't know yet.
@@ -469,7 +599,78 @@ def build_actions(raw_tool_calls: list[dict], cards: list[dict], params: dict) -
                                  params=args.get("params", {}))
             act.preview = f"Add '{args.get('step_type')}' to the processing queue"
             actions.append(act)
+        elif name == "fill_metadata_builder":
+            field = args.get("field")
+            value = args.get("value")
+            index = _safe_int(args.get("index", 0), 0)
+            act = ProposedAction(
+                "fill_metadata_builder",
+                field=field,
+                value=value,
+                index=index,
+                cell_type=args.get("cell_type"),
+            )
+            act.preview = _metadata_builder_preview(field, value, index, args.get("cell_type"))
+            if field is None:
+                act.ok = False
+                act.message = "No field specified for fill_metadata_builder."
+            elif field in (
+                "cell_line", "cell_condition", "cell_segments_image_path",
+                "cell_tracks_image_path", "cell_tracks_csv_path",
+            ) and not args.get("cell_type"):
+                act.ok = False
+                act.message = "Choose the visible cell type name for this sample field."
+            actions.append(act)
     return actions
+
+
+def _metadata_builder_preview(
+    field: Optional[str],
+    value: Any,
+    index: int,
+    cell_type: Optional[str] = None,
+) -> str:
+    _TRIGGER_LABELS = {
+        "open_builder": "Open the Metadata Builder",
+        "configure_cell_types": "Configure cell type name fields",
+        "create_sample_forms": "Create per-sample input forms",
+        "fill_down": "Copy Sample 1 settings to all samples",
+    }
+    if field in _TRIGGER_LABELS:
+        return _TRIGGER_LABELS[field]
+    if field == "n_samples":      return f"Number of samples: {value}"
+    if field == "n_organoids":    return f"Organoid cell types: {value}"
+    if field == "n_immune":       return f"Immune cell types: {value}"
+    if field == "n_other":        return f"Other cell types: {value}"
+    if field == "include_dead":   return f"Include dead channel: {'yes' if _coerce_bool(value) else 'no'}"
+    if field == "immune_multicolor":
+        return f"Immune type {index + 1} multicolor: {'yes' if _coerce_bool(value) else 'no'}"
+    if field == "immune_multicolor_channels":
+        return f"Immune type {index + 1} channels: {value}"
+    if field == "organoid_name":  return f"Organoid type {index + 1} name → \"{value}\""
+    if field == "immune_name":    return f"Immune type {index + 1} name → \"{value}\""
+    if field == "other_name":     return f"Other type {index + 1} name → \"{value}\""
+    if field == "sample_name":    return f"Sample {index + 1} name → \"{value}\""
+    if field == "raw_image_path": return f"Sample {index + 1} image path → \"{value}\""
+    if field == "pixel_distance_xy": return f"Sample {index + 1} pixel XY: {value} μm"
+    if field == "pixel_distance_z":  return f"Sample {index + 1} pixel Z: {value} μm"
+    if field == "time_interval":  return f"Sample {index + 1} time interval: {value}"
+    if field == "time_unit":      return f"Sample {index + 1} time unit: {value}"
+    if field == "exp_nr":         return f"Sample {index + 1} experiment #: {value}"
+    if field == "well":           return f"Sample {index + 1} well: {value}"
+    if field == "dimension_order": return f"Sample {index + 1} dimension order: {value}"
+    if field == "dead_channel_number": return f"Sample {index + 1} dead channel #: {value}"
+    if field == "dead_mask_path": return f"Sample {index + 1} dead mask path → \"{value}\""
+    cell = f" {cell_type}" if cell_type else ""
+    if field == "cell_line": return f"Sample {index + 1}{cell} line → \"{value}\""
+    if field == "cell_condition": return f"Sample {index + 1}{cell} condition → \"{value}\""
+    if field == "cell_segments_image_path":
+        return f"Sample {index + 1}{cell} segments path → \"{value}\""
+    if field == "cell_tracks_image_path":
+        return f"Sample {index + 1}{cell} tracks image path → \"{value}\""
+    if field == "cell_tracks_csv_path":
+        return f"Sample {index + 1}{cell} tracks CSV path → \"{value}\""
+    return f"Metadata builder: {field} = {value!r}"
 
 
 def apply_set_parameter(main_widget, key: str, value: Any):
@@ -539,6 +740,106 @@ def apply_navigate(main_widget, step: str) -> bool:
         return False
 
 
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
+def _metadata_cell_widget(form: dict, cell_type: Optional[str], field: str):
+    if not cell_type:
+        return None
+    cell_fields = (form.get("cell_types") or {}).get(str(cell_type))
+    if not cell_fields:
+        return None
+    return cell_fields.get(field)
+
+
+def apply_fill_metadata_builder(main_widget, action: ProposedAction) -> bool:
+    """Apply a fill_metadata_builder action — sets widgets in the Metadata Builder."""
+    dp = _dp(main_widget)
+    if dp is None:
+        return False
+    field = action.data.get("field")
+    value = action.data.get("value")
+    index = int(action.data.get("index", 0))
+    cell_type = action.data.get("cell_type")
+    try:
+        if field == "open_builder":
+            dp.builder_grp.setChecked(True)
+            return True
+        # Silently open the builder if it isn't already (non-destructive).
+        if not getattr(dp.builder_grp, "isChecked", lambda: True)():
+            dp.builder_grp.setChecked(True)
+        if field == "n_samples":
+            dp.n_samples_spin.setValue(int(value)); pulse_widget(dp.n_samples_spin); return True
+        if field == "n_organoids":
+            dp.n_organoid_spin.setValue(int(value)); pulse_widget(dp.n_organoid_spin); return True
+        if field == "n_immune":
+            dp.n_immune_spin.setValue(int(value)); pulse_widget(dp.n_immune_spin); return True
+        if field == "n_other":
+            dp.n_other_spin.setValue(int(value)); pulse_widget(dp.n_other_spin); return True
+        if field == "include_dead":
+            dp.include_dead_cb.setChecked(_coerce_bool(value)); pulse_widget(dp.include_dead_cb); return True
+        if field == "configure_cell_types":
+            dp._on_configure_cell_types(); return True
+        if field == "immune_multicolor":
+            flags = getattr(dp, "_immune_multicolor_flags", [])
+            if 0 <= index < len(flags):
+                flags[index].setChecked(_coerce_bool(value)); pulse_widget(flags[index]); return True
+        if field == "immune_multicolor_channels":
+            counts = getattr(dp, "_immune_multicolor_counts", [])
+            if 0 <= index < len(counts):
+                counts[index].setValue(int(value)); pulse_widget(counts[index]); return True
+        if field == "organoid_name":
+            edits = getattr(dp, "_organoid_name_edits", [])
+            if 0 <= index < len(edits):
+                edits[index].setText(str(value)); pulse_widget(edits[index]); return True
+        if field == "immune_name":
+            edits = getattr(dp, "_immune_name_edits", [])
+            if 0 <= index < len(edits):
+                edits[index].setText(str(value)); pulse_widget(edits[index]); return True
+        if field == "other_name":
+            edits = getattr(dp, "_other_name_edits", [])
+            if 0 <= index < len(edits):
+                edits[index].setText(str(value)); pulse_widget(edits[index]); return True
+        if field == "create_sample_forms":
+            dp._build_sample_forms(); return True
+        if field == "fill_down":
+            dp._on_fill_down(); return True
+        if field in ("sample_name", "exp_nr", "well", "raw_image_path",
+                     "dimension_order", "pixel_distance_xy", "pixel_distance_z",
+                     "time_interval", "time_unit"):
+            forms = getattr(dp, "_sample_forms", [])
+            if 0 <= index < len(forms):
+                w = forms[index]["basic"].get(field)
+                if w is not None and _push_to_widget(w, value):
+                    pulse_widget(w); return True
+        if field in ("dead_channel_number", "dead_mask_path"):
+            forms = getattr(dp, "_sample_forms", [])
+            if 0 <= index < len(forms):
+                dead_key = "number" if field == "dead_channel_number" else "mask_path"
+                w = forms[index].get("dead_channel", {}).get(dead_key)
+                if w is not None and _push_to_widget(w, value):
+                    pulse_widget(w); return True
+        cell_field_map = {
+            "cell_line": "line",
+            "cell_condition": "condition",
+            "cell_segments_image_path": "segments_image_path",
+            "cell_tracks_image_path": "tracks_image_path",
+            "cell_tracks_csv_path": "tracks_csv_path",
+        }
+        if field in cell_field_map:
+            forms = getattr(dp, "_sample_forms", [])
+            if 0 <= index < len(forms):
+                w = _metadata_cell_widget(forms[index], cell_type, cell_field_map[field])
+                if w is not None and _push_to_widget(w, value):
+                    pulse_widget(w); return True
+    except Exception:
+        pass
+    return False
+
+
 def apply_action(main_widget, action: ProposedAction) -> bool:
     if not action.ok:
         return False
@@ -551,6 +852,10 @@ def apply_action(main_widget, action: ProposedAction) -> bool:
         return apply_navigate(main_widget, action.data["step"])
     if action.kind == "add_queue_step":
         return _apply_add_queue_step(main_widget, action)
+    if action.kind == "fill_metadata_builder":
+        ok = apply_fill_metadata_builder(main_widget, action)
+        action.data["widget_updated"] = ok
+        return ok
     return False
 
 
@@ -604,10 +909,79 @@ TOOL_SCHEMA = [
         "parameters": {
             "type": "object",
             "properties": {
-                "step_type": {"type": "string"},
+                "step_type": {
+                    "type": "string",
+                    "enum": ["segment", "train", "track",
+                             "feature_extract", "filter", "active_killing"],
+                },
                 "params": {"type": "object"},
             },
             "required": ["step_type"],
+        },
+    },
+    {
+        "name": "fill_metadata_builder",
+        "description": (
+            "Fill a field in the Metadata Builder on the Data Preparation tab. "
+            "Use this to guide the user step-by-step through experiment setup. "
+            "REQUIRED ORDER: open_builder → n_samples / n_organoids / n_immune / "
+            "n_other / include_dead → configure_cell_types → organoid_name / "
+            "immune_name / other_name (0-indexed; use immune_multicolor and "
+            "immune_multicolor_channels when applicable) → create_sample_forms → "
+            "per-sample fields (sample_name, exp_nr, well, raw_image_path, "
+            "dimension_order, pixel_distance_xy, pixel_distance_z, time_interval, "
+            "time_unit, dead_channel_number, dead_mask_path — sample index 0, 1, …). "
+            "For per-sample cell-type rows, use cell_line, cell_condition, "
+            "cell_segments_image_path, cell_tracks_image_path, or cell_tracks_csv_path "
+            "with the exact visible cell_type name. "
+            "After filling Sample 1, call fill_down to copy shared values to all samples."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "field": {
+                    "type": "string",
+                    "enum": [
+                        "open_builder",
+                        "n_samples", "n_organoids", "n_immune", "n_other", "include_dead",
+                        "configure_cell_types",
+                        "organoid_name", "immune_name", "other_name",
+                        "immune_multicolor", "immune_multicolor_channels",
+                        "create_sample_forms",
+                        "sample_name", "exp_nr", "well", "raw_image_path",
+                        "dimension_order", "pixel_distance_xy", "pixel_distance_z",
+                        "time_interval", "time_unit",
+                        "dead_channel_number", "dead_mask_path",
+                        "cell_line", "cell_condition", "cell_segments_image_path",
+                        "cell_tracks_image_path", "cell_tracks_csv_path",
+                        "fill_down",
+                    ],
+                    "description": "Which field or action to perform.",
+                },
+                "value": {
+                    "description": (
+                        "The value to set. Omit for configure_cell_types, "
+                        "create_sample_forms, fill_down, open_builder."
+                    ),
+                },
+                "index": {
+                    "type": "integer",
+                    "description": (
+                        "0-based index: cell type (for organoid_name/immune_name/other_name) "
+                        "or sample (for per-sample fields)."
+                    ),
+                    "default": 0,
+                },
+                "cell_type": {
+                    "type": "string",
+                    "description": (
+                        "Exact visible cell type name for per-sample cell-type fields "
+                        "(cell_line, cell_condition, cell_segments_image_path, "
+                        "cell_tracks_image_path, cell_tracks_csv_path)."
+                    ),
+                },
+            },
+            "required": ["field"],
         },
     },
 ]

@@ -9,7 +9,7 @@ reference to the main ``BEHAV3DWidget`` so it can read live workflow context
 Layout (top → bottom):
   • context bar          — 📍 step · N samples · output dir · M queued (live)
   • chat transcript      — QTextBrowser, markdown, streamed assistant tokens
-  • proposed-action tray — confirm cards: "old → new  [Fill it in ✨] [Dismiss]"
+  • proposed-action tray — confirm cards: "old -> new  [Fill it in] [Dismiss]"
   • quick actions        — Explain this screen · Tell me about my data
   • input row            — text box + Send
 
@@ -27,9 +27,169 @@ from qtpy.QtWidgets import (
 
 from behav3d.napari._assistant_context import build_context, context_summary_line
 from behav3d.napari._assistant_actions import (
-    build_actions, apply_action, TOOL_SCHEMA, ProposedAction,
+    build_actions, apply_action, TOOL_SCHEMA, ProposedAction, humanize_parameter_key,
 )
 from behav3d.napari._assistant_client import ChatWorker, load_client_config
+
+
+_UNSET = object()  # sentinel for "parameter not yet in config"
+_METADATA_FIELD_DEFAULTS = {
+    "n_samples": 1,
+    "n_organoids": 0,
+    "n_immune": 0,
+    "n_other": 0,
+    "include_dead": False,
+    "exp_nr": 1,
+    "pixel_distance_xy": 0.5,
+    "pixel_distance_z": 2.0,
+    "time_interval": 1.0,
+    "time_unit": "s",
+}
+
+
+def _coerce_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
+def _metadata_field_has_value(dp, field: str, index: int, cell_type: str | None = None) -> bool:
+    """Return True if the metadata builder field already has a non-default value set."""
+    if dp is None:
+        return False
+    try:
+        from qtpy.QtWidgets import QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox
+        if field == "n_samples":
+            return dp.n_samples_spin.value() != _METADATA_FIELD_DEFAULTS["n_samples"]
+        if field == "n_organoids":
+            return dp.n_organoid_spin.value() != _METADATA_FIELD_DEFAULTS["n_organoids"]
+        if field == "n_immune":
+            return dp.n_immune_spin.value() != _METADATA_FIELD_DEFAULTS["n_immune"]
+        if field == "n_other":
+            return dp.n_other_spin.value() != _METADATA_FIELD_DEFAULTS["n_other"]
+        if field == "include_dead":
+            return dp.include_dead_cb.isChecked() != _METADATA_FIELD_DEFAULTS["include_dead"]
+        if field in ("immune_multicolor", "immune_multicolor_channels"):
+            flags = getattr(dp, "_immune_multicolor_flags", [])
+            counts = getattr(dp, "_immune_multicolor_counts", [])
+            if field == "immune_multicolor":
+                return index < len(flags) and flags[index].isChecked()
+            return index < len(counts) and counts[index].value() != 2
+        for attr, cat in (("_organoid_name_edits", "organoid_name"),
+                          ("_immune_name_edits",   "immune_name"),
+                          ("_other_name_edits",    "other_name")):
+            if field == cat:
+                edits = getattr(dp, attr, [])
+                return index < len(edits) and bool(edits[index].text().strip())
+        # Per-sample fields
+        forms = getattr(dp, "_sample_forms", [])
+        if index >= len(forms):
+            return False
+        if field in ("dead_channel_number", "dead_mask_path"):
+            dead_key = "number" if field == "dead_channel_number" else "mask_path"
+            w = forms[index].get("dead_channel", {}).get(dead_key)
+        elif field in (
+            "cell_line", "cell_condition", "cell_segments_image_path",
+            "cell_tracks_image_path", "cell_tracks_csv_path",
+        ):
+            field_map = {
+                "cell_line": "line",
+                "cell_condition": "condition",
+                "cell_segments_image_path": "segments_image_path",
+                "cell_tracks_image_path": "tracks_image_path",
+                "cell_tracks_csv_path": "tracks_csv_path",
+            }
+            cell_fields = forms[index].get("cell_types", {}).get(str(cell_type), {})
+            w = cell_fields.get(field_map[field])
+        else:
+            w = forms[index]["basic"].get(field)
+        if w is None:
+            return False
+        if isinstance(w, QLineEdit):
+            return bool(w.text().strip())
+        if isinstance(w, (QSpinBox, QDoubleSpinBox)):
+            val = w.value()
+            if field in _METADATA_FIELD_DEFAULTS:
+                return val != _METADATA_FIELD_DEFAULTS[field]
+            return val != 0 and val != w.minimum()
+        if isinstance(w, QComboBox):
+            default = _METADATA_FIELD_DEFAULTS.get(field)
+            if default is not None:
+                return w.currentText() != str(default)
+            return w.currentIndex() > 0
+    except Exception:
+        pass
+    return False
+
+
+def _fill_value_matches_current(
+    dp,
+    field: str,
+    index: int,
+    proposed,
+    cell_type: str | None = None,
+) -> bool:
+    """Return True if the proposed fill value is the same as what's already in the widget.
+    Used to auto-apply no-op repeated calls without showing a confirm card."""
+    if dp is None:
+        return False
+    try:
+        from qtpy.QtWidgets import QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox
+        if field == "n_samples":
+            return dp.n_samples_spin.value() == int(proposed)
+        if field == "n_organoids":
+            return dp.n_organoid_spin.value() == int(proposed)
+        if field == "n_immune":
+            return dp.n_immune_spin.value() == int(proposed)
+        if field == "n_other":
+            return dp.n_other_spin.value() == int(proposed)
+        if field == "include_dead":
+            return dp.include_dead_cb.isChecked() == _coerce_bool(proposed)
+        if field in ("immune_multicolor", "immune_multicolor_channels"):
+            flags = getattr(dp, "_immune_multicolor_flags", [])
+            counts = getattr(dp, "_immune_multicolor_counts", [])
+            if field == "immune_multicolor":
+                return index < len(flags) and flags[index].isChecked() == _coerce_bool(proposed)
+            return index < len(counts) and counts[index].value() == int(proposed)
+        for attr, cat in (("_organoid_name_edits", "organoid_name"),
+                          ("_immune_name_edits",   "immune_name"),
+                          ("_other_name_edits",    "other_name")):
+            if field == cat:
+                edits = getattr(dp, attr, [])
+                return (index < len(edits) and
+                        edits[index].text().strip() == str(proposed).strip())
+        forms = getattr(dp, "_sample_forms", [])
+        if index >= len(forms):
+            return False
+        if field in ("dead_channel_number", "dead_mask_path"):
+            dead_key = "number" if field == "dead_channel_number" else "mask_path"
+            w = forms[index].get("dead_channel", {}).get(dead_key)
+        elif field in (
+            "cell_line", "cell_condition", "cell_segments_image_path",
+            "cell_tracks_image_path", "cell_tracks_csv_path",
+        ):
+            field_map = {
+                "cell_line": "line",
+                "cell_condition": "condition",
+                "cell_segments_image_path": "segments_image_path",
+                "cell_tracks_image_path": "tracks_image_path",
+                "cell_tracks_csv_path": "tracks_csv_path",
+            }
+            cell_fields = forms[index].get("cell_types", {}).get(str(cell_type), {})
+            w = cell_fields.get(field_map[field])
+        else:
+            w = forms[index]["basic"].get(field)
+        if w is None:
+            return False
+        if isinstance(w, QLineEdit):
+            return w.text().strip() == str(proposed).strip()
+        if isinstance(w, (QSpinBox, QDoubleSpinBox)):
+            return w.value() == float(proposed)
+        if isinstance(w, QComboBox):
+            return w.currentText() == str(proposed)
+    except Exception:
+        pass
+    return False
 
 
 _SYSTEM_PRIMER = (
@@ -42,7 +202,7 @@ _SYSTEM_PRIMER = (
     "- Keep it short: lead with a one-sentence answer, then detail only if useful.\n"
     "- Use short paragraphs (1–2 sentences) separated by a blank line.\n"
     "- Use bullet points or a numbered list for any set of items or steps.\n"
-    "- Bold key terms and parameter names; use `code` for values/keys.\n"
+    "- Use researcher-facing labels, not internal variable names.\n"
     "- Avoid long dense paragraphs and walls of text."
 )
 
@@ -69,7 +229,7 @@ class _ActionCard(QFrame):
         lay.addWidget(title)
 
         if not action.ok:
-            warn = QLabel("⚠️ " + action.message)
+            warn = QLabel(action.message)
             warn.setWordWrap(True)
             warn.setStyleSheet("color:#ffb3b3; font-size:10px;")
             lay.addWidget(warn)
@@ -77,7 +237,7 @@ class _ActionCard(QFrame):
         row = QHBoxLayout()
         row.addStretch(1)
         if action.ok:
-            btn_apply = QPushButton("Fill it in ✨")
+            btn_apply = QPushButton("Fill it in")
             btn_apply.setStyleSheet("font-size:10px;")
             btn_apply.clicked.connect(lambda: self.confirmed.emit(self.action))
             row.addWidget(btn_apply)
@@ -99,6 +259,12 @@ class AssistantDock(QWidget):
         self._threads: list[tuple] = []       # keep (thread, worker) refs alive
         self._md_log: list[str] = []          # finalised transcript blocks (markdown)
         self._streaming_text = None           # in-progress assistant text, or None
+        self._greeted_tabs: set = set()       # tabs greeted this session (no repeat proactive)
+        self._guided_flow_active: bool = False  # True while a step-by-step guide is running
+        self._pending_auto_continue: list | None = None  # deferred after _on_finished
+        self._auto_continue_turns: int = 0
+        self._last_auto_continue_signature: tuple | None = None
+        self._confirmed_parameter_keys: set[str] = set()
 
         # Cohesive dark-theme styling for the whole dock (matches napari surfaces).
         self.setStyleSheet("""
@@ -133,7 +299,7 @@ class AssistantDock(QWidget):
         root.setSpacing(8)
 
         # --- context bar --------------------------------------------------
-        self.context_bar = QLabel("📍 …")
+        self.context_bar = QLabel("BEHAV3D Assistant")
         self.context_bar.setStyleSheet(
             "background:#2f3338; color:#9fc6e0; padding:7px 10px;"
             "border:1px solid #3a3f44; border-radius:8px; font-size:11px; font-weight:600;"
@@ -155,17 +321,12 @@ class AssistantDock(QWidget):
         self.action_tray_layout.setSpacing(4)
         root.addWidget(self.action_tray)
 
-        # --- quick actions -----------------------------------------------
-        quick = QHBoxLayout()
-        self.btn_explain = QPushButton("💡 Explain this screen")
-        self.btn_explain.setStyleSheet("font-size:10px;")
-        self.btn_explain.clicked.connect(self._explain_screen)
-        quick.addWidget(self.btn_explain)
-        self.btn_interview = QPushButton("🧬 Tell me about my data")
-        self.btn_interview.setStyleSheet("font-size:10px;")
-        self.btn_interview.clicked.connect(self._start_interview)
-        quick.addWidget(self.btn_interview)
-        root.addLayout(quick)
+        # --- quick actions (rebuilt on tab switch) ------------------------
+        self.quick_widget = QWidget()
+        self._quick_layout = QVBoxLayout(self.quick_widget)
+        self._quick_layout.setContentsMargins(0, 0, 0, 0)
+        self._quick_layout.setSpacing(4)
+        root.addWidget(self.quick_widget)
 
         # --- input row ----------------------------------------------------
         input_row = QHBoxLayout()
@@ -180,6 +341,13 @@ class AssistantDock(QWidget):
 
         self.refresh_context_bar()
         self._greet()
+        try:
+            initial_idx = self.main_widget.tabs.currentIndex()
+            self.main_widget.tabs.currentChanged.connect(self._on_tab_changed)
+        except Exception:
+            initial_idx = 0
+        self._greeted_tabs.add(initial_idx)
+        self._set_quick_buttons(initial_idx)
 
     # ------------------------------------------------------------------
     # Context bar
@@ -189,13 +357,13 @@ class AssistantDock(QWidget):
             ctx = build_context(self.main_widget)
             self.context_bar.setText(context_summary_line(ctx))
         except Exception:
-            self.context_bar.setText("📍 BEHAV3D Assistant")
+            self.context_bar.setText("BEHAV3D Assistant")
 
     def _greet(self):
         cfg = load_client_config()
         mode = "" if cfg.get("endpoint") else "  *(offline mode — no server configured)*"
         self._append_md(
-            f"**🤖 BEHAV3D Assistant**{mode}\n\nAsk me which method or parameter "
+            f"**BEHAV3D Assistant**{mode}\n\nAsk me which method or parameter "
             "values suit your data. I can also fill the forms in for you "
             "(you confirm first). Try *“Explain this screen”* to start."
         )
@@ -212,7 +380,7 @@ class AssistantDock(QWidget):
         """
         blocks = list(self._md_log)
         if self._streaming_text is not None:
-            blocks.append(f"**🤖 Assistant**\n\n{self._streaming_text or '…'}")
+            blocks.append(f"**BEHAV3D Assistant**\n\n{self._streaming_text or '...'}")
         try:
             # A thin rule between turns gives clear visual separation.
             self.transcript.setMarkdown("\n\n---\n\n".join(blocks))
@@ -246,7 +414,7 @@ class AssistantDock(QWidget):
         self._render()
 
     def _append_user(self, text: str):
-        self._append_md(f"**🧑 You**\n\n{text}")
+        self._append_md(f"**You**\n\n{text}")
 
     # ------------------------------------------------------------------
     # Sending
@@ -256,10 +424,22 @@ class AssistantDock(QWidget):
         if not text:
             return
         self.input.clear()
+        self._guided_flow_active = False   # free-form input exits any guided flow
         self._send_message(text)
 
-    def _send_message(self, text: str):
-        self._append_user(text)
+    def _send_message(
+        self,
+        text: str,
+        *,
+        show_as_user: bool = True,
+        display_text: str | None = None,
+        reset_auto_loop: bool = True,
+    ):
+        if reset_auto_loop:
+            self._auto_continue_turns = 0
+            self._last_auto_continue_signature = None
+        if show_as_user:
+            self._append_user(display_text or text)
         self._history.append({"role": "user", "content": text})
         self._set_busy(True)
         self._streaming_text = ""        # opens a live "Assistant:" block
@@ -268,6 +448,9 @@ class AssistantDock(QWidget):
         ctx = {}
         try:
             ctx = build_context(self.main_widget)
+            ctx["assistant_session"] = {
+                "confirmed_parameter_keys": sorted(self._confirmed_parameter_keys),
+            }
         except Exception:
             ctx = {}
 
@@ -289,6 +472,14 @@ class AssistantDock(QWidget):
     def _set_busy(self, busy: bool):
         self.btn_send.setEnabled(not busy)
         self.input.setEnabled(not busy)
+        for i in range(self._quick_layout.count()):
+            row = self._quick_layout.itemAt(i)
+            sub = row.layout() if row else None
+            if sub:
+                for j in range(sub.count()):
+                    w = sub.itemAt(j).widget() if sub.itemAt(j) else None
+                    if w:
+                        w.setEnabled(not busy)
 
     # ------------------------------------------------------------------
     # Worker signal handlers
@@ -306,7 +497,7 @@ class AssistantDock(QWidget):
     def _on_error(self, message: str):
         # close any open streaming block, then show the error
         self._finalize_streaming()
-        self._append_md(f"⚠️ {message}")
+        self._append_md(message)
 
     def _on_tool_calls(self, calls: list):
         try:
@@ -319,13 +510,143 @@ class AssistantDock(QWidget):
             actions = build_actions(calls, cards, params)
         except Exception:
             actions = []
+        auto_previews = []
+        noop_previews = []
+        had_auto = False
         for act in actions:
-            self._add_action_card(act)
+            if self._is_noop_action(act):
+                self._record_noop_action(act)
+                noop_previews.append(self._noop_preview(act))
+                continue
+            if self._should_auto_apply(act):
+                if act.ok:
+                    # Classify BEFORE applying (widget still holds pre-apply state).
+                    _silent_auto = self._is_silent_auto_apply(act)
+                    try:
+                        ok = apply_action(self.main_widget, act)
+                    except Exception:
+                        ok = False
+                    if ok:
+                        had_auto = True
+                        # Only count as a meaningful change if it wasn't a structural
+                        # trigger or a same-value no-op re-call from the model.
+                        if not _silent_auto:
+                            auto_previews.append(act.preview)
+                        self.refresh_context_bar()
+            else:
+                self._add_action_card(act)
+
+        if auto_previews:
+            self._append_md("Filled in: " + " · ".join(auto_previews))
+        # A no-op means the proposed value was already present. Treat that as
+        # confirmation from the user's previous answer and move forward silently
+        # instead of rendering a scary "Already set" card.
+        if (
+            noop_previews and not auto_previews and self.action_tray_layout.count() == 0
+            and not (self._streaming_text or "").strip()
+        ):
+            self._pending_auto_continue = noop_previews
+        # Defer auto-continue until _on_finished so ChatWorker1's _finalize_streaming()
+        # runs first — otherwise it wipes _streaming_text that ChatWorker2 just started.
+        # Only fire for value-setting actions (non-empty previews). Structural-only actions
+        # (open_builder, configure_cell_types, create_sample_forms, fill_down) must not
+        # trigger a new LLM turn — the bot should ask the next question in its current
+        # streaming response, otherwise the loop never terminates.
+        if (
+            had_auto and auto_previews and self.action_tray_layout.count() == 0
+            and not (self._streaming_text or "").strip()
+        ):
+            self._pending_auto_continue = auto_previews
+
+    def _is_noop_action(self, action: ProposedAction) -> bool:
+        return bool(action.data.get("no_op"))
+
+    def _record_noop_action(self, action: ProposedAction) -> None:
+        if action.kind == "set_parameter":
+            key = action.data.get("key")
+            if key:
+                self._confirmed_parameter_keys.add(str(key))
+
+    def _noop_preview(self, action: ProposedAction) -> str:
+        if action.kind == "set_parameter":
+            label = action.data.get("label") or humanize_parameter_key(action.data.get("key"))
+            return f"{label} already set to {action.data.get('value')!r}"
+        return action.preview or "Value already set"
+
+    def _should_auto_apply(self, action: ProposedAction) -> bool:
+        """Auto-apply by default; only show a confirm card if a value is already set."""
+        if not action.ok:
+            return False
+
+        if action.kind == "navigate_to_step":
+            return True  # navigation never overwrites anything
+
+        if action.kind == "add_queue_step":
+            return False  # adding to the queue is a deliberate action
+
+        if action.kind == "fill_metadata_builder":
+            field = action.data.get("field")
+            # Structural triggers never overwrite anything.
+            if field in ("open_builder", "configure_cell_types",
+                         "create_sample_forms", "fill_down"):
+                return True
+            dp = getattr(self.main_widget, "data_prep_tab", None)
+            idx = int(action.data.get("index", 0))
+            cell_type = action.data.get("cell_type")
+            if not _metadata_field_has_value(dp, field, idx, cell_type):
+                return True   # blank field — auto-apply
+            # Field already has a value; auto-apply only if the proposed value is the
+            # same (bot redundantly repeating itself). Different value → confirm card.
+            return _fill_value_matches_current(
+                dp, field, idx, action.data.get("value"), cell_type
+            )
+
+        if action.kind == "set_parameter":
+            try:
+                from behav3d.napari._assistant_actions import get_by_dotted
+                from behav3d.napari._assistant_schema import flatten_config_to_cards
+                key = action.data.get("key")
+                params = getattr(
+                    self.main_widget.data_prep_tab, "behav3d_parameters", {})
+                current = get_by_dotted(params, key, _UNSET)
+                if current is _UNSET:
+                    return True  # never been set
+                for card in flatten_config_to_cards():
+                    if card["key"] == key:
+                        return current == card["default"]
+            except Exception:
+                pass
+            return True
+
+        return True  # unknown action kind: auto-apply
+
+    def _is_silent_auto_apply(self, action: ProposedAction) -> bool:
+        """True when the action auto-applies but should NOT count as a new user answer.
+
+        Covers two cases:
+        - Structural triggers (open_builder, configure_cell_types, etc.) — no user data.
+        - Same-value no-ops — model re-confirming a value that is already set.
+          Detected BEFORE applying, while the widget still holds its current value.
+        """
+        if action.kind != "fill_metadata_builder":
+            return False
+        field = action.data.get("field")
+        if field in ("open_builder", "configure_cell_types",
+                     "create_sample_forms", "fill_down"):
+            return True
+        # Same-value no-op: proposed equals current, checked pre-apply.
+        # This covers both "field at a meaningful value" and "field still at default"
+        # (e.g. n_samples=1 → 1==1) — both are no-ops that should not trigger auto-continue.
+        dp = getattr(self.main_widget, "data_prep_tab", None)
+        idx = int(action.data.get("index", 0))
+        return _fill_value_matches_current(
+            dp, field, idx, action.data.get("value"), action.data.get("cell_type")
+        )
 
     def _finalize_streaming(self):
         """Move the in-progress assistant text into the finalised transcript log."""
         if self._streaming_text:
-            self._md_log.append(f"**🤖 Assistant**\n\n{self._streaming_text}")
+            self._md_log.append(f"**BEHAV3D Assistant**\n\n{self._streaming_text}")
             self._history.append({"role": "assistant", "content": self._streaming_text})
         self._streaming_text = None
 
@@ -336,6 +657,11 @@ class AssistantDock(QWidget):
         self._set_busy(False)
         if had_text:
             self._append_log()
+        # Fire any deferred auto-continue AFTER this turn is fully finalised.
+        pending = self._pending_auto_continue
+        if pending is not None:
+            self._pending_auto_continue = None
+            self._auto_continue(pending)
 
     def _cleanup_thread(self, thread, worker):
         self._threads = [(t, w) for (t, w) in self._threads if t is not thread]
@@ -360,25 +686,56 @@ class AssistantDock(QWidget):
         try:
             ok = apply_action(self.main_widget, action)
         except Exception as e:
-            self._append_md(f"\n⚠️ Could not apply: {e}")
+            self._append_md(f"\nCould not apply: {e}")
         if ok:
             if action.kind == "set_parameter" and not action.data.get("widget_updated"):
                 # stored in config, but no matching field exists on the current screen
+                label = action.data.get("label") or humanize_parameter_key(action.data.get("key"))
                 self._append_md(
-                    f"✅ Saved to config: `{action.data.get('key')}` = "
+                    f"Saved to config: **{label}** = "
                     f"`{action.data.get('value')!r}`\n\n*This step has no form field "
                     "here yet — it'll be used when you reach that part of the pipeline.*"
                 )
             else:
-                self._append_md(f"✅ Filled in: {action.preview}")
+                self._append_md(f"Filled in: {action.preview}")
             self.refresh_context_bar()
         else:
-            self._append_md(f"⚠️ Couldn't apply: {action.preview}")
+            self._append_md(f"Could not apply: {action.preview}")
         # remove all cards for this action
         for i in reversed(range(self.action_tray_layout.count())):
             w = self.action_tray_layout.itemAt(i).widget()
             if isinstance(w, _ActionCard) and w.action is action:
                 self._remove_card(w)
+        # Auto-continue: once the tray is empty, prompt the bot for the next step.
+        if ok and self.action_tray_layout.count() == 0:
+            self._auto_continue([action.preview] if action.preview else [])
+
+    def _auto_continue(self, applied: list[str] | None = None):
+        """Silently prompt the bot to continue, naming what was just applied."""
+        signature = tuple(applied or [])
+        if (
+            self._auto_continue_turns >= 1
+            and signature == self._last_auto_continue_signature
+        ):
+            self._append_md(
+                "That value is already set, so I am pausing instead of repeating "
+                "the same suggestion. Ask me what to check next, or use a guide button."
+            )
+            return
+        if self._auto_continue_turns >= 2:
+            self._append_md(
+                "I paused the guided flow to avoid repeating myself. "
+                "Tell me the next value you want to set, or use one of the buttons below."
+            )
+            return
+        self._auto_continue_turns += 1
+        self._last_auto_continue_signature = signature
+        suffix = " Call fill_metadata_builder (or set_parameter) when the user answers."
+        if applied:
+            msg = f"Applied: {'; '.join(applied)}. Ask the next question.{suffix}"
+        else:
+            msg = f"Ask the next question.{suffix}"
+        self._send_message(msg, show_as_user=False, reset_auto_loop=False)
 
     # ------------------------------------------------------------------
     # Quick actions
@@ -392,7 +749,8 @@ class AssistantDock(QWidget):
         step = ctx.get("current_tab_label") or ctx.get("current_step", "this step")
         self._send_message(
             f"Explain the {step} tab: what does it do, and what do its key "
-            "parameters mean for someone configuring it for the first time?"
+            "parameters mean for someone configuring it for the first time?",
+            display_text="Explain this screen",
         )
 
     def _start_interview(self):
@@ -400,7 +758,247 @@ class AssistantDock(QWidget):
             "I'd like help configuring BEHAV3D for my data. Ask me a short series "
             "of questions about my experiment (imaging modality, cell types, frame "
             "interval, pixel size, expected cell diameter, motility) and then "
-            "recommend sensible default parameters for the current step."
+            "recommend sensible default parameters for the current step.",
+            display_text="Tell me about my data",
+        )
+
+    def _start_metadata_guide(self):
+        self._guided_flow_active = True
+        # Open the builder directly — skip the LLM for this structural step so
+        # the bot can't get stuck by returning text-only on the first turn.
+        act = ProposedAction("fill_metadata_builder", field="open_builder", value=None, index=0)
+        act.preview = "Open the Metadata Builder"
+        try:
+            apply_action(self.main_widget, act)
+            self._append_md("Opened the Metadata Builder")
+            self.refresh_context_bar()
+        except Exception:
+            pass
+        self._send_message(
+            "The Metadata Builder is now open. "
+            "Ask me one question at a time to fill it in — start with: "
+            "'How many samples do you have?' "
+            "When I answer N, call fill_metadata_builder(field='n_samples', value=N) "
+            "in that same response, then ask about organoid types.",
+            display_text="Build metadata",
+        )
+
+    # ------------------------------------------------------------------
+    # Tab-change awareness and dynamic quick buttons
+    # ------------------------------------------------------------------
+    def _on_tab_changed(self, index: int):
+        """Called whenever the user switches tabs in the main widget."""
+        self.refresh_context_bar()
+        self._set_quick_buttons(index)
+        if index not in self._greeted_tabs and not self._guided_flow_active:
+            self._greeted_tabs.add(index)
+            self._dispatch_proactive(index)
+
+    def _dispatch_proactive(self, index: int):
+        dispatch = {
+            0: self._proactive_data_prep,
+            2: self._proactive_segmentation,
+            3: self._proactive_tracking,
+            4: self._proactive_feature_extraction,
+        }
+        fn = dispatch.get(index)
+        if fn:
+            fn()
+
+    def _set_quick_buttons(self, tab_index: int):
+        """Clear and repopulate quick-action buttons for the given tab."""
+        lay = self._quick_layout
+        while lay.count():
+            item = lay.takeAt(0)
+            sub = item.layout()
+            if sub:
+                while sub.count():
+                    si = sub.takeAt(0)
+                    w = si.widget()
+                    if w:
+                        w.setParent(None)
+                        w.deleteLater()
+
+        def _btn(label, handler, tip=""):
+            b = QPushButton(label)
+            b.setStyleSheet("font-size:10px;")
+            if tip:
+                b.setToolTip(tip)
+            b.clicked.connect(handler)
+            return b
+
+        def _row(*btns):
+            r = QHBoxLayout()
+            for b in btns:
+                r.addWidget(b)
+            lay.addLayout(r)
+
+        if tab_index == 0:   # data_preparation
+            _row(_btn("Walk through setup", self._start_setup_guide),
+                 _btn("Check what's missing", self._check_data_prereqs))
+            _row(_btn("Build metadata", self._start_metadata_guide))
+        elif tab_index == 2:  # segmentation
+            _row(_btn("Guide segmentation", self._start_segmentation_guide),
+                 _btn("Choose a method", self._explain_seg_methods))
+        elif tab_index == 3:  # tracking
+            _row(_btn("Guide tracking", self._start_tracking_guide),
+                 _btn("Which method?", self._explain_tracking_methods))
+        elif tab_index == 4:  # feature_extraction
+            _row(_btn("Guide setup", self._start_feature_guide),
+                 _btn("Check prerequisites", self._check_feature_prereqs))
+        else:
+            _row(_btn("Explain this screen", self._explain_screen),
+                 _btn("Tell me about my data", self._start_interview))
+
+    def _proactive_message(self, prompt: str):
+        """Trigger a proactive LLM check; displays as the bot's initiative, not a user message."""
+        self._append_md("*Checking your setup...*")
+        self._send_message(prompt, show_as_user=False)
+
+    # ------------------------------------------------------------------
+    # Proactive per-tab openers (fire once per tab per session)
+    # ------------------------------------------------------------------
+    def _proactive_data_prep(self):
+        self._proactive_message(
+            "I am on the Data Preparation tab. "
+            "Check the context: is output_dir_set? Is metadata loaded (metadata.loaded)? "
+            "If output_dir is not set, mention that first and offer to help. "
+            "If output_dir is set but metadata is not loaded, offer to walk through the Metadata Builder. "
+            "If both are ready, confirm briefly and suggest moving to the next step. "
+            "Keep it to 2–3 sentences maximum."
+        )
+
+    def _proactive_segmentation(self):
+        self._proactive_message(
+            "I just switched to the Segmentation tab. "
+            "Check context: is metadata loaded and output dir set? "
+            "If not, state which prereq is missing and offer to call navigate_to_step to Data Preparation. "
+            "If prerequisites are met, mention the current visible Method dropdown choice and offer "
+            "a guided walkthrough. Treat APOC, ConvPaint, Pixel Classifier, Cellpose, and Import "
+            "segmentation as distinct methods. "
+            "Keep it to 2–3 sentences."
+        )
+
+    def _proactive_tracking(self):
+        self._proactive_message(
+            "I just switched to the Tracking tab. "
+            "Check context: is metadata loaded? What cell types are listed in metadata.cell_types? "
+            "If metadata is not loaded, redirect with navigate_to_step to Data Preparation. "
+            "If loaded, state which cell types you see (immune, organoid, other) and ask if "
+            "I'd like a guided walkthrough to configure tracking methods and parameters. "
+            "Keep it to 2–3 sentences."
+        )
+
+    def _proactive_feature_extraction(self):
+        self._proactive_message(
+            "I just switched to the Feature Extraction tab. "
+            "Check context: is metadata loaded? What cell types are present? "
+            "Briefly say what this step does and mention whether key prereqs are satisfied. "
+            "Offer to guide me through setup. Keep it to 2–3 sentences."
+        )
+
+    # ------------------------------------------------------------------
+    # Guided-flow handlers for per-tab quick buttons
+    # ------------------------------------------------------------------
+    def _start_setup_guide(self):
+        self._guided_flow_active = True
+        ctx = {}
+        try:
+            ctx = build_context(self.main_widget)
+        except Exception:
+            pass
+        if ctx.get("output_dir_set") and not ctx.get("metadata", {}).get("loaded"):
+            # Output dir is already set; open the builder so the LLM can start asking
+            act = ProposedAction("fill_metadata_builder", field="open_builder", value=None, index=0)
+            act.preview = "Open the Metadata Builder"
+            try:
+                apply_action(self.main_widget, act)
+                self._append_md("Opened the Metadata Builder")
+                self.refresh_context_bar()
+            except Exception:
+                pass
+            self._send_message(
+                "The output directory is set and the Metadata Builder is now open. "
+                "Ask me one question at a time starting with: 'How many samples do you have?' "
+                "Call fill_metadata_builder with the answer in the same response, "
+                "then ask about organoid types.",
+                display_text="Walk through setup",
+            )
+        else:
+            self._send_message(
+                "I need help setting up Data Preparation from scratch. "
+                "Check context — is output_dir_set? Is metadata loaded? "
+                "If output dir is not set, ask me for the path. "
+                "Otherwise open the Metadata Builder and ask me 'How many samples?' — "
+                "one question at a time.",
+                display_text="Walk through setup",
+            )
+
+    def _check_data_prereqs(self):
+        self._send_message(
+            "Look at the current context (output_dir_set, metadata.loaded, metadata_builder state, "
+            "metadata.n_samples, metadata.cell_types) and list exactly what is missing or "
+            "incomplete on the Data Preparation tab. If everything is complete, say so and suggest "
+            "the next workflow step.",
+            display_text="Check what's missing",
+        )
+
+    def _start_segmentation_guide(self):
+        self._guided_flow_active = True
+        self._send_message(
+            "I'd like a guided walkthrough of Segmentation setup. "
+            "First check that metadata is loaded and output dir is set — if not, redirect me. "
+            "Then ask which visible segmentation Method fits my data. The available choices are "
+            "APOC (GPU), ConvPaint (DL pixel classifier), Pixel Classifier (Random Forest), "
+            "Cellpose (Deep Learning), and Import segmentation. APOC is its own method, not "
+            "Pixel Classifier. One question at a time — just ask for method first.",
+            display_text="Guide segmentation",
+        )
+
+    def _explain_seg_methods(self):
+        self._send_message(
+            "Explain the visible segmentation methods in BEHAV3D: APOC (GPU), ConvPaint, "
+            "Pixel Classifier (Random Forest), Cellpose, and Import segmentation. "
+            "Recommend one for each of my cell types when that makes sense. "
+            "Read my cell types from the context and be concrete in your recommendation.",
+            display_text="Choose a segmentation method",
+        )
+
+    def _start_tracking_guide(self):
+        self._guided_flow_active = True
+        self._send_message(
+            "I'd like a guided walkthrough of Tracking setup. "
+            "Read my cell types from context and start by listing which types you see. "
+            "For each type ask which tracking method to use — state the recommended default "
+            "(btrack for immune, propagation for organoid, lap for other) and ask for confirmation. "
+            "Then ask the key parameter for that method. One question at a time.",
+            display_text="Guide tracking",
+        )
+
+    def _explain_tracking_methods(self):
+        self._send_message(
+            "Looking at my cell types in context, which tracking method do you recommend for each type "
+            "and why? Compare btrack, LAP, propagation, and trackpy. Give a concrete recommendation.",
+            display_text="Which tracking method?",
+        )
+
+    def _start_feature_guide(self):
+        self._guided_flow_active = True
+        self._send_message(
+            "I'd like a guided walkthrough of Feature Extraction setup. "
+            "Check context: are metadata loaded and output dir set? What cell types are present? "
+            "If prereqs are missing, redirect me. Otherwise ask one question at a time, "
+            "starting with: which features do I want to extract for each cell type?",
+            display_text="Guide feature extraction",
+        )
+
+    def _check_feature_prereqs(self):
+        self._send_message(
+            "Check whether the prerequisites for Feature Extraction are satisfied: "
+            "metadata loaded, output dir set, segmentation masks present, tracking outputs present. "
+            "Tell me specifically what is ready and what is missing. "
+            "If anything is missing, offer to navigate me to the right tab to fix it.",
+            display_text="Check prerequisites",
         )
 
     # ------------------------------------------------------------------

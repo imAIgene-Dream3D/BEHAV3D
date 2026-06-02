@@ -74,7 +74,7 @@ def test_build_actions_preview_and_rejection():
         {"name": "set_parameter", "arguments": {"key": "bogus.key", "value": 1}},
         {"name": "navigate_to_step", "arguments": {"step": "tracking"}},
     ], cards, params)
-    assert acts[0].ok and "→" in acts[0].preview
+    assert acts[0].ok and "immune cells: method" in acts[0].preview
     assert not acts[1].ok                     # unknown key rejected
     assert acts[2].kind == "navigate_to_step"
 
@@ -86,6 +86,7 @@ def test_build_actions_rejects_noops_and_empty():
         [{"name": "set_parameter", "arguments": {"key": "paths.metadata_csv", "value": ""}}],
         cards, {"paths": {"metadata_csv": ""}})
     assert not acts[0].ok and "no change" in acts[0].message.lower()
+    assert acts[0].data.get("no_op") is True
     # empty string for an unset value is rejected too
     acts2 = build_actions(
         [{"name": "set_parameter", "arguments": {"key": "paths.output_dir", "value": "   "}}],
@@ -96,6 +97,19 @@ def test_build_actions_rejects_noops_and_empty():
         [{"name": "set_parameter", "arguments": {"key": "paths.metadata_csv", "value": "/data/m.csv"}}],
         cards, {"paths": {"metadata_csv": ""}})
     assert acts3[0].ok and "/data/m.csv" in acts3[0].preview
+
+
+def test_build_actions_metadata_builder_dynamic_fields():
+    acts = build_actions([
+        {"name": "fill_metadata_builder",
+         "arguments": {"field": "cell_line", "value": "Jurkat", "index": 0}},
+        {"name": "fill_metadata_builder",
+         "arguments": {"field": "cell_line", "value": "Jurkat", "index": 0,
+                       "cell_type": "tcell"}},
+    ], [], {})
+    assert not acts[0].ok
+    assert acts[1].ok and acts[1].data["cell_type"] == "tcell"
+    assert "Sample 1 tcell line" in acts[1].preview
 
 
 def test_metadata_summary_is_defensive():
@@ -134,6 +148,16 @@ def test_app_tool_call_parsing_and_prompt():
         {"current_step": "tracking", "step_schema": [], "parameters": {}, "metadata": {}, "queue": []},
         [{"title": "btrack", "text": "good for crowded cells"}], [])
     assert "BEHAV3D" in sp and "good for crowded cells" in sp
+    sp2 = app.build_system_prompt(
+        {"current_step": "segmentation", "step_schema": [],
+         "required_params_at_default": [
+             {"key": "pixel_classifier.examples_per_sample", "default": 3, "description": "desc"},
+         ],
+         "assistant_session": {"confirmed_parameter_keys": ["pixel_classifier.examples_per_sample"]},
+         "parameters": {}, "metadata": {}, "queue": []},
+        [], [])
+    assert "CONFIRMED VALUES" in sp2
+    assert "PARAMS STILL AT DEFAULT" not in sp2
 
 
 def test_tool_call_parsing_tolerates_malformed_markers():
@@ -154,6 +178,11 @@ def test_tool_call_parsing_tolerates_malformed_markers():
     # bare proposal form + list value
     _, calls3 = app.parse_tool_calls('set_parameter{"key":"x","value":[100,100,10]}')
     assert calls3[0]["arguments"]["value"] == [100, 100, 10]
+    clean4, calls4 = app.parse_tool_calls(
+        'Done.\nfill_metadata_builder{"field":"n_samples","value":3}')
+    assert clean4 == "Done."
+    assert calls4 == [{"name": "fill_metadata_builder",
+                       "arguments": {"field": "n_samples", "value": 3}}]
 
 
 def test_to_openai_tools_injects_key_enum():
