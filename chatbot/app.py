@@ -1,16 +1,16 @@
 """
 BEHAV3D assistant — Modal service (thin DeepSeek proxy + RAG + tool calling).
 
-Modal is a CPU-only middle layer: it authenticates the napari client, retrieves
-BEHAV3D knowledge (RAG), then calls the **DeepSeek API** with native function
-calling and relays the stream back. The DeepSeek key never leaves the server (it
-lives in a Modal secret); clients only ever see the Modal URL + a shared token.
+Modal is a CPU-only middle layer: it retrieves BEHAV3D knowledge (RAG), then
+calls the **DeepSeek API** with native function calling and relays the stream
+back. The DeepSeek key never leaves the server (Modal secret); the endpoint is
+public — no client auth required.
 
 Deploy:   modal deploy chatbot/app.py
 Dev:      modal serve chatbot/app.py        # hot-reloading local proxy
 Ingest:   modal run chatbot/app.py::ingest   # (re)build the RAG index
 
-Endpoints (FastAPI, behind a Bearer token):
+Endpoints (FastAPI, public):
   GET  /health                  -> {"ok": true}
   POST /chat                    -> text/event-stream of:
         {"type":"token","text":...}        streamed assistant text
@@ -526,8 +526,6 @@ if modal is not None:
 
     app = modal.App("behav3d-assistant")
     volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
-    # Shared bearer token the napari client must present.
-    auth_secret = modal.Secret.from_name("behav3d-assistant-auth")  # {"BEHAV3D_ASSISTANT_TOKEN": "..."}
     # DeepSeek API key — stays server-side, never sent to the client.
     deepseek_secret = modal.Secret.from_name("deepseek-api-key")    # {"DEEPSEEK_API_KEY": "..."}
 
@@ -546,12 +544,12 @@ if modal is not None:
     # zero-cold-start endpoint add `min_containers=1` — cheap on CPU (~$15-45/mo),
     # vs ~$0 idle with a ~few-second cold start.
     @app.function(image=service_image, volumes={INDEX_DIR: volume},
-                  secrets=[auth_secret, deepseek_secret], scaledown_window=300,
+                  secrets=[deepseek_secret], scaledown_window=300,
                   min_containers=1)
     @modal.asgi_app()
     def web():
         import os
-        from fastapi import FastAPI, Request, HTTPException
+        from fastapi import FastAPI, Request
         from fastapi.responses import StreamingResponse
         from openai import OpenAI
         from embeddings import Embedder, VectorIndex
@@ -570,7 +568,6 @@ if modal is not None:
         except Exception:
             _key_enum = []
 
-        expected_token = os.environ.get("BEHAV3D_ASSISTANT_TOKEN", "")
         # deepseek-v4-flash is the explicit V4 Flash id (tool-calls + streaming).
         # The older `deepseek-chat` alias also maps to it but is being deprecated.
         # `deepseek-v4-pro` is the stronger/pricier option. Override via DEEPSEEK_MODEL.
@@ -578,19 +575,12 @@ if modal is not None:
         client = OpenAI(base_url=DEEPSEEK_BASE_URL,
                         api_key=os.environ.get("DEEPSEEK_API_KEY", ""))
 
-        def _auth(request: Request):
-            if not expected_token:
-                return
-            if request.headers.get("authorization", "") != f"Bearer {expected_token}":
-                raise HTTPException(status_code=401, detail="bad token")
-
         @api.get("/health")
         def health():
             return {"ok": True, "chunks": len(index.chunks), "model": deepseek_model}
 
         @api.post("/chat")
         async def chat(request: Request):
-            _auth(request)
             body = await request.json()
             messages = body.get("messages", [])
             context = body.get("context", {})

@@ -12,5 +12,4 @@ build/
 *.egg-info
 .ipynb_checkpoints/
 napari/behav3d_env.json
-napari/assistant_config.json
 assistant_log.md

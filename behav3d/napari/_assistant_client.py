@@ -129,8 +129,6 @@ class ChatWorker(QObject):
     def _stream(self, cfg: dict):
         import requests  # available in the behav3d env
         headers = {"Content-Type": "application/json"}
-        if cfg.get("token"):
-            headers["Authorization"] = f"Bearer {cfg['token']}"
         payload = {"messages": self._messages, "context": self._context, "tools": self._tools}
         with requests.post(f"{cfg['endpoint']}/chat", json=payload, headers=headers,
                            stream=True, timeout=cfg.get("timeout", 60)) as resp:
