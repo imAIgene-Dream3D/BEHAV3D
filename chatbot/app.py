@@ -512,6 +512,12 @@ if modal is not None:
             "fastapi[standard]", "sentence-transformers==3.2.1",
             "numpy", "huggingface_hub", "openai>=1.40",
         )
+        # Bake the embedding model into the image so it's never downloaded at
+        # container startup — keeps the warm-container response time fast.
+        .run_commands(
+            "python -c \"from sentence_transformers import SentenceTransformer; "
+            "SentenceTransformer('BAAI/bge-small-en-v1.5')\""
+        )
         .add_local_file("chatbot/embeddings.py", "/root/embeddings.py")
         .add_local_file("chatbot/ingest.py", "/root/ingest.py")
         .add_local_file("chatbot/schema_cards.json", "/root/schema_cards.json")
@@ -559,6 +565,7 @@ if modal is not None:
 
         api = FastAPI(title="BEHAV3D Assistant")
         embedder = Embedder()
+        embedder.encode(["warmup"])  # load model into memory before first request
         try:
             index = VectorIndex.load(INDEX_DIR)
         except Exception:
