@@ -21,17 +21,17 @@ for the stronger/pricier model — by adding it to the `deepseek-api-key` secret
 
 ## One-time setup
 ```bash
-pip install modal && modal token new          # authenticate Modal
+pip install modal && python -m modal token new          # authenticate Modal
 # shared bearer token the napari client must present:
-modal secret create behav3d-assistant-auth BEHAV3D_ASSISTANT_TOKEN=$(openssl rand -hex 16)
+python -m modal secret create behav3d-assistant-auth BEHAV3D_ASSISTANT_TOKEN=$(openssl rand -hex 16)
 # your DeepSeek API key (stays server-side):
-modal secret create deepseek-api-key DEEPSEEK_API_KEY=sk-...   # optionally DEEPSEEK_MODEL=...
+python -m modal secret create deepseek-api-key DEEPSEEK_API_KEY=sk-...   # optionally DEEPSEEK_MODEL=...
 ```
 
 ## Build the index, then deploy
 ```bash
-modal run    chatbot/app.py::ingest    # build/refresh the RAG index (re-run after editing WIKI.md)
-modal deploy chatbot/app.py            # fast — CPU image only; prints the public URL
+python -m modal run    chatbot/app.py::ingest    # build/refresh the RAG index (re-run after editing WIKI.md)
+python -m modal deploy chatbot/app.py            # fast — CPU image only; prints the public URL
 ```
 No weight download and no GPU cold start: the endpoint is responsive immediately
 (only the DeepSeek API latency). It stays warm for `scaledown_window` (300 s); for a
@@ -50,7 +50,7 @@ back to **offline mode** (schema-grounded parameter answers, no LLM).
 
 ## Local development
 ```bash
-modal serve chatbot/app.py             # hot-reloading proxy; gives a temporary URL
+python -m modal serve chatbot/app.py             # hot-reloading proxy; gives a temporary URL
 curl -N -X POST <url>/chat -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"set the trackpy search range to 40 for immune"}],"context":{"current_step":"tracking"}}'
@@ -61,14 +61,14 @@ curl -N -X POST <url>/chat -H "Authorization: Bearer <token>" \
 ```bash
 conda run -n behav3d python -c "from behav3d.napari._assistant_schema import dump_cards_json; dump_cards_json('chatbot/schema_cards.json')"
 ```
-Re-run `modal run chatbot/app.py::ingest` afterwards.
+Re-run `python -m modal run chatbot/app.py::ingest` afterwards.
 
 ## Tearing down the old GPU deployment
 The earlier Qwen/vLLM setup is gone from the code. Remove its leftover cloud
 resources once (they cost nothing idle, but clean them up):
 ```bash
-modal app list                                  # find the old app if separate
-modal volume delete behav3d-model-cache         # the ~15 GB weights cache
+python -m modal app list                                  # find the old app if separate
+python -m modal volume delete behav3d-model-cache         # the ~15 GB weights cache
 ```
-Re-`modal deploy chatbot/app.py` replaces the running `behav3d-assistant` app with
+Re-`python -m modal deploy chatbot/app.py` replaces the running `behav3d-assistant` app with
 the CPU version (no GPU containers remain).

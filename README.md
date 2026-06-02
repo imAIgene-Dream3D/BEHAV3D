@@ -311,12 +311,12 @@ The co-pilot runs as a **CPU-only [Modal](https://modal.com) service** that prox
 
 - A [Modal](https://modal.com) account with the CLI installed (`pip install modal`)
 - A [DeepSeek API](https://platform.deepseek.com) key
-- Authenticated: `modal token new`
+- Authenticated: `python -m modal token new`
 
 ### 1 — Store the DeepSeek API key as a Modal secret
 
 ```bash
-modal secret create deepseek-api-key DEEPSEEK_API_KEY=<your-key>
+python -m modal secret create deepseek-api-key DEEPSEEK_API_KEY=<your-key>
 ```
 
 > Set a **monthly spend limit** in the DeepSeek dashboard to cap costs.
@@ -326,7 +326,7 @@ modal secret create deepseek-api-key DEEPSEEK_API_KEY=<your-key>
 The RAG index embeds all BEHAV3D documentation and parameter descriptions so the bot can retrieve relevant context for every question.
 
 ```bash
-modal run chatbot/app.py::ingest
+python -m modal run chatbot/app.py::ingest
 ```
 
 Re-run this whenever files in `chatbot/knowledge/` or `chatbot/schema_cards.json` change.
@@ -334,7 +334,7 @@ Re-run this whenever files in `chatbot/knowledge/` or `chatbot/schema_cards.json
 ### 3 — Deploy
 
 ```bash
-modal deploy chatbot/app.py
+python -m modal deploy chatbot/app.py
 ```
 
 The deploy output will print the endpoint URL. Update `napari/assistant_config.json` if it changes:
@@ -348,7 +348,7 @@ The service runs on CPU with `min_containers=1` (always warm, ~$6/month at defau
 ### 4 — Development / hot-reload
 
 ```bash
-modal serve chatbot/app.py
+python -m modal serve chatbot/app.py
 ```
 
 This starts a temporary endpoint that hot-reloads on file changes. Useful for testing prompt changes without a full deploy.
@@ -358,7 +358,7 @@ This starts a temporary endpoint that hot-reloads on file changes. Useful for te
 The service defaults to `deepseek-v4-flash`. To switch models, set the `DEEPSEEK_MODEL` environment variable before deploying:
 
 ```bash
-DEEPSEEK_MODEL=deepseek-v4-pro modal deploy chatbot/app.py
+DEEPSEEK_MODEL=deepseek-v4-pro python -m modal deploy chatbot/app.py
 ```
 
 Available options: `deepseek-v4-flash` (fast, cheap), `deepseek-v4-pro` (stronger, pricier).

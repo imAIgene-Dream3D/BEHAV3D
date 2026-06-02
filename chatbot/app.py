@@ -6,9 +6,9 @@ calls the **DeepSeek API** with native function calling and relays the stream
 back. The DeepSeek key never leaves the server (Modal secret); the endpoint is
 public — no client auth required.
 
-Deploy:   modal deploy chatbot/app.py
-Dev:      modal serve chatbot/app.py        # hot-reloading local proxy
-Ingest:   modal run chatbot/app.py::ingest   # (re)build the RAG index
+Deploy:   python -m modal deploy chatbot/app.py
+Dev:      python -m modal serve chatbot/app.py   # hot-reloading local proxy
+Ingest:   python -m modal run chatbot/app.py::ingest  # (re)build the RAG index
 
 Endpoints (FastAPI, public):
   GET  /health                  -> {"ok": true}
