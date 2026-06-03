@@ -56,8 +56,8 @@ cd /path/to/BEHAV3D
 mamba env create -f environment.yml
 mamba activate behav3d
 
-# Install Cellpose
-pip install cellpose>=3.0
+# Install Cellpose and ConvPaint
+pip install cellpose>=3.0 napari-convpaint
 
 # Install PyTorch (choose ONE based on your system):
 
