@@ -1,4 +1,4 @@
-﻿"""
+"""
 Advanced Feature Extraction for BEHAV3D
 
 This module provides advanced analysis features that go beyond basic track feature extraction.
@@ -48,6 +48,7 @@ import numpy as np
 
 from behav3d.core.metadata import detect_organoid_types_from_metadata
 from behav3d.core.utils import get_current_time, format_time
+from behav3d.io.images import load_image
 
 
 def calculate_background_death_rate(
@@ -454,6 +455,7 @@ def run_active_killing_analysis(
     killing_threshold_multiplier: float = 1.5,
     absolute_killing_threshold: Optional[float] = None,
     save_results: bool = True,
+    output_subfolder: str = ""
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
     """
     Run active killing analysis on BEHAV3D processed data.
@@ -594,7 +596,10 @@ def run_active_killing_analysis(
         )
         
         if save_results:
-            results_dir = output_dir / "analysis" / immune_cell_type / "active_killing"
+            if output_subfolder:
+                results_dir = output_dir / "analysis" / immune_cell_type / "active_killing" / output_subfolder
+            else:
+                results_dir = output_dir / "analysis" / immune_cell_type / "active_killing"
             results_dir.mkdir(parents=True, exist_ok=True)
             advanced_features_path = results_dir / f"BEHAV3D_{immune_cell_type}_advanced_track_features.csv"
             df_advanced.to_csv(advanced_features_path, index=False)
@@ -662,7 +667,10 @@ def run_active_killing_analysis(
     
     # Save results
     if save_results:
-        results_dir = output_dir / "analysis" / immune_cell_type / "active_killing"
+        if output_subfolder:
+            results_dir = output_dir / "analysis" / immune_cell_type / "active_killing" / output_subfolder
+        else:
+            results_dir = output_dir / "analysis" / immune_cell_type / "active_killing"
         results_dir.mkdir(parents=True, exist_ok=True)
         
         if not df_killing_per_tp.empty:

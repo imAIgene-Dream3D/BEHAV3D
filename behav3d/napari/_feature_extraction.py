@@ -26,7 +26,7 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QCheckBox,
     QDoubleSpinBox, QSpinBox, QGroupBox, QMessageBox, QScrollArea,
-    QComboBox, QToolTip, QSplitter,
+    QComboBox, QToolTip, QSplitter, QListWidget
 )
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QCursor
@@ -1998,6 +1998,9 @@ class ActiveKillingPanel(QWidget):
         self._queue_callback = queue_callback
         # Background-execution infrastructure.
         self.tab_progress_row = tab_progress_row
+        from behav3d.core.metadata import detect_organoid_types_from_metadata
+        md = getattr(self.metadata_loader, "metadata", None)
+        self.target_types = detect_organoid_types_from_metadata(md) if md is not None else []
         self._bg = BackgroundOperation(self)
         self._init_ui()
 
@@ -2029,6 +2032,23 @@ class ActiveKillingPanel(QWidget):
         self.immune_combo.currentTextChanged.connect(self._validate)
         imm_row.addWidget(self.immune_combo, stretch=1)
         layout.addLayout(imm_row)
+
+        # ── Target cell type selector ──────────────────────────────────────
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Target cell types:"))
+        self.target_list = QListWidget()
+        self.target_list.setSelectionMode(QListWidget.MultiSelection)
+        self.target_list.setMaximumHeight(60)
+        if self.target_types:
+            self.target_list.addItems(self.target_types)
+            for i in range(self.target_list.count()):
+                self.target_list.item(i).setSelected(True)
+        else:
+            self.target_list.addItem("(no targets detected)")
+            self.target_list.setEnabled(False)
+        self.target_list.itemSelectionChanged.connect(self._validate)
+        target_row.addWidget(self.target_list, stretch=1)
+        layout.addLayout(target_row)
 
         self.validation_label = QLabel("")
         self.validation_label.setWordWrap(True)
@@ -2202,6 +2222,11 @@ class ActiveKillingPanel(QWidget):
             feat_dir / f"BEHAV3D_{immune_type}_combined_track_features.csv"
         )
 
+    def _get_selected_targets(self) -> list:
+        if not self.target_list.isEnabled():
+            return []
+        return [item.text() for item in self.target_list.selectedItems()]
+
     def _active_killing_dir(self, immune_type: str) -> Path:
         return Path(self.metadata_loader.output_dir) / "analysis" / immune_type / "active_killing"
 
@@ -2229,6 +2254,8 @@ class ActiveKillingPanel(QWidget):
 
     def _validate(self):
         immune = self._get_immune_type()
+        targets = self._get_selected_targets()
+        
         if not immune or "(no immune" in immune:
             self.validation_label.setText("\u26a0\ufe0f No immune cell types detected in metadata.")
             self.validation_label.setStyleSheet("color: #E57373; font-size: 10px;")
@@ -2236,6 +2263,15 @@ class ActiveKillingPanel(QWidget):
             if hasattr(self, "btn_queue"):
                 self.btn_queue.setEnabled(False)
             return
+            
+        if not targets:
+            self.validation_label.setText("\u26a0\ufe0f No target cell types selected.")
+            self.validation_label.setStyleSheet("color: #E57373; font-size: 10px;")
+            self.btn_run.setEnabled(False)
+            if hasattr(self, "btn_queue"):
+                self.btn_queue.setEnabled(False)
+            return
+            
         csv = self._feature_csv_path(immune)
         if not csv.exists():
             self.validation_label.setText(
@@ -2264,6 +2300,7 @@ class ActiveKillingPanel(QWidget):
                 if self.check_abs_threshold.isChecked() else None
             ),
             "min_contact_duration": int(self.spin_min_contact.value()),
+            "target_types": self._get_selected_targets()
         }
 
     def refresh_immune_types(self, immune_types: list):
@@ -2294,19 +2331,15 @@ class ActiveKillingPanel(QWidget):
             return
 
         from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
-        from behav3d.core.metadata import detect_organoid_types_from_metadata
 
         immune = self._get_immune_type()
+        targets = self._get_selected_targets()
         params = self._collect_params()
         md = self.metadata_loader.metadata
-        target_types = detect_organoid_types_from_metadata(md)
-        if not target_types:
-            self.log("\u26a0\ufe0f No organoid target types detected \u2014 cannot run active killing analysis.")
-            return
 
         self.btn_run.setText("\u23f3 Running\u2026")
         self.log(
-            f"\u25b6 Active Killing Analysis: {immune} vs {target_types}  "
+            f"\u25b6 Active Killing Analysis: {immune} vs {targets}  "
             f"(window={params['observation_window']}, "
             f"signal={params['death_signal_column']}, "
             f"multiplier={params['killing_threshold_multiplier']})\u2026"
@@ -2315,23 +2348,38 @@ class ActiveKillingPanel(QWidget):
         output_dir_str = str(self.metadata_loader.output_dir)
 
         def _do_active_killing(progress_cb=None):
-            df_killing, df_summary, stats = run_active_killing_analysis(
-                metadata=md,
-                output_dir=output_dir_str,
-                immune_cell_type=immune,
-                target_cell_types=target_types,
-                observation_window=params["observation_window"],
-                death_signal_column=params["death_signal_column"],
-                killing_threshold_multiplier=params["killing_threshold_multiplier"],
-                absolute_killing_threshold=params["absolute_killing_threshold"],
-                min_contact_duration=params["min_contact_duration"],
-                save_results=True,
-            )
-            return (df_killing, df_summary, stats)
+            def run_for_targets(t_list, subfolder):
+                return run_active_killing_analysis(
+                    metadata=md,
+                    output_dir=output_dir_str,
+                    immune_cell_type=immune,
+                    target_cell_types=t_list,
+                    observation_window=params["observation_window"],
+                    death_signal_column=params["death_signal_column"],
+                    killing_threshold_multiplier=params["killing_threshold_multiplier"],
+                    absolute_killing_threshold=params.get("absolute_killing_threshold"),
+                    min_contact_duration=params["min_contact_duration"],
+                    save_results=True,
+                    output_subfolder=subfolder
+                )
+
+            df_killing, df_summary, stats = None, None, None
+            for t in targets:
+                self.log(f"--- Running independent analysis for target: {t} ---")
+                df_killing, df_summary, stats = run_for_targets([t], t)
+
+            if len(targets) > 1:
+                self.log("--- Running combined analysis for all selected targets ---")
+                combined_subfolder = "combined"
+                df_killing, df_summary, stats = run_for_targets(targets, combined_subfolder)
+            else:
+                combined_subfolder = targets[0]
+
+            return (df_killing, df_summary, stats, combined_subfolder)
 
         def _on_done(result):
-            df_killing, _df_summary, stats = result
-            results_dir = self._active_killing_dir(immune)
+            df_killing, _df_summary, stats, subfolder = result
+            results_dir = self._active_killing_dir(immune) / subfolder
             self._save_plots(df_killing, immune, results_dir)
             n_active = int(stats.get("total_active_killing_timepoints", 0))
             rate = stats.get("overall_killing_rate", 0.0)
@@ -2416,13 +2464,12 @@ class ActiveKillingPanel(QWidget):
             return
 
         from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
-        from behav3d.core.metadata import detect_organoid_types_from_metadata
 
         immune = self._get_immune_type()
         params = self._collect_params()
         md = self.metadata_loader.metadata
-        target_types = detect_organoid_types_from_metadata(md)
-        if not target_types:
+        targets = params.get("target_types", self.target_types)
+        if not targets:
             self.log("⚠️ No organoid target types detected — cannot run active killing analysis.")
             fire_extra_callback(extra_callbacks, "on_failed", "no organoid target types")
             return
@@ -2433,24 +2480,42 @@ class ActiveKillingPanel(QWidget):
             self.btn_queue.setEnabled(False)
         try:
             self.log(
-                f"▶ Active Killing Analysis: {immune} vs {target_types}  "
+                f"▶ Active Killing Analysis: {immune} vs {targets}  "
                 f"(window={params['observation_window']}, "
                 f"signal={params['death_signal_column']}, "
                 f"multiplier={params['killing_threshold_multiplier']})…"
             )
-            df_killing, df_summary, stats = run_active_killing_analysis(
-                metadata=md,
-                output_dir=str(self.metadata_loader.output_dir),
-                immune_cell_type=immune,
-                target_cell_types=target_types,
-                observation_window=params["observation_window"],
-                death_signal_column=params["death_signal_column"],
-                killing_threshold_multiplier=params["killing_threshold_multiplier"],
-                absolute_killing_threshold=params["absolute_killing_threshold"],
-                min_contact_duration=params["min_contact_duration"],
-                save_results=True,
-            )
-            results_dir = self._active_killing_dir(immune)
+            
+            output_dir_str = str(self.metadata_loader.output_dir)
+            df_killing, df_summary, stats = None, None, None
+
+            def run_for_targets(t_list, subfolder):
+                return run_active_killing_analysis(
+                    metadata=md,
+                    output_dir=output_dir_str,
+                    immune_cell_type=immune,
+                    target_cell_types=t_list,
+                    observation_window=params["observation_window"],
+                    death_signal_column=params["death_signal_column"],
+                    killing_threshold_multiplier=params["killing_threshold_multiplier"],
+                    absolute_killing_threshold=params.get("absolute_killing_threshold"),
+                    min_contact_duration=params["min_contact_duration"],
+                    save_results=True,
+                    output_subfolder=subfolder
+                )
+            
+            for t in targets:
+                self.log(f"--- Running independent analysis for target: {t} ---")
+                df_killing, df_summary, stats = run_for_targets([t], t)
+
+            if len(targets) > 1:
+                self.log("--- Running combined analysis for all selected targets ---")
+                combined_subfolder = "combined"
+                df_killing, df_summary, stats = run_for_targets(targets, combined_subfolder)
+            else:
+                combined_subfolder = targets[0]
+            
+            results_dir = self._active_killing_dir(immune) / combined_subfolder
             self._save_plots(df_killing, immune, results_dir)
             n_active = int(stats.get("total_active_killing_timepoints", 0))
             rate = stats.get("overall_killing_rate", 0.0)
@@ -2460,7 +2525,7 @@ class ActiveKillingPanel(QWidget):
             )
             if interactive:
                 self._offer_open_folder(results_dir)
-            fire_extra_callback(extra_callbacks, "on_done", (df_killing, df_summary, stats))
+            fire_extra_callback(extra_callbacks, "on_done", (df_killing, df_summary, stats, combined_subfolder))
         except Exception as e:
             import traceback as _tb
             _tb.print_exc()
