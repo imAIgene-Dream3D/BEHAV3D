@@ -31,8 +31,7 @@ from behav3d.features.rolling_window_features import create_descriptive_track_da
 from behav3d.features.state_descriptive_features import drop_highly_correlated_features
 from behav3d.analysis.behavior.general.leiden import (
     run_pca, 
-    run_leiden_clustering, 
-    merge_small_clusters
+    run_leiden_clustering
 )
 from behav3d.analysis.behavior.state.filtering import filter_short_state_runs
 

@@ -1406,7 +1406,7 @@ class ProcessingQueuePanel(QWidget):
             # check the raw image channel count as an approximation.
             raw_shape = None
             try:
-                from behav3d.io.image_io import load_image
+                from behav3d.io.images import load_image
                 raw_path = Path(first_sample.get("raw_image_path", ""))
                 zarr_path = Path(output_dir) / "images" / first_sample["sample_name"] / f"{first_sample['sample_name']}.zarr"
                 probe_path = zarr_path if zarr_path.exists() else raw_path

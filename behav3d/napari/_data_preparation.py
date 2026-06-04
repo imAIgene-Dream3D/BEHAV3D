@@ -457,7 +457,7 @@ class DataPreparationTab(QWidget):
         btn_browse_img = QPushButton("…")
         btn_browse_img.setMaximumWidth(40)
         btn_browse_img.clicked.connect(lambda: fields["raw_image_path"].setText(
-            self._browse_folder("Select Image Folder")
+            self._browse_path("Select Raw Image Path", "Image files (*.tiff *.tif *.czi *.ims *.lif *.liff *.zarr);; All Files (*)", allow_zarr=True)
         ))
         img_path_layout.addWidget(btn_browse_img)
         layout.addRow("Image path*:", img_path_layout)
@@ -500,7 +500,7 @@ class DataPreparationTab(QWidget):
             btn_browse_dead = QPushButton("…")
             btn_browse_dead.setMaximumWidth(40)
             btn_browse_dead.clicked.connect(lambda: dead_fields["mask_path"].setText(
-                self._browse_file("Select Dead Mask File", "Image files (*.zarr *.tiff *.tif *.nii *.png);; All Files (*)")
+                self._browse_path("Select Dead Mask Path", "Image files (*.tiff *.tif *.nii *.png *.zarr);; All Files (*)", allow_zarr=True)
             ))
             dead_mask_layout.addWidget(btn_browse_dead)
             layout.addRow("Dead mask:", dead_mask_layout)
@@ -523,7 +523,7 @@ class DataPreparationTab(QWidget):
             btn_browse_seg = QPushButton("…")
             btn_browse_seg.setMaximumWidth(40)
             btn_browse_seg.clicked.connect(lambda: ct["segments_image_path"].setText(
-                self._browse_file("Select Segments File", "Image files (*.zarr *.tiff *.tif *.czi *.nii);; All Files (*)")
+                self._browse_path("Select Segments Path", "Image files (*.tiff *.tif *.czi *.nii *.zarr);; All Files (*)", allow_zarr=True)
             ))
             seg_layout.addWidget(btn_browse_seg)
             layout.addRow(f"  Segments:", seg_layout)
@@ -535,7 +535,7 @@ class DataPreparationTab(QWidget):
             btn_browse_tracks_img = QPushButton("…")
             btn_browse_tracks_img.setMaximumWidth(40)
             btn_browse_tracks_img.clicked.connect(lambda: ct["tracks_image_path"].setText(
-                self._browse_file("Select Tracks Image File", "Image files (*.zarr *.tiff *.tif *.czi *.nii);; All Files (*)")
+                self._browse_path("Select Tracks Image Path", "Image files (*.tiff *.tif *.czi *.nii *.zarr);; All Files (*)", allow_zarr=True)
             ))
             tracks_img_layout.addWidget(btn_browse_tracks_img)
             layout.addRow(f"  Tracks img:", tracks_img_layout)
@@ -582,6 +582,31 @@ class DataPreparationTab(QWidget):
         """Open folder browser dialog and return selected path or empty string."""
         path = QFileDialog.getExistingDirectory(self, title, "")
         return path
+
+    def _browse_path(self, title: str, filter_str: str = "All Files (*.*)", allow_zarr: bool = True) -> str:
+        """Open file/directory browser. If allow_zarr is True, prompts user for file vs. folder/Zarr selection."""
+        if allow_zarr:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Select Input Type")
+            msg.setText("Would you like to select a file or a Zarr directory/folder?")
+            
+            btn_file = msg.addButton("File", QMessageBox.AcceptRole)
+            btn_dir = msg.addButton("Zarr / Folder", QMessageBox.AcceptRole)
+            btn_cancel = msg.addButton("Cancel", QMessageBox.RejectRole)
+            
+            msg.exec_()
+            
+            clicked = msg.clickedButton()
+            if clicked == btn_file:
+                path, _ = QFileDialog.getOpenFileName(self, title, "", filter_str)
+                return path
+            elif clicked == btn_dir:
+                path = QFileDialog.getExistingDirectory(self, title, "")
+                return path
+            return ""
+        else:
+            path, _ = QFileDialog.getOpenFileName(self, title, "", filter_str)
+            return path
 
     # --- Fill-down --------------------------------------------------------
     def _on_fill_down(self):

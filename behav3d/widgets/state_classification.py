@@ -49,13 +49,13 @@ from behav3d.analysis.behavior.state.visualization.plots.state_composition impor
 from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
     save_state_transition_report,
 )
-from behav3d.deprecated.state_classification_clustering import (
+from behav3d.analysis.behavior.state.legacy_clustering import (
     apply_state_classifiers_to_full_dataset,
     build_identity_cluster_mapping,
     load_state_classifier_artifact,
 )
-from behav3d.deprecated.widgets.state_classification import (
-    StateClassificationPanel as _LegacyStateClassificationPanel,
+from behav3d.widgets.base_state_classification import (
+    BaseStateClassificationPanel,
     _winfo,
 )
 from behav3d.analysis.behavior.state.visualization.backprojection import (
@@ -638,7 +638,7 @@ def _update_hmm_report_metadata(
     adata.uns["clustering"] = clustering_meta
 
 
-class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
+class StateClassificationHMMPanel(BaseStateClassificationPanel):
     """Widget for HMM state discovery, relabeling, deployment, and backprojection."""
 
     def __init__(self, metadata_loader, cell_type=None):
@@ -1271,56 +1271,55 @@ class StateClassificationHMMPanel(_LegacyStateClassificationPanel):
             ]
         )
 
-    # def _detect_cell_types(self):
-    #     md = getattr(self.metadata_loader, "metadata", None)
-    #     cell_types = []
-    #     if md is not None:
-    #         try:
-    #             cell_types.extend(filter_multicolor_inputs(detect_organoid_types_from_metadata(md)))
-    #             cell_types.extend(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
-    #             cell_types.extend(filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)))
-    #             cell_types.extend(detect_merged_cell_types_from_metadata(md))
-    #         except Exception:
-    #             pass
+    def _detect_cell_types(self):
+        md = getattr(self.metadata_loader, "metadata", None)
+        cell_types = []
+        if md is not None:
+            try:
+                cell_types.extend(filter_multicolor_inputs(detect_organoid_types_from_metadata(md)))
+                cell_types.extend(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
+                cell_types.extend(filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)))
+            except Exception:
+                pass
 
-    #     # Filesystem fallback
-    #     out_dir = Path(self.output_dir) if self.output_dir else None
-    #     if out_dir is not None:
-    #         analysis_dir = out_dir / "analysis"
-    #         if analysis_dir.exists():
-    #             for p in analysis_dir.iterdir():
-    #                 if p.is_dir():
-    #                     cell_types.append(p.name)
-    #     return sorted({str(x).strip() for x in cell_types if str(x).strip() != ""})
+        # Filesystem fallback
+        out_dir = Path(self.output_dir) if self.output_dir else None
+        if out_dir is not None:
+            analysis_dir = out_dir / "analysis"
+            if analysis_dir.exists():
+                for p in analysis_dir.iterdir():
+                    if p.is_dir():
+                        cell_types.append(p.name)
+        return sorted({str(x).strip() for x in cell_types if str(x).strip() != ""})
 
-    # def _detect_sample_names(self):
-    #     md = getattr(self.metadata_loader, "metadata", None)
-    #     if isinstance(md, pd.DataFrame) and "sample_name" in md.columns:
-    #         meta_names = sorted(
-    #             {
-    #                 str(x).strip()
-    #                 for x in md["sample_name"].astype(str).dropna().unique().tolist()
-    #                 if str(x).strip() != ""
-    #             }
-    #         )
-    #         if len(meta_names) > 0:
-    #             return meta_names
+    def _detect_sample_names(self):
+        md = getattr(self.metadata_loader, "metadata", None)
+        if isinstance(md, pd.DataFrame) and "sample_name" in md.columns:
+            meta_names = sorted(
+                {
+                    str(x).strip()
+                    for x in md["sample_name"].astype(str).dropna().unique().tolist()
+                    if str(x).strip() != ""
+                }
+            )
+            if len(meta_names) > 0:
+                return meta_names
 
-    #     sample_names = []
-    #     if self.model_adata is not None and hasattr(self.model_adata, "obs"):
-    #         if "sample_name" in self.model_adata.obs.columns:
-    #             sample_names.extend(
-    #                 self.model_adata.obs["sample_name"].astype(str).dropna().unique().tolist()
-    #             )
+        sample_names = []
+        if self.model_adata is not None and hasattr(self.model_adata, "obs"):
+            if "sample_name" in self.model_adata.obs.columns:
+                sample_names.extend(
+                    self.model_adata.obs["sample_name"].astype(str).dropna().unique().tolist()
+                )
 
-    #     out_dir = Path(self.output_dir) if self.output_dir else None
-    #     images_dir = (out_dir / "images") if out_dir is not None else None
-    #     if images_dir is not None and images_dir.exists():
-    #         for p in images_dir.iterdir():
-    #             if p.is_dir():
-    #                 sample_names.append(str(p.name))
+        out_dir = Path(self.output_dir) if self.output_dir else None
+        images_dir = (out_dir / "images") if out_dir is not None else None
+        if images_dir is not None and images_dir.exists():
+            for p in images_dir.iterdir():
+                if p.is_dir():
+                    sample_names.append(str(p.name))
 
-    #     return sorted({str(x).strip() for x in sample_names if str(x).strip() != ""})
+        return sorted({str(x).strip() for x in sample_names if str(x).strip() != ""})
 
     def _build_analysis_plots_section(self):
         self.analysis_plots_status = widgets.HTML(
@@ -2968,7 +2967,7 @@ class StateClassificationHMMDeploymentPanel(StateClassificationHMMPanel):
             self.steps.selected_index = None
 
     def _build_apply_section(self):
-        _LegacyStateClassificationPanel._build_apply_section(self)
+        BaseStateClassificationPanel._build_apply_section(self)
         self.apply_hmm_artifact_picker = self._make_hmm_artifact_picker()
         self.apply_hmm_artifact_picker.filter_pattern = "*.pkl"
         self.apply_hmm_default_paths_html = widgets.HTML("")
