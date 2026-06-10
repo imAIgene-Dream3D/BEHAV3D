@@ -5,7 +5,8 @@ import pandas as pd
 import re
 from .utils import (
     _load_config, 
-    detect_cell_type_category
+    detect_cell_type_category,
+    PathPicker
 )
 from behav3d.core.metadata import (
     load_behav3d_metadata,
@@ -444,11 +445,12 @@ class MetadataBuilder(widgets.VBox):
             style={'description_width': '150px'}
         )
         
-        form_data['basic']['raw_image_path'] = widgets.Text(
+        form_data['basic']['raw_image_path'] = PathPicker(
             description='Raw image path*:',
             placeholder='/path/to/image.czi/.ims/.lif/.liff/.tiff/.zarr',
-            style={'description_width': '150px'},
-            layout=widgets.Layout(width='600px')
+            description_width='150px',
+            width='600px',
+            allow_zarr=False
         )
         
         form_data['basic']['dimension_order'] = widgets.Text(
@@ -495,11 +497,12 @@ class MetadataBuilder(widgets.VBox):
         if self.include_dead_channel:
             dead_channel_label = widgets.HTML('<h5>Dead Channel Configuration</h5>')
             
-            dead_mask_path = widgets.Text(
+            dead_mask_path = PathPicker(
                 description='Dead mask path:',
                 placeholder='Optional - path to dead cell mask (filled by pipeline)',
-                style={'description_width': '130px'},
-                layout=widgets.Layout(width='600px')
+                description_width='130px',
+                width='600px',
+                allow_zarr=False
             )
             
             # Calculate max valid channel index
@@ -564,23 +567,26 @@ class MetadataBuilder(widgets.VBox):
                 placeholder='e.g., ko, wt',
                 style={'description_width': '100px'}
             )
-            fields['segments_image_path'] = widgets.Text(
+            fields['segments_image_path'] = PathPicker(
                 description='Segments path:',
                 placeholder='Optional - filled by pipeline',
-                style={'description_width': '130px'},
-                layout=widgets.Layout(width='500px')
+                description_width='130px',
+                width='500px',
+                allow_zarr=False
             )
-            fields['tracks_image_path'] = widgets.Text(
+            fields['tracks_image_path'] = PathPicker(
                 description='Tracks img path:',
                 placeholder='Optional - filled by pipeline',
-                style={'description_width': '130px'},
-                layout=widgets.Layout(width='500px')
+                description_width='130px',
+                width='500px',
+                allow_zarr=False
             )
-            fields['tracks_csv_path'] = widgets.Text(
+            fields['tracks_csv_path'] = PathPicker(
                 description='Tracks csv path:',
                 placeholder='Optional - filled by pipeline',
-                style={'description_width': '130px'},
-                layout=widgets.Layout(width='500px')
+                description_width='130px',
+                width='500px',
+                allow_zarr=False
             )
             form_data['cell_types'][org_name] = fields
             cell_type_widgets.extend([
@@ -604,23 +610,26 @@ class MetadataBuilder(widgets.VBox):
                 placeholder='e.g., activated',
                 style={'description_width': '100px'}
             )
-            fields['segments_image_path'] = widgets.Text(
+            fields['segments_image_path'] = PathPicker(
                 description='Segments path:',
                 placeholder='Optional - filled by pipeline',
-                style={'description_width': '130px'},
-                layout=widgets.Layout(width='500px')
+                description_width='130px',
+                width='500px',
+                allow_zarr=False
             )
-            fields['tracks_image_path'] = widgets.Text(
+            fields['tracks_image_path'] = PathPicker(
                 description='Tracks img path:',
                 placeholder='Optional - filled by pipeline',
-                style={'description_width': '130px'},
-                layout=widgets.Layout(width='500px')
+                description_width='130px',
+                width='500px',
+                allow_zarr=False
             )
-            fields['tracks_csv_path'] = widgets.Text(
+            fields['tracks_csv_path'] = PathPicker(
                 description='Tracks csv path:',
                 placeholder='Optional - filled by pipeline',
-                style={'description_width': '130px'},
-                layout=widgets.Layout(width='500px')
+                description_width='130px',
+                width='500px',
+                allow_zarr=False
             )
             form_data['cell_types'][immune_name] = fields
             cell_type_widgets.extend([
@@ -644,23 +653,26 @@ class MetadataBuilder(widgets.VBox):
                 placeholder='e.g., control',
                 style={'description_width': '100px'}
             )
-            fields['segments_image_path'] = widgets.Text(
+            fields['segments_image_path'] = PathPicker(
                 description='Segments path:',
                 placeholder='Optional - filled by pipeline',
-                style={'description_width': '130px'},
-                layout=widgets.Layout(width='500px')
+                description_width='130px',
+                width='500px',
+                allow_zarr=False
             )
-            fields['tracks_image_path'] = widgets.Text(
+            fields['tracks_image_path'] = PathPicker(
                 description='Tracks img path:',
                 placeholder='Optional - filled by pipeline',
-                style={'description_width': '130px'},
-                layout=widgets.Layout(width='500px')
+                description_width='130px',
+                width='500px',
+                allow_zarr=False
             )
-            fields['tracks_csv_path'] = widgets.Text(
+            fields['tracks_csv_path'] = PathPicker(
                 description='Tracks csv path:',
                 placeholder='Optional - filled by pipeline',
-                style={'description_width': '130px'},
-                layout=widgets.Layout(width='500px')
+                description_width='130px',
+                width='500px',
+                allow_zarr=False
             )
             form_data['cell_types'][other_name] = fields
             cell_type_widgets.extend([

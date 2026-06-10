@@ -531,10 +531,13 @@ class PathPicker(widgets.HBox):
         filter_pattern=None,
         description_width='90px',
         width='100%',
+        allow_zarr=False,
     ):
         super().__init__()
         self._mode = mode
         self._start_dir = start_dir
+        self.allow_zarr = allow_zarr
+        self.filter_pattern = filter_pattern
         
         self.text = widgets.Text(
             value=default,
@@ -556,7 +559,18 @@ class PathPicker(widgets.HBox):
         self.btn.on_click(self._toggle_chooser)
         self.text.observe(self._on_text_change, names='value')
         
-        self.children = [self.text, self.btn, self.chooser_out]
+        if self.allow_zarr:
+            self.toggle_zarr = widgets.ToggleButton(
+                value=(self._mode == 'dir'),
+                description='Zarr/Dir',
+                tooltip='Toggle between File and Zarr/Dir selection mode',
+                layout=widgets.Layout(width='auto', flex='0 0 auto')
+            )
+            self.toggle_zarr.observe(self._on_toggle_zarr, names='value')
+            self.children = [self.text, self.btn, self.toggle_zarr, self.chooser_out]
+        else:
+            self.children = [self.text, self.btn, self.chooser_out]
+            
         self.layout = widgets.Layout(width=width, display='flex', flex_flow='row wrap')
 
     @property
@@ -578,7 +592,7 @@ class PathPicker(widgets.HBox):
                     self._start_dir,
                     select_default=True,
                     show_only_dirs=(self._mode == 'dir'),
-                    filter_pattern=getattr(self, 'filter_pattern', None)
+                    filter_pattern=getattr(self, 'filter_pattern', None) if self._mode == 'file' else None
                 )
                 self.chooser.register_callback(self._on_select)
                 display(self.chooser)
@@ -591,6 +605,20 @@ class PathPicker(widgets.HBox):
         if path:
             self.text.value = str(path)
         self._toggle_chooser()
+
+    def _on_toggle_zarr(self, change):
+        self._mode = 'dir' if change['new'] else 'file'
+        if self.chooser is not None:
+            self.chooser_out.clear_output()
+            self.chooser = FileChooser(
+                self._start_dir,
+                select_default=True,
+                show_only_dirs=(self._mode == 'dir'),
+                filter_pattern=getattr(self, 'filter_pattern', None) if self._mode == 'file' else None
+            )
+            self.chooser.register_callback(self._on_select)
+            with self.chooser_out:
+                display(self.chooser)
 
     def _on_text_change(self, change):
         pass

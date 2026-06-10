@@ -108,6 +108,9 @@ mamba activate behav3d
 
 # Install PyTorch with CUDA support (if GPU available)
 python install_behav3d.py --pytorch-only
+
+# Note: If installing PyTorch/Cellpose manually without the installer script:
+# pip install napari-convpaint
 ```
 
 ### Using Pip
@@ -126,6 +129,9 @@ source behav3d_env/bin/activate
 
 # Install requirements
 pip install -r requirements.txt
+
+# Install ConvPaint
+pip install napari-convpaint
 ```
 
 ## 🎯 What Gets Installed

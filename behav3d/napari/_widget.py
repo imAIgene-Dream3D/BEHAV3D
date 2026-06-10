@@ -65,6 +65,9 @@ class BEHAV3DWidget(QWidget):
         from behav3d.napari._tracking import TrackingTab
         self.tracking_tab = TrackingTab(viewer=self.viewer, metadata_loader=self.data_prep_tab)
         self.tabs.addTab(self.tracking_tab, "📍 Tracking")
+        
+        # Wire tracking completion signal to refresh metadata in data prep
+        self.tracking_tab.tracking_completed.connect(self.data_prep_tab._on_tracking_completed)
 
         # --- Tab 5: Feature Extraction ------------------------------------
         from behav3d.napari._feature_extraction import FeatureExtractionTab

@@ -935,6 +935,9 @@ def calculate_image_based_track_features(
                 # itself an immune type. This prevents immune cells trespassing
                 # through organoids (or other passive structures) from inflating
                 # the target's `percentage_dead_mask`.
+                immune_segments_dict = {
+                    name: load_image(path) for name, path in immune_segments_paths.items()
+                } if immune_segments_paths else {}
                 exclude_immune_from_dead = (
                     cell_type not in immune_segments_paths
                     and bool(immune_segments_dict)

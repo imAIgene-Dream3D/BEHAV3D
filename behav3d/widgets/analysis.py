@@ -1000,7 +1000,7 @@ class ActiveKillingPanel:
 
         self.organoid_types, self.immune_types, self.other_types = _detect_downstream_cell_types(md)
         self.potential_immune = self.immune_types + self.other_types
-        self.target_types = self.organoid_types
+        self.target_types = self.organoid_types + self.other_types
         
         params = dict(self.metadata_loader.behav3d_parameters or {})
         self._cfg = params.setdefault("active_killing", deepcopy(_DEFAULT_CONFIG.get("active_killing", {})))
@@ -1009,8 +1009,14 @@ class ActiveKillingPanel:
         immune_options = self.potential_immune if self.potential_immune else ["(none detected)"]
         self.immune_dd = widgets.Dropdown(options=immune_options, value=immune_options[0] if immune_options else None, description="Immune cell:", style={'description_width': '120px'}, layout=widgets.Layout(width="280px"))
         
-        target_info = ", ".join(self.target_types) if self.target_types else "(none detected)"
-        self.target_info_html = widgets.HTML(f'<div style="padding:5px;background:#f0f0f0;border-radius:4px;"><b>Target cell types:</b> {target_info}</div>')
+        target_options = self.target_types if self.target_types else ["(none detected)"]
+        self.target_dd = widgets.SelectMultiple(
+            options=target_options,
+            value=tuple(target_options) if self.target_types else tuple(["(none detected)"]),
+            description="Target cell(s):",
+            style={'description_width': '120px'},
+            layout=widgets.Layout(width="280px")
+        )
         
         self.observation_window = widgets.IntText(description="Observation window:", value=int(self._cfg.get("observation_window", 5)), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"))
         self.death_signal_dd = widgets.Dropdown(options=["percentage_dead_mask", "mean_dead_dye", "nr_dead_mask_pixels"], value=self._cfg.get("death_signal_column", "percentage_dead_mask"), description="Death signal:", style={'description_width': '150px'}, layout=widgets.Layout(width="300px"))
@@ -1049,11 +1055,14 @@ class ActiveKillingPanel:
         self.validation_html = widgets.HTML("")
         self._validate_inputs()
         self.immune_dd.observe(lambda _: self._validate_inputs(), names="value")
+        self.target_dd.observe(lambda _: self._validate_inputs(), names="value")
+        self.target_dd.observe(lambda _: self._check_existing_results(), names="value")
+        self.immune_dd.observe(lambda _: self._check_existing_results(), names="value")
         
         self.ui = widgets.VBox([
             widgets.HTML('<div style="font-size:22px;font-weight:700;">Active Killing Analysis</div>'),
-            widgets.HTML('<div style="color:#555;font-size:13px;margin-bottom:10px;">Detects functional killing events. <b>Targets:</b> Auto-detected organoids.</div>'),
-            self.immune_dd, self.target_info_html, self.validation_html, widgets.HTML("<hr>"),
+            widgets.HTML('<div style="color:#555;font-size:13px;margin-bottom:10px;">Detects functional killing events. <b>Targets:</b> Select the target cell types to analyze (organoids and/or other cell types).</div>'),
+            self.immune_dd, self.target_dd, self.validation_html, widgets.HTML("<hr>"),
             widgets.HBox([self.observation_window, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints after contact</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.killing_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">× background rate</span>')], layout=widgets.Layout(align_items="center")),
             widgets.HBox([self.min_contact_duration, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.death_signal_dd], layout=widgets.Layout(align_items="center")),
             widgets.HBox([self.use_absolute_threshold, self.absolute_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">death signal increase (bypasses multiplier)</span>')], layout=widgets.Layout(align_items="center")),
@@ -1072,7 +1081,7 @@ class ActiveKillingPanel:
         messages = []
         valid = True
         if immune == "(none detected)": messages.append("⚠️ No immune cell types detected."); valid = False
-        if not self.target_types: messages.append("⚠️ No organoid types detected."); valid = False
+        if not self.target_dd.value or self.target_dd.value[0] == "(none detected)": messages.append("⚠️ No target cell types selected."); valid = False
         if valid:
             p = Path(self.output_dir, "analysis", immune, "track_features", f"BEHAV3D_{immune}_combined_track_features.csv")
             if not p.with_name(f"BEHAV3D_{immune}_combined_track_features_filtered.csv").exists() and not p.exists():
@@ -1094,7 +1103,11 @@ class ActiveKillingPanel:
         immune = self.immune_dd.value
         if immune == "(none detected)": return
         
-        results_dir = Path(self.output_dir, "analysis", immune, "active_killing")
+        selected_targets = list(self.target_dd.value)
+        if not selected_targets or selected_targets[0] == "(none detected)": return
+        
+        subfolder = "combined" if len(selected_targets) > 1 else selected_targets[0]
+        results_dir = Path(self.output_dir, "analysis", immune, "active_killing", subfolder)
         advanced_path = results_dir / f"BEHAV3D_{immune}_advanced_track_features.csv"
         if advanced_path.exists():
             self._existing_results_path = advanced_path
@@ -1145,6 +1158,13 @@ class ActiveKillingPanel:
             self.btn_run.disabled = False
             self.spinner_html.layout.display = "none"
             return
+            
+        selected_targets = list(self.target_dd.value)
+        if not selected_targets or selected_targets[0] == "(none detected)":
+            with self.out: print("Please select at least one target cell type.")
+            self.btn_run.disabled = False
+            self.spinner_html.layout.display = "none"
+            return
 
         with self.out:
             try:
@@ -1168,28 +1188,36 @@ class ActiveKillingPanel:
                     yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
                 
                 # Run analysis
-                results_dir = Path(self.output_dir, "analysis", immune, "active_killing")
-                results_dir.mkdir(parents=True, exist_ok=True)
+                def run_for_targets(targets, subfolder):
+                    return run_active_killing_analysis(
+                        metadata=self.metadata_loader.metadata,
+                        output_dir=self.output_dir,
+                        immune_cell_type=immune,
+                        target_cell_types=targets,
+                        observation_window=self.observation_window.value,
+                        death_signal_column=self.death_signal_dd.value,
+                        killing_threshold_multiplier=float(self.killing_threshold.value),
+                        min_contact_duration=int(self.min_contact_duration.value),
+                        absolute_killing_threshold=abs_thresh,
+                        save_results=bool(self.save_results.value),
+                        output_subfolder=subfolder
+                    )
                 
-                # Determine absolute threshold value
-                abs_thresh = float(self.absolute_threshold.value) if self.use_absolute_threshold.value else None
-                
-                df_killing, _, _ = run_active_killing_analysis(
-                    metadata=self.metadata_loader.metadata,
-                    output_dir=self.output_dir,
-                    immune_cell_type=immune,
-                    target_cell_types=self.target_types,
-                    observation_window=self.observation_window.value,
-                    death_signal_column=self.death_signal_dd.value,
-                    killing_threshold_multiplier=float(self.killing_threshold.value),
-                    min_contact_duration=int(self.min_contact_duration.value),
-                    absolute_killing_threshold=abs_thresh,
-                    save_results=bool(self.save_results.value)
-                )
+                df_killing = None
+                for t in selected_targets:
+                    print(f"--- Running independent analysis for target: {t} ---")
+                    df_killing, _, _ = run_for_targets([t], t)
+
+                if len(selected_targets) > 1:
+                    print("--- Running combined analysis for all selected targets ---")
+                    combined_subfolder = "combined"
+                    df_killing, _, _ = run_for_targets(selected_targets, combined_subfolder)
+                else:
+                    combined_subfolder = selected_targets[0]
                 
                 print("✅ Active Killing Analysis complete! Loading gallery...")
                 # Use the automated loader to ensure enriched columns (coordinates) are present
-                results_dir = Path(self.output_dir, "analysis", immune, "active_killing")
+                results_dir = Path(self.output_dir, "analysis", immune, "active_killing", combined_subfolder)
                 advanced_path = results_dir / f"BEHAV3D_{immune}_advanced_track_features.csv"
                 
                 if advanced_path.exists():
@@ -1238,7 +1266,6 @@ class ActiveKillingPanel:
                 axes[0].set_title("1. Killing Efficiency Distribution", fontsize=14, fontweight='bold')
                 axes[0].set_xlabel("Efficiency Score (signal increase / expected background)")
                 axes[0].set_ylabel("Active Killing Events")
-                axes[0].set_xlim(left=0, right=10)
                 
                 # Plot 2: Smoothed Kinetics
                 temp_counts = df_sample_active.groupby("position_t").size()
@@ -1286,7 +1313,10 @@ class ActiveKillingPanel:
                 plt.tight_layout()
                 
                 # Save per-sample plot
-                sample_plot_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", "plots", sample_name)
+                
+                selected_targets = list(self.target_dd.value)
+                subfolder = "combined" if len(selected_targets) > 1 else selected_targets[0]
+                sample_plot_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", subfolder, "plots", sample_name)
                 sample_plot_dir.mkdir(parents=True, exist_ok=True)
                 plot_path = sample_plot_dir / f"killing_kinetics_summary_{sample_name}.png"
                 plt.savefig(plot_path, dpi=150, bbox_inches='tight')
@@ -1304,7 +1334,9 @@ class ActiveKillingPanel:
                 ax.set_ylabel("Active Killing Events")
                 
                 # Save combined plot
-                combined_plot_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", "plots")
+                selected_targets = list(self.target_dd.value)
+                subfolder = "combined" if len(selected_targets) > 1 else selected_targets[0]
+                combined_plot_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", subfolder, "plots")
                 combined_plot_dir.mkdir(parents=True, exist_ok=True)
                 combined_path = combined_plot_dir / "combined_killing_efficiency_distribution.png"
                 plt.savefig(combined_path, dpi=150, bbox_inches='tight')
@@ -1564,7 +1596,9 @@ class ActiveKillingPanel:
                 return None
             
             # Save GIF to output directory
-            gallery_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", "gallery", sample_name)
+            selected_targets = list(self.target_dd.value)
+            subfolder = "combined" if len(selected_targets) > 1 else selected_targets[0]
+            gallery_dir = Path(self.output_dir, "analysis", self.immune_dd.value, "active_killing", subfolder, "gallery", sample_name)
             gallery_dir.mkdir(parents=True, exist_ok=True)
             gif_name = f"killing_event_{sample_name}_T{t_id}_start{t_start}.gif"
             gif_path = gallery_dir / gif_name

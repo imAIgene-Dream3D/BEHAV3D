@@ -16,17 +16,7 @@ from behav3d.analysis.backprojection import (
 )
 
 # Need this for the default groups
-try:
-    from behav3d.defaults import behav3d_calculated_features
-except ImportError:
-    behav3d_calculated_features = {
-        "movement": ["speed", "msd", "track_duration", "dist_to_origin"],
-        "intensity": ["mean_intensity_*"],
-        "morphology": ["volume", "sphericity", "surface_area"],
-        "contact": ["*_contact", "*_distance"],
-        "death": ["mean_dead_dye", "percentage_dead_mask"],
-        "active_killing": ["is_active_killing", "killing_efficiency"]
-    }
+from behav3d.widgets.utils import behav3d_calculated_features
 
 class BackprojectionPanel:
     """

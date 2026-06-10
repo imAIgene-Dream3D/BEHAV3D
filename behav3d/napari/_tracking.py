@@ -26,7 +26,7 @@ from qtpy.QtWidgets import (
     QScrollArea, QTextEdit, QStackedWidget,
     QLineEdit, QFileDialog, QMessageBox,
 )
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, Signal
 
 from behav3d.napari._widgets import make_help_row
 from behav3d.napari._background_runner import (
@@ -425,7 +425,7 @@ class CellTypeTrackingPanel(QWidget):
     def __init__(self, cell_type: str, category: str, metadata_loader,
                  all_cell_types: list, category_types: list,
                  log_callback=None, viewer=None, parent=None,
-                 tab_progress_row=None):
+                 tab_progress_row=None, on_tracking_complete_callback=None):
         super().__init__(parent)
         self.cell_type = cell_type
         self.category = category          # "organoid" / "immune" / "other"
@@ -434,6 +434,7 @@ class CellTypeTrackingPanel(QWidget):
         self.category_types = category_types   # all types in same category
         self.log = log_callback or print
         self.viewer = viewer
+        self.on_tracking_complete = on_tracking_complete_callback  # callback when tracking finishes
         self._toggle_all_organoids_callback = None  # set by TrackingTab for organoid panels
 
         # Background-execution infrastructure (mirrors editing-mode pattern).
@@ -1296,6 +1297,9 @@ class CellTypeTrackingPanel(QWidget):
             )
             if res == QMessageBox.Yes:
                 self._switch_to_viz_and_show_tracks()
+            # Emit tracking completion signal for metadata refresh
+            if self.on_tracking_complete is not None:
+                self.on_tracking_complete()
 
         def _on_failed(err: str):
             self.log(f"Error during tracking: {err}")
@@ -1702,6 +1706,9 @@ class MulticolorTrackingPanel(QWidget):
 # TrackingTab — main tab with per-cell-type sub-tabs
 # ═══════════════════════════════════════════════════════════════════════════
 class TrackingTab(QWidget):
+    # Signal emitted when tracking is completed
+    tracking_completed = Signal()
+
     def __init__(self, viewer, metadata_loader, parent=None):
         super().__init__(parent)
         self.viewer = viewer
@@ -1923,6 +1930,7 @@ class TrackingTab(QWidget):
                     log_callback=self._log,
                     viewer=self.viewer,
                     tab_progress_row=self.progress_row,
+                    on_tracking_complete_callback=self.tracking_completed.emit,
                 )
                 panel._toggle_all_organoids_callback = self._on_all_organoids_toggled
                 self.panels[ct] = panel
@@ -1948,6 +1956,7 @@ class TrackingTab(QWidget):
                 log_callback=self._log,
                 viewer=self.viewer,
                 tab_progress_row=self.progress_row,
+                on_tracking_complete_callback=self.tracking_completed.emit,
             )
             self.panels[ct] = panel
             self.cell_tabs.addTab(panel, f"🔵 {ct.capitalize()}")
@@ -1972,6 +1981,7 @@ class TrackingTab(QWidget):
                 log_callback=self._log,
                 viewer=self.viewer,
                 tab_progress_row=self.progress_row,
+                on_tracking_complete_callback=self.tracking_completed.emit,
             )
             self.panels[ct] = panel
             self.cell_tabs.addTab(panel, f"🟡 {ct.capitalize()}")
@@ -2243,6 +2253,8 @@ class TrackingTab(QWidget):
                 if interactive:
                     self._prompt_switch_to_viz_after_batch()
                 fire_extra_callback(extra_callbacks, "on_done", result)
+                # Emit tracking completion signal for metadata refresh
+                self.tracking_completed.emit()
             except Exception as e:
                 traceback.print_exc()
                 self._log(f"\u274c Batch tracking error: {e}")
@@ -2253,6 +2265,8 @@ class TrackingTab(QWidget):
             if interactive:
                 self._prompt_switch_to_viz_after_batch()
             fire_extra_callback(extra_callbacks, "on_done", result)
+            # Emit tracking completion signal for metadata refresh
+            self.tracking_completed.emit()
 
         def _on_failed(err: str):
             self._log(f"\u274c Batch tracking error: {err}")
