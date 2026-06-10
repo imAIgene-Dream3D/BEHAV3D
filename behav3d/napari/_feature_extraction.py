@@ -1998,9 +1998,15 @@ class ActiveKillingPanel(QWidget):
         self._queue_callback = queue_callback
         # Background-execution infrastructure.
         self.tab_progress_row = tab_progress_row
-        from behav3d.core.metadata import detect_organoid_types_from_metadata
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+        )
         md = getattr(self.metadata_loader, "metadata", None)
-        self.target_types = detect_organoid_types_from_metadata(md) if md is not None else []
+        self.target_types = (
+            detect_organoid_types_from_metadata(md) + detect_other_cell_types_from_metadata(md)
+            if md is not None else []
+        )
         self._bg = BackgroundOperation(self)
         self._init_ui()
 

@@ -1000,7 +1000,7 @@ class ActiveKillingPanel:
 
         self.organoid_types, self.immune_types, self.other_types = _detect_downstream_cell_types(md)
         self.potential_immune = self.immune_types + self.other_types
-        self.target_types = self.organoid_types
+        self.target_types = self.organoid_types + self.other_types
         
         params = dict(self.metadata_loader.behav3d_parameters or {})
         self._cfg = params.setdefault("active_killing", deepcopy(_DEFAULT_CONFIG.get("active_killing", {})))
@@ -1061,7 +1061,7 @@ class ActiveKillingPanel:
         
         self.ui = widgets.VBox([
             widgets.HTML('<div style="font-size:22px;font-weight:700;">Active Killing Analysis</div>'),
-            widgets.HTML('<div style="color:#555;font-size:13px;margin-bottom:10px;">Detects functional killing events. <b>Targets:</b> Select the organoid types to analyze.</div>'),
+            widgets.HTML('<div style="color:#555;font-size:13px;margin-bottom:10px;">Detects functional killing events. <b>Targets:</b> Select the target cell types to analyze (organoids and/or other cell types).</div>'),
             self.immune_dd, self.target_dd, self.validation_html, widgets.HTML("<hr>"),
             widgets.HBox([self.observation_window, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints after contact</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.killing_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">× background rate</span>')], layout=widgets.Layout(align_items="center")),
             widgets.HBox([self.min_contact_duration, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.death_signal_dd], layout=widgets.Layout(align_items="center")),
@@ -1081,7 +1081,7 @@ class ActiveKillingPanel:
         messages = []
         valid = True
         if immune == "(none detected)": messages.append("⚠️ No immune cell types detected."); valid = False
-        if not self.target_dd.value or self.target_dd.value[0] == "(none detected)": messages.append("⚠️ No organoid types selected."); valid = False
+        if not self.target_dd.value or self.target_dd.value[0] == "(none detected)": messages.append("⚠️ No target cell types selected."); valid = False
         if valid:
             p = Path(self.output_dir, "analysis", immune, "track_features", f"BEHAV3D_{immune}_combined_track_features.csv")
             if not p.with_name(f"BEHAV3D_{immune}_combined_track_features_filtered.csv").exists() and not p.exists():
