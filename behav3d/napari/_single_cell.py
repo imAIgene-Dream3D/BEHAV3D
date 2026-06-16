@@ -723,7 +723,9 @@ class StateClassificationSubTab(QWidget):
             / f"BEHAV3D_{cell_type}_behavioral_states.h5ad"
         )
 
+########### DEPRECATED #########################
     def _classifier_path(self, cell_type: str, kind="full") -> Optional[Path]:
+        """Deprecated: Return expected classifier path for intrinsic or full behavioral state classification."""
         out = self._out_dir()
         if not out:
             return None
@@ -736,6 +738,8 @@ class StateClassificationSubTab(QWidget):
             / "full_behavioral_classification"
             / f"state_classification_random_forest_{kind}_{cell_type}.pkl"
         )
+    
+######################################################
 
     def _report_path(self, cell_type: str, report: str) -> Optional[Path]:
         """Return expected PDF path for composition / transition report."""
@@ -771,7 +775,6 @@ class StateClassificationSubTab(QWidget):
 
         self.btn_rename_intrinsic.setEnabled(has_intrinsic)
         self.btn_rename_full.setEnabled(has_full)
-        self.btn_apply.setEnabled(has_model)
 
         if has_intrinsic:
             n_intr = self._model_adata.obs["intrinsic_behavioral_cluster"].astype(str).nunique()
@@ -793,8 +796,8 @@ class StateClassificationSubTab(QWidget):
         if not ct:
             for btn in (
                 self.btn_view_state,
-                self.btn_view_train,
-                self.btn_view_apply,
+                # self.btn_view_train,
+                # self.btn_view_apply,
                 self.btn_view_composition,
                 self.btn_view_transition,
             ):
@@ -805,13 +808,17 @@ class StateClassificationSubTab(QWidget):
         model_path = self._model_adata_path(ct)
         self.btn_view_state.setEnabled(bool(model_path and model_path.exists()))
 
-        # Classifier
-        clf_path = self._classifier_path(ct, "full")
-        self.btn_view_train.setEnabled(bool(clf_path and clf_path.exists()))
 
-        # Full adata
-        full_path = self._full_adata_path(ct)
-        self.btn_view_apply.setEnabled(bool(full_path and full_path.exists()))
+############## DEPRECATED ##############
+        # # Classifier
+        # clf_path = self._classifier_path(ct, "full")
+        # self.btn_view_train.setEnabled(bool(clf_path and clf_path.exists()))
+
+        # # Full adata
+        # full_path = self._full_adata_path(ct)
+        # self.btn_view_apply.setEnabled(bool(full_path and full_path.exists()))
+
+########################################
 
         # Reports
         comp = self._report_path(ct, "state_composition_report")
@@ -888,17 +895,16 @@ class StateClassificationSubTab(QWidget):
             "binary_features_to_group": bin_grps,
             "output_dir": str(out_dir) if out_dir else "",
             "cell_type": ct,
-            "hmm_log_scale_features": log_feats,
-            "window_size": self.spin_window_size.value(),
-            "hmm_feature_smoothing_window": self.spin_hmm_feature_smoothing_window.value(),
-            "hmm_smoothing_min_periods": 1,
+            "log_scale_features": log_feats,
+            "window_features_window": self.spin_window_size.value(),
+            "feature_smoothing_window": self.spin_hmm_feature_smoothing_window.value(),
             "lower_quantile_cap": lower_cap if lower_cap > 0 else None,
             "upper_quantile_cap": upper_cap if upper_cap < 1.0 else None,
             "n_states": self.spin_hmm_n_states.value() if self.combo_hmm_n_states_mode.currentText() == "fixed" else "auto",
             "k_min": self.spin_hmm_k_min.value(),
             "k_max": self.spin_hmm_k_max.value(),
-            "hmm_start_offset": self.spin_hmm_start_offset.value(),
-            "hmm_start_offset_fill_mode": self.combo_hmm_start_offset_fill_mode.currentText(),
+            "start_offset": self.spin_hmm_start_offset.value(),
+            "start_offset_fill_mode": self.combo_hmm_start_offset_fill_mode.currentText(),
             "covariance_type": self.combo_hmm_covariance_type.currentText(),
             "n_iter": self.spin_hmm_n_iter.value(),
             "tol": self.spin_hmm_tol.value(),
