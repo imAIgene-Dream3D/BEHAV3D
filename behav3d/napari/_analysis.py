@@ -1586,3 +1586,12 @@ class AnalysisTab(QWidget):
     def _on_metadata_loaded(self, *_):
         """Reveal the analysis GUI once metadata is available."""
         self.stack.setCurrentIndex(1)
+
+    def _on_metadata_updated(self, *_):
+        """Cascade metadata updates to inner tabs and results panel."""
+        if hasattr(self, "death_dynamics_tab"):
+            self.death_dynamics_tab._on_metadata_updated()
+        if hasattr(self, "single_cell_tab"):
+            self.single_cell_tab._on_metadata_updated()
+        if hasattr(self, "results_panel"):
+            self.results_panel.refresh()

@@ -65,7 +65,7 @@ from behav3d.widgets.utils import spinning_loader
 class TrackClassificationPanel:
     """Notebook widget for one-hot categorical track clustering."""
 
-    def __init__(self, metadata_loader, cell_type=None):
+    def __init__(self, metadata_loader, cell_type=None, **kwargs):
         self.metadata_loader = metadata_loader
         self.output_dir = str(Path(getattr(metadata_loader, "output_dir", "")).expanduser())
         self.model_adata = None
