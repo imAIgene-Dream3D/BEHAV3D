@@ -2,7 +2,7 @@
 BEHAV3D napari plugin – main dock widget.
 Provides a QTabWidget with tabs for the full BEHAV3D pipeline.
 """
-from qtpy.QtWidgets import QWidget, QVBoxLayout, QTabWidget
+from qtpy.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QPushButton
 from qtpy.QtCore import Qt, QSize
 import napari
 
@@ -42,6 +42,20 @@ class BEHAV3DWidget(QWidget):
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
         layout = outer_layout
+
+        # --- Assistant show/hide toggle -----------------------------------
+        # Lets the user reclaim space, or recover the dock if it was closed by
+        # accident. Closing the dock only hides it, so the conversation survives.
+        header = QHBoxLayout()
+        header.setContentsMargins(6, 4, 6, 0)
+        header.addStretch(1)
+        self.btn_toggle_assistant = QPushButton("💬 Assistant")
+        self.btn_toggle_assistant.setCheckable(True)
+        self.btn_toggle_assistant.setChecked(True)
+        self.btn_toggle_assistant.setToolTip("Show or hide the BEHAV3D Assistant panel")
+        self.btn_toggle_assistant.clicked.connect(self._toggle_assistant)
+        header.addWidget(self.btn_toggle_assistant)
+        layout.addLayout(header)
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, stretch=1)
@@ -163,6 +177,14 @@ class BEHAV3DWidget(QWidget):
             # path) and re-split them *horizontally* → pipeline | assistant.
             from qtpy.QtCore import QTimer
             QTimer.singleShot(0, self._place_assistant_beside)
+            # Keep the toggle button in sync if the dock is shown/hidden by other
+            # means (e.g. its native close button → hide, not destroy).
+            try:
+                self._assistant_dock.visibilityChanged.connect(
+                    self._on_assistant_visibility_changed
+                )
+            except Exception:
+                pass
             # Keep the assistant's context bar in sync with workflow state.
             self.tabs.currentChanged.connect(
                 lambda *_: self.assistant.refresh_context_bar()
@@ -174,6 +196,32 @@ class BEHAV3DWidget(QWidget):
         except Exception as e:  # pragma: no cover - defensive
             import warnings
             warnings.warn(f"BEHAV3D Assistant could not be initialised: {e}")
+            # No dock to toggle — disable the button so it isn't a dead control.
+            try:
+                self.btn_toggle_assistant.setEnabled(False)
+            except Exception:
+                pass
+
+    def _toggle_assistant(self):
+        """Show or hide the assistant dock. Closing only hides the dock, so the
+        conversation is preserved and the panel can be reopened instantly."""
+        dock = self._assistant_dock
+        if dock is None:
+            return
+        try:
+            visible = dock.isVisible()
+            dock.setVisible(not visible)
+            self.btn_toggle_assistant.setChecked(not visible)
+        except Exception:
+            pass
+
+    def _on_assistant_visibility_changed(self, visible: bool):
+        """Mirror the dock's visibility onto the toggle button without re-emitting."""
+        try:
+            self.btn_toggle_assistant.blockSignals(True)
+            self.btn_toggle_assistant.setChecked(bool(visible))
+        finally:
+            self.btn_toggle_assistant.blockSignals(False)
 
     def _place_assistant_beside(self):
         """Move the assistant dock to sit side-by-side (horizontally) with this

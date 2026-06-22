@@ -52,7 +52,7 @@ def load_client_config() -> dict:
     endpoint = os.environ.get("BEHAV3D_ASSISTANT_ENDPOINT", cfg.get("endpoint", ""))
     token = os.environ.get("BEHAV3D_ASSISTANT_TOKEN", cfg.get("token", ""))
     return {"endpoint": endpoint.rstrip("/"), "token": token,
-            "timeout": cfg.get("timeout", 60)}
+            "timeout": cfg.get("timeout", 45)}
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +130,13 @@ class ChatWorker(QObject):
         import requests  # available in the behav3d env
         headers = {"Content-Type": "application/json"}
         payload = {"messages": self._messages, "context": self._context, "tools": self._tools}
+        # Split timeout: cap connect at 10s, read at the configured value, so a
+        # stalled server doesn't leave the dock "thinking" (and buttons greyed) for
+        # the whole window. A warm Modal container (min_containers=1) makes 10s ample.
+        timeout = cfg.get("timeout", 45)
+        ct = timeout if isinstance(timeout, (tuple, list)) else (10, timeout)
         with requests.post(f"{cfg['endpoint']}/chat", json=payload, headers=headers,
-                           stream=True, timeout=cfg.get("timeout", 60)) as resp:
+                           stream=True, timeout=ct) as resp:
             resp.raise_for_status()
             for raw in resp.iter_lines(decode_unicode=True):
                 if not raw:
