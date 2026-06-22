@@ -596,67 +596,66 @@ class TrackClassificationPanel:
         self._sync_advanced_visibility()
         self._sync_mode()
 
-    # def _detect_cell_types(self):
-    #     md = getattr(self.metadata_loader, "metadata", None)
-    #     cell_types = []
-    #     if md is not None:
-    #         try:
-    #             cell_types.extend(filter_multicolor_inputs(detect_organoid_types_from_metadata(md)))
-    #             cell_types.extend(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
-    #             cell_types.extend(filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)))
-    #             cell_types.extend(detect_merged_cell_types_from_metadata(md))
-    #         except Exception:
-    #             pass
+    def _detect_cell_types(self):
+        md = getattr(self.metadata_loader, "metadata", None)
+        cell_types = []
+        if md is not None:
+            try:
+                cell_types.extend(filter_multicolor_inputs(detect_organoid_types_from_metadata(md)))
+                cell_types.extend(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
+                cell_types.extend(filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)))
+            except Exception:
+                pass
 
-    #     out_dir = Path(self.output_dir) if self.output_dir else None
-    #     analysis_dir = (out_dir / "analysis") if out_dir is not None else None
-    #     if analysis_dir is not None and analysis_dir.exists():
-    #         for p in analysis_dir.iterdir():
-    #             if p.is_dir():
-    #                 cell_types.append(p.name)
-    #     return sorted({str(x).strip() for x in cell_types if str(x).strip() != ""})
+        out_dir = Path(self.output_dir) if self.output_dir else None
+        analysis_dir = (out_dir / "analysis") if out_dir is not None else None
+        if analysis_dir is not None and analysis_dir.exists():
+            for p in analysis_dir.iterdir():
+                if p.is_dir():
+                    cell_types.append(p.name)
+        return sorted({str(x).strip() for x in cell_types if str(x).strip() != ""})
 
-    # def _detect_sample_names(self):
-    #     names = []
-    #     md = getattr(self.metadata_loader, "metadata", None)
-    #     if isinstance(md, pd.DataFrame):
-    #         metadata_candidate_cols = [
-    #             "sample_name",
-    #             "sample",
-    #             "sample_id",
-    #             "sampleid",
-    #             "name",
-    #         ]
-    #         for col in metadata_candidate_cols:
-    #             if col in md.columns:
-    #                 names.extend(
-    #                     md[col]
-    #                     .astype("string")
-    #                     .dropna()
-    #                     .str.strip()
-    #                     .tolist()
-    #                 )
-    #                 break
-    #         if len(names) > 0:
-    #             return sorted({str(x).strip() for x in names if str(x).strip() != ""})
+    def _detect_sample_names(self):
+        names = []
+        md = getattr(self.metadata_loader, "metadata", None)
+        if isinstance(md, pd.DataFrame):
+            metadata_candidate_cols = [
+                "sample_name",
+                "sample",
+                "sample_id",
+                "sampleid",
+                "name",
+            ]
+            for col in metadata_candidate_cols:
+                if col in md.columns:
+                    names.extend(
+                        md[col]
+                        .astype("string")
+                        .dropna()
+                        .str.strip()
+                        .tolist()
+                    )
+                    break
+            if len(names) > 0:
+                return sorted({str(x).strip() for x in names if str(x).strip() != ""})
 
-    #     if self.model_adata is not None and "sample_name" in self.model_adata.obs.columns:
-    #         names.extend(
-    #             self.model_adata.obs["sample_name"].astype("string").dropna().str.strip().tolist()
-    #         )
-    #     out_dir = Path(self.output_dir) if self.output_dir else None
-    #     images_dir = (out_dir / "images") if out_dir is not None else None
-    #     if images_dir is not None and images_dir.exists():
-    #         reserved_non_sample_dirs = {
-    #             "SignalUnmixing",
-    #             "PixelClassification",
-    #             "pixel_classifier",
-    #             "pixelclassification",
-    #         }
-    #         for p in images_dir.iterdir():
-    #             if p.is_dir() and str(p.name) not in reserved_non_sample_dirs:
-    #                 names.append(str(p.name))
-    #     return sorted({str(x).strip() for x in names if str(x).strip() != ""})
+        if self.model_adata is not None and "sample_name" in self.model_adata.obs.columns:
+            names.extend(
+                self.model_adata.obs["sample_name"].astype("string").dropna().str.strip().tolist()
+            )
+        out_dir = Path(self.output_dir) if self.output_dir else None
+        images_dir = (out_dir / "images") if out_dir is not None else None
+        if images_dir is not None and images_dir.exists():
+            reserved_non_sample_dirs = {
+                "SignalUnmixing",
+                "PixelClassification",
+                "pixel_classifier",
+                "pixelclassification",
+            }
+            for p in images_dir.iterdir():
+                if p.is_dir() and str(p.name) not in reserved_non_sample_dirs:
+                    names.append(str(p.name))
+        return sorted({str(x).strip() for x in names if str(x).strip() != ""})
 
     def _panel_cfg(self):
         params = getattr(self.metadata_loader, "behav3d_parameters", None)
@@ -761,9 +760,9 @@ class TrackClassificationPanel:
         cell_types = []
         if md is not None:
             try:
-                cell_types.extend(detect_immune_cell_types_from_metadata(md))
-                cell_types.extend(detect_organoid_types_from_metadata(md))
-                cell_types.extend(detect_other_cell_types_from_metadata(md))
+                cell_types.extend(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
+                cell_types.extend(filter_multicolor_inputs(detect_organoid_types_from_metadata(md)))
+                cell_types.extend(filter_multicolor_inputs(detect_other_cell_types_from_metadata(md)))
             except Exception:
                 pass
         analysis_dir = Path(self.output_dir) / "analysis" if self.output_dir else None

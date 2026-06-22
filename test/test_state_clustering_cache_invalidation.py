@@ -564,7 +564,7 @@ def test_classification_module_exposes_hmm_without_legacy_classifier_schema():
 def test_hmm_widget_refresh_enablement_uses_hmm_intrinsic_column(monkeypatch):
     widget_mod = _load_hmm_widget_module()
     widgets = pytest.importorskip("ipywidgets")
-    monkeypatch.setattr(widget_mod._LegacyStateClassificationPanel, "_refresh_enablement", lambda self: None)
+    monkeypatch.setattr(widget_mod.BaseStateClassificationPanel, "_refresh_enablement", lambda self: None)
 
     panel = object.__new__(widget_mod.StateClassificationHMMPanel)
     panel.model_adata = SimpleNamespace(

@@ -484,9 +484,18 @@ class DataPreparationTab(QWidget):
         fields["well"] = QLineEdit(); fields["well"].setPlaceholderText("e.g. A1")
         layout.addRow("Well*:", fields["well"])
 
+        # Image path with browse button
         fields["raw_image_path"] = QLineEdit()
         fields["raw_image_path"].setPlaceholderText("/path/to/image.czi")
-        layout.addRow("Image path*:", fields["raw_image_path"])
+        img_path_layout = QHBoxLayout()
+        img_path_layout.addWidget(fields["raw_image_path"])
+        btn_browse_img = QPushButton("…")
+        btn_browse_img.setMaximumWidth(40)
+        btn_browse_img.clicked.connect(lambda: fields["raw_image_path"].setText(
+            self._browse_path("Select Raw Image Path", "Image files (*.tiff *.tif *.czi *.ims *.lif *.liff *.zarr);; All Files (*)", allow_zarr=True)
+        ))
+        img_path_layout.addWidget(btn_browse_img)
+        layout.addRow("Image path*:", img_path_layout)
 
         fields["dimension_order"] = QLineEdit()
         fields["dimension_order"].setPlaceholderText("e.g. TCZYX")
@@ -518,9 +527,18 @@ class DataPreparationTab(QWidget):
         if include_dead:
             dead_fields["number"] = QSpinBox(); dead_fields["number"].setMinimum(0); dead_fields["number"].setMaximumWidth(60)
             layout.addRow("Dead ch #:", dead_fields["number"])
+            # Dead mask path with browse button
             dead_fields["mask_path"] = QLineEdit()
             dead_fields["mask_path"].setPlaceholderText("Optional — dead mask path")
-            layout.addRow("Dead mask:", dead_fields["mask_path"])
+            dead_mask_layout = QHBoxLayout()
+            dead_mask_layout.addWidget(dead_fields["mask_path"])
+            btn_browse_dead = QPushButton("…")
+            btn_browse_dead.setMaximumWidth(40)
+            btn_browse_dead.clicked.connect(lambda: dead_fields["mask_path"].setText(
+                self._browse_path("Select Dead Mask Path", "Image files (*.tiff *.tif *.nii *.png *.zarr);; All Files (*)", allow_zarr=True)
+            ))
+            dead_mask_layout.addWidget(btn_browse_dead)
+            layout.addRow("Dead mask:", dead_mask_layout)
 
         # Cell-type fields
         cell_type_fields: dict[str, dict[str, QLineEdit]] = {}
@@ -529,15 +547,46 @@ class DataPreparationTab(QWidget):
             layout.addRow(QLabel(f"── {name} ──"), QLabel(""))
             ct: dict[str, QLineEdit] = {}
             ct["line"] = QLineEdit(); ct["line"].setPlaceholderText("Line")
-            layout.addRow(f"  Line:", ct["line"])
+            layout.addRow(f"  Line*:", ct["line"])
             ct["condition"] = QLineEdit(); ct["condition"].setPlaceholderText("Condition")
             layout.addRow(f"  Condition:", ct["condition"])
+            
+            # Segments image path with browse button
             ct["segments_image_path"] = QLineEdit(); ct["segments_image_path"].setPlaceholderText("Optional")
-            layout.addRow(f"  Segments:", ct["segments_image_path"])
+            seg_layout = QHBoxLayout()
+            seg_layout.addWidget(ct["segments_image_path"])
+            btn_browse_seg = QPushButton("…")
+            btn_browse_seg.setMaximumWidth(40)
+            btn_browse_seg.clicked.connect(lambda: ct["segments_image_path"].setText(
+                self._browse_path("Select Segments Path", "Image files (*.tiff *.tif *.czi *.nii *.zarr);; All Files (*)", allow_zarr=True)
+            ))
+            seg_layout.addWidget(btn_browse_seg)
+            layout.addRow(f"  Segments:", seg_layout)
+            
+            # Tracks image path with browse button
             ct["tracks_image_path"] = QLineEdit(); ct["tracks_image_path"].setPlaceholderText("Optional")
-            layout.addRow(f"  Tracks img:", ct["tracks_image_path"])
+            tracks_img_layout = QHBoxLayout()
+            tracks_img_layout.addWidget(ct["tracks_image_path"])
+            btn_browse_tracks_img = QPushButton("…")
+            btn_browse_tracks_img.setMaximumWidth(40)
+            btn_browse_tracks_img.clicked.connect(lambda: ct["tracks_image_path"].setText(
+                self._browse_path("Select Tracks Image Path", "Image files (*.tiff *.tif *.czi *.nii *.zarr);; All Files (*)", allow_zarr=True)
+            ))
+            tracks_img_layout.addWidget(btn_browse_tracks_img)
+            layout.addRow(f"  Tracks img:", tracks_img_layout)
+            
+            # Tracks CSV path with browse button
             ct["tracks_csv_path"] = QLineEdit(); ct["tracks_csv_path"].setPlaceholderText("Optional")
-            layout.addRow(f"  Tracks csv:", ct["tracks_csv_path"])
+            tracks_csv_layout = QHBoxLayout()
+            tracks_csv_layout.addWidget(ct["tracks_csv_path"])
+            btn_browse_tracks_csv = QPushButton("…")
+            btn_browse_tracks_csv.setMaximumWidth(40)
+            btn_browse_tracks_csv.clicked.connect(lambda: ct["tracks_csv_path"].setText(
+                self._browse_file("Select Tracks CSV File", "CSV files (*.csv);; All Files (*)")
+            ))
+            tracks_csv_layout.addWidget(btn_browse_tracks_csv)
+            layout.addRow(f"  Tracks csv:", tracks_csv_layout)
+            
             cell_type_fields[name] = ct
 
         for n in org_names:
@@ -556,6 +605,43 @@ class DataPreparationTab(QWidget):
             "imm_names": imm_names,
             "oth_names": oth_names,
         }
+
+    # --- Fill-down --------------------------------------------------------
+    # --- Browse helpers ---------------------------------------------------
+    def _browse_file(self, title: str, filter_str: str = "All Files (*.*)") -> str:
+        """Open file browser dialog and return selected path or empty string."""
+        path, _ = QFileDialog.getOpenFileName(self, title, "", filter_str)
+        return path
+
+    def _browse_folder(self, title: str = "Select Folder") -> str:
+        """Open folder browser dialog and return selected path or empty string."""
+        path = QFileDialog.getExistingDirectory(self, title, "")
+        return path
+
+    def _browse_path(self, title: str, filter_str: str = "All Files (*.*)", allow_zarr: bool = True) -> str:
+        """Open file/directory browser. If allow_zarr is True, prompts user for file vs. folder/Zarr selection."""
+        if allow_zarr:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Select Input Type")
+            msg.setText("Would you like to select a file or a Zarr directory/folder?")
+            
+            btn_file = msg.addButton("File", QMessageBox.AcceptRole)
+            btn_dir = msg.addButton("Zarr / Folder", QMessageBox.AcceptRole)
+            btn_cancel = msg.addButton("Cancel", QMessageBox.RejectRole)
+            
+            msg.exec_()
+            
+            clicked = msg.clickedButton()
+            if clicked == btn_file:
+                path, _ = QFileDialog.getOpenFileName(self, title, "", filter_str)
+                return path
+            elif clicked == btn_dir:
+                path = QFileDialog.getExistingDirectory(self, title, "")
+                return path
+            return ""
+        else:
+            path, _ = QFileDialog.getOpenFileName(self, title, "", filter_str)
+            return path
 
     # --- Fill-down --------------------------------------------------------
     def _on_fill_down(self):
@@ -729,38 +815,6 @@ class DataPreparationTab(QWidget):
         # Build sample forms (force: loading replaces any prior structure)
         self._build_sample_forms(force=True)
 
-    @staticmethod
-    def _collapse_multicolor_immune_names(imm_types):
-        """Collapse ``base_N_multicolor`` siblings into ``(bases, n_channels)``.
-
-        Mirrors the notebook builder's expansion logic in reverse so that when
-        the user opens an existing CSV containing per-channel multicolor names
-        (e.g. ``tcell_1_multicolor`` + ``tcell_2_multicolor``), the builder
-        re-shows a single ``tcell`` row with the Multicolor checkbox ticked.
-
-        Non-multicolor names pass through unchanged with ``n_channels=0``.
-        """
-        import re
-        pattern = re.compile(r"^(?P<base>.+)_(?P<idx>\d+)_multicolor$")
-        bases: list[str] = []
-        counts: dict[str, int] = {}
-        order: list[str] = []
-        for name in imm_types:
-            m = pattern.match(str(name))
-            if m:
-                base = m.group("base")
-                if base not in counts:
-                    counts[base] = 0
-                    order.append(base)
-                counts[base] += 1
-            else:
-                if name not in counts:
-                    counts[name] = 0
-                    order.append(name)
-
-        n_channels_per_base = [counts[name] for name in order]
-        return order, n_channels_per_base
-
         # Populate each sample form from the DataFrame row
         for row_idx, (_, row) in enumerate(md.iterrows()):
             if row_idx >= len(self._sample_forms):
@@ -822,6 +876,38 @@ class DataPreparationTab(QWidget):
                         ct_fields[fld].setText(str(v))
 
         self._log("📝 Metadata loaded into builder for editing.")
+
+    @staticmethod
+    def _collapse_multicolor_immune_names(imm_types):
+        """Collapse ``base_N_multicolor`` siblings into ``(bases, n_channels)``.
+
+        Mirrors the notebook builder's expansion logic in reverse so that when
+        the user opens an existing CSV containing per-channel multicolor names
+        (e.g. ``tcell_1_multicolor`` + ``tcell_2_multicolor``), the builder
+        re-shows a single ``tcell`` row with the Multicolor checkbox ticked.
+
+        Non-multicolor names pass through unchanged with ``n_channels=0``.
+        """
+        import re
+        pattern = re.compile(r"^(?P<base>.+)_(?P<idx>\d+)_multicolor$")
+        bases: list[str] = []
+        counts: dict[str, int] = {}
+        order: list[str] = []
+        for name in imm_types:
+            m = pattern.match(str(name))
+            if m:
+                base = m.group("base")
+                if base not in counts:
+                    counts[base] = 0
+                    order.append(base)
+                counts[base] += 1
+            else:
+                if name not in counts:
+                    counts[name] = 0
+                    order.append(name)
+
+        n_channels_per_base = [counts[name] for name in order]
+        return order, n_channels_per_base
 
     def _on_save_metadata(self):
         # If button is in "Edit" state, open builder in edit mode instead of saving
@@ -890,6 +976,18 @@ class DataPreparationTab(QWidget):
             rows.append(row)
 
         df = pd.DataFrame(rows)
+
+        # Validate before persisting anything to disk.
+        try:
+            check_behav3d_metadata(df, func=False)
+        except AssertionError as exc:
+            QMessageBox.warning(self, "Invalid metadata", str(exc))
+            self._log("❌ Metadata validation failed; save cancelled.")
+            return
+        except Exception as exc:
+            QMessageBox.warning(self, "Validation error", str(exc))
+            self._log(f"❌ Unexpected metadata validation error: {exc}")
+            return
 
         # Overwrite prompt
         if csv_path.exists():
@@ -1021,6 +1119,23 @@ class DataPreparationTab(QWidget):
         except Exception as e:
             self.metadata_info_label.setText(f"❌ {e}")
             self._log(f"❌ Error loading metadata: {e}")
+
+    def _on_tracking_completed(self):
+        """Reload metadata after tracking completes to reflect new tracking outputs."""
+        csv_path = self.behav3d_parameters.get("paths", {}).get("metadata_csv", "")
+        if not csv_path or not Path(csv_path).exists():
+            self._log("⚠️ Metadata file not found after tracking — cannot refresh.")
+            return
+        
+        try:
+            # Reload metadata from disk
+            self.metadata = load_behav3d_metadata(csv_path)
+            self._log("✅ Metadata refreshed after tracking completion")
+            
+            # Emit signal to update all tabs with new metadata
+            self.metadata_loaded.emit(self.metadata)
+        except Exception as e:
+            self._log(f"❌ Error refreshing metadata after tracking: {e}")
 
     # ══════════════════════════════════════════════════════════════════════
     # Section 4 – Metadata Overview

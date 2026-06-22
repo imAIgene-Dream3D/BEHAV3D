@@ -3013,7 +3013,7 @@ class ImportWidget(QWidget):
                         raw_path = Path(row.get("raw_image_path", ""))
                         if raw_path.exists():
                             import zarr
-                            from behav3d.core.io import load_image
+                            from behav3d.io.images import load_image
                             raw_store = zarr.open(str(raw_path), mode='r')
                             # For TIFF we'd have to load it to check shape, which is slow for many files.
                             # Let's just do it and log if mismatch.
