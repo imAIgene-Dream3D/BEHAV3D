@@ -368,7 +368,12 @@ def build_context(main_widget) -> dict:
         "metadata": summarize_metadata(metadata),
         "queue": queue,
         "parameters": _safe(lambda: _diff_from_defaults(params), {}) or {},
-        "step_schema": _safe(lambda: cards_for_step(step), []) or [],
+        # The Visualization tab is a viewer with no tunable BEHAV3D parameters that
+        # have visible widgets (its schema cards — use_range/start_t/end_t/
+        # channel_colors — are phantom controls). Don't feed them to the model, or
+        # "Explain this screen" describes parameters the user can't see.
+        "step_schema": [] if step == "visualization"
+                       else (_safe(lambda: cards_for_step(step), []) or []),
     }
     # Include metadata builder state only when on the data_preparation tab.
     if step == "data_preparation":

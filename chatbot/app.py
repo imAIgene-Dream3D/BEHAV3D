@@ -39,7 +39,8 @@ import re
 # ===========================================================================
 _TOOLCALL_RE = re.compile(r"<TOOLCALL>\s*(\{.*?\})\s*</TOOLCALL>", re.DOTALL)
 
-_TOOL_NAMES = ("set_parameter", "navigate_to_step", "add_queue_step", "fill_metadata_builder")
+_TOOL_NAMES = ("set_parameter", "navigate_to_step", "add_queue_step", "fill_metadata_builder",
+               "bulk_fill_metadata", "select_segmentation_method")
 
 
 _CATEGORY_LABELS = {
@@ -130,11 +131,17 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "search radius\". Do not mention Python variables, dotted keys, JSON, or "
         "tool-call syntax unless the user explicitly asks for implementation details.\n\n"
         "TOOLS — always call a tool instead of asking the user to click manually:\n"
-        "- `fill_metadata_builder`: guide through the Metadata Builder step-by-step. "
+        "- `fill_metadata_builder`: guide through the Metadata Builder one field at a time. "
         "  Use whenever the user asks to build metadata or be walked through setup.\n"
+        "- `bulk_fill_metadata`: fill the WHOLE Metadata Builder in one call. Use when the "
+        "  user gives many values at once, provides a list of image files, or says 'fill "
+        "  everything' — do not fill field-by-field in that case.\n"
         "- `set_parameter`: propose a parameter change using a dotted key from "
-        "  PARAMETERS FOR THIS STEP. NEVER use set_parameter for the segmentation "
-        "  method selector — tell the user to click the Method dropdown instead.\n"
+        "  PARAMETERS FOR THIS STEP. Do NOT use set_parameter for the segmentation Method "
+        "  selector — use select_segmentation_method instead.\n"
+        "- `select_segmentation_method`: set the global Method dropdown on the Segmentation "
+        "  tab (value = the visible label, e.g. 'APOC', 'ConvPaint', 'Pixel Classifier', "
+        "  'Cellpose', 'Import segmentation').\n"
         "- `navigate_to_step`: switch the active tab. Use proactively when a "
         "  prerequisite is missing (e.g. metadata not loaded → navigate to data_preparation).\n"
         "- `add_queue_step`: add a processing step to the queue.\n\n"
@@ -154,6 +161,8 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
 
     step = context.get("current_step", "?")
     md = context.get("metadata", {})
+    mb_ctx = context.get("metadata_builder", {}) or {}
+    csv_loaded = md.get("loaded", False)
     assistant_session = context.get("assistant_session", {}) or {}
     confirmed_keys = set(assistant_session.get("confirmed_parameter_keys", []) or [])
     active_ct = context.get("active_cell_type_tab")
@@ -162,7 +171,9 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "## CONTEXT\n"
         f"- Current step/tab: {context.get('current_tab_label', step)}\n"
         f"- Output dir set: {context.get('output_dir_set')}\n"
-        f"- Samples loaded: {md.get('n_samples', 0) if md.get('loaded') else 0}\n"
+        f"- Metadata CSV loaded: {csv_loaded}\n"
+        f"- Samples in loaded CSV: {md.get('n_samples', 0) if csv_loaded else 0}\n"
+        f"- Samples being entered in Metadata Builder: {mb_ctx.get('n_samples', 0)}\n"
         f"- Cell types: {md.get('cell_types', {})}\n"
         f"- Non-default parameters: {context.get('parameters', {})}\n"
         f"- Queue: {[s.get('type') for s in context.get('queue', [])]}"
@@ -231,7 +242,9 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
             "cell_segments_image_path, cell_tracks_image_path, and cell_tracks_csv_path "
             "with the exact visible cell_type name. "
             "After filling Sample 1, call fill_down to copy shared values to all others. "
-            "Never skip configure_cell_types or create_sample_forms — they are required actions."
+            "Never skip configure_cell_types or create_sample_forms — they are required actions.\n"
+            "IMPORTANT: every value shown above is ALREADY FILLED IN — never ask the user "
+            "to provide it again. Only ask for fields that are still blank or at their default."
         )
 
     seg = context.get("segmentation", {}) or {}
@@ -282,34 +295,48 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
     # Per-step guided flow instructions.
     _step_guides = {
         "data_preparation": (
-            "Check whether the output directory is set first. If it is not set, ask for "
-            "the output directory path; when the user answers, call set_parameter with "
-            "internal key paths.output_dir. "
-            "If metadata is not loaded, guide through the builder in this exact sequence:\n"
-            "1. Call fill_metadata_builder(open_builder)\n"
-            "2. Ask 'How many samples?' → user answers N → call fill_metadata_builder(n_samples=N)\n"
-            "3. Ask 'How many organoid types?' → call fill_metadata_builder(n_organoids=N)\n"
-            "4. Ask 'How many immune cell types?' → call fill_metadata_builder(n_immune=N)\n"
-            "5. Ask 'How many other cell types?' → call fill_metadata_builder(n_other=N)\n"
-            "6. Call fill_metadata_builder(configure_cell_types) (no user input needed)\n"
-            "7. For each organoid type: ask its name → call fill_metadata_builder(organoid_name=X, index=i)\n"
-            "8. Repeat for immune_name and other_name\n"
-            "9. Call fill_metadata_builder(create_sample_forms) (no user input needed)\n"
-            "10. For each sample: ask image path → call fill_metadata_builder(raw_image_path=P, index=i); "
-            "ask pixel size → fill pixel_distance_xy/z; ask time interval → fill time_interval/time_unit\n"
-            "11. Ask for line/condition only when the metadata needs it; fill those with "
-            "cell_line/cell_condition and the visible cell_type name\n"
-            "12. Call fill_metadata_builder(fill_down) to copy shared values when appropriate\n"
-            "CRITICAL: steps that say 'user answers N → call ...' require a tool call in that same turn. "
-            "Never skip it."
+            "FIRST read the ## METADATA BUILDER STATE block above — it is the source of "
+            "truth for what is already filled in. NEVER re-ask for any value that already "
+            "appears there (a value that is already set counts as the user's answer — move "
+            "on).\n"
+            "Work through this decision order and address ONLY the first unsatisfied item, "
+            "then ask the next question:\n"
+            "1. If the output directory is not set, ask for the output directory path; on "
+            "answer, call set_parameter(key='paths.output_dir').\n"
+            "2. If the builder is not open, call fill_metadata_builder(open_builder).\n"
+            "3. For each of n_samples / n_organoids / n_immune / n_other still at its default "
+            "(1 / 0 / 0 / 0) and not yet given by the user: ask for it and call "
+            "fill_metadata_builder with the answer in the SAME turn. Skip any already above "
+            "its default.\n"
+            "4. Once the counts are set but 'Cell types configured' is False, call "
+            "fill_metadata_builder(configure_cell_types) (no user input needed).\n"
+            "5. For each cell-type name still blank, ask it and call "
+            "fill_metadata_builder(organoid_name / immune_name / other_name, index=i). Skip "
+            "names already present in organoids/immune/other.\n"
+            "6. Once names are set but 'Sample forms created' is False, call "
+            "fill_metadata_builder(create_sample_forms) (no user input needed).\n"
+            "7. For each sample, ask only for the per-sample fields that are still blank in "
+            "the 'Visible sample forms' snapshot (raw_image_path, pixel_distance_xy/z, "
+            "time_interval/time_unit, etc.) and fill them. Skip any already filled.\n"
+            "8. Ask for line/condition only when the metadata needs it; fill those with "
+            "cell_line/cell_condition and the visible cell_type name.\n"
+            "9. After Sample 1 is complete and there are multiple samples, call "
+            "fill_metadata_builder(fill_down) to copy shared values.\n"
+            "BULK SHORTCUT: if the user provides many values at once, gives a list of image "
+            "files, or says 'fill everything', call bulk_fill_metadata ONCE with all the "
+            "counts, names, and per-sample dicts instead of filling one field at a time.\n"
+            "CRITICAL: when the user gives you a value, emit the matching tool call in that "
+            "SAME turn — never acknowledge in text only."
         ),
         "segmentation": (
             "Verify metadata is loaded and output_dir is set before anything else. "
             "Ask about the global Method dropdown first. The visible choices are APOC (GPU), "
             "ConvPaint (DL pixel classifier), Pixel Classifier (Random Forest), Cellpose "
             "(Deep Learning), and Import segmentation. APOC is not the same thing as "
-            "Pixel Classifier (Random Forest). Do NOT call set_parameter for the Method "
-            "dropdown — tell the user the exact visible option to select. Once the user "
+            "Pixel Classifier (Random Forest). When the user picks a method, call "
+            "select_segmentation_method with the leading visible label ('APOC', 'ConvPaint', "
+            "'Pixel Classifier', 'Cellpose', or 'Import segmentation') — that switches the "
+            "visible parameter page — then guide that method's parameters. Once the user "
             "accepts the current/default value for a setting, move to the next setting; "
             "do not ask about it again. For Cellpose: ask number_of_channels, then "
             "labels_mode. For Pixel Classifier: ask examples_per_sample, workers, "

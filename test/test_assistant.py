@@ -232,6 +232,64 @@ def test_ingest_chunkers():
     assert "Parameter: a.b" in cc[0].text and cc[0].title == "a.b"
 
 
+def test_build_actions_bulk_fill_metadata():
+    # One bulk_fill_metadata call carries the whole form; build_actions keeps the
+    # payload and a sample count, and rejects an empty samples list.
+    acts = build_actions([
+        {"name": "bulk_fill_metadata", "arguments": {
+            "n_samples": 2, "n_immune": 1, "immune_names": ["tcell"],
+            "samples": [
+                {"sample_name": "s1", "raw_image_path": "/a.tif",
+                 "cell_types": {"tcell": {"line": "Jurkat"}}},
+                {"sample_name": "s2", "raw_image_path": "/b.tif"},
+            ]}},
+        {"name": "bulk_fill_metadata", "arguments": {"samples": []}},
+    ], [], {})
+    assert acts[0].kind == "bulk_fill_metadata" and acts[0].ok
+    assert acts[0].data["sample_count"] == 2
+    assert acts[0].data["immune_names"] == ["tcell"]
+    assert "2 samples" in acts[0].preview
+    assert not acts[1].ok                       # empty samples → rejected
+
+
+def test_build_actions_select_segmentation_method():
+    acts = build_actions([
+        {"name": "select_segmentation_method", "arguments": {"value": "Cellpose"}},
+        {"name": "select_segmentation_method", "arguments": {"value": ""}},
+    ], [], {})
+    assert acts[0].kind == "select_segmentation_method" and acts[0].ok
+    assert acts[0].data["value"] == "Cellpose" and "Cellpose" in acts[0].preview
+    assert not acts[1].ok                        # empty value → rejected
+
+
+def test_new_tools_registered():
+    import app
+    from behav3d.napari._assistant_actions import TOOL_SCHEMA
+    names = {t["name"] for t in TOOL_SCHEMA}
+    assert {"bulk_fill_metadata", "select_segmentation_method"} <= names
+    # the backend text-fallback parser must also recognise the new tool names
+    assert "bulk_fill_metadata" in app._TOOL_NAMES
+    assert "select_segmentation_method" in app._TOOL_NAMES
+
+
+def test_prompt_data_prep_reconciles_state_and_lists_tools():
+    import app
+    sp = app.build_system_prompt(
+        {"current_step": "data_preparation", "step_schema": [], "parameters": {},
+         "metadata": {"loaded": False},
+         "metadata_builder": {"n_samples": 22, "n_immune": 1, "open": True,
+                              "immune_names": ["tcell"]},
+         "queue": []},
+        [], [])
+    # CONTEXT no longer claims "0 samples" while the builder holds values.
+    assert "Samples being entered in Metadata Builder: 22" in sp
+    assert "Metadata CSV loaded: False" in sp
+    # New tools are advertised, and the guide tells the model not to re-ask.
+    assert "bulk_fill_metadata" in sp
+    assert "select_segmentation_method" in sp
+    assert "NEVER re-ask" in sp or "never re-ask" in sp.lower()
+
+
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from qtpy.QtCore import Qt, QThread, Signal
+from qtpy.QtCore import Qt, QThread, QTimer, Signal
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QTextBrowser, QFrame, QSizePolicy,
@@ -264,7 +264,20 @@ class AssistantDock(QWidget):
         self._pending_auto_continue: list | None = None  # deferred after _on_finished
         self._auto_continue_turns: int = 0
         self._last_auto_continue_signature: tuple | None = None
+        # Progress-based auto-continue guard: keep going as long as each turn applies a
+        # NEW distinct value; only stop after consecutive stalled turns (no new progress).
+        self._auto_continue_seen_signatures: set[tuple] = set()
+        self._auto_continue_stall_count: int = 0
         self._confirmed_parameter_keys: set[str] = set()
+        # Coalesce streamed-token re-renders. Re-rendering the whole transcript on
+        # every token saturates the GUI thread on long answers (the napari window
+        # freezes until the stream ends). This single-shot timer batches tokens into
+        # at most one render per interval; the expensive full-document style walk is
+        # applied only on the final render of the turn.
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(90)
+        self._render_timer.timeout.connect(self._render_streaming)
 
         # Cohesive dark-theme styling for the whole dock (matches napari surfaces).
         self.setStyleSheet("""
@@ -371,25 +384,42 @@ class AssistantDock(QWidget):
     # ------------------------------------------------------------------
     # Transcript helpers
     # ------------------------------------------------------------------
-    def _render(self):
+    def _render(self, style: bool = True):
         """Re-render the whole transcript as markdown.
 
         QTextCursor.insertMarkdown does not exist in PyQt5, so we keep a log of
         markdown blocks and render the document with QTextEdit.setMarkdown (which
         does render bold/italic/lists/code), then pin the scrollbar to the bottom.
+
+        ``style=False`` skips the full-document style walk — used for the throttled
+        renders during token streaming so a long answer doesn't freeze the GUI.
         """
+        # Any direct/full render supersedes a pending throttled one.
+        self._render_timer.stop()
         blocks = list(self._md_log)
         if self._streaming_text is not None:
             blocks.append(f"**BEHAV3D Assistant**\n\n{self._streaming_text or '...'}")
         try:
             # A thin rule between turns gives clear visual separation.
             self.transcript.setMarkdown("\n\n---\n\n".join(blocks))
-            self._style_blocks()
+            if style:
+                self._style_blocks()
         except Exception:
             # Fallback for any Qt build lacking setMarkdown.
             self.transcript.setPlainText("\n\n".join(blocks))
         sb = self.transcript.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def _render_streaming(self):
+        """Throttled render during streaming — skips the expensive style walk,
+        which is applied once when the turn finishes (_on_finished → _render)."""
+        self._render(style=False)
+
+    def _schedule_render(self):
+        """Request a render soon, coalescing bursts of streamed tokens into at
+        most one render per timer interval."""
+        if not self._render_timer.isActive():
+            self._render_timer.start()
 
     def _style_blocks(self):
         """setMarkdown renders paragraphs/lists very tightly. Walk the document
@@ -438,6 +468,8 @@ class AssistantDock(QWidget):
         if reset_auto_loop:
             self._auto_continue_turns = 0
             self._last_auto_continue_signature = None
+            self._auto_continue_seen_signatures = set()
+            self._auto_continue_stall_count = 0
         if show_as_user:
             self._append_user(display_text or text)
         self._history.append({"role": "user", "content": text})
@@ -471,7 +503,8 @@ class AssistantDock(QWidget):
 
     def _set_busy(self, busy: bool):
         self.btn_send.setEnabled(not busy)
-        self.input.setEnabled(not busy)
+        # Leave the input box editable while a turn is in flight so the user can
+        # type their next answer without waiting for the stream to finish.
         for i in range(self._quick_layout.count()):
             row = self._quick_layout.itemAt(i)
             sub = row.layout() if row else None
@@ -488,7 +521,7 @@ class AssistantDock(QWidget):
         if self._streaming_text is None:
             self._streaming_text = ""
         self._streaming_text += chunk
-        self._render()
+        self._schedule_render()
 
     def _on_degraded(self, full_text: str):
         self._streaming_text = full_text
@@ -498,6 +531,9 @@ class AssistantDock(QWidget):
         # close any open streaming block, then show the error
         self._finalize_streaming()
         self._append_md(message)
+        # Defensive: ensure the dock never stays stuck "thinking" if signal
+        # ordering ever changes (worker.finished still clears busy too).
+        self._set_busy(False)
 
     def _on_tool_calls(self, calls: list):
         try:
@@ -513,28 +549,51 @@ class AssistantDock(QWidget):
         auto_previews = []
         noop_previews = []
         had_auto = False
-        for act in actions:
-            if self._is_noop_action(act):
-                self._record_noop_action(act)
-                noop_previews.append(self._noop_preview(act))
-                continue
-            if self._should_auto_apply(act):
-                if act.ok:
-                    # Classify BEFORE applying (widget still holds pre-apply state).
-                    _silent_auto = self._is_silent_auto_apply(act)
-                    try:
-                        ok = apply_action(self.main_widget, act)
-                    except Exception:
-                        ok = False
-                    if ok:
-                        had_auto = True
-                        # Only count as a meaningful change if it wasn't a structural
-                        # trigger or a same-value no-op re-call from the model.
-                        if not _silent_auto:
-                            auto_previews.append(act.preview)
-                        self.refresh_context_bar()
-            else:
-                self._add_action_card(act)
+        # Suppress per-widget pulse glows when applying a batch — a flood of fills
+        # would otherwise schedule hundreds of QTimers and thrash stylesheets,
+        # which can freeze the GUI. One context-bar refresh happens at the end.
+        from behav3d.napari._assistant_actions import set_pulse_suppressed
+        batch = len(actions) > 1
+        if batch:
+            set_pulse_suppressed(True)
+        try:
+            for act in actions:
+                if self._is_noop_action(act):
+                    self._record_noop_action(act)
+                    noop_previews.append(self._noop_preview(act))
+                    continue
+                if self._should_auto_apply(act):
+                    if act.ok:
+                        # Classify BEFORE applying (widget still holds pre-apply state).
+                        _silent_auto = self._is_silent_auto_apply(act)
+                        try:
+                            ok = apply_action(self.main_widget, act)
+                        except Exception:
+                            ok = False
+                        if ok:
+                            had_auto = True
+                            if act.kind == "bulk_fill_metadata":
+                                n = (act.data.get("sample_count")
+                                     or len(act.data.get("samples", []) or []))
+                                self._append_md(
+                                    f"Filled the Metadata Builder for {n} "
+                                    f"sample{'s' if n != 1 else ''}. Review the values "
+                                    "and tell me anything you'd like to change."
+                                )
+                                # Bulk fill completes the form in one pass — do NOT add
+                                # to auto_previews, so it doesn't trigger an auto-continue.
+                            # Only count as a meaningful change if it wasn't a structural
+                            # trigger or a same-value no-op re-call from the model.
+                            elif not _silent_auto:
+                                auto_previews.append(act.preview)
+                            if not batch:
+                                self.refresh_context_bar()
+                else:
+                    self._add_action_card(act)
+        finally:
+            if batch:
+                set_pulse_suppressed(False)
+                self.refresh_context_bar()
 
         if auto_previews:
             self._append_md("Filled in: " + " · ".join(auto_previews))
@@ -543,7 +602,7 @@ class AssistantDock(QWidget):
         # instead of rendering a scary "Already set" card.
         if (
             noop_previews and not auto_previews and self.action_tray_layout.count() == 0
-            and not (self._streaming_text or "").strip()
+            and not self._text_asks_question(self._streaming_text)
         ):
             self._pending_auto_continue = noop_previews
         # Defer auto-continue until _on_finished so ChatWorker1's _finalize_streaming()
@@ -554,9 +613,26 @@ class AssistantDock(QWidget):
         # streaming response, otherwise the loop never terminates.
         if (
             had_auto and auto_previews and self.action_tray_layout.count() == 0
-            and not (self._streaming_text or "").strip()
+            and not self._text_asks_question(self._streaming_text)
         ):
             self._pending_auto_continue = auto_previews
+
+    @staticmethod
+    def _text_asks_question(text: str | None) -> bool:
+        """True if the streamed assistant text already poses a follow-up question.
+
+        The model usually streams a one-line acknowledgement ("Got it — 22 samples.")
+        alongside its tool call; that must NOT suppress auto-continue, otherwise the
+        guided flow stalls. Only an actual question (a '?' at/near the end) means the
+        bot has already prompted the user, so we should not auto-continue."""
+        t = (text or "").strip()
+        if not t:
+            return False
+        tail = t.rstrip(" *_`)\n\t")
+        if tail.endswith("?"):
+            return True
+        # A '?' within the last stretch of text also counts (e.g. trailing emoji/note).
+        return "?" in t[-120:]
 
     def _is_noop_action(self, action: ProposedAction) -> bool:
         return bool(action.data.get("no_op"))
@@ -583,6 +659,19 @@ class AssistantDock(QWidget):
 
         if action.kind == "add_queue_step":
             return False  # adding to the queue is a deliberate action
+
+        if action.kind == "bulk_fill_metadata":
+            return True  # deterministic bulk fill applies in one guarded pass
+
+        if action.kind == "select_segmentation_method":
+            # Apply only when it changes the current selection.
+            seg = getattr(self.main_widget, "segmentation_tab", None)
+            combo = getattr(seg, "method_combo", None) if seg is not None else None
+            if combo is None:
+                return False
+            cur = combo.currentText()
+            val = str(action.data.get("value", "")).strip()
+            return not (cur == val or cur.startswith(val) or (val and val in cur))
 
         if action.kind == "fill_metadata_builder":
             field = action.data.get("field")
@@ -711,22 +800,28 @@ class AssistantDock(QWidget):
             self._auto_continue([action.preview] if action.preview else [])
 
     def _auto_continue(self, applied: list[str] | None = None):
-        """Silently prompt the bot to continue, naming what was just applied."""
+        """Silently prompt the bot to continue, naming what was just applied.
+
+        Continues as long as each turn makes NEW progress (a distinct applied value);
+        only stops after two consecutive stalled turns (a repeated or empty signature),
+        so legitimate multi-field guided flows run to completion instead of cutting off
+        after a fixed number of turns."""
         signature = tuple(applied or [])
-        if (
-            self._auto_continue_turns >= 1
-            and signature == self._last_auto_continue_signature
-        ):
+        made_progress = bool(signature) and signature not in self._auto_continue_seen_signatures
+        if made_progress:
+            self._auto_continue_seen_signatures.add(signature)
+            self._auto_continue_stall_count = 0
+        else:
+            self._auto_continue_stall_count += 1
+        # Stop only when we've stalled (no NEW distinct value) twice in a row.
+        if self._auto_continue_stall_count >= 2:
             self._append_md(
-                "That value is already set, so I am pausing instead of repeating "
-                "the same suggestion. Ask me what to check next, or use a guide button."
+                "I paused because I wasn't making new progress. Tell me the next value "
+                "you want to set, or use one of the buttons below."
             )
             return
-        if self._auto_continue_turns >= 2:
-            self._append_md(
-                "I paused the guided flow to avoid repeating myself. "
-                "Tell me the next value you want to set, or use one of the buttons below."
-            )
+        # Hard safety ceiling against a runaway loop in pathological cases.
+        if self._auto_continue_turns >= 40:
             return
         self._auto_continue_turns += 1
         self._last_auto_continue_signature = signature
@@ -747,6 +842,20 @@ class AssistantDock(QWidget):
         except Exception:
             pass
         step = ctx.get("current_tab_label") or ctx.get("current_step", "this step")
+        if ctx.get("current_step") == "visualization":
+            # The Visualization tab has no tunable parameters — describe only the
+            # controls that are actually on screen, not config-only fields.
+            self._send_message(
+                "Explain the Visualization tab. It has no tunable parameters — only "
+                "these on-screen controls: the Dataset section (Sample selector, "
+                "'Clear existing layers before loading', and 'Load Dataset into Napari'), "
+                "the Visibility Toggles (Raw, Segments, Tracked Segments, Tracks), and "
+                "the Manual Edition section (pick tracked segments and 'Edit tracked "
+                "segments'). Describe what each of these controls does — do not mention "
+                "any other parameters.",
+                display_text="Explain this screen",
+            )
+            return
         self._send_message(
             f"Explain the {step} tab: what does it do, and what do its key "
             "parameters mean for someone configuring it for the first time?",

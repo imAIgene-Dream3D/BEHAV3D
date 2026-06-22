@@ -518,8 +518,21 @@ def _push_to_widget(widget, value) -> bool:
         return False
 
 
+# When True, pulse_widget() is a no-op. Set during batch/bulk applies so a flood
+# of fills doesn't schedule hundreds of QTimers + stylesheet thrash (which can
+# freeze the GUI). See AssistantDock._on_tool_calls and apply_bulk_fill_metadata.
+_SUPPRESS_PULSE = False
+
+
+def set_pulse_suppressed(flag: bool) -> None:
+    global _SUPPRESS_PULSE
+    _SUPPRESS_PULSE = bool(flag)
+
+
 def pulse_widget(widget, msec: int = 1200) -> None:
     """Briefly highlight a widget with a transient stylesheet glow."""
+    if _SUPPRESS_PULSE:
+        return
     try:
         from qtpy.QtCore import QTimer
         original = widget.styleSheet()
@@ -620,6 +633,34 @@ def build_actions(raw_tool_calls: list[dict], cards: list[dict], params: dict) -
             ) and not args.get("cell_type"):
                 act.ok = False
                 act.message = "Choose the visible cell type name for this sample field."
+            actions.append(act)
+        elif name == "bulk_fill_metadata":
+            samples = args.get("samples", []) or []
+            act = ProposedAction(
+                "bulk_fill_metadata",
+                n_samples=args.get("n_samples"),
+                n_organoids=args.get("n_organoids"),
+                n_immune=args.get("n_immune"),
+                n_other=args.get("n_other"),
+                include_dead=args.get("include_dead"),
+                organoid_names=args.get("organoid_names", []) or [],
+                immune_names=args.get("immune_names", []) or [],
+                other_names=args.get("other_names", []) or [],
+                samples=samples,
+                sample_count=len(samples),
+            )
+            act.preview = f"Fill the Metadata Builder ({len(samples)} samples)"
+            if not samples:
+                act.ok = False
+                act.message = "No per-sample data provided for bulk fill."
+            actions.append(act)
+        elif name == "select_segmentation_method":
+            value = args.get("value")
+            act = ProposedAction("select_segmentation_method", value=value)
+            act.preview = f"Segmentation method → {value}"
+            if not value:
+                act.ok = False
+                act.message = "No segmentation method provided."
             actions.append(act)
     return actions
 
@@ -840,6 +881,110 @@ def apply_fill_metadata_builder(main_widget, action: ProposedAction) -> bool:
     return False
 
 
+def apply_bulk_fill_metadata(main_widget, action: ProposedAction) -> bool:
+    """Fill the ENTIRE Metadata Builder in one guarded pass.
+
+    Sets the population counts and cell-type names, then does exactly ONE
+    configure pass and ONE sample-form rebuild, then writes every provided
+    per-sample value. Pulses are suppressed so the batch doesn't schedule a
+    storm of QTimers (the cause of the GUI freeze on "fill everything")."""
+    dp = _dp(main_widget)
+    if dp is None:
+        return False
+    d = action.data
+    set_pulse_suppressed(True)
+    try:
+        if not getattr(dp.builder_grp, "isChecked", lambda: True)():
+            dp.builder_grp.setChecked(True)
+        # 1. population counts (only when provided)
+        for field, attr in (("n_samples", "n_samples_spin"),
+                            ("n_organoids", "n_organoid_spin"),
+                            ("n_immune", "n_immune_spin"),
+                            ("n_other", "n_other_spin")):
+            if d.get(field) is not None:
+                try:
+                    getattr(dp, attr).setValue(int(d[field]))
+                except Exception:
+                    pass
+        if d.get("include_dead") is not None:
+            dp.include_dead_cb.setChecked(_coerce_bool(d["include_dead"]))
+        # 2. ONE configure pass + cell-type names
+        dp._on_configure_cell_types(force=True)
+        for attr, key in (("_organoid_name_edits", "organoid_names"),
+                          ("_immune_name_edits", "immune_names"),
+                          ("_other_name_edits", "other_names")):
+            edits = getattr(dp, attr, [])
+            for i, name in enumerate(d.get(key, []) or []):
+                if i < len(edits):
+                    edits[i].setText(str(name))
+        # 3. ONE sample-form rebuild (picks up the names just set)
+        dp._build_sample_forms(force=True)
+        # 4. all per-sample values in a single pass
+        forms = getattr(dp, "_sample_forms", [])
+        cell_field_map = {
+            "line": "line", "cell_line": "line",
+            "condition": "condition", "cell_condition": "condition",
+            "segments_image_path": "segments_image_path",
+            "cell_segments_image_path": "segments_image_path",
+            "tracks_image_path": "tracks_image_path",
+            "cell_tracks_image_path": "tracks_image_path",
+            "tracks_csv_path": "tracks_csv_path",
+            "cell_tracks_csv_path": "tracks_csv_path",
+        }
+        for idx, sample in enumerate(d.get("samples", []) or []):
+            if idx >= len(forms) or not isinstance(sample, dict):
+                break
+            form = forms[idx]
+            for k, v in sample.items():
+                if k == "cell_types":
+                    continue
+                if k in ("dead_channel_number", "dead_mask_path"):
+                    dk = "number" if k == "dead_channel_number" else "mask_path"
+                    w = form.get("dead_channel", {}).get(dk)
+                else:
+                    w = form.get("basic", {}).get(k)
+                if w is not None:
+                    _push_to_widget(w, v)
+            for ct_name, ct_vals in (sample.get("cell_types") or {}).items():
+                ct_fields = (form.get("cell_types") or {}).get(str(ct_name), {})
+                if not isinstance(ct_vals, dict):
+                    continue
+                for fk, fv in ct_vals.items():
+                    target = ct_fields.get(cell_field_map.get(fk, fk))
+                    if target is not None:
+                        _push_to_widget(target, fv)
+        return True
+    except Exception:
+        return False
+    finally:
+        set_pulse_suppressed(False)
+
+
+def apply_select_segmentation_method(main_widget, value) -> bool:
+    """Select the global Segmentation Method dropdown by its visible label.
+
+    Matches exact → starts-with → contains so a leading label token ('APOC',
+    'Pixel Classifier', 'Cellpose', …) resolves to the labelled combo item.
+    Starts-with ordering keeps 'Pixel Classifier' from matching
+    'ConvPaint (DL pixel classifier)'. Setting the index swaps the param page."""
+    seg = getattr(main_widget, "segmentation_tab", None)
+    combo = getattr(seg, "method_combo", None) if seg is not None else None
+    if combo is None or value is None:
+        return False
+    try:
+        from qtpy.QtCore import Qt
+        s = str(value).strip()
+        for flag in (Qt.MatchFixedString, Qt.MatchStartsWith, Qt.MatchContains):
+            i = combo.findText(s, flag)
+            if i >= 0:
+                combo.setCurrentIndex(i)
+                pulse_widget(combo)
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def apply_action(main_widget, action: ProposedAction) -> bool:
     if not action.ok:
         return False
@@ -854,6 +999,14 @@ def apply_action(main_widget, action: ProposedAction) -> bool:
         return _apply_add_queue_step(main_widget, action)
     if action.kind == "fill_metadata_builder":
         ok = apply_fill_metadata_builder(main_widget, action)
+        action.data["widget_updated"] = ok
+        return ok
+    if action.kind == "bulk_fill_metadata":
+        ok = apply_bulk_fill_metadata(main_widget, action)
+        action.data["widget_updated"] = ok
+        return ok
+    if action.kind == "select_segmentation_method":
+        ok = apply_select_segmentation_method(main_widget, action.data.get("value"))
         action.data["widget_updated"] = ok
         return ok
     return False
@@ -982,6 +1135,58 @@ TOOL_SCHEMA = [
                 },
             },
             "required": ["field"],
+        },
+    },
+    {
+        "name": "bulk_fill_metadata",
+        "description": (
+            "Fill the ENTIRE Metadata Builder in ONE call. Use this (instead of "
+            "many fill_metadata_builder calls) when the user gives lots of values "
+            "at once, provides a list of image files, or says 'fill everything'. "
+            "The app rebuilds the forms once and applies all values in a single "
+            "pass with no per-field confirmation. Provide the population counts, "
+            "cell-type name lists, and one dict per sample."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "n_samples": {"type": "integer"},
+                "n_organoids": {"type": "integer"},
+                "n_immune": {"type": "integer"},
+                "n_other": {"type": "integer"},
+                "include_dead": {"type": "boolean"},
+                "organoid_names": {"type": "array", "items": {"type": "string"}},
+                "immune_names": {"type": "array", "items": {"type": "string"}},
+                "other_names": {"type": "array", "items": {"type": "string"}},
+                "samples": {
+                    "type": "array",
+                    "description": (
+                        "One object per sample, in order. Recognised keys: "
+                        "sample_name, exp_nr, well, raw_image_path, dimension_order, "
+                        "pixel_distance_xy, pixel_distance_z, time_interval, time_unit, "
+                        "dead_channel_number, dead_mask_path, and an optional "
+                        "'cell_types' object mapping each visible cell-type name to "
+                        "{line, condition, segments_image_path, tracks_image_path, "
+                        "tracks_csv_path}."
+                    ),
+                    "items": {"type": "object"},
+                },
+            },
+            "required": ["samples"],
+        },
+    },
+    {
+        "name": "select_segmentation_method",
+        "description": (
+            "Select the global Segmentation Method dropdown on the Segmentation tab "
+            "(this swaps the visible parameter page). Use the leading visible label: "
+            "'APOC', 'ConvPaint', 'Pixel Classifier', 'Cellpose', or "
+            "'Import segmentation'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
         },
     },
 ]
