@@ -197,12 +197,11 @@ class StateClassificationSubTab(QWidget):
     """Steps 1-4 for HMM-based behavioral state classification + backprojection."""
 
     def __init__(self, viewer=None, metadata_loader=None, cell_type_getter=None,
-                 sample_getter=None, parent=None):
+                 parent=None):
         super().__init__(parent)
         self.viewer = viewer
         self.metadata_loader = metadata_loader
         self._get_cell_type = cell_type_getter
-        self._get_sample = sample_getter
         self._model_adata = None
         self._bg = BackgroundOperation(self)
 
@@ -590,6 +589,15 @@ class StateClassificationSubTab(QWidget):
 
         bp_form = QFormLayout()
         bp_form.setSpacing(3)
+
+        self.sample_combo = QComboBox()
+        self.sample_combo.addItem("— All samples —")
+        self.sample_combo.setMinimumWidth(120)
+        self.sample_combo.setToolTip(
+            "Select a sample for backprojection visualisation. "
+            "'— All samples —' uses the first available sample."
+        )
+        bp_form.addRow("Sample:", self.sample_combo)
 
         self.combo_state_color_by = QComboBox()
         self.combo_state_color_by.addItems(
@@ -1006,7 +1014,8 @@ class StateClassificationSubTab(QWidget):
         return self._get_cell_type() if self._get_cell_type else ""
 
     def _sample(self) -> str:
-        return self._get_sample() if self._get_sample else ""
+        txt = self.sample_combo.currentText()
+        return "" if txt.startswith("—") else txt
 
     def _log(self, msg: str):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -1417,12 +1426,11 @@ class TrackClassificationSubTab(QWidget):
     """Steps 1-5 for DTW-based track trajectory classification + backprojection."""
 
     def __init__(self, viewer=None, metadata_loader=None, cell_type_getter=None,
-                 sample_getter=None, parent=None):
+                 parent=None):
         super().__init__(parent)
         self.viewer = viewer
         self.metadata_loader = metadata_loader
         self._get_cell_type = cell_type_getter
-        self._get_sample = sample_getter
         self._track_adata = None
         self._bg = BackgroundOperation(self)
 
@@ -1895,6 +1903,15 @@ class TrackClassificationSubTab(QWidget):
         tbp_form = QFormLayout()
         tbp_form.setSpacing(3)
 
+        self.sample_combo = QComboBox()
+        self.sample_combo.addItem("— All samples —")
+        self.sample_combo.setMinimumWidth(120)
+        self.sample_combo.setToolTip(
+            "Select a sample for backprojection visualisation. "
+            "'— All samples —' uses the first available sample."
+        )
+        tbp_form.addRow("Sample:", self.sample_combo)
+
         self.combo_track_color_by = QComboBox()
         self.combo_track_color_by.addItems(
             ["behavioral_trajectory_cluster", "dtaidistance_cluster", "track_cluster"]
@@ -2168,7 +2185,8 @@ class TrackClassificationSubTab(QWidget):
         return self._get_cell_type() if self._get_cell_type else ""
 
     def _sample(self) -> str:
-        return self._get_sample() if self._get_sample else ""
+        txt = self.sample_combo.currentText()
+        return "" if txt.startswith("—") else txt
 
     def _log(self, msg: str):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -2943,16 +2961,6 @@ class SingleCellTab(QWidget):
         self.cell_type_combo.setToolTip("Immune and other cell types only (non-multicolor).")
         self.cell_type_combo.currentTextChanged.connect(self._on_cell_type_changed)
         hdr_lay.addWidget(self.cell_type_combo)
-
-        hdr_lay.addWidget(QLabel("Sample:"))
-        self.sample_combo = QComboBox()
-        self.sample_combo.addItem("— All samples —")
-        self.sample_combo.setMinimumWidth(120)
-        self.sample_combo.setToolTip(
-            "Select a sample for backprojection visualisation. "
-            "'— All samples —' uses the first available sample."
-        )
-        hdr_lay.addWidget(self.sample_combo)
         hdr_lay.addStretch()
 
         self.status_lbl = QLabel("Load metadata to begin.")
@@ -2968,7 +2976,6 @@ class SingleCellTab(QWidget):
             viewer=self.viewer,
             metadata_loader=self.metadata_loader,
             cell_type_getter=self._current_cell_type,
-            sample_getter=self._current_sample,
             parent=self,
         )
         self.inner_tabs.addTab(self.state_tab, "🔬 State Classification")
@@ -2977,7 +2984,6 @@ class SingleCellTab(QWidget):
             viewer=self.viewer,
             metadata_loader=self.metadata_loader,
             cell_type_getter=self._current_cell_type,
-            sample_getter=self._current_sample,
             parent=self,
         )
         self.inner_tabs.addTab(self.track_tab, "🛤️ Track Classification")
@@ -3007,18 +3013,20 @@ class SingleCellTab(QWidget):
             self.status_lbl.setText("No immune/other cell types detected.")
         self.cell_type_combo.blockSignals(False)
 
-        # Populate sample combo
+        # Populate sample combos in sub-tabs
         md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
-        cur_s = self.sample_combo.currentText()
-        self.sample_combo.blockSignals(True)
-        self.sample_combo.clear()
-        self.sample_combo.addItem("— All samples —")
+        samples = ["— All samples —"]
         if md is not None and "sample_name" in md.columns:
-            for s in sorted(md["sample_name"].astype(str).unique()):
-                self.sample_combo.addItem(s)
-        if cur_s in [self.sample_combo.itemText(i) for i in range(self.sample_combo.count())]:
-            self.sample_combo.setCurrentText(cur_s)
-        self.sample_combo.blockSignals(False)
+            samples.extend(sorted(md["sample_name"].astype(str).unique()))
+            
+        for combo in (self.state_tab.sample_combo, self.track_tab.sample_combo):
+            cur_s = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(samples)
+            if cur_s in samples:
+                combo.setCurrentText(cur_s)
+            combo.blockSignals(False)
 
         self._propagate_metadata_update()
 
@@ -3031,7 +3039,3 @@ class SingleCellTab(QWidget):
 
     def _current_cell_type(self) -> str:
         return self.cell_type_combo.currentText()
-
-    def _current_sample(self) -> str:
-        txt = self.sample_combo.currentText()
-        return "" if txt.startswith("—") else txt
