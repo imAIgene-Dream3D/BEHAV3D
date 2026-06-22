@@ -268,6 +268,14 @@ class AssistantDock(QWidget):
         # NEW distinct value; only stop after consecutive stalled turns (no new progress).
         self._auto_continue_seen_signatures: set[tuple] = set()
         self._auto_continue_stall_count: int = 0
+        # The metadata-builder field applied on the current turn — drives the
+        # deterministic next-question logic in _auto_continue.
+        self._last_applied_md_field: str | None = None
+        # Deterministic metadata wizard state (no LLM): _md_current is the question
+        # awaiting an answer; _md_queue holds the remaining questions in this phase.
+        self._md_current: dict | None = None
+        self._md_queue: list[dict] = []
+        self._md_phase: str | None = None
         self._confirmed_parameter_keys: set[str] = set()
         # Coalesce streamed-token re-renders. Re-rendering the whole transcript on
         # every token saturates the GUI thread on long answers (the napari window
@@ -454,6 +462,11 @@ class AssistantDock(QWidget):
         if not text:
             return
         self.input.clear()
+        # Deterministic metadata wizard owns the input while it's running (the
+        # questions and answers never touch the LLM, so it cannot stall or loop).
+        if self._md_current is not None:
+            self._md_handle_answer(text)
+            return
         self._guided_flow_active = False   # free-form input exits any guided flow
         self._send_message(text)
 
@@ -470,6 +483,12 @@ class AssistantDock(QWidget):
             self._last_auto_continue_signature = None
             self._auto_continue_seen_signatures = set()
             self._auto_continue_stall_count = 0
+            self._last_applied_md_field = None
+            # Any LLM-bound send (free-form or another guide button) cancels the
+            # deterministic metadata wizard.
+            self._md_current = None
+            self._md_queue = []
+            self._md_phase = None
         if show_as_user:
             self._append_user(display_text or text)
         self._history.append({"role": "user", "content": text})
@@ -586,6 +605,10 @@ class AssistantDock(QWidget):
                             # trigger or a same-value no-op re-call from the model.
                             elif not _silent_auto:
                                 auto_previews.append(act.preview)
+                                # Remember the metadata field just filled so the
+                                # deterministic counts driver can ask the next one.
+                                if act.kind == "fill_metadata_builder":
+                                    self._last_applied_md_field = act.data.get("field")
                             if not batch:
                                 self.refresh_context_bar()
                 else:
@@ -795,6 +818,8 @@ class AssistantDock(QWidget):
             w = self.action_tray_layout.itemAt(i).widget()
             if isinstance(w, _ActionCard) and w.action is action:
                 self._remove_card(w)
+        if ok and action.kind == "fill_metadata_builder":
+            self._last_applied_md_field = action.data.get("field")
         # Auto-continue: once the tray is empty, prompt the bot for the next step.
         if ok and self.action_tray_layout.count() == 0:
             self._auto_continue([action.preview] if action.preview else [])
@@ -823,14 +848,72 @@ class AssistantDock(QWidget):
         # Hard safety ceiling against a runaway loop in pathological cases.
         if self._auto_continue_turns >= 40:
             return
+        # --- Deterministic metadata guidance -------------------------------
+        # The model reliably FILLS an answer and ASKS a given question, but is
+        # unreliable at DECIDING the next field on its own (it loops on the field
+        # it just set). So during the metadata guided flow we compute the next
+        # question and tell it to ask exactly that. Verified against the live model:
+        # explicit next-question = 6/6 pass; generic "ask the next field" = 1/6.
+        md_field = self._last_applied_md_field
+        self._last_applied_md_field = None
+        if self._guided_flow_active and md_field in self._MD_COUNT_ORDER:
+            i = self._MD_COUNT_ORDER.index(md_field)
+            nxt = self._MD_COUNT_ORDER[i + 1] if i + 1 < len(self._MD_COUNT_ORDER) else None
+            if nxt is None:
+                # All four counts captured → build the cell-type fields and the
+                # per-sample forms (structural + idempotent), then hand off.
+                self._md_apply_structural("configure_cell_types")
+                self._md_apply_structural("create_sample_forms")
+                self.refresh_context_bar()
+                self._append_md(
+                    "All set — the cell-type fields and per-sample forms are ready below. "
+                    "For each sample, fill in the **image path** and acquisition settings; "
+                    "use **Fill All from Sample 1** to copy shared values (pixel size, time "
+                    "interval), rename the cell types if you like, then **Save Metadata CSV** "
+                    "and click **Load Metadata**. Ask me about any field you're unsure of."
+                )
+                self._guided_flow_active = False
+                return
+            self._auto_continue_turns += 1
+            self._last_auto_continue_signature = signature
+            label = "; ".join(applied) if applied else "That"
+            self._send_message(
+                f"{label} is set — do NOT call any tool now. Ask me exactly this next "
+                f'question: "{self._MD_COUNT_Q[nxt]}"',
+                show_as_user=False, reset_auto_loop=False,
+            )
+            return
+
+        # --- Generic fallback (set_parameter flows, etc.) ------------------
         self._auto_continue_turns += 1
         self._last_auto_continue_signature = signature
-        suffix = " Call fill_metadata_builder (or set_parameter) when the user answers."
         if applied:
-            msg = f"Applied: {'; '.join(applied)}. Ask the next question.{suffix}"
+            msg = (
+                f"Applied: {'; '.join(applied)}. Those values are now set — do NOT set "
+                "them again. Ask me the next field that is still missing in the builder; "
+                "only call a tool after I answer."
+            )
         else:
-            msg = f"Ask the next question.{suffix}"
+            msg = ("Ask me the next field that is still missing; only call a tool after "
+                   "I answer.")
         self._send_message(msg, show_as_user=False, reset_auto_loop=False)
+
+    # Canonical order + questions for the deterministic metadata counts phase.
+    _MD_COUNT_ORDER = ["n_samples", "n_organoids", "n_immune", "n_other"]
+    _MD_COUNT_Q = {
+        "n_organoids": "How many organoid types do you have?",
+        "n_immune": "How many immune cell types do you have?",
+        "n_other": "How many other (non-organoid, non-immune) cell types do you have?",
+    }
+
+    def _md_apply_structural(self, field: str):
+        """Apply a structural metadata-builder step (configure_cell_types /
+        create_sample_forms) directly, without an LLM round-trip."""
+        try:
+            act = ProposedAction("fill_metadata_builder", field=field, value=None, index=0)
+            apply_action(self.main_widget, act)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Quick actions
@@ -872,24 +955,128 @@ class AssistantDock(QWidget):
         )
 
     def _start_metadata_guide(self):
+        self._append_user("Build metadata")
+        self._begin_metadata_wizard()
+
+    # ------------------------------------------------------------------
+    # Deterministic metadata wizard (no LLM — cannot stall or loop)
+    # ------------------------------------------------------------------
+    _MD_COUNT_STEPS = [
+        {"kind": "count", "field": "n_samples",
+         "question": "How many samples (fields of view) do you have?"},
+        {"kind": "count", "field": "n_organoids",
+         "question": "How many organoid types do you have?"},
+        {"kind": "count", "field": "n_immune",
+         "question": "How many immune cell types do you have?"},
+        {"kind": "count", "field": "n_other",
+         "question": "How many other (non-organoid, non-immune) cell types do you have?"},
+    ]
+
+    def _begin_metadata_wizard(self):
+        """Drive the structural metadata setup (sample/cell-type counts and names)
+        entirely on the frontend. Questions are posted directly and the typed answer
+        is applied immediately — the LLM is never in the loop, so it can't stall,
+        loop, or skip a field."""
         self._guided_flow_active = True
-        # Open the builder directly — skip the LLM for this structural step so
-        # the bot can't get stuck by returning text-only on the first turn.
-        act = ProposedAction("fill_metadata_builder", field="open_builder", value=None, index=0)
-        act.preview = "Open the Metadata Builder"
-        try:
-            apply_action(self.main_widget, act)
-            self._append_md("Opened the Metadata Builder")
+        self._md_apply_structural("open_builder")
+        self._append_md("Opened the Metadata Builder")
+        self.refresh_context_bar()
+        self._md_phase = "counts"
+        self._md_queue = [dict(s) for s in self._MD_COUNT_STEPS]
+        self._md_current = None
+        self._md_ask_next()
+
+    def _md_ask_next(self):
+        """Post the next question in the current phase, or advance phases."""
+        if self._md_queue:
+            self._md_current = self._md_queue.pop(0)
+            self._append_md(f"**BEHAV3D Assistant**\n\n{self._md_current['question']}")
+            return
+        if self._md_phase == "counts":
+            # Counts done → build the cell-type name fields, then ask each name.
+            self._md_apply_structural("configure_cell_types")
             self.refresh_context_bar()
+            self._md_phase = "names"
+            self._md_queue = self._md_build_name_steps()
+            self._md_ask_next()
+            return
+        if self._md_phase == "names":
+            # Names done → build the per-sample forms and hand off.
+            self._md_apply_structural("create_sample_forms")
+            self.refresh_context_bar()
+            self._md_finish()
+            return
+        self._md_finish()
+
+    def _md_build_name_steps(self) -> list[dict]:
+        dp = getattr(self.main_widget, "data_prep_tab", None)
+        steps: list[dict] = []
+        if dp is None:
+            return steps
+        spec = [
+            ("n_organoid_spin", "organoid_name", "organoid", 'e.g. "tumor"'),
+            ("n_immune_spin", "immune_name", "immune cell", 'e.g. "CD8"'),
+            ("n_other_spin", "other_name", "other cell", ""),
+        ]
+        for spin_attr, field, label, hint in spec:
+            spin = getattr(dp, spin_attr, None)
+            n = spin.value() if spin is not None else 0
+            for i in range(n):
+                eg = f" ({hint})" if hint else ""
+                steps.append({"kind": "name", "field": field, "index": i,
+                              "question": f"What is the name of {label} type {i + 1}?{eg}"})
+        return steps
+
+    def _md_handle_answer(self, text: str):
+        """Apply the typed answer to the current wizard question and advance."""
+        item = self._md_current
+        self._append_user(text)
+        if item["kind"] == "count":
+            try:
+                value = int("".join(ch for ch in text if (ch.isdigit() or ch == "-")))
+            except ValueError:
+                # Not a number — treat as a free-form question: exit the wizard and
+                # hand the message to the assistant instead of forcing a number.
+                self._md_current = None
+                self._md_queue = []
+                self._md_phase = None
+                self._send_message(text, show_as_user=False)
+                return
+        else:  # name
+            value = text.strip()
+            if not value:
+                self._append_md(f"**BEHAV3D Assistant**\n\n{item['question']}")
+                return  # re-ask; keep _md_current
+        self._md_current = None
+        self._md_apply_value(item["field"], value, item.get("index", 0))
+        self.refresh_context_bar()
+        self._md_ask_next()
+
+    def _md_apply_value(self, field: str, value, index: int = 0):
+        from behav3d.napari._assistant_actions import _metadata_builder_preview
+        act = ProposedAction("fill_metadata_builder", field=field, value=value, index=index)
+        try:
+            ok = apply_action(self.main_widget, act)
         except Exception:
-            pass
-        self._send_message(
-            "The Metadata Builder is now open. "
-            "Ask me one question at a time to fill it in — start with: "
-            "'How many samples do you have?' "
-            "When I answer N, call fill_metadata_builder(field='n_samples', value=N) "
-            "in that same response, then ask about organoid types.",
-            display_text="Build metadata",
+            ok = False
+        if ok:
+            try:
+                preview = _metadata_builder_preview(field, value, index)
+            except Exception:
+                preview = f"{field} = {value}"
+            self._append_md(f"Filled in: {preview}")
+
+    def _md_finish(self):
+        self._md_current = None
+        self._md_queue = []
+        self._md_phase = None
+        self._guided_flow_active = False
+        self._append_md(
+            "All set — the cell-type fields and per-sample forms are ready below. "
+            "For each sample, fill in the **image path** and acquisition settings; use "
+            "**Fill All from Sample 1** to copy shared values (pixel size, time interval), "
+            "then **Save Metadata CSV** and click **Load Metadata**. Ask me about any "
+            "field you're unsure of."
         )
 
     # ------------------------------------------------------------------
@@ -1017,22 +1204,10 @@ class AssistantDock(QWidget):
         except Exception:
             pass
         if ctx.get("output_dir_set") and not ctx.get("metadata", {}).get("loaded"):
-            # Output dir is already set; open the builder so the LLM can start asking
-            act = ProposedAction("fill_metadata_builder", field="open_builder", value=None, index=0)
-            act.preview = "Open the Metadata Builder"
-            try:
-                apply_action(self.main_widget, act)
-                self._append_md("Opened the Metadata Builder")
-                self.refresh_context_bar()
-            except Exception:
-                pass
-            self._send_message(
-                "The output directory is set and the Metadata Builder is now open. "
-                "Ask me one question at a time starting with: 'How many samples do you have?' "
-                "Call fill_metadata_builder with the answer in the same response, "
-                "then ask about organoid types.",
-                display_text="Walk through setup",
-            )
+            # Output dir is already set → run the deterministic metadata wizard
+            # (same robust path as the "Build metadata" button).
+            self._append_user("Walk through setup")
+            self._begin_metadata_wizard()
         else:
             self._send_message(
                 "I need help setting up Data Preparation from scratch. "
