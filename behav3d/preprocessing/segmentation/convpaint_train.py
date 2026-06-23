@@ -485,6 +485,24 @@ class AnnotationLegendTab(QWidget):
         if not has_death:
             self.note.hide()
         layout.addWidget(self.note)
+
+        if has_death:
+            def create_button(text, color_hex, layer_name, label_idx):
+                btn = QtPushButton(text)
+                text_color = "white" if color_hex not in ("none", "white", "#ffffff", "transparent") else "black"
+                bg_color = "transparent" if color_hex == "none" else color_hex
+                btn.setStyleSheet(f"background-color: {bg_color}; color: {text_color}; font-size: 11px; padding: 4px; border: 1px solid #555; border-radius: 2px;")
+                btn.clicked.connect(lambda _, ln=layer_name, idx=label_idx: self._select_brush(ln, idx))
+                return btn
+
+            dead_row = QHBoxLayout()
+            dead_row.addWidget(QLabel("<b>Dead</b>"), stretch=1)
+            layer_name = 'User Provided Labels (Dead)'
+            dead_row.addWidget(create_button("0: Eraser", "none", layer_name, 0))
+            dead_row.addWidget(create_button("1: Background", "#8b3a26", layer_name, 1))
+            dead_row.addWidget(create_button("2: Foreground", "#00ffff", layer_name, 2))
+            layout.addLayout(dead_row)
+
         layout.addLayout(button_row)
         layout.addStretch()
         self.setLayout(layout)
@@ -568,6 +586,28 @@ class AnnotationLegendTab(QWidget):
         if layer is None:
             return
 
+        layer.selected_label = label_idx
+        try:
+            layer.mode = "paint"
+        except Exception:
+            pass
+        try:
+            self.viewer.layers.selection.active = layer
+        except Exception:
+            try:
+                self.viewer.layers.selection = {layer}
+            except Exception:
+                pass
+
+    def _select_brush(self, layer_name, label_idx):
+        layer = None
+        for lyr in self.viewer.layers:
+            if lyr.name == layer_name:
+                layer = lyr
+                break
+        if layer is None:
+            return
+        
         layer.selected_label = label_idx
         try:
             layer.mode = "paint"
@@ -1353,7 +1393,7 @@ class ConvPaintTrainingWidget(QWidget):
             elif isinstance(item, (QHBoxLayout, QVBoxLayout, QGridLayout)):
                 root.addLayout(item)
 
-        # Tabs: legend first, then per-cell-type segmentation params, then Dead.
+        # Tabs: per-cell-type segmentation params, then Dead.
         seg_group = QGroupBox("Annotation & Segmentation")
         seg_layout = QVBoxLayout()
         self.tab_widget = QTabWidget()
@@ -1361,10 +1401,7 @@ class ConvPaintTrainingWidget(QWidget):
         self.tab_widget.tabBar().setExpanding(False)
         self.tab_widget.tabBar().setUsesScrollButtons(True)
 
-        self.legend_tab = AnnotationLegendTab(
-            self.viewer, self.label_map, has_death=self.has_death,
-        )
-        self.tab_widget.addTab(self.legend_tab, "Legend")
+        self.legend_tab = None
 
         per_tab_strategies = list(self.STRATEGIES) if self._per_cell_type_strategy else None
         for ct in self._tab_cell_types:
@@ -1435,18 +1472,7 @@ class ConvPaintTrainingWidget(QWidget):
         root.addWidget(self.log_box)
         root.addStretch()
 
-        scroll_content = QWidget()
-        scroll_content.setLayout(root)
-
-        scroll = QScrollArea()
-        scroll.setWidget(scroll_content)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-
-        outer = QVBoxLayout()
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
-        self.setLayout(outer)
+        self.setLayout(root)
 
     # ── Callbacks ───────────────────────────────────────────────────
 
