@@ -1972,12 +1972,12 @@ def _zero_dead_mask_under_segments(dead_mask_t, immune_arrays_t):
             
 def _calculate_dead_mask_single_timepoint(args):
     t, segments_path, dead_mask_path, immune_segments_dict = args
+    tcell_stack = np.asarray(load_image(segments_path)[t])
+    dead_mask_stack = np.asarray(load_image(dead_mask_path)[t])
+
     if immune_segments_dict:
         immune_arrays_t = {name: arr[t] for name, arr in immune_segments_dict.items()}
         dead_mask_stack = _zero_dead_mask_under_segments(dead_mask_stack, immune_arrays_t)
-
-    tcell_stack = np.asarray(load_image(segments_path)[t])
-    dead_mask_stack = np.asarray(load_image(dead_mask_path)[t])
 
     properties = pd.DataFrame(
         regionprops_table(

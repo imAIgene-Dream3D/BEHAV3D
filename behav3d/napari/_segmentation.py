@@ -3861,6 +3861,12 @@ class APOCWidget(QWidget):
             # clearing layers, so the subsequent checkbox rebuild can restore
             # the live UI state rather than a stale one-time stash.
             current_tab_cfg = self._collect_apoc_tab_config()
+            existing_apoc = self.metadata_loader.behav3d_parameters.get("apoc", {})
+            for key in list(current_tab_cfg.keys()):
+                if key.endswith("_channels") and not current_tab_cfg[key]:
+                    existing_val = existing_apoc.get(key)
+                    if existing_val:
+                        current_tab_cfg[key] = existing_val
             self._save_apoc_params_to_yaml(updated_apoc_params=current_tab_cfg)
             # Refresh the per-tab stash from the freshly written YAML so that
             # _on_training_channels_refreshed re-applies the correct channels.

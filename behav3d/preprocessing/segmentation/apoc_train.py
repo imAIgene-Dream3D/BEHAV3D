@@ -1422,9 +1422,10 @@ class CellTypeTab(QWidget):
                 cb.setChecked(checked)
                 self.chan_checkbox_layout.addWidget(cb)
                 self.channel_checkboxes.append(cb)
-        self._default_channel_names = [
-            cb.text() for cb in self.channel_checkboxes if cb.isChecked()
-        ]
+        if self.channel_checkboxes:
+            self._default_channel_names = [
+                cb.text() for cb in self.channel_checkboxes if cb.isChecked()
+            ]
 
     def get_config(self):
         """Return a dict with all current widget values."""
