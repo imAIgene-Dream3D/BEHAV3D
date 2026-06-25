@@ -1055,11 +1055,22 @@ class StateClassificationSubTab(QWidget):
         feats = [f for f, cb in getattr(self, "_timepoint_checkboxes", {}).items() if cb.isChecked()]
         bin_grps = [b for b, cb in getattr(self, "_bingrp_checkboxes", {}).items() if cb.isChecked()]
         log_feats = [f for f, cb in getattr(self, "_logscale_checkboxes", {}).items() if cb.isChecked()]
+
+        # Collect window-feature checkboxes and pass under the correct backend key.
+        win_feats = []
+        if self.chk_net_disp.isChecked():
+            win_feats.append("net_displacement")
+        if self.chk_straight.isChecked():
+            win_feats.append("straightness")
+        if self.chk_msd.isChecked():
+            win_feats.append("mean_square_displacement")
+
         out_dir = self._out_dir()
         lower_cap = self.spin_quant_lo.value()
         upper_cap = self.spin_quant_hi.value()
         return {
             "features": feats,
+            "additional_window_features": win_feats if win_feats else None,
             "binary_features_to_group": bin_grps,
             "output_dir": str(out_dir) if out_dir else "",
             "cell_type": ct,
@@ -2014,7 +2025,14 @@ class TrackClassificationSubTab(QWidget):
     # ── Prerequisite check ───────────────────────────────────────────────
 
     def _check_prerequisites(self) -> bool:
-        """Check if behavioral states h5ad exists; show warning and disable steps if not."""
+        """Check if behavioral states h5ad exists; conditionally enable/disable steps.
+
+        - If state adata is absent: Step 1 (grp1) stays enabled but is locked into
+          'original BEHAV3D DTW' mode (chk_use_original forced True + disabled).
+          Steps 2-5 are disabled since they all require state adata.
+        - If state adata is present: all steps enabled; if the checkbox was previously
+          force-locked, it is automatically unchecked and re-enabled (standard mode).
+        """
         ct = self._cell_type()
         out = self._out_dir()
         if not ct or not out:
@@ -2025,17 +2043,38 @@ class TrackClassificationSubTab(QWidget):
         if not states_path or not states_path.exists():
             self.warning_label.setText(
                 f"⚠ Behavioral states not found for cell type '{ct}'.\n"
-                "Run State Classification first, then return here.\n"
-                # f"Expected: {states_path}"  ## Removed: Too long for display
+                "Run State Classification first to unlock all steps.\n"
+                "You can still run the original BEHAV3D DTW clustering (Step 1) below."
             )
             self.warning_label.show()
-            for grp in [self.grp1, self.grp2, self.grp3, self.grp4, self.grp_bp]:
+
+            # Step 1 stays available, but lock into 'original DTW' mode.
+            self.grp1.setEnabled(True)
+            for grp in [self.grp2, self.grp3, self.grp4, self.grp_bp]:
                 grp.setEnabled(False)
+
+            # Force 'use original' on and prevent the user from unchecking it.
+            for chk in (self.chk_use_original, self.chk_use_original_top):
+                chk.blockSignals(True)
+                chk.setChecked(True)
+                chk.setEnabled(False)
+                chk.blockSignals(False)
+            self._apply_original_mode(True)
+
             return False
         else:
             self.warning_label.hide()
             for grp in [self.grp1, self.grp2, self.grp3, self.grp4, self.grp_bp]:
                 grp.setEnabled(True)
+
+            # Re-enable the checkboxes and revert to standard mode automatically.
+            for chk in (self.chk_use_original, self.chk_use_original_top):
+                chk.blockSignals(True)
+                chk.setChecked(False)
+                chk.setEnabled(True)
+                chk.blockSignals(False)
+            self._apply_original_mode(False)
+
             return True
 
     # ── Toggle helpers ───────────────────────────────────────────────────
