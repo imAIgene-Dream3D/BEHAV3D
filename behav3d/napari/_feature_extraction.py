@@ -265,17 +265,101 @@ def _load_raw_dask(sample_row: pd.Series, output_dir: Path):
     return None
 
 
+def _clean_dead_frame(dead_frame, immune_segs_dict, frame_idx):
+    """Zero dead-mask voxels under immune segments for a single timepoint.
+
+    Parameters
+    ----------
+    dead_frame : array-like
+        3-D dead mask volume (Z, Y, X) for one timepoint (already materialized).
+    immune_segs_dict : dict[str, array-like]
+        Mapping of immune cell type name -> full (T, Z, Y, X) segment array
+        (may be lazy/dask). Only the slice at *frame_idx* is materialized.
+    frame_idx : int
+        Timepoint index to extract from each immune segment array.
+
+    Returns
+    -------
+    np.ndarray
+        Cleaned dead mask (same shape as input).
+    """
+    cleaned = np.array(dead_frame, copy=True)
+    for _name, im_arr in immune_segs_dict.items():
+        try:
+            im_frame = np.asarray(im_arr[frame_idx])
+        except (IndexError, Exception):
+            continue
+        if im_frame.ndim > 3:
+            im_frame = im_frame[0]
+        if im_frame.shape != cleaned.shape:
+            continue
+        cleaned[im_frame > 0] = 0
+    return cleaned
+
+
+def _merge_org_segments_frame(segs_dict, org_cell_types, frame_idx):
+    """Merge organoid segment arrays for a single timepoint.
+
+    Like :func:`_merge_org_segments` but only materializes the slice at
+    *frame_idx* from each (potentially lazy) segment array.
+
+    Returns
+    -------
+    merged_vol : np.ndarray (Z, Y, X) | None
+    label_type_map : dict  merged_label -> (cell_type, original_label)
+    """
+    available = [ct for ct in org_cell_types if ct in segs_dict]
+    if not available:
+        return None, {}
+
+    def _get_frame(arr, fidx):
+        vol = np.asarray(arr[fidx])
+        if vol.ndim > 3:
+            vol = vol[0]
+        return vol.astype(np.int32)
+
+    if len(available) == 1:
+        ct = available[0]
+        vol = _get_frame(segs_dict[ct], frame_idx)
+        label_map = {int(lbl): (ct, int(lbl)) for lbl in np.unique(vol) if lbl > 0}
+        return vol, label_map
+
+    ref = _get_frame(segs_dict[available[0]], frame_idx)
+    merged = np.zeros(ref.shape, dtype=np.int32)
+    label_map = {}
+    offset = 0
+    for ct in available:
+        vol = _get_frame(segs_dict[ct], frame_idx)
+        if vol.shape != merged.shape:
+            continue
+        max_lbl = int(vol.max()) if vol.size > 0 else 0
+        for lbl in np.unique(vol):
+            if lbl <= 0:
+                continue
+            label_map[int(lbl + offset)] = (ct, int(lbl))
+        shifted = np.where(vol > 0, vol + offset, 0)
+        merged = np.where(shifted > 0, shifted, merged)
+        offset += max_lbl + 1
+    return merged, label_map
+
+
 def _load_all_segments_for_sample(
     sample_row: pd.Series,
     all_cell_types: list,
     output_dir: Path,
-) -> "tuple[dict[str, np.ndarray], dict[str, str]]":
+    lazy: bool = False,
+) -> "tuple[dict, dict[str, str]]":
     """Load segment arrays for every cell type that has data for *sample_row*.
 
-    Returns a dict mapping cell_type -> ndarray, typically:
+    Returns a dict mapping cell_type -> array, typically:
       - 4-D (T, Z, Y, X) for timelapse labels, or
       - 3-D (Z, Y, X) for single-volume labels.
     Missing or unreadable types are silently omitted.
+
+    When *lazy* is True the arrays are kept as dask (or whatever
+    ``load_image`` returns) instead of being materialized with
+    ``np.asarray``. This is useful for the preview where only one
+    timepoint at a time is needed.
 
     Segment source priority is tracked-first:
       1) metadata tracked path
@@ -285,7 +369,7 @@ def _load_all_segments_for_sample(
 
     Returns
     -------
-    segs : dict[str, np.ndarray]
+    segs : dict[str, array-like]
         Loaded segment arrays by cell type.
     sources : dict[str, str]
         Source tag per loaded cell type: "tracked" or "untracked".
@@ -296,9 +380,12 @@ def _load_all_segments_for_sample(
     sample_name = str(sample_row.get("sample_name", ""))
 
     def _normalize(arr):
+        if lazy:
+            if arr.ndim == 5:
+                return arr[:, 0, ...]
+            return arr
         arr_np = np.asarray(arr)
         if arr_np.ndim == 5:
-            # Defensive: collapse channel axis if present.
             arr_np = arr_np[:, 0, ...]
         return arr_np
 
@@ -401,6 +488,9 @@ def _overlay_for_volume(seg_vol, dead_vol, threshold_pct, frame_label="", log_fn
     -------
     overlay_vol : np.ndarray (uint8)
         Same shape as ``seg_vol``. 0 = bg, 1 = alive, 2 = dead.
+    pct_vol : np.ndarray (float32)
+        Same shape as ``seg_vol``. Each segment's voxels contain its
+        ``percentage_dead_mask / 100`` (range 0.0–1.0). Background is 0.
     region_stats : list[dict]
         One entry per labelled segment with keys ``label``, ``centroid``,
         ``pct_dead``, ``extent_x``.
@@ -414,6 +504,7 @@ def _overlay_for_volume(seg_vol, dead_vol, threshold_pct, frame_label="", log_fn
         return datetime.datetime.now().strftime("%H:%M:%S")
 
     overlay_vol = np.zeros_like(seg_vol, dtype=np.uint8)
+    pct_vol = np.zeros_like(seg_vol, dtype=np.float32)
     dead_binary = dead_vol > 0
     region_stats = []
 
@@ -434,6 +525,7 @@ def _overlay_for_volume(seg_vol, dead_vol, threshold_pct, frame_label="", log_fn
         dead_pixels = int((mask & dead_binary).sum())
         pct = (dead_pixels / total_pixels) * 100.0
         overlay_vol[mask] = 2 if (pct >= threshold_pct and threshold_pct > 0) else 1
+        pct_vol[mask] = pct / 100.0
 
         bbox_min = region.bbox[:ndim]
         bbox_max = region.bbox[ndim:]
@@ -446,13 +538,13 @@ def _overlay_for_volume(seg_vol, dead_vol, threshold_pct, frame_label="", log_fn
                 "extent_x": extent_x,
             }
         )
-    return overlay_vol, region_stats
+    return overlay_vol, pct_vol, region_stats
 
 
 def _dead_alive_colormap():
     """Return a DirectLabelColormap for the Dead/Alive overlay, or ``None``."""
-    from napari.utils.colormaps import DirectLabelColormap
     try:
+        from napari.utils.colormaps import DirectLabelColormap
         return DirectLabelColormap(
             color_dict={
                 None: [0, 0, 0, 0],      # default for any unlisted label
@@ -461,147 +553,19 @@ def _dead_alive_colormap():
                 2:    [0.9, 0, 0, 0.6],  # dead → red
             }
         )
-    except Exception:
+    except Exception as exc:
+        print(f"[BEHAV3D] DirectLabelColormap failed ({exc}); will use fallback color dict")
         return None
 
 
-def _update_dead_alive_overlay(
-    viewer,
-    seg_data: np.ndarray,
-    dead_data: np.ndarray,
-    threshold_pct: float,
-    *,
-    frame_idx: int | None = None,
-    overlay_arr: np.ndarray | None = None,
-    layer_name: str = f"{_PREVIEW_PREFIX} Dead/Alive",
-    log_fn=None,
-):
-    """Compute the Dead/Alive overlay and update (or create) the labels layer.
-
-    On-demand single-frame mode
-    ---------------------------
-    For timelapse data (``seg_data.ndim >= 4``) only the timepoint indexed by
-    ``frame_idx`` is computed. ``overlay_arr`` is an in/out full ``T,Z,Y,X``
-    (uint8) array that is allocated lazily on the first call and re-used
-    across calls. Only the slice ``overlay_arr[frame_idx]`` is written; other
-    frames remain whatever the caller previously set them to (typically zero
-    = transparent until that frame is visited).
-
-    For non-timelapse data (3D), behavior is the historical "single shot":
-    the whole volume is computed in one go.
-
-    Labels
-    ------
-    0  transparent (background)
-    1  green  (alive)
-    2  red    (dead)
-
-    Returns
-    -------
-    overlay_arr : np.ndarray
-        The full overlay array passed in (timelapse) or freshly computed (3D).
-    frame_stats : list[dict]
-        For timelapse mode: region stats for the single computed frame.
-        For 3D mode: region stats for the whole volume.
-    """
-    import datetime
-
-    def _ts():
-        return datetime.datetime.now().strftime("%H:%M:%S")
-
-    seg_arr = np.asarray(seg_data)
-    dead_arr = np.asarray(dead_data)
-
-    is_timelapse = seg_arr.ndim >= 4
-
-    if is_timelapse:
-        if dead_arr.ndim == 3:
-            dead_arr = np.repeat(dead_arr[np.newaxis, ...], seg_arr.shape[0], axis=0)
-        t_common = min(seg_arr.shape[0], dead_arr.shape[0])
-
-        if frame_idx is None:
-            frame_idx = 0
-        frame_idx = int(frame_idx)
-        if frame_idx < 0:
-            frame_idx = 0
-        if frame_idx >= t_common:
-            frame_idx = t_common - 1
-
-        overlay_shape = tuple(seg_arr[:t_common].shape)
-        if overlay_arr is None:
-            overlay_arr = np.zeros(overlay_shape, dtype=np.uint8)
-        elif overlay_arr.shape != overlay_shape:
-            overlay_arr = np.zeros(overlay_shape, dtype=np.uint8)
-
-        seg_vol = np.asarray(seg_arr[frame_idx])
-        dead_vol = np.asarray(dead_arr[frame_idx])
-        if seg_vol.ndim > 3:
-            seg_vol = seg_vol[0]
-        if dead_vol.ndim > 3:
-            dead_vol = dead_vol[0]
-        if dead_vol.ndim < seg_vol.ndim:
-            dead_vol = np.broadcast_to(dead_vol, seg_vol.shape)
-
-        print(
-            f"[{_ts()}] [Preview] Dead/Alive overlay (on-demand): "
-            f"frame={frame_idx}/{t_common - 1}, threshold={threshold_pct:.2f}%"
-        )
-        overlay_t, stats_t = _overlay_for_volume(
-            seg_vol, dead_vol, threshold_pct,
-            frame_label=f" t={frame_idx}", log_fn=log_fn,
-        )
-        overlay_arr[frame_idx] = overlay_t
-        n_dead = sum(
-            1 for r in stats_t
-            if r["pct_dead"] >= threshold_pct and threshold_pct > 0
-        )
-        print(
-            f"[{_ts()}] [Preview]   t={frame_idx} done — "
-            f"{len(stats_t)} cells, {n_dead} dead"
-        )
-        overlay = overlay_arr
-        frame_stats = stats_t
-    else:
-        seg_vol = np.asarray(seg_arr)
-        dead_vol = np.asarray(dead_arr)
-        if dead_vol.ndim > seg_vol.ndim:
-            dead_vol = dead_vol.max(axis=0)
-        if dead_vol.ndim < seg_vol.ndim:
-            dead_vol = np.broadcast_to(dead_vol, seg_vol.shape)
-        print(
-            f"[{_ts()}] [Preview] Dead/Alive overlay: single volume, "
-            f"threshold={threshold_pct:.2f}%"
-        )
-        overlay, stats_0 = _overlay_for_volume(
-            seg_vol, dead_vol, threshold_pct, frame_label="", log_fn=log_fn,
-        )
-        n_dead = sum(
-            1 for r in stats_0
-            if r["pct_dead"] >= threshold_pct and threshold_pct > 0
-        )
-        print(f"[{_ts()}] [Preview]   Done — {len(stats_0)} cells, {n_dead} dead")
-        frame_stats = stats_0
-
-    cmap = _dead_alive_colormap()
-
-    print(f"[{_ts()}] [Preview] Updating Dead/Alive layer in viewer…")
+def _apply_dead_alive_colors(layer):
+    """Apply dead/alive colors directly to a labels layer (fallback when
+    DirectLabelColormap is unavailable)."""
     try:
-        layer = viewer.layers[layer_name]
-        # In timelapse mode the layer already references ``overlay_arr`` (same
-        # object), so the in-place slice write above is enough; just refresh.
-        # In 3D mode we replace ``layer.data`` with the freshly computed array.
-        if not is_timelapse or layer.data is not overlay:
-            layer.data = overlay
-        layer.opacity = 1.0
-        layer.refresh()
-    except (KeyError, ValueError):
-        kw = dict(name=layer_name, opacity=1.0)
-        if cmap is not None:
-            kw["colormap"] = cmap
-        viewer.add_labels(overlay, **kw)
+        layer.color = {1: (0, 0.8, 0, 0.6), 2: (0.9, 0, 0, 0.6)}
+    except Exception:
+        pass
 
-    print(f"[{_ts()}] [Preview] Dead/Alive layer ready.")
-    return overlay, frame_stats
 
 
 def _remove_layer_if_exists(viewer, layer_name: str):
@@ -611,6 +575,27 @@ def _remove_layer_if_exists(viewer, layer_name: str):
     except Exception:
         pass
 
+
+def _remove_preview_layers(viewer) -> int:
+    """Remove every layer whose name starts with the preview prefix and
+    force a canvas refresh to clear stale GPU textures."""
+    if viewer is None:
+        return 0
+    to_remove = [
+        layer for layer in list(viewer.layers)
+        if (getattr(layer, "name", "") or "").startswith(_PREVIEW_PREFIX)
+    ]
+    for layer in to_remove:
+        try:
+            viewer.layers.remove(layer)
+        except Exception:
+            pass
+    if to_remove:
+        try:
+            viewer.reset_view()
+        except Exception:
+            pass
+    return len(to_remove)
 
 
 def _build_dead_pct_map(region_stats):
@@ -721,19 +706,22 @@ class CellTypeFeaturePanel(QWidget):
         # Cached arrays for live overlay updates
         self._preview_seg_t = None
         self._preview_dead_t = None
+        self._preview_segs_dict: dict = {}
+        self._preview_immune_segs: dict = {}
         # merged_label_id -> (cell_type, original_label_id)  — organoid panels
         self._preview_label_type_map: dict = {}
         self._preview_hover_callback = None
 
-        # On-demand per-timepoint caches (populated lazily as the user
-        # navigates the napari time slider or changes the threshold).
-        # ``_preview_overlay_arr`` is the full T,Z,Y,X (or 3D) uint8 array
-        # that backs the Dead/Alive labels layer — slices are filled in
-        # place as frames are visited.
-        self._preview_overlay_arr = None
+        # Per-frame caches for the dead-threshold preview.
+        # Overlay/pct arrays hold only the CURRENT frame (Z,Y,X) and are
+        # replaced entirely when the user navigates to a different timepoint.
+        self._preview_overlay_arr = None    # uint8  (Z,Y,X) — current frame
+        self._preview_pct_overlay_arr = None # float32 (Z,Y,X) — current frame
+        self._preview_current_frame: int | None = None
         self._preview_pct_maps_by_frame: dict = {}
         self._preview_stats_by_frame: dict = {}
         self._preview_computed_frames: set = set()
+        self._preview_pct_computed_frames: set = set()
         self._preview_current_thr: float | None = None
         self._preview_dims_callback = None
         self._preview_is_timelapse: bool = False
@@ -1099,6 +1087,29 @@ class CellTypeFeaturePanel(QWidget):
             pass
         self._preview_dims_callback = None
 
+    def _cleanup_preview(self):
+        """Disconnect all preview callbacks and reset cached preview state.
+
+        Does NOT remove layers — the caller handles that via
+        ``_remove_preview_layers``.
+        """
+        self._disconnect_preview_dead_hover()
+        self._disconnect_preview_dims()
+        self._preview_seg_t = None
+        self._preview_dead_t = None
+        self._preview_segs_dict = {}
+        self._preview_immune_segs = {}
+        self._preview_label_type_map = {}
+        self._preview_overlay_arr = None
+        self._preview_pct_overlay_arr = None
+        self._preview_current_frame = None
+        self._preview_pct_maps_by_frame = {}
+        self._preview_stats_by_frame = {}
+        self._preview_computed_frames = set()
+        self._preview_pct_computed_frames = set()
+        self._preview_current_thr = None
+        self._preview_is_timelapse = False
+
     def _connect_preview_dims(self):
         """Connect a viewer.dims.current_step listener that triggers an
         on-demand recomputation for whatever frame the slider moved to.
@@ -1145,13 +1156,12 @@ class CellTypeFeaturePanel(QWidget):
 
         def _segment_label_at(position, frame_idx: int) -> int:
             try:
-                seg_arr = np.asarray(seg_data)
-                if seg_arr.ndim >= 4:
-                    if frame_idx < 0 or frame_idx >= seg_arr.shape[0]:
+                if seg_data.ndim >= 4:
+                    if frame_idx < 0 or frame_idx >= seg_data.shape[0]:
                         return 0
-                    seg_vol = np.asarray(seg_arr[frame_idx])
+                    seg_vol = np.asarray(seg_data[frame_idx])
                 else:
-                    seg_vol = np.asarray(seg_arr)
+                    seg_vol = np.asarray(seg_data)
                 if seg_vol.ndim > 3:
                     seg_vol = seg_vol[0]
 
@@ -1186,6 +1196,22 @@ class CellTypeFeaturePanel(QWidget):
         # Capture label-type map so the closure always uses the current map
         _label_type_map = getattr(self, "_preview_label_type_map", {})
 
+        def _pct_at_cursor(position):
+            """Read dead % directly from pct_overlay_arr at cursor position."""
+            pct_arr = self._preview_pct_overlay_arr
+            if pct_arr is None:
+                return None
+            try:
+                da_layer = self.viewer.layers[layer_name]
+                data_pos = da_layer.world_to_data(position)
+                coords = tuple(int(round(float(c))) for c in data_pos[-pct_arr.ndim:])
+                for i, c in enumerate(coords):
+                    if c < 0 or c >= pct_arr.shape[i]:
+                        return None
+                return float(pct_arr[coords]) * 100.0
+            except Exception:
+                return None
+
         def _on_mouse_move(*args):
             """Works with both napari ≤0.4.18 (event,) and ≥0.4.19 (viewer,event)."""
             if self.viewer is None:
@@ -1204,11 +1230,12 @@ class CellTypeFeaturePanel(QWidget):
                 _hide_tooltip()
                 return
 
-            # Look up the per-frame pct map (may be missing if the user is
-            # hovering before the on-demand recompute for this frame has
-            # finished — in that case fall back to the label only).
-            frame_map = self._preview_pct_maps_by_frame.get(frame_idx)
-            pct_dead = frame_map.get(label_id) if frame_map else None
+            # Read percentage directly from pct_overlay_arr (same data as
+            # the % Dead Mask layer) to guarantee matching values.
+            if frame_idx == self._preview_current_frame:
+                pct_dead = _pct_at_cursor(position)
+            else:
+                pct_dead = None
             # Resolve cell type + original label from merged organoid map
             type_info = _label_type_map.get(label_id)
             if type_info is not None:
@@ -1240,14 +1267,52 @@ class CellTypeFeaturePanel(QWidget):
             return 0
 
     def _invalidate_preview_cache(self):
-        """Drop all cached per-frame overlays/stats (e.g. on threshold change)."""
+        """Drop cached Dead/Alive overlays on threshold change.
+
+        The ``% Dead Mask`` layer is threshold-independent so its cached frames
+        (``_preview_pct_computed_frames``) are preserved.
+        """
         self._preview_computed_frames.clear()
         self._preview_pct_maps_by_frame.clear()
         self._preview_stats_by_frame.clear()
-        if self._preview_overlay_arr is not None:
-            # Zero so previously-visited frames don't render with stale colors
-            # until they are recomputed at the new threshold.
-            self._preview_overlay_arr.fill(0)
+        self._preview_overlay_arr = None
+        self._preview_current_frame = None
+
+    def _materialize_frame(self, frame_idx):
+        """Materialize segment + dead mask for a single timepoint.
+
+        Handles per-frame immune cleaning and organoid merging so that the
+        caller receives ready-to-use 3-D numpy arrays.
+
+        Returns ``(seg_vol, dead_vol, label_type_map)``.
+        """
+        dead_data = self._preview_dead_t
+        immune_segs = getattr(self, "_preview_immune_segs", {})
+
+        # Dead mask — materialize single frame + clean
+        dead_vol = np.asarray(dead_data[frame_idx])
+        if dead_vol.ndim > 3:
+            dead_vol = dead_vol[0]
+        if immune_segs:
+            dead_vol = _clean_dead_frame(dead_vol, immune_segs, frame_idx)
+
+        # Segments — per-frame organoid merge or direct frame extraction
+        segs_dict = getattr(self, "_preview_segs_dict", None)
+        label_type_map = {}
+        if self._is_organoid and self._org_cell_types and segs_dict:
+            seg_vol, label_type_map = _merge_org_segments_frame(
+                segs_dict, self._org_cell_types, frame_idx
+            )
+            if seg_vol is None:
+                seg_vol = np.asarray(self._preview_seg_t[frame_idx])
+        else:
+            seg_vol = np.asarray(self._preview_seg_t[frame_idx])
+
+        if seg_vol.ndim > 3:
+            seg_vol = seg_vol[0]
+        if dead_vol.ndim < seg_vol.ndim:
+            dead_vol = np.broadcast_to(dead_vol, seg_vol.shape)
+        return seg_vol, dead_vol, label_type_map
 
     def _refresh_preview_dead_layers(
         self,
@@ -1256,12 +1321,8 @@ class CellTypeFeaturePanel(QWidget):
     ):
         """Compute (or refresh) the Dead/Alive overlay for a single timepoint.
 
-        Parameters
-        ----------
-        value : float | None
-            New threshold value. If ``None``, uses the panel's spinner value.
-        frame_idx : int | None
-            Timepoint to compute. If ``None``, uses the viewer's current step.
+        Data is materialized on-demand: only the requested frame is loaded
+        from the lazy (dask) source arrays.
         """
         viewer = self.viewer
         if (
@@ -1273,7 +1334,7 @@ class CellTypeFeaturePanel(QWidget):
 
         thr = self._get_threshold() if value is None else round(float(value), 2)
 
-        # Threshold changed -> invalidate every cached frame
+        # Threshold changed -> invalidate Dead/Alive cache (pct is kept)
         if self._preview_current_thr is None or thr != self._preview_current_thr:
             self._invalidate_preview_cache()
             self._preview_current_thr = thr
@@ -1282,19 +1343,20 @@ class CellTypeFeaturePanel(QWidget):
             frame_idx = self._current_viewer_frame() if self._preview_is_timelapse else 0
         frame_idx = int(frame_idx)
 
-        # Fast path: this frame is already computed at the current threshold
-        if frame_idx in self._preview_computed_frames:
+        # Fast path: same frame + same threshold → just refresh layers
+        if (
+            frame_idx == self._preview_current_frame
+            and frame_idx in self._preview_computed_frames
+        ):
             try:
-                layer = viewer.layers[f"{_PREVIEW_PREFIX} Dead/Alive"]
-                layer.refresh()
+                viewer.layers[f"{_PREVIEW_PREFIX} Dead/Alive"].refresh()
+            except Exception:
+                pass
+            try:
+                viewer.layers[f"{_PREVIEW_PREFIX} % Dead Mask"].refresh()
             except Exception:
                 pass
             self._attach_preview_dead_hover()
-            if self._is_organoid and self._org_preview_cache is not None:
-                self._org_preview_cache["stats_by_frame"] = self._preview_stats_by_frame
-                self._org_preview_cache["pct_maps_by_frame"] = self._preview_pct_maps_by_frame
-                self._org_preview_cache["computed_frames"] = self._preview_computed_frames
-                self._org_preview_cache["current_thr"] = thr
             return
 
         import datetime
@@ -1303,21 +1365,66 @@ class CellTypeFeaturePanel(QWidget):
             f"Refreshing Dead/Alive overlay — threshold={thr:.2f}% "
             f"(frame={frame_idx}, {self.cell_type})"
         )
-        overlay_arr, frame_stats = _update_dead_alive_overlay(
-            viewer, self._preview_seg_t, self._preview_dead_t, thr,
-            frame_idx=frame_idx if self._preview_is_timelapse else None,
-            overlay_arr=self._preview_overlay_arr if self._preview_is_timelapse else None,
-            log_fn=self.log,
+
+        # Materialize only this frame (lazy → numpy, clean, merge)
+        seg_vol, dead_vol, label_type_map = self._materialize_frame(frame_idx)
+        if label_type_map:
+            self._preview_label_type_map = label_type_map
+
+        overlay_t, pct_t, frame_stats = _overlay_for_volume(
+            seg_vol, dead_vol, thr,
+            frame_label=f" t={frame_idx}", log_fn=self.log,
         )
-        if self._preview_is_timelapse:
-            self._preview_overlay_arr = overlay_arr
+
+        # Store single-frame (Z,Y,X) arrays and replace layer data
+        self._preview_overlay_arr = overlay_t
+        self._preview_pct_overlay_arr = pct_t
+        self._preview_current_frame = frame_idx
+
+        cmap = _dead_alive_colormap()
+        da_name = f"{_PREVIEW_PREFIX} Dead/Alive"
+        try:
+            layer = viewer.layers[da_name]
+            layer.data = overlay_t
+            layer.opacity = 1.0
+            if cmap is not None:
+                layer.colormap = cmap
+            else:
+                _apply_dead_alive_colors(layer)
+            layer.refresh()
+        except (KeyError, ValueError):
+            kw = dict(name=da_name, opacity=1.0)
+            if cmap is not None:
+                kw["colormap"] = cmap
+            layer = viewer.add_labels(overlay_t, **kw)
+            if cmap is None:
+                _apply_dead_alive_colors(layer)
+
+        pct_name = f"{_PREVIEW_PREFIX} % Dead Mask"
+        try:
+            pct_layer = viewer.layers[pct_name]
+            pct_layer.data = pct_t
+            pct_layer.refresh()
+        except (KeyError, ValueError):
+            viewer.add_image(
+                pct_t,
+                name=pct_name,
+                colormap="inferno",
+                contrast_limits=(0, 1),
+                blending="translucent",
+                opacity=0.7,
+                visible=False,
+            )
+
         self._preview_stats_by_frame[frame_idx] = frame_stats
         self._preview_pct_maps_by_frame[frame_idx] = _build_dead_pct_map(frame_stats)
         self._preview_computed_frames.add(frame_idx)
+        self._preview_pct_computed_frames.add(frame_idx)
         self._attach_preview_dead_hover()
 
         if self._is_organoid and self._org_preview_cache is not None:
             self._org_preview_cache["overlay_arr"] = self._preview_overlay_arr
+            self._org_preview_cache["pct_overlay_arr"] = self._preview_pct_overlay_arr
             self._org_preview_cache["stats_by_frame"] = self._preview_stats_by_frame
             self._org_preview_cache["pct_maps_by_frame"] = self._preview_pct_maps_by_frame
             self._org_preview_cache["computed_frames"] = self._preview_computed_frames
@@ -1696,7 +1803,7 @@ class CellTypeFeaturePanel(QWidget):
             print(f"[{_ts()}] [Preview] Dead threshold preview: {self.cell_type} / {sample_name}")
             print(f"[{_ts()}] [Preview] {'='*46}")
 
-            # Resolve dead mask (with diagnostic logging)
+            # Resolve dead mask (with diagnostic logging) \u2014 kept lazy (dask)
             print(f"[{_ts()}] [Preview] Step 1/5 \u2014 Resolving dead mask...")
             dead_arr, dead_method, tried_paths = _resolve_dead_mask(
                 sample_row, output_dir, log_fn=self.log
@@ -1709,12 +1816,23 @@ class CellTypeFeaturePanel(QWidget):
                     + "\nRun dead mask segmentation first (Segmentation tab)."
                 )
                 return
-            print(f"[{_ts()}] [Preview]   Dead mask loaded (method={dead_method}).")
+            print(f"[{_ts()}] [Preview]   Dead mask loaded (method={dead_method}, shape={dead_arr.shape}).")
             if dead_method == "raw":
                 self.log(
                     "\u2139\ufe0f Dead mask estimated from raw dead channel (Otsu). "
                     "Run dedicated dead mask segmentation for best results."
                 )
+
+            # Ensure dead mask is at least 4-D for consistent frame indexing
+            import dask.array as da
+            if dead_arr.ndim == 2:
+                dead_arr = dead_arr[np.newaxis, np.newaxis, ...]
+                if not isinstance(dead_arr, da.Array):
+                    dead_arr = da.from_array(dead_arr)
+            elif dead_arr.ndim == 3:
+                dead_arr = dead_arr[np.newaxis, ...]
+                if not isinstance(dead_arr, da.Array):
+                    dead_arr = da.from_array(dead_arr)
 
             # Load raw image (all channels, lazy)
             print(f"[{_ts()}] [Preview] Step 2/5 \u2014 Loading raw image (lazy)...")
@@ -1724,18 +1842,17 @@ class CellTypeFeaturePanel(QWidget):
             else:
                 print(f"[{_ts()}] [Preview]   Raw image not found \u2014 skipping channel layers.")
 
-            # Collect ALL available segments for this sample
+            # Collect ALL available segments \u2014 lazy (dask) for per-frame access
             all_types = getattr(self, "all_cell_types", [self.cell_type])
             print(
-                f"[{_ts()}] [Preview] Step 3/5 \u2014 Loading segments for "
+                f"[{_ts()}] [Preview] Step 3/5 \u2014 Loading segments (lazy) for "
                 f"{len(all_types)} type(s): {all_types}..."
             )
             segs_dict, seg_sources = _load_all_segments_for_sample(
-                sample_row, all_types, output_dir
+                sample_row, all_types, output_dir, lazy=True
             )
             for ct, arr in segs_dict.items():
-                shape_str = str(np.asarray(arr).shape)
-                print(f"[{_ts()}] [Preview]   {ct}: shape={shape_str}, source={seg_sources.get(ct,'?')}")
+                print(f"[{_ts()}] [Preview]   {ct}: shape={arr.shape}, source={seg_sources.get(ct,'?')}")
             if self.cell_type not in segs_dict:
                 print(f"[{_ts()}] [Preview] \u274c No segments for '{self.cell_type}' \u2014 aborting.")
                 self.log(
@@ -1744,11 +1861,34 @@ class CellTypeFeaturePanel(QWidget):
                 )
                 return
 
-            # Clear all viewer layers entirely
-            print(f"[{_ts()}] [Preview] Clearing viewer layers...")
-            self._disconnect_preview_dead_hover()
-            self._disconnect_preview_dims()
-            self.viewer.layers.clear()
+            # Build immune segments dict for per-frame dead mask cleaning
+            from behav3d.core.metadata import detect_immune_cell_types_from_metadata
+            try:
+                all_immune_types = detect_immune_cell_types_from_metadata(
+                    self.metadata_loader.metadata
+                ) or []
+            except Exception:
+                all_immune_types = []
+            if self.cell_type not in all_immune_types:
+                immune_segs_for_cleaning = {
+                    ct: segs_dict[ct]
+                    for ct in all_immune_types
+                    if ct in segs_dict and ct != self.cell_type
+                }
+            else:
+                immune_segs_for_cleaning = {}
+            if immune_segs_for_cleaning:
+                self.log(
+                    f"  [Preview] Dead mask will be cleaned per-frame under immune "
+                    f"segments {list(immune_segs_for_cleaning.keys())}"
+                )
+
+            # Remove previous preview layers (preserves non-preview layers)
+            print(f"[{_ts()}] [Preview] Clearing preview layers...")
+            self._cleanup_preview()
+            n_removed = _remove_preview_layers(self.viewer)
+            if n_removed:
+                print(f"[{_ts()}] [Preview]   Removed {n_removed} previous preview layer(s).")
 
             # Raw channels
             if raw_dask is not None:
@@ -1758,59 +1898,14 @@ class CellTypeFeaturePanel(QWidget):
             else:
                 self.log("  \u26a0\ufe0f Could not load raw image.")
 
-            # Dead mask layer (timelapse-aware)
-            dead_stack = np.asarray(dead_arr)
-            if dead_stack.ndim == 2:
-                dead_stack = dead_stack[np.newaxis, np.newaxis, ...]
-            elif dead_stack.ndim == 3:
-                dead_stack = dead_stack[np.newaxis, ...]
-            print(f"[{_ts()}] [Preview]   Dead mask stack shape: {dead_stack.shape}")
-
-            # Mirror the feature-extraction-time cleaning: when the previewed
-            # cell type is NOT itself an immune type, zero dead-mask voxels
-            # that fall inside any immune segment available for this sample.
-            from behav3d.core.metadata import detect_immune_cell_types_from_metadata
-            try:
-                all_immune_types = detect_immune_cell_types_from_metadata(
-                    self.metadata_loader.metadata
-                ) or []
-            except Exception:
-                all_immune_types = []
-            immune_types_present = [
-                ct for ct in all_immune_types if ct in segs_dict and ct != self.cell_type
-            ]
-            if self.cell_type not in all_immune_types and immune_types_present:
-                any_immune = np.zeros(dead_stack.shape, dtype=bool)
-                for im_type in immune_types_present:
-                    im_arr = np.asarray(segs_dict[im_type])
-                    if im_arr.ndim == 2:
-                        im_arr = im_arr[np.newaxis, np.newaxis, ...]
-                    elif im_arr.ndim == 3:
-                        im_arr = im_arr[np.newaxis, ...]
-                    if im_arr.shape != dead_stack.shape:
-                        print(
-                            f"[{_ts()}] [Preview]   Skipping immune '{im_type}' for "
-                            f"dead-mask cleaning (shape {im_arr.shape} != {dead_stack.shape})."
-                        )
-                        continue
-                    any_immune |= (im_arr > 0)
-                if any_immune.any():
-                    dead_stack = np.where(any_immune, 0, dead_stack)
-                    self.log(
-                        "  [Preview] Cleaned dead mask: zeroed voxels under immune "
-                        f"segments {immune_types_present}"
-                    )
-                    print(
-                        f"[{_ts()}] [Preview]   Cleaned dead mask: zeroed voxels under "
-                        f"immune segments {immune_types_present}"
-                    )
-
+            # Dead mask display layer (raw dask \u2014 napari renders lazily)
             viewer.add_image(
-                dead_stack.astype(float),
+                dead_arr,
                 name=f"{_PREVIEW_PREFIX} Dead Mask",
                 colormap="magenta",
                 blending="additive",
                 opacity=0.4,
+                visible=False,
             )
 
             # All segment layers (this type full opacity, others lighter)
@@ -1835,32 +1930,20 @@ class CellTypeFeaturePanel(QWidget):
                 )
             )
 
-            # For organoid panels: merge ALL organoid types into a single
-            # segmentation so the Dead/Alive overlay covers every organoid type.
-            # The shared threshold applies equally to all.
+            # Store for per-frame organoid merge (no upfront materialization)
             if self._is_organoid and self._org_cell_types:
-                print(
-                    f"[{_ts()}] [Preview] Step 4/5 \u2014 Merging "
-                    f"{len(self._org_cell_types)} organoid type(s)..."
-                )
-                overlay_seg, label_type_map = _merge_org_segments(
-                    segs_dict, self._org_cell_types
-                )
-                if overlay_seg is None:
-                    overlay_seg = primary_seg
-                    label_type_map = {}
-                self._preview_label_type_map = label_type_map
                 org_names = [ct for ct in self._org_cell_types if ct in segs_dict]
-                n_labels = len(label_type_map)
-                print(f"[{_ts()}] [Preview]   Merged: {len(org_names)} type(s), {n_labels} total labels")
+                print(
+                    f"[{_ts()}] [Preview] Step 4/5 \u2014 "
+                    f"{len(org_names)} organoid type(s) will be merged per-frame."
+                )
                 self.log(
                     f"  Dead/Alive overlay merges {len(org_names)} organoid type(s): "
                     + ", ".join(org_names)
                 )
             else:
                 print(f"[{_ts()}] [Preview] Step 4/5 \u2014 Single type ({self.cell_type}), no merge needed.")
-                overlay_seg = primary_seg
-                self._preview_label_type_map = {}
+            self._preview_label_type_map = {}
 
             # Compute dead/alive overlay (on-demand: current frame only)
             thr = self._get_threshold()
@@ -1869,24 +1952,20 @@ class CellTypeFeaturePanel(QWidget):
                 f"on-demand for current frame (threshold={thr:.2f}%)..."
             )
 
-            # Cache the source arrays + reset per-frame caches
-            self._preview_seg_t = overlay_seg
-            self._preview_dead_t = dead_stack
+            # Cache the lazy source arrays + per-frame cleaning info
+            self._preview_seg_t = primary_seg
+            self._preview_segs_dict = segs_dict
+            self._preview_immune_segs = immune_segs_for_cleaning
+            self._preview_dead_t = dead_arr
             self._preview_overlay_arr = None
+            self._preview_pct_overlay_arr = None
             self._preview_pct_maps_by_frame = {}
             self._preview_stats_by_frame = {}
             self._preview_computed_frames = set()
+            self._preview_pct_computed_frames = set()
             self._preview_current_thr = None
 
-            overlay_seg_arr = np.asarray(overlay_seg)
-            self._preview_is_timelapse = overlay_seg_arr.ndim >= 4
-
-            # Pre-allocate the full overlay so the labels layer aligns with
-            # the time slider; on-demand frames are written in place.
-            if self._preview_is_timelapse:
-                t_common = min(overlay_seg_arr.shape[0], dead_stack.shape[0])
-                overlay_shape = tuple(overlay_seg_arr[:t_common].shape)
-                self._preview_overlay_arr = np.zeros(overlay_shape, dtype=np.uint8)
+            self._preview_is_timelapse = primary_seg.ndim >= 4
 
             # Tear down any previous time-slider listener and create the
             # layer/compute the current frame.
@@ -1896,12 +1975,16 @@ class CellTypeFeaturePanel(QWidget):
 
             # Organoid panels fill the shared tab cache too
             if self._is_organoid and self._org_preview_cache is not None:
-                self._org_preview_cache["seg_t"] = overlay_seg
-                self._org_preview_cache["dead_t"] = dead_stack
+                self._org_preview_cache["seg_t"] = primary_seg
+                self._org_preview_cache["segs_dict"] = segs_dict
+                self._org_preview_cache["immune_segs"] = immune_segs_for_cleaning
+                self._org_preview_cache["dead_t"] = dead_arr
                 self._org_preview_cache["overlay_arr"] = self._preview_overlay_arr
+                self._org_preview_cache["pct_overlay_arr"] = self._preview_pct_overlay_arr
                 self._org_preview_cache["pct_maps_by_frame"] = self._preview_pct_maps_by_frame
                 self._org_preview_cache["stats_by_frame"] = self._preview_stats_by_frame
                 self._org_preview_cache["computed_frames"] = self._preview_computed_frames
+                self._org_preview_cache["pct_computed_frames"] = self._preview_pct_computed_frames
                 self._org_preview_cache["current_thr"] = self._preview_current_thr
                 self._org_preview_cache["label_type_map"] = self._preview_label_type_map
                 self._org_preview_cache["is_timelapse"] = self._preview_is_timelapse
@@ -2925,6 +3008,30 @@ class FeatureExtractionTab(QWidget):
                     "Please wait for it to finish before switching tabs.",
                 )
                 return False
+
+        # All guards passed — clean up preview state before leaving
+        self._disconnect_org_preview_dims()
+        self._org_preview_cache.update({
+            "seg_t": None,
+            "dead_t": None,
+            "segs_dict": {},
+            "immune_segs": {},
+            "overlay_arr": None,
+            "pct_overlay_arr": None,
+            "stats_by_frame": {},
+            "pct_maps_by_frame": {},
+            "computed_frames": set(),
+            "pct_computed_frames": set(),
+            "current_thr": None,
+            "label_type_map": None,
+            "is_timelapse": False,
+        })
+        for panel in self.panels.values():
+            panel._cleanup_preview()
+        n_removed = _remove_preview_layers(self.viewer)
+        if n_removed:
+            self._log(f"Cleaned up {n_removed} preview layer(s).")
+
         return True
 
     def _detect_cell_types(self):
@@ -3154,28 +3261,27 @@ class FeatureExtractionTab(QWidget):
             self._org_preview_dims_callback = None
 
     def _invalidate_org_preview_cache(self):
-        """Drop per-frame caches and zero the shared overlay (e.g. on
-        threshold change), so the layer doesn't show stale colours for
-        previously-visited frames at the old threshold."""
+        """Drop per-frame caches on threshold change."""
         cache = self._org_preview_cache
         cache["computed_frames"] = set()
         cache["pct_maps_by_frame"] = {}
         cache["stats_by_frame"] = {}
-        overlay_arr = cache.get("overlay_arr")
-        if overlay_arr is not None:
-            overlay_arr.fill(0)
-        # Mirror invalidation onto every organoid panel
+        cache["overlay_arr"] = None
+        cache["pct_overlay_arr"] = None
         for ct, panel in self.panels.items():
             if ct in self._org_types:
                 panel._preview_computed_frames = cache["computed_frames"]
                 panel._preview_pct_maps_by_frame = cache["pct_maps_by_frame"]
                 panel._preview_stats_by_frame = cache["stats_by_frame"]
+                panel._preview_overlay_arr = None
+                panel._preview_pct_overlay_arr = None
+                panel._preview_current_frame = None
 
     def _refresh_org_preview_for_current_frame(self, thr: float | None = None):
         """Recompute the shared organoid Dead/Alive overlay for the
-        currently displayed timepoint (only). Propagates the resulting
-        per-frame caches to every organoid panel so hover tooltips stay
-        in sync."""
+        currently displayed timepoint (only). Materializes data lazily
+        per-frame. Propagates the resulting per-frame caches to every
+        organoid panel so hover tooltips stay in sync."""
         viewer = self.viewer
         cache = self._org_preview_cache
         if (
@@ -3186,7 +3292,6 @@ class FeatureExtractionTab(QWidget):
             return
 
         if thr is None:
-            # Use any organoid panel's current spinner value
             thr_val = None
             for ct, panel in self.panels.items():
                 if ct in self._org_types and panel.spin_dead_threshold is not None:
@@ -3198,7 +3303,6 @@ class FeatureExtractionTab(QWidget):
         else:
             thr = round(float(thr), 2)
 
-        # Threshold changed -> invalidate all cached frames
         cached_thr = cache.get("current_thr")
         if cached_thr is None or thr != cached_thr:
             self._invalidate_org_preview_cache()
@@ -3207,22 +3311,81 @@ class FeatureExtractionTab(QWidget):
         is_timelapse = bool(cache.get("is_timelapse"))
         frame_idx = self._current_viewer_frame() if is_timelapse else 0
 
-        # Fast path: already computed for this frame at the current threshold
         if frame_idx in cache["computed_frames"]:
             try:
                 viewer.layers[f"{_PREVIEW_PREFIX} Dead/Alive"].refresh()
             except Exception:
                 pass
+            try:
+                viewer.layers[f"{_PREVIEW_PREFIX} % Dead Mask"].refresh()
+            except Exception:
+                pass
             self._propagate_org_preview_to_panels()
             return
 
-        overlay_arr, frame_stats = _update_dead_alive_overlay(
-            viewer, cache["seg_t"], cache["dead_t"], thr,
-            frame_idx=frame_idx if is_timelapse else None,
-            overlay_arr=cache.get("overlay_arr") if is_timelapse else None,
+        # Materialize this frame: per-frame immune cleaning + org merge
+        segs_dict = cache.get("segs_dict", {})
+        immune_segs = cache.get("immune_segs", {})
+        dead_data = cache["dead_t"]
+        org_types = getattr(self, "_org_types", [])
+
+        dead_vol = np.asarray(dead_data[frame_idx])
+        if dead_vol.ndim > 3:
+            dead_vol = dead_vol[0]
+        if immune_segs:
+            dead_vol = _clean_dead_frame(dead_vol, immune_segs, frame_idx)
+
+        seg_vol, label_type_map = _merge_org_segments_frame(
+            segs_dict, org_types, frame_idx
         )
-        if is_timelapse:
-            cache["overlay_arr"] = overlay_arr
+        if seg_vol is None:
+            seg_vol = np.asarray(cache["seg_t"][frame_idx])
+            if seg_vol.ndim > 3:
+                seg_vol = seg_vol[0]
+            label_type_map = {}
+        if dead_vol.ndim < seg_vol.ndim:
+            dead_vol = np.broadcast_to(dead_vol, seg_vol.shape)
+        if label_type_map:
+            cache["label_type_map"] = label_type_map
+
+        overlay_t, pct_t, frame_stats = _overlay_for_volume(
+            seg_vol, dead_vol, thr, frame_label=f" t={frame_idx}",
+        )
+
+        # Store single-frame (Z,Y,X) arrays and replace layer data
+        cache["overlay_arr"] = overlay_t
+        cache["pct_overlay_arr"] = pct_t
+
+        cmap = _dead_alive_colormap()
+        da_name = f"{_PREVIEW_PREFIX} Dead/Alive"
+        try:
+            layer = viewer.layers[da_name]
+            layer.data = overlay_t
+            layer.opacity = 1.0
+            if cmap is not None:
+                layer.colormap = cmap
+            else:
+                _apply_dead_alive_colors(layer)
+            layer.refresh()
+        except (KeyError, ValueError):
+            kw = dict(name=da_name, opacity=1.0)
+            if cmap is not None:
+                kw["colormap"] = cmap
+            layer = viewer.add_labels(overlay_t, **kw)
+            if cmap is None:
+                _apply_dead_alive_colors(layer)
+
+        pct_name = f"{_PREVIEW_PREFIX} % Dead Mask"
+        try:
+            pct_layer = viewer.layers[pct_name]
+            pct_layer.data = pct_t
+            pct_layer.refresh()
+        except (KeyError, ValueError):
+            viewer.add_image(
+                pct_t, name=pct_name, colormap="inferno",
+                contrast_limits=(0, 1), blending="translucent", opacity=0.7,
+                visible=False,
+            )
 
         cache["stats_by_frame"][frame_idx] = frame_stats
         cache["pct_maps_by_frame"][frame_idx] = _build_dead_pct_map(frame_stats)
@@ -3238,12 +3401,15 @@ class FeatureExtractionTab(QWidget):
         for ct, panel in self.panels.items():
             if ct in self._org_types and panel._preview_seg_t is not None:
                 panel._preview_overlay_arr = cache.get("overlay_arr")
+                panel._preview_pct_overlay_arr = cache.get("pct_overlay_arr")
                 panel._preview_stats_by_frame = cache["stats_by_frame"]
                 panel._preview_pct_maps_by_frame = cache["pct_maps_by_frame"]
                 panel._preview_computed_frames = cache["computed_frames"]
                 panel._preview_current_thr = cache.get("current_thr")
                 panel._preview_label_type_map = label_type_map
                 panel._preview_is_timelapse = bool(cache.get("is_timelapse"))
+                panel._preview_segs_dict = cache.get("segs_dict", {})
+                panel._preview_immune_segs = cache.get("immune_segs", {})
                 panel._attach_preview_dead_hover()
 
     def _notify_organoid_threshold_changed(self, source_ct: str, value: float):
