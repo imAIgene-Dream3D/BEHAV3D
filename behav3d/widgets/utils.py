@@ -386,6 +386,9 @@ _DEFAULT_CONFIG = {
             "classifier_artifact_path": "",
         },
     },
+    "viewer_display": {
+        "channels": {},
+    },
 }
 
 behav3d_calculated_features = {

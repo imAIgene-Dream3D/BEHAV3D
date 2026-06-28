@@ -577,8 +577,7 @@ def _remove_layer_if_exists(viewer, layer_name: str):
 
 
 def _remove_preview_layers(viewer) -> int:
-    """Remove every layer whose name starts with the preview prefix and
-    force a canvas refresh to clear stale GPU textures."""
+    """Remove every layer whose name starts with the preview prefix."""
     if viewer is None:
         return 0
     to_remove = [
@@ -588,11 +587,6 @@ def _remove_preview_layers(viewer) -> int:
     for layer in to_remove:
         try:
             viewer.layers.remove(layer)
-        except Exception:
-            pass
-    if to_remove:
-        try:
-            viewer.reset_view()
         except Exception:
             pass
     return len(to_remove)
@@ -1886,6 +1880,12 @@ class CellTypeFeaturePanel(QWidget):
             # Remove previous preview layers (preserves non-preview layers)
             print(f"[{_ts()}] [Preview] Clearing preview layers...")
             self._cleanup_preview()
+            if self._is_organoid:
+                pt = self.parent()
+                while pt and not hasattr(pt, "_disconnect_org_preview_dims"):
+                    pt = pt.parent()
+                if pt is not None:
+                    pt._disconnect_org_preview_dims()
             n_removed = _remove_preview_layers(self.viewer)
             if n_removed:
                 print(f"[{_ts()}] [Preview]   Removed {n_removed} previous preview layer(s).")
@@ -3390,6 +3390,7 @@ class FeatureExtractionTab(QWidget):
         cache["stats_by_frame"][frame_idx] = frame_stats
         cache["pct_maps_by_frame"][frame_idx] = _build_dead_pct_map(frame_stats)
         cache["computed_frames"].add(frame_idx)
+        cache["current_frame"] = frame_idx
 
         self._propagate_org_preview_to_panels()
 
@@ -3402,6 +3403,7 @@ class FeatureExtractionTab(QWidget):
             if ct in self._org_types and panel._preview_seg_t is not None:
                 panel._preview_overlay_arr = cache.get("overlay_arr")
                 panel._preview_pct_overlay_arr = cache.get("pct_overlay_arr")
+                panel._preview_current_frame = cache.get("current_frame")
                 panel._preview_stats_by_frame = cache["stats_by_frame"]
                 panel._preview_pct_maps_by_frame = cache["pct_maps_by_frame"]
                 panel._preview_computed_frames = cache["computed_frames"]

@@ -59,18 +59,13 @@ def _fmt_sigma(s):
 # Each preset is a set of (feature_key, sigma_str) pairs that should be
 # pre-checked.  The sigma value is stored as a string matching _fmt_sigma().
 FEATURE_PRESETS = {
-    "small_quick": {
-        "label": "Small / Quick",
+    "small_preset": {
+        "label": "Small Preset",
+        "original": True,
         "checked": {
-            ("difference_of_gaussian",      "1"),
-            ("difference_of_gaussian",      "2"),
-            ("laplace_box_of_gaussian_blur","1"),
-            ("laplace_box_of_gaussian_blur","2"),
-        },
-    },
-    "medium_quick": {
-        "label": "Medium / Quick",
-        "checked": {
+            ("gaussian_blur",               "1"),
+            ("gaussian_blur",               "2"),
+            ("gaussian_blur",               "5"),
             ("difference_of_gaussian",      "1"),
             ("difference_of_gaussian",      "2"),
             ("difference_of_gaussian",      "5"),
@@ -82,8 +77,31 @@ FEATURE_PRESETS = {
             ("sobel_of_gaussian_blur",      "5"),
         },
     },
-    "large_quick": {
-        "label": "Large / Quick",
+    "medium_preset": {
+        "label": "Medium Preset",
+        "original": True,
+        "checked": {
+            ("gaussian_blur",               "1"),
+            ("gaussian_blur",               "2"),
+            ("gaussian_blur",               "5"),
+            ("gaussian_blur",               "15"),
+            ("difference_of_gaussian",      "1"),
+            ("difference_of_gaussian",      "2"),
+            ("difference_of_gaussian",      "5"),
+            ("difference_of_gaussian",      "15"),
+            ("laplace_box_of_gaussian_blur","1"),
+            ("laplace_box_of_gaussian_blur","2"),
+            ("laplace_box_of_gaussian_blur","5"),
+            ("laplace_box_of_gaussian_blur","15"),
+            ("sobel_of_gaussian_blur",      "1"),
+            ("sobel_of_gaussian_blur",      "2"),
+            ("sobel_of_gaussian_blur",      "5"),
+            ("sobel_of_gaussian_blur",      "15"),
+        },
+    },
+    "large_preset": {
+        "label": "Large Preset",
+        "original": True,
         "checked": {
             ("gaussian_blur",               "1"),
             ("gaussian_blur",               "2"),
@@ -109,14 +127,15 @@ FEATURE_PRESETS = {
     },
     "custom": {
         "label": "Custom",
-        "checked": set(),  # user starts with all unchecked
+        "original": False,
+        "checked": set(),
     },
 }
 
 
 def _checked_set_for_preset(preset_name):
     """Return the set of (feature_key, sigma_str) pairs that should be checked for a preset."""
-    return set(FEATURE_PRESETS.get(preset_name, FEATURE_PRESETS["medium_quick"])["checked"])
+    return set(FEATURE_PRESETS.get(preset_name, FEATURE_PRESETS["large_preset"])["checked"])
 
 
 def _build_feature_string_from_checked(checked_set, consider_original=False, current_sigmas=None):
@@ -816,18 +835,18 @@ class CellTypeTab(QWidget):
         feat_row.addWidget(QLabel("Preset:"))
         self.feature_combo = QComboBox()
         self.feature_combo.addItems(list(FEATURE_PRESETS.keys()))
-        saved_preset = ip.get(f"apoc_{cell_type}_feature_preset", "medium_quick")
+        saved_preset = ip.get(f"apoc_{cell_type}_feature_preset", "large_preset")
         if saved_preset not in FEATURE_PRESETS:
-            saved_preset = "medium_quick"
+            saved_preset = "large_preset"
         self.feature_combo.setCurrentText(saved_preset)
         feat_row.addWidget(self.feature_combo)
         feat_row.addWidget(HelpButton(
             "Feature preset",
             "Pre-configured combination of feature filters and sigmas.\n"
-            "  • quick: small sigma grid, fastest training.\n"
-            "  • medium_quick: balanced default for most cell types.\n"
-            "  • medium: more sigmas, better small/large coexistence.\n"
-            "  • thorough: large grid, best quality but slow.\n"
+            "  • Small Preset: all features × sigmas 1, 2, 5 + original image.\n"
+            "  • Medium Preset: all features × sigmas 1, 2, 5, 15 + original image.\n"
+            "  • Large Preset: all features × sigmas 1, 2, 5, 10, 25 + original image.\n"
+            "  • Custom: manually select features and sigmas.\n"
             "Open 'Tune Features' below to customise the grid."
         ))
         feat_row.addStretch()
@@ -869,7 +888,8 @@ class CellTypeTab(QWidget):
         # ── Consider original image checkbox ─────────────────────────────────
         orig_row = QHBoxLayout()
         self.consider_original_cb = QCheckBox("Consider original image as well")
-        saved_orig = bool(ip.get(f"apoc_{cell_type}_consider_original", False))
+        preset_orig_default = FEATURE_PRESETS.get(saved_preset, {}).get("original", False)
+        saved_orig = bool(ip.get(f"apoc_{cell_type}_consider_original", preset_orig_default))
         self.consider_original_cb.setChecked(saved_orig)
         self.consider_original_cb.stateChanged.connect(self._update_preview)
         orig_row.addWidget(self.consider_original_cb)
@@ -904,7 +924,7 @@ class CellTypeTab(QWidget):
         rf_row.addWidget(QLabel("Max depth:"))
         self.max_depth_spin = QSpinBox()
         self.max_depth_spin.setRange(1, 20)
-        self.max_depth_spin.setValue(int(ip.get(f"apoc_{cell_type}_max_depth", 2)))
+        self.max_depth_spin.setValue(int(ip.get(f"apoc_{cell_type}_max_depth", 5)))
         rf_row.addWidget(self.max_depth_spin)
         rf_row.addWidget(HelpButton(
             "Random Forest — max depth",
@@ -1076,7 +1096,7 @@ class CellTypeTab(QWidget):
             self.segment_size_min_spin = QSpinBox()
             self.segment_size_min_spin.setRange(0, 100000)
             self.segment_size_min_spin.setSingleStep(10)
-            self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 10)))
+            self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 0)))
             row2.addWidget(QLabel("Min size:"))
             row2.addWidget(self.segment_size_min_spin)
             row2.addWidget(HelpButton(
@@ -1120,7 +1140,7 @@ class CellTypeTab(QWidget):
             self.segment_size_min_spin = QSpinBox()
             self.segment_size_min_spin.setRange(0, 100000)
             self.segment_size_min_spin.setSingleStep(10)
-            self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 10)))
+            self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 0)))
             row2.addWidget(QLabel("Min size:"))
             row2.addWidget(self.segment_size_min_spin)
             row2.addWidget(HelpButton(
@@ -1246,6 +1266,11 @@ class CellTypeTab(QWidget):
             self.current_sigmas = list(APOC_SIGMAS)
             self._build_grid()
             self._apply_preset_defaults(preset_name)
+            preset_data = FEATURE_PRESETS.get(preset_name, {})
+            if "original" in preset_data:
+                self.consider_original_cb.blockSignals(True)
+                self.consider_original_cb.setChecked(preset_data["original"])
+                self.consider_original_cb.blockSignals(False)
         self._update_preview()
 
     def _on_tune_toggled(self, checked):
@@ -1740,6 +1765,14 @@ class APOCTrainingWidget(QWidget):
         self.apply_all_btn.setStyleSheet("padding: 5px 10px;")
         self.apply_all_btn.setToolTip("Copy the current tab's preset, sigmas, depth and trees to ALL other tabs")
         global_row1.addWidget(self.apply_all_btn)
+
+        self.save_labels_btn = QtPushButton("Save User Labels")
+        self.save_labels_btn.setStyleSheet(
+            "background-color: #fd7e14; color: white; font-weight: bold; padding: 5px 10px;"
+        )
+        self.save_labels_btn.setToolTip("Save all user-provided label layers to disk")
+        self.save_labels_btn.clicked.connect(lambda: self.save_user_labels(log=self._log))
+        global_row1.addWidget(self.save_labels_btn)
         layout.addLayout(global_row1)
 
         global_row2 = QHBoxLayout()

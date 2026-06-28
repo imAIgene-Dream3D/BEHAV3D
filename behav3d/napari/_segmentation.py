@@ -311,9 +311,15 @@ class SegmentationTab(QWidget):
             )
             if res == QMessageBox.No:
                 return False
-            else:
-                self.cleanup_session()
-                return True
+            save_res = QMessageBox.question(
+                self, "Save Labels?",
+                "Do you want to save your user labels before leaving?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if save_res == QMessageBox.Yes:
+                self.pixel_classifier_page._save_user_labels()
+            self.cleanup_session()
+            return True
 
         # 2. APOC Page
         if self.apoc_page._is_session_active:
@@ -325,9 +331,15 @@ class SegmentationTab(QWidget):
             )
             if res == QMessageBox.No:
                 return False
-            else:
-                self.apoc_page.cleanup_session()
-                return True
+            save_res = QMessageBox.question(
+                self, "Save Labels?",
+                "Do you want to save your user labels before leaving?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if save_res == QMessageBox.Yes:
+                self.apoc_page._save_apoc_user_labels()
+            self.apoc_page.cleanup_session()
+            return True
 
         # 3. ConvPaint Page
         if getattr(self.convpaint_page, "_is_session_active", False):
@@ -339,9 +351,17 @@ class SegmentationTab(QWidget):
             )
             if res == QMessageBox.No:
                 return False
-            else:
-                self.convpaint_page.cleanup_session()
-                return True
+            save_res = QMessageBox.question(
+                self, "Save Labels?",
+                "Do you want to save your user labels before leaving?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if save_res == QMessageBox.Yes:
+                tw = getattr(self.convpaint_page, "_training_widget", None)
+                if tw is not None:
+                    tw.save_user_labels()
+            self.convpaint_page.cleanup_session()
+            return True
 
         return True
 
@@ -3996,6 +4016,11 @@ class APOCWidget(QWidget):
         self.log(f"APOC training session cleared ({n_removed} layers removed).")
         self._update_training_controls_state()
 
+    def _save_apoc_user_labels(self):
+        """Save APOC user labels to disk via the training widget."""
+        if self._training_widget is not None:
+            self._training_widget.save_user_labels(log=self.log)
+
     # ── Strategy changed ───────────────────────────────────────────
     def _on_training_widget_strategy_changed(self, strategy):
         """Persist the new APOC strategy when the training widget signals a change."""
@@ -4138,7 +4163,7 @@ class APOCWidget(QWidget):
         pc = params.get("pixel_classifier", {}) or {}
 
         all_strats = self.all_strategies()
-        current_strategy = pc.get("apoc_strategy", all_strats[0])
+        current_strategy = pc.get("apoc_strategy", "APOC Probability Map + Watershed")
         if current_strategy not in all_strats:
             current_strategy = all_strats[0]
         apoc_params["apoc_strategy"] = current_strategy
