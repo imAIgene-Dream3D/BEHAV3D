@@ -23,6 +23,18 @@ def load_zarr(path, group=None, mode="r"):
         dask_img = da.from_zarr(zarr_store)
     return(dask_img)
 
+def load_zarr_timepoint(path, t):
+    """Read a single timepoint from a zarr array as numpy, without dask overhead."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Path to zarr file does not exist:\n{path}")
+    if path.suffix == ".zip":
+        zarr_store = zarr.storage.ZipStore(path)
+    else:
+        zarr_store = zarr.storage.LocalStore(path)
+    arr = zarr.open(zarr_store, mode="r")
+    return np.asarray(arr[t])
+
 def save_as_zarr(
     img, 
     path, 

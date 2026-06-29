@@ -166,7 +166,7 @@ import pandas as pd
 
 import warnings
 
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, find_objects
 from scipy.spatial.distance import cdist
 
 from skimage.measure import regionprops_table
@@ -187,30 +187,36 @@ import traceback
 from behav3d.analysis import smooth_value_over_time
 from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
 from behav3d.core.metadata import is_multicolor_celltype
-from behav3d.io.images import load_image, convert_raw_file_to_zarr
+from behav3d.io.images import load_image, load_image_timepoint, convert_raw_file_to_zarr
 from tqdm import tqdm
 from datetime import datetime
 
+import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
 
-def _run_parallel_with_fallback(fn, args_list, n_workers):
+def _run_parallel_with_fallback(fn, args_list, n_workers, use_processes=True):
     """
-    Run fn over args_list using ProcessPoolExecutor with n_workers.
-    If a BrokenProcessPool error occurs (e.g. Windows out-of-virtual-memory),
-    raise a RuntimeError so that batch/queue processing can stop and
-    inform the user to lower the number of workers.
+    Run fn over args_list in parallel with n_workers.
+
+    By default uses ThreadPoolExecutor (shared memory, no fork overhead).
+    Set use_processes=True for ProcessPoolExecutor with spawn context
+    (full CPU parallelism but higher memory per worker).
     """
-    try:
-        with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            return list(tqdm(ex.map(fn, args_list), total=len(args_list)))
-    except BrokenProcessPool:
-        raise RuntimeError(
-            f"Worker processes crashed while using {n_workers} workers "
-            f"(likely out of memory). Please lower the number of workers "
-            f"and try again."
-        )
+    if use_processes:
+        try:
+            ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
+                return list(tqdm(ex.map(fn, args_list), total=len(args_list)))
+        except BrokenProcessPool:
+            raise RuntimeError(
+                f"Worker processes crashed while using {n_workers} workers "
+                f"(likely out of memory). Please lower the number of workers "
+                f"and try again."
+            )
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        return list(tqdm(ex.map(fn, args_list), total=len(args_list)))
 
 
 def _normalize_merge_keys(df, keys=("TrackID", "position_t")):
@@ -221,9 +227,19 @@ def _normalize_merge_keys(df, keys=("TrackID", "position_t")):
     return df
 
 
-def _segment_touches_border(mask):
-    """Return True when any foreground voxel touches the 3D image border."""
-    if mask.ndim != 3:
+def _segment_touches_border(mask=None, *, slices=None, stack_shape=None):
+    """Return True when any foreground voxel touches the 3D image border.
+
+    Can be called with either:
+    - mask: full boolean mask (legacy)
+    - slices + stack_shape: bounding-box slices from find_objects (fast path)
+    """
+    if slices is not None and stack_shape is not None:
+        for sl, dim_size in zip(slices, stack_shape):
+            if sl.start == 0 or sl.stop >= dim_size:
+                return True
+        return False
+    if mask is None or mask.ndim != 3:
         return False
     return bool(
         np.any(mask[0, :, :])
@@ -269,7 +285,7 @@ def _principal_axis_metrics(coords, voxel_spacing):
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         center = pts.mean(axis=0, keepdims=True)
         X = pts - center
-        _, _, Vt = np.linalg.svd(X, full_matrices=True)
+        _, _, Vt = np.linalg.svd(X, full_matrices=False)
         V = Vt.T
         proj = X @ V
         center_lengths = np.ptp(proj, axis=0)
@@ -935,17 +951,14 @@ def calculate_image_based_track_features(
                 # itself an immune type. This prevents immune cells trespassing
                 # through organoids (or other passive structures) from inflating
                 # the target's `percentage_dead_mask`.
-                immune_segments_dict = {
-                    name: load_image(path) for name, path in immune_segments_paths.items()
-                } if immune_segments_paths else {}
                 exclude_immune_from_dead = (
                     cell_type not in immune_segments_paths
-                    and bool(immune_segments_dict)
+                    and bool(immune_segments_paths)
                 )
                 if exclude_immune_from_dead:
                     print(
                         f"{get_current_time()} - Cleaning dead mask: zeroing voxels "
-                        f"inside immune segments {list(immune_segments_dict.keys())} "
+                        f"inside immune segments {list(immune_segments_paths.keys())} "
                         f"before computing {cell_type} death features."
                     )
 
@@ -953,7 +966,7 @@ def calculate_image_based_track_features(
                     segments=segments_path,
                     dead_mask=dead_mask_path,
                     n_workers=n_workers,
-                    immune_segments_dict=immune_segments_dict if exclude_immune_from_dead else None,
+                    immune_segments_paths=immune_segments_paths if exclude_immune_from_dead else None,
                 )
                 if df_dead_mask_outpath != "":
                     df_dead_mask.to_csv(df_dead_mask_outpath, sep=",", index=False)
@@ -1580,22 +1593,22 @@ def _calculate_contact_single_timepoint(args):
             )
 
     # Load current cell type's segments for this timepoint
-    current_segments = np.asarray(load_image(current_cell_segments_path)[t])
-    
+    current_segments = load_image_timepoint(current_cell_segments_path, t)
+
     # Load all organoid types' segments
     organoid_segments_dict = {}
     for org_type, org_path in organoid_segments_paths.items():
-        organoid_segments_dict[org_type] = np.asarray(load_image(org_path)[t])
-    
+        organoid_segments_dict[org_type] = load_image_timepoint(org_path, t)
+
     # Load all immune cell types' segments
     immune_segments_dict = {}
     for immune_type, immune_path in immune_segments_paths.items():
-        immune_segments_dict[immune_type] = np.asarray(load_image(immune_path)[t])
-    
+        immune_segments_dict[immune_type] = load_image_timepoint(immune_path, t)
+
     # Load all other cell types' segments
     other_segments_dict = {}
     for other_type, other_path in other_segments_paths.items():
-        other_segments_dict[other_type] = np.asarray(load_image(other_path)[t])
+        other_segments_dict[other_type] = load_image_timepoint(other_path, t)
     
     df_contacts = []
     segment_ids = np.unique(current_segments)
@@ -1831,8 +1844,8 @@ def calculate_contact_features(
 
 def _calculate_segment_intensity_single_timepoint(args):
     t, segments_path, intensity_image_path, calculation = args
-    tcell_stack = np.asarray(load_image(segments_path)[t])
-    intensity_stack = np.asarray(load_image(intensity_image_path)[t]).transpose(1, 2, 3, 0)
+    tcell_stack = load_image_timepoint(segments_path, t)
+    intensity_stack = load_image_timepoint(intensity_image_path, t).transpose(1, 2, 3, 0)
 
     properties = pd.DataFrame(
         regionprops_table(
@@ -1971,13 +1984,13 @@ def _zero_dead_mask_under_segments(dead_mask_t, immune_arrays_t):
     return cleaned
             
 def _calculate_dead_mask_single_timepoint(args):
-    t, segments_path, dead_mask_path, immune_segments_dict = args
-    if immune_segments_dict:
-        immune_arrays_t = {name: arr[t] for name, arr in immune_segments_dict.items()}
-        dead_mask_stack = _zero_dead_mask_under_segments(dead_mask_stack, immune_arrays_t)
+    t, segments_path, dead_mask_path, immune_segments_paths = args
+    tcell_stack = load_image_timepoint(segments_path, t)
+    dead_mask_stack = load_image_timepoint(dead_mask_path, t)
 
-    tcell_stack = np.asarray(load_image(segments_path)[t])
-    dead_mask_stack = np.asarray(load_image(dead_mask_path)[t])
+    if immune_segments_paths:
+        immune_arrays_t = {name: load_image_timepoint(path, t) for name, path in immune_segments_paths.items()}
+        dead_mask_stack = _zero_dead_mask_under_segments(dead_mask_stack, immune_arrays_t)
 
     properties = pd.DataFrame(
         regionprops_table(
@@ -1998,7 +2011,7 @@ def _calculate_dead_mask_single_timepoint(args):
     return properties[["TrackID", "position_t", "percentage_dead_mask", "nr_dead_mask_pixels"]]
 
 
-def calculate_dead_mask(segments, dead_mask, n_workers=1, immune_segments_dict=None):
+def calculate_dead_mask(segments, dead_mask, n_workers=1, immune_segments_paths=None):
     """
     Calculates the intensity of a specific marker features for each segment.
     The calculation can be the minimum, maximum, mean or median
@@ -2011,16 +2024,16 @@ def calculate_dead_mask(segments, dead_mask, n_workers=1, immune_segments_dict=N
     dead_mask : array-like
         Binary dead mask (T, Z, Y, X). Each voxel is 1 where the death
         classifier marked the pixel as positive.
-    immune_segments_dict : dict[str, array-like] | None
-        Optional mapping of immune cell type name -> immune segment array
-        (T, Z, Y, X). When provided, the per-timepoint dead mask is cleaned
-        via :func:`_zero_dead_mask_under_segments` before regionprops, so that
-        immune cells trespassing through ``segments`` do not contribute to the
-        ``percentage_dead_mask`` of the target segment.
+    immune_segments_paths : dict[str, str | Path] | None
+        Optional mapping of immune cell type name -> path to immune segment
+        array (T, Z, Y, X). When provided, the per-timepoint dead mask is
+        cleaned via :func:`_zero_dead_mask_under_segments` before regionprops,
+        so that immune cells trespassing through ``segments`` do not contribute
+        to the ``percentage_dead_mask`` of the target segment.
     """
     if isinstance(segments, (str, Path)) and isinstance(dead_mask, (str, Path)):
         timepoints = int(load_image(segments).shape[0])
-        args_list = [(t, segments, dead_mask, immune_segments_dict) for t in range(timepoints)]
+        args_list = [(t, segments, dead_mask, immune_segments_paths) for t in range(timepoints)]
         if n_workers > 1:
             results = _run_parallel_with_fallback(_calculate_dead_mask_single_timepoint, args_list, n_workers)
         else:
@@ -2084,8 +2097,8 @@ def _basic_counts_single_timepoint(args):
     Worker: compute nr_pixels and volume for one timepoint using np.bincount.
     """
     t, segments_path, voxel_volume = args
-    seg_t = load_image(segments_path)[t]  # expects a (Z, Y, X) label image at time t
-    labels = np.asarray(seg_t, dtype=np.int64).ravel()
+    seg_t = load_image_timepoint(segments_path, t)
+    labels = seg_t.astype(np.int64).ravel()
 
     if labels.size == 0:
         return pd.DataFrame(columns=["TrackID", "position_t", "nr_pixels", "volume"])
@@ -2168,8 +2181,7 @@ def _calculate_morphology_single_timepoint(args):
     
     """
     t, segments_path, voxel_spacing = args
-    segments = load_image(segments_path)
-    stack = np.asarray(segments[t])
+    stack = load_image_timepoint(segments_path, t)
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*convex hull image.*")
@@ -2217,6 +2229,9 @@ def _calculate_morphology_single_timepoint(args):
     prolateness_list = []
     border_touching_segments = []
 
+    label_slices = find_objects(stack)
+    stack_shape = stack.shape
+
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="divide by zero encountered in scalar divide")
         warnings.filterwarnings("ignore", message=".*convex hull image.*")
@@ -2225,13 +2240,17 @@ def _calculate_morphology_single_timepoint(args):
         properties_by_track = properties.set_index("TrackID", drop=False)
 
         for region_label in properties["TrackID"]:
-            mask = (stack == region_label)
+            slices = label_slices[region_label - 1]
+            cropped = stack[slices]
+            mask = (cropped == region_label)
             coords = np.argwhere(mask)
             row = properties_by_track.loc[region_label]
             volume = float(row["volume"]) if np.isfinite(row["volume"]) else np.nan
             solidity = float(row["solidity"]) if np.isfinite(row["solidity"]) else np.nan
 
-            border_touching_segments.append(bool(_segment_touches_border(mask)))
+            border_touching_segments.append(bool(
+                _segment_touches_border(slices=slices, stack_shape=stack_shape)
+            ))
 
             surface_area = _voxel_surface_area(mask, voxel_spacing)
             surface_areas.append(surface_area)
