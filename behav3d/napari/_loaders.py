@@ -86,6 +86,7 @@ def load_raw_into_viewer(
     row: pd.Series,
     output_dir: str = "",
     log: Callable[[str], None] = _noop,
+    display_settings: Optional[Dict] = None,
 ) -> List[str]:
     """Load the raw image as one Image layer per channel.  Returns layer names."""
     from behav3d.io.formats.zarr import load_zarr
@@ -135,14 +136,20 @@ def load_raw_into_viewer(
             pass
 
     n_channels = dask_img.shape[1] if dask_img.ndim >= 5 else 1
+    saved_channels = display_settings or {}
     added: List[str] = []
     for c in range(n_channels):
         ch_data = dask_img[:, c, :, :, :] if dask_img.ndim >= 5 else dask_img
-        color = _CHANNEL_COLORS[c % len(_CHANNEL_COLORS)]
+        saved = saved_channels.get(c) or saved_channels.get(str(c))
+        color = (saved["colormap"] if saved and "colormap" in saved
+                 else _CHANNEL_COLORS[c % len(_CHANNEL_COLORS)])
         name = f"{sample_name} – Ch{c}"
-        viewer.add_image(
-            ch_data, name=name, colormap=color, blending="additive", visible=True,
+        add_kwargs = dict(
+            name=name, colormap=color, blending="additive", visible=True,
         )
+        if saved and "contrast_limits" in saved:
+            add_kwargs["contrast_limits"] = tuple(saved["contrast_limits"])
+        viewer.add_image(ch_data, **add_kwargs)
         log(f"    + Image layer: {name}  ({color})")
         added.append(name)
     return added

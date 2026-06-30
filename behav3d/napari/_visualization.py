@@ -13,10 +13,11 @@ from __future__ import annotations
 import traceback
 from pathlib import Path
 
+import yaml
 import dask.array as da
 import numpy as np
 import pandas as pd
-from qtpy.QtCore import Qt, QPropertyAnimation, QEasingCurve, Property, QRect, QPoint, QSize
+from qtpy.QtCore import Qt, QPropertyAnimation, QEasingCurve, Property, QRect, QPoint, QSize, QTimer
 from qtpy.QtGui import QPainter, QColor
 from qtpy.QtWidgets import (
     QWidget,
@@ -252,6 +253,12 @@ class VisualizationTab(QWidget):
 
         self._metadata: pd.DataFrame | None = None
 
+        # Debounced save for viewer display settings (contrast / colormap)
+        self._display_save_timer = QTimer(self)
+        self._display_save_timer.setSingleShot(True)
+        self._display_save_timer.setInterval(1000)
+        self._display_save_timer.timeout.connect(self._persist_viewer_display)
+
         # ------- Build UI -------
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -441,6 +448,7 @@ class VisualizationTab(QWidget):
                 qt_dims._animation_thread.wait()
         except Exception:
             pass
+        self._display_save_timer.stop()
         self.viewer.layers.clear()
 
         output_dir = self.data_prep.output_dir or ""
@@ -523,23 +531,73 @@ class VisualizationTab(QWidget):
 
         n_channels = dask_img.shape[1] if dask_img.ndim >= 5 else 1
 
+        saved_channels = (
+            self.data_prep.behav3d_parameters
+            .get("viewer_display", {})
+            .get("channels", {})
+        )
+
         for c in range(n_channels):
             if dask_img.ndim >= 5:
                 ch_data = dask_img[:, c, :, :, :]  # T Z Y X
             else:
                 ch_data = dask_img
 
-            color = _CHANNEL_COLORS[c % len(_CHANNEL_COLORS)]
+            saved = saved_channels.get(c) or saved_channels.get(str(c))
+            color = (saved["colormap"] if saved and "colormap" in saved
+                     else _CHANNEL_COLORS[c % len(_CHANNEL_COLORS)])
             layer_name = f"{sample_name} – Ch{c}"
 
-            self.viewer.add_image(
-                ch_data,
+            add_kwargs = dict(
                 name=layer_name,
                 colormap=color,
                 blending="additive",
                 visible=True,
             )
+            if saved and "contrast_limits" in saved:
+                add_kwargs["contrast_limits"] = tuple(saved["contrast_limits"])
+
+            layer = self.viewer.add_image(ch_data, **add_kwargs)
+
+            layer.events.contrast_limits.connect(self._on_layer_display_changed)
+            layer.events.colormap.connect(self._on_layer_display_changed)
+
             self._log(f"    + Image layer: {layer_name}  ({color})")
+
+    # ------------------------------------------------------------------
+    # Viewer display persistence
+    # ------------------------------------------------------------------
+    def _on_layer_display_changed(self, event=None):
+        self._display_save_timer.start()
+
+    def _persist_viewer_display(self):
+        """Snapshot current channel display settings and save to YAML."""
+        out_dir = self.data_prep.output_dir
+        if not out_dir:
+            return
+
+        params = self.data_prep.behav3d_parameters
+        channels_cfg = params.setdefault("viewer_display", {}).setdefault("channels", {})
+
+        for layer in self.viewer.layers:
+            if " – Ch" not in layer.name:
+                continue
+            try:
+                ch_idx = int(layer.name.rsplit("Ch", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            channels_cfg[ch_idx] = {
+                "colormap": str(layer.colormap.name),
+                "contrast_limits": [float(layer.contrast_limits[0]),
+                                    float(layer.contrast_limits[1])],
+            }
+
+        params_path = Path(out_dir) / "behav3d_parameters.yml"
+        try:
+            with open(params_path, "w") as f:
+                yaml.safe_dump(params, f, sort_keys=False)
+        except Exception as e:
+            self._log(f"Warning: Could not save display settings: {e}")
 
     # ------------------------------------------------------------------
     # Segment loader
@@ -817,8 +875,18 @@ class VisualizationTab(QWidget):
                 qt_dims._animation_thread.wait()
         except Exception:
             pass
+        self._display_save_timer.stop()
         self.viewer.layers.clear()
-        load_raw_into_viewer(self.viewer, sample_name, row, output_dir=output_dir, log=self._log)
+        saved_channels = (
+            self.data_prep.behav3d_parameters
+            .get("viewer_display", {})
+            .get("channels", {})
+        )
+        load_raw_into_viewer(
+            self.viewer, sample_name, row,
+            output_dir=output_dir, log=self._log,
+            display_settings=saved_channels,
+        )
         # Load the tracked-segments layer dask-backed (as_numpy=False) so
         # napari can display it immediately while materialisation happens in
         # the background.  The editor will kick off a QThread worker that

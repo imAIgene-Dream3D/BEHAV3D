@@ -92,14 +92,8 @@ class BEHAV3DWidget(QWidget):
         )
         self.tabs.addTab(self.analysis_tab, "📊 Analysis")
 
-        # --- Tab 8: Backprojection ----------------------------------------
-        from behav3d.napari._backprojection import BackprojectionTab
-        self.backprojection_tab = BackprojectionTab(
-            viewer=self.viewer,
-            metadata_loader=self.data_prep_tab,
-            parent=self,
-        )
-        self.tabs.addTab(self.backprojection_tab, "🔭 Backprojection")
+        # Backprojection is now integrated into the Single Cell tab
+        # (Step 4 in State Classification, Step 5 in Track Classification)
 
         # --- Processing Queue (collapsible bottom panel) ------------------
         self.queue_panel = ProcessingQueuePanel(
@@ -427,16 +421,13 @@ class BEHAV3DWidget(QWidget):
 
         self._last_tab_index = index
 
-        # Auto-refresh Analysis and Backprojection tabs when switched to
+        # Auto-refresh Analysis tab when switched to
         if index == 6 and hasattr(self, 'analysis_tab'):
             if hasattr(self.analysis_tab, '_on_metadata_updated'):
                 self.analysis_tab._on_metadata_updated()
-            # Also notify inner single cell tab to reload
+            # Also notify inner single cell tab to reload (picks up Track tab auto-fill)
             if hasattr(self.analysis_tab, 'single_cell_tab') and hasattr(self.analysis_tab.single_cell_tab, '_on_metadata_updated'):
                 self.analysis_tab.single_cell_tab._on_metadata_updated()
-        elif index == 7 and hasattr(self, 'backprojection_tab'):
-            if hasattr(self.backprojection_tab, '_on_metadata_updated'):
-                self.backprojection_tab._on_metadata_updated()
 
     def sizeHint(self):
         return QSize(440, 650)
