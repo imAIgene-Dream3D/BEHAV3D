@@ -42,6 +42,10 @@ class StepType(Enum):
     MULTI_ORG_DEATH = "multi_org_death"
     INTERACTION = "interaction"
     MULTI_ORG_INTERACTION = "multi_org_interaction"
+    SC_STATE_CLUSTER = "sc_state_cluster"
+    SC_TRAIN_STATE = "sc_train_state"
+    SC_APPLY_STATE = "sc_apply_state"
+    SC_TRACK_CLUSTER = "sc_track_cluster"
 
     @property
     def label(self):
@@ -60,6 +64,10 @@ class StepType(Enum):
             StepType.MULTI_ORG_DEATH: "💀 Combined Death Dynamics",
             StepType.INTERACTION: "🤝 Interaction Analysis",
             StepType.MULTI_ORG_INTERACTION: "🤝 Combined Interaction Comparison",
+            StepType.SC_STATE_CLUSTER: "🔬 State Clustering",
+            StepType.SC_TRAIN_STATE: "🔬 Train State Classifier",
+            StepType.SC_APPLY_STATE: "🔬 Apply State Classifier",
+            StepType.SC_TRACK_CLUSTER: "🛤️ Track Clustering",
         }[self]
 
     @property
@@ -79,6 +87,10 @@ class StepType(Enum):
             StepType.MULTI_ORG_DEATH: 5.5,
             StepType.INTERACTION: 6,
             StepType.MULTI_ORG_INTERACTION: 6.5,
+            StepType.SC_STATE_CLUSTER: 7,
+            StepType.SC_TRAIN_STATE: 7.5,
+            StepType.SC_APPLY_STATE: 8,
+            StepType.SC_TRACK_CLUSTER: 8.5,
         }[self]
 
 
@@ -1328,6 +1340,14 @@ class ProcessingQueuePanel(QWidget):
             return self._run_interaction(step, cbs)
         if step.step_type == StepType.MULTI_ORG_INTERACTION:
             return self._run_multi_org_interaction(step, cbs)
+        if step.step_type == StepType.SC_STATE_CLUSTER:
+            return self._run_sc_state_cluster(step, cbs)
+        if step.step_type == StepType.SC_TRAIN_STATE:
+            return self._run_sc_train_state(step, cbs)
+        if step.step_type == StepType.SC_APPLY_STATE:
+            return self._run_sc_apply_state(step, cbs)
+        if step.step_type == StepType.SC_TRACK_CLUSTER:
+            return self._run_sc_track_cluster(step, cbs)
         # Unknown step — fail fast.
         QTimer.singleShot(
             0,
@@ -1778,3 +1798,98 @@ class ProcessingQueuePanel(QWidget):
             interactive=False, block=False, extra_callbacks=extra_callbacks,
         )
         return convpaint_widget
+
+    # ── Single Cell step runners ──────────────────────────────────────────
+
+    def _require_single_cell_tab(self):
+        """Return the SingleCellTab embedded in the AnalysisTab."""
+        if self.analysis_tab is None:
+            raise RuntimeError("Analysis tab not wired to queue.")
+        sc = getattr(self.analysis_tab, "single_cell_tab", None)
+        if sc is None:
+            raise RuntimeError("Single Cell tab not found inside Analysis tab.")
+        return sc
+
+    def _run_sc_state_cluster(self, step: QueueStep, extra_callbacks):
+        """Run HMM state clustering (asynchronous via BackgroundOperation)."""
+        try:
+            sc = self._require_single_cell_tab()
+        except RuntimeError as e:
+            QTimer.singleShot(0, lambda err=str(e): self._step_failed_cb(err))
+            return None
+
+        ct = step.params.get("cell_type") or ""
+        if ct:
+            combo = getattr(sc, "cell_type_combo", None)
+            if combo is not None:
+                idx = combo.findText(ct)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+
+        sc.state_tab.run_state_classification(
+            interactive=False, extra_callbacks=extra_callbacks
+        )
+        return sc.state_tab  # exposes ._bg.progress for queue progress bar
+
+    def _run_sc_train_state(self, step: QueueStep, extra_callbacks):
+        """Train state random-forest classifier (asynchronous)."""
+        try:
+            sc = self._require_single_cell_tab()
+        except RuntimeError as e:
+            QTimer.singleShot(0, lambda err=str(e): self._step_failed_cb(err))
+            return None
+
+        ct = step.params.get("cell_type") or ""
+        if ct:
+            combo = getattr(sc, "cell_type_combo", None)
+            if combo is not None:
+                idx = combo.findText(ct)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+
+        sc.state_tab.run_train_state(
+            interactive=False, extra_callbacks=extra_callbacks
+        )
+        return sc.state_tab
+
+    def _run_sc_apply_state(self, step: QueueStep, extra_callbacks):
+        """Apply state classifier to full dataset (asynchronous)."""
+        try:
+            sc = self._require_single_cell_tab()
+        except RuntimeError as e:
+            QTimer.singleShot(0, lambda err=str(e): self._step_failed_cb(err))
+            return None
+
+        ct = step.params.get("cell_type") or ""
+        if ct:
+            combo = getattr(sc, "cell_type_combo", None)
+            if combo is not None:
+                idx = combo.findText(ct)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+
+        sc.state_tab.run_apply_state(
+            interactive=False, extra_callbacks=extra_callbacks
+        )
+        return sc.state_tab
+
+    def _run_sc_track_cluster(self, step: QueueStep, extra_callbacks):
+        """Run DTW track clustering (asynchronous)."""
+        try:
+            sc = self._require_single_cell_tab()
+        except RuntimeError as e:
+            QTimer.singleShot(0, lambda err=str(e): self._step_failed_cb(err))
+            return None
+
+        ct = step.params.get("cell_type") or ""
+        if ct:
+            combo = getattr(sc, "cell_type_combo", None)
+            if combo is not None:
+                idx = combo.findText(ct)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+
+        sc.track_tab.run_track_clustering(
+            interactive=False, extra_callbacks=extra_callbacks
+        )
+        return sc.track_tab

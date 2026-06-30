@@ -7,12 +7,14 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
     QStackedWidget, QPushButton, QGroupBox, QFormLayout, 
     QSpinBox, QDoubleSpinBox, QCheckBox, QFileDialog, QScrollArea,
-    QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox, QFrame
+    QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox, QFrame, QGridLayout
 )
 from qtpy.QtCore import Qt
 import pandas as pd
 from pathlib import Path
 import traceback
+
+from behav3d.preprocessing.segmentation.convpaint_train import AnnotationLegendTab
 import numpy as np
 import dask.array as da
 import shutil
@@ -418,6 +420,77 @@ def _remove_segmentation_layers(viewer) -> int:
     return len(to_remove)
 
 
+class PerClassLegendWidget(QWidget):
+    """Clickable legend for Random Forest and APOC that use one layer per cell type."""
+    def __init__(self, viewer, all_cell_types, has_death=False, parent=None):
+        super().__init__(parent)
+        self.viewer = viewer
+        self.all_cell_types = all_cell_types
+        self.has_death = has_death
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        intro = QLabel(
+            "<b>Annotation legend.</b> Click a button to select the target layer and set the active brush (Eraser, Background, or Foreground)."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(intro)
+
+        def create_button(text, color_hex, layer_name, label_idx):
+            btn = QPushButton(text)
+            text_color = "white" if color_hex not in ("none", "white", "#ffffff", "transparent") else "black"
+            bg_color = "transparent" if color_hex == "none" else color_hex
+            btn.setStyleSheet(f"background-color: {bg_color}; color: {text_color}; font-size: 11px; padding: 4px; border: 1px solid #555; border-radius: 2px;")
+            btn.clicked.connect(lambda _, ln=layer_name, idx=label_idx: self._select_brush(ln, idx))
+            return btn
+
+        if self.has_death:
+            row_layout = QHBoxLayout()
+            row_layout.addWidget(QLabel("<b>Dead</b>"), stretch=1)
+            layer_name = 'User Provided Labels (Dead)'
+            row_layout.addWidget(create_button("0: Eraser", "none", layer_name, 0))
+            row_layout.addWidget(create_button("1: Background", "#8b3a26", layer_name, 1))
+            row_layout.addWidget(create_button("2: Foreground", "#00ffff", layer_name, 2))
+            layout.addLayout(row_layout)
+
+        for ct in self.all_cell_types:
+            row_layout = QHBoxLayout()
+            row_layout.addWidget(QLabel(f"<b>{ct.capitalize()}</b>"), stretch=1)
+            layer_name = f'User Provided Labels ({ct.capitalize()})'
+            row_layout.addWidget(create_button("0: Eraser", "none", layer_name, 0))
+            row_layout.addWidget(create_button("1: Background", "#8b3a26", layer_name, 1))
+            row_layout.addWidget(create_button("2: Foreground", "#00ffff", layer_name, 2))
+            layout.addLayout(row_layout)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+    def _select_brush(self, layer_name, label_idx):
+        layer = None
+        for lyr in self.viewer.layers:
+            if lyr.name == layer_name:
+                layer = lyr
+                break
+        if layer is None:
+            return
+        
+        layer.selected_label = label_idx
+        try:
+            layer.mode = "paint"
+        except Exception:
+            pass
+        try:
+            self.viewer.layers.selection.active = layer
+        except Exception:
+            try:
+                self.viewer.layers.selection = {layer}
+            except Exception:
+                pass
+
+
 class PixelClassifierWidget(QWidget):
     def __init__(self, viewer, metadata_loader, log_callback=None,
                  tab_progress_row=None):
@@ -557,40 +630,21 @@ class PixelClassifierWidget(QWidget):
         self.instruction_label.setVisible(False)
         train_layout.addWidget(self.instruction_label)
 
-        # Legend for labels
-        legend_layout = QHBoxLayout()
-        legend_layout.setContentsMargins(6, 4, 6, 4)
-        
-        def create_legend_item(text, color_hex):
-            item = QHBoxLayout()
-            box = QLabel()
-            box.setFixedSize(12, 12)
-            box.setStyleSheet(f"background-color: {color_hex}; border: 1px solid #555;")
-            label = QLabel(text)
-            label.setStyleSheet("font-size: 10px; font-weight: bold;")
-            item.addWidget(box)
-            item.addWidget(label)
-            return item
-
-        legend_layout.addLayout(create_legend_item("0: Eraser", "none"))
-        legend_layout.addLayout(create_legend_item("1: Background", "#8b3a26")) # Red
-        legend_layout.addLayout(create_legend_item("2: Foreground", "#00ffff")) # Cyan
-        legend_layout.addStretch()
-        
-        self.legend_widget = QWidget()
-        self.legend_widget.setLayout(legend_layout)
-        self.legend_widget.setVisible(False) # Hide until data loaded
-        train_layout.addWidget(self.legend_widget)
-
         # Add training related buttons
         train_layout.addLayout(train_btn_row)
+
+        # Placeholder for dynamic legend
+        self.legend_container = QWidget()
+        self.legend_container.setLayout(QVBoxLayout())
+        self.legend_container.layout().setContentsMargins(0, 0, 0, 0)
+        self.legend_container.setVisible(False)
+        train_layout.addWidget(self.legend_container)
 
         # Hide action buttons until training data is loaded
         self.btn_save_labels.setVisible(False)
         self.btn_clear_layer.setVisible(False)
         self.btn_clear_all.setVisible(False)
         self.btn_train_update.setVisible(False)
-        self.legend_widget.setVisible(False)
         self.instruction_label.setVisible(False)
         
         train_group.setLayout(train_layout)
@@ -897,7 +951,12 @@ class PixelClassifierWidget(QWidget):
         self.btn_clear_layer.setVisible(False)
         self.btn_clear_all.setVisible(False)
         self.btn_train_update.setVisible(False)
-        self.legend_widget.setVisible(False)
+        # Delete elements inside legend_container
+        while self.legend_container.layout().count():
+            child = self.legend_container.layout().takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self.legend_container.setVisible(False)
         self.instruction_label.setVisible(False)
         self.btn_queue_train.setVisible(False)
         
@@ -1565,7 +1624,16 @@ class PixelClassifierWidget(QWidget):
             self.btn_clear_layer.setVisible(True)
             self.btn_clear_all.setVisible(True)
             self.btn_train_update.setVisible(True)
-            self.legend_widget.setVisible(True)
+            
+            # Update and show legend
+            while self.legend_container.layout().count():
+                child = self.legend_container.layout().takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+            legend = PerClassLegendWidget(self.viewer, self.all_cell_types, self.has_death)
+            self.legend_container.layout().addWidget(legend)
+            self.legend_container.setVisible(True)
+            
             self.instruction_label.setVisible(True)
             self.btn_queue_train.setVisible(True)  # Show queue button now that training data is loaded
             self.is_session_active = True
@@ -3364,6 +3432,13 @@ class APOCWidget(QWidget):
         
         self.training_layout.addLayout(train_ctrl_lay)
 
+        # Legend container for APOC
+        self.legend_container = QWidget()
+        self.legend_container.setLayout(QVBoxLayout())
+        self.legend_container.layout().setContentsMargins(0, 0, 0, 0)
+        self.legend_container.setVisible(False)
+        self.training_layout.addWidget(self.legend_container)
+
         self.training_placeholder = QLabel(
             "Load metadata to enable APOC classifier training."
         )
@@ -3986,6 +4061,15 @@ class APOCWidget(QWidget):
             self.log("✅ Training data generated/loaded in viewer!")
             self._is_session_active = True
             self._update_training_controls_state()
+            
+            # Update and show legend
+            while self.legend_container.layout().count():
+                child = self.legend_container.layout().takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+            legend = PerClassLegendWidget(self.viewer, all_cell_types, has_death)
+            self.legend_container.layout().addWidget(legend)
+            self.legend_container.setVisible(True)
 
         except Exception as e:
             traceback.print_exc()
@@ -4015,6 +4099,13 @@ class APOCWidget(QWidget):
         self._is_session_active = False
         self.log(f"APOC training session cleared ({n_removed} layers removed).")
         self._update_training_controls_state()
+        
+        # Hide legend
+        while self.legend_container.layout().count():
+            child = self.legend_container.layout().takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self.legend_container.setVisible(False)
 
     def _save_apoc_user_labels(self):
         """Save APOC user labels to disk via the training widget."""
@@ -4990,6 +5081,13 @@ class ConvPaintWidget(QWidget):
         train_ctrl_lay.addStretch()
         self.training_layout.addLayout(train_ctrl_lay)
 
+        # Legend container for ConvPaint
+        self.legend_container = QWidget()
+        self.legend_container.setLayout(QVBoxLayout())
+        self.legend_container.layout().setContentsMargins(0, 0, 0, 0)
+        self.legend_container.setVisible(False)
+        self.training_layout.addWidget(self.legend_container)
+
         self.training_placeholder = QLabel(
             "Load metadata and click <b>Generate Training Data</b> to enable "
             "ConvPaint classifier training."
@@ -5574,6 +5672,16 @@ class ConvPaintWidget(QWidget):
             self._is_session_active = True
 
             _reorder_convpaint_layers(self.viewer, all_cell_types, has_death=has_death)
+            
+            # Show AnnotationLegendTab
+            while self.legend_container.layout().count():
+                child = self.legend_container.layout().takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+            legend = AnnotationLegendTab(self.viewer, label_map, has_death=has_death)
+            self.legend_container.layout().addWidget(legend)
+            self.legend_container.setVisible(True)
+            
             self.log("✅ ConvPaint training data generated/loaded in viewer!")
 
         except Exception as e:
@@ -5591,6 +5699,13 @@ class ConvPaintWidget(QWidget):
 
         self._all_images_cache = None
         self._is_session_active = False
+
+        # Delete elements inside legend_container and hide it
+        while self.legend_container.layout().count():
+            child = self.legend_container.layout().takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self.legend_container.setVisible(False)
 
         # Rebuild the parameter-only widget so parameters remain tunable.
         self._on_metadata_updated()

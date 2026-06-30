@@ -678,17 +678,14 @@ def filter_tracks(
     plot_filter_count_outpath = Path(qc_outdir, f"BEHAV3D_filter_counts.pdf")
     print(f"- Writing filter QC PDF (track length + counts) to {plot_filter_count_outpath}")
 
-    df_before_raw = pd.read_csv(df_all_tracks_path)
-    df_before_raw["sample_name"] = df_before_raw["sample_name"].astype(str)
-    if missing_group_cols:
-        df_before_for_hist = pd.merge(
-            df_before_raw, metadata_info, how="left", on="sample_name"
-        )
-    else:
-        df_before_for_hist = df_before_raw
-
-    df_after_for_hist = pd.read_csv(filt_tracks_out_path)
-    df_after_for_hist["sample_name"] = df_after_for_hist["sample_name"].astype(str)
+    df_before_for_hist, before_group_cols = _prepare_track_dataframe_for_grouping(
+        metadata,
+        df_all_tracks_path,
+    )
+    df_after_for_hist, after_group_cols = _prepare_track_dataframe_for_grouping(
+        metadata,
+        filt_tracks_out_path,
+    )
 
     with PdfPages(plot_filter_count_outpath) as pdf:
         _append_track_length_histogram_pages(

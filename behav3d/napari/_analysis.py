@@ -36,6 +36,7 @@ from qtpy.QtGui import QDesktopServices
 
 from behav3d.napari._pdf_view import open_pdf_in_napari
 from behav3d.napari._results_panel import ResultsPanel
+from behav3d.core.qt_help import make_help_row
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -474,13 +475,17 @@ class DeathDynamicsTab(QWidget):
         self.spin_time_window.setValue(60)
         self.spin_time_window.setSuffix(" min")
         self.spin_time_window.setMaximumWidth(100)
-        ia_adv_form.addRow("Time window before TOD:", self.spin_time_window)
+        ia_adv_form.addRow("Time window before TOD:", make_help_row(
+            self.spin_time_window, "Time window before TOD", "Lookback time window before Time of Death to consider an interaction."
+        ))
 
         self.combo_group_by = QComboBox()
         self.combo_group_by.addItem("By target (organoid) type", userData="organoid_type")
         self.combo_group_by.addItem("By treatment (immune cell)", userData="treatment")
         self.combo_group_by.setMaximumWidth(280)
-        ia_adv_form.addRow("Combined group by:", self.combo_group_by)
+        ia_adv_form.addRow("Combined group by:", make_help_row(
+            self.combo_group_by, "Combined group by", "Metadata attribute to group results by in combined analysis."
+        ))
 
         self.ia_adv.addLayout(ia_adv_form)
         ia_lay.addWidget(self.ia_adv)
@@ -1469,34 +1474,9 @@ class DeathDynamicsTab(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Single Cell sub-tab (placeholder)
+# Single Cell sub-tab — real implementation imported from _single_cell.py
 # ═══════════════════════════════════════════════════════════════════════════
-class SingleCellTab(QWidget):
-    """Placeholder for the upcoming Single Cell analysis sub-tab."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        lay = QVBoxLayout(self)
-        lay.setAlignment(Qt.AlignCenter)
-
-        icon = QLabel("🧬")
-        icon.setStyleSheet("font-size: 48px;")
-        icon.setAlignment(Qt.AlignCenter)
-        lay.addWidget(icon)
-
-        title = QLabel("Single Cell")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #aaa;")
-        title.setAlignment(Qt.AlignCenter)
-        lay.addWidget(title)
-
-        sub = QLabel(
-            "Coming soon — DTW/UMAP/clustering analyses for motile cell "
-            "types will live here."
-        )
-        sub.setStyleSheet("color: #888; font-size: 11px;")
-        sub.setAlignment(Qt.AlignCenter)
-        sub.setWordWrap(True)
-        lay.addWidget(sub)
+from behav3d.napari._single_cell import SingleCellTab  # noqa: E402  (re-exported)
 
 
 # NOTE: ResultsPanel used to be defined here; it now lives in
@@ -1534,6 +1514,7 @@ class AnalysisTab(QWidget):
         # -- Page 0: Placeholder --
         self.placeholder_page = QWidget()
         place_lay = QVBoxLayout(self.placeholder_page)
+        place_lay.setContentsMargins(20, 20, 20, 20)
         place_lay.setAlignment(Qt.AlignCenter)
         self.placeholder_label = QLabel(
             "Load metadata in the Data Preparation tab to see analysis options."
@@ -1541,7 +1522,7 @@ class AnalysisTab(QWidget):
         self.placeholder_label.setAlignment(Qt.AlignCenter)
         self.placeholder_label.setWordWrap(True)
         self.placeholder_label.setStyleSheet(
-            "color: #888; font-style: italic; font-size: 14px; padding: 20px;"
+            "color: #888; font-style: italic; font-size: 14px;"
         )
         place_lay.addWidget(self.placeholder_label)
         self.stack.addWidget(self.placeholder_page)
@@ -1564,7 +1545,9 @@ class AnalysisTab(QWidget):
         )
         self.inner_tabs.addTab(self.death_dynamics_tab, "💀 Death Dynamics")
 
-        self.single_cell_tab = SingleCellTab(parent=self)
+        self.single_cell_tab = SingleCellTab(
+            viewer=viewer, metadata_loader=metadata_loader, parent=self
+        )
         self.inner_tabs.addTab(self.single_cell_tab, "🧬 Single Cell")
 
         self.results_panel = ResultsPanel(
@@ -1603,3 +1586,12 @@ class AnalysisTab(QWidget):
     def _on_metadata_loaded(self, *_):
         """Reveal the analysis GUI once metadata is available."""
         self.stack.setCurrentIndex(1)
+
+    def _on_metadata_updated(self, *_):
+        """Cascade metadata updates to inner tabs and results panel."""
+        if hasattr(self, "death_dynamics_tab"):
+            self.death_dynamics_tab._on_metadata_updated()
+        if hasattr(self, "single_cell_tab"):
+            self.single_cell_tab._on_metadata_updated()
+        if hasattr(self, "results_panel"):
+            self.results_panel.refresh()
