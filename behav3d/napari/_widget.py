@@ -92,6 +92,9 @@ class BEHAV3DWidget(QWidget):
         )
         self.tabs.addTab(self.analysis_tab, "📊 Analysis")
 
+        # Backprojection is now integrated into the Single Cell tab
+        # (Step 4 in State Classification, Step 5 in Track Classification)
+
         # --- Processing Queue (collapsible bottom panel) ------------------
         self.queue_panel = ProcessingQueuePanel(
             segmentation_tab=self.segmentation_tab,
@@ -129,6 +132,21 @@ class BEHAV3DWidget(QWidget):
         dd.btn_queue_ia_single.clicked.connect(self._add_interaction_to_queue)
         dd.btn_queue_ia_combined.clicked.connect(self._add_multi_org_interaction_to_queue)
         dd.btn_queue_all.clicked.connect(self._add_all_analysis_to_queue)
+
+        # Single Cell Analysis +🛒 buttons
+        sc = self.analysis_tab.single_cell_tab
+        sc.state_tab.btn_queue_state_cluster.clicked.connect(
+            lambda: self._add_sc_step_to_queue(StepType.SC_STATE_CLUSTER)
+        )
+        sc.state_tab.btn_queue_train_state.clicked.connect(
+            lambda: self._add_sc_step_to_queue(StepType.SC_TRAIN_STATE)
+        )
+        sc.state_tab.btn_queue_apply_state.clicked.connect(
+            lambda: self._add_sc_step_to_queue(StepType.SC_APPLY_STATE)
+        )
+        sc.track_tab.btn_queue_track_cluster.clicked.connect(
+            lambda: self._add_sc_step_to_queue(StepType.SC_TRACK_CLUSTER)
+        )
 
         # Cellpose +🛒 button
         cp = self.segmentation_tab.cellpose_page
@@ -328,6 +346,18 @@ class BEHAV3DWidget(QWidget):
                 "one interaction cell type."
             )
 
+    # ── Single Cell queue helpers ───────────────────────────────────────
+    def _add_sc_step_to_queue(self, step_type):
+        """Add a single-cell analysis step to the queue, tagging the
+        currently selected cell type in the SingleCellTab."""
+        try:
+            sc = self.analysis_tab.single_cell_tab
+            ct = sc.cell_type_combo.currentText()
+        except Exception:
+            ct = ""
+        params = {"cell_type": ct} if ct else {}
+        self.queue_panel.add_step(step_type, params=params)
+
     def _on_tab_changed(self, index):
         """Intercept tab switches to handle exit warnings and missing output dir."""
         # 1. Handle missing output directory (indices >= 2: Segmentation, Tracking, etc.)
@@ -378,6 +408,7 @@ class BEHAV3DWidget(QWidget):
             3: "tracking_tab",
             4: "feature_extraction_tab",
             5: "filtering_tab",
+            6: "analysis_tab",
         }
         guarded_attr = guarded_attrs.get(self._last_tab_index)
         if guarded_attr is not None and hasattr(self, guarded_attr):
@@ -389,6 +420,14 @@ class BEHAV3DWidget(QWidget):
                 return
 
         self._last_tab_index = index
+
+        # Auto-refresh Analysis tab when switched to
+        if index == 6 and hasattr(self, 'analysis_tab'):
+            if hasattr(self.analysis_tab, '_on_metadata_updated'):
+                self.analysis_tab._on_metadata_updated()
+            # Also notify inner single cell tab to reload (picks up Track tab auto-fill)
+            if hasattr(self.analysis_tab, 'single_cell_tab') and hasattr(self.analysis_tab.single_cell_tab, '_on_metadata_updated'):
+                self.analysis_tab.single_cell_tab._on_metadata_updated()
 
     def sizeHint(self):
         return QSize(440, 650)

@@ -8,6 +8,80 @@ from behav3d.deprecated.state_classification_clustering import (
 )
 
 class StateClassificationPanel(BaseStateClassificationPanel):
+    def __init__(self, metadata_loader, cell_type=None):
+        self._build_train_section()
+        super().__init__(metadata_loader=metadata_loader, cell_type=cell_type)
+
+    def _build_steps(self):
+        step_defs = [
+            ("Primary dynamic state clustering (based on continuous features)", self.clustering_section),
+            ("Rename primary dynamic state clusters", self.rename_intrinsic_section),
+            ("Rename clusters assigned to binary groups", self.rename_full_section),
+            ("Train classification", self.train_section),
+            ("Apply classification", self.apply_section),
+            ("Backprojection", self.backprojection_section),
+        ]
+        self._step_accordions = []
+        for title, section in step_defs:
+            acc = widgets.Accordion(children=[section], selected_index=None)
+            acc.set_title(0, title)
+            self._step_accordions.append(acc)
+        self.steps = widgets.VBox(self._step_accordions)
+
+    def _apply_cfg_defaults(self):
+        super()._apply_cfg_defaults()
+        cfg = self._panel_cfg()
+        if not isinstance(cfg, dict):
+            return
+        
+        self.n_estimators.value = int(cfg.get("classifier_n_estimators", self.n_estimators.value))
+        self.min_samples_leaf.value = int(cfg.get("classifier_min_samples_leaf", self.min_samples_leaf.value))
+        self.n_jobs.value = int(cfg.get("classifier_n_jobs", self.n_jobs.value))
+        self.max_depth.value = str(cfg.get("classifier_max_depth", self.max_depth.value))
+        self.min_samples_split.value = int(cfg.get("classifier_min_samples_split", self.min_samples_split.value))
+        self.max_features.value = str(cfg.get("classifier_max_features", self.max_features.value))
+        self.class_weight.value = str(cfg.get("classifier_class_weight", self.class_weight.value))
+        self.validation_test_size.value = float(cfg.get("validation_test_size", self.validation_test_size.value))
+        self.validation_random_state.value = str(
+            cfg.get("validation_random_state", self.validation_random_state.value)
+        )
+        self.validation_stratify.value = bool(cfg.get("validation_stratify", self.validation_stratify.value))
+
+    def _persist_current_settings(self):
+        cfg = self._panel_cfg()
+        if isinstance(cfg, dict):
+            cfg.update(
+                {
+                    "classifier_n_estimators": int(self.n_estimators.value),
+                    "classifier_min_samples_leaf": int(self.min_samples_leaf.value),
+                    "classifier_n_jobs": int(self.n_jobs.value),
+                    "classifier_max_depth": str(self.max_depth.value),
+                    "classifier_min_samples_split": int(self.min_samples_split.value),
+                    "classifier_max_features": str(self.max_features.value),
+                    "classifier_class_weight": str(self.class_weight.value),
+                    "validation_test_size": float(self.validation_test_size.value),
+                    "validation_random_state": str(self.validation_random_state.value),
+                    "validation_stratify": bool(self.validation_stratify.value),
+                    "save_label_classifier": True,
+                    "save_full_label_classifier": True,
+                    "train_continuous_classifier": True,
+                    "train_full_classifier": True,
+                }
+            )
+        super()._persist_current_settings()
+    def _refresh_enablement(self):
+        super()._refresh_enablement()
+        has_model = self.model_adata is not None
+        self.btn_train.disabled = not has_model
+
+        if has_model:
+            self.train_status.value = (
+                f"<b>Model loaded:</b> {self._model_adata_path().name} "
+                f"({self.model_adata.n_obs} rows)"
+            )
+        else:
+            self.train_status.value = "<i>Load or create model adata first.</i>"
+
     def _build_train_section(self):
         self.train_status = widgets.HTML("<i>Load or create model adata first.</i>")
         self.n_estimators = widgets.IntText(description="Trees", value=300, style={"description_width": "130px"})

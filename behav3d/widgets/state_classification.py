@@ -2883,10 +2883,6 @@ class StateClassificationHMMDeploymentPanel(StateClassificationHMMPanel):
 
     def __init__(self, metadata_loader, cell_type=None):
         super().__init__(metadata_loader=metadata_loader, cell_type=cell_type)
-        if hasattr(self, "train_section"):
-            self.train_section.layout.display = "none"
-        if hasattr(self, "btn_train"):
-            self.btn_train.layout.display = "none"
 
     def _panel_cfg(self):
         params = getattr(self.metadata_loader, "behav3d_parameters", None)
@@ -2996,8 +2992,8 @@ class StateClassificationHMMDeploymentPanel(StateClassificationHMMPanel):
         super()._refresh_enablement()
         has_cell_type = self._current_cell_type() != ""
         has_hmm_artifact_input = str(self.apply_hmm_artifact_picker.value).strip() != ""
-        self.btn_apply.disabled = True
-        self.btn_train.disabled = True
+        if hasattr(self, "btn_apply"):
+            self.btn_apply.disabled = True
         self.btn_apply_hmm_artifact.disabled = not (has_cell_type and has_hmm_artifact_input)
 
 

@@ -297,18 +297,21 @@ class DataPreparationTab(QWidget):
 
         # --- Fill-down + Save (Horizontal Row) ---
         btns = QHBoxLayout()
-        btn_fill = QPushButton("Fill All from Sample 1")
-        btn_fill.clicked.connect(self._on_fill_down)
+        self.btn_fill = QPushButton("Fill All from Sample 1")
+        self.btn_fill.clicked.connect(self._on_fill_down)
         
         self.btn_save_metadata = QPushButton("Save Metadata CSV")
         self.btn_save_metadata.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         self.btn_save_metadata.clicked.connect(self._on_save_metadata)
         
-        btns.addWidget(btn_fill)
+        btns.addWidget(self.btn_fill)
         btns.addWidget(self.btn_save_metadata)
-        lay.addLayout(btns)
+        
+        # We don't add the buttons to the group box layout so they don't get disabled
+        # lay.addLayout(btns)
 
         self._layout.addWidget(self.builder_grp)
+        self._layout.addLayout(btns)
 
         # Internal storage
         self._organoid_name_edits: list[QLineEdit] = []
@@ -561,6 +564,37 @@ class DataPreparationTab(QWidget):
         for n in oth_names:
             _add_ct(n, "ot")
 
+        # ── Synchronize multicolor fields ────────────────────────────────────
+        import re
+        pattern = re.compile(r"^(?P<base>.+)_(?P<idx>\d+)_multicolor$")
+        
+        multi_groups = {}
+        for ct_name in cell_type_fields.keys():
+            m = pattern.match(ct_name)
+            if m:
+                base = m.group("base")
+                multi_groups.setdefault(base, []).append(ct_name)
+                
+        for base, ct_names in multi_groups.items():
+            if len(ct_names) > 1:
+                fields_to_sync = ["line", "condition", "segments_image_path", "tracks_image_path", "tracks_csv_path"]
+                for field_name in fields_to_sync:
+                    for ct_name in ct_names:
+                        w = cell_type_fields[ct_name][field_name]
+                        
+                        def make_slot(b=base, fn=field_name, sender=ct_name):
+                            def slot(text):
+                                for other_ct in multi_groups[b]:
+                                    if other_ct != sender:
+                                        other_w = cell_type_fields[other_ct][fn]
+                                        if other_w.text() != text:
+                                            other_w.blockSignals(True)
+                                            other_w.setText(text)
+                                            other_w.blockSignals(False)
+                            return slot
+                        
+                        w.textChanged.connect(make_slot())
+
         return {
             "group": grp,
             "basic": fields,
@@ -617,6 +651,8 @@ class DataPreparationTab(QWidget):
             for k, w in src["basic"].items():
                 if k == "sample_name":
                     continue
+                if k == "raw_image_path":
+                    continue  # Don't fill down raw_image_path
                 tw = tgt["basic"][k]
                 if isinstance(w, QLineEdit):
                     tw.setText(w.text())
@@ -685,6 +721,8 @@ class DataPreparationTab(QWidget):
         self.include_dead_cb.blockSignals(True)
         self.include_dead_cb.setChecked(False)
         self.include_dead_cb.blockSignals(False)
+        
+        self.btn_fill.setEnabled(False)
 
         # Clear UI sections
         self._clear_layout(self.cell_type_naming_container)
@@ -708,6 +746,7 @@ class DataPreparationTab(QWidget):
                 "background-color: #FFA726; color: white; font-weight: bold;"
             )
         elif is_checked and not self._edit_mode:
+            self.btn_fill.setEnabled(True)
             # Open + Not editing -> Green Save New
             self.btn_save_metadata.setText("Save Metadata CSV")
             self.btn_save_metadata.setStyleSheet(
@@ -875,12 +914,36 @@ class DataPreparationTab(QWidget):
         return order, n_channels_per_base
 
     def _on_save_metadata(self):
-        # If button is in "Edit" state, open builder in edit mode instead of saving
+        # If button is in "Edit" state, prompt the user just like toggling the groupbox
         if self.btn_save_metadata.text() == "Edit Metadata CSV":
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Metadata Builder")
+            msg.setText("Metadata is already loaded. Do you want to edit the current metadata or generate a new one?")
+            
+            btn_edit = msg.addButton("Edit Current", QMessageBox.AcceptRole)
+            btn_new = msg.addButton("Generate New", QMessageBox.DestructiveRole)
+            btn_cancel = msg.addButton("Cancel", QMessageBox.RejectRole)
+            
+            msg.exec_()
+            
+            clicked = msg.clickedButton()
+            if clicked == btn_cancel:
+                return
+            
             self.builder_grp.blockSignals(True)
             self.builder_grp.setChecked(True)
             self.builder_grp.blockSignals(False)
-            self._enter_edit_mode()
+            
+            if clicked == btn_edit:
+                self._enter_edit_mode()
+            else: # Generate New
+                self._reset_builder()
+                # When resetting, it stays checked, but we need to update the button
+                self.btn_save_metadata.setText("Save Metadata CSV")
+                self.btn_save_metadata.setStyleSheet(
+                    "background-color: #4CAF50; color: white; font-weight: bold;"
+                )
+                self.btn_fill.setEnabled(True)
             return
 
         # Determine save target

@@ -110,7 +110,6 @@ class BaseStateClassificationPanel:
         self._build_intrinsic_rename_section()
         self._build_full_rename_section()
         self._build_backprojection_section()
-        self._build_train_section()
 
         self._build_steps()
 
@@ -138,7 +137,6 @@ class BaseStateClassificationPanel:
             ("Primary dynamic state clustering (based on continuous features)", self.clustering_section),
             ("Rename primary dynamic state clusters", self.rename_intrinsic_section),
             ("Rename clusters assigned to binary groups", self.rename_full_section),
-            ("Train classification", self.train_section),
             ("Apply classification", self.apply_section),
             ("Backprojection", self.backprojection_section),
         ]
@@ -830,18 +828,7 @@ class BaseStateClassificationPanel:
                 if feat in self.additional_window_feature_cbs:
                     self.additional_window_feature_cbs[str(feat)].value = True
 
-        self.n_estimators.value = int(cfg.get("classifier_n_estimators", self.n_estimators.value))
-        self.min_samples_leaf.value = int(cfg.get("classifier_min_samples_leaf", self.min_samples_leaf.value))
-        self.n_jobs.value = int(cfg.get("classifier_n_jobs", self.n_jobs.value))
-        self.max_depth.value = str(cfg.get("classifier_max_depth", self.max_depth.value))
-        self.min_samples_split.value = int(cfg.get("classifier_min_samples_split", self.min_samples_split.value))
-        self.max_features.value = str(cfg.get("classifier_max_features", self.max_features.value))
-        self.class_weight.value = str(cfg.get("classifier_class_weight", self.class_weight.value))
-        self.validation_test_size.value = float(cfg.get("validation_test_size", self.validation_test_size.value))
-        self.validation_random_state.value = str(
-            cfg.get("validation_random_state", self.validation_random_state.value)
-        )
-        self.validation_stratify.value = bool(cfg.get("validation_stratify", self.validation_stratify.value))
+
 
     def _persist_current_settings(self):
         cfg = self._panel_cfg()
@@ -867,20 +854,6 @@ class BaseStateClassificationPanel:
                 "descriptive_features": list(self._selected_descriptive_features()),
                 "selected_features": self._selected_feature_columns(),
                 "binary_features_to_group": self._selected_binary_columns(),
-                "classifier_n_estimators": int(self.n_estimators.value),
-                "classifier_min_samples_leaf": int(self.min_samples_leaf.value),
-                "classifier_n_jobs": int(self.n_jobs.value),
-                "classifier_max_depth": str(self.max_depth.value),
-                "classifier_min_samples_split": int(self.min_samples_split.value),
-                "classifier_max_features": str(self.max_features.value),
-                "classifier_class_weight": str(self.class_weight.value),
-                "validation_test_size": float(self.validation_test_size.value),
-                "validation_random_state": str(self.validation_random_state.value),
-                "validation_stratify": bool(self.validation_stratify.value),
-                "save_label_classifier": True,
-                "save_full_label_classifier": True,
-                "train_continuous_classifier": True,
-                "train_full_classifier": True,
             }
         )
         self._save_panel_cfg()
@@ -1167,15 +1140,6 @@ class BaseStateClassificationPanel:
         self.btn_combine_full.disabled = not has_full
         self.full_combine_name.disabled = not has_full
         self.btn_open_backprojection.disabled = not (has_cell_type and has_backproj_sample)
-        self.btn_train.disabled = not has_model
-
-        if has_model:
-            self.train_status.value = (
-                f"<b>Model loaded:</b> {self._model_adata_path().name} "
-                f"({self.model_adata.n_obs} rows)"
-            )
-        else:
-            self.train_status.value = "<i>Load or create model adata first.</i>"
 
         if has_cell_type:
             self.status_html.value = f"<b>Ready:</b> cell_type='{self._current_cell_type()}'"
