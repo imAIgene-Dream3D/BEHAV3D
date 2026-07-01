@@ -23,7 +23,9 @@ from qtpy.QtWidgets import (
     QSizePolicy, QTabWidget, QFrame, QMessageBox,
     QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
 )
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import Qt, Signal, QTimer
+
+from behav3d.napari._background_runner import BackgroundOperation, ThreadSafeLogger
 from qtpy.QtGui import QColor
 
 import dask.array as da
@@ -1607,6 +1609,7 @@ class APOCTrainingWidget(QWidget):
         extra_toolbar_widgets=None,
     ):
         super().__init__(parent)
+        self._bg = BackgroundOperation(self)
         self.viewer = viewer
         self.pixel_class_outdir = pixel_class_outdir
         self.all_cell_types = all_cell_types
@@ -1822,6 +1825,11 @@ class APOCTrainingWidget(QWidget):
         self.apply_all_btn.clicked.connect(self._on_apply_to_all)
         self.train_current_btn.clicked.connect(self._on_train_current)
         self.train_all_btn.clicked.connect(self._on_train_all)
+        # Forward background progress label to the status_label for live updates.
+        self._bg.progress.connect(
+            lambda cur, tot, lbl: self.status_label.setText(lbl),
+            Qt.QueuedConnection,
+        )
         # In docked mode, switching tabs reparents the instance group; in
         # inline mode the group already lives in the tab so we do nothing.
         if self._instance_controls_mode == "docked":
@@ -2037,11 +2045,11 @@ class APOCTrainingWidget(QWidget):
     def _on_train_current(self):
         """Train only the classifier for the currently visible tab."""
         current_ct = self._tab_cell_types[self.tab_widget.currentIndex()]
-        self._run_training([current_ct])
+        self._run_training_bg([current_ct])
 
     def _on_train_all(self):
         """Train classifiers for ALL cell types using each tab's individual config."""
-        self._run_training(self._tab_cell_types)
+        self._run_training_bg(self._tab_cell_types)
 
     # ------------------------------------------------------------------
     # Core training logic
@@ -2329,6 +2337,293 @@ class APOCTrainingWidget(QWidget):
             log(f"Saved Death labels → {dead_outpath}")
 
         log("✅ All user labels saved!")
+
+    def _run_training_bg(self, cell_types_to_train):
+        """Background-threaded version of :meth:`_run_training`.
+
+        Phase 1 (Qt thread): read viewer layers & widget values into plain
+        NumPy arrays and APOC config dicts.
+        Phase 2 (worker thread): fit classifiers, run predictions.
+        Phase 3 (Qt thread, via on_done): write result arrays to viewer layers,
+        persist params, update status label.
+        """
+        import apoc
+
+        if self._bg.is_running():
+            self._log("⚠️ Training is already in progress.")
+            return
+
+        cell_types_to_train = list(cell_types_to_train)
+
+        # ── Phase 1 (Qt thread): emit signal + gather all data ────────────
+        try:
+            self.training_started.emit(cell_types_to_train)
+        except Exception:
+            pass
+
+        self._log("Auto-saving user labels before training…")
+        self.save_user_labels(log=self._log)
+
+        # Collect per-cell-type config, images, and annotation arrays.
+        ct_inputs = {}
+        for ct in cell_types_to_train:
+            tab = self.tabs[ct]
+            cfg = tab.get_config()
+            feature_string = cfg["feature_string"]
+
+            # Images: convert to numpy so the worker never touches viewer layers.
+            images_np = [
+                np.asarray(img) for img in self._get_images_for_tab(ct)
+            ]
+            if not images_np:
+                self._log(f"  ⚠️ No image layers selected for '{ct}' — skipping.")
+                continue
+
+            # Annotation layer data.
+            if ct == "dead":
+                layer_name = "User Provided Labels (Dead)"
+            else:
+                layer_name = f"User Provided Labels ({ct.capitalize()})"
+            try:
+                annotation = np.asarray(self.viewer.layers[layer_name].data)
+            except KeyError:
+                self._log(f"  ⚠️ Annotation layer '{layer_name}' not found — skipping.")
+                continue
+            if not np.any(annotation):
+                self._log(f"  ⚠️ No labels drawn for '{ct}' — skipping.")
+                continue
+
+            # Snapshot per-tab segmentation params (must happen on Qt thread).
+            strategy = self._resolve_strategy(ct)
+            tab_params = {}
+            if hasattr(tab, "edt_threshold_spin") and tab.edt_threshold_spin is not None:
+                tab_params["edt_thr"] = float(tab.edt_threshold_spin.value())
+            if hasattr(tab, "opening_nr_pixels_spin") and tab.opening_nr_pixels_spin is not None:
+                tab_params["opening"] = int(tab.opening_nr_pixels_spin.value())
+            if hasattr(tab, "segment_size_min_spin") and tab.segment_size_min_spin is not None:
+                tab_params["min_size"] = int(tab.segment_size_min_spin.value())
+            if hasattr(tab, "fill_holes_cb") and tab.fill_holes_cb is not None:
+                tab_params["fill_holes"] = bool(tab.fill_holes_cb.isChecked())
+            if hasattr(tab, "prob_mask_threshold_spin") and tab.prob_mask_threshold_spin is not None:
+                tab_params["prob_mask_thr"] = float(tab.prob_mask_threshold_spin.value())
+            if hasattr(tab, "prob_seed_threshold_spin") and tab.prob_seed_threshold_spin is not None:
+                tab_params["prob_seed_thr"] = float(tab.prob_seed_threshold_spin.value())
+            if hasattr(tab, "peak_min_distance_spin") and tab.peak_min_distance_spin is not None:
+                tab_params["peak_min_dist"] = float(tab.peak_min_distance_spin.value())
+            if hasattr(tab, "peak_min_ratio_spin") and tab.peak_min_ratio_spin is not None:
+                tab_params["peak_min_ratio"] = float(tab.peak_min_ratio_spin.value())
+
+            if ct == "dead":
+                clf_name = "PixelClassifier_Death.cl"
+            else:
+                clf_name = f"PixelClassifier_{ct.capitalize()}.cl"
+            clf_path = str(Path(self.pixel_class_outdir, clf_name))
+
+            ct_inputs[ct] = {
+                "cfg": cfg,
+                "feature_string": feature_string,
+                "images_np": images_np,
+                "annotation": annotation,
+                "clf_path": clf_path,
+                "strategy": strategy,
+                "tab_params": tab_params,
+            }
+
+        if not ct_inputs:
+            self._log("⚠️ No cell types with valid data to train.")
+            try:
+                self.training_finished.emit(cell_types_to_train, [])
+            except Exception:
+                pass
+            return
+
+        pixel_class_outdir = Path(self.pixel_class_outdir)
+        safe_log = ThreadSafeLogger(self._log)
+        training_start = time.time()
+
+        # ── Phase 2 (worker thread) ───────────────────────────────────────
+        def _do_train(progress_cb=None):
+            import apoc as _apoc
+            from sklearn.ensemble import RandomForestClassifier
+
+            cts = list(ct_inputs.keys())
+            n = len(cts)
+            results = {}  # ct -> {"display_segments", "prob_result"}
+
+            for i, ct in enumerate(cts):
+                if progress_cb:
+                    progress_cb(i, n, f"Training {ct}…")
+                safe_log(f"  Training {ct}…")
+
+                inp = ct_inputs[ct]
+                cfg            = inp["cfg"]
+                feature_string = inp["feature_string"]
+                images_np      = inp["images_np"]
+                annotation     = inp["annotation"]
+                clf_path       = inp["clf_path"]
+                strategy       = inp["strategy"]
+                tab_params     = inp["tab_params"]
+                max_depth      = cfg["max_depth"]
+                num_ensembles  = cfg["num_ensembles"]
+
+                # Erase existing classifier
+                if Path(clf_path).exists():
+                    _apoc.erase_classifier(clf_path)
+
+                clf = _apoc.ObjectSegmenter(
+                    opencl_filename=clf_path,
+                    max_depth=max_depth,
+                    num_ensembles=num_ensembles,
+                    positive_class_identifier=2,
+                )
+
+                # Build X/y arrays
+                X_parts, y_parts = [], []
+                gt_ndim = None
+                n_timepoints = annotation.shape[0] if annotation.ndim == 4 else 1
+
+                if annotation.ndim == 4:
+                    for t in range(n_timepoints):
+                        ann_t = annotation[t]
+                        if not np.any(ann_t):
+                            continue
+                        feats_t = self._generate_feature_list_for_timepoint(
+                            images_np, feature_string, t
+                        )
+                        X_t, y_t = clf._to_np(feats_t, ann_t)
+                        if X_t.size == 0 or y_t.size == 0:
+                            continue
+                        X_parts.append(X_t)
+                        y_parts.append(y_t)
+                        gt_ndim = ann_t.ndim
+                else:
+                    feats_np = self._generate_feature_list_for_timepoint(
+                        images_np, feature_string, 0
+                    )
+                    X_t, y_t = clf._to_np(feats_np, annotation)
+                    if X_t.size > 0 and y_t.size > 0:
+                        X_parts.append(X_t)
+                        y_parts.append(y_t)
+                        gt_ndim = annotation.ndim
+
+                if not X_parts:
+                    safe_log(f"  ⚠️ No labeled pixels for '{ct}' — skipping.")
+                    continue
+
+                X = np.concatenate(X_parts, axis=0)
+                y = np.concatenate(y_parts, axis=0)
+                fitted_rf = RandomForestClassifier(
+                    max_depth=max_depth, n_estimators=num_ensembles, random_state=0
+                )
+                fitted_rf.fit(X, y)
+                clf.classifier              = fitted_rf
+                clf._feature_importances   = fitted_rf.feature_importances_
+                clf._X                     = X
+                clf._y                     = y
+                clf.num_features           = X.shape[1]
+                clf.num_ground_truth_dimensions = gt_ndim
+                clf.feature_specification  = feature_string
+                clf.to_opencl_file(clf_path)
+                _write_classifier_channel_metadata(clf_path, cfg["channels"])
+                safe_log(f"  Saved classifier: {Path(clf_path).name}")
+
+                # Predict (for visual confirmation in viewer).
+                if progress_cb:
+                    progress_cb(i, n, f"Predicting {ct}…")
+                raw_prediction, prob_result = self._predict_classifier_outputs(
+                    ct, clf=clf
+                )
+
+                # Build display segments using snapshotted tab params
+                # (mirrors _build_display_segments but without touching Qt widgets).
+                if ct == "dead" or strategy == "APOC (Direct Instance Segmentation)":
+                    display_segments = np.asarray(raw_prediction).astype(np.int16)
+                elif strategy == "APOC Probability Map + Watershed":
+                    display_segments = _probability_array_to_segments(
+                        prob_result,
+                        mask_thr=tab_params.get("prob_mask_thr", 0.5),
+                        seed_thr=tab_params.get("prob_seed_thr", 0.5),
+                        opening_nr_pixels=tab_params.get("opening", 0),
+                        segment_size_min=tab_params.get("min_size", 10),
+                    )
+                else:
+                    marker_strategy = (
+                        "peak"
+                        if strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
+                        else "threshold"
+                    )
+                    display_segments = _mask_array_to_segments(
+                        raw_prediction > 0,
+                        edt_thr=tab_params.get("edt_thr", 1.0),
+                        opening_nr_pixels=tab_params.get("opening", 0),
+                        segment_size_min=tab_params.get("min_size", 10),
+                        fill_holes=tab_params.get("fill_holes", True),
+                        marker_strategy=marker_strategy,
+                        peak_min_distance=tab_params.get("peak_min_dist"),
+                        peak_min_ratio=tab_params.get("peak_min_ratio", 0.35),
+                    )
+
+                # Save preview arrays to disk (file I/O is fine in the worker).
+                pred_path = _predicted_labels_path(pixel_class_outdir, ct)
+                if pred_path is not None:
+                    self._save_preview_array(pred_path, display_segments)
+                prob_path = _probability_map_path(pixel_class_outdir, ct)
+                if prob_path is not None:
+                    self._save_preview_array(prob_path, prob_result)
+
+                results[ct] = {
+                    "display_segments": display_segments,
+                    "prob_result": prob_result,
+                }
+
+            return results
+
+        # ── Phase 3 (Qt thread, on_done): write results to viewer ─────────
+        def _on_done(results):
+            successes = list(results.keys())
+            for ct, r in results.items():
+                self._update_prediction_layers(ct, r["display_segments"], r["prob_result"])
+                # Auto-show statistics
+                if ct in self.tabs:
+                    self.tabs[ct]._on_show_statistics()
+
+            elapsed_s   = time.time() - training_start
+            elapsed_txt = f"{elapsed_s:.1f}s"
+            if successes:
+                self.status_label.setText(
+                    f"✅ Trained: {', '.join(successes)} ({elapsed_txt})"
+                )
+                self._log(f"✅ Training finished in {elapsed_txt}")
+            else:
+                self.status_label.setText(
+                    f"⚠️ No cell types were trained (check labels). ({elapsed_txt})"
+                )
+                self._log(f"⚠️ No cell types were trained. Elapsed: {elapsed_txt}")
+
+            self._persist_params()
+            try:
+                self.training_finished.emit(cell_types_to_train, successes)
+            except Exception:
+                pass
+
+        def _on_failed(err):
+            self.status_label.setText(f"❌ Error: {err}")
+            self._log(f"❌ Training error: {err}")
+            try:
+                self.training_finished.emit(cell_types_to_train, [])
+            except Exception:
+                pass
+
+        self._bg.run(
+            fn=_do_train,
+            desc="APOC training…",
+            buttons=[self.train_current_btn, self.train_all_btn],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+            inject_progress=True,
+            indeterminate=False,
+        )
 
     def _run_training(self, cell_types_to_train):
         """Train (and apply) APOC classifiers for the given list of cell types."""
