@@ -50,6 +50,8 @@ from qtpy.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from qtpy.QtCore import Qt, Signal
+
+from behav3d.napari._background_runner import BackgroundOperation, ThreadSafeLogger
 from qtpy.QtGui import QColor
 
 from behav3d.io.images import load_image, load_zarr, save_as_zarr
@@ -1080,6 +1082,7 @@ class ConvPaintTrainingWidget(QWidget):
         self.legend_tab = None
         self.strategy_combo = None
         self.strategy_help_button = None
+        self._bg = BackgroundOperation(self)
         self._build_ui()
         if self._external_log is not None and hasattr(self, "log_box"):
             self.log_box.hide()
@@ -1680,25 +1683,419 @@ class ConvPaintTrainingWidget(QWidget):
     # ── Training ────────────────────────────────────────────────────
 
     def _on_train_clicked(self):
+        """Train unified (+ death) ConvPaint classifiers on a background thread.
+
+        Phase 1 (Qt thread) — read viewer layers into NumPy arrays, build the
+        ConvpaintModel object (which reads Qt widget values), save labels.
+        Phase 2 (worker thread) — model.train, segment_per_z, predict_probas.
+        Phase 3 (Qt thread, on_done) — write result arrays to viewer layers,
+        persist params, refresh legend.
+        """
+        if self._bg.is_running():
+            self._log("⚠️ Training is already in progress.")
+            return
+
         cell_types = list(self._tab_cell_types)
+
+        # ── Phase 1 (Qt thread): emit signal + gather all data ────────────
         try:
             self.training_started.emit(cell_types)
         except Exception:
             pass
-        try:
-            self._log("Auto-saving user labels before training...")
-            self.save_user_labels()
-            self._train_unified_classifier()
-            if self.has_death:
-                self._train_death_classifier()
-            self._persist_all_params()
-            if self.legend_tab is not None:
-                self.legend_tab.refresh()
-        finally:
+
+        self._log("Auto-saving user labels before training…")
+        self.save_user_labels()
+
+        # Read unified annotation layer on the Qt thread.
+        unified_annotations = None
+        for lyr in self.viewer.layers:
+            if lyr.name == UNIFIED_LABELS_LAYER_NAME:
+                unified_annotations = np.asarray(lyr.data)
+                break
+        if unified_annotations is None:
+            self._log(f"❌ Label layer '{UNIFIED_LABELS_LAYER_NAME}' not found!")
             try:
                 self.training_finished.emit(cell_types, None)
             except Exception:
                 pass
+            return
+
+        # Read death annotation layer if needed (Qt thread).
+        death_annotations = None
+        if self.has_death:
+            for lyr in self.viewer.layers:
+                if lyr.name == DEAD_LABELS_LAYER_NAME:
+                    death_annotations = np.asarray(lyr.data)
+                    break
+
+        # Build model NOW on Qt thread (reads widget values: fe_combo, etc.).
+        try:
+            model, fe_device = self._build_model()
+        except Exception as e:
+            self._log(f"❌ Failed to build model: {e}")
+            try:
+                self.training_finished.emit(cell_types, None)
+            except Exception:
+                pass
+            return
+
+        # Snapshot all other state needed by the worker.
+        unified_input_channels = list(self.unified_input_channels)
+        death_input_channels   = list(self.death_input_channels)
+        label_map              = dict(self.label_map)
+        all_cell_types         = list(self.all_cell_types)
+        has_death              = self.has_death
+        pixel_class_outdir     = Path(self.pixel_class_outdir)
+        all_images             = list(self.all_images)  # references; data is lazy
+        convpaint_strategy     = self.convpaint_strategy
+        fe_alias               = self.fe_combo.currentData()  # for death model
+
+        # Snapshot per-tab params (Qt thread only).
+        tabs_params = {}
+        for ct, tab in self.tabs.items():
+            p = {}
+            for attr in (
+                "edt_threshold_spin", "opening_nr_pixels_spin",
+                "segment_size_min_spin", "peak_min_distance_spin",
+                "peak_min_ratio_spin", "prob_mask_threshold_spin",
+                "prob_seed_threshold_spin",
+            ):
+                w = getattr(tab, attr, None)
+                if w is not None:
+                    p[attr] = w.value()
+            w2 = getattr(tab, "fill_holes_cb", None)
+            if w2 is not None:
+                p["fill_holes"] = bool(w2.isChecked())
+            tabs_params[ct] = p
+
+        safe_log = ThreadSafeLogger(self._log)
+
+        # ── Phase 2 (worker thread) ───────────────────────────────────────
+        def _do_train(progress_cb=None):
+            n_steps = 2 if has_death else 1
+            result = {}
+
+            # ── Unified classifier ──────────────────────────────────────
+            if progress_cb:
+                progress_cb(0, n_steps, "Training unified classifier…")
+
+            # Determine active cell types from annotations.
+            unique_vals = set(
+                int(v) for v in np.unique(unified_annotations) if int(v) > 0
+            )
+            active_cell_types = [
+                ct for ct in all_cell_types
+                if int(label_map["celltype_to_label"][ct]) in unique_vals
+            ]
+            skipped = [ct for ct in all_cell_types if ct not in active_cell_types]
+            if skipped:
+                safe_log(
+                    f"⚠️ No annotations for: {', '.join(skipped)}. "
+                    "Those cell types will not be predicted."
+                )
+            if not active_cell_types:
+                safe_log("❌ No annotated cell types — aborting training.")
+                result["error"] = "no_active_cell_types"
+                return result
+
+            # Remap annotations to dense indices.
+            active_label_map = build_label_map(active_cell_types)
+            remap = {0: 0, BACKGROUND_LABEL: BACKGROUND_LABEL}
+            for ct in active_cell_types:
+                old_idx = int(label_map["celltype_to_label"][ct])
+                new_idx = int(active_label_map["celltype_to_label"][ct])
+                remap[old_idx] = new_idx
+            remapped = np.zeros_like(unified_annotations)
+            for old_v, new_v in remap.items():
+                if old_v != 0:
+                    remapped[unified_annotations == old_v] = new_v
+
+            train_images, train_annots = [], []
+            for i, img in enumerate(all_images):
+                fa = remapped[i]
+                if np.any(fa > 0):
+                    train_images.append(
+                        _slice_image_channels(img, unified_input_channels)
+                    )
+                    train_annots.append(fa)
+
+            if not train_images:
+                safe_log("⚠️ No annotated frames — aborting training.")
+                result["error"] = "no_annotated_frames"
+                return result
+
+            safe_log(
+                f"Training unified classifier on {len(train_images)} frames "
+                f"({len(active_cell_types)} cell types: {active_cell_types})…"
+            )
+            model.train(
+                train_images, train_annots,
+                fe_use_device=fe_device, clf_use_device=fe_device,
+            )
+
+            # Save model + label-map sidecar.
+            model_path = unified_model_path(pixel_class_outdir)
+            map_path   = unified_label_map_path(pixel_class_outdir)
+            model.save(str(model_path))
+            save_label_map(map_path, active_label_map)
+            save_input_channels(
+                unified_input_channels_path(pixel_class_outdir),
+                unified_input_channels,
+                model_name="unified",
+            )
+            safe_log(f"✅ Saved model: {model_path.name}")
+
+            # Run inference on the training stack (pure compute).
+            safe_log("Running unified inference on the training stack…")
+            seg_stack = np.stack(
+                [
+                    segment_per_z(
+                        model,
+                        _slice_image_channels(img, unified_input_channels),
+                        fe_use_device=fe_device,
+                    )
+                    for img in all_images
+                ],
+                axis=0,
+            ).astype(np.int16)
+            _save_preview_array(
+                unified_predicted_labels_path(pixel_class_outdir), seg_stack
+            )
+
+            # Per-cell-type probability maps (when needed by strategy).
+            needs_prob = convpaint_strategy == STRATEGY_PROB or any(
+                tabs_params.get(ct, {}).get("prob_mask_threshold_spin") is not None
+                for ct in active_cell_types
+            )
+            per_ct_prob_stacks = {}
+            if needs_prob:
+                per_ct_stacks = {ct: [] for ct in active_cell_types}
+                for img in all_images:
+                    probas = np.asarray(predict_probas_per_z(
+                        model,
+                        _slice_image_channels(img, unified_input_channels),
+                        fe_use_device=fe_device,
+                    ))
+                    for ct in active_cell_types:
+                        k = int(active_label_map["celltype_to_label"][ct])
+                        if 0 <= (k - 1) < probas.shape[0]:
+                            per_ct_stacks[ct].append(
+                                probas[k - 1].astype(np.float32)
+                            )
+                        else:
+                            per_ct_stacks[ct].append(
+                                np.zeros(probas.shape[1:], dtype=np.float32)
+                            )
+                for ct, slices in per_ct_stacks.items():
+                    stack = np.stack(slices, axis=0)
+                    _save_preview_array(
+                        _probability_map_path(pixel_class_outdir, ct), stack
+                    )
+                    per_ct_prob_stacks[ct] = stack
+            else:
+                # EDT mode: remove stale probability files.
+                for ct in active_cell_types:
+                    p = _probability_map_path(pixel_class_outdir, ct)
+                    if p is not None and p.exists():
+                        shutil.rmtree(p)
+
+            # Instance segmentation previews (pure compute, use snapshotted params).
+            instance_previews = {}  # ct -> array
+            for ct in active_cell_types:
+                tp = tabs_params.get(ct, {})
+                effective = _normalize_strategy(
+                    self._resolve_strategy(ct)  # reads strategy_combo; OK if readonly
+                ) if False else convpaint_strategy  # use global strategy as fallback
+
+                k = int(active_label_map["celltype_to_label"][ct])
+                mask_stack = (seg_stack == k).astype(np.uint8)
+
+                if effective == STRATEGY_PROB and ct in per_ct_prob_stacks:
+                    instances = probability_to_instances(
+                        per_ct_prob_stacks[ct],
+                        mask_thr=tp.get("prob_mask_threshold_spin", 0.5),
+                        seed_thr=tp.get("prob_seed_threshold_spin", 0.5),
+                        opening_nr_pixels=int(tp.get("opening_nr_pixels_spin", 0)),
+                        segment_size_min=int(tp.get("segment_size_min_spin", 10)),
+                    )
+                else:
+                    instances = mask_to_instances(
+                        mask_stack,
+                        edt_thr=float(tp.get("edt_threshold_spin", 1.0)),
+                        opening_nr_pixels=int(tp.get("opening_nr_pixels_spin", 0)),
+                        fill_holes=bool(tp.get("fill_holes", True)),
+                        segment_size_min=int(tp.get("segment_size_min_spin", 10)),
+                        marker_strategy=(
+                            "peak" if effective == STRATEGY_PEAK_EDT else "threshold"
+                        ),
+                        peak_min_distance=float(tp.get("peak_min_distance_spin", 2.0))
+                        if "peak_min_distance_spin" in tp else None,
+                        peak_min_ratio=float(tp.get("peak_min_ratio_spin", 0.35))
+                        if "peak_min_ratio_spin" in tp else 0.35,
+                    )
+                # Save to disk (I/O fine in worker).
+                pred_path = _predicted_labels_path(pixel_class_outdir, ct)
+                if pred_path is not None:
+                    _save_preview_array(pred_path, instances)
+                instance_previews[ct] = instances
+
+            result["unified"] = {
+                "active_label_map": active_label_map,
+                "seg_stack": seg_stack,
+                "per_ct_prob_stacks": per_ct_prob_stacks,
+                "instance_previews": instance_previews,
+                "active_cell_types": active_cell_types,
+            }
+
+            # ── Death classifier (optional) ─────────────────────────────
+            if has_death and death_annotations is not None and np.any(death_annotations):
+                if progress_cb:
+                    progress_cb(1, n_steps, "Training death classifier…")
+                safe_log("Training death classifier…")
+
+                train_d_images, train_d_annots = [], []
+                for i, img in enumerate(all_images):
+                    if np.any(death_annotations[i] > 0):
+                        train_d_images.append(
+                            _slice_image_channels(img, death_input_channels)
+                        )
+                        train_d_annots.append(death_annotations[i])
+
+                if train_d_images:
+                    try:
+                        # Build a second model with the same params (already
+                        # saved the unified model above so model.save is safe).
+                        from napari_convpaint import ConvpaintModel
+                        d_model = ConvpaintModel(fe_alias)
+                        try:
+                            d_model.set_params(**model.params)
+                        except Exception:
+                            pass  # older ConvpaintModel may not support all params
+                        d_model.train(
+                            train_d_images, train_d_annots,
+                            fe_use_device=fe_device, clf_use_device=fe_device,
+                        )
+                        mp = _death_model_path(pixel_class_outdir)
+                        d_model.save(str(mp))
+                        save_input_channels(
+                            death_input_channels_path(pixel_class_outdir),
+                            death_input_channels,
+                            model_name="death",
+                        )
+                        safe_log(f"✅ Saved death model: {mp.name}")
+
+                        # Death preview
+                        d_seg_stack = np.stack(
+                            [
+                                segment_per_z(
+                                    d_model,
+                                    _slice_image_channels(img, death_input_channels),
+                                    fe_use_device=fe_device,
+                                )
+                                for img in all_images
+                            ],
+                            axis=0,
+                        ).astype(np.int16)
+                        death_mask = (d_seg_stack >= 2).astype(np.uint16)
+                        pred_path_d = _predicted_labels_path(pixel_class_outdir, "dead")
+                        if pred_path_d is not None:
+                            _save_preview_array(pred_path_d, death_mask)
+                        result["death"] = death_mask
+                    except Exception as e:
+                        safe_log(f"❌ Death training failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    safe_log("⚠️ No annotations for death — skipping.")
+            elif has_death:
+                safe_log("⚠️ Death layer missing or empty — skipping death training.")
+
+            return result
+
+        # ── Phase 3 (Qt thread, on_done): write results to viewer ─────────
+        def _on_done(result):
+            if not result or "error" in result:
+                self._log("❌ Training produced no results.")
+                try:
+                    self.training_finished.emit(cell_types, None)
+                except Exception:
+                    pass
+                return
+
+            # Apply unified results.
+            u = result.get("unified", {})
+            active_label_map = u.get("active_label_map", {})
+            seg_stack        = u.get("seg_stack")
+            per_ct_prob      = u.get("per_ct_prob_stacks", {})
+            instance_prev    = u.get("instance_previews", {})
+            active_cts       = u.get("active_cell_types", [])
+
+            # Update the live label map so downstream tabs decode correctly.
+            if active_label_map:
+                self.label_map = active_label_map
+
+            if seg_stack is not None:
+                self._set_labels_layer(
+                    UNIFIED_PREDICTED_LAYER_NAME, seg_stack, visible=False
+                )
+
+            for ct, prob_stack in per_ct_prob.items():
+                self._set_image_layer(
+                    _probability_layer_name(ct), prob_stack, visible=False
+                )
+
+            for ct, instances in instance_prev.items():
+                self._set_labels_layer(
+                    _segments_layer_name(ct), instances
+                )
+                prob_stack = per_ct_prob.get(ct)
+                if prob_stack is not None:
+                    self._set_image_layer(
+                        _probability_layer_name(ct), prob_stack, visible=False
+                    )
+
+            # Hide probability layers for non-active cell types.
+            for ct in self.all_cell_types:
+                if ct not in active_cts:
+                    lname = _probability_layer_name(ct)
+                    if lname in self.viewer.layers:
+                        self.viewer.layers[lname].visible = False
+
+            # Apply death result.
+            death_mask = result.get("death")
+            if death_mask is not None:
+                self._set_labels_layer(DEAD_PREDICTED_LAYER_NAME, death_mask)
+
+            _reorder_convpaint_layers(
+                self.viewer, self.all_cell_types, has_death=self.has_death
+            )
+            self._log("✅ Unified inference + previews complete.")
+
+            self._persist_all_params()
+            if self.legend_tab is not None:
+                self.legend_tab.refresh()
+            try:
+                self.training_finished.emit(cell_types, None)
+            except Exception:
+                pass
+
+        def _on_failed(err):
+            self._log(f"❌ Training failed: {err}")
+            try:
+                self.training_finished.emit(cell_types, None)
+            except Exception:
+                pass
+
+        self._bg.run(
+            fn=_do_train,
+            desc="ConvPaint training…",
+            buttons=[self.btn_train],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+            inject_progress=True,
+            indeterminate=False,
+        )
 
     def _train_unified_classifier(self):
         """Train the single multi-class ConvPaint model."""

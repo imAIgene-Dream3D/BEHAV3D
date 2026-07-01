@@ -1591,257 +1591,331 @@ class PixelClassifierWidget(QWidget):
                 fire_extra_callback(extra_callbacks, "on_done", None)
             except Exception as e:
                 fire_extra_callback(extra_callbacks, "on_failed", str(e))
-                raise
-        else:
-            self.log("Error: Failed to load training data for classifier.")
-            fire_extra_callback(extra_callbacks, "on_failed", "no training data")
-            if not interactive:
-                 raise RuntimeError("Training data not loaded. Please load training data manually first.")
-
     def _on_train_clicked(self):
-        """Train classifiers, predict pixels, and segment — mirrors original segment_and_update().
+        """Train classifiers, predict pixels, and segment — runs on a background thread.
 
-        Training is deeply interleaved with napari viewer reads/writes
-        (label layers, prediction layers, segment layers), so this call
-        stays on the Qt thread and napari may briefly appear unresponsive
-        while sklearn fits / predicts.  The in-tab progress row is set
-        to indeterminate-busy mode so the user gets visual feedback.
+        The work is split into three phases:
+          1. Qt thread  — read viewer layers & widget values into plain NumPy arrays
+                          via :meth:`_gather_train_inputs`.
+          2. Worker     — RandomForestClassifier fit, batch predict, instance segment.
+          3. Qt thread  — write result arrays back to viewer layers via
+                          :meth:`_apply_train_results` (the ``on_done`` callback).
+
+        The in-tab progress bar shows live per-target labels, e.g.
+        ``"Training Dead… — 1/3 — ETA 0:22"``.
         """
-        if self.tab_progress_row is not None:
-            self.tab_progress_row.set_busy(
-                "Training pixel classifier (may take a while)\u2026"
-            )
+        if self._bg.is_running():
+            self.log("⚠️ Training is already in progress.")
+            return
 
-        self.log("Training classifier & segmenting...")
-        self._persist_params()
-        self._save_user_labels()  # Always persist labels before training
+        # ── Phase 1 (Qt thread): gather all data we need ────────────────
+        ctx = self._gather_train_inputs()
+        if ctx is None:
+            return  # validation failed; error already logged
 
-        # ── Load features ───────────────────────────────────────────
-        if self.all_features is None:
-            output_dir = Path(self.metadata_loader.output_dir)
-            pixel_class_outdir = output_dir / "images" / "PixelClassification"
-            features_outpath = pixel_class_outdir / 'PixelClassifier_Features.zarr'
-            if features_outpath.exists():
-                self.log("Loading features from disk...")
-                self.all_features = np.asarray(load_zarr(features_outpath))
-            else:
-                self.log("Error: No features found. Please load training data first.")
-                if self.tab_progress_row is not None:
-                    self.tab_progress_row.finish()
-                return
+        all_features       = ctx["all_features"]
+        targets            = ctx["targets"]
+        label_data         = ctx["label_data"]
+        params_by_target   = ctx["params_by_target"]
+        seg_params         = ctx["seg_params"]
+        all_cell_types     = ctx["all_cell_types"]
+        pixel_class_outdir = ctx["pixel_class_outdir"]
 
-        output_dir = Path(self.metadata_loader.output_dir)
-        pixel_class_outdir = output_dir / "images" / "PixelClassification"
-        pixel_class_outdir.mkdir(parents=True, exist_ok=True)
-        n_workers = self.spin_workers.value()
+        from behav3d.napari._background_runner import ThreadSafeLogger
+        safe_log = ThreadSafeLogger(self.log)
 
-        # all_features shape: (T, Z, Y, X, C_feat) — channel LAST
-        all_features = np.asarray(self.all_features)
-        self.log(f"Features shape: {all_features.shape}")
-
-        # ── Collect targets ─────────────────────────────────────────
-        targets = []
-        if self.has_death:
-            targets.append('Dead')
-        targets.extend([t.capitalize() for t in self.all_cell_types])
-
-        try:
-            # ── 1. Save & postprocess user labels, then train ───────
+        # ── Phase 2 (worker thread) ──────────────────────────────────────
+        def _do_train(progress_cb=None):
             classifiers = {}
-            cell_type_labels = {}
+            valid_targets = [t for t in targets if t in label_data]
+            n_valid = len(valid_targets)
 
-            for target in targets:
-                label_layer_name = f'User Provided Labels ({target})'
-                if label_layer_name not in self.viewer.layers:
-                    self.log(f"  Layer {label_layer_name} not found. Skipping.")
-                    continue
-                
-                labels = self.viewer.layers[label_layer_name].data.copy()
+            # 1. Train one RF per target ─────────────────────────────────
+            for i, target in enumerate(valid_targets):
+                if progress_cb:
+                    progress_cb(i, n_valid * 2, f"Training {target}…")
+                safe_log(f"  Training {target}…")
 
-                if labels.max() == 0:
-                    self.log(f"  No labels for {target}. Skipping.")
-                    continue
+                labels  = label_data[target]
+                opening = params_by_target[target]["opening"]
+                fill    = params_by_target[target]["fill"]
 
-                # Get postprocessing params for this target
-                cell_type_key = target.lower()
-                if cell_type_key in self.param_widgets:
-                    w = self.param_widgets[cell_type_key]
-                    opening = int(w['opening'].value())
-                    fill = bool(w['fill_holes'].isChecked())
-                elif cell_type_key == 'dead':
-                    opening, fill = 0, True
-                else:
-                    opening, fill = 0, True
-
-                # Postprocess user labels before training (match original lines 594-618)
+                # Postprocess user labels
                 fg_mask = (labels == 2).astype(bool)
                 if np.any(fg_mask):
-                    processed_fg = postprocess_mask(fg_mask, fill_holes=fill, opening_nr_pixels=opening)
-                    labels = np.where(processed_fg, 2,
-                                      np.where(labels == 1, 1, 0)).astype(labels.dtype)
+                    processed_fg = postprocess_mask(
+                        fg_mask, fill_holes=fill, opening_nr_pixels=opening
+                    )
+                    labels = np.where(
+                        processed_fg, 2, np.where(labels == 1, 1, 0)
+                    ).astype(labels.dtype)
 
-                # Save user labels to zarr
-                labels_outpath = pixel_class_outdir / f'PixelClassifier_User{target}Labels.zarr'
+                # Save postprocessed labels to zarr
+                labels_outpath = (
+                    pixel_class_outdir / f"PixelClassifier_User{target}Labels.zarr"
+                )
                 if labels_outpath.exists():
                     shutil.rmtree(labels_outpath)
                 save_as_zarr(labels, labels_outpath)
-                cell_type_labels[target] = labels
-                self.log(f"  Saved {target} user labels (postprocessed)")
+                safe_log(f"  Saved {target} user labels (postprocessed)")
 
-                # Train classifier (match original train_classifier)
-                self.log(f"  Training {target}...")
-                flat_labels = labels.ravel()
+                flat_labels   = labels.ravel()
                 flat_features = all_features.reshape(-1, all_features.shape[-1])
-
                 label_indices = np.flatnonzero(flat_labels > 0)
+                if label_indices.size == 0:
+                    safe_log(f"  No labeled pixels for {target}. Skipping.")
+                    continue
                 selected_features = flat_features[label_indices]
-                selected_labels = flat_labels[label_indices]
+                selected_labels   = flat_labels[label_indices]
 
                 nr_bg = int(np.sum(selected_labels == 1))
                 nr_fg = int(np.sum(selected_labels == 2))
                 total = nr_bg + nr_fg
-                self.log(f"    BG pixels: {nr_bg}, FG pixels: {nr_fg}")
-
+                safe_log(f"    BG pixels: {nr_bg}, FG pixels: {nr_fg}")
                 if total == 0:
-                    self.log(f"  No labeled pixels for {target}. Skipping.")
+                    safe_log(f"  No labeled pixels for {target}. Skipping.")
                     continue
 
                 class_weights = {1: nr_bg / total, 2: nr_fg / total}
-
                 clf = RandomForestClassifier(
-                    n_estimators=50,
-                    n_jobs=-1,
-                    max_depth=20,
-                    class_weight=class_weights
+                    n_estimators=50, n_jobs=-1, max_depth=20,
+                    class_weight=class_weights,
                 )
                 from skimage import future
                 clf = future.fit_segmenter(selected_labels, selected_features, clf)
 
-                clf_path = pixel_class_outdir / f'PixelClassifier_{target}.joblib'
+                clf_path = pixel_class_outdir / f"PixelClassifier_{target}.joblib"
                 joblib.dump(clf, clf_path)
-                self.log(f"  Saved classifier: {clf_path.name}")
+                safe_log(f"  Saved classifier: {clf_path.name}")
                 classifiers[target] = clf
 
-            # ── 2. Predict all pixels ───────────────────────────────
-            pred_masks = {}
+            # 2. Predict all pixels ──────────────────────────────────────
+            pred_masks   = {}
             n_timepoints = all_features.shape[0]
 
-            for target, clf in classifiers.items():
-                self.log(f"  Predicting {target} pixels...")
+            for j, (target, clf) in enumerate(classifiers.items()):
+                if progress_cb:
+                    progress_cb(
+                        n_valid + j, n_valid * 2,
+                        f"Predicting {target} pixels…",
+                    )
+                safe_log(f"  Predicting {target} pixels…")
                 prediction_stack = []
-
                 for t in range(n_timepoints):
-                    # all_features[t] shape: (Z, Y, X, C_feat) — already channel-last
-                    feat_t = all_features[t]
-                    spatial_shape = feat_t.shape[:-1]  # (Z, Y, X)
-                    X_t = feat_t.reshape(-1, feat_t.shape[-1])
+                    feat_t        = all_features[t]
+                    spatial_shape = feat_t.shape[:-1]
+                    X_t           = feat_t.reshape(-1, feat_t.shape[-1])
+                    batch_size    = 100_000
+                    y_pred_t      = np.zeros(X_t.shape[0], dtype=np.uint8)
+                    for start in range(0, X_t.shape[0], batch_size):
+                        y_pred_t[start : start + batch_size] = clf.predict(
+                            X_t[start : start + batch_size]
+                        )
+                    prediction_stack.append(y_pred_t.reshape(spatial_shape))
+                full_prediction = np.stack(prediction_stack)
 
-                    # Predict in batches
-                    batch_size = 100_000
-                    y_pred_t = np.zeros(X_t.shape[0], dtype=np.uint8)
-                    for i in range(0, X_t.shape[0], batch_size):
-                        y_pred_t[i:i+batch_size] = clf.predict(X_t[i:i+batch_size])
-
-                    y_pred_t = y_pred_t.reshape(spatial_shape)
-                    prediction_stack.append(y_pred_t)
-
-                full_prediction = np.stack(prediction_stack)  # (T, Z, Y, X)
-
-                # Postprocess predictions (match original lines 728-738)
-                cell_type_key = target.lower()
-                if cell_type_key in self.param_widgets:
-                    w = self.param_widgets[cell_type_key]
-                    opening = int(w['opening'].value())
-                    fill = bool(w['fill_holes'].isChecked())
-                elif cell_type_key == 'dead':
-                    opening, fill = 0, True
-                else:
-                    opening, fill = 0, True
-
+                opening = params_by_target.get(target, {}).get("opening", 0)
+                fill    = params_by_target.get(target, {}).get("fill", True)
                 fg_mask = (full_prediction == 2).astype(bool)
-                processed_fg = postprocess_mask(fg_mask, fill_holes=fill, opening_nr_pixels=opening)
-                full_prediction = np.where(processed_fg, 2,
-                                           np.where(full_prediction == 1, 1, 0)).astype(np.uint8)
-
+                processed_fg = postprocess_mask(
+                    fg_mask, fill_holes=fill, opening_nr_pixels=opening
+                )
+                full_prediction = np.where(
+                    processed_fg, 2, np.where(full_prediction == 1, 1, 0)
+                ).astype(np.uint8)
                 pred_masks[target] = full_prediction
 
-                # Save predictions to zarr
-                pred_outpath = pixel_class_outdir / f'PixelClassifier_{target}_PredictedLabels.zarr'
+                pred_outpath = (
+                    pixel_class_outdir
+                    / f"PixelClassifier_{target}_PredictedLabels.zarr"
+                )
                 if pred_outpath.exists():
                     shutil.rmtree(pred_outpath)
                 save_as_zarr(full_prediction, pred_outpath)
 
-                # Update viewer layer
-                pred_layer_name = f'Pixel Classification ({target})'
-                if pred_layer_name in self.viewer.layers:
-                    self.viewer.layers[pred_layer_name].data = full_prediction
-                    # self.viewer.layers[pred_layer_name].visible = True
-                    self.viewer.layers[pred_layer_name].refresh()
-                else:
-                    self.viewer.add_labels(full_prediction, name=pred_layer_name, opacity=0.3)
-                self.log(f"  {target} prediction updated.")
-
-            # ── 3. Segment instances (match original lines 757-819) ──
-            self.log("Segmenting cell instances...")
-            for cell_type in self.all_cell_types:
+            # 3. Segment instances ───────────────────────────────────────
+            seg_results = {}
+            safe_log("Segmenting cell instances…")
+            for cell_type in all_cell_types:
                 target = cell_type.capitalize()
                 if target not in pred_masks:
                     continue
-
-                cell_type_key = cell_type.lower()
-                if cell_type_key in self.param_widgets:
-                    w = self.param_widgets[cell_type_key]
-                    edt_threshold = float(w['edt'].value())
-                    segment_size_min = int(w['min_size'].value())
-                else:
-                    if cell_type in self.organoid_types:
-                        edt_threshold, segment_size_min = 12.0, 1000
-                    elif cell_type in self.immune_types:
-                        edt_threshold, segment_size_min = 2.5, 10
-                    else:
-                        edt_threshold, segment_size_min = 1.0, 10
-
-                self.log(f"  Segmenting {target} (EDT={edt_threshold}, min_size={segment_size_min})...")
+                sp               = seg_params.get(cell_type, {})
+                edt_threshold    = sp.get("edt_threshold", 1.0)
+                segment_size_min = sp.get("segment_size_min", 10)
+                safe_log(
+                    f"  Segmenting {target} (EDT={edt_threshold}, "
+                    f"min_size={segment_size_min})…"
+                )
                 pred_mask = pred_masks[target]
-
                 segmented_timepoints = []
                 for t_idx in range(pred_mask.shape[0]):
                     mask_t = (pred_mask[t_idx] == 2)
-                    fg_pixels = int(mask_t.sum())
-
-                    if fg_pixels == 0:
-                        segmented = np.zeros_like(mask_t, dtype=np.uint16)
+                    if int(mask_t.sum()) == 0:
+                        segmented_timepoints.append(
+                            np.zeros_like(mask_t, dtype=np.uint16)
+                        )
                     else:
-                        segmented = segment_mask(
-                            mask=mask_t,
-                            edt_thr=edt_threshold,
-                            edt_thr_refined=None,
-                            segment_size_min=segment_size_min,
-                            use_dims=2,
-                            n_workers=1,
-                        ).astype(np.uint16, copy=False)
-
-                    segmented_timepoints.append(segmented)
-
+                        segmented_timepoints.append(
+                            segment_mask(
+                                mask=mask_t,
+                                edt_thr=edt_threshold,
+                                edt_thr_refined=None,
+                                segment_size_min=segment_size_min,
+                                use_dims=2,
+                                n_workers=1,
+                            ).astype(np.uint16, copy=False)
+                        )
                 full_seg = np.stack(segmented_timepoints, axis=0)
-                self.log(f"  {target}: max label = {int(full_seg.max())}")
+                safe_log(f"  {target}: max label = {int(full_seg.max())}")
+                seg_results[cell_type] = full_seg
 
-                seg_layer_name = f'{target} Segments'
-                if seg_layer_name in self.viewer.layers:
-                    self.viewer.layers[seg_layer_name].data = full_seg
-                    self.viewer.layers[seg_layer_name].visible = True
-                    self.viewer.layers[seg_layer_name].refresh()
+            return {"predictions": pred_masks, "segments": seg_results}
+
+        # ── Phase 3 (Qt thread): apply results to viewer ─────────────────
+        def _on_done(results):
+            self._apply_train_results(results)
+
+        def _on_failed(err):
+            self.log(f"❌ Error during training/segmentation: {err}")
+
+        self._bg.run(
+            fn=_do_train,
+            desc="Training pixel classifier…",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_train_update],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+            inject_progress=True,
+            indeterminate=False,
+        )
+
+    # ── Training helpers ─────────────────────────────────────────────────
+
+    def _gather_train_inputs(self):
+        """Phase 1 (Qt thread): read viewer layers & widget values.
+
+        Persists params and labels, loads features, reads label layer data
+        and all widget values into plain Python/NumPy objects so the worker
+        thread never touches Qt widgets or napari layers directly.
+
+        Returns a context dict on success, or ``None`` when validation fails.
+        """
+        self._persist_params()
+        self._save_user_labels()
+
+        # Load features
+        if self.all_features is None:
+            output_dir = Path(self.metadata_loader.output_dir)
+            pixel_class_outdir = output_dir / "images" / "PixelClassification"
+            features_outpath = pixel_class_outdir / "PixelClassifier_Features.zarr"
+            if features_outpath.exists():
+                self.log("Loading features from disk…")
+                self.all_features = np.asarray(load_zarr(features_outpath))
+            else:
+                self.log("Error: No features found. Please load training data first.")
+                return None
+
+        output_dir = Path(self.metadata_loader.output_dir)
+        pixel_class_outdir = output_dir / "images" / "PixelClassification"
+        pixel_class_outdir.mkdir(parents=True, exist_ok=True)
+
+        all_features = np.asarray(self.all_features)
+        self.log(f"Features shape: {all_features.shape}")
+
+        targets = []
+        if self.has_death:
+            targets.append("Dead")
+        targets.extend([t.capitalize() for t in self.all_cell_types])
+
+        # Read label layers — must be on the Qt thread
+        label_data = {}
+        for target in targets:
+            layer_name = f"User Provided Labels ({target})"
+            if layer_name not in self.viewer.layers:
+                self.log(f"  Layer {layer_name} not found. Skipping.")
+                continue
+            labels = self.viewer.layers[layer_name].data.copy()
+            if labels.max() == 0:
+                self.log(f"  No labels for {target}. Skipping.")
+                continue
+            label_data[target] = labels
+
+        # Read postprocessing params from widgets — must be on the Qt thread
+        params_by_target = {}
+        for target in targets:
+            cell_type_key = target.lower()
+            if cell_type_key in self.param_widgets:
+                w       = self.param_widgets[cell_type_key]
+                opening = int(w["opening"].value())
+                fill    = bool(w["fill_holes"].isChecked())
+            elif cell_type_key == "dead":
+                opening, fill = 0, True
+            else:
+                opening, fill = 0, True
+            params_by_target[target] = {"opening": opening, "fill": fill}
+
+        # Read segmentation params from widgets — must be on the Qt thread
+        seg_params = {}
+        for cell_type in self.all_cell_types:
+            cell_type_key = cell_type.lower()
+            if cell_type_key in self.param_widgets:
+                w                = self.param_widgets[cell_type_key]
+                edt_threshold    = float(w["edt"].value())
+                segment_size_min = int(w["min_size"].value())
+            else:
+                if cell_type in self.organoid_types:
+                    edt_threshold, segment_size_min = 12.0, 1000
+                elif cell_type in self.immune_types:
+                    edt_threshold, segment_size_min = 2.5, 10
                 else:
-                    self.viewer.add_labels(full_seg, name=seg_layer_name, opacity=0.7)
+                    edt_threshold, segment_size_min = 1.0, 10
+            seg_params[cell_type] = {
+                "edt_threshold": edt_threshold,
+                "segment_size_min": segment_size_min,
+            }
 
-            self.log("Training, prediction, and segmentation complete!")
+        return {
+            "all_features": all_features,
+            "targets": targets,
+            "label_data": label_data,
+            "params_by_target": params_by_target,
+            "seg_params": seg_params,
+            "all_cell_types": list(self.all_cell_types),
+            "pixel_class_outdir": pixel_class_outdir,
+        }
 
-        except Exception as e:
-            traceback.print_exc()
-            self.log(f"Error during training/segmentation: {e}")
-        finally:
-            if self.tab_progress_row is not None:
-                self.tab_progress_row.finish()
+    def _apply_train_results(self, results):
+        """Phase 3 (Qt thread): write training results back to viewer layers."""
+        if results is None:
+            return
+        pred_masks  = results.get("predictions", {})
+        seg_results = results.get("segments", {})
+
+        for target, full_prediction in pred_masks.items():
+            pred_layer_name = f"Pixel Classification ({target})"
+            if pred_layer_name in self.viewer.layers:
+                self.viewer.layers[pred_layer_name].data = full_prediction
+                self.viewer.layers[pred_layer_name].refresh()
+            else:
+                self.viewer.add_labels(
+                    full_prediction, name=pred_layer_name, opacity=0.3
+                )
+            self.log(f"  {target} prediction updated.")
+
+        for cell_type, full_seg in seg_results.items():
+            target         = cell_type.capitalize()
+            seg_layer_name = f"{target} Segments"
+            if seg_layer_name in self.viewer.layers:
+                self.viewer.layers[seg_layer_name].data    = full_seg
+                self.viewer.layers[seg_layer_name].visible = True
+                self.viewer.layers[seg_layer_name].refresh()
+            else:
+                self.viewer.add_labels(full_seg, name=seg_layer_name, opacity=0.7)
+
+        self.log("Training, prediction, and segmentation complete!")
+
 
     def _on_resegment_clicked(self):
         self.log("Testing segmentation parameters on current view...")
