@@ -1478,6 +1478,7 @@ def run_pixel_classifier_segmentation(
     n_workers=4,
     log_callback=print,
     progress_cb=None,
+    only_cell_types=None,   # list of cell-type strings to process; None = process all
     ):
 
     """
@@ -1528,6 +1529,15 @@ def run_pixel_classifier_segmentation(
     has_death = has_dead_channel(metadata)
     
     all_cell_types = organoid_types + immune_types + other_types
+    
+    # Apply optional cell-type filter
+    if only_cell_types is not None:
+        only_set = set(only_cell_types)
+        organoid_types = [ct for ct in organoid_types if ct in only_set]
+        immune_types   = [ct for ct in immune_types   if ct in only_set]
+        other_types    = [ct for ct in other_types    if ct in only_set]
+        has_death = has_death and "death" in only_set
+        all_cell_types = organoid_types + immune_types + other_types
     
     print(f"Detected cell types: organoids={organoid_types}, immune={immune_types}, other={other_types}")
     print(f"Dead channel: {has_death}")
@@ -2001,55 +2011,67 @@ def run_pixel_classifier_segmentation(
                         f"{requested_range_count} (compact requested range)."
                     )
 
-        # Range-aware reuse/skip checks must happen after the requested raw range is known.
-        if not resuming and not overwrite_existing and not only_segment:
-            existing_segment_paths = [p for p in segments_outpaths.values() if p.exists()]
-            if existing_segment_paths:
-                if stale_done_markers:
-                    log(
-                        f"  Found stale .seg_done_* markers for {sample_name}. "
-                        f"Will recompute instead of reusing existing outputs."
-                    )
-                else:
-                    all_outputs_match = True
-                    for cell_type, seg_path in segments_outpaths.items():
-                        if not seg_path.exists():
-                            all_outputs_match = False
-                            break
-                        try:
-                            _validate_output_array(
-                                zarr.open(str(seg_path), mode="r+"),
-                                context=f"{sample_name} {cell_type} segments",
-                            )
-                        except ValueError:
-                            all_outputs_match = False
-                            break
-                    if all_outputs_match:
-                        _backfill_sample_metadata(preserve_existing=True)
-                        _persist_metadata_snapshot()
-                        log(
-                            f"  Sample {sample_name} already segmented for raw range "
-                            f"{requested_range_start}:{requested_range_end}. Skipping."
-                        )
-                        continue
-                    raise RuntimeError(
-                        f"Sample {sample_name} already has segmentation outputs on disk, but they do not match the "
-                        f"requested raw range {requested_range_start}:{requested_range_end}. "
-                        f"Use overwrite or remove the existing outputs first."
-                    )
+        # Range-aware reuse/skip checks: operate per cell type so we can skip
+        # already-segmented types and only compute what is missing.
+        active_cts_for_sample = list(all_cell_types)
+        has_death_for_sample = has_death
 
-        # If we are NOT resuming and NOT overwriting, clean outputs only after range compatibility checks.
+        if not resuming and not overwrite_existing and not only_segment:
+            remaining_cts = []
+            for cell_type in active_cts_for_sample:
+                seg_path = segments_outpaths[cell_type]
+                if not seg_path.exists():
+                    remaining_cts.append(cell_type)
+                    continue
+                if stale_done_markers:
+                    # Interrupted run — keep in active list for resume
+                    remaining_cts.append(cell_type)
+                    continue
+                try:
+                    _validate_output_array(
+                        zarr.open(str(seg_path), mode="r"),
+                        context=f"{sample_name} {cell_type} segments",
+                    )
+                    # Already complete and shape matches — skip this cell type
+                    log(f"  ⏭️  {cell_type}: already segmented for range {requested_range_start}:{requested_range_end}, skipping.")
+                except ValueError:
+                    remaining_cts.append(cell_type)
+            active_cts_for_sample = remaining_cts
+
+            # Check death mask
+            if has_death_for_sample and death_mask_outpath.exists() and not stale_done_markers:
+                try:
+                    _validate_output_array(
+                        zarr.open(str(death_mask_outpath), mode="r"),
+                        context=f"{sample_name} death mask",
+                    )
+                    log(f"  ⏭️  death: already segmented for range {requested_range_start}:{requested_range_end}, skipping.")
+                    has_death_for_sample = False
+                except ValueError:
+                    pass  # Shape mismatch, needs recompute
+
+            if not active_cts_for_sample and not has_death_for_sample:
+                _backfill_sample_metadata(preserve_existing=True)
+                _persist_metadata_snapshot()
+                log(
+                    f"  ⏭️  Sample {sample_name} already fully segmented for raw range "
+                    f"{requested_range_start}:{requested_range_end}. Skipping."
+                )
+                continue
+
+        # If we are NOT resuming and NOT overwriting, only clear outputs for cell types that need recompute.
         if not resuming and not overwrite_existing:
             if not only_segment:
-                for seg_path in segments_outpaths.values():
-                    if seg_path.exists():
+                for cell_type in active_cts_for_sample:
+                    seg_path = segments_outpaths.get(cell_type)
+                    if seg_path and seg_path.exists():
                         shutil.rmtree(seg_path)
-                if death_mask_outpath.exists():
-                    shutil.rmtree(death_mask_outpath)
-                for mask_path in mask_outpaths.values():
-                    if mask_path.exists():
+                    mask_path = mask_outpaths.get(cell_type)
+                    if mask_path and mask_path.exists():
                         shutil.rmtree(mask_path)
-        
+                if has_death_for_sample and death_mask_outpath.exists():
+                    shutil.rmtree(death_mask_outpath)
+
         # Build per-sample feature extractor from pixel size metadata
         sample_pixel_xy = float(sample.get('pixel_distance_xy', 1.0))
         sample_pixel_z  = float(sample.get('pixel_distance_z', 1.0))
@@ -2183,7 +2205,7 @@ def run_pixel_classifier_segmentation(
         if not only_segment:
             zarr_masks = {}
             zarr_segs = {}
-            for cell_type in all_cell_types:
+            for cell_type in active_cts_for_sample:
                 zarr_masks[cell_type] = _open_output_array(
                     mask_outpaths[cell_type],
                     "int16",
@@ -2197,7 +2219,7 @@ def run_pixel_classifier_segmentation(
                     reuse_existing=resuming,
                 )
             zarr_death = None
-            if has_death and clf_death is not None:
+            if has_death_for_sample and clf_death is not None:
                 zarr_death = _open_output_array(
                     death_mask_outpath,
                     "int16",
@@ -2206,7 +2228,7 @@ def run_pixel_classifier_segmentation(
                 )
         else:
             zarr_segs = {}
-            for cell_type in all_cell_types:
+            for cell_type in active_cts_for_sample:
                 zarr_segs[cell_type] = _open_output_array(
                     segments_outpaths[cell_type],
                     "uint16",
@@ -2239,7 +2261,7 @@ def run_pixel_classifier_segmentation(
                     features = _ff(t_img)
                 del t_img  # free immediately — features is all we need from here
                 
-                for cell_type in all_cell_types:
+                for cell_type in active_cts_for_sample:
                     # RF already has n_jobs=1 (Mejora 1) → 1 core per worker
                     pred_mask = future.predict_segmenter(features, classifiers[cell_type])
                     pred_mask[pred_mask > 0] -= 1
@@ -2267,7 +2289,7 @@ def run_pixel_classifier_segmentation(
                     del pred_mask, fg_mask, processed_fg, seg
                 
                 # Death classifier
-                if has_death and clf_death is not None and zarr_death is not None:
+                if has_death_for_sample and clf_death is not None and zarr_death is not None:
                     death_mask = future.predict_segmenter(features, clf_death)
                     death_mask[death_mask > 0] -= 1
                     zarr_death[write_idx] = death_mask
@@ -2276,7 +2298,7 @@ def run_pixel_classifier_segmentation(
                 del features
             else:
                 # only_segment mode: read existing masks, segment, write
-                for cell_type in all_cell_types:
+                for cell_type in active_cts_for_sample:
                     if cell_type not in loaded_masks:
                         continue
                     index_mode = loaded_mask_index_modes.get(cell_type, "absolute")

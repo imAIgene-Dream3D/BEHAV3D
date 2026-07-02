@@ -1834,8 +1834,19 @@ class APOCTrainingWidget(QWidget):
         # inline mode the group already lives in the tab so we do nothing.
         if self._instance_controls_mode == "docked":
             self.tab_widget.currentChanged.connect(lambda _idx: self._refresh_instance_controls())
+        self.tab_widget.currentChanged.connect(self._update_train_current_btn_text)
         if self.strategy_combo is not None:
             self.strategy_combo.currentTextChanged.connect(self._on_global_strategy_changed)
+        self._update_train_current_btn_text()
+
+    def _update_train_current_btn_text(self, *_args):
+        if hasattr(self, "train_current_btn") and hasattr(self, "tab_widget") and self._tab_cell_types:
+            try:
+                current_ct = self._tab_cell_types[self.tab_widget.currentIndex()]
+                self.train_current_btn.setText(f"▶ Train {current_ct.capitalize()} classifier")
+            except IndexError:
+                pass
+
 
     def _refresh_instance_controls(self):
         """Show the current tab's instance-segmentation controls in the main dock.

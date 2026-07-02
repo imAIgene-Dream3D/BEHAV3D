@@ -318,7 +318,7 @@ class PixelClassifierPanel:
         )
 
         self.btn_run = widgets.Button(
-            description="Run segmentation",
+            description="Run batch segmentation",
             button_style="success",
             layout=widgets.Layout(width="fit-content", flex="0 0 auto")
         )
@@ -330,10 +330,37 @@ class PixelClassifierPanel:
         
         self.spinner_apply = widgets.HTML(value=spinning_loader)
         self.spinner_apply.layout.display = "none"
+
+        ct_options = self.all_cell_types
+        if self.has_death:
+            ct_options = ct_options + ["death"]
+
+        self.segment_ct_dropdown = widgets.Dropdown(
+            options=ct_options,
+            description="Cell type:",
+            layout=widgets.Layout(width="250px")
+        )
+        self.btn_run_single = widgets.Button(
+            description="Run for selected cell type",
+            button_style="info",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
+
+        self.single_apply_row = widgets.HBox(
+            [self.segment_ct_dropdown, self.btn_run_single],
+            layout=widgets.Layout(align_items="center", gap="8px", margin="0 0 10px 0")
+        )
+
         self.apply_row = widgets.HBox(
             [self.btn_run, self.btn_resegment, self.spinner_apply],
             layout=widgets.Layout(align_items="center", gap="8px")
         )
+        
+        self.apply_container = widgets.VBox(
+            [self.single_apply_row, self.apply_row],
+            layout=widgets.Layout(margin="10px 0")
+        )
+
         self.only_resegment_warning = widgets.HTML(
             "<span style='color:#b26a00;'>"
             "Warning: Only resegment must use the same timepoint range as the masks/segmentation it comes from. "
@@ -343,8 +370,9 @@ class PixelClassifierPanel:
 
         self.btn_train.on_click(self._on_train_clicked)
         self.close_button.on_click(self._on_close_clicked)
-        self.btn_run.on_click(partial(self._on_apply_clicked, only_segment=False))
-        self.btn_resegment.on_click(partial(self._on_apply_clicked, only_segment=True))
+        self.btn_run.on_click(partial(self._on_apply_clicked, only_segment=False, target_cell_type=None))
+        self.btn_resegment.on_click(partial(self._on_apply_clicked, only_segment=True, target_cell_type=None))
+        self.btn_run_single.on_click(lambda _: self._on_apply_clicked(None, only_segment=False, target_cell_type=self.segment_ct_dropdown.value))
 
         # --- Post-processing: size filtering ---
         # We create a list of min size inputs, one per cell type
@@ -477,7 +505,7 @@ class PixelClassifierPanel:
                 self.overwrite_existing,
                 widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end]),
                 self.only_resegment_warning,
-                self.apply_row,
+                self.apply_container,
             ]),
             widgets.HTML("<hr>"),
             self.post_processing_box,
@@ -953,8 +981,7 @@ class PixelClassifierPanel:
 
     def _lock(self, state: bool):
         to_lock = [
-            self.btn_train, self.btn_run, self.btn_resegment,
-            self.classifier_engine,
+            self.btn_train, self.apply_container,
             #self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
             self.examples_per_sample, self.n_workers,
             self.use_all_timepoints, self.tp_start, self.tp_end,
@@ -1187,7 +1214,7 @@ class PixelClassifierPanel:
                 self.out.clear_output()
                 print("Training finished.")
 
-    def _on_apply_clicked(self, _, only_segment=False):
+    def _on_apply_clicked(self, _, only_segment=False, target_cell_type=None):
         self._lock(True)
         with self.out:
             self.out.clear_output()
@@ -1195,7 +1222,10 @@ class PixelClassifierPanel:
             try:
                 odir = Path(self.metadata_loader.output_dir).expanduser()
                 tpr = _mk_timepoint_range(bool(self.use_all_timepoints.value), int(self.tp_start.value), int(self.tp_end.value))
-                
+
+                # Build only_cell_types filter: None means run all
+                only_cell_types = None if target_cell_type is None else [target_cell_type]
+
                 clf_organoid_paths = {ct: str(self.clf_paths[ct].value) for ct in self.organoid_types if ct in self.clf_paths and self.clf_paths[ct].value} if self.manual_clf_paths.value else None
                 clf_immune_paths = {ct: str(self.clf_paths[ct].value) for ct in self.immune_types if ct in self.clf_paths and self.clf_paths[ct].value} if self.manual_clf_paths.value else None
                 clf_other_paths = {ct: str(self.clf_paths[ct].value) for ct in self.other_types if ct in self.clf_paths and self.clf_paths[ct].value} if self.manual_clf_paths.value else None
@@ -1211,9 +1241,6 @@ class PixelClassifierPanel:
                         metadata=self.metadata_loader.metadata,
                         metadata_csv_path=str(self.metadata_loader.metadata_csv_path),
                         apoc_config=pc,
-                        organoid_types=self.organoid_types,
-                        immune_types=self.immune_types,
-                        other_types=self.other_types,
                         timepoint_range=tpr,
                         clf_organoid_paths=clf_organoid_paths,
                         clf_immune_paths=clf_immune_paths,
@@ -1224,6 +1251,7 @@ class PixelClassifierPanel:
                         n_workers=int(self.n_workers.value),
                         gpu_device=str(self.gpu_device.value),
                         apoc_strategy=str(self.apoc_strategy.value),
+                        only_cell_types=only_cell_types,
                     )
                 elif str(self.classifier_engine.value) == "ConvPaint":
                     from behav3d.preprocessing.segmentation.convpaint_segment import run_convpaint_segmentation
@@ -1247,9 +1275,6 @@ class PixelClassifierPanel:
                         metadata=self.metadata_loader.metadata,
                         metadata_csv_path=str(self.metadata_loader.metadata_csv_path),
                         convpaint_config=pc,
-                        organoid_types=self.organoid_types,
-                        immune_types=self.immune_types,
-                        other_types=self.other_types,
                         timepoint_range=tpr,
                         clf_unified_path=clf_unified_path,
                         clf_death_path=clf_death_convpaint_path,
@@ -1257,6 +1282,7 @@ class PixelClassifierPanel:
                         overwrite_existing=bool(self.overwrite_existing.value),
                         n_workers=int(self.n_workers.value),
                         convpaint_strategy=str(self.convpaint_strategy.value),
+                        only_cell_types=only_cell_types,
                     )
                 else:
                     # Original scikit-learn pixel classifier
@@ -1292,6 +1318,7 @@ class PixelClassifierPanel:
                         only_segment=bool(only_segment),
                         overwrite_existing=bool(self.overwrite_existing.value),
                         n_workers=int(self.n_workers.value),
+                        only_cell_types=only_cell_types,
                     )
                 if new_md is not None:
                     new_md = self._apply_multicolor_segment_cleanup(new_md, odir)
