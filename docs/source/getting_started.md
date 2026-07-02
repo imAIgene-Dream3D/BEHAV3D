@@ -42,9 +42,9 @@ The widget has seven tabs, stacked top to bottom inside the right-hand dock:
 | 4 | 📍 **Tracking** | Per cell-type subtabs with LAP, TrackPy, Propagation, btrack, or Import existing. Manual editing of tracked segments lives in the Visualization tab. | [Tracking](processing/tracking/index) |
 | 5 | 🧪 **Feature Extraction** | Movement, intensity, morphology, contact and death features per track. Extended analysis: active killing. | [Feature Extraction](analysis/feature_extraction) |
 | 6 | 🧹 **Filtering** | Track-length, experiment-duration, dead-at-t0 and minimal size filters. | [Filtering](analysis/filtering) |
-| 7 | 📊 **Analysis** | 🚧 *Stub today*. death dynamics, interactions, backprojection — coming soon. | [Analysis](analysis/index) |
+| 7 | 📊 **Analysis** | Death Dynamics & Interaction Analysis, plus Single Cell behavioural-state and trajectory (track) classification — each ending in a Backprojection step that paints the labels back onto the raw images. | [Analysis](analysis/index) |
 
-At the bottom of the dock widget sits the **🛒 Processing Queue**, a collapsible panel that accepts steps from tabs 3 / 4 / 5 / 6 and runs them sequentially per sample. See [Processing Queue](plugin_essentials/processing_queue).
+At the bottom of the dock widget sits the **🛒 Processing Queue**, a collapsible panel that accepts steps from tabs 3 / 4 / 5 / 6 / 7 and runs them sequentially per sample. See [Processing Queue](plugin_essentials/processing_queue).
 
 ## Pipeline tour
 
@@ -69,7 +69,10 @@ This is the happy path. Each step links to its full reference page.
    - For immune + organoid datasets, you can also run Extended Analysis → Active Killing to detect which immune contacts actually killed their target organoid. Requires baseline feature extraction (with contact + death features) on both cell types first.
 6. **Filter in Filtering** ([details](analysis/filtering))
    - Drop tracks shorter than `min_track_length`, optionally cap them at `max_track_length`, drop undersized starting cells with `min_size_t1`, drop dead-at-t0 cells, cap the experiment duration.
-7. **Analyse** — *the napari Analysis tab is still a stub*. For now the analysis modules are reachable from Python; the GUI pages of this wiki are skeletons that will be filled in as each sub-tab lands ([analysis index](analysis/index)).
+7. **Analyse in Analysis** ([details](analysis/index))
+   - **💀 Death Dynamics** — population death dynamics for your target cells and target–effector interaction analysis ([details](analysis/death_dynamics)).
+   - **🧬 Single Cell** — classify each cell's behavioural states over time ([State Classification](analysis/single_cell/state_classification)) and group whole trajectories into clusters ([Track Classification](analysis/single_cell/track_classification)).
+   - Each Single Cell workflow ends with a **Backprojection** step that overlays the behavioural-state / track-cluster labels on the raw images so you can sanity-check the analysis and export figures or movies.
 
 ## Next steps
 

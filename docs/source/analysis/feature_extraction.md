@@ -1,6 +1,6 @@
 # 🧪 Feature Extraction
 
-Tab 5 of the BEHAV3D EXPLORER dock widget. Feature Extraction takes your **tracked segments** plus the **raw image** and computes, for every cell at every timepoint, a panel of biological measurements (movement, intensity, morphology, contact with neighbours, death). The result is the table that every downstream analysis — Filtering, Behavioral states, Death & Morphology, Interaction — reads from.
+Tab 5 of the BEHAV3D EXPLORER dock widget. Feature Extraction takes your **tracked segments** plus the **raw image** and computes, for every cell at every timepoint, a panel of biological measurements (movement, intensity, morphology, contact with neighbours, death). The result is the table that every downstream analysis — Filtering, Death Dynamics, Interaction, and behavioural-state classification — reads from.
 
 ![Feature Extraction tab](../_static/screenshots/feature_extraction_tab.png)
 
@@ -18,9 +18,17 @@ Each row in that CSV = one cell (`TrackID`) at one timepoint (`position_t`). The
 Optionally, an **Active Killing** detector can run on top of the immune-cell features to flag the timepoints at which an immune cell appears to kill a target. That produces several extra files in `analysis/<immune_type>/active_killing/`.
 
 ```{important}
-Feature Extraction itself does **not** generate plots or PDF reports. Quality-control plots are produced by the [Filtering](filtering) tab, behavioural plots by the [Behavioral Analysis](behavioral) tab, and so on. The only graphical output here is:
-- The **Preview Dead Threshold in Viewer** overlay (live in napari).
-- One PNG (`combined_killing_efficiency_distribution.png`) when you run Active Killing.
+The main **▶ Run Feature Extraction** step writes CSVs only — no plot PDFs. Other tabs produce most QC and behavioural figures ([Filtering](filtering.md), [State Classification](single_cell/state_classification.md), etc.).
+
+Graphics from **this** tab are limited to:
+
+- **Preview Dead Threshold in Viewer** — live napari overlay only (not saved).
+- **Active Killing** (immune panel, after baseline extraction) — when you run the analysis or **Display Existing Results**:
+  - Per sample: `plots/<sample>/killing_kinetics_summary_<sample>.png` (four panels: efficiency, kinetics, cumulative events, events per cell).
+  - All samples: `plots/combined_killing_efficiency_distribution.png`.
+  - Top killers: `gallery/<sample>/killing_event_*.gif` (Event GIFs of cropped 3D views (maximum-intensity projections) around each top killing event; count set by **Top-N killers to display**).
+
+See [Active Killing outputs](#active-killing-outputs) for file names; plot interpretation belongs in that section (or a short “Reading the plots” subsection).
 ```
 
 ## Per-cell-type sub-tabs
@@ -47,7 +55,7 @@ Each sub-tab exposes the same six feature-family checkboxes. Some are **mandator
 | **Intensity** | Mean intensity of each raw channel inside each cell's mask | All cell types |
 | **Morphology** | Volume, shape descriptors, surface area, principal axes, orientation | Optional |
 | **Contact** | Which neighbours (of any cell type) each cell is touching or close to | All cell types |
-| **Organoid Invasiveness** | Fraction of each immune cell's surface that lies inside an organoid | Optional, **immune only**, requires Contact |
+| **Organoid Invasiveness** | How much of the immune cell’s surface is in contact with an organoid (0–100%; “invasive” when ≥ about half) | Optional, **immune only**, requires Contact |
 | **Death** | Fraction of the cell's mask that overlaps the dead mask, plus a sticky alive/dead flag | Whenever a dead channel exists |
 
 ### Per-category summary
@@ -65,7 +73,7 @@ Each sub-tab exposes the following spinboxes:
 | Control | Default | Range | Units | Meaning |
 |---|---|---|---|---|
 | **Contact Threshold** | 0.0 | 0.0 – 500.0 | µm | Maximum distance between two cells to be counted as "in contact" (used for distance-based contact columns and `touching_*`). Pixel contact is fixed at one-voxel-diagonal (≈ 1.73 px). Visible only when Contact is checked. |
-| **Dead mask % threshold** | 0.1 | 0.0 – 100.0 | % | Minimum fraction of the cell's voxels that must overlap the dead mask before the cell is flagged as dead. Set to **0** to skip dead classification entirely. |
+| **Dead mask % threshold** | 0.1 | 0.0 – 100.0 | fraction (0–1) | Minimum fraction of the cell's voxels that must overlap the dead mask before the cell is flagged as dead. The value is compared **directly** to `percentage_dead_mask` (a 0–1 fraction), so `0.1` means ≈ 10 % of the mask. Set to **0** to skip dead classification entirely. |
 | **Preview sample** | first sample | dropdown | — | Sample used by the dead-threshold preview button. |
 | **Workers** | balanced default | 1 – (CPU cores − 1) | cores | Parallel workers for image-based computations (morphology / intensity / contact / dead mask). |
 
@@ -75,7 +83,7 @@ The **Dead mask % threshold** is **shared across all organoid sub-tabs**. If you
 
 ## Preview Dead Threshold in Viewer
 
-The **👁 Preview Dead Threshold in Viewer** button (only visible when Death is enabled) is the quickest way to set a sensible Dead threshold for a dataset. It:
+The **👁 Preview Dead Threshold in Viewer** button (only visible when Death is enabled — death channel exists ) is the quickest way to set a sensible Dead threshold for a dataset. It:
 
 1. Clears the napari viewer.
 2. Loads, for the selected preview sample, the raw channels, the dead mask, and the tracked segments of every cell type.
@@ -91,8 +99,15 @@ The overlay updates **live** as you drag the Dead mask % threshold spinner. Hove
 For organoid sub-tabs, all organoid types are merged into a single overlay so you can see them together.
 
 ```{tip}
-Picking the dead threshold is dataset-specific. Start at **0.1 %** and adjust until the green/red split visually matches the dead organoids in your raw image at the end of the movie.
+Picking the dead threshold is dataset-specific, but use these starting points (the value is the fraction of the mask that must overlap the dead signal):
+
+- **Organoids ≈ 0.05** (about 5 % of the mask). It sounds low, but organoids are large 3-D objects, so a few dead cells are only a small volume fraction.
+- **T cells ≈ 0.1** (about 10 %, the default). For a clean dead-dye signal there is a clear central red dot.
+
+Adjust from there until the green/red split visually matches the dead cells in your raw image at a timepoint you trust. The binary alive/dead flag is stored alongside the actual intensity and percentage, so you can re-tune later with **▶ Re-run death**.
 ```
+
+If you already ran extraction with one threshold and want another, change Dead mask % threshold and run ▶ Re-run death
 
 ## Active Killing detection (immune cells only)
 
@@ -187,7 +202,7 @@ All measurements are in µm and hours. Movement is computed only after missing t
 | `mean_speed` | Speed averaged over the last 10 frames (rolling window) |
 
 ```{note}
-The Feature Extraction tab does **not** produce the broader catalogue of motility statistics (turning-angle distributions, straightness, longest forward run, …) used by the state classifier — those are built later, from this table, by the Behavioral Analysis step using a *rolling window* representation of the same movement data.
+The Feature Extraction tab does not produce the broader rolling-window motility statistics used by the state classifier (e.g. straightness, net displacement over a window, median turning angle, run-length summaries). Those are computed later from this table by [State Classification](single_cell/state_classification) when you run the HMM — they are not extra columns in the Feature Extraction CSV.
 ```
 
 ### Intensity (when checked)
@@ -273,11 +288,11 @@ If you set the threshold to 0, the `dead` column is not added.
 - **Workers parallelise image-based work, not movement.** Movement and death-flag calculation are CPU-cheap and serial. The bulk of wall time is in morphology + intensity + contact + dead-mask measurement, which is what the worker count actually speeds up.
 - **Reruns are incremental.** Per-sample intermediate CSVs (intensity, contact, morphology, dead mask) are reused if they already exist on disk and you choose **Skip** in the overwrite dialog — useful when you only need to recompute one feature family. Choose **Overwrite** when you change a threshold and need a clean recompute.
 - **Active Killing is opt-in for a reason.** Baseline Feature Extraction is fast; Active Killing has to scan every contact event for every immune track per sample and is much slower. Run it only when you actually need killing-event analysis.
-- **Active Killing reads the *filtered* CSV when available.** If you have already run [Filtering](filtering), Active Killing will use the filtered feature table rather than the raw one — so it sees the same set of tracks you'll be analysing downstream.
+- **Active Killing reads the *filtered* CSV when available.** If you have already run [Filtering](filtering.md), Active Killing will use the filtered feature table rather than the raw one — so it sees the same set of tracks you'll be analysing downstream.
 
 ## See also
 
-- [Filtering](filtering) — the next step. Drops low-quality tracks and produces QC plots.
-- [Behavioral Analysis](behavioral) — uses the filtered movement / contact / morphology table to classify behavioural states.
-- [Death & Morphology Analysis](death_morphology) — uses the death and morphology columns for organoid-level dynamics.
+- [Filtering](filtering.md) — the next step. Drops low-quality tracks and produces QC plots.
+- [Death Dynamics & Interaction](death_dynamics) — uses the death and contact columns for population death dynamics and interaction analysis.
+- [Single Cell](single_cell/index) — classifies per-cell behavioural states from the movement / contact / morphology table.
 - [Output Directory & File Layout](../plugin_essentials/output_layout) — where the CSVs live.

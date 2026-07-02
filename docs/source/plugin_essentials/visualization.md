@@ -21,7 +21,7 @@ The tab reads paths derived from the metadata + output directory, in this order:
 
 | Layer group | Source files |
 |---|---|
-| **Raw** | `raw_image_path` from metadata, the `.zarr` version under `output_dir/{sample}.zarr` (created by the *Convert to Zarr* step in Data Preparation). |
+| **Raw** | `raw_image_path` from metadata, the `.zarr` version under `output_dir/images/{sample}/{sample}.zarr` (created by the *Convert to Zarr* step in Data Preparation). |
 | **Segments** | `output_dir/images/{sample}/{sample}_{cell_type}_segments.zarr` for each cell type detected in the metadata. |
 | **Tracked Segments** | `output_dir/images/{sample}/{sample}_{cell_type}_tracked.zarr`. |
 | **Tracks** | `output_dir/trackdata/{sample}/{cell_type}/{sample}_{cell_type}_tracks.csv`. |

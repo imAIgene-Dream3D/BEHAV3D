@@ -20,7 +20,7 @@ BEHAV3D EXPLORER runs on Windows, macOS and Linux. The easiest way to install BE
 **Option 1 (Recommended):** Double-click `install_behav3d_windows.bat`
 
 **Option 2:** Open Command Prompt and run:
-```cmd
+```bat
 cd path\to\BEHAV3D\installation
 python install_behav3d.py
 ```

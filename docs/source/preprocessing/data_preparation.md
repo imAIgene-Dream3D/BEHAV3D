@@ -173,6 +173,16 @@ Multicolor is only meaningful when the channels really belong to the *same* cell
 - The Builder created **two** T-cell entries: `tcell_1_multicolor` and `tcell_2_multicolor`. Each one is segmented and tracked independently.
 - After the merge step, an additional `tcell_merged_segments_image_path` (and `_tracks_image_path`, `_tracks_csv_path`) column will be added automatically. These are the columns the rest of the pipeline consumes.
 
+## Combining multiple experiments
+
+There is no one-click "combine experiments" feature, but you can merge several runs manually and have BEHAV3D treat them as a single batch:
+
+1. **Segment and track each experiment separately first**, with whatever channels and settings each one needs.
+2. **Copy each experiment's per-sample `images/<sample>` folders into one shared output directory** so all samples live side by side under the same `images/` folder.
+3. **Merge the experiments' `metadata.csv` files into one** (one row per sample, sample names unique) in that shared directory, and **Load Metadata** on it.
+
+BEHAV3D then sees every sample as one experiment, so you can run **Feature Extraction**, **Filtering** and **Analysis** jointly across all of them. Keep sample names unique across experiments to avoid path collisions.
+
 ## Tips & troubleshooting
 
 - **Spaces in paths**: avoid them where possible.
@@ -183,4 +193,4 @@ Multicolor is only meaningful when the channels really belong to the *same* cell
 
 - [Output Directory & File Layout](../plugin_essentials/output_layout) — what gets written where.
 - [Visualization tab](../plugin_essentials/visualization) — open one sample after zarr conversion to verify channels.
-- [Segmentation overview](segmentation/index) — next step in the pipeline.
+- [Segmentation overview](../processing/segmentation/index.md) — next step in the pipeline.

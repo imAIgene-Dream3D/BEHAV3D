@@ -44,11 +44,14 @@ autodoc_mock_imports = [
     "scanpy",
     "anndata",
     "umap",
+    "igraph",
+    "leidenalg",
     "dtaidistance",
     "sklearn",
     "skimage",
     "tifffile",
     "imageio",
+    "imageio_ffmpeg",
     "joblib",
     "yaml",
     "pandas",
@@ -72,6 +75,11 @@ myst_enable_extensions = [
     "attrs_inline",
     "attrs_block",
 ]
+
+# Auto-generate anchor slugs for headings (h1–h4) so in-page and cross-page
+# "#heading-slug" links resolve. Without this, MyST does not create heading
+# targets and those links warn as missing.
+myst_heading_anchors = 4
 
 source_suffix = {
     ".rst": "restructuredtext",

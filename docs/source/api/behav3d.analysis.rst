@@ -14,14 +14,6 @@ behav3d.analysis.filtering
    :undoc-members:
    :show-inheritance:
 
-behav3d.analysis.tcell_analysis
--------------------------------
-
-.. automodule:: behav3d.analysis.tcell_analysis
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
 behav3d.analysis.organoid_analysis
 ----------------------------------
 
