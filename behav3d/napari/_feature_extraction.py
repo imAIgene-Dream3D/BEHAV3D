@@ -576,22 +576,6 @@ def _remove_layer_if_exists(viewer, layer_name: str):
         pass
 
 
-def _remove_preview_layers(viewer) -> int:
-    """Remove every layer whose name starts with the preview prefix."""
-    if viewer is None:
-        return 0
-    to_remove = [
-        layer for layer in list(viewer.layers)
-        if (getattr(layer, "name", "") or "").startswith(_PREVIEW_PREFIX)
-    ]
-    for layer in to_remove:
-        try:
-            viewer.layers.remove(layer)
-        except Exception:
-            pass
-    return len(to_remove)
-
-
 def _build_dead_pct_map(region_stats):
     """Build a {label_id: pct_dead} map from a single frame's region stats."""
     frame_map: dict = {}
@@ -1085,7 +1069,7 @@ class CellTypeFeaturePanel(QWidget):
         """Disconnect all preview callbacks and reset cached preview state.
 
         Does NOT remove layers — the caller handles that via
-        ``_remove_preview_layers``.
+        ``self.viewer.layers.clear()``.
         """
         self._disconnect_preview_dead_hover()
         self._disconnect_preview_dims()
@@ -1886,9 +1870,7 @@ class CellTypeFeaturePanel(QWidget):
                     pt = pt.parent()
                 if pt is not None:
                     pt._disconnect_org_preview_dims()
-            n_removed = _remove_preview_layers(self.viewer)
-            if n_removed:
-                print(f"[{_ts()}] [Preview]   Removed {n_removed} previous preview layer(s).")
+            self.viewer.layers.clear()
 
             # Raw channels
             if raw_dask is not None:
@@ -3028,9 +3010,8 @@ class FeatureExtractionTab(QWidget):
         })
         for panel in self.panels.values():
             panel._cleanup_preview()
-        n_removed = _remove_preview_layers(self.viewer)
-        if n_removed:
-            self._log(f"Cleaned up {n_removed} preview layer(s).")
+        self.viewer.layers.clear()
+        self._log("Cleaned up viewer layers.")
 
         return True
 
