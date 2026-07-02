@@ -1,37 +1,38 @@
 # Analysis
 
-The Analysis section covers everything that happens **after tracking**: turning the tracked-segments + raw image into per-track features, filtering for quality, and running the higher-level analyses (behavioural clustering, death dynamics, interactions, backprojection).
+The Analysis section covers everything that happens **after tracking**: turning the tracked segments + raw image into per-cell features, filtering for quality, and running the higher-level analyses (death dynamics, cell–cell interactions, behavioural-state classification) and finally visualising those results back on the images.
 
-## Pipeline stage in the dock widget
+In the BEHAV3D EXPLORER dock widget these steps are spread across four tabs:
 
 ```{mermaid}
 flowchart LR
-    T["📍 Tracked segments + tracks.csv"] --> FE["🧪 Feature Extraction"]
+    T["📍 Tracked segments"] --> FE["🧪 Feature Extraction"]
     FE --> F["🧹 Filtering"]
-    F --> A["📊 Analysis<br/>(behavioural, death &amp; morphology, interaction, backprojection)"]
+    F --> A["📊 Analysis"]
 ```
 
-| Page | Tab in napari | Implementation status |
+| Page | Tab in napari | Status |
 |---|---|---|
-| [Feature Extraction](feature_extraction) | 🧪 | ✅ Implemented in the GUI |
-| [Filtering](filtering) | 🧹 | ✅ Implemented in the GUI |
-| [Behavioural Analysis](behavioural) | 📊 (sub) | 🚧 GUI coming soon — function callable from Python |
-| [Death & Morphology Analysis](death_morphology) | 📊 (sub) | 🚧 GUI coming soon — function callable from Python |
-| [Interaction Analysis](interaction) | 📊 (sub) | 🚧 GUI coming soon |
-| [Backprojection](backprojection) | 📊 (sub) | 🚧 GUI coming soon |
+| [Feature Extraction](feature_extraction) | 🧪 Feature Extraction | ✅ Documented |
+| [Filtering](filtering.md) | 🧹 Filtering | ✅ Documented |
+| [Death Dynamics & Interaction](death_dynamics) | 📊 Analysis → 💀 Death Dynamics | ✅ Documented |
+| [Single Cell](single_cell/index) | 📊 Analysis → 🧬 Single Cell | ✅ State Classification · ✅ Track Classification |
 
-```{important}
-The **napari Analysis tab is currently a stub** ([behav3d/napari/_stubs.py](../api/behav3d.napari)). The four sub-pages above describe what the future GUI will look like and document the underlying Python functions you can call today from a script / notebook. Each page will get its full GUI walkthrough as the corresponding sub-tab lands.
+```{note}
+The **📊 Analysis** tab has two sub-tabs:
+
+- **💀 Death Dynamics** — population death dynamics and target–effector interaction analysis (organoid/other vs immune/other).
+- **🧬 Single Cell** — per-cell behavioural classification: **🔬 State Classification** (per-timepoint HMM states) and **🛤️ Track Classification** (whole-trajectory DTW clustering with a trainable classifier).
+
+**Backprojection** — painting state / track-cluster labels back onto the raw images — is  the final step inside each Single Cell workflow (**State Classification → Step 4** and **Track Classification → Step 5**).
 ```
 
 ```{toctree}
 :hidden:
-:maxdepth: 1
+:maxdepth: 2
 
 feature_extraction
 filtering
-behavioural
-death_morphology
-interaction
-backprojection
+death_dynamics
+single_cell/index
 ```

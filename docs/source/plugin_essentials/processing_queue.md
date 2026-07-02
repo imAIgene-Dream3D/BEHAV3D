@@ -1,6 +1,6 @@
 # 🛒 Processing Queue
 
-The Processing Queue is the collapsible panel at the bottom of the BEHAV3D EXPLORER dock widget. It batches steps from segmentation / tracking / feature extraction / filtering and runs them sequentially per sample, so you can leave a long pipeline running overnight and come back to results in the morning.
+The Processing Queue is the collapsible panel at the bottom of the BEHAV3D EXPLORER dock widget. It batches steps from segmentation, tracking, feature extraction, filtering and analysis, and runs them sequentially in canonical pipeline order, so you can leave a long pipeline running overnight and come back to results in the morning.
 
 ![Processing Queue](../_static/screenshots/processing_queue.png)
 
@@ -18,12 +18,21 @@ Running each step manually from its tab is fine for testing and checking. But on
 
 | Step | Source tab | What it does |
 |---|---|---|
-| 🧠 `TRAIN` | Segmentation | Train segmentation classifiers on the labelled examples |
-| 🦠 `SEGMENT` | Segmentation | Run segmentation using the trained classifiers |
-| 📍 `TRACK` | Tracking | Batch tracking across cell types |
-| 🧪 `FEATURE_EXTRACT` | Feature Extraction | Compute per-track features |
-| 🔥 `ACTIVE_KILLING` | Feature Extraction | Detect immune-cell killing events |
-| 🧹 `FILTER` | Filtering | Track-length / dead-at-t0 / experiment-duration filters |
+| 🧠 Train Classifier | Segmentation | Train segmentation classifiers on the labelled examples |
+| 🦠 Segmentation | Segmentation | Run segmentation using the trained classifiers (Cellpose / APOC / ConvPaint / Pixel Classifier) |
+| ☠ Dead Mask (Otsu) | Segmentation | Compute the Otsu dead-cell mask |
+| 📍 Batch Tracking | Tracking | Batch tracking across cell types |
+| 🧪 Feature Extraction | Feature Extraction | Compute per-track features |
+| 🔥 Active Killing | Feature Extraction | Detect immune-cell killing events |
+| 🧹 Filtering | Filtering | Track-length / dead-at-t0 / experiment-duration filters |
+| 💀 Death Dynamics | Analysis | Per-target death-dynamics analysis |
+| 💀 Combined Death Dynamics | Analysis | Cross-sample death-dynamics comparison |
+| 🤝 Interaction Analysis | Analysis | Immune ↔ organoid contact analysis |
+| 🤝 Combined Interaction Comparison | Analysis | Cross-sample interaction comparison |
+| 🔬 State Clustering | Analysis → Single Cell | Fit the behavioural-state HMM |
+| 🔬 Train State Classifier | Analysis → Single Cell | Train a state classifier for reuse |
+| 🔬 Apply State Classifier | Analysis → Single Cell | Apply a saved state model to new data |
+| 🛤️ Track Clustering | Analysis → Single Cell | Cluster whole trajectories (DTW) |
 
 Each step has a **canonical order** so even if you add them out of sequence, the queue runs them in pipeline order.
 
@@ -53,15 +62,14 @@ Re-running a step whose own outputs already exist is allowed but is not silent. 
 
 ## Presets
 
-Three one-click presets are exposed via the dropdown:
+Two one-click presets are exposed via the dropdown:
 
 | Preset | Expands to |
 |---|---|
-| **Train + Segment + Track** | TRAIN → SEGMENT → TRACK |
-| **Segment + Track** | SEGMENT → TRACK |
-| **Segment → Filter** | SEGMENT → TRACK → FEATURE_EXTRACT → FILTER |
+| **Segment + Track** | Segmentation → Batch Tracking |
+| **Segment → Filter** | Segmentation → Batch Tracking → Feature Extraction → Filtering |
 
-Pick a preset and the steps populate. You can still edit individual steps' parameters afterwards (by going back to the tab that owns them) and reorder by removing + re-adding.
+The `Segmentation` placeholder in a preset is replaced at load-time with whichever segmentation method is currently selected in the Segmentation tab (APOC / ConvPaint / Cellpose / Pixel Classifier). Pick a preset and the steps populate. You can still edit individual steps' parameters afterwards (by going back to the tab that owns them) and reorder by removing + re-adding.
 
 ## Running the queue
 

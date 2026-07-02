@@ -62,7 +62,7 @@ Once each row shows ✅ Ready for tracking, the Visualization tab can load these
 ## Tips
 
 - **Always preview a converted sample in the Visualization tab before committing the rest.** Channel-order swaps or T ↔ Z swaps in the source file are silent failure modes: the zarr writes fine, but downstream tracking will produce nonsense.
-- **Absolute paths are the most robust choice.**Use absolute paths when you set {prefix}_{ct}_segments_image_path for external segmentations (Metadata Builder). They are the most robust choice; relative paths work only if they resolve from the metadata CSV’s directory or the working directory.
+- **Absolute paths are the most robust choice.** Use absolute paths when you set {prefix}_{ct}_segments_image_path for external segmentations (Metadata Builder). They are the most robust choice; relative paths work only if they resolve from the metadata CSV’s directory or the working directory.
 
 ## See also
 

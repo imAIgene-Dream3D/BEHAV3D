@@ -28,8 +28,8 @@ You pick it once, in **Data Preparation → Output Directory**. Every other tab 
     │   ├── active_killing/                         # immune cell types only — killing events
     │   ├── results/                                # organoid-type dynamics analyses
     │   ├── interaction_analysis/                   # immune ↔ organoid contact analyses
-    │   ├── behavioral_states/                      # state classification (.h5ad)
-    │   └── behavioral_state_trajectories/          # state-labelled backprojection zarrs
+    │   ├── behavioral_states/                      # state classification (.h5ad) + backprojection/ subfolder (state-labelled zarrs)
+    │   └── behavorial_trajectories/                 # track classification (DTW) results
     └── multi_organoid_comparison/                  # multi-organoid death-dynamics comparisons
     
 ```
@@ -75,12 +75,18 @@ File names use the cell type name from your metadata. If your metadata defines `
 | Filtered & summarised features | `analysis/{cell_type}/track_features/` |
 | Quality-control plots | `analysis/{cell_type}/quality_control/` |
 
-### Analysis (Python today — napari Analysis tab is a stub)
+### Analysis & Backprojection
 
 | Writes | Path |
 |---|---|
-| Per-cell-type analyses | `analysis/{cell_type}/` |
-| Cross-cell-type analyses | `analysis/multi_organoid_comparison/` |
+| Death Dynamics results (per target) | `analysis/{cell_type}/results/` |
+| Interaction Analysis results (per target) | `analysis/{cell_type}/interaction_analysis/` |
+| Behavioural-state classification | `analysis/{cell_type}/behavioral_states/` |
+| Cross-cell-type comparisons (combined Death Dynamics / Interaction) | `analysis/multi_organoid_comparison/` |
+
+```{note}
+Backprojection exports and Track Classification outputs are also written under each `analysis/{cell_type}/` folder. The easiest way to reopen them is the per-step **👁** buttons or the shared **📄 Results** panel at the bottom of the **Analysis**, **Feature Extraction**, and **Filtering** tabs — a collapsible tree of everything under `analysis/` with **Open in napari**, **Open externally**, and **Reveal in folder** — rather than browsing these paths by hand.
+```
 
 ## How tabs find prior outputs
 
@@ -96,7 +102,7 @@ The Data Preparation tab owns:
 
 - The loaded `metadata.csv` (DataFrame).
 - The output directory path.
-- The combined config (`behav3d_parameters` dict, persisted as YAML in `output_dir/behav3d_config.yaml`).
+- The combined config (`behav3d_parameters` dict, persisted as YAML in `output_dir/behav3d_parameters.yml`).
 
 ## Importing pre-existing data
 
@@ -117,4 +123,4 @@ Be careful with:
 
 - `images/{sample}/{sample}.zarr` — this is the raw zarr conversion. Deleting it means redoing zarr conversion in Data Preparation.
 - `models/*` — trained classifiers / Cellpose models. Keep these unless you intend to retrain.
-- `behav3d_config.yaml` — the saved tab parameters. Deleting resets all tabs to defaults the next time you load metadata.
+- `behav3d_parameters.yml` — the saved tab parameters. Deleting resets all tabs to defaults the next time you load metadata.

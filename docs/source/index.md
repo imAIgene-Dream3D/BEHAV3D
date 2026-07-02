@@ -19,11 +19,10 @@ flowchart LR
     PQ["🛒 Processing Queue"] -.batches.-> Pipeline
 ```
 
-The **Visualization** and the **Processing Queue** work across the whole pipeline: Visualization lets you visualize any sample and its outputs at any stage of the pipeline, and the Processing Queue batches segmentation / tracking / feature-extraction / filtering / analysis steps to run sequentially across all your samples.
-
+The **Visualization** and the **Processing Queue** work across the whole pipeline: Visualization lets you visualize any sample and its outputs at any stage of the pipeline, and the Processing Queue batches segmentation / tracking / feature-extraction / filtering / analysis steps to run sequentially across all your samples. **Backprojection** — painting analysis results back onto the raw images — is built into the Single Cell workflows as their final step.
 
 ```{note}
-The **Analysis** tab is currently a stub in the plugin ("🚧 Coming soon"). The corresponding pages of this wiki are skeletons that will be filled in as each analysis sub-tab is implemented.
+The **Analysis** tab is implemented end-to-end: Death Dynamics, Interaction Analysis, and Single Cell (both behavioural-**state** and **track** classification), each Single Cell workflow ending in a **Backprojection** step.
 ```
 
 ## Where to next
@@ -70,7 +69,7 @@ Segmentation (5 methods) and Tracking (5 methods) — the heavy computation that
 :link: analysis/index
 :link-type: doc
 
-Feature extraction, filtering, plus skeletons for the behavioural / death-morphology / interaction / backprojection pipelines.
+Feature extraction, filtering, death dynamics, interaction analysis, behavioural-state classification, and backprojection.
 ::::
 
 ::::{grid-item-card} 🧠 Cellpose Training

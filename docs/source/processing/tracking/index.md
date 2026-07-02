@@ -73,6 +73,10 @@ Three questions usually settle the choice:
 
 When it finishes you are asked whether to switch to the Visualization tab to inspect the tracks.
 
+```{tip}
+**How to confirm tracking worked.** In the Visualization tab, look at the tracked-segments layer over time: **untracked** segments get a new colour/ID every timepoint, whereas **correctly tracked** segments keep the **same colour/ID across frames**. Hover over a label and check that its ID stays constant as you scrub through time.
+```
+
 ### Tab-level controls (below the sub-tabs)
 
 Two controls sit underneath the sub-tab area and act on **all** cell types at once:

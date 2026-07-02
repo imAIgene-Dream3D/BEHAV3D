@@ -94,6 +94,23 @@ The three pixel-classifier methods (APOC, Pixel Classifier, ConvPaint) are train
 - **Avoid contradictory labels**; only label regions you are confident about.
 - **Save your labels often** (the *Save Labels* / *Save User Labels* button) — unsaved labels are lost when the viewer closes.
 
+### Drawing technique
+
+These practical conventions come from the training sessions and give noticeably cleaner segmentations:
+
+- **Draw background first, then overlay foreground.** Lay down the background class along and just over the object edge, then paint the foreground over the part that sits on the object. Layering it this way produces a very clean border.
+- **Split touching objects with a thin background line.** Where two objects touch, draw a thin background line between them, bordered by foreground, so the classifier learns to separate them. For organoids tracked by **propagation**, you only need to get this right on **timepoint 1** of each sample — propagation copies the segmentation forward.
+- **Draw thin / elongated cells thicker than the signal (~3 px).** Segmentation connects adjacent pixels, so a one-pixel-wide stroke on an elongated T cell leaves gaps; a slightly over-thick line yields one clean segment.
+- **Paint channel bleed-through as background.** Where another channel's signal bleeds into the one you are training (e.g. organoid signal appearing in the T-cell channel at higher Z), explicitly paint it as background — even when it is much brighter — so the model learns to ignore it.
+- **For the dead mask, label the bright dead blobs.** Concentrate on the clear high-intensity dead signal; including very dim red is optional and tends to be noisier.
+
+### Reading the probability map
+
+After training, the probability map shows the classifier's confidence (e.g. yellow = confident foreground, dark/blue = low confidence). Use it to target corrections:
+
+- Aim for **background clearly below ~0.3–0.4** and **foreground above ~0.7**. Anything above **0.5 is not treated as background**, so keep borderline pixels away from that line to stop them flickering across slices.
+- Where an area *should* be foreground but reads low, paint a little more **foreground** there (or **background** where it wrongly reads high) and **retrain** — only small tweaks are usually needed.
+
 (instance-post-processing-parameters)=
 ## Instance post-processing parameters
 
@@ -110,8 +127,7 @@ APOC, ConvPaint and the Pixel Classifier are *pixel* classifiers: their raw outp
 | **Peak min dist** *(peak-EDT strategies)* | Minimum distance (µm) between local EDT peaks used as seeds. Larger → fewer, more separated seeds. |
 | **Peak min ratio** *(peak-EDT strategies)* | Minimum EDT peak height as a fraction of the local maximum (0–1). Higher → fewer seeds. |
 
-(instance-post-processing-tuning)=
-#### Tuning (failure mode → fix)
+### Instance post-processing tuning
 
 - Touching cells **merged** into one label → **lower EDT** (or, for probability strategies, **raise Seed threshold**).
 - One cell **split** into several labels → **raise EDT** (or **lower Seed threshold**).
