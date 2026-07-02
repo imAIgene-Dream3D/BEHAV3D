@@ -268,69 +268,90 @@ def run_trackpy_tracking_generic(
                 properties["position_t"] = t
                 df_centroids.append(properties)
             df_centroids = pd.concat(df_centroids)
-            df_centroids["position_z"] = df_centroids["centroid-0"]*element_size_z
-            df_centroids["position_y"] = df_centroids["centroid-1"]*element_size_y
-            df_centroids["position_x"] = df_centroids["centroid-2"]*element_size_x
-
-            # print("Running trackpy tracking...")
-            # Tracking
-            from trackpy.linking.utils import SubnetOversizeException
-
-            if _BEHAV3D_MAX_SUB_NET_SIZE != _ORIGINAL_MAX:
-                _msg = (f"[TrackPy] MAX_SUB_NET_SIZE raised from {_ORIGINAL_MAX} "
-                        f"to {_BEHAV3D_MAX_SUB_NET_SIZE}. Large subnets may be slow.")
-                print(_msg, file=sys.stderr)
-                if log_callback:
-                    log_callback(f"⚠️ {_msg}")
-
-            try:
-                df_tracks = tp.link(
-                    df_centroids,
-                    search_range=search_range,
-                    memory=memory,
-                    adaptive_stop=adaptive_stop,
-                    adaptive_step=adaptive_step,
-                    pos_columns=['position_z', 'position_y', 'position_x'],
-                    t_column='position_t',
+            if df_centroids.empty:
+                warn_msg = (
+                    f"[WARNING] No segmented objects found for {sample_name} "
+                    f"({cell_type}). Saving empty tracking outputs and skipping trackpy."
                 )
-            except SubnetOversizeException as e:
-                _warn = (f"[WARNING] Numba linking hit subnet limit: {e}\n"
-                         f"Falling back to recursive (slower) linking strategy...")
-                print(_warn, file=sys.stderr)
+                print(warn_msg)
                 if log_callback:
-                    log_callback(f"⚠️ {_warn}")
+                    log_callback(f"⚠️ {warn_msg}")
+                df_tracks = pd.DataFrame(columns=[
+                    "TrackID",
+                    "SegmentID",
+                    "position_t",
+                    "position_x",
+                    "position_y",
+                    "position_z",
+                    "pixel_position_x",
+                    "pixel_position_y",
+                    "pixel_position_z",
+                ])
+            else:
+                df_centroids["position_z"] = df_centroids["centroid-0"]*element_size_z
+                df_centroids["position_y"] = df_centroids["centroid-1"]*element_size_y
+                df_centroids["position_x"] = df_centroids["centroid-2"]*element_size_x
 
-                df_tracks = tp.link(
-                    df_centroids,
-                    search_range=search_range,
-                    memory=memory,
-                    adaptive_stop=adaptive_stop,
-                    adaptive_step=adaptive_step,
-                    pos_columns=['position_z', 'position_y', 'position_x'],
-                    t_column='position_t',
-                    link_strategy='recursive'
+                # print("Running trackpy tracking...")
+                # Tracking
+                from trackpy.linking.utils import SubnetOversizeException
+
+                if _BEHAV3D_MAX_SUB_NET_SIZE != _ORIGINAL_MAX:
+                    _msg = (f"[TrackPy] MAX_SUB_NET_SIZE raised from {_ORIGINAL_MAX} "
+                            f"to {_BEHAV3D_MAX_SUB_NET_SIZE}. Large subnets may be slow.")
+                    print(_msg, file=sys.stderr)
+                    if log_callback:
+                        log_callback(f"⚠️ {_msg}")
+
+                try:
+                    df_tracks = tp.link(
+                        df_centroids,
+                        search_range=search_range,
+                        memory=memory,
+                        adaptive_stop=adaptive_stop,
+                        adaptive_step=adaptive_step,
+                        pos_columns=['position_z', 'position_y', 'position_x'],
+                        t_column='position_t',
+                    )
+                except SubnetOversizeException as e:
+                    _warn = (f"[WARNING] Numba linking hit subnet limit: {e}\n"
+                             f"Falling back to recursive (slower) linking strategy...")
+                    print(_warn, file=sys.stderr)
+                    if log_callback:
+                        log_callback(f"⚠️ {_warn}")
+
+                    df_tracks = tp.link(
+                        df_centroids,
+                        search_range=search_range,
+                        memory=memory,
+                        adaptive_stop=adaptive_stop,
+                        adaptive_step=adaptive_step,
+                        pos_columns=['position_z', 'position_y', 'position_x'],
+                        t_column='position_t',
+                        link_strategy='recursive'
+                    )
+
+            if not df_tracks.empty:
+                # Rename columns to match BEHAV3D convention
+                df_tracks = df_tracks.reset_index()
+                df_tracks.rename(
+                    columns={
+                        'particle': 'TrackID',
+                        'label': 'SegmentID',
+                        'centroid-0': "pixel_position_z",
+                        'centroid-1': "pixel_position_y",
+                        'centroid-2': "pixel_position_x",
+                    }, 
+                    inplace=True
                 )
-                 
-            # Rename columns to match BEHAV3D convention
-            df_tracks = df_tracks.reset_index()
-            df_tracks.rename(
-                columns={
-                    'particle': 'TrackID',
-                    'label': 'SegmentID',
-                    'centroid-0': "pixel_position_z",
-                    'centroid-1': "pixel_position_y",
-                    'centroid-2': "pixel_position_x",
-                }, 
-                inplace=True
-            )
-            df_tracks["TrackID"] += 1
-            
+                df_tracks["TrackID"] += 1
+
             # Select only needed columns
             df_tracks = df_tracks[[
                 "TrackID", "SegmentID", "position_t", "position_x", "position_y", "position_z",
                 "pixel_position_x", "pixel_position_y", "pixel_position_z"
             ]]
-            
+
             print(f"Saving tracks CSV to {tracked_csv_outpath}")
             df_tracks.to_csv(tracked_csv_outpath, sep=",", index=False)
             
