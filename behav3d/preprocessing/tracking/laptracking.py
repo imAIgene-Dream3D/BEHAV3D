@@ -46,6 +46,23 @@ def laptrack_image(
         properties["position_t"]=t
         df_centroids.append(properties)
     df_centroids = pd.concat(df_centroids)
+
+    if df_centroids.empty:
+        print("Warning: No segmented objects found — skipping LAP tracking and saving empty outputs.")
+        df_tracks = pd.DataFrame(columns=[
+            "TrackID", "SegmentID", "position_t", "position_x", "position_y", "position_z",
+            "pixel_position_x", "pixel_position_y", "pixel_position_z",
+        ])
+        df_tracks.to_csv(tracked_csv_outpath, sep=",", index=False)
+        if return_trackimg:
+            convert_segments_to_tracks(
+                df_tracks=df_tracks,
+                segments=segments,
+                outpath=tracked_img_outpath,
+                n_workers=n_workers,
+            )
+        return
+
     df_centroids["position_z"]=df_centroids["centroid-0"]*element_size_z
     df_centroids["position_y"]=df_centroids["centroid-1"]*element_size_y
     df_centroids["position_x"]=df_centroids["centroid-2"]*element_size_x

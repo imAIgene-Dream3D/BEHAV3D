@@ -38,6 +38,18 @@ _BTRACK_VISUAL_FEATURES = (
     "intensity_mean",
 )
 
+_TRACK_CSV_COLUMNS = [
+    "TrackID",
+    "SegmentID",
+    "position_t",
+    "position_x",
+    "position_y",
+    "position_z",
+    "pixel_position_x",
+    "pixel_position_y",
+    "pixel_position_z",
+]
+
 
 def _run_parallel_with_fallback(fn, args_list, n_workers):
     try:
@@ -441,6 +453,8 @@ def btrack_image(
     if tracked_csv_outpath is None:
         tracked_csv_outpath = Path(segments_path.parent,
                                    f"{basename}_tracks.csv")
+    tracked_img_outpath = Path(tracked_img_outpath)
+    tracked_csv_outpath = Path(tracked_csv_outpath)
 
     # ------------------------------------------------------------------
     # Resolve config and whether this run should use visual updates
@@ -472,7 +486,18 @@ def btrack_image(
 
     if df_centroids is None:
         print("WARNING: No objects found in segmentation — skipping btrack.")
-        return
+        df_tracks = pd.DataFrame(columns=_TRACK_CSV_COLUMNS)
+        tracked_csv_outpath.parent.mkdir(parents=True, exist_ok=True)
+        tracked_img_outpath.parent.mkdir(parents=True, exist_ok=True)
+        df_tracks.to_csv(tracked_csv_outpath, sep=",", index=False)
+        if return_trackimg:
+            convert_segments_to_tracks(
+                df_tracks=df_tracks,
+                segments=segments,
+                outpath=tracked_img_outpath,
+                n_workers=n_workers,
+            )
+        return df_tracks
 
     # ------------------------------------------------------------------
     # 2. Build btrack objects from detections
@@ -592,12 +617,7 @@ def btrack_image(
                 "pixel_position_z": float(idx_to_px_z[ref]),
             })
 
-    df_tracks = pd.DataFrame(rows)
-    df_tracks = df_tracks[[
-        "TrackID", "SegmentID", "position_t",
-        "position_x", "position_y", "position_z",
-        "pixel_position_x", "pixel_position_y", "pixel_position_z",
-    ]]
+    df_tracks = pd.DataFrame(rows, columns=_TRACK_CSV_COLUMNS)
     df_tracks.to_csv(tracked_csv_outpath, sep=",", index=False)
 
     if return_trackimg:
