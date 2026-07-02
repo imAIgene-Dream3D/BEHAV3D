@@ -87,6 +87,16 @@ class CellTypeFilterPanel(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
+        # ── Preview ────────────────────────────────────────────────────────
+        self.btn_preview_lengths = QPushButton("📊 See Track Length Distributions")
+        self.btn_preview_lengths.setStyleSheet(
+            "QPushButton { background: #17a2b8; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px; font-size: 12px; } "
+            "QPushButton:hover { background: #138496; }"
+        )
+        self.btn_preview_lengths.clicked.connect(self._on_preview_lengths_clicked)
+        layout.addWidget(self.btn_preview_lengths)
+
         # ── Experiment duration ────────────────────────────────────────
         self.en_exp_duration = QCheckBox("Trim full time series to max timepoints")
         self.en_exp_duration.setChecked(bool(cfg.get("exp_duration_enabled", True)))
@@ -237,6 +247,82 @@ class CellTypeFilterPanel(QWidget):
         layout.addStretch()
 
     # ---- Helpers ----------------------------------------------------------
+    def _on_preview_lengths_clicked(self):
+        if self.viewer is not None and self.viewer.layers:
+            reply = QMessageBox.question(
+                self, "Warning",
+                "This will remove current layers in the viewer. Continue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+        ct = self.cell_type
+        out = Path(self.metadata_loader.output_dir) if self.metadata_loader.output_dir else None
+        if not out:
+            self.log(f"⚠️ Metadata output dir not set.")
+            return
+            
+        csv_path = out / "analysis" / ct / "track_features" / f"BEHAV3D_{ct}_combined_track_features.csv"
+        if not csv_path.exists():
+            self.log(f"⚠️ Unfiltered track features not found:\n  {csv_path}")
+            return
+            
+        try:
+            import pandas as pd
+            import matplotlib.pyplot as plt
+            import tempfile
+            from qtpy.QtGui import QDesktopServices
+            from qtpy.QtCore import QUrl
+            import os
+            
+            df = pd.read_csv(csv_path)
+            if "sample_name" not in df.columns or "TrackID" not in df.columns:
+                self.log(f"⚠️ CSV missing required columns (sample_name, TrackID).")
+                return
+                
+            samples = df["sample_name"].unique()
+            n_samples = len(samples)
+            if n_samples == 0:
+                self.log(f"⚠️ No samples found in CSV.")
+                return
+                
+            cols = min(3, n_samples)
+            rows = (n_samples + cols - 1) // cols
+            fig, axes = plt.subplots(rows, cols, figsize=(cols * 5, rows * 4), squeeze=False)
+            axes = axes.flatten()
+            
+            for i, sample in enumerate(samples):
+                ax = axes[i]
+                sample_df = df[df["sample_name"] == sample]
+                track_lengths = sample_df.groupby("TrackID").size()
+                
+                ax.hist(track_lengths, bins=50, color='skyblue', edgecolor='black')
+                ax.set_title(sample)
+                ax.set_xlabel("Track Length (timepoints)")
+                ax.set_ylabel("Frequency")
+                
+            for j in range(i + 1, len(axes)):
+                fig.delaxes(axes[j])
+                
+            plt.tight_layout()
+            
+            fd, temp_path = tempfile.mkstemp(suffix=".png", prefix=f"track_lengths_{ct}_")
+            os.close(fd)
+            plt.savefig(temp_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            
+            QDesktopServices.openUrl(QUrl.fromLocalFile(temp_path))
+            self.log(f"📊 Track length distribution generated.")
+            
+            # Actually clear layers if the user consented to this preview.
+            if self.viewer is not None:
+                self.viewer.layers.clear()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.log(f"❌ Error generating plot: {e}")
+
     def _collect_params(self) -> dict:
         d = {
             "exp_duration_enabled": self.en_exp_duration.isChecked(),

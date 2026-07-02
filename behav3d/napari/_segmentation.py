@@ -491,6 +491,66 @@ class PerClassLegendWidget(QWidget):
                 pass
 
 
+def _run_multicolor_cleanup_if_needed(metadata_loader, log_fn, skip_unified=False):
+    """Run multicolor redundancy cleanup after segmentation."""
+    if skip_unified:
+        log_fn(
+            "Skipping multicolor cleanup: unified ConvPaint already "
+            "produces mutually-exclusive per-cell-type masks."
+        )
+        return metadata_loader.metadata
+
+    metadata = metadata_loader.metadata
+    if metadata is None or metadata.empty:
+        return metadata
+
+    from behav3d.core.cell_types import (
+        is_multicolor_celltype, 
+        multicolor_base_name,
+        detect_organoid_types_from_metadata,
+        detect_immune_cell_types_from_metadata,
+        detect_other_cell_types_from_metadata
+    )
+    all_cell_types = (
+        detect_organoid_types_from_metadata(metadata) +
+        detect_immune_cell_types_from_metadata(metadata) +
+        detect_other_cell_types_from_metadata(metadata)
+    )
+
+    families = {}
+    for cell_type in all_cell_types:
+        if not is_multicolor_celltype(cell_type):
+            continue
+        base_name = multicolor_base_name(cell_type)
+        families.setdefault(base_name, []).append(cell_type)
+
+    if not families:
+        return metadata
+
+    from behav3d.preprocessing.segmentation.multicolor_segment_processing import (
+        apply_multicolor_segment_correction_for_base,
+    )
+
+    cleaned_metadata = metadata
+    for base_name, family_cell_types in sorted(families.items()):
+        if len(family_cell_types) < 2:
+            continue
+        log_fn(
+            f"Running multicolor cleanup for '{base_name}' after batch segmentation: "
+            f"{sorted(family_cell_types)}"
+        )
+        cleaned_metadata = apply_multicolor_segment_correction_for_base(
+            metadata=cleaned_metadata,
+            output_dir=str(metadata_loader.output_dir),
+            base_cell_type=base_name,
+            n_channels=len(family_cell_types),
+            overwrite=True,
+            n_workers=1,
+        )
+
+    return cleaned_metadata
+
+
 class PixelClassifierWidget(QWidget):
     def __init__(self, viewer, metadata_loader, log_callback=None,
                  tab_progress_row=None):
@@ -1196,6 +1256,10 @@ class PixelClassifierWidget(QWidget):
             return updated_metadata
 
         def _apply_result(updated_metadata):
+            if updated_metadata is not None:
+                self.metadata_loader.metadata = updated_metadata
+                updated_metadata = _run_multicolor_cleanup_if_needed(self.metadata_loader, self.log, skip_unified=False)
+                self.metadata_loader.metadata = updated_metadata
             self.metadata_loader.metadata = updated_metadata
             csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
             if csv_path:
@@ -5030,6 +5094,8 @@ class APOCWidget(QWidget):
             def _apply_apoc_result(updated_metadata):
                 if updated_metadata is not None:
                     self.metadata_loader.metadata = updated_metadata
+                    updated_metadata = _run_multicolor_cleanup_if_needed(self.metadata_loader, self.log, skip_unified=False)
+                    self.metadata_loader.metadata = updated_metadata
                     if metadata_csv:
                         try:
                             updated_metadata.to_csv(metadata_csv, index=False)
@@ -6079,6 +6145,8 @@ class ConvPaintWidget(QWidget):
 
             def _apply_result(updated_metadata):
                 if updated_metadata is not None:
+                    self.metadata_loader.metadata = updated_metadata
+                    updated_metadata = _run_multicolor_cleanup_if_needed(self.metadata_loader, self.log, skip_unified=True)
                     self.metadata_loader.metadata = updated_metadata
                     if metadata_csv:
                         try:

@@ -651,6 +651,34 @@ class VisualizationTab(QWidget):
             except Exception as e:
                 self._log(f"    ⚠️ Could not load segments for {ct_name}: {e}")
 
+        # Load death mask if present
+        dead_col = "dead_mask_path"
+        dead_path_val = row.get(dead_col)
+        if not pd.isna(dead_path_val) and str(dead_path_val).strip():
+            dead_path = str(dead_path_val).strip()
+            if Path(dead_path).exists():
+                try:
+                    dead_p = Path(dead_path)
+                    if dead_p.suffix == ".zarr":
+                        dead_data = _bust_dask_cache(load_zarr(dead_p))
+                    else:
+                        from behav3d.io.images import load_image
+                        dead_data = load_image(dead_p)
+                        if not isinstance(dead_data, da.Array):
+                            dead_data = da.from_array(dead_data, chunks=(1,) + dead_data.shape[1:])
+
+                    layer_name = f"{sample_name} – dead mask"
+                    self.viewer.add_labels(
+                        dead_data,
+                        name=layer_name,
+                        visible=False, # Hidden by default
+                    )
+                    self._log(f"    + Dead mask layer: {layer_name}")
+                except Exception as e:
+                    self._log(f"    ⚠️ Could not load dead mask: {e}")
+            else:
+                self._log(f"    - Skipping dead mask: File not found ({dead_path})")
+
     # ------------------------------------------------------------------
     # Track loader
     # ------------------------------------------------------------------

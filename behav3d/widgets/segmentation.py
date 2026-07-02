@@ -1,5 +1,5 @@
 import ipywidgets as widgets
-from IPython.display import display
+from IPython.display import display, HTML
 from pathlib import Path
 import os
 import pandas as pd
@@ -96,6 +96,59 @@ def _normalize_segmentation_labels_for_view(label_arr, raw_img_shape, layer_name
     raise ValueError(
         f"{layer_name}: expected label shape {target_shape}, got {label_shape}."
     )
+
+
+def _build_notebook_annotation_legend(label_map, has_death=False):
+    """Generate an HTML table displaying the ConvPaint annotation legend."""
+    if not label_map or "celltype_to_label" not in label_map:
+        return
+        
+    BACKGROUND_LABEL = 0
+    UNKNOWN_LABEL = 1
+    CELL_TYPE_COLORS = {
+        "tcells": "#00FFFF",  # Cyan
+        "nkcells": "#FF00FF", # Magenta
+        "macrophages": "#00FF00", # Green
+        "tumor": "#FF0000", # Red
+        "organoid": "#FF0000", # Red
+    }
+    
+    html = [
+        "<div style='margin-top: 10px; margin-bottom: 10px; font-family: sans-serif;'>",
+        "<h4>ConvPaint Annotation Legend</h4>",
+        "<table style='border-collapse: collapse; width: 300px; text-align: left;'>",
+        "<tr style='border-bottom: 1px solid #ddd;'><th>Index</th><th>Color</th><th>Cell Type</th></tr>"
+    ]
+    
+    bg_label = int(label_map.get("background_label", BACKGROUND_LABEL))
+    html.append(
+        f"<tr><td>{bg_label}</td>"
+        f"<td style='background-color: #000000; width: 20px;'></td>"
+        f"<td>Background</td></tr>"
+    )
+    
+    ordered_cts = sorted(list(label_map["celltype_to_label"].keys()))
+    for ct in ordered_cts:
+        idx = int(label_map["celltype_to_label"][ct])
+        # Find base name for coloring (e.g. organoid1 -> organoid)
+        base_ct = ''.join([i for i in ct if not i.isdigit()]).lower()
+        color = CELL_TYPE_COLORS.get(base_ct, "#888888")
+        html.append(
+            f"<tr><td>{idx}</td>"
+            f"<td style='background-color: {color}; width: 20px;'></td>"
+            f"<td>{ct}</td></tr>"
+        )
+        
+    if has_death:
+        death_label = int(label_map.get("death_label", UNKNOWN_LABEL))
+        html.append(
+            f"<tr><td>{death_label}</td>"
+            f"<td style='background-color: #FFFFFF; width: 20px; border: 1px solid #000;'></td>"
+            f"<td>Death</td></tr>"
+        )
+        
+    html.append("</table></div>")
+    display(HTML("".join(html)))
 
 
 class PixelClassifierPanel:
@@ -2197,6 +2250,18 @@ class SegmentationVisualizationPanel:
                     print("No segments/mask layers found.")
                 elif added_label_layers == 0:
                     print("No segments/mask layers added after shape normalization.")
+
+                # Try to load and display the ConvPaint label legend if present
+                try:
+                    from behav3d.preprocessing.segmentation.convpaint_label_map import load_label_map, unified_label_map_path
+                    pixel_class_outdir = output_dir / "images" / "PixelClassification"
+                    map_path = unified_label_map_path(pixel_class_outdir)
+                    if map_path.exists():
+                        label_map = load_label_map(map_path)
+                        has_death = has_dead_channel(metadata)
+                        _build_notebook_annotation_legend(label_map, has_death=has_death)
+                except Exception as e:
+                    print(f"Could not load ConvPaint legend: {e}")
 
                 napari.run()
                 self._viewer = viewer
