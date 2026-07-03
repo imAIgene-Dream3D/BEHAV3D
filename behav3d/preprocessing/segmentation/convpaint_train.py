@@ -1088,7 +1088,8 @@ class ConvPaintTrainingWidget(QWidget):
                  strategy_resolver=None,
                  extra_toolbar_widgets=None,
                  show_device=True,
-                 external_log=None):
+                 external_log=None,
+                 show_legend=False):
         super().__init__(parent)
         self.viewer = viewer
         self.all_images = all_images
@@ -1106,6 +1107,7 @@ class ConvPaintTrainingWidget(QWidget):
         self._strategy_resolver = strategy_resolver
         self._extra_toolbar_widgets = list(extra_toolbar_widgets or [])
         self._show_device = bool(show_device)
+        self._show_legend = bool(show_legend)
         # When provided, log messages are forwarded here instead of the
         # internal log_box (which is then hidden to reclaim vertical space).
         self._external_log = external_log if callable(external_log) else None
@@ -1134,7 +1136,8 @@ class ConvPaintTrainingWidget(QWidget):
     # ── UI construction ─────────────────────────────────────────────
 
     def _build_ui(self):
-        root = QVBoxLayout()
+        self.content_widget = QWidget()
+        root = QVBoxLayout(self.content_widget)
         root.setContentsMargins(4, 4, 4, 4)
         self._main_layout = root
         root.addWidget(QLabel("<h3>ConvPaint Training (unified)</h3>"))
@@ -1183,6 +1186,11 @@ class ConvPaintTrainingWidget(QWidget):
             root.addLayout(help_row)
 
             self.strategy_combo.currentTextChanged.connect(self._on_global_strategy_changed)
+
+        self.legend_tab = None
+        if self._show_legend:
+            self.legend_tab = AnnotationLegendTab(self.viewer, self.label_map, has_death=self.has_death)
+            root.addWidget(self.legend_tab)
 
         # Feature Extractor (global)
         fe_group = QGroupBox("Feature Extractor")
@@ -1404,8 +1412,6 @@ class ConvPaintTrainingWidget(QWidget):
         self.tab_widget.tabBar().setExpanding(False)
         self.tab_widget.tabBar().setUsesScrollButtons(True)
 
-        self.legend_tab = None
-
         per_tab_strategies = list(self.STRATEGIES) if self._per_cell_type_strategy else None
         for ct in self._tab_cell_types:
             tab = CellTypeConvPaintTab(
@@ -1475,7 +1481,15 @@ class ConvPaintTrainingWidget(QWidget):
         root.addWidget(self.log_box)
         root.addStretch()
 
-        self.setLayout(root)
+        scroll = QScrollArea()
+        scroll.setWidget(self.content_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.addWidget(scroll)
 
     # ── Callbacks ───────────────────────────────────────────────────
 
@@ -2801,6 +2815,7 @@ def train_pixel_classifier_convpaint(
         convpaint_strategy=cp_strategy,
         unified_input_channels=unified_input_channels,
         death_input_channels=death_input_channels,
+        show_legend=True,
     )
     viewer.window.add_dock_widget(widget, name="ConvPaint", area="right")
     _reorder_convpaint_layers(viewer, all_cell_types, has_death=has_death)

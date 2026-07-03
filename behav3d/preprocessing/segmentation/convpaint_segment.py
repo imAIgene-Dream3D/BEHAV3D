@@ -314,9 +314,9 @@ def run_convpaint_segmentation(
     output_dir = Path(output_dir)
     pixelclass_dir = output_dir / "images" / "PixelClassification"
 
-    organoid_types = organoid_types or detect_organoid_types_from_metadata(metadata)
-    immune_types = immune_types or detect_immune_cell_types_from_metadata(metadata)
-    other_types = other_types or detect_other_cell_types_from_metadata(metadata)
+    organoid_types = detect_organoid_types_from_metadata(metadata)
+    immune_types = detect_immune_cell_types_from_metadata(metadata)
+    other_types = detect_other_cell_types_from_metadata(metadata)
     all_cell_types = organoid_types + immune_types + other_types
     _has_death = has_dead_channel(metadata)
 
@@ -417,19 +417,7 @@ def run_convpaint_segmentation(
     for sample_name in sample_names:
         t0 = time.time()
         img_outdir = output_dir / "images" / sample_name
-
-        if not overwrite_existing:
-            all_done = True
-            for ct in active_cell_types:
-                if not (img_outdir / f"{sample_name}_{ct}_segments.zarr").exists():
-                    all_done = False
-                    break
-            if all_done and _has_death and model_death:
-                if not (img_outdir / f"{sample_name}_mask_dead.zarr").exists():
-                    all_done = False
-            if all_done and active_cell_types:
-                print(f"  \u23ED\uFE0F Skipping {sample_name} (all outputs already exist)")
-                continue
+        done_dir = img_outdir / ".done_markers"
 
         sample_row = metadata[metadata['sample_name'] == sample_name].iloc[0]
         raw_image_path = sample_row.get('raw_image_path')
@@ -438,8 +426,7 @@ def run_convpaint_segmentation(
             continue
 
         raw_image_path = Path(raw_image_path)
-        _ensure_zarr(raw_image_path, label=f"Raw image for '{sample_name}'")
-
+        
         axis_order = sample_row.get('dimension_order', "TCZYX")
         if not isinstance(axis_order, str) or not axis_order:
             axis_order = "TCZYX"
@@ -447,13 +434,53 @@ def run_convpaint_segmentation(
         img = load_image(raw_image_path, axis_order=axis_order)
         n_timepoints = img.shape[0]
 
+        if timepoint_range is not None:
+            if isinstance(timepoint_range, (range, list)):
+                t_range = list(timepoint_range)
+            else:
+                s, e = timepoint_range
+                t_range = list(range(s, e + 1))
+        else:
+            t_range = list(range(n_timepoints))
+
+        # Check existing segmentations for skip logic (cell-type level)
+        active_cts_for_sample = list(active_cell_types)
+        has_death_for_sample = _has_death
+
+        if not overwrite_existing:
+            # Check cell types
+            remaining_cts = []
+            for ct in active_cts_for_sample:
+                seg_path = img_outdir / f"{sample_name}_{ct}_segments.zarr"
+                if seg_path.exists():
+                    all_done = all((done_dir / f"{ct}_t{t:04d}.done").exists() for t in t_range)
+                    if all_done:
+                        continue  # Skip this cell type for this sample
+                remaining_cts.append(ct)
+            active_cts_for_sample = remaining_cts
+
+            # Check death mask
+            if has_death_for_sample and model_death:
+                death_path = img_outdir / f"{sample_name}_mask_dead.zarr"
+                if death_path.exists():
+                    all_done = all((done_dir / f"dead_t{t:04d}.done").exists() for t in t_range)
+                    if all_done:
+                        has_death_for_sample = False
+
+            if not active_cts_for_sample and (not has_death_for_sample or not model_death):
+                print(f"  \u23ED\uFE0F Skipping {sample_name} (all selected outputs already exist)")
+                continue
+
+        _ensure_zarr(raw_image_path, label=f"Raw image for '{sample_name}'")
+
         img_outdir.mkdir(parents=True, exist_ok=True)
+        done_dir.mkdir(parents=True, exist_ok=True)
         spatial_shape = img.shape[2:]
         out_shape = (n_timepoints,) + spatial_shape
 
         zarr_segs = {}
         zarr_masks = {}
-        for ct in active_cell_types:
+        for ct in active_cts_for_sample:
             zarr_segs[ct] = _open_zarr_output(
                 img_outdir / f"{sample_name}_{ct}_segments.zarr",
                 "uint16", out_shape, overwrite_existing if not only_segment else True,
@@ -472,20 +499,11 @@ def run_convpaint_segmentation(
                 )
 
         zarr_death = None
-        if _has_death and model_death and not only_segment:
+        if has_death_for_sample and model_death and not only_segment:
             zarr_death = _open_zarr_output(
                 img_outdir / f"{sample_name}_mask_dead.zarr",
                 "uint16", out_shape, overwrite_existing,
             )
-
-        if timepoint_range is not None:
-            if isinstance(timepoint_range, (range, list)):
-                t_range = list(timepoint_range)
-            else:
-                s, e = timepoint_range
-                t_range = list(range(s, e + 1))
-        else:
-            t_range = list(range(n_timepoints))
 
         def _load_tp(img_obj, t_idx):
             return np.asarray(img_obj[t_idx])
@@ -515,10 +533,17 @@ def run_convpaint_segmentation(
                 if i + 1 < len(t_range):
                     future = executor.submit(_load_tp, img, t_range[i + 1])
 
+                # Filter active cell types for this timepoint
+                active_cts_for_timepoint = []
+                for ct in active_cts_for_sample:
+                    if not overwrite_existing and (done_dir / f"{ct}_t{t:04d}.done").exists():
+                        continue
+                    active_cts_for_timepoint.append(ct)
+
                 # Bucket cell types by their effective strategy so each
                 # strategy can run in its own (single) inference call.
                 strat_buckets = {}
-                for ct in active_cell_types:
+                for ct in active_cts_for_timepoint:
                     eff = _resolve_effective_strategy(
                         ct, convpaint_strategy, per_ct_norm,
                     )
@@ -532,50 +557,59 @@ def run_convpaint_segmentation(
                             zarr_masks, zarr_segs, eff_strategy,
                         )
                 else:
-                    unified_frame = _slice_frame_channels(
-                        t_img, unified_input_channels, label="Unified ConvPaint"
-                    )
-                    for eff_strategy, cts in strat_buckets.items():
-                        if eff_strategy == STRATEGY_PROB:
-                            _process_probability_timepoint(
-                                unified_model, unified_frame, t, cts,
-                                label_map, cfg, zarr_masks, zarr_segs,
-                                fe_device=fe_device, diag=(i == 0),
-                            )
-                        else:
-                            _process_edt_timepoint(
-                                unified_model, unified_frame, t, cts,
-                                label_map, cfg, zarr_masks, zarr_segs,
-                                fe_device=fe_device,
-                                diag=(i == 0),
-                                marker_strategy=(
-                                    "peak" if eff_strategy == STRATEGY_PEAK_EDT
-                                    else "threshold"
-                                ),
-                            )
+                    if active_cts_for_timepoint:
+                        unified_frame = _slice_frame_channels(
+                            t_img, unified_input_channels, label="Unified ConvPaint"
+                        )
+                        for eff_strategy, cts in strat_buckets.items():
+                            if eff_strategy == STRATEGY_PROB:
+                                _process_probability_timepoint(
+                                    unified_model, unified_frame, t, cts,
+                                    label_map, cfg, zarr_masks, zarr_segs,
+                                    fe_device=fe_device, diag=(i == 0),
+                                )
+                            else:
+                                _process_edt_timepoint(
+                                    unified_model, unified_frame, t, cts,
+                                    label_map, cfg, zarr_masks, zarr_segs,
+                                    fe_device=fe_device,
+                                    diag=(i == 0),
+                                    marker_strategy=(
+                                        "peak" if eff_strategy == STRATEGY_PEAK_EDT
+                                        else "threshold"
+                                    ),
+                                )
+                
+                # Mark timepoint as done for these cell types
+                for ct in active_cts_for_timepoint:
+                    (done_dir / f"{ct}_t{t:04d}.done").touch()
 
                 if zarr_death is not None and model_death is not None:
-                    _t0_death = time.time()
-                    death_frame = _slice_frame_channels(
-                        t_img, death_input_channels, label="Death ConvPaint"
-                    )
-                    death_seg = segment_per_z(
-                        model_death, death_frame, fe_use_device=fe_device,
-                    )
-                    death_mask = (death_seg >= 2).astype(np.uint16)
-                    zarr_death[t] = death_mask
-                    if i == 0:
-                        print(
-                            f"    \u23F1 death segment_per_z + write: "
-                            f"{time.time() - _t0_death:.2f}s"
+                    if not overwrite_existing and (done_dir / f"dead_t{t:04d}.done").exists():
+                        pass
+                    else:
+                        _t0_death = time.time()
+                        death_frame = _slice_frame_channels(
+                            t_img, death_input_channels, label="Death ConvPaint"
                         )
+                        death_seg = segment_per_z(
+                            model_death, death_frame, fe_use_device=fe_device,
+                        )
+                        death_mask = (death_seg >= 2).astype(np.uint16)
+                        zarr_death[t] = death_mask
+                        (done_dir / f"dead_t{t:04d}.done").touch()
+                        if i == 0:
+                            print(
+                                f"    \u23F1 death segment_per_z + write: "
+                                f"{time.time() - _t0_death:.2f}s"
+                            )
 
         # Write paths back into the metadata table.
         row_idx = metadata.index[
             metadata['sample_name'] == sample_name
         ].tolist()[0]
 
-        for ct in active_cell_types:
+        for ct in active_cts_for_sample:
             if ct in organoid_types:
                 prefix = 'or'
             elif ct in immune_types:

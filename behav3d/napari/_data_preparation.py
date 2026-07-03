@@ -1668,6 +1668,14 @@ class DataPreparationTab(QWidget):
         summary.setStandardButtons(QMessageBox.Ok)
         summary.exec_()
 
+        # Re-emit metadata_loaded so all other tabs (segmentation, tracking, etc.)
+        # automatically pick up the updated zarr paths without a manual reload.
+        try:
+            self.metadata_loaded.emit(self.metadata)
+            self._log("✅ Metadata reloaded in all tabs automatically.")
+        except Exception as e:
+            self._log(f"⚠ Could not auto-reload metadata: {e}")
+
     # ══════════════════════════════════════════════════════════════════════
     # Utility
     # ══════════════════════════════════════════════════════════════════════

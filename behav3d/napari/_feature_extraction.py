@@ -576,22 +576,6 @@ def _remove_layer_if_exists(viewer, layer_name: str):
         pass
 
 
-def _remove_preview_layers(viewer) -> int:
-    """Remove every layer whose name starts with the preview prefix."""
-    if viewer is None:
-        return 0
-    to_remove = [
-        layer for layer in list(viewer.layers)
-        if (getattr(layer, "name", "") or "").startswith(_PREVIEW_PREFIX)
-    ]
-    for layer in to_remove:
-        try:
-            viewer.layers.remove(layer)
-        except Exception:
-            pass
-    return len(to_remove)
-
-
 def _build_dead_pct_map(region_stats):
     """Build a {label_id: pct_dead} map from a single frame's region stats."""
     frame_map: dict = {}
@@ -1085,7 +1069,7 @@ class CellTypeFeaturePanel(QWidget):
         """Disconnect all preview callbacks and reset cached preview state.
 
         Does NOT remove layers — the caller handles that via
-        ``_remove_preview_layers``.
+        ``self.viewer.layers.clear()``.
         """
         self._disconnect_preview_dead_hover()
         self._disconnect_preview_dims()
@@ -1765,6 +1749,16 @@ class CellTypeFeaturePanel(QWidget):
                 self.log("\u26a0\ufe0f No viewer available for dead threshold preview.")
                 return
 
+            if viewer.layers:
+                from qtpy.QtWidgets import QMessageBox
+                reply = QMessageBox.question(
+                    self, "Warning",
+                    "This will remove current layers in the viewer. Continue?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    return
+
             md = self.metadata_loader.metadata
             if md is None or md.empty:
                 self.log("\u26a0\ufe0f No metadata loaded.")
@@ -1886,9 +1880,7 @@ class CellTypeFeaturePanel(QWidget):
                     pt = pt.parent()
                 if pt is not None:
                     pt._disconnect_org_preview_dims()
-            n_removed = _remove_preview_layers(self.viewer)
-            if n_removed:
-                print(f"[{_ts()}] [Preview]   Removed {n_removed} previous preview layer(s).")
+            self.viewer.layers.clear()
 
             # Raw channels
             if raw_dask is not None:
@@ -2517,6 +2509,82 @@ class ActiveKillingPanel(QWidget):
             _has_sns = False
 
         df_active_all = df_killing[df_killing["is_active_killing"]].copy()
+        
+        # 1. Per-sample kinetics (4 plots each)
+        samples = df_killing["sample_name"].unique()
+        for sample_name in samples:
+            df_sample_all = df_killing[df_killing["sample_name"] == sample_name]
+            df_sample_active = df_sample_all[df_sample_all["is_active_killing"]].copy()
+            
+            fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+            axes = axes.flatten()
+            
+            # Plot 1: Efficiency Distribution (Per Sample)
+            if not df_sample_active.empty and "killing_efficiency" in df_sample_active.columns:
+                if _has_sns:
+                    sns.histplot(df_sample_active["killing_efficiency"], kde=True, ax=axes[0], color='red')
+                else:
+                    axes[0].hist(df_sample_active["killing_efficiency"].dropna(), bins=20, color="red", alpha=0.8)
+            axes[0].set_title("1. Killing Efficiency Distribution", fontsize=14, fontweight='bold')
+            axes[0].set_xlabel("Efficiency Score (signal increase / expected background)")
+            axes[0].set_ylabel("Active Killing Events")
+            
+            # Plot 2: Smoothed Kinetics
+            if "position_t" in df_sample_all.columns:
+                temp_counts = df_sample_active.groupby("position_t").size()
+                if not temp_counts.empty:
+                    max_t = int(df_sample_all["position_t"].max())
+                    full_t = pd.Series(0, index=range(max_t + 1))
+                    full_t.update(temp_counts)
+                    window = max(5, max_t // 20)
+                    smoothed = full_t.rolling(window=window, center=True).mean()
+                    
+                    axes[1].plot(full_t.index, full_t.values, color='darkred', alpha=0.2, label='Raw Counts')
+                    axes[1].plot(smoothed.index, smoothed.values, color='red', linewidth=2, label='Kinetics Trend')
+                    axes[1].fill_between(smoothed.index, 0, smoothed.values, color='red', alpha=0.1)
+                    axes[1].set_title("2. Killing Intensity (Smoothed)", fontsize=14, fontweight='bold')
+                    axes[1].set_xlabel("Timepoint")
+                    axes[1].set_ylabel("Events / Timepoint")
+                    axes[1].legend()
+
+                # Plot 3: Cumulative Progress
+                if not temp_counts.empty:
+                    cumulative = full_t.cumsum()
+                    axes[2].plot(cumulative.index, cumulative.values, color='darkblue', linewidth=3)
+                    axes[2].fill_between(cumulative.index, 0, cumulative.values, color='blue', alpha=0.1)
+                    axes[2].set_title("3. Cumulative Killing Progress", fontsize=14, fontweight='bold')
+                    axes[2].set_xlabel("Timepoint")
+                    axes[2].set_ylabel("Cumulative Sum of Active Killing Events")
+                    axes[2].grid(True, linestyle='--', alpha=0.6)
+
+            # Plot 4: Distribution of active killing events per cell
+            if not df_sample_active.empty:
+                events_per_cell = df_sample_active.groupby("immune_track_id").size()
+                max_events = int(events_per_cell.max())
+                counts_per_bin = events_per_cell.value_counts().reindex(range(1, max_events + 1), fill_value=0)
+                axes[3].bar(counts_per_bin.index, counts_per_bin.values, color='red', edgecolor='black', alpha=0.8)
+                axes[3].set_xticks(range(1, max_events + 1))
+                axes[3].set_title("4. Distribution of Killing Events per Cell", fontsize=14, fontweight='bold')
+                axes[3].set_xlabel("Number of Active Killing Events")
+                axes[3].set_ylabel("Number of Cells")
+                axes[3].grid(True, axis='y', linestyle='--', alpha=0.6)
+            else:
+                axes[3].set_title("4. Distribution of Killing Events per Cell", fontsize=14, fontweight='bold')
+                axes[3].set_xlabel("Number of Active Killing Events")
+                axes[3].set_ylabel("Number of Cells")
+
+            plt.tight_layout()
+            sample_plot_dir = results_dir / "plots" / sample_name
+            sample_plot_dir.mkdir(parents=True, exist_ok=True)
+            plot_path = sample_plot_dir / f"killing_kinetics_summary_{sample_name}.png"
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            try:
+                self.log(f"  📊 Saved: {plot_path.relative_to(Path(self.metadata_loader.output_dir))}")
+            except ValueError:
+                self.log(f"  📊 Saved: {plot_path}")
+
+        # 2. Combined Killing Efficiency Distribution
         if not df_active_all.empty and "killing_efficiency" in df_active_all.columns:
             fig, ax = plt.subplots(figsize=(10, 6))
             if _has_sns:
@@ -3028,9 +3096,8 @@ class FeatureExtractionTab(QWidget):
         })
         for panel in self.panels.values():
             panel._cleanup_preview()
-        n_removed = _remove_preview_layers(self.viewer)
-        if n_removed:
-            self._log(f"Cleaned up {n_removed} preview layer(s).")
+        self.viewer.layers.clear()
+        self._log("Cleaned up viewer layers.")
 
         return True
 

@@ -321,9 +321,13 @@ class StateClassificationSubTab(QWidget):
         feat_proc_content = QWidget()
         self.feat_proc_lay = QVBoxLayout(feat_proc_content)
 
-        self.feat_proc_lay.addWidget(QLabel("<b>Log scaling</b>"))
+        # Log Scaling inside Feature Processing
+        log_scale_sec = CollapsibleSection("Log scaling", expanded=False)
         self.log_scale_lay = QVBoxLayout()
-        self.feat_proc_lay.addLayout(self.log_scale_lay)
+        log_scale_container = QWidget()
+        log_scale_container.setLayout(self.log_scale_lay)
+        log_scale_sec.addWidget(log_scale_container)
+        self.feat_proc_lay.addWidget(log_scale_sec)
 
         proc_form = QFormLayout()
         self.spin_hmm_feature_smoothing_window = QSpinBox()
@@ -708,22 +712,33 @@ class StateClassificationSubTab(QWidget):
             self.warning_label.hide()
             return True
 
-        csv_path = out / "analysis" / ct / "track_features" / f"{ct}_track_features.csv"
-        if not csv_path.exists():
+        csv_filtered = out / "analysis" / ct / "track_features" / f"BEHAV3D_{ct}_combined_track_features_filtered.csv"
+        csv_unfiltered = out / "analysis" / ct / "track_features" / f"BEHAV3D_{ct}_combined_track_features.csv"
+
+        if csv_filtered.exists():
+            self.warning_label.hide()
+            for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
+                grp.setEnabled(True)
+            return True
+        elif csv_unfiltered.exists():
+            self.warning_label.setText(
+                f"⚠ Filtered data not found for cell type '{ct}'.\n"
+                "Run Filtering first for full functionality.\n"
+                "Using unfiltered data as a fallback."
+            )
+            self.warning_label.show()
+            for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
+                grp.setEnabled(True)
+            return True
+        else:
             self.warning_label.setText(
                 f"⚠ Feature data not found for cell type '{ct}'.\n"
-                "Run Feature Extraction first, then return here.\n"
-                # f"Expected: {csv_path}" ## Removed: Too long for display
+                "Run Filtering first, then return here."
             )
             self.warning_label.show()
             for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
                 grp.setEnabled(False)
             return False
-        else:
-            self.warning_label.hide()
-            for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
-                grp.setEnabled(True)
-            return True
 
     # ── Toggle helpers ───────────────────────────────────────────────────
 
@@ -821,6 +836,32 @@ class StateClassificationSubTab(QWidget):
         except Exception:
             traceback.print_exc()
 
+    def _rebuild_log_scale_features(self, state=None):
+        while self.log_scale_lay.count():
+            child = self.log_scale_lay.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+                
+        selected_feats = [f for f, cb in getattr(self, "_timepoint_checkboxes", {}).items() if cb.isChecked()]
+        ct = self._cell_type()
+        cfg = getattr(self.metadata_loader, "behav3d_parameters", {}).get("state_classification", {}).get(ct, {}) if ct else {}
+        saved_log = set(cfg.get("log_scale_features", []))
+        prev_checked = {f for f, cb in getattr(self, "_logscale_checkboxes", {}).items() if cb.isChecked()}
+        
+        self._logscale_checkboxes = {}
+        if not selected_feats:
+            self.log_scale_lay.addWidget(QLabel("<i>No features selected.</i>"))
+            return
+            
+        grid_log = QGridLayout()
+        for i, f in enumerate(selected_feats):
+            cb = QCheckBox(f)
+            if f in prev_checked or f in saved_log:
+                cb.setChecked(True)
+            self._logscale_checkboxes[f] = cb
+            grid_log.addWidget(cb, i // 3, i % 3)
+        self.log_scale_lay.addLayout(grid_log)
+
     def _populate_dynamic_features(self, ct):
         from behav3d.widgets.utils import behav3d_calculated_features
         from behav3d.core.utils import expand_column_patterns
@@ -855,7 +896,18 @@ class StateClassificationSubTab(QWidget):
                 w.setEnabled(False)
             return
 
-        df = pd.read_csv(csv_path, nrows=0)
+        # Read at least 5 rows so pandas can infer column dtypes properly.
+        # If nrows=0, many columns default to dtype 'object'.
+        for w in [self.spin_window_size, self.chk_net_disp, self.chk_straight, self.chk_msd,
+                  self.spin_hmm_feature_smoothing_window, self.spin_quant_lo, self.spin_quant_hi]:
+            w.setEnabled(True)
+            
+        ct = self._cell_type()
+        cfg = getattr(self.metadata_loader, "behav3d_parameters", {}).get("state_classification", {}).get(ct, {})
+        saved_features = set(cfg.get("selected_features", cfg.get("features", [])))
+        saved_bin = set(cfg.get("binary_features_to_group", []))
+
+        df = pd.read_csv(csv_path, nrows=5)
         cols = list(df.columns)
         excluded = [
             "TrackID", "position_t", "position_x", "position_y", "position_z",
@@ -881,37 +933,44 @@ class StateClassificationSubTab(QWidget):
                 vals.extend(expand_column_patterns(pat, feat_cols))
             clean_vals = sorted({x for x in vals if x in feat_cols})
             if clean_vals:
-                self.timepoint_features_lay.addWidget(QLabel(f"<b>{gname}</b>"))
-                grid = QGridLayout()
+                group_sec = CollapsibleSection(gname, expanded=False)
+                group_content = QWidget()
+                grid = QGridLayout(group_content)
                 for i, f in enumerate(clean_vals):
                     cb = QCheckBox(f)
+                    if f in saved_features:
+                        cb.setChecked(True)
+                    cb.stateChanged.connect(self._rebuild_log_scale_features)
                     self._timepoint_checkboxes[f] = cb
                     grid.addWidget(cb, i // 3, i % 3)
-                self.timepoint_features_lay.addLayout(grid)
+                group_sec.addWidget(group_content)
+                self.timepoint_features_lay.addWidget(group_sec)
                 matched.update(clean_vals)
 
         other = sorted([c for c in feat_cols if c not in matched])
         if other:
-            self.timepoint_features_lay.addWidget(QLabel("<b>other</b>"))
-            grid = QGridLayout()
+            group_sec = CollapsibleSection("other", expanded=False)
+            group_content = QWidget()
+            grid = QGridLayout(group_content)
             for i, f in enumerate(other):
                 cb = QCheckBox(f)
+                if f in saved_features:
+                    cb.setChecked(True)
+                cb.stateChanged.connect(self._rebuild_log_scale_features)
                 self._timepoint_checkboxes[f] = cb
                 grid.addWidget(cb, i // 3, i % 3)
-            self.timepoint_features_lay.addLayout(grid)
+            group_sec.addWidget(group_content)
+            self.timepoint_features_lay.addWidget(group_sec)
 
-        grid_log = QGridLayout()
-        for i, f in enumerate(feat_cols):
-            cb = QCheckBox(f)
-            self._logscale_checkboxes[f] = cb
-            grid_log.addWidget(cb, i // 3, i % 3)
-        self.log_scale_lay.addLayout(grid_log)
+        self._rebuild_log_scale_features()
 
         if not bin_cols:
             self.bin_grp_lay.addWidget(QLabel("<i>No binary columns detected yet.</i>"))
         else:
             for b in bin_cols:
                 cb = QCheckBox(b)
+                if b in saved_bin:
+                    cb.setChecked(True)
                 self._bingrp_checkboxes[b] = cb
                 self.bin_grp_lay.addWidget(cb)
 

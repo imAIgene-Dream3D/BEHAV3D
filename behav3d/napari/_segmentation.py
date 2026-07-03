@@ -491,6 +491,66 @@ class PerClassLegendWidget(QWidget):
                 pass
 
 
+def _run_multicolor_cleanup_if_needed(metadata_loader, log_fn, skip_unified=False):
+    """Run multicolor redundancy cleanup after segmentation."""
+    if skip_unified:
+        log_fn(
+            "Skipping multicolor cleanup: unified ConvPaint already "
+            "produces mutually-exclusive per-cell-type masks."
+        )
+        return metadata_loader.metadata
+
+    metadata = metadata_loader.metadata
+    if metadata is None or metadata.empty:
+        return metadata
+
+    from behav3d.core.cell_types import (
+        is_multicolor_celltype, 
+        multicolor_base_name,
+        detect_organoid_types_from_metadata,
+        detect_immune_cell_types_from_metadata,
+        detect_other_cell_types_from_metadata
+    )
+    all_cell_types = (
+        detect_organoid_types_from_metadata(metadata) +
+        detect_immune_cell_types_from_metadata(metadata) +
+        detect_other_cell_types_from_metadata(metadata)
+    )
+
+    families = {}
+    for cell_type in all_cell_types:
+        if not is_multicolor_celltype(cell_type):
+            continue
+        base_name = multicolor_base_name(cell_type)
+        families.setdefault(base_name, []).append(cell_type)
+
+    if not families:
+        return metadata
+
+    from behav3d.preprocessing.segmentation.multicolor_segment_processing import (
+        apply_multicolor_segment_correction_for_base,
+    )
+
+    cleaned_metadata = metadata
+    for base_name, family_cell_types in sorted(families.items()):
+        if len(family_cell_types) < 2:
+            continue
+        log_fn(
+            f"Running multicolor cleanup for '{base_name}' after batch segmentation: "
+            f"{sorted(family_cell_types)}"
+        )
+        cleaned_metadata = apply_multicolor_segment_correction_for_base(
+            metadata=cleaned_metadata,
+            output_dir=str(metadata_loader.output_dir),
+            base_cell_type=base_name,
+            n_channels=len(family_cell_types),
+            overwrite=True,
+            n_workers=1,
+        )
+
+    return cleaned_metadata
+
+
 class PixelClassifierWidget(QWidget):
     def __init__(self, viewer, metadata_loader, log_callback=None,
                  tab_progress_row=None):
@@ -1196,6 +1256,10 @@ class PixelClassifierWidget(QWidget):
             return updated_metadata
 
         def _apply_result(updated_metadata):
+            if updated_metadata is not None:
+                self.metadata_loader.metadata = updated_metadata
+                updated_metadata = _run_multicolor_cleanup_if_needed(self.metadata_loader, self.log, skip_unified=False)
+                self.metadata_loader.metadata = updated_metadata
             self.metadata_loader.metadata = updated_metadata
             csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
             if csv_path:
@@ -4383,6 +4447,44 @@ class APOCWidget(QWidget):
 
         # Add global "▶ Run [CellType] Segmentation" button below the
         # train buttons. Lives in the same APOC layout as the Train buttons.
+        # Per-cell type time range limits for the global Run button
+        ct_tp_row = QHBoxLayout()
+        self.check_limit_timerange_ct = QCheckBox("Process all timepoints")
+        self.check_limit_timerange_ct.setChecked(True)
+        ct_tp_row.addWidget(self.check_limit_timerange_ct)
+        
+        self.spin_t_start_ct = QSpinBox()
+        self.spin_t_start_ct.setRange(0, 9999)
+        self.spin_t_start_ct.setValue(0)
+        self.spin_t_start_ct.setMaximumWidth(70)
+        self.spin_t_end_ct = QSpinBox()
+        self.spin_t_end_ct.setRange(0, 9999)
+        self.spin_t_end_ct.setValue(0)
+        self.spin_t_end_ct.setMaximumWidth(70)
+
+        ct_tp_range_row = QHBoxLayout()
+        ct_tp_range_row.addWidget(QLabel("  From t:"))
+        ct_tp_range_row.addWidget(self.spin_t_start_ct)
+        ct_tp_range_row.addWidget(QLabel("to t:"))
+        ct_tp_range_row.addWidget(self.spin_t_end_ct)
+        ct_tp_range_row.addStretch()
+
+        self.spin_t_start_ct.setVisible(False)
+        self.spin_t_end_ct.setVisible(False)
+        ct_tp_range_row_widget = QWidget()
+        ct_tp_range_row_widget.setLayout(ct_tp_range_row)
+        ct_tp_range_row_widget.setVisible(False)
+
+        def _toggle_ct_tp(_state):
+            ct_tp_range_row_widget.setVisible(not self.check_limit_timerange_ct.isChecked())
+            self.spin_t_start_ct.setVisible(not self.check_limit_timerange_ct.isChecked())
+            self.spin_t_end_ct.setVisible(not self.check_limit_timerange_ct.isChecked())
+
+        self.check_limit_timerange_ct.stateChanged.connect(_toggle_ct_tp)
+
+        tw._main_layout.addLayout(ct_tp_row)
+        tw._main_layout.addWidget(ct_tp_range_row_widget)
+
         first_ct = tw._tab_cell_types[0] if tw._tab_cell_types else "?"
         self._global_run_instance_btn = QPushButton(f"▶ Run {first_ct.capitalize()} Segmentation")
         self._global_run_instance_btn.setStyleSheet(
@@ -4894,11 +4996,18 @@ class APOCWidget(QWidget):
                     self.check_overwrite.setChecked(choice == "overwrite")
 
             # Timepoint range
-            if self.check_process_all.isChecked():
-                timepoint_range = None
+            if only_cell_types is not None and hasattr(self, 'check_limit_timerange_ct'):
+                use_all = self.check_limit_timerange_ct.isChecked()
+                t_start = self.spin_t_start_ct.value()
+                t_end = self.spin_t_end_ct.value()
             else:
+                use_all = self.check_process_all.isChecked()
                 t_start = self.spin_t_start.value()
                 t_end = self.spin_t_end.value()
+
+            if use_all:
+                timepoint_range = None
+            else:
                 if t_start > t_end:
                     self.log("Error: Start timepoint must be <= End timepoint.")
                     fire_extra_callback(extra_callbacks, "on_failed", "bad timepoint range")
@@ -4984,6 +5093,8 @@ class APOCWidget(QWidget):
 
             def _apply_apoc_result(updated_metadata):
                 if updated_metadata is not None:
+                    self.metadata_loader.metadata = updated_metadata
+                    updated_metadata = _run_multicolor_cleanup_if_needed(self.metadata_loader, self.log, skip_unified=False)
                     self.metadata_loader.metadata = updated_metadata
                     if metadata_csv:
                         try:
@@ -6034,6 +6145,8 @@ class ConvPaintWidget(QWidget):
 
             def _apply_result(updated_metadata):
                 if updated_metadata is not None:
+                    self.metadata_loader.metadata = updated_metadata
+                    updated_metadata = _run_multicolor_cleanup_if_needed(self.metadata_loader, self.log, skip_unified=True)
                     self.metadata_loader.metadata = updated_metadata
                     if metadata_csv:
                         try:

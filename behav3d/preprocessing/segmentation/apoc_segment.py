@@ -321,7 +321,7 @@ def run_apoc_segmentation(
     output_dir = Path(output_dir)
     pixelclass_dir = output_dir / "images" / "PixelClassification"
 
-    # --- Discover cell types from metadata (same logic as the rest of BEHAV3D) ---
+    # --- Discover cell types from metadata ---
     organoid_types = detect_organoid_types_from_metadata(metadata)
     immune_types = detect_immune_cell_types_from_metadata(metadata)
     other_types = detect_other_cell_types_from_metadata(metadata)
@@ -392,22 +392,8 @@ def run_apoc_segmentation(
  
         # Output directory
         img_outdir = output_dir / "images" / sample_name
- 
-        # SKIP LOGIC: If all active outputs already exist and overwrite=False, skip
-        if not overwrite_existing:
-            all_done = True
-            for ct in active_cell_types:
-                if not (img_outdir / f"{sample_name}_{ct}_segments.zarr").exists():
-                    all_done = False
-                    break
-            if all_done and has_death and clf_death:
-                if not (img_outdir / f"{sample_name}_mask_dead.zarr").exists():
-                    all_done = False
-
-            if all_done and active_cell_types:  # guard: don't skip if nothing was checked
-                print(f"  ⏭️ Skipping {sample_name} (all outputs already exist)")
-                continue
-
+        done_dir = img_outdir / ".done_markers"
+        
         # Use raw_image_path from metadata (source of truth)
         sample_row = metadata[metadata['sample_name'] == sample_name].iloc[0]
         raw_image_path = sample_row.get('raw_image_path')
@@ -419,8 +405,6 @@ def run_apoc_segmentation(
             print(f"  ⚠️ Raw image not found for {sample_name}: {raw_image_path}")
             continue
 
-        _ensure_zarr(raw_image_path, label=f"Raw image for '{sample_name}'")
-
         # Get dimension order from metadata for this sample
         axis_order = sample_row.get('dimension_order', "TCZYX")
         if not isinstance(axis_order, str) or not axis_order:
@@ -429,8 +413,50 @@ def run_apoc_segmentation(
         img = load_image(raw_image_path, axis_order=axis_order)             # lazy load via metadata path
         n_timepoints = img.shape[0]
 
-        # Ensure output directory exists
+        # Timepoint progress via tqdm (per-sample)
+        if timepoint_range is not None:
+            if isinstance(timepoint_range, (range, list)):
+                t_range = list(timepoint_range)
+            else:
+                # Handle old tuple (start, end)
+                s, e = timepoint_range
+                t_range = list(range(s, e + 1))
+        else:
+            t_range = list(range(n_timepoints))
+
+        # Check existing segmentations for skip logic (cell-type level)
+        active_cts_for_sample = list(active_cell_types)
+        has_death_for_sample = has_death
+
+        if not overwrite_existing:
+            # Check cell types
+            remaining_cts = []
+            for ct in active_cts_for_sample:
+                seg_path = img_outdir / f"{sample_name}_{ct}_segments.zarr"
+                if seg_path.exists():
+                    all_done = all((done_dir / f"{ct}_t{t:04d}.done").exists() for t in t_range)
+                    if all_done:
+                        continue  # Skip this cell type for this sample
+                remaining_cts.append(ct)
+            active_cts_for_sample = remaining_cts
+
+            # Check death mask
+            if has_death_for_sample and clf_death:
+                death_path = img_outdir / f"{sample_name}_mask_dead.zarr"
+                if death_path.exists():
+                    all_done = all((done_dir / f"dead_t{t:04d}.done").exists() for t in t_range)
+                    if all_done:
+                        has_death_for_sample = False
+
+            if not active_cts_for_sample and (not has_death_for_sample or not clf_death):
+                print(f"  ⏭️ Skipping {sample_name} (all selected outputs already exist)")
+                continue
+
+        _ensure_zarr(raw_image_path, label=f"Raw image for '{sample_name}'")
+
+        # Ensure output directories exist
         img_outdir.mkdir(parents=True, exist_ok=True)
+        done_dir.mkdir(parents=True, exist_ok=True)
 
         # Spatial shape for output arrays
         spatial_shape = img.shape[2:]           # (Z, Y, X)  — img is (T, C, Z, Y, X)
@@ -439,7 +465,7 @@ def run_apoc_segmentation(
         # Create output zarr arrays
         zarr_segs = {}
         zarr_masks = {}
-        for ct in active_cell_types:
+        for ct in active_cts_for_sample:
             zarr_segs[ct] = _open_zarr_output(
                 img_outdir / f"{sample_name}_{ct}_segments.zarr",
                 "uint16", out_shape, overwrite_existing if not only_segment else True,
@@ -457,22 +483,11 @@ def run_apoc_segmentation(
                 )
 
         zarr_death = None
-        if has_death and clf_death and not only_segment:
+        if has_death_for_sample and clf_death and not only_segment:
             zarr_death = _open_zarr_output(
                 img_outdir / f"{sample_name}_mask_dead.zarr",
                 "uint16", out_shape, overwrite_existing,
             )
-
-        # Timepoint progress via tqdm (per-sample)
-        if timepoint_range is not None:
-            if isinstance(timepoint_range, (range, list)):
-                t_range = list(timepoint_range)
-            else:
-                # Handle old tuple (start, end)
-                s, e = timepoint_range
-                t_range = list(range(s, e + 1))
-        else:
-            t_range = list(range(n_timepoints))
 
         def _load_tp(img_obj, t_idx):
             return np.asarray(img_obj[t_idx])
@@ -494,7 +509,10 @@ def run_apoc_segmentation(
                     future = executor.submit(_load_tp, img, t_range[i + 1])
 
                 # 3. Process current timepoint (GPU-bound or CPU-bound if only_segment)
-                for ct in active_cell_types:
+                for ct in active_cts_for_sample:
+                    if not overwrite_existing and (done_dir / f"{ct}_t{t:04d}.done").exists():
+                        continue  # Skip timepoint for this cell type if already computed
+
                     cfg = apoc_config or {}
                     indices = [i_ch for i_ch in clf_channels[ct] if 0 <= i_ch < t_img.shape[0]] or [0]
                     imgs = [t_img[i_ch] for i_ch in indices]
@@ -632,16 +650,23 @@ def run_apoc_segmentation(
                                 print(f"⚠️ Warning: 'Only resegment' selected but strategy is Direct APOC. Cannot tweak instance rules without EDT method. Resaving {ct} instances.")
                         zarr_segs[ct][t] = seg_out
 
+                    # Mark timepoint as done for this cell type
+                    (done_dir / f"{ct}_t{t:04d}.done").touch()
+
                 if zarr_death is not None:
-                    indices = [i_ch for i_ch in death_channels if 0 <= i_ch < t_img.shape[0]] or [0]
-                    imgs = [t_img[i_ch] for i_ch in indices]
-                    imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
-                    death_mask = (np.asarray(clf_death.predict(image=imgs_to_pass)) > 0).astype(np.uint16)
-                    zarr_death[t] = death_mask
+                    if not overwrite_existing and (done_dir / f"dead_t{t:04d}.done").exists():
+                        pass  # Skip timepoint for death mask if already computed
+                    else:
+                        indices = [i_ch for i_ch in death_channels if 0 <= i_ch < t_img.shape[0]] or [0]
+                        imgs = [t_img[i_ch] for i_ch in indices]
+                        imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
+                        death_mask = (np.asarray(clf_death.predict(image=imgs_to_pass)) > 0).astype(np.uint16)
+                        zarr_death[t] = death_mask
+                        (done_dir / f"dead_t{t:04d}.done").touch()
 
         # Update metadata with output paths
         row_idx = metadata.index[metadata['sample_name'] == sample_name].tolist()[0]
-        for ct in active_cell_types:
+        for ct in active_cts_for_sample:
             if ct in organoid_types: prefix = 'or'
             elif ct in immune_types: prefix = 'im'
             elif ct in other_types: prefix = 'ot'

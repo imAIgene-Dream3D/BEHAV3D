@@ -569,7 +569,8 @@ class _CellTypeFeatureExtractionPanel:
             try:
                 self._persist_params()
                 self.output_dir.mkdir(parents=True, exist_ok=True)
-                self._reset_required_intermediates()
+                if bool(self.overwrite.value):
+                    self._reset_required_intermediates()
                 run_feature_extraction(
                     dead_mask_percentage_threshold=(self._current_dead_threshold() if self.has_dead else None),
                     contact_threshold=float(self.contact_threshold.value),
