@@ -2,6 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
+.behav3d_dev
 **/__pycache__
 *.ilp
 *.tiff

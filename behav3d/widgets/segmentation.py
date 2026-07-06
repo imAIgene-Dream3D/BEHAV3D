@@ -216,6 +216,9 @@ class PixelClassifierPanel:
             "APOC Mask + Peak EDT/Watershed Resegmentation",
             "APOC Probability Map + Watershed",
         ]
+        import os
+        if os.environ.get("BEHAV3D_DEV_MODE") != "1":
+            _apoc_strategy_options.remove("APOC Mask + Peak EDT/Watershed Resegmentation")
         _saved_apoc_strategy = pc.get("apoc_strategy", "APOC (Direct Instance Segmentation)")
         if _saved_apoc_strategy not in _apoc_strategy_options:
             _saved_apoc_strategy = "APOC (Direct Instance Segmentation)"
@@ -234,6 +237,9 @@ class PixelClassifierPanel:
             "ConvPaint Mask + Peak EDT/Watershed",
             "ConvPaint Probability + Watershed",
         ]
+        import os
+        if os.environ.get("BEHAV3D_DEV_MODE") != "1":
+            _convpaint_strategy_options.remove("ConvPaint Mask + Peak EDT/Watershed")
         _saved_cp_strategy = pc.get(
             "convpaint_strategy", "ConvPaint Mask + EDT/Watershed"
         )
