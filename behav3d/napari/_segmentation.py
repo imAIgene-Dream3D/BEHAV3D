@@ -507,7 +507,7 @@ def _run_multicolor_cleanup_if_needed(metadata_loader, log_fn, skip_unified=Fals
     if metadata is None or metadata.empty:
         return metadata
 
-    from behav3d.core.cell_types import (
+    from behav3d.core.metadata import (
         is_multicolor_celltype, 
         multicolor_base_name,
         detect_organoid_types_from_metadata,
