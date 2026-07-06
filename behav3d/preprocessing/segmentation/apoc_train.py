@@ -52,6 +52,14 @@ APOC_FEATURES = [
 # For custom preset every feature is available (same list here; extend if needed)
 APOC_ALL_FEATURES = APOC_FEATURES
 
+# macOS creates ghost `._filename` resource-fork files on external drives that
+# appear in directory listings but fail on unlink. Ignore those FileNotFoundErrors
+# so rmtree can complete and the zarr directory is fully cleared before rewriting.
+def _rmtree_ignore_missing(func, path, exc):
+    if not isinstance(exc, FileNotFoundError):
+        raise exc
+
+
 # Format sigma values nicely (drop trailing .0)
 def _fmt_sigma(s):
     s_float = float(s)
@@ -729,6 +737,244 @@ def _load_training_images(
 
 
 # ---------------------------------------------------------------------------
+# Training data persistence helpers
+# ---------------------------------------------------------------------------
+# Training data is stored as a single zip bundle: PixelClassifier_TrainingData.zip
+# containing training_metadata.yml and per-cell-type {Stem}_X.npy / {Stem}_y.npy.
+# The bundle is written with a read-modify-write pattern so each save call
+# (per cell type, then metadata) updates only its own members.
+# Old-style TrainingData/ folders are still readable for backward compat.
+# ---------------------------------------------------------------------------
+
+def _training_bundle_path(pixel_class_outdir):
+    """Return the path to the single-file training bundle (.zip), or None."""
+    if not pixel_class_outdir:
+        return None
+    return Path(pixel_class_outdir) / "PixelClassifier_TrainingData.zip"
+
+
+def _training_data_dir(pixel_class_outdir):
+    """Return the legacy TrainingData/ subdirectory path (backward compat)."""
+    if not pixel_class_outdir:
+        return None
+    return Path(pixel_class_outdir) / "TrainingData"
+
+
+def _celltype_file_stem(cell_type):
+    """Return the file stem used for saving a cell type's data ('Death' / capitalized)."""
+    return "Death" if cell_type == "dead" else cell_type.capitalize()
+
+
+def _zip_read_all_members(zip_path):
+    """Return a dict {member_name: bytes} for an existing zip, or {} if absent."""
+    import zipfile
+    if not zip_path.exists():
+        return {}
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        return {name: zf.read(name) for name in zf.namelist()}
+
+
+def _zip_write_members(zip_path, members):
+    """Write *members* dict {name: bytes} to *zip_path*, replacing the file."""
+    import zipfile
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+
+
+def _save_training_data(pixel_class_outdir, cell_type, X, y):
+    """Save flattened feature matrix X and label vector y for one cell type."""
+    import io
+    bundle = _training_bundle_path(pixel_class_outdir)
+    if bundle is None:
+        return
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    stem = _celltype_file_stem(cell_type)
+
+    members = _zip_read_all_members(bundle)
+
+    buf_X = io.BytesIO()
+    np.save(buf_X, X.astype(np.float32))
+    members[f"{stem}_X.npy"] = buf_X.getvalue()
+
+    buf_y = io.BytesIO()
+    np.save(buf_y, y.astype(np.uint8))
+    members[f"{stem}_y.npy"] = buf_y.getvalue()
+
+    _zip_write_members(bundle, members)
+
+
+def _load_training_data_for_celltype(path_or_dir, cell_type):
+    """Load (X, y) arrays for one cell type; returns (None, None) if not found.
+
+    Accepts either a .zip bundle path or a legacy TrainingData/ directory.
+    """
+    import io, zipfile
+    stem = _celltype_file_stem(cell_type)
+    p = Path(path_or_dir)
+
+    if p.suffix == ".zip":
+        if not p.exists():
+            return None, None
+        with zipfile.ZipFile(p, "r") as zf:
+            names = zf.namelist()
+            x_name, y_name = f"{stem}_X.npy", f"{stem}_y.npy"
+            if x_name not in names or y_name not in names:
+                return None, None
+            X = np.load(io.BytesIO(zf.read(x_name)))
+            y = np.load(io.BytesIO(zf.read(y_name)))
+        return X, y
+
+    # Backward compat: old TrainingData/ folder
+    x_path = p / f"{stem}_X.npz"
+    y_path = p / f"{stem}_y.npy"
+    if not x_path.exists() or not y_path.exists():
+        return None, None
+    X = np.load(str(x_path))["X"]
+    y = np.load(str(y_path))
+    return X, y
+
+
+def _save_training_metadata(pixel_class_outdir, metadata_dict):
+    """Write training_metadata.yml into the training bundle zip."""
+    import yaml
+    bundle = _training_bundle_path(pixel_class_outdir)
+    if bundle is None:
+        return
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+
+    members = _zip_read_all_members(bundle)
+    members["training_metadata.yml"] = yaml.safe_dump(
+        metadata_dict, default_flow_style=False, sort_keys=False
+    ).encode("utf-8")
+    _zip_write_members(bundle, members)
+
+
+def _load_training_metadata(path_to_zip_yml_or_dir):
+    """Load training metadata; accepts a .zip bundle, a .yml path, or a directory.
+
+    Returns the parsed dict, or None if the file does not exist or fails to parse.
+    """
+    import yaml, zipfile
+    if path_to_zip_yml_or_dir is None:
+        return None
+    p = Path(path_to_zip_yml_or_dir)
+
+    if p.suffix == ".zip":
+        if not p.exists():
+            return None
+        try:
+            with zipfile.ZipFile(p, "r") as zf:
+                return yaml.safe_load(zf.read("training_metadata.yml"))
+        except Exception:
+            return None
+
+    # Backward compat: .yml path or directory
+    if p.is_dir():
+        p = p / "training_metadata.yml"
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r") as fh:
+            return yaml.safe_load(fh)
+    except Exception:
+        return None
+
+
+def _load_training_bundle(zip_path):
+    """Load a training bundle zip; returns (metadata_dict, {cell_type: (X, y)}).
+
+    Raises on unreadable files so callers can show a meaningful error dialog.
+    """
+    import io, yaml, zipfile
+    p = Path(zip_path)
+    with zipfile.ZipFile(p, "r") as zf:
+        meta = yaml.safe_load(zf.read("training_metadata.yml"))
+        cell_types = list(meta.get("cell_types", []))
+        if meta.get("has_death"):
+            cell_types.append("dead")
+        names = zf.namelist()
+        result = {}
+        for ct in cell_types:
+            stem = _celltype_file_stem(ct)
+            x_name, y_name = f"{stem}_X.npy", f"{stem}_y.npy"
+            if x_name in names and y_name in names:
+                X = np.load(io.BytesIO(zf.read(x_name)))
+                y = np.load(io.BytesIO(zf.read(y_name)))
+                result[ct] = (X, y)
+    return meta, result
+
+
+def _build_training_metadata(
+    cell_types,
+    has_death,
+    params_per_ct,
+    n_input_channels,
+    channel_names,
+    pixel_size_xy_um,
+    pixel_size_z_um,
+    pixel_counts_by_ct,
+    imported_from=None,
+    imported_counts=None,
+    new_counts=None,
+):
+    """Build the metadata dict that is written to training_metadata.yml."""
+    import datetime
+
+    all_cts = list(cell_types) + (["dead"] if has_death else [])
+    features_section = {}
+    for ct in all_cts:
+        cfg = params_per_ct.get(ct, {})
+        raw_sigmas = cfg.get("grid_sigmas", "") or ""
+        sigma_list = []
+        for tok in raw_sigmas.replace(",", " ").split():
+            try:
+                sigma_list.append(float(tok))
+            except ValueError:
+                pass
+        features_section[ct] = {
+            "feature_string":    cfg.get("feature_string", ""),
+            "sigmas":            sigma_list,
+            "consider_original": bool(cfg.get("consider_original", False)),
+            "channels_used":     list(cfg.get("channels", [])),
+            "max_depth":         int(cfg.get("max_depth", 5)),
+            "num_ensembles":     int(cfg.get("num_ensembles", 100)),
+        }
+
+    training_data_section = {}
+    for ct, counts in (pixel_counts_by_ct or {}).items():
+        training_data_section[ct] = {
+            "n_pixels":   int(counts.get("total", 0)),
+            "n_positive": int(counts.get("positive", 0)),
+            "n_negative": int(counts.get("negative", 0)),
+        }
+
+    return {
+        "version":    1,
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "cell_types": [str(ct) for ct in cell_types],
+        "has_death":  bool(has_death),
+        "image_metadata": {
+            "n_input_channels": int(n_input_channels) if n_input_channels is not None else None,
+            "channel_names":    list(channel_names),
+            "pixel_size_xy_um": float(pixel_size_xy_um) if pixel_size_xy_um is not None else None,
+            "pixel_size_z_um":  float(pixel_size_z_um)  if pixel_size_z_um  is not None else None,
+        },
+        "features":      features_section,
+        "training_data": training_data_section,
+        "provenance": {
+            "imported_from":         str(imported_from) if imported_from else None,
+            "imported_pixel_counts": {
+                str(k): int(v) for k, v in (imported_counts or {}).items()
+            },
+            "new_pixel_counts": {
+                str(k): int(v) for k, v in (new_counts or {}).items()
+            },
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Per-cell-type tab panel
 # ---------------------------------------------------------------------------
 
@@ -792,7 +1038,7 @@ class CellTypeTab(QWidget):
         layout.setSpacing(6)
 
         # ── Channel selection ────────────────────────────────────────────────
-        chan_group = QGroupBox("Image Channel Inputs")
+        self.chan_group = QGroupBox("Image Channel Inputs")
         chan_layout = QVBoxLayout()
         chan_layout.setSpacing(2)
         self.channel_checkboxes = []
@@ -801,8 +1047,8 @@ class CellTypeTab(QWidget):
         self.chan_checkbox_layout.setContentsMargins(0, 0, 0, 0)
         self.chan_checkbox_container.setLayout(self.chan_checkbox_layout)
         chan_layout.addWidget(self.chan_checkbox_container)
-        chan_group.setLayout(chan_layout)
-        layout.addWidget(chan_group)
+        self.chan_group.setLayout(chan_layout)
+        layout.addWidget(self.chan_group)
 
         # ── Optional per-tab strategy combo ──────────────────────────────────
         # Only shown in the napari GUI plugin (per_cell_type_strategy=True). The
@@ -1004,6 +1250,7 @@ class CellTypeTab(QWidget):
             # Apply preset defaults
             self._apply_preset_defaults(saved_preset)
 
+        self._locked_feature_string = None
         self._update_preview()
 
     # ────────────────────────────────────────────────────────────────────────
@@ -1413,7 +1660,14 @@ class CellTypeTab(QWidget):
     # ────────────────────────────────────────────────────────────────────────
 
     def get_feature_string(self):
-        """Return the full APOC feature string based on current grid state."""
+        """Return the full APOC feature string based on current grid state.
+
+        When features are locked (imported mode) the locked string is returned
+        unchanged so the training loop always uses the imported classifier's
+        feature specification.
+        """
+        if getattr(self, "_locked_feature_string", None):
+            return self._locked_feature_string
         checked = self._get_current_checked_set()
         consider_orig = self.consider_original_cb.isChecked()
         return _build_feature_string_from_checked(checked, consider_original=consider_orig, current_sigmas=self.current_sigmas)
@@ -1544,6 +1798,97 @@ class CellTypeTab(QWidget):
             self.peak_min_ratio_spin.setValue(float(cfg["peak_min_ratio"]))
         self._update_preview()
 
+    # ── Import / feature-locking API ──────────────────────────────────────────
+
+    def lock_features(self, feature_string, sigmas=None, consider_original=None, channels_used=None):
+        """Disable all feature controls and fix the feature string (imported mode).
+
+        Applies the imported settings visually before locking so greyed-out
+        controls show the imported values rather than the last user-edited state.
+        """
+        self._locked_feature_string = feature_string
+
+        # --- Apply imported values visually before disabling ---
+        parsed = _parse_feature_string(feature_string)
+
+        # Sigmas: explicit list from metadata takes priority over parsed
+        if sigmas:
+            sigma_str = ", ".join(_fmt_sigma(s) for s in sigmas)
+        else:
+            sigma_str = parsed.get("grid_sigmas", "")
+        if sigma_str:
+            self.sigma_input.setText(sigma_str)
+            try:
+                parts = sigma_str.replace(",", " ").split()
+                new_sigmas = [float(p) for p in parts if p.strip()]
+                if new_sigmas:
+                    self.current_sigmas = new_sigmas
+                    self._build_grid()
+            except ValueError:
+                pass
+
+        # Feature grid checkboxes
+        checked_set = {tuple(pair) for pair in parsed.get("checked_features", [])}
+        self._apply_checked_set(checked_set)
+
+        # Consider-original: explicit value takes priority over parsed
+        co_value = parsed.get("consider_original", False) if consider_original is None else consider_original
+        self.consider_original_cb.blockSignals(True)
+        self.consider_original_cb.setChecked(co_value)
+        self.consider_original_cb.blockSignals(False)
+
+        # Channel checkboxes
+        if channels_used is not None:
+            self._default_channel_names = list(channels_used)
+            channels_used_set = set(channels_used)
+            for cb in self.channel_checkboxes:
+                cb.setChecked(cb.text() in channels_used_set)
+
+        # --- Disable all controls ---
+        self.feature_combo.setEnabled(False)
+        self.sigma_input.setEnabled(False)
+        self.update_grid_btn.setEnabled(False)
+        self.consider_original_cb.setEnabled(False)
+        for cb in self._feat_sigma_checks.values():
+            cb.setEnabled(False)
+        for ch_cb in self.channel_checkboxes:
+            ch_cb.setEnabled(False)
+        self.chan_group.setEnabled(False)
+        self.tune_group.setEnabled(False)
+
+        short = feature_string if len(feature_string) <= 110 else feature_string[:107] + "…"
+        self.preview_label.setText(
+            f"<b>🔒 Features locked (imported):</b><br/>"
+            f"<span style='font-family:monospace;'>{short}</span>"
+        )
+        self.preview_label.setToolTip(feature_string)
+        self.preview_label.setStyleSheet(
+            "color: #c06000; font-size: 10px; padding: 4px 6px; "
+            "background: rgba(220,120,0,0.08); border-radius: 3px; "
+            "border: 1px solid #c06000;"
+        )
+
+    def unlock_features(self):
+        """Re-enable all feature controls and clear the import lock."""
+        self._locked_feature_string = None
+
+        self.feature_combo.setEnabled(True)
+        self.sigma_input.setEnabled(True)
+        self.update_grid_btn.setEnabled(True)
+        self.consider_original_cb.setEnabled(True)
+        for cb in self._feat_sigma_checks.values():
+            cb.setEnabled(True)
+        for ch_cb in self.channel_checkboxes:
+            ch_cb.setEnabled(True)
+        self.chan_group.setEnabled(True)
+        self.tune_group.setEnabled(True)
+
+        self.preview_label.setStyleSheet(
+            "color: #888; font-size: 10px; padding: 2px 4px; "
+            "background: rgba(0,0,0,0.05); border-radius: 3px;"
+        )
+        self._update_preview()
+
 
 # ---------------------------------------------------------------------------
 # Main APOC training widget
@@ -1585,6 +1930,9 @@ class APOCTrainingWidget(QWidget):
     instance_preview_finished = Signal(str)
     # Emitted when the global strategy combo value changes (plugin mode).
     strategy_changed = Signal(str)
+    # Emitted when imported training data is applied or cleared.
+    import_applied = Signal()
+    import_cleared = Signal()
 
     STRATEGIES = [
         "APOC (Direct Instance Segmentation)",
@@ -1607,6 +1955,7 @@ class APOCTrainingWidget(QWidget):
         per_cell_type_strategy=False,
         strategy_resolver=None,
         extra_toolbar_widgets=None,
+        pixel_sizes=None,
     ):
         super().__init__(parent)
         self._bg = BackgroundOperation(self)
@@ -1618,6 +1967,13 @@ class APOCTrainingWidget(QWidget):
         self._on_params_changed = on_params_changed
         self._apoc_strategy = str(self._initial_params.get("apoc_strategy", "APOC Probability Map + Watershed"))
         self._log_fn = print
+        # Optional pixel sizes dict: {"xy_um": float, "z_um": float}
+        self._pixel_sizes = dict(pixel_sizes) if pixel_sizes else {}
+        # Imported training data state
+        self._imported_training_data: dict = {}
+        self._imported_metadata: dict = {}
+        self._cell_type_mapping: dict = {}
+        self._imported_metadata_path: str = ""
 
         if instance_controls_mode not in ("docked", "inline"):
             raise ValueError(
@@ -1675,6 +2031,90 @@ class APOCTrainingWidget(QWidget):
         print(text)
         if callable(self._log_fn) and self._log_fn is not print:
             self._log_fn(text)
+
+    # ── Imported training data API ────────────────────────────────────────────
+
+    def apply_import(self, imported_metadata, data_by_celltype, cell_type_mapping, source_path=""):
+        """Apply imported training data: store X/y pairs and lock per-tab features.
+
+        Parameters
+        ----------
+        imported_metadata : dict
+            Parsed training_metadata.yml from the source experiment.
+        data_by_celltype : dict
+            {imported_cell_type: (X, y)} numpy arrays.
+        cell_type_mapping : dict
+            {imported_cell_type: local_cell_type | None}.  None means skip.
+        source_path : str
+            Path to the source training_metadata.yml (stored for provenance).
+        """
+        self._imported_metadata = dict(imported_metadata)
+        self._cell_type_mapping = dict(cell_type_mapping)
+        self._imported_training_data = {}
+        self._imported_metadata_path = str(source_path)
+
+        features_info = imported_metadata.get("features", {})
+        for imp_ct, local_ct in cell_type_mapping.items():
+            if local_ct is None:
+                continue
+            if imp_ct in data_by_celltype:
+                imp_X, imp_y = data_by_celltype[imp_ct]
+                self._imported_training_data[local_ct] = (
+                    imp_X.astype(np.float32),
+                    imp_y.astype(np.int32),
+                )
+            if local_ct in self.tabs:
+                ct_features = features_info.get(imp_ct, {})
+                feature_string = ct_features.get("feature_string", "")
+                if feature_string:
+                    self.tabs[local_ct].lock_features(
+                        feature_string,
+                        sigmas=ct_features.get("sigmas"),
+                        consider_original=ct_features.get("consider_original"),
+                        channels_used=ct_features.get("channels_used"),
+                    )
+
+        try:
+            self.import_applied.emit()
+        except Exception:
+            pass
+
+    def clear_import(self):
+        """Remove imported training data and unlock all feature controls."""
+        self._imported_training_data = {}
+        self._imported_metadata = {}
+        self._cell_type_mapping = {}
+        self._imported_metadata_path = ""
+        for tab in self.tabs.values():
+            tab.unlock_features()
+        try:
+            self.import_cleared.emit()
+        except Exception:
+            pass
+
+    def get_import_summary(self):
+        """Return a human-readable summary of the active import (or empty string)."""
+        if not self._imported_metadata:
+            return ""
+        lines = []
+        img_meta = self._imported_metadata.get("image_metadata", {})
+        xy = img_meta.get("pixel_size_xy_um")
+        z  = img_meta.get("pixel_size_z_um")
+        if xy is not None:
+            lines.append(f"Pixel size: xy={xy} µm, z={z} µm")
+        ch_names = img_meta.get("channel_names", [])
+        if ch_names:
+            lines.append(f"Channels: {', '.join(ch_names)}")
+        td_info = self._imported_metadata.get("training_data", {})
+        for imp_ct, local_ct in self._cell_type_mapping.items():
+            if local_ct is None:
+                continue
+            counts = td_info.get(imp_ct, {})
+            n = counts.get("n_pixels", 0)
+            pos = counts.get("n_positive", 0)
+            neg = counts.get("n_negative", 0)
+            lines.append(f"  {imp_ct} → {local_ct}: {n} px ({pos} fg / {neg} bg)")
+        return "\n".join(lines)
 
     def _build_ui(self):
         # Content widget (scrollable)
@@ -2334,7 +2774,7 @@ class APOCTrainingWidget(QWidget):
             label_data = np.asarray(label_layer.data)
             outpath = Path(self.pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
             if outpath.exists():
-                shutil.rmtree(outpath)
+                shutil.rmtree(outpath, onexc=_rmtree_ignore_missing)
             save_as_zarr(label_data, outpath)
             log(f"Saved {cell_type} labels → {outpath}")
 
@@ -2343,7 +2783,7 @@ class APOCTrainingWidget(QWidget):
             dead_label_data = np.asarray(dead_layer.data)
             dead_outpath = Path(self.pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
             if dead_outpath.exists():
-                shutil.rmtree(dead_outpath)
+                shutil.rmtree(dead_outpath, onexc=_rmtree_ignore_missing)
             save_as_zarr(dead_label_data, dead_outpath)
             log(f"Saved Death labels → {dead_outpath}")
 
@@ -2451,6 +2891,8 @@ class APOCTrainingWidget(QWidget):
         pixel_class_outdir = Path(self.pixel_class_outdir)
         safe_log = ThreadSafeLogger(self._log)
         training_start = time.time()
+        new_pixel_counts: dict = {}     # {ct: n_new_pixels} populated in _do_train
+        pixel_counts_by_ct: dict = {}   # {ct: {"total", "positive", "negative"}}
 
         # ── Phase 2 (worker thread) ───────────────────────────────────────
         def _do_train(progress_cb=None):
@@ -2523,6 +2965,21 @@ class APOCTrainingWidget(QWidget):
 
                 X = np.concatenate(X_parts, axis=0)
                 y = np.concatenate(y_parts, axis=0)
+
+                # Track new-label pixel counts before import prepend
+                new_pixel_counts[ct] = int(len(y))
+
+                # Prepend imported training data when available for this type
+                imp_pair = self._imported_training_data.get(ct)
+                if imp_pair is not None:
+                    imp_X, imp_y = imp_pair
+                    safe_log(
+                        f"  {ct}: combining {len(imp_y)} imported + "
+                        f"{len(y)} new = {len(imp_y) + len(y)} total pixels"
+                    )
+                    X = np.concatenate([imp_X, X], axis=0)
+                    y = np.concatenate([imp_y, y], axis=0)
+
                 fitted_rf = RandomForestClassifier(
                     max_depth=max_depth, n_estimators=num_ensembles, random_state=0
                 )
@@ -2537,6 +2994,19 @@ class APOCTrainingWidget(QWidget):
                 clf.to_opencl_file(clf_path)
                 _write_classifier_channel_metadata(clf_path, cfg["channels"])
                 safe_log(f"  Saved classifier: {Path(clf_path).name}")
+
+                # Save flattened training data (combined) for future import
+                try:
+                    _save_training_data(pixel_class_outdir, ct, X, y)
+                    n_pos = int(np.sum(y == 2))
+                    n_neg = int(np.sum(y == 1))
+                    pixel_counts_by_ct[ct] = {
+                        "total":    len(y),
+                        "positive": n_pos,
+                        "negative": n_neg,
+                    }
+                except Exception as _exc:
+                    safe_log(f"  ⚠️ Could not save training data for '{ct}': {_exc}")
 
                 # Predict (for visual confirmation in viewer).
                 if progress_cb:
@@ -2612,6 +3082,45 @@ class APOCTrainingWidget(QWidget):
                 self._log(f"⚠️ No cell types were trained. Elapsed: {elapsed_txt}")
 
             self._persist_params()
+
+            # Save training metadata YAML when at least one cell type was trained
+            if successes:
+                try:
+                    params_per_ct = {}
+                    for ct in list(self.all_cell_types) + (["dead"] if self.has_death else []):
+                        if ct in self.tabs:
+                            params_per_ct[ct] = self.tabs[ct].get_config()
+                    image_layers = [
+                        la for la in self.viewer.layers
+                        if hasattr(la, "data") and la.name.startswith("Channel ")
+                    ]
+                    n_channels = len(image_layers) if image_layers else None
+                    ch_names = [la.name for la in image_layers]
+                    imported_counts = {}
+                    for imp_ct, local_ct in self._cell_type_mapping.items():
+                        if local_ct is None:
+                            continue
+                        imp_pair = self._imported_training_data.get(local_ct)
+                        if imp_pair is not None:
+                            imported_counts[imp_ct] = int(len(imp_pair[1]))
+                    meta = _build_training_metadata(
+                        cell_types=self.all_cell_types,
+                        has_death=self.has_death,
+                        params_per_ct=params_per_ct,
+                        n_input_channels=n_channels,
+                        channel_names=ch_names,
+                        pixel_size_xy_um=self._pixel_sizes.get("xy_um"),
+                        pixel_size_z_um=self._pixel_sizes.get("z_um"),
+                        pixel_counts_by_ct=pixel_counts_by_ct,
+                        imported_from=self._imported_metadata_path or None,
+                        imported_counts=imported_counts if imported_counts else None,
+                        new_counts=new_pixel_counts if new_pixel_counts else None,
+                    )
+                    _save_training_metadata(self.pixel_class_outdir, meta)
+                    self._log("📄 Training data bundle saved to PixelClassifier_TrainingData.zip")
+                except Exception as _exc:
+                    self._log(f"  ⚠️ Could not save training metadata: {_exc}")
+
             try:
                 self.training_finished.emit(cell_types_to_train, successes)
             except Exception:
@@ -2651,6 +3160,8 @@ class APOCTrainingWidget(QWidget):
         self.save_user_labels(log=self._log)
 
         successes = []
+        pixel_counts_by_ct: dict = {}
+        new_pixel_counts: dict = {}
         try:
             for ct in cell_types_to_train:
                 tab = self.tabs[ct]
@@ -2678,11 +3189,11 @@ class APOCTrainingWidget(QWidget):
                 try:
                     annotation = self.viewer.layers[layer_name].data
                 except KeyError:
-                    print(f"Skipping '{ct}': annotation layer not found")
+                    self._log(f"Skipping '{ct}': annotation layer not found")
                     continue
 
                 if not np.any(annotation):
-                    print(f"Skipping '{ct}': no labels drawn")
+                    self._log(f"Skipping '{ct}': no labels drawn")
                     continue
 
                 if ct == "dead":
@@ -2696,7 +3207,6 @@ class APOCTrainingWidget(QWidget):
                 if Path(clf_path).exists():
                     apoc.erase_classifier(clf_path)
 
-                # Train with ObjectSegmenter
                 clf = apoc.ObjectSegmenter(
                     opencl_filename=clf_path,
                     max_depth=max_depth,
@@ -2706,27 +3216,6 @@ class APOCTrainingWidget(QWidget):
 
                 has_trained = False
                 n_timepoints = annotation.shape[0] if annotation.ndim == 4 else 1
-
-                # Old APOC incremental-style training path kept for reference:
-                # if annotation.ndim == 4:
-                #     for t in range(n_timepoints):
-                #         # Load only the current timepoint slice into memory
-                #         ann_t = np.asarray(annotation[t])
-                #         if not np.any(ann_t):
-                #             continue
-                #         feats_t = self._generate_feature_list_for_timepoint(images, feature_string, t)
-                #         clf.feature_specification = expanded_feature_spec
-                #         clf.train(feats_t, ann_t, continue_training=has_trained)
-                #         clf.feature_specification = expanded_feature_spec
-                #         has_trained = True
-                # else:
-                #     # Single timepoint
-                #     ann_np = np.asarray(annotation)
-                #     feats_np = self._generate_feature_list_for_timepoint(images, feature_string, 0)
-                #     clf.feature_specification = expanded_feature_spec
-                #     clf.train(feats_np, ann_np)
-                #     clf.feature_specification = expanded_feature_spec
-                #     has_trained = True
 
                 from sklearn.ensemble import RandomForestClassifier
 
@@ -2756,8 +3245,25 @@ class APOCTrainingWidget(QWidget):
                         gt_ndim = ann_np.ndim
 
                 if X_parts:
-                    X = np.concatenate(X_parts, axis=0)
-                    y = np.concatenate(y_parts, axis=0)
+                    X_new = np.concatenate(X_parts, axis=0)
+                    y_new = np.concatenate(y_parts, axis=0)
+
+                    # Track new-label pixel counts before adding imported data
+                    new_pixel_counts[ct] = int(len(y_new))
+
+                    # Prepend imported training data when available for this type
+                    imp_pair = self._imported_training_data.get(ct)
+                    if imp_pair is not None:
+                        imp_X, imp_y = imp_pair
+                        X = np.concatenate([imp_X, X_new], axis=0)
+                        y = np.concatenate([imp_y, y_new], axis=0)
+                        self._log(
+                            f"  {ct}: combined {len(imp_y)} imported + "
+                            f"{len(y_new)} new = {len(y)} total pixels"
+                        )
+                    else:
+                        X, y = X_new, y_new
+
                     fitted_rf = RandomForestClassifier(
                         max_depth=max_depth,
                         n_estimators=num_ensembles,
@@ -2772,6 +3278,19 @@ class APOCTrainingWidget(QWidget):
                     clf.num_ground_truth_dimensions = gt_ndim
                     clf.feature_specification = feature_string
                     has_trained = True
+
+                    # Save flattened training data (combined) for future import
+                    try:
+                        _save_training_data(self.pixel_class_outdir, ct, X, y)
+                        n_pos = int(np.sum(y == 2))
+                        n_neg = int(np.sum(y == 1))
+                        pixel_counts_by_ct[ct] = {
+                            "total":    len(y),
+                            "positive": n_pos,
+                            "negative": n_neg,
+                        }
+                    except Exception as _exc:
+                        self._log(f"  ⚠️ Could not save training data for '{ct}': {_exc}")
 
                 if not has_trained:
                     continue
@@ -2799,7 +3318,6 @@ class APOCTrainingWidget(QWidget):
                 elapsed_txt = f"{elapsed_s:.1f}s"
                 self.status_label.setText(f"✅ Trained: {', '.join(successes)} ({elapsed_txt})")
                 self._log(f"✅ Training finished in {elapsed_txt}")
-                # Auto-show statistics for each successfully trained classifier
                 for ct in successes:
                     if ct in self.tabs:
                         self.tabs[ct]._on_show_statistics()
@@ -2809,8 +3327,46 @@ class APOCTrainingWidget(QWidget):
                 self.status_label.setText(f"⚠️ No cell types were trained (check labels). ({elapsed_txt})")
                 self._log(f"⚠️ No cell types were trained. Elapsed time: {elapsed_txt}")
 
-            # Persist all params back to caller
             self._persist_params()
+
+            # Save training metadata YAML when at least one cell type was trained
+            if successes:
+                try:
+                    params_per_ct = {}
+                    for ct in list(self.all_cell_types) + (["dead"] if self.has_death else []):
+                        if ct in self.tabs:
+                            cfg = self.tabs[ct].get_config()
+                            params_per_ct[ct] = cfg
+                    image_layers = [
+                        la for la in self.viewer.layers
+                        if hasattr(la, "data") and la.name.startswith("Channel ")
+                    ]
+                    n_channels = len(image_layers) if image_layers else None
+                    ch_names = [la.name for la in image_layers]
+                    imported_counts = {}
+                    for imp_ct, local_ct in self._cell_type_mapping.items():
+                        if local_ct is None:
+                            continue
+                        imp_pair = self._imported_training_data.get(local_ct)
+                        if imp_pair is not None:
+                            imported_counts[imp_ct] = int(len(imp_pair[1]))
+                    meta = _build_training_metadata(
+                        cell_types=self.all_cell_types,
+                        has_death=self.has_death,
+                        params_per_ct=params_per_ct,
+                        n_input_channels=n_channels,
+                        channel_names=ch_names,
+                        pixel_size_xy_um=self._pixel_sizes.get("xy_um"),
+                        pixel_size_z_um=self._pixel_sizes.get("z_um"),
+                        pixel_counts_by_ct=pixel_counts_by_ct,
+                        imported_from=self._imported_metadata_path or None,
+                        imported_counts=imported_counts if imported_counts else None,
+                        new_counts=new_pixel_counts if new_pixel_counts else None,
+                    )
+                    _save_training_metadata(self.pixel_class_outdir, meta)
+                    self._log("📄 Training data bundle saved to PixelClassifier_TrainingData.zip")
+                except Exception as _exc:
+                    self._log(f"  ⚠️ Could not save training metadata: {_exc}")
 
         except Exception as e:
             self.status_label.setText(f"❌ Error: {e}")

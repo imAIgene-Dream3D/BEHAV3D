@@ -218,7 +218,11 @@ def run_organoid_analysis(
         df_tracks_sample = df_tracks[df_tracks["sample_name"] == sample_name]
         
         img_outdir = Path(output_dir, "images", sample_name)
-        
+
+        sample_metadata = pd.DataFrame()
+        if metadata is not None:
+            sample_metadata = metadata[metadata['sample_name'] == sample_name]
+
         df_tracks_sample_outpath = Path(analysis_sample_outdir, f"{sample_name}_{org_type}_track_analysis.csv")
         df_tracks_sample.to_csv(
             df_tracks_sample_outpath,
@@ -243,27 +247,27 @@ def run_organoid_analysis(
         
         sample_pdf_outpath = Path(analysis_sample_outdir, f"{sample_name}_{org_type}_analysis.pdf")
     
+        # raw_img_path: prefer metadata raw_image_path, fall back to constructed path
         raw_img_path = Path(img_outdir, f"{sample_name}.zarr")
+        if not sample_metadata.empty and 'raw_image_path' in sample_metadata.columns:
+            raw_path_val = sample_metadata['raw_image_path'].values[0]
+            if pd.notna(raw_path_val) and str(raw_path_val).strip():
+                raw_img_path = Path(raw_path_val)
+
         organoid_seg_path = Path(img_outdir, f"{sample_name}_{org_type}_tracked.zarr")
-        
-        # Get dead_mask_path from metadata
-        # only runs if has_dead_data=True, so dead_channel must exist
+
+        # dead_mask_path: prefer metadata, fall back to constructed path
         dead_mask_path = None
-        
-        if metadata is not None:
-            sample_metadata = metadata[metadata['sample_name'] == sample_name]
-            if not sample_metadata.empty:
-                # dead_mask_path directly from metadata
-                if 'dead_mask_path' in sample_metadata.columns:
-                    mask_path_val = sample_metadata['dead_mask_path'].values[0]
-                    if pd.notna(mask_path_val) and str(mask_path_val).strip():
-                        dead_mask_path = Path(mask_path_val)
-                        if dead_mask_path.exists():
-                            print(f"  Using dead_mask_path from metadata: {dead_mask_path}")
-                        else:
-                            print(f"  ⚠️  dead_mask_path in metadata does not exist: {dead_mask_path}")
-                            dead_mask_path = None
-        
+        if not sample_metadata.empty and 'dead_mask_path' in sample_metadata.columns:
+            mask_path_val = sample_metadata['dead_mask_path'].values[0]
+            if pd.notna(mask_path_val) and str(mask_path_val).strip():
+                dead_mask_path = Path(mask_path_val)
+                if dead_mask_path.exists():
+                    print(f"  Using dead_mask_path from metadata: {dead_mask_path}")
+                else:
+                    print(f"  ⚠️  dead_mask_path in metadata does not exist: {dead_mask_path}")
+                    dead_mask_path = None
+
         # Fallback: construct path if not found in metadata
         if dead_mask_path is None:
             fallback_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
@@ -272,18 +276,16 @@ def run_organoid_analysis(
                 print(f"  Using fallback dead_mask_path: {dead_mask_path}")
             else:
                 print(f"  ⚠️  Fallback dead_mask_path does not exist: {fallback_path}")
-        
+
         # Skip PDF plotting if dead_mask_path is still None
         if dead_mask_path is None:
             has_dead_channel = (
-                metadata is not None
-                and "sample_metadata" in locals()
-                and not sample_metadata.empty
+                not sample_metadata.empty
                 and "dead_channel" in sample_metadata.columns
                 and sample_metadata["dead_channel"].notna().any()
             )
             print(f"  ⚠️  Skipping PDF generation for {sample_name} - no dead_mask_path available")
-            print(f"      (has_dead_channel={has_dead_channel}, metadata columns: {list(sample_metadata.columns) if metadata is not None and not sample_metadata.empty else 'N/A'})")
+            print(f"      (has_dead_channel={has_dead_channel}, metadata columns: {list(sample_metadata.columns) if not sample_metadata.empty else 'N/A'})")
             continue
 
         ### Plot analysis results per sample

@@ -4,10 +4,12 @@ from behav3d.napari._widgets import HelpButton, make_help_row
 import yaml
 from magicgui.widgets import create_widget
 from qtpy.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
-    QStackedWidget, QPushButton, QGroupBox, QFormLayout, 
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+    QStackedWidget, QPushButton, QGroupBox, QFormLayout,
     QSpinBox, QDoubleSpinBox, QCheckBox, QFileDialog, QScrollArea,
-    QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox, QFrame, QGridLayout
+    QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox, QFrame, QGridLayout,
+    QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QHeaderView,
+    QSizePolicy,
 )
 from qtpy.QtCore import Qt
 import pandas as pd
@@ -26,6 +28,7 @@ from sklearn.ensemble import RandomForestClassifier
 import joblib
 
 
+from behav3d.core.utils import convert_distance
 from behav3d.io.images import load_image, get_image_shape, save_as_zarr, append_to_zarr, load_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
@@ -1723,6 +1726,13 @@ class PixelClassifierWidget(QWidget):
                 fire_extra_callback(extra_callbacks, "on_done", None)
             except Exception as e:
                 fire_extra_callback(extra_callbacks, "on_failed", str(e))
+                raise
+        else:
+            self.log("Error: Failed to load training data for classifier.")
+            fire_extra_callback(extra_callbacks, "on_failed", "no training data")
+            if not interactive:
+                raise RuntimeError("Training data not loaded. Please load training data manually first.")
+
     def _on_train_clicked(self):
         """Train classifiers, predict pixels, and segment — runs on a background thread.
 
@@ -3570,6 +3580,79 @@ class APOCWidget(QWidget):
         
         self.training_layout.addLayout(train_ctrl_lay)
 
+        # ── Import Training Data row ──────────────────────────────────
+        import_ctrl_lay = QHBoxLayout()
+        self.btn_import_training = QPushButton("Import Training Data")
+        self.btn_import_training.setToolTip(
+            "Select a training_metadata.yml file from a previous BEHAV3D experiment.\n"
+            "Features and sigma values will be locked to match the imported classifier."
+        )
+        self.btn_import_training.setStyleSheet(
+            "background-color: #6f42c1; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px;"
+        )
+        self.btn_import_training.clicked.connect(self._on_import_training_data_clicked)
+        self.btn_import_training.setEnabled(False)   # enabled once metadata is loaded
+        self.btn_import_training.setVisible(False)   # hidden until training data is generated
+        import_ctrl_lay.addWidget(self.btn_import_training)
+        self._btn_import_help = HelpButton(
+            "Import Training Data",
+            "Select a training_metadata.yml file from a previous BEHAV3D experiment to reuse its "
+            "labeled training data (pixel features + labels).\n\n"
+            "⚠️ Features and sigma values will be locked to match the imported classifier. "
+            "This is required because the classifier was trained on a specific set of features "
+            "computed at specific scales (sigma values) — changing them would make the classifier "
+            "incompatible with the imported labels.\n\n"
+            "⚠️ Even when importing, you must first click 'Generate Training Data' to load this "
+            "experiment's images into the viewer. Importing replaces the need to manually label "
+            "pixels — but the viewer session must be active first."
+        )
+        self._btn_import_help.setToolTip(
+            "Requires: training_metadata.yml from a previous BEHAV3D experiment.\n"
+            "Locks features and sigma values to match the imported classifier — because the "
+            "classifier was trained on those exact features and cannot be used with different ones.\n"
+            "Note: click 'Generate Training Data' first — importing replaces labeling, not image loading."
+        )
+        self._btn_import_help.setVisible(False)
+        import_ctrl_lay.addWidget(self._btn_import_help)
+        import_ctrl_lay.addStretch()
+        self.training_layout.addLayout(import_ctrl_lay)
+
+        # ── Imported data info panel (hidden until import is applied) ─
+        self.import_info_group = QGroupBox("📦 Imported Training Data")
+        self.import_info_group.setVisible(False)
+        import_info_lay = QVBoxLayout(self.import_info_group)
+        import_info_lay.setContentsMargins(6, 6, 6, 6)
+        import_info_lay.setSpacing(4)
+
+        self.import_source_label = QLabel("")
+        self.import_source_label.setWordWrap(True)
+        self.import_source_label.setStyleSheet("color: #666; font-size: 10px;")
+        import_info_lay.addWidget(self.import_source_label)
+
+        self.import_details_label = QLabel("")
+        self.import_details_label.setWordWrap(True)
+        self.import_details_label.setStyleSheet(
+            "color: #444; font-size: 10px; font-family: monospace;"
+        )
+        import_info_lay.addWidget(self.import_details_label)
+
+        btn_clear_import = QPushButton("Clear Import")
+        btn_clear_import.setToolTip("Remove the imported training data and unlock feature controls.")
+        btn_clear_import.clicked.connect(self._on_clear_import_clicked)
+        import_info_lay.addWidget(btn_clear_import)
+
+        self.training_layout.addWidget(self.import_info_group)
+
+        # ── Export Training Bundle button ─────────────────────────────
+        self.btn_export_bundle = QPushButton("Export Training Bundle…")
+        self.btn_export_bundle.setToolTip(
+            "Copy PixelClassifier_TrainingData.zip + .cl classifier files into a shareable archive."
+        )
+        self.btn_export_bundle.setEnabled(False)
+        self.btn_export_bundle.clicked.connect(self._on_export_training_bundle)
+        self.training_layout.addWidget(self.btn_export_bundle)
+
         # Legend container for APOC
         self.legend_container = QWidget()
         self.legend_container.setLayout(QVBoxLayout())
@@ -3755,6 +3838,20 @@ class APOCWidget(QWidget):
                 w = getattr(tab, name, None)
                 if w is not None:
                     w.setEnabled(can_train)
+
+        # Re-apply import lock for tabs whose features were locked by a previous import.
+        # The enable loop above would otherwise undo locks set by apply_import().
+        if can_train:
+            for tab in getattr(tw, "tabs", {}).values():
+                fs = getattr(tab, "_locked_feature_string", None)
+                if fs:
+                    tab.lock_features(fs)
+
+        # Show/hide training parameters and import button based on session state
+        tw.setVisible(can_train)
+        self.btn_import_training.setVisible(can_train)
+        if hasattr(self, '_btn_import_help'):
+            self._btn_import_help.setVisible(can_train)
 
         if can_train:
             self.log("APOC training controls unlocked (training data loaded).")
@@ -4154,7 +4251,7 @@ class APOCWidget(QWidget):
                     blending="additive",
                     opacity=0.8,
                 )
-                img_layer.contrast_limits_range = (0, float(channel_data.max()))
+                img_layer.contrast_limits_range = (0, max(float(channel_data.max()), 1e-3))
 
             # Add Label layers
             label_shape = (T_total,) + stacked.shape[2:] 
@@ -4414,6 +4511,20 @@ class APOCWidget(QWidget):
             self._check_unify_organoids.stateChanged.connect(self._on_unify_organoids_changed)
             toolbar_widgets.append(self._check_unify_organoids)
 
+        _pc_params = params.get("pixel_classifier", {}) or {}
+        _md = self.metadata_loader.metadata
+        if _md is not None and "pixel_distance_xy" in _md.columns and "distance_unit" in _md.columns:
+            _unit = str(_md["distance_unit"].iloc[0])
+            _xy_from_md = convert_distance(float(_md["pixel_distance_xy"].iloc[0]), _unit)
+            _z_from_md  = convert_distance(float(_md["pixel_distance_z"].iloc[0]),  _unit)
+        else:
+            _xy_from_md = None
+            _z_from_md  = None
+        _pixel_sizes = {
+            "xy_um": _pc_params.get("pixel_size_xy") or _pc_params.get("pixel_size_xy_um") or _xy_from_md,
+            "z_um":  _pc_params.get("pixel_size_z")  or _pc_params.get("pixel_size_z_um")  or _z_from_md,
+        }
+
         self._training_widget = APOCTrainingWidget(
             viewer=self.viewer,
             pixel_class_outdir=str(pixel_class_outdir),
@@ -4424,6 +4535,7 @@ class APOCWidget(QWidget):
             instance_controls_mode="inline",
             per_cell_type_strategy=True,
             extra_toolbar_widgets=toolbar_widgets,
+            pixel_sizes=_pixel_sizes,
         )
         # Pre-select the saved global strategy via the widget's combo (this
         # also propagates per-tab visibility for ``Advanced`` mode).
@@ -4444,6 +4556,9 @@ class APOCWidget(QWidget):
         tw.instance_preview_started.connect(self._on_instance_preview_started)
         tw.instance_preview_finished.connect(self._on_instance_preview_finished)
         tw.strategy_changed.connect(self._on_training_widget_strategy_changed)
+        tw.training_finished.connect(self._on_training_finished_update_export_btn)
+        tw.import_applied.connect(self._on_import_applied)
+        tw.import_cleared.connect(self._on_import_cleared)
 
         # Add global "▶ Run [CellType] Segmentation" button below the
         # train buttons. Lives in the same APOC layout as the Train buttons.
@@ -4504,7 +4619,374 @@ class APOCWidget(QWidget):
             self._wire_non_organoid_tab_channel_signals(ct, tab)
 
         self.training_layout.addWidget(self._training_widget)
+        self._training_widget.setVisible(False)   # revealed by _update_training_controls_state when session starts
         self._update_training_controls_state()
+
+        # Enable import button now that cell types are known
+        self.btn_import_training.setEnabled(True)
+
+        # Re-apply persisted import if available
+        self._restore_import_on_session_load()
+
+        # Enable export bundle if training bundle already exists
+        self._refresh_export_btn_state()
+
+    # ── Import training data ────────────────────────────────────
+
+    def _on_import_training_data_clicked(self):
+        """Open file dialog, validate and apply imported training data."""
+        from behav3d.preprocessing.segmentation.apoc_train import (
+            _load_training_metadata,
+            _load_training_data_for_celltype,
+            _load_training_bundle,
+        )
+
+        if self._training_widget is None:
+            QMessageBox.warning(self, "No Metadata", "Load metadata first before importing training data.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select training data bundle or metadata from source experiment",
+            "",
+            "BEHAV3D Training Bundle (*.zip);;YAML files (training_metadata.yml);;All files (*)",
+        )
+        if not path:
+            return
+
+        if path.endswith(".zip"):
+            try:
+                meta, data_by_celltype = _load_training_bundle(path)
+            except Exception as exc:
+                QMessageBox.critical(self, "Import Error", f"Could not read training bundle from:\n{path}\n\n{exc}")
+                return
+            if meta is None:
+                QMessageBox.critical(self, "Import Error", f"Could not read training metadata from:\n{path}")
+                return
+            imported_cts = list(meta.get("cell_types", []))
+            if meta.get("has_death"):
+                imported_cts.append("dead")
+            missing = [ct for ct in imported_cts if ct not in data_by_celltype]
+        else:
+            meta = _load_training_metadata(path)
+            if meta is None:
+                QMessageBox.critical(self, "Import Error", f"Could not read training metadata from:\n{path}")
+                return
+            source_td = Path(path).parent
+            imported_cts = list(meta.get("cell_types", []))
+            if meta.get("has_death"):
+                imported_cts.append("dead")
+            data_by_celltype = {}
+            missing = []
+            for ct in imported_cts:
+                X, y = _load_training_data_for_celltype(source_td, ct)
+                if X is None:
+                    missing.append(ct)
+                else:
+                    data_by_celltype[ct] = (X, y)
+
+        if not data_by_celltype:
+            QMessageBox.critical(
+                self, "Import Error",
+                "No training data arrays found in the selected file.\n"
+                "Ensure the training bundle is complete."
+            )
+            return
+
+        if missing:
+            QMessageBox.warning(
+                self, "Partial Import",
+                f"Training data not found for: {', '.join(missing)}\n"
+                "The remaining cell types will still be imported."
+            )
+
+        local_cts = list(self.all_cell_types)
+        if self._training_widget.has_death:
+            local_cts.append("dead")
+
+        # Build cell type mapping (imported → local)
+        cell_type_mapping = self._build_celltype_mapping(imported_cts, local_cts, meta)
+        if cell_type_mapping is None:
+            return  # user cancelled the remap dialog
+
+        # Check pixel size compatibility
+        if not self._check_pixel_size_compatibility(meta):
+            return  # user cancelled
+
+        # Show validation preview (pixel counts) before committing
+        if not self._show_import_validation_dialog(meta, data_by_celltype, cell_type_mapping):
+            return  # user cancelled
+
+        # Apply import
+        self._training_widget.apply_import(meta, data_by_celltype, cell_type_mapping, source_path=path)
+
+        # Persist import path to YAML
+        pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        pc["apoc_imported_training_path"] = str(path)
+        self._flush_params_to_yaml()
+
+    def _build_celltype_mapping(self, imported_cts, local_cts, meta):
+        """Return {imported_ct: local_ct | None} mapping, or None if cancelled.
+
+        When all names match exactly, returns the identity mapping immediately.
+        Otherwise shows the remap dialog.
+        """
+        exact = {ct: ct for ct in imported_cts if ct in local_cts}
+        unmatched = [ct for ct in imported_cts if ct not in local_cts]
+        if not unmatched:
+            return exact
+
+        remap = self._show_celltype_remap_dialog(imported_cts, local_cts, exact)
+        return remap
+
+    def _show_celltype_remap_dialog(self, imported_cts, local_cts, initial_mapping):
+        """Show a dialog letting the user map imported cell types to local ones.
+
+        Returns the mapping dict {imported_ct: local_ct | None}, or None if cancelled.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Cell Type Mapping")
+        dlg.setMinimumWidth(420)
+        lay = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "Some cell type names in the imported data do not match the current experiment.\n"
+            "Please map each imported type to a local type (or '(skip)' to exclude it)."
+        )
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        combos = {}
+        for imp_ct in imported_cts:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"<b>{imp_ct}</b>  →"))
+            combo = QComboBox()
+            options = ["(skip)"] + local_cts
+            combo.addItems(options)
+            default = initial_mapping.get(imp_ct, None)
+            if default and default in local_cts:
+                combo.setCurrentText(default)
+            elif imp_ct in local_cts:
+                combo.setCurrentText(imp_ct)
+            row.addWidget(combo, stretch=1)
+            lay.addLayout(row)
+            combos[imp_ct] = combo
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+
+        result = {}
+        for imp_ct, combo in combos.items():
+            sel = combo.currentText()
+            result[imp_ct] = None if sel == "(skip)" else sel
+        return result
+
+    def _check_pixel_size_compatibility(self, imported_meta):
+        """Warn if pixel sizes differ significantly. Returns True to proceed, False to cancel."""
+        img_meta = imported_meta.get("image_metadata", {})
+        imp_xy = img_meta.get("pixel_size_xy_um")
+        imp_z  = img_meta.get("pixel_size_z_um")
+        if imp_xy is None and imp_z is None:
+            return True   # no pixel size info in imported data — skip check
+
+        pc = self.metadata_loader.behav3d_parameters.get("pixel_classifier", {}) or {}
+        cur_xy = pc.get("pixel_size_xy") or pc.get("pixel_size_xy_um")
+        cur_z  = pc.get("pixel_size_z")  or pc.get("pixel_size_z_um")
+
+        mismatches = []
+        if imp_xy is not None and cur_xy is not None:
+            if abs(float(imp_xy) - float(cur_xy)) / max(float(imp_xy), 1e-9) > 0.10:
+                mismatches.append(f"XY: imported {imp_xy} µm/px vs current {cur_xy} µm/px")
+        if imp_z is not None and cur_z is not None:
+            if abs(float(imp_z) - float(cur_z)) / max(float(imp_z), 1e-9) > 0.10:
+                mismatches.append(f"Z: imported {imp_z} µm/px vs current {cur_z} µm/px")
+
+        if not mismatches:
+            return True
+
+        msg = (
+            "Pixel sizes differ between the imported and current experiment:\n\n"
+            + "\n".join(f"  • {m}" for m in mismatches)
+            + "\n\nFeatures are computed in pixel space, so the same sigma value covers "
+            "a different physical scale. This may reduce classifier performance.\n\n"
+            "Proceed anyway?"
+        )
+        reply = QMessageBox.warning(
+            self, "Pixel Size Mismatch", msg,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def _show_import_validation_dialog(self, imported_meta, data_by_celltype, cell_type_mapping):
+        """Show a summary of imported pixel counts before committing. Returns True to proceed."""
+        td_info = imported_meta.get("training_data", {})
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Imported Training Data — Summary")
+        dlg.setMinimumWidth(480)
+        lay = QVBoxLayout(dlg)
+
+        img_meta = imported_meta.get("image_metadata", {})
+        header_lines = []
+        xy = img_meta.get("pixel_size_xy_um")
+        z  = img_meta.get("pixel_size_z_um")
+        if xy:
+            header_lines.append(f"Pixel size: xy={xy} µm, z={z} µm")
+        ch_names = img_meta.get("channel_names", [])
+        if ch_names:
+            header_lines.append(f"Channels: {', '.join(ch_names)}")
+        if header_lines:
+            lbl = QLabel("\n".join(header_lines))
+            lbl.setStyleSheet("color:#555; font-size:10px;")
+            lay.addWidget(lbl)
+
+        active_rows = [
+            (imp_ct, local_ct)
+            for imp_ct, local_ct in cell_type_mapping.items()
+            if local_ct is not None and imp_ct in data_by_celltype
+        ]
+
+        table = QTableWidget(len(active_rows), 4)
+        table.setHorizontalHeaderLabels(["Imported type", "→ Local type", "Total px", "Fg / Bg"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        for row_idx, (imp_ct, local_ct) in enumerate(active_rows):
+            counts = td_info.get(imp_ct, {})
+            n = counts.get("n_pixels", len(data_by_celltype[imp_ct][1]))
+            pos = counts.get("n_positive", int(np.sum(data_by_celltype[imp_ct][1] == 2)))
+            neg = counts.get("n_negative", int(np.sum(data_by_celltype[imp_ct][1] == 1)))
+            table.setItem(row_idx, 0, QTableWidgetItem(str(imp_ct)))
+            table.setItem(row_idx, 1, QTableWidgetItem(str(local_ct)))
+            table.setItem(row_idx, 2, QTableWidgetItem(str(n)))
+            table.setItem(row_idx, 3, QTableWidgetItem(f"{pos} / {neg}"))
+        lay.addWidget(table)
+
+        note = QLabel(
+            "These pixels will be prepended to your new labels when you click Train.\n"
+            "The combined dataset is saved so this experiment can itself be imported later."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555; font-style: italic; font-size: 10px; padding-top: 4px;")
+        lay.addWidget(note)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Proceed with Import")
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        return dlg.exec_() == QDialog.Accepted
+
+    def _update_import_panel(self):
+        """Refresh the import info panel from the training widget's active import."""
+        if self._training_widget is None:
+            return
+        summary = self._training_widget.get_import_summary()
+        if not summary:
+            self.import_info_group.setVisible(False)
+            return
+
+        meta_path = self._training_widget._imported_metadata_path
+        short_path = str(meta_path)
+        if len(short_path) > 60:
+            short_path = "…" + short_path[-57:]
+        self.import_source_label.setText(f"Source: {short_path}")
+        self.import_source_label.setToolTip(str(meta_path))
+        self.import_details_label.setText(summary)
+        self.import_info_group.setVisible(True)
+
+    def _on_import_applied(self):
+        """Slot: update panel after import is applied."""
+        self._update_import_panel()
+
+    def _on_import_cleared(self):
+        """Slot: hide panel after import is cleared."""
+        self.import_info_group.setVisible(False)
+
+    def _on_clear_import_clicked(self):
+        """Clear imported training data and remove it from YAML."""
+        if self._training_widget is not None:
+            self._training_widget.clear_import()
+        pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        pc.pop("apoc_imported_training_path", None)
+        self._flush_params_to_yaml()
+
+    def _restore_import_on_session_load(self):
+        """Re-apply a persisted import if the YAML holds an import path."""
+        from behav3d.preprocessing.segmentation.apoc_train import (
+            _load_training_metadata,
+            _load_training_data_for_celltype,
+            _load_training_bundle,
+        )
+        if self._training_widget is None:
+            return
+        pc = self.metadata_loader.behav3d_parameters.get("pixel_classifier", {}) or {}
+        saved_path = pc.get("apoc_imported_training_path", "")
+        if not saved_path or not Path(saved_path).exists():
+            return
+
+        try:
+            if saved_path.endswith(".zip"):
+                meta, data_by_celltype = _load_training_bundle(saved_path)
+                if meta is None or not data_by_celltype:
+                    return
+                imported_cts = list(meta.get("cell_types", []))
+                if meta.get("has_death"):
+                    imported_cts.append("dead")
+            else:
+                meta = _load_training_metadata(saved_path)
+                if meta is None:
+                    return
+                source_td = Path(saved_path).parent
+                imported_cts = list(meta.get("cell_types", []))
+                if meta.get("has_death"):
+                    imported_cts.append("dead")
+                data_by_celltype = {}
+                for ct in imported_cts:
+                    X, y = _load_training_data_for_celltype(source_td, ct)
+                    if X is not None:
+                        data_by_celltype[ct] = (X, y)
+            if not data_by_celltype:
+                return
+
+            local_cts = list(self.all_cell_types)
+            if self._training_widget.has_death:
+                local_cts.append("dead")
+            cell_type_mapping = {ct: ct for ct in imported_cts if ct in local_cts}
+
+            # Run pixel size check silently on restore (just warn, no cancel)
+            self._check_pixel_size_compatibility(meta)
+
+            self._training_widget.apply_import(
+                meta, data_by_celltype, cell_type_mapping, source_path=saved_path
+            )
+            self._update_import_panel()
+            self.log(f"↩ Restored import from {saved_path}")
+        except Exception as exc:
+            self.log(f"⚠️ Could not restore import from {saved_path}: {exc}")
+
+    def _on_training_finished_update_export_btn(self, *_):
+        """Enable the export button once training data has been saved."""
+        self._refresh_export_btn_state()
+
+    def _refresh_export_btn_state(self):
+        """Enable the export button if the training bundle exists for this experiment."""
+        try:
+            pixel_class_outdir = (
+                Path(self.metadata_loader.output_dir) / "images" / "PixelClassification"
+            )
+            bundle = pixel_class_outdir / "PixelClassifier_TrainingData.zip"
+            self.btn_export_bundle.setEnabled(
+                bool(self.metadata_loader.output_dir) and bundle.is_file()
+            )
+        except Exception:
+            pass
 
     # ── Queue param snapshot ────────────────────────────────────
     def _current_global_strategy(self):
@@ -4638,6 +5120,55 @@ class APOCWidget(QWidget):
                 self._maybe_sync_organoid_tabs(source_ct=sync_source_ct)
             else:
                 self._maybe_sync_organoid_tabs()
+
+    def _flush_params_to_yaml(self):
+        """Persist current behav3d_parameters to the YAML file on disk."""
+        self._save_apoc_params_to_yaml(skip_sync=True)
+
+    # ── Export training bundle ──────────────────────────────────
+
+    def _on_export_training_bundle(self):
+        """Copy PixelClassifier_TrainingData.zip + .cl classifiers into a shareable archive."""
+        import zipfile
+
+        if not self.metadata_loader.output_dir:
+            QMessageBox.warning(self, "No Output Directory", "No output directory is set.")
+            return
+
+        pixel_class_outdir = (
+            Path(self.metadata_loader.output_dir) / "images" / "PixelClassification"
+        )
+        bundle = pixel_class_outdir / "PixelClassifier_TrainingData.zip"
+        if not bundle.is_file():
+            QMessageBox.warning(
+                self, "No Training Data",
+                "PixelClassifier_TrainingData.zip not found. Train at least one classifier first."
+            )
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Training Bundle As",
+            str(Path(self.metadata_loader.output_dir) / "behav3d_training_bundle.zip"),
+            "ZIP archives (*.zip)",
+        )
+        if not save_path:
+            return
+
+        try:
+            with zipfile.ZipFile(save_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(bundle, arcname=bundle.name)
+                for cl_file in sorted(pixel_class_outdir.glob("*.cl")):
+                    zf.write(cl_file, arcname=cl_file.name)
+
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Training bundle saved to:\n{save_path}"
+            )
+            self.log(f"📦 Training bundle exported to {save_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Error", f"Could not create bundle:\n{exc}")
+            self.log(f"❌ Training bundle export failed: {exc}")
 
     # ── APOC GUI compatibility helpers (frontend-only) ──────────
     def _apoc_normalize_feature_spec(self, feature_spec):
