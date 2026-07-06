@@ -202,9 +202,13 @@ class PixelClassifierPanel:
         if not CONVPAINT_AVAILABLE:
             self.classifier_engine.tooltip = (self.classifier_engine.tooltip or "") + " ConvPaint disabled: 'napari-convpaint' required."
 
+        _saved_gpu = pc.get("gpu_device_name", _gpu_devices[0] if _gpu_devices else "")
+        if _gpu_devices and _saved_gpu not in _gpu_devices:
+            _saved_gpu = _gpu_devices[0]
+
         self.gpu_device = widgets.Dropdown(
             options=_gpu_devices,
-            value=pc.get("gpu_device_name", _gpu_devices[0]) if _gpu_devices else "",
+            value=_saved_gpu,
             description="GPU Device:",
             layout=widgets.Layout(width="auto", display="none")  # Hidden by default
         )
