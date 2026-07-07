@@ -42,6 +42,7 @@ from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    is_multicolor_celltype,
 )
 
 # Channel colormaps (cycled if there are many channels)
@@ -758,7 +759,7 @@ class VisualizationTab(QWidget):
                 self.viewer.add_labels(
                     seg_data,
                     name=layer_name,
-                    visible=True,
+                    visible=not is_multicolor_celltype(ct_name),
                 )
                 self._log(f"    + Tracked Labels layer: {layer_name}")
                 
@@ -794,11 +795,19 @@ class VisualizationTab(QWidget):
             elif group_type == "tracked_segments":
                 # Tracked segments: "sample_name – celltype tracked segments"
                 if name.endswith(" tracked segments"):
-                    match = True
+                    body = name[:-17].rstrip()
+                    if " – " in body:
+                        ct_name = body.rsplit(" – ", 1)[1].strip()
+                        if not is_multicolor_celltype(ct_name):
+                            match = True
             elif group_type == "tracks":
                 # Tracks: "sample_name – celltype tracks"
                 if name.endswith(" tracks"):
-                    match = True
+                    body = name[:-7].rstrip()
+                    if " – " in body:
+                        ct_name = body.rsplit(" – ", 1)[1].strip()
+                        if not is_multicolor_celltype(ct_name):
+                            match = True
                     
             if match:
                 layer.visible = visible
@@ -819,11 +828,16 @@ class VisualizationTab(QWidget):
             )
 
     def _tracked_layer_names(self) -> list[str]:
-        return [
-            layer.name for layer in self.viewer.layers
-            if isinstance(layer.name, str)
-            and layer.name.endswith(" tracked segments")
-        ]
+        names = []
+        for layer in self.viewer.layers:
+            name = layer.name
+            if isinstance(name, str) and name.endswith(" tracked segments"):
+                body = name[:-17].rstrip()
+                if " – " in body:
+                    ct_name = body.rsplit(" – ", 1)[1].strip()
+                    if not is_multicolor_celltype(ct_name):
+                        names.append(name)
+        return names
 
     def _refresh_edition_panel(self) -> None:
         """Show the Manual Edition group iff a tracked-segments layer exists."""
