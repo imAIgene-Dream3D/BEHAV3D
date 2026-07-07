@@ -3848,7 +3848,10 @@ class APOCWidget(QWidget):
                     tab.lock_features(fs)
 
         # Show/hide training parameters and import button based on session state
-        tw.setVisible(can_train)
+        if hasattr(tw, "set_classifier_params_visible"):
+            tw.set_classifier_params_visible(can_train)
+        else:
+            tw.setVisible(can_train)
         self.btn_import_training.setVisible(can_train)
         if hasattr(self, '_btn_import_help'):
             self._btn_import_help.setVisible(can_train)
@@ -4619,7 +4622,7 @@ class APOCWidget(QWidget):
             self._wire_non_organoid_tab_channel_signals(ct, tab)
 
         self.training_layout.addWidget(self._training_widget)
-        self._training_widget.setVisible(False)   # revealed by _update_training_controls_state when session starts
+        self._training_widget.setVisible(True)
         self._update_training_controls_state()
 
         # Enable import button now that cell types are known

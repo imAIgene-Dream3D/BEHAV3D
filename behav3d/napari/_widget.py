@@ -4,6 +4,7 @@ Provides a QTabWidget with tabs for the full BEHAV3D pipeline.
 """
 from qtpy.QtWidgets import QWidget, QVBoxLayout, QTabWidget
 from qtpy.QtCore import Qt, QSize
+import os
 import napari
 
 from behav3d.napari._queue import ProcessingQueuePanel, StepType
@@ -15,6 +16,7 @@ class BEHAV3DWidget(QWidget):
     def __init__(self, napari_viewer: "napari.Viewer", parent=None):
         super().__init__(parent)
         self.viewer = napari_viewer
+        self.dev_mode = os.environ.get("BEHAV3D_DEV_MODE") == "1"
         self.setMinimumWidth(300)
 
         # --- Global QGroupBox styling -----------------------------------------
