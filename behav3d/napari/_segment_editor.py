@@ -51,6 +51,7 @@ from behav3d.editing import (
     EditBuffer,
     create_label,
     delete_label,
+    delete_labels,
     dilate_label,
     erode_label,
     lifetime_of,
@@ -331,6 +332,20 @@ class TrackedSegmentEditor(QWidget):
         self._tool_buttons[0].setChecked(True)
         self.tool_stack.setCurrentIndex(0)
 
+        # ---- Progress bar (hidden until an operation is running) -----
+        prog_row = QHBoxLayout()
+        self.lbl_progress = QLabel("Running…")
+        self.lbl_progress.setStyleSheet("color:#555; font-size:11px; min-width:120px;")
+        self.lbl_progress.setVisible(False)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)   # indeterminate by default
+        self.progress_bar.setMaximumHeight(14)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setVisible(False)
+        prog_row.addWidget(self.lbl_progress)
+        prog_row.addWidget(self.progress_bar, stretch=1)
+        layout.addLayout(prog_row)
+
         # ---- Time range ---------------------------------------------
         rng_group = QGroupBox("Time range")
         rng_lay = QVBoxLayout(rng_group)
@@ -381,20 +396,6 @@ class TrackedSegmentEditor(QWidget):
         self.log.setMaximumHeight(100)
         self.log.setStyleSheet("font-family: monospace; font-size: 11px;")
         layout.addWidget(self.log)
-
-        # ---- Progress bar (hidden until an operation is running) -----
-        prog_row = QHBoxLayout()
-        self.lbl_progress = QLabel("Running…")
-        self.lbl_progress.setStyleSheet("color:#555; font-size:11px; min-width:120px;")
-        self.lbl_progress.setVisible(False)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)   # indeterminate by default
-        self.progress_bar.setMaximumHeight(14)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setVisible(False)
-        prog_row.addWidget(self.lbl_progress)
-        prog_row.addWidget(self.progress_bar, stretch=1)
-        layout.addLayout(prog_row)
 
         # ---- Footer --------------------------------------------------
         foot = QHBoxLayout()
@@ -918,16 +919,21 @@ class TrackedSegmentEditor(QWidget):
         Parameters
         ----------
         fn:
-            Callable that performs the editing primitive.  Must not call
-            ``buf.apply()`` itself — that is done by ``_on_edit_done``.
-        args, kwargs:
-            Positional and keyword arguments forwarded to ``fn``.
+            Callable executed in the worker thread.
+        args:
+            Arguments passed to ``fn``.
+        kwargs:
+            Keyword arguments passed to ``fn``.  A ``progress_cb`` kwarg is
+            automatically injected if the signature accepts it.
         on_success:
-            Optional callable invoked with the result after every
-            :meth:`_commit_op` succeeds (e.g. clear split seeds).
+            Callback invoked on the Qt thread after the results have been
+            successfully applied to the buffer.
         desc:
-            Short description shown in the napari activity-dock progress bar.
+            Short description displayed in the progress UI.
         """
+        if self._edit_thread is not None:
+            self._log_msg("  ⚠️ An operation is already running. Please wait.")
+            return
         if kwargs is None:
             kwargs = {}
         self._pending_on_success = on_success
@@ -1021,6 +1027,9 @@ class TrackedSegmentEditor(QWidget):
         undo stack.  Buttons are disabled during execution (same as the real
         operations) to avoid race conditions.
         """
+        if self._edit_thread is not None:
+            self._log_msg("  ⚠️ An operation is already running. Please wait.")
+            return
         if kwargs is None:
             kwargs = {}
         self._pending_preview_tool = tool_name
@@ -1551,21 +1560,12 @@ class TrackedSegmentEditor(QWidget):
         self._log_msg(f"  Running delete of label(s) {label_ids}…")
 
         def _do_delete_all(_buf, progress_cb=None):
-            n = len(label_ids)
-            results = []
-            for i, lid in enumerate(label_ids):
-                # For a single label forward progress_cb directly so the bar
-                # tracks per-frame; for multiple labels track per-label.
-                if n == 1:
-                    results.append(delete_label(_buf, label_id=lid, t_range=ranges[lid],
-                                                progress_cb=progress_cb))
-                else:
-                    if progress_cb:
-                        progress_cb(i, n)
-                    results.append(delete_label(_buf, label_id=lid, t_range=ranges[lid]))
-                    if progress_cb:
-                        progress_cb(i + 1, n)
-            return results
+            return delete_labels(
+                _buf,
+                label_ids=label_ids,
+                t_ranges=ranges,
+                progress_cb=progress_cb,
+            )
 
         def _uncheck(_result):
             self.cb_delete_confirm.setChecked(False)
@@ -1586,11 +1586,12 @@ class TrackedSegmentEditor(QWidget):
         self._log_msg(f"  Previewing delete of label(s) {label_ids} at t={t_now}…")
 
         def _do_delete_preview(_buf, progress_cb=None):
-            return [
-                delete_label(_buf, label_id=lid, t_range=(t_now, t_now),
-                             progress_cb=progress_cb)
-                for lid in label_ids
-            ]
+            return delete_labels(
+                _buf,
+                label_ids=label_ids,
+                t_ranges={lid: (t_now, t_now) for lid in label_ids},
+                progress_cb=progress_cb,
+            )
 
         self._run_preview_async(
             _do_delete_preview,

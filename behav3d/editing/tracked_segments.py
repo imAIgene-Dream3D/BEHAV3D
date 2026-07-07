@@ -839,3 +839,71 @@ def delete_label(
             f"Deleted label {label_id} across {len(new_frames)} frame(s)"
         ),
     )
+
+
+def delete_labels(
+    buf,
+    label_ids: Sequence[int],
+    t_ranges: Optional[Dict[int, Tuple[int, int]]] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> OpResult:
+    """Set every pixel of `label_ids` to background (`0`) in their respective ranges."""
+    new_frames: Dict[int, np.ndarray] = {}
+    
+    # Pre-calculate ranges
+    resolved_ranges = {}
+    starts = []
+    ends = []
+    for lid in label_ids:
+        rng = t_ranges.get(lid) if t_ranges else None
+        if rng is None:
+            f, l = lifetime_of(buf, lid)
+            if f is None:
+                continue
+            rng = (f, l)
+        rng = _normalize_t_range(buf, rng)
+        resolved_ranges[lid] = rng
+        starts.append(rng[0])
+        ends.append(rng[1])
+        
+    if not resolved_ranges:
+        return OpResult(
+            name="delete",
+            new_frames={},
+            affected_labels=list(label_ids),
+            new_labels=[],
+            summary=f"Deleted labels {list(label_ids)}: none present in the volume"
+        )
+        
+    t0, t1 = min(starts), max(ends)
+    _total = t1 - t0 + 1
+    
+    for _i, t in enumerate(range(t0, t1 + 1)):
+        if progress_cb:
+            progress_cb(_i + 1, _total)
+            
+        frame = buf.peek(t)
+        out = None
+        for lid in label_ids:
+            if lid not in resolved_ranges:
+                continue
+            lt0, lt1 = resolved_ranges[lid]
+            if not (lt0 <= t <= lt1):
+                continue
+                
+            mask = (out if out is not None else frame) == lid
+            if mask.any():
+                if out is None:
+                    out = frame.copy()
+                out[mask] = 0
+                
+        if out is not None:
+            new_frames[t] = out
+            
+    return OpResult(
+        name="delete",
+        new_frames=new_frames,
+        affected_labels=list(label_ids),
+        new_labels=[],
+        summary=f"Deleted label(s) {list(label_ids)} across {len(new_frames)} frame(s)"
+    )

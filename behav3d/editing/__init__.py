@@ -16,6 +16,7 @@ from behav3d.editing.tracked_segments import (
     erode_label,
     dilate_label,
     delete_label,
+    delete_labels,
     lifetime_of,
 )
 from behav3d.editing.edit_buffer import EditBuffer
@@ -28,5 +29,6 @@ __all__ = [
     "erode_label",
     "dilate_label",
     "delete_label",
+    "delete_labels",
     "lifetime_of",
 ]

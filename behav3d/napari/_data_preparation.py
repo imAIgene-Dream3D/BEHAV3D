@@ -1383,6 +1383,9 @@ class DataPreparationTab(QWidget):
         self._layout.addWidget(grp)
 
     def _on_convert_zarr(self):
+        if self._zarr_worker is not None:
+            self._log("⚠️ Zarr conversion already running. Please wait.")
+            return
         out_dir = self.output_dir_edit.text().strip()
         if self.metadata is None:
             QMessageBox.warning(self, "Error", "Please load metadata first.")
