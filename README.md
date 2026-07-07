@@ -145,6 +145,16 @@ mamba activate behav3d
 jupyter notebook notebooks/run_behav3d.ipynb
 ```
 
+## Co-pilot Assistant
+
+The napari GUI includes a right-side **AI co-pilot dock** that answers questions about parameters and methods, and can fill in the forms for you after a one-click confirmation.
+
+**For users:** it works out of the box — `napari/assistant_config.json` is pre-configured to point at our hosted endpoint. No setup required.
+
+**For maintainers:** see the [Deploying / Managing the Chatbot](#deploying--managing-the-chatbot) section below.
+
+---
+
 ### Required files
 
 [REQUIRED]
@@ -290,3 +300,71 @@ These files are automatically picked up by the downstream **Analysis** module to
 ---
 
 *Note: For custom motion models, refer to the [btrack documentation](https://btrack.readthedocs.io).*
+
+---
+
+## Deploying / Managing the Chatbot
+
+The co-pilot runs as a **CPU-only [Modal](https://modal.com) service** that proxies requests to the DeepSeek API. The DeepSeek key stays server-side; the endpoint is public. This section is only relevant if you are managing the hosted service.
+
+### Prerequisites
+
+- A [Modal](https://modal.com) account with the CLI installed (`pip install modal`)
+- A [DeepSeek API](https://platform.deepseek.com) key
+- Authenticated: `python -m modal token new`
+
+### 1 — Store the DeepSeek API key as a Modal secret
+
+```bash
+python -m modal secret create deepseek-api-key DEEPSEEK_API_KEY=<your-key>
+```
+
+> Set a **monthly spend limit** in the DeepSeek dashboard to cap costs.
+
+### 2 — Build the RAG index
+
+The RAG index embeds all BEHAV3D documentation and parameter descriptions so the bot can retrieve relevant context for every question.
+
+```bash
+python -m modal run chatbot/app.py::ingest
+```
+
+Re-run this whenever files in `chatbot/knowledge/` or `chatbot/schema_cards.json` change.
+
+### 3 — Deploy
+
+```bash
+python -m modal deploy chatbot/app.py
+```
+
+The deploy output will print the endpoint URL. Update `napari/assistant_config.json` if it changes:
+
+```json
+{ "endpoint": "https://<your-modal-url>.modal.run", "timeout": 60 }
+```
+
+The service runs on CPU with `min_containers=1` (always warm, ~$6/month at default specs). No GPU or model weights are downloaded — cold start is a few seconds.
+
+### 4 — Development / hot-reload
+
+```bash
+python -m modal serve chatbot/app.py
+```
+
+This starts a temporary endpoint that hot-reloads on file changes. Useful for testing prompt changes without a full deploy.
+
+### Changing the model
+
+The service defaults to `deepseek-v4-flash`. To switch models, set the `DEEPSEEK_MODEL` environment variable before deploying:
+
+```bash
+DEEPSEEK_MODEL=deepseek-v4-pro python -m modal deploy chatbot/app.py
+```
+
+Available options: `deepseek-v4-flash` (fast, cheap), `deepseek-v4-pro` (stronger, pricier).
+
+### Monitoring costs
+
+- DeepSeek usage: [platform.deepseek.com](https://platform.deepseek.com) → Usage
+- Modal compute: [modal.com/apps](https://modal.com/apps) — the `behav3d-assistant` app
+- Set a DeepSeek spend limit to prevent runaway costs from unexpected traffic

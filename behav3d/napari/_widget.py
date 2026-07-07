@@ -2,7 +2,7 @@
 BEHAV3D napari plugin – main dock widget.
 Provides a QTabWidget with tabs for the full BEHAV3D pipeline.
 """
-from qtpy.QtWidgets import QWidget, QVBoxLayout, QTabWidget
+from qtpy.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QPushButton
 from qtpy.QtCore import Qt, QSize
 import os
 import napari
@@ -44,6 +44,20 @@ class BEHAV3DWidget(QWidget):
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
         layout = outer_layout
+
+        # --- Assistant show/hide toggle -----------------------------------
+        # Lets the user reclaim space, or recover the dock if it was closed by
+        # accident. Closing the dock only hides it, so the conversation survives.
+        header = QHBoxLayout()
+        header.setContentsMargins(6, 4, 6, 0)
+        header.addStretch(1)
+        self.btn_toggle_assistant = QPushButton("💬 Assistant")
+        self.btn_toggle_assistant.setCheckable(True)
+        self.btn_toggle_assistant.setChecked(True)
+        self.btn_toggle_assistant.setToolTip("Show or hide the BEHAV3D Assistant panel")
+        self.btn_toggle_assistant.clicked.connect(self._toggle_assistant)
+        header.addWidget(self.btn_toggle_assistant)
+        layout.addLayout(header)
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, stretch=1)
@@ -168,6 +182,96 @@ class BEHAV3DWidget(QWidget):
         # --- Tab Switch Logic ---------------------------------------------
         self._last_tab_index = self.tabs.currentIndex()
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        # --- Co-pilot Assistant dock (right side) -------------------------
+        # Added as a *separate* dock so it stays visible across all tabs. Wrapped
+        # in try/except so an assistant failure can never block the main UI.
+        self.assistant = None
+        self._assistant_dock = None
+        try:
+            from behav3d.napari._assistant import AssistantDock
+            self.assistant = AssistantDock(main_widget=self)
+            self._assistant_dock = self.viewer.window.add_dock_widget(
+                self.assistant, area="right", name="BEHAV3D Assistant"
+            )
+            # Both this pipeline and the assistant dock to the "right" area, so Qt
+            # stacks them vertically by default. Defer to the next event-loop tick
+            # (by which point this widget's own dock exists, for either launch
+            # path) and re-split them *horizontally* → pipeline | assistant.
+            from qtpy.QtCore import QTimer
+            QTimer.singleShot(0, self._place_assistant_beside)
+            # Keep the toggle button in sync if the dock is shown/hidden by other
+            # means (e.g. its native close button → hide, not destroy).
+            try:
+                self._assistant_dock.visibilityChanged.connect(
+                    self._on_assistant_visibility_changed
+                )
+            except Exception:
+                pass
+            # Keep the assistant's context bar in sync with workflow state.
+            self.tabs.currentChanged.connect(
+                lambda *_: self.assistant.refresh_context_bar()
+            )
+            if hasattr(self.data_prep_tab, "metadata_loaded"):
+                self.data_prep_tab.metadata_loaded.connect(
+                    lambda *_: self.assistant.refresh_context_bar()
+                )
+        except Exception as e:  # pragma: no cover - defensive
+            import warnings
+            warnings.warn(f"BEHAV3D Assistant could not be initialised: {e}")
+            # No dock to toggle — disable the button so it isn't a dead control.
+            try:
+                self.btn_toggle_assistant.setEnabled(False)
+            except Exception:
+                pass
+
+    def _toggle_assistant(self):
+        """Show or hide the assistant dock. Closing only hides the dock, so the
+        conversation is preserved and the panel can be reopened instantly."""
+        dock = self._assistant_dock
+        if dock is None:
+            return
+        try:
+            visible = dock.isVisible()
+            dock.setVisible(not visible)
+            self.btn_toggle_assistant.setChecked(not visible)
+        except Exception:
+            pass
+
+    def _on_assistant_visibility_changed(self, visible: bool):
+        """Mirror the dock's visibility onto the toggle button without re-emitting."""
+        try:
+            self.btn_toggle_assistant.blockSignals(True)
+            self.btn_toggle_assistant.setChecked(bool(visible))
+        finally:
+            self.btn_toggle_assistant.blockSignals(False)
+
+    def _place_assistant_beside(self):
+        """Move the assistant dock to sit side-by-side (horizontally) with this
+        pipeline dock instead of stacked above it. Best-effort; never fatal."""
+        try:
+            from qtpy.QtWidgets import QDockWidget, QMainWindow
+            from qtpy.QtCore import Qt
+            if self._assistant_dock is None:
+                return
+            # Find the QMainWindow and this pipeline's enclosing QDockWidget.
+            qmain = self._assistant_dock.parent()
+            while qmain is not None and not isinstance(qmain, QMainWindow):
+                qmain = qmain.parent()
+            if qmain is None:
+                return
+            my_dock = None
+            for dock in qmain.findChildren(QDockWidget):
+                w = dock.widget()
+                # the pipeline dock wraps `self` (possibly via a layout wrapper)
+                if w is self or (w is not None and self in w.findChildren(type(self))):
+                    if dock is not self._assistant_dock:
+                        my_dock = dock
+                        break
+            if my_dock is not None:
+                qmain.splitDockWidget(my_dock, self._assistant_dock, Qt.Horizontal)
+        except Exception:
+            pass
 
     def _add_cellpose_to_queue(self):
         """Validate cellpose config and add a CELLPOSE_SEGMENT step to the queue."""
