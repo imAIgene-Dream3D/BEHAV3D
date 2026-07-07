@@ -610,7 +610,7 @@ class VisualizationTab(QWidget):
         ct_map = self._detect_cell_type_columns(row)
 
         for ct_name, prefix in ct_map.items():
-            seg_col = f"{prefix}_{ct_name}_segments_image_path"
+            seg_col = f"{prefix}_{ct_name}_segments_image_path" if prefix else f"{ct_name}_segments_image_path"
             seg_path_val = row.get(seg_col)
             
             # Robust check for missing values (NaN or empty)
@@ -688,15 +688,15 @@ class VisualizationTab(QWidget):
         ct_map = self._detect_cell_type_columns(row)
 
         for ct_name, prefix in ct_map.items():
-            csv_col = f"{prefix}_{ct_name}_tracks_csv_path"
-            csv_path_val = row.get(csv_col)
+            tracks_csv_col = f"{prefix}_{ct_name}_tracks_csv_path" if prefix else f"{ct_name}_tracks_csv_path"
+            tracks_csv_val = row.get(tracks_csv_col)
             
             # Robust check for missing values (NaN or empty)
-            if pd.isna(csv_path_val) or not str(csv_path_val).strip():
+            if pd.isna(tracks_csv_val) or not str(tracks_csv_val).strip():
                 self._log(f"    - Skipping {ct_name} tracks: Path not defined in metadata")
                 continue
 
-            csv_path_str = str(csv_path_val).strip()
+            csv_path_str = str(tracks_csv_val).strip()
             if not Path(csv_path_str).exists():
                 self._log(f"    - Skipping {ct_name} tracks: File not found ({csv_path_str})")
                 continue
@@ -735,7 +735,7 @@ class VisualizationTab(QWidget):
         ct_map = self._detect_cell_type_columns(row)
 
         for ct_name, prefix in ct_map.items():
-            track_seg_col = f"{prefix}_{ct_name}_tracks_image_path"
+            track_seg_col = f"{prefix}_{ct_name}_tracks_image_path" if prefix else f"{ct_name}_tracks_image_path"
             track_seg_path_val = row.get(track_seg_col)
             
             if pd.isna(track_seg_path_val) or not str(track_seg_path_val).strip():
@@ -1023,4 +1023,16 @@ class VisualizationTab(QWidget):
             if m:
                 prefix, ct_name = m.group(1), m.group(2)
                 ct_map[ct_name] = prefix
+                
+        merged_pattern = re.compile(r"^(.+?)_(segments_image_path|tracks_image_path|tracks_csv_path)$")
+        for col in row.index:
+            if col.startswith(("or_", "im_", "ot_")):
+                continue
+            m = merged_pattern.match(col)
+            if m:
+                ct_name = m.group(1)
+                if ct_name.endswith("_merged") or ct_name.endswith("_grouped"):
+                    if ct_name not in ct_map:
+                        ct_map[ct_name] = ""
+                        
         return ct_map
