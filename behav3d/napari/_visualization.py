@@ -989,7 +989,8 @@ class VisualizationTab(QWidget):
         except Exception:
             pass
         self._editor = None
-        self._log("  Editing stopped.")
+        self._log("  Editing stopped. Reloading visualizer...")
+        self._on_load_dataset()
         return True
 
     def request_tab_exit(self) -> bool:

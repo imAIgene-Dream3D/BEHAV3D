@@ -43,6 +43,18 @@ def detect_cell_type_columns(row: pd.Series) -> Dict[str, str]:
         if m:
             prefix, ct_name = m.group(1), m.group(2)
             out[ct_name] = prefix
+            
+    merged_pattern = re.compile(r"^(.+?)_(segments_image_path|tracks_image_path|tracks_csv_path)$")
+    for col in row.index:
+        if col.startswith(("or_", "im_", "ot_")):
+            continue
+        m = merged_pattern.match(col)
+        if m:
+            ct_name = m.group(1)
+            if ct_name.endswith("_merged") or ct_name.endswith("_grouped"):
+                if ct_name not in out:
+                    out[ct_name] = ""
+                    
     return out
 
 
@@ -50,7 +62,7 @@ def cell_types_with_tracked_segments(row: pd.Series) -> List[str]:
     """Return cell-type names that have a non-empty ``*_tracks_image_path``."""
     out: List[str] = []
     for ct_name, prefix in detect_cell_type_columns(row).items():
-        col = f"{prefix}_{ct_name}_tracks_image_path"
+        col = f"{prefix}_{ct_name}_tracks_image_path" if prefix else f"{ct_name}_tracks_image_path"
         v = row.get(col)
         if pd.notna(v) and str(v).strip():
             p = Path(str(v).strip())
@@ -181,7 +193,7 @@ def load_tracked_segments_into_viewer(
     for ct_name, prefix in detect_cell_type_columns(row).items():
         if only_cell_type is not None and ct_name != only_cell_type:
             continue
-        col = f"{prefix}_{ct_name}_tracks_image_path"
+        col = f"{prefix}_{ct_name}_tracks_image_path" if prefix else f"{ct_name}_tracks_image_path"
         val = row.get(col)
         if pd.isna(val) or not str(val).strip():
             continue
@@ -226,7 +238,7 @@ def load_tracks_into_viewer(
     for ct_name, prefix in detect_cell_type_columns(row).items():
         if only_cell_type is not None and ct_name != only_cell_type:
             continue
-        col = f"{prefix}_{ct_name}_tracks_csv_path"
+        col = f"{prefix}_{ct_name}_tracks_csv_path" if prefix else f"{ct_name}_tracks_csv_path"
         val = row.get(col)
         if pd.isna(val) or not str(val).strip():
             continue
