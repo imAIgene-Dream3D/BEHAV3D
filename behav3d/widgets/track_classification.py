@@ -60,6 +60,7 @@ from behav3d.core.metadata import (
     detect_merged_cell_types_from_metadata,
     filter_multicolor_inputs,
 )
+from behav3d.core.utils import ignore_missing_rmtree_error
 from behav3d.widgets.utils import spinning_loader
 
 
@@ -1363,7 +1364,7 @@ class TrackClassificationPanel:
                 import shutil
                 _traj_dir = Path(self.output_dir) / "analysis" / self._current_cell_type() / "behavorial_trajectories"
                 if _traj_dir.exists():
-                    shutil.rmtree(_traj_dir)
+                    shutil.rmtree(_traj_dir, onexc=ignore_missing_rmtree_error)
                 trajectory_size = _resolve_optional_int(self.behavioral_trajectory_size.value)
                 _winfo(
                     "trajectory-dtai-widget",
@@ -1418,7 +1419,7 @@ class TrackClassificationPanel:
                 import shutil
                 _traj_dir = Path(self.output_dir) / "analysis" / ct / "behavorial_trajectories"
                 if _traj_dir.exists():
-                    shutil.rmtree(_traj_dir)
+                    shutil.rmtree(_traj_dir, onexc=ignore_missing_rmtree_error)
                 csv_path = self._original_track_features_path(ct)
                 if not csv_path.exists():
                     raise FileNotFoundError(f"Original BEHAV3D track-features CSV not found: {csv_path}")

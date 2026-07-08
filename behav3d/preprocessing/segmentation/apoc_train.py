@@ -34,6 +34,7 @@ import pyclesperanto_prototype as cle
 from behav3d.io.images import load_image, load_zarr, save_as_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.core.utils import ignore_missing_rmtree_error
 
 # ---------------------------------------------------------------------------
 # Feature grid constants (matching the official napari-apoc widget)
@@ -51,14 +52,6 @@ APOC_FEATURES = [
 ]
 # For custom preset every feature is available (same list here; extend if needed)
 APOC_ALL_FEATURES = APOC_FEATURES
-
-# macOS creates ghost `._filename` resource-fork files on external drives that
-# appear in directory listings but fail on unlink. Ignore those FileNotFoundErrors
-# so rmtree can complete and the zarr directory is fully cleared before rewriting.
-def _rmtree_ignore_missing(func, path, exc):
-    if not isinstance(exc, FileNotFoundError):
-        raise exc
-
 
 # Format sigma values nicely (drop trailing .0)
 def _fmt_sigma(s):
@@ -2804,7 +2797,7 @@ class APOCTrainingWidget(QWidget):
             label_data = np.asarray(label_layer.data)
             outpath = Path(self.pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
             if outpath.exists():
-                shutil.rmtree(outpath, onexc=_rmtree_ignore_missing)
+                shutil.rmtree(outpath, onexc=ignore_missing_rmtree_error)
             save_as_zarr(label_data, outpath)
             log(f"Saved {cell_type} labels → {outpath}")
 
@@ -2813,7 +2806,7 @@ class APOCTrainingWidget(QWidget):
             dead_label_data = np.asarray(dead_layer.data)
             dead_outpath = Path(self.pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
             if dead_outpath.exists():
-                shutil.rmtree(dead_outpath, onexc=_rmtree_ignore_missing)
+                shutil.rmtree(dead_outpath, onexc=ignore_missing_rmtree_error)
             save_as_zarr(dead_label_data, dead_outpath)
             log(f"Saved Death labels → {dead_outpath}")
 
