@@ -116,10 +116,23 @@ def _apply_state_code_colors_to_layer(layer, code_colors):
     if layer is None or not isinstance(code_colors, dict) or len(code_colors) == 0:
         return False
     try:
-        layer.color = {int(code): str(color) for code, color in code_colors.items()}
+        color_dict = {None: "transparent", 0: "transparent"}
+        for code, color in code_colors.items():
+            try:
+                label = int(float(code))
+            except (ValueError, TypeError):
+                continue
+            if label != 0:
+                color_dict[label] = str(color)
+        from napari.utils.colormaps import DirectLabelColormap
+        layer.colormap = DirectLabelColormap(color_dict=color_dict)
         layer.metadata["state_code_colors"] = dict(code_colors)
         return True
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            f"Could not set state code colors on layer: {exc}",
+            RuntimeWarning,
+        )
         return False
 
 
@@ -1046,14 +1059,14 @@ def _add_mapping_dock_widget(viewer, mapping_text=None, title="State Class Mappi
             text_box.setPlainText(str(mapping_text))
             layout.addWidget(text_box)
         widget.setLayout(layout)
-        viewer.window.add_dock_widget(widget, area="right", name=str(title))
-        return True
+        dw = viewer.window.add_dock_widget(widget, area="right", name=str(title))
+        return dw
     except Exception as exc:
         warnings.warn(
             f"Could not add mapping dock widget to napari window: {exc}",
             RuntimeWarning,
         )
-        return False
+        return None
 
 
 def _is_dask_array(arr):
@@ -1075,72 +1088,57 @@ def _broadcast_to_shape(arr, target_shape):
 
 
 def _align_labels_to_raw_shape_for_view(labels_img, raw_img, layer_name, verbose=False):
+    """Return a 4-D TZYX labels array aligned to the raw image's T and ZYX dimensions.
+
+    Labels layers in napari do not use a channel axis, so this function always
+    returns a 4-D (TZYX) array regardless of whether the raw image is 4-D or 5-D.
+    If the labels have more or fewer timepoints than the raw image, they are
+    truncated or zero-padded to match.
+    """
+    import numpy as np
+
     raw_shape = tuple(int(v) for v in raw_img.shape)
-    labels_shape = tuple(int(v) for v in labels_img.shape)
-
-    if labels_shape == raw_shape:
-        if verbose:
-            print(f"{layer_name} view align: already matched to raw shape {raw_shape}")
-        return labels_img
-
     if len(raw_shape) not in {4, 5}:
         raise ValueError(
             f"Unsupported raw image shape {raw_shape} for viewer alignment."
         )
-    if len(labels_shape) not in {4, 5}:
+
+    labels = np.asarray(labels_img)
+    if labels.ndim == 5:
+        # TCZYX → TZYX: drop the channel axis (labels layers have no channels)
+        labels = labels[:, 0, ...]
+    elif labels.ndim != 4:
         raise ValueError(
-            f"Unsupported {layer_name} shape {labels_shape} for viewer alignment."
+            f"Unsupported {layer_name} shape {labels.shape} for viewer alignment."
         )
 
-    if int(labels_shape[0]) != int(raw_shape[0]):
+    # Spatial (ZYX) must match
+    if tuple(labels.shape[-3:]) != tuple(raw_shape[-3:]):
         raise ValueError(
-            f"{layer_name}/raw timepoint mismatch: labels_shape={labels_shape}, raw_shape={raw_shape}."
-        )
-    if tuple(labels_shape[-3:]) != tuple(raw_shape[-3:]):
-        raise ValueError(
-            f"{layer_name}/raw spatial mismatch: labels_shape={labels_shape}, raw_shape={raw_shape}."
+            f"{layer_name}/raw spatial mismatch: labels_shape={labels.shape}, raw_shape={raw_shape}."
         )
 
-    aligned = labels_img
+    raw_T = int(raw_shape[0])
+    labels_T = int(labels.shape[0])
 
-    # Convert labels TZYX -> TCZYX if raw has channel axis.
-    if len(raw_shape) == 5 and len(labels_shape) == 4:
-        aligned = aligned[:, None, ...]
-        labels_shape = tuple(int(v) for v in aligned.shape)
+    if labels_T == raw_T:
+        if verbose:
+            print(f"{layer_name} view align: shape already TZYX {labels.shape}")
+        return labels
 
-    # Convert labels TCZYX -> TZYX only for singleton C when raw has no channel axis.
-    if len(raw_shape) == 4 and len(labels_shape) == 5:
-        if int(labels_shape[1]) != 1:
-            raise ValueError(
-                f"Cannot align {layer_name} with non-singleton channel axis to raw: "
-                f"labels_shape={labels_shape}, raw_shape={raw_shape}."
-            )
-        aligned = aligned[:, 0, ...]
-        labels_shape = tuple(int(v) for v in aligned.shape)
-
-    # Match channel count for TCZYX shapes by broadcasting singleton C.
-    if len(raw_shape) == 5 and len(labels_shape) == 5:
-        raw_c = int(raw_shape[1])
-        labels_c = int(labels_shape[1])
-        if labels_c != raw_c:
-            if labels_c != 1:
-                raise ValueError(
-                    f"Cannot align {layer_name} channels to raw: labels_shape={labels_shape}, raw_shape={raw_shape}."
-                )
-            aligned = _broadcast_to_shape(aligned, raw_shape)
-            labels_shape = tuple(int(v) for v in aligned.shape)
-
-    if tuple(labels_shape) != tuple(raw_shape):
-        raise ValueError(
-            f"Could not align {layer_name} to raw shape: labels_shape={labels_shape}, raw_shape={raw_shape}."
-        )
+    # Align T by padding with zeros or truncating
+    if labels_T < raw_T:
+        pad = np.zeros((raw_T - labels_T,) + labels.shape[1:], dtype=labels.dtype)
+        labels = np.concatenate([labels, pad], axis=0)
+    else:
+        labels = labels[:raw_T]
 
     if verbose:
         print(
-            f"{layer_name} view align: aligned from {tuple(int(v) for v in labels_img.shape)} "
-            f"to raw shape {raw_shape}"
+            f"{layer_name} view align: T adjusted {labels_T}→{raw_T}, "
+            f"final shape {labels.shape}"
         )
-    return aligned
+    return labels
 
 
 def show_behavioral_state_backprojection(
@@ -1256,10 +1254,11 @@ def show_behavioral_state_backprojection(
         layer_name="TrackID",
         verbose=verbose,
     )
+    _state_layer_name = state_col or "state_class"
     state_img_view = _align_labels_to_raw_shape_for_view(
         state_img,
         raw_img,
-        layer_name="behavioral_state_class",
+        layer_name=_state_layer_name,
         verbose=verbose,
     )
 
@@ -1268,7 +1267,7 @@ def show_behavioral_state_backprojection(
     viewer = napari.Viewer()
     viewer.add_image(raw_img, name="raw_data")
     viewer.add_labels(tracked_img_view, name="TrackID", visible=False)
-    state_layer = viewer.add_labels(state_img_view, name="behavioral_state_class", visible=True)
+    state_layer = viewer.add_labels(state_img_view, name=_state_layer_name, visible=True)
 
     label_map = _extract_state_label_map(state_path)
     code_colors = _extract_state_code_color_map(state_path)
