@@ -819,13 +819,19 @@ def _natural_sort_key(value):
     return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 
-def _plot_transition_heatmap_page(df_matrix, title, colorbar_label, normalized):
-    fig, ax = plt.subplots(figsize=(7.5, 6.0))
+def _plot_transition_heatmap_page(df_matrix, title, colorbar_label, normalized, mask_diagonal=False):
+    fig, ax = plt.subplots(figsize=(8.27, 11.69), constrained_layout=True)
     arr = df_matrix.to_numpy(dtype=float, copy=True)
+    if mask_diagonal:
+        arr = np.ma.array(arr, mask=np.eye(arr.shape[0], dtype=bool))
     if normalized:
-        im = ax.imshow(arr, aspect="auto", vmin=0.0, vmax=1.0)
+        im = ax.imshow(arr, aspect="equal", vmin=0.0, vmax=1.0)
     else:
-        im = ax.imshow(arr, aspect="auto")
+        im = ax.imshow(arr, aspect="equal")
+    if mask_diagonal:
+        cmap = plt.colormaps[im.cmap.name].copy()
+        cmap.set_bad(color="white")
+        im.set_cmap(cmap)
 
     n_rows, n_cols = arr.shape
     ax.set_xticks(np.arange(n_cols))
@@ -836,7 +842,94 @@ def _plot_transition_heatmap_page(df_matrix, title, colorbar_label, normalized):
     ax.set_ylabel("Current state")
     ax.set_title(str(title))
     plt.colorbar(im, ax=ax, label=str(colorbar_label))
-    fig.tight_layout()
+    return fig
+
+
+def _plot_heatmap_on_ax(ax, df_matrix, title, colorbar_label, normalized, mask_diagonal=False):
+    """Plot a square transition heatmap onto an existing axes object."""
+    arr = df_matrix.to_numpy(dtype=float, copy=True)
+    if mask_diagonal:
+        arr = np.ma.array(arr, mask=np.eye(arr.shape[0], dtype=bool))
+    if normalized:
+        im = ax.imshow(arr, aspect="equal", vmin=0.0, vmax=1.0)
+    else:
+        im = ax.imshow(arr, aspect="equal")
+    if mask_diagonal:
+        cmap = plt.colormaps[im.cmap.name].copy()
+        cmap.set_bad(color="white")
+        im.set_cmap(cmap)
+
+    n_rows, n_cols = arr.shape
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_xticklabels([str(c) for c in df_matrix.columns], rotation=90, fontsize=8)
+    ax.set_yticklabels([str(i) for i in df_matrix.index], fontsize=8)
+    ax.set_xlabel("Next state", fontsize=9)
+    ax.set_ylabel("Current state", fontsize=9)
+    ax.set_title(str(title), fontsize=10, pad=6)
+    ax.get_figure().colorbar(im, ax=ax, label=str(colorbar_label), fraction=0.046, pad=0.04)
+
+
+def _plot_transition_heatmap_quad_page(
+    df_probs, df_probs_no_self,
+    df_counts, df_counts_no_self,
+    state_col="",
+):
+    """A4 portrait figure with all four transition heatmaps in a 2×2 square grid.
+
+    Row 0: transition probabilities (full | no-self with hollow diagonal)
+    Row 1: transition counts       (full | no-self with hollow diagonal)
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(8.27, 11.69), constrained_layout=True)
+    _plot_heatmap_on_ax(
+        axes[0, 0], df_probs,
+        "Transition Probabilities\n(all transitions incl. self)",
+        "P(next | current)", normalized=True, mask_diagonal=False,
+    )
+    _plot_heatmap_on_ax(
+        axes[0, 1], df_probs_no_self,
+        "Transition Probabilities\n(self-transitions excluded)",
+        "P(next | current, next ≠ current)", normalized=True, mask_diagonal=True,
+    )
+    _plot_heatmap_on_ax(
+        axes[1, 0], df_counts,
+        "Transition Counts\n(all transitions incl. self)",
+        "Count", normalized=False, mask_diagonal=False,
+    )
+    _plot_heatmap_on_ax(
+        axes[1, 1], df_counts_no_self,
+        "Transition Counts\n(self-transitions excluded)",
+        "Count  (diagonal = no data)", normalized=False, mask_diagonal=True,
+    )
+    if state_col:
+        fig.suptitle(f"Transition Matrices  ·  {state_col}", fontsize=12, fontweight="bold")
+    return fig
+
+
+def _plot_ngram_batch_page(items, y_col="ngram_str", x_col="count"):
+    """A4 portrait figure with 1 or 2 n-gram bar charts stacked vertically.
+
+    items: list of (df_ranking, title) tuples — 1 or 2 entries.
+    Returns fig or None if all items are empty.
+    """
+    non_empty = [(df, t) for df, t in items if df is not None and len(df) > 0]
+    if not non_empty:
+        return None
+    n_rows = len(non_empty)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(8.27, 11.69), squeeze=False)
+    for i, (df, title) in enumerate(non_empty):
+        ax = axes[i, 0]
+        work = df.copy()
+        work[x_col] = pd.to_numeric(work[x_col], errors="coerce").fillna(0.0)
+        work = work.sort_values(x_col, ascending=False, kind="stable")
+        labels = work[y_col].astype(str).tolist()[::-1]
+        values = work[x_col].astype(float).tolist()[::-1]
+        ax.barh(labels, values)
+        ax.set_xlabel("Count (pooled across tracks)", fontsize=9)
+        ax.set_ylabel("N-gram", fontsize=9)
+        ax.set_title(str(title), fontsize=10)
+        ax.tick_params(axis="y", labelsize=8)
+    fig.subplots_adjust(left=0.28, right=0.95, top=0.93, bottom=0.05, hspace=0.50)
     return fig
 
 
@@ -978,6 +1071,9 @@ def save_state_transition_report(
     """Save transition matrix + all-pairs Sankey report for one state column."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    matrix_dir = output_dir / "transition_matrix"
+    matrix_data_dir = matrix_dir / "data"
+    matrix_data_dir.mkdir(parents=True, exist_ok=True)
     html_dir = output_dir / "sankey_html"
 
     include_no_self_matrices = bool(include_no_self_matrices)
@@ -999,11 +1095,11 @@ def save_state_transition_report(
         only_transitions=False,
     )
 
-    matrix_counts_csv = output_dir / "transition_matrix_counts.csv"
-    matrix_probs_csv = output_dir / "transition_matrix_probs.csv"
-    matrix_counts_no_self_csv = output_dir / "transition_matrix_counts_no_self.csv"
-    matrix_probs_no_self_csv = output_dir / "transition_matrix_probs_no_self.csv"
-    matrix_heatmap_pdf = output_dir / "transition_matrix_heatmap.pdf"
+    matrix_counts_csv = matrix_data_dir / "transition_matrix_counts.csv"
+    matrix_probs_csv = matrix_data_dir / "transition_matrix_probs.csv"
+    matrix_counts_no_self_csv = matrix_data_dir / "transition_matrix_counts_no_self.csv"
+    matrix_probs_no_self_csv = matrix_data_dir / "transition_matrix_probs_no_self.csv"
+    matrix_heatmap_pdf = matrix_dir / "transition_matrix_heatmap.pdf"
     counts.to_csv(matrix_counts_csv)
     probs.to_csv(matrix_probs_csv)
 
@@ -1033,10 +1129,10 @@ def save_state_transition_report(
     )
     states = sorted(states.unique().tolist(), key=_natural_sort_key)
 
-    ngrams_all_csv = output_dir / "transition_ngrams_all.csv"
-    ngrams_pooled_csv = output_dir / "transition_ngrams_pooled.csv"
-    ngrams_per_end_csv = output_dir / "transition_ngrams_per_end.csv"
-    ngrams_per_start_csv = output_dir / "transition_ngrams_per_start.csv"
+    ngrams_all_csv = matrix_data_dir / "transition_ngrams_all.csv"
+    ngrams_pooled_csv = matrix_data_dir / "transition_ngrams_pooled.csv"
+    ngrams_per_end_csv = matrix_data_dir / "transition_ngrams_per_end.csv"
+    ngrams_per_start_csv = matrix_data_dir / "transition_ngrams_per_start.csv"
 
     df_ngrams = None
     df_ngrams_pooled = None
@@ -1060,49 +1156,39 @@ def save_state_transition_report(
         df_ngrams_per_start.to_csv(ngrams_per_start_csv, index=False)
 
     with PdfPages(matrix_heatmap_pdf) as pdf:
-        fig_counts = _plot_transition_heatmap_page(
-            counts,
-            title=f"Transition Counts ({state_col})",
-            colorbar_label="Count",
-            normalized=False,
-        )
-        pdf.savefig(fig_counts, bbox_inches="tight")
-        plt.close(fig_counts)
+        # Page 1 — all four heatmaps in a 2×2 square grid (when no-self matrices available)
+        if include_no_self_matrices and probs_no_self is not None and counts_no_self is not None:
+            fig_quad = _plot_transition_heatmap_quad_page(
+                probs, probs_no_self, counts, counts_no_self, state_col=str(state_col),
+            )
+            pdf.savefig(fig_quad, bbox_inches="tight")
+            plt.close(fig_quad)
+        else:
+            # Fallback: one A4 page per metric when no-self matrices are not computed
+            fig_probs = _plot_transition_heatmap_page(
+                probs,
+                title=f"Transition Probabilities — all transitions  ({state_col})",
+                colorbar_label="P(next | current)",
+                normalized=True,
+            )
+            pdf.savefig(fig_probs, bbox_inches="tight")
+            plt.close(fig_probs)
 
-        fig_probs = _plot_transition_heatmap_page(
-            probs,
-            title=f"Transition Probabilities ({state_col})",
-            colorbar_label="P(next | current)",
-            normalized=True,
-        )
-        pdf.savefig(fig_probs, bbox_inches="tight")
-        plt.close(fig_probs)
-
-        if include_no_self_matrices and counts_no_self is not None and probs_no_self is not None:
-            fig_counts_no_self = _plot_transition_heatmap_page(
-                counts_no_self,
-                title=f"Transition Counts (self-transitions removed) ({state_col})",
+            fig_counts = _plot_transition_heatmap_page(
+                counts,
+                title=f"Transition Counts — all transitions  ({state_col})",
                 colorbar_label="Count",
                 normalized=False,
             )
-            pdf.savefig(fig_counts_no_self, bbox_inches="tight")
-            plt.close(fig_counts_no_self)
+            pdf.savefig(fig_counts, bbox_inches="tight")
+            plt.close(fig_counts)
 
-            fig_probs_no_self = _plot_transition_heatmap_page(
-                probs_no_self,
-                title=f"Transition Probabilities (self-transitions removed) ({state_col})",
-                colorbar_label="P(next | current, next != current)",
-                normalized=True,
-            )
-            pdf.savefig(fig_probs_no_self, bbox_inches="tight")
-            plt.close(fig_probs_no_self)
-
+        # Pages 3+ — N-gram rankings (A4, batched 2 per page)
         if include_ngram_rankings and df_ngrams is not None:
             for n in ngram_orders:
                 pooled_n = df_ngrams_pooled[df_ngrams_pooled["n"] == int(n)].copy()
-                fig = _plot_ngram_ranking_page(
-                    pooled_n,
-                    title=f"Top {ngram_pooled_top_n} {n}-grams (pooled)",
+                fig = _plot_ngram_batch_page(
+                    [(pooled_n, f"Top {ngram_pooled_top_n} {n}-grams (pooled across all tracks)")],
                 )
                 if fig is not None:
                     pdf.savefig(fig, bbox_inches="tight")
@@ -1113,38 +1199,40 @@ def save_state_transition_report(
                     df_ngrams_per_end.get("group_state", pd.Series([], dtype=str)).astype(str).unique().tolist(),
                     key=_natural_sort_key,
                 )
+                per_end_items = []
                 for end_state in end_states:
                     for n in ngram_orders:
                         sub = df_ngrams_per_end[
                             (df_ngrams_per_end["n"] == int(n))
                             & (df_ngrams_per_end["group_state"].astype(str) == str(end_state))
                         ].copy()
-                        fig = _plot_ngram_ranking_page(
-                            sub,
-                            title=f"Top {ngram_per_state_top_n} {n}-grams ending in {end_state}",
-                        )
-                        if fig is not None:
-                            pdf.savefig(fig, bbox_inches="tight")
-                            plt.close(fig)
+                        per_end_items.append((sub, f"Top {ngram_per_state_top_n} {n}-grams ending in state {end_state}"))
+                for batch_start in range(0, len(per_end_items), 2):
+                    batch = per_end_items[batch_start: batch_start + 2]
+                    fig = _plot_ngram_batch_page(batch)
+                    if fig is not None:
+                        pdf.savefig(fig, bbox_inches="tight")
+                        plt.close(fig)
 
             if ngram_include_per_start_state:
                 start_states = sorted(
                     df_ngrams_per_start.get("group_state", pd.Series([], dtype=str)).astype(str).unique().tolist(),
                     key=_natural_sort_key,
                 )
+                per_start_items = []
                 for start_state in start_states:
                     for n in ngram_orders:
                         sub = df_ngrams_per_start[
                             (df_ngrams_per_start["n"] == int(n))
                             & (df_ngrams_per_start["group_state"].astype(str) == str(start_state))
                         ].copy()
-                        fig = _plot_ngram_ranking_page(
-                            sub,
-                            title=f"Top {ngram_per_state_top_n} {n}-grams starting in {start_state}",
-                        )
-                        if fig is not None:
-                            pdf.savefig(fig, bbox_inches="tight")
-                            plt.close(fig)
+                        per_start_items.append((sub, f"Top {ngram_per_state_top_n} {n}-grams starting from state {start_state}"))
+                for batch_start in range(0, len(per_start_items), 2):
+                    batch = per_start_items[batch_start: batch_start + 2]
+                    fig = _plot_ngram_batch_page(batch)
+                    if fig is not None:
+                        pdf.savefig(fig, bbox_inches="tight")
+                        plt.close(fig)
 
     rows_per_page = max(1, int(rows_per_page))
     include_self_pairs = bool(include_self_pairs)
