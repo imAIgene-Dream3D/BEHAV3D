@@ -670,7 +670,11 @@ def run_tcell_analysis(
 # ---------------------------------------------------------------------------
 
 def _feature_dtw_outdir(output_dir, cell_type):
-    return Path(output_dir).expanduser() / "analysis" / str(cell_type) / "behavorial_trajectories"
+    return (
+        Path(output_dir).expanduser()
+        / "analysis" / str(cell_type)
+        / "behavorial_trajectories" / "original_behav3d"
+    )
 
 
 def _feature_dtw_clustered_csv_path(output_dir, cell_type):
@@ -788,3 +792,56 @@ def _save_feature_dtw_quality_control(output_dir, cell_type, *, outfolder=None):
         "heatmap_pdf": str(heatmap_path),
         "percentages_pdf": str(perc_prefix.with_suffix(".pdf")),
     }
+
+
+def _create_original_behav3d_adata(output_dir, cell_type):
+    """Create and save an AnnData h5ad wrapping original BEHAV3D feature-DTW cluster results.
+
+    Reads the UMAP clusters CSV produced by run_tcell_analysis and packages it
+    as an AnnData so the rest of the pipeline (rename dialog, backprojection,
+    napari track-adata loading) can work with original BEHAV3D results the same
+    way it works with the dtaidistance method.
+
+    The file is saved to:
+        behavorial_trajectories/BEHAV3D_{cell_type}_behavioral_trajectories.h5ad
+    """
+    import anndata as ad
+    from behav3d.analysis.behavior.track.utils import get_dtaidistance_track_trajectories_filename
+
+    src_dir = _feature_dtw_outdir(output_dir, cell_type)
+    umap_csv = src_dir / f"BEHAV3D_{cell_type}_UMAP_clusters.csv"
+    if not umap_csv.exists():
+        raise FileNotFoundError(
+            f"Original BEHAV3D UMAP CSV not found: {umap_csv}. "
+            "Run the original BEHAV3D feature-DTW step first."
+        )
+
+    df = pd.read_csv(umap_csv, low_memory=False)
+    obs = df.copy()
+    obs.index = (
+        obs.get("TrackID", pd.Series(range(len(obs)))).astype(str)
+        + "--"
+        + obs.get("sample_name", pd.Series([""] * len(obs))).astype(str)
+    )
+    obs.index.name = None
+
+    umap_cols = [c for c in ["UMAP1", "UMAP2"] if c in obs.columns]
+    if umap_cols:
+        X = obs[umap_cols].to_numpy(dtype=float)
+        obs = obs.drop(columns=umap_cols)
+    else:
+        X = np.zeros((len(obs), 0), dtype=float)
+
+    if "ClusterID" in obs.columns:
+        obs["ClusterID"] = pd.Categorical(obs["ClusterID"].astype(str))
+
+    adata = ad.AnnData(X=X, obs=obs)
+    adata.uns["dtai_trajectory_clustering"] = {
+        "method": "original_behav3d_feature_dtw",
+        "cluster_key": "ClusterID",
+    }
+
+    out_path = src_dir.parent / get_dtaidistance_track_trajectories_filename(cell_type)
+    adata.write(out_path, compression="gzip")
+    print(f"- Saved original BEHAV3D AnnData ({len(adata)} tracks) to {out_path}")
+    return adata

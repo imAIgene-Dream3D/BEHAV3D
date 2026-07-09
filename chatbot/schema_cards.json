@@ -1,0 +1,2118 @@
+[
+  {
+    "key": "seed",
+    "title": "seed",
+    "step": "general",
+    "category": null,
+    "type": "int",
+    "default": 42,
+    "choices": null,
+    "description": "Random seed for reproducible clustering / UMAP / sampling."
+  },
+  {
+    "key": "paths.metadata_csv",
+    "title": "metadata_csv",
+    "step": "data_preparation",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "Path to the BEHAV3D metadata.csv describing every sample."
+  },
+  {
+    "key": "paths.output_dir",
+    "title": "output_dir",
+    "step": "data_preparation",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "Directory where all BEHAV3D outputs (zarr, csv, results) are written."
+  },
+  {
+    "key": "dim_order.default_apply_all",
+    "title": "default_apply_all",
+    "step": "data_preparation",
+    "category": null,
+    "type": "str",
+    "default": "TCZYX",
+    "choices": [
+      "TCZYX",
+      "TZCYX",
+      "CTZYX",
+      "CZTYX",
+      "ZCTYX",
+      "ZTCYX",
+      "CZYX",
+      "ZCYX",
+      "TZYX",
+      "ZTYX",
+      "TCYX",
+      "CTYX",
+      "ZYX",
+      "CYX",
+      "TYX",
+      "YX"
+    ],
+    "description": "Dimension order of the raw images (e.g. TCZYX = time, channel, z, y, x). Used to interpret every input image unless overridden per sample."
+  },
+  {
+    "key": "signal_unmixing.sink_channel",
+    "title": "sink_channel",
+    "step": "preprocessing",
+    "category": null,
+    "type": "int",
+    "default": 2,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.sink_channel' (type int, default 2)."
+  },
+  {
+    "key": "signal_unmixing.source_channels",
+    "title": "source_channels",
+    "step": "preprocessing",
+    "category": null,
+    "type": "str",
+    "default": "0, 1",
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.source_channels' (type str, default '0, 1')."
+  },
+  {
+    "key": "signal_unmixing.train_z",
+    "title": "train_z",
+    "step": "preprocessing",
+    "category": null,
+    "type": "str",
+    "default": "4,5,6",
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.train_z' (type str, default '4,5,6')."
+  },
+  {
+    "key": "signal_unmixing.train_t",
+    "title": "train_t",
+    "step": "preprocessing",
+    "category": null,
+    "type": "str",
+    "default": "1,3,6",
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.train_t' (type str, default '1,3,6')."
+  },
+  {
+    "key": "signal_unmixing.bg_percentile",
+    "title": "bg_percentile",
+    "step": "preprocessing",
+    "category": null,
+    "type": "int",
+    "default": 1,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.bg_percentile' (type int, default 1)."
+  },
+  {
+    "key": "signal_unmixing.median_size",
+    "title": "median_size",
+    "step": "preprocessing",
+    "category": null,
+    "type": "int",
+    "default": 3,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.median_size' (type int, default 3)."
+  },
+  {
+    "key": "signal_unmixing.gaussian_sigma",
+    "title": "gaussian_sigma",
+    "step": "preprocessing",
+    "category": null,
+    "type": "int",
+    "default": 4,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.gaussian_sigma' (type int, default 4)."
+  },
+  {
+    "key": "signal_unmixing.visualize_napari",
+    "title": "visualize_napari",
+    "step": "preprocessing",
+    "category": null,
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.visualize_napari' (type bool, default True)."
+  },
+  {
+    "key": "signal_unmixing.training_log",
+    "title": "training_log",
+    "step": "preprocessing",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.training_log' (type bool, default False)."
+  },
+  {
+    "key": "signal_unmixing.timepoints",
+    "title": "timepoints",
+    "step": "preprocessing",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.timepoints' (type int, default 0)."
+  },
+  {
+    "key": "signal_unmixing.use_all_timepoints",
+    "title": "use_all_timepoints",
+    "step": "preprocessing",
+    "category": null,
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "Process every timepoint. Disable to restrict to a [tp_start, tp_end] range."
+  },
+  {
+    "key": "signal_unmixing.use_range",
+    "title": "use_range",
+    "step": "preprocessing",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.use_range' (type bool, default False)."
+  },
+  {
+    "key": "signal_unmixing.start_t",
+    "title": "start_t",
+    "step": "preprocessing",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.start_t' (type int, default 0)."
+  },
+  {
+    "key": "signal_unmixing.end_t",
+    "title": "end_t",
+    "step": "preprocessing",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.end_t' (type int, default 0)."
+  },
+  {
+    "key": "signal_unmixing.use_unmix_path",
+    "title": "use_unmix_path",
+    "step": "preprocessing",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.use_unmix_path' (type bool, default False)."
+  },
+  {
+    "key": "signal_unmixing.channel_colors",
+    "title": "channel_colors",
+    "step": "preprocessing",
+    "category": null,
+    "type": "list",
+    "default": [
+      "cyan",
+      "yellow",
+      "red",
+      "green",
+      "magenta",
+      "blue",
+      "gray",
+      "turbo",
+      "viridis",
+      "plasma",
+      "inferno",
+      "twilight"
+    ],
+    "choices": null,
+    "description": "BEHAV3D parameter 'signal_unmixing.channel_colors' (type list, default ['cyan', 'yellow', 'red', 'green', 'magenta', 'blue', 'gray', 'turbo', 'viridis', 'plasma', 'inferno', 'twilight'])."
+  },
+  {
+    "key": "pixel_classifier.examples_per_sample",
+    "title": "examples_per_sample",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 3,
+    "choices": null,
+    "description": "How many annotated example timepoints to draw per sample when training the pixel classifier. More examples = better but slower training."
+  },
+  {
+    "key": "pixel_classifier.sample_specific_classifier",
+    "title": "sample_specific_classifier",
+    "step": "segmentation",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Train a separate classifier per sample instead of one shared classifier. Use when samples differ a lot in appearance."
+  },
+  {
+    "key": "pixel_classifier.workers",
+    "title": "workers",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 8,
+    "choices": null,
+    "description": "Number of parallel CPU worker processes. Higher = faster but more RAM/CPU."
+  },
+  {
+    "key": "pixel_classifier.use_all_timepoints",
+    "title": "use_all_timepoints",
+    "step": "segmentation",
+    "category": null,
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "Process every timepoint. Disable to restrict to a [tp_start, tp_end] range."
+  },
+  {
+    "key": "pixel_classifier.tp_start",
+    "title": "tp_start",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'pixel_classifier.tp_start' (type int, default 0)."
+  },
+  {
+    "key": "pixel_classifier.tp_end",
+    "title": "tp_end",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'pixel_classifier.tp_end' (type int, default 0)."
+  },
+  {
+    "key": "cellpose.number_of_channels",
+    "title": "number_of_channels",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "Number of image channels passed to Cellpose."
+  },
+  {
+    "key": "cellpose.extra_channel_slots",
+    "title": "extra_channel_slots",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose.extra_channel_slots' (type int, default 0)."
+  },
+  {
+    "key": "cellpose.labels_mode",
+    "title": "labels_mode",
+    "step": "segmentation",
+    "category": null,
+    "type": "str",
+    "default": "same_for_all",
+    "choices": [
+      "same_for_all",
+      "per_sample"
+    ],
+    "description": "'same_for_all' applies one channel\u2192cell-type label map to every sample; 'per_sample' lets each sample differ."
+  },
+  {
+    "key": "cellpose.channel_labels",
+    "title": "channel_labels",
+    "step": "segmentation",
+    "category": null,
+    "type": "dict",
+    "default": {},
+    "choices": null,
+    "description": "Mapping of channel index \u2192 cell-type name (e.g. {0: 'organoid', 1: 'tcell'})."
+  },
+  {
+    "key": "cellpose.per_sample_channel_labels",
+    "title": "per_sample_channel_labels",
+    "step": "segmentation",
+    "category": null,
+    "type": "dict",
+    "default": {},
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose.per_sample_channel_labels' (type dict, default {})."
+  },
+  {
+    "key": "tracking.track_organoids_together",
+    "title": "track_organoids_together",
+    "step": "tracking",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Track all organoids as a single merged object rather than individually."
+  },
+  {
+    "key": "tracking.all_organoids.method",
+    "title": "method",
+    "step": "tracking",
+    "category": null,
+    "type": "str",
+    "default": "propagation_all_organoids",
+    "choices": [
+      "trackpy",
+      "lap",
+      "btrack",
+      "propagation",
+      "propagation_all_organoids"
+    ],
+    "description": "Tracking algorithm: 'trackpy' (linking by proximity), 'lap' (linear assignment with gap-closing), 'btrack' (Bayesian, best for crowded/dividing cells), or 'propagation' (label propagation for organoids)."
+  },
+  {
+    "key": "tracking.all_organoids.overwrite",
+    "title": "overwrite",
+    "step": "tracking",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Re-run and overwrite existing outputs instead of skipping completed samples."
+  },
+  {
+    "key": "tracking.immune.method",
+    "title": "method",
+    "step": "tracking",
+    "category": "immune",
+    "type": "str",
+    "default": "trackpy",
+    "choices": [
+      "trackpy",
+      "lap",
+      "btrack",
+      "propagation",
+      "propagation_all_organoids"
+    ],
+    "description": "Tracking algorithm: 'trackpy' (linking by proximity), 'lap' (linear assignment with gap-closing), 'btrack' (Bayesian, best for crowded/dividing cells), or 'propagation' (label propagation for organoids)."
+  },
+  {
+    "key": "tracking.immune.overwrite",
+    "title": "overwrite",
+    "step": "tracking",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Re-run and overwrite existing outputs instead of skipping completed samples."
+  },
+  {
+    "key": "tracking.immune.lap.track_cost_px",
+    "title": "track_cost_px",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 60,
+    "choices": null,
+    "description": "LAP frame-to-frame linking cost cutoff in pixels (akin to a max move distance)."
+  },
+  {
+    "key": "tracking.immune.lap.gap_close_cost_px",
+    "title": "gap_close_cost_px",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 45,
+    "choices": null,
+    "description": "LAP cost cutoff for bridging gaps where a cell was briefly undetected."
+  },
+  {
+    "key": "tracking.immune.lap.gap_close_max_frames",
+    "title": "gap_close_max_frames",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 5,
+    "choices": null,
+    "description": "Maximum gap length (frames) LAP will bridge when gap-closing."
+  },
+  {
+    "key": "tracking.immune.lap.merging_cost_px",
+    "title": "merging_cost_px",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "LAP cost for allowing two tracks to merge (0 disables merging)."
+  },
+  {
+    "key": "tracking.immune.lap.splitting_cost_px",
+    "title": "splitting_cost_px",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "LAP cost for allowing a track to split (0 disables splitting)."
+  },
+  {
+    "key": "tracking.immune.trackpy.search_range_px",
+    "title": "search_range_px",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 31,
+    "choices": null,
+    "description": "Max distance (pixels) a cell may move between consecutive frames. Set just above the fastest expected displacement; too small drops links, too large makes spurious ones."
+  },
+  {
+    "key": "tracking.immune.trackpy.memory_frames",
+    "title": "memory_frames",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 5,
+    "choices": null,
+    "description": "How many frames a cell may disappear (occlusion/missed detection) and still be re-linked to the same track."
+  },
+  {
+    "key": "tracking.immune.trackpy.adaptive_stop",
+    "title": "adaptive_stop",
+    "step": "tracking",
+    "category": "immune",
+    "type": "float",
+    "default": 5.0,
+    "choices": null,
+    "description": "trackpy adaptive-search lower bound; linking subdivides the search range down to this value when ambiguous."
+  },
+  {
+    "key": "tracking.immune.trackpy.adaptive_step",
+    "title": "adaptive_step",
+    "step": "tracking",
+    "category": "immune",
+    "type": "float",
+    "default": 0.95,
+    "choices": null,
+    "description": "Factor by which trackpy shrinks the search range on each adaptive subdivision (0\u20131)."
+  },
+  {
+    "key": "tracking.immune.btrack.config_preset",
+    "title": "config_preset",
+    "step": "tracking",
+    "category": "immune",
+    "type": "str",
+    "default": "cell",
+    "choices": [
+      "cell",
+      "particle"
+    ],
+    "description": "btrack motion-model preset: 'cell' (typical migrating cells) or 'particle' (fast, near-random motion)."
+  },
+  {
+    "key": "tracking.immune.btrack.config_path",
+    "title": "config_path",
+    "step": "tracking",
+    "category": "immune",
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "Optional path to a custom btrack config JSON; overrides the preset."
+  },
+  {
+    "key": "tracking.immune.btrack.max_search_radius",
+    "title": "max_search_radius",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 100,
+    "choices": null,
+    "description": "btrack maximum linking radius in pixels."
+  },
+  {
+    "key": "tracking.immune.btrack.update_method",
+    "title": "update_method",
+    "step": "tracking",
+    "category": "immune",
+    "type": "str",
+    "default": "EXACT",
+    "choices": [
+      "EXACT",
+      "APPROXIMATE"
+    ],
+    "description": "btrack hypothesis update: 'EXACT' (accurate, slower) or 'APPROXIMATE' (faster for large datasets)."
+  },
+  {
+    "key": "tracking.immune.btrack.step_size",
+    "title": "step_size",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 100,
+    "choices": null,
+    "description": "btrack optimiser batch/step size; larger trades memory for speed."
+  },
+  {
+    "key": "tracking.immune.btrack.n_workers",
+    "title": "n_workers",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 16,
+    "choices": null,
+    "description": "Parallel workers for this step."
+  },
+  {
+    "key": "tracking.immune.btrack.use_optimize",
+    "title": "use_optimize",
+    "step": "tracking",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Run btrack's global optimisation pass (better tracks, slower)."
+  },
+  {
+    "key": "tracking.immune.btrack.hypotheses",
+    "title": "hypotheses",
+    "step": "tracking",
+    "category": "immune",
+    "type": "list",
+    "default": [
+      "P_FP",
+      "P_init",
+      "P_term",
+      "P_link"
+    ],
+    "choices": null,
+    "description": "btrack hypotheses to evaluate (P_FP false-positive, P_init initialisation, P_term termination, P_link linking, P_branch division)."
+  },
+  {
+    "key": "tracking.immune.btrack.dist_thresh",
+    "title": "dist_thresh",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 60,
+    "choices": null,
+    "description": "btrack distance threshold (pixels) for candidate links."
+  },
+  {
+    "key": "tracking.immune.btrack.time_thresh",
+    "title": "time_thresh",
+    "step": "tracking",
+    "category": "immune",
+    "type": "int",
+    "default": 3,
+    "choices": null,
+    "description": "btrack time threshold (frames) for candidate links."
+  },
+  {
+    "key": "tracking.other.method",
+    "title": "method",
+    "step": "tracking",
+    "category": "other",
+    "type": "str",
+    "default": "trackpy",
+    "choices": [
+      "trackpy",
+      "lap",
+      "btrack",
+      "propagation",
+      "propagation_all_organoids"
+    ],
+    "description": "Tracking algorithm: 'trackpy' (linking by proximity), 'lap' (linear assignment with gap-closing), 'btrack' (Bayesian, best for crowded/dividing cells), or 'propagation' (label propagation for organoids)."
+  },
+  {
+    "key": "tracking.other.overwrite",
+    "title": "overwrite",
+    "step": "tracking",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Re-run and overwrite existing outputs instead of skipping completed samples."
+  },
+  {
+    "key": "tracking.other.lap.track_cost_px",
+    "title": "track_cost_px",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 60,
+    "choices": null,
+    "description": "LAP frame-to-frame linking cost cutoff in pixels (akin to a max move distance)."
+  },
+  {
+    "key": "tracking.other.lap.gap_close_cost_px",
+    "title": "gap_close_cost_px",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 45,
+    "choices": null,
+    "description": "LAP cost cutoff for bridging gaps where a cell was briefly undetected."
+  },
+  {
+    "key": "tracking.other.lap.gap_close_max_frames",
+    "title": "gap_close_max_frames",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 5,
+    "choices": null,
+    "description": "Maximum gap length (frames) LAP will bridge when gap-closing."
+  },
+  {
+    "key": "tracking.other.lap.merging_cost_px",
+    "title": "merging_cost_px",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "LAP cost for allowing two tracks to merge (0 disables merging)."
+  },
+  {
+    "key": "tracking.other.lap.splitting_cost_px",
+    "title": "splitting_cost_px",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "LAP cost for allowing a track to split (0 disables splitting)."
+  },
+  {
+    "key": "tracking.other.trackpy.search_range_px",
+    "title": "search_range_px",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 31,
+    "choices": null,
+    "description": "Max distance (pixels) a cell may move between consecutive frames. Set just above the fastest expected displacement; too small drops links, too large makes spurious ones."
+  },
+  {
+    "key": "tracking.other.trackpy.memory_frames",
+    "title": "memory_frames",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 5,
+    "choices": null,
+    "description": "How many frames a cell may disappear (occlusion/missed detection) and still be re-linked to the same track."
+  },
+  {
+    "key": "tracking.other.trackpy.adaptive_stop",
+    "title": "adaptive_stop",
+    "step": "tracking",
+    "category": "other",
+    "type": "float",
+    "default": 5.0,
+    "choices": null,
+    "description": "trackpy adaptive-search lower bound; linking subdivides the search range down to this value when ambiguous."
+  },
+  {
+    "key": "tracking.other.trackpy.adaptive_step",
+    "title": "adaptive_step",
+    "step": "tracking",
+    "category": "other",
+    "type": "float",
+    "default": 0.95,
+    "choices": null,
+    "description": "Factor by which trackpy shrinks the search range on each adaptive subdivision (0\u20131)."
+  },
+  {
+    "key": "tracking.other.btrack.config_preset",
+    "title": "config_preset",
+    "step": "tracking",
+    "category": "other",
+    "type": "str",
+    "default": "cell",
+    "choices": [
+      "cell",
+      "particle"
+    ],
+    "description": "btrack motion-model preset: 'cell' (typical migrating cells) or 'particle' (fast, near-random motion)."
+  },
+  {
+    "key": "tracking.other.btrack.config_path",
+    "title": "config_path",
+    "step": "tracking",
+    "category": "other",
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "Optional path to a custom btrack config JSON; overrides the preset."
+  },
+  {
+    "key": "tracking.other.btrack.max_search_radius",
+    "title": "max_search_radius",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 100,
+    "choices": null,
+    "description": "btrack maximum linking radius in pixels."
+  },
+  {
+    "key": "tracking.other.btrack.update_method",
+    "title": "update_method",
+    "step": "tracking",
+    "category": "other",
+    "type": "str",
+    "default": "EXACT",
+    "choices": [
+      "EXACT",
+      "APPROXIMATE"
+    ],
+    "description": "btrack hypothesis update: 'EXACT' (accurate, slower) or 'APPROXIMATE' (faster for large datasets)."
+  },
+  {
+    "key": "tracking.other.btrack.step_size",
+    "title": "step_size",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 100,
+    "choices": null,
+    "description": "btrack optimiser batch/step size; larger trades memory for speed."
+  },
+  {
+    "key": "tracking.other.btrack.n_workers",
+    "title": "n_workers",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 8,
+    "choices": null,
+    "description": "Parallel workers for this step."
+  },
+  {
+    "key": "tracking.other.btrack.use_optimize",
+    "title": "use_optimize",
+    "step": "tracking",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Run btrack's global optimisation pass (better tracks, slower)."
+  },
+  {
+    "key": "tracking.other.btrack.hypotheses",
+    "title": "hypotheses",
+    "step": "tracking",
+    "category": "other",
+    "type": "list",
+    "default": [
+      "P_FP",
+      "P_init",
+      "P_term",
+      "P_link"
+    ],
+    "choices": null,
+    "description": "btrack hypotheses to evaluate (P_FP false-positive, P_init initialisation, P_term termination, P_link linking, P_branch division)."
+  },
+  {
+    "key": "tracking.other.btrack.dist_thresh",
+    "title": "dist_thresh",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 60,
+    "choices": null,
+    "description": "btrack distance threshold (pixels) for candidate links."
+  },
+  {
+    "key": "tracking.other.btrack.time_thresh",
+    "title": "time_thresh",
+    "step": "tracking",
+    "category": "other",
+    "type": "int",
+    "default": 3,
+    "choices": null,
+    "description": "btrack time threshold (frames) for candidate links."
+  },
+  {
+    "key": "tracking.organoid.method",
+    "title": "method",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "str",
+    "default": "propagation",
+    "choices": [
+      "trackpy",
+      "lap",
+      "btrack",
+      "propagation",
+      "propagation_all_organoids"
+    ],
+    "description": "Tracking algorithm: 'trackpy' (linking by proximity), 'lap' (linear assignment with gap-closing), 'btrack' (Bayesian, best for crowded/dividing cells), or 'propagation' (label propagation for organoids)."
+  },
+  {
+    "key": "tracking.organoid.overwrite",
+    "title": "overwrite",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Re-run and overwrite existing outputs instead of skipping completed samples."
+  },
+  {
+    "key": "tracking.organoid.lap.track_cost_px",
+    "title": "track_cost_px",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 60,
+    "choices": null,
+    "description": "LAP frame-to-frame linking cost cutoff in pixels (akin to a max move distance)."
+  },
+  {
+    "key": "tracking.organoid.lap.gap_close_cost_px",
+    "title": "gap_close_cost_px",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 80,
+    "choices": null,
+    "description": "LAP cost cutoff for bridging gaps where a cell was briefly undetected."
+  },
+  {
+    "key": "tracking.organoid.lap.gap_close_max_frames",
+    "title": "gap_close_max_frames",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 3,
+    "choices": null,
+    "description": "Maximum gap length (frames) LAP will bridge when gap-closing."
+  },
+  {
+    "key": "tracking.organoid.lap.merging_cost_px",
+    "title": "merging_cost_px",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "LAP cost for allowing two tracks to merge (0 disables merging)."
+  },
+  {
+    "key": "tracking.organoid.lap.splitting_cost_px",
+    "title": "splitting_cost_px",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "LAP cost for allowing a track to split (0 disables splitting)."
+  },
+  {
+    "key": "tracking.organoid.trackpy.search_range_px",
+    "title": "search_range_px",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 35,
+    "choices": null,
+    "description": "Max distance (pixels) a cell may move between consecutive frames. Set just above the fastest expected displacement; too small drops links, too large makes spurious ones."
+  },
+  {
+    "key": "tracking.organoid.trackpy.memory_frames",
+    "title": "memory_frames",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 2,
+    "choices": null,
+    "description": "How many frames a cell may disappear (occlusion/missed detection) and still be re-linked to the same track."
+  },
+  {
+    "key": "tracking.organoid.trackpy.adaptive_stop",
+    "title": "adaptive_stop",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "float",
+    "default": 10.0,
+    "choices": null,
+    "description": "trackpy adaptive-search lower bound; linking subdivides the search range down to this value when ambiguous."
+  },
+  {
+    "key": "tracking.organoid.trackpy.adaptive_step",
+    "title": "adaptive_step",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "float",
+    "default": 0.95,
+    "choices": null,
+    "description": "Factor by which trackpy shrinks the search range on each adaptive subdivision (0\u20131)."
+  },
+  {
+    "key": "tracking.organoid.btrack.config_preset",
+    "title": "config_preset",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "str",
+    "default": "cell",
+    "choices": [
+      "cell",
+      "particle"
+    ],
+    "description": "btrack motion-model preset: 'cell' (typical migrating cells) or 'particle' (fast, near-random motion)."
+  },
+  {
+    "key": "tracking.organoid.btrack.config_path",
+    "title": "config_path",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "Optional path to a custom btrack config JSON; overrides the preset."
+  },
+  {
+    "key": "tracking.organoid.btrack.max_search_radius",
+    "title": "max_search_radius",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 100,
+    "choices": null,
+    "description": "btrack maximum linking radius in pixels."
+  },
+  {
+    "key": "tracking.organoid.btrack.update_method",
+    "title": "update_method",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "str",
+    "default": "EXACT",
+    "choices": [
+      "EXACT",
+      "APPROXIMATE"
+    ],
+    "description": "btrack hypothesis update: 'EXACT' (accurate, slower) or 'APPROXIMATE' (faster for large datasets)."
+  },
+  {
+    "key": "tracking.organoid.btrack.step_size",
+    "title": "step_size",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 100,
+    "choices": null,
+    "description": "btrack optimiser batch/step size; larger trades memory for speed."
+  },
+  {
+    "key": "tracking.organoid.btrack.n_workers",
+    "title": "n_workers",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 8,
+    "choices": null,
+    "description": "Parallel workers for this step."
+  },
+  {
+    "key": "tracking.organoid.btrack.use_optimize",
+    "title": "use_optimize",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Run btrack's global optimisation pass (better tracks, slower)."
+  },
+  {
+    "key": "tracking.organoid.btrack.hypotheses",
+    "title": "hypotheses",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "list",
+    "default": [
+      "P_FP",
+      "P_init",
+      "P_term",
+      "P_link"
+    ],
+    "choices": null,
+    "description": "btrack hypotheses to evaluate (P_FP false-positive, P_init initialisation, P_term termination, P_link linking, P_branch division)."
+  },
+  {
+    "key": "tracking.organoid.btrack.dist_thresh",
+    "title": "dist_thresh",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 60,
+    "choices": null,
+    "description": "btrack distance threshold (pixels) for candidate links."
+  },
+  {
+    "key": "tracking.organoid.btrack.time_thresh",
+    "title": "time_thresh",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "int",
+    "default": 3,
+    "choices": null,
+    "description": "btrack time threshold (frames) for candidate links."
+  },
+  {
+    "key": "tracking_visualization.sample_name",
+    "title": "sample_name",
+    "step": "visualization",
+    "category": null,
+    "type": "none",
+    "default": null,
+    "choices": null,
+    "description": "BEHAV3D parameter 'tracking_visualization.sample_name' (type none, default None)."
+  },
+  {
+    "key": "tracking_visualization.use_range",
+    "title": "use_range",
+    "step": "visualization",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'tracking_visualization.use_range' (type bool, default False)."
+  },
+  {
+    "key": "tracking_visualization.start_t",
+    "title": "start_t",
+    "step": "visualization",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'tracking_visualization.start_t' (type int, default 0)."
+  },
+  {
+    "key": "tracking_visualization.end_t",
+    "title": "end_t",
+    "step": "visualization",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'tracking_visualization.end_t' (type int, default 0)."
+  },
+  {
+    "key": "tracking_visualization.channel_colors",
+    "title": "channel_colors",
+    "step": "visualization",
+    "category": null,
+    "type": "list",
+    "default": [
+      "cyan",
+      "yellow",
+      "red",
+      "green",
+      "magenta",
+      "blue",
+      "gray",
+      "turbo",
+      "viridis",
+      "plasma",
+      "inferno",
+      "twilight"
+    ],
+    "choices": null,
+    "description": "BEHAV3D parameter 'tracking_visualization.channel_colors' (type list, default ['cyan', 'yellow', 'red', 'green', 'magenta', 'blue', 'gray', 'turbo', 'viridis', 'plasma', 'inferno', 'twilight'])."
+  },
+  {
+    "key": "features.immune.features_choice",
+    "title": "features_choice",
+    "step": "feature_extraction",
+    "category": "immune",
+    "type": "list",
+    "default": [
+      "movement",
+      "intensity",
+      "contact",
+      "death"
+    ],
+    "choices": null,
+    "description": "Which feature groups to compute for this cell category: movement, intensity, contact, death, morphology."
+  },
+  {
+    "key": "features.immune.contact_threshold",
+    "title": "contact_threshold",
+    "step": "feature_extraction",
+    "category": "immune",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "Distance (pixels) within which two cells count as in contact. 0 = touching only."
+  },
+  {
+    "key": "features.immune.n_workers",
+    "title": "n_workers",
+    "step": "feature_extraction",
+    "category": "immune",
+    "type": "int",
+    "default": 16,
+    "choices": null,
+    "description": "Parallel workers for this step."
+  },
+  {
+    "key": "features.immune.overwrite",
+    "title": "overwrite",
+    "step": "feature_extraction",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Re-run and overwrite existing outputs instead of skipping completed samples."
+  },
+  {
+    "key": "features.organoid.features_choice",
+    "title": "features_choice",
+    "step": "feature_extraction",
+    "category": "organoid",
+    "type": "list",
+    "default": [
+      "intensity",
+      "death",
+      "morphology"
+    ],
+    "choices": null,
+    "description": "Which feature groups to compute for this cell category: movement, intensity, contact, death, morphology."
+  },
+  {
+    "key": "features.organoid.contact_threshold",
+    "title": "contact_threshold",
+    "step": "feature_extraction",
+    "category": "organoid",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "Distance (pixels) within which two cells count as in contact. 0 = touching only."
+  },
+  {
+    "key": "features.organoid.n_workers",
+    "title": "n_workers",
+    "step": "feature_extraction",
+    "category": "organoid",
+    "type": "int",
+    "default": 8,
+    "choices": null,
+    "description": "Parallel workers for this step."
+  },
+  {
+    "key": "features.organoid.overwrite",
+    "title": "overwrite",
+    "step": "feature_extraction",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Re-run and overwrite existing outputs instead of skipping completed samples."
+  },
+  {
+    "key": "features.other.features_choice",
+    "title": "features_choice",
+    "step": "feature_extraction",
+    "category": "other",
+    "type": "list",
+    "default": [
+      "movement",
+      "intensity",
+      "contact"
+    ],
+    "choices": null,
+    "description": "Which feature groups to compute for this cell category: movement, intensity, contact, death, morphology."
+  },
+  {
+    "key": "features.other.contact_threshold",
+    "title": "contact_threshold",
+    "step": "feature_extraction",
+    "category": "other",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "Distance (pixels) within which two cells count as in contact. 0 = touching only."
+  },
+  {
+    "key": "features.other.n_workers",
+    "title": "n_workers",
+    "step": "feature_extraction",
+    "category": "other",
+    "type": "int",
+    "default": 8,
+    "choices": null,
+    "description": "Parallel workers for this step."
+  },
+  {
+    "key": "features.other.overwrite",
+    "title": "overwrite",
+    "step": "feature_extraction",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Re-run and overwrite existing outputs instead of skipping completed samples."
+  },
+  {
+    "key": "track_filtering.immune.exp_duration",
+    "title": "exp_duration",
+    "step": "filtering",
+    "category": "immune",
+    "type": "float",
+    "default": 24.0,
+    "choices": null,
+    "description": "Total experiment duration (hours); used to convert frame counts to time."
+  },
+  {
+    "key": "track_filtering.immune.exp_duration_enabled",
+    "title": "exp_duration_enabled",
+    "step": "filtering",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether to apply the experiment-duration based filter."
+  },
+  {
+    "key": "track_filtering.immune.min_track_length",
+    "title": "min_track_length",
+    "step": "filtering",
+    "category": "immune",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "Discard tracks shorter than this many frames."
+  },
+  {
+    "key": "track_filtering.immune.min_track_length_enabled",
+    "title": "min_track_length_enabled",
+    "step": "filtering",
+    "category": "immune",
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "Whether the minimum-track-length filter is active."
+  },
+  {
+    "key": "track_filtering.immune.max_track_length",
+    "title": "max_track_length",
+    "step": "filtering",
+    "category": "immune",
+    "type": "int",
+    "default": 999999,
+    "choices": null,
+    "description": "Discard tracks longer than this many frames."
+  },
+  {
+    "key": "track_filtering.immune.max_track_length_enabled",
+    "title": "max_track_length_enabled",
+    "step": "filtering",
+    "category": "immune",
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "Whether the maximum-track-length filter is active."
+  },
+  {
+    "key": "track_filtering.organoid.exp_duration_enabled",
+    "title": "exp_duration_enabled",
+    "step": "filtering",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether to apply the experiment-duration based filter."
+  },
+  {
+    "key": "track_filtering.organoid.exp_duration",
+    "title": "exp_duration",
+    "step": "filtering",
+    "category": "organoid",
+    "type": "float",
+    "default": 24.0,
+    "choices": null,
+    "description": "Total experiment duration (hours); used to convert frame counts to time."
+  },
+  {
+    "key": "track_filtering.organoid.min_track_length_enabled",
+    "title": "min_track_length_enabled",
+    "step": "filtering",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether the minimum-track-length filter is active."
+  },
+  {
+    "key": "track_filtering.organoid.min_track_length",
+    "title": "min_track_length",
+    "step": "filtering",
+    "category": "organoid",
+    "type": "int",
+    "default": 50,
+    "choices": null,
+    "description": "Discard tracks shorter than this many frames."
+  },
+  {
+    "key": "track_filtering.organoid.max_track_length_enabled",
+    "title": "max_track_length_enabled",
+    "step": "filtering",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether the maximum-track-length filter is active."
+  },
+  {
+    "key": "track_filtering.organoid.max_track_length",
+    "title": "max_track_length",
+    "step": "filtering",
+    "category": "organoid",
+    "type": "int",
+    "default": 999999,
+    "choices": null,
+    "description": "Discard tracks longer than this many frames."
+  },
+  {
+    "key": "track_filtering.other.exp_duration",
+    "title": "exp_duration",
+    "step": "filtering",
+    "category": "other",
+    "type": "float",
+    "default": 24.0,
+    "choices": null,
+    "description": "Total experiment duration (hours); used to convert frame counts to time."
+  },
+  {
+    "key": "track_filtering.other.exp_duration_enabled",
+    "title": "exp_duration_enabled",
+    "step": "filtering",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether to apply the experiment-duration based filter."
+  },
+  {
+    "key": "track_filtering.other.min_track_length",
+    "title": "min_track_length",
+    "step": "filtering",
+    "category": "other",
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "Discard tracks shorter than this many frames."
+  },
+  {
+    "key": "track_filtering.other.min_track_length_enabled",
+    "title": "min_track_length_enabled",
+    "step": "filtering",
+    "category": "other",
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "Whether the minimum-track-length filter is active."
+  },
+  {
+    "key": "track_filtering.other.max_track_length",
+    "title": "max_track_length",
+    "step": "filtering",
+    "category": "other",
+    "type": "int",
+    "default": 999999,
+    "choices": null,
+    "description": "Discard tracks longer than this many frames."
+  },
+  {
+    "key": "track_filtering.other.max_track_length_enabled",
+    "title": "max_track_length_enabled",
+    "step": "filtering",
+    "category": "other",
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "Whether the maximum-track-length filter is active."
+  },
+  {
+    "key": "analysis.immune.seed",
+    "title": "seed",
+    "step": "analysis",
+    "category": "immune",
+    "type": "int",
+    "default": 42,
+    "choices": null,
+    "description": "Random seed for reproducible clustering / UMAP / sampling."
+  },
+  {
+    "key": "analysis.immune.umap_min_dist",
+    "title": "umap_min_dist",
+    "step": "analysis",
+    "category": "immune",
+    "type": "float",
+    "default": 0.1,
+    "choices": null,
+    "description": "UMAP min_dist: lower packs clusters tighter, higher spreads points out (0\u20131)."
+  },
+  {
+    "key": "analysis.immune.umap_n_neighbors",
+    "title": "umap_n_neighbors",
+    "step": "analysis",
+    "category": "immune",
+    "type": "int",
+    "default": 15,
+    "choices": null,
+    "description": "UMAP neighbourhood size: low = local structure, high = global structure."
+  },
+  {
+    "key": "analysis.immune.nr_of_clusters",
+    "title": "nr_of_clusters",
+    "step": "analysis",
+    "category": "immune",
+    "type": "int",
+    "default": 5,
+    "choices": null,
+    "description": "Number of behavioural clusters to extract."
+  },
+  {
+    "key": "analysis.immune.dtw_feature_groups_enabled.morphology",
+    "title": "morphology",
+    "step": "analysis",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.immune.dtw_feature_groups_enabled.morphology' (type bool, default False)."
+  },
+  {
+    "key": "analysis.immune.dtw_feature_groups_enabled.movement",
+    "title": "movement",
+    "step": "analysis",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.immune.dtw_feature_groups_enabled.movement' (type bool, default False)."
+  },
+  {
+    "key": "analysis.immune.dtw_feature_groups_enabled.intensity",
+    "title": "intensity",
+    "step": "analysis",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.immune.dtw_feature_groups_enabled.intensity' (type bool, default False)."
+  },
+  {
+    "key": "analysis.immune.dtw_feature_groups_enabled.death",
+    "title": "death",
+    "step": "analysis",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.immune.dtw_feature_groups_enabled.death' (type bool, default False)."
+  },
+  {
+    "key": "analysis.immune.dtw_feature_groups_enabled.contact",
+    "title": "contact",
+    "step": "analysis",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.immune.dtw_feature_groups_enabled.contact' (type bool, default False)."
+  },
+  {
+    "key": "analysis.immune.dtw_features_input",
+    "title": "dtw_features_input",
+    "step": "analysis",
+    "category": "immune",
+    "type": "list",
+    "default": [],
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.immune.dtw_features_input' (type list, default [])."
+  },
+  {
+    "key": "analysis.immune.dtw_features_resolved",
+    "title": "dtw_features_resolved",
+    "step": "analysis",
+    "category": "immune",
+    "type": "list",
+    "default": [],
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.immune.dtw_features_resolved' (type list, default [])."
+  },
+  {
+    "key": "analysis.immune.z_normalize",
+    "title": "z_normalize",
+    "step": "analysis",
+    "category": "immune",
+    "type": "dict",
+    "default": {},
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.immune.z_normalize' (type dict, default {})."
+  },
+  {
+    "key": "analysis.organoid.seed",
+    "title": "seed",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "int",
+    "default": 42,
+    "choices": null,
+    "description": "Random seed for reproducible clustering / UMAP / sampling."
+  },
+  {
+    "key": "analysis.organoid.umap_min_dist",
+    "title": "umap_min_dist",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "float",
+    "default": 0.1,
+    "choices": null,
+    "description": "UMAP min_dist: lower packs clusters tighter, higher spreads points out (0\u20131)."
+  },
+  {
+    "key": "analysis.organoid.umap_n_neighbors",
+    "title": "umap_n_neighbors",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "int",
+    "default": 15,
+    "choices": null,
+    "description": "UMAP neighbourhood size: low = local structure, high = global structure."
+  },
+  {
+    "key": "analysis.organoid.nr_of_clusters",
+    "title": "nr_of_clusters",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "int",
+    "default": 3,
+    "choices": null,
+    "description": "Number of behavioural clusters to extract."
+  },
+  {
+    "key": "analysis.organoid.dtw_feature_groups_enabled.morphology",
+    "title": "morphology",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.organoid.dtw_feature_groups_enabled.morphology' (type bool, default False)."
+  },
+  {
+    "key": "analysis.organoid.dtw_feature_groups_enabled.movement",
+    "title": "movement",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.organoid.dtw_feature_groups_enabled.movement' (type bool, default False)."
+  },
+  {
+    "key": "analysis.organoid.dtw_feature_groups_enabled.intensity",
+    "title": "intensity",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.organoid.dtw_feature_groups_enabled.intensity' (type bool, default False)."
+  },
+  {
+    "key": "analysis.organoid.dtw_feature_groups_enabled.death",
+    "title": "death",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.organoid.dtw_feature_groups_enabled.death' (type bool, default False)."
+  },
+  {
+    "key": "analysis.organoid.dtw_feature_groups_enabled.contact",
+    "title": "contact",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.organoid.dtw_feature_groups_enabled.contact' (type bool, default False)."
+  },
+  {
+    "key": "analysis.organoid.dtw_features_input",
+    "title": "dtw_features_input",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "list",
+    "default": [],
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.organoid.dtw_features_input' (type list, default [])."
+  },
+  {
+    "key": "analysis.organoid.dtw_features_resolved",
+    "title": "dtw_features_resolved",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "list",
+    "default": [],
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.organoid.dtw_features_resolved' (type list, default [])."
+  },
+  {
+    "key": "analysis.organoid.z_normalize",
+    "title": "z_normalize",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "dict",
+    "default": {},
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.organoid.z_normalize' (type dict, default {})."
+  },
+  {
+    "key": "analysis.other.seed",
+    "title": "seed",
+    "step": "analysis",
+    "category": "other",
+    "type": "int",
+    "default": 42,
+    "choices": null,
+    "description": "Random seed for reproducible clustering / UMAP / sampling."
+  },
+  {
+    "key": "analysis.other.umap_min_dist",
+    "title": "umap_min_dist",
+    "step": "analysis",
+    "category": "other",
+    "type": "float",
+    "default": 0.1,
+    "choices": null,
+    "description": "UMAP min_dist: lower packs clusters tighter, higher spreads points out (0\u20131)."
+  },
+  {
+    "key": "analysis.other.umap_n_neighbors",
+    "title": "umap_n_neighbors",
+    "step": "analysis",
+    "category": "other",
+    "type": "int",
+    "default": 15,
+    "choices": null,
+    "description": "UMAP neighbourhood size: low = local structure, high = global structure."
+  },
+  {
+    "key": "analysis.other.nr_of_clusters",
+    "title": "nr_of_clusters",
+    "step": "analysis",
+    "category": "other",
+    "type": "int",
+    "default": 5,
+    "choices": null,
+    "description": "Number of behavioural clusters to extract."
+  },
+  {
+    "key": "analysis.other.dtw_feature_groups_enabled.morphology",
+    "title": "morphology",
+    "step": "analysis",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.other.dtw_feature_groups_enabled.morphology' (type bool, default False)."
+  },
+  {
+    "key": "analysis.other.dtw_feature_groups_enabled.movement",
+    "title": "movement",
+    "step": "analysis",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.other.dtw_feature_groups_enabled.movement' (type bool, default False)."
+  },
+  {
+    "key": "analysis.other.dtw_feature_groups_enabled.intensity",
+    "title": "intensity",
+    "step": "analysis",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.other.dtw_feature_groups_enabled.intensity' (type bool, default False)."
+  },
+  {
+    "key": "analysis.other.dtw_feature_groups_enabled.death",
+    "title": "death",
+    "step": "analysis",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.other.dtw_feature_groups_enabled.death' (type bool, default False)."
+  },
+  {
+    "key": "analysis.other.dtw_feature_groups_enabled.contact",
+    "title": "contact",
+    "step": "analysis",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.other.dtw_feature_groups_enabled.contact' (type bool, default False)."
+  },
+  {
+    "key": "analysis.other.dtw_features_input",
+    "title": "dtw_features_input",
+    "step": "analysis",
+    "category": "other",
+    "type": "list",
+    "default": [],
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.other.dtw_features_input' (type list, default [])."
+  },
+  {
+    "key": "analysis.other.dtw_features_resolved",
+    "title": "dtw_features_resolved",
+    "step": "analysis",
+    "category": "other",
+    "type": "list",
+    "default": [],
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.other.dtw_features_resolved' (type list, default [])."
+  },
+  {
+    "key": "analysis.other.z_normalize",
+    "title": "z_normalize",
+    "step": "analysis",
+    "category": "other",
+    "type": "dict",
+    "default": {},
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.other.z_normalize' (type dict, default {})."
+  },
+  {
+    "key": "backprojection.mode",
+    "title": "mode",
+    "step": "analysis",
+    "category": null,
+    "type": "str",
+    "default": "mean",
+    "choices": [
+      "mean",
+      "max",
+      "median",
+      "sum"
+    ],
+    "description": "BEHAV3D parameter 'backprojection.mode' (type str, default 'mean')."
+  },
+  {
+    "key": "backprojection.save",
+    "title": "save",
+    "step": "analysis",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'backprojection.save' (type bool, default False)."
+  },
+  {
+    "key": "backprojection.last_sample",
+    "title": "last_sample",
+    "step": "analysis",
+    "category": null,
+    "type": "none",
+    "default": null,
+    "choices": null,
+    "description": "BEHAV3D parameter 'backprojection.last_sample' (type none, default None)."
+  },
+  {
+    "key": "backprojection.feature_groups_enabled.morphology",
+    "title": "morphology",
+    "step": "analysis",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'backprojection.feature_groups_enabled.morphology' (type bool, default False)."
+  },
+  {
+    "key": "backprojection.feature_groups_enabled.movement",
+    "title": "movement",
+    "step": "analysis",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'backprojection.feature_groups_enabled.movement' (type bool, default False)."
+  },
+  {
+    "key": "backprojection.feature_groups_enabled.intensity",
+    "title": "intensity",
+    "step": "analysis",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'backprojection.feature_groups_enabled.intensity' (type bool, default False)."
+  },
+  {
+    "key": "backprojection.feature_groups_enabled.death",
+    "title": "death",
+    "step": "analysis",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'backprojection.feature_groups_enabled.death' (type bool, default False)."
+  },
+  {
+    "key": "backprojection.feature_groups_enabled.contact",
+    "title": "contact",
+    "step": "analysis",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'backprojection.feature_groups_enabled.contact' (type bool, default False)."
+  },
+  {
+    "key": "backprojection.columns_input",
+    "title": "columns_input",
+    "step": "analysis",
+    "category": null,
+    "type": "list",
+    "default": [],
+    "choices": null,
+    "description": "BEHAV3D parameter 'backprojection.columns_input' (type list, default [])."
+  },
+  {
+    "key": "backprojection.columns_resolved",
+    "title": "columns_resolved",
+    "step": "analysis",
+    "category": null,
+    "type": "list",
+    "default": [],
+    "choices": null,
+    "description": "BEHAV3D parameter 'backprojection.columns_resolved' (type list, default [])."
+  },
+  {
+    "key": "active_killing.observation_window",
+    "title": "observation_window",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "int",
+    "default": 5,
+    "choices": null,
+    "description": "Frames over which a death-signal increase is assessed for active killing."
+  },
+  {
+    "key": "active_killing.death_signal_column",
+    "title": "death_signal_column",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "str",
+    "default": "percentage_dead_mask",
+    "choices": [
+      "percentage_dead_mask",
+      "mean_dead_dye"
+    ],
+    "description": "Feature column used as the death/viability signal."
+  },
+  {
+    "key": "active_killing.killing_threshold_multiplier",
+    "title": "killing_threshold_multiplier",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "float",
+    "default": 1.5,
+    "choices": null,
+    "description": "Multiplier over baseline death signal that flags an active-killing event."
+  },
+  {
+    "key": "active_killing.min_contact_duration",
+    "title": "min_contact_duration",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "int",
+    "default": 1,
+    "choices": null,
+    "description": "Minimum frames of immune\u2013target contact required to call active killing."
+  },
+  {
+    "key": "active_killing.use_absolute_threshold",
+    "title": "use_absolute_threshold",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'active_killing.use_absolute_threshold' (type bool, default False)."
+  },
+  {
+    "key": "active_killing.absolute_killing_threshold",
+    "title": "absolute_killing_threshold",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "none",
+    "default": null,
+    "choices": null,
+    "description": "BEHAV3D parameter 'active_killing.absolute_killing_threshold' (type none, default None)."
+  },
+  {
+    "key": "active_killing.save_results",
+    "title": "save_results",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "BEHAV3D parameter 'active_killing.save_results' (type bool, default True)."
+  },
+  {
+    "key": "death_dynamics.organoid.dead_perc_threshold",
+    "title": "dead_perc_threshold",
+    "step": "feature_extraction",
+    "category": "organoid",
+    "type": "float",
+    "default": 0.02,
+    "choices": null,
+    "description": "Fraction of dead-mask pixels above which a cell is considered dead."
+  },
+  {
+    "key": "death_dynamics.immune.dead_perc_threshold",
+    "title": "dead_perc_threshold",
+    "step": "feature_extraction",
+    "category": "immune",
+    "type": "float",
+    "default": 0.25,
+    "choices": null,
+    "description": "Fraction of dead-mask pixels above which a cell is considered dead."
+  },
+  {
+    "key": "death_dynamics.other.dead_perc_threshold",
+    "title": "dead_perc_threshold",
+    "step": "feature_extraction",
+    "category": "other",
+    "type": "float",
+    "default": 0.1,
+    "choices": null,
+    "description": "Fraction of dead-mask pixels above which a cell is considered dead."
+  },
+  {
+    "key": "calculated_features.morphology",
+    "title": "morphology",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "list",
+    "default": [
+      "nr_pixels",
+      "volume",
+      "bbox_volume",
+      "extent",
+      "solidity",
+      "equivalent_diameter",
+      "major_axis_length",
+      "minor_axis_length",
+      "elongation",
+      "surface_area",
+      "sphericity",
+      "convex_volume",
+      "orientation_vector"
+    ],
+    "choices": null,
+    "description": "Computed 'morphology' feature columns produced by BEHAV3D (reference, not user-tunable): nr_pixels, volume, bbox_volume, extent, solidity, equivalent_diameter, major_axis_length, minor_axis_length, elongation, surface_area, sphericity, convex_volume, orientation_vector."
+  },
+  {
+    "key": "calculated_features.movement",
+    "title": "movement",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "list",
+    "default": [
+      "displacement",
+      "cumulative_displacement",
+      "displacement_from_origin",
+      "mean_square_displacement",
+      "speed",
+      "mean_speed"
+    ],
+    "choices": null,
+    "description": "Computed 'movement' feature columns produced by BEHAV3D (reference, not user-tunable): displacement, cumulative_displacement, displacement_from_origin, mean_square_displacement, speed, mean_speed."
+  },
+  {
+    "key": "calculated_features.intensity",
+    "title": "intensity",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "list",
+    "default": [
+      "mean_intensity_*",
+      "mean_dead_dye"
+    ],
+    "choices": null,
+    "description": "Computed 'intensity' feature columns produced by BEHAV3D (reference, not user-tunable): mean_intensity_*, mean_dead_dye."
+  },
+  {
+    "key": "calculated_features.death",
+    "title": "death",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "list",
+    "default": [
+      "percentage_dead_mask",
+      "nr_dead_mask_pixels",
+      "increase_dead_mask",
+      "dead"
+    ],
+    "choices": null,
+    "description": "Computed 'death' feature columns produced by BEHAV3D (reference, not user-tunable): percentage_dead_mask, nr_dead_mask_pixels, increase_dead_mask, dead."
+  },
+  {
+    "key": "calculated_features.contact",
+    "title": "contact",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "list",
+    "default": [
+      "*_contact",
+      "*_contact_pixels",
+      "touching_*",
+      "active_*_contact"
+    ],
+    "choices": null,
+    "description": "Computed 'contact' feature columns produced by BEHAV3D (reference, not user-tunable): *_contact, *_contact_pixels, touching_*, active_*_contact."
+  },
+  {
+    "key": "calculated_features.invasiveness",
+    "title": "invasiveness",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "list",
+    "default": [
+      "*_invasiveness",
+      "*_invasiveness_perc",
+      "any_org_invasiveness",
+      "any_org_invasiveness_perc"
+    ],
+    "choices": null,
+    "description": "Computed 'invasiveness' feature columns produced by BEHAV3D (reference, not user-tunable): *_invasiveness, *_invasiveness_perc, any_org_invasiveness, any_org_invasiveness_perc."
+  },
+  {
+    "key": "calculated_features.active_killing",
+    "title": "active_killing",
+    "step": "feature_extraction",
+    "category": null,
+    "type": "list",
+    "default": [
+      "is_active_killing",
+      "killing_efficiency"
+    ],
+    "choices": null,
+    "description": "Computed 'active_killing' feature columns produced by BEHAV3D (reference, not user-tunable): is_active_killing, killing_efficiency."
+  }
+]

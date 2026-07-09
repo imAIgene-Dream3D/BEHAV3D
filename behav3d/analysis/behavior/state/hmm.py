@@ -184,7 +184,8 @@ def run_hmm_state_classification(
 
             for k in range(int(k_min), int(k_max) + 1):
                 m = _build_model(k)
-                m.fit(X_all, lengths=lengths)
+                with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                    m.fit(X_all, lengths=lengths)
                 if hasattr(m, "monitor_") and not m.monitor_.converged:
                     warnings.warn(
                         f"HMM (n_states={k}) stopped after reaching n_iter={n_iter} without converging. "
@@ -208,7 +209,8 @@ def run_hmm_state_classification(
             selection_df = pd.DataFrame(rows)
         else:
             model = _build_model(int(n_states))
-            model.fit(X_all, lengths=lengths)
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                model.fit(X_all, lengths=lengths)
             if hasattr(model, "monitor_") and not model.monitor_.converged:
                 warnings.warn(
                     f"HMM (n_states={n_states}) stopped after reaching n_iter={n_iter} without converging. "

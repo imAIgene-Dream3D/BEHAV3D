@@ -288,7 +288,7 @@ class DataPreparationTab(QWidget):
         lay.addLayout(self.cell_type_naming_container)
 
         btn_configure = QPushButton("Configure Cell Types")
-        btn_configure.clicked.connect(self._on_configure_cell_types)
+        btn_configure.clicked.connect(lambda: self._on_configure_cell_types(force=True))
         lay.addWidget(btn_configure)
 
         # --- Sample form area (dynamically rebuilt) ---
@@ -320,7 +320,18 @@ class DataPreparationTab(QWidget):
         self._sample_forms: list[dict] = []
 
     # --- configure cell-type naming fields --------------------------------
-    def _on_configure_cell_types(self):
+    def _on_configure_cell_types(self, force: bool = False):
+        # Idempotent: when the existing naming fields already match the configured
+        # counts, skip the destructive rebuild so entered names survive. The
+        # assistant may re-trigger this structurally; user button clicks pass
+        # force=True to always rebuild.
+        if (not force
+                and (self._organoid_name_edits or self._immune_name_edits
+                     or self._other_name_edits)
+                and len(self._organoid_name_edits) == self.n_organoid_spin.value()
+                and len(self._immune_name_edits) == self.n_immune_spin.value()
+                and len(self._other_name_edits) == self.n_other_spin.value()):
+            return
         # Clear old
         self._clear_layout(self.cell_type_naming_container)
 
@@ -383,10 +394,34 @@ class DataPreparationTab(QWidget):
 
         # After naming is set, build sample forms
         btn = QPushButton("Create Sample Forms")
-        btn.clicked.connect(self._build_sample_forms)
+        btn.clicked.connect(lambda: self._build_sample_forms(force=True))
         self.cell_type_naming_container.addWidget(btn)
 
-    def _build_sample_forms(self):
+    def _sample_forms_match_current(self) -> bool:
+        """True if the existing sample forms already match the configured sample
+        count, cell-type names and dead-channel flag — so a rebuild would only
+        destroy values the user (or assistant) already entered."""
+        forms = getattr(self, "_sample_forms", [])
+        if not forms or len(forms) != self.n_samples_spin.value():
+            return False
+        org = [e.text().strip() for e in self._organoid_name_edits]
+        imm = self._expanded_immune_names()
+        oth = [e.text().strip() for e in self._other_name_edits]
+        include_dead = self.include_dead_cb.isChecked()
+        for form in forms:
+            if (form.get("org_names") != org or form.get("imm_names") != imm
+                    or form.get("oth_names") != oth):
+                return False
+            if include_dead != bool(form.get("dead_channel")):
+                return False
+        return True
+
+    def _build_sample_forms(self, force: bool = False):
+        # Idempotent: skip the destructive rebuild when the forms already match the
+        # configured structure, so entered values survive structural re-triggers
+        # from the assistant. User button clicks pass force=True to always rebuild.
+        if not force and self._sample_forms_match_current():
+            return
         self._clear_layout(self.sample_form_container)
         self._sample_forms = []
 
@@ -797,8 +832,8 @@ class DataPreparationTab(QWidget):
         self.n_other_spin.setValue(len(oth_types))
         self.include_dead_cb.setChecked(include_dead)
 
-        # Build cell type naming fields
-        self._on_configure_cell_types()
+        # Build cell type naming fields (force: loading replaces any prior structure)
+        self._on_configure_cell_types(force=True)
 
         # Fill naming edits with detected names
         for i, name in enumerate(org_types):
@@ -816,8 +851,8 @@ class DataPreparationTab(QWidget):
             if i < len(self._other_name_edits):
                 self._other_name_edits[i].setText(name)
 
-        # Build sample forms
-        self._build_sample_forms()
+        # Build sample forms (force: loading replaces any prior structure)
+        self._build_sample_forms(force=True)
 
         # Populate each sample form from the DataFrame row
         for row_idx, (_, row) in enumerate(md.iterrows()):
