@@ -969,6 +969,15 @@ class VisualizationTab(QWidget):
         self.edit_container_layout.addWidget(editor)
         self._editor = editor
         self._log(f"  Editing started on '{target}'.")
+        # Link the edition Workers spinbox to the global workers controller
+        # (defined in BEHAV3DWidget).  Safe no-op when running in a notebook.
+        try:
+            main_widget = self.parent()
+            ctrl = getattr(main_widget, "workers_ctrl", None)
+            if ctrl is not None and hasattr(editor, "spin_workers"):
+                ctrl.link(editor.spin_workers)
+        except Exception:
+            pass
         # Kick off background materialisation now that the editor is shown.
         editor.start_materialisation()
         return True

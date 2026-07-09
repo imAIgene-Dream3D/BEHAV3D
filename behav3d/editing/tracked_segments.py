@@ -2,9 +2,9 @@
 
 Each operation works on numpy arrays and returns the modified frames as a
 ``dict[t, np.ndarray]`` plus an ``OpResult`` describing what changed.  The
-:class:`~behav3d.editing.edit_buffer.EditBuffer` wraps these into commits with
-per-frame snapshots that power undo/redo, but the primitives can also be
-called directly from scripts/tests with a plain ``EditBuffer``-like object.
+:class:`~behav3d.editing.edit_buffer.EditBuffer` wraps these into committed
+dirty frames.  The primitives can also be called directly from
+scripts/tests with a plain ``EditBuffer``-like object.
 
 Coordinate convention: every volume is ``T x Z x Y x X`` with integer label
 IDs and ``0`` reserved for background.  All primitives are restricted to one
@@ -15,6 +15,13 @@ The ``split_label`` propagation reuses
 ``behav3d.preprocessing.tracking.propagation_tracking`` so that splits behave
 identically to propagation tracking (watershed of the label mask seeded by
 the previous frame's sub-labels).
+
+Operations that process each timepoint independently (``merge_labels``,
+``delete_label``, ``delete_labels``, ``fill_label``) accept an optional
+``n_workers`` argument and dispatch frames via :class:`ThreadPoolExecutor`
+(numpy/skimage ops release the GIL so true parallel CPU utilisation is
+achieved).  When ``n_workers`` is ``None`` the function uses one worker per
+frame up to ``os.cpu_count()``.
 """
 from __future__ import annotations
 
@@ -559,6 +566,7 @@ def merge_labels(
     label_ids: Sequence[int],
     target_id: Optional[int] = None,
     t_range: Optional[Tuple[int, int]] = None,
+    n_workers: Optional[int] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> OpResult:
     """Merge several labels into one.
@@ -566,6 +574,9 @@ def merge_labels(
     All pixels equal to any of ``label_ids`` (across ``t_range``, default =
     union of their lifetimes) are rewritten to ``target_id``.  ``target_id``
     defaults to ``min(label_ids)`` so the lowest existing TrackID is kept.
+
+    Frames are processed in parallel via :class:`ThreadPoolExecutor` when
+    ``n_workers`` > 1 (numpy ``isin`` releases the GIL).
     """
     ids = [int(x) for x in label_ids]
     if len(ids) < 2:
@@ -587,19 +598,34 @@ def merge_labels(
         t_range = (min(starts), max(ends))
 
     t0, t1 = _normalize_t_range(buf, t_range)
-    new_frames: Dict[int, np.ndarray] = {}
     others = [i for i in ids if i != target_id]
-    _total = t1 - t0 + 1
-    for _i, t in enumerate(range(t0, t1 + 1)):
-        if progress_cb:
-            progress_cb(_i + 1, _total)
+
+    # Prefetch sequentially — buf.peek() is not thread-safe.
+    frames_to_process: List[Tuple[int, np.ndarray]] = []
+    for t in range(t0, t1 + 1):
         frame = buf.peek(t)
+        if np.isin(frame, others).any():
+            frames_to_process.append((t, frame.copy()))
+
+    def _merge_one(t_frame: Tuple[int, np.ndarray]) -> Tuple[int, Optional[np.ndarray]]:
+        t, frame = t_frame
         mask = np.isin(frame, others)
         if not mask.any():
-            continue
+            return t, None
         out = frame.copy()
         out[mask] = target_id
-        new_frames[t] = out
+        return t, out
+
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
+              max(1, len(frames_to_process)))
+    _total = len(frames_to_process)
+    new_frames: Dict[int, np.ndarray] = {}
+    with ThreadPoolExecutor(max_workers=_nw) as ex:
+        for _i, (t, out) in enumerate(ex.map(_merge_one, frames_to_process)):
+            if progress_cb:
+                progress_cb(_i + 1, _total)
+            if out is not None:
+                new_frames[t] = out
 
     return OpResult(
         name="merge",
@@ -619,6 +645,7 @@ def erode_label(
     r_xy: int = 1,
     r_z: int = 1,
     t_range: Optional[Tuple[int, int]] = None,
+    n_workers: Optional[int] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> OpResult:
     """Erode a single label by a 3D ellipsoid footprint, per timepoint.
@@ -668,9 +695,10 @@ def erode_label(
         return t, out
 
     new_frames: Dict[int, np.ndarray] = {}
-    n_workers = min(len(candidate_frames), os.cpu_count() or 1)
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
+              max(1, len(candidate_frames)))
     _total = len(candidate_frames)
-    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+    with ThreadPoolExecutor(max_workers=_nw) as ex:
         for _i, (t, out) in enumerate(ex.map(_erode_one, candidate_frames)):
             if progress_cb:
                 progress_cb(_i + 1, _total)
@@ -736,6 +764,7 @@ def dilate_label(
     r_xy: int = 1,
     r_z: int = 1,
     t_range: Optional[Tuple[int, int]] = None,
+    n_workers: Optional[int] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> OpResult:
     """Dilate / expand a single label by ``r_xy`` (px) in plane and ``r_z`` (slices).
@@ -781,9 +810,10 @@ def dilate_label(
     _worker = partial(_dilate_one_frame, label_id=label_id, r_xy=r_xy, r_z=r_z)
 
     new_frames: Dict[int, np.ndarray] = {}
-    n_workers = min(len(candidate_frames), os.cpu_count() or 1)
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
+              max(1, len(candidate_frames)))
     _total = len(candidate_frames)
-    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+    with ThreadPoolExecutor(max_workers=_nw) as ex:
         for _i, (t, out) in enumerate(ex.map(_worker, candidate_frames)):
             if progress_cb:
                 progress_cb(_i + 1, _total)
@@ -806,9 +836,14 @@ def delete_label(
     buf,
     label_id: int,
     t_range: Optional[Tuple[int, int]] = None,
+    n_workers: Optional[int] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> OpResult:
-    """Set every pixel of ``label_id`` to background (``0``) in ``t_range``."""
+    """Set every pixel of ``label_id`` to background (``0``) in ``t_range``.
+
+    Frames are processed in parallel via :class:`ThreadPoolExecutor` when
+    ``n_workers`` > 1.
+    """
     label_id = int(label_id)
     if t_range is None:
         f, l = lifetime_of(buf, label_id)
@@ -817,18 +852,28 @@ def delete_label(
         t_range = (f, l)
     t0, t1 = _normalize_t_range(buf, t_range)
 
-    new_frames: Dict[int, np.ndarray] = {}
-    _total = t1 - t0 + 1
-    for _i, t in enumerate(range(t0, t1 + 1)):
-        if progress_cb:
-            progress_cb(_i + 1, _total)
+    # Prefetch sequentially — buf.peek() is not thread-safe.
+    frames_to_process: List[Tuple[int, np.ndarray]] = []
+    for t in range(t0, t1 + 1):
         frame = buf.peek(t)
-        mask = frame == label_id
-        if not mask.any():
-            continue
+        if (frame == label_id).any():
+            frames_to_process.append((t, frame.copy()))
+
+    def _del_one(t_frame: Tuple[int, np.ndarray]) -> Tuple[int, np.ndarray]:
+        t, frame = t_frame
         out = frame.copy()
-        out[mask] = 0
-        new_frames[t] = out
+        out[frame == label_id] = 0
+        return t, out
+
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
+              max(1, len(frames_to_process)))
+    _total = len(frames_to_process)
+    new_frames: Dict[int, np.ndarray] = {}
+    with ThreadPoolExecutor(max_workers=_nw) as ex:
+        for _i, (t, out) in enumerate(ex.map(_del_one, frames_to_process)):
+            if progress_cb:
+                progress_cb(_i + 1, _total)
+            new_frames[t] = out
 
     return OpResult(
         name="delete",
@@ -845,13 +890,16 @@ def delete_labels(
     buf,
     label_ids: Sequence[int],
     t_ranges: Optional[Dict[int, Tuple[int, int]]] = None,
+    n_workers: Optional[int] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> OpResult:
-    """Set every pixel of `label_ids` to background (`0`) in their respective ranges."""
-    new_frames: Dict[int, np.ndarray] = {}
-    
-    # Pre-calculate ranges
-    resolved_ranges = {}
+    """Set every pixel of ``label_ids`` to background (``0``) in their respective ranges.
+
+    Frames are processed in parallel via :class:`ThreadPoolExecutor` when
+    ``n_workers`` > 1.
+    """
+    # Resolve per-label time ranges.
+    resolved_ranges: Dict[int, Tuple[int, int]] = {}
     starts = []
     ends = []
     for lid in label_ids:
@@ -865,7 +913,7 @@ def delete_labels(
         resolved_ranges[lid] = rng
         starts.append(rng[0])
         ends.append(rng[1])
-        
+
     if not resolved_ranges:
         return OpResult(
             name="delete",
@@ -874,36 +922,143 @@ def delete_labels(
             new_labels=[],
             summary=f"Deleted labels {list(label_ids)}: none present in the volume"
         )
-        
-    t0, t1 = min(starts), max(ends)
-    _total = t1 - t0 + 1
-    
-    for _i, t in enumerate(range(t0, t1 + 1)):
-        if progress_cb:
-            progress_cb(_i + 1, _total)
-            
+
+    t0_global, t1_global = min(starts), max(ends)
+
+    # Prefetch sequentially — buf.peek() is not thread-safe.
+    frames_to_process: List[Tuple[int, np.ndarray]] = []
+    for t in range(t0_global, t1_global + 1):
         frame = buf.peek(t)
+        active = [lid for lid, (lt0, lt1) in resolved_ranges.items() if lt0 <= t <= lt1]
+        if any((frame == lid).any() for lid in active):
+            frames_to_process.append((t, frame.copy()))
+
+    def _del_multi(t_frame: Tuple[int, np.ndarray]) -> Tuple[int, Optional[np.ndarray]]:
+        t, frame = t_frame
         out = None
-        for lid in label_ids:
-            if lid not in resolved_ranges:
-                continue
-            lt0, lt1 = resolved_ranges[lid]
+        for lid, (lt0, lt1) in resolved_ranges.items():
             if not (lt0 <= t <= lt1):
                 continue
-                
             mask = (out if out is not None else frame) == lid
             if mask.any():
                 if out is None:
                     out = frame.copy()
                 out[mask] = 0
-                
-        if out is not None:
-            new_frames[t] = out
-            
+        return t, out
+
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
+              max(1, len(frames_to_process)))
+    _total = len(frames_to_process)
+    new_frames: Dict[int, np.ndarray] = {}
+    with ThreadPoolExecutor(max_workers=_nw) as ex:
+        for _i, (t, out) in enumerate(ex.map(_del_multi, frames_to_process)):
+            if progress_cb:
+                progress_cb(_i + 1, _total)
+            if out is not None:
+                new_frames[t] = out
+
     return OpResult(
         name="delete",
         new_frames=new_frames,
         affected_labels=list(label_ids),
         new_labels=[],
         summary=f"Deleted label(s) {list(label_ids)} across {len(new_frames)} frame(s)"
+    )
+
+
+def fill_label(
+    buf,
+    label_id: int,
+    t_range: Optional[Tuple[int, int]] = None,
+    n_workers: Optional[int] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> OpResult:
+    """Fill internal holes inside a label's 3D mask at each timepoint.
+
+    Uses :func:`scipy.ndimage.binary_fill_holes` to close cavities in the
+    binary mask of ``label_id``.  Only voxels that are currently **background**
+    (``== 0``) inside the filled region are assigned to ``label_id`` — other
+    labels' pixels are never overwritten.
+
+    This is useful for hollow sphere-like organoids that are segmented only on
+    the outer shell: after filling the interior becomes solid.
+
+    Frames are processed in parallel via :class:`ThreadPoolExecutor`.
+
+    Parameters
+    ----------
+    buf:
+        An :class:`~behav3d.editing.edit_buffer.EditBuffer` instance.
+    label_id:
+        The label whose holes are to be filled.
+    t_range:
+        Inclusive ``(t_first, t_last)`` range.  Defaults to the label's
+        full lifetime.
+    n_workers:
+        Number of worker threads.  Defaults to ``os.cpu_count()``.
+    progress_cb:
+        Optional ``(current, total)`` progress callback.
+    """
+    try:
+        from scipy.ndimage import binary_fill_holes as _fill_holes
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "fill_label requires scipy.  Install it with: pip install scipy"
+        ) from exc
+
+    label_id = int(label_id)
+    if t_range is None:
+        f, l = lifetime_of(buf, label_id)
+        if f is None:
+            raise ValueError(f"label {label_id} not present anywhere in the volume")
+        t_range = (f, l)
+    t0, t1 = _normalize_t_range(buf, t_range)
+
+    # Prefetch sequentially — buf.peek() is not thread-safe.
+    frames_to_process: List[Tuple[int, np.ndarray]] = []
+    for t in range(t0, t1 + 1):
+        frame = buf.peek(t)
+        if (frame == label_id).any():
+            frames_to_process.append((t, frame.copy()))
+
+    if not frames_to_process:
+        return OpResult(
+            name="fill",
+            new_frames={},
+            affected_labels=[label_id],
+            new_labels=[],
+            summary=f"Fill label {label_id}: no frames contained the label",
+        )
+
+    def _fill_one(t_frame: Tuple[int, np.ndarray]) -> Tuple[int, Optional[np.ndarray]]:
+        t, frame = t_frame
+        mask = frame == label_id
+        filled = _fill_holes(mask)
+        # New pixels = filled but not in original mask AND background
+        new_pixels = filled & ~mask & (frame == 0)
+        if not new_pixels.any():
+            return t, None
+        out = frame.copy()
+        out[new_pixels] = label_id
+        return t, out
+
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
+              max(1, len(frames_to_process)))
+    _total = len(frames_to_process)
+    new_frames: Dict[int, np.ndarray] = {}
+    with ThreadPoolExecutor(max_workers=_nw) as ex:
+        for _i, (t, out) in enumerate(ex.map(_fill_one, frames_to_process)):
+            if progress_cb:
+                progress_cb(_i + 1, _total)
+            if out is not None:
+                new_frames[t] = out
+
+    return OpResult(
+        name="fill",
+        new_frames=new_frames,
+        affected_labels=[label_id],
+        new_labels=[],
+        summary=(
+            f"Filled label {label_id}: plugged holes in {len(new_frames)} frame(s)"
+        ),
     )
