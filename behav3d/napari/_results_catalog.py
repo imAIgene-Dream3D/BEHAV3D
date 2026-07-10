@@ -101,6 +101,25 @@ FILE_CATALOG: list[tuple[str, str]] = [
         "Per-track features for a single sample (intermediate).",
     ),
 
+    # ── Analysis: Invasiveness ────────────────────────────────────────────
+    (
+        "invasiveness_analysis_*.pdf",
+        "Invasiveness analysis for an immune cell type vs one or more"
+        " targets: fraction / percentage over time + per-movie summary.",
+    ),
+    (
+        "invasiveness_fraction_over_time_*.csv",
+        "Per-(sample, timepoint) fraction of invasive immune cells per target.",
+    ),
+    (
+        "invasiveness_perc_over_time_*.csv",
+        "Per-(sample, timepoint) mean/median invasiveness percentage per target.",
+    ),
+    (
+        "invasiveness_per_movie_summary_*.csv",
+        "Per-movie invasiveness summary (one row per sample x target).",
+    ),
+
     # ── Analysis: Death Dynamics ──────────────────────────────────────────
     (
         "interaction_analysis_*_vs_*.pdf",
@@ -108,9 +127,9 @@ FILE_CATALOG: list[tuple[str, str]] = [
         " cell type: contact / fate / cumulative-to-death plots.",
     ),
     (
-        "multi_organoid_interaction_comparison.pdf",
-        "Cross-organoid comparison of interaction metrics (violin,"
-        " cumulative-to-death, active-killing dashboard).",
+        "multi_organoid_interaction_comparison*.pdf",
+        "Interaction Overview: violin, before-death curves, and active-killing "
+        "dashboard (one or more organoid types).",
     ),
     (
         "*_organoid_analysis.pdf",
