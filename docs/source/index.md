@@ -112,6 +112,7 @@ analysis/index
 :maxdepth: 2
 
 cellpose_training
+recommended_settings
 ```
 
 ```{toctree}

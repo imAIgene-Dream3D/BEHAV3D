@@ -27,6 +27,7 @@ from behav3d.analysis.behavior.track.visualization.plots.exemplar_track_per_clus
     select_exemplar_tracks_by_cluster,
 )
 from behav3d.analysis.behavior.track.feature_dtw import (
+    _create_original_behav3d_adata,
     _feature_dtw_clustered_csv_path,
     _feature_dtw_outdir,
     _feature_dtw_output_csv_paths,
@@ -59,6 +60,7 @@ from behav3d.core.metadata import (
     detect_merged_cell_types_from_metadata,
     filter_multicolor_inputs,
 )
+from behav3d.core.utils import ignore_missing_rmtree_error
 from behav3d.widgets.utils import spinning_loader
 
 
@@ -1359,6 +1361,10 @@ class TrackClassificationPanel:
         self.out_run.clear_output()
         with self.out_run:
             try:
+                import shutil
+                _traj_dir = Path(self.output_dir) / "analysis" / self._current_cell_type() / "behavorial_trajectories"
+                if _traj_dir.exists():
+                    shutil.rmtree(_traj_dir, onexc=ignore_missing_rmtree_error)
                 trajectory_size = _resolve_optional_int(self.behavioral_trajectory_size.value)
                 _winfo(
                     "trajectory-dtai-widget",
@@ -1410,6 +1416,10 @@ class TrackClassificationPanel:
         with self.out_original:
             try:
                 ct = self._current_cell_type()
+                import shutil
+                _traj_dir = Path(self.output_dir) / "analysis" / ct / "behavorial_trajectories"
+                if _traj_dir.exists():
+                    shutil.rmtree(_traj_dir, onexc=ignore_missing_rmtree_error)
                 csv_path = self._original_track_features_path(ct)
                 if not csv_path.exists():
                     raise FileNotFoundError(f"Original BEHAV3D track-features CSV not found: {csv_path}")
@@ -1438,12 +1448,13 @@ class TrackClassificationPanel:
                     nr_of_clusters=int(self.original_n_clusters.value),
                     plot_results=False,
                     seed=int(self.random_state.value),
-                    output_subdir_name="behavorial_trajectories",
+                    output_subdir_name="behavorial_trajectories/original_behav3d",
                     feature_scaling_preset="original_behav3d",
                     min_track_length=int(self.original_trajectory_size.value),
                     max_track_length=int(self.original_trajectory_size.value),
                 )
                 plot_paths = _save_feature_dtw_quality_control(self.output_dir, ct)
+                _create_original_behav3d_adata(self.output_dir, ct)
                 _winfo("trajectory-dtai-widget", "Original BEHAV3D feature-DTW analysis complete.")
                 for path in plot_paths.values():
                     _winfo("trajectory-dtai-widget", f"Created original BEHAV3D QC: {path}")

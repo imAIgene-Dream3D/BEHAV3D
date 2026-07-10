@@ -221,6 +221,53 @@ def save_dtaidistance_diagnostics(
     return plot_paths
 
 
+def save_dtaidistance_exemplar_overview(
+    adata_tracks,
+    output_dir,
+    cell_type,
+    *,
+    outfolder=None,
+    n_per_cluster=10,
+    random_state=None,
+    verbose=True,
+):
+    """Save only the exemplar overview grid PDF to outfolder (default: quality_control/)."""
+    paths = _resolve_dtaidistance_paths(output_dir, cell_type)
+    meta = _dtai_meta(adata_tracks)
+    resolved_cluster_key = _resolve_cluster_key(adata_tracks)
+    state_col = str(meta.get("state_col", FULL_STATE_COL))
+    time_col = str(meta.get("time_col", "position_t"))
+    if random_state is None:
+        random_state = int(meta.get("random_state", 123))
+    adata_filt = _load_filtered_state_adata_for_model(
+        adata_tracks, output_dir, cell_type, verbose=verbose,
+    )
+    _ensure_exemplar_coordinate_columns(
+        adata_filt, output_dir=output_dir, cell_type=cell_type, require_pixel_for_video=False,
+    )
+    dest = Path(outfolder) if outfolder is not None else paths["quality_control_outfolder"]
+    dest.mkdir(parents=True, exist_ok=True)
+    fig, _, _ = plot_exemplar_tracks_by_cluster(
+        adata_filt, adata_tracks,
+        n_per_cluster=int(n_per_cluster),
+        sample_key="sample_name",
+        track_key="TrackID",
+        time_key=time_col,
+        state_key=state_col,
+        cluster_key=resolved_cluster_key,
+        tmin_key="position_t_min",
+        tmax_key="position_t_max",
+        seed=int(random_state),
+    )
+    overview_pdf = dest / "example_tracks_overview.pdf"
+    with PdfPages(overview_pdf) as pdf:
+        pdf.savefig(fig, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    if bool(verbose):
+        _winfo("trajectory-dtai", f"saved exemplar overview: {overview_pdf}")
+    return str(overview_pdf)
+
+
 def _load_filtered_state_adata_for_model(
     adata_tracks,
     output_dir,
@@ -615,10 +662,12 @@ def run_categorical_dtaidistance_trajectory_clustering(
     }
 
     if bool(plot_results):
+        raw_qc_dir = paths["quality_control_outfolder"] / "raw"
+        raw_qc_dir.mkdir(parents=True, exist_ok=True)
         plot_paths = _save_diagnostics(
             adata_tracks,
             distances,
-            paths["quality_control_outfolder"],
+            raw_qc_dir,
             cluster_key=cluster_key,
             max_heatmap_tracks=int(max_heatmap_tracks),
             random_state=int(random_state),

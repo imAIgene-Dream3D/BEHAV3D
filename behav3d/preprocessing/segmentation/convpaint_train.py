@@ -1077,6 +1077,9 @@ class ConvPaintTrainingWidget(QWidget):
     strategy_changed = Signal(str)
 
     STRATEGIES = [STRATEGY_EDT, STRATEGY_PEAK_EDT, STRATEGY_PROB]
+    import os
+    if os.environ.get("BEHAV3D_DEV_MODE") != "1":
+        STRATEGIES.remove(STRATEGY_PEAK_EDT)
     ADVANCED_STRATEGY = "Advanced (per cell type)"
 
     def __init__(self, viewer, all_images, pixel_class_outdir,

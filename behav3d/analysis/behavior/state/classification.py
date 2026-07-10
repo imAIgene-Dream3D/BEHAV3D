@@ -10,6 +10,7 @@ import scanpy as sc
 import seaborn as sns
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.figure import Figure
 from sklearn.preprocessing import StandardScaler
 
 from behav3d.core.anndata import df_to_adata
@@ -451,6 +452,8 @@ def _rebuild_hmm_full_behavioral_state_from_intrinsic(
     adata.obs[full_state_col] = pd.Categorical(
         pd.Series(adata.obs["full_behavioral_cluster"], index=adata.obs.index, dtype="string")
     )
+    if intrinsic_col != "intrinsic_behavioral_cluster":
+        adata.obs["intrinsic_behavioral_cluster"] = adata.obs[intrinsic_col].copy()
     return adata
 
 
@@ -904,9 +907,14 @@ def _prepare_hmm_apply_adata_from_df_positions(
         "n_tracks_valid_for_offset": int(len(valid_track_sizes)),
     }
 
+    _meta_obs_extra = [
+        c for c in (["exp_nr", "well"] + [col for col in df_valid.columns if col.endswith("_line_condition")])
+        if c in df_valid.columns and c not in set(binary_cols_to_merge)
+    ]
     obs_cols = (
         ["sample_name", "TrackID", "position_t"]
         + list(binary_cols_to_merge)
+        + _meta_obs_extra
         + ["_start_offset_track_idx", "_start_offset_scored", "_start_offset_skipped"]
     )
     adata_query = df_to_adata(df_valid, feature_cols=cont_cols, obs_cols=obs_cols)
@@ -1229,11 +1237,8 @@ def _plot_hmm_feature_distribution_pdf(
                     else:
                         pad = max((y_max - y_min) * 0.05, 1e-6)
                     y_limits = (y_min - pad, y_max + pad)
-            fig, ax = plt.subplots(
-                nrows=1,
-                ncols=1,
-                figsize=(max(6.4, 1.15 * len(page_data) + 3.6), 7.2),
-            )
+            fig = Figure(figsize=(max(6.4, 1.15 * len(page_data) + 3.6), 7.2))
+            ax = fig.add_subplot(1, 1, 1)
             positions = np.arange(1, len(page_data) + 1, dtype=float)
             tick_labels = []
             for pos, (panel_label, color, raw_vals) in zip(positions, page_data):
@@ -1335,18 +1340,23 @@ def _plot_hmm_state_diagnostics_pdf(
                 except Exception:
                     dendrogram_arg = False
 
-            sc.pl.heatmap(
-                ad_heat,
-                var_names=valid_features,
-                groupby=cluster_col,
-                standard_scale="var",
-                figsize=A4_LANDSCAPE,
-                swap_axes=True,
-                dendrogram=dendrogram_arg,
-                show_gene_labels=True,
-                show=False,
-            )
-            fig_sc = plt.gcf()
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Starting a Matplotlib GUI outside of the main thread",
+                )
+                sc.pl.heatmap(
+                    ad_heat,
+                    var_names=valid_features,
+                    groupby=cluster_col,
+                    standard_scale="var",
+                    figsize=A4_LANDSCAPE,
+                    swap_axes=True,
+                    dendrogram=dendrogram_arg,
+                    show_gene_labels=True,
+                    show=False,
+                )
+                fig_sc = plt.gcf()
             fig_sc.suptitle(f"{title} | Scanpy heatmap", y=0.995)
             _save_pdf_page_a4(pdf, fig_sc, orientation="landscape")
             plt.close(fig_sc)
@@ -1354,7 +1364,8 @@ def _plot_hmm_state_diagnostics_pdf(
 
         if not transition_df.empty:
             transition_started = _vstart(verbose, "state-hmm", "diagnostics transition matrix heatmap")
-            fig_dyn, ax = plt.subplots(1, 1, figsize=A4_LANDSCAPE)
+            fig_dyn = Figure(figsize=A4_LANDSCAPE)
+            ax = fig_dyn.add_subplot(1, 1, 1)
             sns.heatmap(
                 transition_df,
                 cmap="mako",
@@ -1374,7 +1385,8 @@ def _plot_hmm_state_diagnostics_pdf(
 
         if not cluster_corr_df.empty:
             cluster_corr_started = _vstart(verbose, "state-hmm", "diagnostics cluster correlation heatmap")
-            fig_corr, ax = plt.subplots(1, 1, figsize=A4_LANDSCAPE)
+            fig_corr = Figure(figsize=A4_LANDSCAPE)
+            ax = fig_corr.add_subplot(1, 1, 1)
             sns.heatmap(
                 cluster_corr_df,
                 cmap="vlag",
@@ -1401,7 +1413,8 @@ def _plot_hmm_state_diagnostics_pdf(
                 "state-hmm",
                 f"diagnostics model selection plot | rows={len(selection_df)}",
             )
-            fig_sel, axes = plt.subplots(1, 2, figsize=A4_LANDSCAPE)
+            fig_sel = Figure(figsize=A4_LANDSCAPE)
+            axes = fig_sel.subplots(1, 2)
             axes[0].plot(selection_df["k"], selection_df["bic"], marker="o", color="#D18951")
             axes[0].set_title("BIC by number of states", fontsize=10)
             axes[0].set_xlabel("k")
@@ -1938,7 +1951,8 @@ def _finalize_hmm_apply_outputs(
     preprocessing_meta,
     classification_meta,
     full_output_col,
-    export_state_transitions=True,
+    export_state_composition=False,
+    export_state_transitions=False,
     state_transitions_rows_per_page=3,
     state_transitions_include_self_pairs=True,
     state_transitions_min_count=100,
@@ -1971,7 +1985,7 @@ def _finalize_hmm_apply_outputs(
     state_composition_report_plot_csvs = []
     state_composition_report_error = None
 
-    if (full_output_col in report_adata.obs.columns) and int(report_adata.n_obs) > 0:
+    if bool(export_state_composition) and (full_output_col in report_adata.obs.columns) and int(report_adata.n_obs) > 0:
         report_dir = state_paths.state_composition_outdir
         report_dir.mkdir(parents=True, exist_ok=True)
         report_token = _sanitize_filename_token(
@@ -2118,7 +2132,8 @@ def apply_hmm_deployment_artifact_to_full_dataset(
     hmm_deployment_artifact,
     continuous_output_col=INTRINSIC_STATE_COL,
     full_output_col=FULL_STATE_COL,
-    export_state_transitions=True,
+    export_state_composition=False,
+    export_state_transitions=False,
     state_transitions_rows_per_page=3,
     state_transitions_include_self_pairs=True,
     state_transitions_min_count=100,
@@ -2301,6 +2316,7 @@ def apply_hmm_deployment_artifact_to_full_dataset(
             f"{missing_labels[:20]}"
         )
     adata_full.obs[FULL_STATE_COL] = pd.Categorical(curated_full_labels)
+    adata_full.obs["full_behavioral_cluster"] = pd.Categorical(curated_full_labels)
     adata_full.obs["full_behavioral_cluster_confidence"] = adata_full.obs[
         "intrinsic_behavioral_cluster_confidence"
     ].astype(float)
@@ -2355,6 +2371,7 @@ def apply_hmm_deployment_artifact_to_full_dataset(
         preprocessing_meta=pre_meta,
         classification_meta=classification_meta,
         full_output_col=str(full_output_col),
+        export_state_composition=export_state_composition,
         export_state_transitions=export_state_transitions,
         state_transitions_rows_per_page=state_transitions_rows_per_page,
         state_transitions_include_self_pairs=state_transitions_include_self_pairs,

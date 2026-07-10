@@ -202,9 +202,13 @@ class PixelClassifierPanel:
         if not CONVPAINT_AVAILABLE:
             self.classifier_engine.tooltip = (self.classifier_engine.tooltip or "") + " ConvPaint disabled: 'napari-convpaint' required."
 
+        _saved_gpu = pc.get("gpu_device_name", _gpu_devices[0] if _gpu_devices else "")
+        if _gpu_devices and _saved_gpu not in _gpu_devices:
+            _saved_gpu = _gpu_devices[0]
+
         self.gpu_device = widgets.Dropdown(
             options=_gpu_devices,
-            value=pc.get("gpu_device_name", _gpu_devices[0]) if _gpu_devices else "",
+            value=_saved_gpu,
             description="GPU Device:",
             layout=widgets.Layout(width="auto", display="none")  # Hidden by default
         )
@@ -216,6 +220,9 @@ class PixelClassifierPanel:
             "APOC Mask + Peak EDT/Watershed Resegmentation",
             "APOC Probability Map + Watershed",
         ]
+        import os
+        if os.environ.get("BEHAV3D_DEV_MODE") != "1":
+            _apoc_strategy_options.remove("APOC Mask + Peak EDT/Watershed Resegmentation")
         _saved_apoc_strategy = pc.get("apoc_strategy", "APOC (Direct Instance Segmentation)")
         if _saved_apoc_strategy not in _apoc_strategy_options:
             _saved_apoc_strategy = "APOC (Direct Instance Segmentation)"
@@ -234,6 +241,9 @@ class PixelClassifierPanel:
             "ConvPaint Mask + Peak EDT/Watershed",
             "ConvPaint Probability + Watershed",
         ]
+        import os
+        if os.environ.get("BEHAV3D_DEV_MODE") != "1":
+            _convpaint_strategy_options.remove("ConvPaint Mask + Peak EDT/Watershed")
         _saved_cp_strategy = pc.get(
             "convpaint_strategy", "ConvPaint Mask + EDT/Watershed"
         )

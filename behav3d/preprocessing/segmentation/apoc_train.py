@@ -34,6 +34,7 @@ import pyclesperanto_prototype as cle
 from behav3d.io.images import load_image, load_zarr, save_as_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.core.utils import ignore_missing_rmtree_error
 
 # ---------------------------------------------------------------------------
 # Feature grid constants (matching the official napari-apoc widget)
@@ -51,14 +52,6 @@ APOC_FEATURES = [
 ]
 # For custom preset every feature is available (same list here; extend if needed)
 APOC_ALL_FEATURES = APOC_FEATURES
-
-# macOS creates ghost `._filename` resource-fork files on external drives that
-# appear in directory listings but fail on unlink. Ignore those FileNotFoundErrors
-# so rmtree can complete and the zarr directory is fully cleared before rewriting.
-def _rmtree_ignore_missing(func, path, exc):
-    if not isinstance(exc, FileNotFoundError):
-        raise exc
-
 
 # Format sigma values nicely (drop trailing .0)
 def _fmt_sigma(s):
@@ -1074,12 +1067,14 @@ class CellTypeTab(QWidget):
             layout.addWidget(self._per_tab_strategy_widget)
 
         # Labeling hint
-        hint = QLabel("Labels: <b>1</b> = background&nbsp;&nbsp; <b>2</b> = foreground")
-        hint.setStyleSheet("color: #666; font-style: italic;")
-        layout.addWidget(hint)
+        self._hint_label = QLabel("Labels: <b>1</b> = background&nbsp;&nbsp; <b>2</b> = foreground")
+        self._hint_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self._hint_label)
 
         # ── Preset dropdown ──────────────────────────────────────────────────
-        feat_row = QHBoxLayout()
+        self._feat_row_widget = QWidget()
+        feat_row = QHBoxLayout(self._feat_row_widget)
+        feat_row.setContentsMargins(0, 0, 0, 0)
         feat_row.addWidget(QLabel("Preset:"))
         self.feature_combo = QComboBox()
         self.feature_combo.addItems(list(FEATURE_PRESETS.keys()))
@@ -1098,7 +1093,7 @@ class CellTypeTab(QWidget):
             "Open 'Tune Features' below to customise the grid."
         ))
         feat_row.addStretch()
-        layout.addLayout(feat_row)
+        layout.addWidget(self._feat_row_widget)
 
         # ── Tune Features collapsible group ─────────────────────────────────
         self.tune_group = QGroupBox("Tune Features")
@@ -1134,7 +1129,9 @@ class CellTypeTab(QWidget):
         layout.addWidget(self.tune_group)
 
         # ── Consider original image checkbox ─────────────────────────────────
-        orig_row = QHBoxLayout()
+        self._orig_row_widget = QWidget()
+        orig_row = QHBoxLayout(self._orig_row_widget)
+        orig_row.setContentsMargins(0, 0, 0, 0)
         self.consider_original_cb = QCheckBox("Consider original image as well")
         preset_orig_default = FEATURE_PRESETS.get(saved_preset, {}).get("original", False)
         saved_orig = bool(ip.get(f"apoc_{cell_type}_consider_original", preset_orig_default))
@@ -1148,7 +1145,7 @@ class CellTypeTab(QWidget):
             "Useful when intensity alone is a strong cue (e.g. very bright nuclei)."
         ))
         orig_row.addStretch()
-        layout.addLayout(orig_row)
+        layout.addWidget(self._orig_row_widget)
 
         # ── Feature string preview ───────────────────────────────────────────
         self.preview_label = QLabel("")
@@ -1168,7 +1165,9 @@ class CellTypeTab(QWidget):
         layout.addWidget(self.stats_btn)
 
         # ── RF parameters ────────────────────────────────────────────────────
-        rf_row = QHBoxLayout()
+        self._rf_row_widget = QWidget()
+        rf_row = QHBoxLayout(self._rf_row_widget)
+        rf_row.setContentsMargins(0, 0, 0, 0)
         rf_row.addWidget(QLabel("Max depth:"))
         self.max_depth_spin = QSpinBox()
         self.max_depth_spin.setRange(1, 20)
@@ -1193,7 +1192,7 @@ class CellTypeTab(QWidget):
             "Default (100) is a good starting point."
         ))
         rf_row.addStretch()
-        layout.addLayout(rf_row)
+        layout.addWidget(self._rf_row_widget)
 
         self.run_instance_btn = None
         self.instance_group = None
@@ -1252,6 +1251,17 @@ class CellTypeTab(QWidget):
 
         self._locked_feature_string = None
         self._update_preview()
+
+    def set_classifier_params_visible(self, visible):
+        """Toggle the visibility of all classifier-specific parameters."""
+        self.chan_group.setVisible(visible)
+        self._hint_label.setVisible(visible)
+        self._feat_row_widget.setVisible(visible)
+        self.tune_group.setVisible(visible)
+        self._orig_row_widget.setVisible(visible)
+        self.preview_label.setVisible(visible)
+        self.stats_btn.setVisible(visible)
+        self._rf_row_widget.setVisible(visible)
 
     # ────────────────────────────────────────────────────────────────────────
     # Internal helpers
@@ -1940,6 +1950,9 @@ class APOCTrainingWidget(QWidget):
         "APOC Mask + Peak EDT/Watershed Resegmentation",
         "APOC Probability Map + Watershed",
     ]
+    import os
+    if os.environ.get("BEHAV3D_DEV_MODE") != "1":
+        STRATEGIES.remove("APOC Mask + Peak EDT/Watershed Resegmentation")
     ADVANCED_STRATEGY = "Advanced (per cell type)"
 
     def __init__(
@@ -2464,6 +2477,16 @@ class APOCTrainingWidget(QWidget):
             if btn is not None:
                 btn.setEnabled(enabled)
 
+    def set_classifier_params_visible(self, visible):
+        """Show or hide the classifier-specific parameters while keeping segmentation parameters active."""
+        self.apply_all_btn.setVisible(visible)
+        self.train_current_btn.setVisible(visible)
+        self.train_all_btn.setVisible(visible)
+        self.save_labels_btn.setVisible(visible)
+        for tab in self.tabs.values():
+            if hasattr(tab, "set_classifier_params_visible"):
+                tab.set_classifier_params_visible(visible)
+
     def cleanup(self):
         """Disconnect viewer-layer callbacks before the widget is destroyed.
 
@@ -2774,7 +2797,7 @@ class APOCTrainingWidget(QWidget):
             label_data = np.asarray(label_layer.data)
             outpath = Path(self.pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
             if outpath.exists():
-                shutil.rmtree(outpath, onexc=_rmtree_ignore_missing)
+                shutil.rmtree(outpath, onexc=ignore_missing_rmtree_error)
             save_as_zarr(label_data, outpath)
             log(f"Saved {cell_type} labels → {outpath}")
 
@@ -2783,7 +2806,7 @@ class APOCTrainingWidget(QWidget):
             dead_label_data = np.asarray(dead_layer.data)
             dead_outpath = Path(self.pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
             if dead_outpath.exists():
-                shutil.rmtree(dead_outpath, onexc=_rmtree_ignore_missing)
+                shutil.rmtree(dead_outpath, onexc=ignore_missing_rmtree_error)
             save_as_zarr(dead_label_data, dead_outpath)
             log(f"Saved Death labels → {dead_outpath}")
 

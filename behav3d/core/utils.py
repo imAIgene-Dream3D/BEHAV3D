@@ -2,6 +2,11 @@ from datetime import datetime
 import fnmatch
 import numpy as np
 
+def ignore_missing_rmtree_error(func, path, exc):
+    err = exc[1] if isinstance(exc, tuple) else exc
+    if not isinstance(err, FileNotFoundError):
+        raise err
+
 def format_time(
     start_time,
     end_time

@@ -404,7 +404,7 @@ def _infer_binary_group_constraints(df: pd.DataFrame, binary_cols: list[str]) ->
             "binary_cols": [],
             "binary_group_names": [],
             "allowed_binary_groups": ["no_contact"],
-            "forbidden_binary_combinations": [],
+            "forbidden_binary_combinations": {},
             "support_counts": {},
         }
 
@@ -474,9 +474,9 @@ def _normalize_binary_group_constraints(binary_group_constraints):
 
     allowed_set = None
     if allowed_raw is not None:
-        if not isinstance(allowed_raw, list):
-            raise ValueError("binary_group_constraints['allowed_binary_groups'] must be a list.")
-        allowed_set = set([str(x) for x in allowed_raw])
+        if not hasattr(allowed_raw, "__iter__") or isinstance(allowed_raw, (str, dict, set)):
+            raise ValueError("binary_group_constraints['allowed_binary_groups'] must be a list or sequence.")
+        allowed_set = set(str(x) for x in allowed_raw)
 
     if forbidden_raw is None:
         raise ValueError("binary_group_constraints['forbidden_binary_combinations'] is required.")
@@ -492,12 +492,12 @@ def _normalize_binary_group_constraints(binary_group_constraints):
             ) from exc
         if arity_int < 2:
             raise ValueError("binary_group_constraints['forbidden_binary_combinations'] arity keys must be >= 2.")
-        if not isinstance(combos, list):
+        if not hasattr(combos, "__iter__") or isinstance(combos, (str, dict, set)):
             raise ValueError(
                 "binary_group_constraints['forbidden_binary_combinations'] values must be lists of combinations."
             )
         for item in combos:
-            if not isinstance(item, (list, tuple)) or len(item) != arity_int:
+            if not isinstance(item, (list, tuple, np.ndarray)) or len(item) != arity_int:
                 raise ValueError(
                     "binary_group_constraints['forbidden_binary_combinations'] entries must match their arity key."
                 )
@@ -598,7 +598,7 @@ def _add_clean_binary_annotation_columns(df: pd.DataFrame, binary_cols: list[str
         if col not in out.columns:
             continue
         clean_name = _binary_col_to_group_name(col)
-        if clean_name == col or clean_name in out.columns:
+        if clean_name != col and clean_name in out.columns:
             continue
         vals = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
         out[clean_name] = (vals > 0).astype(np.int8)
@@ -615,7 +615,8 @@ def _rebuild_full_behavioral_cluster_from_intrinsic(
     if intrinsic_col not in adata.obs.columns:
         raise ValueError(f"Missing '{intrinsic_col}' in adata.obs.")
 
-    binary_cols = [str(c) for c in list(binary_cols_to_merge or [])]
+    _bcols = binary_cols_to_merge if binary_cols_to_merge is not None else []
+    binary_cols = [str(c) for c in list(_bcols)]
     adata.obs = _add_clean_binary_annotation_columns(adata.obs, binary_cols)
     adata.obs["behavioral_clusterid"] = adata.obs[intrinsic_col].astype(str)
     adata.obs["binary_group"] = _assign_binary_group_labels(
