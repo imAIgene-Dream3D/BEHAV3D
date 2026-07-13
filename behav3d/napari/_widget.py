@@ -139,6 +139,7 @@ class FloatingAssistantButton(QPushButton):
         self.raise_()
 
 
+from behav3d.napari._analysis import _period_from_t_radios
 
 
 class BEHAV3DWidget(QWidget):
@@ -281,6 +282,7 @@ class BEHAV3DWidget(QWidget):
         dd.btn_queue_dd_combined.clicked.connect(self._add_multi_org_death_to_queue)
         dd.btn_queue_ia_single.clicked.connect(self._add_interaction_to_queue)
         dd.btn_queue_ia_combined.clicked.connect(self._add_multi_org_interaction_to_queue)
+        dd.btn_queue_inv.clicked.connect(self._add_invasiveness_to_queue)
         dd.btn_queue_all.clicked.connect(self._add_all_analysis_to_queue)
 
         # Single Cell Analysis +🛒 buttons
@@ -503,11 +505,13 @@ class BEHAV3DWidget(QWidget):
                 "Select at least one target and one interaction cell type."
             )
             return
+        dd._persist_advanced()
         self.queue_panel.add_step(
             StepType.INTERACTION,
             params={
                 "cell_types": list(targets),
                 "interaction_cell_types": list(interactions),
+                "group_by_line_condition": bool(dd.check_group_by_lc.isChecked()),
             },
         )
 
@@ -515,11 +519,11 @@ class BEHAV3DWidget(QWidget):
         dd = self.analysis_tab.death_dynamics_tab
         targets = dd._selected_targets()
         interactions = dd._selected_interactions()
-        if len(targets) < 2 or not interactions:
+        if not targets or not interactions:
             from qtpy.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self, "Cannot Add to Queue",
-                "Select at least two targets and one interaction cell type."
+                "Select at least one target and one interaction cell type."
             )
             return
         # Persist advanced settings before queueing
@@ -531,6 +535,34 @@ class BEHAV3DWidget(QWidget):
                 "interaction_cell_types": list(interactions),
                 "time_window_min": int(dd.spin_time_window.value()),
                 "group_by": dd.combo_group_by.currentData() or "organoid_type",
+                "annotate_line_condition": bool(dd.check_annotate_lc.isChecked()),
+                "analysis_period_t": _period_from_t_radios(
+                    dd.period_radio_group, dd.spin_period_start_t, dd.spin_period_end_t,
+                ),
+            },
+        )
+
+    def _add_invasiveness_to_queue(self):
+        dd = self.analysis_tab.death_dynamics_tab
+        immune_list = dd._selected_invasiveness_immune()
+        targets = dd._selected_invasiveness_targets()
+        if not immune_list or not targets:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Cannot Add to Queue",
+                "Select at least one immune cell type and one target."
+            )
+            return
+        self.queue_panel.add_step(
+            StepType.INVASIVENESS,
+            params={
+                "immune_cell_types": list(immune_list),
+                "targets": list(targets),
+                "summary_stat": dd.inv_summary_combo.currentData() or "mean",
+                "group_by_line_condition": bool(dd.check_inv_group_by_lc.isChecked()),
+                "analysis_period_t": _period_from_t_radios(
+                    dd.inv_period_radio_group, dd.spin_inv_start_t, dd.spin_inv_end_t,
+                ),
             },
         )
 
@@ -580,27 +612,58 @@ class BEHAV3DWidget(QWidget):
                 )
 
         if interactions:
+            dd._persist_advanced()
             self.queue_panel.add_step(
                 StepType.INTERACTION,
                 params={
                     "cell_types": list(targets),
                     "interaction_cell_types": list(interactions),
+                    "group_by_line_condition": bool(dd.check_group_by_lc.isChecked()),
                 },
             )
             added_any = True
-            if len(targets) >= 2:
-                dd._persist_advanced()
-                self.queue_panel.add_step(
-                    StepType.MULTI_ORG_INTERACTION,
-                    params={
-                        "cell_types": list(targets),
-                        "interaction_cell_types": list(interactions),
-                        "time_window_min": int(dd.spin_time_window.value()),
-                        "group_by": (
-                            dd.combo_group_by.currentData() or "organoid_type"
-                        ),
-                    },
-                )
+            self.queue_panel.add_step(
+                StepType.MULTI_ORG_INTERACTION,
+                params={
+                    "cell_types": list(targets),
+                    "interaction_cell_types": list(interactions),
+                    "time_window_min": int(dd.spin_time_window.value()),
+                    "group_by": (
+                        dd.combo_group_by.currentData() or "organoid_type"
+                    ),
+                    "annotate_line_condition": bool(
+                        dd.check_annotate_lc.isChecked()
+                    ),
+                    "analysis_period_t": _period_from_t_radios(
+                        dd.period_radio_group,
+                        dd.spin_period_start_t,
+                        dd.spin_period_end_t,
+                    ),
+                },
+            )
+
+        # Invasiveness (immune-cell perspective) uses its own selectors,
+        # independent of the target/interaction pickers above.
+        inv_immune = dd._selected_invasiveness_immune()
+        inv_targets = dd._selected_invasiveness_targets()
+        if inv_immune and inv_targets:
+            self.queue_panel.add_step(
+                StepType.INVASIVENESS,
+                params={
+                    "immune_cell_types": list(inv_immune),
+                    "targets": list(inv_targets),
+                    "summary_stat": dd.inv_summary_combo.currentData() or "mean",
+                    "group_by_line_condition": bool(
+                        dd.check_inv_group_by_lc.isChecked()
+                    ),
+                    "analysis_period_t": _period_from_t_radios(
+                        dd.inv_period_radio_group,
+                        dd.spin_inv_start_t,
+                        dd.spin_inv_end_t,
+                    ),
+                },
+            )
+            added_any = True
 
         if not added_any:
             QMessageBox.warning(

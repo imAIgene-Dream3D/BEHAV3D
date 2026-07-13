@@ -263,6 +263,21 @@ def _load_classifier(pixelclass_dir, cell_type, provided_path=None):
     return None
 
 
+def _cfg_val(cfg, ct, key, default):
+    """Look up a per-cell-type instance-segmentation postprocessing param.
+
+    Two callers feed ``apoc_config`` here with different key conventions: the
+    napari GUI (``behav3d/napari/_segmentation.py``) writes ``apoc_{ct}_{key}``,
+    while the notebook widget (``behav3d/widgets/segmentation.py``) writes the
+    unprefixed ``{ct}_{key}`` into its own ``pixel_classifier`` config. Prefer
+    the prefixed key and fall back to the unprefixed one so both stay correct.
+    """
+    prefixed = f"apoc_{ct}_{key}"
+    if prefixed in cfg:
+        return cfg[prefixed]
+    return cfg.get(f"{ct}_{key}", default)
+
+
 def _open_zarr_output(path, dtype, shape, overwrite):
     """Open a zarr array for output, creating/recreating as needed."""
     path = Path(path)
@@ -514,7 +529,21 @@ def run_apoc_segmentation(
                         continue  # Skip timepoint for this cell type if already computed
 
                     cfg = apoc_config or {}
-                    indices = [i_ch for i_ch in clf_channels[ct] if 0 <= i_ch < t_img.shape[0]] or [0]
+                    opencl_path = getattr(classifiers[ct], "opencl_file", None)
+                    n_clf_ch_raw = _read_classifier_header_value(opencl_path, "n_image_channels")
+                    if n_clf_ch_raw is not None:
+                        try:
+                            n_clf_ch = int(n_clf_ch_raw)
+                            if n_clf_ch != t_img.shape[0]:
+                                raise ValueError(
+                                    f"Classifier for '{ct}' was trained on an image with {n_clf_ch} channel(s), "
+                                    f"but the current image has {t_img.shape[0]} channel(s). "
+                                    f"Retrain the classifier on an image with the same number of channels."
+                                )
+                        except (TypeError, ValueError) as _e:
+                            if "channel" in str(_e).lower():
+                                raise
+                    indices = clf_channels[ct] or [0]
                     imgs = [t_img[i_ch] for i_ch in indices]
                     imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
 
@@ -529,7 +558,7 @@ def run_apoc_segmentation(
                         from behav3d.preprocessing.segmentation.segmentation_utils import postprocess_mask, segment_mask
                         _diag = (i == 0)  # print timings on first timepoint only
 
-                        opening_nr_pixels = int(cfg.get(f"{ct}_opening_nr_pixels", 0))
+                        opening_nr_pixels = int(_cfg_val(cfg, ct, "opening_nr_pixels", 0))
                         if not only_segment:
                             _t0 = time.time()
                             prob_clf = _get_probability_classifier(classifiers[ct])
@@ -539,7 +568,7 @@ def run_apoc_segmentation(
                             if _diag: print(f"    ⏱ {ct} predict (prob): {time.time()-_t0:.2f}s  range=[{prob_map.min():.3f}, {prob_map.max():.3f}]")
 
                             _t0 = time.time()
-                            mask_thr = float(cfg.get(f"{ct}_prob_mask_threshold", 0.5))
+                            mask_thr = float(_cfg_val(cfg, ct, "prob_mask_threshold", 0.5))
                             mask_out = postprocess_mask(
                                 prob_map > mask_thr,
                                 fill_holes=False,
@@ -551,8 +580,9 @@ def run_apoc_segmentation(
                             mask_out = np.asarray(zarr_masks[ct][t])
                             prob_map = None
 
-                        seed_thr = float(cfg.get(f"{ct}_prob_seed_threshold", 0.8))
-                        segment_size_min = int(cfg.get(f"{ct}_segment_size_min", 10))
+                        seed_thr = float(_cfg_val(cfg, ct, "prob_seed_threshold", 0.8))
+                        segment_size_min = int(_cfg_val(cfg, ct, "segment_size_min", 10))
+                        if _diag: print(f"    ⚙ {ct} params: mask_thr={mask_thr if not only_segment else 'n/a'}, seed_thr={seed_thr}, min_size={segment_size_min}, opening_px={opening_nr_pixels}")
 
                         if prob_map is not None:
                             _t0 = time.time()
@@ -604,6 +634,7 @@ def run_apoc_segmentation(
                         from behav3d.preprocessing.segmentation.segmentation_utils import (
                             postprocess_mask, segment_mask
                         )
+                        _diag = (i == 0)  # print timings/params on first timepoint only
                         if not only_segment:
                             seg_out = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
                             mask_out = (seg_out > 0).astype(np.uint16)
@@ -611,15 +642,16 @@ def run_apoc_segmentation(
                         else:
                             mask_out = np.asarray(zarr_masks[ct][t])
 
-                        fill_holes = cfg.get(f"{ct}_fill_holes", True)
-                        opening_nr_pixels = cfg.get(f"{ct}_opening_nr_pixels", 0)
+                        fill_holes = _cfg_val(cfg, ct, "fill_holes", True)
+                        opening_nr_pixels = _cfg_val(cfg, ct, "opening_nr_pixels", 0)
                         proc_mask = postprocess_mask(mask_out, fill_holes=fill_holes, opening_nr_pixels=opening_nr_pixels)
 
-                        edt_thr = cfg.get(f"{ct}_edt_threshold", 1.0)
-                        segment_size_min = cfg.get(f"{ct}_segment_size_min", 10)
-                        _raw_peak_dist = cfg.get(f"{ct}_peak_min_distance", 0)
+                        edt_thr = _cfg_val(cfg, ct, "edt_threshold", 1.0)
+                        segment_size_min = _cfg_val(cfg, ct, "segment_size_min", 10)
+                        _raw_peak_dist = _cfg_val(cfg, ct, "peak_min_distance", 0)
                         peak_min_distance = None if (not _raw_peak_dist or float(_raw_peak_dist) <= 0) else float(_raw_peak_dist)
-                        peak_min_ratio = float(cfg.get(f"{ct}_peak_min_ratio", 0.35))
+                        peak_min_ratio = float(_cfg_val(cfg, ct, "peak_min_ratio", 0.35))
+                        if _diag: print(f"    ⚙ {ct} params: edt_thr={edt_thr}, min_size={segment_size_min}, fill_holes={fill_holes}, opening_px={opening_nr_pixels}, peak_min_distance={peak_min_distance}, peak_min_ratio={peak_min_ratio}")
                         seg_refined = segment_mask(
                             proc_mask,
                             edt_thr=edt_thr,
@@ -639,6 +671,8 @@ def run_apoc_segmentation(
 
                     else:
                         # ── Default: Direct APOC (or unknown strategy) ────
+                        if i == 0:
+                            print(f"    ⚙ {ct}: Direct APOC strategy — no postprocessing parameters applied")
                         if not only_segment:
                             seg_out = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
                             mask_out = (seg_out > 0).astype(np.uint16)
@@ -657,7 +691,20 @@ def run_apoc_segmentation(
                     if not overwrite_existing and (done_dir / f"dead_t{t:04d}.done").exists():
                         pass  # Skip timepoint for death mask if already computed
                     else:
-                        indices = [i_ch for i_ch in death_channels if 0 <= i_ch < t_img.shape[0]] or [0]
+                        n_death_ch_raw = _read_classifier_header_value(clf_death.opencl_file, "n_image_channels")
+                        if n_death_ch_raw is not None:
+                            try:
+                                n_death_ch = int(n_death_ch_raw)
+                                if n_death_ch != t_img.shape[0]:
+                                    raise ValueError(
+                                        f"Death classifier was trained on an image with {n_death_ch} channel(s), "
+                                        f"but the current image has {t_img.shape[0]} channel(s). "
+                                        f"Retrain the classifier on an image with the same number of channels."
+                                    )
+                            except (TypeError, ValueError) as _e:
+                                if "channel" in str(_e).lower():
+                                    raise
+                        indices = death_channels or [0]
                         imgs = [t_img[i_ch] for i_ch in indices]
                         imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
                         death_mask = (np.asarray(clf_death.predict(image=imgs_to_pass)) > 0).astype(np.uint16)

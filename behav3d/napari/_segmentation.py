@@ -3987,8 +3987,6 @@ class APOCWidget(QWidget):
             cfg = tab.get_config()
             for k, v in cfg.items():
                 apoc_config[f"apoc_{ct}_{k}"] = v
-            if cfg.get("segment_size_min") is not None:
-                apoc_config[f"{ct}_segment_size_min"] = cfg["segment_size_min"]
         return apoc_config
 
     def _on_organoid_tab_input_changed(self, source_ct, *_args):
@@ -4174,7 +4172,9 @@ class APOCWidget(QWidget):
             other_types = [ct for ct in detect_other_cell_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
             
             # Use apoc_train helper to fetch and process images
-            from behav3d.preprocessing.segmentation.apoc_train import _load_training_images
+            from behav3d.preprocessing.segmentation.apoc_train import (
+                _load_training_images, _predicted_labels_path, _probability_map_path,
+            )
             from behav3d.preprocessing import zeropad_image_to_match_shape
             
             # Determine the cached data path and whether it already exists
@@ -4336,6 +4336,63 @@ class APOCWidget(QWidget):
                     
                 dead_layer = self.viewer.add_labels(dead_labels, name="User Provided Labels (Dead)", opacity=0.5)
                 self._configure_user_label_layer(dead_layer)
+
+            # Restore previously generated probability maps and segmentations
+            for cell_type in all_cell_types:
+                seg_p = _predicted_labels_path(pixel_class_outdir, cell_type)
+                if seg_p and seg_p.exists():
+                    try:
+                        pred = np.asarray(load_zarr(seg_p))
+                        if pred.shape == label_shape:
+                            self.viewer.add_labels(
+                                pred,
+                                name=f"{cell_type.capitalize()} Segments",
+                                opacity=0.8, visible=False,
+                            )
+                            self.log(f"  ↩ Restored predicted labels for '{cell_type}'")
+                    except Exception:
+                        pass
+                prob_p = _probability_map_path(pixel_class_outdir, cell_type)
+                if prob_p and prob_p.exists():
+                    try:
+                        prob = np.asarray(load_zarr(prob_p))
+                        if prob.shape == label_shape:
+                            self.viewer.add_image(
+                                prob,
+                                name=f"Probability Map ({cell_type.capitalize()})",
+                                opacity=0.6, blending="additive", colormap="magma",
+                                contrast_limits=(0.0, 1.0), visible=False,
+                            )
+                            self.log(f"  ↩ Restored probability map for '{cell_type}'")
+                    except Exception:
+                        pass
+
+            if has_death:
+                seg_p = _predicted_labels_path(pixel_class_outdir, "dead")
+                if seg_p and seg_p.exists():
+                    try:
+                        pred = np.asarray(load_zarr(seg_p))
+                        if pred.shape == label_shape:
+                            self.viewer.add_labels(
+                                pred, name="Pixel Classification (Dead)",
+                                opacity=0.8, visible=False,
+                            )
+                            self.log("  ↩ Restored predicted labels for 'dead'")
+                    except Exception:
+                        pass
+                prob_p = _probability_map_path(pixel_class_outdir, "dead")
+                if prob_p and prob_p.exists():
+                    try:
+                        prob = np.asarray(load_zarr(prob_p))
+                        if prob.shape == label_shape:
+                            self.viewer.add_image(
+                                prob, name="Probability Map (Dead)",
+                                opacity=0.6, blending="additive", colormap="magma",
+                                contrast_limits=(0.0, 1.0), visible=False,
+                            )
+                            self.log("  ↩ Restored probability map for 'dead'")
+                    except Exception:
+                        pass
 
             self._reorder_apoc_training_layers()
 
@@ -4760,7 +4817,8 @@ class APOCWidget(QWidget):
             return  # user cancelled
 
         # Show validation preview (pixel counts) before committing
-        if not self._show_import_validation_dialog(meta, data_by_celltype, cell_type_mapping):
+        cell_type_mapping = self._show_import_validation_dialog(meta, data_by_celltype, cell_type_mapping)
+        if cell_type_mapping is None:
             return  # user cancelled
 
         # Apply import
@@ -4870,7 +4928,12 @@ class APOCWidget(QWidget):
         return reply == QMessageBox.Yes
 
     def _show_import_validation_dialog(self, imported_meta, data_by_celltype, cell_type_mapping):
-        """Show a summary of imported pixel counts before committing. Returns True to proceed."""
+        """Show a summary of imported pixel counts before committing, with a per-row checkbox
+        to opt out of importing specific cell types.
+
+        Returns the (possibly filtered) cell_type_mapping dict to proceed, with unchecked
+        rows set to None, or None if the user cancelled.
+        """
         td_info = imported_meta.get("training_data", {})
 
         dlg = QDialog(self)
@@ -4898,23 +4961,36 @@ class APOCWidget(QWidget):
             if local_ct is not None and imp_ct in data_by_celltype
         ]
 
-        table = QTableWidget(len(active_rows), 4)
-        table.setHorizontalHeaderLabels(["Imported type", "→ Local type", "Total px", "Fg / Bg"])
+        table = QTableWidget(len(active_rows), 5)
+        table.setHorizontalHeaderLabels(["Import", "Imported type", "→ Local type", "Total px", "Fg / Bg"])
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
+        row_checkboxes = {}
         for row_idx, (imp_ct, local_ct) in enumerate(active_rows):
             counts = td_info.get(imp_ct, {})
             n = counts.get("n_pixels", len(data_by_celltype[imp_ct][1]))
             pos = counts.get("n_positive", int(np.sum(data_by_celltype[imp_ct][1] == 2)))
             neg = counts.get("n_negative", int(np.sum(data_by_celltype[imp_ct][1] == 1)))
-            table.setItem(row_idx, 0, QTableWidgetItem(str(imp_ct)))
-            table.setItem(row_idx, 1, QTableWidgetItem(str(local_ct)))
-            table.setItem(row_idx, 2, QTableWidgetItem(str(n)))
-            table.setItem(row_idx, 3, QTableWidgetItem(f"{pos} / {neg}"))
+
+            checkbox = QCheckBox()
+            checkbox.setChecked(True)
+            cb_container = QWidget()
+            cb_layout = QHBoxLayout(cb_container)
+            cb_layout.addWidget(checkbox)
+            cb_layout.setAlignment(Qt.AlignCenter)
+            cb_layout.setContentsMargins(0, 0, 0, 0)
+            table.setCellWidget(row_idx, 0, cb_container)
+            row_checkboxes[imp_ct] = checkbox
+
+            table.setItem(row_idx, 1, QTableWidgetItem(str(imp_ct)))
+            table.setItem(row_idx, 2, QTableWidgetItem(str(local_ct)))
+            table.setItem(row_idx, 3, QTableWidgetItem(str(n)))
+            table.setItem(row_idx, 4, QTableWidgetItem(f"{pos} / {neg}"))
         lay.addWidget(table)
 
         note = QLabel(
-            "These pixels will be prepended to your new labels when you click Train.\n"
+            "Uncheck a row to exclude that cell type from the import.\n"
+            "Checked pixels will be prepended to your new labels when you click Train.\n"
             "The combined dataset is saved so this experiment can itself be imported later."
         )
         note.setWordWrap(True)
@@ -4927,7 +5003,14 @@ class APOCWidget(QWidget):
         btns.rejected.connect(dlg.reject)
         lay.addWidget(btns)
 
-        return dlg.exec_() == QDialog.Accepted
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+
+        filtered_mapping = dict(cell_type_mapping)
+        for imp_ct, checkbox in row_checkboxes.items():
+            if not checkbox.isChecked():
+                filtered_mapping[imp_ct] = None
+        return filtered_mapping
 
     def _update_import_panel(self):
         """Refresh the import info panel from the training widget's active import."""
@@ -5601,8 +5684,6 @@ class APOCWidget(QWidget):
                     cfg = tab.get_config()
                     for k, v in cfg.items():
                         apoc_config[f"apoc_{ct}_{k}"] = v
-                    if cfg.get("segment_size_min") is not None:
-                        apoc_config[f"{ct}_segment_size_min"] = cfg["segment_size_min"]
 
             # Save all parameters safely
             self._save_apoc_params_to_yaml(updated_apoc_params=apoc_config)

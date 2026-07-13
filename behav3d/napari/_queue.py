@@ -42,6 +42,7 @@ class StepType(Enum):
     MULTI_ORG_DEATH = "multi_org_death"
     INTERACTION = "interaction"
     MULTI_ORG_INTERACTION = "multi_org_interaction"
+    INVASIVENESS = "invasiveness"
     SC_STATE_CLUSTER = "sc_state_cluster"
     SC_TRAIN_STATE = "sc_train_state"
     SC_APPLY_STATE = "sc_apply_state"
@@ -63,7 +64,8 @@ class StepType(Enum):
             StepType.DEATH_DYNAMICS: "💀 Death Dynamics",
             StepType.MULTI_ORG_DEATH: "💀 Combined Death Dynamics",
             StepType.INTERACTION: "🤝 Interaction Analysis",
-            StepType.MULTI_ORG_INTERACTION: "🤝 Combined Interaction Comparison",
+            StepType.MULTI_ORG_INTERACTION: "🤝 Interaction Overview",
+            StepType.INVASIVENESS: "🧗 Invasiveness Analysis",
             StepType.SC_STATE_CLUSTER: "🔬 State Clustering",
             StepType.SC_TRAIN_STATE: "🔬 Train State Classifier",
             StepType.SC_APPLY_STATE: "🔬 Apply State Classifier",
@@ -87,6 +89,7 @@ class StepType(Enum):
             StepType.MULTI_ORG_DEATH: 5.5,
             StepType.INTERACTION: 6,
             StepType.MULTI_ORG_INTERACTION: 6.5,
+            StepType.INVASIVENESS: 6.75,
             StepType.SC_STATE_CLUSTER: 7,
             StepType.SC_TRAIN_STATE: 7.5,
             StepType.SC_APPLY_STATE: 8,
@@ -143,6 +146,12 @@ class QueueStep:
             cts = self.params.get("cell_types", [])
             if cts:
                 return f"{self.step_type.label} — {', '.join(cts)}"
+        if self.step_type == StepType.INVASIVENESS:
+            immune = self.params.get("immune_cell_type", "")
+            tgts = self.params.get("targets", [])
+            if immune:
+                suffix = f"{immune} → {', '.join(tgts)}" if tgts else immune
+                return f"{self.step_type.label} — {suffix}"
         return self.step_type.label
 
 
@@ -1010,7 +1019,25 @@ class ProcessingQueuePanel(QWidget):
             elif step.step_type == StepType.MULTI_ORG_INTERACTION:
                 comp_dir = out_dir / "analysis" / "multi_organoid_comparison"
                 if comp_dir.exists() and any(comp_dir.iterdir()):
-                    warnings.append("Multi-organoid interaction comparison outputs")
+                    warnings.append("Interaction Overview outputs")
+
+            elif step.step_type == StepType.INVASIVENESS:
+                immune_list = step.params.get("immune_cell_types")
+                if not immune_list:
+                    single = step.params.get("immune_cell_type", "")
+                    immune_list = [single] if single else []
+                check_dirs = [
+                    out_dir / "analysis" / im / "invasiveness_analysis"
+                    for im in immune_list
+                ]
+                if len(immune_list) > 1:
+                    check_dirs.append(out_dir / "analysis" / "invasiveness_analysis")
+                for inv_dir in check_dirs:
+                    if inv_dir.exists() and any(inv_dir.iterdir()):
+                        warnings.append(
+                            f"Invasiveness analysis for {', '.join(immune_list)}"
+                        )
+                        break
 
             elif step.step_type == StepType.FILTER:
                 analysis_dir = out_dir / "analysis"
@@ -1340,6 +1367,8 @@ class ProcessingQueuePanel(QWidget):
             return self._run_interaction(step, cbs)
         if step.step_type == StepType.MULTI_ORG_INTERACTION:
             return self._run_multi_org_interaction(step, cbs)
+        if step.step_type == StepType.INVASIVENESS:
+            return self._run_invasiveness(step, cbs)
         if step.step_type == StepType.SC_STATE_CLUSTER:
             return self._run_sc_state_cluster(step, cbs)
         if step.step_type == StepType.SC_TRAIN_STATE:
@@ -1596,9 +1625,15 @@ class ProcessingQueuePanel(QWidget):
         dd = self._require_death_dynamics_tab()
         cell_types = step.params.get("cell_types") or []
         interaction_cts = step.params.get("interaction_cell_types") or []
+        group_by_line_condition = bool(
+            step.params.get("group_by_line_condition", False)
+        )
         self._run_sync_analysis(
             lambda: dd.run_interaction_for(
-                cell_types, interaction_cts, interactive=False,
+                cell_types,
+                interaction_cts,
+                group_by_line_condition=group_by_line_condition,
+                interactive=False,
             ),
             extra_callbacks,
         )
@@ -1610,12 +1645,49 @@ class ProcessingQueuePanel(QWidget):
         interaction_cts = step.params.get("interaction_cell_types") or []
         time_window_min = float(step.params.get("time_window_min", 60.0))
         group_by = step.params.get("group_by", "organoid_type")
+        annotate_line_condition = bool(
+            step.params.get("annotate_line_condition", False)
+        )
+        analysis_period_t = step.params.get("analysis_period_t")
+        if analysis_period_t is None:
+            analysis_period_t = step.params.get("analysis_period_min")
         self._run_sync_analysis(
             lambda: dd.run_multi_organoid_interaction_for(
                 cell_types,
                 interaction_cts,
                 time_window_min=time_window_min,
                 group_by=group_by,
+                annotate_line_condition=annotate_line_condition,
+                analysis_period_t=analysis_period_t,
+                interactive=False,
+            ),
+            extra_callbacks,
+        )
+        return None
+
+    def _run_invasiveness(self, step: QueueStep, extra_callbacks):
+        dd = self._require_death_dynamics_tab()
+        # Prefer the multi-immune list; fall back to the legacy single field
+        # for older queued steps.
+        immune = step.params.get("immune_cell_types")
+        if not immune:
+            single = step.params.get("immune_cell_type")
+            immune = [single] if single else []
+        targets = step.params.get("targets") or []
+        summary_stat = step.params.get("summary_stat", "mean")
+        group_by_line_condition = bool(
+            step.params.get("group_by_line_condition", False)
+        )
+        analysis_period_t = step.params.get("analysis_period_t")
+        if analysis_period_t is None:
+            analysis_period_t = step.params.get("analysis_period_min")
+        self._run_sync_analysis(
+            lambda: dd.run_invasiveness_for(
+                immune,
+                targets,
+                summary_stat=summary_stat,
+                group_by_line_condition=group_by_line_condition,
+                analysis_period_t=analysis_period_t,
                 interactive=False,
             ),
             extra_callbacks,
