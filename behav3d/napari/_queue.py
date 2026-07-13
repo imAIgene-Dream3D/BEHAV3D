@@ -1643,6 +1643,10 @@ class ProcessingQueuePanel(QWidget):
             if idx >= 0:
                 apoc_widget.combo_gpu_device.setCurrentIndex(idx)
 
+        force_cpu = p.get("force_cpu", False)
+        if hasattr(apoc_widget, "btn_force_cpu"):
+            apoc_widget.btn_force_cpu.setChecked(force_cpu)
+
         # Strategy: snapshot stored ``strategy_name`` / ``strategy_index``.
         if tw is not None and tw.strategy_combo is not None:
             strat_name = p.get("strategy_name")

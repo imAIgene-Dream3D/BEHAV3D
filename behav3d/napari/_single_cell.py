@@ -2646,6 +2646,8 @@ class TrackClassificationSubTab(QWidget):
         self.chk_use_original_top.setChecked(checked)
         self.chk_use_original_top.blockSignals(False)
         self._apply_original_mode(checked)
+        if checked:
+            self._show_original_dtw_disclaimer()
 
     def _on_original_toggled_from_top(self, checked: bool):
         """Top checkbox toggled (user unchecks from top) → sync adv checkbox + apply mode."""
@@ -2653,6 +2655,8 @@ class TrackClassificationSubTab(QWidget):
         self.chk_use_original.setChecked(checked)
         self.chk_use_original.blockSignals(False)
         self._apply_original_mode(checked)
+        if checked:
+            self._show_original_dtw_disclaimer()
 
     def _apply_original_mode(self, checked: bool):
         """Update visibility of UI sections for original vs dtaidistance mode."""
@@ -2663,6 +2667,29 @@ class TrackClassificationSubTab(QWidget):
             self.btn_run_track.setText("▶ Run Original BEHAV3D DTW")
         else:
             self.btn_run_track.setText("▶ Run Track Clustering")
+
+    def _show_original_dtw_disclaimer(self):
+        """Warn the user that the original BEHAV3D DTW pipeline requires equal-length tracks."""
+        if getattr(self, '_hide_original_dtw_disclaimer', False):
+            return
+
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Warning)
+        msg_box.setWindowTitle("Track length requirement")
+        msg_box.setText(
+            "The original feature-based BEHAV3D DTW pipeline requires that all tracks "
+            "be of the same length for a reliable result.\n\n"
+            "If your tracks are not all the same length, please go back to the "
+            "Filtering tab and filter/trim them to a uniform length before running "
+            "this analysis."
+        )
+        
+        cb = QCheckBox("Don't show again")
+        msg_box.setCheckBox(cb)
+        msg_box.exec_()
+        
+        if cb.isChecked():
+            self._hide_original_dtw_disclaimer = True
 
     # ── Browse helpers ───────────────────────────────────────────────────
 
@@ -4003,6 +4030,8 @@ class SingleCellTab(QWidget):
         """Auto-fill path fields when switching to Track Classification tab."""
         if index == 1:  # Track Classification
             self.track_tab._autofill_paths(self._current_cell_type())
+            if self.track_tab.chk_use_original.isChecked():
+                self.track_tab._show_original_dtw_disclaimer()
 
     # ── Metadata update ──────────────────────────────────────────────────
 

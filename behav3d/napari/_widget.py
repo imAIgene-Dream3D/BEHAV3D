@@ -3,11 +3,142 @@ BEHAV3D napari plugin – main dock widget.
 Provides a QTabWidget with tabs for the full BEHAV3D pipeline.
 """
 from qtpy.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QPushButton
-from qtpy.QtCore import Qt, QSize
+from qtpy.QtCore import Qt, QSize, QEvent
+from qtpy.QtGui import QIcon
 import os
 import napari
 
 from behav3d.napari._queue import ProcessingQueuePanel, StepType
+from pathlib import Path
+
+
+class FloatingAssistantButton(QPushButton):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setChecked(True)
+        self.setToolTip("Show or hide the BEHAV3D Assistant panel")
+        self.setFixedSize(60, 60)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(42, 45, 48, 200);
+                border: 2px solid #555;
+                border-radius: 30px;
+            }
+            QPushButton:hover {
+                background-color: rgba(80, 85, 90, 220);
+            }
+            QPushButton:pressed {
+                background-color: rgba(100, 105, 110, 240);
+                border: 2px solid #888;
+            }
+            QPushButton:checked {
+                background-color: rgba(60, 120, 180, 200);
+                border: 2px solid #6ba;
+            }
+            QPushButton:checked:pressed {
+                background-color: rgba(70, 130, 190, 220);
+                border: 2px solid #7cb;
+            }
+        """)
+        icon_path = str(Path(__file__).resolve().parents[1] / "resources" / "assistant_icon.png")
+        if os.path.exists(icon_path):
+            self.setIcon(QIcon(icon_path))
+            self.setIconSize(QSize(50, 50))
+        else:
+            self.setText("💬")
+        
+        self.setCheckable(True)
+        self.setChecked(True)
+        
+        self._drag_active = False
+        self._drag_start_global_pos = None
+        self._drag_start_window_pos = None
+        self._user_moved = False
+
+        if parent is not None:
+            parent.installEventFilter(self)
+            # Use a timer to initialize position once layout is computed
+            from qtpy.QtCore import QTimer
+            QTimer.singleShot(100, self._update_position)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start_global_pos = event.globalPos()
+            self._drag_start_window_pos = self.pos()
+            self._drag_active = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton and self._drag_start_global_pos is not None:
+            # Add a small distance threshold to differentiate a click from a drag
+            diff = event.globalPos() - self._drag_start_global_pos
+            if not self._drag_active and diff.manhattanLength() < 5:
+                super().mouseMoveEvent(event)
+                return
+
+            if self.parent() is not None:
+                new_pos = self._drag_start_window_pos + diff
+                
+                # Constrain within parent widget bounds
+                p_rect = self.parent().rect()
+                x = max(0, min(new_pos.x(), p_rect.width() - self.width()))
+                y = max(0, min(new_pos.y(), p_rect.height() - self.height()))
+                self.move(x, y)
+                self._drag_active = True
+                self._user_moved = True
+
+                # Since the button follows the cursor, Qt keeps thinking the
+                # mouse is hovering a pressed button and re-applies the
+                # ":pressed" style on every move. Force it back to the
+                # "up" visual state so only :checked (active/hidden) drives
+                # the color while dragging, and skip the base-class handler
+                # so it doesn't immediately re-set "down" itself.
+                self.setDown(False)
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_active:
+            # We dragged the button. Call super to reset visual state (un-press), 
+            # but block signals so it doesn't trigger a 'click' action.
+            self.blockSignals(True)
+            super().mouseReleaseEvent(event)
+            self.blockSignals(False)
+        else:
+            # Normal click
+            super().mouseReleaseEvent(event)
+            
+        self._drag_start_global_pos = None
+        self._drag_start_window_pos = None
+        self._drag_active = False
+
+    def eventFilter(self, obj, event):
+        if obj == self.parent() and event.type() == QEvent.Resize:
+            if not getattr(self, '_user_moved', False):
+                self._update_position()
+            else:
+                # We don't force it to bottom-right if they moved it, 
+                # but we ensure it stays within the new bounds.
+                p_rect = self.parent().rect()
+                x = max(0, min(self.x(), p_rect.width() - self.width()))
+                y = max(0, min(self.y(), p_rect.height() - self.height()))
+                if self.x() != x or self.y() != y:
+                    self.move(x, y)
+        return super().eventFilter(obj, event)
+
+    def _update_position(self):
+        if self.parent() is None:
+            return
+        p_rect = self.parent().rect()
+        margin = 20
+        x = p_rect.width() - self.width() - margin
+        y = p_rect.height() - self.height() - margin
+        self.move(x, y)
+        self.raise_()
+
+
 
 
 class BEHAV3DWidget(QWidget):
@@ -45,19 +176,22 @@ class BEHAV3DWidget(QWidget):
         outer_layout.setSpacing(0)
         layout = outer_layout
 
-        # --- Assistant show/hide toggle -----------------------------------
-        # Lets the user reclaim space, or recover the dock if it was closed by
-        # accident. Closing the dock only hides it, so the conversation survives.
-        header = QHBoxLayout()
-        header.setContentsMargins(6, 4, 6, 0)
-        header.addStretch(1)
-        self.btn_toggle_assistant = QPushButton("💬 Assistant")
-        self.btn_toggle_assistant.setCheckable(True)
-        self.btn_toggle_assistant.setChecked(True)
-        self.btn_toggle_assistant.setToolTip("Show or hide the BEHAV3D Assistant panel")
-        self.btn_toggle_assistant.clicked.connect(self._toggle_assistant)
-        header.addWidget(self.btn_toggle_assistant)
-        layout.addLayout(header)
+        # --- Assistant show/hide toggle (Floating) ------------------------
+        try:
+            # Parent to BEHAV3DWidget itself so it overlaps this plugin and 
+            # closes properly when this plugin closes.
+            self.btn_toggle_assistant = FloatingAssistantButton(parent=self)
+            self.btn_toggle_assistant.clicked.connect(self._toggle_assistant)
+            self.btn_toggle_assistant.show()
+        except Exception:
+
+            # Fallback
+            self.btn_toggle_assistant = QPushButton("💬 Assistant")
+            self.btn_toggle_assistant.setCheckable(True)
+            self.btn_toggle_assistant.setChecked(True)
+            self.btn_toggle_assistant.clicked.connect(self._toggle_assistant)
+            layout.addWidget(self.btn_toggle_assistant)
+
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, stretch=1)
@@ -191,9 +325,26 @@ class BEHAV3DWidget(QWidget):
         try:
             from behav3d.napari._assistant import AssistantDock
             self.assistant = AssistantDock(main_widget=self)
-            self._assistant_dock = self.viewer.window.add_dock_widget(
-                self.assistant, area="right", name="BEHAV3D Assistant"
+            # self._assistant_dock = self.viewer.window.add_dock_widget(
+            #     self.assistant, area="right", name="BEHAV3D Assistant"
+            # )
+            # # Remove the native 'x' button so napari doesn't destroy the widget
+            # from qtpy.QtWidgets import QDockWidget
+            # self._assistant_dock.setFeatures(
+            #     self._assistant_dock.features() & ~QDockWidget.DockWidgetClosable
+            # )
+
+            from napari._qt.widgets.qt_viewer_dock_widget import QtViewerDockWidget
+
+            self._assistant_dock = QtViewerDockWidget(
+                self.viewer.window._qt_viewer,
+                self.assistant,
+                name="BEHAV3D Assistant",
+                area="right",
+                close_btn=False,   # <-- this is the one that actually works
             )
+            self.viewer.window._add_viewer_dock_widget(self._assistant_dock, menu=self.viewer.window.window_menu)
+            
             # Both this pipeline and the assistant dock to the "right" area, so Qt
             # stacks them vertically by default. Defer to the next event-loop tick
             # (by which point this widget's own dock exists, for either launch
@@ -232,9 +383,16 @@ class BEHAV3DWidget(QWidget):
         if dock is None:
             return
         try:
-            visible = dock.isVisible()
-            dock.setVisible(not visible)
-            self.btn_toggle_assistant.setChecked(not visible)
+            if hasattr(dock, "toggleViewAction"):
+                # Use the native QAction trigger to cleanly toggle the dock. 
+                # This works even if Napari's internal layout manager hid it via the 'X' button.
+                dock.toggleViewAction().trigger()
+            else:
+                visible = dock.isVisible()
+                dock.setVisible(not visible)
+            
+            if dock.isVisible():
+                dock.raise_()
         except Exception:
             pass
 

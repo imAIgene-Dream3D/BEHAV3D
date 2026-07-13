@@ -1108,9 +1108,40 @@ class TrackedSegmentEditor(QWidget):
         except Exception:
             pass
         try:
+            self.viewer.layers.events.removed.connect(self._on_layer_removed)
+        except Exception:
+            pass
+        try:
             self.viewer.layers.selection.active = self.viewer.layers[self.layer_name]
         except Exception:
             pass
+
+    def _on_layer_removed(self, event) -> None:
+        """Keep the tracked-segments layer active when the seed-points
+        layer is removed.
+
+        This covers deletion via the Apply/Cancel flow *and* manual
+        deletion from napari's own layer list (e.g. the trash icon or
+        the Delete key), which otherwise leaves napari to fall back to
+        whatever layer happens to be first in the list.
+        """
+        removed = getattr(event, "value", None)
+        if getattr(removed, "name", None) != _SPLIT_SEEDS_LAYER:
+            return
+        # Defer: napari's LayerList does its own "pick a new active layer"
+        # bookkeeping in response to the same ``removed`` event, and
+        # depending on connection order that can run *after* us — which
+        # would leave both the tracked-segments layer and napari's default
+        # pick selected. Running on the next event-loop tick guarantees we
+        # go last and end up with exactly one layer selected.
+        QTimer.singleShot(0, self._reselect_tracked_layer)
+
+    def _reselect_tracked_layer(self) -> None:
+        if self.layer_name in self.viewer.layers:
+            layer = self.viewer.layers[self.layer_name]
+            self.viewer.layers.selection.clear()
+            self.viewer.layers.selection.add(layer)
+            self.viewer.layers.selection.active = layer
 
     def _build_dask_with_dirty_frames(self) -> da.Array:
         """Return a dask array where dirty frames are served from memory.
