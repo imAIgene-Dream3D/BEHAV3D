@@ -90,13 +90,15 @@ class SegmentationTab(QWidget):
         method_group = QGroupBox("Segmentation Method")
         method_layout = QHBoxLayout()
         self.method_combo = QComboBox()
-        self.method_combo.addItems([
+
+        methods = [
             "APOC (GPU)",
             "ConvPaint (DL pixel classifier)",
             "Pixel Classifier (Random Forest)",
             "Cellpose (Deep Learning)",
             "Import segmentation",
-        ])
+        ]
+        self.method_combo.addItems(methods)
         self.method_combo.currentIndexChanged.connect(self._on_method_changed)
         method_layout.addWidget(QLabel("Method:"))
         method_layout.addWidget(self.method_combo)
@@ -126,21 +128,25 @@ class SegmentationTab(QWidget):
         )
         self.param_stack.addWidget(self.convpaint_page)
 
-        # 2. Pixel Classifier Page  ← matches combo index 2
+        # 2. Pixel Classifier Page
         self.pixel_classifier_page = PixelClassifierWidget(
-            self.viewer, self.metadata_loader, log_callback=self._log,
+            self.viewer,
+            self.metadata_loader,
+            log_callback=self._log,
             tab_progress_row=self.progress_row,
         )
         self.param_stack.addWidget(self.pixel_classifier_page)
 
-        # 3. Cellpose Page  ← matches combo index 3
+        # 2. Cellpose Page  ← matches combo index 2
         self.cellpose_page = CellposeWidget(
-            self.viewer, self.metadata_loader, log_callback=self._log,
+            self.viewer,
+            self.metadata_loader,
+            log_callback=self._log,
             tab_progress_row=self.progress_row,
         )
         self.param_stack.addWidget(self.cellpose_page)
-
-        # 4. Import Page  ← matches combo index 4
+        
+        # 3. Import Page ← matches combo index 3
         self.import_page = ImportWidget(self.viewer, self.metadata_loader, log_callback=self._log)
         self.param_stack.addWidget(self.import_page)
 
@@ -3556,6 +3562,14 @@ class APOCWidget(QWidget):
         gpu_row.addStretch()
         layout.addLayout(gpu_row)
 
+        self.btn_force_cpu = QCheckBox("Force CPU-only processing")
+        self.btn_force_cpu.setToolTip("Override GPU selection and run pyclesperanto on the CPU")
+        is_force_cpu = bool(pc.get("force_cpu", False))
+        self.btn_force_cpu.setChecked(is_force_cpu)
+        if is_force_cpu:
+            self.combo_gpu_device.setEnabled(False)
+        layout.addWidget(self.btn_force_cpu)
+
         # ── Training section (embedded APOCTrainingWidget) ──────
         self.training_group = QGroupBox("🎯 APOC Classifier Training")
         self.training_layout = QVBoxLayout(self.training_group)
@@ -3757,6 +3771,7 @@ class APOCWidget(QWidget):
         self.spin_examples.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
         self.spin_workers.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
         self.combo_gpu_device.currentTextChanged.connect(self._on_gpu_device_changed)
+        self.btn_force_cpu.toggled.connect(self._on_force_cpu_toggled)
         self.check_process_all.stateChanged.connect(lambda _: self._save_apoc_params_to_yaml())
         self.spin_t_start.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
         self.spin_t_end.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
@@ -3786,6 +3801,11 @@ class APOCWidget(QWidget):
         self._save_apoc_params_to_yaml()
         self._apply_apoc_gpu_selection(log_message=True)
 
+    def _on_force_cpu_toggled(self, checked):
+        self.combo_gpu_device.setEnabled(not checked)
+        self._save_apoc_params_to_yaml()
+        self._apply_apoc_gpu_selection(log_message=True)
+
     def _selected_gpu_device_name(self):
         if not hasattr(self, 'combo_gpu_device'):
             return ""
@@ -3794,6 +3814,29 @@ class APOCWidget(QWidget):
         return str(self.combo_gpu_device.currentText() or "").strip()
 
     def _apply_apoc_gpu_selection(self, log_message=True):
+        if hasattr(self, 'btn_force_cpu') and self.btn_force_cpu.isChecked():
+            try:
+                import pyclesperanto_prototype as cle
+                import warnings
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    device = cle.select_device("CPU")
+                    
+                    device_name = device.name if hasattr(device, 'name') else str(device)
+                    warning_msg = str(w[-1].message) if len(w) > 0 else ""
+                    
+                    if log_message:
+                        if "CPU" not in device_name and "No OpenCL device found" in warning_msg:
+                            self.log(f"⚠️ OpenCL CPU driver missing. Fell back to: {device_name}")
+                            self.log("To run APOC on the CPU, install an OpenCL CPU runtime (e.g. Intel CPU Runtime for OpenCL).")
+                        else:
+                            self.log(f"APOC: Forced OpenCL device '{device_name}'")
+                return True
+            except Exception as e:
+                if log_message:
+                    self.log(f"⚠️ Could not force CPU device: {e}")
+                return False
+
         gpu_device = self._selected_gpu_device_name()
         if not gpu_device:
             return False
@@ -5139,6 +5182,7 @@ class APOCWidget(QWidget):
             "strategy_index": all_strats.index(strategy) if strategy in all_strats else 0,
             "strategy_name": strategy,
             "gpu_device_name": self._selected_gpu_device_name(),
+            "force_cpu": self.btn_force_cpu.isChecked() if hasattr(self, 'btn_force_cpu') else False,
             "overwrite": self.check_overwrite.isChecked(),
             "workers": self.spin_workers.value(),
             "process_all": self.check_process_all.isChecked(),
@@ -5185,6 +5229,8 @@ class APOCWidget(QWidget):
             pc["examples_per_sample"] = self.spin_examples.value()
         if hasattr(self, 'combo_gpu_device') and self.combo_gpu_device is not None:
             pc["gpu_device_name"] = self._selected_gpu_device_name()
+        if hasattr(self, 'btn_force_cpu') and self.btn_force_cpu is not None:
+            pc["force_cpu"] = self.btn_force_cpu.isChecked()
             
         if hasattr(self, 'spin_workers') and hasattr(self, 'check_process_all'):
             pc["workers"] = self.spin_workers.value()
