@@ -600,13 +600,6 @@ def merge_labels(
     t0, t1 = _normalize_t_range(buf, t_range)
     others = [i for i in ids if i != target_id]
 
-    # Prefetch sequentially — buf.peek() is not thread-safe.
-    frames_to_process: List[Tuple[int, np.ndarray]] = []
-    for t in range(t0, t1 + 1):
-        frame = buf.peek(t)
-        if np.isin(frame, others).any():
-            frames_to_process.append((t, frame.copy()))
-
     def _merge_one(t_frame: Tuple[int, np.ndarray]) -> Tuple[int, Optional[np.ndarray]]:
         t, frame = t_frame
         mask = np.isin(frame, others)
@@ -616,16 +609,32 @@ def merge_labels(
         out[mask] = target_id
         return t, out
 
-    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
-              max(1, len(frames_to_process)))
-    _total = len(frames_to_process)
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1), max(1, t1 - t0 + 1))
+    batch_size = _nw * 2
+    _total = t1 - t0 + 1
+    _processed = 0
     new_frames: Dict[int, np.ndarray] = {}
+
     with ThreadPoolExecutor(max_workers=_nw) as ex:
-        for _i, (t, out) in enumerate(ex.map(_merge_one, frames_to_process)):
-            if progress_cb:
-                progress_cb(_i + 1, _total)
-            if out is not None:
-                new_frames[t] = out
+        batch = []
+        for t in range(t0, t1 + 1):
+            frame = buf.peek(t)
+            if np.isin(frame, others).any():
+                batch.append((t, frame.copy()))
+            else:
+                _processed += 1
+                if progress_cb:
+                    progress_cb(_processed, _total)
+            
+            if len(batch) >= batch_size or t == t1:
+                if batch:
+                    for _i, (t_out, out) in enumerate(ex.map(_merge_one, batch)):
+                        _processed += 1
+                        if progress_cb:
+                            progress_cb(_processed, _total)
+                        if out is not None:
+                            new_frames[t_out] = out
+                    batch = []
 
     return OpResult(
         name="merge",
@@ -667,22 +676,6 @@ def erode_label(
 
     footprint = _ellipsoid_footprint(r_xy=r_xy, r_z=r_z)
 
-    # Prefetch frames sequentially — buf.peek() is not thread-safe.
-    candidate_frames: List[Tuple[int, np.ndarray]] = []
-    for t in range(t0, t1 + 1):
-        frame = buf.peek(t)
-        if (frame == label_id).any():
-            candidate_frames.append((t, frame.copy()))
-
-    if not candidate_frames:
-        return OpResult(
-            name="erode",
-            new_frames={},
-            affected_labels=[label_id],
-            new_labels=[],
-            summary=f"Eroded label {label_id}: no frames contained the label",
-        )
-
     def _erode_one(t_frame: Tuple[int, np.ndarray]):
         t, frame = t_frame
         mask = frame == label_id
@@ -694,16 +687,43 @@ def erode_label(
         out[removed] = 0
         return t, out
 
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1), max(1, t1 - t0 + 1))
+    batch_size = _nw * 2
+    _total = t1 - t0 + 1
+    _processed = 0
+    _found_any = False
     new_frames: Dict[int, np.ndarray] = {}
-    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
-              max(1, len(candidate_frames)))
-    _total = len(candidate_frames)
+
     with ThreadPoolExecutor(max_workers=_nw) as ex:
-        for _i, (t, out) in enumerate(ex.map(_erode_one, candidate_frames)):
-            if progress_cb:
-                progress_cb(_i + 1, _total)
-            if out is not None:
-                new_frames[t] = out
+        batch = []
+        for t in range(t0, t1 + 1):
+            frame = buf.peek(t)
+            if (frame == label_id).any():
+                _found_any = True
+                batch.append((t, frame.copy()))
+            else:
+                _processed += 1
+                if progress_cb:
+                    progress_cb(_processed, _total)
+            
+            if len(batch) >= batch_size or t == t1:
+                if batch:
+                    for _i, (t_out, out) in enumerate(ex.map(_erode_one, batch)):
+                        _processed += 1
+                        if progress_cb:
+                            progress_cb(_processed, _total)
+                        if out is not None:
+                            new_frames[t_out] = out
+                    batch = []
+
+    if not _found_any:
+        return OpResult(
+            name="erode",
+            new_frames={},
+            affected_labels=[label_id],
+            new_labels=[],
+            summary=f"Eroded label {label_id}: no frames contained the label",
+        )
 
     return OpResult(
         name="erode",
@@ -791,14 +811,38 @@ def dilate_label(
     if r_xy == 0 and r_z == 0:
         return OpResult(name="dilate", summary="no-op (radii are 0)")
 
-    # Prefetch frames sequentially — buf.peek() is not thread-safe.
-    candidate_frames: List[Tuple[int, np.ndarray]] = []
-    for t in range(t0, t1 + 1):
-        frame = buf.peek(t)
-        if (frame == label_id).any():
-            candidate_frames.append((t, frame.copy()))
+    _worker = partial(_dilate_one_frame, label_id=label_id, r_xy=r_xy, r_z=r_z)
 
-    if not candidate_frames:
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1), max(1, t1 - t0 + 1))
+    batch_size = _nw * 2
+    _total = t1 - t0 + 1
+    _processed = 0
+    _found_any = False
+    new_frames: Dict[int, np.ndarray] = {}
+
+    with ThreadPoolExecutor(max_workers=_nw) as ex:
+        batch = []
+        for t in range(t0, t1 + 1):
+            frame = buf.peek(t)
+            if (frame == label_id).any():
+                _found_any = True
+                batch.append((t, frame.copy()))
+            else:
+                _processed += 1
+                if progress_cb:
+                    progress_cb(_processed, _total)
+            
+            if len(batch) >= batch_size or t == t1:
+                if batch:
+                    for _i, (t_out, out) in enumerate(ex.map(_worker, batch)):
+                        _processed += 1
+                        if progress_cb:
+                            progress_cb(_processed, _total)
+                        if out is not None:
+                            new_frames[t_out] = out
+                    batch = []
+
+    if not _found_any:
         return OpResult(
             name="dilate",
             new_frames={},
@@ -806,19 +850,6 @@ def dilate_label(
             new_labels=[],
             summary=f"Dilated label {label_id}: no frames contained the label",
         )
-
-    _worker = partial(_dilate_one_frame, label_id=label_id, r_xy=r_xy, r_z=r_z)
-
-    new_frames: Dict[int, np.ndarray] = {}
-    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
-              max(1, len(candidate_frames)))
-    _total = len(candidate_frames)
-    with ThreadPoolExecutor(max_workers=_nw) as ex:
-        for _i, (t, out) in enumerate(ex.map(_worker, candidate_frames)):
-            if progress_cb:
-                progress_cb(_i + 1, _total)
-            if out is not None:
-                new_frames[t] = out
 
     return OpResult(
         name="dilate",
@@ -852,28 +883,37 @@ def delete_label(
         t_range = (f, l)
     t0, t1 = _normalize_t_range(buf, t_range)
 
-    # Prefetch sequentially — buf.peek() is not thread-safe.
-    frames_to_process: List[Tuple[int, np.ndarray]] = []
-    for t in range(t0, t1 + 1):
-        frame = buf.peek(t)
-        if (frame == label_id).any():
-            frames_to_process.append((t, frame.copy()))
-
     def _del_one(t_frame: Tuple[int, np.ndarray]) -> Tuple[int, np.ndarray]:
         t, frame = t_frame
         out = frame.copy()
         out[frame == label_id] = 0
         return t, out
 
-    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
-              max(1, len(frames_to_process)))
-    _total = len(frames_to_process)
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1), max(1, t1 - t0 + 1))
+    batch_size = _nw * 2
+    _total = t1 - t0 + 1
+    _processed = 0
     new_frames: Dict[int, np.ndarray] = {}
+
     with ThreadPoolExecutor(max_workers=_nw) as ex:
-        for _i, (t, out) in enumerate(ex.map(_del_one, frames_to_process)):
-            if progress_cb:
-                progress_cb(_i + 1, _total)
-            new_frames[t] = out
+        batch = []
+        for t in range(t0, t1 + 1):
+            frame = buf.peek(t)
+            if (frame == label_id).any():
+                batch.append((t, frame.copy()))
+            else:
+                _processed += 1
+                if progress_cb:
+                    progress_cb(_processed, _total)
+            
+            if len(batch) >= batch_size or t == t1:
+                if batch:
+                    for _i, (t_out, out) in enumerate(ex.map(_del_one, batch)):
+                        _processed += 1
+                        if progress_cb:
+                            progress_cb(_processed, _total)
+                        new_frames[t_out] = out
+                    batch = []
 
     return OpResult(
         name="delete",
@@ -925,14 +965,6 @@ def delete_labels(
 
     t0_global, t1_global = min(starts), max(ends)
 
-    # Prefetch sequentially — buf.peek() is not thread-safe.
-    frames_to_process: List[Tuple[int, np.ndarray]] = []
-    for t in range(t0_global, t1_global + 1):
-        frame = buf.peek(t)
-        active = [lid for lid, (lt0, lt1) in resolved_ranges.items() if lt0 <= t <= lt1]
-        if any((frame == lid).any() for lid in active):
-            frames_to_process.append((t, frame.copy()))
-
     def _del_multi(t_frame: Tuple[int, np.ndarray]) -> Tuple[int, Optional[np.ndarray]]:
         t, frame = t_frame
         out = None
@@ -946,16 +978,33 @@ def delete_labels(
                 out[mask] = 0
         return t, out
 
-    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
-              max(1, len(frames_to_process)))
-    _total = len(frames_to_process)
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1), max(1, t1_global - t0_global + 1))
+    batch_size = _nw * 2
+    _total = t1_global - t0_global + 1
+    _processed = 0
     new_frames: Dict[int, np.ndarray] = {}
+
     with ThreadPoolExecutor(max_workers=_nw) as ex:
-        for _i, (t, out) in enumerate(ex.map(_del_multi, frames_to_process)):
-            if progress_cb:
-                progress_cb(_i + 1, _total)
-            if out is not None:
-                new_frames[t] = out
+        batch = []
+        for t in range(t0_global, t1_global + 1):
+            frame = buf.peek(t)
+            active = [lid for lid, (lt0, lt1) in resolved_ranges.items() if lt0 <= t <= lt1]
+            if any((frame == lid).any() for lid in active):
+                batch.append((t, frame.copy()))
+            else:
+                _processed += 1
+                if progress_cb:
+                    progress_cb(_processed, _total)
+            
+            if len(batch) >= batch_size or t == t1_global:
+                if batch:
+                    for _i, (t_out, out) in enumerate(ex.map(_del_multi, batch)):
+                        _processed += 1
+                        if progress_cb:
+                            progress_cb(_processed, _total)
+                        if out is not None:
+                            new_frames[t_out] = out
+                    batch = []
 
     return OpResult(
         name="delete",
@@ -1014,22 +1063,6 @@ def fill_label(
         t_range = (f, l)
     t0, t1 = _normalize_t_range(buf, t_range)
 
-    # Prefetch sequentially — buf.peek() is not thread-safe.
-    frames_to_process: List[Tuple[int, np.ndarray]] = []
-    for t in range(t0, t1 + 1):
-        frame = buf.peek(t)
-        if (frame == label_id).any():
-            frames_to_process.append((t, frame.copy()))
-
-    if not frames_to_process:
-        return OpResult(
-            name="fill",
-            new_frames={},
-            affected_labels=[label_id],
-            new_labels=[],
-            summary=f"Fill label {label_id}: no frames contained the label",
-        )
-
     def _fill_one(t_frame: Tuple[int, np.ndarray]) -> Tuple[int, Optional[np.ndarray]]:
         t, frame = t_frame
         mask = frame == label_id
@@ -1042,16 +1075,43 @@ def fill_label(
         out[new_pixels] = label_id
         return t, out
 
-    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
-              max(1, len(frames_to_process)))
-    _total = len(frames_to_process)
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1), max(1, t1 - t0 + 1))
+    batch_size = _nw * 2
+    _total = t1 - t0 + 1
+    _processed = 0
+    _found_any = False
     new_frames: Dict[int, np.ndarray] = {}
+
     with ThreadPoolExecutor(max_workers=_nw) as ex:
-        for _i, (t, out) in enumerate(ex.map(_fill_one, frames_to_process)):
-            if progress_cb:
-                progress_cb(_i + 1, _total)
-            if out is not None:
-                new_frames[t] = out
+        batch = []
+        for t in range(t0, t1 + 1):
+            frame = buf.peek(t)
+            if (frame == label_id).any():
+                _found_any = True
+                batch.append((t, frame.copy()))
+            else:
+                _processed += 1
+                if progress_cb:
+                    progress_cb(_processed, _total)
+            
+            if len(batch) >= batch_size or t == t1:
+                if batch:
+                    for _i, (t_out, out) in enumerate(ex.map(_fill_one, batch)):
+                        _processed += 1
+                        if progress_cb:
+                            progress_cb(_processed, _total)
+                        if out is not None:
+                            new_frames[t_out] = out
+                    batch = []
+
+    if not _found_any:
+        return OpResult(
+            name="fill",
+            new_frames={},
+            affected_labels=[label_id],
+            new_labels=[],
+            summary=f"Fill label {label_id}: no frames contained the label",
+        )
 
     return OpResult(
         name="fill",
