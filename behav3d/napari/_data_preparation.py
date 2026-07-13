@@ -166,6 +166,34 @@ class _ZarrWorker(QThread):
             )
 
 
+class _ZarrClipWorker(QThread):
+    """Clips already-converted .zarr files in place to a timepoint range."""
+    progress = Signal(str)
+    # (success, message)
+    finished = Signal(bool, str)
+
+    def __init__(self, samples: list, t_start: int, t_end: int, parent=None):
+        super().__init__(parent)
+        # samples: list of {"sample_name": str, "zarr_path": str}
+        self.samples = samples
+        self.t_start = t_start
+        self.t_end = t_end
+
+    def run(self):
+        try:
+            from behav3d.io.images import clip_zarr_timepoints
+
+            for entry in self.samples:
+                sample_name = entry["sample_name"]
+                zarr_path = entry["zarr_path"]
+                self.progress.emit(f"Clipping '{sample_name}' to timepoints [{self.t_start}, {self.t_end}]…")
+                clip_zarr_timepoints(zarr_path, t_start=self.t_start, t_end=self.t_end)
+
+            self.finished.emit(True, f"✅ Clipped {len(self.samples)} existing zarr file(s)!")
+        except Exception:
+            self.finished.emit(False, f"❌ Clipping existing zarr failed:\n{traceback.format_exc()}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # DataPreparationTab
 # ═══════════════════════════════════════════════════════════════════════════
@@ -183,6 +211,8 @@ class DataPreparationTab(QWidget):
         self.output_dir: str = ""
         self.behav3d_parameters: dict = deepcopy(_DEFAULT_CONFIG)
         self._zarr_worker: _ZarrWorker | None = None
+        self._zarr_clip_worker: _ZarrClipWorker | None = None
+        self._sample_t_counts: dict = {}       # sample_name -> T count (Section 5)
         self._edit_mode: bool = False          # True when editing loaded metadata
         self._loaded_csv_path: str = ""        # CSV path of last loaded metadata
 
@@ -1275,6 +1305,7 @@ class DataPreparationTab(QWidget):
 
         samples = self.metadata["sample_name"].tolist()
         self.dim_table.setRowCount(len(samples))
+        self._sample_t_counts = {}
 
         for i, sample in enumerate(samples):
             # Sample name (read-only)
@@ -1284,13 +1315,15 @@ class DataPreparationTab(QWidget):
 
             # Shape
             raw_path = self.metadata.loc[self.metadata["sample_name"] == sample, "raw_image_path"]
+            raw_shape = None
             shape_str = ""
             detected_order = "TCZYX"
             if not raw_path.empty:
                 p = Path(str(raw_path.iloc[0]).strip())
                 if p.exists():
                     try:
-                        shape_str = str(get_image_shape(p))
+                        raw_shape = get_image_shape(p)
+                        shape_str = str(raw_shape)
                     except Exception:
                         shape_str = "?"
                     try:
@@ -1317,7 +1350,54 @@ class DataPreparationTab(QWidget):
                     combo.setCurrentText(detected_order if detected_order in DIM_ORDER_OPTIONS else "TCZYX")
             else:
                 combo.setCurrentText(detected_order if detected_order in DIM_ORDER_OPTIONS else "TCZYX")
+            combo.currentTextChanged.connect(self._recompute_sample_t_counts_from_table)
             self.dim_table.setCellWidget(i, 2, combo)
+
+        self._recompute_sample_t_counts_from_table()
+
+    def _recompute_sample_t_counts_from_table(self, *_args):
+        """Re-derive each sample's T count from the dim_table's Shape/Dim Order
+        columns (no disk access) and refresh the T-mismatch warning."""
+        import ast
+
+        counts: dict = {}
+        for i in range(self.dim_table.rowCount()):
+            sample_item = self.dim_table.item(i, 0)
+            shape_item = self.dim_table.item(i, 1)
+            combo = self.dim_table.cellWidget(i, 2)
+            if sample_item is None:
+                continue
+            t_count = None
+            if shape_item is not None and combo is not None and shape_item.text():
+                order = combo.currentText()
+                try:
+                    raw_shape = ast.literal_eval(shape_item.text())
+                    if "T" in order and len(order) == len(raw_shape):
+                        t_count = int(raw_shape[order.index("T")])
+                except Exception:
+                    t_count = None
+            counts[sample_item.text()] = t_count
+        self._sample_t_counts = counts
+        self._update_t_mismatch_warning()
+
+    def _update_t_mismatch_warning(self):
+        """Show/hide the Section 6 warning when samples have differing T counts."""
+        if not hasattr(self, "t_mismatch_warning"):
+            return
+        counts = {s: t for s, t in self._sample_t_counts.items() if t is not None}
+        distinct = sorted(set(counts.values()))
+        if len(distinct) <= 1:
+            self.t_mismatch_warning.setVisible(False)
+            return
+        lo, hi = distinct[0], distinct[-1]
+        self.t_mismatch_warning.setText(
+            f"⚠ Images do not have the same number of timepoints ({lo}–{hi} T). "
+            f"Clipping timepoints is recommended before conversion."
+        )
+        self.t_mismatch_warning.setToolTip(
+            "\n".join(f"{s}: T={t}" for s, t in sorted(counts.items()))
+        )
+        self.t_mismatch_warning.setVisible(True)
 
     def _apply_dim_order_all(self):
         order = self.dim_apply_all_combo.currentText()
@@ -1325,6 +1405,7 @@ class DataPreparationTab(QWidget):
             combo = self.dim_table.cellWidget(i, 2)
             if combo:
                 combo.setCurrentText(order)
+        self._recompute_sample_t_counts_from_table()
 
     def _save_dim_order(self):
         if self.metadata is None:
@@ -1357,6 +1438,16 @@ class DataPreparationTab(QWidget):
     def _build_zarr_section(self):
         grp = QGroupBox("6 · Convert to Zarr")
         lay = QVBoxLayout(grp)
+
+        # T-mismatch warning (hidden until _update_t_mismatch_warning finds a mismatch)
+        self.t_mismatch_warning = QLabel("")
+        self.t_mismatch_warning.setWordWrap(True)
+        self.t_mismatch_warning.setStyleSheet(
+            "QLabel { background: #4a2222; color: #ffdada; border-radius: 4px; "
+            "padding: 6px 8px; font-size: 11px; }"
+        )
+        self.t_mismatch_warning.setVisible(False)
+        lay.addWidget(self.t_mismatch_warning)
 
         # Timepoint clipping
         self.zarr_clip_check = QCheckBox("Clip timepoints (select range)")
@@ -1417,6 +1508,17 @@ class DataPreparationTab(QWidget):
 
         self._layout.addWidget(grp)
 
+    def _find_already_converted_samples(self, out_dir: str) -> list:
+        """Return the samples whose output .zarr (from a previous conversion
+        run) already exists at the path convert_input_files_to_zarr writes to."""
+        found = []
+        for _, row in self.metadata.iterrows():
+            sample_name = str(row.get("sample_name", ""))
+            zarr_path = Path(out_dir, "images", sample_name, f"{sample_name}.zarr")
+            if zarr_path.exists():
+                found.append({"sample_name": sample_name, "zarr_path": str(zarr_path)})
+        return found
+
     def _on_convert_zarr(self):
         if self._zarr_worker is not None:
             self._log("⚠️ Zarr conversion already running. Please wait.")
@@ -1443,6 +1545,66 @@ class DataPreparationTab(QWidget):
                     f"End timepoint ({t_end}) must be greater than start ({t_start}).")
                 return
 
+            already_converted = self._find_already_converted_samples(out_dir)
+            if already_converted:
+                names = ", ".join(e["sample_name"] for e in already_converted)
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Question)
+                box.setWindowTitle("Clip already-converted images?")
+                box.setTextFormat(Qt.RichText)
+                box.setText(
+                    f"<b>{len(already_converted)}</b> sample(s) already have a converted "
+                    f".zarr and will be skipped by a normal conversion run."
+                )
+                box.setInformativeText(
+                    f"Clip their existing .zarr in place to timepoints "
+                    f"[{t_start}, {t_end}] now?\n\n"
+                    "Clip existing zarr: truncate the already-converted files to the "
+                    "selected range (fast, no re-read of raw files)\n"
+                    "Leave as-is: keep them untouched and only convert samples that "
+                    "haven't been converted yet"
+                )
+                box.setDetailedText("Already converted:\n" + "\n".join(
+                    f"  • {n}" for n in names.split(", ")
+                ))
+                btn_clip = box.addButton("Clip Existing Zarr", QMessageBox.AcceptRole)
+                btn_leave = box.addButton("Leave As-Is", QMessageBox.YesRole)
+                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+                box.exec_()
+                clicked = box.clickedButton()
+                if clicked == btn_cancel:
+                    self._log("Action cancelled.")
+                    return
+                if clicked == btn_clip:
+                    self.zarr_btn.setEnabled(False)
+                    self.zarr_status.setText("⏳ Clipping already-converted zarr files…")
+                    self._log(f"Clipping {len(already_converted)} already-converted sample(s)…")
+                    self._zarr_clip_worker = _ZarrClipWorker(
+                        already_converted, t_start, t_end, parent=self
+                    )
+                    self._zarr_clip_worker.progress.connect(lambda msg: self._log(msg))
+                    self._zarr_clip_worker.finished.connect(
+                        lambda success, message: self._on_zarr_clip_done(
+                            success, message, out_dir, t_start, t_end
+                        )
+                    )
+                    self._zarr_clip_worker.start()
+                    return
+                # else: "Leave As-Is" clicked — fall through to normal conversion
+
+        self._start_zarr_conversion(out_dir, t_start, t_end)
+
+    def _on_zarr_clip_done(self, success: bool, message: str,
+                            out_dir: str, t_start, t_end):
+        self._log(message)
+        if not success:
+            self.zarr_btn.setEnabled(True)
+            self.zarr_status.setText(message.split("\n")[0])
+            return
+        # Continue with the normal conversion for any not-yet-converted samples.
+        self._start_zarr_conversion(out_dir, t_start, t_end)
+
+    def _start_zarr_conversion(self, out_dir: str, t_start, t_end):
         self.zarr_btn.setEnabled(False)
         self.zarr_status.setText("⏳ Converting…")
         self._log("Starting zarr conversion…")

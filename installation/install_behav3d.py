@@ -940,18 +940,18 @@ Examples:
             print_info(f"Using micromamba (lightweight conda alternative)")
     else:
         print_warning("Conda not found on system")
-        response = input("\nWould you like to install Micromamba (lightweight conda alternative)? [Y/n]: ")
+        response = input("\nWould you like to install Miniforge (lightweight conda alternative)? [Y/n]: ")
         if response.lower() != 'n':
-            conda_path = install_micromamba()
+            conda_path = install_miniforge()
             if not conda_path:
-                print_error("Failed to install Micromamba. Please install manually.")
-                print_info("Visit: https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html")
+                print_error("Failed to install Miniforge. Please install manually.")
+                print_info("Visit: https://miniforge.github.io/miniforge/")
                 return 1
             print_warning("Please restart your terminal and run this script again.")
-            print_info("The micromamba installation needs a shell restart to take effect.")
+            print_info("The miniforge installation needs a shell restart to take effect.")
             return 0
         else:
-            print_error("Conda/Micromamba is required for BEHAV3D installation.")
+            print_error("Conda/Miniforge is required for BEHAV3D installation.")
             return 1
     
     # Check if environment exists

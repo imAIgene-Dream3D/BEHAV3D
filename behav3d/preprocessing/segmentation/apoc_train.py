@@ -2745,12 +2745,17 @@ class APOCTrainingWidget(QWidget):
             if strategy == "APOC Probability Map + Watershed":
                 if prob_prediction is None or prob_path is None or not Path(prob_path).exists():
                     _raw_prediction, prob_prediction = self._predict_classifier_outputs(ct)
+                mask_thr = float(tab.prob_mask_threshold_spin.value())
+                seed_thr = float(tab.prob_seed_threshold_spin.value())
+                opening_nr_pixels = int(tab.opening_nr_pixels_spin.value())
+                segment_size_min = int(tab.segment_size_min_spin.value())
+                print(f"  ⚙ {ct} preview params: mask_thr={mask_thr}, seed_thr={seed_thr}, min_size={segment_size_min}, opening_px={opening_nr_pixels}")
                 instance_preview = _probability_array_to_segments(
                     prob_prediction,
-                    mask_thr=float(tab.prob_mask_threshold_spin.value()),
-                    seed_thr=float(tab.prob_seed_threshold_spin.value()),
-                    opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
-                    segment_size_min=int(tab.segment_size_min_spin.value()),
+                    mask_thr=mask_thr,
+                    seed_thr=seed_thr,
+                    opening_nr_pixels=opening_nr_pixels,
+                    segment_size_min=segment_size_min,
                 )
             else:
                 raw_prediction, prob_prediction = self._predict_classifier_outputs(ct)
@@ -2759,15 +2764,22 @@ class APOCTrainingWidget(QWidget):
                     if strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
                     else "threshold"
                 )
+                edt_thr = float(tab.edt_threshold_spin.value())
+                opening_nr_pixels = int(tab.opening_nr_pixels_spin.value())
+                segment_size_min = int(tab.segment_size_min_spin.value())
+                fill_holes = bool(tab.fill_holes_cb.isChecked())
+                peak_min_distance = float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None
+                peak_min_ratio = float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35
+                print(f"  ⚙ {ct} preview params: edt_thr={edt_thr}, min_size={segment_size_min}, fill_holes={fill_holes}, opening_px={opening_nr_pixels}, peak_min_distance={peak_min_distance}, peak_min_ratio={peak_min_ratio}")
                 instance_preview = _mask_array_to_segments(
                     raw_prediction > 0,
-                    edt_thr=float(tab.edt_threshold_spin.value()),
-                    opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
-                    segment_size_min=int(tab.segment_size_min_spin.value()),
-                    fill_holes=bool(tab.fill_holes_cb.isChecked()),
+                    edt_thr=edt_thr,
+                    opening_nr_pixels=opening_nr_pixels,
+                    segment_size_min=segment_size_min,
+                    fill_holes=fill_holes,
                     marker_strategy=marker_strategy,
-                    peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
-                    peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
+                    peak_min_distance=peak_min_distance,
+                    peak_min_ratio=peak_min_ratio,
                 )
 
             self._update_prediction_layers(ct, instance_preview, prob_prediction)
