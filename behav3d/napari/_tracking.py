@@ -723,10 +723,10 @@ class CellTypeTrackingPanel(QWidget):
         self.bt_max_search_radius.setRange(1, 9999)
         self.bt_max_search_radius.setValue(int(bt_cfg.get("max_search_radius", 100)))
         self.bt_max_search_radius.setMaximumWidth(80)
-        step1_form.addRow("Max search radius (px):", make_help_row(
+        step1_form.addRow("Max search radius (µm):", make_help_row(
             self.bt_max_search_radius,
-            "Max Search Radius (pixels)",
-            "Maximum isotropic distance (pixels) to search for\n"
+            "Max Search Radius (µm)",
+            "Maximum physical distance (µm) to search for\n"
             "linking objects between frames.\n\n"
             "Increase for fast-moving cells; decrease to\n"
             "prevent long-range false links."
@@ -843,10 +843,10 @@ class CellTypeTrackingPanel(QWidget):
         self.bt_dist_thresh.setRange(1, 9999)
         self.bt_dist_thresh.setValue(int(bt_cfg.get("dist_thresh", 60)))
         self.bt_dist_thresh.setMaximumWidth(80)
-        step2_form.addRow("Distance threshold:", make_help_row(
+        step2_form.addRow("Distance threshold (µm):", make_help_row(
             self.bt_dist_thresh,
-            "Distance Threshold",
-            "Maximum distance (pixels) for generating\n"
+            "Distance Threshold (µm)",
+            "Maximum physical distance (µm) for generating\n"
             "link/branch hypotheses in the optimizer."
         ))
 

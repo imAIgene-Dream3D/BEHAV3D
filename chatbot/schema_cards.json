@@ -518,6 +518,16 @@
     "description": "Optional path to a custom btrack config JSON; overrides the preset."
   },
   {
+    "key": "tracking.immune.btrack.use_visual_features",
+    "title": "use_visual_features",
+    "step": "tracking",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Use image-derived intensity measurements alongside motion for btrack linking. This is separate from global track optimization."
+  },
+  {
     "key": "tracking.immune.btrack.max_search_radius",
     "title": "max_search_radius",
     "step": "tracking",
@@ -525,7 +535,7 @@
     "type": "int",
     "default": 100,
     "choices": null,
-    "description": "btrack maximum linking radius in pixels."
+    "description": "btrack maximum linking radius in physical distance units (normally micrometres after metadata scaling)."
   },
   {
     "key": "tracking.immune.btrack.update_method",
@@ -593,7 +603,7 @@
     "type": "int",
     "default": 60,
     "choices": null,
-    "description": "btrack distance threshold (pixels) for candidate links."
+    "description": "btrack optimizer distance threshold in physical distance units (normally micrometres after metadata scaling)."
   },
   {
     "key": "tracking.immune.btrack.time_thresh",
@@ -745,6 +755,16 @@
     "description": "Optional path to a custom btrack config JSON; overrides the preset."
   },
   {
+    "key": "tracking.other.btrack.use_visual_features",
+    "title": "use_visual_features",
+    "step": "tracking",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Use image-derived intensity measurements alongside motion for btrack linking. This is separate from global track optimization."
+  },
+  {
     "key": "tracking.other.btrack.max_search_radius",
     "title": "max_search_radius",
     "step": "tracking",
@@ -752,7 +772,7 @@
     "type": "int",
     "default": 100,
     "choices": null,
-    "description": "btrack maximum linking radius in pixels."
+    "description": "btrack maximum linking radius in physical distance units (normally micrometres after metadata scaling)."
   },
   {
     "key": "tracking.other.btrack.update_method",
@@ -820,7 +840,7 @@
     "type": "int",
     "default": 60,
     "choices": null,
-    "description": "btrack distance threshold (pixels) for candidate links."
+    "description": "btrack optimizer distance threshold in physical distance units (normally micrometres after metadata scaling)."
   },
   {
     "key": "tracking.other.btrack.time_thresh",
@@ -972,6 +992,16 @@
     "description": "Optional path to a custom btrack config JSON; overrides the preset."
   },
   {
+    "key": "tracking.organoid.btrack.use_visual_features",
+    "title": "use_visual_features",
+    "step": "tracking",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Use image-derived intensity measurements alongside motion for btrack linking. This is separate from global track optimization."
+  },
+  {
     "key": "tracking.organoid.btrack.max_search_radius",
     "title": "max_search_radius",
     "step": "tracking",
@@ -979,7 +1009,7 @@
     "type": "int",
     "default": 100,
     "choices": null,
-    "description": "btrack maximum linking radius in pixels."
+    "description": "btrack maximum linking radius in physical distance units (normally micrometres after metadata scaling)."
   },
   {
     "key": "tracking.organoid.btrack.update_method",
@@ -1047,7 +1077,7 @@
     "type": "int",
     "default": 60,
     "choices": null,
-    "description": "btrack distance threshold (pixels) for candidate links."
+    "description": "btrack optimizer distance threshold in physical distance units (normally micrometres after metadata scaling)."
   },
   {
     "key": "tracking.organoid.btrack.time_thresh",
@@ -1476,6 +1506,66 @@
     "description": "Number of behavioural clusters to extract."
   },
   {
+    "key": "analysis.immune.feature_scaling_preset",
+    "title": "feature_scaling_preset",
+    "step": "analysis",
+    "category": "immune",
+    "type": "none",
+    "default": null,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.immune.feature_scaling_preset' (type none, default None)."
+  },
+  {
+    "key": "analysis.immune.min_track_length_enabled",
+    "title": "min_track_length_enabled",
+    "step": "analysis",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether the minimum-track-length filter is active."
+  },
+  {
+    "key": "analysis.immune.min_track_length",
+    "title": "min_track_length",
+    "step": "analysis",
+    "category": "immune",
+    "type": "int",
+    "default": 1,
+    "choices": null,
+    "description": "Discard tracks shorter than this many frames."
+  },
+  {
+    "key": "analysis.immune.max_track_length_enabled",
+    "title": "max_track_length_enabled",
+    "step": "analysis",
+    "category": "immune",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether the maximum-track-length filter is active."
+  },
+  {
+    "key": "analysis.immune.max_track_length",
+    "title": "max_track_length",
+    "step": "analysis",
+    "category": "immune",
+    "type": "int",
+    "default": 999999,
+    "choices": null,
+    "description": "Discard tracks longer than this many frames."
+  },
+  {
+    "key": "analysis.immune.feature_dtw_napari_backprojection_workers",
+    "title": "feature_dtw_napari_backprojection_workers",
+    "step": "analysis",
+    "category": "immune",
+    "type": "int",
+    "default": 4,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.immune.feature_dtw_napari_backprojection_workers' (type int, default 4)."
+  },
+  {
     "key": "analysis.immune.dtw_feature_groups_enabled.morphology",
     "title": "morphology",
     "step": "analysis",
@@ -1596,6 +1686,66 @@
     "description": "Number of behavioural clusters to extract."
   },
   {
+    "key": "analysis.organoid.feature_scaling_preset",
+    "title": "feature_scaling_preset",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "none",
+    "default": null,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.organoid.feature_scaling_preset' (type none, default None)."
+  },
+  {
+    "key": "analysis.organoid.min_track_length_enabled",
+    "title": "min_track_length_enabled",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether the minimum-track-length filter is active."
+  },
+  {
+    "key": "analysis.organoid.min_track_length",
+    "title": "min_track_length",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "int",
+    "default": 1,
+    "choices": null,
+    "description": "Discard tracks shorter than this many frames."
+  },
+  {
+    "key": "analysis.organoid.max_track_length_enabled",
+    "title": "max_track_length_enabled",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether the maximum-track-length filter is active."
+  },
+  {
+    "key": "analysis.organoid.max_track_length",
+    "title": "max_track_length",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "int",
+    "default": 999999,
+    "choices": null,
+    "description": "Discard tracks longer than this many frames."
+  },
+  {
+    "key": "analysis.organoid.feature_dtw_napari_backprojection_workers",
+    "title": "feature_dtw_napari_backprojection_workers",
+    "step": "analysis",
+    "category": "organoid",
+    "type": "int",
+    "default": 4,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.organoid.feature_dtw_napari_backprojection_workers' (type int, default 4)."
+  },
+  {
     "key": "analysis.organoid.dtw_feature_groups_enabled.morphology",
     "title": "morphology",
     "step": "analysis",
@@ -1714,6 +1864,66 @@
     "default": 5,
     "choices": null,
     "description": "Number of behavioural clusters to extract."
+  },
+  {
+    "key": "analysis.other.feature_scaling_preset",
+    "title": "feature_scaling_preset",
+    "step": "analysis",
+    "category": "other",
+    "type": "none",
+    "default": null,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.other.feature_scaling_preset' (type none, default None)."
+  },
+  {
+    "key": "analysis.other.min_track_length_enabled",
+    "title": "min_track_length_enabled",
+    "step": "analysis",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether the minimum-track-length filter is active."
+  },
+  {
+    "key": "analysis.other.min_track_length",
+    "title": "min_track_length",
+    "step": "analysis",
+    "category": "other",
+    "type": "int",
+    "default": 1,
+    "choices": null,
+    "description": "Discard tracks shorter than this many frames."
+  },
+  {
+    "key": "analysis.other.max_track_length_enabled",
+    "title": "max_track_length_enabled",
+    "step": "analysis",
+    "category": "other",
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Whether the maximum-track-length filter is active."
+  },
+  {
+    "key": "analysis.other.max_track_length",
+    "title": "max_track_length",
+    "step": "analysis",
+    "category": "other",
+    "type": "int",
+    "default": 999999,
+    "choices": null,
+    "description": "Discard tracks longer than this many frames."
+  },
+  {
+    "key": "analysis.other.feature_dtw_napari_backprojection_workers",
+    "title": "feature_dtw_napari_backprojection_workers",
+    "step": "analysis",
+    "category": "other",
+    "type": "int",
+    "default": 4,
+    "choices": null,
+    "description": "BEHAV3D parameter 'analysis.other.feature_dtw_napari_backprojection_workers' (type int, default 4)."
   },
   {
     "key": "analysis.other.dtw_feature_groups_enabled.morphology",
@@ -2004,6 +2214,532 @@
     "description": "Fraction of dead-mask pixels above which a cell is considered dead."
   },
   {
+    "key": "behavioral_state_classification.defaults.hmm_n_states_mode",
+    "title": "hmm_n_states_mode",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "str",
+    "default": "fixed",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_n_states_mode' (type str, default 'fixed')."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_n_states",
+    "title": "hmm_n_states",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "int",
+    "default": 4,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_n_states' (type int, default 4)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_k_min",
+    "title": "hmm_k_min",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "int",
+    "default": 2,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_k_min' (type int, default 2)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_k_max",
+    "title": "hmm_k_max",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "int",
+    "default": 8,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_k_max' (type int, default 8)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_covariance_type",
+    "title": "hmm_covariance_type",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "str",
+    "default": "full",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_covariance_type' (type str, default 'full')."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_n_iter",
+    "title": "hmm_n_iter",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "int",
+    "default": 500,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_n_iter' (type int, default 500)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_tol",
+    "title": "hmm_tol",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "float",
+    "default": 0.001,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_tol' (type float, default 0.001)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_sticky",
+    "title": "hmm_sticky",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_sticky' (type bool, default False)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_stickiness_kappa",
+    "title": "hmm_stickiness_kappa",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "float",
+    "default": 8.0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_stickiness_kappa' (type float, default 8.0)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_transmat_alpha",
+    "title": "hmm_transmat_alpha",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "float",
+    "default": 1.0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_transmat_alpha' (type float, default 1.0)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_min_covar",
+    "title": "hmm_min_covar",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "float",
+    "default": 0.001,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_min_covar' (type float, default 0.001)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_feature_smoothing_window",
+    "title": "hmm_feature_smoothing_window",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "int",
+    "default": 5,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_feature_smoothing_window' (type int, default 5)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_smoothing_min_periods",
+    "title": "hmm_smoothing_min_periods",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "int",
+    "default": 1,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_smoothing_min_periods' (type int, default 1)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_start_offset",
+    "title": "hmm_start_offset",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "int",
+    "default": 1,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_start_offset' (type int, default 1)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_start_offset_fill_mode",
+    "title": "hmm_start_offset_fill_mode",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "str",
+    "default": "backfill",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_start_offset_fill_mode' (type str, default 'backfill')."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_backprojection_workers",
+    "title": "hmm_backprojection_workers",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "int",
+    "default": 4,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_backprojection_workers' (type int, default 4)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_window_features",
+    "title": "hmm_window_features",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "list",
+    "default": [
+      "net_displacement"
+    ],
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_window_features' (type list, default ['net_displacement'])."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_window_features_window",
+    "title": "hmm_window_features_window",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "int",
+    "default": 5,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_window_features_window' (type int, default 5)."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.hmm_log_scale_features",
+    "title": "hmm_log_scale_features",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "list",
+    "default": [
+      "speed",
+      "net_displacement"
+    ],
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_log_scale_features' (type list, default ['speed', 'net_displacement'])."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.feature_quantile_capping_low_percentile",
+    "title": "feature_quantile_capping_low_percentile",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.feature_quantile_capping_low_percentile' (type str, default '')."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.feature_quantile_capping_high_percentile",
+    "title": "feature_quantile_capping_high_percentile",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.feature_quantile_capping_high_percentile' (type str, default '')."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.apply_hmm_deployment_artifact_path",
+    "title": "apply_hmm_deployment_artifact_path",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.apply_hmm_deployment_artifact_path' (type str, default '')."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.selected_features",
+    "title": "selected_features",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "list",
+    "default": [
+      "elongation",
+      "extent",
+      "solidity",
+      "sphericity",
+      "speed"
+    ],
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.selected_features' (type list, default ['elongation', 'extent', 'solidity', 'sphericity', 'speed'])."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.binary_features_to_group",
+    "title": "binary_features_to_group",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "list",
+    "default": [
+      "any_immune_cell_contact",
+      "any_organoid_contact",
+      "dead",
+      "is_active_killing"
+    ],
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.binary_features_to_group' (type list, default ['any_immune_cell_contact', 'any_organoid_contact', 'dead', 'is_active_killing'])."
+  },
+  {
+    "key": "behavioral_state_classification.defaults.random_state",
+    "title": "random_state",
+    "step": "behavioral_state_classification",
+    "category": null,
+    "type": "int",
+    "default": 12345,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.random_state' (type int, default 12345)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.behavioral_trajectory_size",
+    "title": "behavioral_trajectory_size",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "int",
+    "default": 100,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.behavioral_trajectory_size' (type int, default 100)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.n_clusters",
+    "title": "n_clusters",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "int",
+    "default": 6,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.n_clusters' (type int, default 6)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.n_per_cluster",
+    "title": "n_per_cluster",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "int",
+    "default": 10,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.n_per_cluster' (type int, default 10)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.random_state",
+    "title": "random_state",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "int",
+    "default": 12345,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.random_state' (type int, default 12345)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.trajectory_trim_mode",
+    "title": "trajectory_trim_mode",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "last",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.trajectory_trim_mode' (type str, default 'last')."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.linkage",
+    "title": "linkage",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "average",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.linkage' (type str, default 'average')."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.missing_policy",
+    "title": "missing_policy",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "keep",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.missing_policy' (type str, default 'keep')."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.parallel",
+    "title": "parallel",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.parallel' (type bool, default True)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.save_distance_matrix",
+    "title": "save_distance_matrix",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.save_distance_matrix' (type bool, default False)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.window",
+    "title": "window",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.window' (type str, default '')."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.max_dist",
+    "title": "max_dist",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.max_dist' (type str, default '')."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.max_length_diff",
+    "title": "max_length_diff",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.max_length_diff' (type str, default '')."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.penalty",
+    "title": "penalty",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.penalty' (type str, default '')."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.psi",
+    "title": "psi",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.psi' (type str, default '')."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.make_overview_statebars",
+    "title": "make_overview_statebars",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.make_overview_statebars' (type bool, default True)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.make_backprojection_pdf",
+    "title": "make_backprojection_pdf",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.make_backprojection_pdf' (type bool, default False)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.make_backprojection_mp4",
+    "title": "make_backprojection_mp4",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.make_backprojection_mp4' (type bool, default False)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.classifier_n_estimators",
+    "title": "classifier_n_estimators",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "int",
+    "default": 100,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.classifier_n_estimators' (type int, default 100)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.classifier_min_samples_leaf",
+    "title": "classifier_min_samples_leaf",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "int",
+    "default": 1,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.classifier_min_samples_leaf' (type int, default 1)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.classifier_min_samples_split",
+    "title": "classifier_min_samples_split",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "int",
+    "default": 2,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.classifier_min_samples_split' (type int, default 2)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.classifier_max_features",
+    "title": "classifier_max_features",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "sqrt",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.classifier_max_features' (type str, default 'sqrt')."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.classifier_max_depth",
+    "title": "classifier_max_depth",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.classifier_max_depth' (type str, default '')."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.classifier_test_size",
+    "title": "classifier_test_size",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "float",
+    "default": 0.2,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.classifier_test_size' (type float, default 0.2)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.classifier_n_jobs",
+    "title": "classifier_n_jobs",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "int",
+    "default": -1,
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.classifier_n_jobs' (type int, default -1)."
+  },
+  {
+    "key": "behavioral_track_classification.defaults.classifier_artifact_path",
+    "title": "classifier_artifact_path",
+    "step": "behavioral_track_classification",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.classifier_artifact_path' (type str, default '')."
+  },
+  {
+    "key": "viewer_display.channels",
+    "title": "channels",
+    "step": "viewer_display",
+    "category": null,
+    "type": "dict",
+    "default": {},
+    "choices": null,
+    "description": "BEHAV3D parameter 'viewer_display.channels' (type dict, default {})."
+  },
+  {
     "key": "calculated_features.morphology",
     "title": "morphology",
     "step": "feature_extraction",
@@ -2018,14 +2754,17 @@
       "equivalent_diameter",
       "major_axis_length",
       "minor_axis_length",
+      "axis1_length",
+      "axis2_length",
+      "axis3_length",
       "elongation",
       "surface_area",
       "sphericity",
       "convex_volume",
-      "orientation_vector"
+      "surface_to_volume_ratio"
     ],
     "choices": null,
-    "description": "Computed 'morphology' feature columns produced by BEHAV3D (reference, not user-tunable): nr_pixels, volume, bbox_volume, extent, solidity, equivalent_diameter, major_axis_length, minor_axis_length, elongation, surface_area, sphericity, convex_volume, orientation_vector."
+    "description": "Computed 'morphology' feature columns produced by BEHAV3D (reference, not user-tunable): nr_pixels, volume, bbox_volume, extent, solidity, equivalent_diameter, major_axis_length, minor_axis_length, axis1_length, axis2_length, axis3_length, elongation, surface_area, sphericity, convex_volume, surface_to_volume_ratio."
   },
   {
     "key": "calculated_features.movement",
@@ -2039,10 +2778,16 @@
       "displacement_from_origin",
       "mean_square_displacement",
       "speed",
-      "mean_speed"
+      "mean_speed",
+      "summed_displacement",
+      "net_displacement",
+      "straightness",
+      "directional_persistence",
+      "median_turning_angle",
+      "fraction_reversed_movement"
     ],
     "choices": null,
-    "description": "Computed 'movement' feature columns produced by BEHAV3D (reference, not user-tunable): displacement, cumulative_displacement, displacement_from_origin, mean_square_displacement, speed, mean_speed."
+    "description": "Computed 'movement' feature columns produced by BEHAV3D (reference, not user-tunable): displacement, cumulative_displacement, displacement_from_origin, mean_square_displacement, speed, mean_speed, summed_displacement, net_displacement, straightness, directional_persistence, median_turning_angle, fraction_reversed_movement."
   },
   {
     "key": "calculated_features.intensity",
@@ -2080,12 +2825,12 @@
     "type": "list",
     "default": [
       "*_contact",
+      "*_contact_on_distance",
       "*_contact_pixels",
-      "touching_*",
       "active_*_contact"
     ],
     "choices": null,
-    "description": "Computed 'contact' feature columns produced by BEHAV3D (reference, not user-tunable): *_contact, *_contact_pixels, touching_*, active_*_contact."
+    "description": "Computed 'contact' feature columns produced by BEHAV3D (reference, not user-tunable): *_contact, *_contact_on_distance, *_contact_pixels, active_*_contact."
   },
   {
     "key": "calculated_features.invasiveness",

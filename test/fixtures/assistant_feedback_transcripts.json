@@ -1,0 +1,51 @@
+[
+  {
+    "id": "loaded_metadata_is_visible",
+    "step": "data_preparation",
+    "user": "I already added those details. Please check every sample.",
+    "required": ["loaded metadata is authoritative", "never ask the user to repeat"]
+  },
+  {
+    "id": "segmentation_method_ladder",
+    "step": "segmentation",
+    "user": "Which segmentation method should I use?",
+    "required": ["start with apoc", "random forest", "custom-trained cellpose", "tiff or zarr"],
+    "forbidden": ["apoc is the random forest"]
+  },
+  {
+    "id": "btrack_units_and_features",
+    "step": "tracking",
+    "user": "Help with btrack visual features, branching, and search radius.",
+    "required": ["physical distances", "global optimization is a separate", "p_branch only"]
+  },
+  {
+    "id": "filtering_tradeoff",
+    "step": "filtering",
+    "user": "What minimum track length should I use?",
+    "required": ["track-length distribution", "exclude real short-lived behavior", "downstream"]
+  },
+  {
+    "id": "hmm_not_dtw",
+    "step": "analysis",
+    "user": "Explain HMM windows, log scaling and where the heatmap is.",
+    "required": ["hmm", "legacy dtw", "window size", "smooth window", "standardized", "behavioral_clustering_diagnostics.pdf"]
+  },
+  {
+    "id": "death_preview",
+    "step": "feature_extraction",
+    "user": "What do the death preview colors mean?",
+    "required": ["green means alive", "red means dead", "hovering"]
+  },
+  {
+    "id": "metadata_based_edt",
+    "step": "segmentation",
+    "user": "Calcula el EDT segun la resolucion de mis imagenes.",
+    "required": ["10 um cell", "pixel_distance_xy", "20%, 25%, and 30%", "cell widths"]
+  },
+  {
+    "id": "interactive_track_counts",
+    "step": "filtering",
+    "user": "Si filtro a 200 timepoints, cuantos tracks quedan en position_t 0?",
+    "required": ["unique position_t", "requested position_t", "never estimate"]
+  }
+]

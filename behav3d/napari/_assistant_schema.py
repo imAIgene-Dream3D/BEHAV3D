@@ -107,13 +107,14 @@ _DESCRIPTIONS: dict[str, str] = {
     # tracking — btrack
     "config_preset": "btrack motion-model preset: 'cell' (typical migrating cells) or 'particle' (fast, near-random motion).",
     "config_path": "Optional path to a custom btrack config JSON; overrides the preset.",
-    "max_search_radius": "btrack maximum linking radius in pixels.",
+    "use_visual_features": "Use image-derived intensity measurements alongside motion for btrack linking. This is separate from global track optimization.",
+    "max_search_radius": "btrack maximum linking radius in physical distance units (normally micrometres after metadata scaling).",
     "update_method": "btrack hypothesis update: 'EXACT' (accurate, slower) or 'APPROXIMATE' (faster for large datasets).",
     "step_size": "btrack optimiser batch/step size; larger trades memory for speed.",
     "n_workers": "Parallel workers for this step.",
     "use_optimize": "Run btrack's global optimisation pass (better tracks, slower).",
     "hypotheses": "btrack hypotheses to evaluate (P_FP false-positive, P_init initialisation, P_term termination, P_link linking, P_branch division).",
-    "dist_thresh": "btrack distance threshold (pixels) for candidate links.",
+    "dist_thresh": "btrack optimizer distance threshold in physical distance units (normally micrometres after metadata scaling).",
     "time_thresh": "btrack time threshold (frames) for candidate links.",
     # features
     "features_choice": "Which feature groups to compute for this cell category: movement, intensity, contact, death, morphology.",
