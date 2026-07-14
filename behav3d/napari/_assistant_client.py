@@ -84,13 +84,17 @@ class LocalResponder:
             hits = [c for s, c in scored[:3] if s > 0]
         if not hits:
             return ("⚠️ Offline mode (no assistant server reachable). I can only "
-                    "answer parameter questions locally. Try naming a parameter, "
-                    "e.g. “what is search_range_px?”")
+                    "answer field questions locally. Try asking, for example, "
+                    "“What does search range mean?”")
         lines = ["⚠️ *Offline mode* — answering from the local parameter schema:\n"]
+        from behav3d.napari._assistant_actions import humanize_parameter_key
         for c in hits[:3]:
             dv = c.get("default")
             ch = f" Choices: {c['choices']}." if c.get("choices") else ""
-            lines.append(f"**{c['key']}** (default `{dv}`)\n{c['description']}{ch}\n")
+            lines.append(
+                f"**{humanize_parameter_key(c['key'])}** (default `{dv}`)\n"
+                f"{c['description']}{ch}\n"
+            )
         return "\n".join(lines)
 
 

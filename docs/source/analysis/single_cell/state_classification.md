@@ -42,8 +42,8 @@ Optional clean-up applied to the chosen features before fitting:
 
 | Control | Default | Meaning | When to use |
 |---|---|---|---|
-| **Log scaling** (per-feature checkboxes) | none | Log-transform the ticked features. | For strongly skewed features (speed, mean square displacement) so a few large values don't dominate. |
-| **Smooth window** | 1 | Rolling-average smoothing applied to features (1 = no smoothing). | Increase slightly to damp frame-to-frame noise before fitting. |
+| **Log scaling** (per-feature checkboxes) | selected skewed features | Optionally apply `log1p` to the ticked features before the model standardises all continuous features. | Use for strongly right-skewed non-negative measurements; it is not required merely because features have different numeric ranges. |
+| **Smooth window** | 5 | Rolling-average smoothing applied to features (1 = no smoothing). | Increase slightly to damp frame-to-frame noise before fitting. |
 | **Low percentile cap** | 0.00 | Clip values below this quantile (0 = off). | Tame extreme low outliers. |
 | **High percentile cap** | 0.99 | Clip values above this quantile (1 = off). | Tame extreme high outliers (e.g. tracking spikes). |
 
@@ -154,6 +154,14 @@ Use Backprojection as a sanity check: scrub through time and the colours should 
 ```
 
 It is stored as an `.h5ad` data file that holds, for every cell at every timepoint, its assigned **intrinsic state** and its **full behavioural cluster** — using your chosen names after renaming. This is the file the Reports and the **Step 4 — Backprojection** step read.
+
+The HMM fit diagnostics, including the state-feature heatmap used to interpret each state, are saved at:
+
+```text
+<output_dir>/analysis/<cell_type>/behavioral_states/processing/hmm_behavioral_classification/quality_control/raw/behavioral_clustering_diagnostics.pdf
+```
+
+State Classification uses an **HMM on per-timepoint and rolling-window features**. The separate **Track Classification** tab contains whole-trajectory clustering, including the legacy DTW workflow; the two analyses answer different questions and should not be described interchangeably.
 
 The two reports are each saved as a PDF (the composition report also writes a CSV of the underlying curves).
 

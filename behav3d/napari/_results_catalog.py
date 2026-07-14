@@ -48,6 +48,16 @@ FILE_CATALOG: list[tuple[str, str]] = [
         "Bar plots of track counts after each filtering step (per sample).",
     ),
     (
+        "BEHAV3D_*_track_count_summary.csv",
+        "Standard per-sample cell-count comparison at timepoint 0 for minimum "
+        "track lengths of 20, 50, 100, and 200.",
+    ),
+    (
+        "BEHAV3D_*_track_count_query_t*_min_*.csv",
+        "Per-sample cell counts at one timepoint before and after minimum "
+        "track-length thresholds.",
+    ),
+    (
         "BEHAV3D_*_touching_distribution.pdf",
         "Distribution of contacts between tracks and the given target cell"
         " type, used to tune contact thresholds.",
@@ -327,11 +337,6 @@ def _classify(path: Path, analysis_root: Path) -> tuple[str, Optional[str], Opti
     parts = rel.parts
     cell_type = parts[0] if parts else None
 
-    if "quality_control" in parts:
-        return ("filtering", None, cell_type)
-    if "track_features" in parts:
-        return ("feature_extraction", None, cell_type)
-
     in_sc_dir = any(p in _SINGLE_CELL_DIRS for p in parts)
     name = path.name
     matches_sc_name = any(
@@ -339,6 +344,11 @@ def _classify(path: Path, analysis_root: Path) -> tuple[str, Optional[str], Opti
     )
     if in_sc_dir or matches_sc_name:
         return ("analysis", "single_cell", cell_type)
+
+    if "quality_control" in parts:
+        return ("filtering", None, cell_type)
+    if "track_features" in parts:
+        return ("feature_extraction", None, cell_type)
 
     return ("analysis", "death_dynamics", cell_type)
 

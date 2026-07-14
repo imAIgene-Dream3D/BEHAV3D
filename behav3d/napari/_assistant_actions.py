@@ -68,6 +68,7 @@ _LEAF_LABELS = {
     "step_size": "btrack step size",
     "n_workers": "worker count",
     "use_optimize": "global optimization",
+    "use_visual_features": "use visual features",
     "hypotheses": "btrack hypotheses",
     "dist_thresh": "distance threshold",
     "time_thresh": "time threshold",
@@ -567,14 +568,83 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def build_actions(raw_tool_calls: list[dict], cards: list[dict], params: dict) -> list[ProposedAction]:
+def _coerce_control_value(control: dict, value: Any) -> tuple[bool, Any, str]:
+    current = control.get("value")
+    try:
+        if isinstance(current, bool):
+            coerced = _coerce_bool(value)
+        elif isinstance(current, int):
+            coerced = int(value)
+        elif isinstance(current, float):
+            coerced = float(value)
+        elif isinstance(current, list):
+            if not isinstance(value, (list, tuple, set)):
+                return False, value, "Choose one or more values from the available options."
+            coerced = list(value)
+        else:
+            coerced = str(value)
+    except (TypeError, ValueError):
+        return False, value, f"{value!r} is not valid for {control.get('label', 'this control')}."
+    choices = control.get("choices")
+    if choices:
+        requested = coerced if isinstance(coerced, list) else [coerced]
+        resolved = []
+        for item in requested:
+            text = str(item).lower()
+            match = next((choice for choice in choices
+                          if str(choice).lower() == text
+                          or str(choice).lower().startswith(text)), None)
+            if match is None:
+                return False, coerced, f"Choose a value shown in {control.get('label', 'this control')}."
+            resolved.append(match)
+        coerced = resolved if isinstance(coerced, list) else resolved[0]
+    minimum, maximum = control.get("minimum"), control.get("maximum")
+    if minimum is not None and isinstance(coerced, (int, float)) and coerced < minimum:
+        return False, coerced, f"{control.get('label')} must be at least {minimum}."
+    if maximum is not None and isinstance(coerced, (int, float)) and coerced > maximum:
+        return False, coerced, f"{control.get('label')} must be at most {maximum}."
+    return True, coerced, ""
+
+
+def build_actions(
+    raw_tool_calls: list[dict],
+    cards: list[dict],
+    params: dict,
+    controls: list[dict] | None = None,
+) -> list[ProposedAction]:
     """Turn raw model tool-calls into validated ProposedAction objects with previews."""
     idx = _card_index(cards)
     actions: list[ProposedAction] = []
     for call in raw_tool_calls or []:
         name = call.get("name")
         args = call.get("arguments", {}) or {}
-        if name == "set_parameter":
+        if name == "set_ui_value":
+            control_id = str(args.get("control_id") or "")
+            control = next((c for c in (controls or []) if c.get("id") == control_id), None)
+            act = ProposedAction("set_ui_value", control_id=control_id,
+                                 value=args.get("value"))
+            if control is None:
+                act.ok = False
+                act.message = "That field is not available in the current interface."
+            elif not control.get("enabled", False):
+                act.ok = False
+                act.message = f"{control.get('label', 'That field')} is currently disabled."
+            elif control.get("method") and not control.get("visible", False):
+                act.ok = False
+                act.message = "That field belongs to a different method than the one selected."
+            else:
+                ok, coerced, message = _coerce_control_value(control, args.get("value"))
+                act.ok, act.message = ok, message
+                act.data.update(value=coerced, label=control.get("label"),
+                                old_value=control.get("value"))
+                act.preview = (f"{control.get('label')}: "
+                               f"{_display_value(control.get('value'))} -> {_display_value(coerced)}")
+                if ok and coerced == control.get("value"):
+                    act.ok = False
+                    act.data["no_op"] = True
+                    act.message = "This value is already set."
+            actions.append(act)
+        elif name == "set_parameter":
             key = args.get("key")
             card = idx.get(key)
             act = ProposedAction("set_parameter", key=key, value=args.get("value"))
@@ -661,6 +731,98 @@ def build_actions(raw_tool_calls: list[dict], cards: list[dict], params: dict) -
             if not value:
                 act.ok = False
                 act.message = "No segmentation method provided."
+            actions.append(act)
+        elif name == "show_track_length_distribution":
+            cell_type = str(args.get("cell_type") or "")
+            act = ProposedAction("show_track_length_distribution", cell_type=cell_type)
+            act.preview = f"Show track-length distributions for {cell_type}"
+            if not cell_type:
+                act.ok = False
+                act.message = "Choose a cell type first."
+            actions.append(act)
+        elif name == "recommend_edt":
+            cell_type = str(args.get("cell_type") or "").strip()
+            try:
+                diameter_um = float(args.get("cell_diameter_um", 10.0))
+                cells_across = args.get("organoid_cells_across")
+                cells_across = None if cells_across is None else float(cells_across)
+            except (TypeError, ValueError):
+                diameter_um, cells_across = 10.0, None
+            act = ProposedAction(
+                "recommend_edt", cell_type=cell_type,
+                cell_diameter_um=diameter_um,
+                organoid_cells_across=cells_across,
+            )
+            act.preview = f"Calculate EDT starting values for {cell_type}"
+            if not cell_type:
+                act.ok = False
+                act.message = "Choose a cell type first."
+            elif diameter_um <= 0 or (cells_across is not None and cells_across < 1):
+                act.ok = False
+                act.message = "Object size values must be greater than zero."
+            actions.append(act)
+        elif name == "summarize_track_counts":
+            cell_type = str(args.get("cell_type") or "").strip()
+            try:
+                position_t = int(args.get("position_t", 0))
+                raw_lengths = args.get("minimum_lengths") or [20, 50, 100, 200]
+                minimum_lengths = sorted({int(value) for value in raw_lengths})
+            except (TypeError, ValueError):
+                position_t, minimum_lengths = 0, []
+            act = ProposedAction(
+                "summarize_track_counts", cell_type=cell_type,
+                position_t=position_t, minimum_lengths=minimum_lengths,
+            )
+            act.preview = (
+                f"Count {cell_type} tracks at timepoint {position_t} for minimum "
+                f"lengths {minimum_lengths}"
+            )
+            if not cell_type:
+                act.ok = False
+                act.message = "Choose a cell type first."
+            elif position_t < 0:
+                act.ok = False
+                act.message = "The timepoint must be zero or greater."
+            elif not minimum_lengths or any(value < 1 for value in minimum_lengths):
+                act.ok = False
+                act.message = "Minimum track lengths must be positive integers."
+            elif len(minimum_lengths) > 20:
+                act.ok = False
+                act.message = "Compare at most 20 minimum track lengths at once."
+            actions.append(act)
+        elif name == "create_cell_type_group":
+            group_name = str(args.get("group_name") or "").strip()
+            members = [str(v) for v in (args.get("members") or [])]
+            act = ProposedAction("create_cell_type_group", group_name=group_name,
+                                 members=members)
+            act.preview = f"Create cell-type group '{group_name}' from {', '.join(members)}"
+            if not group_name or not members:
+                act.ok = False
+                act.message = "Provide a group name and at least one cell type."
+            elif not all(c.isalnum() or c in "_-" for c in group_name):
+                act.ok = False
+                act.message = "Group names may only contain letters, numbers, hyphens, and underscores."
+            actions.append(act)
+        elif name == "create_btrack_config_copy":
+            cell_type = str(args.get("cell_type") or "")
+            destination = str(args.get("destination") or "").strip()
+            act = ProposedAction("create_btrack_config_copy", cell_type=cell_type,
+                                 destination=destination)
+            act.preview = f"Create a custom btrack configuration for {cell_type} at {destination}"
+            if not cell_type or not destination:
+                act.ok = False
+                act.message = "Choose a cell type and destination file."
+            elif not destination.lower().endswith(".json"):
+                act.ok = False
+                act.message = "The custom btrack configuration must be a JSON file."
+            actions.append(act)
+        elif name == "open_result":
+            result_id = str(args.get("result_id") or "")
+            act = ProposedAction("open_result", result_id=result_id)
+            act.preview = f"Open result: {result_id}"
+            if not result_id:
+                act.ok = False
+                act.message = "Choose a result first."
             actions.append(act)
     return actions
 
@@ -752,6 +914,48 @@ def apply_set_parameter(main_widget, key: str, value: Any):
     return True, (widget is not None)
 
 
+def _values_match(actual: Any, requested: Any) -> bool:
+    if isinstance(actual, str) and isinstance(requested, str):
+        return actual.strip().lower() == requested.strip().lower() or (
+            bool(requested.strip()) and actual.strip().lower().startswith(requested.strip().lower())
+        )
+    if isinstance(actual, float) or isinstance(requested, float):
+        try:
+            return abs(float(actual) - float(requested)) < 1e-9
+        except (TypeError, ValueError):
+            pass
+    return actual == requested
+
+
+def apply_set_ui_value(main_widget, control_id: str, value: Any) -> bool:
+    """Set one exact live control and verify the value was actually applied."""
+    from behav3d.napari._assistant_controls import find_control
+
+    binding = find_control(main_widget, control_id)
+    if binding is None or not binding.get("enabled", False):
+        return False
+    setter = binding.get("_setter")
+    if setter is None or not setter(value):
+        return False
+    persist = binding.get("_persist")
+    if persist is not None:
+        try:
+            persist()
+        except Exception:
+            return False
+    refreshed = find_control(main_widget, control_id)
+    actual = refreshed.get("value") if refreshed is not None else None
+    if not _values_match(actual, value):
+        return False
+    widget = binding.get("_widget")
+    if widget is not None:
+        pulse_widget(widget)
+    dp = getattr(main_widget, "data_prep_tab", None)
+    if dp is not None:
+        _persist_params(dp)
+    return True
+
+
 def _persist_params(dp) -> None:
     import os
     out_dir = getattr(dp, "output_dir", "") or ""
@@ -808,7 +1012,9 @@ def apply_fill_metadata_builder(main_widget, action: ProposedAction) -> bool:
     try:
         if field == "open_builder":
             dp.builder_grp.setChecked(True)
-            return True
+            # Toggling can open a modal when metadata is already loaded. If the
+            # user cancels, the handler restores the unchecked state.
+            return bool(dp.builder_grp.isChecked())
         # Silently open the builder if it isn't already (non-destructive).
         if not getattr(dp.builder_grp, "isChecked", lambda: True)():
             dp.builder_grp.setChecked(True)
@@ -993,6 +1199,11 @@ def apply_action(main_widget, action: ProposedAction) -> bool:
             main_widget, action.data["key"], action.data["value"])
         action.data["widget_updated"] = visible   # dock uses this for an honest message
         return stored
+    if action.kind == "set_ui_value":
+        ok = apply_set_ui_value(main_widget, action.data["control_id"],
+                                action.data["value"])
+        action.data["widget_updated"] = ok
+        return ok
     if action.kind == "navigate_to_step":
         return apply_navigate(main_widget, action.data["step"])
     if action.kind == "add_queue_step":
@@ -1009,7 +1220,228 @@ def apply_action(main_widget, action: ProposedAction) -> bool:
         ok = apply_select_segmentation_method(main_widget, action.data.get("value"))
         action.data["widget_updated"] = ok
         return ok
+    if action.kind == "show_track_length_distribution":
+        return _apply_show_track_length_distribution(main_widget, action)
+    if action.kind == "recommend_edt":
+        return _apply_recommend_edt(main_widget, action)
+    if action.kind == "summarize_track_counts":
+        return _apply_summarize_track_counts(main_widget, action)
+    if action.kind == "create_cell_type_group":
+        return _apply_create_cell_type_group(main_widget, action)
+    if action.kind == "create_btrack_config_copy":
+        return _apply_create_btrack_config_copy(main_widget, action)
+    if action.kind == "open_result":
+        return _apply_open_result(main_widget, action)
     return False
+
+
+def _apply_show_track_length_distribution(main_widget, action: ProposedAction) -> bool:
+    tab = getattr(main_widget, "filtering_tab", None)
+    panel = (getattr(tab, "panels", {}) or {}).get(action.data.get("cell_type"))
+    callback = getattr(panel, "_on_preview_lengths_clicked", None) if panel is not None else None
+    if callback is None:
+        return False
+    callback()
+    return True
+
+
+def _apply_recommend_edt(main_widget, action: ProposedAction) -> bool:
+    dp = _dp(main_widget)
+    metadata = getattr(dp, "metadata", None) if dp is not None else None
+    try:
+        from behav3d.napari._assistant_context import _metadata_builder_state
+        builder_state = _metadata_builder_state(dp)
+    except Exception:
+        builder_state = {}
+    records = builder_state.get("draft_records") or []
+    if not records and metadata is not None and not getattr(metadata, "empty", True):
+        records = metadata.to_dict(orient="records")
+    if not records:
+        action.data["result_markdown"] = (
+            "Load or save experiment metadata first so I can read the XY pixel size."
+        )
+        return True
+
+    cell_type = action.data["cell_type"]
+    organoid_names = builder_state.get("organoid_names") or []
+    available_types = set(organoid_names)
+    available_types.update(builder_state.get("immune_names") or [])
+    available_types.update(builder_state.get("other_names") or [])
+    is_organoid = cell_type in organoid_names
+    try:
+        from behav3d.core.metadata import (
+            detect_immune_cell_types_from_metadata,
+            detect_organoid_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+        )
+        if metadata is not None and not getattr(metadata, "empty", True):
+            metadata_organoids = detect_organoid_types_from_metadata(metadata)
+            is_organoid = is_organoid or cell_type in metadata_organoids
+            available_types.update(metadata_organoids)
+            available_types.update(detect_immune_cell_types_from_metadata(metadata))
+            available_types.update(detect_other_cell_types_from_metadata(metadata))
+    except Exception:
+        pass
+    if available_types and cell_type not in available_types:
+        action.data["result_markdown"] = (
+            f"I could not find **{cell_type}** in the current metadata. Choose one of: "
+            + ", ".join(sorted(available_types)) + "."
+        )
+        return True
+    cells_across = action.data.get("organoid_cells_across")
+    if is_organoid and cells_across is None:
+        action.data["result_markdown"] = (
+            f"For **{cell_type}**, approximately how many cell widths span the "
+            "organoid diameter? I will use 10 µm per cell unless you provide a "
+            "different typical cell diameter."
+        )
+        return True
+    if not is_organoid:
+        cells_across = None
+
+    try:
+        from behav3d.napari._assistant_recommendations import (
+            calculate_edt_recommendations,
+            format_edt_recommendations,
+        )
+        result = calculate_edt_recommendations(
+            records,
+            cell_diameter_um=action.data.get("cell_diameter_um", 10.0),
+            organoid_cells_across=cells_across,
+        )
+        action.data["recommendation"] = result
+        action.data["result_markdown"] = format_edt_recommendations(result, cell_type)
+        return True
+    except Exception as exc:
+        action.data["result_markdown"] = f"Could not calculate EDT values: {exc}"
+        return True
+
+
+def _apply_summarize_track_counts(main_widget, action: ProposedAction) -> bool:
+    dp = _dp(main_widget)
+    output_dir = getattr(dp, "output_dir", "") if dp is not None else ""
+    if not output_dir:
+        action.data["result_markdown"] = (
+            "Set the output directory first so I can locate the track feature CSV."
+        )
+        return True
+    try:
+        from behav3d.analysis.track_counts import (
+            format_track_count_summary,
+            generate_track_count_summary,
+        )
+        result = generate_track_count_summary(
+            output_dir,
+            action.data["cell_type"],
+            minimum_lengths=action.data["minimum_lengths"],
+            position_t=action.data["position_t"],
+        )
+        action.data["summary"] = result
+        action.data["result_markdown"] = format_track_count_summary(
+            result, action.data["cell_type"]
+        )
+        try:
+            from behav3d.napari._results_panel import notify_results_changed
+            notify_results_changed(main_widget)
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        action.data["result_markdown"] = f"Could not calculate track counts: {exc}"
+        return True
+
+
+def _apply_create_cell_type_group(main_widget, action: ProposedAction) -> bool:
+    """Create the same metadata columns as the Feature Extraction grouping dialog."""
+    dp = _dp(main_widget)
+    md = getattr(dp, "metadata", None) if dp is not None else None
+    if md is None or getattr(md, "empty", True):
+        return False
+    group_name = action.data["group_name"]
+    members = action.data["members"]
+    try:
+        from behav3d.core.metadata import (
+            detect_immune_cell_types_from_metadata,
+            detect_merged_cell_types_from_metadata,
+            detect_organoid_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+        )
+        available = set(detect_organoid_types_from_metadata(md))
+        available.update(detect_immune_cell_types_from_metadata(md))
+        available.update(detect_other_cell_types_from_metadata(md))
+        if not set(members).issubset(available):
+            return False
+        merged_name = f"{group_name}_merged"
+        if group_name in available or merged_name in set(detect_merged_cell_types_from_metadata(md)):
+            return False
+        organoids = set(detect_organoid_types_from_metadata(md))
+        immune = set(detect_immune_cell_types_from_metadata(md))
+        prefix = "or_" if any(m in organoids for m in members) else (
+            "im_" if any(m in immune for m in members) else "ot_")
+        for suffix in ("line_condition", "segments_image_path",
+                       "tracks_image_path", "tracks_csv_path"):
+            md[f"{prefix}{merged_name}_{suffix}"] = None
+        csv_path = (getattr(dp, "metadata_csv_path", None)
+                    or getattr(dp, "metadata_csv", None)
+                    or (getattr(dp, "behav3d_parameters", {}) or {})
+                    .get("paths", {}).get("metadata_csv"))
+        if csv_path:
+            md.to_csv(csv_path, index=False)
+        tab = getattr(main_widget, "feature_extraction_tab", None)
+        if tab is not None and hasattr(tab, "_on_metadata_updated"):
+            tab._on_metadata_updated()
+        return True
+    except Exception:
+        return False
+
+
+def _apply_create_btrack_config_copy(main_widget, action: ProposedAction) -> bool:
+    from pathlib import Path
+    import shutil
+
+    destination = Path(action.data["destination"]).expanduser()
+    if destination.exists():
+        return False
+    source = (Path(__file__).resolve().parents[1] / "preprocessing" / "tracking"
+              / "models" / "cell_config.json")
+    if not source.exists():
+        return False
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    except OSError:
+        return False
+    control_id = f"tracking.{action.data['cell_type']}.btrack.config_preset"
+    # Selecting Custom JSON exposes the path field; both writes are postcondition checked.
+    preset_ok = apply_set_ui_value(main_widget, control_id, "Custom JSON")
+    path_ok = apply_set_ui_value(
+        main_widget,
+        f"tracking.{action.data['cell_type']}.btrack.config_path",
+        str(destination),
+    )
+    return preset_ok and path_ok
+
+
+def _apply_open_result(main_widget, action: ProposedAction) -> bool:
+    from pathlib import Path
+    from behav3d.napari._results_catalog import scan_outputs
+
+    dp = _dp(main_widget)
+    output_dir = getattr(dp, "output_dir", "") if dp is not None else ""
+    if not output_dir:
+        return False
+    results = scan_outputs(Path(output_dir))
+    wanted = action.data["result_id"]
+    match = next((item for item in results
+                  if str(item.path.relative_to(Path(output_dir))) == wanted), None)
+    if match is None:
+        return False
+    panel = getattr(main_widget, "results_panel", None)
+    opener = getattr(panel, "_open_in_napari", None) if panel is not None else None
+    if opener is None or not match.is_viewable:
+        return False
+    opener(match)
+    return True
 
 
 def _apply_add_queue_step(main_widget, action: ProposedAction) -> bool:
@@ -1030,17 +1462,19 @@ def _apply_add_queue_step(main_widget, action: ProposedAction) -> bool:
 # ---------------------------------------------------------------------------
 TOOL_SCHEMA = [
     {
-        "name": "set_parameter",
-        "description": "Propose setting a BEHAV3D parameter. Requires user confirmation. "
-                       "Use dotted keys from the provided step_schema (e.g. "
-                       "'tracking.immune.trackpy.search_range_px').",
+        "name": "set_ui_value",
+        "description": (
+            "Set one exact field that exists in ui_state.controls. Use its id exactly. "
+            "Never invent an id and never use internal configuration keys. Blank fields "
+            "may apply immediately; changing an existing value requires confirmation."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "key": {"type": "string"},
+                "control_id": {"type": "string"},
                 "value": {},
             },
-            "required": ["key", "value"],
+            "required": ["control_id", "value"],
         },
     },
     {
@@ -1176,17 +1610,104 @@ TOOL_SCHEMA = [
         },
     },
     {
-        "name": "select_segmentation_method",
+        "name": "recommend_edt",
         "description": (
-            "Select the global Segmentation Method dropdown on the Segmentation tab "
-            "(this swaps the visible parameter page). Use the leading visible label: "
-            "'APOC', 'ConvPaint', 'Pixel Classifier', 'Cellpose', or "
-            "'Import segmentation'."
+            "Calculate EDT/watershed starting values from each sample's metadata XY "
+            "resolution. For ordinary cells, use the default 10 um diameter unless "
+            "the user provides another value. For organoids, first ask approximately "
+            "how many cell widths span the organoid diameter, then pass that number as "
+            "organoid_cells_across. This action reports recommendations but does not "
+            "change the EDT field."
         ),
         "parameters": {
             "type": "object",
-            "properties": {"value": {"type": "string"}},
-            "required": ["value"],
+            "properties": {
+                "cell_type": {"type": "string"},
+                "cell_diameter_um": {
+                    "type": "number", "default": 10,
+                    "description": "Typical diameter of one cell in micrometers.",
+                },
+                "organoid_cells_across": {
+                    "type": "number",
+                    "description": (
+                        "Approximate number of cell widths across the organoid diameter. "
+                        "Required for organoid recommendations."
+                    ),
+                },
+            },
+            "required": ["cell_type"],
+        },
+    },
+    {
+        "name": "summarize_track_counts",
+        "description": (
+            "Read the unfiltered combined track-features CSV, count unique tracks "
+            "present at one position_t, compare minimum track-length thresholds, and "
+            "save the resulting sample-by-threshold table under quality_control. Use "
+            "this for both the standard 20/50/100/200 summary and arbitrary interactive "
+            "threshold or timepoint questions."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cell_type": {"type": "string"},
+                "position_t": {"type": "integer", "minimum": 0, "default": 0},
+                "minimum_lengths": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "maxItems": 20,
+                    "default": [20, 50, 100, 200],
+                },
+            },
+            "required": ["cell_type"],
+        },
+    },
+    {
+        "name": "show_track_length_distribution",
+        "description": "Open the existing track-length distribution preview for one cell type.",
+        "parameters": {
+            "type": "object",
+            "properties": {"cell_type": {"type": "string"}},
+            "required": ["cell_type"],
+        },
+    },
+    {
+        "name": "create_cell_type_group",
+        "description": (
+            "Create a merged cell-type group in metadata. This changes the metadata CSV "
+            "and therefore always requires confirmation. It does not require re-tracking."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "group_name": {"type": "string"},
+                "members": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["group_name", "members"],
+        },
+    },
+    {
+        "name": "create_btrack_config_copy",
+        "description": (
+            "Copy the bundled cell btrack configuration to a new JSON file and select "
+            "it for one cell type. File creation always requires confirmation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cell_type": {"type": "string"},
+                "destination": {"type": "string"},
+            },
+            "required": ["cell_type", "destination"],
+        },
+    },
+    {
+        "name": "open_result",
+        "description": "Open a viewable result listed in context.results using its exact id.",
+        "parameters": {
+            "type": "object",
+            "properties": {"result_id": {"type": "string"}},
+            "required": ["result_id"],
         },
     },
 ]
