@@ -489,7 +489,7 @@ class BackgroundOperation(QObject):
     # ------------------------------------------------------------------
     def is_running(self) -> bool:
         st = self._state
-        return st is not None and st.thread is not None and st.thread.isRunning()
+        return st is not None and st.thread is not None
 
     # ------------------------------------------------------------------
     def run(
@@ -545,7 +545,8 @@ class BackgroundOperation(QObject):
             disappearing.
         """
         if self.is_running():
-            raise RuntimeError("BackgroundOperation already running")
+            print("BackgroundOperation already running, ignoring request.", flush=True)
+            return
 
         kwargs = dict(kwargs or {})
         btn_list = [b for b in (buttons or []) if b is not None]

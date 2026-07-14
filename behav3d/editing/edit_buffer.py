@@ -4,13 +4,16 @@ The buffer wraps a zarr-backed dask array (the on-disk
 ``*_tracked.zarr``) and:
 
 * Loads frames lazily into a small per-frame numpy cache.
-* Stages every primitive's output as a *commit* on a bounded undo/redo
-  stack so the editor's Undo button can revert any layer-changing
-  action before Save.
+* Stages every primitive's output as a dirty frame in memory.
 * On :meth:`save` writes only the dirty frames back to the original
   zarr (via :func:`behav3d.io.formats.zarr.write_zarr_parallel`) and
   regenerates the matching tracks CSV via
   :func:`behav3d.preprocessing.tracking.convert_tracked_image_to_csv`.
+
+.. note::
+    Undo/redo has been intentionally removed to minimise RAM usage.
+    The :meth:`discard` method reverts **all** unsaved edits back to
+    the on-disk state, which is the recommended recovery path.
 
 The on-disk file is touched **only** by :meth:`save`; until then every
 edit lives in memory and can be discarded with :meth:`discard`.
@@ -18,7 +21,6 @@ edit lives in memory and can be discarded with :meth:`discard`.
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -31,24 +33,10 @@ from behav3d.editing.tracked_segments import OpResult
 
 
 # ---------------------------------------------------------------------------
-# Internals
-# ---------------------------------------------------------------------------
-@dataclass
-class _Commit:
-    """One reversible operation: pre/post snapshots of affected frames only."""
-    name: str
-    summary: str
-    # Per-frame numpy snapshots — small because operations only touch one
-    # label at a time; the buffer caps the maximum number of commits kept.
-    pre: Dict[int, np.ndarray] = field(default_factory=dict)
-    post: Dict[int, np.ndarray] = field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
 # EditBuffer
 # ---------------------------------------------------------------------------
 class EditBuffer:
-    """Lazy, undoable view of a tracked-segment 4D zarr.
+    """Lazy, committable view of a tracked-segment 4D zarr.
 
     Parameters
     ----------
@@ -59,10 +47,6 @@ class EditBuffer:
     pixel_size_xy, pixel_size_z:
         Used by :func:`convert_tracked_image_to_csv` when regenerating
         the CSV; usually pulled from the metadata row.
-    max_history:
-        Maximum number of commits kept on the undo stack.  Older
-        commits are dropped (they cannot be undone, but they remain
-        applied).
     cache_size:
         Maximum number of un-edited frames kept hot in memory.  Edited
         frames are always kept regardless.
@@ -74,17 +58,16 @@ class EditBuffer:
         csv_path: Optional[Path] = None,
         pixel_size_xy: float = 1.0,
         pixel_size_z: float = 1.0,
-        max_history: int = 30,
         cache_size: int = 4,
+        # Kept for backward-compat — ignored (undo/redo removed).
+        max_history: int = 30,
         max_undoable_frames: int = 50,
     ) -> None:
         self.zarr_path = Path(zarr_path)
         self.csv_path = Path(csv_path) if csv_path is not None else None
         self.pixel_size_xy = float(pixel_size_xy)
         self.pixel_size_z = float(pixel_size_z)
-        self.max_history = int(max_history)
         self.cache_size = int(cache_size)
-        self.max_undoable_frames = int(max_undoable_frames)
 
         self._darr: da.Array = load_zarr(self.zarr_path)
         if self._darr.ndim != 4:
@@ -98,22 +81,18 @@ class EditBuffer:
         self._dirty: Dict[int, np.ndarray] = {}
         # Hot cache of frames freshly read from disk.
         self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
-        # Undo/redo
-        self._undo: List[_Commit] = []
-        self._redo: List[_Commit] = []
         # Listeners that get notified whenever frames are mutated.
         self._listeners: List[Callable[[List[int]], None]] = []
 
         # --- Performance caches ------------------------------------------
         # Maximum non-zero label ID seen across the whole volume.  None means
         # "not yet computed"; populated lazily by max_label().  Maintained
-        # incrementally by apply() so that subsequent splits never rescan the
-        # full volume.  Reset to None by undo/redo (conservative) and by
-        # save/discard (full reload).
+        # incrementally by commit() so that subsequent splits never rescan the
+        # full volume.  Reset to None by save/discard (full reload).
         self._max_label: Optional[int] = None
         # Per-label lifetime cache: label_id → (t_first, t_last).  Populated
-        # lazily by lifetime_of(); invalidated for affected labels whenever
-        # frames change.
+        # lazily by get_lifetime() or eagerly by build_lifetime_index();
+        # invalidated for affected labels whenever frames change.
         self._lifetime_cache: Dict[int, Tuple[int, int]] = {}
 
     # ------------------------------------------------------------------
@@ -165,12 +144,10 @@ class EditBuffer:
         """Return the maximum non-zero label ID in the volume.
 
         The result is cached after the first (full) scan and maintained
-        incrementally by :meth:`apply` so that repeated calls — e.g. once
+        incrementally by :meth:`commit` so that repeated calls — e.g. once
         per split — are O(1) instead of O(T × Z × Y × X).
 
-        The cache is conservatively reset to ``None`` by :meth:`undo` and
-        :meth:`redo` (those operations may lower the true maximum) and
-        cleared entirely by :meth:`save` / :meth:`discard`.
+        The cache is cleared by :meth:`save` / :meth:`discard`.
         """
         if self._max_label is not None:
             return self._max_label
@@ -193,6 +170,10 @@ class EditBuffer:
         On a cache miss the full O(T) scan is performed and the result is
         stored.  On subsequent calls (including from different primitives in
         the same editing session) the lookup is O(1).
+
+        Call :meth:`build_lifetime_index` on editor start to pre-populate
+        the cache for all labels in a single pass, avoiding O(T) per-label
+        scans on first use.
         """
         label_id = int(label_id)
         if label_id in self._lifetime_cache:
@@ -210,121 +191,100 @@ class EditBuffer:
             self._lifetime_cache[label_id] = (first, last)  # type: ignore[assignment]
         return first, last
 
+    def build_lifetime_index(
+        self,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        """Scan the entire volume once and populate the lifetime cache.
+
+        After this call, :meth:`get_lifetime` is O(1) for every label
+        present in the volume.  Also pre-computes :meth:`max_label`.
+
+        This is called in a background thread when the editor opens so
+        the user does not block on first label click.
+
+        Parameters
+        ----------
+        progress_cb:
+            Optional ``(current_frame, total_frames)`` callback invoked
+            after each timepoint is processed.
+        is_interrupted:
+            Optional callback returning True if the scan should abort early.
+        """
+        T = int(self.shape[0])
+        # first_seen[label] → t_first, last_seen[label] → t_last
+        first_seen: Dict[int, int] = {}
+        last_seen: Dict[int, int] = {}
+        cur_max = 0
+
+        for t in range(T):
+            if is_interrupted is not None and is_interrupted():
+                return
+            frame = self.peek(t)
+            if frame.size:
+                cur_max = max(cur_max, int(frame.max()))
+            for lbl in np.unique(frame):
+                lbl = int(lbl)
+                if lbl == 0:
+                    continue
+                if lbl not in first_seen:
+                    first_seen[lbl] = t
+                last_seen[lbl] = t
+            if progress_cb is not None:
+                progress_cb(t + 1, T)
+
+        # Bulk-write to cache (don't overwrite entries that were already
+        # invalidated / re-populated by edits that raced with the scan).
+        for lbl, t_first in first_seen.items():
+            if lbl not in self._lifetime_cache:
+                self._lifetime_cache[lbl] = (t_first, last_seen[lbl])
+        if self._max_label is None:
+            self._max_label = cur_max
+
     def invalidate_lifetime(self, label_id: int) -> None:
         """Remove ``label_id`` from the lifetime cache.
 
-        Called by :meth:`apply` for every label touched by a commit so that
-        the next :meth:`get_lifetime` call performs a fresh scan.
+        Called by :meth:`commit` for every label touched by an operation
+        so that the next :meth:`get_lifetime` call performs a fresh scan.
         """
         self._lifetime_cache.pop(int(label_id), None)
 
     # ------------------------------------------------------------------
-    # Apply / undo / redo
+    # Commit (replaces the old apply/undo/redo)
     # ------------------------------------------------------------------
-    def apply(self, op: OpResult) -> None:
-        """Apply an :class:`OpResult` from a primitive as a new commit.
+    def commit(self, op: OpResult) -> None:
+        """Apply an :class:`OpResult` from a primitive to the dirty set.
 
-        Pre-snapshots are taken from the current state (which may be
-        already-edited dirty frames); post-snapshots come from the op.
-        Empty ops (no ``new_frames``) are ignored so the undo stack
-        stays meaningful.
+        Unlike the old ``apply()`` method, **no undo snapshot is stored**,
+        which keeps RAM usage proportional only to the number of dirty
+        frames (not the number of operations performed).  To recover from
+        an unwanted edit, use :meth:`discard` to revert all unsaved changes.
 
-        When the operation modifies more than ``max_undoable_frames``
-        timepoints, pre-snapshots are skipped to avoid an out-of-memory
-        crash (N × frame_size bytes for pre + same for post would be
-        unaffordable for long tracks).  The frames are still written to
-        ``_dirty`` so the edit is applied, but the commit is **not**
-        pushed onto the undo stack.  Callers that need to inform the user
-        can check the returned bool: ``True`` = undoable, ``False`` = applied
-        but not undoable.
+        Empty ops (``op.new_frames`` is empty) are ignored.
         """
         if not op.new_frames:
             return
-        large = len(op.new_frames) > self.max_undoable_frames
-        commit = _Commit(name=op.name, summary=op.summary)
+
+        changed: List[int] = []
         for t, post_frame in op.new_frames.items():
             t = int(t)
-            if not large:
-                # Capture pre-state BEFORE overwriting _dirty so that undo
-                # can restore the frame that existed prior to this operation.
-                commit.pre[t] = self.peek(t).copy()
-            # Use copy=False: worker frames are freshly computed and never
-            # mutated, so sharing the reference is safe and halves peak RAM.
-            commit.post[t] = np.asarray(post_frame).astype(self.dtype, copy=False)
-            self._dirty[t] = commit.post[t]
-        if not large:
-            self._undo.append(commit)
-            # New action invalidates redo history.
-            self._redo.clear()
-            # Bound history.
-            while len(self._undo) > self.max_history:
-                self._undo.pop(0)
+            self._dirty[t] = np.asarray(post_frame).astype(self.dtype, copy=False)
+            changed.append(t)
 
         # --- Update performance caches -----------------------------------
-        # Advance _max_label without rescanning if the new frames contain
-        # a higher ID.
         if self._max_label is not None:
-            for frame in commit.post.values():
+            for frame in op.new_frames.values():
                 if frame.size:
                     self._max_label = max(self._max_label, int(frame.max()))
-        # Invalidate lifetime cache for every label touched by this op so
-        # the next lookup triggers a fresh (but lazy) scan.
         for label_id in op.affected_labels:
             self.invalidate_lifetime(label_id)
 
-        self._emit(list(commit.post.keys()))
+        self._emit(changed)
 
-    def can_undo(self) -> bool:
-        return bool(self._undo)
-
-    def can_redo(self) -> bool:
-        return bool(self._redo)
-
-    def undo(self) -> Optional[str]:
-        """Revert the latest commit; return its summary or ``None``."""
-        if not self._undo:
-            return None
-        commit = self._undo.pop()
-        for t, pre_frame in commit.pre.items():
-            t = int(t)
-            self._dirty[t] = pre_frame.copy()
-            # If the pre-frame matches what's on disk, we can drop it
-            # from the dirty set, but reading from disk to compare would
-            # cost a full frame read; safer to leave it dirty until save
-            # — write_zarr_parallel handles a no-op write fine.
-        self._redo.append(commit)
-        # Undo may lower the max label or restore lifetimes — reset
-        # conservatively so the next access triggers a fresh scan.
-        self._max_label = None
-        # Invalidate lifetimes for every label that appears in the pre-frames
-        # (the state we're reverting to) and the post-frames (what we're
-        # undoing away from).
-        for frames_dict in (commit.pre, commit.post):
-            for frame in frames_dict.values():
-                for lbl in np.unique(frame):
-                    self.invalidate_lifetime(int(lbl))
-        self._emit(list(commit.pre.keys()))
-        return f"Undone: {commit.summary}"
-
-    def redo(self) -> Optional[str]:
-        if not self._redo:
-            return None
-        commit = self._redo.pop()
-        for t, post_frame in commit.post.items():
-            self._dirty[int(t)] = post_frame.copy()
-        self._undo.append(commit)
-        while len(self._undo) > self.max_history:
-            self._undo.pop(0)
-        # Re-advance max_label if possible; otherwise reset.
-        if self._max_label is not None:
-            for frame in commit.post.values():
-                if frame.size:
-                    self._max_label = max(self._max_label, int(frame.max()))
-        for frame in commit.post.values():
-            for lbl in np.unique(frame):
-                self.invalidate_lifetime(int(lbl))
-        self._emit(list(commit.post.keys()))
-        return f"Redone: {commit.summary}"
+    # backward-compat alias so callers using the old name still work
+    def apply(self, op: OpResult) -> None:  # noqa: D401
+        """Alias for :meth:`commit` (backward-compatibility)."""
+        self.commit(op)
 
     # ------------------------------------------------------------------
     # State queries
@@ -334,9 +294,6 @@ class EditBuffer:
 
     def dirty_count(self) -> int:
         return len(self._dirty)
-
-    def history(self) -> List[Tuple[str, str]]:
-        return [(c.name, c.summary) for c in self._undo]
 
     # ------------------------------------------------------------------
     # Save / discard
@@ -380,8 +337,6 @@ class EditBuffer:
         # the new bytes.
         self._dirty.clear()
         self._cache.clear()
-        self._undo.clear()
-        self._redo.clear()
         self._max_label = None
         self._lifetime_cache.clear()
         self._darr = load_zarr(self.zarr_path)
@@ -403,8 +358,6 @@ class EditBuffer:
         """Drop every staged edit; the next :meth:`peek` re-reads disk."""
         self._dirty.clear()
         self._cache.clear()
-        self._undo.clear()
-        self._redo.clear()
         self._max_label = None
         self._lifetime_cache.clear()
         self._darr = load_zarr(self.zarr_path)

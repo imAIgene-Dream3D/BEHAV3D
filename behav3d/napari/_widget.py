@@ -9,6 +9,7 @@ import os
 import napari
 
 from behav3d.napari._queue import ProcessingQueuePanel, StepType
+from behav3d.napari._global_workers import GlobalWorkersController
 from pathlib import Path
 
 
@@ -319,6 +320,34 @@ class BEHAV3DWidget(QWidget):
         self._last_tab_index = self.tabs.currentIndex()
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
+        # --- Global Workers Controller ------------------------------------
+        # Created AFTER all tabs so that every spin_workers spinbox already
+        # exists when we link them.  The controller reads the saved
+        # top-level ``n_workers`` value from behav3d_parameters.yml (via
+        # data_prep_tab.behav3d_parameters) and propagates it to all spinboxes.
+        self.workers_ctrl = GlobalWorkersController(metadata_loader=self.data_prep_tab)
+        # Segmentation tab — pixel classifier spin_workers
+        seg_pc = self.segmentation_tab.pixel_classifier_page
+        if hasattr(seg_pc, "spin_workers"):
+            self.workers_ctrl.link(seg_pc.spin_workers)
+        # Segmentation tab — APOC spin_workers
+        seg_apoc = self.segmentation_tab.apoc_page
+        if hasattr(seg_apoc, "spin_workers"):
+            self.workers_ctrl.link(seg_apoc.spin_workers)
+        # Segmentation tab — ConvPaint spin_workers
+        seg_cp = self.segmentation_tab.convpaint_page
+        if hasattr(seg_cp, "spin_workers"):
+            self.workers_ctrl.link(seg_cp.spin_workers)
+        # Data Preparation tab — zarr conversion spin_workers
+        if hasattr(self.data_prep_tab, "zarr_workers_spin"):
+            self.workers_ctrl.link(self.data_prep_tab.zarr_workers_spin)
+        # Feature extraction tab
+        if hasattr(self.feature_extraction_tab, "spin_workers"):
+            self.workers_ctrl.link(self.feature_extraction_tab.spin_workers)
+        # When a new parameters file is loaded, reload the global value.
+        self.data_prep_tab.metadata_loaded.connect(
+            lambda _: self.workers_ctrl.reload()
+        )
         # --- Co-pilot Assistant dock (right side) -------------------------
         # Added as a *separate* dock so it stays visible across all tabs. Wrapped
         # in try/except so an assistant failure can never block the main UI.
