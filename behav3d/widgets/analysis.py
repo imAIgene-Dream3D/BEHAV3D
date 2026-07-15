@@ -869,10 +869,6 @@ class TrackFilterPanel:
         self.has_dead_channel_in_metadata = has_dead_channel(self.metadata_loader.metadata)
         self.category = detect_cell_type_category(self.cell_type, metadata_loader.metadata)
         
-        active_killing_dir = Path(self.output_dir, "analysis", self.cell_type, "active_killing")
-        self._advanced_features_path = Path(active_killing_dir, f"BEHAV3D_{self.cell_type}_advanced_track_features.csv")
-        self._use_advanced_features = self._advanced_features_path.exists()
-        
         params = self.metadata_loader.behav3d_parameters
         cfg = params.setdefault("track_filtering", {}).setdefault(self.cell_type, {})
         
@@ -961,13 +957,18 @@ class TrackFilterPanel:
         w_list = [self.en_exp_duration, self.exp_duration, self.en_min_length, self.min_track_length, self.en_max_length, self.max_track_length, self.en_min_size, self.min_size_val, self.filter_t0_dead, self.time_type, self.btn_run, self.btn_preview_lengths]
         for w in w_list: w.disabled = locked
 
+    def _get_advanced_features_path(self):
+        from behav3d.features.advanced_timepoint_features import find_advanced_features_csv
+        return find_advanced_features_csv(self.output_dir, self.cell_type)
+
     def _on_preview_lengths_clicked(self, *_):
         self._lock(True)
         self.out_preview.clear_output()
         self.spinner_html.layout.display = None
         with self.out_preview:
             try:
-                df_input_path = str(self._advanced_features_path) if self._use_advanced_features else None
+                adv_path = self._get_advanced_features_path()
+                df_input_path = str(adv_path) if adv_path is not None else None
                 preview_track_length_before_filtering(
                     metadata=self.metadata_loader.metadata,
                     output_dir=self.output_dir,
@@ -1000,7 +1001,8 @@ class TrackFilterPanel:
                 })
                 with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
 
-                df_input_path = str(self._advanced_features_path) if self._use_advanced_features else None
+                adv_path = self._get_advanced_features_path()
+                df_input_path = str(adv_path) if adv_path is not None else None
                 filter_tracks(
                     metadata=self.metadata_loader.metadata,
                     output_dir=self.output_dir,

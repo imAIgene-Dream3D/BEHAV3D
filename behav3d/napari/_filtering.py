@@ -518,6 +518,7 @@ class CellTypeFilterPanel(QWidget):
         """
         from behav3d.analysis.filtering import filter_tracks
         from behav3d.analysis import summarize_track_features
+        from behav3d.features.advanced_timepoint_features import find_advanced_features_csv
 
         if params is None:
             params = self.collect_runtime_params()
@@ -529,9 +530,8 @@ class CellTypeFilterPanel(QWidget):
         out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
 
         # Check for advanced features CSV
-        active_killing_dir = Path(out_dir) / "analysis" / cell_type / "active_killing"
-        adv_path = active_killing_dir / f"BEHAV3D_{cell_type}_advanced_track_features.csv"
-        df_input_path = str(adv_path) if adv_path.exists() else None
+        adv_path = find_advanced_features_csv(out_dir, cell_type)
+        df_input_path = str(adv_path) if adv_path is not None else None
 
         filter_kwargs = {
             "metadata": self.metadata_loader.metadata,
