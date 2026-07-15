@@ -59,6 +59,32 @@ from behav3d.napari._results_catalog import (
 
 
 # ---------------------------------------------------------------------------
+# Per-tick scan cache
+# ---------------------------------------------------------------------------
+# Every top-level tab (Filtering, Feature Extraction, Analysis) embeds its
+# own ResultsPanel, but all of them point at the same output directory and
+# refresh in response to the same events (metadata_loaded, job-finished
+# callbacks) — so a single event can trigger scan_outputs() back-to-back for
+# the exact same directory. scan_outputs() walks the whole analysis/ tree
+# twice (os.walk + rglob("*.zarr")), so that's wasted disk I/O repeated per
+# panel. Memoize per output_dir for the rest of the current Qt event-loop
+# tick only (cleared via a zero-delay QTimer): simultaneous refreshes share
+# one real scan, while any later refresh (e.g. after a background job
+# writes new files) always re-scans, so results can never go stale.
+_scan_cache: dict[str, list[ResultFile]] = {}
+
+
+def _scan_outputs_coalesced(output_dir: Path) -> list[ResultFile]:
+    key = str(output_dir)
+    if key in _scan_cache:
+        return _scan_cache[key]
+    results = scan_outputs(output_dir)
+    _scan_cache[key] = results
+    QTimer.singleShot(0, lambda: _scan_cache.pop(key, None))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Cross-widget refresh helper
 # ---------------------------------------------------------------------------
 def notify_results_changed(widget) -> bool:
@@ -374,7 +400,7 @@ class ResultsPanel(QWidget):
             placeholder.setFlags(placeholder.flags() & ~Qt.ItemIsSelectable)
             return
 
-        files = scan_outputs(out_dir)
+        files = _scan_outputs_coalesced(out_dir)
         if not self.chk_show_extras.isChecked():
             files = [f for f in files if f.is_viewable]
         if not files:

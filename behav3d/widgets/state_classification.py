@@ -893,6 +893,15 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         self.hmm_log_scale_status = widgets.HTML("<i>Select features to choose optional log1p scaling.</i>")
         self.hmm_log_scale_box = widgets.VBox([])
         self._hmm_log_scale_checkboxes = {}
+        # Distribution preview: sits just below the "Log scaling" header and
+        # above the per-feature checkboxes, so the user can inspect which
+        # features are skewed before applying log scaling.
+        self.hmm_log_scale_dist_btn = widgets.Button(
+            description="📊 Preview feature distributions",
+            layout=widgets.Layout(width="260px"),
+        )
+        self.hmm_log_scale_dist_btn.on_click(self._on_preview_log_scale_distributions)
+        self.hmm_log_scale_dist_out = widgets.Output()
         self.binary_group_status = widgets.HTML("<i>No binary columns detected yet.</i>")
         self.binary_group_checks_box = widgets.VBox([])
         self._binary_group_checkboxes = {}
@@ -1093,6 +1102,8 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             children=[
                 widgets.VBox(
                     [
+                        self.hmm_log_scale_dist_btn,
+                        self.hmm_log_scale_dist_out,
                         self.hmm_log_scale_status,
                         self.hmm_log_scale_box,
                     ],
@@ -1449,6 +1460,34 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             for col, cb in self._hmm_log_scale_checkboxes.items()
             if bool(cb.value)
         ]
+
+    def _on_preview_log_scale_distributions(self, *_):
+        """Plot histograms of the currently selected features so the user can
+        judge which benefit from log scaling before applying it."""
+        from behav3d.widgets.utils import build_feature_distribution_figure
+        from IPython.display import display
+
+        out = self.hmm_log_scale_dist_out
+        out.clear_output(wait=True)
+        ct = self._current_cell_type()
+        csv_path = self._resolve_track_features_csv()
+        feats = self._selected_hmm_feature_columns()
+        with out:
+            if csv_path is None:
+                print(f"No track-features CSV found for '{ct}'. Run feature extraction/filtering first.")
+                return
+            if not feats:
+                print("Select at least one feature above to preview its distribution.")
+                return
+            fig, truncated = build_feature_distribution_figure(
+                csv_path, feats, title=f"Feature distributions — {ct}"
+            )
+            if fig is None:
+                print(f"Could not read features from: {csv_path}")
+                return
+            if truncated:
+                print("Showing the first 36 selected features.")
+            display(fig)
 
     def _rebuild_log_scale_feature_controls(self):
         selected_features = self._selected_hmm_feature_columns()

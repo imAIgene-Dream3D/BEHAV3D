@@ -414,3 +414,8 @@ if os.environ.get("BEHAV3D_DEV_MODE") == "1":
 ```
 
 > **Note:** The `.behav3d_dev` file is listed in `.gitignore` and will never be committed to version control. It is a purely local, per-machine toggle.
+
+## About AI Usage
+
+*The BEHAV3D Explorer toolkit was developed with the assistance of AI models from OpenAI (Codex, ChatGPT), Anthropic (Sonnet, Haiku, Opus), Cursor and Google (Gemini Flash, Gemini Pro).*
+*All AI model code edits have been supervised by our team of developers and have been tested thoroughly among the team of developers and by outside testers.*

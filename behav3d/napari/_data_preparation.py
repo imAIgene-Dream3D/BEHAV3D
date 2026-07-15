@@ -56,6 +56,7 @@ from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
 )
+from behav3d.core.qt_help import HelpButton
 
 # These are imported lazily by the conversion worker to keep startup fast.
 # from behav3d.preprocessing import convert_input_files_to_zarr
@@ -98,6 +99,94 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+def _compute_dim_order_data(metadata: pd.DataFrame, progress_callback=None):
+    """Per-sample ``(sample_name, shape_str, detected_dim_order)``.
+
+    This is the I/O-heavy part of populating the Dimension Order table —
+    it opens each sample's raw image container to read its shape/axes.
+    Kept as a plain function (no Qt widget access) so it can run on a
+    background thread; the caller is responsible for feeding the result
+    into the table widget on the GUI thread.
+    """
+    from behav3d.io.images import get_image_shape, get_image_dimension_order, get_czi_shape_and_dimension_order
+
+    samples = metadata["sample_name"].tolist()
+    data = []
+    for idx, sample in enumerate(samples):
+        if progress_callback is not None:
+            progress_callback(f"Reading image info {idx + 1}/{len(samples)}: {sample}")
+
+        raw_path = metadata.loc[metadata["sample_name"] == sample, "raw_image_path"]
+        shape_str = ""
+        detected_order = "TCZYX"
+        if not raw_path.empty:
+            p = Path(str(raw_path.iloc[0]).strip())
+            if p.exists():
+                if p.suffix == ".czi":
+                    # Single open covers both shape and dim order (avoids opening the file twice).
+                    try:
+                        raw_shape, detected_order = get_czi_shape_and_dimension_order(p)
+                        shape_str = str(raw_shape)
+                    except Exception:
+                        shape_str = "?"
+                else:
+                    try:
+                        raw_shape = get_image_shape(p)
+                        shape_str = str(raw_shape)
+                    except Exception:
+                        shape_str = "?"
+                    try:
+                        detected_order = get_image_dimension_order(p)
+                    except Exception:
+                        pass
+        data.append((sample, shape_str, detected_order))
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Background worker for metadata load (CSV read + validation + per-sample
+# image-header reads can be slow, especially over network storage)
+# ═══════════════════════════════════════════════════════════════════════════
+class _MetadataLoadWorker(QThread):
+    progress = Signal(str)
+    finished = Signal(object)  # dict — see run()
+
+    def __init__(self, csv_path: str, out_dir: str, parent=None):
+        super().__init__(parent)
+        self.csv_path = csv_path
+        self.out_dir = out_dir
+
+    def run(self):
+        try:
+            metadata = load_behav3d_metadata(self.csv_path)
+            check_behav3d_metadata(metadata, func=False)
+
+            behav3d_parameters = None
+            params_path = Path(self.out_dir) / "behav3d_parameters.yml" if self.out_dir else None
+            if params_path:
+                if params_path.exists():
+                    behav3d_parameters = _deep_merge(deepcopy(_DEFAULT_CONFIG), _load_config(params_path))
+                else:
+                    behav3d_parameters = deepcopy(_DEFAULT_CONFIG)
+                behav3d_parameters["paths"]["metadata_csv"] = self.csv_path
+                behav3d_parameters["paths"]["output_dir"] = self.out_dir
+                with open(params_path, "w") as f:
+                    yaml.safe_dump(behav3d_parameters, f, sort_keys=False)
+
+            dim_order_data = _compute_dim_order_data(metadata, progress_callback=self.progress.emit)
+
+            self.finished.emit({
+                "ok": True,
+                "metadata": metadata,
+                "behav3d_parameters": behav3d_parameters,
+                "dim_order_data": dim_order_data,
+                "csv_path": self.csv_path,
+                "out_dir": self.out_dir,
+            })
+        except Exception as e:
+            self.finished.emit({"ok": False, "error": str(e)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -309,8 +398,22 @@ class DataPreparationTab(QWidget):
         pop_form.addRow("Organoid types:", self.n_organoid_spin)
         pop_form.addRow("Immune types:", self.n_immune_spin)
         pop_form.addRow("Other types:", self.n_other_spin)
+        dead_row = QHBoxLayout()
         self.include_dead_cb = QCheckBox("Include dead channel")
-        pop_form.addRow(self.include_dead_cb)
+        dead_row.addWidget(self.include_dead_cb)
+        dead_row.addWidget(HelpButton(
+            "Include Dead Channel",
+            "Tick this when the acquisition has a dedicated viability/death "
+            "marker channel (e.g. a live/dead dye), separate from the "
+            "organoid/immune/other cell-type channels above.\n\n"
+            "Enabling it adds a 'Dead ch #' field and an optional 'Dead "
+            "mask' path to each sample form, writing 'dead_channel' and "
+            "'dead_mask_path' columns to metadata.csv. If a dead channel "
+            "number is set but no mask path is given, the mask must be "
+            "produced later via Segmentation."
+        ))
+        dead_row.addStretch()
+        pop_form.addRow(dead_row)
         lay.addLayout(pop_form)
 
         # --- Cell type naming inputs (dynamically rebuilt) ---
@@ -642,7 +745,11 @@ class DataPreparationTab(QWidget):
                 
         for base, ct_names in multi_groups.items():
             if len(ct_names) > 1:
-                fields_to_sync = ["line", "condition", "segments_image_path", "tracks_image_path", "tracks_csv_path"]
+                # Path fields (segments/tracks) are intentionally excluded: each
+                # multicolor channel is a distinct external segmentation/tracking
+                # result and must keep its own path, unlike line/condition which
+                # describe the same underlying population.
+                fields_to_sync = ["line", "condition"]
                 for field_name in fields_to_sync:
                     for ct_name in ct_names:
                         w = cell_type_fields[ct_name][field_name]
@@ -1136,10 +1243,10 @@ class DataPreparationTab(QWidget):
         row.addWidget(btn_browse)
         lay.addLayout(row)
 
-        btn_load = QPushButton("Load Metadata")
-        btn_load.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
-        btn_load.clicked.connect(self._on_load_metadata)
-        lay.addWidget(btn_load)
+        self.btn_load_metadata = QPushButton("Load Metadata")
+        self.btn_load_metadata.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        self.btn_load_metadata.clicked.connect(self._on_load_metadata)
+        lay.addWidget(self.btn_load_metadata)
 
         self.metadata_info_label = QLabel("")
         self.metadata_info_label.setWordWrap(True)
@@ -1163,55 +1270,62 @@ class DataPreparationTab(QWidget):
             QMessageBox.warning(self, "Error", f"File not found: {csv_path}")
             return
 
-        try:
-            self.metadata = load_behav3d_metadata(csv_path)
-            self.output_dir = out_dir
-            check_behav3d_metadata(self.metadata, func=False)
+        if getattr(self, "_metadata_load_worker", None) is not None and self._metadata_load_worker.isRunning():
+            return
 
-            # Persist parameters
-            params_path = Path(out_dir) / "behav3d_parameters.yml" if out_dir else None
-            if params_path:
-                if params_path.exists():
-                    self.behav3d_parameters = _deep_merge(deepcopy(_DEFAULT_CONFIG), _load_config(params_path))
-                else:
-                    self.behav3d_parameters = deepcopy(_DEFAULT_CONFIG)
-                self.behav3d_parameters["paths"]["metadata_csv"] = csv_path
-                self.behav3d_parameters["paths"]["output_dir"] = out_dir
-                with open(params_path, "w") as f:
-                    yaml.safe_dump(self.behav3d_parameters, f, sort_keys=False)
+        self.btn_load_metadata.setEnabled(False)
+        self.btn_load_metadata.setText("Loading…")
+        self.metadata_info_label.setText("⏳ Loading metadata…")
 
-            n = len(self.metadata)
-            cols = len(self.metadata.columns)
-            org = detect_organoid_types_from_metadata(self.metadata)
-            imm = detect_immune_cell_types_from_metadata(self.metadata)
-            oth = detect_other_cell_types_from_metadata(self.metadata)
-            info_parts = [f"✅ Loaded {n} samples, {cols} columns."]
-            if org:
-                info_parts.append(f"Organoid: {', '.join(org)}")
-            if imm:
-                info_parts.append(f"Immune: {', '.join(imm)}")
-            if oth:
-                info_parts.append(f"Other: {', '.join(oth)}")
-            self.metadata_info_label.setText("  |  ".join(info_parts))
-            self._log(f"✅ Metadata loaded from {csv_path}")
-            self._loaded_csv_path = csv_path
+        self._metadata_load_worker = _MetadataLoadWorker(csv_path, out_dir, parent=self)
+        self._metadata_load_worker.progress.connect(lambda msg: self._log(msg))
+        self._metadata_load_worker.finished.connect(self._on_metadata_load_finished)
+        self._metadata_load_worker.start()
 
-            # Switch save button to "Edit Metadata CSV" (yellow)
-            self.btn_save_metadata.setText("Edit Metadata CSV")
-            self.btn_save_metadata.setStyleSheet(
-                "background-color: #FFA726; color: white; font-weight: bold;"
-            )
+    def _on_metadata_load_finished(self, result: dict):
+        self.btn_load_metadata.setEnabled(True)
+        self.btn_load_metadata.setText("Load Metadata")
 
-            # Populate overview and dim-order table
-            self._populate_metadata_overview()
-            self._populate_dim_order_table()
+        if not result["ok"]:
+            self.metadata_info_label.setText(f"❌ {result['error']}")
+            self._log(f"❌ Error loading metadata: {result['error']}")
+            return
 
-            # Emit signal for other tabs
-            self.metadata_loaded.emit(self.metadata)
+        csv_path = result["csv_path"]
+        self.metadata = result["metadata"]
+        self.output_dir = result["out_dir"]
+        if result["behav3d_parameters"] is not None:
+            self.behav3d_parameters = result["behav3d_parameters"]
 
-        except Exception as e:
-            self.metadata_info_label.setText(f"❌ {e}")
-            self._log(f"❌ Error loading metadata: {e}")
+        n = len(self.metadata)
+        cols = len(self.metadata.columns)
+        org = detect_organoid_types_from_metadata(self.metadata)
+        imm = detect_immune_cell_types_from_metadata(self.metadata)
+        oth = detect_other_cell_types_from_metadata(self.metadata)
+        info_parts = [f"✅ Loaded {n} samples, {cols} columns."]
+        if org:
+            info_parts.append(f"Organoid: {', '.join(org)}")
+        if imm:
+            info_parts.append(f"Immune: {', '.join(imm)}")
+        if oth:
+            info_parts.append(f"Other: {', '.join(oth)}")
+        self.metadata_info_label.setText("  |  ".join(info_parts))
+        self._log(f"✅ Metadata loaded from {csv_path}")
+        self._loaded_csv_path = csv_path
+
+        # Switch save button to "Edit Metadata CSV" (yellow)
+        self.btn_save_metadata.setText("Edit Metadata CSV")
+        self.btn_save_metadata.setStyleSheet(
+            "background-color: #FFA726; color: white; font-weight: bold;"
+        )
+
+        # Populate overview and dim-order table (dim-order data was already
+        # computed on the background thread — no extra image I/O here).
+        self._populate_metadata_overview()
+        self._populate_dim_order_table(result["dim_order_data"])
+
+        # Emit signal for other tabs
+        self.metadata_loaded.emit(self.metadata)
 
     def _on_tracking_completed(self):
         """Reload metadata after tracking completes to reflect new tracking outputs."""
@@ -1271,7 +1385,7 @@ class DataPreparationTab(QWidget):
     # Section 5 – Dimension Order Table
     # ══════════════════════════════════════════════════════════════════════
     def _build_dim_order_section(self):
-        grp = QGroupBox("5 · Dimension Order")
+        grp = QGroupBox("5 · Dimension Order (Optional)")
         lay = QVBoxLayout(grp)
 
         self.dim_table = QTableWidget(0, 3)
@@ -1297,39 +1411,24 @@ class DataPreparationTab(QWidget):
 
         self._layout.addWidget(grp)
 
-    def _populate_dim_order_table(self):
+    def _populate_dim_order_table(self, dim_order_data=None):
         if self.metadata is None:
             return
 
-        from behav3d.io.images import get_image_shape, get_image_dimension_order
+        # dim_order_data lets callers (e.g. the background metadata-load
+        # worker) hand in already-computed (sample, shape_str, detected_order)
+        # tuples so this method only ever touches Qt widgets, never the disk.
+        if dim_order_data is None:
+            dim_order_data = _compute_dim_order_data(self.metadata)
 
-        samples = self.metadata["sample_name"].tolist()
-        self.dim_table.setRowCount(len(samples))
+        self.dim_table.setRowCount(len(dim_order_data))
         self._sample_t_counts = {}
 
-        for i, sample in enumerate(samples):
+        for i, (sample, shape_str, detected_order) in enumerate(dim_order_data):
             # Sample name (read-only)
             item = QTableWidgetItem(str(sample))
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             self.dim_table.setItem(i, 0, item)
-
-            # Shape
-            raw_path = self.metadata.loc[self.metadata["sample_name"] == sample, "raw_image_path"]
-            raw_shape = None
-            shape_str = ""
-            detected_order = "TCZYX"
-            if not raw_path.empty:
-                p = Path(str(raw_path.iloc[0]).strip())
-                if p.exists():
-                    try:
-                        raw_shape = get_image_shape(p)
-                        shape_str = str(raw_shape)
-                    except Exception:
-                        shape_str = "?"
-                    try:
-                        detected_order = get_image_dimension_order(p)
-                    except Exception:
-                        pass
 
             shape_item = QTableWidgetItem(shape_str)
             shape_item.setFlags(shape_item.flags() & ~Qt.ItemIsEditable)
@@ -1450,9 +1549,23 @@ class DataPreparationTab(QWidget):
         lay.addWidget(self.t_mismatch_warning)
 
         # Timepoint clipping
+        clip_check_row = QHBoxLayout()
         self.zarr_clip_check = QCheckBox("Clip timepoints (select range)")
         self.zarr_clip_check.setChecked(False)
-        lay.addWidget(self.zarr_clip_check)
+        clip_check_row.addWidget(self.zarr_clip_check)
+        clip_check_row.addWidget(HelpButton(
+            "Clip Timepoints",
+            "Restrict every image to an inclusive [Start, End] timepoint "
+            "range during zarr conversion, instead of keeping all "
+            "timepoints. Useful when samples have differing timepoint "
+            "counts (see the warning above) — trimming them to a common "
+            "range avoids mismatches in downstream tracking/feature steps.\n\n"
+            "If some samples were already converted to .zarr in a previous "
+            "run, you will additionally be offered the option to clip those "
+            "existing .zarr files in place to the same range."
+        ))
+        clip_check_row.addStretch()
+        lay.addLayout(clip_check_row)
 
         clip_row = QHBoxLayout()
         clip_row.setContentsMargins(20, 0, 0, 0)

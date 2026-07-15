@@ -36,7 +36,7 @@ from qtpy.QtGui import QDesktopServices
 
 from behav3d.napari._pdf_view import open_pdf_in_napari
 from behav3d.napari._results_panel import ResultsPanel
-from behav3d.core.qt_help import make_help_row
+from behav3d.core.qt_help import make_help_row, HelpButton
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -76,8 +76,9 @@ def _period_from_t_radios(radio_group, start_spin, end_spin):
 def _detect_cell_types(metadata_loader):
     """Return (organoid_types, immune_types, other_types) lists.
 
-    Includes merged/grouped outputs routed to their detected category.
-    Returns three empty lists when metadata is missing.
+    Includes both legacy metadata-registered merged types and the current
+    ``cell_type_groups`` (yml-based, post-filtering) groups, routed to their
+    detected category. Returns three empty lists when metadata is missing.
     """
     if metadata_loader is None or metadata_loader.metadata is None:
         return [], [], []
@@ -89,6 +90,7 @@ def _detect_cell_types(metadata_loader):
         filter_multicolor_inputs,
     )
     from behav3d.widgets.utils import detect_cell_type_category
+    from behav3d.analysis.grouping import list_cell_type_groups, group_category
 
     md = metadata_loader.metadata
     org = filter_multicolor_inputs(detect_organoid_types_from_metadata(md))
@@ -106,6 +108,16 @@ def _detect_cell_types(metadata_loader):
             oth.append(ct)
         elif category == "immune" and ct not in imm:
             imm.append(ct)
+
+    params = getattr(metadata_loader, "behav3d_parameters", {}) or {}
+    for group_id in list_cell_type_groups(params):
+        category = group_category(params, md, group_id)
+        if category == "organoid" and group_id not in org:
+            org.append(group_id)
+        elif category == "other" and group_id not in oth:
+            oth.append(group_id)
+        elif group_id not in imm:
+            imm.append(group_id)
     return org, imm, oth
 
 
@@ -521,7 +533,18 @@ class DeathDynamicsTab(QWidget):
         self.check_group_by_lc = QCheckBox(
             "Group overall plots by immune line condition"
         )
-        ia_single_form.addRow("", self.check_group_by_lc)
+        gbl_row = QHBoxLayout()
+        gbl_row.addWidget(self.check_group_by_lc)
+        gbl_row.addWidget(HelpButton(
+            "Group overall plots by immune line condition",
+            "Splits the two per-target overall plots by the interacting "
+            "immune cell's line condition (im_{type}_line_condition): the "
+            "cumulative-contact curve draws one line per condition, and the "
+            "alive-vs-dead bar plot colours bars by condition. Only affects "
+            "the 2a per-target overall plots.",
+        ))
+        gbl_row.addStretch()
+        ia_single_form.addRow("", gbl_row)
         ia_single_adv_host = QWidget()
         ia_single_adv_host.setLayout(ia_single_form)
         self.ia_single_adv.contentLayout().addWidget(ia_single_adv_host)
@@ -617,7 +640,18 @@ class DeathDynamicsTab(QWidget):
         self.check_annotate_lc = QCheckBox(
             "Annotate by immune line condition"
         )
-        ia_overview_form.addRow("", self.check_annotate_lc)
+        annotate_lc_row = QHBoxLayout()
+        annotate_lc_row.addWidget(self.check_annotate_lc)
+        annotate_lc_row.addWidget(HelpButton(
+            "Annotate by immune line condition",
+            "When enabled, the violin (cumulative contacts per organoid) and "
+            "the active-killing dashboard add the immune line condition as a "
+            "hue / line-style annotation within the selected 'Group by' "
+            "grouping, instead of pooling all line conditions together. Does "
+            "not affect the cumulative-to-death curve.",
+        ))
+        annotate_lc_row.addStretch()
+        ia_overview_form.addRow("", annotate_lc_row)
 
         self.combo_group_by = QComboBox()
         self.combo_group_by.addItem("By target (organoid) type", userData="organoid_type")
@@ -625,7 +659,12 @@ class DeathDynamicsTab(QWidget):
         self.combo_group_by.setMaximumWidth(280)
         ia_overview_form.addRow("Group by:", make_help_row(
             self.combo_group_by, "Group by",
-            "How to group results on the x-axis in Interaction Overview.",
+            "How results are grouped on the x-axis in Interaction Overview "
+            "(violin, cumulative-to-death curve, active-killing dashboard). "
+            "'By target (organoid) type' keeps each organoid type as its own "
+            "x-axis group. 'By treatment (immune cell)' pools all organoid "
+            "types together and groups by the interacting immune cell type "
+            "instead.",
         ))
 
         ia_overview_host = QWidget()
@@ -654,18 +693,33 @@ class DeathDynamicsTab(QWidget):
         inv_lay = QVBoxLayout(self.inv_group)
         inv_lay.setSpacing(4)
 
-        inv_info = QLabel(
+        inv_info_row = QHBoxLayout()
+        inv_info_row.addStretch()
+        inv_info_row.addWidget(HelpButton(
+            "Invasiveness Analysis",
             "Measures invasiveness of the selected immune cell type(s) against "
-            "one or more targets over time and summarized per "
-            "movie. Over-time plots: fraction (% cells invasive), mean % "
-            "(average contact), median % (typical cell). Per-movie stat "
-            "collapses the time window into one dot per movie. Fate violins "
-            "(one point per organoid) require organoid filtered CSVs with "
-            "death data. Enable 'invasiveness' during feature extraction."
-        )
-        inv_info.setWordWrap(True)
-        inv_info.setStyleSheet("color: #aaa; font-size: 11px;")
-        inv_lay.addWidget(inv_info)
+            "one or more targets, over time and summarized per movie. Enable "
+            "'invasiveness' during feature extraction to compute the underlying "
+            "values.\n\n"
+            "Feature extraction records, for every immune cell at every "
+            "timepoint, the % of its surface touching a chosen organoid "
+            "target (a '{target}_invasiveness_perc' value, 0-100) and a "
+            "boolean invasive flag that is True once that contact reaches "
+            "≥50%. This step turns those per-cell, per-timepoint values "
+            "into three views:\n\n"
+            "• Fraction over time: % of cells flagged invasive (≥50% "
+            "contact) at each timepoint.\n"
+            "• Mean / median % over time: average / typical contact % "
+            "across ALL cells (including non-invasive 0% ones) at each "
+            "timepoint.\n"
+            "• Per-movie summary: the chosen over-time curve collapsed to "
+            "one dot per movie (see the 'Per-movie summary stat' help).\n\n"
+            "If organoid types are selected for fate cross-referencing, "
+            "fate violins (one point per organoid, requires organoid filtered "
+            "CSVs with death data) additionally show contact %/invasive-cell "
+            "counts per organoid, split by whether that organoid died.",
+        ))
+        inv_lay.addLayout(inv_info_row)
 
         self.inv_immune_group = QGroupBox("Immune cell type(s)")
         self.inv_immune_lay = QVBoxLayout(self.inv_immune_group)
@@ -696,20 +750,43 @@ class DeathDynamicsTab(QWidget):
             self.inv_summary_combo.addItem(_s, userData=_s)
         self.inv_summary_combo.setMaximumWidth(160)
         inv_stat_row.addWidget(self.inv_summary_combo)
-        inv_stat_help = QLabel(
+        inv_stat_row.addWidget(HelpButton(
+            "Per-movie summary stat",
             "Collapses each movie's time series to one value (mean/median/max/AUC). "
-            "Does not affect the separate median-over-time curve."
-        )
-        inv_stat_help.setWordWrap(True)
-        inv_stat_help.setStyleSheet("color: #aaa; font-size: 10px;")
-        inv_stat_row.addWidget(inv_stat_help)
+            "Does not affect the separate mean/median-over-time curves.\n\n"
+            "Defines the single number plotted as one dot per movie in the "
+            "'Per-movie' plots (for both the boolean fraction and the "
+            "percentage). For each movie (per immune type / target / line "
+            "condition), the per-timepoint curve is first built by averaging "
+            "across that movie's cells at each timepoint (mean %, or the "
+            "per-timepoint median % when 'median' is selected), then "
+            "collapsed over time using the selected statistic:\n\n"
+            "• mean — average of the per-timepoint values.\n"
+            "• median — median of the per-timepoint values.\n"
+            "• max — highest per-timepoint value reached.\n"
+            "• AUC — area under the per-timepoint curve, normalized by the "
+            "time span (trapezoidal integral / duration), so it stays on "
+            "the same 0-1 / 0-100 scale as the other statistics.\n\n"
+            "This choice only affects the per-movie summary plots/CSV, not "
+            "the separate fraction/mean/median over-time curves.",
+        ))
         inv_stat_row.addStretch()
         inv_lay.addLayout(inv_stat_row)
 
         self.check_inv_group_by_lc = QCheckBox(
             "Separate by immune line condition"
         )
-        inv_lay.addWidget(self.check_inv_group_by_lc)
+        inv_lc_row = QHBoxLayout()
+        inv_lc_row.addWidget(self.check_inv_group_by_lc)
+        inv_lc_row.addWidget(HelpButton(
+            "Separate by immune line condition",
+            "When enabled, results are additionally split by the immune "
+            "cell's line condition (im_{type}_line_condition): a distinct "
+            "box/line per line condition in the per-movie summary and "
+            "over-time plots, instead of pooling all conditions together.",
+        ))
+        inv_lc_row.addStretch()
+        inv_lay.addLayout(inv_lc_row)
 
         # Invasiveness temporal range: radio + Start T / End T
         from qtpy.QtWidgets import QRadioButton, QButtonGroup
@@ -2129,6 +2206,33 @@ class AnalysisTab(QWidget):
         main_lay.setContentsMargins(0, 0, 0, 0)
         main_lay.setSpacing(0)
 
+        # ── Cell type grouping ──────────────────────────────────────────
+        # Sits above both subtabs: grouping merges already-*filtered*
+        # populations (see behav3d.analysis.grouping), so it belongs after
+        # Filtering and before Death Dynamics / Single Cell, not before
+        # Feature Extraction — that would duplicate feature
+        # extraction/filtering work for every group.
+        grouping_row = QHBoxLayout()
+        grouping_row.setContentsMargins(6, 6, 6, 4)
+        self.btn_open_grouping = QPushButton("🧬  Cell type grouping…")
+        self.btn_open_grouping.setToolTip(
+            "Merge several already-filtered cell types into a single "
+            "'{name}_merged' population for Death Dynamics / Single Cell.\n"
+            "Metadata is not modified — only behav3d_parameters.yml and a "
+            "merged filtered CSV are written."
+        )
+        self.btn_open_grouping.setStyleSheet(
+            "QPushButton { background:#1f3a5f; color:#bbdefb; font-weight:bold; "
+            "border:1px solid #64b5f6; border-radius:4px; padding:6px 12px; } "
+            "QPushButton:hover { background:#2c4f7f; }"
+            "QPushButton:disabled { color:#666; border-color:#444; }"
+        )
+        self.btn_open_grouping.clicked.connect(self._on_open_grouping_dialog)
+        self.btn_open_grouping.setEnabled(False)
+        grouping_row.addWidget(self.btn_open_grouping)
+        grouping_row.addStretch()
+        main_lay.addLayout(grouping_row)
+
         self.splitter = QSplitter(Qt.Vertical, self.main_content)
         self.splitter.setChildrenCollapsible(True)
         main_lay.addWidget(self.splitter)
@@ -2176,12 +2280,17 @@ class AnalysisTab(QWidget):
             and getattr(metadata_loader, "metadata", None) is not None
         ):
             self.stack.setCurrentIndex(1)
+            self.btn_open_grouping.setEnabled(True)
         else:
             self.stack.setCurrentIndex(0)
 
     def _on_metadata_loaded(self, *_):
         """Reveal the analysis GUI once metadata is available."""
         self.stack.setCurrentIndex(1)
+        self.btn_open_grouping.setEnabled(
+            self.metadata_loader is not None
+            and getattr(self.metadata_loader, "metadata", None) is not None
+        )
 
     def _on_metadata_updated(self, *_):
         """Cascade metadata updates to inner tabs and results panel."""
@@ -2191,3 +2300,22 @@ class AnalysisTab(QWidget):
             self.single_cell_tab._on_metadata_updated()
         if hasattr(self, "results_panel"):
             self.results_panel.refresh()
+
+    # ── Cell type grouping ────────────────────────────────────────────────
+    def _on_open_grouping_dialog(self):
+        """Open the cell-type grouping dialog and refresh cell-type
+        dropdowns (Death Dynamics / Single Cell) on success."""
+        from behav3d.napari._grouping_dialog import GroupBuilderDialog
+
+        if self.metadata_loader is None or self.metadata_loader.metadata is None:
+            return
+
+        dlg = GroupBuilderDialog(self.metadata_loader, parent=self)
+        dlg.group_created.connect(self._on_group_changed)
+        dlg.group_removed.connect(self._on_group_changed)
+        dlg.exec_()
+
+    def _on_group_changed(self, group_id: str):
+        """Slot: refresh Death Dynamics / Single Cell dropdowns after a
+        group is created or removed."""
+        self._on_metadata_updated()
