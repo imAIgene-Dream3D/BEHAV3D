@@ -35,7 +35,7 @@ import pyclesperanto_prototype as cle
 from behav3d.io.images import load_image, load_zarr, save_as_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 from behav3d.core.qt_help import HelpButton, make_help_row
-from behav3d.core.utils import ignore_missing_rmtree_error
+from behav3d.core.utils import rmtree_ignore_missing
 
 # ---------------------------------------------------------------------------
 # Feature grid constants (matching the official napari-apoc widget)
@@ -2940,7 +2940,7 @@ class APOCTrainingWidget(QWidget):
             label_data = np.asarray(label_layer.data)
             outpath = Path(self.pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
             if outpath.exists():
-                shutil.rmtree(outpath, onexc=ignore_missing_rmtree_error)
+                rmtree_ignore_missing(outpath)
             save_as_zarr(label_data, outpath)
             log(f"Saved {cell_type} labels → {outpath}")
 
@@ -2949,7 +2949,7 @@ class APOCTrainingWidget(QWidget):
             dead_label_data = np.asarray(dead_layer.data)
             dead_outpath = Path(self.pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
             if dead_outpath.exists():
-                shutil.rmtree(dead_outpath, onexc=ignore_missing_rmtree_error)
+                rmtree_ignore_missing(dead_outpath)
             save_as_zarr(dead_label_data, dead_outpath)
             log(f"Saved Death labels → {dead_outpath}")
 

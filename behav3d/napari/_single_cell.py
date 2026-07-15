@@ -61,7 +61,7 @@ from behav3d.napari._background_runner import (
 from behav3d.napari._pdf_view import open_pdf_in_napari
 from behav3d.napari._rename_dialog import RenameClusterDialog
 from behav3d.core.qt_help import HelpButton, make_help_row
-from behav3d.core.utils import ignore_missing_rmtree_error
+from behav3d.core.utils import rmtree_ignore_missing
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3226,7 +3226,7 @@ class TrackClassificationSubTab(QWidget):
             import shutil
             _traj_dir = out / "analysis" / ct / "behavorial_trajectories"
             if _traj_dir.exists():
-                shutil.rmtree(_traj_dir, onexc=ignore_missing_rmtree_error)
+                rmtree_ignore_missing(_traj_dir)
             from behav3d.analysis.behavior.track.state_dtw import (
                 run_categorical_dtaidistance_trajectory_clustering,
             )
@@ -3326,7 +3326,7 @@ class TrackClassificationSubTab(QWidget):
             import shutil
             _traj_dir = out / "analysis" / ct / "behavorial_trajectories"
             if _traj_dir.exists():
-                shutil.rmtree(_traj_dir, onexc=ignore_missing_rmtree_error)
+                rmtree_ignore_missing(_traj_dir)
             from behav3d.analysis.behavior.track.feature_dtw import run_tcell_analysis
             return run_tcell_analysis(
                 output_dir=str(out) if out else "",
