@@ -369,6 +369,52 @@ Available options: `deepseek-v4-flash` (fast, cheap), `deepseek-v4-pro` (stronge
 - Modal compute: [modal.com/apps](https://modal.com/apps) — the `behav3d-assistant` app
 - Set a DeepSeek spend limit to prevent runaway costs from unexpected traffic
 
+## Developer Options
+
+### Developer Mode
+
+BEHAV3D supports a lightweight developer mode that can be activated without modifying any code.
+
+**How to enable:**
+
+Create an empty file named `.behav3d_dev` in the BEHAV3D project root directory (the same folder that contains `README.md`):
+
+```bash
+# Linux / macOS
+touch .behav3d_dev
+
+# Windows PowerShell
+New-Item -ItemType File .behav3d_dev
+```
+
+**What it does:**
+
+| Effect | Detail |
+|---|---|
+| Window title | Adds `[DEV MODE]` to the napari window title bar |
+| Environment variable | Sets `BEHAV3D_DEV_MODE=1` for the duration of the session |
+| Console output | Enables extra verbose logging in some pipeline stages |
+
+**How to disable:**
+
+Delete or rename the `.behav3d_dev` file:
+
+```bash
+# Linux / macOS / Windows
+del .behav3d_dev        # Windows CMD
+Remove-Item .behav3d_dev  # Windows PowerShell
+```
+
+**For developers — checking dev mode in code:**
+
+```python
+import os
+if os.environ.get("BEHAV3D_DEV_MODE") == "1":
+    print("Running in developer mode")
+```
+
+> **Note:** The `.behav3d_dev` file is listed in `.gitignore` and will never be committed to version control. It is a purely local, per-machine toggle.
+
 ## About AI Usage
 
 *The BEHAV3D Explorer toolkit was developed with the assistance of AI models from OpenAI (Codex, ChatGPT), Anthropic (Sonnet, Haiku, Opus), Cursor and Google (Gemini Flash, Gemini Pro).*

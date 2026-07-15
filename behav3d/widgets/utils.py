@@ -103,6 +103,7 @@ _DEFAULT_CONFIG = {
             "btrack": {
                 "config_preset": "cell",
                 "config_path": "",
+                "use_visual_features": False,
                 "max_search_radius": 100,
                 "update_method": "EXACT",
                 "step_size": 100,
@@ -132,6 +133,7 @@ _DEFAULT_CONFIG = {
             "btrack": {
                 "config_preset": "cell",
                 "config_path": "",
+                "use_visual_features": False,
                 "max_search_radius": 100,
                 "update_method": "EXACT",
                 "step_size": 100,
@@ -161,6 +163,7 @@ _DEFAULT_CONFIG = {
             "btrack": {
                 "config_preset": "cell",
                 "config_path": "",
+                "use_visual_features": False,
                 "max_search_radius": 100,
                 "update_method": "EXACT",
                 "step_size": 100,

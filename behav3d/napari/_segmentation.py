@@ -4024,6 +4024,10 @@ class APOCWidget(QWidget):
 
         for ct, tab in tw.tabs.items():
             cfg = tab.get_config()
+            if not tab.channel_selection_is_complete():
+                # Channel layers are still loading in — don't overwrite the
+                # saved selection with this partial checkbox state.
+                cfg.pop("channels", None)
             for k, v in cfg.items():
                 apoc_config[f"apoc_{ct}_{k}"] = v
         return apoc_config
@@ -4323,20 +4327,38 @@ class APOCWidget(QWidget):
                 "gray", "turbo", "viridis", "plasma", "inferno", "twilight",
             ]
 
-            # Add Image layers
-            for ch in range(n_channels):
-                channel_data = stacked[:, ch, :, :, :]
-                nonzero = channel_data[channel_data > 0]
-                clim = (0, float(np.percentile(nonzero, 99.8))) if nonzero.size > 0 else (0, 1e-3)
-                img_layer = self.viewer.add_image(
-                    channel_data,
-                    name=f"Channel {ch}",
-                    contrast_limits=clim,
-                    colormap=channel_colors[ch % len(channel_colors)],
-                    blending="additive",
-                    opacity=0.8,
-                )
-                img_layer.contrast_limits_range = (0, max(float(channel_data.max()), 1e-3))
+            # Add Image layers. Channels are added one at a time, and each
+            # `add_image` call fires its own `layers.events.inserted` event —
+            # pause the training widget's own listener for the duration of
+            # the loop and refresh the training tabs' channel checkboxes
+            # once afterwards, so per-tab channel selections aren't rebuilt
+            # against a still-partial set of channel layers (which would
+            # look like no channels matching a tab's saved selection).
+            # Note: this must only block the training widget's own callback
+            # (via `pause_channel_refresh`), not the whole event — napari's
+            # internal layer-controls widget registration listens on the
+            # same event, and blocking it desyncs the viewer UI.
+            def _add_channel_layers():
+                for ch in range(n_channels):
+                    channel_data = stacked[:, ch, :, :, :]
+                    nonzero = channel_data[channel_data > 0]
+                    clim = (0, float(np.percentile(nonzero, 99.8))) if nonzero.size > 0 else (0, 1e-3)
+                    img_layer = self.viewer.add_image(
+                        channel_data,
+                        name=f"Channel {ch}",
+                        contrast_limits=clim,
+                        colormap=channel_colors[ch % len(channel_colors)],
+                        blending="additive",
+                        opacity=0.8,
+                    )
+                    img_layer.contrast_limits_range = (0, max(float(channel_data.max()), 1e-3))
+
+            if self._training_widget is not None:
+                with self._training_widget.pause_channel_refresh():
+                    _add_channel_layers()
+                self._training_widget._refresh_all_channels()
+            else:
+                _add_channel_layers()
 
             # Add Label layers
             label_shape = (T_total,) + stacked.shape[2:] 

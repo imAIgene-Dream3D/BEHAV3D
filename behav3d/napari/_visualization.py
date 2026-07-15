@@ -42,6 +42,7 @@ from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    is_multicolor_celltype,
 )
 # Channel colormaps (cycled if there are many channels)
 _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
@@ -594,7 +595,7 @@ class VisualizationTab(QWidget):
         ct_map = self._detect_cell_type_columns(row)
 
         for ct_name, prefix in ct_map.items():
-            seg_col = f"{prefix}_{ct_name}_segments_image_path"
+            seg_col = f"{prefix}_{ct_name}_segments_image_path" if prefix else f"{ct_name}_segments_image_path"
             seg_path_val = row.get(seg_col)
             
             # Robust check for missing values (NaN or empty)
@@ -734,7 +735,7 @@ class VisualizationTab(QWidget):
                 self._log(f"    - Skipping {name} tracks: Path not defined")
                 continue
 
-            csv_path_str = str(csv_path_val).strip()
+            csv_path_str = str(tracks_csv_val).strip()
             if not Path(csv_path_str).exists():
                 self._log(f"    - Skipping {name} tracks: File not found ({csv_path_str})")
                 continue
@@ -809,7 +810,7 @@ class VisualizationTab(QWidget):
                 self.viewer.add_labels(
                     seg_data,
                     name=layer_name,
-                    visible=True,
+                    visible=not is_multicolor_celltype(ct_name),
                 )
                 self._log(f"    + Tracked Labels layer: {layer_name}")
 
@@ -845,11 +846,19 @@ class VisualizationTab(QWidget):
             elif group_type == "tracked_segments":
                 # Tracked segments: "sample_name – celltype tracked segments"
                 if name.endswith(" tracked segments"):
-                    match = True
+                    body = name[:-17].rstrip()
+                    if " – " in body:
+                        ct_name = body.rsplit(" – ", 1)[1].strip()
+                        if not is_multicolor_celltype(ct_name):
+                            match = True
             elif group_type == "tracks":
                 # Tracks: "sample_name – celltype tracks"
                 if name.endswith(" tracks"):
-                    match = True
+                    body = name[:-7].rstrip()
+                    if " – " in body:
+                        ct_name = body.rsplit(" – ", 1)[1].strip()
+                        if not is_multicolor_celltype(ct_name):
+                            match = True
                     
             if match:
                 layer.visible = visible
@@ -870,11 +879,16 @@ class VisualizationTab(QWidget):
             )
 
     def _tracked_layer_names(self) -> list[str]:
-        return [
-            layer.name for layer in self.viewer.layers
-            if isinstance(layer.name, str)
-            and layer.name.endswith(" tracked segments")
-        ]
+        names = []
+        for layer in self.viewer.layers:
+            name = layer.name
+            if isinstance(name, str) and name.endswith(" tracked segments"):
+                body = name[:-17].rstrip()
+                if " – " in body:
+                    ct_name = body.rsplit(" – ", 1)[1].strip()
+                    if not is_multicolor_celltype(ct_name):
+                        names.append(name)
+        return names
 
     def _refresh_edition_panel(self) -> None:
         """Show the Manual Edition group iff a tracked-segments layer exists."""
@@ -1000,6 +1014,15 @@ class VisualizationTab(QWidget):
         self.edit_container_layout.addWidget(editor)
         self._editor = editor
         self._log(f"  Editing started on '{target}'.")
+        # Link the edition Workers spinbox to the global workers controller
+        # (defined in BEHAV3DWidget).  Safe no-op when running in a notebook.
+        try:
+            main_widget = self.parent()
+            ctrl = getattr(main_widget, "workers_ctrl", None)
+            if ctrl is not None and hasattr(editor, "spin_workers"):
+                ctrl.link(editor.spin_workers)
+        except Exception:
+            pass
         # Kick off background materialisation now that the editor is shown.
         editor.start_materialisation()
         return True
@@ -1020,7 +1043,8 @@ class VisualizationTab(QWidget):
         except Exception:
             pass
         self._editor = None
-        self._log("  Editing stopped.")
+        self._log("  Editing stopped. Reloading visualizer...")
+        self._on_load_dataset()
         return True
 
     def request_tab_exit(self) -> bool:
@@ -1054,4 +1078,16 @@ class VisualizationTab(QWidget):
             if m:
                 prefix, ct_name = m.group(1), m.group(2)
                 ct_map[ct_name] = prefix
+                
+        merged_pattern = re.compile(r"^(.+?)_(segments_image_path|tracks_image_path|tracks_csv_path)$")
+        for col in row.index:
+            if col.startswith(("or_", "im_", "ot_")):
+                continue
+            m = merged_pattern.match(col)
+            if m:
+                ct_name = m.group(1)
+                if ct_name.endswith("_merged") or ct_name.endswith("_grouped"):
+                    if ct_name not in ct_map:
+                        ct_map[ct_name] = ""
+                        
         return ct_map

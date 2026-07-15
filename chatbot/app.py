@@ -17,9 +17,9 @@ Endpoints (FastAPI, public):
         {"type":"tool_calls","calls":[...]}  proposed actions (client confirms)
         {"type":"done"} | {"type":"error","message":...}
 
-Tool calls use DeepSeek's native function-calling; `set_parameter.key` is
-constrained to the real BEHAV3D parameter keys (enum) so the model can't invent
-them. `parse_tool_calls` is retained only as a fallback for a call accidentally
+Tool calls use DeepSeek's native function-calling; `set_ui_value.control_id` is
+constrained to the live control registry so the model can't invent fields.
+`parse_tool_calls` is retained only as a fallback for a call accidentally
 embedded in the content text.
 
 The pure helpers (:func:`build_system_prompt`, :func:`to_openai_tools`,
@@ -37,334 +37,93 @@ import re
 # ===========================================================================
 # Pure logic (no Modal / network) — unit-testable
 # ===========================================================================
-_TOOLCALL_RE = re.compile(r"<TOOLCALL>\s*(\{.*?\})\s*</TOOLCALL>", re.DOTALL)
-
-_TOOL_NAMES = ("set_parameter", "navigate_to_step", "add_queue_step", "fill_metadata_builder",
-               "bulk_fill_metadata", "select_segmentation_method")
-
-
-_CATEGORY_LABELS = {
-    "immune": "immune cells",
-    "organoid": "organoids",
-    "other": "other cells",
-    "all_organoids": "all organoids",
-}
-
-_LEAF_LABELS = {
-    "metadata_csv": "metadata CSV",
-    "output_dir": "output directory",
-    "default_apply_all": "dimension order",
-    "examples_per_sample": "examples per sample",
-    "sample_specific_classifier": "sample-specific classifier",
-    "workers": "worker count",
-    "use_all_timepoints": "use all timepoints",
-    "tp_start": "first timepoint",
-    "tp_end": "last timepoint",
-    "number_of_channels": "number of channels",
-    "labels_mode": "channel-label setup",
-    "channel_labels": "channel labels",
-    "method": "method",
-    "overwrite": "overwrite existing outputs",
-    "search_range_px": "search range",
-    "memory_frames": "memory frames",
-    "track_cost_px": "frame-to-frame linking distance",
-    "gap_close_cost_px": "gap-closing distance",
-    "gap_close_max_frames": "maximum gap length",
-    "max_search_radius": "maximum search radius",
-    "features_choice": "feature groups",
-    "contact_threshold": "contact distance",
-    "n_workers": "worker count",
-    "dead_perc_threshold": "dead-pixel threshold",
-    "exp_duration": "experiment duration",
-    "min_track_length": "minimum track length",
-    "max_track_length": "maximum track length",
-    "umap_min_dist": "UMAP minimum distance",
-    "umap_n_neighbors": "UMAP neighbors",
-    "nr_of_clusters": "number of clusters",
-}
-
-
-def label_for_key(key) -> str:
-    """Small local copy of the client-side labeler; Modal only has JSON cards."""
-    if not key:
-        return "Parameter"
-    parts = str(key).split(".")
-    leaf = parts[-1]
-    label = _LEAF_LABELS.get(leaf, leaf.replace("_", " "))
-    category = next((p for p in parts if p in _CATEGORY_LABELS), None)
-    method = next((p for p in parts if p in {"lap", "trackpy", "btrack"}), None)
-    top = parts[0] if parts else ""
-    prefixes = []
-    if category:
-        prefixes.append(_CATEGORY_LABELS[category])
-    if method and leaf != "method":
-        prefixes.append({"lap": "LAP", "trackpy": "TrackPy", "btrack": "btrack"}[method])
-    elif top == "pixel_classifier":
-        prefixes.append("pixel classifier")
-    elif top == "cellpose":
-        prefixes.append("Cellpose")
-    elif top == "features":
-        prefixes.append("feature extraction")
-    elif top == "track_filtering":
-        prefixes.append("track filtering")
-    elif top == "analysis":
-        prefixes.append("analysis")
-    return ": ".join(prefixes + [label]) if prefixes else label.capitalize()
+_TOOL_NAMES = (
+    "set_ui_value", "navigate_to_step", "add_queue_step", "fill_metadata_builder",
+    "bulk_fill_metadata", "show_track_length_distribution", "create_cell_type_group",
+    "create_btrack_config_copy", "open_result", "recommend_edt",
+    "summarize_track_counts",
+)
+_TOOL_NAME_PATTERN = "|".join(re.escape(name) for name in _TOOL_NAMES)
 
 
 def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict]) -> str:
-    """Assemble the system prompt from persona + context + retrieved docs."""
-    parts = [
-        "You are the BEHAV3D co-pilot, embedded in a napari plugin for analysing "
-        "cell behaviour in 3D fluorescent imaging. Be concise and concrete. Ground "
-        "every recommendation in the BEHAV3D KNOWLEDGE below and the user's CONTEXT. "
-        "If you are unsure, ask one clarifying question about their data.\n\n"
-        "FORMATTING (responses render as markdown in a narrow side panel): lead "
-        "with a one-sentence answer; use short paragraphs separated by blank lines; "
-        "use bullet/numbered lists for any set of items or steps; bold key terms "
-        "and researcher-facing labels; use `code` only for literal values; avoid "
-        "dense walls of text.\n\n"
-        "USER-FACING LANGUAGE RULE: Internal names such as `n_samples`, "
-        "`metadata.loaded`, `tracking.immune.btrack.max_search_radius`, and tool "
-        "names are for tool calls only. In normal text, use visible labels such as "
-        "\"Number of samples\", \"metadata loaded\", and \"immune cells: maximum "
-        "search radius\". Do not mention Python variables, dotted keys, JSON, or "
-        "tool-call syntax unless the user explicitly asks for implementation details.\n\n"
-        "TOOLS — always call a tool instead of asking the user to click manually:\n"
-        "- `fill_metadata_builder`: guide through the Metadata Builder one field at a time. "
-        "  Use whenever the user asks to build metadata or be walked through setup.\n"
-        "- `bulk_fill_metadata`: fill the WHOLE Metadata Builder in one call. Use when the "
-        "  user gives many values at once, provides a list of image files, or says 'fill "
-        "  everything' — do not fill field-by-field in that case.\n"
-        "- `set_parameter`: propose a parameter change using a dotted key from "
-        "  PARAMETERS FOR THIS STEP. Do NOT use set_parameter for the segmentation Method "
-        "  selector — use select_segmentation_method instead.\n"
-        "- `select_segmentation_method`: set the global Method dropdown on the Segmentation "
-        "  tab (value = the visible label, e.g. 'APOC', 'ConvPaint', 'Pixel Classifier', "
-        "  'Cellpose', 'Import segmentation').\n"
-        "- `navigate_to_step`: switch the active tab. Use proactively when a "
-        "  prerequisite is missing (e.g. metadata not loaded → navigate to data_preparation).\n"
-        "- `add_queue_step`: add a processing step to the queue.\n\n"
-        "TOOL-CALL RULE (CRITICAL): When the user gives you a value during a guided flow, "
-        "you MUST emit the fill_metadata_builder or set_parameter tool call in THAT SAME "
-        "response — never acknowledge an answer in text only. "
-        "Pattern: user answers → you call the tool → you ask the next question. "
-        "If you skip the tool call, the UI will not update.\n\n"
-        "ONE-QUESTION RULE: Ask exactly ONE question per turn. After the tool call, "
-        "ask the NEXT question. Never bundle multiple questions.\n\n"
-        "PREREQ RULE: If the current step or the step the user is asking about has "
-        "a blocker, address ONLY that blocker first. Call navigate_to_step to the "
-        "required tab when the user is on the wrong tab and explain why.\n\n"
-        "The app may fill empty fields immediately and asks before overwriting "
-        "existing values. In text, say what you are filling or asking next.",
-    ]
+    """Build the current control-grounded assistant contract."""
+    session = context.get("assistant_session", {}) or {}
+    intent = session.get("intent") or "free_form"
+    controls = (context.get("ui_state", {}) or {}).get("controls", []) or []
+    metadata = context.get("metadata", {}) or {}
+    validation = metadata.get("validation", []) or []
+    guidance = retrieved or []
+    tool_names = [tool.get("name") for tool in tools or []]
 
-    step = context.get("current_step", "?")
-    md = context.get("metadata", {})
-    mb_ctx = context.get("metadata_builder", {}) or {}
-    csv_loaded = md.get("loaded", False)
-    assistant_session = context.get("assistant_session", {}) or {}
-    confirmed_keys = set(assistant_session.get("confirmed_parameter_keys", []) or [])
-    active_ct = context.get("active_cell_type_tab")
-    ct_line = f"\n- Active cell-type sub-tab: {active_ct}" if active_ct else ""
-    parts.append(
-        "## CONTEXT\n"
-        f"- Current step/tab: {context.get('current_tab_label', step)}\n"
-        f"- Output dir set: {context.get('output_dir_set')}\n"
-        f"- Metadata CSV loaded: {csv_loaded}\n"
-        f"- Samples in loaded CSV: {md.get('n_samples', 0) if csv_loaded else 0}\n"
-        f"- Samples being entered in Metadata Builder: {mb_ctx.get('n_samples', 0)}\n"
-        f"- Cell types: {md.get('cell_types', {})}\n"
-        f"- Non-default parameters: {context.get('parameters', {})}\n"
-        f"- Queue: {[s.get('type') for s in context.get('queue', [])]}"
-        + ct_line
+    rules = (
+        "You are the BEHAV3D Assistant for researchers analysing 3D fluorescence imaging. "
+        "Answer the user's actual question first, then add only context that helps them decide "
+        "or act. Use concise researcher-facing labels and never expose control IDs, variable "
+        "names, dotted configuration keys, JSON, or tool names in normal prose.\n\n"
+        "TRUST AND SCOPE\n"
+        "- The LIVE CONTEXT is authoritative. Read all loaded metadata records and current control "
+        "values before asking for information. Never ask for a value already present.\n"
+        "- Field names in LIVE CONTEXT are internal only. In every visible response say 'XY pixel "
+        "size' instead of pixel_distance_xy, 'timepoint' instead of position_t, and 'sample' "
+        "instead of sample_name. This remains mandatory when quoting or summarizing metadata.\n"
+        "- When metadata.record_source is metadata_builder_draft, those records are the current form "
+        "values and supersede the last saved DataFrame for this conversation. Do not repeat a resolved "
+        "validation issue. Make clear that draft changes still need to be saved.\n"
+        "- Separate informational, planning, execution, and troubleshooting requests. Missing "
+        "prerequisites block execution only; they do not block explanations or planning.\n"
+        "- Treat errors as evidence and offer hypotheses to check. Do not claim a cause without evidence.\n"
+        "- Ask at most one focused question when an answer is genuinely needed. Do not manufacture a "
+        "step-by-step interview for a simple question.\n\n"
+        "ACTIONS\n"
+        "- To edit a visible field, call set_ui_value with an exact id from LIVE CONTROLS. Never invent "
+        "an id. Same-value requests are complete: acknowledge briefly and move to the next relevant "
+        "decision without calling the tool again.\n"
+        "- Use only controls matching the selected method and exact cell type. Do not apply a change to "
+        "a broad cell category.\n"
+        "- Navigation and read-only result/preview actions may happen immediately. Filling a blank field "
+        "may happen immediately. Overwriting a populated value, creating a file/group, or adding queue "
+        "work requires user confirmation in the client.\n"
+        "- Never tell the user to click a field that you can edit with set_ui_value.\n"
+        "- Do not claim an action succeeded in prose. State the intended change briefly; the client "
+        "reports whether it was applied.\n"
+        "- For EDT advice, use recommend_edt so the conversion comes from metadata. Use a 10 um cell "
+        "diameter by default. For an organoid, first ask how many cell widths span its diameter. Treat "
+        "the returned values as preview starting points, not ground truth.\n"
+        "- For cell counts under minimum track-length filters or at a requested timepoint, always use "
+        "summarize_track_counts. Never estimate counts or calculate them from prose.\n"
+        "- Produce at most the actions needed for this one user turn. There is no hidden continuation turn."
     )
+    context_text = json.dumps({
+        "intent": intent,
+        "current_step": context.get("current_step"),
+        "current_tab_label": context.get("current_tab_label"),
+        "active_cell_type": context.get("active_cell_type"),
+        "output_dir_set": context.get("output_dir_set"),
+        "metadata": metadata,
+        "metadata_builder": context.get("metadata_builder"),
+        "segmentation": context.get("segmentation"),
+        "active_preview": context.get("active_preview"),
+        "step_readiness": context.get("step_readiness"),
+        "queue": context.get("queue", []),
+        "results": context.get("results", []),
+        "live_controls": controls,
+        "available_actions": tool_names,
+    }, indent=2, default=str)
+    knowledge = "\n\n".join(
+        f"[{item.get('id') or item.get('title', 'guidance')}] {item.get('text', '')}"
+        for item in guidance if item.get("text")
+    )
+    validation_note = (
+        "Metadata validation has no flagged items."
+        if not validation else
+        "Discuss validation items only when relevant; 'review' notes are not errors."
+    )
+    return (f"{rules}\n\nSESSION INTENT: {intent}\n{validation_note}\n\n"
+            f"LIVE CONTEXT\n{context_text}\n\n"
+            f"FEEDBACK-GROUNDED KNOWLEDGE\n{knowledge or 'No additional card selected.'}")
 
-    # Step readiness — show blockers so the model can redirect proactively.
-    readiness = context.get("step_readiness", {})
-    current_ready = readiness.get(step)
-    if current_ready is not None:
-        status = "ready" if current_ready.get("ready", True) else "not ready"
-        blockers = ", ".join(current_ready.get("blockers", [])) or "none"
-        parts.append(
-            "## CURRENT STEP READINESS\n"
-            f"- {step}: {status}; blockers: {blockers}"
-        )
-    downstream = {
-        k: v for k, v in readiness.items()
-        if k != step and not v.get("ready", True)
-    }
-    if downstream:
-        lines = [
-            f"- {k}: {', '.join(v.get('blockers', ['unknown blocker']))}"
-            for k, v in downstream.items()
-        ]
-        parts.append(
-            "## DOWNSTREAM BLOCKERS\n"
-            "Use these only when the user asks about that later step:\n" + "\n".join(lines)
-        )
 
-    mb = context.get("metadata_builder", {})
-    if mb:
-        org = mb.get("organoid_names", [])
-        imm = mb.get("immune_names", [])
-        oth = mb.get("other_names", [])
-        sample_forms = mb.get("sample_forms", []) or []
-        sample_lines = []
-        for sample in sample_forms[:3]:
-            sample_lines.append(
-                f"- {sample.get('label', 'Sample')}: basic={sample.get('basic', {})}; "
-                f"cell_types={list((sample.get('cell_types') or {}).keys())}"
-            )
-        samples_text = "\n".join(sample_lines) if sample_lines else "- none"
-        parts.append(
-            "## METADATA BUILDER STATE\n"
-            f"- Builder open: {mb.get('open')}\n"
-            f"- n_samples={mb.get('n_samples')}, n_organoids={mb.get('n_organoids')}, "
-            f"n_immune={mb.get('n_immune')}, n_other={mb.get('n_other')}, "
-            f"include_dead={mb.get('include_dead')}\n"
-            f"- Cell types configured: {mb.get('cell_types_configured')} "
-            f"(organoids={org}, immune={imm}, other={oth})\n"
-            f"- Sample forms created: {mb.get('sample_forms_created')} "
-            f"(count={mb.get('sample_form_count', 0)})\n"
-            f"- Visible sample forms (first 3):\n{samples_text}\n\n"
-            "Use `fill_metadata_builder` tool calls to fill the form. "
-            "In user-facing text, use visible labels such as Number of samples, "
-            "Organoid types, Immune types, Image path, Pixel XY, Pixel Z, and "
-            "Time interval. "
-            "REQUIRED ORDER: open_builder → n_samples / n_organoids / n_immune / n_other / "
-            "include_dead → configure_cell_types → organoid_name / immune_name / other_name "
-            "(index 0, 1, …; use immune_multicolor and immune_multicolor_channels when needed) "
-            "→ create_sample_forms → per-sample fields (sample_name, exp_nr, well, "
-            "raw_image_path, pixel_distance_xy, pixel_distance_z, time_interval, time_unit, "
-            "dead_channel_number, dead_mask_path). "
-            "For per-sample cell-type rows, use cell_line, cell_condition, "
-            "cell_segments_image_path, cell_tracks_image_path, and cell_tracks_csv_path "
-            "with the exact visible cell_type name. "
-            "After filling Sample 1, call fill_down to copy shared values to all others. "
-            "Never skip configure_cell_types or create_sample_forms — they are required actions.\n"
-            "IMPORTANT: every value shown above is ALREADY FILLED IN — never ask the user "
-            "to provide it again. Only ask for fields that are still blank or at their default."
-        )
-
-    seg = context.get("segmentation", {}) or {}
-    if seg:
-        parts.append(
-            "## SEGMENTATION UI STATE\n"
-            f"- Current method: {seg.get('method')}\n"
-            f"- Available methods: {seg.get('available_methods', [])}\n"
-            "APOC (GPU), ConvPaint, Pixel Classifier (Random Forest), Cellpose, "
-            "and Import segmentation are distinct choices. If the user says APOC, "
-            "guide the APOC page; do not call it Pixel Classifier."
-        )
-
-    # Params still at default — surface the most actionable missing configs.
-    at_default = context.get("required_params_at_default", [])
-    if confirmed_keys:
-        at_default = [p for p in at_default if p.get("key") not in confirmed_keys]
-        parts.append(
-            "## CONFIRMED VALUES\n"
-            "The user has already accepted these current values; do not ask about "
-            "them again unless they ask to change them:\n"
-            + "\n".join(f"- {label_for_key(k)} [internal key: `{k}`]" for k in sorted(confirmed_keys))
-        )
-    if at_default:
-        lines = [
-            f"- {label_for_key(p['key'])} [internal key: `{p['key']}`] "
-            f"(default {p['default']!r}): {p.get('description', '')}"
-            for p in at_default[:6]
-        ]
-        parts.append(
-            "## PARAMS STILL AT DEFAULT\n"
-            "These parameters have not been changed from their defaults — ask about "
-            "the most important one if guiding the user:\n" + "\n".join(lines)
-        )
-
-    schema = context.get("step_schema", [])
-    if schema:
-        lines = [f"- {label_for_key(c['key'])} [internal key: `{c['key']}`] "
-                 f"(default {c['default']!r}"
-                 + (f", choices {c['choices']}" if c.get("choices") else "") + ")"
-                 for c in schema[:40]]
-        parts.append(
-            "## PARAMETERS FOR THIS STEP\n"
-            "Use the internal key only inside set_parameter calls. Use the label in text.\n"
-            + "\n".join(lines)
-        )
-
-    # Per-step guided flow instructions.
-    _step_guides = {
-        "data_preparation": (
-            "FIRST read the ## METADATA BUILDER STATE block above — it is the source of "
-            "truth for what is already filled in. NEVER re-ask for any value that already "
-            "appears there (a value that is already set counts as the user's answer — move "
-            "on).\n"
-            "Work through this decision order and address ONLY the first unsatisfied item, "
-            "then ask the next question:\n"
-            "1. If the output directory is not set, ask for the output directory path; on "
-            "answer, call set_parameter(key='paths.output_dir').\n"
-            "2. If the builder is not open, call fill_metadata_builder(open_builder).\n"
-            "3. For each of n_samples / n_organoids / n_immune / n_other still at its default "
-            "(1 / 0 / 0 / 0) and not yet given by the user: ask for it and call "
-            "fill_metadata_builder with the answer in the SAME turn. Skip any already above "
-            "its default.\n"
-            "4. Once the counts are set but 'Cell types configured' is False, call "
-            "fill_metadata_builder(configure_cell_types) (no user input needed).\n"
-            "5. For each cell-type name still blank, ask it and call "
-            "fill_metadata_builder(organoid_name / immune_name / other_name, index=i). Skip "
-            "names already present in organoids/immune/other.\n"
-            "6. Once names are set but 'Sample forms created' is False, call "
-            "fill_metadata_builder(create_sample_forms) (no user input needed).\n"
-            "7. For each sample, ask only for the per-sample fields that are still blank in "
-            "the 'Visible sample forms' snapshot (raw_image_path, pixel_distance_xy/z, "
-            "time_interval/time_unit, etc.) and fill them. Skip any already filled.\n"
-            "8. Ask for line/condition only when the metadata needs it; fill those with "
-            "cell_line/cell_condition and the visible cell_type name.\n"
-            "9. After Sample 1 is complete and there are multiple samples, call "
-            "fill_metadata_builder(fill_down) to copy shared values.\n"
-            "BULK SHORTCUT: if the user provides many values at once, gives a list of image "
-            "files, or says 'fill everything', call bulk_fill_metadata ONCE with all the "
-            "counts, names, and per-sample dicts instead of filling one field at a time.\n"
-            "CRITICAL: when the user gives you a value, emit the matching tool call in that "
-            "SAME turn — never acknowledge in text only."
-        ),
-        "segmentation": (
-            "Verify metadata is loaded and output_dir is set before anything else. "
-            "Ask about the global Method dropdown first. The visible choices are APOC (GPU), "
-            "ConvPaint (DL pixel classifier), Pixel Classifier (Random Forest), Cellpose "
-            "(Deep Learning), and Import segmentation. APOC is not the same thing as "
-            "Pixel Classifier (Random Forest). When the user picks a method, call "
-            "select_segmentation_method with the leading visible label ('APOC', 'ConvPaint', "
-            "'Pixel Classifier', 'Cellpose', or 'Import segmentation') — that switches the "
-            "visible parameter page — then guide that method's parameters. Once the user "
-            "accepts the current/default value for a setting, move to the next setting; "
-            "do not ask about it again. For Cellpose: ask number_of_channels, then "
-            "labels_mode. For Pixel Classifier: ask examples_per_sample, workers, "
-            "use_all_timepoints. For APOC or ConvPaint: guide the user through generating "
-            "training data, labeling, training, and then batch segmentation."
-        ),
-        "tracking": (
-            "Read cell types from context. For each immune type: default=btrack, state it and ask "
-            "to confirm, then ask max_search_radius. For organoid: default=propagation. "
-            "For other: default=lap. Propose set_parameter calls for method and key params, "
-            "one at a time. After each type is configured, move to the next."
-        ),
-        "feature_extraction": (
-            "Check metadata.columns for *_tracks_image_path — missing means tracking is not done. "
-            "Use features.<category>.contact_threshold for the contact distance (in µm). "
-            "Use features.<category>.n_workers for worker count. "
-            "Check metadata.columns for a dead_channel column to detect viability staining."
-        ),
-    }
-    guide = _step_guides.get(step)
-    if guide:
-        parts.append(f"## GUIDED FLOW — {step.upper()}\n{guide}")
-
-    if retrieved:
-        docs = "\n\n".join(f"[{d.get('title','doc')}] {d.get('text','')}" for d in retrieved)
-        parts.append("## BEHAV3D KNOWLEDGE (retrieved)\n" + docs)
-
-    return "\n\n".join(parts)
 
 
 def _balanced_json_spans(text: str):
@@ -407,7 +166,7 @@ def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
 
     Accepts the canonical ``<TOOLCALL>{...}</TOOLCALL>`` as well as the common
     small-model variants: ``TOOLCALL>{...}`` (missing `<`/closing tag) and bare
-    ``set_parameter{...}`` where the object holds the arguments. Returns
+    ``set_ui_value{...}`` where the object holds the arguments. Returns
     (clean_text_for_display, calls)."""
     calls: list[dict] = []
     for start, _end, obj in _balanced_json_spans(text):
@@ -416,14 +175,13 @@ def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
         name = obj.get("name")
         if name in _TOOL_NAMES:
             calls.append({"name": name, "arguments": obj.get("arguments", {}) or {}})
-        elif any(k in obj for k in ("key", "step", "step_type", "field")):
+        elif any(k in obj for k in ("control_id", "step", "step_type", "field",
+                                    "result_id", "cell_type", "group_name",
+                                    "position_t", "minimum_lengths",
+                                    "cell_diameter_um", "organoid_cells_across")):
             # bare arguments object — infer the tool from the preceding token
             pre = text[max(0, start - 48):start]
-            m = re.search(
-                r"(set_parameter|navigate_to_step|add_queue_step|fill_metadata_builder)"
-                r"[^A-Za-z0-9_]*$",
-                pre,
-            )
+            m = re.search(rf"({_TOOL_NAME_PATTERN})[^A-Za-z0-9_]*$", pre)
             if m:
                 calls.append({"name": m.group(1), "arguments": obj})
     return split_streamable(text), calls
@@ -432,12 +190,9 @@ def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
 def split_streamable(text: str) -> str:
     """Return only the human-visible prefix — text before any tool-call syntax,
     whether well-formed (`<TOOLCALL>`), malformed (`TOOLCALL>`), or bare
-    (`set_parameter{`/`set_parameter(`)."""
+    (`set_ui_value{`/`set_ui_value(`)."""
     idxs = [text.find(mk) for mk in ("<TOOLCALL", "TOOLCALL>") if text.find(mk) != -1]
-    m = re.search(
-        r"(?:set_parameter|navigate_to_step|add_queue_step|fill_metadata_builder)\s*[\({]",
-        text,
-    )
+    m = re.search(rf"(?:{_TOOL_NAME_PATTERN})\s*[\x28\x7b]", text)
     if m:
         idxs.append(m.start())
     return text[:min(idxs)].rstrip() if idxs else text.rstrip()
@@ -448,14 +203,14 @@ _QUEUE_STEP_TYPES = ["segment", "train", "track", "feature_extract", "filter", "
 
 def to_openai_tools(tool_schema: list[dict], key_enum=None) -> list[dict]:
     """Wrap our TOOL_SCHEMA (name/description/parameters) into OpenAI `tools`
-    format. If `key_enum` is given, constrain `set_parameter.key` to those values
-    so the model cannot invent parameter keys."""
+    format. If `key_enum` is given, constrain `set_ui_value.control_id` to those
+    live values so the model cannot invent fields."""
     out = []
     for t in tool_schema or []:
         params = json.loads(json.dumps(t.get("parameters", {})))  # deep copy
-        if t.get("name") == "set_parameter" and key_enum:
+        if t.get("name") == "set_ui_value" and key_enum:
             props = params.setdefault("properties", {})
-            key_prop = props.setdefault("key", {"type": "string"})
+            key_prop = props.setdefault("control_id", {"type": "string"})
             key_prop["enum"] = list(key_enum)
         if t.get("name") == "add_queue_step":
             props = params.setdefault("properties", {})
@@ -547,6 +302,7 @@ if modal is not None:
         )
         .add_local_file("chatbot/embeddings.py", "/root/embeddings.py")
         .add_local_file("chatbot/ingest.py", "/root/ingest.py")
+        .add_local_file("chatbot/guidance.py", "/root/guidance.py")
         .add_local_file("chatbot/schema_cards.json", "/root/schema_cards.json")
     )
     # Knowledge sources — paths are relative to CWD, so run modal from the repo root.
@@ -597,13 +353,7 @@ if modal is not None:
             index = VectorIndex.load(INDEX_DIR)
         except Exception:
             index = VectorIndex()
-        # Valid parameter keys → constrain set_parameter so the model can't invent.
-        try:
-            with open("/root/schema_cards.json", encoding="utf-8") as f:
-                _key_enum = [c["key"] for c in json.load(f)
-                             if not c["key"].startswith("calculated_features.")]
-        except Exception:
-            _key_enum = []
+        from guidance import KNOWLEDGE_VERSION, select_guidance_cards
 
         # deepseek-v4-flash is the explicit V4 Flash id (tool-calls + streaming).
         # The older `deepseek-chat` alias also maps to it but is being deprecated.
@@ -614,7 +364,9 @@ if modal is not None:
 
         @api.get("/health")
         def health():
-            return {"ok": True, "chunks": len(index.chunks), "model": deepseek_model}
+            return {"ok": True, "chunks": len(index.chunks), "model": deepseek_model,
+                    "control_contract_version": "2.0",
+                    "knowledge_version": KNOWLEDGE_VERSION}
 
         @api.post("/chat")
         async def chat(request: Request):
@@ -631,10 +383,17 @@ if modal is not None:
             except Exception:
                 retrieved = []
 
+            intent = (context.get("assistant_session", {}) or {}).get("intent")
+            deterministic = select_guidance_cards(context, user_msg, intent)
+            retrieved = deterministic + retrieved
+
             system = build_system_prompt(context, retrieved, tools)
             convo = [{"role": "system", "content": system}]
             convo += [m for m in messages if m.get("role") != "system"]
-            oai_tools = to_openai_tools(tools, key_enum=_key_enum)
+            control_ids = [item.get("id") for item in
+                           (context.get("ui_state", {}) or {}).get("controls", [])
+                           if item.get("id") and item.get("enabled") and item.get("visible")]
+            oai_tools = to_openai_tools(tools, key_enum=control_ids)
 
             def sse(obj):
                 return "data: " + json.dumps(obj) + "\n\n"

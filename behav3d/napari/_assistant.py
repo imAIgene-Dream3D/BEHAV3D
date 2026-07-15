@@ -193,18 +193,35 @@ def _fill_value_matches_current(
 
 
 _SYSTEM_PRIMER = (
-    "You are the BEHAV3D co-pilot, embedded in the napari plugin for analysing "
-    "cell behaviour in 3D fluorescent imaging. Help the user choose methods and "
-    "parameter values for their data. Ground answers in the provided step_schema "
-    "and retrieved docs. When you recommend a concrete value, also emit a "
-    "set_parameter tool call (the user confirms before it applies).\n\n"
-    "FORMATTING — keep responses easy to read in a narrow side panel:\n"
-    "- Keep it short: lead with a one-sentence answer, then detail only if useful.\n"
-    "- Use short paragraphs (1–2 sentences) separated by a blank line.\n"
-    "- Use bullet points or a numbered list for any set of items or steps.\n"
-    "- Use researcher-facing labels, not internal variable names.\n"
-    "- Avoid long dense paragraphs and walls of text."
+    "Answer as the BEHAV3D Assistant. Use researcher-facing labels, read the live "
+    "interface context before asking for values, and keep answers concise."
 )
+
+
+_RESEARCHER_LABELS = {
+    "pixel_distance_xy": "XY pixel size",
+    "pixel_distance_z": "Z pixel size",
+    "distance_unit": "distance unit",
+    "raw_image_path": "raw image path",
+    "dimension_order": "dimension order",
+    "sample_name": "sample name",
+    "time_interval": "time interval",
+    "time_unit": "time unit",
+    "position_t": "timepoint",
+    "TrackID": "track ID",
+    "track_id": "track ID",
+    "cell_type": "cell type",
+    "organoid_cells_across": "organoid size in cell widths",
+    "minimum_lengths": "minimum track lengths",
+}
+
+
+def researcher_facing_text(text: str) -> str:
+    """Replace context/schema field names that should never reach the chat UI."""
+    result = str(text or "")
+    for technical, label in _RESEARCHER_LABELS.items():
+        result = result.replace(technical, label)
+    return result
 
 
 class _ActionCard(QFrame):
@@ -237,11 +254,11 @@ class _ActionCard(QFrame):
         row = QHBoxLayout()
         row.addStretch(1)
         if action.ok:
-            btn_apply = QPushButton("Fill it in")
+            btn_apply = QPushButton("Apply change")
             btn_apply.setStyleSheet("font-size:10px;")
             btn_apply.clicked.connect(lambda: self.confirmed.emit(self.action))
             row.addWidget(btn_apply)
-        btn_dismiss = QPushButton("Dismiss")
+        btn_dismiss = QPushButton("Keep current")
         btn_dismiss.setStyleSheet("font-size:10px;")
         btn_dismiss.clicked.connect(lambda: self.dismissed.emit(self.action))
         row.addWidget(btn_dismiss)
@@ -259,24 +276,14 @@ class AssistantDock(QWidget):
         self._threads: list[tuple] = []       # keep (thread, worker) refs alive
         self._md_log: list[str] = []          # finalised transcript blocks (markdown)
         self._streaming_text = None           # in-progress assistant text, or None
-        self._greeted_tabs: set = set()       # tabs greeted this session (no repeat proactive)
         self._guided_flow_active: bool = False  # True while a step-by-step guide is running
-        self._pending_auto_continue: list | None = None  # deferred after _on_finished
-        self._auto_continue_turns: int = 0
-        self._last_auto_continue_signature: tuple | None = None
-        # Progress-based auto-continue guard: keep going as long as each turn applies a
-        # NEW distinct value; only stop after consecutive stalled turns (no new progress).
-        self._auto_continue_seen_signatures: set[tuple] = set()
-        self._auto_continue_stall_count: int = 0
-        # The metadata-builder field applied on the current turn — drives the
-        # deterministic next-question logic in _auto_continue.
-        self._last_applied_md_field: str | None = None
         # Deterministic metadata wizard state (no LLM): _md_current is the question
         # awaiting an answer; _md_queue holds the remaining questions in this phase.
         self._md_current: dict | None = None
         self._md_queue: list[dict] = []
         self._md_phase: str | None = None
-        self._confirmed_parameter_keys: set[str] = set()
+        self._current_intent: str = "free_form"
+        self._request_active = False
         # Coalesce streamed-token re-renders. Re-rendering the whole transcript on
         # every token saturates the GUI thread on long answers (the napari window
         # freezes until the stream ends). This single-shot timer batches tokens into
@@ -294,21 +301,21 @@ class AssistantDock(QWidget):
                 background-color: #232629;
                 color: #e6e6e6;
                 border: 1px solid #3a3f44;
-                border-radius: 8px;
-                padding: 12px;
-                font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+                border-radius: 4px;
+                padding: 10px;
+                font-family: "Helvetica Neue", "Segoe UI", Arial, sans-serif;
                 font-size: 13px;
                 selection-background-color: #3d6b8a;
             }
             QLineEdit {
                 background-color: #2f3338; color: #e6e6e6;
-                border: 1px solid #3a3f44; border-radius: 8px;
+                border: 1px solid #3a3f44; border-radius: 4px;
                 padding: 7px 10px; font-size: 13px;
             }
             QLineEdit:focus { border: 1px solid #5285a6; }
             QPushButton {
                 background-color: #353a3f; color: #e6e6e6;
-                border: 1px solid #454b50; border-radius: 8px;
+                border: 1px solid #454b50; border-radius: 4px;
                 padding: 7px 10px; font-size: 12px;
             }
             QPushButton:hover { background-color: #3f464c; }
@@ -323,10 +330,15 @@ class AssistantDock(QWidget):
         self.context_bar = QLabel("BEHAV3D Assistant")
         self.context_bar.setStyleSheet(
             "background:#2f3338; color:#9fc6e0; padding:7px 10px;"
-            "border:1px solid #3a3f44; border-radius:8px; font-size:11px; font-weight:600;"
+            "border:1px solid #3a3f44; border-radius:4px; font-size:11px; font-weight:600;"
         )
         self.context_bar.setWordWrap(True)
         root.addWidget(self.context_bar)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color:#9aa4aa; font-size:11px; padding:0 2px;")
+        self.status_label.setVisible(False)
+        root.addWidget(self.status_label)
 
         # --- transcript ---------------------------------------------------
         self.transcript = QTextBrowser()
@@ -367,7 +379,6 @@ class AssistantDock(QWidget):
             self.main_widget.tabs.currentChanged.connect(self._on_tab_changed)
         except Exception:
             initial_idx = 0
-        self._greeted_tabs.add(initial_idx)
         self._set_quick_buttons(initial_idx)
 
     # ------------------------------------------------------------------
@@ -405,8 +416,8 @@ class AssistantDock(QWidget):
         # Any direct/full render supersedes a pending throttled one.
         self._render_timer.stop()
         blocks = list(self._md_log)
-        if self._streaming_text is not None:
-            blocks.append(f"**BEHAV3D Assistant**\n\n{self._streaming_text or '...'}")
+        if self._streaming_text:
+            blocks.append(f"**BEHAV3D Assistant**\n\n{self._streaming_text}")
         try:
             # A thin rule between turns gives clear visual separation.
             self.transcript.setMarkdown("\n\n---\n\n".join(blocks))
@@ -467,8 +478,13 @@ class AssistantDock(QWidget):
         if self._md_current is not None:
             self._md_handle_answer(text)
             return
-        self._guided_flow_active = False   # free-form input exits any guided flow
-        self._send_message(text)
+        # Short replies such as "APOC", "3 is fine", or "next" remain part of a
+        # button-started guide. Longer questions return to normal free-form mode.
+        guided_reply = self._guided_flow_active and len(text) <= 100
+        intent = self._current_intent if guided_reply else "free_form"
+        if not guided_reply:
+            self._guided_flow_active = False
+        self._send_message(text, intent=intent)
 
     def _send_message(
         self,
@@ -476,14 +492,13 @@ class AssistantDock(QWidget):
         *,
         show_as_user: bool = True,
         display_text: str | None = None,
-        reset_auto_loop: bool = True,
+        reset_guidance: bool = True,
+        intent: str = "free_form",
     ):
-        if reset_auto_loop:
-            self._auto_continue_turns = 0
-            self._last_auto_continue_signature = None
-            self._auto_continue_seen_signatures = set()
-            self._auto_continue_stall_count = 0
-            self._last_applied_md_field = None
+        if self._request_active:
+            return
+        self._current_intent = intent
+        if reset_guidance:
             # Any LLM-bound send (free-form or another guide button) cancels the
             # deterministic metadata wizard.
             self._md_current = None
@@ -492,6 +507,9 @@ class AssistantDock(QWidget):
         if show_as_user:
             self._append_user(display_text or text)
         self._history.append({"role": "user", "content": text})
+        # Keep only the latest 12 user/assistant exchanges. Session facts and live
+        # values are carried separately in structured context.
+        self._history = self._history[-24:]
         self._set_busy(True)
         self._streaming_text = ""        # opens a live "Assistant:" block
         self._render()
@@ -500,7 +518,7 @@ class AssistantDock(QWidget):
         try:
             ctx = build_context(self.main_widget)
             ctx["assistant_session"] = {
-                "confirmed_parameter_keys": sorted(self._confirmed_parameter_keys),
+                "intent": self._current_intent,
             }
         except Exception:
             ctx = {}
@@ -521,7 +539,10 @@ class AssistantDock(QWidget):
         thread.start()
 
     def _set_busy(self, busy: bool):
+        self._request_active = bool(busy)
         self.btn_send.setEnabled(not busy)
+        self.status_label.setText("Thinking..." if busy else "")
+        self.status_label.setVisible(bool(busy))
         # Leave the input box editable while a turn is in flight so the user can
         # type their next answer without waiting for the stream to finish.
         for i in range(self._quick_layout.count()):
@@ -540,10 +561,13 @@ class AssistantDock(QWidget):
         if self._streaming_text is None:
             self._streaming_text = ""
         self._streaming_text += chunk
+        # The model sees structured field names in live context. Enforce the
+        # researcher-facing vocabulary even if it repeats one despite prompting.
+        self._streaming_text = researcher_facing_text(self._streaming_text)
         self._schedule_render()
 
     def _on_degraded(self, full_text: str):
-        self._streaming_text = full_text
+        self._streaming_text = researcher_facing_text(full_text)
         self._render()
 
     def _on_error(self, message: str):
@@ -562,12 +586,20 @@ class AssistantDock(QWidget):
             from behav3d.napari._assistant_schema import flatten_config_to_cards
             cards = flatten_config_to_cards()
             params = getattr(self.main_widget.data_prep_tab, "behav3d_parameters", {})
-            actions = build_actions(calls, cards, params)
+            actions = build_actions(calls, cards, params,
+                                    controls=(ctx.get("ui_state", {}) or {}).get("controls", []))
         except Exception:
             actions = []
+        if actions and all(self._is_noop_action(action) for action in actions):
+            # A model may still narrate a future action despite the live value
+            # already matching. Replace that stale promise with the verified fact.
+            self._streaming_text = self._noop_response(actions)
+        if actions and self._streaming_text is not None:
+            # Tool calls arrive after streamed prose. Finalise that prose before
+            # appending action outcomes so the transcript preserves causality.
+            self._finalize_streaming()
+            self._render()
         auto_previews = []
-        noop_previews = []
-        had_auto = False
         # Suppress per-widget pulse glows when applying a batch — a flood of fills
         # would otherwise schedule hundreds of QTimers and thrash stylesheets,
         # which can freeze the GUI. One context-bar refresh happens at the end.
@@ -578,8 +610,6 @@ class AssistantDock(QWidget):
         try:
             for act in actions:
                 if self._is_noop_action(act):
-                    self._record_noop_action(act)
-                    noop_previews.append(self._noop_preview(act))
                     continue
                 if self._should_auto_apply(act):
                     if act.ok:
@@ -590,8 +620,9 @@ class AssistantDock(QWidget):
                         except Exception:
                             ok = False
                         if ok:
-                            had_auto = True
-                            if act.kind == "bulk_fill_metadata":
+                            if act.data.get("result_markdown"):
+                                self._append_action_result(act.data["result_markdown"])
+                            elif act.kind == "bulk_fill_metadata":
                                 n = (act.data.get("sample_count")
                                      or len(act.data.get("samples", []) or []))
                                 self._append_md(
@@ -599,16 +630,10 @@ class AssistantDock(QWidget):
                                     f"sample{'s' if n != 1 else ''}. Review the values "
                                     "and tell me anything you'd like to change."
                                 )
-                                # Bulk fill completes the form in one pass — do NOT add
-                                # to auto_previews, so it doesn't trigger an auto-continue.
                             # Only count as a meaningful change if it wasn't a structural
                             # trigger or a same-value no-op re-call from the model.
                             elif not _silent_auto:
                                 auto_previews.append(act.preview)
-                                # Remember the metadata field just filled so the
-                                # deterministic counts driver can ask the next one.
-                                if act.kind == "fill_metadata_builder":
-                                    self._last_applied_md_field = act.data.get("field")
                             if not batch:
                                 self.refresh_context_bar()
                 else:
@@ -623,54 +648,29 @@ class AssistantDock(QWidget):
         # A no-op means the proposed value was already present. Treat that as
         # confirmation from the user's previous answer and move forward silently
         # instead of rendering a scary "Already set" card.
-        if (
-            noop_previews and not auto_previews and self.action_tray_layout.count() == 0
-            and not self._text_asks_question(self._streaming_text)
-        ):
-            self._pending_auto_continue = noop_previews
-        # Defer auto-continue until _on_finished so ChatWorker1's _finalize_streaming()
-        # runs first — otherwise it wipes _streaming_text that ChatWorker2 just started.
-        # Only fire for value-setting actions (non-empty previews). Structural-only actions
-        # (open_builder, configure_cell_types, create_sample_forms, fill_down) must not
-        # trigger a new LLM turn — the bot should ask the next question in its current
-        # streaming response, otherwise the loop never terminates.
-        if (
-            had_auto and auto_previews and self.action_tray_layout.count() == 0
-            and not self._text_asks_question(self._streaming_text)
-        ):
-            self._pending_auto_continue = auto_previews
-
-    @staticmethod
-    def _text_asks_question(text: str | None) -> bool:
-        """True if the streamed assistant text already poses a follow-up question.
-
-        The model usually streams a one-line acknowledgement ("Got it — 22 samples.")
-        alongside its tool call; that must NOT suppress auto-continue, otherwise the
-        guided flow stalls. Only an actual question (a '?' at/near the end) means the
-        bot has already prompted the user, so we should not auto-continue."""
-        t = (text or "").strip()
-        if not t:
-            return False
-        tail = t.rstrip(" *_`)\n\t")
-        if tail.endswith("?"):
-            return True
-        # A '?' within the last stretch of text also counts (e.g. trailing emoji/note).
-        return "?" in t[-120:]
+        # Deliberately no hidden continuation request. One user or button input maps
+        # to exactly one model request, even when actions were applied or were no-ops.
 
     def _is_noop_action(self, action: ProposedAction) -> bool:
         return bool(action.data.get("no_op"))
 
-    def _record_noop_action(self, action: ProposedAction) -> None:
-        if action.kind == "set_parameter":
-            key = action.data.get("key")
-            if key:
-                self._confirmed_parameter_keys.add(str(key))
-
-    def _noop_preview(self, action: ProposedAction) -> str:
-        if action.kind == "set_parameter":
-            label = action.data.get("label") or humanize_parameter_key(action.data.get("key"))
-            return f"{label} already set to {action.data.get('value')!r}"
-        return action.preview or "Value already set"
+    def _noop_response(self, actions: list[ProposedAction]) -> str:
+        details = []
+        metadata_draft = False
+        for action in actions:
+            label = action.data.get("label") or "That field"
+            value = action.data.get("value")
+            details.append(f"{label} is already set to **{value}**")
+            metadata_draft = metadata_draft or str(
+                action.data.get("control_id") or ""
+            ).startswith("metadata.")
+        message = ". ".join(details) + ". No change was needed."
+        if metadata_draft:
+            message += (
+                " The value is in the Metadata Builder draft; save the metadata "
+                "when ready."
+            )
+        return message
 
     def _should_auto_apply(self, action: ProposedAction) -> bool:
         """Auto-apply by default; only show a confirm card if a value is already set."""
@@ -684,7 +684,7 @@ class AssistantDock(QWidget):
             return False  # adding to the queue is a deliberate action
 
         if action.kind == "bulk_fill_metadata":
-            return True  # deterministic bulk fill applies in one guarded pass
+            return False  # one confirmation covers the complete multi-field change
 
         if action.kind == "select_segmentation_method":
             # Apply only when it changes the current selection.
@@ -730,6 +730,21 @@ class AssistantDock(QWidget):
                 pass
             return True
 
+        if action.kind == "set_ui_value":
+            old = action.data.get("old_value")
+            # Empty text fields can be filled immediately. Existing values require
+            # the explicit Apply change card.
+            return old is None or (isinstance(old, str) and not old.strip())
+
+        if action.kind in (
+            "show_track_length_distribution", "open_result", "recommend_edt",
+            "summarize_track_counts",
+        ):
+            return True
+
+        if action.kind in ("create_cell_type_group", "create_btrack_config_copy"):
+            return False
+
         return True  # unknown action kind: auto-apply
 
     def _is_silent_auto_apply(self, action: ProposedAction) -> bool:
@@ -758,6 +773,7 @@ class AssistantDock(QWidget):
     def _finalize_streaming(self):
         """Move the in-progress assistant text into the finalised transcript log."""
         if self._streaming_text:
+            self._streaming_text = researcher_facing_text(self._streaming_text)
             self._md_log.append(f"**BEHAV3D Assistant**\n\n{self._streaming_text}")
             self._history.append({"role": "assistant", "content": self._streaming_text})
         self._streaming_text = None
@@ -769,11 +785,6 @@ class AssistantDock(QWidget):
         self._set_busy(False)
         if had_text:
             self._append_log()
-        # Fire any deferred auto-continue AFTER this turn is fully finalised.
-        pending = self._pending_auto_continue
-        if pending is not None:
-            self._pending_auto_continue = None
-            self._auto_continue(pending)
 
     def _cleanup_thread(self, thread, worker):
         self._threads = [(t, w) for (t, w) in self._threads if t is not thread]
@@ -793,6 +804,12 @@ class AssistantDock(QWidget):
         card.setParent(None)
         card.deleteLater()
 
+    def _append_action_result(self, markdown: str):
+        """Display a deterministic action result and retain it for follow-ups."""
+        self._append_md(markdown)
+        self._history.append({"role": "assistant", "content": markdown})
+        self._history = self._history[-24:]
+
     def _apply_action(self, action: ProposedAction):
         ok = False
         try:
@@ -800,7 +817,9 @@ class AssistantDock(QWidget):
         except Exception as e:
             self._append_md(f"\nCould not apply: {e}")
         if ok:
-            if action.kind == "set_parameter" and not action.data.get("widget_updated"):
+            if action.data.get("result_markdown"):
+                self._append_action_result(action.data["result_markdown"])
+            elif action.kind == "set_parameter" and not action.data.get("widget_updated"):
                 # stored in config, but no matching field exists on the current screen
                 label = action.data.get("label") or humanize_parameter_key(action.data.get("key"))
                 self._append_md(
@@ -818,141 +837,28 @@ class AssistantDock(QWidget):
             w = self.action_tray_layout.itemAt(i).widget()
             if isinstance(w, _ActionCard) and w.action is action:
                 self._remove_card(w)
-        if ok and action.kind == "fill_metadata_builder":
-            self._last_applied_md_field = action.data.get("field")
-        # Auto-continue: once the tray is empty, prompt the bot for the next step.
-        if ok and self.action_tray_layout.count() == 0:
-            self._auto_continue([action.preview] if action.preview else [])
 
-    def _auto_continue(self, applied: list[str] | None = None):
-        """Silently prompt the bot to continue, naming what was just applied.
-
-        Continues as long as each turn makes NEW progress (a distinct applied value);
-        only stops after two consecutive stalled turns (a repeated or empty signature),
-        so legitimate multi-field guided flows run to completion instead of cutting off
-        after a fixed number of turns."""
-        signature = tuple(applied or [])
-        made_progress = bool(signature) and signature not in self._auto_continue_seen_signatures
-        if made_progress:
-            self._auto_continue_seen_signatures.add(signature)
-            self._auto_continue_stall_count = 0
-        else:
-            self._auto_continue_stall_count += 1
-        # Stop only when we've stalled (no NEW distinct value) twice in a row.
-        if self._auto_continue_stall_count >= 2:
-            self._append_md(
-                "I paused because I wasn't making new progress. Tell me the next value "
-                "you want to set, or use one of the buttons below."
-            )
-            return
-        # Hard safety ceiling against a runaway loop in pathological cases.
-        if self._auto_continue_turns >= 40:
-            return
-        # --- Deterministic metadata guidance -------------------------------
-        # The model reliably FILLS an answer and ASKS a given question, but is
-        # unreliable at DECIDING the next field on its own (it loops on the field
-        # it just set). So during the metadata guided flow we compute the next
-        # question and tell it to ask exactly that. Verified against the live model:
-        # explicit next-question = 6/6 pass; generic "ask the next field" = 1/6.
-        md_field = self._last_applied_md_field
-        self._last_applied_md_field = None
-        if self._guided_flow_active and md_field in self._MD_COUNT_ORDER:
-            i = self._MD_COUNT_ORDER.index(md_field)
-            nxt = self._MD_COUNT_ORDER[i + 1] if i + 1 < len(self._MD_COUNT_ORDER) else None
-            if nxt is None:
-                # All four counts captured → build the cell-type fields and the
-                # per-sample forms (structural + idempotent), then hand off.
-                self._md_apply_structural("configure_cell_types")
-                self._md_apply_structural("create_sample_forms")
-                self.refresh_context_bar()
-                self._append_md(
-                    "All set — the cell-type fields and per-sample forms are ready below. "
-                    "For each sample, fill in the **image path** and acquisition settings; "
-                    "use **Fill All from Sample 1** to copy shared values (pixel size, time "
-                    "interval), rename the cell types if you like, then **Save Metadata CSV** "
-                    "and click **Load Metadata**. Ask me about any field you're unsure of."
-                )
-                self._guided_flow_active = False
-                return
-            self._auto_continue_turns += 1
-            self._last_auto_continue_signature = signature
-            label = "; ".join(applied) if applied else "That"
-            self._send_message(
-                f"{label} is set — do NOT call any tool now. Ask me exactly this next "
-                f'question: "{self._MD_COUNT_Q[nxt]}"',
-                show_as_user=False, reset_auto_loop=False,
-            )
-            return
-
-        # --- Generic fallback (set_parameter flows, etc.) ------------------
-        self._auto_continue_turns += 1
-        self._last_auto_continue_signature = signature
-        if applied:
-            msg = (
-                f"Applied: {'; '.join(applied)}. Those values are now set — do NOT set "
-                "them again. Ask me the next field that is still missing in the builder; "
-                "only call a tool after I answer."
-            )
-        else:
-            msg = ("Ask me the next field that is still missing; only call a tool after "
-                   "I answer.")
-        self._send_message(msg, show_as_user=False, reset_auto_loop=False)
-
-    # Canonical order + questions for the deterministic metadata counts phase.
-    _MD_COUNT_ORDER = ["n_samples", "n_organoids", "n_immune", "n_other"]
-    _MD_COUNT_Q = {
-        "n_organoids": "How many organoid types do you have?",
-        "n_immune": "How many immune cell types do you have?",
-        "n_other": "How many other (non-organoid, non-immune) cell types do you have?",
-    }
-
-    def _md_apply_structural(self, field: str):
+    def _md_apply_structural(self, field: str) -> bool:
         """Apply a structural metadata-builder step (configure_cell_types /
         create_sample_forms) directly, without an LLM round-trip."""
         try:
             act = ProposedAction("fill_metadata_builder", field=field, value=None, index=0)
-            apply_action(self.main_widget, act)
+            return bool(apply_action(self.main_widget, act))
         except Exception:
-            pass
+            return False
 
     # ------------------------------------------------------------------
     # Quick actions
     # ------------------------------------------------------------------
+    def _send_intent(self, intent: str, label: str):
+        """Send a short visible command plus a structured intent in context."""
+        self._send_message(label, display_text=label, intent=intent)
+
     def _explain_screen(self):
-        ctx = {}
-        try:
-            ctx = build_context(self.main_widget)
-        except Exception:
-            pass
-        step = ctx.get("current_tab_label") or ctx.get("current_step", "this step")
-        if ctx.get("current_step") == "visualization":
-            # The Visualization tab has no tunable parameters — describe only the
-            # controls that are actually on screen, not config-only fields.
-            self._send_message(
-                "Explain the Visualization tab. It has no tunable parameters — only "
-                "these on-screen controls: the Dataset section (Sample selector, "
-                "'Clear existing layers before loading', and 'Load Dataset into Napari'), "
-                "the Visibility Toggles (Raw, Segments, Tracked Segments, Tracks), and "
-                "the Manual Edition section (pick tracked segments and 'Edit tracked "
-                "segments'). Describe what each of these controls does — do not mention "
-                "any other parameters.",
-                display_text="Explain this screen",
-            )
-            return
-        self._send_message(
-            f"Explain the {step} tab: what does it do, and what do its key "
-            "parameters mean for someone configuring it for the first time?",
-            display_text="Explain this screen",
-        )
+        self._send_intent("explain_screen", "Explain this screen")
 
     def _start_interview(self):
-        self._send_message(
-            "I'd like help configuring BEHAV3D for my data. Ask me a short series "
-            "of questions about my experiment (imaging modality, cell types, frame "
-            "interval, pixel size, expected cell diameter, motility) and then "
-            "recommend sensible default parameters for the current step.",
-            display_text="Tell me about my data",
-        )
+        self._send_intent("review_data", "Review my data")
 
     def _start_metadata_guide(self):
         self._append_user("Build metadata")
@@ -978,9 +884,27 @@ class AssistantDock(QWidget):
         is applied immediately — the LLM is never in the loop, so it can't stall,
         loop, or skip a field."""
         self._guided_flow_active = True
-        self._md_apply_structural("open_builder")
+        try:
+            nav = ProposedAction("navigate_to_step", step="data_preparation")
+            apply_action(self.main_widget, nav)
+        except Exception:
+            pass
+        if not self._md_apply_structural("open_builder"):
+            self._guided_flow_active = False
+            self._append_md("Metadata Builder was not opened.")
+            return
         self._append_md("Opened the Metadata Builder")
         self.refresh_context_bar()
+        dp = getattr(self.main_widget, "data_prep_tab", None)
+        if (getattr(dp, "_edit_mode", False)
+                and bool(getattr(dp, "_sample_forms", []) or [])):
+            self._guided_flow_active = False
+            self._current_intent = "review_data"
+            self._append_md(
+                "Your loaded metadata is ready to edit. I can review the current "
+                "sample values or help change a specific field."
+            )
+            return
         self._md_phase = "counts"
         self._md_queue = [dict(s) for s in self._MD_COUNT_STEPS]
         self._md_current = None
@@ -1031,6 +955,12 @@ class AssistantDock(QWidget):
         """Apply the typed answer to the current wizard question and advance."""
         item = self._md_current
         self._append_user(text)
+        if self._md_help_requested(text):
+            self._append_md(
+                f"**BEHAV3D Assistant**\n\n{self._md_help_text(item)}\n\n"
+                f"{item['question']}"
+            )
+            return
         if item["kind"] == "count":
             try:
                 value = int("".join(ch for ch in text if (ch.isdigit() or ch == "-")))
@@ -1051,6 +981,39 @@ class AssistantDock(QWidget):
         self._md_apply_value(item["field"], value, item.get("index", 0))
         self.refresh_context_bar()
         self._md_ask_next()
+
+    @staticmethod
+    def _md_help_requested(text: str) -> bool:
+        normalized = (text or "").strip().lower()
+        return any(phrase in normalized for phrase in (
+            "help", "not sure", "what does", "what counts", "how do i know",
+        ))
+
+    @staticmethod
+    def _md_help_text(item: dict) -> str:
+        help_by_field = {
+            "n_samples": (
+                "A sample is one independently imaged field of view or acquisition "
+                "that will become one metadata row. Count image files or fields of "
+                "view, not the number of cell types inside them."
+            ),
+            "n_organoids": (
+                "Count the distinct organoid populations you want to segment and "
+                "track separately. Use 0 if your experiment has no organoids."
+            ),
+            "n_immune": (
+                "Count the distinct immune-cell populations you want BEHAV3D to "
+                "process separately, such as T cells and macrophages."
+            ),
+            "n_other": (
+                "Count any additional cell populations that are neither organoids "
+                "nor immune cells. Use 0 if there are none."
+            ),
+        }
+        return help_by_field.get(
+            item.get("field"),
+            "Use the short label you want to see for this cell population throughout BEHAV3D.",
+        )
 
     def _md_apply_value(self, field: str, value, index: int = 0):
         from behav3d.napari._assistant_actions import _metadata_builder_preview
@@ -1086,20 +1049,6 @@ class AssistantDock(QWidget):
         """Called whenever the user switches tabs in the main widget."""
         self.refresh_context_bar()
         self._set_quick_buttons(index)
-        if index not in self._greeted_tabs and not self._guided_flow_active:
-            self._greeted_tabs.add(index)
-            self._dispatch_proactive(index)
-
-    def _dispatch_proactive(self, index: int):
-        dispatch = {
-            0: self._proactive_data_prep,
-            2: self._proactive_segmentation,
-            3: self._proactive_tracking,
-            4: self._proactive_feature_extraction,
-        }
-        fn = dispatch.get(index)
-        if fn:
-            fn()
 
     def _set_quick_buttons(self, tab_index: int):
         """Clear and repopulate quick-action buttons for the given tab."""
@@ -1117,7 +1066,7 @@ class AssistantDock(QWidget):
 
         def _btn(label, handler, tip=""):
             b = QPushButton(label)
-            b.setStyleSheet("font-size:10px;")
+            b.setStyleSheet("font-size:11px; padding:5px 8px;")
             if tip:
                 b.setToolTip(tip)
             b.clicked.connect(handler)
@@ -1136,62 +1085,23 @@ class AssistantDock(QWidget):
         elif tab_index == 2:  # segmentation
             _row(_btn("Guide segmentation", self._start_segmentation_guide),
                  _btn("Choose a method", self._explain_seg_methods))
+            _row(_btn("Estimate EDT", self._estimate_edt))
         elif tab_index == 3:  # tracking
             _row(_btn("Guide tracking", self._start_tracking_guide),
                  _btn("Which method?", self._explain_tracking_methods))
         elif tab_index == 4:  # feature_extraction
             _row(_btn("Guide setup", self._start_feature_guide),
                  _btn("Check prerequisites", self._check_feature_prereqs))
+        elif tab_index == 5:  # filtering
+            _row(_btn("Review filters", self._review_filters),
+                 _btn("Track lengths", self._show_track_lengths))
+            _row(_btn("Cell counts", self._show_track_counts))
+        elif tab_index == 6:  # analysis
+            _row(_btn("Choose analysis", self._choose_analysis),
+                 _btn("Review results", self._review_results))
         else:
             _row(_btn("Explain this screen", self._explain_screen),
                  _btn("Tell me about my data", self._start_interview))
-
-    def _proactive_message(self, prompt: str):
-        """Trigger a proactive LLM check; displays as the bot's initiative, not a user message."""
-        self._append_md("*Checking your setup...*")
-        self._send_message(prompt, show_as_user=False)
-
-    # ------------------------------------------------------------------
-    # Proactive per-tab openers (fire once per tab per session)
-    # ------------------------------------------------------------------
-    def _proactive_data_prep(self):
-        self._proactive_message(
-            "I am on the Data Preparation tab. "
-            "Check the context: is output_dir_set? Is metadata loaded (metadata.loaded)? "
-            "If output_dir is not set, mention that first and offer to help. "
-            "If output_dir is set but metadata is not loaded, offer to walk through the Metadata Builder. "
-            "If both are ready, confirm briefly and suggest moving to the next step. "
-            "Keep it to 2–3 sentences maximum."
-        )
-
-    def _proactive_segmentation(self):
-        self._proactive_message(
-            "I just switched to the Segmentation tab. "
-            "Check context: is metadata loaded and output dir set? "
-            "If not, state which prereq is missing and offer to call navigate_to_step to Data Preparation. "
-            "If prerequisites are met, mention the current visible Method dropdown choice and offer "
-            "a guided walkthrough. Treat APOC, ConvPaint, Pixel Classifier, Cellpose, and Import "
-            "segmentation as distinct methods. "
-            "Keep it to 2–3 sentences."
-        )
-
-    def _proactive_tracking(self):
-        self._proactive_message(
-            "I just switched to the Tracking tab. "
-            "Check context: is metadata loaded? What cell types are listed in metadata.cell_types? "
-            "If metadata is not loaded, redirect with navigate_to_step to Data Preparation. "
-            "If loaded, state which cell types you see (immune, organoid, other) and ask if "
-            "I'd like a guided walkthrough to configure tracking methods and parameters. "
-            "Keep it to 2–3 sentences."
-        )
-
-    def _proactive_feature_extraction(self):
-        self._proactive_message(
-            "I just switched to the Feature Extraction tab. "
-            "Check context: is metadata loaded? What cell types are present? "
-            "Briefly say what this step does and mention whether key prereqs are satisfied. "
-            "Offer to guide me through setup. Keep it to 2–3 sentences."
-        )
 
     # ------------------------------------------------------------------
     # Guided-flow handlers for per-tab quick buttons
@@ -1209,81 +1119,93 @@ class AssistantDock(QWidget):
             self._append_user("Walk through setup")
             self._begin_metadata_wizard()
         else:
-            self._send_message(
-                "I need help setting up Data Preparation from scratch. "
-                "Check context — is output_dir_set? Is metadata loaded? "
-                "If output dir is not set, ask me for the path. "
-                "Otherwise open the Metadata Builder and ask me 'How many samples?' — "
-                "one question at a time.",
-                display_text="Walk through setup",
-            )
+            self._send_intent("guide_data_setup", "Walk through setup")
 
     def _check_data_prereqs(self):
-        self._send_message(
-            "Look at the current context (output_dir_set, metadata.loaded, metadata_builder state, "
-            "metadata.n_samples, metadata.cell_types) and list exactly what is missing or "
-            "incomplete on the Data Preparation tab. If everything is complete, say so and suggest "
-            "the next workflow step.",
-            display_text="Check what's missing",
-        )
+        self._send_intent("check_data_setup", "Check what's missing")
 
     def _start_segmentation_guide(self):
         self._guided_flow_active = True
-        self._send_message(
-            "I'd like a guided walkthrough of Segmentation setup. "
-            "First check that metadata is loaded and output dir is set — if not, redirect me. "
-            "Then ask which visible segmentation Method fits my data. The available choices are "
-            "APOC (GPU), ConvPaint (DL pixel classifier), Pixel Classifier (Random Forest), "
-            "Cellpose (Deep Learning), and Import segmentation. APOC is its own method, not "
-            "Pixel Classifier. One question at a time — just ask for method first.",
-            display_text="Guide segmentation",
-        )
+        self._send_intent("guide_segmentation", "Guide segmentation")
 
     def _explain_seg_methods(self):
-        self._send_message(
-            "Explain the visible segmentation methods in BEHAV3D: APOC (GPU), ConvPaint, "
-            "Pixel Classifier (Random Forest), Cellpose, and Import segmentation. "
-            "Recommend one for each of my cell types when that makes sense. "
-            "Read my cell types from the context and be concrete in your recommendation.",
-            display_text="Choose a segmentation method",
+        self._send_intent("compare_segmentation_methods", "Choose a method")
+
+    def _estimate_edt(self):
+        ctx = build_context(self.main_widget)
+        cell_type = ctx.get("active_cell_type")
+        if not cell_type:
+            groups = (ctx.get("metadata", {}).get("cell_types", {}) or {})
+            candidates = []
+            for category in ("organoid", "immune", "other"):
+                candidates.extend(groups.get(category, []) or [])
+            candidates = list(dict.fromkeys(str(value) for value in candidates))
+            if len(candidates) == 1:
+                cell_type = candidates[0]
+        if not cell_type:
+            self._send_intent("recommend_edt", "Estimate EDT")
+            return
+        self._append_user("Estimate EDT")
+        action = ProposedAction(
+            "recommend_edt", cell_type=cell_type, cell_diameter_um=10.0,
+            organoid_cells_across=None,
         )
+        action.preview = f"Calculate EDT starting values for {cell_type}"
+        if apply_action(self.main_widget, action) and action.data.get("result_markdown"):
+            self._append_action_result(action.data["result_markdown"])
+        else:
+            self._append_md(f"I could not calculate EDT values for **{cell_type}**.")
 
     def _start_tracking_guide(self):
         self._guided_flow_active = True
-        self._send_message(
-            "I'd like a guided walkthrough of Tracking setup. "
-            "Read my cell types from context and start by listing which types you see. "
-            "For each type ask which tracking method to use — state the recommended default "
-            "(btrack for immune, propagation for organoid, lap for other) and ask for confirmation. "
-            "Then ask the key parameter for that method. One question at a time.",
-            display_text="Guide tracking",
-        )
+        self._send_intent("guide_tracking", "Guide tracking")
 
     def _explain_tracking_methods(self):
-        self._send_message(
-            "Looking at my cell types in context, which tracking method do you recommend for each type "
-            "and why? Compare btrack, LAP, propagation, and trackpy. Give a concrete recommendation.",
-            display_text="Which tracking method?",
-        )
+        self._send_intent("compare_tracking_methods", "Which method?")
 
     def _start_feature_guide(self):
         self._guided_flow_active = True
-        self._send_message(
-            "I'd like a guided walkthrough of Feature Extraction setup. "
-            "Check context: are metadata loaded and output dir set? What cell types are present? "
-            "If prereqs are missing, redirect me. Otherwise ask one question at a time, "
-            "starting with: which features do I want to extract for each cell type?",
-            display_text="Guide feature extraction",
-        )
+        self._send_intent("guide_feature_extraction", "Guide setup")
 
     def _check_feature_prereqs(self):
-        self._send_message(
-            "Check whether the prerequisites for Feature Extraction are satisfied: "
-            "metadata loaded, output dir set, segmentation masks present, tracking outputs present. "
-            "Tell me specifically what is ready and what is missing. "
-            "If anything is missing, offer to navigate me to the right tab to fix it.",
-            display_text="Check prerequisites",
+        self._send_intent("check_feature_prerequisites", "Check prerequisites")
+
+    def _review_filters(self):
+        self._send_intent("review_filters", "Review filters")
+
+    def _show_track_lengths(self):
+        ctx = build_context(self.main_widget)
+        cell_type = ctx.get("active_cell_type")
+        if not cell_type:
+            self._append_md("Select a cell type in Filtering first.")
+            return
+        action = ProposedAction("show_track_length_distribution", cell_type=cell_type)
+        action.preview = f"Show track-length distributions for {cell_type}"
+        if not apply_action(self.main_widget, action):
+            self._append_md(f"I could not open the track-length preview for **{cell_type}**.")
+
+    def _show_track_counts(self):
+        ctx = build_context(self.main_widget)
+        cell_type = ctx.get("active_cell_type")
+        if not cell_type:
+            self._append_md("Select a cell type in Filtering first.")
+            return
+        self._append_user("Cell counts by minimum track length")
+        action = ProposedAction(
+            "summarize_track_counts", cell_type=cell_type, position_t=0,
+            minimum_lengths=[20, 50, 100, 200],
         )
+        action.preview = f"Summarize track counts for {cell_type}"
+        if apply_action(self.main_widget, action) and action.data.get("result_markdown"):
+            self._append_action_result(action.data["result_markdown"])
+        else:
+            self._append_md(f"I could not calculate track counts for **{cell_type}**.")
+
+    def _choose_analysis(self):
+        self._send_intent("choose_analysis", "Choose analysis")
+
+    def _review_results(self):
+        self._send_intent("review_results", "Review results")
 
     # ------------------------------------------------------------------
     # Session replay log

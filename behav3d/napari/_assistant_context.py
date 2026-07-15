@@ -32,7 +32,14 @@ The returned dict shape:
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
+
+from behav3d.napari._assistant_controls import (
+    CONTROL_CONTRACT_VERSION,
+    active_cell_type,
+    control_registry,
+)
 
 # Tab index -> workflow step key (mirrors the order tabs are added in _widget.py)
 _TAB_INDEX_TO_STEP = {
@@ -53,8 +60,97 @@ def _safe(fn, default=None):
         return default
 
 
+_DIMENSION_ORDERS = {"TCZYX", "TZCYX", "ZCTYX", "ZTCYX", "CZTYX", "CTZYX"}
+_RAW_IMAGE_SUFFIXES = (".zarr", ".zarr.zip", ".czi", ".lif", ".liff",
+                       ".tif", ".tiff", ".ims", ".h5")
+
+
+def _json_value(value):
+    """Convert pandas/numpy/path values to JSON primitives without hiding data."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_value(item) for item in value]
+    try:
+        import pandas as pd
+        if bool(pd.isna(value)):
+            return None
+    except (ImportError, TypeError, ValueError):
+        pass
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "item"):
+        return _safe(value.item, str(value))
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def validate_metadata_records(records: list[dict]) -> list[dict]:
+    """Return factual metadata issues and review notes without biological guesses."""
+    issues: list[dict] = []
+
+    def add(row, field, severity, message):
+        issues.append({"row": row, "field": field, "severity": severity,
+                       "message": message})
+
+    required = ("sample_name", "raw_image_path", "pixel_distance_xy",
+                "pixel_distance_z", "time_interval")
+    for index, record in enumerate(records):
+        sample = record.get("sample_name") or f"row {index + 1}"
+        for field in required:
+            value = record.get(field)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                add(index, field, "error", f"{sample}: {field.replace('_', ' ')} is missing.")
+
+        raw = str(record.get("raw_image_path") or "").strip()
+        if raw:
+            path = Path(raw).expanduser()
+            lower = raw.lower()
+            if path.is_dir() and not lower.endswith(".zarr"):
+                add(index, "raw_image_path", "error",
+                    f"{sample}: the raw image path is a folder; select one multidimensional image file.")
+            elif not any(lower.endswith(suffix) for suffix in _RAW_IMAGE_SUFFIXES):
+                add(index, "raw_image_path", "error",
+                    f"{sample}: the raw image format is not supported by the loader.")
+            elif not path.exists():
+                add(index, "raw_image_path", "warning",
+                    f"{sample}: the raw image path does not exist on this machine.")
+
+        order = str(record.get("dimension_order") or "").strip().upper()
+        if order and order not in _DIMENSION_ORDERS:
+            add(index, "dimension_order", "error",
+                f"{sample}: dimension order must be one of {', '.join(sorted(_DIMENSION_ORDERS))}.")
+        for field in ("pixel_distance_xy", "pixel_distance_z", "time_interval"):
+            value = record.get(field)
+            if value is None or value == "":
+                continue
+            try:
+                if float(value) <= 0:
+                    add(index, field, "error",
+                        f"{sample}: {field.replace('_', ' ')} must be greater than zero.")
+            except (TypeError, ValueError):
+                add(index, field, "error",
+                    f"{sample}: {field.replace('_', ' ')} must be numeric.")
+
+    names = [str(r.get("sample_name") or "").strip() for r in records]
+    duplicates = sorted({name for name in names if name and names.count(name) > 1})
+    for name in duplicates:
+        add(None, "sample_name", "error", f"Sample name '{name}' is used more than once.")
+
+    for field in ("pixel_distance_xy", "pixel_distance_z", "time_interval",
+                  "time_unit", "dimension_order"):
+        values = {_json_value(r.get(field)) for r in records if r.get(field) not in (None, "")}
+        if len(values) > 1:
+            add(None, field, "review",
+                f"{field.replace('_', ' ').capitalize()} differs between samples; verify that this is intentional.")
+    return issues
+
+
 def summarize_metadata(metadata) -> dict:
-    """Summarise a metadata DataFrame without assuming any column exists."""
+    """Serialize every loaded metadata row and validate researcher-facing fields."""
     if metadata is None:
         return {"loaded": False}
     try:
@@ -90,12 +186,21 @@ def summarize_metadata(metadata) -> dict:
     except Exception:
         cell_types = {}
 
+    records = []
+    try:
+        for _index, row in metadata.iterrows():
+            records.append({str(column): _json_value(row.get(column)) for column in columns})
+    except Exception:
+        records = []
+
     return {
         "loaded": True,
         "n_samples": n_samples,
         "sample_names": sample_names,
         "columns": columns,
         "cell_types": cell_types,
+        "records": records,
+        "validation": validate_metadata_records(records),
     }
 
 
@@ -136,6 +241,41 @@ def serialize_queue(queue_panel) -> list[dict]:
             "params": _safe(lambda s=step: dict(s.params), {}) or {},
         })
     return out
+
+
+def _serialize_results(output_dir: str) -> list[dict]:
+    if not output_dir:
+        return []
+    try:
+        from behav3d.napari._results_catalog import scan_outputs
+        root = Path(output_dir).expanduser()
+        return [{
+            "id": str(item.path.relative_to(root)),
+            "label": item.label,
+            "description": item.description,
+            "kind": item.kind,
+            "category": item.category,
+            "subcategory": item.subcategory,
+            "cell_type": item.cell_type,
+            "viewable": item.is_viewable,
+        } for item in scan_outputs(root)]
+    except Exception:
+        return []
+
+
+def _active_preview(main_widget) -> dict | None:
+    feature_tab = getattr(main_widget, "feature_extraction_tab", None)
+    for cell_type, panel in (getattr(feature_tab, "panels", {}) or {}).items():
+        if getattr(panel, "_preview_seg_t", None) is not None:
+            return {
+                "type": "dead_threshold",
+                "cell_type": cell_type,
+                "sample": _widget_value(getattr(panel, "preview_sample_combo", None)),
+                "threshold_percent": _widget_value(getattr(panel, "spin_dead_threshold", None)),
+                "overlay": "green cells are alive; red cells are dead",
+                "hover": "hover a cell to see its dead-mask percentage",
+            }
+    return None
 
 
 def _widget_value(widget):
@@ -179,7 +319,8 @@ def _metadata_builder_state(dp) -> dict:
         n_oth = len(getattr(dp, "_other_name_edits", []))
         forms = getattr(dp, "_sample_forms", []) or []
         sample_forms = []
-        for idx, form in enumerate(forms[:5]):
+        draft_records = []
+        for idx, form in enumerate(forms):
             basic = _clean_widget_values({
                 k: _widget_value(w) for k, w in (form.get("basic") or {}).items()
             })
@@ -198,6 +339,14 @@ def _metadata_builder_state(dp) -> dict:
                 "dead_channel": dead,
                 "cell_types": cell_types,
             })
+            record = dict(basic)
+            if "number" in dead:
+                record["dead_channel"] = dead["number"]
+            if "mask_path" in dead:
+                record["dead_mask_path"] = dead["mask_path"]
+            if cell_types:
+                record["cell_types"] = cell_types
+            draft_records.append(record)
 
         return {
             "open": bool(getattr(dp, "builder_grp", None) and dp.builder_grp.isChecked()),
@@ -213,6 +362,12 @@ def _metadata_builder_state(dp) -> dict:
             "immune_names": [e.text() for e in getattr(dp, "_immune_name_edits", [])],
             "other_names": [e.text() for e in getattr(dp, "_other_name_edits", [])],
             "sample_forms": sample_forms,
+            # These values are the live form draft and can be newer than
+            # dp.metadata while an existing CSV is being edited.
+            "draft_records": draft_records,
+            "draft_validation": validate_metadata_records(draft_records) if draft_records else [],
+            "record_source": "metadata_builder_draft" if draft_records else None,
+            "save_required": bool(draft_records),
         }
     except Exception:
         return {"open": False}
@@ -279,30 +434,6 @@ def _step_readiness(main_widget, ctx: dict) -> dict:
     return steps
 
 
-def _active_cell_type_tab(main_widget, step: str) -> str | None:
-    """Return 'immune', 'organoid', or 'other' for the active cell-type sub-tab."""
-    tab_attr = {
-        "tracking": "tracking_tab",
-        "feature_extraction": "feature_extraction_tab",
-        "filtering": "filtering_tab",
-    }.get(step)
-    if tab_attr is None:
-        return None
-    tab_widget = _safe(lambda: getattr(main_widget, tab_attr, None))
-    if tab_widget is None:
-        return None
-    panels_tab = _safe(lambda: getattr(tab_widget, "panels_tab", None) or
-                       getattr(tab_widget, "tab_widget", None))
-    if panels_tab is None:
-        return None
-    idx = _safe(lambda: panels_tab.currentIndex(), 0)
-    label = _safe(lambda: panels_tab.tabText(idx).lower(), "")
-    for ct in ("immune", "organoid", "other"):
-        if ct in label:
-            return ct
-    return None
-
-
 def _segmentation_state(main_widget) -> dict:
     """Snapshot the visible segmentation method selector."""
     seg = _safe(lambda: getattr(main_widget, "segmentation_tab", None))
@@ -359,14 +490,34 @@ def build_context(main_widget) -> dict:
     queue_panel = getattr(main_widget, "queue_panel", None)
     queue = serialize_queue(queue_panel) if queue_panel is not None else []
 
+    metadata_summary = summarize_metadata(metadata)
+    builder_state = _safe(lambda: _metadata_builder_state(dp), {"open": False}) or {
+        "open": False
+    }
+    draft_records = builder_state.get("draft_records") or []
+    if draft_records:
+        # Questions about current form entries must use the draft. Otherwise an
+        # older loaded DataFrame can make the assistant repeat a completed change.
+        metadata_summary["records"] = draft_records
+        metadata_summary["validation"] = builder_state.get("draft_validation", [])
+        metadata_summary["n_samples"] = len(draft_records)
+        metadata_summary["sample_names"] = [
+            str(record.get("sample_name")) for record in draft_records
+            if record.get("sample_name") not in (None, "")
+        ]
+        metadata_summary["record_source"] = "metadata_builder_draft"
+        metadata_summary["save_required"] = True
+
     ctx = {
         "current_step": step,
         "current_tab_label": tab_label,
         "tab_index": tab_index,
         "output_dir": output_dir,
         "output_dir_set": bool(output_dir),
-        "metadata": summarize_metadata(metadata),
+        "metadata": metadata_summary,
         "queue": queue,
+        "results": _safe(lambda: _serialize_results(output_dir), []) or [],
+        "active_preview": _safe(lambda: _active_preview(main_widget), None),
         "parameters": _safe(lambda: _diff_from_defaults(params), {}) or {},
         # The Visualization tab is a viewer with no tunable BEHAV3D parameters that
         # have visible widgets (its schema cards — use_range/start_t/end_t/
@@ -375,16 +526,23 @@ def build_context(main_widget) -> dict:
         "step_schema": [] if step == "visualization"
                        else (_safe(lambda: cards_for_step(step), []) or []),
     }
-    # Include metadata builder state only when on the data_preparation tab.
-    if step == "data_preparation":
-        ctx["metadata_builder"] = _metadata_builder_state(dp)
+    # Keep an open/drafted builder visible even after a tab switch. This avoids
+    # regressing to the stale saved DataFrame on the next assistant turn.
+    if (step == "data_preparation" or builder_state.get("open")
+            or builder_state.get("sample_forms_created")):
+        ctx["metadata_builder"] = builder_state
     if step == "segmentation":
         ctx["segmentation"] = _safe(lambda: _segmentation_state(main_widget), {})
 
+    controls = _safe(lambda: control_registry(main_widget), []) or []
+    ctx["ui_state"] = {
+        "contract_version": CONTROL_CONTRACT_VERSION,
+        "controls": controls,
+    }
+
     # Guided-flow enrichments.
     ctx["step_readiness"] = _safe(lambda: _step_readiness(main_widget, ctx), {})
-    ctx["active_cell_type_tab"] = _safe(
-        lambda: _active_cell_type_tab(main_widget, step), None)
+    ctx["active_cell_type"] = _safe(lambda: active_cell_type(main_widget, step), None)
     ctx["required_params_at_default"] = _safe(
         lambda: _required_params_at_default(step, ctx["step_schema"], params), [])
     return ctx
@@ -397,4 +555,11 @@ def context_summary_line(ctx: dict) -> str:
     out_ok = "output set" if ctx.get("output_dir_set") else "no output dir"
     nq = len(ctx.get("queue", []))
     step = ctx.get("current_tab_label") or ctx.get("current_step", "")
-    return f"📍 {step} · {n} sample(s) · {out_ok} · {nq} queued"
+    details = [str(step), f"{n} sample(s)", out_ok, f"{nq} queued"]
+    active = ctx.get("active_cell_type")
+    if active:
+        details.insert(1, str(active))
+    method = (ctx.get("segmentation") or {}).get("method")
+    if method:
+        details.insert(1, str(method).split("(")[0].strip())
+    return "  |  ".join(details)

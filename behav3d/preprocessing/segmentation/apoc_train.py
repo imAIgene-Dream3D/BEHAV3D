@@ -12,6 +12,7 @@ import json
 import re
 import time
 import shutil
+import contextlib
 from pathlib import Path
 
 import numpy as np
@@ -1045,6 +1046,7 @@ class CellTypeTab(QWidget):
         chan_layout = QVBoxLayout()
         chan_layout.setSpacing(2)
         self.channel_checkboxes = []
+        self._rebuilding_channel_checkboxes = False
         self.chan_checkbox_container = QWidget()
         self.chan_checkbox_layout = QVBoxLayout()
         self.chan_checkbox_layout.setContentsMargins(0, 0, 0, 0)
@@ -1776,29 +1778,61 @@ class CellTypeTab(QWidget):
             cb.deleteLater()
         self.channel_checkboxes = []
 
-        for layer in self.viewer.layers:
-            if (
-                isinstance(layer, napari.layers.Image)
-                and not layer.name.startswith("Pixel Classification")
-                and not layer.name.startswith("Probability Map")
-                and not layer.name.startswith("Instance Segmentation")
-            ):
-                cb = QCheckBox(layer.name)
-                if use_defaults and default_names:
-                    checked = layer.name in default_names
-                elif layer.name in existing_names:
-                    checked = layer.name in checked_names
-                elif default_names:
-                    checked = layer.name in default_names
-                else:
-                    checked = True
-                cb.setChecked(checked)
-                self.chan_checkbox_layout.addWidget(cb)
-                self.channel_checkboxes.append(cb)
-        if self.channel_checkboxes:
-            self._default_channel_names = [
-                cb.text() for cb in self.channel_checkboxes if cb.isChecked()
-            ]
+        # Image layers can arrive one at a time (e.g. one `add_image` call per
+        # channel while a session loads), so this rebuild can run repeatedly
+        # against a still-partial set of layers. Only a real user click
+        # (``_on_channel_checkbox_toggled``) is allowed to update
+        # ``_default_channel_names`` — otherwise an in-progress load would
+        # permanently forget a saved channel selection that hasn't appeared
+        # as a layer yet.
+        self._rebuilding_channel_checkboxes = True
+        try:
+            for layer in self.viewer.layers:
+                if (
+                    isinstance(layer, napari.layers.Image)
+                    and not layer.name.startswith("Pixel Classification")
+                    and not layer.name.startswith("Probability Map")
+                    and not layer.name.startswith("Instance Segmentation")
+                ):
+                    cb = QCheckBox(layer.name)
+                    if use_defaults and default_names:
+                        checked = layer.name in default_names
+                    elif layer.name in existing_names:
+                        checked = layer.name in checked_names
+                    elif default_names:
+                        checked = layer.name in default_names
+                    else:
+                        checked = True
+                    cb.setChecked(checked)
+                    cb.toggled.connect(self._on_channel_checkbox_toggled)
+                    self.chan_checkbox_layout.addWidget(cb)
+                    self.channel_checkboxes.append(cb)
+        finally:
+            self._rebuilding_channel_checkboxes = False
+
+    def _on_channel_checkbox_toggled(self, _checked=None):
+        """Update the remembered default only in response to a real user click."""
+        if getattr(self, "_rebuilding_channel_checkboxes", False):
+            return
+        self._default_channel_names = [
+            cb.text() for cb in self.channel_checkboxes if cb.isChecked()
+        ]
+
+    def channel_selection_is_complete(self):
+        """Whether ``channel_checkboxes`` covers every eligible image layer.
+
+        False while a session is still loading channels one at a time, which
+        callers use to avoid persisting a partial channel selection.
+        """
+        expected = {
+            layer.name for layer in self.viewer.layers
+            if isinstance(layer, napari.layers.Image)
+            and not layer.name.startswith("Pixel Classification")
+            and not layer.name.startswith("Probability Map")
+            and not layer.name.startswith("Instance Segmentation")
+        }
+        current = {cb.text() for cb in self.channel_checkboxes}
+        return current == expected
 
     def get_config(self):
         """Return a dict with all current widget values."""
@@ -2584,6 +2618,20 @@ class APOCTrainingWidget(QWidget):
             except Exception:
                 pass
         self._layer_event_handles = []
+
+    @contextlib.contextmanager
+    def pause_channel_refresh(self):
+        """Temporarily block this widget's own layer-inserted/removed callbacks.
+
+        Blocking the whole event (``emitter.blocker()``) would also block
+        napari's internal layer-controls-widget registration, which listens
+        on the same event and desyncs the viewer UI. Blocking only this
+        widget's own callback leaves other listeners free to run.
+        """
+        with contextlib.ExitStack() as stack:
+            for emitter, callback in self._layer_event_handles:
+                stack.enter_context(emitter.blocker(callback))
+            yield
 
     # ------------------------------------------------------------------
     # Button handlers
@@ -3515,7 +3563,10 @@ class APOCTrainingWidget(QWidget):
             params[f"apoc_{ct}_checked_features"]      = cfg["checked_features"]
             params[f"apoc_{ct}_max_depth"]             = cfg["max_depth"]
             params[f"apoc_{ct}_num_ensembles"]         = cfg["num_ensembles"]
-            params[f"apoc_{ct}_channels"]              = cfg["channels"]
+            # Channel layers can still be loading in one at a time; don't
+            # overwrite the saved selection with a partial checkbox state.
+            if tab.channel_selection_is_complete():
+                params[f"apoc_{ct}_channels"] = cfg["channels"]
             if cfg["prob_mask_threshold"] is not None:
                 params[f"{ct}_prob_mask_threshold"] = cfg["prob_mask_threshold"]
             if cfg["prob_seed_threshold"] is not None:
