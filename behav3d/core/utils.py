@@ -43,6 +43,85 @@ def convert_distance(distance, distance_unit):
         distance = distance/distance_conversions[distance_unit]
         return(distance)
       
+def unit_conversion_factor(kind, pixel_distance_xy, pixel_distance_z=None):
+    """Native→physical multiplier for a parameter of the given ``kind``.
+
+    Segmentation parameters are stored in native pixel/voxel units; the GUI
+    can display them in physical units (µm). This returns the factor ``f``
+    such that ``physical = native * f``:
+
+    - ``"distance"`` (lateral distance, e.g. EDT threshold, search radius):
+      ``f = pixel_distance_xy`` (µm per pixel, XY).
+    - ``"volume"`` (e.g. minimum segment size in voxels):
+      ``f = pixel_distance_xy**2 * pixel_distance_z`` (µm³ per voxel).
+    - anything else (dimensionless / fixed-by-definition): ``f = 1.0``.
+    """
+    xy = float(pixel_distance_xy)
+    if kind == "distance":
+        return xy
+    if kind == "volume":
+        z = float(pixel_distance_z if pixel_distance_z is not None else xy)
+        return xy * xy * z
+    return 1.0
+
+
+def native_to_physical(native, kind, pixel_distance_xy, pixel_distance_z=None):
+    """Convert a native pixel/voxel value to physical units (µm / µm³)."""
+    return float(native) * unit_conversion_factor(kind, pixel_distance_xy, pixel_distance_z)
+
+
+def physical_to_native(physical, kind, pixel_distance_xy, pixel_distance_z=None):
+    """Convert a physical-unit value (µm / µm³) back to native pixels/voxels."""
+    f = unit_conversion_factor(kind, pixel_distance_xy, pixel_distance_z)
+    if f == 0:
+        return float(physical)
+    return float(physical) / f
+
+
+def resolution_from_metadata(metadata):
+    """Return ``(xy, z, valid)`` pixel sizes (µm) from a metadata DataFrame.
+
+    Uses the first sample row and assumes uniform resolution across samples.
+    ``valid`` is False when the columns are missing/unusable, in which case
+    callers should fall back to pixel units and disable the physical toggle.
+    """
+    try:
+        if metadata is None or len(metadata) == 0:
+            return 1.0, 1.0, False
+        if "pixel_distance_xy" not in metadata.columns or "pixel_distance_z" not in metadata.columns:
+            return 1.0, 1.0, False
+        xy = float(metadata["pixel_distance_xy"].iloc[0])
+        z = float(metadata["pixel_distance_z"].iloc[0])
+        if not (np.isfinite(xy) and np.isfinite(z)) or xy <= 0 or z <= 0:
+            return 1.0, 1.0, False
+        return xy, z, True
+    except Exception:
+        return 1.0, 1.0, False
+
+
+def hours_per_frame_from_metadata(metadata):
+    """Return ``(hours_per_frame, valid)`` from a metadata DataFrame.
+
+    Uses the first sample row's ``time_interval``/``time_unit`` columns and
+    assumes a uniform frame interval across samples, mirroring
+    :func:`resolution_from_metadata`. ``valid`` is False when the columns
+    are missing/unusable, in which case callers should fall back to frame
+    units and disable any hours display toggle.
+    """
+    try:
+        if metadata is None or len(metadata) == 0:
+            return 1.0, False
+        if "time_interval" not in metadata.columns or "time_unit" not in metadata.columns:
+            return 1.0, False
+        interval = float(metadata["time_interval"].iloc[0])
+        unit = str(metadata["time_unit"].iloc[0])
+        if not np.isfinite(interval) or interval <= 0:
+            return 1.0, False
+        return float(convert_time(interval, unit, convert_to="h")), True
+    except Exception:
+        return 1.0, False
+
+
 def element_to_dict(element):
     """
     Convert an ElementTree Element object to a dictionary.

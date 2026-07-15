@@ -21,12 +21,13 @@ import yaml
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QCheckBox,
-    QSpinBox, QGroupBox, QComboBox, QMessageBox, QScrollArea,
+    QSpinBox, QGroupBox, QMessageBox, QScrollArea,
     QSplitter,
 )
 from qtpy.QtCore import Qt, Signal
 
-from behav3d.core.qt_help import make_help_row
+from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.napari._units import UnitGroupManager, TimeUnitGroupManager
 from behav3d.napari._results_panel import (
     ResultsPanel,
     notify_results_changed,
@@ -87,6 +88,25 @@ class CellTypeFilterPanel(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
+        # Frames/hours display toggle for the time-based filters below
+        # (Max timepoints / Min length / Max length). The native, persisted
+        # value is always frames; 'hours' is a display convenience computed
+        # from this sample's time_interval/time_unit metadata.
+        legacy_time_type = cfg.get("time_type", "frames")
+        self._time_unit_mgr = TimeUnitGroupManager(
+            self.metadata_loader.metadata, default_hours=(legacy_time_type == "hours")
+        )
+
+        def _legacy_native_frames(value):
+            # Configs saved before this toggle existed stored raw numbers
+            # interpreted directly as the selected unit (frames or hours);
+            # convert legacy hours-mode values to native frames so old
+            # saved projects keep the same meaning going forward.
+            if legacy_time_type == "hours" and self._time_unit_mgr.valid:
+                return float(value) / self._time_unit_mgr.hours_per_frame
+            return float(value)
+        self._legacy_native_frames = _legacy_native_frames
+
         # ── Preview ────────────────────────────────────────────────────────
         self.btn_preview_lengths = QPushButton("📊 See Track Length Distributions")
         self.btn_preview_lengths.setStyleSheet(
@@ -98,21 +118,42 @@ class CellTypeFilterPanel(QWidget):
         layout.addWidget(self.btn_preview_lengths)
 
         # ── Experiment duration ────────────────────────────────────────
+        exp_row = QHBoxLayout()
         self.en_exp_duration = QCheckBox("Trim full time series to max timepoints")
         self.en_exp_duration.setChecked(bool(cfg.get("exp_duration_enabled", True)))
-        layout.addWidget(self.en_exp_duration)
+        exp_row.addWidget(self.en_exp_duration)
+        exp_row.addWidget(HelpButton(
+            "Trim Full Time Series",
+            "When enabled, every row with a timepoint beyond 'Max timepoints' "
+            "is permanently dropped before any other filter runs (this is the "
+            "first filtering step). It applies to the whole dataset, not just "
+            "individual tracks, so it also caps what 'Min length'/'Max length' "
+            "see afterwards.\n\n"
+            "Measured in frames ('position_t'); displayed in frames or hours "
+            "per the unit toggle at the bottom of this panel.\n\n"
+            "When disabled, no timepoint cutoff is applied and the full "
+            "recorded duration of every sample is kept."
+        ))
+        exp_row.addStretch()
+        layout.addLayout(exp_row)
 
         self.spin_exp_duration = QSpinBox()
         self.spin_exp_duration.setRange(1, 99999)
-        self.spin_exp_duration.setValue(int(cfg.get("exp_duration", 350)))
-        self.spin_exp_duration.setMaximumWidth(100)
+        self.spin_exp_duration.setMaximumWidth(110)
+        self._time_unit_mgr.register(
+            self.spin_exp_duration, self._legacy_native_frames(cfg.get("exp_duration", 350))
+        )
         dur_form = QFormLayout()
         dur_form.setContentsMargins(20, 0, 0, 0)
         dur_form.addRow("Max timepoints:", make_help_row(
             self.spin_exp_duration,
             "Max Experiment Duration",
-            "Cut off all data after this many timepoints/hours.\n\n"
-            "Timepoints beyond this are removed."
+            "Rows whose timepoint is greater than this value are removed "
+            "(rows at exactly this value are kept). Runs first, before the "
+            "min-size, min-length and max-length filters below, so it also "
+            "limits the span those filters can measure.\n\n"
+            "Unit follows the frames/hours toggle at the bottom of this "
+            "panel; the underlying filter always runs on frames."
         ))
         self.dur_widget = QWidget()
         self.dur_widget.setLayout(dur_form)
@@ -124,21 +165,41 @@ class CellTypeFilterPanel(QWidget):
         _toggle_dur(None)
 
         # ── Min track length ──────────────────────────────────────────
+        min_row = QHBoxLayout()
         self.en_min_length = QCheckBox("Filter tracks shorter than minimal length")
         self.en_min_length.setChecked(bool(cfg.get("min_length_enabled", True)))
-        layout.addWidget(self.en_min_length)
+        min_row.addWidget(self.en_min_length)
+        min_row.addWidget(HelpButton(
+            "Filter Short Tracks",
+            "When enabled, whole tracks are dropped if their span (last "
+            "timepoint minus first timepoint, after the 'Max timepoints' "
+            "trim above and the 'Min size at t1' filter have already run) "
+            "is shorter than 'Min length'. Tracks whose span is exactly "
+            "'Min length' are kept.\n\n"
+            "This removes short, unreliable tracks entirely (not just their "
+            "extra timepoints) — use it before the 'Max length' trim/split "
+            "below.\n\n"
+            "When disabled, no minimum-length filter is applied."
+        ))
+        min_row.addStretch()
+        layout.addLayout(min_row)
 
         self.spin_min_length = QSpinBox()
         self.spin_min_length.setRange(1, 99999)
-        self.spin_min_length.setValue(int(cfg.get("min_track_length", 30)))
-        self.spin_min_length.setMaximumWidth(100)
+        self.spin_min_length.setMaximumWidth(110)
+        self._time_unit_mgr.register(
+            self.spin_min_length, self._legacy_native_frames(cfg.get("min_track_length", 30))
+        )
         min_form = QFormLayout()
         min_form.setContentsMargins(20, 0, 0, 0)
         min_form.addRow("Min length:", make_help_row(
             self.spin_min_length,
             "Minimum Track Length",
-            "Tracks with fewer timepoints than this are removed.\n\n"
-            "Helps eliminate short, unreliable tracks."
+            "Tracks whose duration (last timepoint − first timepoint) is "
+            "shorter than this value are removed entirely.\n\n"
+            "Helps eliminate short, unreliable tracks. Unit follows the "
+            "frames/hours toggle below; the underlying filter always runs "
+            "on frames."
         ))
         self.min_widget = QWidget()
         self.min_widget.setLayout(min_form)
@@ -150,22 +211,82 @@ class CellTypeFilterPanel(QWidget):
         _toggle_min(None)
 
         # ── Max track length ──────────────────────────────────────────
+        max_row = QHBoxLayout()
         self.en_max_length = QCheckBox("Trim tracks to maximum length")
         self.en_max_length.setChecked(bool(cfg.get("max_length_enabled", True)))
-        layout.addWidget(self.en_max_length)
+        max_row.addWidget(self.en_max_length)
+        max_row.addWidget(HelpButton(
+            "Trim Long Tracks",
+            "When enabled, tracks longer than 'Max length' are cut down to "
+            "that length, starting from each track's first timepoint. "
+            "Whether the removed tail is discarded or turned into extra "
+            "tracks depends on the 'Split long tracks into chunks' option "
+            "below.\n\n"
+            "Runs after the min-size and min-length filters above. Useful "
+            "for DTW and other analyses that work best with equal-length "
+            "tracks.\n\n"
+            "When disabled, tracks are left at their full (post min/max "
+            "timepoints and min-length) length."
+        ))
+        max_row.addStretch()
+        layout.addLayout(max_row)
 
         self.spin_max_length = QSpinBox()
         self.spin_max_length.setRange(1, 99999)
-        self.spin_max_length.setValue(int(cfg.get("max_track_length", 30)))
-        self.spin_max_length.setMaximumWidth(100)
+        self.spin_max_length.setMaximumWidth(110)
+        self._time_unit_mgr.register(
+            self.spin_max_length, self._legacy_native_frames(cfg.get("max_track_length", 30))
+        )
         max_form = QFormLayout()
         max_form.setContentsMargins(20, 0, 0, 0)
         max_form.addRow("Max length:", make_help_row(
             self.spin_max_length,
             "Maximum Track Length",
-            "Tracks longer than this are trimmed to this length.\n\n"
-            "Useful for DTW which works best with equal-length tracks."
+            "Tracks longer than this value (from each track's own start) "
+            "are trimmed. A track of exactly this length is left "
+            "untouched.\n\n"
+            "Useful for DTW which works best with equal-length tracks. Unit "
+            "follows the frames/hours toggle below; the underlying filter "
+            "always runs on frames."
         ))
+        # Split long tracks into consecutive chunks (new TrackIDs) instead of
+        # discarding everything past the first window.
+        self.check_split_long_tracks = QCheckBox("Split long tracks into chunks")
+        self.check_split_long_tracks.setChecked(bool(cfg.get("split_long_tracks", True)))
+        self.check_split_long_tracks.setToolTip(
+            "When a track is longer than the maximum length, split it into "
+            "consecutive full-length chunks: the first keeps the original "
+            "TrackID, each following full window gets a new unique TrackID, "
+            "and only the final partial window is discarded.\n\n"
+            "When off, only the first window is kept (legacy crop)."
+        )
+        split_row = QHBoxLayout()
+        split_row.setContentsMargins(20, 0, 0, 0)
+        split_row.addWidget(self.check_split_long_tracks)
+        split_row.addWidget(HelpButton(
+            "Split Long Tracks Into Chunks",
+            "When ON: a track longer than 'Max length' is cut into "
+            "consecutive full-length chunks instead of being cropped. The "
+            "first chunk keeps the track's original TrackID; each following "
+            "full-length chunk becomes a new track with a new unique "
+            "TrackID (unique within its sample). Only the final, partial "
+            "remainder (shorter than 'Max length') is discarded. This turns "
+            "one long track into several equal-length tracks instead of "
+            "throwing away most of its data.\n\n"
+            "Every row also keeps an 'original_TrackID' column with the "
+            "pre-filter TrackID, so downstream analysis (DTW, clustering) "
+            "can group/split on the new 'TrackID' while backprojection onto "
+            "segmentation label images can still look cells up by their "
+            "real, unsplit 'original_TrackID'.\n\n"
+            "When OFF: only the first 'Max length' window of each track is "
+            "kept and everything after it is discarded (legacy crop "
+            "behavior).\n\n"
+            "Works the same regardless of the frames/hours display toggle "
+            "below — chunking always runs on frames internally."
+        ))
+        split_row.addStretch()
+        max_form.addRow(split_row)
+
         self.max_widget = QWidget()
         self.max_widget.setLayout(max_form)
         layout.addWidget(self.max_widget)
@@ -176,17 +297,39 @@ class CellTypeFilterPanel(QWidget):
         _toggle_max(None)
 
         # ── Min size at first timepoint filter ───────────────────────────
+        size_row = QHBoxLayout()
         self.check_filter_min_size = QCheckBox("Filter by minimal size at first timepoint")
         self.check_filter_min_size.setChecked(bool(cfg.get("filter_min_size_t1", False)))
-        layout.addWidget(self.check_filter_min_size)
+        size_row.addWidget(self.check_filter_min_size)
+        size_row.addWidget(HelpButton(
+            "Filter By Minimal Size At T1",
+            "When enabled, a track is removed entirely if the cell's size "
+            "at its first timepoint (relative_time == 1) is below 'Min "
+            "size'. Size is read from the 'volume' column when available, "
+            "otherwise from 'nr_pixels'.\n\n"
+            "Runs after the 'Max timepoints' trim but before the 'Min "
+            "length' and 'Max length' filters, so it removes small/spurious "
+            "objects (e.g. segmentation fragments) before track-length "
+            "filtering is applied.\n\n"
+            "When disabled, tracks are never removed based on their initial "
+            "size."
+        ))
+        size_row.addStretch()
+        layout.addLayout(size_row)
 
         self.spin_min_size_t1 = QSpinBox()
-        self.spin_min_size_t1.setRange(1, 999999)
+        self.spin_min_size_t1.setRange(1, 1000000000)
         self.spin_min_size_t1.setValue(int(cfg.get("min_size_t1", 1000)))
-        self.spin_min_size_t1.setMaximumWidth(100)
+        self.spin_min_size_t1.setMaximumWidth(110)
+        # Physical(µm³)/voxel unit toggle for the size filter (native = voxels).
+        self._size_unit_mgr = UnitGroupManager(
+            self.metadata_loader.metadata, default_physical=True
+        )
         size_form = QFormLayout()
         size_form.setContentsMargins(20, 0, 0, 0)
-        size_form.addRow("Min size (px):", self.spin_min_size_t1)
+        size_form.addRow("Min size:", self.spin_min_size_t1)
+        size_form.addRow("Units:", self._size_unit_mgr.header_row(label=""))
+        self._size_unit_mgr.register(self.spin_min_size_t1, "volume", int(cfg.get("min_size_t1", 1000)))
         self.size_widget = QWidget()
         self.size_widget.setLayout(size_form)
         layout.addWidget(self.size_widget)
@@ -214,12 +357,7 @@ class CellTypeFilterPanel(QWidget):
         unit_label = QLabel("Unit for time-based filters:")
         unit_label.setStyleSheet("font-weight: bold; margin-top: 6px;")
         layout.addWidget(unit_label)
-
-        self.combo_time_type = QComboBox()
-        self.combo_time_type.addItems(["frames", "hours"])
-        self.combo_time_type.setCurrentText(cfg.get("time_type", "frames"))
-        self.combo_time_type.setMaximumWidth(120)
-        layout.addWidget(self.combo_time_type)
+        layout.addWidget(self._time_unit_mgr.header_row(label=""))
 
         # ── Apply settings buttons ────────────────────────────────────
         cat_label = self.category.capitalize() + "s" if self.category != "other" else "Other types"
@@ -248,76 +386,39 @@ class CellTypeFilterPanel(QWidget):
 
     # ---- Helpers ----------------------------------------------------------
     def _on_preview_lengths_clicked(self):
-        if self.viewer is not None and self.viewer.layers:
-            reply = QMessageBox.question(
-                self, "Warning",
-                "This will remove current layers in the viewer. Continue?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if reply == QMessageBox.No:
-                return
-
+        """Preview per-sample track-length histograms from the *unfiltered*
+        combined track features, to help pick a max-track-length threshold
+        before running Filtering. Rendered in an embedded dialog — no
+        napari layers are touched."""
         ct = self.cell_type
         out = Path(self.metadata_loader.output_dir) if self.metadata_loader.output_dir else None
         if not out:
-            self.log(f"⚠️ Metadata output dir not set.")
+            self.log("⚠️ Metadata output dir not set.")
             return
-            
+
         csv_path = out / "analysis" / ct / "track_features" / f"BEHAV3D_{ct}_combined_track_features.csv"
         if not csv_path.exists():
-            self.log(f"⚠️ Unfiltered track features not found:\n  {csv_path}")
+            self.log(
+                f"⚠️ Unfiltered track features not found for '{ct}':\n  {csv_path}\n"
+                "Run Feature Extraction first."
+            )
             return
-            
+
         try:
-            import pandas as pd
-            import matplotlib.pyplot as plt
-            import tempfile
-            from qtpy.QtGui import QDesktopServices
-            from qtpy.QtCore import QUrl
-            import os
-            
-            df = pd.read_csv(csv_path)
-            if "sample_name" not in df.columns or "TrackID" not in df.columns:
-                self.log(f"⚠️ CSV missing required columns (sample_name, TrackID).")
+            from behav3d.widgets.utils import build_track_length_distribution_figure
+            from behav3d.napari._pdf_view import show_matplotlib_figure
+
+            fig = build_track_length_distribution_figure(
+                csv_path, title=f"Track length distribution — {ct}"
+            )
+            if fig is None:
+                self.log(
+                    f"⚠️ Could not build a track-length distribution for '{ct}' "
+                    f"(missing sample_name/TrackID columns or empty CSV: {csv_path})."
+                )
                 return
-                
-            samples = df["sample_name"].unique()
-            n_samples = len(samples)
-            if n_samples == 0:
-                self.log(f"⚠️ No samples found in CSV.")
-                return
-                
-            cols = min(3, n_samples)
-            rows = (n_samples + cols - 1) // cols
-            fig, axes = plt.subplots(rows, cols, figsize=(cols * 5, rows * 4), squeeze=False)
-            axes = axes.flatten()
-            
-            for i, sample in enumerate(samples):
-                ax = axes[i]
-                sample_df = df[df["sample_name"] == sample]
-                track_lengths = sample_df.groupby("TrackID").size()
-                
-                ax.hist(track_lengths, bins=50, color='skyblue', edgecolor='black')
-                ax.set_title(sample)
-                ax.set_xlabel("Track Length (timepoints)")
-                ax.set_ylabel("Frequency")
-                
-            for j in range(i + 1, len(axes)):
-                fig.delaxes(axes[j])
-                
-            plt.tight_layout()
-            
-            fd, temp_path = tempfile.mkstemp(suffix=".png", prefix=f"track_lengths_{ct}_")
-            os.close(fd)
-            plt.savefig(temp_path, dpi=150, bbox_inches='tight')
-            plt.close(fig)
-            
-            QDesktopServices.openUrl(QUrl.fromLocalFile(temp_path))
-            self.log(f"📊 Track length distribution generated.")
-            
-            # Actually clear layers if the user consented to this preview.
-            if self.viewer is not None:
-                self.viewer.layers.clear()
+            show_matplotlib_figure(fig, title=f"Track lengths — {ct}", parent=self)
+            self.log("📊 Track length distribution generated.")
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -326,15 +427,19 @@ class CellTypeFilterPanel(QWidget):
     def _collect_params(self) -> dict:
         d = {
             "exp_duration_enabled": self.en_exp_duration.isChecked(),
-            "exp_duration": int(self.spin_exp_duration.value()),
+            "exp_duration": int(round(self._time_unit_mgr.get_native(self.spin_exp_duration))),
             "min_length_enabled": self.en_min_length.isChecked(),
-            "min_track_length": int(self.spin_min_length.value()),
+            "min_track_length": int(round(self._time_unit_mgr.get_native(self.spin_min_length))),
             "max_length_enabled": self.en_max_length.isChecked(),
-            "max_track_length": int(self.spin_max_length.value()),
+            "max_track_length": int(round(self._time_unit_mgr.get_native(self.spin_max_length))),
+            "split_long_tracks": self.check_split_long_tracks.isChecked(),
             "filter_min_size_t1": self.check_filter_min_size.isChecked(),
-            "min_size_t1": int(self.spin_min_size_t1.value()),
+            "min_size_t1": int(round(self._size_unit_mgr.get_native(self.spin_min_size_t1))),
             "filter_t0_dead": self.check_filter_dead_t0.isChecked(),
-            "time_type": self.combo_time_type.currentText(),
+            # 'exp_duration'/'min_track_length'/'max_track_length' are always
+            # native frame counts now; 'time_type' only remembers which unit
+            # was displayed, so the toggle is restored next time.
+            "time_type": "hours" if self._time_unit_mgr.hours else "frames",
         }
         return d
 
@@ -354,15 +459,16 @@ class CellTypeFilterPanel(QWidget):
             if ct in parent_tab.panels:
                 p = parent_tab.panels[ct]
                 p.en_exp_duration.setChecked(settings["exp_duration_enabled"])
-                p.spin_exp_duration.setValue(settings["exp_duration"])
+                p._time_unit_mgr.set_native(p.spin_exp_duration, settings["exp_duration"])
                 p.en_min_length.setChecked(settings["min_length_enabled"])
-                p.spin_min_length.setValue(settings["min_track_length"])
+                p._time_unit_mgr.set_native(p.spin_min_length, settings["min_track_length"])
                 p.en_max_length.setChecked(settings["max_length_enabled"])
-                p.spin_max_length.setValue(settings["max_track_length"])
+                p._time_unit_mgr.set_native(p.spin_max_length, settings["max_track_length"])
+                p.check_split_long_tracks.setChecked(settings.get("split_long_tracks", True))
                 p.check_filter_min_size.setChecked(settings["filter_min_size_t1"])
-                p.spin_min_size_t1.setValue(settings["min_size_t1"])
+                p._size_unit_mgr.set_native(p.spin_min_size_t1, settings["min_size_t1"])
                 p.check_filter_dead_t0.setChecked(settings.get("filter_t0_dead", False))
-                p.combo_time_type.setCurrentText(settings["time_type"])
+                p._time_unit_mgr.switch.setChecked(settings["time_type"] == "hours")
                 count += 1
         scope = "category" if category_only else "all"
         self.log(f"Applied filter settings to {count} other cell types ({scope}).")
@@ -382,18 +488,24 @@ class CellTypeFilterPanel(QWidget):
                 self.log(f"Warning: Could not save parameters: {e}")
 
     def collect_runtime_params(self) -> dict:
-        """Snapshot Qt widget values for thread-safe handoff to a worker."""
+        """Snapshot Qt widget values for thread-safe handoff to a worker.
+
+        Time-based values are always native frame counts regardless of the
+        frames/hours display toggle, so ``time_type`` is always "frames"
+        here — the backend never needs to interpret these as hours.
+        """
         return {
             "exp_duration_enabled": bool(self.en_exp_duration.isChecked()),
-            "exp_duration": int(self.spin_exp_duration.value()),
+            "exp_duration": int(round(self._time_unit_mgr.get_native(self.spin_exp_duration))),
             "min_length_enabled": bool(self.en_min_length.isChecked()),
-            "min_track_length": int(self.spin_min_length.value()),
+            "min_track_length": int(round(self._time_unit_mgr.get_native(self.spin_min_length))),
             "max_length_enabled": bool(self.en_max_length.isChecked()),
-            "max_track_length": int(self.spin_max_length.value()),
+            "max_track_length": int(round(self._time_unit_mgr.get_native(self.spin_max_length))),
+            "split_long_tracks": bool(self.check_split_long_tracks.isChecked()),
             "filter_min_size": bool(self.check_filter_min_size.isChecked()),
-            "min_size_t1": int(self.spin_min_size_t1.value()),
+            "min_size_t1": int(round(self._size_unit_mgr.get_native(self.spin_min_size_t1))),
             "filter_t0_dead": bool(self.check_filter_dead_t0.isChecked()),
-            "time_type": self.combo_time_type.currentText(),
+            "time_type": "frames",
         }
 
     def _run_filtering_for(self, cell_type: str, overwrite: bool = False,
@@ -428,6 +540,7 @@ class CellTypeFilterPanel(QWidget):
             "exp_duration": (int(params["exp_duration"]) if params["exp_duration_enabled"] else None),
             "min_track_length": (int(params["min_track_length"]) if params["min_length_enabled"] else None),
             "max_track_length": (int(params["max_track_length"]) if params["max_length_enabled"] else None),
+            "split_long_tracks": bool(params.get("split_long_tracks", True)),
             "df_input_path": df_input_path,
             "time_type": params["time_type"],
             "plot_results": True,

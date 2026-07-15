@@ -888,7 +888,12 @@ class TrackFilterPanel:
 
         self.max_track_length = widgets.IntText(description=f"Maximal length ({cfg.get('time_type','frames')})", value=int(cfg.get("max_track_length", 30)), style={'description_width': '180px'})
         self.en_max_length = widgets.Checkbox(description="Trim down tracks to supplied length", value=bool(cfg.get("max_length_enabled", True)), indent=False)
-        self.row_max = widgets.HBox([self.max_track_length], layout=widgets.Layout(display=(None if self.en_max_length.value else "none")))
+        self.split_long_tracks = widgets.Checkbox(
+            description="Split long tracks into chunks (new TrackIDs)",
+            value=bool(cfg.get("split_long_tracks", True)),
+            indent=False,
+        )
+        self.row_max = widgets.HBox([self.max_track_length, self.split_long_tracks], layout=widgets.Layout(display=(None if self.en_max_length.value else "none")))
         self.en_max_length.observe(lambda c: setattr(self.row_max.layout, 'display', None if c['new'] else 'none'), names="value")
 
         self.has_dead = has_dead_channel(self.metadata_loader.metadata)
@@ -987,6 +992,7 @@ class TrackFilterPanel:
                     "min_track_length": int(self.min_track_length.value),
                     "max_length_enabled": self.en_max_length.value,
                     "max_track_length": int(self.max_track_length.value),
+                    "split_long_tracks": bool(self.split_long_tracks.value),
                     "filter_min_size": self.en_min_size.value,
                     "min_size": int(self.min_size_val.value),
                     "filter_t0_dead": bool(self.filter_t0_dead.value),
@@ -1001,6 +1007,7 @@ class TrackFilterPanel:
                     exp_duration=(int(self.exp_duration.value) if self.en_exp_duration.value else None),
                     min_track_length=(int(self.min_track_length.value) if self.en_min_length.value else None),
                     max_track_length=(int(self.max_track_length.value) if self.en_max_length.value else None),
+                    split_long_tracks=bool(self.split_long_tracks.value),
                     filter_t0_dead=(bool(self.filter_t0_dead.value) if self.has_dead else False),
                     min_size=(int(self.min_size_val.value) if self.en_min_size.value else None),
                     cell_type=self.cell_type,
@@ -2123,7 +2130,14 @@ class DeathDynamicsPanel:
         self.has_dead_channel_in_metadata = has_dead_channel(self.metadata_loader.metadata)
 
         feature_outdir = Path(self.output_dir, "analysis", self.cell_type, "track_features")
-        p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features.csv")
+        # Check the *filtered* CSV first — this is what run_organoid_analysis
+        # actually reads (df_tracks_path=None resolves to it), and it's the
+        # only file that exists for a cell-type *group* (see
+        # behav3d.analysis.grouping.create_cell_type_group), which merges
+        # already-filtered populations and never produces an unfiltered CSV.
+        filtered_p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
+        unfiltered_p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features.csv")
+        p = filtered_p if filtered_p.exists() else unfiltered_p
         self.has_death_features = False
         if p.exists():
             try:

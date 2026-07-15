@@ -48,6 +48,18 @@ _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
 # Prefix used for all temporary preview layers so they can be cleaned up easily
 _PREVIEW_PREFIX = "[Preview]"
 
+# The Dead/Alive preview overlay is a single shared napari layer (one
+# "[Preview] Dead/Alive" layer for the whole viewer, even when several
+# organoid cell-type panels share it — see ``_propagate_org_preview_to_panels``,
+# which re-attaches a hover callback on *every* organoid panel each time the
+# frame is recomputed). Track the single currently-active hover callback here
+# (keyed by ``id(viewer)``) so attaching a new one always removes whichever
+# callback — from *any* panel instance — is currently registered, instead of
+# only removing the calling panel's own previous callback. Without this,
+# multiple simultaneously-registered callbacks race on every mouse move and
+# most of them overwrite ``viewer.status`` with an empty/wrong result.
+_ACTIVE_PREVIEW_HOVER: dict = {}
+
 
 def _find_main_widget(start):
     """Walk up the parent chain to the top-level ``BEHAV3DWidget``."""
@@ -489,8 +501,10 @@ def _overlay_for_volume(seg_vol, dead_vol, threshold_pct, frame_label="", log_fn
     overlay_vol : np.ndarray (uint8)
         Same shape as ``seg_vol``. 0 = bg, 1 = alive, 2 = dead.
     pct_vol : np.ndarray (float32)
-        Same shape as ``seg_vol``. Each segment's voxels contain its
-        ``percentage_dead_mask / 100`` (range 0.0–1.0). Background is 0.
+        Same shape as ``seg_vol``. Each segment's voxels contain its dead
+        coverage as a percentage (range 0.0–100.0), matching ``pct_dead`` in
+        ``region_stats`` below and the "% Dead Mask" layer's own label.
+        Background is 0.
     region_stats : list[dict]
         One entry per labelled segment with keys ``label``, ``centroid``,
         ``pct_dead``, ``extent_x``.
@@ -525,7 +539,7 @@ def _overlay_for_volume(seg_vol, dead_vol, threshold_pct, frame_label="", log_fn
         dead_pixels = int((mask & dead_binary).sum())
         pct = (dead_pixels / total_pixels) * 100.0
         overlay_vol[mask] = 2 if (pct >= threshold_pct and threshold_pct > 0) else 1
-        pct_vol[mask] = pct / 100.0
+        pct_vol[mask] = pct
 
         bbox_min = region.bbox[:ndim]
         bbox_max = region.bbox[ndim:]
@@ -695,6 +709,7 @@ class CellTypeFeaturePanel(QWidget):
         # replaced entirely when the user navigates to a different timepoint.
         self._preview_overlay_arr = None    # uint8  (Z,Y,X) — current frame
         self._preview_pct_overlay_arr = None # float32 (Z,Y,X) — current frame
+        self._preview_label_arr = None      # int32  (Z,Y,X) — current frame, cell label ids
         self._preview_current_frame: int | None = None
         self._preview_pct_maps_by_frame: dict = {}
         self._preview_stats_by_frame: dict = {}
@@ -764,7 +779,7 @@ class CellTypeFeaturePanel(QWidget):
                 # voxels inside organoid masks). Mirrors the notebook widget.
                 continue
             label = (
-                "Organoid Invasiveness (Advanced)"
+                "Invasiveness"
                 if f == "invasiveness" else f.capitalize()
             )
             cb = QCheckBox(label)
@@ -782,6 +797,7 @@ class CellTypeFeaturePanel(QWidget):
             "ℹ  Greyed-out features are always extracted for this cell type."
         )
         _mandatory_note.setWordWrap(True)
+        _mandatory_note.setMinimumWidth(0)
         _mandatory_note.setStyleSheet(
             "color: #90A4AE; font-style: italic; font-size: 10px;"
         )
@@ -802,9 +818,15 @@ class CellTypeFeaturePanel(QWidget):
         contact_help = make_help_row(
             self.contact_threshold,
             "Contact Threshold (µm)",
-            "Distance threshold (in micrometers) for detecting intensity transfer\n"
-            "between neighbouring cells (contact features).\n\n"
-            "Segments closer than this will be checked for contact signal.",
+            "Physical distance (in micrometers) used to decide whether two cell\n"
+            "segments are 'in contact'.\n\n"
+            "A distance transform (using real voxel spacing) is computed around\n"
+            "each segment's border; any other-cell-type segment found within this\n"
+            "distance sets '{type}_contact_on_distance' = True and adds its\n"
+            "TrackID to 'touching_{type}s'.\n\n"
+            "This value also defines the neighbourhood used by the Organoid\n"
+            "Invasiveness calculation and by the Active Killing contact/target\n"
+            "matching.",
         )
         contact_row.addLayout(contact_help)
 
@@ -820,10 +842,17 @@ class CellTypeFeaturePanel(QWidget):
             contact_row.addWidget(inv_cb)
             contact_row.addWidget(HelpButton(
                 "Organoid Invasiveness (Advanced)",
-                "Per-timepoint count of voxels of this immune cell type that fall "
-                "inside any organoid mask.\n\n"
-                "Helps quantify how aggressively immune cells penetrate organoids. "
-                "Only available when Contact is enabled."
+                "Per-timepoint measure of how much of this immune cell's surface\n"
+                "is embedded in an organoid, not a voxel count inside the mask.\n\n"
+                "'Surface' pixels are those within 2 µm of the immune cell's\n"
+                "segment boundary. Of those, the fraction that also lies within\n"
+                "the Contact Threshold distance of an organoid segment gives\n"
+                "'{organoid}_invasiveness_perc' (0-100%).\n\n"
+                "'{organoid}_invasiveness' (bool) is True when that percentage is\n"
+                "≥ 50%. 'any_org_invasiveness[_perc]' aggregates across all\n"
+                "organoid types (max / any).\n\n"
+                "Requires both immune segments and organoid masks; only available "
+                "when Contact is enabled."
             ))
         contact_row.addStretch()
 
@@ -862,6 +891,7 @@ class CellTypeFeaturePanel(QWidget):
             f"above which {self.cell_type} cells are classified as 'dead'."
         )
         dead_desc.setWordWrap(True)
+        dead_desc.setMinimumWidth(0)
         dead_desc.setStyleSheet("color: #888; font-size: 10px;")
         dead_lay.addWidget(dead_desc)
 
@@ -871,6 +901,7 @@ class CellTypeFeaturePanel(QWidget):
                 "Adjusting it here updates every other organoid tab in real time."
             )
             shared_note.setWordWrap(True)
+            shared_note.setMinimumWidth(0)
             shared_note.setStyleSheet(
                 "color: #FFB74D; font-style: italic; font-size: 10px;"
             )
@@ -915,6 +946,9 @@ class CellTypeFeaturePanel(QWidget):
             "Dead Mask Percentage Threshold",
             "Percentage of dead-mask pixels overlapping a segment's volume\n"
             "required to classify the cell as dead.\n\n"
+            "Classification is sticky: once a track crosses this threshold at\n"
+            "any timepoint, it is marked 'dead' from that timepoint onward for\n"
+            "the rest of the track, even if the percentage later drops again.\n\n"
             "Set to 0 to skip dead classification.\n"
             "Typical range: 0.05\u20130.5 %.",
         )
@@ -932,6 +966,15 @@ class CellTypeFeaturePanel(QWidget):
         prev_sample_row_layout.addWidget(QLabel("Preview sample:"))
         self.preview_sample_combo = QComboBox()
         self.preview_sample_combo.setMinimumWidth(180)
+        # Long sample names must not be allowed to size this combo (and, via
+        # the enclosing QTabWidget which sizes to the widest tab across ALL
+        # cell types, the entire Feature Extraction panel) to fit the widest
+        # item unelided — cap it and rely on the tooltip/elided text instead.
+        self.preview_sample_combo.setMaximumWidth(240)
+        self.preview_sample_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.preview_sample_combo.setMinimumContentsLength(18)
         self.preview_sample_combo.setToolTip(
             "Select which sample to load for the dead threshold preview."
         )
@@ -957,6 +1000,21 @@ class CellTypeFeaturePanel(QWidget):
         )
         btn_preview.clicked.connect(self._on_preview_dead_clicked)
         dead_lay.addWidget(btn_preview)
+
+        # Legend for the dead/alive overlay colours (matches _dead_alive_colormap).
+        legend_row = QHBoxLayout()
+        legend_row.setContentsMargins(2, 0, 2, 0)
+        legend_row.setSpacing(12)
+        legend_label = QLabel(
+            "<span style='color:#00cc00;'>■</span> Alive"
+            "&nbsp;&nbsp;&nbsp;"
+            "<span style='color:#e60000;'>■</span> Dead"
+        )
+        legend_label.setToolTip("Overlay colours in the Dead Threshold preview.")
+        legend_label.setStyleSheet("font-size: 11px;")
+        legend_row.addWidget(legend_label)
+        legend_row.addStretch(1)
+        dead_lay.addLayout(legend_row)
 
         # Organoid spinners notify parent tab -> all org panels stay in sync
         if self._is_organoid:
@@ -1044,6 +1102,7 @@ class CellTypeFeaturePanel(QWidget):
         return 0.0
 
     def _disconnect_preview_dead_hover(self):
+        """Remove this panel's own previously-attached hover callback, if any."""
         if self.viewer is None or self._preview_hover_callback is None:
             self._preview_hover_callback = None
             return
@@ -1051,7 +1110,28 @@ class CellTypeFeaturePanel(QWidget):
             self.viewer.mouse_move_callbacks.remove(self._preview_hover_callback)
         except Exception:
             pass
+        if _ACTIVE_PREVIEW_HOVER.get(id(self.viewer)) is self._preview_hover_callback:
+            _ACTIVE_PREVIEW_HOVER.pop(id(self.viewer), None)
         self._preview_hover_callback = None
+
+    @staticmethod
+    def _disconnect_any_active_preview_hover(viewer):
+        """Remove whichever preview-hover callback is currently active on
+        ``viewer``, regardless of which panel instance attached it.
+
+        The Dead/Alive preview overlay is a single shared layer; only one
+        hover callback should ever be registered for it at a time (see
+        ``_ACTIVE_PREVIEW_HOVER`` docstring above).
+        """
+        if viewer is None:
+            return
+        cb = _ACTIVE_PREVIEW_HOVER.pop(id(viewer), None)
+        if cb is None:
+            return
+        try:
+            viewer.mouse_move_callbacks.remove(cb)
+        except Exception:
+            pass
 
     def _disconnect_preview_dims(self):
         """Disconnect the napari time-slider listener if connected."""
@@ -1080,6 +1160,7 @@ class CellTypeFeaturePanel(QWidget):
         self._preview_label_type_map = {}
         self._preview_overlay_arr = None
         self._preview_pct_overlay_arr = None
+        self._preview_label_arr = None
         self._preview_current_frame = None
         self._preview_pct_maps_by_frame = {}
         self._preview_stats_by_frame = {}
@@ -1117,7 +1198,11 @@ class CellTypeFeaturePanel(QWidget):
 
     def _attach_preview_dead_hover(self, layer_name: str = f"{_PREVIEW_PREFIX} Dead/Alive"):
         viewer = self.viewer
+        # Drop this panel's own previous callback *and* whichever callback
+        # (from any other organoid panel sharing this layer) is currently
+        # active, so at most one hover callback is ever registered.
         self._disconnect_preview_dead_hover()
+        self._disconnect_any_active_preview_hover(viewer)
         if (
             viewer is None
             or self._preview_seg_t is None
@@ -1128,33 +1213,6 @@ class CellTypeFeaturePanel(QWidget):
             viewer.layers[layer_name]
         except Exception:
             return
-
-        seg_data = self._preview_seg_t
-        seg_layer_name = f"{_PREVIEW_PREFIX} {self.cell_type} segments"
-
-        def _segment_label_at(position, frame_idx: int) -> int:
-            try:
-                if seg_data.ndim >= 4:
-                    if frame_idx < 0 or frame_idx >= seg_data.shape[0]:
-                        return 0
-                    seg_vol = np.asarray(seg_data[frame_idx])
-                else:
-                    seg_vol = np.asarray(seg_data)
-                if seg_vol.ndim > 3:
-                    seg_vol = seg_vol[0]
-
-                try:
-                    seg_layer = self.viewer.layers[seg_layer_name]
-                except Exception:
-                    return 0
-                data_position = seg_layer.world_to_data(position)
-                coords = tuple(int(round(float(c))) for c in data_position[-seg_vol.ndim:])
-                for i, c in enumerate(coords):
-                    if c < 0 or c >= seg_vol.shape[i]:
-                        return 0
-                return int(seg_vol[coords])
-            except Exception:
-                return 0
 
         def _show_tooltip(text: str):
             try:
@@ -1171,24 +1229,32 @@ class CellTypeFeaturePanel(QWidget):
             except Exception:
                 pass
 
-        # Capture label-type map so the closure always uses the current map
-        _label_type_map = getattr(self, "_preview_label_type_map", {})
-
-        def _pct_at_cursor(position):
-            """Read dead % directly from pct_overlay_arr at cursor position."""
+        def _values_at_cursor(position):
+            """Single coordinate lookup shared by the label id and the dead
+            percentage: both ``_preview_label_arr`` and
+            ``_preview_pct_overlay_arr`` are the same-shaped, same-frame
+            arrays produced together by ``_overlay_for_volume``, so one
+            ``world_to_data`` transform (via the Dead/Alive layer) is enough
+            to index both. Returns ``(label_id, pct_dead)``, with either
+            element ``None`` when unavailable.
+            """
+            label_arr = self._preview_label_arr
             pct_arr = self._preview_pct_overlay_arr
-            if pct_arr is None:
-                return None
+            if label_arr is None and pct_arr is None:
+                return None, None
             try:
                 da_layer = self.viewer.layers[layer_name]
+                ref_arr = label_arr if label_arr is not None else pct_arr
                 data_pos = da_layer.world_to_data(position)
-                coords = tuple(int(round(float(c))) for c in data_pos[-pct_arr.ndim:])
+                coords = tuple(int(round(float(c))) for c in data_pos[-ref_arr.ndim:])
                 for i, c in enumerate(coords):
-                    if c < 0 or c >= pct_arr.shape[i]:
-                        return None
-                return float(pct_arr[coords]) * 100.0
+                    if c < 0 or c >= ref_arr.shape[i]:
+                        return None, None
+                label_id = int(label_arr[coords]) if label_arr is not None else None
+                pct_dead = float(pct_arr[coords]) if pct_arr is not None else None
+                return label_id, pct_dead
             except Exception:
-                return None
+                return None, None
 
         def _on_mouse_move(*args):
             """Works with both napari ≤0.4.18 (event,) and ≥0.4.19 (viewer,event)."""
@@ -1201,36 +1267,34 @@ class CellTypeFeaturePanel(QWidget):
                 return
 
             frame_idx = self._current_viewer_frame() if self._preview_is_timelapse else 0
-
-            label_id = _segment_label_at(position, frame_idx)
-            if label_id <= 0:
+            if frame_idx != self._preview_current_frame:
                 self.viewer.status = ""
                 _hide_tooltip()
                 return
 
-            # Read percentage directly from pct_overlay_arr (same data as
-            # the % Dead Mask layer) to guarantee matching values.
-            if frame_idx == self._preview_current_frame:
-                pct_dead = _pct_at_cursor(position)
-            else:
-                pct_dead = None
-            # Resolve cell type + original label from merged organoid map
+            label_id, pct_dead = _values_at_cursor(position)
+            if not label_id:
+                self.viewer.status = ""
+                _hide_tooltip()
+                return
+
+            # Resolve cell type + original label from the (merged organoid,
+            # when applicable) label-type map captured at attach time.
+            _label_type_map = getattr(self, "_preview_label_type_map", {})
             type_info = _label_type_map.get(label_id)
             if type_info is not None:
                 ct_name, orig_lbl = type_info
-                if pct_dead is None:
-                    status_text = f"{ct_name} #{orig_lbl}"
-                else:
-                    status_text = f"{ct_name} #{orig_lbl} | {pct_dead:.2f}% dead"
+                cell_label = f"{ct_name} #{orig_lbl}"
             else:
-                if pct_dead is None:
-                    status_text = f"Cell #{label_id}"
-                else:
-                    status_text = f"Cell #{label_id} | {pct_dead:.2f}% dead"
+                cell_label = f"Cell #{label_id}"
+            status_text = (
+                f"{cell_label} | {pct_dead:.2f}% dead" if pct_dead is not None else cell_label
+            )
             self.viewer.status = status_text
             _show_tooltip(status_text)
 
         self._preview_hover_callback = _on_mouse_move
+        _ACTIVE_PREVIEW_HOVER[id(viewer)] = _on_mouse_move
         # viewer.mouse_move_callbacks is the napari-version-agnostic API
         viewer.mouse_move_callbacks.append(_on_mouse_move)
 
@@ -1254,6 +1318,7 @@ class CellTypeFeaturePanel(QWidget):
         self._preview_pct_maps_by_frame.clear()
         self._preview_stats_by_frame.clear()
         self._preview_overlay_arr = None
+        self._preview_label_arr = None
         self._preview_current_frame = None
 
     def _materialize_frame(self, frame_idx):
@@ -1354,9 +1419,14 @@ class CellTypeFeaturePanel(QWidget):
             frame_label=f" t={frame_idx}", log_fn=self.log,
         )
 
-        # Store single-frame (Z,Y,X) arrays and replace layer data
+        # Store single-frame (Z,Y,X) arrays and replace layer data. ``seg_vol``
+        # is stored verbatim as the label-id array for hover lookups — it is
+        # already the (merged, when applicable) array used to build both
+        # ``overlay_t``/``pct_t`` and ``label_type_map`` above, so it is
+        # guaranteed consistent with them.
         self._preview_overlay_arr = overlay_t
         self._preview_pct_overlay_arr = pct_t
+        self._preview_label_arr = seg_vol
         self._preview_current_frame = frame_idx
 
         cmap = _dead_alive_colormap()
@@ -1388,7 +1458,7 @@ class CellTypeFeaturePanel(QWidget):
                 pct_t,
                 name=pct_name,
                 colormap="inferno",
-                contrast_limits=(0, 1),
+                contrast_limits=(0, 100),
                 blending="translucent",
                 opacity=0.7,
                 visible=False,
@@ -1403,6 +1473,7 @@ class CellTypeFeaturePanel(QWidget):
         if self._is_organoid and self._org_preview_cache is not None:
             self._org_preview_cache["overlay_arr"] = self._preview_overlay_arr
             self._org_preview_cache["pct_overlay_arr"] = self._preview_pct_overlay_arr
+            self._org_preview_cache["label_arr"] = self._preview_label_arr
             self._org_preview_cache["stats_by_frame"] = self._preview_stats_by_frame
             self._org_preview_cache["pct_maps_by_frame"] = self._preview_pct_maps_by_frame
             self._org_preview_cache["computed_frames"] = self._preview_computed_frames
@@ -1880,6 +1951,13 @@ class CellTypeFeaturePanel(QWidget):
                     pt = pt.parent()
                 if pt is not None:
                     pt._disconnect_org_preview_dims()
+            # Stop any running dims animation before clearing layers so napari
+            # doesn't try to use slider widgets it is about to destroy.
+            from behav3d.napari._visualization import (
+                _is_addable_layer_data,
+                _stop_dim_playback,
+            )
+            _stop_dim_playback(self.viewer)
             self.viewer.layers.clear()
 
             # Raw channels
@@ -1891,14 +1969,20 @@ class CellTypeFeaturePanel(QWidget):
                 self.log("  \u26a0\ufe0f Could not load raw image.")
 
             # Dead mask display layer (raw dask \u2014 napari renders lazily)
-            viewer.add_image(
-                dead_arr,
-                name=f"{_PREVIEW_PREFIX} Dead Mask",
-                colormap="magenta",
-                blending="additive",
-                opacity=0.4,
-                visible=False,
-            )
+            if _is_addable_layer_data(dead_arr):
+                viewer.add_image(
+                    dead_arr,
+                    name=f"{_PREVIEW_PREFIX} Dead Mask",
+                    colormap="magenta",
+                    blending="additive",
+                    opacity=0.4,
+                    visible=False,
+                )
+            else:
+                self.log(
+                    f"  \u26a0\ufe0f Skipping dead-mask display: unexpected/degenerate "
+                    f"shape {getattr(dead_arr, 'shape', '?')}"
+                )
 
             # All segment layers (this type full opacity, others lighter)
             primary_seg = segs_dict[self.cell_type]
@@ -1951,6 +2035,7 @@ class CellTypeFeaturePanel(QWidget):
             self._preview_dead_t = dead_arr
             self._preview_overlay_arr = None
             self._preview_pct_overlay_arr = None
+            self._preview_label_arr = None
             self._preview_pct_maps_by_frame = {}
             self._preview_stats_by_frame = {}
             self._preview_computed_frames = set()
@@ -1973,11 +2058,13 @@ class CellTypeFeaturePanel(QWidget):
                 self._org_preview_cache["dead_t"] = dead_arr
                 self._org_preview_cache["overlay_arr"] = self._preview_overlay_arr
                 self._org_preview_cache["pct_overlay_arr"] = self._preview_pct_overlay_arr
+                self._org_preview_cache["label_arr"] = self._preview_label_arr
                 self._org_preview_cache["pct_maps_by_frame"] = self._preview_pct_maps_by_frame
                 self._org_preview_cache["stats_by_frame"] = self._preview_stats_by_frame
                 self._org_preview_cache["computed_frames"] = self._preview_computed_frames
                 self._org_preview_cache["pct_computed_frames"] = self._preview_pct_computed_frames
                 self._org_preview_cache["current_thr"] = self._preview_current_thr
+                self._org_preview_cache["current_frame"] = self._preview_current_frame
                 self._org_preview_cache["label_type_map"] = self._preview_label_type_map
                 self._org_preview_cache["is_timelapse"] = self._preview_is_timelapse
 
@@ -2098,6 +2185,7 @@ class ActiveKillingPanel(QWidget):
             "\u26a0\ufe0f  Run baseline feature extraction for the immune type FIRST."
         )
         desc.setWordWrap(True)
+        desc.setMinimumWidth(0)
         desc.setStyleSheet("color: #90A4AE; font-size: 10px; padding: 2px 0;")
         layout.addWidget(desc)
 
@@ -2105,6 +2193,7 @@ class ActiveKillingPanel(QWidget):
         imm_row = QHBoxLayout()
         imm_row.addWidget(QLabel("Immune cell type:"))
         self.immune_combo = QComboBox()
+        self.immune_combo.setMaximumWidth(240)
         if self.immune_types:
             self.immune_combo.addItems(self.immune_types)
         else:
@@ -2133,6 +2222,7 @@ class ActiveKillingPanel(QWidget):
 
         self.validation_label = QLabel("")
         self.validation_label.setWordWrap(True)
+        self.validation_label.setMinimumWidth(0)
         self.validation_label.setStyleSheet("font-size: 10px;")
         layout.addWidget(self.validation_label)
 
@@ -2151,9 +2241,16 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.spin_obs_window,
                 "Observation Window",
-                "Timepoints after each contact timepoint to measure death-signal change.\n\n"
-                "A contact is 'active killing' if the death-signal increase exceeds:\n"
-                "  background_rate x observation_window x threshold_multiplier",
+                "Number of timepoints after each contact timepoint over which the\n"
+                "death-signal change is measured (signal at t+window minus signal\n"
+                "at t, for the touched target with the largest increase).\n\n"
+                "A contact timepoint is 'active killing' when this increase exceeds\n"
+                "the killing threshold:\n"
+                "  killing_threshold = background_rate x observation_window x threshold_multiplier\n"
+                "  (or the fixed Absolute Threshold, if 'Use absolute threshold' is checked)\n\n"
+                "Near the end of a timelapse, once fewer than 'observation window'\n"
+                "timepoints remain, the last fully-computed value is forward-filled\n"
+                "instead of being recalculated.",
             ),
         )
 
@@ -2163,7 +2260,20 @@ class ActiveKillingPanel(QWidget):
         )
         self.death_signal_combo.setCurrentText("percentage_dead_mask")
         self.death_signal_combo.setMaximumWidth(220)
-        params_form.addRow("Death signal column:", self.death_signal_combo)
+        params_form.addRow(
+            "Death signal column:",
+            make_help_row(
+                self.death_signal_combo,
+                "Death Signal Column",
+                "Target-cell column used to measure death-signal increase, for both\n"
+                "the background death rate and the per-contact killing check.\n\n"
+                "  percentage_dead_mask  - fraction of dead-mask pixels in the segment\n"
+                "  mean_dead_dye         - mean dead-dye channel intensity\n"
+                "  nr_dead_mask_pixels   - raw count of dead-mask pixels\n\n"
+                "Changing this changes the units of the background rate and of the\n"
+                "Absolute Threshold below, so re-check that value if you switch.",
+            ),
+        )
 
         self.spin_threshold_mult = QDoubleSpinBox()
         self.spin_threshold_mult.setRange(0.1, 20.0)
@@ -2176,16 +2286,38 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.spin_threshold_mult,
                 "Killing Threshold Multiplier",
-                "Multiplier applied to the per-sample background death rate.\n\n"
-                "A contact is classified as 'active killing' only when:\n"
-                "  death_increase > background_rate x window x multiplier\n\n"
-                "Default: 1.5  (signal must exceed 150% of expected background).",
+                "Multiplier applied to the expected background death-signal increase\n"
+                "for a contact.\n\n"
+                "The 'background rate' is a per-sample baseline: for every target\n"
+                "(organoid) track in the sample, (final - initial death signal) /\n"
+                "track duration is computed, and these per-track rates are averaged\n"
+                "across ALL target tracks in that sample (immune cells excluded).\n"
+                "It reflects passive/expected signal drift with no immune contact.\n\n"
+                "A contact timepoint is classified as 'active killing' only when:\n"
+                "  death_increase > background_rate x observation_window x multiplier\n\n"
+                "Default: 1.5  (signal must exceed 150% of the expected background "
+                "increase over the observation window).\n\n"
+                "Ignored when 'Use absolute threshold' is checked.",
             ),
         )
 
-        self.check_abs_threshold = QCheckBox("Use absolute threshold instead of multiplier")
+        abs_threshold_row = QHBoxLayout()
+        self.check_abs_threshold = QCheckBox("Use absolute threshold")
         self.check_abs_threshold.stateChanged.connect(self._on_abs_toggle)
-        params_form.addRow("", self.check_abs_threshold)
+        abs_threshold_row.addWidget(self.check_abs_threshold)
+        abs_threshold_row.addWidget(HelpButton(
+            "Use Absolute Threshold",
+            "When checked, active killing is decided using the fixed 'Absolute "
+            "threshold' value below instead of the multiplier-based threshold\n"
+            "(background_rate x observation_window x multiplier).\n\n"
+            "Useful when the per-sample background death rate is near zero, which "
+            "would make the multiplier-based threshold near zero (and therefore "
+            "unreliable / oversensitive) regardless of the multiplier chosen.\n\n"
+            "When unchecked, the 'Absolute threshold' field is disabled and the "
+            "Killing Threshold Multiplier is used instead.",
+        ))
+        abs_threshold_row.addStretch()
+        params_form.addRow("", abs_threshold_row)
 
         self.spin_abs_threshold = QDoubleSpinBox()
         self.spin_abs_threshold.setRange(0.0, 100.0)
@@ -2199,9 +2331,14 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.spin_abs_threshold,
                 "Absolute Killing Threshold",
-                "Fixed minimum death-signal increase required to classify a contact\n"
-                "as active killing.  Bypasses the multiplier-based threshold.\n\n"
-                "Useful when the background death rate is near zero.",
+                "Fixed minimum death-signal increase (in the units of the Death\n"
+                "Signal Column, over the Observation Window) required to classify a\n"
+                "contact timepoint as active killing.\n\n"
+                "Only used when 'Use absolute threshold' is checked; it then\n"
+                "replaces the multiplier-based threshold\n"
+                "(background_rate x observation_window x multiplier) entirely.\n\n"
+                "Useful when the per-sample background death rate is near zero, "
+                "which makes the multiplier-based threshold unreliable.",
             ),
         )
 
@@ -2869,6 +3006,8 @@ class FeatureExtractionTab(QWidget):
             "seg_t": None,
             "dead_t": None,
             "overlay_arr": None,
+            "pct_overlay_arr": None,
+            "label_arr": None,
             "stats_by_frame": {},
             "pct_maps_by_frame": {},
             "computed_frames": set(),
@@ -2901,10 +3040,12 @@ class FeatureExtractionTab(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setMinimumWidth(0)
         self.splitter.addWidget(scroll)
 
         content = QWidget()
+        content.setMinimumWidth(0)
         layout = QVBoxLayout(content)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
@@ -2924,26 +3065,9 @@ class FeatureExtractionTab(QWidget):
 
         # ── Global Death Classification group (Organoids only) ─────────────
 
-        # ── Cell type grouping ─────────────────────────────────────────────
-        grouping_row = QHBoxLayout()
-        grouping_row.setContentsMargins(0, 0, 0, 4)
-        self.btn_open_grouping = QPushButton("🧬  Cell type grouping…")
-        self.btn_open_grouping.setToolTip(
-            "Group several detected cell types under a single '{name}_merged' "
-            "label.\nThe new group is added as metadata columns and processed "
-            "downstream alongside the original cell types."
-        )
-        self.btn_open_grouping.setStyleSheet(
-            "QPushButton { background:#1f3a5f; color:#bbdefb; font-weight:bold; "
-            "border:1px solid #64b5f6; border-radius:4px; padding:6px 12px; } "
-            "QPushButton:hover { background:#2c4f7f; }"
-            "QPushButton:disabled { color:#666; border-color:#444; }"
-        )
-        self.btn_open_grouping.clicked.connect(self._on_open_grouping_dialog)
-        self.btn_open_grouping.setEnabled(False)
-        grouping_row.addWidget(self.btn_open_grouping)
-        grouping_row.addStretch()
-        layout.addLayout(grouping_row)
+        # Note: cell-type grouping now lives in the Analysis tab (after
+        # Filtering) — see AnalysisTab in _analysis.py. It merges already
+        # *filtered* populations, so it never needs to appear here.
 
         # ── Per-cell-type sub-tabs ─────────────────────────────────────────
         self.cell_tabs = QTabWidget()
@@ -3086,6 +3210,7 @@ class FeatureExtractionTab(QWidget):
             "immune_segs": {},
             "overlay_arr": None,
             "pct_overlay_arr": None,
+            "label_arr": None,
             "stats_by_frame": {},
             "pct_maps_by_frame": {},
             "computed_frames": set(),
@@ -3140,8 +3265,6 @@ class FeatureExtractionTab(QWidget):
             self.cell_tabs.addTab(self._placeholder, "—")
             self.btn_run_batch.setVisible(False)
             self.btn_queue_feature.setVisible(False)
-            if hasattr(self, "btn_open_grouping"):
-                self.btn_open_grouping.setEnabled(False)
             self._ak_toggle_btn.setVisible(False)
             self._ak_toggle_btn.blockSignals(True)
             self._ak_toggle_btn.setChecked(False)
@@ -3151,8 +3274,6 @@ class FeatureExtractionTab(QWidget):
 
         self.btn_run_batch.setVisible(True)
         self.btn_queue_feature.setVisible(True)
-        if hasattr(self, "btn_open_grouping"):
-            self.btn_open_grouping.setEnabled(True)
 
         color_map = {"organoid": "🟣", "immune": "🔵", "other": "🟡"}
         for ct in org:
@@ -3210,50 +3331,6 @@ class FeatureExtractionTab(QWidget):
         self.panels[ct] = panel
         icon = color_map.get(category, "")
         self.cell_tabs.addTab(panel, f"{icon} {ct}")
-
-    def _on_open_grouping_dialog(self):
-        """Open the cell-type grouping dialog and rebuild tabs on success."""
-        from behav3d.napari._grouping_dialog import GroupBuilderDialog
-
-        if self.metadata_loader is None or self.metadata_loader.metadata is None:
-            self._log("\u26a0\ufe0f Load metadata before creating groups.")
-            return
-
-        dlg = GroupBuilderDialog(self.metadata_loader, parent=self)
-        dlg.group_created.connect(self._on_group_created)
-        dlg.group_removed.connect(self._on_group_removed)
-        dlg.exec_()
-
-    def _on_group_created(self, merged_name: str):
-        """Slot: rebuild feature extraction tabs after a new group is added."""
-        self._log(
-            f"\U0001f9ec New cell-type group '{merged_name}' added \u2014 "
-            "rebuilding feature extraction tabs."
-        )
-        # Notify other tabs (segmentation / tracking / filtering) when wired.
-        loader = self.metadata_loader
-        if loader is not None and hasattr(loader, "metadata_loaded"):
-            try:
-                loader.metadata_loaded.emit(loader.metadata)
-            except Exception:
-                pass
-        else:
-            self._rebuild_tabs()
-
-    def _on_group_removed(self, merged_name: str):
-        """Slot: rebuild feature extraction tabs after a *_merged group is removed."""
-        self._log(
-            f"\U0001f9f9 Cell-type group '{merged_name}' removed \u2014 "
-            "rebuilding feature extraction tabs."
-        )
-        loader = self.metadata_loader
-        if loader is not None and hasattr(loader, "metadata_loaded"):
-            try:
-                loader.metadata_loaded.emit(loader.metadata)
-            except Exception:
-                pass
-        else:
-            self._rebuild_tabs()
 
     def set_queue_panel(self, queue_panel):
         """Attach the processing queue so Active Killing can enqueue itself."""
@@ -3335,6 +3412,7 @@ class FeatureExtractionTab(QWidget):
         cache["stats_by_frame"] = {}
         cache["overlay_arr"] = None
         cache["pct_overlay_arr"] = None
+        cache["label_arr"] = None
         for ct, panel in self.panels.items():
             if ct in self._org_types:
                 panel._preview_computed_frames = cache["computed_frames"]
@@ -3342,6 +3420,7 @@ class FeatureExtractionTab(QWidget):
                 panel._preview_stats_by_frame = cache["stats_by_frame"]
                 panel._preview_overlay_arr = None
                 panel._preview_pct_overlay_arr = None
+                panel._preview_label_arr = None
                 panel._preview_current_frame = None
 
     def _refresh_org_preview_for_current_frame(self, thr: float | None = None):
@@ -3419,9 +3498,12 @@ class FeatureExtractionTab(QWidget):
             seg_vol, dead_vol, thr, frame_label=f" t={frame_idx}",
         )
 
-        # Store single-frame (Z,Y,X) arrays and replace layer data
+        # Store single-frame (Z,Y,X) arrays and replace layer data. ``seg_vol``
+        # is the merged label-id array (see ``_merge_org_segments_frame``)
+        # already used to build ``overlay_t``/``pct_t``/``label_type_map``.
         cache["overlay_arr"] = overlay_t
         cache["pct_overlay_arr"] = pct_t
+        cache["label_arr"] = seg_vol
 
         cmap = _dead_alive_colormap()
         da_name = f"{_PREVIEW_PREFIX} Dead/Alive"
@@ -3450,7 +3532,7 @@ class FeatureExtractionTab(QWidget):
         except (KeyError, ValueError):
             viewer.add_image(
                 pct_t, name=pct_name, colormap="inferno",
-                contrast_limits=(0, 1), blending="translucent", opacity=0.7,
+                contrast_limits=(0, 100), blending="translucent", opacity=0.7,
                 visible=False,
             )
 
@@ -3470,6 +3552,7 @@ class FeatureExtractionTab(QWidget):
             if ct in self._org_types and panel._preview_seg_t is not None:
                 panel._preview_overlay_arr = cache.get("overlay_arr")
                 panel._preview_pct_overlay_arr = cache.get("pct_overlay_arr")
+                panel._preview_label_arr = cache.get("label_arr")
                 panel._preview_current_frame = cache.get("current_frame")
                 panel._preview_stats_by_frame = cache["stats_by_frame"]
                 panel._preview_pct_maps_by_frame = cache["pct_maps_by_frame"]

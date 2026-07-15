@@ -108,6 +108,102 @@ def trim_to_maximal_track_length(
     return df
 
 
+def chunk_tracks_to_maximal_length(
+    df,
+    window_tps=None,
+    time_column="position_t",
+    group_cols=["TrackID", "sample_name"],
+    relative_time_column="relative_time",
+    ):
+    """Split over-long tracks into consecutive fixed-length chunks.
+
+    Instead of keeping only the first ``window_tps`` timepoints of a long
+    track and discarding the remainder (see
+    :func:`trim_to_maximal_track_length`), this cuts each track into
+    consecutive windows of ``window_tps`` units of ``time_column``:
+
+    - the first window keeps the original ``TrackID``;
+    - each subsequent full window gets a new, unique ``TrackID`` (unique
+      within ``sample_name``);
+    - the final partial window (fewer rows than a full window) is
+      discarded.
+
+    ``window_tps`` is expressed in the same units as ``time_column``
+    (unit-spaced integer frames for ``"position_t"``, or real-valued hours
+    for a converted time column). The window is translated into a row
+    count using each track's own median timepoint spacing, so chunking is
+    not tied to unit-spaced frames and works the same regardless of which
+    time axis is used. ``relative_time`` is recomputed per resulting track
+    so each chunk is treated as an independent track downstream. Tracks are
+    assumed to be gap-free (feature extraction interpolates missing
+    timepoints).
+    """
+    if window_tps is None or df is None or df.empty:
+        return df
+    window_tps = float(window_tps)
+    if window_tps <= 0:
+        return df
+
+    df = df.sort_values(group_cols + [time_column]).reset_index(drop=True)
+
+    # Translate the time-based window into a row count using the typical
+    # (median) positive spacing between consecutive timepoints. For
+    # unit-spaced frames this is 1, reproducing the previous behavior
+    # exactly; for a real-valued hours column it's the sample's frame
+    # interval in hours, so a chunk always covers `window_tps` worth of
+    # time regardless of which axis is being filtered on.
+    diffs = df.groupby(group_cols)[time_column].diff()
+    positive_diffs = diffs[diffs > 0]
+    step = float(positive_diffs.median()) if not positive_diffs.empty else 1.0
+    if not np.isfinite(step) or step <= 0:
+        step = 1.0
+    window_rows = max(1, int(round(window_tps / step)))
+
+    row_pos = df.groupby(group_cols).cumcount()
+    df["__chunk"] = row_pos // window_rows
+
+    # Keep only chunks with a full window's worth of rows; the final,
+    # shorter remainder of each track is discarded.
+    chunk_size = df.groupby(group_cols + ["__chunk"])[time_column].transform("size")
+    df = df[chunk_size >= window_rows].copy()
+    if df.empty:
+        return df.drop(columns=["__chunk"], errors="ignore")
+
+    # Reassign TrackID for every chunk after the first, keeping ids unique
+    # within each sample and clear of existing original ids.
+    sample_col = "sample_name" if "sample_name" in df.columns else None
+    if sample_col is None:
+        df["__sample__"] = 0
+        sample_col = "__sample__"
+
+    parts = []
+    for _sample, sdf in df.groupby(sample_col, sort=False):
+        sdf = sdf.copy()
+        try:
+            next_id = int(pd.to_numeric(sdf["TrackID"], errors="coerce").max()) + 1
+        except (ValueError, TypeError):
+            next_id = 1
+        chunk_groups = sdf.groupby(["TrackID", "__chunk"], sort=True).groups
+        for (tid, ch), idx in chunk_groups.items():
+            if ch == 0:
+                continue
+            sdf.loc[idx, "TrackID"] = next_id
+            next_id += 1
+        parts.append(sdf)
+    df = pd.concat(parts, ignore_index=True)
+
+    if sample_col == "__sample__":
+        df = df.drop(columns=["__sample__"], errors="ignore")
+
+    # Recompute relative_time so each resulting track starts fresh.
+    if relative_time_column in df.columns:
+        df = df.sort_values(group_cols + [time_column]).reset_index(drop=True)
+        df[relative_time_column] = df.groupby(group_cols).cumcount() + 1
+
+    df = df.drop(columns=["__chunk", "__local"], errors="ignore")
+    return df.reset_index(drop=True)
+
+
 def _track_length_group_cols(df: pd.DataFrame, group_cols: list):
     """Subset of group_cols present in df; require TrackID and sample_name."""
     if df is None or df.empty:
@@ -426,7 +522,8 @@ def filter_tracks(
     cell_type="tcell",
     time_type="frames", #can also be "relative_time"
     plot_results=True,
-    df_input_path=None  # Optional: path to input CSV (e.g., advanced features CSV)
+    df_input_path=None,  # Optional: path to input CSV (e.g., advanced features CSV)
+    split_long_tracks=True,  # split over-length tracks into chunks vs. keep-first-window crop
     ):
     """
     This code filters tracks based on supplied parameters in the config.yml
@@ -444,9 +541,14 @@ def filter_tracks(
     df_input_path : Path or str, optional
         Path to input CSV file. If provided, reads from this file instead of the default
         combined_track_features.csv. Useful for reading advanced features CSV with active killing data.
-    
+
     Output:
-    - A .csv file containing filtered tracks from all experiments
+    - A .csv file containing filtered tracks from all experiments. Includes an
+      'original_TrackID' column snapshotting each row's pre-filter TrackID: when
+      'Split long tracks into chunks' reassigns 'TrackID' for chunks after the
+      first, 'original_TrackID' still points at the underlying segmentation
+      track (used e.g. for backprojection onto tracked label images), while
+      'TrackID' is what downstream analysis should group/split on.
     """
     
     start_time = time.time()
@@ -510,7 +612,14 @@ def filter_tracks(
         ["TrackID", "sample_name"],
         context="track filtering",
     )
-    
+
+    # Snapshot pre-filter TrackIDs. 'TrackID' may be reassigned below when
+    # 'Split long tracks into chunks' splits one long track into several
+    # (each chunk gets its own unique TrackID for analysis); 'original_TrackID'
+    # keeps the pre-filter id so consumers that need the actual segmentation
+    # label (e.g. backprojection onto tracked label images) can still find it.
+    df_all_tracks_filt["original_TrackID"] = df_all_tracks_filt["TrackID"]
+
     # Function to count the number of unique tracks in the DataFrame
     def count_tracks(df_all_tracks, col_name="nr_tracks", df_track_counts=None):
         # Dynamically detect which grouping columns are present (including *_line_condition columns)
@@ -599,17 +708,37 @@ def filter_tracks(
         group_cols=resolved_group_cols
     )
 
-    # Cutting down tracks to maximal track length    
-    df_all_tracks_filt = trim_to_maximal_track_length(
-        df=df_all_tracks_filt,
-        max_track_length=max_track_length,
-        time_column=time_column,
-        group_cols=resolved_group_cols
-    )
-    
+    # Cutting down tracks to maximal track length.
+    # Either keep only the first window (legacy crop) or split long tracks
+    # into consecutive full-length chunks with new TrackIDs (default).
+    # Supported on both time axes: chunk_tracks_to_maximal_length derives the
+    # equivalent row count from the data itself, so it works the same whether
+    # filtering on frames ('position_t') or real hours ('time').
+    if split_long_tracks and max_track_length is not None:
+        if time_column == "position_t":
+            # ``max_track_length`` was decremented by 1 above for 0-indexed
+            # frames, so the window is (max_track_length + 1) timepoints.
+            window_tps = int(max_track_length) + 1
+        else:
+            window_tps = float(max_track_length)
+        print(f"- Splitting long tracks into consecutive chunks of {window_tps} {time_type}")
+        df_all_tracks_filt = chunk_tracks_to_maximal_length(
+            df=df_all_tracks_filt,
+            window_tps=window_tps,
+            time_column=time_column,
+            group_cols=resolved_group_cols,
+        )
+    else:
+        df_all_tracks_filt = trim_to_maximal_track_length(
+            df=df_all_tracks_filt,
+            max_track_length=max_track_length,
+            time_column=time_column,
+            group_cols=resolved_group_cols
+        )
+
     df_track_counts = count_tracks(
-            df_all_tracks_filt, 
-            col_name="nr_tracks_min_track_length", 
+            df_all_tracks_filt,
+            col_name="nr_tracks_min_track_length",
             df_track_counts=df_track_counts
         )
     
@@ -670,7 +799,8 @@ def filter_tracks(
         by=["sample_name", "TrackID", "position_t"],
         ascending=[True, True, True],
     )
-    new_order = ["sample_name"] + [c for c in df_all_tracks_filt.columns.tolist() if c != "sample_name"]
+    leading_cols = [c for c in ["sample_name", "TrackID", "original_TrackID"] if c in df_all_tracks_filt.columns]
+    new_order = leading_cols + [c for c in df_all_tracks_filt.columns.tolist() if c not in leading_cols]
     df_all_tracks_filt = df_all_tracks_filt[new_order]
 
     df_all_tracks_filt.to_csv(filt_tracks_out_path, sep=",", index=False)

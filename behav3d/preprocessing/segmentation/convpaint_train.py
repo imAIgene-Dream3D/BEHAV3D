@@ -646,7 +646,8 @@ class CellTypeConvPaintTab(QWidget):
                  parent=None,
                  show_strategy_combo=False,
                  per_tab_strategies=None,
-                 on_per_tab_strategy_changed=None):
+                 on_per_tab_strategy_changed=None,
+                 pixel_sizes=None):
         super().__init__(parent)
         self.cell_type = cell_type
         self.strategy = _normalize_strategy(strategy)
@@ -658,6 +659,15 @@ class CellTypeConvPaintTab(QWidget):
         self._on_per_tab_strategy_changed = on_per_tab_strategy_changed
         self._per_tab_strategy_combo = None
         self._per_tab_strategy_widget = None
+        # Optional resolved pixel sizes ({"xy_um":..., "z_um":...}) for the
+        # physical(µm)/pixel unit toggle on EDT/min-size/peak-distance
+        # controls (see behav3d.napari._units.UnitGroupManager).
+        self._pixel_sizes = dict(pixel_sizes) if pixel_sizes else {}
+        self._unit_mgr = None  # created lazily in _build_controls
+        # Persists the user's px/µm display choice across strategy-change
+        # rebuilds (a fresh UnitGroupManager is created each rebuild since
+        # the spinbox instances themselves are discarded and recreated).
+        self._units_physical = True
 
         # Cached so future strategy switches reuse persisted values.
         self._initial_params_cache = dict(initial_params or {})
@@ -803,6 +813,35 @@ class CellTypeConvPaintTab(QWidget):
         row.addStretch()
         return row
 
+    def get_native(self, widget):
+        """Return the canonical native (px/voxel) value for a spinbox
+        registered with this tab's unit manager, or its raw ``.value()``
+        when no manager applies (dimensionless params, or no resolution
+        available). Safe to call with ``widget=None``."""
+        if widget is None:
+            return None
+        if self._unit_mgr is not None and widget in getattr(self._unit_mgr, "_entries", ()):
+            return self._unit_mgr.get_native(widget)
+        return widget.value()
+
+    def set_native(self, widget, native_value):
+        """Set a spinbox to a native value, converting to the currently
+        displayed unit via this tab's unit manager when registered."""
+        if widget is None or native_value is None:
+            return
+        if self._unit_mgr is not None and widget in getattr(self._unit_mgr, "_entries", ()):
+            self._unit_mgr.set_native(widget, native_value)
+        else:
+            widget.setValue(native_value)
+
+    def _on_units_toggled(self, checked):
+        """Remember the px/µm display choice across strategy rebuilds.
+
+        Native values are unaffected by this toggle — it only changes what
+        the spinboxes *display* — so this does not need to trigger a param
+        re-persist."""
+        self._units_physical = bool(checked)
+
     def _build_controls(self, strategy):
         """(Re)create the strategy-dependent spinners + preview button."""
         self._clear_controls_layout()
@@ -822,12 +861,28 @@ class CellTypeConvPaintTab(QWidget):
 
         strategy = _normalize_strategy(strategy)
         self.strategy = strategy
+        # A fresh manager is created below (rather than reused) since the
+        # spinbox instances themselves are rebuilt from scratch here.
+        self._unit_mgr = None
 
         layout = self._controls_layout
 
         strategy_lbl = QLabel(f"<i>Strategy:</i> <b>{strategy}</b>")
         strategy_lbl.setWordWrap(True)
         layout.addWidget(strategy_lbl)
+
+        # Per-tab physical(µm)/pixel unit toggle for the distance/volume
+        # controls below (EDT threshold, min size, peak distance). Mask/seed
+        # thresholds and peak ratio are dimensionless (0-1) and excluded, as
+        # is opening (fixed in pixels by definition).
+        from behav3d.napari._units import UnitGroupManager
+        self._unit_mgr = UnitGroupManager(
+            xy_um=self._pixel_sizes.get("xy_um"),
+            z_um=self._pixel_sizes.get("z_um"),
+            default_physical=self._units_physical,
+        )
+        self._unit_mgr.switch.toggled.connect(self._on_units_toggled)
+        layout.addWidget(self._unit_mgr.header_row("Units:"))
 
         if strategy == STRATEGY_PROB:
             self.prob_mask_threshold_spin = QDoubleSpinBox()
@@ -853,7 +908,13 @@ class CellTypeConvPaintTab(QWidget):
                 QLabel("Seed threshold:"), self.prob_seed_threshold_spin,
                 HelpButton("Seed threshold",
                     "Higher cutoff used to place watershed seeds (≥ Mask threshold).\n"
-                    "Lower values produce more seeds and split more touching objects."),
+                    "Higher values keep only each object's confident core as a "
+                    "separate seed, splitting more touching objects. Lower values "
+                    "(closer to Mask threshold) merge neighboring cores together, "
+                    "splitting fewer objects.\n\n"
+                    "Note: this is the opposite direction from the 'EDT threshold' "
+                    "used by the EDT/Watershed strategy (there, lower values split "
+                    "more) — same identical behaviour in APOC and ConvPaint."),
             ))
 
             self.opening_nr_pixels_spin = QSpinBox()
@@ -863,10 +924,14 @@ class CellTypeConvPaintTab(QWidget):
             )
 
             self.segment_size_min_spin = QSpinBox()
-            self.segment_size_min_spin.setRange(0, 100000)
+            self.segment_size_min_spin.setRange(0, 1000000000)
             self.segment_size_min_spin.setSingleStep(10)
             self.segment_size_min_spin.setValue(
                 int(ip.get(f"{cell_type}_segment_size_min", 10))
+            )
+            self._unit_mgr.register(
+                self.segment_size_min_spin, "volume",
+                ip.get(f"{cell_type}_segment_size_min", 10),
             )
             layout.addLayout(self._pair_row(
                 QLabel("Opening px:"), self.opening_nr_pixels_spin,
@@ -880,11 +945,15 @@ class CellTypeConvPaintTab(QWidget):
             ))
         else:
             self.edt_threshold_spin = QDoubleSpinBox()
-            self.edt_threshold_spin.setRange(0.0, 50.0)
+            self.edt_threshold_spin.setRange(0.0, 1000.0)
             self.edt_threshold_spin.setSingleStep(0.5)
             self.edt_threshold_spin.setDecimals(2)
             self.edt_threshold_spin.setValue(
                 float(ip.get(f"{cell_type}_edt_threshold", 1.0))
+            )
+            self._unit_mgr.register(
+                self.edt_threshold_spin, "distance",
+                ip.get(f"{cell_type}_edt_threshold", 1.0),
             )
 
             self.opening_nr_pixels_spin = QSpinBox()
@@ -897,7 +966,11 @@ class CellTypeConvPaintTab(QWidget):
                 HelpButton("EDT threshold",
                     "Euclidean-distance-transform threshold used to derive seeds inside "
                     "the binary mask.\n"
-                    "Lower values give more aggressive splitting of touching objects."),
+                    "Lower values give more aggressive splitting of touching objects.\n\n"
+                    "Note: this is the opposite direction from the 'Seed threshold' used "
+                    "by the Probability Map + Watershed strategy (there, higher values "
+                    "split more) — the two strategies use different mechanisms "
+                    "(distance-from-edge vs. classifier confidence)."),
                 QLabel("Opening px:"), self.opening_nr_pixels_spin,
                 HelpButton("Morphological opening",
                     "Number of erosion-then-dilation iterations applied to the mask.\n"
@@ -905,10 +978,14 @@ class CellTypeConvPaintTab(QWidget):
             ))
 
             self.segment_size_min_spin = QSpinBox()
-            self.segment_size_min_spin.setRange(0, 100000)
+            self.segment_size_min_spin.setRange(0, 1000000000)
             self.segment_size_min_spin.setSingleStep(10)
             self.segment_size_min_spin.setValue(
                 int(ip.get(f"{cell_type}_segment_size_min", 10))
+            )
+            self._unit_mgr.register(
+                self.segment_size_min_spin, "volume",
+                ip.get(f"{cell_type}_segment_size_min", 10),
             )
             self.fill_holes_cb = QCheckBox("Fill holes")
             self.fill_holes_cb.setChecked(
@@ -927,14 +1004,18 @@ class CellTypeConvPaintTab(QWidget):
 
             if strategy == STRATEGY_PEAK_EDT:
                 self.peak_min_distance_spin = QDoubleSpinBox()
-                self.peak_min_distance_spin.setRange(0.0, 50.0)
+                self.peak_min_distance_spin.setRange(0.0, 1000.0)
                 self.peak_min_distance_spin.setSingleStep(0.5)
                 self.peak_min_distance_spin.setDecimals(2)
                 self.peak_min_distance_spin.setValue(
                     float(ip.get(f"{cell_type}_peak_min_distance", 0.0))
                 )
+                self._unit_mgr.register(
+                    self.peak_min_distance_spin, "distance",
+                    ip.get(f"{cell_type}_peak_min_distance", 0.0),
+                )
                 self.peak_min_distance_spin.setToolTip(
-                    "Minimum distance (µm) between local EDT peaks used as watershed seeds"
+                    "Minimum distance between local EDT peaks used as watershed seeds"
                 )
 
                 self.peak_min_ratio_spin = QDoubleSpinBox()
@@ -1015,11 +1096,11 @@ class CellTypeConvPaintTab(QWidget):
         ct = self.cell_type
         params = {}
         if self.edt_threshold_spin is not None:
-            params[f"{ct}_edt_threshold"] = float(self.edt_threshold_spin.value())
+            params[f"{ct}_edt_threshold"] = float(self.get_native(self.edt_threshold_spin))
         if self.opening_nr_pixels_spin is not None:
             params[f"{ct}_opening_nr_pixels"] = int(self.opening_nr_pixels_spin.value())
         if self.segment_size_min_spin is not None:
-            params[f"{ct}_segment_size_min"] = int(self.segment_size_min_spin.value())
+            params[f"{ct}_segment_size_min"] = int(round(self.get_native(self.segment_size_min_spin)))
         if self.fill_holes_cb is not None:
             params[f"{ct}_fill_holes"] = bool(self.fill_holes_cb.isChecked())
         if self.prob_mask_threshold_spin is not None:
@@ -1032,7 +1113,7 @@ class CellTypeConvPaintTab(QWidget):
             )
         if self.peak_min_distance_spin is not None:
             params[f"{ct}_peak_min_distance"] = float(
-                self.peak_min_distance_spin.value()
+                self.get_native(self.peak_min_distance_spin)
             )
         if self.peak_min_ratio_spin is not None:
             params[f"{ct}_peak_min_ratio"] = float(
@@ -1092,13 +1173,18 @@ class ConvPaintTrainingWidget(QWidget):
                  extra_toolbar_widgets=None,
                  show_device=True,
                  external_log=None,
-                 show_legend=False):
+                 show_legend=False,
+                 pixel_sizes=None):
         super().__init__(parent)
         self.viewer = viewer
         self.all_images = all_images
         self.pixel_class_outdir = Path(pixel_class_outdir)
         self.all_cell_types = list(all_cell_types)
         self.has_death = has_death
+        # Optional resolved pixel sizes ({"xy_um":..., "z_um":...}) threaded
+        # down to each per-cell-type tab for the µm/pixel unit toggle on
+        # EDT threshold / min size / peak distance.
+        self._pixel_sizes = dict(pixel_sizes) if pixel_sizes else {}
         self.unified_input_channels = list(unified_input_channels or [])
         self.death_input_channels = list(death_input_channels or [])
         self._on_params_changed = on_params_changed
@@ -1426,6 +1512,7 @@ class ConvPaintTrainingWidget(QWidget):
                 show_strategy_combo=self._per_cell_type_strategy,
                 per_tab_strategies=per_tab_strategies,
                 on_per_tab_strategy_changed=self._on_per_tab_strategy_changed,
+                pixel_sizes=self._pixel_sizes,
             )
             self.tabs[ct] = tab
             self.tab_widget.addTab(tab, ct.capitalize())
@@ -1793,7 +1880,12 @@ class ConvPaintTrainingWidget(QWidget):
         convpaint_strategy     = self.convpaint_strategy
         fe_alias               = self.fe_combo.currentData()  # for death model
 
-        # Snapshot per-tab params (Qt thread only).
+        # Snapshot per-tab params (Qt thread only). Distance/volume spinboxes
+        # (edt_threshold_spin, segment_size_min_spin, peak_min_distance_spin)
+        # go through get_native() so the training run always uses the
+        # canonical native (px/voxel) value regardless of the tab's current
+        # px/µm display setting.
+        _native_attrs = {"edt_threshold_spin", "segment_size_min_spin", "peak_min_distance_spin"}
         tabs_params = {}
         for ct, tab in self.tabs.items():
             p = {}
@@ -1805,7 +1897,7 @@ class ConvPaintTrainingWidget(QWidget):
             ):
                 w = getattr(tab, attr, None)
                 if w is not None:
-                    p[attr] = w.value()
+                    p[attr] = tab.get_native(w) if attr in _native_attrs else w.value()
             w2 = getattr(tab, "fill_holes_cb", None)
             if w2 is not None:
                 p["fill_holes"] = bool(w2.isChecked())
@@ -2474,16 +2566,16 @@ class ConvPaintTrainingWidget(QWidget):
         effective_strategy = _normalize_strategy(strategy or self.convpaint_strategy)
         instances = mask_to_instances(
             mask_stack,
-            edt_thr=float(tab.edt_threshold_spin.value()),
+            edt_thr=float(tab.get_native(tab.edt_threshold_spin)),
             opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
             fill_holes=bool(tab.fill_holes_cb.isChecked())
             if tab.fill_holes_cb is not None else True,
-            segment_size_min=int(tab.segment_size_min_spin.value()),
+            segment_size_min=int(round(tab.get_native(tab.segment_size_min_spin))),
             marker_strategy=(
                 "peak" if effective_strategy == STRATEGY_PEAK_EDT
                 else "threshold"
             ),
-            peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
+            peak_min_distance=float(tab.get_native(tab.peak_min_distance_spin)) if tab.peak_min_distance_spin is not None else None,
             peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
         )
         self._set_labels_layer(_segments_layer_name(cell_type), instances)
@@ -2510,7 +2602,7 @@ class ConvPaintTrainingWidget(QWidget):
             mask_thr=float(tab.prob_mask_threshold_spin.value()),
             seed_thr=float(tab.prob_seed_threshold_spin.value()),
             opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
-            segment_size_min=int(tab.segment_size_min_spin.value()),
+            segment_size_min=int(round(tab.get_native(tab.segment_size_min_spin))),
         )
         self._set_labels_layer(_segments_layer_name(cell_type), instances)
         self._set_image_layer(
@@ -2690,6 +2782,22 @@ def train_pixel_classifier_convpaint(
     label_shape = (T_total,) + stacked.shape[2:]
     ip = initial_params or {}
 
+    # Resolve pixel sizes (µm) from metadata so the per-tab µm/pixel unit
+    # toggle (EDT threshold / min size / peak distance) is available here
+    # too, matching the napari plugin's own ConvPaintWidget.
+    from behav3d.core.utils import convert_distance
+    if metadata is not None and "pixel_distance_xy" in metadata.columns and "distance_unit" in metadata.columns:
+        _unit = str(metadata["distance_unit"].iloc[0])
+        _xy_from_md = convert_distance(float(metadata["pixel_distance_xy"].iloc[0]), _unit)
+        _z_from_md = convert_distance(float(metadata["pixel_distance_z"].iloc[0]), _unit)
+    else:
+        _xy_from_md = None
+        _z_from_md = None
+    pixel_sizes = {
+        "xy_um": ip.get("pixel_size_xy") or ip.get("pixel_size_xy_um") or _xy_from_md,
+        "z_um": ip.get("pixel_size_z") or ip.get("pixel_size_z_um") or _z_from_md,
+    }
+
     # Build (or rebuild) the label map for the active cell-type set.
     label_map = build_label_map(all_cell_types)
 
@@ -2819,6 +2927,7 @@ def train_pixel_classifier_convpaint(
         unified_input_channels=unified_input_channels,
         death_input_channels=death_input_channels,
         show_legend=True,
+        pixel_sizes=pixel_sizes,
     )
     viewer.window.add_dock_widget(widget, name="ConvPaint", area="right")
     _reorder_convpaint_layers(viewer, all_cell_types, has_death=has_death)

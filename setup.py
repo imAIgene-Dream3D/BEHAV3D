@@ -11,6 +11,7 @@ setup(
     packages=setuptools.find_packages(),
     package_data={
         "behav3d.napari": ["napari.yaml"],
+        "behav3d": ["resources/*.png", "resources/tutorials/*.png"],
     },
     install_requires=[
         "napari>=0.5.0",

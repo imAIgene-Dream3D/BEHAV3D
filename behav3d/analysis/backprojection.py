@@ -25,6 +25,7 @@ STRUCTURAL_FEATURE_COLUMNS = {
     "sample_name",
     "TrackID",
     "track_id",
+    "original_TrackID",
     "position_t",
 }
 
@@ -740,7 +741,11 @@ def backproject_mean_features_behav3d(
     track_img = np.expand_dims(track_img, axis=1)
     
     # Filter to only tracks with ClusterID
-    filt_track_img = np.where(np.isin(track_img, df_tracks_clustered["TrackID"].unique()), track_img, 0)
+    # Pixel labels in track_img are always original segmentation ids; use
+    # original_TrackID (when present) so chunks split by filtering still
+    # match, not just the first chunk of each split track.
+    keep_id_col = "original_TrackID" if "original_TrackID" in df_tracks_clustered.columns else "TrackID"
+    filt_track_img = np.where(np.isin(track_img, df_tracks_clustered[keep_id_col].unique()), track_img, 0)
     
     # Check filtered result (handle dask arrays)
     if hasattr(filt_track_img, 'compute'):
@@ -923,7 +928,11 @@ def backproject_time_features_behav3d(
     track_img = np.expand_dims(track_img, axis=1)
     
     # Filter to only tracks with ClusterID
-    filt_track_img = np.where(np.isin(track_img, df_tracks_clustered["TrackID"].unique()), track_img, 0)
+    # Pixel labels in track_img are always original segmentation ids; use
+    # original_TrackID (when present) so chunks split by filtering still
+    # match, not just the first chunk of each split track.
+    keep_id_col = "original_TrackID" if "original_TrackID" in df_tracks_clustered.columns else "TrackID"
+    filt_track_img = np.where(np.isin(track_img, df_tracks_clustered[keep_id_col].unique()), track_img, 0)
     
     # Check filtered result (handle dask arrays)
     if hasattr(filt_track_img, 'compute'):
@@ -1134,8 +1143,19 @@ def backproject_columns(
     overwrite : bool
         If True, recompute requested feature groups even when they already exist
         in the backprojection zarr store.
+
+    Notes
+    -----
+    Pixel values in ``track_img`` are always the original segmentation
+    labels. When tracks were split into chunks by the filtering step's
+    "Split long tracks into chunks" option, ``TrackID`` no longer matches
+    those labels for chunks after the first — ``original_TrackID`` does.
+    So whenever ``df_tracks_clustered`` carries an ``original_TrackID``
+    column, it is used to key the pixel lookup instead of ``track_col``.
     """
     mode = _normalize_backprojection_mode(mode)
+    if "original_TrackID" in df_tracks_clustered.columns:
+        track_col = "original_TrackID"
     zarr_outpath = None if zarr_outpath is None else Path(zarr_outpath)
     if zarr_outpath is not None and Path(f"{zarr_outpath}.zip").exists():
         zarr_outpath = Path(f"{zarr_outpath}.zip")

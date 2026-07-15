@@ -193,44 +193,56 @@ class TrackingPanel:
             value=bool(tcfg.get("overwrite", False))
         )
 
+        # Per-method physical(µm)/pixel unit toggles. LAP/TrackPy/btrack all
+        # link on micron-scaled coordinates, so these distance parameters are
+        # natively in µm despite the historical "_px" config keys — see
+        # behav3d.widgets.utils.UnitGroupManager (mirrors the napari plugin's
+        # behav3d.napari._units.UnitGroupManager).
+        from .utils import UnitGroupManager
+        metadata = getattr(self.metadata_loader, "metadata", None)
+        self._lap_unit_mgr = UnitGroupManager(metadata, default_physical=True)
+        self._tp_unit_mgr = UnitGroupManager(metadata, default_physical=True)
+        self._bt_unit_mgr = UnitGroupManager(metadata, default_physical=True)
+
         lap = tcfg.get("lap", {})
         self.track_cost_dist = widgets.IntText(
-            description="Track cost (px)",
-            value=int(lap.get("track_cost_px", 45)),
+            description="Track cost",
             style={'description_width':'160px'}
         )
+        self._lap_unit_mgr.register(self.track_cost_dist, "distance", lap.get("track_cost_px", 45), native_unit="physical")
         self.gap_cost_dist = widgets.IntText(
-            description="Gap close cost (px)",
-            value=int(lap.get("gap_close_cost_px", 60)),
+            description="Gap close cost",
             style={'description_width':'160px'}
         )
+        self._lap_unit_mgr.register(self.gap_cost_dist, "distance", lap.get("gap_close_cost_px", 60), native_unit="physical")
         self.gap_max_frames = widgets.IntText(
             description="Gap close max frames",
             value=int(lap.get("gap_close_max_frames", 3)),
             style={'description_width':'160px'}
         )
         self.merging_cost_dist = widgets.IntText(
-            description="Merging cost (px)",
-            value=int(lap.get("merging_cost_px", 0)),
+            description="Merging cost",
             style={'description_width':'160px'}
         )
+        self._lap_unit_mgr.register(self.merging_cost_dist, "distance", lap.get("merging_cost_px", 0), native_unit="physical")
         self.splitting_cost_dist = widgets.IntText(
-            description="Splitting cost (px)",
-            value=int(lap.get("splitting_cost_px", 0)),
+            description="Splitting cost",
             style={'description_width':'160px'}
         )
+        self._lap_unit_mgr.register(self.splitting_cost_dist, "distance", lap.get("splitting_cost_px", 0), native_unit="physical")
         self.lap_params = widgets.VBox([
             widgets.HTML("<b>LAP parameters</b>"),
+            self._lap_unit_mgr.header_row("Distance units:"),
             self.track_cost_dist, self.gap_cost_dist, self.gap_max_frames,
             self.merging_cost_dist, self.splitting_cost_dist
         ])
 
         tpy = tcfg.get("trackpy", {})
         self.tp_search_range = widgets.IntText(
-            description="Search range (px)",
-            value=int(tpy.get("search_range_px", 31)),
+            description="Search range",
             style={'description_width':'160px'}
         )
+        self._tp_unit_mgr.register(self.tp_search_range, "distance", tpy.get("search_range_px", 31), native_unit="physical")
         self.tp_memory = widgets.IntText(
             description="Memory (frames)",
             value=int(tpy.get("memory_frames", 2)),
@@ -248,6 +260,7 @@ class TrackingPanel:
         )
         self.tp_params = widgets.VBox([
             widgets.HTML("<b>TrackPy parameters</b>"),
+            self._tp_unit_mgr.header_row("Distance units:"),
             self.tp_search_range, self.tp_memory, self.tp_adaptive_stop, self.tp_adaptive_step
         ])
 
@@ -289,10 +302,10 @@ class TrackingPanel:
         )
 
         self.bt_max_search_radius = widgets.IntText(
-            description="Max search radius (px)",
-            value=int(bt.get("max_search_radius", 100)),
+            description="Max search radius",
             style={'description_width': '160px'}
         )
+        self._bt_unit_mgr.register(self.bt_max_search_radius, "distance", bt.get("max_search_radius", 100), native_unit="physical")
         self.bt_update_method = widgets.Dropdown(
             description="Update method",
             options=[("EXACT (recommended)", "EXACT"),
@@ -339,9 +352,9 @@ class TrackingPanel:
 
         self.bt_dist_thresh = widgets.IntText(
             description="Distance threshold",
-            value=int(bt.get("dist_thresh", 60)),
             style={'description_width': '160px'}
         )
+        self._bt_unit_mgr.register(self.bt_dist_thresh, "distance", bt.get("dist_thresh", 60), native_unit="physical")
         self.bt_time_thresh = widgets.IntText(
             description="Time threshold",
             value=int(bt.get("time_thresh", 3)),
@@ -374,6 +387,7 @@ class TrackingPanel:
             self.bt_config_path,
             self.bt_use_visual_features,
             self.bt_visual_help,
+            self._bt_unit_mgr.header_row("Distance units:"),
             self.bt_max_search_radius,
             self.bt_update_method,
             self.bt_step_size,
@@ -694,14 +708,14 @@ class TrackingPanel:
         self.overwrite.value = bool(profile.get("overwrite", False))
 
         lap = profile.get("lap", {})
-        self.track_cost_dist.value = int(lap.get("track_cost_px", 45))
-        self.gap_cost_dist.value = int(lap.get("gap_close_cost_px", 60))
+        self._lap_unit_mgr.set_native(self.track_cost_dist, lap.get("track_cost_px", 45))
+        self._lap_unit_mgr.set_native(self.gap_cost_dist, lap.get("gap_close_cost_px", 60))
         self.gap_max_frames.value = int(lap.get("gap_close_max_frames", 3))
-        self.merging_cost_dist.value = int(lap.get("merging_cost_px", 0))
-        self.splitting_cost_dist.value = int(lap.get("splitting_cost_px", 0))
+        self._lap_unit_mgr.set_native(self.merging_cost_dist, lap.get("merging_cost_px", 0))
+        self._lap_unit_mgr.set_native(self.splitting_cost_dist, lap.get("splitting_cost_px", 0))
 
         tpy = profile.get("trackpy", {})
-        self.tp_search_range.value = int(tpy.get("search_range_px", 31))
+        self._tp_unit_mgr.set_native(self.tp_search_range, tpy.get("search_range_px", 31))
         self.tp_memory.value = int(tpy.get("memory_frames", 2))
         self.tp_adaptive_stop.value = float(tpy.get("adaptive_stop", 10.0))
         self.tp_adaptive_step.value = float(tpy.get("adaptive_step", 0.95))
@@ -711,7 +725,7 @@ class TrackingPanel:
         self.bt_config_preset.value = bt_preset_value
         self.bt_config_path.value = bt_config_path_value
         self.bt_use_visual_features.value = bool(bt.get("use_visual_features", False))
-        self.bt_max_search_radius.value = int(bt.get("max_search_radius", 100))
+        self._bt_unit_mgr.set_native(self.bt_max_search_radius, bt.get("max_search_radius", 100))
         self.bt_update_method.value = str(bt.get("update_method", "EXACT"))
         self.bt_step_size.value = int(bt.get("step_size", 100))
         self.bt_n_workers.value = int(bt.get("n_workers", 8))
@@ -733,7 +747,7 @@ class TrackingPanel:
             else:
                 cb.value = hyp_name in saved_hyps if saved_hyps else default_hyps.get(hyp_name, False)
 
-        self.bt_dist_thresh.value = int(bt.get("dist_thresh", 60))
+        self._bt_unit_mgr.set_native(self.bt_dist_thresh, bt.get("dist_thresh", 60))
         self.bt_time_thresh.value = int(bt.get("time_thresh", 3))
         self._toggle_param_groups()
 
@@ -882,14 +896,14 @@ class TrackingPanel:
             prof["method"] = str(self.method.value)
             prof["overwrite"] = bool(self.overwrite.value)
             prof.setdefault("lap", {}).update({
-                "track_cost_px": int(self.track_cost_dist.value),
-                "gap_close_cost_px": int(self.gap_cost_dist.value),
+                "track_cost_px": int(round(self._lap_unit_mgr.get_native(self.track_cost_dist))),
+                "gap_close_cost_px": int(round(self._lap_unit_mgr.get_native(self.gap_cost_dist))),
                 "gap_close_max_frames": int(self.gap_max_frames.value),
-                "merging_cost_px": int(self.merging_cost_dist.value),
-                "splitting_cost_px": int(self.splitting_cost_dist.value),
+                "merging_cost_px": int(round(self._lap_unit_mgr.get_native(self.merging_cost_dist))),
+                "splitting_cost_px": int(round(self._lap_unit_mgr.get_native(self.splitting_cost_dist))),
             })
             prof.setdefault("trackpy", {}).update({
-                "search_range_px": int(self.tp_search_range.value),
+                "search_range_px": int(round(self._tp_unit_mgr.get_native(self.tp_search_range))),
                 "memory_frames": int(self.tp_memory.value),
                 "adaptive_stop": float(self.tp_adaptive_stop.value),
                 "adaptive_step": float(self.tp_adaptive_step.value),
@@ -899,13 +913,13 @@ class TrackingPanel:
             bt["config_preset"] = "custom" if preset_val == "custom" else preset_val
             bt["config_path"] = self.bt_config_path.value.strip() if preset_val == "custom" else ""
             bt["use_visual_features"] = bool(self.bt_use_visual_features.value)
-            bt["max_search_radius"] = int(self.bt_max_search_radius.value)
+            bt["max_search_radius"] = int(round(self._bt_unit_mgr.get_native(self.bt_max_search_radius)))
             bt["update_method"] = str(self.bt_update_method.value)
             bt["step_size"] = int(self.bt_step_size.value)
             bt["n_workers"] = max(1, int(self.bt_n_workers.value))
             bt["use_optimize"] = bool(self.bt_use_optimize.value)
             bt["hypotheses"] = [name for name, cb in self.bt_hyp_checks.items() if cb.value]
-            bt["dist_thresh"] = int(self.bt_dist_thresh.value)
+            bt["dist_thresh"] = int(round(self._bt_unit_mgr.get_native(self.bt_dist_thresh)))
             bt["time_thresh"] = int(self.bt_time_thresh.value)
 
         self.metadata_loader.behav3d_parameters = params
@@ -933,10 +947,13 @@ class TrackingPanel:
                     or (method == "propagation_all_organoids")
                 )
                 if method == "lap":
-                    tc, gc, mc, sc = int(self.track_cost_dist.value)**2, int(self.gap_cost_dist.value)**2, int(self.merging_cost_dist.value), int(self.splitting_cost_dist.value)
+                    tc = int(round(self._lap_unit_mgr.get_native(self.track_cost_dist)))**2
+                    gc = int(round(self._lap_unit_mgr.get_native(self.gap_cost_dist)))**2
+                    mc = int(round(self._lap_unit_mgr.get_native(self.merging_cost_dist)))
+                    sc = int(round(self._lap_unit_mgr.get_native(self.splitting_cost_dist)))
                     new_md = run_laptracking(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, track_cost_cutoff=tc, gap_closing_cost_cutoff=gc, gap_closing_max_frame_count=int(self.gap_max_frames.value), merging_cost_cutoff=(mc**2 if mc>0 else False), splitting_cost_cutoff=(sc**2 if sc>0 else False), overwrite=bool(self.overwrite.value))
                 elif method == "trackpy":
-                    new_md = run_trackpy_tracking_generic(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, overwrite=bool(self.overwrite.value), search_range=int(self.tp_search_range.value), memory=int(self.tp_memory.value), adaptive_stop=float(self.tp_adaptive_stop.value), adaptive_step=float(self.tp_adaptive_step.value))
+                    new_md = run_trackpy_tracking_generic(metadata=self.metadata_loader.metadata, output_dir=str(out_dir), cell_type=self.cell_type, overwrite=bool(self.overwrite.value), search_range=int(round(self._tp_unit_mgr.get_native(self.tp_search_range))), memory=int(self.tp_memory.value), adaptive_stop=float(self.tp_adaptive_stop.value), adaptive_step=float(self.tp_adaptive_step.value))
                 elif method == "btrack":
                     preset_val = str(self.bt_config_preset.value)
                     config_preset = self.bt_config_path.value.strip() if preset_val == "custom" else preset_val
@@ -949,13 +966,13 @@ class TrackingPanel:
                         overwrite=bool(self.overwrite.value),
                         config_preset=config_preset,
                         use_visual_features=bool(self.bt_use_visual_features.value),
-                        max_search_radius=int(self.bt_max_search_radius.value),
+                        max_search_radius=int(round(self._bt_unit_mgr.get_native(self.bt_max_search_radius))),
                         update_method=str(self.bt_update_method.value),
                         step_size=int(self.bt_step_size.value),
                         n_workers=max(1, int(self.bt_n_workers.value)),
                         use_optimize=use_opt,
                         hypotheses=hyps,
-                        dist_thresh=int(self.bt_dist_thresh.value) if use_opt else None,
+                        dist_thresh=int(round(self._bt_unit_mgr.get_native(self.bt_dist_thresh))) if use_opt else None,
                         time_thresh=int(self.bt_time_thresh.value) if use_opt else None,
                     )
                 else:

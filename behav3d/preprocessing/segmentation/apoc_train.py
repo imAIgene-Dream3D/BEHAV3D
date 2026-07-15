@@ -998,11 +998,21 @@ class CellTypeTab(QWidget):
         show_strategy_combo=False,
         per_tab_strategies=None,
         on_per_tab_strategy_changed=None,
+        pixel_sizes=None,
     ):
         super().__init__(parent)
         self.cell_type = cell_type
         self.viewer = viewer
         self._pixel_class_outdir = pixel_class_outdir
+        # Optional resolved pixel sizes ({"xy_um":..., "z_um":...}) for the
+        # physical(µm)/pixel unit toggle on EDT/min-size/peak-distance
+        # controls (see behav3d.napari._units.UnitGroupManager).
+        self._pixel_sizes = dict(pixel_sizes) if pixel_sizes else {}
+        self._unit_mgr = None  # created lazily in _build_instance_controls
+        # Persists the user's px/µm display choice across strategy-change
+        # rebuilds (a fresh UnitGroupManager is created each rebuild since
+        # the spinbox instances themselves are discarded and recreated).
+        self._units_physical = True
         self._on_params_changed = on_params_changed
         self._run_instance_callback = run_instance_callback
         self._apoc_strategy = str(apoc_strategy)
@@ -1284,6 +1294,35 @@ class CellTypeTab(QWidget):
         """Return the set of (feat_key, sigma_str) currently checked in the grid."""
         return {key for key, cb in self._feat_sigma_checks.items() if cb.isChecked()}
 
+    def get_native(self, widget):
+        """Return the canonical native (px/voxel) value for a spinbox
+        registered with this tab's unit manager, or its raw ``.value()``
+        when no manager applies (dimensionless params, or no resolution
+        available). Safe to call with ``widget=None``."""
+        if widget is None:
+            return None
+        if self._unit_mgr is not None and widget in getattr(self._unit_mgr, "_entries", ()):
+            return self._unit_mgr.get_native(widget)
+        return widget.value()
+
+    def set_native(self, widget, native_value):
+        """Set a spinbox to a native value, converting to the currently
+        displayed unit via this tab's unit manager when registered."""
+        if widget is None or native_value is None:
+            return
+        if self._unit_mgr is not None and widget in getattr(self._unit_mgr, "_entries", ()):
+            self._unit_mgr.set_native(widget, native_value)
+        else:
+            widget.setValue(native_value)
+
+    def _on_units_toggled(self, checked):
+        """Remember the px/µm display choice across strategy rebuilds.
+
+        Native values are unaffected by this toggle — it only changes what
+        the spinboxes *display* — so this does not need to trigger a param
+        re-persist."""
+        self._units_physical = bool(checked)
+
     def _build_instance_controls(self, initial_params, strategy=None):
         """Create per-tab instance-segmentation preview controls.
 
@@ -1303,6 +1342,10 @@ class CellTypeTab(QWidget):
         self.fill_holes_cb = None
         self.peak_min_distance_spin = None
         self.peak_min_ratio_spin = None
+        # A fresh manager is created below (if any distance/volume controls
+        # end up being built for this strategy) rather than reused, since
+        # the spinbox instances themselves are rebuilt from scratch here.
+        self._unit_mgr = None
 
         effective_strategy = str(strategy or self._apoc_strategy)
 
@@ -1313,6 +1356,19 @@ class CellTypeTab(QWidget):
         group_layout = QVBoxLayout()
         group_layout.setContentsMargins(4, 4, 4, 4)
         group_layout.setSpacing(4)
+
+        # Per-tab physical(µm)/pixel unit toggle for the distance/volume
+        # controls below (EDT threshold, min size, peak distance). Mask/seed
+        # thresholds and peak ratio are dimensionless (0-1) and excluded, as
+        # is opening (fixed in pixels by definition).
+        from behav3d.napari._units import UnitGroupManager
+        self._unit_mgr = UnitGroupManager(
+            xy_um=self._pixel_sizes.get("xy_um"),
+            z_um=self._pixel_sizes.get("z_um"),
+            default_physical=self._units_physical,
+        )
+        self._unit_mgr.switch.toggled.connect(self._on_units_toggled)
+        group_layout.addWidget(self._unit_mgr.header_row("Units:"))
 
         if effective_strategy == "APOC Probability Map + Watershed":
             row1 = QHBoxLayout()
@@ -1339,7 +1395,13 @@ class CellTypeTab(QWidget):
                 "Seed threshold",
                 "Higher cutoff used to place watershed seeds.\n"
                 "Should be ≥ Mask threshold (typical: 0.8).\n"
-                "Lower values produce more seeds (split more touching objects)."
+                "Higher values keep only each object's confident core as a "
+                "separate seed, splitting more touching objects. Lower values "
+                "(closer to Mask threshold) merge neighboring cores together, "
+                "splitting fewer objects.\n\n"
+                "Note: this is the opposite direction from the 'EDT threshold' "
+                "used by the EDT/Watershed strategy (there, lower values split "
+                "more) — same identical behaviour in APOC and ConvPaint."
             ))
             group_layout.addLayout(row1)
 
@@ -1355,9 +1417,13 @@ class CellTypeTab(QWidget):
             ))
 
             self.segment_size_min_spin = QSpinBox()
-            self.segment_size_min_spin.setRange(0, 100000)
+            self.segment_size_min_spin.setRange(0, 1000000000)
             self.segment_size_min_spin.setSingleStep(10)
             self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 0)))
+            self._unit_mgr.register(
+                self.segment_size_min_spin, "volume",
+                initial_params.get(f"{self.cell_type}_segment_size_min", 0),
+            )
             row2.addWidget(QLabel("Min size:"))
             row2.addWidget(self.segment_size_min_spin)
             row2.addWidget(HelpButton(
@@ -1374,16 +1440,24 @@ class CellTypeTab(QWidget):
             row1 = QHBoxLayout()
             row2 = QHBoxLayout()
             self.edt_threshold_spin = QDoubleSpinBox()
-            self.edt_threshold_spin.setRange(0.0, 50.0)
+            self.edt_threshold_spin.setRange(0.0, 1000.0)
             self.edt_threshold_spin.setSingleStep(0.5)
             self.edt_threshold_spin.setValue(float(initial_params.get(f"{self.cell_type}_edt_threshold", 1.0)))
+            self._unit_mgr.register(
+                self.edt_threshold_spin, "distance",
+                initial_params.get(f"{self.cell_type}_edt_threshold", 1.0),
+            )
             row1.addWidget(QLabel("EDT threshold:"))
             row1.addWidget(self.edt_threshold_spin)
             row1.addWidget(HelpButton(
                 "EDT threshold",
                 "Euclidean-distance-transform threshold used to derive seeds inside "
                 "the binary mask.\n"
-                "Lower values give more aggressive splitting of touching objects."
+                "Lower values give more aggressive splitting of touching objects.\n\n"
+                "Note: this is the opposite direction from the 'Seed threshold' used "
+                "by the Probability Map + Watershed strategy (there, higher values "
+                "split more) — the two strategies use different mechanisms "
+                "(distance-from-edge vs. classifier confidence)."
             ))
 
             self.opening_nr_pixels_spin = QSpinBox()
@@ -1399,9 +1473,13 @@ class CellTypeTab(QWidget):
             group_layout.addLayout(row1)
 
             self.segment_size_min_spin = QSpinBox()
-            self.segment_size_min_spin.setRange(0, 100000)
+            self.segment_size_min_spin.setRange(0, 1000000000)
             self.segment_size_min_spin.setSingleStep(10)
             self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 0)))
+            self._unit_mgr.register(
+                self.segment_size_min_spin, "volume",
+                initial_params.get(f"{self.cell_type}_segment_size_min", 0),
+            )
             row2.addWidget(QLabel("Min size:"))
             row2.addWidget(self.segment_size_min_spin)
             row2.addWidget(HelpButton(
@@ -1423,10 +1501,14 @@ class CellTypeTab(QWidget):
             if effective_strategy == "APOC Mask + Peak EDT/Watershed Resegmentation":
                 row3 = QHBoxLayout()
                 self.peak_min_distance_spin = QDoubleSpinBox()
-                self.peak_min_distance_spin.setRange(0.0, 50.0)
+                self.peak_min_distance_spin.setRange(0.0, 1000.0)
                 self.peak_min_distance_spin.setSingleStep(0.5)
                 self.peak_min_distance_spin.setValue(float(initial_params.get(f"{self.cell_type}_peak_min_distance", 0.0)))
-                self.peak_min_distance_spin.setToolTip("Minimum distance (µm) between local EDT peaks used as watershed seeds")
+                self._unit_mgr.register(
+                    self.peak_min_distance_spin, "distance",
+                    initial_params.get(f"{self.cell_type}_peak_min_distance", 0.0),
+                )
+                self.peak_min_distance_spin.setToolTip("Minimum distance between local EDT peaks used as watershed seeds")
                 row3.addWidget(QLabel("Peak min dist:"))
                 row3.addWidget(self.peak_min_distance_spin)
                 row3.addWidget(HelpButton(
@@ -1780,10 +1862,10 @@ class CellTypeTab(QWidget):
                 float(self.prob_seed_threshold_spin.value()) if self.prob_seed_threshold_spin is not None else None
             ),
             "edt_threshold": (
-                float(self.edt_threshold_spin.value()) if self.edt_threshold_spin is not None else None
+                float(self.get_native(self.edt_threshold_spin)) if self.edt_threshold_spin is not None else None
             ),
             "segment_size_min": (
-                int(self.segment_size_min_spin.value()) if self.segment_size_min_spin is not None else None
+                int(round(self.get_native(self.segment_size_min_spin))) if self.segment_size_min_spin is not None else None
             ),
             "opening_nr_pixels": (
                 int(self.opening_nr_pixels_spin.value()) if self.opening_nr_pixels_spin is not None else None
@@ -1792,7 +1874,7 @@ class CellTypeTab(QWidget):
                 bool(self.fill_holes_cb.isChecked()) if self.fill_holes_cb is not None else None
             ),
             "peak_min_distance": (
-                float(self.peak_min_distance_spin.value()) if self.peak_min_distance_spin is not None else None
+                float(self.get_native(self.peak_min_distance_spin)) if self.peak_min_distance_spin is not None else None
             ),
             "peak_min_ratio": (
                 float(self.peak_min_ratio_spin.value()) if self.peak_min_ratio_spin is not None else None
@@ -1829,15 +1911,15 @@ class CellTypeTab(QWidget):
         if "prob_seed_threshold" in cfg and self.prob_seed_threshold_spin is not None and cfg["prob_seed_threshold"] is not None:
             self.prob_seed_threshold_spin.setValue(float(cfg["prob_seed_threshold"]))
         if "edt_threshold" in cfg and self.edt_threshold_spin is not None and cfg["edt_threshold"] is not None:
-            self.edt_threshold_spin.setValue(float(cfg["edt_threshold"]))
+            self.set_native(self.edt_threshold_spin, float(cfg["edt_threshold"]))
         if "segment_size_min" in cfg and self.segment_size_min_spin is not None and cfg["segment_size_min"] is not None:
-            self.segment_size_min_spin.setValue(int(cfg["segment_size_min"]))
+            self.set_native(self.segment_size_min_spin, int(cfg["segment_size_min"]))
         if "opening_nr_pixels" in cfg and self.opening_nr_pixels_spin is not None and cfg["opening_nr_pixels"] is not None:
             self.opening_nr_pixels_spin.setValue(int(cfg["opening_nr_pixels"]))
         if "fill_holes" in cfg and self.fill_holes_cb is not None and cfg["fill_holes"] is not None:
             self.fill_holes_cb.setChecked(bool(cfg["fill_holes"]))
         if "peak_min_distance" in cfg and self.peak_min_distance_spin is not None and cfg["peak_min_distance"] is not None:
-            self.peak_min_distance_spin.setValue(float(cfg["peak_min_distance"]))
+            self.set_native(self.peak_min_distance_spin, float(cfg["peak_min_distance"]))
         if "peak_min_ratio" in cfg and self.peak_min_ratio_spin is not None and cfg["peak_min_ratio"] is not None:
             self.peak_min_ratio_spin.setValue(float(cfg["peak_min_ratio"]))
         self._update_preview()
@@ -2228,6 +2310,7 @@ class APOCTrainingWidget(QWidget):
                 show_strategy_combo=self._per_cell_type_strategy,
                 per_tab_strategies=per_tab_strategies,
                 on_per_tab_strategy_changed=self._on_per_tab_strategy_changed,
+                pixel_sizes=self._pixel_sizes,
             )
             self.tabs[ct] = tab
             self.tab_widget.addTab(tab, ct.capitalize())
@@ -2744,7 +2827,7 @@ class APOCTrainingWidget(QWidget):
                 mask_thr=float(tab.prob_mask_threshold_spin.value()),
                 seed_thr=float(tab.prob_seed_threshold_spin.value()),
                 opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
-                segment_size_min=int(tab.segment_size_min_spin.value()),
+                segment_size_min=int(round(tab.get_native(tab.segment_size_min_spin))),
             )
 
         marker_strategy = (
@@ -2754,12 +2837,12 @@ class APOCTrainingWidget(QWidget):
         )
         return _mask_array_to_segments(
             raw_prediction > 0,
-            edt_thr=float(tab.edt_threshold_spin.value()),
+            edt_thr=float(tab.get_native(tab.edt_threshold_spin)),
             opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
-            segment_size_min=int(tab.segment_size_min_spin.value()),
+            segment_size_min=int(round(tab.get_native(tab.segment_size_min_spin))),
             fill_holes=bool(tab.fill_holes_cb.isChecked()),
             marker_strategy=marker_strategy,
-            peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
+            peak_min_distance=float(tab.get_native(tab.peak_min_distance_spin)) if tab.peak_min_distance_spin is not None else None,
             peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
         )
 
@@ -2796,7 +2879,7 @@ class APOCTrainingWidget(QWidget):
                 mask_thr = float(tab.prob_mask_threshold_spin.value())
                 seed_thr = float(tab.prob_seed_threshold_spin.value())
                 opening_nr_pixels = int(tab.opening_nr_pixels_spin.value())
-                segment_size_min = int(tab.segment_size_min_spin.value())
+                segment_size_min = int(round(tab.get_native(tab.segment_size_min_spin)))
                 print(f"  ⚙ {ct} preview params: mask_thr={mask_thr}, seed_thr={seed_thr}, min_size={segment_size_min}, opening_px={opening_nr_pixels}")
                 instance_preview = _probability_array_to_segments(
                     prob_prediction,
@@ -2812,11 +2895,11 @@ class APOCTrainingWidget(QWidget):
                     if strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
                     else "threshold"
                 )
-                edt_thr = float(tab.edt_threshold_spin.value())
+                edt_thr = float(tab.get_native(tab.edt_threshold_spin))
                 opening_nr_pixels = int(tab.opening_nr_pixels_spin.value())
-                segment_size_min = int(tab.segment_size_min_spin.value())
+                segment_size_min = int(round(tab.get_native(tab.segment_size_min_spin)))
                 fill_holes = bool(tab.fill_holes_cb.isChecked())
-                peak_min_distance = float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None
+                peak_min_distance = float(tab.get_native(tab.peak_min_distance_spin)) if tab.peak_min_distance_spin is not None else None
                 peak_min_ratio = float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35
                 print(f"  ⚙ {ct} preview params: edt_thr={edt_thr}, min_size={segment_size_min}, fill_holes={fill_holes}, opening_px={opening_nr_pixels}, peak_min_distance={peak_min_distance}, peak_min_ratio={peak_min_ratio}")
                 instance_preview = _mask_array_to_segments(
@@ -2931,11 +3014,11 @@ class APOCTrainingWidget(QWidget):
             strategy = self._resolve_strategy(ct)
             tab_params = {}
             if hasattr(tab, "edt_threshold_spin") and tab.edt_threshold_spin is not None:
-                tab_params["edt_thr"] = float(tab.edt_threshold_spin.value())
+                tab_params["edt_thr"] = float(tab.get_native(tab.edt_threshold_spin))
             if hasattr(tab, "opening_nr_pixels_spin") and tab.opening_nr_pixels_spin is not None:
                 tab_params["opening"] = int(tab.opening_nr_pixels_spin.value())
             if hasattr(tab, "segment_size_min_spin") and tab.segment_size_min_spin is not None:
-                tab_params["min_size"] = int(tab.segment_size_min_spin.value())
+                tab_params["min_size"] = int(round(tab.get_native(tab.segment_size_min_spin)))
             if hasattr(tab, "fill_holes_cb") and tab.fill_holes_cb is not None:
                 tab_params["fill_holes"] = bool(tab.fill_holes_cb.isChecked())
             if hasattr(tab, "prob_mask_threshold_spin") and tab.prob_mask_threshold_spin is not None:
@@ -2943,7 +3026,7 @@ class APOCTrainingWidget(QWidget):
             if hasattr(tab, "prob_seed_threshold_spin") and tab.prob_seed_threshold_spin is not None:
                 tab_params["prob_seed_thr"] = float(tab.prob_seed_threshold_spin.value())
             if hasattr(tab, "peak_min_distance_spin") and tab.peak_min_distance_spin is not None:
-                tab_params["peak_min_dist"] = float(tab.peak_min_distance_spin.value())
+                tab_params["peak_min_dist"] = float(tab.get_native(tab.peak_min_distance_spin))
             if hasattr(tab, "peak_min_ratio_spin") and tab.peak_min_ratio_spin is not None:
                 tab_params["peak_min_ratio"] = float(tab.peak_min_ratio_spin.value())
 
@@ -3536,6 +3619,22 @@ def train_pixel_classifier_apoc(
         print(f"APOC Training: Selecting device {gpu_device}")
         cle.select_device(gpu_device)
 
+    # Resolve pixel sizes (µm) from metadata so the per-tab µm/pixel unit
+    # toggle (EDT threshold / min size / peak distance) is available here
+    # too, matching the napari plugin's own APOCWidget.
+    from behav3d.core.utils import convert_distance
+    if metadata is not None and "pixel_distance_xy" in metadata.columns and "distance_unit" in metadata.columns:
+        _unit = str(metadata["distance_unit"].iloc[0])
+        _xy_from_md = convert_distance(float(metadata["pixel_distance_xy"].iloc[0]), _unit)
+        _z_from_md = convert_distance(float(metadata["pixel_distance_z"].iloc[0]), _unit)
+    else:
+        _xy_from_md = None
+        _z_from_md = None
+    pixel_sizes = {
+        "xy_um": ip.get("pixel_size_xy") or ip.get("pixel_size_xy_um") or _xy_from_md,
+        "z_um": ip.get("pixel_size_z") or ip.get("pixel_size_z_um") or _z_from_md,
+    }
+
     organoid_types = organoid_types or []
     immune_types   = immune_types   or []
     other_types    = other_types    or []
@@ -3708,6 +3807,7 @@ def train_pixel_classifier_apoc(
         has_death=has_death,
         initial_params=ip,
         on_params_changed=on_params_changed,
+        pixel_sizes=pixel_sizes,
     )
     viewer.window.add_dock_widget(apoc_widget, area="right", name="APOC Pixel Classification")
 

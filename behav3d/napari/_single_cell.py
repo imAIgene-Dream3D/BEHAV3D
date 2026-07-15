@@ -69,7 +69,9 @@ from behav3d.core.utils import ignore_missing_rmtree_error
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _detect_sc_cell_types(metadata_loader) -> list[str]:
-    """Return immune + other cell types (non-multicolor)."""
+    """Return immune + other cell types (non-multicolor), plus any
+    ``cell_type_groups`` (yml-based, post-filtering) groups categorized as
+    immune/other."""
     if metadata_loader is None or getattr(metadata_loader, "metadata", None) is None:
         return []
     try:
@@ -80,6 +82,7 @@ def _detect_sc_cell_types(metadata_loader) -> list[str]:
             filter_multicolor_inputs,
         )
         from behav3d.widgets.utils import detect_cell_type_category
+        from behav3d.analysis.grouping import list_cell_type_groups, group_category
 
         md = metadata_loader.metadata
         imm = list(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
@@ -95,10 +98,114 @@ def _detect_sc_cell_types(metadata_loader) -> list[str]:
             elif cat == "other" and ct not in oth:
                 oth.append(ct)
 
+        # Every group is offered here regardless of its best-effort display
+        # category — groups exist specifically for Death Dynamics/Single
+        # Cell use (see behav3d/analysis/grouping.py), so an "organoid"
+        # category (picked from the group's first member, for icon/bucket
+        # purposes only) must never cause a group to be silently dropped.
+        params = getattr(metadata_loader, "behav3d_parameters", {}) or {}
+        for group_id in list_cell_type_groups(params):
+            cat = group_category(params, md, group_id)
+            if cat == "other":
+                if group_id not in oth:
+                    oth.append(group_id)
+            elif group_id not in imm:
+                imm.append(group_id)
+
         return imm + oth
     except Exception:
         traceback.print_exc()
         return []
+
+
+def _group_tracked_status_for(metadata_loader, cell_type):
+    """Return ``{"built", "total"}`` tracked-segment status if ``cell_type``
+    is a group, else ``None`` (not a group, or status can't be determined).
+
+    Training (HMM/DTW) only needs the group's merged track-features CSV
+    (already produced at group-creation time), so this is only relevant for
+    gating backprojection/exemplar features, which need per-sample tracked
+    zarrs built via ``create_group_tracked_segments``.
+    """
+    if metadata_loader is None or not cell_type:
+        return None
+    try:
+        from behav3d.analysis.grouping import (
+            group_tracked_segments_status,
+            list_cell_type_groups,
+        )
+
+        params = getattr(metadata_loader, "behav3d_parameters", {}) or {}
+        if cell_type not in list_cell_type_groups(params):
+            return None
+        output_dir = getattr(metadata_loader, "output_dir", None)
+        metadata = getattr(metadata_loader, "metadata", None)
+        if not output_dir or metadata is None:
+            return None
+        return group_tracked_segments_status(output_dir, cell_type, metadata)
+    except Exception:
+        return None
+
+
+def _apply_group_tracked_gate(warning_label, grp_bp, metadata_loader, cell_type):
+    """Disable ``grp_bp`` (Backprojection) and warn if ``cell_type`` is a
+    group with no tracked segments built yet.
+
+    Only touches the backprojection group box — training group boxes are
+    left alone since training doesn't need tracked segments.
+    """
+    status = _group_tracked_status_for(metadata_loader, cell_type)
+    if status is None or status["built"] > 0:
+        return
+    grp_bp.setEnabled(False)
+    extra = (
+        f"⚠ Tracked segments not built for group '{cell_type}' — "
+        "Backprojection/Exemplar export unavailable.\n"
+        "Build them from the Group Builder dialog (Analysis tab) → "
+        "'Build Tracked Segments'."
+    )
+    # Only stack onto an already-visible warning set earlier in this same
+    # prerequisite check; a hidden label may hold stale text from a
+    # previous cell-type selection.
+    if warning_label.isVisible() and warning_label.text():
+        warning_label.setText(f"{warning_label.text()}\n\n{extra}")
+    else:
+        warning_label.setText(extra)
+    warning_label.show()
+
+
+def _log_backprojection_manifest(log_fn, manifest):
+    """Log a backprojection export manifest's success/skip/error counts.
+
+    ``manifest`` is the dict returned by
+    ``export_behavioral_state_backprojection_zarrs`` (and, transitively,
+    ``export_track_cluster_backprojection``): keys ``output_paths``,
+    ``skipped_samples``, ``errors``. Per-sample skip/error reasons
+    previously only reached ``warnings.warn`` (invisible in the GUI) — this
+    surfaces them in the log instead, which matters most for a group whose
+    tracked segments haven't been built for every sample yet.
+    """
+    if not isinstance(manifest, dict):
+        log_fn("✅ Backprojection export done.")
+        return
+    n_ok = len(manifest.get("output_paths", {}) or {})
+    skipped = manifest.get("skipped_samples", []) or []
+    errors = manifest.get("errors", []) or []
+    log_fn(f"✅ Backprojection export done: {n_ok} sample(s) written.")
+    if skipped:
+        preview = "; ".join(
+            f"{s.get('sample_name', '?')} ({s.get('reason', 'unknown')})"
+            for s in skipped[:5]
+        )
+        more = f" (+{len(skipped) - 5} more)" if len(skipped) > 5 else ""
+        log_fn(f"⚠ {len(skipped)} sample(s) skipped: {preview}{more}")
+    if errors:
+        preview = "; ".join(
+            f"{e.get('sample_name', '?')} ({e.get('error', 'unknown')})"
+            for e in errors[:5]
+        )
+        more = f" (+{len(errors) - 5} more)" if len(errors) > 5 else ""
+        log_fn(f"❌ {len(errors)} sample(s) errored: {preview}{more}")
 
 
 def _style_primary(btn: QPushButton):
@@ -286,6 +393,10 @@ class StateClassificationSubTab(QWidget):
         self._bg = BackgroundOperation(self)
         self._preload_bg = BackgroundOperation(self)
         self._last_features_key: tuple = ()
+        # Populated by _populate_dynamic_features; reused by the log-scaling
+        # "Preview feature distributions" histogram button.
+        self._logscale_candidate_cols: list = []
+        self._logscale_csv_path: Optional[Path] = None
 
         self._display_save_timer = QTimer(self)
         self._display_save_timer.setSingleShot(True)
@@ -370,31 +481,24 @@ class StateClassificationSubTab(QWidget):
         self.feat_sel_lay = QVBoxLayout(feat_sel_content)
         self.feat_sel_lay.setSpacing(2)
 
-        self.feat_sel_lay.addWidget(QLabel("<b>Timepoint features</b>"))
-        self.timepoint_features_lay = QVBoxLayout()
-        self.feat_sel_lay.addLayout(self.timepoint_features_lay)
-
         self.feat_sel_lay.addWidget(QLabel("<b>Window features</b>"))
         win_feat_form = QFormLayout()
         self.spin_window_size = QSpinBox()
         self.spin_window_size.setRange(1, 500)
         self.spin_window_size.setValue(5)
-        win_feat_form.addRow("Window size:", make_help_row(
-            self.spin_window_size, "Window size",
-            "Number of timepoints used for computing rolling window features "
-            "(e.g. net displacement, straightness over a sliding window)."
-        ))
+        win_feat_form.addRow("Window size:", self.spin_window_size)
         self.feat_sel_lay.addLayout(win_feat_form)
 
         self.chk_net_disp = QCheckBox("net_displacement")
         self.chk_straight = QCheckBox("straightness")
         self.chk_msd = QCheckBox("mean_square_displacement")
-        self.feat_sel_lay.addLayout(_make_chk_help_row(self.chk_net_disp,
-            "net_displacement", "Include net displacement window feature."))
-        self.feat_sel_lay.addLayout(_make_chk_help_row(self.chk_straight,
-            "straightness", "Include straightness window feature."))
-        self.feat_sel_lay.addLayout(_make_chk_help_row(self.chk_msd,
-            "mean_square_displacement", "Include mean square displacement window feature."))
+        self.feat_sel_lay.addWidget(self.chk_net_disp)
+        self.feat_sel_lay.addWidget(self.chk_straight)
+        self.feat_sel_lay.addWidget(self.chk_msd)
+
+        self.feat_sel_lay.addWidget(QLabel("<b>Timepoint features</b>"))
+        self.timepoint_features_lay = QVBoxLayout()
+        self.feat_sel_lay.addLayout(self.timepoint_features_lay)
 
         self.feat_sel_scroll.setWidget(feat_sel_content)
         feat_sel_sec.addWidget(self.feat_sel_scroll)
@@ -410,6 +514,16 @@ class StateClassificationSubTab(QWidget):
 
         # Log Scaling inside Feature Processing
         log_scale_sec = CollapsibleSection("Log scaling", expanded=False)
+        # Distribution preview: sits just below the "Log scaling" header and
+        # above the per-feature checkboxes, so the user can inspect which
+        # features are skewed (and would benefit from log scaling) first.
+        self.btn_preview_distributions = QPushButton("\U0001F4CA  Preview feature distributions")
+        self.btn_preview_distributions.setToolTip(
+            "Show histograms of the continuous features for the selected cell "
+            "type, to judge which ones benefit from log scaling before applying it."
+        )
+        self.btn_preview_distributions.clicked.connect(self._on_preview_feature_distributions)
+        log_scale_sec.addWidget(self.btn_preview_distributions)
         self.log_scale_lay = QVBoxLayout()
         log_scale_container = QWidget()
         log_scale_container.setLayout(self.log_scale_lay)
@@ -468,27 +582,32 @@ class StateClassificationSubTab(QWidget):
         self.combo_hmm_n_states_mode.addItems(["fixed", "auto"])
         adv_form.addRow("State selection mode:", make_help_row(
             self.combo_hmm_n_states_mode, "State selection mode",
-            "'fixed' uses n_states directly. 'auto' searches between k_min and k_max "
-            "and selects the best number by BIC/AIC."
+            "'fixed' uses n_states directly. 'auto' fits a separate HMM for every k "
+            "between k_min and k_max and selects the model with the lowest BIC "
+            "(Bayesian Information Criterion)."
         ))
 
         self.spin_hmm_k_min = QSpinBox()
         self.spin_hmm_k_min.setRange(2, 50)
         self.spin_hmm_k_min.setValue(2)
         self.row_k_min = QLabel("k_min (Auto mode):")
-        adv_form.addRow(self.row_k_min, make_help_row(
+        k_min_row = make_help_row(
             self.spin_hmm_k_min, "k_min",
             "Minimum number of states to test in auto mode."
-        ))
+        )
+        self.help_k_min = k_min_row.itemAt(1).widget()
+        adv_form.addRow(self.row_k_min, k_min_row)
 
         self.spin_hmm_k_max = QSpinBox()
         self.spin_hmm_k_max.setRange(2, 50)
         self.spin_hmm_k_max.setValue(8)
         self.row_k_max = QLabel("k_max (Auto mode):")
-        adv_form.addRow(self.row_k_max, make_help_row(
+        k_max_row = make_help_row(
             self.spin_hmm_k_max, "k_max",
             "Maximum number of states to test in auto mode."
-        ))
+        )
+        self.help_k_max = k_max_row.itemAt(1).widget()
+        adv_form.addRow(self.row_k_max, k_max_row)
 
         self.spin_hmm_start_offset = QSpinBox()
         self.spin_hmm_start_offset.setRange(0, 100000)
@@ -544,7 +663,7 @@ class StateClassificationSubTab(QWidget):
         ))
 
         self.chk_hmm_sticky = QCheckBox("Sticky HMM")
-        adv_form.addRow("", make_help_row(
+        adv_form.addRow("", _make_chk_help_row(
             self.chk_hmm_sticky, "Sticky HMM",
             "Adds a self-transition bias (kappa) to make the model prefer staying "
             "in the same state, producing longer, more stable behavioral bouts."
@@ -554,19 +673,23 @@ class StateClassificationSubTab(QWidget):
         self.spin_hmm_stickiness_kappa.setRange(0.0, 100.0)
         self.spin_hmm_stickiness_kappa.setValue(8.0)
         self.row_kappa = QLabel("kappa (Sticky):")
-        adv_form.addRow(self.row_kappa, make_help_row(
+        kappa_row = make_help_row(
             self.spin_hmm_stickiness_kappa, "Stickiness kappa",
             "Self-transition bias strength. Higher = longer bouts before switching states."
-        ))
+        )
+        self.help_kappa = kappa_row.itemAt(1).widget()
+        adv_form.addRow(self.row_kappa, kappa_row)
 
         self.spin_hmm_transmat_alpha = QDoubleSpinBox()
         self.spin_hmm_transmat_alpha.setRange(0.0, 100.0)
         self.spin_hmm_transmat_alpha.setValue(1.0)
         self.row_alpha = QLabel("alpha (Sticky):")
-        adv_form.addRow(self.row_alpha, make_help_row(
+        alpha_row = make_help_row(
             self.spin_hmm_transmat_alpha, "Transition matrix alpha",
             "Dirichlet prior concentration for the transition matrix in sticky HMM mode."
-        ))
+        )
+        self.help_alpha = alpha_row.itemAt(1).widget()
+        adv_form.addRow(self.row_alpha, alpha_row)
 
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(0, 99999)
@@ -800,6 +923,7 @@ class StateClassificationSubTab(QWidget):
             self.warning_label.hide()
             for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
                 grp.setEnabled(True)
+            _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
             return True
         elif csv_unfiltered.exists():
             self.warning_label.setText(
@@ -810,6 +934,7 @@ class StateClassificationSubTab(QWidget):
             self.warning_label.show()
             for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
                 grp.setEnabled(True)
+            _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
             return True
         else:
             self.warning_label.setText(
@@ -834,14 +959,18 @@ class StateClassificationSubTab(QWidget):
         self.spin_hmm_n_states.setEnabled(not auto)
         self.spin_hmm_k_min.setVisible(auto)
         self.row_k_min.setVisible(auto)
+        self.help_k_min.setVisible(auto)
         self.spin_hmm_k_max.setVisible(auto)
         self.row_k_max.setVisible(auto)
+        self.help_k_max.setVisible(auto)
 
     def _toggle_sticky_hmm(self, checked):
         self.spin_hmm_stickiness_kappa.setVisible(checked)
         self.row_kappa.setVisible(checked)
+        self.help_kappa.setVisible(checked)
         self.spin_hmm_transmat_alpha.setVisible(checked)
         self.row_alpha.setVisible(checked)
+        self.help_alpha.setVisible(checked)
 
     def _update_config_summary(self):
         tp_feats = sorted(
@@ -1008,6 +1137,41 @@ class StateClassificationSubTab(QWidget):
         self.log_scale_lay.addLayout(grid_log)
         self._update_config_summary()
 
+    def _on_preview_feature_distributions(self, *_):
+        """Show histograms of the continuous features for the selected cell
+        type so the user can judge which benefit from log scaling."""
+        from behav3d.napari._pdf_view import show_matplotlib_figure
+        from behav3d.widgets.utils import build_feature_distribution_figure
+
+        ct = self._cell_type()
+        csv_path = getattr(self, "_logscale_csv_path", None)
+        candidates = list(getattr(self, "_logscale_candidate_cols", []) or [])
+        if not csv_path or not Path(csv_path).exists() or not candidates:
+            QMessageBox.information(
+                self,
+                "Feature distributions",
+                "No feature table is loaded yet for this cell type. "
+                "Select a cell type with extracted track features first.",
+            )
+            return
+
+        # Prefer the features the user has actually selected (those shown in the
+        # log-scaling list); fall back to all continuous candidates.
+        selected = [f for f, cb in getattr(self, "_timepoint_checkboxes", {}).items()
+                    if cb.isChecked() and f in candidates]
+        feats = selected or candidates
+        title = f"Feature distributions — {ct}"
+        fig, truncated = build_feature_distribution_figure(csv_path, feats, title=title)
+        if fig is None:
+            QMessageBox.warning(
+                self, "Feature distributions",
+                f"Could not read features from:\n{csv_path}",
+            )
+            return
+        if truncated:
+            title += "  (showing first 36)"
+        show_matplotlib_figure(fig, title=title, parent=self)
+
     def _populate_dynamic_features(self, ct):
         from behav3d.widgets.utils import behav3d_calculated_features
         from behav3d.core.utils import expand_column_patterns
@@ -1118,22 +1282,27 @@ class StateClassificationSubTab(QWidget):
             if "random_state" in cfg:
                 self.spin_seed.setValue(int(cfg["random_state"]))
 
-            df = pd.read_csv(csv_path, nrows=5)
-            cols = list(df.columns)
+            cols = list(pd.read_csv(csv_path, nrows=0).columns)
             excluded = [
                 "TrackID", "position_t", "position_x", "position_y", "position_z",
                 "frame", "file", "index", "id", "sample_name", "Condition", "Timepoint"
             ]
             usable_cols = [c for c in cols if c not in excluded]
-            bin_cols, feat_cols = [], []
-            for c in usable_cols:
-                dtype = df.dtypes.get(c)
-                if (dtype == 'object' or dtype == 'bool'
-                        or pd.api.types.is_string_dtype(dtype)
-                        or pd.api.types.is_bool_dtype(dtype)):
-                    bin_cols.append(c)
-                else:
-                    feat_cols.append(c)
+            # Value-based binary detection over the full CSV (see
+            # behav3d.widgets.base_state_classification.detect_binary_columns_from_csv).
+            # The previous 5-row dtype heuristic mis-classified numeric feature
+            # columns as "binary" whenever the sampled rows were NaN/blank, so
+            # switching cell types could dump every feature into the binary list.
+            from behav3d.widgets.base_state_classification import (
+                detect_binary_columns_from_csv,
+            )
+            bin_cols = detect_binary_columns_from_csv(Path(csv_path), usable_cols)
+            bin_set = set(bin_cols)
+            feat_cols = [c for c in usable_cols if c not in bin_set]
+            # Continuous features eligible for log scaling; reused by the
+            # "Preview feature distributions" histogram button.
+            self._logscale_candidate_cols = list(feat_cols)
+            self._logscale_csv_path = Path(csv_path)
 
             from copy import deepcopy
             base_groups = deepcopy(behav3d_calculated_features)
@@ -1928,7 +2097,7 @@ class StateClassificationSubTab(QWidget):
             buttons=[self.btn_export_state_bp, self.btn_show_state_bp],
             viewer=self.viewer,
             inject_progress=False,
-            on_done=lambda r: self._log("✅ State backprojection export done."),
+            on_done=lambda r: _log_backprojection_manifest(self._log, r),
             on_failed=lambda e: self._log(f"❌ Export failed: {e}"),
         )
 
@@ -2110,8 +2279,9 @@ class TrackClassificationSubTab(QWidget):
         self.spin_traj_size.setMaximumWidth(120)
         basic_form.addRow("Trajectory size:", make_help_row(
             self.spin_traj_size, "Trajectory size",
-            "Number of timepoints to include per track (trims from the end by default). "
-            "Shorter trajectories are discarded. Match the value used in your notebook."
+            "Number of timepoints to include per track. With the default 'last' trim mode "
+            "this keeps each track's final N timepoints (dropping its earlier ones); "
+            "tracks shorter than this are discarded. Match the value used in your notebook."
         ))
         self.spin_n_clusters = QSpinBox()
         self.spin_n_clusters.setRange(2, 200)
@@ -2170,8 +2340,9 @@ class TrackClassificationSubTab(QWidget):
         self.combo_trim.setMaximumWidth(130)
         dtw_form.addRow("Trim mode:", make_help_row(
             self.combo_trim, "Trim mode",
-            "How to trim trajectories to behavioral_trajectory_size: "
-            "'last' removes trailing timepoints; 'first' removes leading ones."
+            "How to trim each track to Trajectory size: "
+            "'last' keeps each track's final N timepoints (removes leading/early ones); "
+            "'first' keeps each track's first N timepoints (removes trailing/late ones)."
         ))
         self.adv1.addLayout(dtw_form)
 
@@ -2339,12 +2510,12 @@ class TrackClassificationSubTab(QWidget):
         ))
 
         self.combo_track_max_features = QComboBox()
-        self.combo_track_max_features.addItems(["sqrt", "log2", "auto"])
+        self.combo_track_max_features.addItems(["sqrt", "log2"])
         self.combo_track_max_features.setMaximumWidth(100)
         adv3_form.addRow("Max features:", make_help_row(
             self.combo_track_max_features, "Max features",
-            "Number of features to consider at each split: 'sqrt' (recommended), "
-            "'log2', or 'auto' (same as sqrt)."
+            "Number of features considered when looking for the best split: "
+            "'sqrt' (recommended) or 'log2'."
         ))
 
         self.spin_track_n_jobs = QSpinBox()
@@ -2629,6 +2800,7 @@ class TrackClassificationSubTab(QWidget):
                 chk.blockSignals(False)
             self._apply_original_mode(False)
 
+            _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
             return True
 
     # ── Toggle helpers ───────────────────────────────────────────────────
@@ -3879,7 +4051,7 @@ class TrackClassificationSubTab(QWidget):
             buttons=[self.btn_export_track_bp, self.btn_show_track_bp],
             viewer=self.viewer,
             inject_progress=False,
-            on_done=lambda r: self._log("✅ Track backprojection export done."),
+            on_done=lambda r: _log_backprojection_manifest(self._log, r),
             on_failed=lambda e: self._log(f"❌ Export failed: {e}"),
         )
 
