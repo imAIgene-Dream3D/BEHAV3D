@@ -1197,14 +1197,6 @@ class CellTypeTrackingPanel(QWidget):
     # ------------------------------------------------------------------
     # Running
     # ------------------------------------------------------------------
-    def _determine_targets(self) -> list:
-        """Which cell types to track based on batch checkboxes."""
-        if self.check_batch_all.isChecked():
-            return list(self.all_cell_types)
-        if self.check_batch_category.isChecked():
-            return list(self.category_types)
-        return [self.cell_type]
-
     def collect_runtime_params(self) -> dict:
         """Snapshot all per-method widget values into a thread-safe dict.
 
@@ -1463,9 +1455,9 @@ class CellTypeTrackingPanel(QWidget):
                 parent.visualization_tab.sample_combo.setCurrentIndex(0)
                 parent.visualization_tab._on_load_dataset()
                 
-                # Make 'Tracks' layers visible
+                # Make 'tracks' layers visible
                 for layer in self.viewer.layers:
-                    if "Tracks" in layer.name:
+                    if "tracks" in layer.name:
                         layer.visible = True
 
 
@@ -1655,7 +1647,7 @@ class AllOrganoidsPropagationPanel(QWidget):
                 parent.visualization_tab.sample_combo.setCurrentIndex(0)
                 parent.visualization_tab._on_load_dataset()
                 for layer in self.viewer.layers:
-                    if "Tracks" in layer.name:
+                    if "tracks" in layer.name:
                         layer.visible = True
 
 

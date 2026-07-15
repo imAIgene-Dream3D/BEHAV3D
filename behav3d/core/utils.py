@@ -1,11 +1,26 @@
 from datetime import datetime
 import fnmatch
+import inspect
+import shutil
 import numpy as np
 
 def ignore_missing_rmtree_error(func, path, exc):
     err = exc[1] if isinstance(exc, tuple) else exc
     if not isinstance(err, FileNotFoundError):
         raise err
+
+# shutil.rmtree() only gained the `onexc` keyword in Python 3.12; on older
+# versions (e.g. the pinned 3.11 conda env) it must be called as `onerror`
+# instead. ignore_missing_rmtree_error() already handles both calling
+# conventions, so pick whichever keyword this interpreter supports.
+_RMTREE_SUPPORTS_ONEXC = "onexc" in inspect.signature(shutil.rmtree).parameters
+
+def rmtree_ignore_missing(path):
+    """Remove a directory tree, ignoring races where a file is already gone."""
+    if _RMTREE_SUPPORTS_ONEXC:
+        shutil.rmtree(path, onexc=ignore_missing_rmtree_error)
+    else:
+        shutil.rmtree(path, onerror=ignore_missing_rmtree_error)
 
 def format_time(
     start_time,

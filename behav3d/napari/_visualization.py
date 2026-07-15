@@ -735,7 +735,7 @@ class VisualizationTab(QWidget):
                 self._log(f"    - Skipping {name} tracks: Path not defined")
                 continue
 
-            csv_path_str = str(tracks_csv_val).strip()
+            csv_path_str = str(csv_path_val).strip()
             if not Path(csv_path_str).exists():
                 self._log(f"    - Skipping {name} tracks: File not found ({csv_path_str})")
                 continue
@@ -810,7 +810,7 @@ class VisualizationTab(QWidget):
                 self.viewer.add_labels(
                     seg_data,
                     name=layer_name,
-                    visible=not is_multicolor_celltype(ct_name),
+                    visible=not is_multicolor_celltype(name),
                 )
                 self._log(f"    + Tracked Labels layer: {layer_name}")
 

@@ -6,7 +6,7 @@ import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 from behav3d.analysis.behavior.state.legacy_clustering import *
-from behav3d.core.utils import ignore_missing_rmtree_error
+from behav3d.core.utils import rmtree_ignore_missing
 
 def rename_intrinsic_behavioral_clusters(
     adata,
@@ -173,7 +173,7 @@ def _rmtree_ignore_missing(path):
     if not path.exists():
         return
 
-    shutil.rmtree(path, onexc=ignore_missing_rmtree_error)
+    rmtree_ignore_missing(path)
 
 
 def _select_exemplar_windows_by_cluster(
