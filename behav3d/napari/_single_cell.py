@@ -481,31 +481,24 @@ class StateClassificationSubTab(QWidget):
         self.feat_sel_lay = QVBoxLayout(feat_sel_content)
         self.feat_sel_lay.setSpacing(2)
 
-        self.feat_sel_lay.addWidget(QLabel("<b>Timepoint features</b>"))
-        self.timepoint_features_lay = QVBoxLayout()
-        self.feat_sel_lay.addLayout(self.timepoint_features_lay)
-
         self.feat_sel_lay.addWidget(QLabel("<b>Window features</b>"))
         win_feat_form = QFormLayout()
         self.spin_window_size = QSpinBox()
         self.spin_window_size.setRange(1, 500)
         self.spin_window_size.setValue(5)
-        win_feat_form.addRow("Window size:", make_help_row(
-            self.spin_window_size, "Window size",
-            "Number of timepoints used for computing rolling window features "
-            "(e.g. net displacement, straightness over a sliding window)."
-        ))
+        win_feat_form.addRow("Window size:", self.spin_window_size)
         self.feat_sel_lay.addLayout(win_feat_form)
 
         self.chk_net_disp = QCheckBox("net_displacement")
         self.chk_straight = QCheckBox("straightness")
         self.chk_msd = QCheckBox("mean_square_displacement")
-        self.feat_sel_lay.addLayout(_make_chk_help_row(self.chk_net_disp,
-            "net_displacement", "Include net displacement window feature."))
-        self.feat_sel_lay.addLayout(_make_chk_help_row(self.chk_straight,
-            "straightness", "Include straightness window feature."))
-        self.feat_sel_lay.addLayout(_make_chk_help_row(self.chk_msd,
-            "mean_square_displacement", "Include mean square displacement window feature."))
+        self.feat_sel_lay.addWidget(self.chk_net_disp)
+        self.feat_sel_lay.addWidget(self.chk_straight)
+        self.feat_sel_lay.addWidget(self.chk_msd)
+
+        self.feat_sel_lay.addWidget(QLabel("<b>Timepoint features</b>"))
+        self.timepoint_features_lay = QVBoxLayout()
+        self.feat_sel_lay.addLayout(self.timepoint_features_lay)
 
         self.feat_sel_scroll.setWidget(feat_sel_content)
         feat_sel_sec.addWidget(self.feat_sel_scroll)
@@ -598,19 +591,23 @@ class StateClassificationSubTab(QWidget):
         self.spin_hmm_k_min.setRange(2, 50)
         self.spin_hmm_k_min.setValue(2)
         self.row_k_min = QLabel("k_min (Auto mode):")
-        adv_form.addRow(self.row_k_min, make_help_row(
+        k_min_row = make_help_row(
             self.spin_hmm_k_min, "k_min",
             "Minimum number of states to test in auto mode."
-        ))
+        )
+        self.help_k_min = k_min_row.itemAt(1).widget()
+        adv_form.addRow(self.row_k_min, k_min_row)
 
         self.spin_hmm_k_max = QSpinBox()
         self.spin_hmm_k_max.setRange(2, 50)
         self.spin_hmm_k_max.setValue(8)
         self.row_k_max = QLabel("k_max (Auto mode):")
-        adv_form.addRow(self.row_k_max, make_help_row(
+        k_max_row = make_help_row(
             self.spin_hmm_k_max, "k_max",
             "Maximum number of states to test in auto mode."
-        ))
+        )
+        self.help_k_max = k_max_row.itemAt(1).widget()
+        adv_form.addRow(self.row_k_max, k_max_row)
 
         self.spin_hmm_start_offset = QSpinBox()
         self.spin_hmm_start_offset.setRange(0, 100000)
@@ -676,19 +673,23 @@ class StateClassificationSubTab(QWidget):
         self.spin_hmm_stickiness_kappa.setRange(0.0, 100.0)
         self.spin_hmm_stickiness_kappa.setValue(8.0)
         self.row_kappa = QLabel("kappa (Sticky):")
-        adv_form.addRow(self.row_kappa, make_help_row(
+        kappa_row = make_help_row(
             self.spin_hmm_stickiness_kappa, "Stickiness kappa",
             "Self-transition bias strength. Higher = longer bouts before switching states."
-        ))
+        )
+        self.help_kappa = kappa_row.itemAt(1).widget()
+        adv_form.addRow(self.row_kappa, kappa_row)
 
         self.spin_hmm_transmat_alpha = QDoubleSpinBox()
         self.spin_hmm_transmat_alpha.setRange(0.0, 100.0)
         self.spin_hmm_transmat_alpha.setValue(1.0)
         self.row_alpha = QLabel("alpha (Sticky):")
-        adv_form.addRow(self.row_alpha, make_help_row(
+        alpha_row = make_help_row(
             self.spin_hmm_transmat_alpha, "Transition matrix alpha",
             "Dirichlet prior concentration for the transition matrix in sticky HMM mode."
-        ))
+        )
+        self.help_alpha = alpha_row.itemAt(1).widget()
+        adv_form.addRow(self.row_alpha, alpha_row)
 
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(0, 99999)
@@ -958,14 +959,18 @@ class StateClassificationSubTab(QWidget):
         self.spin_hmm_n_states.setEnabled(not auto)
         self.spin_hmm_k_min.setVisible(auto)
         self.row_k_min.setVisible(auto)
+        self.help_k_min.setVisible(auto)
         self.spin_hmm_k_max.setVisible(auto)
         self.row_k_max.setVisible(auto)
+        self.help_k_max.setVisible(auto)
 
     def _toggle_sticky_hmm(self, checked):
         self.spin_hmm_stickiness_kappa.setVisible(checked)
         self.row_kappa.setVisible(checked)
+        self.help_kappa.setVisible(checked)
         self.spin_hmm_transmat_alpha.setVisible(checked)
         self.row_alpha.setVisible(checked)
+        self.help_alpha.setVisible(checked)
 
     def _update_config_summary(self):
         tp_feats = sorted(
