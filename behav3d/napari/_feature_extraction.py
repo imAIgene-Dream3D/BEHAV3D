@@ -779,7 +779,7 @@ class CellTypeFeaturePanel(QWidget):
                 # voxels inside organoid masks). Mirrors the notebook widget.
                 continue
             label = (
-                "Organoid Invasiveness (Advanced)"
+                "Invasiveness"
                 if f == "invasiveness" else f.capitalize()
             )
             cb = QCheckBox(label)
@@ -966,6 +966,15 @@ class CellTypeFeaturePanel(QWidget):
         prev_sample_row_layout.addWidget(QLabel("Preview sample:"))
         self.preview_sample_combo = QComboBox()
         self.preview_sample_combo.setMinimumWidth(180)
+        # Long sample names must not be allowed to size this combo (and, via
+        # the enclosing QTabWidget which sizes to the widest tab across ALL
+        # cell types, the entire Feature Extraction panel) to fit the widest
+        # item unelided — cap it and rely on the tooltip/elided text instead.
+        self.preview_sample_combo.setMaximumWidth(240)
+        self.preview_sample_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.preview_sample_combo.setMinimumContentsLength(18)
         self.preview_sample_combo.setToolTip(
             "Select which sample to load for the dead threshold preview."
         )
@@ -2184,6 +2193,7 @@ class ActiveKillingPanel(QWidget):
         imm_row = QHBoxLayout()
         imm_row.addWidget(QLabel("Immune cell type:"))
         self.immune_combo = QComboBox()
+        self.immune_combo.setMaximumWidth(240)
         if self.immune_types:
             self.immune_combo.addItems(self.immune_types)
         else:

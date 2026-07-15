@@ -21,13 +21,13 @@ import yaml
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QCheckBox,
-    QSpinBox, QGroupBox, QComboBox, QMessageBox, QScrollArea,
+    QSpinBox, QGroupBox, QMessageBox, QScrollArea,
     QSplitter,
 )
 from qtpy.QtCore import Qt, Signal
 
 from behav3d.core.qt_help import HelpButton, make_help_row
-from behav3d.napari._units import UnitGroupManager
+from behav3d.napari._units import UnitGroupManager, TimeUnitGroupManager
 from behav3d.napari._results_panel import (
     ResultsPanel,
     notify_results_changed,
@@ -88,6 +88,25 @@ class CellTypeFilterPanel(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
+        # Frames/hours display toggle for the time-based filters below
+        # (Max timepoints / Min length / Max length). The native, persisted
+        # value is always frames; 'hours' is a display convenience computed
+        # from this sample's time_interval/time_unit metadata.
+        legacy_time_type = cfg.get("time_type", "frames")
+        self._time_unit_mgr = TimeUnitGroupManager(
+            self.metadata_loader.metadata, default_hours=(legacy_time_type == "hours")
+        )
+
+        def _legacy_native_frames(value):
+            # Configs saved before this toggle existed stored raw numbers
+            # interpreted directly as the selected unit (frames or hours);
+            # convert legacy hours-mode values to native frames so old
+            # saved projects keep the same meaning going forward.
+            if legacy_time_type == "hours" and self._time_unit_mgr.valid:
+                return float(value) / self._time_unit_mgr.hours_per_frame
+            return float(value)
+        self._legacy_native_frames = _legacy_native_frames
+
         # ── Preview ────────────────────────────────────────────────────────
         self.btn_preview_lengths = QPushButton("📊 See Track Length Distributions")
         self.btn_preview_lengths.setStyleSheet(
@@ -110,8 +129,8 @@ class CellTypeFilterPanel(QWidget):
             "first filtering step). It applies to the whole dataset, not just "
             "individual tracks, so it also caps what 'Min length'/'Max length' "
             "see afterwards.\n\n"
-            "Measured on the 'position_t' column when the unit below is "
-            "'frames', or on the 'time' column when it is 'hours'.\n\n"
+            "Measured in frames ('position_t'); displayed in frames or hours "
+            "per the unit toggle at the bottom of this panel.\n\n"
             "When disabled, no timepoint cutoff is applied and the full "
             "recorded duration of every sample is kept."
         ))
@@ -120,8 +139,10 @@ class CellTypeFilterPanel(QWidget):
 
         self.spin_exp_duration = QSpinBox()
         self.spin_exp_duration.setRange(1, 99999)
-        self.spin_exp_duration.setValue(int(cfg.get("exp_duration", 350)))
-        self.spin_exp_duration.setMaximumWidth(100)
+        self.spin_exp_duration.setMaximumWidth(110)
+        self._time_unit_mgr.register(
+            self.spin_exp_duration, self._legacy_native_frames(cfg.get("exp_duration", 350))
+        )
         dur_form = QFormLayout()
         dur_form.setContentsMargins(20, 0, 0, 0)
         dur_form.addRow("Max timepoints:", make_help_row(
@@ -131,9 +152,8 @@ class CellTypeFilterPanel(QWidget):
             "(rows at exactly this value are kept). Runs first, before the "
             "min-size, min-length and max-length filters below, so it also "
             "limits the span those filters can measure.\n\n"
-            "Unit follows the 'Unit for time-based filters' combo at the "
-            "bottom of this panel: frames (0-indexed 'position_t') or hours "
-            "(real elapsed 'time')."
+            "Unit follows the frames/hours toggle at the bottom of this "
+            "panel; the underlying filter always runs on frames."
         ))
         self.dur_widget = QWidget()
         self.dur_widget.setLayout(dur_form)
@@ -166,17 +186,20 @@ class CellTypeFilterPanel(QWidget):
 
         self.spin_min_length = QSpinBox()
         self.spin_min_length.setRange(1, 99999)
-        self.spin_min_length.setValue(int(cfg.get("min_track_length", 30)))
-        self.spin_min_length.setMaximumWidth(100)
+        self.spin_min_length.setMaximumWidth(110)
+        self._time_unit_mgr.register(
+            self.spin_min_length, self._legacy_native_frames(cfg.get("min_track_length", 30))
+        )
         min_form = QFormLayout()
         min_form.setContentsMargins(20, 0, 0, 0)
         min_form.addRow("Min length:", make_help_row(
             self.spin_min_length,
             "Minimum Track Length",
             "Tracks whose duration (last timepoint − first timepoint) is "
-            "shorter than this many timepoints/hours are removed entirely.\n\n"
+            "shorter than this value are removed entirely.\n\n"
             "Helps eliminate short, unreliable tracks. Unit follows the "
-            "'Unit for time-based filters' combo below."
+            "frames/hours toggle below; the underlying filter always runs "
+            "on frames."
         ))
         self.min_widget = QWidget()
         self.min_widget.setLayout(min_form)
@@ -210,18 +233,21 @@ class CellTypeFilterPanel(QWidget):
 
         self.spin_max_length = QSpinBox()
         self.spin_max_length.setRange(1, 99999)
-        self.spin_max_length.setValue(int(cfg.get("max_track_length", 30)))
-        self.spin_max_length.setMaximumWidth(100)
+        self.spin_max_length.setMaximumWidth(110)
+        self._time_unit_mgr.register(
+            self.spin_max_length, self._legacy_native_frames(cfg.get("max_track_length", 30))
+        )
         max_form = QFormLayout()
         max_form.setContentsMargins(20, 0, 0, 0)
         max_form.addRow("Max length:", make_help_row(
             self.spin_max_length,
             "Maximum Track Length",
-            "Tracks longer than this many timepoints/hours (from each "
-            "track's own start) are trimmed. A track of exactly this length "
-            "is left untouched.\n\n"
+            "Tracks longer than this value (from each track's own start) "
+            "are trimmed. A track of exactly this length is left "
+            "untouched.\n\n"
             "Useful for DTW which works best with equal-length tracks. Unit "
-            "follows the 'Unit for time-based filters' combo below."
+            "follows the frames/hours toggle below; the underlying filter "
+            "always runs on frames."
         ))
         # Split long tracks into consecutive chunks (new TrackIDs) instead of
         # discarding everything past the first window.
@@ -247,13 +273,16 @@ class CellTypeFilterPanel(QWidget):
             "remainder (shorter than 'Max length') is discarded. This turns "
             "one long track into several equal-length tracks instead of "
             "throwing away most of its data.\n\n"
+            "Every row also keeps an 'original_TrackID' column with the "
+            "pre-filter TrackID, so downstream analysis (DTW, clustering) "
+            "can group/split on the new 'TrackID' while backprojection onto "
+            "segmentation label images can still look cells up by their "
+            "real, unsplit 'original_TrackID'.\n\n"
             "When OFF: only the first 'Max length' window of each track is "
             "kept and everything after it is discarded (legacy crop "
             "behavior).\n\n"
-            "Chunk-splitting is only supported when the time unit below is "
-            "'frames'. If the unit is set to 'hours', this option is "
-            "ignored and the legacy crop (first window only) is used "
-            "instead."
+            "Works the same regardless of the frames/hours display toggle "
+            "below — chunking always runs on frames internally."
         ))
         split_row.addStretch()
         max_form.addRow(split_row)
@@ -328,12 +357,7 @@ class CellTypeFilterPanel(QWidget):
         unit_label = QLabel("Unit for time-based filters:")
         unit_label.setStyleSheet("font-weight: bold; margin-top: 6px;")
         layout.addWidget(unit_label)
-
-        self.combo_time_type = QComboBox()
-        self.combo_time_type.addItems(["frames", "hours"])
-        self.combo_time_type.setCurrentText(cfg.get("time_type", "frames"))
-        self.combo_time_type.setMaximumWidth(120)
-        layout.addWidget(self.combo_time_type)
+        layout.addWidget(self._time_unit_mgr.header_row(label=""))
 
         # ── Apply settings buttons ────────────────────────────────────
         cat_label = self.category.capitalize() + "s" if self.category != "other" else "Other types"
@@ -403,16 +427,19 @@ class CellTypeFilterPanel(QWidget):
     def _collect_params(self) -> dict:
         d = {
             "exp_duration_enabled": self.en_exp_duration.isChecked(),
-            "exp_duration": int(self.spin_exp_duration.value()),
+            "exp_duration": int(round(self._time_unit_mgr.get_native(self.spin_exp_duration))),
             "min_length_enabled": self.en_min_length.isChecked(),
-            "min_track_length": int(self.spin_min_length.value()),
+            "min_track_length": int(round(self._time_unit_mgr.get_native(self.spin_min_length))),
             "max_length_enabled": self.en_max_length.isChecked(),
-            "max_track_length": int(self.spin_max_length.value()),
+            "max_track_length": int(round(self._time_unit_mgr.get_native(self.spin_max_length))),
             "split_long_tracks": self.check_split_long_tracks.isChecked(),
             "filter_min_size_t1": self.check_filter_min_size.isChecked(),
             "min_size_t1": int(round(self._size_unit_mgr.get_native(self.spin_min_size_t1))),
             "filter_t0_dead": self.check_filter_dead_t0.isChecked(),
-            "time_type": self.combo_time_type.currentText(),
+            # 'exp_duration'/'min_track_length'/'max_track_length' are always
+            # native frame counts now; 'time_type' only remembers which unit
+            # was displayed, so the toggle is restored next time.
+            "time_type": "hours" if self._time_unit_mgr.hours else "frames",
         }
         return d
 
@@ -432,16 +459,16 @@ class CellTypeFilterPanel(QWidget):
             if ct in parent_tab.panels:
                 p = parent_tab.panels[ct]
                 p.en_exp_duration.setChecked(settings["exp_duration_enabled"])
-                p.spin_exp_duration.setValue(settings["exp_duration"])
+                p._time_unit_mgr.set_native(p.spin_exp_duration, settings["exp_duration"])
                 p.en_min_length.setChecked(settings["min_length_enabled"])
-                p.spin_min_length.setValue(settings["min_track_length"])
+                p._time_unit_mgr.set_native(p.spin_min_length, settings["min_track_length"])
                 p.en_max_length.setChecked(settings["max_length_enabled"])
-                p.spin_max_length.setValue(settings["max_track_length"])
+                p._time_unit_mgr.set_native(p.spin_max_length, settings["max_track_length"])
                 p.check_split_long_tracks.setChecked(settings.get("split_long_tracks", True))
                 p.check_filter_min_size.setChecked(settings["filter_min_size_t1"])
                 p._size_unit_mgr.set_native(p.spin_min_size_t1, settings["min_size_t1"])
                 p.check_filter_dead_t0.setChecked(settings.get("filter_t0_dead", False))
-                p.combo_time_type.setCurrentText(settings["time_type"])
+                p._time_unit_mgr.switch.setChecked(settings["time_type"] == "hours")
                 count += 1
         scope = "category" if category_only else "all"
         self.log(f"Applied filter settings to {count} other cell types ({scope}).")
@@ -461,19 +488,24 @@ class CellTypeFilterPanel(QWidget):
                 self.log(f"Warning: Could not save parameters: {e}")
 
     def collect_runtime_params(self) -> dict:
-        """Snapshot Qt widget values for thread-safe handoff to a worker."""
+        """Snapshot Qt widget values for thread-safe handoff to a worker.
+
+        Time-based values are always native frame counts regardless of the
+        frames/hours display toggle, so ``time_type`` is always "frames"
+        here — the backend never needs to interpret these as hours.
+        """
         return {
             "exp_duration_enabled": bool(self.en_exp_duration.isChecked()),
-            "exp_duration": int(self.spin_exp_duration.value()),
+            "exp_duration": int(round(self._time_unit_mgr.get_native(self.spin_exp_duration))),
             "min_length_enabled": bool(self.en_min_length.isChecked()),
-            "min_track_length": int(self.spin_min_length.value()),
+            "min_track_length": int(round(self._time_unit_mgr.get_native(self.spin_min_length))),
             "max_length_enabled": bool(self.en_max_length.isChecked()),
-            "max_track_length": int(self.spin_max_length.value()),
+            "max_track_length": int(round(self._time_unit_mgr.get_native(self.spin_max_length))),
             "split_long_tracks": bool(self.check_split_long_tracks.isChecked()),
             "filter_min_size": bool(self.check_filter_min_size.isChecked()),
             "min_size_t1": int(round(self._size_unit_mgr.get_native(self.spin_min_size_t1))),
             "filter_t0_dead": bool(self.check_filter_dead_t0.isChecked()),
-            "time_type": self.combo_time_type.currentText(),
+            "time_type": "frames",
         }
 
     def _run_filtering_for(self, cell_type: str, overwrite: bool = False,

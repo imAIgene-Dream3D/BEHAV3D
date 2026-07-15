@@ -58,15 +58,58 @@ from behav3d.editing import (
     split_label,
 )
 from behav3d.napari._loaders import tracked_segments_paths_for
+from behav3d.napari._tutorial_dialog import TutorialButton, TutorialStep
 
 try:
     from napari.utils import progress as _NapariProgress
 except Exception:
     _NapariProgress = None
 
+try:
+    from napari.utils.colormaps import DirectLabelColormap
+except Exception:
+    DirectLabelColormap = None
+
 
 _SPLIT_SEEDS_LAYER = "__split_seeds__"
+_HIGHLIGHT_LAYER = "__selected_label_highlight__"
+_HIGHLIGHT_COLOR = "yellow"
 _TRACKED_SUFFIX = " tracked segments"
+
+_SEED_TUTORIAL_STEPS = [
+    TutorialStep(
+        "1. Select the label to edit",
+        "seed_step1_select_label.png",
+        "Click the cell you want to split/create from in the viewer "
+        "(or type its ID above). It becomes the active label.",
+    ),
+    TutorialStep(
+        "2. Click “Add seed points”",
+        "seed_step2_add_seed_points.png",
+        "This creates a temporary points layer and switches the view to "
+        "2D so seed clicks land precisely.",
+    ),
+    TutorialStep(
+        "3. Place seeds, one per sub-region",
+        "seed_step3_place_seeds.png",
+        "Click inside the label for each seed. Move the Z slider between "
+        "clicks if you want seeds on different planes — seeds don't "
+        "need to share a Z-slice, they just need to land inside the label.",
+    ),
+    TutorialStep(
+        "4. Preview",
+        "seed_step4_preview.png",
+        "Once the seed counter shows enough seeds, click Preview to run "
+        "the split/create on the current frame only, so you can check the "
+        "result before committing to the full time range.",
+    ),
+    TutorialStep(
+        "5. Apply",
+        "seed_step5_apply.png",
+        "Happy with the preview? Click Apply to commit it and propagate "
+        "the result forward and backward across the track's lifetime.",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +280,9 @@ class TrackedSegmentEditor(QWidget):
         self._preview_tool: Optional[str] = None
         # napari activity-dock progress bar (None when no operation is running).
         self._activity_progress = None
+        # ndisplay saved while seed placement forces the view to 2D (None
+        # when not currently overridden).
+        self._ndisplay_before_seeds: Optional[int] = None
 
         self._build_ui()
         self._bind_to_layer()
@@ -442,6 +488,12 @@ class TrackedSegmentEditor(QWidget):
         self.lbl_seed_count.setStyleSheet("color:#1976D2;")
         seed_row.addWidget(self.lbl_seed_count, stretch=1)
         lay.addLayout(seed_row)
+        seed_tutorial_row = QHBoxLayout()
+        seed_tutorial_row.addWidget(
+            TutorialButton("? How to place seeds", "Placing seed points", _SEED_TUTORIAL_STEPS)
+        )
+        seed_tutorial_row.addStretch(1)
+        lay.addLayout(seed_tutorial_row)
         keep_row = QHBoxLayout()
         self.cb_keep_first = QCheckBox("First seed keeps the original TrackID")
         self.cb_keep_first.setChecked(True)
@@ -661,6 +713,12 @@ class TrackedSegmentEditor(QWidget):
         self.lbl_create_seed_count.setStyleSheet("color:#1976D2;")
         seed_row.addWidget(self.lbl_create_seed_count, stretch=1)
         lay.addLayout(seed_row)
+        create_tutorial_row = QHBoxLayout()
+        create_tutorial_row.addWidget(
+            TutorialButton("? How to place seeds", "Placing seed points", _SEED_TUTORIAL_STEPS)
+        )
+        create_tutorial_row.addStretch(1)
+        lay.addLayout(create_tutorial_row)
         self.btn_create_preview = QPushButton("👁 Preview create (single timepoint)")
         self.btn_create_preview.setToolTip(
             "Run the watershed on the current frame only so you can verify\n"
@@ -1105,6 +1163,9 @@ class TrackedSegmentEditor(QWidget):
             self.viewer.dims.events.current_step.connect(
                 lambda *_: self._refresh_seed_counter()
             )
+            self.viewer.dims.events.current_step.connect(
+                lambda *_: self._refresh_highlight_layer()
+            )
         except Exception:
             pass
         try:
@@ -1128,6 +1189,10 @@ class TrackedSegmentEditor(QWidget):
         removed = getattr(event, "value", None)
         if getattr(removed, "name", None) != _SPLIT_SEEDS_LAYER:
             return
+        # The layer is already gone at this point, so the counter must be
+        # refreshed explicitly — it won't get another data/current_step
+        # event to react to.
+        self._refresh_seed_counter()
         # Defer: napari's LayerList does its own "pick a new active layer"
         # bookkeeping in response to the same ``removed`` event, and
         # depending on connection order that can run *after* us — which
@@ -1260,6 +1325,7 @@ class TrackedSegmentEditor(QWidget):
             self.combo_merge_target.addItem(str(lid), userData=int(lid))
         self._refresh_buttons()
         self._refresh_seed_counter()
+        self._refresh_highlight_layer()
 
     # ------------------------------------------------------------------
     # Tool dispatch
@@ -1271,6 +1337,8 @@ class TrackedSegmentEditor(QWidget):
         is_seed_tool = idx in (0, 5)
         if not is_seed_tool and _SPLIT_SEEDS_LAYER in self.viewer.layers:
             self.viewer.layers[_SPLIT_SEEDS_LAYER].visible = False
+        if not is_seed_tool:
+            self._restore_ndisplay()
         if is_seed_tool and _SPLIT_SEEDS_LAYER in self.viewer.layers:
             self.viewer.layers[_SPLIT_SEEDS_LAYER].visible = True
         # Refresh channel list whenever the user switches to Create.
@@ -1289,6 +1357,22 @@ class TrackedSegmentEditor(QWidget):
 
     # ---- Split -------------------------------------------------------
     def _ensure_seeds_layer(self) -> None:
+        # Split needs an existing label to seed the watershed from; Create
+        # (index 5) deliberately has no such requirement.
+        if self.tool_stack.currentIndex() == 0 and not self._selected_labels:
+            QMessageBox.warning(
+                self,
+                "No label selected",
+                "Select a label in the viewer (or type its ID) before adding seed points.",
+            )
+            return
+        if self.viewer.dims.ndisplay == 3 and self._ndisplay_before_seeds is None:
+            self._ndisplay_before_seeds = 3
+            self.viewer.dims.ndisplay = 2
+            self._log_msg(
+                "  Switched to 2D view for precise seed placement — move "
+                "the Z slider between clicks to place seeds at different depths."
+            )
         if _SPLIT_SEEDS_LAYER not in self.viewer.layers:
             layer = self.viewer.add_points(
                 np.empty((0, 4)),
@@ -1306,10 +1390,19 @@ class TrackedSegmentEditor(QWidget):
                 self.viewer.window._qt_viewer.layer_to_visual[layer].node.text.visible = False
             except Exception:
                 pass
+            layer.events.data.connect(lambda *_: self._refresh_seed_counter())
         layer = self.viewer.layers[_SPLIT_SEEDS_LAYER]
         layer.mode = "add"
         self.viewer.layers.selection.active = layer
         self._refresh_seed_counter()
+
+    def _restore_ndisplay(self) -> None:
+        if self._ndisplay_before_seeds is not None:
+            try:
+                self.viewer.dims.ndisplay = self._ndisplay_before_seeds
+            except Exception:
+                pass
+            self._ndisplay_before_seeds = None
 
     def _refresh_seed_counter(self) -> None:
         n = 0
@@ -1327,6 +1420,46 @@ class TrackedSegmentEditor(QWidget):
             self.lbl_seed_count.setText(text)
         if hasattr(self, "lbl_create_seed_count"):
             self.lbl_create_seed_count.setText(text)
+
+    def _refresh_highlight_layer(self) -> None:
+        """Show the selected label(s) as a bright contour-only overlay.
+
+        Uses a dedicated Labels layer rather than recoloring
+        ``self.layer_name`` in place, so the rest of the tracked-segments
+        layer keeps its normal per-object colors.  Whatever layer was
+        active before this call (e.g. the seeds layer mid-placement, or
+        the tracked-segments layer during label picking) is restored
+        afterward so this never steals mouse interaction away from it.
+        """
+        try:
+            prev_active = self.viewer.layers.selection.active
+            if not self._selected_labels:
+                if _HIGHLIGHT_LAYER in self.viewer.layers:
+                    self.viewer.layers.remove(_HIGHLIGHT_LAYER)
+                    if (
+                        prev_active is not None
+                        and getattr(prev_active, "name", None) != _HIGHLIGHT_LAYER
+                    ):
+                        self.viewer.layers.selection.active = prev_active
+                return
+            t_now = int(self.viewer.dims.current_step[0])
+            mask = np.isin(self.buffer.peek(t_now), self._selected_labels).astype(np.uint8)
+            if _HIGHLIGHT_LAYER in self.viewer.layers:
+                layer = self.viewer.layers[_HIGHLIGHT_LAYER]
+                layer.data = mask
+                layer.visible = True
+            else:
+                layer = self.viewer.add_labels(mask, name=_HIGHLIGHT_LAYER, opacity=1.0)
+                layer.editable = False
+                layer.contour = 1
+                if DirectLabelColormap is not None:
+                    layer.colormap = DirectLabelColormap(
+                        color_dict={1: _HIGHLIGHT_COLOR, None: "transparent"}
+                    )
+            if prev_active is not None and getattr(prev_active, "name", None) != _HIGHLIGHT_LAYER:
+                self.viewer.layers.selection.active = prev_active
+        except Exception:
+            pass
 
     def _apply_split(self) -> None:
         self._clear_preview()
@@ -1368,6 +1501,7 @@ class TrackedSegmentEditor(QWidget):
                     )
             except Exception:
                 pass
+            self._restore_ndisplay()
 
         self._run_operation_async(
             split_label,
@@ -1708,6 +1842,7 @@ class TrackedSegmentEditor(QWidget):
                     )
             except Exception:
                 pass
+            self._restore_ndisplay()
 
         self._run_operation_async(
             create_label,
@@ -1976,6 +2111,12 @@ class TrackedSegmentEditor(QWidget):
                 self.viewer.layers.remove(_SPLIT_SEEDS_LAYER)
         except Exception:
             pass
+        # Remove the selection-highlight overlay if present.
+        try:
+            if _HIGHLIGHT_LAYER in self.viewer.layers:
+                self.viewer.layers.remove(_HIGHLIGHT_LAYER)
+        except Exception:
+            pass
         # Remove our mouse callback from the bound layer (best-effort).
         try:
             layer = self.viewer.layers[self.layer_name]
@@ -1989,6 +2130,7 @@ class TrackedSegmentEditor(QWidget):
     # ------------------------------------------------------------------
     def _on_frames_changed(self, frames: List[int]) -> None:
         self._refresh_layer_data(frames)
+        self._refresh_highlight_layer()
 
     def _refresh_buttons(self) -> None:
         has_sel = bool(self._selected_labels)

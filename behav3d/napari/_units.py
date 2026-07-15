@@ -35,6 +35,7 @@ from behav3d.core.utils import (
     native_to_physical,
     physical_to_native,
     resolution_from_metadata,
+    hours_per_frame_from_metadata,
 )
 from behav3d.core.qt_help import HelpButton
 
@@ -257,6 +258,124 @@ class UnitGroupManager:
 
     def _on_toggle(self, checked):
         self.physical = bool(checked) and self.valid
+        for w in self._entries:
+            self._set_display(w)
+            self._update_suffix(w)
+
+
+# Suffixes shown on the spinboxes for the frames/hours time toggle.
+_TIME_SUFFIX = {
+    True: " h",
+    False: " frames",
+}
+
+
+class TimeUnitGroupManager:
+    """Manage the frames/hours display of a group of time-based spinboxes.
+
+    Mirrors :class:`UnitGroupManager`, but the native unit is always frames
+    (the same 0-indexed ``position_t`` count filtering operates on); the
+    'hours' display is a pure UI convenience computed from this sample's
+    ``time_interval``/``time_unit`` metadata columns (see
+    :func:`behav3d.core.utils.hours_per_frame_from_metadata`). Because the
+    persisted/native value is always frames, filtering logic downstream
+    never needs to special-case which unit is shown.
+    """
+
+    def __init__(self, metadata=None, default_hours=False):
+        self.hours_per_frame, self.valid = hours_per_frame_from_metadata(metadata)
+        self.hours = bool(default_hours and self.valid)
+        self._entries = []
+
+        self.switch = QSwitch()
+        self.switch.setChecked(self.hours)
+        if not self.valid:
+            self.switch.setEnabled(False)
+        self.switch.toggled.connect(self._on_toggle)
+
+    # -- widget construction -------------------------------------------
+    def header_row(self, label="Unit:"):
+        """Return a small ``QWidget`` row: ``label  frames [switch] hours``."""
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        if label:
+            lay.addWidget(QLabel(label))
+        lay.addWidget(QLabel("frames"))
+        lay.addWidget(self.switch)
+        lay.addWidget(QLabel("hours"))
+        if not self.valid:
+            note = QLabel("(no time interval in metadata)")
+            note.setStyleSheet("color:#999; font-style:italic; font-size:10px;")
+            lay.addWidget(note)
+        lay.addWidget(HelpButton(
+            "Frames vs. Hours Units",
+            "Toggle how the time-based filter values above are displayed:\n\n"
+            "- 'frames' (off): the value is shown as a raw frame/timepoint "
+            "count — the same 0-indexed 'position_t' axis filtering runs "
+            "on internally.\n"
+            "- 'hours' (on): the value is shown converted to real elapsed "
+            "time using this sample's 'time_interval'/'time_unit' "
+            "metadata.\n\n"
+            "This only changes how the number is displayed — filtering "
+            "always runs on frames under the hood, so 'Split long tracks "
+            "into chunks' behaves the same regardless of which unit is "
+            "shown. If the toggle is disabled, the metadata has no valid "
+            "time interval and only frames are available."
+        ))
+        lay.addStretch(1)
+        return row
+
+    # -- registration ---------------------------------------------------
+    def register(self, widget, native_value):
+        """Register ``widget`` (a spinbox) holding a value in native frames."""
+        widget._time_native = float(native_value)
+        self._set_display(widget)
+        self._update_suffix(widget)
+        widget.valueChanged.connect(lambda _v, w=widget: self._on_edit(w))
+        self._entries.append(widget)
+
+    def get_native(self, widget):
+        """Return the canonical native frame count for ``widget``."""
+        return float(getattr(widget, "_time_native", widget.value()))
+
+    def set_native(self, widget, native_value):
+        """Set ``widget``'s canonical native frame count and refresh its display."""
+        widget._time_native = float(native_value)
+        self._set_display(widget)
+
+    # -- internal -------------------------------------------------------
+    def _display_to_native(self, value):
+        if not self.valid or not self.hours:
+            return float(value)
+        return float(value) / self.hours_per_frame
+
+    def _native_to_display(self, native):
+        if not self.valid or not self.hours:
+            return float(native)
+        return float(native) * self.hours_per_frame
+
+    def _on_edit(self, widget):
+        widget._time_native = self._display_to_native(widget.value())
+
+    def _set_display(self, widget):
+        disp = self._native_to_display(widget._time_native)
+        widget.blockSignals(True)
+        if isinstance(widget, QSpinBox):
+            widget.setValue(int(round(disp)))
+        elif isinstance(widget, QDoubleSpinBox):
+            widget.setValue(float(disp))
+        widget.blockSignals(False)
+
+    def _update_suffix(self, widget):
+        try:
+            widget.setSuffix(_TIME_SUFFIX.get(self.hours, ""))
+        except Exception:
+            pass
+
+    def _on_toggle(self, checked):
+        self.hours = bool(checked) and self.valid
         for w in self._entries:
             self._set_display(w)
             self._update_suffix(w)

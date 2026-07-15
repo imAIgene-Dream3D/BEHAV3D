@@ -657,7 +657,11 @@ class DataPreparationTab(QWidget):
                 
         for base, ct_names in multi_groups.items():
             if len(ct_names) > 1:
-                fields_to_sync = ["line", "condition", "segments_image_path", "tracks_image_path", "tracks_csv_path"]
+                # Path fields (segments/tracks) are intentionally excluded: each
+                # multicolor channel is a distinct external segmentation/tracking
+                # result and must keep its own path, unlike line/condition which
+                # describe the same underlying population.
+                fields_to_sync = ["line", "condition"]
                 for field_name in fields_to_sync:
                     for ct_name in ct_names:
                         w = cell_type_fields[ct_name][field_name]
@@ -1316,7 +1320,7 @@ class DataPreparationTab(QWidget):
         if self.metadata is None:
             return
 
-        from behav3d.io.images import get_image_shape, get_image_dimension_order
+        from behav3d.io.images import get_image_shape, get_image_dimension_order, get_czi_shape_and_dimension_order
 
         samples = self.metadata["sample_name"].tolist()
         self.dim_table.setRowCount(len(samples))
@@ -1336,15 +1340,23 @@ class DataPreparationTab(QWidget):
             if not raw_path.empty:
                 p = Path(str(raw_path.iloc[0]).strip())
                 if p.exists():
-                    try:
-                        raw_shape = get_image_shape(p)
-                        shape_str = str(raw_shape)
-                    except Exception:
-                        shape_str = "?"
-                    try:
-                        detected_order = get_image_dimension_order(p)
-                    except Exception:
-                        pass
+                    if p.suffix == ".czi":
+                        # Single open covers both shape and dim order (avoids opening the file twice).
+                        try:
+                            raw_shape, detected_order = get_czi_shape_and_dimension_order(p)
+                            shape_str = str(raw_shape)
+                        except Exception:
+                            shape_str = "?"
+                    else:
+                        try:
+                            raw_shape = get_image_shape(p)
+                            shape_str = str(raw_shape)
+                        except Exception:
+                            shape_str = "?"
+                        try:
+                            detected_order = get_image_dimension_order(p)
+                        except Exception:
+                            pass
 
             shape_item = QTableWidgetItem(shape_str)
             shape_item.setFlags(shape_item.flags() & ~Qt.ItemIsEditable)

@@ -752,3 +752,24 @@ def get_image_dimension_order(path):
 
     except Exception:
         return None
+
+
+def get_czi_shape_and_dimension_order(path, take_dims="TCZYX"):
+    """
+    Like calling get_image_shape() and get_image_dimension_order() on a
+    .czi path, but opens the CziFile only once instead of twice.
+    """
+    from aicspylibczi import CziFile
+
+    path = Path(path)
+    czifile = CziFile(path)
+    raw_dims = czifile.dims
+
+    dim_size = {ax: int(sz[1]) for ax, sz in czifile.get_dims_shape()[0].items()}
+    shape = tuple(dim_size.get(ax, 1) for ax in raw_dims if ax in take_dims)
+
+    dim_order = "".join(ax for ax in raw_dims if ax in "TCZYX")
+    if not (dim_order and len(dim_order) == len(set(dim_order))):
+        dim_order = None
+
+    return shape, dim_order

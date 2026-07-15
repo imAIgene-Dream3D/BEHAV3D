@@ -99,6 +99,29 @@ def resolution_from_metadata(metadata):
         return 1.0, 1.0, False
 
 
+def hours_per_frame_from_metadata(metadata):
+    """Return ``(hours_per_frame, valid)`` from a metadata DataFrame.
+
+    Uses the first sample row's ``time_interval``/``time_unit`` columns and
+    assumes a uniform frame interval across samples, mirroring
+    :func:`resolution_from_metadata`. ``valid`` is False when the columns
+    are missing/unusable, in which case callers should fall back to frame
+    units and disable any hours display toggle.
+    """
+    try:
+        if metadata is None or len(metadata) == 0:
+            return 1.0, False
+        if "time_interval" not in metadata.columns or "time_unit" not in metadata.columns:
+            return 1.0, False
+        interval = float(metadata["time_interval"].iloc[0])
+        unit = str(metadata["time_unit"].iloc[0])
+        if not np.isfinite(interval) or interval <= 0:
+            return 1.0, False
+        return float(convert_time(interval, unit, convert_to="h")), True
+    except Exception:
+        return 1.0, False
+
+
 def element_to_dict(element):
     """
     Convert an ElementTree Element object to a dictionary.

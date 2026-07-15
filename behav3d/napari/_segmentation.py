@@ -603,14 +603,10 @@ class PixelClassifierWidget(QWidget):
         self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
 
     def _init_ui(self):
-        # Connect to metadata updates
-        if hasattr(self.metadata_loader, 'metadata_loaded'):
-            self.metadata_loader.metadata_loaded.connect(self._on_metadata_updated)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
-        
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -2314,9 +2310,6 @@ class CellposeWidget(QWidget):
 
     # ── UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
-        if hasattr(self.metadata_loader, "metadata_loaded"):
-            self.metadata_loader.metadata_loaded.connect(self._on_metadata_updated)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
@@ -3095,9 +3088,6 @@ class ImportWidget(QWidget):
 
     # ── UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
-        if hasattr(self.metadata_loader, "metadata_loaded"):
-            self.metadata_loader.metadata_loaded.connect(self._on_metadata_updated)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)

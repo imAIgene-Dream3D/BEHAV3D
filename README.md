@@ -368,3 +368,8 @@ Available options: `deepseek-v4-flash` (fast, cheap), `deepseek-v4-pro` (stronge
 - DeepSeek usage: [platform.deepseek.com](https://platform.deepseek.com) → Usage
 - Modal compute: [modal.com/apps](https://modal.com/apps) — the `behav3d-assistant` app
 - Set a DeepSeek spend limit to prevent runaway costs from unexpected traffic
+
+## About AI Usage
+
+*The BEHAV3D Explorer toolkit was developed with the assistance of AI models from OpenAI (Codex, ChatGPT), Anthropic (Sonnet, Haiku, Opus), Cursor and Google (Gemini Flash, Gemini Pro).*
+*All AI model code edits have been supervised by our team of developers and have been tested thoroughly among the team of developers and by outside testers.*
