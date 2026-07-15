@@ -439,6 +439,222 @@ spinning_loader = (
 # ===============================
 # HELPER FUNCTIONS
 # ===============================
+def build_feature_distribution_figure(csv_path, feats, title=None, max_plots=36):
+    """Build a matplotlib grid of per-feature histograms from a CSV.
+
+    Shared by the napari plugin and the notebook log-scaling panels so the
+    user can visually judge which features are skewed (and would benefit
+    from log scaling) before applying it. Returns ``(figure, truncated)``
+    where ``truncated`` is True when ``feats`` was capped at ``max_plots``.
+    Returns ``(None, False)`` when there is nothing to plot.
+    """
+    from matplotlib.figure import Figure
+
+    feats = [f for f in (feats or [])]
+    if csv_path is None or not Path(csv_path).exists() or not feats:
+        return None, False
+
+    truncated = len(feats) > max_plots
+    feats = feats[:max_plots]
+    try:
+        df = pd.read_csv(csv_path, usecols=feats, low_memory=False)
+    except Exception:
+        return None, False
+
+    n = len(feats)
+    ncols = min(4, n) or 1
+    nrows = (n + ncols - 1) // ncols
+    fig = Figure(figsize=(3.2 * ncols, 2.4 * nrows), tight_layout=True)
+    for i, feat in enumerate(feats):
+        ax = fig.add_subplot(nrows, ncols, i + 1)
+        series = pd.to_numeric(df[feat], errors="coerce").dropna()
+        if len(series):
+            ax.hist(series.values, bins=40, color="#4C72B0", edgecolor="none")
+        else:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=8, color="#999")
+        ax.set_title(str(feat), fontsize=8)
+        ax.tick_params(labelsize=7)
+    if title:
+        fig.suptitle(str(title), fontsize=11)
+    return fig, truncated
+
+
+def build_track_length_distribution_figure(
+    csv_path, group_col="TrackID", sample_col="sample_name", title=None,
+):
+    """Build a per-sample grid of track-length histograms from a track CSV.
+
+    Shared by the Filtering tab's "See Track Length Distributions" preview
+    and the cell-type Grouping dialog (so a freshly merged population can be
+    sanity-checked the same way). Returns a matplotlib ``Figure``, or
+    ``None`` if the CSV is missing/unreadable or lacks the required columns.
+    """
+    from matplotlib.figure import Figure
+
+    if csv_path is None or not Path(csv_path).exists():
+        return None
+    try:
+        df = pd.read_csv(csv_path, usecols=lambda c: c in {group_col, sample_col}, low_memory=False)
+    except Exception:
+        return None
+    if group_col not in df.columns or sample_col not in df.columns:
+        return None
+
+    samples = sorted(df[sample_col].dropna().unique())
+    if not samples:
+        return None
+
+    ncols = min(3, len(samples))
+    nrows = (len(samples) + ncols - 1) // ncols
+    fig = Figure(figsize=(5 * ncols, 4 * nrows), tight_layout=True)
+    for i, sample in enumerate(samples):
+        ax = fig.add_subplot(nrows, ncols, i + 1)
+        lengths = df[df[sample_col] == sample].groupby(group_col).size()
+        ax.hist(lengths.values, bins=50, color="skyblue", edgecolor="black")
+        ax.set_title(str(sample))
+        ax.set_xlabel("Track Length (timepoints)")
+        ax.set_ylabel("Frequency")
+    if title:
+        fig.suptitle(str(title), fontsize=12)
+    return fig
+
+
+class UnitGroupManager:
+    """ipywidgets counterpart of ``behav3d.napari._units.UnitGroupManager``.
+
+    Manages the physical(µm)/pixel display of a group of ipywidgets
+    number inputs (``BoundedFloatText``/``BoundedIntText``/``IntText``/
+    ``FloatText``). Persistence stays native: :meth:`get_native` always
+    returns the canonical pixel/voxel (or µm, for parameters whose native
+    unit is already physical, e.g. tracking distances) value regardless of
+    the currently displayed unit, so config round-trips unchanged.
+
+    Conversions use :func:`behav3d.core.utils.resolution_from_metadata` /
+    ``native_to_physical`` / ``physical_to_native``.
+    """
+
+    def __init__(self, metadata, default_physical=True):
+        from behav3d.core.utils import resolution_from_metadata
+
+        self.xy, self.z, self.valid = resolution_from_metadata(metadata)
+        self.physical = bool(default_physical and self.valid)
+        self._entries = []  # list of (widget, kind, native_unit)
+
+        self.toggle = widgets.ToggleButtons(
+            options=[("px", False), ("µm", True)],
+            value=self.physical,
+            style={"button_width": "50px"},
+        )
+        if not self.valid:
+            self.toggle.disabled = True
+        self.toggle.observe(self._on_toggle, names="value")
+
+    # -- widget construction ---------------------------------------------
+    def header_row(self, label="Units:"):
+        """Return a small ``HBox`` row: ``label [px|µm]``."""
+        children = []
+        if label:
+            children.append(widgets.HTML(f"<b>{label}</b>"))
+        children.append(self.toggle)
+        if not self.valid:
+            children.append(widgets.HTML(
+                "<i style='color:#999;font-size:10px;'>(no resolution in metadata)</i>"
+            ))
+        return widgets.HBox(children)
+
+    # -- registration -------------------------------------------------------
+    def register(self, widget, kind, native_value, native_unit="pixel"):
+        """Register ``widget`` (a numeric ipywidgets input) holding a value
+        of ``kind`` (``"distance"`` or ``"volume"``).
+
+        ``native_value`` is the value in the parameter's *native* unit
+        (what gets persisted/passed to the backend). ``native_unit`` is
+        ``"pixel"`` (segmentation defaults) or ``"physical"`` (tracking,
+        whose linking already runs in µm).
+        """
+        widget._unit_kind = kind
+        widget._unit_native_unit = native_unit
+        widget._unit_native = float(native_value)
+        # Store the exact bound handler so later unobserve/observe calls
+        # only ever touch this manager's own listener, never any other
+        # "value" observer the panel itself may have registered.
+        widget._unit_handler = lambda change, w=widget: self._on_edit(w)
+        self._set_display(widget)
+        self._update_description_suffix(widget)
+        widget.observe(widget._unit_handler, names="value")
+        self._entries.append(widget)
+
+    def get_native(self, widget):
+        """Return the canonical native value for ``widget``."""
+        return float(getattr(widget, "_unit_native", widget.value))
+
+    def set_native(self, widget, native_value):
+        """Set ``widget``'s canonical native value and refresh its display."""
+        widget._unit_native = float(native_value)
+        self._set_display(widget)
+
+    # -- internal -------------------------------------------------------
+    def _display_to_native(self, value, kind, native_unit):
+        from behav3d.core.utils import native_to_physical, physical_to_native
+
+        if not self.valid:
+            return float(value)
+        if native_unit == "physical":
+            if self.physical:
+                return float(value)
+            return native_to_physical(value, kind, self.xy, self.z)
+        if self.physical:
+            return physical_to_native(value, kind, self.xy, self.z)
+        return float(value)
+
+    def _native_to_display(self, native, kind, native_unit):
+        from behav3d.core.utils import native_to_physical, physical_to_native
+
+        if not self.valid:
+            return float(native)
+        if native_unit == "physical":
+            if self.physical:
+                return float(native)
+            return physical_to_native(native, kind, self.xy, self.z)
+        if self.physical:
+            return native_to_physical(native, kind, self.xy, self.z)
+        return float(native)
+
+    def _on_edit(self, widget):
+        widget._unit_native = self._display_to_native(
+            widget.value, widget._unit_kind, widget._unit_native_unit
+        )
+
+    def _set_display(self, widget):
+        disp = self._native_to_display(
+            widget._unit_native, widget._unit_kind, widget._unit_native_unit
+        )
+        handler = getattr(widget, "_unit_handler", None)
+        if handler is not None:
+            widget.unobserve(handler, names="value")
+        if isinstance(widget, (widgets.IntText, widgets.BoundedIntText)):
+            widget.value = int(round(disp))
+        else:
+            widget.value = float(disp)
+        if handler is not None:
+            widget.observe(handler, names="value")
+
+    def _update_description_suffix(self, widget):
+        unit_label = "µm" if self.physical else ("px" if widget._unit_kind == "distance" else "vox")
+        base = getattr(widget, "_unit_base_description", None)
+        if base is None:
+            base = widget.description
+            widget._unit_base_description = base
+        widget.description = f"{base} ({unit_label})" if base else f"({unit_label})"
+
+    def _on_toggle(self, change):
+        self.physical = bool(change["new"]) and self.valid
+        for w in self._entries:
+            self._set_display(w)
+            self._update_description_suffix(w)
+
+
 def _deep_merge(a: dict, b: dict) -> dict:
     out = deepcopy(a)
     for k, v in (b or {}).items():

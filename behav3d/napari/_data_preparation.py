@@ -56,6 +56,7 @@ from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
 )
+from behav3d.core.qt_help import HelpButton
 
 # These are imported lazily by the conversion worker to keep startup fast.
 # from behav3d.preprocessing import convert_input_files_to_zarr
@@ -309,8 +310,22 @@ class DataPreparationTab(QWidget):
         pop_form.addRow("Organoid types:", self.n_organoid_spin)
         pop_form.addRow("Immune types:", self.n_immune_spin)
         pop_form.addRow("Other types:", self.n_other_spin)
+        dead_row = QHBoxLayout()
         self.include_dead_cb = QCheckBox("Include dead channel")
-        pop_form.addRow(self.include_dead_cb)
+        dead_row.addWidget(self.include_dead_cb)
+        dead_row.addWidget(HelpButton(
+            "Include Dead Channel",
+            "Tick this when the acquisition has a dedicated viability/death "
+            "marker channel (e.g. a live/dead dye), separate from the "
+            "organoid/immune/other cell-type channels above.\n\n"
+            "Enabling it adds a 'Dead ch #' field and an optional 'Dead "
+            "mask' path to each sample form, writing 'dead_channel' and "
+            "'dead_mask_path' columns to metadata.csv. If a dead channel "
+            "number is set but no mask path is given, the mask must be "
+            "produced later via Segmentation."
+        ))
+        dead_row.addStretch()
+        pop_form.addRow(dead_row)
         lay.addLayout(pop_form)
 
         # --- Cell type naming inputs (dynamically rebuilt) ---
@@ -1271,7 +1286,7 @@ class DataPreparationTab(QWidget):
     # Section 5 – Dimension Order Table
     # ══════════════════════════════════════════════════════════════════════
     def _build_dim_order_section(self):
-        grp = QGroupBox("5 · Dimension Order")
+        grp = QGroupBox("5 · Dimension Order (Optional)")
         lay = QVBoxLayout(grp)
 
         self.dim_table = QTableWidget(0, 3)
@@ -1450,9 +1465,23 @@ class DataPreparationTab(QWidget):
         lay.addWidget(self.t_mismatch_warning)
 
         # Timepoint clipping
+        clip_check_row = QHBoxLayout()
         self.zarr_clip_check = QCheckBox("Clip timepoints (select range)")
         self.zarr_clip_check.setChecked(False)
-        lay.addWidget(self.zarr_clip_check)
+        clip_check_row.addWidget(self.zarr_clip_check)
+        clip_check_row.addWidget(HelpButton(
+            "Clip Timepoints",
+            "Restrict every image to an inclusive [Start, End] timepoint "
+            "range during zarr conversion, instead of keeping all "
+            "timepoints. Useful when samples have differing timepoint "
+            "counts (see the warning above) — trimming them to a common "
+            "range avoids mismatches in downstream tracking/feature steps.\n\n"
+            "If some samples were already converted to .zarr in a previous "
+            "run, you will additionally be offered the option to clip those "
+            "existing .zarr files in place to the same range."
+        ))
+        clip_check_row.addStretch()
+        lay.addLayout(clip_check_row)
 
         clip_row = QHBoxLayout()
         clip_row.setContentsMargins(20, 0, 0, 0)

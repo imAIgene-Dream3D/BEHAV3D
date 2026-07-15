@@ -29,6 +29,7 @@ import joblib
 
 
 from behav3d.core.utils import convert_distance
+from behav3d.napari._units import UnitGroupManager
 from behav3d.io.images import load_image, get_image_shape, save_as_zarr, append_to_zarr, load_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
@@ -638,9 +639,12 @@ class PixelClassifierWidget(QWidget):
         train_form.addRow("Examples/sample:", make_help_row(
             self.spin_examples,
             "Examples per Sample",
-            "Number of timepoints randomly sampled from each dataset "
-            "for training the pixel classifier.\n\n"
-            "More examples → better generalization but slower training."
+            "Number of timepoints selected from each dataset for labeling and "
+            "training the pixel classifier.\n\n"
+            "Timepoints are chosen evenly spaced across the time series "
+            "(including the first and last), not at random.\n\n"
+            "More examples → better generalization but more labeling work "
+            "and slower training."
         ))
         
 
@@ -867,6 +871,12 @@ class PixelClassifierWidget(QWidget):
             ct_form.setSpacing(3)
             ct_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
+            # Per-group physical(µm)/pixel unit toggle. EDT & min-size are
+            # entered in the chosen unit and converted to native px/voxels
+            # before running/persisting; opening stays fixed in pixels.
+            unit_mgr = UnitGroupManager(self.metadata_loader.metadata, default_physical=True)
+            ct_form.addRow("Units:", unit_mgr.header_row(label=""))
+
             # Determine defaults based on category
             if cell_type in self.organoid_types:
                 def_edt, def_size, def_open, def_fill = 12.0, 1000, 3, True
@@ -882,34 +892,37 @@ class PixelClassifierWidget(QWidget):
             saved_fill = pc.get(f"{cell_type}_fill_holes", def_fill)
 
             w_edt = QDoubleSpinBox()
-            w_edt.setRange(0.0, 50.0)
+            # Range widened so physical-unit display never clamps.
+            w_edt.setRange(0.0, 1000.0)
             w_edt.setSingleStep(0.5)
             w_edt.setValue(float(saved_edt))
-            w_edt.setMaximumWidth(70)
+            w_edt.setMaximumWidth(90)
             ct_form.addRow("EDT:", make_help_row(
                 w_edt,
                 "EDT (Distance Transform Threshold)",
                 "Controls sensitivity for separating touching objects.\n\n"
                 "Lower values → more sensitive, splits objects more aggressively.\n"
                 "Higher values → less splitting, objects stay merged.\n\n"
-                "Typical values:\n"
-                "  • Organoids: 8–15\n"
-                "  • Immune cells: 1.5–4.0"
+                "Shown in the unit selected above (µm by default; converted "
+                "using the image's pixel size). Typical values in pixels:\n"
+                "  • Organoids: 8–15 px\n"
+                "  • Immune cells: 1.5–4.0 px\n"
                 "  • Disable: 0.0 (not recommended, leads to under-segmentation)"
             ))
 
             w_size = QSpinBox()
-            w_size.setRange(1, 100000)
+            w_size.setRange(1, 1000000000)
             w_size.setValue(int(saved_size))
-            w_size.setMaximumWidth(80)
+            w_size.setMaximumWidth(90)
             ct_form.addRow("Min size:", make_help_row(
                 w_size,
-                "Minimum Object Size (pixels)",
-                "Minimum volume (in pixels) for a segmented object to be kept.\n\n"
+                "Minimum Object Size",
+                "Minimum volume for a segmented object to be kept.\n\n"
                 "Objects smaller than this are removed as noise.\n\n"
-                "Typical values:\n"
-                "  • Organoids: 500–2000\n"
-                "  • Immune cells: 5–50"
+                "Shown in the unit selected above (µm³ by default; converted "
+                "using the image's pixel size). Typical values in voxels:\n"
+                "  • Organoids: 500–2000 voxels\n"
+                "  • Immune cells: 5–50 voxels"
             ))
 
             w_open = QSpinBox()
@@ -927,13 +940,21 @@ class PixelClassifierWidget(QWidget):
 
             w_fill = QCheckBox("Fill holes")
             w_fill.setChecked(bool(saved_fill))
-            ct_form.addRow(make_help_row(
-                w_fill,
+            fill_row = QHBoxLayout()
+            fill_row.addWidget(w_fill)
+            fill_row.addWidget(HelpButton(
                 "Fill Holes",
                 "When checked, internal gaps or holes within segmented "
                 "objects are automatically filled.\n\n"
                 "Recommended ON for most use cases."
             ))
+            fill_row.addStretch()
+            ct_form.addRow("", fill_row)
+
+            # Register distance/volume spinboxes with the unit toggle so they
+            # display in the chosen unit; opening/fill-holes stay native.
+            unit_mgr.register(w_edt, "distance", float(saved_edt))
+            unit_mgr.register(w_size, "volume", int(saved_size))
 
             ct_group.setLayout(ct_form)
             self.param_layout.addWidget(ct_group)
@@ -942,7 +963,8 @@ class PixelClassifierWidget(QWidget):
                 'edt': w_edt,
                 'min_size': w_size,
                 'opening': w_open,
-                'fill_holes': w_fill
+                'fill_holes': w_fill,
+                'unit_mgr': unit_mgr,
             }
         
         # Add Test Button at the end of params list
@@ -962,8 +984,17 @@ class PixelClassifierWidget(QWidget):
         for cell_type in self.all_cell_types:
             if cell_type in self.param_widgets:
                 w = self.param_widgets[cell_type]
-                pc[f"{cell_type}_edt_threshold"] = float(w['edt'].value())
-                pc[f"{cell_type}_segment_size_min"] = int(w['min_size'].value())
+                mgr = w.get('unit_mgr')
+                if mgr is not None:
+                    # Persist canonical native (pixel/voxel) values regardless
+                    # of the current display unit.
+                    edt_native = mgr.get_native(w['edt'])
+                    size_native = mgr.get_native(w['min_size'])
+                else:
+                    edt_native = float(w['edt'].value())
+                    size_native = int(w['min_size'].value())
+                pc[f"{cell_type}_edt_threshold"] = float(edt_native)
+                pc[f"{cell_type}_segment_size_min"] = int(round(size_native))
                 pc[f"{cell_type}_opening_nr_pixels"] = int(w['opening'].value())
                 pc[f"{cell_type}_fill_holes"] = bool(w['fill_holes'].isChecked())
 
@@ -1188,8 +1219,9 @@ class PixelClassifierWidget(QWidget):
             ct_key = cell_type.lower()
             if ct_key in self.param_widgets:
                 w = self.param_widgets[ct_key]
-                edt = float(w['edt'].value())
-                sz  = int(w['min_size'].value())
+                mgr = w.get('unit_mgr')
+                edt = float(mgr.get_native(w['edt'])) if mgr is not None else float(w['edt'].value())
+                sz  = int(round(mgr.get_native(w['min_size']))) if mgr is not None else int(w['min_size'].value())
                 opn = int(w['opening'].value())
                 fh  = bool(w['fill_holes'].isChecked())
             else:
@@ -2010,8 +2042,9 @@ class PixelClassifierWidget(QWidget):
             cell_type_key = cell_type.lower()
             if cell_type_key in self.param_widgets:
                 w                = self.param_widgets[cell_type_key]
-                edt_threshold    = float(w["edt"].value())
-                segment_size_min = int(w["min_size"].value())
+                mgr              = w.get('unit_mgr')
+                edt_threshold    = float(mgr.get_native(w["edt"])) if mgr is not None else float(w["edt"].value())
+                segment_size_min = int(round(mgr.get_native(w["min_size"]))) if mgr is not None else int(w["min_size"].value())
             else:
                 if cell_type in self.organoid_types:
                     edt_threshold, segment_size_min = 12.0, 1000
@@ -2117,8 +2150,9 @@ class PixelClassifierWidget(QWidget):
                 else:
                     if cell_type_key in self.param_widgets:
                         widgets = self.param_widgets[cell_type_key]
-                        edt = widgets['edt'].value()
-                        size = widgets['min_size'].value()
+                        mgr = widgets.get('unit_mgr')
+                        edt = float(mgr.get_native(widgets['edt'])) if mgr is not None else widgets['edt'].value()
+                        size = int(round(mgr.get_native(widgets['min_size']))) if mgr is not None else widgets['min_size'].value()
                         opening = widgets['opening'].value()
                         fill = widgets['fill_holes'].isChecked()
                     else:
@@ -3562,13 +3596,28 @@ class APOCWidget(QWidget):
         gpu_row.addStretch()
         layout.addLayout(gpu_row)
 
+        force_cpu_row = QHBoxLayout()
         self.btn_force_cpu = QCheckBox("Force CPU-only processing")
         self.btn_force_cpu.setToolTip("Override GPU selection and run pyclesperanto on the CPU")
         is_force_cpu = bool(pc.get("force_cpu", False))
         self.btn_force_cpu.setChecked(is_force_cpu)
         if is_force_cpu:
             self.combo_gpu_device.setEnabled(False)
-        layout.addWidget(self.btn_force_cpu)
+        force_cpu_row.addWidget(self.btn_force_cpu)
+        force_cpu_row.addWidget(HelpButton(
+            "Force CPU-only Processing",
+            "Overrides the GPU Device selection above and asks pyclesperanto "
+            "to run APOC (pixel classification + EDT/watershed) on the CPU "
+            "instead of the GPU.\n\n"
+            "Requires an OpenCL CPU runtime to be installed (e.g. the Intel "
+            "CPU Runtime for OpenCL). If none is found, pyclesperanto silently "
+            "falls back to whatever OpenCL device it can find and a warning "
+            "is logged.\n\n"
+            "Use this if you don't have a compatible GPU, or if GPU "
+            "processing is unstable/unavailable on this machine."
+        ))
+        force_cpu_row.addStretch()
+        layout.addLayout(force_cpu_row)
 
         # ── Training section (embedded APOCTrainingWidget) ──────
         self.training_group = QGroupBox("🎯 APOC Classifier Training")
@@ -4602,6 +4651,7 @@ class APOCWidget(QWidget):
         toolbar_widgets = []
         self._check_unify_organoids = None
         if len(org) >= 2:
+            unify_row = QHBoxLayout()
             self._check_unify_organoids = QCheckBox(
                 "\u26d3 Apply same settings to all organoids"
             )
@@ -4612,7 +4662,22 @@ class APOCWidget(QWidget):
                 "Toggle again to re-sync after making further changes."
             )
             self._check_unify_organoids.stateChanged.connect(self._on_unify_organoids_changed)
-            toolbar_widgets.append(self._check_unify_organoids)
+            unify_row.addWidget(self._check_unify_organoids)
+            unify_row.addWidget(HelpButton(
+                "Apply Same Settings to All Organoids",
+                "When there are multiple organoid cell types, checking this box "
+                "immediately copies the first organoid tab's configuration "
+                "(selected channels/features, strategy, and EDT/opening/min "
+                "size/fill-holes parameters) to all other organoid tabs.\n\n"
+                "It only syncs once at the moment you check it \u2014 further edits "
+                "to any organoid tab are NOT automatically propagated. Toggle "
+                "the checkbox off and back on to re-sync after making more "
+                "changes.\n\n"
+                "Immune and other non-organoid cell types are not affected."
+            ))
+            unify_widget = QWidget()
+            unify_widget.setLayout(unify_row)
+            toolbar_widgets.append(unify_widget)
 
         _pc_params = params.get("pixel_classifier", {}) or {}
         _md = self.metadata_loader.metadata
@@ -5848,6 +5913,7 @@ class ConvPaintWidget(QWidget):
         self._training_widget = None
         self._is_session_active = False
         self._all_images_cache = None
+        self.all_cell_types = []           # set when metadata loaded
         # Background-execution infrastructure (shared progress row).
         self.tab_progress_row = tab_progress_row
         self._bg = BackgroundOperation(self)
@@ -6114,6 +6180,7 @@ class ConvPaintWidget(QWidget):
 
         md = self.metadata_loader.metadata
         if md is None:
+            self.all_cell_types = []
             if self.training_placeholder.parent() is None:
                 self.training_layout.addWidget(self.training_placeholder)
             self.training_placeholder.show()
@@ -6137,6 +6204,7 @@ class ConvPaintWidget(QWidget):
         other_types    = _filter_merge_types(detect_other_cell_types_from_metadata(md))
         all_cell_types = organoid_types + immune_types + other_types
         has_death      = has_dead_channel(md)
+        self.all_cell_types = list(all_cell_types)
 
         if not all_cell_types:
             if self.training_placeholder.parent() is None:
@@ -6158,6 +6226,18 @@ class ConvPaintWidget(QWidget):
         ip["convpaint_device"] = self._selected_device()
         cp_strategy = _normalize_strategy(ip.get("convpaint_strategy", DEFAULT_STRATEGY))
 
+        if "pixel_distance_xy" in md.columns and "distance_unit" in md.columns:
+            _unit = str(md["distance_unit"].iloc[0])
+            _xy_from_md = convert_distance(float(md["pixel_distance_xy"].iloc[0]), _unit)
+            _z_from_md  = convert_distance(float(md["pixel_distance_z"].iloc[0]),  _unit)
+        else:
+            _xy_from_md = None
+            _z_from_md  = None
+        _pixel_sizes = {
+            "xy_um": ip.get("pixel_size_xy") or ip.get("pixel_size_xy_um") or _xy_from_md,
+            "z_um":  ip.get("pixel_size_z")  or ip.get("pixel_size_z_um")  or _z_from_md,
+        }
+
         self._training_widget = ConvPaintTrainingWidget(
             viewer=self.viewer,
             all_images=[],          # no training data yet — parameter-only mode
@@ -6169,6 +6249,7 @@ class ConvPaintWidget(QWidget):
             convpaint_strategy=cp_strategy,
             unified_input_channels=[],
             death_input_channels=[],
+            pixel_sizes=_pixel_sizes,
             per_cell_type_strategy=True,
             show_device=False,
             external_log=self.log,
@@ -6319,6 +6400,7 @@ class ConvPaintWidget(QWidget):
                 overwrite_images=overwrite_images,
             )
             all_cell_types = _filter_merge_types(all_cell_types)
+            self.all_cell_types = list(all_cell_types)
 
             if not all_images:
                 self.log("⚠️ No training images loaded.")
@@ -6486,6 +6568,18 @@ class ConvPaintWidget(QWidget):
                 ip.get("convpaint_strategy", DEFAULT_STRATEGY)
             )
 
+            if md is not None and "pixel_distance_xy" in md.columns and "distance_unit" in md.columns:
+                _unit = str(md["distance_unit"].iloc[0])
+                _xy_from_md = convert_distance(float(md["pixel_distance_xy"].iloc[0]), _unit)
+                _z_from_md  = convert_distance(float(md["pixel_distance_z"].iloc[0]),  _unit)
+            else:
+                _xy_from_md = None
+                _z_from_md  = None
+            _pixel_sizes = {
+                "xy_um": ip.get("pixel_size_xy") or ip.get("pixel_size_xy_um") or _xy_from_md,
+                "z_um":  ip.get("pixel_size_z")  or ip.get("pixel_size_z_um")  or _z_from_md,
+            }
+
             self._training_widget = ConvPaintTrainingWidget(
                 viewer=self.viewer,
                 all_images=all_images,
@@ -6497,6 +6591,7 @@ class ConvPaintWidget(QWidget):
                 convpaint_strategy=cp_strategy,
                 unified_input_channels=unified_input_channels,
                 death_input_channels=death_input_channels,
+                pixel_sizes=_pixel_sizes,
                 per_cell_type_strategy=True,
                 show_device=False,
                 external_log=self.log,

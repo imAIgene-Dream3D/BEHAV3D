@@ -1235,13 +1235,24 @@ def calculate_death(
     ):
     # print(f"- Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
     df_tracks["dead"] = False
-    
+
+    # ``percentage_dead_mask`` is stored as the *fraction* of dead-mask-positive
+    # voxels per segment (mean of a 0/1 mask -> range 0.0-1.0), but the GUI dead
+    # threshold is entered as a percentage (0-100, matching the death preview
+    # overlay which computes coverage on a 0-100 scale). Convert the percentage
+    # threshold to a fraction here so the analysis "dead" classification matches
+    # what the preview shows. Other threshold columns (e.g. mean_dead_dye) are
+    # compared on their own native scale.
+    effective_threshold = threshold
+    if threshold_column == "percentage_dead_mask" and threshold is not None:
+        effective_threshold = float(threshold) / 100.0
+
     # For any cell crossing the dead_dye_threshold, set the cell to dead. Any timepoint after this timepoint are
     # Also set to dead, even if the mean dead dye intensity goes under the threshold again
     for track_id in df_tracks["TrackID"].unique():
         track_df = df_tracks[df_tracks["TrackID"] == track_id]
         track_df_reset = track_df.reset_index(drop=True)
-        threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset[threshold_column] >= threshold].index
+        threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset[threshold_column] >= effective_threshold].index
         
         if not threshold_indices.empty:
             first_threshold_index = threshold_indices.min()

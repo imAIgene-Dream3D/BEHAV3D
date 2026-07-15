@@ -53,6 +53,58 @@ _LABEL_CMAP = {
     "ot": "plasma",
 }
 # ----------------------------------------------------------------------
+
+
+def _is_addable_layer_data(data) -> bool:
+    """Return True if ``data`` is safe to hand to napari's add_* methods.
+
+    A degenerate array (rank < 2, or any axis of length ≤ 1) makes napari's
+    thumbnail generation call ``scipy.ndimage.zoom`` with a mismatched rank
+    and raise ``RuntimeError: sequence argument must have length equal to
+    input rank``. This happens when a segments/dead-mask zarr on disk reads
+    back as an empty/placeholder store (e.g. shape ``(1,)`` or ``(0, …)``).
+    Guarding here turns a hard crash into a skippable, logged warning.
+    """
+    shape = getattr(data, "shape", None)
+    if shape is None:
+        return False
+    if len(shape) < 2:
+        return False
+    if any((int(s) <= 1) for s in shape[-2:]):
+        # A spatial plane must be at least 2×2 for napari's thumbnail zoom.
+        return False
+    if any(int(s) == 0 for s in shape):
+        return False
+    return True
+
+
+def _stop_dim_playback(viewer) -> None:
+    """Best-effort stop of any running napari dims animation.
+
+    Clearing/replacing layers while a 3-D movie is playing destroys the
+    ``QtDimSliderWidget`` objects the animation thread still references,
+    raising ``RuntimeError: wrapped C/C++ object … has been deleted``. We
+    stop playback via the public ``QtDims.stop()`` and also quit the
+    animation thread directly, since depending on the napari version either
+    (or neither) attribute may be present while a movie is live.
+    """
+    try:
+        qt_dims = viewer.window._qt_viewer.dims
+    except Exception:
+        return
+    # Public stop first (handles the current napari playback implementation).
+    try:
+        qt_dims.stop()
+    except Exception:
+        pass
+    # Fall back to tearing down the animation thread if it is still around.
+    try:
+        thread = getattr(qt_dims, "_animation_thread", None)
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+    except Exception:
+        pass
 # Dask cache-buster
 # ----------------------------------------------------------------------
 def _bust_dask_cache(arr: "da.Array") -> "da.Array":
@@ -160,76 +212,10 @@ class _FlowLayout(QLayout):
 
 
 # ----------------------------------------------------------------------
-# Custom Toggle Switch (QSwitch)
+# Custom Toggle Switch (QSwitch) — defined in _units so the units toggle
+# and this tab share one implementation.
 # ----------------------------------------------------------------------
-class QSwitch(QAbstractButton):
-    """Modern toggle switch widget."""
-    def __init__(self, parent=None, track_radius=10, thumb_radius=8):
-        super().__init__(parent)
-        self.setCheckable(True)
-        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        
-        self._track_radius = track_radius
-        self._thumb_radius = thumb_radius
-        
-        self._margin = 3
-        self._base_width = 40
-        self._base_height = 22
-        
-        # Position of the thumb (0 to 1 float)
-        self._offset = 0.0
-        self._animation = QPropertyAnimation(self, b"offset", self)
-        self._animation.setDuration(150)
-        self._animation.setEasingCurve(QEasingCurve.InOutSine)
-        
-        self.setFixedSize(self._base_width, self._base_height)
-
-    @Property(float)
-    def offset(self):
-        return self._offset
-
-    @offset.setter
-    def offset(self, pos):
-        self._offset = pos
-        self.update()
-
-    def sizeHint(self):
-        return self.size()
-
-    def nextCheckState(self):
-        super().nextCheckState()
-        start = self._offset
-        end = 1.0 if self.isChecked() else 0.0
-        self._animation.stop()
-        self._animation.setStartValue(start)
-        self._animation.setEndValue(end)
-        self._animation.start()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(Qt.NoPen)
-        
-        # Draw background track
-        if self.isChecked():
-            # Green for ON
-            p.setBrush(QColor("#4CAF50"))
-        else:
-            # Grey for OFF
-            p.setBrush(QColor("#CCCCCC"))
-            
-        p.drawRoundedRect(0, 0, self.width(), self.height(), self._track_radius, self._track_radius)
-        
-        # Draw thumb
-        p.setBrush(QColor("white"))
-        thumb_x = self._margin + self._offset * (self.width() - 2 * self._thumb_radius - 2 * self._margin)
-        p.drawEllipse(int(thumb_x), self._margin, 2 * self._thumb_radius, 2 * self._thumb_radius)
-
-    def setChecked(self, checked: bool):
-        super().setChecked(checked)
-        self._offset = 1.0 if checked else 0.0
-        self.update()
-
+from behav3d.napari._units import QSwitch  # noqa: E402
 
 
 class VisualizationTab(QWidget):
@@ -438,16 +424,9 @@ class VisualizationTab(QWidget):
         self.toggle_track_seg.setChecked(True)
         self.toggle_tracks.setChecked(False) # Tracks are hidden by default
 
-        # if self.clear_layers_cb.isChecked():
         # Stop any running napari dim animation before clearing layers
         # (prevents RuntimeError: wrapped C/C++ object has been deleted)
-        try:
-            qt_dims = self.viewer.window._qt_viewer.dims
-            if hasattr(qt_dims, '_animation_thread') and qt_dims._animation_thread is not None:
-                qt_dims._animation_thread.quit()
-                qt_dims._animation_thread.wait()
-        except Exception:
-            pass
+        _stop_dim_playback(self.viewer)
         self._display_save_timer.stop()
         self.viewer.layers.clear()
 
@@ -557,6 +536,13 @@ class VisualizationTab(QWidget):
             if saved and "contrast_limits" in saved:
                 add_kwargs["contrast_limits"] = tuple(saved["contrast_limits"])
 
+            if not _is_addable_layer_data(ch_data):
+                self._log(
+                    f"    ⚠️ Skipping {layer_name}: unexpected/degenerate "
+                    f"shape {getattr(ch_data, 'shape', '?')}"
+                )
+                continue
+
             layer = self.viewer.add_image(ch_data, **add_kwargs)
 
             layer.events.contrast_limits.connect(self._on_layer_display_changed)
@@ -642,6 +628,12 @@ class VisualizationTab(QWidget):
                         seg_data = da.from_array(seg_data, chunks=(1,) + seg_data.shape[1:])
 
                 layer_name = f"{sample_name} – {ct_name} segments"
+                if not _is_addable_layer_data(seg_data):
+                    self._log(
+                        f"    ⚠️ Skipping {ct_name} segments: unexpected/degenerate "
+                        f"shape {getattr(seg_data, 'shape', '?')} ({seg_path})"
+                    )
+                    continue
                 self.viewer.add_labels(
                     seg_data,
                     name=layer_name,
@@ -668,6 +660,12 @@ class VisualizationTab(QWidget):
                             dead_data = da.from_array(dead_data, chunks=(1,) + dead_data.shape[1:])
 
                     layer_name = f"{sample_name} – dead mask"
+                    if not _is_addable_layer_data(dead_data):
+                        self._log(
+                            f"    ⚠️ Skipping dead mask: unexpected/degenerate "
+                            f"shape {getattr(dead_data, 'shape', '?')} ({dead_path})"
+                        )
+                        return
                     self.viewer.add_labels(
                         dead_data,
                         name=layer_name,
@@ -680,24 +678,66 @@ class VisualizationTab(QWidget):
                 self._log(f"    - Skipping dead mask: File not found ({dead_path})")
 
     # ------------------------------------------------------------------
+    # Cell-type-group loader
+    # ------------------------------------------------------------------
+    def _detect_group_columns(self, sample_name: str) -> dict[str, str]:
+        """Return ``{group_id: category_prefix}`` for groups with tracked
+        segments/files already built for this sample (see
+        ``create_group_tracked_segments`` in ``behav3d.analysis.grouping``).
+
+        Groups are never written into metadata.csv, so unlike
+        ``_detect_cell_type_columns`` this resolves file paths on demand
+        instead of reading metadata columns.
+        """
+        from behav3d.analysis.grouping import (
+            group_category,
+            group_tracked_csv_path,
+            group_tracked_image_path,
+            list_cell_type_groups,
+        )
+
+        output_dir = self.data_prep.output_dir
+        if not output_dir or not sample_name:
+            return {}
+        params = self.data_prep.behav3d_parameters or {}
+        groups = list_cell_type_groups(params)
+        category_prefix = {"organoid": "or", "immune": "im", "other": "ot"}
+
+        result: dict[str, str] = {}
+        for group_id in groups:
+            img_p = group_tracked_image_path(output_dir, sample_name, group_id)
+            csv_p = group_tracked_csv_path(output_dir, sample_name, group_id)
+            if img_p.exists() and csv_p.exists():
+                cat = group_category(params, self._metadata, group_id)
+                result[group_id] = category_prefix.get(cat, "im")
+        return result
+
+    # ------------------------------------------------------------------
     # Track loader
     # ------------------------------------------------------------------
     def _load_tracks(self, sample_name: str, row: pd.Series):
         """Load tracks CSVs and add them as napari Tracks layers."""
-        ct_map = self._detect_cell_type_columns(row)
+        from behav3d.analysis.grouping import group_tracked_csv_path
 
-        for ct_name, prefix in ct_map.items():
-            csv_col = f"{prefix}_{ct_name}_tracks_csv_path"
-            csv_path_val = row.get(csv_col)
-            
+        ct_map = self._detect_cell_type_columns(row)
+        sources = {
+            ct_name: row.get(f"{prefix}_{ct_name}_tracks_csv_path")
+            for ct_name, prefix in ct_map.items()
+        }
+        for group_id in self._detect_group_columns(sample_name):
+            sources[group_id] = group_tracked_csv_path(
+                self.data_prep.output_dir, sample_name, group_id
+            )
+
+        for name, csv_path_val in sources.items():
             # Robust check for missing values (NaN or empty)
-            if pd.isna(csv_path_val) or not str(csv_path_val).strip():
-                self._log(f"    - Skipping {ct_name} tracks: Path not defined in metadata")
+            if csv_path_val is None or (isinstance(csv_path_val, float) and pd.isna(csv_path_val)) or not str(csv_path_val).strip():
+                self._log(f"    - Skipping {name} tracks: Path not defined")
                 continue
 
             csv_path_str = str(csv_path_val).strip()
             if not Path(csv_path_str).exists():
-                self._log(f"    - Skipping {ct_name} tracks: File not found ({csv_path_str})")
+                self._log(f"    - Skipping {name} tracks: File not found ({csv_path_str})")
                 continue
 
             try:
@@ -706,7 +746,7 @@ class VisualizationTab(QWidget):
                 # Expect columns: track_id, t, z, y, x (at minimum)
                 required = {"TrackID", "position_t", "pixel_position_y", "pixel_position_x"}
                 if not required.issubset(set(tracks_df.columns)):
-                    self._log(f"    ⚠️ Tracks CSV for {ct_name} missing columns {required - set(tracks_df.columns)}")
+                    self._log(f"    ⚠️ Tracks CSV for {name} missing columns {required - set(tracks_df.columns)}")
                     continue
 
                 if "pixel_position_z" in tracks_df.columns:
@@ -714,7 +754,7 @@ class VisualizationTab(QWidget):
                 else:
                     track_data = tracks_df[["TrackID", "position_t", "pixel_position_y", "pixel_position_x"]].values
 
-                layer_name = f"{sample_name} – {ct_name} tracks"
+                layer_name = f"{sample_name} – {name} tracks"
                 self.viewer.add_tracks(
                     track_data,
                     name=layer_name,
@@ -722,7 +762,7 @@ class VisualizationTab(QWidget):
                 )
                 self._log(f"    + Tracks layer: {layer_name}")
             except Exception as e:
-                self._log(f"    ⚠️ Could not load tracks for {ct_name}: {e}")
+                self._log(f"    ⚠️ Could not load tracks for {name}: {e}")
 
     # ------------------------------------------------------------------
     # Tracked Segment loader
@@ -730,16 +770,22 @@ class VisualizationTab(QWidget):
     def _load_tracked_segments(self, sample_name: str, row: pd.Series):
         """Load tracked segments (labeled images with track IDs)."""
         from behav3d.io.formats.zarr import load_zarr
-        
-        ct_map = self._detect_cell_type_columns(row)
+        from behav3d.analysis.grouping import group_tracked_image_path
 
-        for ct_name, prefix in ct_map.items():
-            track_seg_col = f"{prefix}_{ct_name}_tracks_image_path"
-            track_seg_path_val = row.get(track_seg_col)
-            
-            if pd.isna(track_seg_path_val) or not str(track_seg_path_val).strip():
+        ct_map = self._detect_cell_type_columns(row)
+        sources = {
+            ct_name: row.get(f"{prefix}_{ct_name}_tracks_image_path")
+            for ct_name, prefix in ct_map.items()
+        }
+        for group_id in self._detect_group_columns(sample_name):
+            sources[group_id] = group_tracked_image_path(
+                self.data_prep.output_dir, sample_name, group_id
+            )
+
+        for name, track_seg_path_val in sources.items():
+            if track_seg_path_val is None or (isinstance(track_seg_path_val, float) and pd.isna(track_seg_path_val)) or not str(track_seg_path_val).strip():
                 continue
-                
+
             track_seg_path = str(track_seg_path_val).strip()
             if not Path(track_seg_path).exists():
                 continue
@@ -754,26 +800,32 @@ class VisualizationTab(QWidget):
                     if not isinstance(seg_data, da.Array):
                         seg_data = da.from_array(seg_data, chunks=(1,) + seg_data.shape[1:])
 
-                layer_name = f"{sample_name} – {ct_name} tracked segments"
+                layer_name = f"{sample_name} – {name} tracked segments"
+                if not _is_addable_layer_data(seg_data):
+                    self._log(
+                        f"    ⚠️ Skipping {name} tracked segments: unexpected/degenerate "
+                        f"shape {getattr(seg_data, 'shape', '?')} ({track_seg_path})"
+                    )
+                    continue
                 self.viewer.add_labels(
                     seg_data,
                     name=layer_name,
                     visible=True,
                 )
                 self._log(f"    + Tracked Labels layer: {layer_name}")
-                
+
                 # If we have tracked segments, hide the regular segments
-                reg_seg_layer_name = f"{sample_name} – {ct_name} segments"
+                reg_seg_layer_name = f"{sample_name} – {name} segments"
                 if reg_seg_layer_name in self.viewer.layers:
                     self.viewer.layers[reg_seg_layer_name].visible = False
-                    self._log(f"    - Hiding regular segments for {ct_name}")
+                    self._log(f"    - Hiding regular segments for {name}")
                     # Update toggle state to reflect that some segments are hidden
-                    # Note: This affects ALL segments if multiple cell types exist, 
+                    # Note: This affects ALL segments if multiple cell types exist,
                     # but usually it's consistent.
                     self.toggle_seg.setChecked(False)
 
             except Exception as e:
-                self._log(f"    ⚠️ Could not load tracked segments for {ct_name}: {e}")
+                self._log(f"    ⚠️ Could not load tracked segments for {name}: {e}")
 
     def _on_toggle_layer_group(self, state, group_type):
         """Batch show/hide layers based on their name suffix/pattern."""
@@ -896,13 +948,7 @@ class VisualizationTab(QWidget):
             f"  Entering edit mode — clearing viewer and reloading "
             f"raw + '{cell_type} tracked segments' + '{cell_type} tracks' only."
         )
-        try:
-            qt_dims = self.viewer.window._qt_viewer.dims
-            if hasattr(qt_dims, "_animation_thread") and qt_dims._animation_thread is not None:
-                qt_dims._animation_thread.quit()
-                qt_dims._animation_thread.wait()
-        except Exception:
-            pass
+        _stop_dim_playback(self.viewer)
         self._display_save_timer.stop()
         self.viewer.layers.clear()
         saved_channels = (
