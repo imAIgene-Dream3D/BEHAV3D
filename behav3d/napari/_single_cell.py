@@ -61,7 +61,7 @@ from behav3d.napari._background_runner import (
 from behav3d.napari._pdf_view import open_pdf_in_napari
 from behav3d.napari._rename_dialog import RenameClusterDialog
 from behav3d.core.qt_help import HelpButton, make_help_row
-from behav3d.core.utils import rmtree_ignore_missing
+from behav3d.core.utils import rmtree_ignore_missing, format_timepoints_as_time
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -262,6 +262,13 @@ def _make_view_btn() -> QPushButton:
         "border: 1px solid #333; }"
     )
     return btn
+
+
+def _make_timepoint_time_label() -> QLabel:
+    """Return a small muted QLabel for showing a timepoint-window's real-time equivalent."""
+    lbl = QLabel("")
+    lbl.setStyleSheet("color: #999; font-style: italic; font-size: 10px;")
+    return lbl
 
 
 def _make_info_label(text: str) -> QLabel:
@@ -486,7 +493,16 @@ class StateClassificationSubTab(QWidget):
         self.spin_window_size = QSpinBox()
         self.spin_window_size.setRange(1, 500)
         self.spin_window_size.setValue(5)
-        win_feat_form.addRow("Window size:", self.spin_window_size)
+        win_feat_form.addRow("Window size (timepoints):", make_help_row(
+            self.spin_window_size, "Window size",
+            "Size of the rolling window (in timepoints/frames) used to compute window "
+            "features (net_displacement, straightness, mean_square_displacement). The line "
+            "below shows the equivalent real time, computed from this sample's "
+            "time_interval/time_unit metadata."
+        ))
+        self.lbl_window_size_time = _make_timepoint_time_label()
+        win_feat_form.addRow("", self.lbl_window_size_time)
+        self.spin_window_size.valueChanged.connect(self._update_timepoint_time_labels)
         self.feat_sel_lay.addLayout(win_feat_form)
 
         self.chk_net_disp = QCheckBox("net_displacement")
@@ -534,11 +550,15 @@ class StateClassificationSubTab(QWidget):
         self.spin_hmm_feature_smoothing_window = QSpinBox()
         self.spin_hmm_feature_smoothing_window.setRange(1, 100)
         self.spin_hmm_feature_smoothing_window.setValue(5)
-        proc_form.addRow("Smooth window:", make_help_row(
+        proc_form.addRow("Smooth window (timepoints):", make_help_row(
             self.spin_hmm_feature_smoothing_window, "Feature smoothing window",
-            "Size of the rolling smoothing window applied to features before HMM fitting. "
-            "1 = no smoothing."
+            "Size of the rolling smoothing window (in timepoints/frames) applied to features "
+            "before HMM fitting. 1 = no smoothing. The line below shows the equivalent real "
+            "time, computed from this sample's time_interval/time_unit metadata."
         ))
+        self.lbl_hmm_smoothing_time = _make_timepoint_time_label()
+        proc_form.addRow("", self.lbl_hmm_smoothing_time)
+        self.spin_hmm_feature_smoothing_window.valueChanged.connect(self._update_timepoint_time_labels)
 
         self.spin_quant_lo = QDoubleSpinBox()
         self.spin_quant_lo.setRange(0.0, 0.5)
@@ -1057,8 +1077,18 @@ class StateClassificationSubTab(QWidget):
     def on_metadata_updated(self):
         self._reload()
 
+    def _update_timepoint_time_labels(self, *_):
+        metadata = getattr(self.metadata_loader, "metadata", None)
+        self.lbl_window_size_time.setText(
+            format_timepoints_as_time(self.spin_window_size.value(), metadata)
+        )
+        self.lbl_hmm_smoothing_time.setText(
+            format_timepoints_as_time(self.spin_hmm_feature_smoothing_window.value(), metadata)
+        )
+
     def _reload(self):
         try:
+            self._update_timepoint_time_labels()
             ct = self._cell_type()
             if not ct:
                 self._model_adata = None
@@ -2277,12 +2307,17 @@ class TrackClassificationSubTab(QWidget):
         self.spin_traj_size.setRange(1, 9999)
         self.spin_traj_size.setValue(100)
         self.spin_traj_size.setMaximumWidth(120)
-        basic_form.addRow("Trajectory size:", make_help_row(
+        basic_form.addRow("Trajectory size (timepoints):", make_help_row(
             self.spin_traj_size, "Trajectory size",
             "Number of timepoints to include per track. With the default 'last' trim mode "
             "this keeps each track's final N timepoints (dropping its earlier ones); "
-            "tracks shorter than this are discarded. Match the value used in your notebook."
+            "tracks shorter than this are discarded. Match the value used in your notebook. "
+            "The line below shows the equivalent real time, computed from this sample's "
+            "time_interval/time_unit metadata."
         ))
+        self.lbl_traj_size_time = _make_timepoint_time_label()
+        basic_form.addRow("", self.lbl_traj_size_time)
+        self.spin_traj_size.valueChanged.connect(self._update_timepoint_time_labels)
         self.spin_n_clusters = QSpinBox()
         self.spin_n_clusters.setRange(2, 200)
         self.spin_n_clusters.setValue(6)
@@ -2971,7 +3006,14 @@ class TrackClassificationSubTab(QWidget):
     def on_metadata_updated(self):
         self._reload()
 
+    def _update_timepoint_time_labels(self, *_):
+        metadata = getattr(self.metadata_loader, "metadata", None)
+        self.lbl_traj_size_time.setText(
+            format_timepoints_as_time(self.spin_traj_size.value(), metadata)
+        )
+
     def _reload(self):
+        self._update_timepoint_time_labels()
         ct = self._cell_type()
         if not ct:
             self._track_adata = None
