@@ -303,6 +303,22 @@ def _save_preview_array(path, data):
     save_as_zarr(np.asarray(data), path)
 
 
+def _set_dead_mask_layer_color(layer, color=(0.9, 0.0, 0.0, 1.0)):
+    """Render the death pixel-classification layer as a solid color (red by
+    default) instead of napari's default per-label random colors — it is a
+    binary mask (dead vs. not), not a multi-class label map. Any nonzero
+    label (whichever convention is used for "dead") is painted ``color``;
+    background (0) stays transparent."""
+    try:
+        from napari.utils.colormaps import DirectLabelColormap
+        layer.colormap = DirectLabelColormap(color_dict={None: list(color), 0: [0, 0, 0, 0]})
+    except Exception:
+        try:
+            layer.color = {1: color, 2: color}
+        except Exception:
+            pass
+
+
 def _reorder_convpaint_layers(viewer, all_cell_types, has_death=False):
     """Stable layer ordering for the unified-mode viewer."""
     layer_names = [layer.name for layer in viewer.layers]
@@ -2200,6 +2216,7 @@ class ConvPaintTrainingWidget(QWidget):
             death_mask = result.get("death")
             if death_mask is not None:
                 self._set_labels_layer(DEAD_PREDICTED_LAYER_NAME, death_mask)
+                _set_dead_mask_layer_color(self.viewer.layers[DEAD_PREDICTED_LAYER_NAME])
 
             _reorder_convpaint_layers(
                 self.viewer, self.all_cell_types, has_death=self.has_death
@@ -2643,6 +2660,7 @@ class ConvPaintTrainingWidget(QWidget):
         ).astype(np.int16)
         mask_stack = (seg_stack >= 2).astype(np.uint16)
         self._set_labels_layer(DEAD_PREDICTED_LAYER_NAME, mask_stack)
+        _set_dead_mask_layer_color(self.viewer.layers[DEAD_PREDICTED_LAYER_NAME])
         pred_path = _predicted_labels_path(self.pixel_class_outdir, "dead")
         if pred_path is not None:
             _save_preview_array(pred_path, mask_stack)
@@ -2904,10 +2922,11 @@ def train_pixel_classifier_convpaint(
             try:
                 pred = np.asarray(load_zarr(seg_path))
                 if pred.shape == label_shape:
-                    viewer.add_labels(
+                    dead_pred_layer = viewer.add_labels(
                         pred, name=DEAD_PREDICTED_LAYER_NAME, opacity=0.8,
                         visible=False,
                     )
+                    _set_dead_mask_layer_color(dead_pred_layer)
             except Exception as exc:
                 print(f"  \u26a0\ufe0f Could not restore death mask: {exc}")
 

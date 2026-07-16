@@ -10,6 +10,7 @@ import napari
 
 from behav3d.napari._queue import ProcessingQueuePanel, StepType
 from behav3d.napari._global_workers import GlobalWorkersController
+from behav3d.core.qt_help import disable_spinbox_wheel_scroll
 from pathlib import Path
 
 
@@ -56,7 +57,8 @@ class FloatingAssistantButton(QPushButton):
         self._drag_active = False
         self._drag_start_global_pos = None
         self._drag_start_window_pos = None
-        self._user_moved = False
+        self._anchor_corner = "br"
+        self._anchor_offset = (20, 20)
 
         if parent is not None:
             parent.installEventFilter(self)
@@ -88,7 +90,6 @@ class FloatingAssistantButton(QPushButton):
                 y = max(0, min(new_pos.y(), p_rect.height() - self.height()))
                 self.move(x, y)
                 self._drag_active = True
-                self._user_moved = True
 
                 # Since the button follows the cursor, Qt keeps thinking the
                 # mouse is hovering a pressed button and re-applies the
@@ -102,40 +103,59 @@ class FloatingAssistantButton(QPushButton):
 
     def mouseReleaseEvent(self, event):
         if self._drag_active:
-            # We dragged the button. Call super to reset visual state (un-press), 
+            # We dragged the button. Call super to reset visual state (un-press),
             # but block signals so it doesn't trigger a 'click' action.
+            self._update_anchor_from_position()
             self.blockSignals(True)
             super().mouseReleaseEvent(event)
             self.blockSignals(False)
         else:
             # Normal click
             super().mouseReleaseEvent(event)
-            
+
         self._drag_start_global_pos = None
         self._drag_start_window_pos = None
         self._drag_active = False
 
     def eventFilter(self, obj, event):
         if obj == self.parent() and event.type() == QEvent.Resize:
-            if not getattr(self, '_user_moved', False):
-                self._update_position()
-            else:
-                # We don't force it to bottom-right if they moved it, 
-                # but we ensure it stays within the new bounds.
-                p_rect = self.parent().rect()
-                x = max(0, min(self.x(), p_rect.width() - self.width()))
-                y = max(0, min(self.y(), p_rect.height() - self.height()))
-                if self.x() != x or self.y() != y:
-                    self.move(x, y)
+            self._update_position()
         return super().eventFilter(obj, event)
+
+    def _update_anchor_from_position(self):
+        """Remember which corner the button is closest to, and its offset
+        from that corner, so _update_position can keep it there as the
+        parent resizes (e.g. when the assistant panel opens/closes)."""
+        if self.parent() is None:
+            return
+        p_rect = self.parent().rect()
+        x, y = self.x(), self.y()
+        left = x
+        right = p_rect.width() - self.width() - x
+        top = y
+        bottom = p_rect.height() - self.height() - y
+
+        horizontal = "l" if left <= right else "r"
+        vertical = "t" if top <= bottom else "b"
+        self._anchor_corner = vertical + horizontal
+        self._anchor_offset = (
+            left if horizontal == "l" else right,
+            top if vertical == "t" else bottom,
+        )
 
     def _update_position(self):
         if self.parent() is None:
             return
         p_rect = self.parent().rect()
-        margin = 20
-        x = p_rect.width() - self.width() - margin
-        y = p_rect.height() - self.height() - margin
+        dx, dy = self._anchor_offset
+        vertical, horizontal = self._anchor_corner[0], self._anchor_corner[1]
+
+        x = dx if horizontal == "l" else p_rect.width() - self.width() - dx
+        y = dy if vertical == "t" else p_rect.height() - self.height() - dy
+
+        x = max(0, min(x, p_rect.width() - self.width()))
+        y = max(0, min(y, p_rect.height() - self.height()))
+
         self.move(x, y)
         self.raise_()
 
@@ -151,6 +171,10 @@ class BEHAV3DWidget(QWidget):
         self.viewer = napari_viewer
         self.dev_mode = os.environ.get("BEHAV3D_DEV_MODE") == "1"
         self.setMinimumWidth(300)
+
+        # Stop the mouse wheel from silently changing spin box / combo box
+        # values when the user is just scrolling a tab past them.
+        disable_spinbox_wheel_scroll()
 
         # --- Global QGroupBox styling -----------------------------------------
         # Qt's default QGroupBox leaves no room between the title and the top

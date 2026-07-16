@@ -721,7 +721,9 @@ class VisualizationTab(QWidget):
 
         ct_map = self._detect_cell_type_columns(row)
         sources = {
-            ct_name: row.get(f"{prefix}_{ct_name}_tracks_csv_path")
+            ct_name: row.get(
+                f"{prefix}_{ct_name}_tracks_csv_path" if prefix else f"{ct_name}_tracks_csv_path"
+            )
             for ct_name, prefix in ct_map.items()
         }
         for group_id in self._detect_group_columns(sample_name):
@@ -774,7 +776,9 @@ class VisualizationTab(QWidget):
 
         ct_map = self._detect_cell_type_columns(row)
         sources = {
-            ct_name: row.get(f"{prefix}_{ct_name}_tracks_image_path")
+            ct_name: row.get(
+                f"{prefix}_{ct_name}_tracks_image_path" if prefix else f"{ct_name}_tracks_image_path"
+            )
             for ct_name, prefix in ct_map.items()
         }
         for group_id in self._detect_group_columns(sample_name):

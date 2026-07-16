@@ -416,6 +416,22 @@ def _classifier_path(pixel_class_outdir, cell_type):
     return Path(pixel_class_outdir) / fname
 
 
+def _set_dead_mask_layer_color(layer, color=(0.9, 0.0, 0.0, 1.0)):
+    """Render the death pixel-classification layer as a solid color (red by
+    default) instead of napari's default per-label random colors — it is a
+    binary mask (dead vs. not), not a multi-class label map. Any nonzero
+    label (whichever convention is used for "dead") is painted ``color``;
+    background (0) stays transparent."""
+    try:
+        from napari.utils.colormaps import DirectLabelColormap
+        layer.colormap = DirectLabelColormap(color_dict={None: list(color), 0: [0, 0, 0, 0]})
+    except Exception:
+        try:
+            layer.color = {1: color, 2: color}
+        except Exception:
+            pass
+
+
 def _predicted_labels_path(pixel_class_outdir, cell_type):
     """Return the expected predicted-label zarr path for a cell type."""
     if not pixel_class_outdir:
@@ -1222,7 +1238,10 @@ class CellTypeTab(QWidget):
         # Placeholder where the instance group is inserted in inline mode.
         # In docked mode this placeholder is unused; the group is reparented
         # into the parent training widget's shared dock area.
-        self._instance_group_anchor = QWidget()
+        # Parented to `self` directly (not just added to `layout`, which has
+        # no widget parent until setLayout() runs below) so this widget is
+        # never briefly a real top-level window when setVisible(True) fires.
+        self._instance_group_anchor = QWidget(self)
         self._instance_group_anchor.setVisible(False)
         self._instance_group_anchor_layout = QVBoxLayout(self._instance_group_anchor)
         self._instance_group_anchor_layout.setContentsMargins(0, 0, 0, 0)
@@ -2809,6 +2828,8 @@ class APOCTrainingWidget(QWidget):
         """Push classifier preview outputs into Napari layers."""
         seg_layer_name = "Pixel Classification (Dead)" if ct == "dead" else f"{ct.capitalize()} Segments"
         self._set_labels_layer(seg_layer_name, segments_result, visible=True, opacity=0.8)
+        if ct == "dead":
+            _set_dead_mask_layer_color(self.viewer.layers[seg_layer_name])
 
         prob_layer_name = "Probability Map (Dead)" if ct == "dead" else f"Probability Map ({ct.capitalize()})"
         self._set_image_layer(prob_layer_name, prob_result, visible=False, opacity=0.6)
@@ -3743,7 +3764,8 @@ def train_pixel_classifier_apoc(
                 pred_death = np.zeros(label_shape, dtype=np.int16)
         else:
             pred_death = np.zeros(label_shape, dtype=np.int16)
-        viewer.add_labels(pred_death, name="Pixel Classification (Dead)", opacity=0.8, visible=False)
+        dead_pred_layer = viewer.add_labels(pred_death, name="Pixel Classification (Dead)", opacity=0.8, visible=False)
+        _set_dead_mask_layer_color(dead_pred_layer)
 
         prob_death_path = _probability_map_path(pixel_class_outdir, "dead")
         if prob_death_path.exists():

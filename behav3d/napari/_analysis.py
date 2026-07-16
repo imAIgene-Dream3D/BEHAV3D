@@ -223,8 +223,8 @@ class CollapsibleSection(QWidget):
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(12, 2, 4, 4)
         self._content_layout.setSpacing(4)
-        self._content.setVisible(expanded)
         outer.addWidget(self._content)
+        self._content.setVisible(expanded)
 
         self._update_arrow()
 
@@ -1733,6 +1733,7 @@ class DeathDynamicsTab(QWidget):
                     df_tracks_path=None,
                     org_type=ct,
                     metadata=self.metadata_loader.metadata,
+                    show_in_notebook=False,
                 )
                 self._log(f"✅ Death Dynamics complete for {ct}.")
                 any_ok = True
@@ -1814,6 +1815,7 @@ class DeathDynamicsTab(QWidget):
                 output_dir=out_dir,
                 organoid_types=usable,
                 dead_perc_threshold_map=thr_map,
+                show_in_notebook=False,
             )
             self._log("✅ Combined Death Dynamics complete.")
             return True
