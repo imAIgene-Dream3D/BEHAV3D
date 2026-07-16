@@ -32,6 +32,7 @@ from qtpy.QtCore import Qt
 from qtpy.QtGui import QCursor
 
 from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.napari._units import UnitGroupManager
 from behav3d.napari._results_panel import (
     ResultsPanel,
     notify_results_changed,
@@ -59,6 +60,32 @@ _PREVIEW_PREFIX = "[Preview]"
 # multiple simultaneously-registered callbacks race on every mouse move and
 # most of them overwrite ``viewer.status`` with an empty/wrong result.
 _ACTIVE_PREVIEW_HOVER: dict = {}
+
+# Likewise, only one dims (time-slider) listener should ever be registered
+# on ``viewer.dims.events.current_step`` for the preview feature at a time —
+# whether it's a single cell-type panel's own listener or the organoid-shared
+# one on FeatureExtractionTab. Switching from one preview (e.g. a "tcell"
+# panel) to another (e.g. the organoid panel) must drop whichever listener —
+# from *any* panel/tab instance — is currently registered, not just the
+# newly-active side's own previous listener. Otherwise the stale listener
+# keeps firing against layers/arrays that were just cleared/replaced,
+# producing missing or clobbered "Dead/Alive" / "% Dead Mask" layers (or a
+# crash if it reaches for layers mid-teardown).
+_ACTIVE_PREVIEW_DIMS: dict = {}
+
+
+def _disconnect_any_active_preview_dims(viewer):
+    """Remove whichever preview dims listener is currently active on
+    ``viewer``, regardless of which panel/tab registered it."""
+    if viewer is None:
+        return
+    cb = _ACTIVE_PREVIEW_DIMS.pop(id(viewer), None)
+    if cb is None:
+        return
+    try:
+        viewer.dims.events.current_step.disconnect(cb)
+    except Exception:
+        pass
 
 
 def _find_main_widget(start):
@@ -112,7 +139,7 @@ def _notify_post_extraction(source_widget):
         filt = getattr(main, "filtering_tab", None)
         if filt is not None and hasattr(filt, "run_batch_filtering"):
             try:
-                filt.run_batch_filtering(interactive=True)
+                filt.run_batch_filtering(interactive=True, block=False)
             except Exception:
                 traceback.print_exc()
     elif clicked is btn_goto:
@@ -803,32 +830,52 @@ class CellTypeFeaturePanel(QWidget):
         )
         feat_lay.addWidget(_mandatory_note)
 
-        # Contact threshold (enabled only when Contact is checked)
+        # ── Contact threshold (top of the box; enabled only when Contact is
+        # checked). Contact distance is computed in real (µm) space using the
+        # sample's voxel spacing, so the native unit is physical — the toggle
+        # below only changes how the value is *displayed*.
+        self._contact_unit_mgr = UnitGroupManager(
+            self.metadata_loader.metadata, default_physical=True,
+        )
+        contact_unit_row = QHBoxLayout()
+        contact_unit_row.setSpacing(4)
+        contact_unit_row.addWidget(QLabel("Contact units:"))
+        contact_unit_row.addWidget(self._contact_unit_mgr.header_row(label=""))
+        contact_unit_wrap = QWidget()
+        contact_unit_wrap.setLayout(contact_unit_row)
+        feat_lay.addWidget(contact_unit_wrap)
+
         self.contact_threshold = QDoubleSpinBox()
-        self.contact_threshold.setRange(0.0, 500.0)
+        self.contact_threshold.setRange(0.0, 100000.0)
         self.contact_threshold.setSingleStep(0.5)
         self.contact_threshold.setDecimals(2)
-        self.contact_threshold.setValue(float(fcfg.get("contact_threshold", 0.0)))
         self.contact_threshold.setMaximumWidth(90)
-        self.contact_threshold.setSuffix(" µm")
 
         contact_row = QHBoxLayout()
         contact_row.setSpacing(6)
         contact_row.addWidget(self.feature_checks.get("contact", QCheckBox()))
         contact_help = make_help_row(
             self.contact_threshold,
-            "Contact Threshold (µm)",
-            "Physical distance (in micrometers) used to decide whether two cell\n"
-            "segments are 'in contact'.\n\n"
-            "A distance transform (using real voxel spacing) is computed around\n"
-            "each segment's border; any other-cell-type segment found within this\n"
-            "distance sets '{type}_contact_on_distance' = True and adds its\n"
-            "TrackID to 'touching_{type}s'.\n\n"
-            "This value also defines the neighbourhood used by the Organoid\n"
-            "Invasiveness calculation and by the Active Killing contact/target\n"
+            "Contact Threshold",
+            "Distance used to decide whether two cell segments are 'in "
+            "contact'.\n\n"
+            "Entered in the unit selected above (µm by default; contact "
+            "distance is computed in real (µm) space using the sample's "
+            "voxel spacing, so pixel-entered values are converted to µm "
+            "before use).\n\n"
+            "A distance transform (using real voxel spacing) is computed "
+            "around each segment's border; any other-cell-type segment "
+            "found within this distance sets '{type}_contact_on_distance' "
+            "= True and adds its TrackID to 'touching_{type}s'.\n\n"
+            "This value also defines the neighbourhood used by the Organoid "
+            "Invasiveness calculation and by the Active Killing contact/target "
             "matching.",
         )
         contact_row.addLayout(contact_help)
+        self._contact_unit_mgr.register(
+            self.contact_threshold, "distance",
+            float(fcfg.get("contact_threshold", 0.0)), native_unit="physical",
+        )
 
         # Group the optional 'Organoid Invasiveness' checkbox inline with the
         # contact row (immune cells only, mirroring the notebook widget).
@@ -863,16 +910,20 @@ class CellTypeFeaturePanel(QWidget):
             if self.category == "immune" and "invasiveness" in self.feature_checks:
                 self.feature_checks["invasiveness"].setVisible(contact_on)
 
-        _toggle_ct()
         if "contact" in self.feature_checks:
             self.feature_checks["contact"].stateChanged.connect(_toggle_ct)
 
+        # Contact (with its unit toggle) sits at the top of the box; the
+        # remaining checkboxes follow below in their usual order.
+        feat_lay.addLayout(contact_row)
+        # Run only after contact_row is parented, so setVisible() inside
+        # _toggle_ct() doesn't hit a still-unparented (top-level) checkbox.
+        _toggle_ct()
+
         for f in all_feats:
-            if f == "contact":
-                feat_lay.addLayout(contact_row)
-            elif f == "invasiveness":
-                # Already rendered inline within contact_row (or skipped entirely
-                # for non-immune cell types above).
+            if f in ("contact", "invasiveness"):
+                # Contact was already added above; invasiveness is rendered
+                # inline within contact_row (or skipped for non-immune types).
                 continue
             elif f in self.feature_checks:
                 feat_lay.addWidget(self.feature_checks[f])
@@ -1025,8 +1076,8 @@ class CellTypeFeaturePanel(QWidget):
                 if pt:
                     pt._notify_organoid_threshold_changed(_ct, value)
             self.spin_dead_threshold.valueChanged.connect(_org_sync)
-        dead_group.setVisible(self._has_dead)
         layout.addWidget(dead_group)
+        dead_group.setVisible(self._has_dead)
         self._dead_group = dead_group
 
         def _toggle_dead_group(state=None):
@@ -1143,6 +1194,8 @@ class CellTypeFeaturePanel(QWidget):
             viewer.dims.events.current_step.disconnect(self._preview_dims_callback)
         except Exception:
             pass
+        if _ACTIVE_PREVIEW_DIMS.get(id(viewer)) is self._preview_dims_callback:
+            _ACTIVE_PREVIEW_DIMS.pop(id(viewer), None)
         self._preview_dims_callback = None
 
     def _cleanup_preview(self):
@@ -1179,6 +1232,7 @@ class CellTypeFeaturePanel(QWidget):
         if viewer is None:
             return
         self._disconnect_preview_dims()
+        _disconnect_any_active_preview_dims(viewer)
 
         def _on_step(*_):
             # Only act if we still have valid preview state
@@ -1188,11 +1242,20 @@ class CellTypeFeaturePanel(QWidget):
                 or not self._preview_is_timelapse
             ):
                 return
-            self._refresh_preview_dead_layers(value=None)
+            try:
+                self._refresh_preview_dead_layers(value=None)
+            except Exception as exc:
+                # A failed per-frame recompute otherwise leaves
+                # ``_preview_current_frame`` silently stuck on the last
+                # successfully-computed frame, which makes the hover
+                # tooltip's frame-mismatch guard suppress every hover on
+                # this frame with no visible cause.
+                self.log(f"⚠️ [Preview] Failed to recompute frame: {exc}")
 
         try:
             viewer.dims.events.current_step.connect(_on_step)
             self._preview_dims_callback = _on_step
+            _ACTIVE_PREVIEW_DIMS[id(viewer)] = _on_step
         except Exception:
             self._preview_dims_callback = None
 
@@ -1253,7 +1316,15 @@ class CellTypeFeaturePanel(QWidget):
                 label_id = int(label_arr[coords]) if label_arr is not None else None
                 pct_dead = float(pct_arr[coords]) if pct_arr is not None else None
                 return label_id, pct_dead
-            except Exception:
+            except Exception as exc:
+                # Throttled: mouse-move fires very frequently, so only log
+                # when the failure reason actually changes, instead of
+                # silently swallowing every occurrence (which previously
+                # made "hover sometimes shows nothing" undiagnosable).
+                msg = str(exc)
+                if getattr(self, "_last_hover_error_msg", None) != msg:
+                    self._last_hover_error_msg = msg
+                    self.log(f"⚠️ [Preview] Hover lookup failed: {msg}")
                 return None, None
 
         def _on_mouse_move(*args):
@@ -1501,7 +1572,7 @@ class CellTypeFeaturePanel(QWidget):
         thr = self._get_threshold()
         return {
             "features_choice": self._selected_features(),
-            "contact_threshold": float(self.contact_threshold.value()),
+            "contact_threshold": float(self._contact_unit_mgr.get_native(self.contact_threshold)),
             "dead_mask_percentage_threshold": thr if thr > 0 else None,
             "n_workers": int(self.spin_workers.value()),
         }
@@ -1523,7 +1594,7 @@ class CellTypeFeaturePanel(QWidget):
                 p = parent_tab.panels[ct]
                 for f, cb in p.feature_checks.items():
                     cb.setChecked(f in settings["features_choice"])
-                p.contact_threshold.setValue(settings["contact_threshold"])
+                p._contact_unit_mgr.set_native(p.contact_threshold, settings["contact_threshold"])
                 p.spin_workers.setValue(settings["n_workers"])
                 # Only sync dead threshold for non-organoid panels that own a spinner
                 if not p._is_organoid and p.spin_dead_threshold is not None:
@@ -1610,33 +1681,64 @@ class CellTypeFeaturePanel(QWidget):
     def _on_rerun_death_clicked(self):
         from behav3d.features.timepoint_features import rerun_death_classification
 
-        if not self._has_combined_csv():
-            self.log(
-                f"\u26a0\ufe0f No combined features CSV for {self.cell_type} \u2014 "
-                "run full feature extraction first."
-            )
-            return
         new_thr = self._get_threshold()
         if new_thr <= 0:
             self.log(
                 "\u26a0\ufe0f Dead threshold is 0 \u2014 set a positive value before re-running."
             )
             return
-        try:
-            rerun_death_classification(
-                output_dir=str(Path(self.metadata_loader.output_dir).expanduser()),
-                cell_type=self.cell_type,
-                new_threshold=float(new_thr),
-            )
-            self._persist()
-            self.log(
-                f"\u2705 Re-ran death classification for {self.cell_type} "
-                f"with threshold={new_thr}."
-            )
+
+        # Organoid panels share a single global threshold (kept in sync via
+        # _notify_organoid_threshold_changed). Re-running death for only the
+        # panel that was clicked would leave sibling organoid types'
+        # combined CSVs classified under a different, now-stale threshold
+        # even though the UI shows one shared value everywhere. Re-run for
+        # every organoid type at once in that case.
+        targets = [self.cell_type]
+        panels_by_type = {self.cell_type: self}
+        if self._is_organoid:
+            parent_tab = self.parent()
+            while parent_tab and not hasattr(parent_tab, "panels"):
+                parent_tab = parent_tab.parent()
+            if parent_tab is not None:
+                org_types = list(getattr(parent_tab, "_org_types", []))
+                found = {
+                    ct: parent_tab.panels[ct]
+                    for ct in org_types
+                    if ct in parent_tab.panels
+                }
+                if found:
+                    panels_by_type = found
+                    panels_by_type.setdefault(self.cell_type, self)
+                    targets = list(panels_by_type.keys())
+
+        ran_any = False
+        for ct in targets:
+            panel = panels_by_type[ct]
+            if not panel._has_combined_csv():
+                self.log(
+                    f"\u26a0\ufe0f No combined features CSV for {ct} \u2014 "
+                    "run full feature extraction first."
+                )
+                continue
+            try:
+                rerun_death_classification(
+                    output_dir=str(Path(self.metadata_loader.output_dir).expanduser()),
+                    cell_type=ct,
+                    new_threshold=float(new_thr),
+                )
+                panel._persist()
+                self.log(
+                    f"\u2705 Re-ran death classification for {ct} "
+                    f"with threshold={new_thr}."
+                )
+                ran_any = True
+            except Exception as e:
+                traceback.print_exc()
+                self.log(f"Error during death re-run for {ct}: {e}")
+
+        if ran_any:
             _notify_post_extraction(self)
-        except Exception as e:
-            traceback.print_exc()
-            self.log(f"Error during death re-run: {e}")
 
     def _run_feature_extraction_for(self, cell_type: str, overwrite: bool = False,
                                     params: dict = None, progress_cb=None):
@@ -1920,37 +2022,60 @@ class CellTypeFeaturePanel(QWidget):
                 )
                 return
 
-            # Build immune segments dict for per-frame dead mask cleaning
-            from behav3d.core.metadata import detect_immune_cell_types_from_metadata
+            # Build immune segments dict for per-frame dead mask cleaning.
+            # Shares its detection logic with feature extraction via
+            # resolve_immune_track_paths_for_sample (keyed off this specific
+            # sample row, same as run_feature_extraction) so the preview and
+            # the real pipeline can never disagree about which loaded types
+            # count as immune.
+            from behav3d.core.metadata import resolve_immune_track_paths_for_sample
             try:
-                all_immune_types = detect_immune_cell_types_from_metadata(
-                    self.metadata_loader.metadata
-                ) or []
-            except Exception:
-                all_immune_types = []
-            if self.cell_type not in all_immune_types:
+                immune_track_paths = resolve_immune_track_paths_for_sample(sample_row)
+            except Exception as exc:
+                self.log(f"⚠️ [Preview] Immune-type detection failed: {exc}")
+                immune_track_paths = {}
+            if self.cell_type in immune_track_paths:
+                # Mirrors exclude_immune_from_dead in timepoint_features.py:
+                # don't clean a type's own dead mask under itself.
+                immune_segs_for_cleaning = {}
+            else:
                 immune_segs_for_cleaning = {
                     ct: segs_dict[ct]
-                    for ct in all_immune_types
-                    if ct in segs_dict and ct != self.cell_type
+                    for ct in immune_track_paths
+                    if ct in segs_dict
                 }
-            else:
-                immune_segs_for_cleaning = {}
             if immune_segs_for_cleaning:
                 self.log(
                     f"  [Preview] Dead mask will be cleaned per-frame under immune "
                     f"segments {list(immune_segs_for_cleaning.keys())}"
                 )
+            elif immune_track_paths and self.cell_type not in immune_track_paths:
+                missing = [ct for ct in immune_track_paths if ct not in segs_dict]
+                self.log(
+                    f"  ℹ️ [Preview] Detected immune type(s) {missing} in "
+                    "metadata, but their segments weren't loaded for this "
+                    "preview — dead mask will NOT be cleaned under them "
+                    "(feature extraction will still clean under them if "
+                    "loaded there)."
+                )
+            elif not immune_track_paths:
+                self.log(
+                    "  ℹ️ [Preview] No immune cell types detected for "
+                    "this sample — dead mask will not be cleaned."
+                )
 
             # Remove previous preview layers (preserves non-preview layers)
             print(f"[{_ts()}] [Preview] Clearing preview layers...")
             self._cleanup_preview()
-            if self._is_organoid:
-                pt = self.parent()
-                while pt and not hasattr(pt, "_disconnect_org_preview_dims"):
-                    pt = pt.parent()
-                if pt is not None:
-                    pt._disconnect_org_preview_dims()
+            # Always tear down whichever dims listener — this panel's own,
+            # another panel's, or the shared organoid one — is currently
+            # active before clearing layers. A stale listener from whatever
+            # preview was loaded previously would otherwise fire on the
+            # dims-range change caused by clearing/re-adding layers below,
+            # recompute against its now-stale cache, and either write into
+            # layers that were just removed (crash) or silently clobber the
+            # new preview's "Dead/Alive" / "% Dead Mask" layers.
+            _disconnect_any_active_preview_dims(self.viewer)
             # Stop any running dims animation before clearing layers so napari
             # doesn't try to use slider widgets it is about to destroy.
             from behav3d.napari._visualization import (
@@ -3376,6 +3501,8 @@ class FeatureExtractionTab(QWidget):
             viewer.dims.events.current_step.disconnect(self._org_preview_dims_callback)
         except Exception:
             pass
+        if _ACTIVE_PREVIEW_DIMS.get(id(viewer)) is self._org_preview_dims_callback:
+            _ACTIVE_PREVIEW_DIMS.pop(id(viewer), None)
         self._org_preview_dims_callback = None
 
     def _connect_org_preview_dims(self):
@@ -3387,6 +3514,7 @@ class FeatureExtractionTab(QWidget):
         if viewer is None:
             return
         self._disconnect_org_preview_dims()
+        _disconnect_any_active_preview_dims(viewer)
 
         def _on_step(*_):
             cache = self._org_preview_cache
@@ -3401,6 +3529,7 @@ class FeatureExtractionTab(QWidget):
         try:
             viewer.dims.events.current_step.connect(_on_step)
             self._org_preview_dims_callback = _on_step
+            _ACTIVE_PREVIEW_DIMS[id(viewer)] = _on_step
         except Exception:
             self._org_preview_dims_callback = None
 

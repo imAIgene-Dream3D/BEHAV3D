@@ -38,6 +38,7 @@ from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
     segment_mask,
     postprocess_mask,
     make_features,
+    _set_dead_mask_layer_color,
 )
 from behav3d.napari._background_runner import (
     BackgroundOperation,
@@ -1690,7 +1691,8 @@ class PixelClassifierWidget(QWidget):
                          pred_dead = np.zeros(label_dims, dtype=np.uint16)
                 else:
                     pred_dead = np.zeros(label_dims, dtype=np.uint16)
-                self.viewer.add_labels(pred_dead, name='Pixel Classification (Dead)', opacity=0.3, visible=False)
+                dead_pred_layer = self.viewer.add_labels(pred_dead, name='Pixel Classification (Dead)', opacity=0.3, visible=False)
+                _set_dead_mask_layer_color(dead_pred_layer)
 
             for cell_type in self.all_cell_types:
                 pred_label_path = pixel_class_outdir / f'PixelClassifier_{cell_type.capitalize()}_PredictedLabels.zarr'
@@ -2073,12 +2075,15 @@ class PixelClassifierWidget(QWidget):
         for target, full_prediction in pred_masks.items():
             pred_layer_name = f"Pixel Classification ({target})"
             if pred_layer_name in self.viewer.layers:
-                self.viewer.layers[pred_layer_name].data = full_prediction
-                self.viewer.layers[pred_layer_name].refresh()
+                pred_layer = self.viewer.layers[pred_layer_name]
+                pred_layer.data = full_prediction
+                pred_layer.refresh()
             else:
-                self.viewer.add_labels(
+                pred_layer = self.viewer.add_labels(
                     full_prediction, name=pred_layer_name, opacity=0.3
                 )
+            if target == "Dead":
+                _set_dead_mask_layer_color(pred_layer)
             self.log(f"  {target} prediction updated.")
 
         for cell_type, full_seg in seg_results.items():
@@ -4434,10 +4439,11 @@ class APOCWidget(QWidget):
                     try:
                         pred = np.asarray(load_zarr(seg_p))
                         if pred.shape == label_shape:
-                            self.viewer.add_labels(
+                            dead_pred_layer = self.viewer.add_labels(
                                 pred, name="Pixel Classification (Dead)",
                                 opacity=0.8, visible=False,
                             )
+                            _set_dead_mask_layer_color(dead_pred_layer)
                             self.log("  ↩ Restored predicted labels for 'dead'")
                     except Exception:
                         pass
@@ -6549,10 +6555,11 @@ class ConvPaintWidget(QWidget):
                     try:
                         pred = np.asarray(load_zarr(seg_p))
                         if pred.shape == label_shape:
-                            self.viewer.add_labels(
+                            dead_pred_layer = self.viewer.add_labels(
                                 pred, name=DEAD_PREDICTED_LAYER_NAME,
                                 opacity=0.8, visible=False,
                             )
+                            _set_dead_mask_layer_color(dead_pred_layer)
                     except Exception:
                         pass
 

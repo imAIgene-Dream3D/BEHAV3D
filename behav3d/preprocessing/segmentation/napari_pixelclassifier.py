@@ -60,6 +60,22 @@ def _log_mem(tag, log_func=print):
     else:
         log_func(f"[MEM] {tag}: psutil not installed, skipping memory log")
 
+
+def _set_dead_mask_layer_color(layer, color=(0.9, 0.0, 0.0, 1.0)):
+    """Render the death pixel-classification layer as a solid color (red by
+    default) instead of napari's default per-label random colors — it is a
+    binary mask (dead vs. not), not a multi-class label map. Any nonzero
+    label (whichever convention is used for "dead") is painted ``color``;
+    background (0) stays transparent."""
+    try:
+        from napari.utils.colormaps import DirectLabelColormap
+        layer.colormap = DirectLabelColormap(color_dict={None: list(color), 0: [0, 0, 0, 0]})
+    except Exception:
+        try:
+            layer.color = {1: color, 2: color}
+        except Exception:
+            pass
+
 # ---------------------------------------------------------------------------
 # Sigma values in µm — optimised via random-forest feature importance.
 # They are converted to pixel units at runtime using the sample's pixel size.
@@ -1000,6 +1016,7 @@ def train_pixel_classifier(
                 log("    Death prediction finished!")
                 QApplication.processEvents()
                 viewer.layers["Pixel Classification (Dead)"].data = pred_death_mask
+                _set_dead_mask_layer_color(viewer.layers["Pixel Classification (Dead)"])
                 log("    Death layer updated!")
                 QApplication.processEvents()
             else:
@@ -1234,6 +1251,8 @@ def train_pixel_classifier(
     for name, data in pixelclass_layers.items():
         layer = viewer.add_labels(data, name=name, opacity=0.8, visible=False)
         layer.blending = 'additive'
+        if name == "Pixel Classification (Dead)":
+            _set_dead_mask_layer_color(layer)
    
     # Add all segment layers to viewer
     for name, data in segment_layers.items():
