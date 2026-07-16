@@ -1,6 +1,12 @@
 
 import napari
-from behav3d.napari._widgets import HelpButton, make_help_row
+from behav3d.napari._widgets import (
+    HelpButton,
+    make_help_row,
+    browse_file_or_zarr,
+    prompt_axis_order,
+    resolve_external_path,
+)
 import yaml
 from magicgui.widgets import create_widget
 from qtpy.QtWidgets import (
@@ -30,7 +36,7 @@ import joblib
 
 from behav3d.core.utils import convert_distance
 from behav3d.napari._units import UnitGroupManager
-from behav3d.io.images import load_image, get_image_shape, save_as_zarr, append_to_zarr, load_zarr
+from behav3d.io.images import load_image, get_image_shape, save_as_zarr, append_to_zarr, load_zarr, convert_label_file_to_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
     train_pixel_classifier,
@@ -149,7 +155,12 @@ class SegmentationTab(QWidget):
         self.param_stack.addWidget(self.cellpose_page)
         
         # 3. Import Page ← matches combo index 3
-        self.import_page = ImportWidget(self.viewer, self.metadata_loader, log_callback=self._log)
+        self.import_page = ImportWidget(
+            self.viewer,
+            self.metadata_loader,
+            log_callback=self._log,
+            switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
+        )
         self.param_stack.addWidget(self.import_page)
 
 
@@ -205,6 +216,22 @@ class SegmentationTab(QWidget):
         self.log.verticalScrollBar().setValue(
             self.log.verticalScrollBar().maximum()
         )
+
+    def _switch_to_data_prep_edit(self):
+        """Switch the main window to the Data Preparation tab with the
+        Metadata Builder already open in edit mode.
+
+        Used by ``ImportWidget`` (the "Add a new sample or cell type"
+        shortcut) so users don't need to duplicate the sample/cell-type
+        editing UI here — they jump straight to it instead.
+        """
+        parent = self.parent()
+        while parent and not hasattr(parent, 'tabs'):
+            parent = parent.parent()
+        if parent and hasattr(parent, 'tabs'):
+            parent.tabs.setCurrentIndex(0)
+            if hasattr(parent, 'data_prep_tab'):
+                parent.data_prep_tab.enter_metadata_edit_mode()
 
     def _switch_to_visualization(self):
         """Switch the main window to the Visualization tab and load the first sample.
@@ -3015,20 +3042,32 @@ class CellposeWidget(QWidget):
 
 
 class ImportWidget(QWidget):
-    """Widget to validate and import pre-existing segmentation files.
-    
-    Shows a per-sample, per-cell-type status table with conversion actions.
+    """Widget to browse-in, convert, and validate pre-existing segmentation
+    (and dead-mask) files.
+
+    Shows a per-sample, per-cell-type list of editable path rows (prefilled
+    from metadata when a path is already set) with live status/conversion
+    actions. Newly browsed/typed paths are staged in the row's own widget —
+    metadata.csv is only updated once the corresponding Convert/Save action
+    actually runs (or a batch Convert/Save-All).
     """
 
-    def __init__(self, viewer, metadata_loader, log_callback=None):
+    def __init__(self, viewer, metadata_loader, log_callback=None,
+                 switch_to_data_prep_edit_callback=None):
         super().__init__()
         self.viewer = viewer
         self.metadata_loader = metadata_loader
         self.log = log_callback or print
+        self._switch_to_data_prep_edit = switch_to_data_prep_edit_callback
         self.organoid_types = []
         self.immune_types = []
         self.other_types = []
         self.all_cell_types = []
+        # (sample_name, cell_type) -> {"path_edit", "browse_btn",
+        #  "status_container", "status_layout", "last_value", "row_idx"}
+        self._rows = {}
+        # sample_name -> same widget dict, for the dead-mask row
+        self._dead_rows = {}
         self._init_ui()
 
     # ── helpers ──────────────────────────────────────────────────────────
@@ -3049,27 +3088,34 @@ class ImportWidget(QWidget):
         out_dir = Path(self.metadata_loader.output_dir)
         return out_dir / "images" / sample_name / f"{sample_name}_{cell_type}_segments.zarr"
 
+    def _expected_dead_mask_outpath(self, sample_name):
+        """Where a converted dead-mask zarr would be saved."""
+        out_dir = Path(self.metadata_loader.output_dir)
+        return out_dir / "images" / sample_name / f"{sample_name}_dead_mask.zarr"
+
+    def _metadata_csv_path(self):
+        path = getattr(self.metadata_loader, "_loaded_csv_path", None)
+        if path:
+            return path
+        return self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
+
     def _resolve_path(self, path_str):
         """Resolve a path string, trying the metadata CSV directory if not absolute/found."""
-        if not path_str:
-            return None
-        p = Path(path_str)
-        if p.exists():
-            return p
-        
-        # Try relative to metadata CSV
-        md_path = getattr(self.metadata_loader, "_loaded_csv_path", None)
-        if md_path:
-            p_rel = Path(md_path).parent / path_str
-            if p_rel.exists():
-                return p_rel
-        return p # Return original if still not found (will trigger 'File not found' UI)
+        return resolve_external_path(path_str, self._metadata_csv_path())
+
+    @staticmethod
+    def _clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
 
     # ── zarr validation ─────────────────────────────────────────────────
     @staticmethod
     def _check_zarr_structure(path):
         """Check that a .zarr file matches the expected save_as_zarr structure.
-        
+
         Expected: single root array (no sub-groups), chunks starting with (1, ...).
         Returns (ok: bool, reason: str).
         """
@@ -3096,6 +3142,24 @@ class ImportWidget(QWidget):
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
+
+        if self._switch_to_data_prep_edit is not None:
+            add_row = QHBoxLayout()
+            btn_add = QPushButton("➕  Add a new sample or cell type…")
+            btn_add.setToolTip(
+                "Jumps to the Data Preparation tab's Metadata Builder "
+                "(already in edit mode) to add samples/cell types that "
+                "don't exist in metadata yet."
+            )
+            btn_add.setStyleSheet(
+                "QPushButton{background:#455A64;color:white;padding:6px 12px;"
+                "border-radius:3px}"
+                "QPushButton:hover{background:#546E7A}"
+            )
+            btn_add.clicked.connect(self._switch_to_data_prep_edit)
+            add_row.addWidget(btn_add)
+            add_row.addStretch()
+            layout.addLayout(add_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -3130,7 +3194,10 @@ class ImportWidget(QWidget):
 
     # ── table builder ───────────────────────────────────────────────────
     def _rebuild_table(self):
-        """Clear and rebuild the entire status table."""
+        """Clear and rebuild the entire status table from metadata."""
+        self._rows = {}
+        self._dead_rows = {}
+
         # clear old widgets
         while self.scroll_layout.count():
             item = self.scroll_layout.takeAt(0)
@@ -3153,19 +3220,13 @@ class ImportWidget(QWidget):
         any_fixes_needed = False
         for i in range(self.scroll_layout.count()):
             w = self.scroll_layout.itemAt(i).widget()
-            if isinstance(w, QWidget):
-                # Look for buttons with specific text/tooltips
-                btns = w.findChildren(QPushButton)
-                for b in btns:
-                    if "Convert" in b.text() or "Fix" in b.text():
-                        any_fixes_needed = True
-                        break
-            if any_fixes_needed:
+            if isinstance(w, QWidget) and w.findChildren(QPushButton):
+                any_fixes_needed = True
                 break
 
         if any_fixes_needed:
             # ── global Convert All button ──
-            btn_all = QPushButton("⚡  Convert / Fix All Samples")
+            btn_all = QPushButton("⚡  Convert / Save All Samples")
             btn_all.setStyleSheet(
                 "QPushButton{background:#1565C0;color:white;padding:8px 16px;"
                 "border-radius:4px;font-weight:bold;font-size:13px}"
@@ -3181,10 +3242,10 @@ class ImportWidget(QWidget):
             success_msg.setStyleSheet("color:#2E7D32; background:#E8F5E9; padding:12px; border-radius:8px; margin:5px; border:1px solid #C8E6C9; font-weight:bold;")
             self.scroll_layout.addWidget(success_msg)
 
-        # ── General Instruction (ALWAYS visible at the bottom) ──
+        # ── Save-timing note (ALWAYS visible at the bottom) ──
         instr = QLabel(
-            "To add or change segmentation paths, go to the <b>Data Preparation</b> tab "
-            "and check the <b>Metadata Builder</b>."
+            "Paths typed or browsed above are only written to metadata.csv "
+            "once you click Convert/Save for that row (or Convert/Save All)."
         )
         instr.setWordWrap(True)
         instr.setAlignment(Qt.AlignCenter)
@@ -3194,173 +3255,48 @@ class ImportWidget(QWidget):
         self.scroll_layout.addStretch()
 
     def _add_sample_section(self, sample_name, row_idx, row):
-        """Add a grouped section for one sample."""
-        from functools import partial
+        """Add a grouped section for one sample: one editable row per cell
+        type, plus a dead-mask row when applicable."""
+        from behav3d.core.metadata import has_dead_channel
 
-        # Sample header
         header = QLabel(f"📁  {sample_name}")
         header.setStyleSheet("font-weight:bold; font-size:13px; padding:6px 0 2px 0;")
         self.scroll_layout.addWidget(header)
 
-        # Track whether ALL cell types have empty paths
-        all_empty = True
-
         for ct in self.all_cell_types:
-            col = self._seg_col(ct)
-            raw_val = row.get(col) if col in row.index else None
-            has_value = raw_val is not None and pd.notna(raw_val) and str(raw_val).strip() not in ("", "nan")
+            self._add_cell_type_row(sample_name, row_idx, row, ct)
 
-            if has_value:
-                all_empty = False
+        md = self.metadata_loader.metadata
+        if has_dead_channel(md):
+            self._add_dead_mask_row(sample_name, row_idx, row)
 
-            row_widget = QWidget()
-            row_lay = QHBoxLayout(row_widget)
-            row_lay.setContentsMargins(16, 2, 4, 2)
-            lbl = QLabel(f"{ct}:")
-            lbl.setFixedWidth(120)
-            row_lay.addWidget(lbl)
-
-            if not has_value:
-                status = QLabel("No segmentation available")
-                status.setStyleSheet("color:#999; font-style:italic;")
-                row_lay.addWidget(status)
-            else:
-                path_str = str(raw_val).strip().strip('"').strip("'")
-                file_path = self._resolve_path(path_str)
-
-                if not file_path.exists():
-                    status = QLabel(f"⚠️  File not found")
-                    status.setToolTip(str(file_path))
-                    status.setStyleSheet("color:#E65100;")
-                    row_lay.addWidget(status)
-
-                elif file_path.suffix == ".zarr":
-                    ok, reason = self._check_zarr_structure(file_path)
-                    if ok:
-                        # --- Dimension check ---
-                        dims_match = True
-                        try:
-                            raw_path = Path(row.get("raw_image_path", ""))
-                            if raw_path.exists():
-                                import zarr
-                                raw_store = zarr.open(str(raw_path), mode='r')
-                                seg_store = zarr.open(str(file_path), mode='r')
-                                raw_shape = raw_store.shape
-                                seg_shape = seg_store.shape
-                                
-                                if len(seg_shape) < 3 or raw_shape[-3:] != seg_shape[-3:]:
-                                    dims_match = False
-                                    reason = f"Spatial mismatch: Raw {raw_shape[-3:]} vs Seg {seg_shape[-3:]}"
-                                elif raw_shape[0] != seg_shape[0]:
-                                    dims_match = False
-                                    reason = f"Time mismatch: Raw {raw_shape[0]}T vs Seg {seg_shape[0]}T"
-                        except:
-                            pass
-
-                        if dims_match:
-                            status = QLabel("✅  Ready for tracking")
-                            status.setStyleSheet("color:#2E7D32; font-weight:bold;")
-                            row_lay.addWidget(status)
-                        else:
-                            status = QLabel(f"⚠️  Dimension mismatch")
-                            status.setToolTip(reason)
-                            status.setStyleSheet("color:#E65100; font-weight:bold;")
-                            row_lay.addWidget(status)
-                    else:
-                        btn = QPushButton("🔄  Fix zarr format")
-                        btn.setToolTip(f"Issue: {reason}")
-                        btn.setStyleSheet(
-                            "QPushButton{background:#F57C00;color:white;padding:4px 10px;"
-                            "border-radius:3px}"
-                            "QPushButton:hover{background:#FB8C00}"
-                        )
-                        btn.clicked.connect(partial(self._convert_single, path_str, ct, sample_name, row_idx))
-                        row_lay.addWidget(btn)
-
-                elif file_path.suffix.lower() in (".tif", ".tiff"):
-                    # Check TIFF dims if possible
-                    warning = ""
-                    try:
-                        raw_path = Path(row.get("raw_image_path", ""))
-                        if raw_path.exists():
-                            import zarr
-                            from behav3d.io.images import load_image
-                            raw_store = zarr.open(str(raw_path), mode='r')
-                            # For TIFF we'd have to load it to check shape, which is slow for many files.
-                            # Let's just do it and log if mismatch.
-                            # Actually, maybe just keep it simple and check AFTER conversion? 
-                            # No, user wants check during import.
-                    except:
-                        pass
-
-                    btn = QPushButton("🔄  Convert TIFF → zarr")
-                    btn.setStyleSheet(
-                        "QPushButton{background:#1565C0;color:white;padding:4px 10px;"
-                        "border-radius:3px}"
-                        "QPushButton:hover{background:#1976D2}"
-                    )
-                    btn.clicked.connect(partial(self._convert_single, path_str, ct, sample_name, row_idx))
-                    row_lay.addWidget(btn)
-                else:
-                    status = QLabel(f"⚠️  Format not supported ({file_path.suffix})")
-                    status.setStyleSheet("color:#E65100;")
-                    row_lay.addWidget(status)
-
-            row_lay.addStretch()
-            self.scroll_layout.addWidget(row_widget)
-
-        # If ALL cell types empty → show combined message instead
-        if all_empty:
-            # remove the per-cell-type rows we just added (they all say "No segmentation")
-            # keep the header, remove the rest
-            items_to_remove = []
-            for i in range(self.scroll_layout.count() - 1, -1, -1):
-                item = self.scroll_layout.itemAt(i)
-                w = item.widget()
+        # Check if any "action" buttons were added for this sample
+        fixes_needed = False
+        found_header = False
+        for i in range(self.scroll_layout.count()):
+            w = self.scroll_layout.itemAt(i).widget()
+            if not found_header:
                 if w is header:
-                    break
-                items_to_remove.append(i)
-            for i in items_to_remove:
-                item = self.scroll_layout.takeAt(i)
-                if item.widget():
-                    item.widget().deleteLater()
+                    found_header = True
+                continue
+            if isinstance(w, QWidget) and w.findChildren(QPushButton):
+                fixes_needed = True
+                break
 
-            msg = QLabel("  No segmentation data found for this sample.<br>  (Check the <b>Metadata Builder</b> in Data Prep if you have files to import)")
-            msg.setStyleSheet("color:#888; font-style:italic; padding:4px 16px;")
-            msg.setWordWrap(True)
-            self.scroll_layout.addWidget(msg)
-        else:
-            # Check if any "action" buttons were added for this sample
-            fixes_needed = False
-            # We look at the widgets added after the header
-            found_header = False
-            for i in range(self.scroll_layout.count()):
-                w = self.scroll_layout.itemAt(i).widget()
-                if not found_header:
-                    if w is header:
-                        found_header = True
-                    continue
-                # Now we are past the header
-                if isinstance(w, QWidget):
-                    if w.findChildren(QPushButton):
-                        fixes_needed = True
-                        break
-            
-            if fixes_needed:
-                # Per-sample Convert All button
-                btn = QPushButton(f"⚡  Convert / Fix all for {sample_name}")
-                btn.setStyleSheet(
-                    "QPushButton{background:#2E7D32;color:white;padding:5px 12px;"
-                    "border-radius:3px;font-size:12px}"
-                    "QPushButton:hover{background:#388E3C}"
-                )
-                btn.clicked.connect(partial(self._convert_sample, sample_name, row_idx))
-                wrap = QWidget()
-                wrap_lay = QHBoxLayout(wrap)
-                wrap_lay.setContentsMargins(16, 2, 4, 6)
-                wrap_lay.addWidget(btn)
-                wrap_lay.addStretch()
-                self.scroll_layout.addWidget(wrap)
+        if fixes_needed:
+            btn = QPushButton(f"⚡  Convert / Save all for {sample_name}")
+            btn.setStyleSheet(
+                "QPushButton{background:#2E7D32;color:white;padding:5px 12px;"
+                "border-radius:3px;font-size:12px}"
+                "QPushButton:hover{background:#388E3C}"
+            )
+            btn.clicked.connect(partial(self._convert_sample, sample_name, row_idx))
+            wrap = QWidget()
+            wrap_lay = QHBoxLayout(wrap)
+            wrap_lay.setContentsMargins(16, 2, 4, 6)
+            wrap_lay.addWidget(btn)
+            wrap_lay.addStretch()
+            self.scroll_layout.addWidget(wrap)
 
         # separator
         sep = QWidget()
@@ -3368,113 +3304,472 @@ class ImportWidget(QWidget):
         sep.setStyleSheet("background:#ddd;")
         self.scroll_layout.addWidget(sep)
 
-    # ── conversion logic ────────────────────────────────────────────────
-    def _convert_single(self, src_path_str, cell_type, sample_name, row_idx, 
-                        save_metadata=True, refresh_ui=True):
-        """Convert a single file (TIFF or bad zarr) and update metadata."""
-        from qtpy.QtWidgets import QMessageBox
-        src = Path(src_path_str)
-        dest = self._expected_outpath(sample_name, cell_type)
+    def _add_cell_type_row(self, sample_name, row_idx, row, cell_type):
+        """Build+register one editable segmentation-path row for one
+        (sample, cell_type) pair."""
+        col = self._seg_col(cell_type)
+        raw_val = row.get(col) if col in row.index else None
+        has_value = raw_val is not None and pd.notna(raw_val) and str(raw_val).strip() not in ("", "nan")
+        initial_value = str(raw_val).strip().strip('"').strip("'") if has_value else ""
 
-        # Overwrite check
-        if dest.exists():
-            # If we are in a batch operation (save_metadata=False), we might want to skip prompt
-            # but for safety let's prompt or assume user already confirmed global action?
-            # Actually, per-file confirmation is safer unless we add "Apply to all".
+        row_widget, path_edit, browse_btn, status_layout = self._build_path_row(f"{cell_type}:", initial_value)
+
+        key = (sample_name, cell_type)
+        self._rows[key] = {
+            "path_edit": path_edit,
+            "browse_btn": browse_btn,
+            "status_layout": status_layout,
+            "last_value": initial_value,
+            "row_idx": row_idx,
+        }
+        path_edit.editingFinished.connect(partial(self._on_row_path_edited, sample_name, cell_type))
+        browse_btn.clicked.connect(partial(self._on_browse_clicked, sample_name, cell_type))
+
+        self.scroll_layout.addWidget(row_widget)
+        self._refresh_row_status(sample_name, cell_type)
+
+    def _add_dead_mask_row(self, sample_name, row_idx, row):
+        """Build+register one editable dead-mask-path row for one sample."""
+        col = "dead_mask_path"
+        raw_val = row.get(col) if col in row.index else None
+        has_value = raw_val is not None and pd.notna(raw_val) and str(raw_val).strip() not in ("", "nan")
+        initial_value = str(raw_val).strip().strip('"').strip("'") if has_value else ""
+
+        row_widget, path_edit, browse_btn, status_layout = self._build_path_row("dead mask:", initial_value)
+
+        self._dead_rows[sample_name] = {
+            "path_edit": path_edit,
+            "browse_btn": browse_btn,
+            "status_layout": status_layout,
+            "last_value": initial_value,
+            "row_idx": row_idx,
+        }
+        path_edit.editingFinished.connect(partial(self._on_dead_mask_path_edited, sample_name))
+        browse_btn.clicked.connect(partial(self._on_dead_mask_browse_clicked, sample_name))
+
+        self.scroll_layout.addWidget(row_widget)
+        self._refresh_dead_mask_status(sample_name)
+
+    @staticmethod
+    def _build_path_row(label_text, initial_value):
+        """Build the shared visual shape of an editable path row (label,
+        path field, Browse button, status container) without wiring any
+        signals or registering it anywhere — callers do that."""
+        row_widget = QWidget()
+        row_lay = QHBoxLayout(row_widget)
+        row_lay.setContentsMargins(16, 2, 4, 2)
+
+        lbl = QLabel(label_text)
+        lbl.setFixedWidth(120)
+        row_lay.addWidget(lbl)
+
+        path_edit = QLineEdit(initial_value)
+        path_edit.setPlaceholderText("Path to .tif/.tiff file or .zarr directory")
+        path_edit.setMinimumWidth(220)
+        row_lay.addWidget(path_edit, stretch=1)
+
+        browse_btn = QPushButton("Browse…")
+        row_lay.addWidget(browse_btn)
+
+        status_container = QWidget()
+        status_layout = QHBoxLayout(status_container)
+        status_layout.setContentsMargins(8, 0, 0, 0)
+        row_lay.addWidget(status_container)
+        row_lay.addStretch()
+
+        return row_widget, path_edit, browse_btn, status_layout
+
+    # ── live status refresh (reads from the widget, not metadata) ───────
+    def _refresh_row_status(self, sample_name, cell_type):
+        info = self._rows.get((sample_name, cell_type))
+        if info is None:
+            return
+        self._clear_layout(info["status_layout"])
+
+        path_str = info["path_edit"].text().strip().strip('"').strip("'")
+        row_idx = info["row_idx"]
+
+        if not path_str:
+            status = QLabel("No segmentation available")
+            status.setStyleSheet("color:#999; font-style:italic;")
+            info["status_layout"].addWidget(status)
+            return
+
+        file_path = self._resolve_path(path_str)
+        if file_path is None or not file_path.exists():
+            status = QLabel("⚠️  File not found")
+            status.setToolTip(str(file_path))
+            status.setStyleSheet("color:#E65100;")
+            info["status_layout"].addWidget(status)
+            return
+
+        if file_path.suffix == ".zarr" or file_path.is_dir():
+            ok, reason = self._check_zarr_structure(file_path)
+            if not ok:
+                btn = QPushButton("🔄  Fix zarr format")
+                btn.setToolTip(f"Issue: {reason}")
+                btn.setStyleSheet(
+                    "QPushButton{background:#F57C00;color:white;padding:4px 10px;"
+                    "border-radius:3px}"
+                    "QPushButton:hover{background:#FB8C00}"
+                )
+                btn.clicked.connect(partial(self._convert_single, sample_name, cell_type, row_idx))
+                info["status_layout"].addWidget(btn)
+                return
+
+            # --- Dimension check against the sample's raw image ---
+            dims_match = True
+            try:
+                md = self.metadata_loader.metadata
+                raw_path_str = md.at[row_idx, "raw_image_path"] if "raw_image_path" in md.columns else ""
+                raw_path = Path(str(raw_path_str)) if raw_path_str else None
+                if raw_path is not None and raw_path.exists():
+                    import zarr
+                    raw_store = zarr.open(str(raw_path), mode='r')
+                    seg_store = zarr.open(str(file_path), mode='r')
+                    raw_shape = raw_store.shape
+                    seg_shape = seg_store.shape
+                    if len(seg_shape) < 3 or raw_shape[-3:] != seg_shape[-3:]:
+                        dims_match = False
+                        reason = f"Spatial mismatch: Raw {raw_shape[-3:]} vs Seg {seg_shape[-3:]}"
+                    elif raw_shape[0] != seg_shape[0]:
+                        dims_match = False
+                        reason = f"Time mismatch: Raw {raw_shape[0]}T vs Seg {seg_shape[0]}T"
+            except Exception:
+                pass
+
+            if not dims_match:
+                status = QLabel("⚠️  Dimension mismatch")
+                status.setToolTip(reason)
+                status.setStyleSheet("color:#E65100; font-weight:bold;")
+                info["status_layout"].addWidget(status)
+            elif str(file_path) == info["last_value"]:
+                status = QLabel("✅  Ready for tracking")
+                status.setStyleSheet("color:#2E7D32; font-weight:bold;")
+                info["status_layout"].addWidget(status)
+            else:
+                # Already a valid zarr, just not yet persisted to metadata.
+                btn = QPushButton("💾  Save path to metadata")
+                btn.setStyleSheet(
+                    "QPushButton{background:#2E7D32;color:white;padding:4px 10px;"
+                    "border-radius:3px}"
+                    "QPushButton:hover{background:#388E3C}"
+                )
+                btn.clicked.connect(partial(self._convert_single, sample_name, cell_type, row_idx))
+                info["status_layout"].addWidget(btn)
+
+        elif file_path.suffix.lower() in (".tif", ".tiff"):
+            btn = QPushButton("🔄  Convert TIFF → zarr")
+            btn.setStyleSheet(
+                "QPushButton{background:#1565C0;color:white;padding:4px 10px;"
+                "border-radius:3px}"
+                "QPushButton:hover{background:#1976D2}"
+            )
+            btn.clicked.connect(partial(self._convert_single, sample_name, cell_type, row_idx))
+            info["status_layout"].addWidget(btn)
+        else:
+            status = QLabel(f"⚠️  Format not supported ({file_path.suffix})")
+            status.setStyleSheet("color:#E65100;")
+            info["status_layout"].addWidget(status)
+
+    def _refresh_dead_mask_status(self, sample_name):
+        info = self._dead_rows.get(sample_name)
+        if info is None:
+            return
+        self._clear_layout(info["status_layout"])
+
+        path_str = info["path_edit"].text().strip().strip('"').strip("'")
+        row_idx = info["row_idx"]
+
+        if not path_str:
+            status = QLabel("No dead mask available")
+            status.setStyleSheet("color:#999; font-style:italic;")
+            info["status_layout"].addWidget(status)
+            return
+
+        file_path = self._resolve_path(path_str)
+        if file_path is None or not file_path.exists():
+            status = QLabel("⚠️  File not found")
+            status.setToolTip(str(file_path))
+            status.setStyleSheet("color:#E65100;")
+            info["status_layout"].addWidget(status)
+            return
+
+        if file_path.suffix == ".zarr" or file_path.is_dir():
+            ok, reason = self._check_zarr_structure(file_path)
+            if not ok:
+                btn = QPushButton("🔄  Fix zarr format")
+                btn.setToolTip(f"Issue: {reason}")
+                btn.setStyleSheet(
+                    "QPushButton{background:#F57C00;color:white;padding:4px 10px;"
+                    "border-radius:3px}"
+                    "QPushButton:hover{background:#FB8C00}"
+                )
+                btn.clicked.connect(partial(self._convert_dead_mask, sample_name, row_idx))
+                info["status_layout"].addWidget(btn)
+            elif str(file_path) == info["last_value"]:
+                status = QLabel("✅  Ready")
+                status.setStyleSheet("color:#2E7D32; font-weight:bold;")
+                info["status_layout"].addWidget(status)
+            else:
+                btn = QPushButton("💾  Save path to metadata")
+                btn.setStyleSheet(
+                    "QPushButton{background:#2E7D32;color:white;padding:4px 10px;"
+                    "border-radius:3px}"
+                    "QPushButton:hover{background:#388E3C}"
+                )
+                btn.clicked.connect(partial(self._convert_dead_mask, sample_name, row_idx))
+                info["status_layout"].addWidget(btn)
+        elif file_path.suffix.lower() in (".tif", ".tiff"):
+            btn = QPushButton("🔄  Convert TIFF → zarr")
+            btn.setStyleSheet(
+                "QPushButton{background:#1565C0;color:white;padding:4px 10px;"
+                "border-radius:3px}"
+                "QPushButton:hover{background:#1976D2}"
+            )
+            btn.clicked.connect(partial(self._convert_dead_mask, sample_name, row_idx))
+            info["status_layout"].addWidget(btn)
+        else:
+            status = QLabel(f"⚠️  Format not supported ({file_path.suffix})")
+            status.setStyleSheet("color:#E65100;")
+            info["status_layout"].addWidget(status)
+
+    # ── path-field change handlers ───────────────────────────────────────
+    def _on_browse_clicked(self, sample_name, cell_type):
+        info = self._rows.get((sample_name, cell_type))
+        if info is None:
+            return
+        new_path = browse_file_or_zarr(
+            self, f"Select {cell_type} segmentation for {sample_name}",
+            "Image files (*.tif *.tiff *.zarr);; All Files (*)",
+            allow_zarr=True,
+        )
+        if not new_path:
+            return
+        self._maybe_accept_new_value(
+            info, new_path,
+            label=f"{cell_type} / {sample_name}",
+            on_accept=lambda: self._refresh_row_status(sample_name, cell_type),
+        )
+
+    def _on_row_path_edited(self, sample_name, cell_type):
+        info = self._rows.get((sample_name, cell_type))
+        if info is None:
+            return
+        new_value = info["path_edit"].text().strip()
+        self._maybe_accept_new_value(
+            info, new_value,
+            label=f"{cell_type} / {sample_name}",
+            on_accept=lambda: self._refresh_row_status(sample_name, cell_type),
+            already_in_field=True,
+        )
+
+    def _on_dead_mask_browse_clicked(self, sample_name):
+        info = self._dead_rows.get(sample_name)
+        if info is None:
+            return
+        new_path = browse_file_or_zarr(
+            self, f"Select dead mask for {sample_name}",
+            "Image files (*.tif *.tiff *.zarr);; All Files (*)",
+            allow_zarr=True,
+        )
+        if not new_path:
+            return
+        self._maybe_accept_new_value(
+            info, new_path,
+            label=f"dead mask / {sample_name}",
+            on_accept=lambda: self._refresh_dead_mask_status(sample_name),
+        )
+
+    def _on_dead_mask_path_edited(self, sample_name):
+        info = self._dead_rows.get(sample_name)
+        if info is None:
+            return
+        new_value = info["path_edit"].text().strip()
+        self._maybe_accept_new_value(
+            info, new_value,
+            label=f"dead mask / {sample_name}",
+            on_accept=lambda: self._refresh_dead_mask_status(sample_name),
+            already_in_field=True,
+        )
+
+    def _maybe_accept_new_value(self, info, new_value, *, label, on_accept, already_in_field=False):
+        """Shared change-acceptance logic for both cell-type and dead-mask
+        rows: confirms overwriting an already-set metadata value, then
+        (re)writes the field and refreshes that row's status."""
+        new_value = str(new_value).strip()
+        old_value = info["last_value"]
+
+        if new_value != old_value and old_value:
             res = QMessageBox.question(
-                self, "Overwrite?",
-                f"There is a pre-existing segmentation file:\n{dest}\n\nDo you want to overwrite it?",
+                self, "Replace existing path?",
+                f"This will replace the existing path for {label}:\n{old_value}\n→\n{new_value}\n\nContinue?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if res != QMessageBox.Yes:
-                self.log(f"Skipped {cell_type} for {sample_name} (user declined overwrite)")
-                return False
+                info["path_edit"].blockSignals(True)
+                info["path_edit"].setText(old_value)
+                info["path_edit"].blockSignals(False)
+                return
 
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            self.log(f"Converting {src.name} → {dest.name} ...")
-            img = load_image(src)
-            if dest.exists():
-                import shutil
-                shutil.rmtree(dest)
-            save_as_zarr(img, dest)
-            self.log(f"✅  Saved: {dest}")
+        if not already_in_field:
+            info["path_edit"].blockSignals(True)
+            info["path_edit"].setText(new_value)
+            info["path_edit"].blockSignals(False)
 
-            # Update metadata
-            md = self.metadata_loader.metadata
-            col = self._seg_col(cell_type)
-            if col not in md.columns:
-                md[col] = pd.NA
-            md[col] = md[col].astype("object")
-            md.at[row_idx, col] = str(dest)
-            
-            if save_metadata:
-                self._save_metadata(refresh_ui=refresh_ui)
-            return True
+        on_accept()
 
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.log(f"❌  Error converting {cell_type} for {sample_name}: {e}")
-            if refresh_ui: # Only show error dialog if not in background bulk operation
-                QMessageBox.warning(self, "Conversion Error", str(e))
+    # ── conversion logic ────────────────────────────────────────────────
+    def _row_action(self, info, col, dest_path, row_idx, *, save_metadata, refresh_ui, label):
+        """Shared conversion engine for one row (cell-type or dead-mask):
+        saves an already-valid zarr path as-is, repairs a malformed zarr, or
+        converts a TIFF (with axis-order confirmation) — then writes the
+        result into metadata. Returns True if metadata changed."""
+        path_str = info["path_edit"].text().strip().strip('"').strip("'")
+        if not path_str:
+            return False
+        src = self._resolve_path(path_str)
+        if src is None or not src.exists():
             return False
 
-    def _convert_sample(self, sample_name, row_idx, save_metadata=True, refresh_ui=True):
-        """Convert all actionable files for one sample."""
         md = self.metadata_loader.metadata
-        row = md.iloc[row_idx]
+
+        if src.suffix == ".zarr" or src.is_dir():
+            ok, _ = self._check_zarr_structure(src)
+            if ok:
+                if str(src) == info["last_value"]:
+                    return False  # already saved, nothing to do
+                if col not in md.columns:
+                    md[col] = pd.NA
+                md[col] = md[col].astype("object")
+                md.at[row_idx, col] = str(src)
+                info["last_value"] = str(src)
+                self.log(f"  {col} for {label} -> {src}")
+                if save_metadata:
+                    self._save_metadata(refresh_ui=refresh_ui)
+                return True
+
+            # bad zarr structure -> repair via raw save_as_zarr (unchanged behavior)
+            if dest_path.exists():
+                res = QMessageBox.question(
+                    self, "Overwrite?",
+                    f"There is a pre-existing file:\n{dest_path}\n\nDo you want to overwrite it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if res != QMessageBox.Yes:
+                    self.log(f"Skipped {label} (user declined overwrite)")
+                    return False
+            try:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                self.log(f"Repairing zarr format: {src.name} → {dest_path.name} ...")
+                img = load_image(src)
+                if dest_path.exists():
+                    shutil.rmtree(dest_path)
+                save_as_zarr(img, dest_path)
+            except Exception as e:
+                traceback.print_exc()
+                self.log(f"❌  Error repairing {label}: {e}")
+                if refresh_ui:
+                    QMessageBox.warning(self, "Conversion Error", str(e))
+                return False
+
+        elif src.suffix.lower() in (".tif", ".tiff"):
+            if dest_path.exists():
+                res = QMessageBox.question(
+                    self, "Overwrite?",
+                    f"There is a pre-existing file:\n{dest_path}\n\nDo you want to overwrite it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if res != QMessageBox.Yes:
+                    self.log(f"Skipped {label} (user declined overwrite)")
+                    return False
+            axis_order = prompt_axis_order(self, src, log=self.log)
+            if axis_order is None:
+                self.log(f"Cancelled: no axis order selected for {label}")
+                return False
+            try:
+                self.log(f"Converting {src.name} → {dest_path.name} ...")
+                convert_label_file_to_zarr(path=src, outpath=dest_path, axis_order=axis_order, overwrite=True)
+            except Exception as e:
+                traceback.print_exc()
+                self.log(f"❌  Error converting {label}: {e}")
+                if refresh_ui:
+                    QMessageBox.warning(self, "Conversion Error", str(e))
+                return False
+        else:
+            self.log(f"⚠️  Unsupported format for {label}: {src.suffix}")
+            return False
+
+        self.log(f"✅  Saved: {dest_path}")
+        if col not in md.columns:
+            md[col] = pd.NA
+        md[col] = md[col].astype("object")
+        md.at[row_idx, col] = str(dest_path)
+        info["last_value"] = str(dest_path)
+        if save_metadata:
+            self._save_metadata(refresh_ui=refresh_ui)
+        return True
+
+    def _convert_single(self, sample_name, cell_type, row_idx, save_metadata=True, refresh_ui=True):
+        """Convert/save one cell type's segmentation row for one sample."""
+        info = self._rows.get((sample_name, cell_type))
+        if info is None:
+            return False
+        dest = self._expected_outpath(sample_name, cell_type)
+        col = self._seg_col(cell_type)
+        return self._row_action(
+            info, col, dest, row_idx,
+            save_metadata=save_metadata, refresh_ui=refresh_ui,
+            label=f"{cell_type} / {sample_name}",
+        )
+
+    def _convert_dead_mask(self, sample_name, row_idx, save_metadata=True, refresh_ui=True):
+        """Convert/save the dead-mask row for one sample."""
+        info = self._dead_rows.get(sample_name)
+        if info is None:
+            return False
+        dest = self._expected_dead_mask_outpath(sample_name)
+        return self._row_action(
+            info, "dead_mask_path", dest, row_idx,
+            save_metadata=save_metadata, refresh_ui=refresh_ui,
+            label=f"dead mask / {sample_name}",
+        )
+
+    def _convert_sample(self, sample_name, row_idx, save_metadata=True, refresh_ui=True):
+        """Convert/save all actionable rows (cell types + dead mask) for one sample."""
         converted_any = False
 
         for ct in self.all_cell_types:
-            col = self._seg_col(ct)
-            raw_val = row.get(col) if col in row.index else None
-            has_value = raw_val is not None and pd.notna(raw_val) and str(raw_val).strip() not in ("", "nan")
-            if not has_value:
-                continue
-
-            path_str = str(raw_val).strip().strip('"').strip("'")
-            file_path = self._resolve_path(path_str)
-
-            if not file_path.exists():
-                continue
-
-            needs_convert = False
-            if file_path.suffix.lower() in (".tif", ".tiff"):
-                needs_convert = True
-            elif file_path.suffix == ".zarr":
-                ok, _ = self._check_zarr_structure(file_path)
-                if not ok:
-                    needs_convert = True
-
-            if needs_convert:
-                # We pass refresh_ui=False here to prevent the table from being rebuilt 
-                # inside the loop, which causes the crash!
-                if self._convert_single(path_str, ct, sample_name, row_idx, 
-                                        save_metadata=False, refresh_ui=False):
+            if (sample_name, ct) in self._rows:
+                # refresh_ui=False to avoid rebuilding the table mid-loop, which crashes.
+                if self._convert_single(sample_name, ct, row_idx, save_metadata=False, refresh_ui=False):
                     converted_any = True
+
+        if sample_name in self._dead_rows:
+            if self._convert_dead_mask(sample_name, row_idx, save_metadata=False, refresh_ui=False):
+                converted_any = True
 
         if converted_any:
             if save_metadata:
                 self._save_metadata(refresh_ui=refresh_ui)
         elif refresh_ui:
             self.log(f"No conversions needed for {sample_name}")
-        
+
         return converted_any
 
     def _convert_all(self):
-        """Convert all actionable files across all samples."""
+        """Convert/save all actionable rows across all samples."""
         md = self.metadata_loader.metadata
         if md is None:
             return
-        
+
         converted_any = False
         for idx, row in md.iterrows():
             sample_name = str(row.get("sample_name", f"Row {idx+1}"))
             # refresh_ui=False to avoid crash
             if self._convert_sample(sample_name, idx, save_metadata=False, refresh_ui=False):
                 converted_any = True
-        
+
         if converted_any:
             self._save_metadata(refresh_ui=True)
         else:
@@ -3482,7 +3777,6 @@ class ImportWidget(QWidget):
 
     def _save_metadata(self, show_popup=True, refresh_ui=True):
         """Save metadata CSV to disk and show info popup."""
-        from qtpy.QtWidgets import QMessageBox
         md = self.metadata_loader.metadata
         csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv", "")
         if not csv_path:

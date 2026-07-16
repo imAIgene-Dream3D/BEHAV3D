@@ -946,6 +946,26 @@ class DataPreparationTab(QWidget):
             "background-color: #4CAF50; color: white; font-weight: bold;"
         )
 
+    def enter_metadata_edit_mode(self):
+        """Open the Metadata Builder already in edit mode for the currently
+        loaded metadata.
+
+        Bypasses the "Edit Current / Generate New / Cancel" prompt normally
+        shown by ``_on_builder_toggled`` — intent is unambiguous when this is
+        called from an external shortcut (e.g. the Segmentation/Tracking
+        import tabs' "Add a new sample or cell type" button).
+        """
+        if self.metadata is None:
+            QMessageBox.information(
+                self, "No Metadata Loaded",
+                "Load or build a metadata CSV first before adding samples or cell types.",
+            )
+            return
+        self.builder_grp.blockSignals(True)
+        self.builder_grp.setChecked(True)
+        self.builder_grp.blockSignals(False)
+        self._enter_edit_mode()
+
     def _populate_builder_from_metadata(self):
         """Fill the metadata builder forms from self.metadata."""
         md = self.metadata
