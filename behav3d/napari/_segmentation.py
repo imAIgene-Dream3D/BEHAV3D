@@ -3290,7 +3290,9 @@ class ImportWidget(QWidget):
                 "border-radius:3px;font-size:12px}"
                 "QPushButton:hover{background:#388E3C}"
             )
-            btn.clicked.connect(partial(self._convert_sample, sample_name, row_idx))
+            btn.clicked.connect(
+                lambda _checked=False, s=sample_name, r=row_idx: self._convert_sample(s, r)
+            )
             wrap = QWidget()
             wrap_lay = QHBoxLayout(wrap)
             wrap_lay.setContentsMargins(16, 2, 4, 6)
@@ -3413,7 +3415,9 @@ class ImportWidget(QWidget):
                     "border-radius:3px}"
                     "QPushButton:hover{background:#FB8C00}"
                 )
-                btn.clicked.connect(partial(self._convert_single, sample_name, cell_type, row_idx))
+                btn.clicked.connect(
+                    lambda _checked=False, s=sample_name, c=cell_type, r=row_idx: self._convert_single(s, c, r)
+                )
                 info["status_layout"].addWidget(btn)
                 return
 
@@ -3455,7 +3459,9 @@ class ImportWidget(QWidget):
                     "border-radius:3px}"
                     "QPushButton:hover{background:#388E3C}"
                 )
-                btn.clicked.connect(partial(self._convert_single, sample_name, cell_type, row_idx))
+                btn.clicked.connect(
+                    lambda _checked=False, s=sample_name, c=cell_type, r=row_idx: self._convert_single(s, c, r)
+                )
                 info["status_layout"].addWidget(btn)
 
         elif file_path.suffix.lower() in (".tif", ".tiff"):
@@ -3465,7 +3471,9 @@ class ImportWidget(QWidget):
                 "border-radius:3px}"
                 "QPushButton:hover{background:#1976D2}"
             )
-            btn.clicked.connect(partial(self._convert_single, sample_name, cell_type, row_idx))
+            btn.clicked.connect(
+                lambda _checked=False, s=sample_name, c=cell_type, r=row_idx: self._convert_single(s, c, r)
+            )
             info["status_layout"].addWidget(btn)
         else:
             status = QLabel(f"⚠️  Format not supported ({file_path.suffix})")
@@ -3505,7 +3513,9 @@ class ImportWidget(QWidget):
                     "border-radius:3px}"
                     "QPushButton:hover{background:#FB8C00}"
                 )
-                btn.clicked.connect(partial(self._convert_dead_mask, sample_name, row_idx))
+                btn.clicked.connect(
+                    lambda _checked=False, s=sample_name, r=row_idx: self._convert_dead_mask(s, r)
+                )
                 info["status_layout"].addWidget(btn)
             elif str(file_path) == info["last_value"]:
                 status = QLabel("✅  Ready")
@@ -3518,7 +3528,9 @@ class ImportWidget(QWidget):
                     "border-radius:3px}"
                     "QPushButton:hover{background:#388E3C}"
                 )
-                btn.clicked.connect(partial(self._convert_dead_mask, sample_name, row_idx))
+                btn.clicked.connect(
+                    lambda _checked=False, s=sample_name, r=row_idx: self._convert_dead_mask(s, r)
+                )
                 info["status_layout"].addWidget(btn)
         elif file_path.suffix.lower() in (".tif", ".tiff"):
             btn = QPushButton("🔄  Convert TIFF → zarr")
@@ -3527,7 +3539,9 @@ class ImportWidget(QWidget):
                 "border-radius:3px}"
                 "QPushButton:hover{background:#1976D2}"
             )
-            btn.clicked.connect(partial(self._convert_dead_mask, sample_name, row_idx))
+            btn.clicked.connect(
+                lambda _checked=False, s=sample_name, r=row_idx: self._convert_dead_mask(s, r)
+            )
             info["status_layout"].addWidget(btn)
         else:
             status = QLabel(f"⚠️  Format not supported ({file_path.suffix})")
@@ -3710,7 +3724,7 @@ class ImportWidget(QWidget):
             self._save_metadata(refresh_ui=refresh_ui)
         return True
 
-    def _convert_single(self, sample_name, cell_type, row_idx, save_metadata=True, refresh_ui=True):
+    def _convert_single(self, sample_name, cell_type, row_idx, *, save_metadata=True, refresh_ui=True):
         """Convert/save one cell type's segmentation row for one sample."""
         info = self._rows.get((sample_name, cell_type))
         if info is None:
@@ -3723,7 +3737,7 @@ class ImportWidget(QWidget):
             label=f"{cell_type} / {sample_name}",
         )
 
-    def _convert_dead_mask(self, sample_name, row_idx, save_metadata=True, refresh_ui=True):
+    def _convert_dead_mask(self, sample_name, row_idx, *, save_metadata=True, refresh_ui=True):
         """Convert/save the dead-mask row for one sample."""
         info = self._dead_rows.get(sample_name)
         if info is None:
@@ -3735,7 +3749,7 @@ class ImportWidget(QWidget):
             label=f"dead mask / {sample_name}",
         )
 
-    def _convert_sample(self, sample_name, row_idx, save_metadata=True, refresh_ui=True):
+    def _convert_sample(self, sample_name, row_idx, *, save_metadata=True, refresh_ui=True):
         """Convert/save all actionable rows (cell types + dead mask) for one sample."""
         converted_any = False
 

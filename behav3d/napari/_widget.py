@@ -451,6 +451,25 @@ class BEHAV3DWidget(QWidget):
         except Exception:
             pass
 
+    def ask_assistant(self, prompt: str):
+        """Reveal the assistant dock and send ``prompt`` on the user's behalf.
+
+        Called by the Analysis tab's Guided "Ask the assistant" buttons.
+        Best-effort: never fatal to the caller.
+        """
+        if getattr(self, "assistant", None) is None:
+            return
+        dock = getattr(self, "_assistant_dock", None)
+        try:
+            if dock is not None and not dock.isVisible():
+                self._toggle_assistant()
+        except Exception:
+            pass
+        try:
+            self.assistant.ask_about(prompt)
+        except Exception:
+            pass
+
     def _on_assistant_visibility_changed(self, visible: bool):
         """Mirror the dock's visibility onto the toggle button without re-emitting."""
         try:

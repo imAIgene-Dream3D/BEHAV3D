@@ -50,11 +50,20 @@ def extract_categorical_track_sequences(
     time_col="position_t",
     missing_policy="keep",
     missing_token="missing",
+    extra_meta_cols=(),
 ):
-    """Return per-track categorical state sequences and track-level metadata."""
+    """Return per-track categorical state sequences and track-level metadata.
+
+    extra_meta_cols are carried through as track-level metadata (first value per
+    track) without affecting how tracks are grouped, e.g. a per-track-constant
+    population tag such as ``origin_cell_type``.
+    """
     state_cols = _normalize_state_cols(state_cols)
     groupby_cols = [str(c) for c in list(groupby_cols)]
-    required_cols = list(groupby_cols) + [str(time_col)] + list(state_cols)
+    extra_meta_cols = [
+        str(c) for c in list(extra_meta_cols) if str(c) not in groupby_cols and str(c) in adata.obs.columns
+    ]
+    required_cols = list(groupby_cols) + [str(time_col)] + list(state_cols) + extra_meta_cols
     missing = [c for c in required_cols if c not in adata.obs.columns]
     if missing:
         raise KeyError(f"Missing required columns for distance clustering: {missing}")
@@ -92,6 +101,9 @@ def extract_categorical_track_sequences(
         else:
             track_values = list(track_id)
         meta = {col: track_values[i] for i, col in enumerate(groupby_cols)}
+        for col in extra_meta_cols:
+            vals = df_seq[col].dropna().unique()
+            meta[col] = vals[0] if len(vals) > 0 else pd.NA
         meta["position_t_min"] = df_seq[str(time_col)].min()
         meta["position_t_max"] = df_seq[str(time_col)].max()
         meta["n_timepoints"] = int(len(df_seq))

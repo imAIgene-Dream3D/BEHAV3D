@@ -468,6 +468,25 @@ class AssistantDock(QWidget):
     # ------------------------------------------------------------------
     # Sending
     # ------------------------------------------------------------------
+    def ask_about(self, prompt: str):
+        """Send ``prompt`` to the assistant on the user's behalf.
+
+        Used by the Analysis tab's Guided "Ask the assistant" buttons. If a
+        request is already in flight, the text is dropped into the input box
+        instead of being lost, so the user can send it when ready.
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return
+        if self._request_active:
+            try:
+                self.input.setText(prompt)
+            except Exception:
+                pass
+            return
+        self._guided_flow_active = False
+        self._send_message(prompt, intent="free_form")
+
     def _on_send(self):
         text = self.input.text().strip()
         if not text:

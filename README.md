@@ -1,28 +1,92 @@
-[wiki](https://imaigene-dream3d.github.io/BEHAV3D/)
 # BEHAV3D
 
-A Python package for analyzing cell behavior in fluorescent 3D imaging.
+BEHAV3D analyzes cell behavior (movement, contacts, cell death) from 3D microscopy images — no coding required. Built for biologists.
 
-## Installation
+📖 [Full wiki](https://imaigene-dream3d.github.io/BEHAV3D/)
 
-### Quick Install (Recommended)
+![BEHAV3D panel in napari](docs/source/_static/screenshots/dock_widget_overview.png)
 
-The easiest way to install BEHAV3D is using our automated installer that handles everything:
+## Installation (3 steps, no code)
 
-**Windows:**
-1. Download this repository (Code > Download ZIP) and extract it
-2. Double-click `install_behav3d_windows.bat`
-3. Follow the prompts
+1. Download this repository: green **Code > Download ZIP** button, then unzip it.
+2. Open the `installation` folder and double-click the installer for your system:
+   - **Windows:** `install_behav3d_windows.bat`
+   - **macOS:** `install_behav3d_macOS.command`
+3. Follow the on-screen prompts. The installer handles everything (conda, GPU, PyTorch, Cellpose) automatically.
 
-### macOS
-**Option 1:** Double-click `install_behav3d_macOS.command`
+> Using Linux, or prefer the terminal? See the manual installation and advanced options below.
 
-**Option 2:** Open Terminal and run:
+## How to open the program
+
+Double-click the launcher for your system, inside the `napari` folder:
+
+- **Windows:** `napari/run_behav3d_windows.bat`
+- **macOS:** `napari/run_behav3d_macOS.command`
+- **Linux:** `napari/run_behav3d_linux.sh`
+
+The BEHAV3D plugin opens automatically inside napari, covering the full pipeline: data preparation → segmentation → tracking → feature extraction → filtering.
+
+## Files you need before starting
+
+**Required:**
+- A [metadata.csv file](./configs/metadata.csv) listing the samples to analyze. On Windows we recommend editing it with https://www.moderncsv.com/, as it doesn't alter the format on save.
+- Per sample, a microscopy image (.czi, .tiff, .zarr).
+
+**Optional:**
+- Already segmented data per sample.
+- Already tracked data per sample.
+
+See the exact `metadata.csv` structure [below](#metadatacsv-structure).
+
+## Co-pilot assistant
+
+The napari panel includes an AI assistant on the right that answers questions about parameters and methods, and can fill in the forms for you (with your confirmation). Works out of the box, no setup required.
+
+---
+
+## FAQ
+
+<details>
+<summary><strong>The installer doesn't work / PyTorch errors out</strong></summary>
+
+Try one of these two options from the terminal, inside the `behav3d` environment:
+
+**Option 1:** Install `nomkl` **before** installing PyTorch (avoids conflicts with OpenMP)
 ```bash
-cd path/to/BEHAV3D/installation
-chmod +x install_behav3d_linux.sh
-./install_behav3d.sh
+mamba install -c conda-forge igraph "blas=*=openblas"
+mamba install nomkl
 ```
+
+**Option 2:** Reinstall Cellpose with conda instead of pip
+```bash
+pip uninstall cellpose -y
+mamba install -c conda-forge cellpose
+```
+</details>
+
+<details>
+<summary><strong>I want to use Jupyter Notebook instead of the graphical panel</strong></summary>
+
+Built for advanced users who want more control over each step of the pipeline.
+
+1. Install [VS Code](https://code.visualstudio.com/Download) with the Python and Jupyter extensions.
+2. Open the BEHAV3D folder.
+3. Open `notebooks/run_behav3d.ipynb`.
+4. Select the kernel: Python Environments > behav3d.
+
+Or from a web browser:
+```bash
+mamba activate behav3d
+jupyter notebook notebooks/run_behav3d.ipynb
+```
+</details>
+
+---
+
+## Technical documentation (advanced)
+
+<details>
+<summary><strong>Manual installation (Linux, or if you prefer the terminal)</strong></summary>
 
 ### Linux
 ```bash
@@ -31,36 +95,41 @@ chmod +x install_behav3d_linux.sh
 ./install_behav3d.sh
 ```
 
-The installer will automatically:
-- ✅ Install Miniforge (conda) if not found
-- ✅ Detect your GPU (NVIDIA CUDA / Apple Silicon MPS / CPU-only)
-- ✅ Create the conda environment with all dependencies
-- ✅ Install PyTorch with the appropriate backend
-- ✅ Install Cellpose for cell segmentation
+### macOS via terminal
+```bash
+cd path/to/BEHAV3D/installation
+chmod +x install_behav3d_linux.sh
+./install_behav3d.sh
+```
 
-### Manual Installation
+The installer automatically:
+- Installs Miniforge (conda) if not found
+- Detects your GPU (NVIDIA CUDA / Apple Silicon MPS / CPU-only)
+- Creates the conda environment with all dependencies
+- Installs PyTorch with the appropriate backend
+- Installs Cellpose for cell segmentation
 
-If you prefer manual installation:
+### Fully manual installation
 
 **Step 1: Install Miniforge**
 
 If you don't have conda/mamba installed, download [Miniforge](https://github.com/conda-forge/miniforge/releases/latest/) (recommended, includes `mamba`) or [Miniconda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html).
 
-> **Note:** We recommend using `mamba` instead of `conda` for faster dependency resolution. Miniforge includes `mamba` by default. All `mamba` commands below can be replaced with `conda` if using Miniconda/Anaconda.
+> We recommend `mamba` over `conda` for faster dependency resolution. Miniforge includes it by default. All `mamba` commands below work the same with `conda` if you're using Miniconda/Anaconda.
 
 **Step 2: Create the environment**
 
 ```bash
 cd /path/to/BEHAV3D
 
-# Create environment from yml file
+# Create environment from the yml file
 mamba env create -f environment.yml
 mamba activate behav3d
 
 # Install Cellpose and ConvPaint
 pip install cellpose>=3.0 napari-convpaint
 
-# Install PyTorch (choose ONE based on your system):
+# Install PyTorch (choose ONE option based on your system):
 
 # First remove any preexisting pytorch installations:
 mamba remove pytorch torchvision torchaudio
@@ -71,101 +140,40 @@ mamba install pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1 -c pytorch
 # CUDA 12.1 (Windows/Linux with NVIDIA GPU):
 mamba install pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia
 
-# Install BEHAV3D package
+# Install the BEHAV3D package
 pip install -e .
 
-# Register Jupyter kernel
+# Register the Jupyter kernel
 python -m ipykernel install --user --name=behav3d --display-name "behav3d"
 ```
 
-***If pytorch installation is not working or you run into errors (OpenMP related), try this:***
-
-**Option 1:** Install nomkl **before** installing pytorch (avoids conflicts with OpenMP)
-```
-# First switch BLAS backend to openblas (fixes igraph/nomkl conflict)
-mamba install -c conda-forge igraph "blas=*=openblas"
-# Then install nomkl
-mamba install nomkl
-```
-**Option 2:** Remove cellpose and re-install it with conda:
-```
-pip uninstall cellpose -y
-mamba install -c conda-forge cellpose
-```
-
-### Installation Options
+### Installer options
 
 ```bash
 # Check system info before installing
 python install_behav3d.py --check
 
-# Force CPU-only installation (even if GPU detected)
+# Force CPU-only installation (even if a GPU is detected)
 python install_behav3d.py --cpu-only
 
-# Only install PyTorch/Cellpose (if environment already exists)
+# Only install PyTorch/Cellpose (if the environment already exists)
 python install_behav3d.py --pytorch-only
 ```
 
-## How to Run
+### Manual napari launch
 
-### Napari GUI (Recommended)
-
-BEHAV3D provides a full graphical interface through the napari viewer:
-
-**Quick launch:**
-1. Double-click the launcher for your platform:
-   - Windows: `napari/run_behav3d_windows.bat`
-   - macOS: `napari/run_behav3d_macOS.command`
-   - Linux: `napari/run_behav3d_linux.sh` (run from a terminal: `chmod +x napari/run_behav3d_linux.sh && ./napari/run_behav3d_linux.sh`)
-2. The BEHAV3D plugin will open automatically inside napari
-
-> **Note:** The launcher reads its environment configuration from `napari/.config/behav3d_env.json`, which is generated by the installer.
-
-**Manual launch:**
 ```bash
 mamba activate behav3d
 napari
 ```
 Then open the BEHAV3D plugin from the **Plugins** menu.
 
-The napari GUI covers the full pipeline: data preparation → segmentation → tracking → feature extraction → filtering.
+> The launcher reads its environment configuration from `napari/.config/behav3d_env.json`, generated by the installer.
+</details>
 
-### Jupyter Notebook (Alternative)
-
-> **Note:** The Jupyter notebook provides an alternative, script-based interface for advanced users who prefer more control over individual pipeline steps.
-
-1. Install [VS Code](https://code.visualstudio.com/Download) with the Python and Jupyter extensions
-2. Open the BEHAV3D folder
-3. Open `notebooks/run_behav3d.ipynb`
-4. Select kernel: Python Environments > behav3d
-
-Or in a web browser:
-```bash
-mamba activate behav3d
-jupyter notebook notebooks/run_behav3d.ipynb
-```
-
-## Co-pilot Assistant
-
-The napari GUI includes a right-side **AI co-pilot dock** that answers questions about parameters and methods, and can fill in the forms for you after a one-click confirmation.
-
-**For users:** it works out of the box — `napari/assistant_config.json` is pre-configured to point at our hosted endpoint. No setup required.
-
-**For maintainers:** see the [Deploying / Managing the Chatbot](#deploying--managing-the-chatbot) section below.
-
----
-
-### Required files
-
-[REQUIRED]
-- A [metadata .csv](./configs/metadata.csv) that contains all samples that should be analyzed. To manage the metadata.csv in windows we recommend using https://www.moderncsv.com/ as it doesn't modify the format upon saving.
-- Per sample, a raw microscopy image (.czi, .tiff, .zarr)
-
-[Optional]
-- Already segmented data for each sample
-- Already tracked data for each sample
-  
-## Metadata.csv structure
+<a id="metadatacsv-structure"></a>
+<details>
+<summary><strong>metadata.csv structure</strong></summary>
 
 ### Required
 | Column Name                    | Explanation                                                                                         |
@@ -196,11 +204,10 @@ The napari GUI includes a right-side **AI co-pilot dock** that answers questions
 | organoid_tracks_image_path    | Path to the image showing organoid tracks over time.                                               |
 | organoid_tracks_csv_path      | Path to the CSV file containing organoid tracking data.                                            |
 
-\
-\
-\\
+</details>
 
-## Cellpose Segmentation
+<details>
+<summary><strong>Segmentation with Cellpose</strong></summary>
 
 To use **Cellpose** for 3D segmentation with pretrained models using the `run_behav3d.ipynb` notebook:
 
@@ -249,6 +256,10 @@ After segmentation, use the **Visualize the sample** button:
 
 *Note: To train a new Cellpose model, refer to the `train_behav3d_cellpose.ipynb` notebook.*
 
+</details>
+
+<details>
+<summary><strong>Tracking with btrack</strong></summary>
 
 ## btrack Tracking
 
@@ -301,7 +312,10 @@ These files are automatically picked up by the downstream **Analysis** module to
 
 *Note: For custom motion models, refer to the [btrack documentation](https://btrack.readthedocs.io).*
 
----
+</details>
+
+<details>
+<summary><strong>Chatbot deployment (maintainers only)</strong></summary>
 
 ## Deploying / Managing the Chatbot
 
@@ -369,6 +383,11 @@ Available options: `deepseek-v4-flash` (fast, cheap), `deepseek-v4-pro` (stronge
 - Modal compute: [modal.com/apps](https://modal.com/apps) — the `behav3d-assistant` app
 - Set a DeepSeek spend limit to prevent runaway costs from unexpected traffic
 
+</details>
+
+<details>
+<summary><strong>Developer options</strong></summary>
+
 ## Developer Options
 
 ### Developer Mode
@@ -414,6 +433,10 @@ if os.environ.get("BEHAV3D_DEV_MODE") == "1":
 ```
 
 > **Note:** The `.behav3d_dev` file is listed in `.gitignore` and will never be committed to version control. It is a purely local, per-machine toggle.
+
+</details>
+
+---
 
 ## About AI Usage
 

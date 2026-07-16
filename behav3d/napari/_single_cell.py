@@ -45,6 +45,7 @@ from qtpy.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QTabWidget,
     QTextEdit,
     QToolButton,
@@ -1469,6 +1470,7 @@ class StateClassificationSubTab(QWidget):
 
     def _refresh_composition_group_cols(self):
         self.list_composition_group_cols.clear()
+        added = set()
 
         # Prefer columns from the metadata CSV, but only surface the known
         # experimental-design grouping columns (exp_nr, well, *_line_condition).
@@ -1477,10 +1479,11 @@ class StateClassificationSubTab(QWidget):
             for col in md.columns:
                 if col in ("exp_nr", "well") or col.endswith("_line_condition"):
                     self.list_composition_group_cols.addItem(col)
-            return
+                    added.add(col)
 
-        # Fallback when metadata is not loaded: read obs columns from adata but
-        # only surface metadata-style grouping columns, not behavioral features.
+        # Metadata CSV never carries per-cell columns like `origin_cell_type`
+        # (stamped during multi-population track merging), so also check the
+        # adata/h5ad obs columns for those, whether or not metadata was loaded.
         if self._model_adata is not None:
             obs_cols = list(self._model_adata.obs.columns)
         else:
@@ -1495,10 +1498,11 @@ class StateClassificationSubTab(QWidget):
             except Exception:
                 return
         for col in obs_cols:
-            if col.startswith("_") or col in _TECHNICAL_OBS_COLS:
+            if col in added or col.startswith("_") or col in _TECHNICAL_OBS_COLS:
                 continue
-            if col in ("exp_nr", "well") or col.endswith("_line_condition"):
+            if col in ("exp_nr", "well", "origin_cell_type") or col.endswith("_line_condition"):
                 self.list_composition_group_cols.addItem(col)
+                added.add(col)
 
     def _update_view_buttons(self):
         ct = self._cell_type()
@@ -4216,9 +4220,33 @@ class SingleCellTab(QWidget):
         hdr_lay.addWidget(self.status_lbl)
         outer.addLayout(hdr_lay)
 
-        # ── Inner sub-tabs ───────────────────────────────────────────────
+        # ── Guided / Advanced switch + stacked pages ─────────────────────
+        from behav3d.napari._guided import (
+            ModeSwitch, GuidedPanel, load_guided_mode,
+        )
+        from behav3d.napari.analysis_guided_copy import (
+            SINGLE_CELL_ANALYSES, GUIDED_INTRO,
+        )
+
+        guided_default = load_guided_mode()
+        self._mode_switch = ModeSwitch(guided=guided_default)
+        self._mode_switch.modeChanged.connect(self._on_mode_changed)
+        outer.addWidget(self._mode_switch)
+
+        self._stack = QStackedWidget()
+        outer.addWidget(self._stack, stretch=1)
+
+        # Page 0 — Guided explainers.
+        self._guided_panel = GuidedPanel(
+            SINGLE_CELL_ANALYSES,
+            start_cb=self._on_guided_start,
+            intro=GUIDED_INTRO,
+        )
+        self._stack.addWidget(self._guided_panel)
+
+        # Page 1 — the existing inner sub-tabs (settings forms).
         self.inner_tabs = QTabWidget()
-        outer.addWidget(self.inner_tabs, stretch=1)
+        self._stack.addWidget(self.inner_tabs)
 
         self.state_tab = StateClassificationSubTab(
             viewer=self.viewer,
@@ -4226,7 +4254,9 @@ class SingleCellTab(QWidget):
             cell_type_getter=self._current_cell_type,
             parent=self,
         )
-        self.inner_tabs.addTab(self.state_tab, "🔬 State Classification")
+        # Display name only — internal SC_STATE_CLUSTER StepType / methods /
+        # outputs are unchanged.
+        self.inner_tabs.addTab(self.state_tab, "🔬 Behavioral State")
 
         self.track_tab = TrackClassificationSubTab(
             viewer=self.viewer,
@@ -4234,16 +4264,39 @@ class SingleCellTab(QWidget):
             cell_type_getter=self._current_cell_type,
             parent=self,
         )
-        self.inner_tabs.addTab(self.track_tab, "🛤️ Track Classification")
+        # Display name only — internal SC_TRACK_CLUSTER StepType / methods /
+        # outputs are unchanged.
+        self.inner_tabs.addTab(self.track_tab, "🛤️ State Trajectory")
 
-        # When switching to Track Classification (index 1), trigger a reload
+        # When switching to State Trajectory (index 1), trigger a reload
         # so the behavioral-states path auto-fills from disk if it exists.
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
+
+        self._stack.setCurrentIndex(0 if guided_default else 1)
+
+    # ── Guided / Advanced mode ─────────────────────────────────────────────
+    def _on_mode_changed(self, guided: bool):
+        from behav3d.napari._guided import save_guided_mode
+
+        self._stack.setCurrentIndex(0 if guided else 1)
+        save_guided_mode(guided)
+
+    def _on_guided_start(self, analysis_id: str):
+        """Start from a Guided card: reveal the form and focus its sub-tab."""
+        self._mode_switch.set_guided(False)  # → _on_mode_changed flips the page
+        index = {"state": 0, "track": 1}.get(analysis_id)
+        if index is not None:
+            self.inner_tabs.setCurrentIndex(index)
 
     def _on_inner_tab_changed(self, index: int):
         """Auto-fill path fields when switching to Track Classification tab."""
         if index == 1:  # Track Classification
             self.track_tab._autofill_paths(self._current_cell_type())
+            # Re-check prerequisites too: a behavioral-states h5ad may have been
+            # written (or rewritten) by the State Classification tab since the
+            # last time this tab was visited, and _autofill_paths alone doesn't
+            # refresh the "states not found" warning/lock state.
+            self.track_tab._check_prerequisites()
             if self.track_tab.chk_use_original.isChecked():
                 self.track_tab._show_original_dtw_disclaimer()
 

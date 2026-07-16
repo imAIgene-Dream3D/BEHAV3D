@@ -103,18 +103,23 @@ def extract_descibing_track_state_features(
     use_bigrams=True,
     use_trigrams=True,
     ngram_weight="count",
+    extra_meta_cols=("origin_cell_type",),
 ):
     """
     Track-level feature extraction -> returns (track_adata, blocks)
 
     track_adata.X        = features (n_tracks x n_features)
-    track_adata.obs      = per-track metadata (sample_name, TrackID, position_t_min/max, n_timepoints)
+    track_adata.obs      = per-track metadata (sample_name, TrackID, position_t_min/max, n_timepoints,
+                            plus any extra_meta_cols present in adata.obs, e.g. origin_cell_type)
     track_adata.var_names= feature names
     """
 
     group_col = list(group_col) if isinstance(group_col, (list, tuple)) else [group_col]
+    extra_meta_cols = [
+        str(c) for c in list(extra_meta_cols) if str(c) not in group_col and str(c) in adata.obs.columns
+    ]
 
-    obs = adata.obs[group_col + [time_col, state_col]].copy()
+    obs = adata.obs[group_col + [time_col, state_col] + extra_meta_cols].copy()
     obs = obs.sort_values(group_col + [time_col])
 
     # Stable state universe
@@ -218,6 +223,14 @@ def extract_descibing_track_state_features(
 
     # Build obs table in the same row order as features
     df_meta = df_ids.merge(df_time, on=group_col, how="left")
+
+    if extra_meta_cols:
+        df_extra = (
+            obs.groupby(group_col, sort=False, observed=True)[extra_meta_cols]
+            .first()
+            .reset_index()
+        )
+        df_meta = df_meta.merge(df_extra, on=group_col, how="left")
 
     # Combine for conversion using your helper
     df_out = pd.concat([df_meta.reset_index(drop=True), df_feat.reset_index(drop=True)], axis=1)
