@@ -1,6 +1,6 @@
-# BEHAV3D
+# BEHAV3D Explorer
 
-BEHAV3D is a tool for analyzing how cells behave in 3D microscopy images: no coding required, built for biologists.
+BEHAV3D Explorer is a tool for analyzing how cells behave in 3D microscopy images: no coding required, built for biologists.
 
 It works with pretty much any 3D microscopy data, for example 3D live co-cultures or intravital microscopy, and turns your raw movies into quantitative, cell-by-cell readouts. Here's the kind of analysis you can get out of it:
 
@@ -11,7 +11,7 @@ It works with pretty much any 3D microscopy data, for example 3D live co-culture
   <img src="docs/source/_static/icons/death_dynamics.svg" width="200" alt="Death dynamics"/>
 </p>
 
-There's no one-size-fits-all solution, so BEHAV3D-Explorer is built as a set of flexible, modular tools: you pick and combine the segmentation, tracking and analysis methods that fit your experiment, or your computational power, instead of being locked into one fixed pipeline. Navigating a complex software with so many options is difficult, but you don't have to figure it out alone: a built-in Co-pilot assistant (QueenB) sits next to the panel, explains what each parameter does, and can fill in the forms for you.
+There's no one-size-fits-all solution, so BEHAV3D-Explorer is built as a set of flexible, modular tools: you pick and combine the segmentation, tracking and analysis methods that fit your experiment, or your computational power, instead of being locked into one fixed pipeline. Navigating a complex software with so many options is difficult, but you don't have to figure it out alone: **a built-in Co-pilot assistant** (QueenB) sits next to the panel, explains what each parameter does, and can fill in the forms for you.
 
 📖 [Full wiki](https://imaigene-dream3d.github.io/BEHAV3D/)
 
