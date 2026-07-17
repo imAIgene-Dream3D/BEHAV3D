@@ -43,7 +43,11 @@ from behav3d.analysis.behavior.track.visualization.plots.feature_dtw import (
     plot_clustering_feature_heatmap,
     plot_feature_umap,
 )
-from behav3d.core.metadata import load_behav3d_metadata, check_behav3d_metadata
+from behav3d.core.metadata import (
+    load_behav3d_metadata,
+    check_behav3d_metadata,
+    merge_condition_columns_into_obs,
+)
 from behav3d.analysis.behavior.general import relabel_cluster_ids
 from behav3d.features.state_descriptive_features import (
     extract_descibing_track_state_features, 
@@ -926,6 +930,9 @@ def apply_track_classifier_to_subtracks(
     plot_dpi=300,
     plot_track_class_proportions=True,
     track_class_proportion_plot_dpi=300,
+    group_cols=None,
+    metadata=None,
+    metadata_path=None,
     exemplar_video_fps=6,
     exemplar_video_dpi=180,
     exemplar_video_margin=20,
@@ -1072,11 +1079,32 @@ def apply_track_classifier_to_subtracks(
         f"rows={adata_tracks.n_obs} | unique_labels={adata_tracks.obs[str(output_col)].astype(str).nunique()}",
     )
     _vdone(verbose, "trajectory-apply", "build features + predict", predict_started)
+
+    valid_group_cols = []
+    if group_cols:
+        md = metadata if metadata is not None else (load_behav3d_metadata(metadata_path) if metadata_path else None)
+        if md is not None and "sample_name" in getattr(md, "columns", []):
+            cols_to_merge = [c for c in group_cols if c not in adata_tracks.obs.columns and c in md.columns]
+            if cols_to_merge:
+                adata_tracks = merge_condition_columns_into_obs(adata_tracks, md, cols_to_merge)
+            valid_group_cols = [c for c in group_cols if c in adata_tracks.obs.columns]
+            missing = [c for c in group_cols if c not in valid_group_cols]
+            if missing:
+                _vinfo(verbose, "trajectory-apply", f"group_cols not found in metadata/obs, skipping: {missing}")
+        else:
+            _vinfo(
+                verbose,
+                "trajectory-apply",
+                "group_cols requested but no metadata provided/available — skipping grouping.",
+            )
+
     track_class_proportions_plot_pdf = None
     track_class_proportions_table_csv = None
     track_class_proportions_sample_order = []
     track_class_proportions_class_order = []
     track_class_proportions_colors = {}
+    track_class_proportions_group_cols = []
+    track_class_proportions_grouped_csv = None
     track_class_proportions_error = None
     track_class_proportions_config = {
         "enabled": bool(plot_track_class_proportions),
@@ -1084,6 +1112,7 @@ def apply_track_classifier_to_subtracks(
         "class_col": str(output_col),
         "dpi": int(track_class_proportion_plot_dpi),
         "cmap_name": "tab20",
+        "group_cols": valid_group_cols,
     }
     if bool(plot_track_class_proportions):
         proportions_started = time.perf_counter()
@@ -1095,8 +1124,10 @@ def apply_track_classifier_to_subtracks(
                 out_dir=class_outdir,
                 sample_col="sample_name",
                 class_col=str(output_col),
+                group_cols=valid_group_cols or None,
                 dpi=int(track_class_proportion_plot_dpi),
                 cmap_name="tab20",
+                verbose=verbose,
             )
             track_class_proportions_plot_pdf = proportions_out.get("pdf_path")
             track_class_proportions_table_csv = proportions_out.get("csv_path")
@@ -1107,6 +1138,8 @@ def apply_track_classifier_to_subtracks(
                 proportions_out.get("class_order", [])
             )
             track_class_proportions_colors = dict(proportions_out.get("colors", {}))
+            track_class_proportions_group_cols = list(proportions_out.get("group_cols", []))
+            track_class_proportions_grouped_csv = proportions_out.get("grouped_csv_path")
             _vsave(verbose, "trajectory-apply", "track class proportions PDF", track_class_proportions_plot_pdf)
             _vsave(verbose, "trajectory-apply", "track class proportions CSV", track_class_proportions_table_csv)
             _vdone(verbose, "trajectory-apply", "write track class proportions outputs", proportions_started)
@@ -1396,6 +1429,8 @@ def apply_track_classifier_to_subtracks(
             "track_class_proportions_sample_order": list(track_class_proportions_sample_order),
             "track_class_proportions_class_order": list(track_class_proportions_class_order),
             "track_class_proportions_colors": dict(track_class_proportions_colors),
+            "track_class_proportions_group_cols": list(track_class_proportions_group_cols),
+            "track_class_proportions_grouped_csv": track_class_proportions_grouped_csv,
             "track_class_proportions_error": track_class_proportions_error,
             "track_class_proportions_config": dict(track_class_proportions_config),
             "exemplar_render_stage": "after_classification",
@@ -1439,6 +1474,8 @@ def apply_track_classifier_to_subtracks(
         "output_path": None if output_path is None else str(output_path),
         "track_class_proportions_plot_pdf": track_class_proportions_plot_pdf,
         "track_class_proportions_table_csv": track_class_proportions_table_csv,
+        "track_class_proportions_group_cols": list(track_class_proportions_group_cols),
+        "track_class_proportions_grouped_csv": track_class_proportions_grouped_csv,
         "apply_input_source_kind": str(apply_input_source_kind),
         "apply_input_source_path": None if apply_input_source_path is None else str(apply_input_source_path),
         "apply_preprocessing_spec": dict(apply_preprocessing_spec),

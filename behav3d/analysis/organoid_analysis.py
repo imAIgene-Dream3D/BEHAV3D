@@ -38,6 +38,7 @@ def run_organoid_analysis(
     metadata=None,
     df_tracks_path=None,
     org_type="organoid",
+    group_cols=None,
     # df_tracks_summarized_path=None,
     ):
     print(f"--------------- Performing {org_type} Death Dynamics analysis ---------------")
@@ -73,7 +74,17 @@ def run_organoid_analysis(
     # df_tracks_summarized = pd.read_csv(df_tracks_summarized_path)
     df_tracks=df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
     df_tracks["TrackID"] = df_tracks["TrackID"].astype(str)
-    
+
+    # Attach the user-selected condition-column grouping (e.g. organoid_line +
+    # macrophage_line) once, so every downstream consumer (grouped mean/SEM,
+    # dead-fraction pooling) sees it without re-merging metadata.
+    df_tracks = add_condition_group_column(df_tracks, metadata, group_cols)
+    has_condition_groups = group_cols and df_tracks["condition_group"].nunique() > 1
+    group_sample_counts = (
+        df_tracks.groupby("condition_group")["sample_name"].nunique().to_dict()
+        if has_condition_groups else None
+    )
+
     # Death dynamics now reads the final death classification from feature extraction.
     dead_columns = ["nr_dead_mask_pixels", "percentage_dead_mask", "dead"]
     has_dead_data = all(col in df_tracks.columns for col in dead_columns)
@@ -178,28 +189,60 @@ def run_organoid_analysis(
         index=False
     )
 
-    # Per-sample mean +/- SEM dynamics across organoids (raw + smoothed,
-    # baseline-normalized; cummax for percentage_dead_mask). Saved as a
-    # separate CSV; plots are appended as extra pages to the combined PDF.
-    df_meansem = _compute_per_sample_mean_sem_dynamics(df_tracks, org_type=org_type)
-    meansem_value_cols = [
-        c for c in ("mean_dead_dye", "percentage_dead_mask")
+    # Track-level dead indicator pooled by condition group (page 1's grouped
+    # % dead plot). `grid` already carries TrackID (broadcast from `summ`),
+    # so no extra death-state computation is needed here.
+    condition_color_map = None
+    df_dead_at_t_grouped = None
+    if has_condition_groups:
+        df_dead_at_t = grid[["sample_name", "TrackID", "position_t"]].copy()
+        df_dead_at_t["dead_at_t"] = dead_at_t.astype(float)
+        group_map = df_tracks[["sample_name", "TrackID", "condition_group"]].drop_duplicates()
+        df_dead_at_t = df_dead_at_t.merge(group_map, on=["sample_name", "TrackID"], how="left")
+        df_dead_at_t_grouped = _compute_grouped_mean_sem_dynamics(
+            df_dead_at_t, value_cols=["dead_at_t"], org_type=org_type
+        )
+        condition_color_map = _build_group_color_map(df_tracks["condition_group"].dropna().unique())
+
+    # Per-sample AND per-condition-group mean +/- SEM dynamics across
+    # organoids (raw + already-smoothed columns, absolute + baseline-from-0).
+    # Saved as separate CSVs; plots are appended as extra pages to the PDF.
+    raw_meansem_cols = [
+        c for c in ("percentage_dead_mask", "nr_dead_mask_pixels", "mean_dead_dye")
         if c in df_tracks.columns
     ]
+    meansem_value_cols = raw_meansem_cols + [f"smoothed_{c}" for c in raw_meansem_cols]
+
+    df_meansem = _compute_per_sample_mean_sem_dynamics(df_tracks, value_cols=meansem_value_cols, org_type=org_type)
+    df_meansem_grouped = (
+        _compute_grouped_mean_sem_dynamics(df_tracks, value_cols=meansem_value_cols, org_type=org_type)
+        if has_condition_groups else None
+    )
+
     df_meansem_outpath = Path(
         results_outdir, f"combined_mean_sem_{org_type}_dynamics_analysis.csv"
     )
     df_meansem.to_csv(df_meansem_outpath, sep=",", index=False)
+    if df_meansem_grouped is not None:
+        df_meansem_grouped_outpath = Path(
+            results_outdir, f"combined_mean_sem_grouped_{org_type}_dynamics_analysis.csv"
+        )
+        df_meansem_grouped.to_csv(df_meansem_grouped_outpath, sep=",", index=False)
 
     general_pdf_outpath = Path(results_outdir, f"combined_general_{org_type}_dynamics_analysis.pdf")
-    
+
     plot_general_organoid_analysis(
             df_general=df_general,
             outpath=general_pdf_outpath,
             df_meansem=df_meansem,
-            value_cols=meansem_value_cols,
+            value_cols=raw_meansem_cols,
             org_type=org_type,
-            figsize=(8.27, 11.69)
+            figsize=(8.27, 11.69),
+            df_meansem_grouped=df_meansem_grouped,
+            df_dead_at_t_grouped=df_dead_at_t_grouped,
+            group_cols=group_cols if has_condition_groups else None,
+            color_map=condition_color_map,
+            group_sample_counts=group_sample_counts,
             )
     
     ## TODO PLOT A STACKED BARPLOT OVER TIME WHERE THE TOTAL BAR IS 
@@ -501,6 +544,37 @@ def plot_feature_lineplot(
     ).set_title(hue, prop={'size': 6})
     return ax
 
+def add_condition_group_column(df, metadata, group_cols, sample_col="sample_name", label_col="condition_group"):
+    """
+    Merge selected metadata condition column(s) onto ``df`` (by ``sample_col``)
+    and combine them into a single grouping label column ``label_col``, joining
+    values with " | ". Missing values become "(unknown)".
+
+    Degrades to a constant "(all)" group when ``group_cols``/``metadata`` are
+    not usable, so callers can always group by ``label_col``.
+    """
+    df = df.copy()
+    group_cols = [c for c in (group_cols or []) if metadata is not None and c in getattr(metadata, "columns", [])]
+    if not group_cols or metadata is None or sample_col not in metadata.columns:
+        df[label_col] = "(all)"
+        return df
+
+    # Some track-feature CSVs (e.g. those produced by Filtering) already have
+    # the grouping columns merged in from metadata. Only merge columns that
+    # are missing to avoid pandas silently renaming collisions to _x/_y.
+    missing_cols = [c for c in group_cols if c not in df.columns]
+    if missing_cols:
+        meta_subset = metadata[[sample_col] + missing_cols].drop_duplicates(subset=[sample_col])
+        df = df.merge(meta_subset, on=sample_col, how="left")
+
+    parts = [df[c].fillna("(unknown)").astype(str) for c in group_cols]
+    label = parts[0]
+    for p in parts[1:]:
+        label = label + " | " + p
+    df[label_col] = label
+    return df
+
+
 def _sem(x):
     """Standard error of the mean: std(ddof=1)/sqrt(n); 0 when n <= 1."""
     x = x.dropna()
@@ -510,12 +584,14 @@ def _sem(x):
     return 0.0
 
 
-def _compute_per_sample_mean_sem_dynamics(df_tracks, org_type=None):
+def _compute_per_sample_mean_sem_dynamics(df_tracks, value_cols, org_type=None):
     """
     Aggregate per-sample mean +/- SEM dynamics across organoid tracks.
 
-    For each value column in {"mean_dead_dye", "percentage_dead_mask"} that
-    is present in ``df_tracks``, the recipe is the simple cohort-level one:
+    For each column in ``value_cols`` present in ``df_tracks`` (pass both raw
+    and ``smoothed_*`` column names to get both variants - smoothing already
+    happened per-track upstream via ``smooth_value_over_time``, so no
+    additional cohort-level smoothing is applied here):
 
     1. Aggregate across tracks per (sample_name, position_t):
         ``<col>_mean``  = mean of ``<col>`` across organoids at time t.
@@ -526,22 +602,11 @@ def _compute_per_sample_mean_sem_dynamics(df_tracks, org_type=None):
         ``<col>_from0_mean`` = ``<col>_mean`` - per-sample first-timepoint mean.
         ``<col>_from0_sem``  = ``<col>_sem``.
 
-    3. Smoothed-from-0. Smoothing happens at the COHORT level on the
-        already-baseline-subtracted mean and SEM (same window), so the
-        smoothed line and band are a self-consistent statistical pair:
-        ``<col>_smooth_from0_mean`` = rolling_mean( <col>_from0_mean ).
-        ``<col>_smooth_from0_sem``  = rolling_mean( <col>_from0_sem ).
-        The window used is the same fractional rolling-mean as
-        ``smooth_value_over_time`` (window = max(3, 0.2 * sample_length))
-        but with ``min_periods=1`` so the smoothed curve has no NaN
-        warm-up at t=0.
-
     Returns a tidy DataFrame keyed on (sample_name, position_t).
     Returns an empty DataFrame if no value columns are available.
     """
     time_col = "position_t"
-    candidate_cols = ["mean_dead_dye", "percentage_dead_mask"]
-    value_cols = [c for c in candidate_cols if c in df_tracks.columns]
+    value_cols = [c for c in value_cols if c in df_tracks.columns]
     if not value_cols:
         return pd.DataFrame(columns=["sample_name", time_col])
 
@@ -565,103 +630,343 @@ def _compute_per_sample_mean_sem_dynamics(df_tracks, org_type=None):
         g[f"{col}_from0_mean"] = g[f"{col}_mean"] - base
         g[f"{col}_from0_sem"] = g[f"{col}_sem"]
 
-    # ---- 3. smoothed-from-0 (per sample, COHORT level) -----------------
-    # Smooth both the cohort mean and the cohort SEM with the same fractional
-    # rolling window. Window = max(3, round(0.2 * len(per-sample series))),
-    # min_periods=1 avoids any NaN warm-up at t=0.
-    # No cummax here: smoothing-only keeps "smoothed mean +/- smoothed SEM"
-    # a self-consistent statistical pair (line and band always reflect the
-    # same timepoint).
-    def _frac_rolling_mean(series, window_fraction=0.2, min_window=3):
-        n = len(series)
-        window = max(min_window, int(round(n * window_fraction)))
-        return series.rolling(window=window, min_periods=1).mean()
-
-    for col in value_cols:
-        g[f"{col}_smooth_from0_mean"] = (
-            g.groupby("sample_name")[f"{col}_from0_mean"]
-             .transform(_frac_rolling_mean)
-        )
-        g[f"{col}_smooth_from0_sem"] = (
-            g.groupby("sample_name")[f"{col}_from0_sem"]
-             .transform(_frac_rolling_mean)
-        )
-
     return g.sort_values(["sample_name", time_col]).reset_index(drop=True)
 
 
-def _plot_per_sample_mean_sem_pages(pdf, df_meansem, value_cols, org_type=None):
+def _compute_grouped_mean_sem_dynamics(df, value_cols, group_col="condition_group", org_type=None):
     """
-    Append up to 4 mean +/- SEM pages (one figure per page) to an open
-    ``PdfPages`` object. One line + SEM band per ``sample_name``.
+    Aggregate mean +/- SEM dynamics per (group_col, position_t), pooling
+    across ALL rows (organoid tracks) that fall in each group - not
+    per-sample averages. This matches the pooling convention used by the
+    multi-organoid ``plot_grouped_dead_signal``: n at each timepoint is the
+    number of contributing organoid tracks, and SEM = std / sqrt(n).
+
+    Returns a tidy DataFrame keyed on (group_col, position_t). Returns an
+    empty DataFrame if no value columns are available.
+    """
+    time_col = "position_t"
+    value_cols = [c for c in value_cols if c in df.columns]
+    if not value_cols or group_col not in df.columns:
+        return pd.DataFrame(columns=[group_col, time_col])
+
+    g = (
+        df.groupby([group_col, time_col])[value_cols]
+          .agg(["mean", _sem])
+          .reset_index()
+    )
+    g.columns = ["_".join([c for c in col if c]).strip("_") for col in g.columns]
+    g = g.rename(columns={f"{c}__sem": f"{c}_sem" for c in value_cols})
+    return g.sort_values([group_col, time_col]).reset_index(drop=True)
+
+
+def _build_group_color_map(levels):
+    """Build a consistent tab10/husl color map for a set of group labels."""
+    levels = sorted(set(str(l) for l in levels))
+    n = len(levels)
+    palette = sns.color_palette("tab10", n) if n <= 10 else sns.color_palette("husl", max(n, 1))
+    return dict(zip(levels, palette))
+
+
+def _plot_grouped_mean_sem_panel(
+    ax,
+    df_grouped,
+    mean_col,
+    sem_col,
+    group_col="condition_group",
+    title=None,
+    ylabel=None,
+    xlabel="Timepoint",
+    legend_title=None,
+    color_map=None,
+    axhline_zero=False,
+    group_sample_counts=None,
+    suppress_single_sample_sem=True,
+):
+    """
+    Draw one mean +/- SEM line per group into ``ax``, where each group's
+    mean/SEM was computed by pooling across organoid tracks (see
+    ``_compute_grouped_mean_sem_dynamics``) - the single-organoid analog of
+    the multi-organoid grouped mean +/- SEM plots.
+
+    ``group_sample_counts`` (optional dict of group -> number of distinct
+    samples backing it) appends a "N sample(s)" suffix to each legend entry.
+    When ``suppress_single_sample_sem`` is True (default), it also suppresses
+    the SEM band for groups backed by only 1 sample - appropriate for metrics
+    that collapse to a single value per sample (e.g. fraction dead), where a
+    single biological replicate can't support a between-replicate error
+    estimate. Metrics that vary per organoid (e.g. dead-dye intensity) still
+    have a meaningful SEM across organoids within one sample, so callers for
+    those should pass ``suppress_single_sample_sem=False``.
+    """
+    groups = sorted(df_grouped[group_col].dropna().astype(str).unique())
+    if color_map is None:
+        color_map = _build_group_color_map(groups)
+
+    for grp in groups:
+        s = df_grouped[df_grouped[group_col].astype(str) == grp].sort_values("position_t")
+        if s.empty or s[mean_col].dropna().empty:
+            continue
+        color = color_map.get(grp, "C0")
+        n_samples = (group_sample_counts or {}).get(grp)
+        label = grp if n_samples is None else f"{grp} | {n_samples} sample{'s' if n_samples != 1 else ''}"
+        ax.plot(s["position_t"], s[mean_col], linewidth=2.4, label=label, color=color, zorder=3)
+        if not suppress_single_sample_sem or n_samples is None or n_samples >= 2:
+            ax.fill_between(
+                s["position_t"],
+                s[mean_col] - s[sem_col],
+                s[mean_col] + s[sem_col],
+                alpha=0.2, color=color, linewidth=0, zorder=1,
+            )
+
+    if axhline_zero:
+        ax.axhline(0, color="black", linewidth=0.6, alpha=0.35, zorder=0)
+
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel or "", fontsize=11)
+    ax.set_title(title or "", fontsize=12)
+    ax.grid(True, linestyle=":", linewidth=0.7, alpha=0.35)
+    ax.legend(
+        bbox_to_anchor=(1.02, 1.0), loc="upper left", borderaxespad=0,
+        prop={"size": 9}, title=legend_title or group_col, title_fontsize=10,
+    )
+    return ax
+
+
+def _plot_per_sample_mean_sem_panel(
+    ax,
+    df_meansem,
+    mean_col,
+    sem_col,
+    title=None,
+    ylabel=None,
+    xlabel="Timepoint",
+    axhline_zero=False,
+):
+    """Draw one mean +/- SEM line per sample_name into ``ax``."""
+    samples = sorted(df_meansem["sample_name"].dropna().unique().tolist())
+    for sample in samples:
+        s = df_meansem[df_meansem["sample_name"] == sample].sort_values("position_t")
+        if s.empty or s[mean_col].dropna().empty:
+            continue
+        line, = ax.plot(s["position_t"], s[mean_col], linewidth=2, label=sample)
+        ax.fill_between(
+            s["position_t"], s[mean_col] - s[sem_col], s[mean_col] + s[sem_col],
+            alpha=0.2, color=line.get_color(), linewidth=0,
+        )
+
+    if axhline_zero:
+        ax.axhline(0, color="k", linewidth=0.6, alpha=0.4)
+
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel or "", fontsize=11)
+    ax.set_title(title or "", fontsize=12)
+    ax.grid(alpha=0.3)
+    ax.legend(
+        bbox_to_anchor=(1.02, 1.0), loc="upper left", borderaxespad=0,
+        prop={"size": 8}, title="Sample Name", title_fontsize=9,
+    )
+    return ax
+
+
+_NICE_FEATURE_NAMES = {
+    "percentage_dead_mask": "Dead-Mask Area Coverage",
+    "nr_dead_mask_pixels": "Dead-Mask Pixel Count",
+    "mean_dead_dye": "Dead-Dye Intensity",
+}
+
+
+def _nice_feature_name(col):
+    """Human-readable label for a raw feature column name."""
+    if col in _NICE_FEATURE_NAMES:
+        return _NICE_FEATURE_NAMES[col]
+    return col.replace("_", " ").strip().capitalize()
+
+
+def _pretty_group_col_name(col):
+    """Shorten a metadata condition-column name for legend titles, e.g.
+    'or_organoid_line_condition' -> 'organoid', 'im_macrophage_line_condition'
+    -> 'macrophage'."""
+    name = col
+    for prefix in ("or_", "im_", "ot_"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    if name.endswith("_line_condition"):
+        name = name[: -len("_line_condition")]
+    return name.replace("_", " ") or col
+
+
+def _group_legend_title(group_cols):
+    """Build a short legend title from the selected condition column(s)."""
+    if not group_cols:
+        return "Condition Group"
+    return " / ".join(_pretty_group_col_name(c) for c in group_cols)
+
+
+def _plot_feature_pages(
+    pdf,
+    df_meansem_persample,
+    df_meansem_grouped,
+    feature_cols,
+    group_col="condition_group",
+    group_label_title=None,
+    color_map=None,
+    org_type=None,
+    figsize=(8.27, 11.69),
+    group_sample_counts=None,
+):
+    """
+    Append 1 A4 page per feature in ``feature_cols`` (RAW only - smoothed
+    pages are hidden for now) to an open ``PdfPages`` object. Each page has
+    3 stacked panels:
+      (a) grouped mean +/- SEM, absolute (pooled across organoids per
+          ``group_col``);
+      (b) per-sample mean +/- SEM, absolute;
+      (c) per-sample mean +/- SEM, baseline-shifted to start at 0.
+
+    Unlike the page-1 fraction-dead panel, these features vary per organoid,
+    so panel (a)'s SEM band is always shown (even for a single sample) as
+    long as that sample has more than one organoid.
 
     Figures are constructed with ``matplotlib.figure.Figure`` +
-    ``FigureCanvasAgg`` (NOT through ``pyplot``), so the inline notebook
-    backends never see them. Result: these pages land only in the PDF on
-    every backend (`%matplotlib inline`, `widget`, `notebook`, ...).
+    ``FigureCanvasAgg`` (NOT through ``pyplot``) so they never render inline
+    in notebooks - only saved to the PDF.
     """
-    if df_meansem is None or len(df_meansem) == 0 or not value_cols:
-        return
-
-    # Local imports keep the PDF-only behaviour scoped to this helper.
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-    time_col = "position_t"
+    if not feature_cols:
+        return
+
     org_label = f" [{org_type}]" if org_type else ""
+    legend_title = group_label_title or group_col
 
-    # (mean_col, sem_col, title, ylabel)
-    # Raw pages (1-2): cohort mean +/- SEM, only baseline-subtracted to
-    # start at 0. Allowed to go negative - that's the honest signal.
-    # Smoothed pages (3-4): same series, cohort-level rolling smoothed
-    # (same window for mean and SEM), so line and band remain a
-    # self-consistent statistical pair.
-    pages = []
-    for col in value_cols:
-        mean_c = f"{col}_from0_mean"
-        sem_c = f"{col}_from0_sem"
-        if mean_c in df_meansem.columns and sem_c in df_meansem.columns:
-            pages.append((
-                mean_c, sem_c,
-                f"Mean +/- SEM per Sample ({col}, from 0){org_label}",
-                f"{col} - baseline",
-            ))
-    for col in value_cols:
-        mean_c = f"{col}_smooth_from0_mean"
-        sem_c = f"{col}_smooth_from0_sem"
-        if mean_c in df_meansem.columns and sem_c in df_meansem.columns:
-            pages.append((
-                mean_c, sem_c,
-                f"Mean +/- SEM per Sample ({col}, smoothed from 0){org_label}",
-                f"{col} - baseline (smoothed)",
-            ))
+    for col in feature_cols:
+        nice_name = _nice_feature_name(col)
+        for variant, source_col in (("raw", col),):
+            mean_c, sem_c = f"{source_col}_mean", f"{source_col}_sem"
+            from0_mean_c, from0_sem_c = f"{source_col}_from0_mean", f"{source_col}_from0_sem"
 
-    samples = sorted(df_meansem["sample_name"].dropna().unique().tolist())
-    for ycol_mean, ycol_sem, title, ylabel in pages:
-        fig = Figure(figsize=(12, 6))
-        FigureCanvasAgg(fig)
-        ax = fig.add_subplot(111)
-        for sample in samples:
-            s = (df_meansem[df_meansem["sample_name"] == sample]
-                 .sort_values(time_col))
-            if s.empty or s[ycol_mean].dropna().empty:
-                continue
-            line, = ax.plot(s[time_col], s[ycol_mean], linewidth=2, label=sample)
-            ax.fill_between(
-                s[time_col],
-                s[ycol_mean] - s[ycol_sem],
-                s[ycol_mean] + s[ycol_sem],
-                alpha=0.2, color=line.get_color(), linewidth=0,
+            has_persample = (
+                df_meansem_persample is not None
+                and mean_c in df_meansem_persample.columns
             )
-        ax.axhline(0, color="k", linewidth=0.5, alpha=0.4)
-        ax.set_xlabel("Timepoint")
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left",
-                  prop={"size": 7}, title="Sample Name", title_fontsize=8)
-        ax.grid(alpha=0.3)
-        fig.tight_layout()
-        pdf.savefig(fig, bbox_inches="tight")
+            has_grouped = (
+                df_meansem_grouped is not None
+                and mean_c in df_meansem_grouped.columns
+            )
+            if not has_persample and not has_grouped:
+                continue
+
+            fig = Figure(figsize=figsize)
+            FigureCanvasAgg(fig)
+            gs = GridSpec(3, 1, figure=fig, hspace=0.65)
+            variant_label = "Raw" if variant == "raw" else "Smoothed"
+            fig.suptitle(
+                f"{nice_name} Over Time (Per Organoid) — {variant_label}{org_label}",
+                fontsize=13, y=0.98, fontweight="bold",
+            )
+
+            ax_a = fig.add_subplot(gs[0])
+            if has_grouped:
+                _plot_grouped_mean_sem_panel(
+                    ax_a, df_meansem_grouped, mean_c, sem_c, group_col=group_col,
+                    title="Grouped mean +/- SEM (pooled across organoids)", ylabel=col,
+                    legend_title=legend_title, color_map=color_map, axhline_zero=False,
+                    group_sample_counts=group_sample_counts,
+                    suppress_single_sample_sem=False,
+                )
+            else:
+                ax_a.axis("off")
+                ax_a.text(0.5, 0.5, "No condition groups selected", ha="center", va="center", fontsize=10)
+
+            ax_b = fig.add_subplot(gs[1])
+            if has_persample:
+                _plot_per_sample_mean_sem_panel(
+                    ax_b, df_meansem_persample, mean_c, sem_c,
+                    title="Per-sample mean +/- SEM (absolute)", ylabel=col, axhline_zero=False,
+                )
+
+            ax_c = fig.add_subplot(gs[2])
+            if has_persample and from0_mean_c in df_meansem_persample.columns:
+                _plot_per_sample_mean_sem_panel(
+                    ax_c, df_meansem_persample, from0_mean_c, from0_sem_c,
+                    title="Per-sample mean +/- SEM (from baseline)", ylabel=f"{col} - baseline", axhline_zero=True,
+                )
+
+            right_margin = 0.55 if has_grouped else 0.78
+            fig.subplots_adjust(left=0.10, right=right_margin, top=0.91, bottom=0.06)
+            pdf.savefig(fig)
+
+
+def _draw_persample_percentage_dead_panel(ax, df_general):
+    """Panel: % dead over time, one line per sample_name."""
+    sns.lineplot(
+        data=df_general,
+        x='position_t',
+        y='percentage_dead',
+        hue='sample_name',
+        ax=ax,
+        )
+    ax.grid(True, linestyle=':', linewidth=1, alpha=0.5)
+    ax.set_ylim(0, 1.1)
+    ax.set_xlim(0)
+    ax.set_xlabel('Timepoint', fontsize=11)
+    ax.set_ylabel('')
+    ax.set_title('Percentage Dead Organoids (per sample)', fontsize=12)
+    ax.legend(
+        bbox_to_anchor=(1.02, 1.0),
+        loc='upper left',
+        borderaxespad=0,
+        prop={'size': 9},
+        title='Sample Name',
+        title_fontsize=10,
+        )
+
+
+def _draw_end_state_barplot_panel(ax, df_general):
+    """Panel: stacked bar of alive/dead/disappeared at each sample's endpoint."""
+    idx = df_general.groupby("sample_name")["position_t"].idxmax()
+    df_end = (
+        df_general.loc[idx, ["sample_name", "percentage_alive", "percentage_dead", "percentage_disappeared"]]
+        .copy()
+        .sort_values("sample_name")
+    )
+
+    if "percentage_dead" not in df_end.columns:
+        df_end["percentage_dead"] = 1.0 - df_end["percentage_alive"]
+
+    plot_cols = ["percentage_alive", "percentage_dead", "percentage_disappeared"]
+
+    df_end.set_index("sample_name")[plot_cols].plot(
+        kind="bar",
+        stacked=True,
+        ax=ax,
+        color=["#6699CC", "#CC6666", "#898989"],  # Blue=Alive, Red=Dead, Grey=Disappeared
+        alpha=1.0,
+        width=0.25,
+        zorder=2,
+    )
+
+    ax.grid(True, linestyle=":", linewidth=1, alpha=0.5, zorder=1)
+    ax.set_ylim(0, 1.1)
+    ax.set_xlabel("")
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", size=9)
+    ax.set_ylabel("")
+    ax.set_title("Percentage Alive Organoids at end of experiment", fontsize=12)
+
+    handles, labels = ax.get_legend_handles_labels()
+    order = [2, 0, 1]  # 0=Dead (red), 1=Alive (blue), 2=Disappeared (grey)
+    nice_labels = {"percentage_alive": "Alive", "percentage_dead": "Dead", "percentage_disappeared": "Disappeared"}
+    ax.legend(
+        [handles[i] for i in order],
+        [nice_labels.get(labels[i], labels[i]) for i in order],
+        bbox_to_anchor=(1.02, 1.0),
+        loc="upper left",
+        borderaxespad=0,
+        prop={"size": 9},
+        title="",
+    )
 
 
 def plot_general_organoid_analysis(
@@ -670,124 +975,92 @@ def plot_general_organoid_analysis(
     df_meansem=None,
     value_cols=None,
     org_type=None,
-    figsize=(8.27, 11.69)
+    figsize=(8.27, 11.69),
+    df_meansem_grouped=None,
+    df_dead_at_t_grouped=None,
+    group_cols=None,
+    color_map=None,
+    group_sample_counts=None,
     ):
-    
+
+    has_grouped_dead = df_dead_at_t_grouped is not None and len(df_dead_at_t_grouped) > 0
+    legend_title = _group_legend_title(group_cols)
+    org_label = f" [{org_type}]" if org_type else ""
+
+    n_groups = df_dead_at_t_grouped["condition_group"].nunique() if has_grouped_dead else 0
+    n_samples = df_general["sample_name"].nunique()
+    # Keep all 3 page-1 plots on one A4 page when legends fit; split onto a
+    # second physical page once there are enough groups/samples that the
+    # stacked legends would start crowding/overlapping.
+    split_page1 = has_grouped_dead and (n_groups > 8 or n_samples > 15)
+
     with PdfPages(outpath) as pdf:
-        fig = plt.figure(figsize=figsize)
-        gs = GridSpec(4, 1, figure=fig, wspace=0.1, hspace=0.3)
-        
-        ### Plot the percentage organoid death of all samples
-        ax = fig.add_subplot(gs[:2, :])
-        sns.lineplot(
-            data = df_general,
-            x = 'position_t', 
-            y = 'percentage_dead', 
-            hue = 'sample_name',
-            ax = ax,
+        if has_grouped_dead and split_page1:
+            fig1 = plt.figure(figsize=figsize)
+            fig1.suptitle(f"Death Dynamics Overview — Grouped by Condition{org_label}", fontsize=14, fontweight="bold", y=0.98)
+            ax_top = fig1.add_subplot(GridSpec(1, 1, figure=fig1)[0])
+            _plot_grouped_mean_sem_panel(
+                ax_top, df_dead_at_t_grouped, "dead_at_t_mean", "dead_at_t_sem",
+                title="Percentage Dead Organoids (grouped, pooled across organoids)",
+                ylabel="Fraction Dead", legend_title=legend_title, color_map=color_map,
+                group_sample_counts=group_sample_counts,
             )
-        ax.grid(True, linestyle=':', linewidth=1, alpha=0.5)
-        ax.set_ylim(0, 1.1)
-        ax.set_xlim(0)
-        ax.set_xlabel('Timepoint')
-        ax.set_ylabel('')
-        ax.set_title(f'Percentage Dead Organoids')
-        ax.legend(
-            bbox_to_anchor=(1.05, 1),  # Position to the right
-            loc='upper left',
-            borderaxespad=0,
-            prop={'size': 5},  # Smaller font size
-            title=''  # Optional: keep or remove the title
-            ).set_title('Sample Name', prop={'size': 6})
-        
-        ### Plot the barplot organoid death of all samples
-        ax = fig.add_subplot(gs[2, :])
-        # df_end = df_general[df_general["position_t"] == df_general["position_t"].max()]
-        # df_end = df_end[["sample_name", "percentage_dead", "percentage_alive"]]
-        
-        # df_end.set_index("sample_name").plot(
-        #     kind='bar', 
-        #     stacked=True, 
-        #     ax=ax, 
-        #     color=["#CC6666", "#6699CC"], 
-        #     alpha=1.0,
-        #     width=0.25,
-        #     zorder=2
-        #     )
-        # ax.grid(True, linestyle=':', linewidth=1, alpha=0.5, zorder=1)
-        # ax.set_ylim(0, 1.1)
-        # ax.set_xlabel('')
-        # ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', size=6)
-        # ax.set_ylabel('')
-        # ax.set_title(f'Percentage Alive Organoids at end of experiment')
-        # handles, labels = ax.get_legend_handles_labels()
-        # new_order = [1, 0]  # Dead first (red, index 0), then Alive (blue, index 1)
-        # ax.legend(
-        #     [handles[idx] for idx in new_order], [labels[idx] for idx in new_order],
-        #     bbox_to_anchor=(1.05, 1),  # Position to the right
-        #     loc='upper left',
-        #     borderaxespad=0,
-        #     prop={'size': 5},  # Smaller font size
-        #     title=''  # Optional: keep or remove the title
-        #     )
-        
-        # Take each sample's own endpoint
-        idx = df_general.groupby("sample_name")["position_t"].idxmax()
-        df_end = (
-            df_general.loc[idx, ["sample_name", "percentage_alive", "percentage_dead", "percentage_disappeared"]]
-            .copy()
-            .sort_values("sample_name")
-        )
+            ax_top.set_ylim(0, 1.05)
+            ax_top.set_xlim(0)
+            fig1.subplots_adjust(left=0.10, right=0.55, top=0.90, bottom=0.08)
+            plt.show()
+            pdf.savefig(fig1, bbox_inches="tight")
+            plt.close(fig1)
 
-        # If percentage_dead is missing, compute it from alive
-        if "percentage_dead" not in df_end.columns:
-            df_end["percentage_dead"] = 1.0 - df_end["percentage_alive"]
+            fig2 = plt.figure(figsize=figsize)
+            fig2.suptitle(f"Death Dynamics Overview — Per Sample & End State{org_label}", fontsize=14, fontweight="bold", y=0.98)
+            gs2 = GridSpec(2, 1, figure=fig2, height_ratios=[1.4, 1.0], hspace=0.5)
+            _draw_persample_percentage_dead_panel(fig2.add_subplot(gs2[0]), df_general)
+            _draw_end_state_barplot_panel(fig2.add_subplot(gs2[1]), df_general)
+            fig2.subplots_adjust(left=0.10, right=0.78, top=0.90, bottom=0.10)
+            plt.show()
+            pdf.savefig(fig2, bbox_inches="tight")
+            plt.close(fig2)
+        else:
+            fig = plt.figure(figsize=figsize)
+            fig.suptitle(f"Death Dynamics Overview{org_label}", fontsize=14, fontweight="bold", y=0.98)
+            if has_grouped_dead:
+                gs = GridSpec(3, 1, figure=fig, height_ratios=[1.3, 1.3, 1.0], hspace=0.6)
+                _plot_grouped_mean_sem_panel(
+                    fig.add_subplot(gs[0]), df_dead_at_t_grouped, "dead_at_t_mean", "dead_at_t_sem",
+                    title="Percentage Dead Organoids (grouped, pooled across organoids)",
+                    ylabel="Fraction Dead", legend_title=legend_title, color_map=color_map,
+                    group_sample_counts=group_sample_counts,
+                )
+                fig.axes[-1].set_ylim(0, 1.05)
+                fig.axes[-1].set_xlim(0)
+                _draw_persample_percentage_dead_panel(fig.add_subplot(gs[1]), df_general)
+                _draw_end_state_barplot_panel(fig.add_subplot(gs[2]), df_general)
+                right_margin = 0.55
+            else:
+                gs = GridSpec(2, 1, figure=fig, height_ratios=[1.3, 1.0], hspace=0.5)
+                _draw_persample_percentage_dead_panel(fig.add_subplot(gs[0]), df_general)
+                _draw_end_state_barplot_panel(fig.add_subplot(gs[1]), df_general)
+                right_margin = 0.78
 
-        # Keep the plotting columns in the intended order: dead (red) then alive (blue)
-        plot_cols = ["percentage_alive", "percentage_dead", "percentage_disappeared"]
+            fig.subplots_adjust(left=0.10, right=right_margin, top=0.91, bottom=0.06)
+            plt.show()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
 
-        df_end.set_index("sample_name")[plot_cols].plot(
-            kind="bar",
-            stacked=True,
-            ax=ax,
-            color=["#6699CC", "#CC6666", "#898989"],  # Red for Dead, Blue for Alive, Grey for Disappeared
-            alpha=1.0,
-            width=0.25,
-            zorder=2,
-        )
-
-        ax.grid(True, linestyle=":", linewidth=1, alpha=0.5, zorder=1)
-        ax.set_ylim(0, 1.1)
-        ax.set_xlabel("")
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", size=6)
-        ax.set_ylabel("")
-        ax.set_title("Percentage Alive Organoids at end of experiment")
-
-        # Legend: Dead first, then Alive (matches bar order/colors)
-        handles, labels = ax.get_legend_handles_labels()
-        order = [2, 0, 1]  # 0=Dead (red), 1=Alive (blue), 2=Disappeared (grey)
-        ax.legend(
-            [handles[i] for i in order],
-            [labels[i] for i in order],
-            bbox_to_anchor=(1.05, 1),
-            loc="upper left",
-            borderaxespad=0,
-            prop={"size": 5},
-            title="",
-        )
-
-        fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
-
-        plt.show()
-        pdf.savefig(fig, bbox_inches='tight')
-        plt.close(fig)
-
-        # Append per-sample mean +/- SEM dynamics pages (raw + smoothed) if provided
-        _plot_per_sample_mean_sem_pages(
+        # Append the restructured feature pages (grouped + per-sample mean +/-
+        # SEM) for percentage_dead_mask, nr_dead_mask_pixels, and mean_dead_dye
+        # (whichever are available), in that order. Smoothed variants are
+        # hidden for now (raw only).
+        _plot_feature_pages(
             pdf=pdf,
-            df_meansem=df_meansem,
-            value_cols=value_cols,
+            df_meansem_persample=df_meansem,
+            df_meansem_grouped=df_meansem_grouped,
+            feature_cols=value_cols,
+            group_label_title=legend_title,
+            color_map=color_map,
             org_type=org_type,
+            group_sample_counts=group_sample_counts,
         )
 
 

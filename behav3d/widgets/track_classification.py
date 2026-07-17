@@ -59,6 +59,7 @@ from behav3d.core.metadata import (
     detect_other_cell_types_from_metadata,
     detect_merged_cell_types_from_metadata,
     filter_multicolor_inputs,
+    list_grouping_candidate_columns,
 )
 from behav3d.core.utils import rmtree_ignore_missing
 from behav3d.widgets.utils import spinning_loader
@@ -461,6 +462,19 @@ class TrackClassificationPanel:
         self.apply_classifier_spinner.layout.display = "none"
         self.out_apply_classifier = widgets.Output()
 
+        self.apply_group_cols_select = widgets.SelectMultiple(
+            options=[],
+            value=[],
+            description="",
+            layout=widgets.Layout(width="360px", height="80px"),
+            disabled=True,
+        )
+        self.apply_group_cols_html = widgets.HTML(
+            "<b>Group classification plots by:</b><br>"
+            "<span style='color:#555;'>Select 1-2 metadata columns to arrange the track-class "
+            "proportion grid by condition. Hold Ctrl/Cmd to select multiple.</span>"
+        )
+
         self.classifier_section = widgets.VBox(
             [
                 widgets.HTML("<b>Train RF classifier on named clusters</b>"),
@@ -474,6 +488,8 @@ class TrackClassificationPanel:
                 widgets.HTML("<b>Apply classifier to new data</b>"),
                 self.classifier_artifact_path,
                 self.classifier_apply_states_path,
+                self.apply_group_cols_html,
+                self.apply_group_cols_select,
                 widgets.HBox([self.btn_apply_classifier, self.apply_classifier_spinner], layout=widgets.Layout(gap="8px")),
                 self.out_apply_classifier,
             ],
@@ -485,6 +501,8 @@ class TrackClassificationPanel:
                 widgets.HTML("<b>Apply pretrained classifier</b>"),
                 self.classifier_artifact_path,
                 self.classifier_apply_states_path,
+                self.apply_group_cols_html,
+                self.apply_group_cols_select,
                 widgets.HBox([self.btn_apply_classifier, self.apply_classifier_spinner], layout=widgets.Layout(gap="8px")),
                 self.out_apply_classifier,
             ],
@@ -558,6 +576,8 @@ class TrackClassificationPanel:
             [
                 self.original_description_html,
                 self.original_controls_row,
+                self.apply_group_cols_html,
+                self.apply_group_cols_select,
                 self.original_run_row,
                 self.out_original,
             ],
@@ -886,6 +906,8 @@ class TrackClassificationPanel:
                 self.original_mode_switch_row,
                 self.original_description_html,
                 self.original_controls_row,
+                self.apply_group_cols_html,
+                self.apply_group_cols_select,
                 self.original_run_row,
                 self.out_original,
             ]
@@ -921,6 +943,8 @@ class TrackClassificationPanel:
             self.original_run_section.children = [
                 self.original_description_html,
                 self.original_controls_row,
+                self.apply_group_cols_html,
+                self.apply_group_cols_select,
                 self.original_run_row,
                 self.out_original,
             ]
@@ -975,6 +999,12 @@ class TrackClassificationPanel:
             self.btn_exemplars.disabled = True
         self._refresh_backprojection_samples()
         self._rebuild_rename_rows()
+        candidate_group_cols = list_grouping_candidate_columns(getattr(self.metadata_loader, "metadata", None))
+        if candidate_group_cols != list(self.apply_group_cols_select.options):
+            prev_selection = set(self.apply_group_cols_select.value)
+            self.apply_group_cols_select.options = candidate_group_cols
+            self.apply_group_cols_select.value = [c for c in candidate_group_cols if c in prev_selection]
+        self.apply_group_cols_select.disabled = len(candidate_group_cols) == 0
         if bool(self.use_original_behav3d.value):
             self.btn_diagnostics.disabled = not _feature_dtw_umap_csv_path(
                 self.output_dir,
@@ -1140,7 +1170,6 @@ class TrackClassificationPanel:
 
     def _rename_original_behav3d_clusters(self, mapping):
         ct = self._current_cell_type()
-        outdir = _feature_dtw_outdir(self.output_dir, ct)
         mapping_path = _feature_dtw_rename_mapping_path(self.output_dir, ct)
         mapping_path.parent.mkdir(parents=True, exist_ok=True)
         with mapping_path.open("w", encoding="utf-8") as f:
@@ -1169,7 +1198,7 @@ class TrackClassificationPanel:
         plot_paths = _save_feature_dtw_quality_control(
             self.output_dir,
             ct,
-            outfolder=outdir / "quality_control" / "after_renaming",
+            cluster_percentage_group_by=list(self.apply_group_cols_select.value) or None,
         )
         self.plot_status_html.value = "<b>Renamed QC ready:</b> original BEHAV3D diagnostics were written after renaming."
         _winfo("trajectory-dtai-widget", f"Saved original BEHAV3D cluster names: {mapping_path}")
@@ -1448,18 +1477,19 @@ class TrackClassificationPanel:
                     nr_of_clusters=int(self.original_n_clusters.value),
                     plot_results=False,
                     seed=int(self.random_state.value),
-                    output_subdir_name="behavorial_trajectories/original_behav3d",
+                    output_subdir_name="behavorial_trajectories/original_behav3d/raw",
                     feature_scaling_preset="original_behav3d",
                     min_track_length=int(self.original_trajectory_size.value),
                     max_track_length=int(self.original_trajectory_size.value),
+                    cluster_percentage_group_by=list(self.apply_group_cols_select.value) or None,
                 )
-                plot_paths = _save_feature_dtw_quality_control(self.output_dir, ct)
                 _create_original_behav3d_adata(self.output_dir, ct)
                 _winfo("trajectory-dtai-widget", "Original BEHAV3D feature-DTW analysis complete.")
-                for path in plot_paths.values():
-                    _winfo("trajectory-dtai-widget", f"Created original BEHAV3D QC: {path}")
                 self.btn_diagnostics.disabled = False
-                self.plot_status_html.value = "<b>Ready for renaming:</b> raw original BEHAV3D QC was written."
+                self.plot_status_html.value = (
+                    "<b>Ready for renaming:</b> raw clusters written. Click 'Create diagnostics plots' "
+                    "to generate the original_behav3d QC (with any renamed cluster names)."
+                )
                 self._rebuild_rename_rows()
                 self._sync_exemplar_state_controls()
                 self.steps.selected_index = 1
@@ -1477,6 +1507,7 @@ class TrackClassificationPanel:
                     plot_paths = _save_feature_dtw_quality_control(
                         self.output_dir,
                         self._current_cell_type(),
+                        cluster_percentage_group_by=list(self.apply_group_cols_select.value) or None,
                     )
                     self.plot_status_html.value = "<b>Diagnostics ready:</b> original BEHAV3D QC was written."
                     for path in plot_paths.values():
@@ -1680,6 +1711,8 @@ class TrackClassificationPanel:
                     classifier_artifact_or_path=clf_path,
                     adata_full_path=states_path,
                     output_subdir_name="behavorial_trajectories",
+                    group_cols=list(self.apply_group_cols_select.value) or None,
+                    metadata=getattr(self.metadata_loader, "metadata", None),
                     verbose=True,
                 )
                 out_path = apply_result.get("output_path", "")

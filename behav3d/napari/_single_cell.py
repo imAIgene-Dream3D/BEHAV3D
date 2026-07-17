@@ -2792,13 +2792,17 @@ class TrackClassificationSubTab(QWidget):
             for grp in [self.grp1, self.grp2, self.grp3, self.grp4, self.grp_bp]:
                 grp.setEnabled(True)
 
-            # Re-enable the checkboxes and revert to standard mode automatically.
+            # Only revert to standard mode if the checkbox was previously force-locked
+            # (i.e. disabled because state adata was missing). Otherwise preserve the
+            # user's/config's current choice.
+            was_force_locked = not self.chk_use_original.isEnabled()
             for chk in (self.chk_use_original, self.chk_use_original_top):
                 chk.blockSignals(True)
-                chk.setChecked(False)
+                if was_force_locked:
+                    chk.setChecked(False)
                 chk.setEnabled(True)
                 chk.blockSignals(False)
-            self._apply_original_mode(False)
+            self._apply_original_mode(self.chk_use_original.isChecked())
 
             _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
             return True
@@ -3075,6 +3079,17 @@ class TrackClassificationSubTab(QWidget):
                 return f
         return None
 
+    def _track_diagnostics_qc_dirs(self, traj_dir: Optional[Path]) -> list:
+        """Both possible diagnostics output folders: dtaidistance's shared
+        quality_control/, and the original-BEHAV3D method's own
+        original_behav3d/ folder (root — Create Diagnostics writes there)."""
+        if not traj_dir:
+            return []
+        return [
+            traj_dir / "quality_control",
+            traj_dir / "original_behav3d",
+        ]
+
     def _sync_track_cluster_combo(self, adata_tracks) -> None:
         """Repopulate the 'Color by' combo from actual obs columns in adata_tracks."""
         from behav3d.napari._rename_dialog import _track_cluster_col
@@ -3170,9 +3185,9 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_exemplars.setEnabled(
             bool(traj_dir and any(traj_dir.glob("exemplar_tracks*.pdf")))
         )
-        qc_dir = traj_dir / "quality_control" if traj_dir else None
+        qc_dirs = self._track_diagnostics_qc_dirs(traj_dir)
         self.btn_view_diagnostics.setEnabled(
-            bool(qc_dir and any(qc_dir.glob("*diagnostics*.pdf")))
+            any(any(qc_dir.glob("*.pdf")) for qc_dir in qc_dirs)
         )
 
     def _update_bp_buttons(self):
@@ -3337,7 +3352,7 @@ class TrackClassificationSubTab(QWidget):
                 umap_n_neighbors=n_neigh,
                 umap_minimal_distance=min_dist,
                 feature_scaling_preset="original_behav3d",
-                output_subdir_name="behavorial_trajectories/original_behav3d",
+                output_subdir_name="behavorial_trajectories/original_behav3d/raw",
             )
 
         def _done(_):
@@ -3720,7 +3735,9 @@ class TrackClassificationSubTab(QWidget):
             full_adata = _ad.read_h5ad(str(state_adata_path))
 
             out_path = _Path(out) if out else _Path(".")
-            exemplar_root = out_path / "example_tracks"
+            exemplar_root = (
+                out_path / "analysis" / ct / "behavorial_trajectories" / "example_tracks"
+            )
             exemplar_root.mkdir(parents=True, exist_ok=True)
             results = {}
 
@@ -3833,12 +3850,22 @@ class TrackClassificationSubTab(QWidget):
                 save_dtaidistance_diagnostics,
                 save_dtaidistance_exemplar_overview,
             )
-            result = save_dtaidistance_diagnostics(
-                adata_tracks=track_adata,
-                output_dir=str(out) if out else "",
-                cell_type=ct,
-                verbose=True,
-            )
+            method = (track_adata.uns.get("dtai_trajectory_clustering", {}) or {}).get("method")
+            if method == "original_behav3d_feature_dtw":
+                from behav3d.analysis.behavior.track.feature_dtw import (
+                    _save_feature_dtw_quality_control,
+                )
+                result = _save_feature_dtw_quality_control(
+                    output_dir=str(out) if out else "",
+                    cell_type=ct,
+                )
+            else:
+                result = save_dtaidistance_diagnostics(
+                    adata_tracks=track_adata,
+                    output_dir=str(out) if out else "",
+                    cell_type=ct,
+                    verbose=True,
+                )
             try:
                 save_dtaidistance_exemplar_overview(
                     track_adata,
@@ -4077,10 +4104,17 @@ class TrackClassificationSubTab(QWidget):
             if p:
                 candidates = [(f"Track clusters CSV ({ct})", p)]
         elif kind == "track_exemplars" and traj_dir:
-            candidates = [(f.stem, f) for f in sorted(traj_dir.glob("exemplar_tracks*.pdf"))]
+            exemplar_dir = traj_dir / "example_tracks"
+            candidates = [
+                (f.relative_to(exemplar_dir).as_posix(), f)
+                for f in sorted(exemplar_dir.glob("**/*.pdf"))
+            ]
         elif kind == "track_diagnostics" and traj_dir:
-            qc_dir = traj_dir / "quality_control"
-            candidates = [(f.stem, f) for f in sorted(qc_dir.glob("*diagnostics*.pdf"))]
+            candidates = [
+                (f.stem, f)
+                for qc_dir in self._track_diagnostics_qc_dirs(traj_dir)
+                for f in sorted(qc_dir.glob("*.pdf"))
+            ]
 
         existing = [(lbl, p) for lbl, p in candidates if p and p.exists()]
         if not existing:

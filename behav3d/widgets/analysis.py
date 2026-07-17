@@ -27,6 +27,7 @@ from behav3d.core.metadata import (
     filter_multicolor_inputs,
     has_dead_channel,
     is_multicolor_celltype,
+    list_grouping_candidate_columns,
 )
 from behav3d.core.utils import expand_column_patterns
 from behav3d.io.formats.zarr import load_zarr
@@ -2159,6 +2160,23 @@ class DeathDynamicsPanel:
         self.spinner_html.layout.display = "none"
         self.out = widgets.Output()
 
+        # Condition columns to group/color the mean +/- SEM plots by (e.g.
+        # organoid_line + macrophage_line), mirroring the state-composition
+        # "group by" multi-select pattern.
+        md = self.metadata_loader.metadata
+        group_col_options = []
+        if md is not None and hasattr(md, "columns"):
+            group_col_options = [
+                c for c in md.columns
+                if c in ("exp_nr", "well") or c.endswith("_line_condition")
+            ]
+        self.select_group_cols = widgets.SelectMultiple(
+            options=group_col_options,
+            value=[],
+            layout=widgets.Layout(width="360px", height="80px"),
+            disabled=len(group_col_options) == 0,
+        )
+
         if not self.has_dead_channel_in_metadata:
             self.ui = widgets.VBox([
                 widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'),
@@ -2172,6 +2190,8 @@ class DeathDynamicsPanel:
         else:
             self.ui = widgets.VBox([
                 widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'),
+                widgets.HTML('Group plots by condition column(s) (hold Ctrl/Cmd to select multiple):'),
+                self.select_group_cols,
                 widgets.HBox([self.btn_run, self.spinner_html]),
                 self.out
             ])
@@ -2186,7 +2206,8 @@ class DeathDynamicsPanel:
                     output_dir=self.output_dir,
                     df_tracks_path=None,
                     org_type=self.cell_type,
-                    metadata=self.metadata_loader.metadata
+                    metadata=self.metadata_loader.metadata,
+                    group_cols=list(self.select_group_cols.value) or None,
                 )
                 print(f"{self.cell_type} death dynamics complete!")
             except Exception:
@@ -3150,6 +3171,14 @@ class MotileCellAnalysisPanel:
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
         self.out = widgets.Output()
+        group_col_options = list_grouping_candidate_columns(getattr(self.metadata_loader, "metadata", None))
+        self.group_cols_select = widgets.SelectMultiple(
+            options=group_col_options,
+            value=[],
+            description="",
+            layout=widgets.Layout(width="360px", height="80px"),
+            disabled=len(group_col_options) == 0,
+        )
 
         self.backproj_pdf = widgets.Checkbox(
             description="Backprojection PDFs",
@@ -3257,6 +3286,12 @@ class MotileCellAnalysisPanel:
             feature_section,
             widgets.HBox([self.umap_dist, self.umap_neigh, self.clusters]),
             widgets.HBox([self.en_min_track_length, self.min_track_length, self.en_max_track_length, self.max_track_length]),
+            widgets.HTML(
+                "<b>Group classification plots by:</b><br>"
+                "<span style='color:#555;'>Select 1-2 metadata columns to arrange the cluster "
+                "percentage grid by condition. Hold Ctrl/Cmd to select multiple.</span>"
+            ),
+            self.group_cols_select,
             widgets.HBox([self.btn_run, self.spinner_html]),
             self.out,
             widgets.HTML("<b>Track backprojection:</b>"),
@@ -3481,7 +3516,7 @@ class MotileCellAnalysisPanel:
             plot_cluster_percentage_bars(
                 df_clust_perc,
                 perc_prefix,
-                group_by_columns=None,
+                group_cols=list(self.group_cols_select.value) or None,
                 plot_results=True,
             )
 
@@ -3873,7 +3908,7 @@ class MotileCellAnalysisPanel:
             try:
                 self._panel_cfg.update({"seed": int(self.seed_widget.value), "umap_min_dist": float(self.umap_dist.value), "umap_n_neighbors": int(self.umap_neigh.value), "nr_of_clusters": int(self.clusters.value), "dtw_features_input": sel, "feature_scaling_preset": scaling_preset, "min_track_length_enabled": bool(self.en_min_track_length.value), "min_track_length": int(self.min_track_length.value), "max_track_length_enabled": bool(self.en_max_track_length.value), "max_track_length": int(self.max_track_length.value)})
                 with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self._params, f, sort_keys=False)
-                run_tcell_analysis(cell_type=self.cell_type, output_dir=self.output_dir, df_tracks_path=str(self.df_tracks_path), columns_to_use=sel, columns_to_normalize=sel, umap_minimal_distance=float(self.umap_dist.value), umap_n_neighbors=int(self.umap_neigh.value), nr_of_clusters=int(self.clusters.value), plot_results=True, seed=int(self.seed_widget.value), output_subdir_name="timepoint_feature_dtw", feature_scaling_preset=scaling_preset, min_track_length=min_track_length, max_track_length=max_track_length)
+                run_tcell_analysis(cell_type=self.cell_type, output_dir=self.output_dir, df_tracks_path=str(self.df_tracks_path), columns_to_use=sel, columns_to_normalize=sel, umap_minimal_distance=float(self.umap_dist.value), umap_n_neighbors=int(self.umap_neigh.value), nr_of_clusters=int(self.clusters.value), plot_results=True, seed=int(self.seed_widget.value), output_subdir_name="timepoint_feature_dtw", feature_scaling_preset=scaling_preset, min_track_length=min_track_length, max_track_length=max_track_length, cluster_percentage_group_by=list(self.group_cols_select.value) or None)
                 self._rebuild_feature_dtw_rename_rows()
                 self._refresh_feature_dtw_napari_samples()
                 print(f"✅ {self.cell_type} analysis complete!")

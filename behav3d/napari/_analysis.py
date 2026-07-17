@@ -30,6 +30,7 @@ from qtpy.QtWidgets import (
     QScrollArea, QSpinBox, QDoubleSpinBox, QComboBox, QFrame, QSizePolicy,
     QToolButton, QMessageBox, QSplitter, QStackedWidget,
     QTreeWidget, QTreeWidgetItem, QMenu, QHeaderView,
+    QListWidget, QAbstractItemView,
 )
 from qtpy.QtCore import Qt, QUrl
 from qtpy.QtGui import QDesktopServices
@@ -387,6 +388,16 @@ class DeathDynamicsTab(QWidget):
         )
         self.dd_warning_label.setVisible(False)
         dd_lay.addWidget(self.dd_warning_label)
+
+        # ── Condition-column grouping (per-target Death Dynamics only) ──
+        # Lets the user group/color the mean +/- SEM plots by one or more
+        # metadata condition columns (e.g. organoid_line + macrophage_line),
+        # mirroring the state-composition "group by" multi-select.
+        dd_lay.addWidget(QLabel("Group plots by condition column(s):"))
+        self.list_dd_group_cols = QListWidget()
+        self.list_dd_group_cols.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_dd_group_cols.setMaximumHeight(70)
+        dd_lay.addWidget(self.list_dd_group_cols)
 
         dd_btn_row = QHBoxLayout()
         self.btn_run_dd_single = QPushButton("▶ Run Death Dynamics (per target)")
@@ -939,6 +950,7 @@ class DeathDynamicsTab(QWidget):
         ):
             self.targets_lay.addWidget(self._targets_placeholder)
             self.interaction_lay.addWidget(self._interaction_placeholder)
+            self.list_dd_group_cols.clear()
             self._refresh_button_states()
             return
 
@@ -948,6 +960,18 @@ class DeathDynamicsTab(QWidget):
         out_dir = Path(self.metadata_loader.output_dir)
         md = self.metadata_loader.metadata
         has_dead = _has_dead_channel(md)
+
+        # ---- Condition-column grouping options -----------------------
+        prev_selected = {item.text() for item in self.list_dd_group_cols.selectedItems()}
+        self.list_dd_group_cols.clear()
+        group_col_options = [
+            c for c in md.columns
+            if c in ("exp_nr", "well") or c.endswith("_line_condition")
+        ]
+        for col in group_col_options:
+            self.list_dd_group_cols.addItem(col)
+            if col in prev_selected:
+                self.list_dd_group_cols.item(self.list_dd_group_cols.count() - 1).setSelected(True)
 
         # ---- Target cells (organoid + other) -----------------------
         target_types = list(organoid_types) + list(other_types)
@@ -1708,6 +1732,9 @@ class DeathDynamicsTab(QWidget):
             return False
         out_dir_path = Path(self.metadata_loader.output_dir).expanduser()
         out_dir = str(out_dir_path)
+        selected_group_cols = [
+            item.text() for item in self.list_dd_group_cols.selectedItems()
+        ] or None
         any_ok = False
         for ct in cts:
             csv = _filtered_csv(out_dir_path, ct)
@@ -1733,6 +1760,7 @@ class DeathDynamicsTab(QWidget):
                     df_tracks_path=None,
                     org_type=ct,
                     metadata=self.metadata_loader.metadata,
+                    group_cols=selected_group_cols,
                 )
                 self._log(f"✅ Death Dynamics complete for {ct}.")
                 any_ok = True

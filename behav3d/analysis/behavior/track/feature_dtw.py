@@ -467,48 +467,9 @@ def cluster_umap(
         plot_results=plot_results,
     )
 
-    all_line_cols = [c for c in df_umap.columns if c.endswith("_line_condition")]
-    this_cell_line_cols = [c for c in all_line_cols if f"_{cell_type}_" in c]
-    other_line_cols = [c for c in all_line_cols if c not in this_cell_line_cols]
-    line_cols = this_cell_line_cols + other_line_cols
-
-    if cluster_percentage_group_by is None:
-        cluster_percentage_groups = []
-    elif isinstance(cluster_percentage_group_by, str):
-        cluster_percentage_groups = [cluster_percentage_group_by]
-    else:
-        cluster_percentage_groups = list(cluster_percentage_group_by)
-    extra_group_cols = [
-        col for col in cluster_percentage_groups
-        if col in df_umap.columns and col not in line_cols
-    ]
-
-    group_cols_sample = line_cols + extra_group_cols + ["sample_name", "ClusterID"]
-    group_cols_sample_only = line_cols + extra_group_cols + ["sample_name"]
-
-    df_clust_perc = (
-        df_umap
-        .groupby(group_cols_sample, observed=True)
-        .size()
-        .reset_index(name="count")
+    df_clust_perc = _compute_feature_dtw_cluster_percentages(
+        df_umap, cell_type, cluster_percentage_group_by=cluster_percentage_group_by,
     )
-    sample_totals = (
-        df_clust_perc
-        .groupby(group_cols_sample_only, observed=True)["count"]
-        .sum()
-        .reset_index(name="sample_total")
-    )
-    combo_totals = (
-        df_clust_perc
-        .groupby(line_cols, observed=True)["count"]
-        .sum()
-        .reset_index(name="combo_total")
-    ) if line_cols else None
-
-    df_clust_perc = df_clust_perc.merge(sample_totals, how="left", on=group_cols_sample_only)
-    if combo_totals is not None:
-        df_clust_perc = df_clust_perc.merge(combo_totals, how="left", on=line_cols)
-    df_clust_perc["percentage"] = df_clust_perc["count"] / df_clust_perc["sample_total"]
 
     cluster_percentage_plot_prefix = Path(
         results_outdir, f"BEHAV3D_{cell_type}_UMAP_cluster_percentages"
@@ -517,11 +478,10 @@ def cluster_umap(
     plot_cluster_percentage_bars(
         df_clust_perc,
         cluster_percentage_plot_prefix,
-        group_by_columns=cluster_percentage_group_by,
+        group_cols=cluster_percentage_group_by,
         plot_results=plot_results,
     )
 
-    df_clust_perc = df_clust_perc.reset_index(drop=True)
     df_clust_perc_out_path = Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_cluster_percentages.csv")
     print(f"- Writing cluster percentages to {df_clust_perc_out_path}")
     df_clust_perc.to_csv(df_clust_perc_out_path, sep=",", index=False)
@@ -677,16 +637,21 @@ def _feature_dtw_outdir(output_dir, cell_type):
     )
 
 
+def _feature_dtw_raw_outdir(output_dir, cell_type):
+    """Where the untouched, first-pass clustering output lives (unnamed clusters)."""
+    return _feature_dtw_outdir(output_dir, cell_type) / "raw"
+
+
 def _feature_dtw_clustered_csv_path(output_dir, cell_type):
-    return _feature_dtw_outdir(output_dir, cell_type) / f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv"
+    return _feature_dtw_raw_outdir(output_dir, cell_type) / f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv"
 
 
 def _feature_dtw_umap_csv_path(output_dir, cell_type):
-    return _feature_dtw_outdir(output_dir, cell_type) / f"BEHAV3D_{cell_type}_UMAP_clusters.csv"
+    return _feature_dtw_raw_outdir(output_dir, cell_type) / f"BEHAV3D_{cell_type}_UMAP_clusters.csv"
 
 
 def _feature_dtw_output_csv_paths(output_dir, cell_type):
-    outdir = _feature_dtw_outdir(output_dir, cell_type)
+    outdir = _feature_dtw_raw_outdir(output_dir, cell_type)
     return [
         outdir / f"BEHAV3D_{cell_type}_UMAP_clusters.csv",
         outdir / f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv",
@@ -713,9 +678,23 @@ def _load_feature_dtw_name_mapping(output_dir, cell_type):
         return {}
 
 
-def _feature_dtw_plot_info_cols(df):
-    preferred = ["sample_name", "TrackID", "ClusterID", "ClusterName", "UMAP1", "UMAP2"]
-    return [col for col in preferred if col in df.columns]
+def _feature_dtw_plot_info_cols(df, cell_type=None):
+    """Real behavioral feature columns to display on the UMAP/heatmap QC pages.
+
+    Must mirror the feature set the original BEHAV3D clustering was run on
+    (see `_original_behav3d_features` in track_classification.py) — plotting
+    identifier/embedding columns (TrackID, UMAP1, UMAP2) here would show
+    those instead of actual behavioral features in the cluster heatmap.
+    """
+    preferred = [
+        "sample_name",
+        "mean_square_displacement",
+        "speed",
+        "mean_dead_dye",
+        f"{cell_type}_contact" if cell_type else None,
+        "organoid_contact",
+    ]
+    return [col for col in preferred if col and col in df.columns]
 
 
 def _feature_dtw_sample_cols(df):
@@ -723,24 +702,68 @@ def _feature_dtw_sample_cols(df):
     return sample_cols if len(sample_cols) > 0 else None
 
 
-def _feature_dtw_cluster_percentage_groups(df):
-    if "ClusterID" not in df.columns:
-        return None
-    group_cols = [col for col in ["sample_name", "condition", "treatment", "well"] if col in df.columns]
-    if len(group_cols) == 0:
-        counts = df["ClusterID"].astype(str).value_counts().rename_axis("ClusterID").reset_index(name="count")
-        total = counts["count"].sum()
-        counts["percentage"] = counts["count"] / total if total else 0.0
-        return counts
-    counts = df.groupby(group_cols + ["ClusterID"], observed=True).size().reset_index(name="count")
-    totals = counts.groupby(group_cols, observed=True)["count"].transform("sum")
-    counts["percentage"] = np.where(totals > 0, counts["count"] / totals, 0.0)
-    return counts
+def _compute_feature_dtw_cluster_percentages(df_umap, cell_type, cluster_percentage_group_by=None):
+    """Per-sample (and optionally per-group) cluster percentages.
+
+    Shared by `cluster_umap` (raw run) and `_save_feature_dtw_quality_control`
+    (Create Diagnostics) so both produce the same grouping/columns.
+    """
+    all_line_cols = [c for c in df_umap.columns if c.endswith("_line_condition")]
+    this_cell_line_cols = [c for c in all_line_cols if f"_{cell_type}_" in c]
+    other_line_cols = [c for c in all_line_cols if c not in this_cell_line_cols]
+    line_cols = this_cell_line_cols + other_line_cols
+
+    if cluster_percentage_group_by is None:
+        cluster_percentage_groups = []
+    elif isinstance(cluster_percentage_group_by, str):
+        cluster_percentage_groups = [cluster_percentage_group_by]
+    else:
+        cluster_percentage_groups = list(cluster_percentage_group_by)
+    extra_group_cols = [
+        col for col in cluster_percentage_groups
+        if col in df_umap.columns and col not in line_cols
+    ]
+
+    group_cols_sample = line_cols + extra_group_cols + ["sample_name", "ClusterID"]
+    group_cols_sample_only = line_cols + extra_group_cols + ["sample_name"]
+
+    df_clust_perc = (
+        df_umap
+        .groupby(group_cols_sample, observed=True)
+        .size()
+        .reset_index(name="count")
+    )
+    sample_totals = (
+        df_clust_perc
+        .groupby(group_cols_sample_only, observed=True)["count"]
+        .sum()
+        .reset_index(name="sample_total")
+    )
+    combo_totals = (
+        df_clust_perc
+        .groupby(line_cols, observed=True)["count"]
+        .sum()
+        .reset_index(name="combo_total")
+    ) if line_cols else None
+
+    df_clust_perc = df_clust_perc.merge(sample_totals, how="left", on=group_cols_sample_only)
+    if combo_totals is not None:
+        df_clust_perc = df_clust_perc.merge(combo_totals, how="left", on=line_cols)
+    df_clust_perc["percentage"] = df_clust_perc["count"] / df_clust_perc["sample_total"]
+    return df_clust_perc.reset_index(drop=True)
 
 
-def _save_feature_dtw_quality_control(output_dir, cell_type, *, outfolder=None):
+def _save_feature_dtw_quality_control(
+    output_dir, cell_type, *, outfolder=None, cluster_percentage_group_by=None,
+):
+    """Regenerate the original-BEHAV3D QC plots ("Create diagnostics").
+
+    Reads the raw clustered UMAP CSV (behavorial_trajectories/original_behav3d/raw/)
+    and writes the refreshed plots — reflecting any cluster renaming — directly
+    into behavorial_trajectories/original_behav3d/ (unless `outfolder` overrides it).
+    """
     outdir = _feature_dtw_outdir(output_dir, cell_type)
-    qc_outdir = outdir / "quality_control" if outfolder is None else Path(outfolder)
+    qc_outdir = outdir if outfolder is None else Path(outfolder)
     qc_outdir.mkdir(parents=True, exist_ok=True)
     umap_csv = _feature_dtw_umap_csv_path(output_dir, cell_type)
     if not umap_csv.exists():
@@ -756,7 +779,7 @@ def _save_feature_dtw_quality_control(output_dir, cell_type, *, outfolder=None):
         raise ValueError("Original BEHAV3D UMAP CSV is missing ClusterID.")
 
     sample_cols = _feature_dtw_sample_cols(df_plot)
-    info_cols = _feature_dtw_plot_info_cols(df_plot)
+    info_cols = _feature_dtw_plot_info_cols(df_plot, cell_type=cell_type)
     cluster_umap_path = qc_outdir / f"BEHAV3D_{cell_type}_UMAP_clusters.pdf"
     heatmap_path = qc_outdir / f"BEHAV3D_{cell_type}_UMAP_cluster_feature_heatmap.pdf"
     perc_prefix = qc_outdir / f"BEHAV3D_{cell_type}_UMAP_cluster_percentages"
@@ -782,10 +805,13 @@ def _save_feature_dtw_quality_control(output_dir, cell_type, *, outfolder=None):
         figsize=(8.27, 11.69),
         plot_results=False,
     )
-    df_clust_perc = _feature_dtw_cluster_percentage_groups(df_plot)
-    if df_clust_perc is not None:
-        df_clust_perc.to_csv(perc_prefix.with_suffix(".csv"), index=False)
-        plot_cluster_percentage_bars(df_clust_perc, perc_prefix, group_by_columns=None, plot_results=False)
+    df_clust_perc = _compute_feature_dtw_cluster_percentages(
+        df_plot, cell_type, cluster_percentage_group_by=cluster_percentage_group_by,
+    )
+    df_clust_perc.to_csv(perc_prefix.with_suffix(".csv"), index=False)
+    plot_cluster_percentage_bars(
+        df_clust_perc, perc_prefix, group_cols=cluster_percentage_group_by, plot_results=False,
+    )
 
     return {
         "umap_pdf": str(cluster_umap_path),
@@ -808,8 +834,8 @@ def _create_original_behav3d_adata(output_dir, cell_type):
     import anndata as ad
     from behav3d.analysis.behavior.track.utils import get_dtaidistance_track_trajectories_filename
 
-    src_dir = _feature_dtw_outdir(output_dir, cell_type)
-    umap_csv = src_dir / f"BEHAV3D_{cell_type}_UMAP_clusters.csv"
+    outdir = _feature_dtw_outdir(output_dir, cell_type)
+    umap_csv = _feature_dtw_umap_csv_path(output_dir, cell_type)
     if not umap_csv.exists():
         raise FileNotFoundError(
             f"Original BEHAV3D UMAP CSV not found: {umap_csv}. "
@@ -841,7 +867,7 @@ def _create_original_behav3d_adata(output_dir, cell_type):
         "cluster_key": "ClusterID",
     }
 
-    out_path = src_dir.parent / get_dtaidistance_track_trajectories_filename(cell_type)
+    out_path = outdir.parent / get_dtaidistance_track_trajectories_filename(cell_type)
     adata.write(out_path, compression="gzip")
     print(f"- Saved original BEHAV3D AnnData ({len(adata)} tracks) to {out_path}")
     return adata

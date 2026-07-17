@@ -16,7 +16,7 @@ from behav3d.analysis.filtering import round_legend_ticks
 def plot_cluster_percentage_bars(
     df_clust_perc: pd.DataFrame,
     outprefix,
-    group_by_columns=None,
+    group_cols=None,
     plot_results=True,
     grid_figsize=(20, 10),
     ncols_samples=3,
@@ -29,11 +29,13 @@ def plot_cluster_percentage_bars(
     """
     Produce a PDF with cluster percentage visualizations.
 
-    Page(s) 1+: 'Combined' view (samples pooled). Grid layout:
-                rows = this cell_type's line_condition values
-                columns = values of user-selected grouping column
-                One page per selected grouping column.
-                If group_by_columns is empty/None, skip these pages.
+    Page 1: 'Combined' view (samples pooled). Grid layout: 1 or 2 user-selected
+            `group_cols` (e.g. organoid_line_condition, tcell_line_condition)
+            arranged as a true 2D grid on one page — the column with more unique
+            values becomes rows, the other becomes columns. If only 1 column is
+            given, panels are laid out as a single column of rows. If more than
+            2 columns are given, only the first 2 are used. If group_cols is
+            empty/None, this page is skipped.
 
     Last Page: 'Per-sample' view. Panels laid out in 3 columns (configurable).
                Each panel is a single horizontal stacked bar of ClusterID percentages
@@ -42,40 +44,50 @@ def plot_cluster_percentage_bars(
     outprefix = Path(outprefix)
     outpdf = outprefix.with_suffix(".pdf")
 
-    if group_by_columns is None:
-        group_by_columns = []
-    elif isinstance(group_by_columns, str):
-        group_by_columns = [group_by_columns]
+    if group_cols is None:
+        group_cols = []
+    elif isinstance(group_cols, str):
+        group_cols = [group_cols]
 
-    group_by_columns = [c for c in group_by_columns if c in df_clust_perc.columns]
+    valid_group_cols = [c for c in group_cols if c in df_clust_perc.columns]
+    if len(valid_group_cols) > 2:
+        print(f"  Note: {len(valid_group_cols)} group_cols given — using only the first 2 for the grid.")
+        valid_group_cols = valid_group_cols[:2]
 
-    all_line_cols = [c for c in df_clust_perc.columns if c.endswith("_line_condition")]
-    this_cell_line_col = all_line_cols[0] if all_line_cols else None
+    grid_config = None
+    if valid_group_cols:
+        pooled_group_cols = valid_group_cols + ["ClusterID"]
 
-    if this_cell_line_col:
-        group_by_columns = [c for c in group_by_columns if c != this_cell_line_col]
-
-    pooled_group_cols = all_line_cols + group_by_columns + ["ClusterID"]
-    pooled_group_cols = list(dict.fromkeys(pooled_group_cols))
-
-    pooled = (
-        df_clust_perc
-        .groupby(pooled_group_cols, as_index=False, observed=True)["count"]
-        .sum()
-    )
-    pooled_total_cols = all_line_cols + group_by_columns
-    pooled_total_cols = list(dict.fromkeys(pooled_total_cols))
-
-    if pooled_total_cols:
+        pooled = (
+            df_clust_perc
+            .groupby(pooled_group_cols, as_index=False, observed=True)["count"]
+            .sum()
+        )
         pooled_combo_totals = (
-            pooled.groupby(pooled_total_cols, observed=True)["count"]
+            pooled.groupby(valid_group_cols, observed=True)["count"]
             .sum()
             .reset_index(name="combo_total_pooled")
         )
-        pooled = pooled.merge(pooled_combo_totals, on=pooled_total_cols, how="left")
-    else:
-        pooled["combo_total_pooled"] = pooled["count"].sum()
-    pooled["percentage_pooled"] = pooled["count"] / pooled["combo_total_pooled"]
+        pooled = pooled.merge(pooled_combo_totals, on=valid_group_cols, how="left")
+        pooled["percentage_pooled"] = pooled["count"] / pooled["combo_total_pooled"]
+
+        if len(valid_group_cols) == 2:
+            row_col, col_col = sorted(valid_group_cols, key=lambda c: -df_clust_perc[c].nunique())
+            row_values = df_clust_perc[row_col].drop_duplicates().sort_values().tolist()
+            col_values = df_clust_perc[col_col].drop_duplicates().sort_values().tolist()
+        else:
+            row_col = valid_group_cols[0]
+            col_col = None
+            row_values = df_clust_perc[row_col].drop_duplicates().sort_values().tolist()
+            col_values = [None]
+        grid_config = {
+            "row_col": row_col,
+            "row_values": row_values,
+            "col_col": col_col,
+            "col_values": col_values,
+            "nrows": len(row_values),
+            "ncols": len(col_values),
+        }
 
     per_sample = (
         df_clust_perc
@@ -98,26 +110,8 @@ def plot_cluster_percentage_bars(
         .tolist()
     )
 
-    grids_to_plot = []
-
-    if group_by_columns and this_cell_line_col:
-        line_values_rows = df_clust_perc[this_cell_line_col].drop_duplicates().sort_values().tolist()
-        nrows = len(line_values_rows)
-
-        for col_for_columns in group_by_columns:
-            if col_for_columns in df_clust_perc.columns:
-                col_values = df_clust_perc[col_for_columns].drop_duplicates().sort_values().tolist()
-                grids_to_plot.append({
-                    "row_col": this_cell_line_col,
-                    "row_values": line_values_rows,
-                    "col_col": col_for_columns,
-                    "col_values": col_values,
-                    "nrows": nrows,
-                    "ncols": len(col_values),
-                })
-
     with PdfPages(outpdf) as pdf:
-        for grid_config in grids_to_plot:
+        if grid_config is not None:
             row_col = grid_config["row_col"]
             row_values = grid_config["row_values"]
             col_col = grid_config["col_col"]
@@ -137,12 +131,15 @@ def plot_cluster_percentage_bars(
             for i, row_val in enumerate(row_values):
                 for j, col_val in enumerate(col_values):
                     ax = axes1[i, j]
-                    subset = pooled[
-                        (pooled[row_col] == row_val) &
-                        (pooled[col_col] == col_val)
-                    ]
+                    if col_col is not None:
+                        subset = pooled[
+                            (pooled[row_col] == row_val) &
+                            (pooled[col_col] == col_val)
+                        ]
+                    else:
+                        subset = pooled[pooled[row_col] == row_val]
 
-                    if i == 0:
+                    if i == 0 and col_col is not None:
                         ax.set_title(f"{col_val}", fontsize=title_fontsize)
                     if j == 0:
                         ax.text(
@@ -180,8 +177,11 @@ def plot_cluster_percentage_bars(
                     ax.axis("off")
 
             row_col_name = row_col.replace("_line_condition", "").replace("_", " ").title()
-            col_col_name = col_col.replace("_line_condition", "").replace("_", " ").title()
-            fig1.suptitle(f"Cluster percentages: {row_col_name} × {col_col_name}", fontsize=title_fontsize, y=0.995)
+            if col_col is not None:
+                col_col_name = col_col.replace("_line_condition", "").replace("_", " ").title()
+                fig1.suptitle(f"Cluster percentages: {row_col_name} × {col_col_name}", fontsize=title_fontsize, y=0.995)
+            else:
+                fig1.suptitle(f"Cluster percentages: {row_col_name}", fontsize=title_fontsize, y=0.995)
 
             if legend_handles_1 and legend_labels_1:
                 fig1.legend(

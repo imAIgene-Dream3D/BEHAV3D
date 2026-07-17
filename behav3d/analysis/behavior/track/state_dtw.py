@@ -197,6 +197,12 @@ def save_dtaidistance_diagnostics(
     """Write diagnostics for a saved one-hot dtaidistance clustering model."""
     paths = _resolve_dtaidistance_paths(output_dir, cell_type)
     resolved_cluster_key = _resolve_cluster_key(adata_tracks, cluster_key=cluster_key)
+    if _dtai_meta(adata_tracks).get("method") == "original_behav3d_feature_dtw":
+        raise ValueError(
+            "Diagnostics are not available for the 'Original BEHAV3D' feature-DTW model — "
+            "no pairwise distance matrix is stored for this clustering method. Use "
+            "_save_feature_dtw_quality_control() instead."
+        )
     distances = _validate_distance_matrix(adata_tracks.X, adata_tracks.n_obs)
     plot_paths = _save_diagnostics(
         adata_tracks,
