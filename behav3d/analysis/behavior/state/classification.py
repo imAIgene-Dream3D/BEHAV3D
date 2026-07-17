@@ -908,7 +908,11 @@ def _prepare_hmm_apply_adata_from_df_positions(
     }
 
     _meta_obs_extra = [
-        c for c in (["exp_nr", "well"] + [col for col in df_valid.columns if col.endswith("_line_condition")])
+        c
+        for c in (
+            ["exp_nr", "well", "origin_cell_type"]
+            + [col for col in df_valid.columns if col.endswith("_line_condition")]
+        )
         if c in df_valid.columns and c not in set(binary_cols_to_merge)
     ]
     obs_cols = (
@@ -1647,7 +1651,12 @@ def run_hmm_state_clustering(
             if first_intrinsic != "":
                 df_model.loc[skipped_group.index, INTRINSIC_STATE_COL] = first_intrinsic
 
-    obs_cols = sort_cols + binary_cols_to_merge + [HMM_INTRINSIC_RAW_STATE_COL, INTRINSIC_STATE_COL]
+    _model_meta_obs_extra = [
+        c for c in ("origin_cell_type",) if c in df_model.columns and c not in set(binary_cols_to_merge)
+    ]
+    obs_cols = (
+        sort_cols + binary_cols_to_merge + _model_meta_obs_extra + [HMM_INTRINSIC_RAW_STATE_COL, INTRINSIC_STATE_COL]
+    )
     model_adata = df_to_adata(df_model, feature_cols=kept_features, obs_cols=obs_cols)
     raw_labels = _coerce_hmm_raw_state_series(
         model_adata.obs[HMM_INTRINSIC_RAW_STATE_COL],

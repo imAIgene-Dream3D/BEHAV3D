@@ -9,6 +9,7 @@ import scanpy as sc
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from sklearn.metrics import silhouette_score
+from scipy.stats import chi2_contingency, ttest_rel, wilcoxon
 
 from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
 from behav3d.analysis.behavior.track.dtw import (
@@ -45,6 +46,130 @@ from behav3d.analysis.behavior.track.visualization.plots.exemplar_track_per_clus
 )
 
 
+_DIAGNOSTICS_GROUP_COL_CANDIDATES = ("origin_cell_type",)
+
+
+def _resolve_diagnostics_group_col(adata_tracks, group_col=None):
+    """Pick a per-track grouping column (e.g. population tag) to break diagnostics down by."""
+    if group_col is not None:
+        candidates = [str(group_col)]
+    else:
+        candidates = list(_DIAGNOSTICS_GROUP_COL_CANDIDATES)
+    for col in candidates:
+        if col not in adata_tracks.obs.columns:
+            continue
+        n_unique = adata_tracks.obs[col].dropna().nunique()
+        if n_unique >= 2:
+            return col
+    return None
+
+
+_DIAGNOSTICS_REPLICATE_COL_CANDIDATES = ("well", "sample_name")
+
+
+def _resolve_diagnostics_replicate_col(adata_tracks, replicate_col=None, exclude=()):
+    """Pick a per-track replicate column (e.g. well) to assess between-replicate variation."""
+    exclude = set(exclude)
+    if replicate_col is not None:
+        candidates = [str(replicate_col)]
+    else:
+        candidates = [c for c in _DIAGNOSTICS_REPLICATE_COL_CANDIDATES if c not in exclude]
+    for col in candidates:
+        if col not in adata_tracks.obs.columns:
+            continue
+        n_unique = adata_tracks.obs[col].dropna().nunique()
+        if n_unique >= 2:
+            return col
+    return None
+
+
+def _chi2_group_cluster_test(df, *, cluster_key, group_col):
+    """Chi-square test of independence between cluster membership and group_col."""
+    table = pd.crosstab(df[cluster_key], df[group_col])
+    if table.shape[0] < 2 or table.shape[1] < 2 or table.to_numpy().sum() == 0:
+        return {"n_tracks": int(table.to_numpy().sum()), "chi2": np.nan, "p_value": np.nan, "dof": np.nan, "cramers_v": np.nan}
+    chi2, p, dof, _ = chi2_contingency(table)
+    n = table.to_numpy().sum()
+    min_dim = min(table.shape) - 1
+    cramers_v = float(np.sqrt((chi2 / n) / min_dim)) if min_dim > 0 and n > 0 else np.nan
+    return {"n_tracks": int(n), "chi2": float(chi2), "p_value": float(p), "dof": int(dof), "cramers_v": cramers_v}
+
+
+def _full_replicate_cluster_group_counts(df, *, replicate_col, cluster_key, group_col):
+    """Cross-tab of (replicate, cluster, group) counts, with zero-count combinations filled in."""
+    full_index = pd.MultiIndex.from_product(
+        [
+            sorted(df[replicate_col].unique().tolist()),
+            sorted(df[cluster_key].unique().tolist(), key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x))),
+            sorted(df[group_col].unique().tolist()),
+        ],
+        names=[replicate_col, cluster_key, group_col],
+    )
+    counts = (
+        df.groupby([replicate_col, cluster_key, group_col], observed=True)
+        .size()
+        .reindex(full_index, fill_value=0)
+        .rename("n_tracks")
+        .reset_index()
+    )
+    denom = counts.groupby([replicate_col, group_col], observed=True)["n_tracks"].transform("sum")
+    counts["frac_within_replicate_group"] = np.where(denom > 0, counts["n_tracks"] / denom, 0.0)
+    return counts
+
+
+def _paired_group_stats_by_replicate(replicate_group_counts, *, cluster_key, group_col, replicate_col):
+    """For exactly two groups, compare per-cluster group fractions across replicates (paired)."""
+    group_values = sorted(replicate_group_counts[group_col].unique().tolist())
+    if len(group_values) != 2:
+        return None
+    grp_a, grp_b = group_values
+    cluster_order = sorted(
+        replicate_group_counts[cluster_key].unique().tolist(),
+        key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x)),
+    )
+
+    rows = []
+    for cluster in cluster_order:
+        pivot = (
+            replicate_group_counts[replicate_group_counts[cluster_key] == cluster]
+            .pivot(index=replicate_col, columns=group_col, values="frac_within_replicate_group")
+            .reindex(columns=group_values, fill_value=0.0)
+        )
+        vals_a = pivot[grp_a].to_numpy(dtype=float)
+        vals_b = pivot[grp_b].to_numpy(dtype=float)
+        n_rep = len(pivot)
+        row = {
+            cluster_key: cluster,
+            "n_replicates": n_rep,
+            f"mean_frac_{grp_a}": float(np.mean(vals_a)) if n_rep > 0 else np.nan,
+            f"mean_frac_{grp_b}": float(np.mean(vals_b)) if n_rep > 0 else np.nan,
+            "mean_diff": float(np.mean(vals_a - vals_b)) if n_rep > 0 else np.nan,
+            "std_diff": float(np.std(vals_a - vals_b, ddof=1)) if n_rep > 1 else np.nan,
+            "paired_ttest_stat": np.nan,
+            "paired_ttest_p": np.nan,
+            "wilcoxon_stat": np.nan,
+            "wilcoxon_p": np.nan,
+        }
+        if n_rep >= 2 and not np.allclose(vals_a, vals_b):
+            try:
+                t_stat, t_p = ttest_rel(vals_a, vals_b)
+                row["paired_ttest_stat"] = float(t_stat)
+                row["paired_ttest_p"] = float(t_p)
+            except Exception:
+                pass
+            try:
+                w_stat, w_p = wilcoxon(vals_a, vals_b)
+                row["wilcoxon_stat"] = float(w_stat)
+                row["wilcoxon_p"] = float(w_p)
+            except Exception:
+                pass
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    result.attrs["group_a"] = grp_a
+    result.attrs["group_b"] = grp_b
+    return result
+
+
 def _save_diagnostics(
     adata_tracks,
     distances,
@@ -53,6 +178,7 @@ def _save_diagnostics(
     cluster_key="ClusterID",
     max_heatmap_tracks=200,
     random_state=123,
+    group_col=None,
 ):
     outfolder = Path(outfolder)
     outfolder.mkdir(parents=True, exist_ok=True)
@@ -64,6 +190,83 @@ def _save_diagnostics(
     labels = pd.Series(adata_tracks.obs[cluster_key]).astype(str)
     counts = labels.value_counts().rename_axis(cluster_key).reset_index(name="n_tracks")
     counts.to_csv(counts_csv, index=False)
+
+    resolved_group_col = _resolve_diagnostics_group_col(adata_tracks, group_col=group_col)
+    group_counts = None
+    group_counts_csv = None
+    if resolved_group_col is not None:
+        groups = pd.Series(adata_tracks.obs[resolved_group_col]).astype(str)
+        group_df = pd.DataFrame({cluster_key: labels.to_numpy(), resolved_group_col: groups.to_numpy()})
+        group_counts = (
+            group_df.groupby([cluster_key, resolved_group_col], observed=True)
+            .size()
+            .rename("n_tracks")
+            .reset_index()
+        )
+        group_counts["frac_of_cluster"] = group_counts["n_tracks"] / group_counts.groupby(cluster_key)[
+            "n_tracks"
+        ].transform("sum")
+        group_counts["frac_of_group"] = group_counts["n_tracks"] / group_counts.groupby(resolved_group_col)[
+            "n_tracks"
+        ].transform("sum")
+        group_counts_csv = outfolder / f"dtaidistance_cluster_counts_by_{resolved_group_col}.csv"
+        group_counts.to_csv(group_counts_csv, index=False)
+
+    resolved_replicate_col = None
+    replicate_group_counts = None
+    replicate_group_counts_csv = None
+    chi2_stats = None
+    chi2_stats_csv = None
+    paired_stats = None
+    paired_stats_csv = None
+    if resolved_group_col is not None:
+        resolved_replicate_col = _resolve_diagnostics_replicate_col(adata_tracks, exclude={resolved_group_col})
+    if resolved_group_col is not None and resolved_replicate_col is not None:
+        reps = pd.Series(adata_tracks.obs[resolved_replicate_col]).astype(str)
+        rep_df = pd.DataFrame(
+            {
+                cluster_key: labels.to_numpy(),
+                resolved_group_col: groups.to_numpy(),
+                resolved_replicate_col: reps.to_numpy(),
+            }
+        )
+        replicate_group_counts = _full_replicate_cluster_group_counts(
+            rep_df,
+            replicate_col=resolved_replicate_col,
+            cluster_key=cluster_key,
+            group_col=resolved_group_col,
+        )
+        replicate_group_counts_csv = (
+            outfolder / f"dtaidistance_cluster_counts_by_{resolved_group_col}_by_{resolved_replicate_col}.csv"
+        )
+        replicate_group_counts.to_csv(replicate_group_counts_csv, index=False)
+
+        overall_chi2 = _chi2_group_cluster_test(rep_df, cluster_key=cluster_key, group_col=resolved_group_col)
+        overall_chi2["scope"] = "overall"
+        chi2_rows = [overall_chi2]
+        for rep_val, sub in rep_df.groupby(resolved_replicate_col, observed=True):
+            row = _chi2_group_cluster_test(sub, cluster_key=cluster_key, group_col=resolved_group_col)
+            row["scope"] = str(rep_val)
+            chi2_rows.append(row)
+        chi2_stats = pd.DataFrame(chi2_rows)[
+            ["scope", "n_tracks", "chi2", "dof", "p_value", "cramers_v"]
+        ]
+        chi2_stats_csv = (
+            outfolder / f"dtaidistance_{resolved_group_col}_vs_cluster_chi2_by_{resolved_replicate_col}.csv"
+        )
+        chi2_stats.to_csv(chi2_stats_csv, index=False)
+
+        paired_stats = _paired_group_stats_by_replicate(
+            replicate_group_counts,
+            cluster_key=cluster_key,
+            group_col=resolved_group_col,
+            replicate_col=resolved_replicate_col,
+        )
+        if paired_stats is not None:
+            paired_stats_csv = (
+                outfolder / f"dtaidistance_{resolved_group_col}_paired_by_{resolved_replicate_col}.csv"
+            )
+            paired_stats.to_csv(paired_stats_csv, index=False)
 
     medoid_cols = [
         c
@@ -113,6 +316,31 @@ def _save_diagnostics(
             fig.tight_layout()
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
+
+            if resolved_group_col is not None:
+                groups = pd.Series(adata_tracks.obs[resolved_group_col]).astype(str)
+                group_order = sorted(groups.unique().tolist())
+                fig, ax = plt.subplots(figsize=(7, 6))
+                gcmap = plt.get_cmap("Set2")
+                gcolor_map = {grp: gcmap(i % gcmap.N) for i, grp in enumerate(group_order)}
+                for grp in group_order:
+                    mask = groups.to_numpy() == grp
+                    ax.scatter(
+                        umap_embedding[mask, 0],
+                        umap_embedding[mask, 1],
+                        s=18,
+                        alpha=0.8,
+                        color=gcolor_map[grp],
+                        label=grp,
+                        linewidths=0,
+                    )
+                ax.set_xlabel("UMAP1")
+                ax.set_ylabel("UMAP2")
+                ax.set_title(f"One-hot dtaidistance UMAP by {resolved_group_col}")
+                ax.legend(title=str(resolved_group_col), loc="best", frameon=False, markerscale=1.4)
+                fig.tight_layout()
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
         elif umap_error is not None:
             fig, ax = plt.subplots(figsize=(8, 3))
             ax.axis("off")
@@ -131,6 +359,142 @@ def _save_diagnostics(
         fig.tight_layout()
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
+
+        if group_counts is not None:
+            cluster_order = counts[cluster_key].astype(str).tolist()
+            group_order = sorted(group_counts[resolved_group_col].unique().tolist())
+            gcmap = plt.get_cmap("Set2")
+            gcolor_map = {grp: gcmap(i % gcmap.N) for i, grp in enumerate(group_order)}
+            pivot_counts = (
+                group_counts.pivot(index=cluster_key, columns=resolved_group_col, values="n_tracks")
+                .reindex(index=cluster_order, columns=group_order)
+                .fillna(0)
+            )
+
+            y_pos = np.arange(len(cluster_order))
+            fig, ax = plt.subplots(figsize=(8, max(4, 0.4 * len(cluster_order) + 1.5)))
+            left = np.zeros(len(cluster_order))
+            for grp in group_order:
+                vals = pivot_counts[grp].to_numpy()
+                ax.barh(y_pos, vals, left=left, height=0.7, color=gcolor_map[grp], label=grp)
+                left = left + vals
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(cluster_order)
+            ax.invert_yaxis()
+            ax.set_xlabel("N tracks")
+            ax.set_ylabel(str(cluster_key))
+            ax.set_title(f"One-hot dtaidistance cluster counts by {resolved_group_col} (stacked)")
+            ax.legend(title=str(resolved_group_col), loc="best", frameon=False)
+            ax.grid(axis="x", alpha=0.2)
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+            pivot_frac = pivot_counts.div(pivot_counts.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+            fig, ax = plt.subplots(figsize=(8, max(4, 0.4 * len(cluster_order) + 1.5)))
+            left = np.zeros(len(cluster_order))
+            for grp in group_order:
+                vals = pivot_frac[grp].to_numpy()
+                ax.barh(y_pos, vals, left=left, height=0.7, color=gcolor_map[grp], label=grp)
+                left = left + vals
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(cluster_order)
+            ax.invert_yaxis()
+            ax.set_xlim(0, 1)
+            ax.set_xlabel(f"Fraction of cluster ({resolved_group_col})")
+            ax.set_ylabel(str(cluster_key))
+            ax.set_title(f"One-hot dtaidistance cluster composition by {resolved_group_col}")
+            ax.legend(title=str(resolved_group_col), loc="lower right", frameon=False)
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+            if replicate_group_counts is not None:
+                replicate_order = sorted(replicate_group_counts[resolved_replicate_col].unique().tolist())
+                group_order_rep = sorted(replicate_group_counts[resolved_group_col].unique().tolist())
+                cluster_cmap = plt.get_cmap("tab20")
+                cluster_color_map = {c: cluster_cmap(i % cluster_cmap.N) for i, c in enumerate(cluster_order)}
+
+                fig, axes = plt.subplots(
+                    1, len(replicate_order), figsize=(3.2 * len(replicate_order) + 1, 5), sharey=True
+                )
+                axes = np.atleast_1d(axes)
+                for ax, rep_val in zip(axes, replicate_order):
+                    sub = replicate_group_counts[replicate_group_counts[resolved_replicate_col] == rep_val]
+                    pivot_rep = (
+                        sub.pivot(index=resolved_group_col, columns=cluster_key, values="frac_within_replicate_group")
+                        .reindex(index=group_order_rep, columns=cluster_order)
+                        .fillna(0.0)
+                    )
+                    bottom = np.zeros(len(group_order_rep))
+                    x_pos = np.arange(len(group_order_rep))
+                    for c in cluster_order:
+                        vals = pivot_rep[c].to_numpy()
+                        ax.bar(x_pos, vals, bottom=bottom, width=0.6, color=cluster_color_map[c], label=c)
+                        bottom = bottom + vals
+                    ax.set_xticks(x_pos)
+                    ax.set_xticklabels(group_order_rep, rotation=30, ha="right", fontsize=8)
+                    ax.set_title(str(rep_val), fontsize=10, fontweight="bold")
+                    ax.set_ylim(0, 1)
+                axes[0].set_ylabel(f"Fraction of tracks (by {cluster_key})")
+                handles, labels_leg = axes[0].get_legend_handles_labels()
+                fig.legend(
+                    handles,
+                    labels_leg,
+                    title=str(cluster_key),
+                    loc="lower center",
+                    ncol=min(len(cluster_order), 8),
+                    frameon=False,
+                    fontsize=7,
+                )
+                fig.suptitle(
+                    f"Cluster composition by {resolved_group_col}, split by {resolved_replicate_col}",
+                    fontsize=12,
+                    fontweight="bold",
+                )
+                fig.tight_layout(rect=(0.02, 0.1, 1, 0.92))
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+            if chi2_stats is not None:
+                fig, ax = plt.subplots(figsize=(8.27, 11.69))
+                ax.axis("off")
+                lines = [
+                    f"{resolved_group_col} vs {cluster_key} — chi-square test of independence",
+                    "",
+                ]
+                for _, row in chi2_stats.iterrows():
+                    lines.append(
+                        f"{str(row['scope']):>16s}:  n={int(row['n_tracks'])}, chi2={row['chi2']:.3g}, "
+                        f"dof={row['dof']}, p={row['p_value']:.3g}, Cramer's V={row['cramers_v']:.3g}"
+                    )
+                if paired_stats is not None and len(paired_stats) > 0:
+                    grp_a = paired_stats.attrs.get("group_a", "group_a")
+                    grp_b = paired_stats.attrs.get("group_b", "group_b")
+                    max_n_rep = int(paired_stats["n_replicates"].max())
+                    lines += [
+                        "",
+                        f"Paired comparison across {resolved_replicate_col} ({grp_a} vs {grp_b}, "
+                        "fraction of that well's population per cluster):",
+                        "",
+                    ]
+                    for _, row in paired_stats.iterrows():
+                        lines.append(
+                            f"{str(cluster_key)} {row[cluster_key]}: "
+                            f"mean {grp_a}={row[f'mean_frac_{grp_a}']:.3f}, "
+                            f"mean {grp_b}={row[f'mean_frac_{grp_b}']:.3f}, "
+                            f"diff={row['mean_diff']:.3f}, "
+                            f"paired-t p={row['paired_ttest_p']:.3g}, wilcoxon p={row['wilcoxon_p']:.3g}"
+                        )
+                    lines += [
+                        "",
+                        f"Caveat: only {max_n_rep} replicate(s) ({resolved_replicate_col}) available — "
+                        "treat these p-values as indicative, not confirmatory.",
+                    ]
+                ax.text(0.02, 0.98, "\n".join(lines), va="top", ha="left", fontsize=9, family="monospace")
+                fig.tight_layout()
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
 
         n = distances.shape[0]
         if n > 0:
@@ -158,6 +522,14 @@ def _save_diagnostics(
         "cluster_medoids_csv": str(medoids_csv),
         "umap_csv": str(umap_csv) if umap_embedding is not None else None,
         "umap_error": umap_error,
+        "cluster_counts_by_group_csv": str(group_counts_csv) if group_counts_csv is not None else None,
+        "diagnostics_group_col": resolved_group_col,
+        "diagnostics_replicate_col": resolved_replicate_col,
+        "cluster_counts_by_group_by_replicate_csv": (
+            str(replicate_group_counts_csv) if replicate_group_counts_csv is not None else None
+        ),
+        "group_vs_cluster_chi2_csv": str(chi2_stats_csv) if chi2_stats_csv is not None else None,
+        "group_paired_by_replicate_csv": str(paired_stats_csv) if paired_stats_csv is not None else None,
     }
 
 
@@ -191,10 +563,15 @@ def save_dtaidistance_diagnostics(
     outfolder=None,
     max_heatmap_tracks=200,
     random_state=123,
+    group_col=None,
     save_outputs=True,
     verbose=True,
 ):
-    """Write diagnostics for a saved one-hot dtaidistance clustering model."""
+    """Write diagnostics for a saved one-hot dtaidistance clustering model.
+
+    group_col optionally breaks the cluster-count/UMAP diagnostics down by a
+    per-track grouping column (default: auto-detects "origin_cell_type" if present).
+    """
     paths = _resolve_dtaidistance_paths(output_dir, cell_type)
     resolved_cluster_key = _resolve_cluster_key(adata_tracks, cluster_key=cluster_key)
     if _dtai_meta(adata_tracks).get("method") == "original_behav3d_feature_dtw":
@@ -211,6 +588,7 @@ def save_dtaidistance_diagnostics(
         cluster_key=resolved_cluster_key,
         max_heatmap_tracks=int(max_heatmap_tracks),
         random_state=int(random_state),
+        group_col=group_col,
     )
     adata_tracks.uns.setdefault("visualization", {})
     adata_tracks.uns["visualization"].update(plot_paths)
@@ -584,6 +962,7 @@ def run_categorical_dtaidistance_trajectory_clustering(
         groupby_cols=groupby_cols,
         time_col=time_col,
         missing_policy=missing_policy,
+        extra_meta_cols=("origin_cell_type", "well"),
     )
 
     if max_tracks is not None and int(max_tracks) > 0 and len(sequences) > int(max_tracks):

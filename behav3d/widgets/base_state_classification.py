@@ -774,6 +774,8 @@ class BaseStateClassificationPanel:
             "interpolated",
             "exp_nr",
             "well",
+            "origin_cell_type",
+            "origin_TrackID",
         }
 
         md = getattr(self.metadata_loader, "metadata", None)
