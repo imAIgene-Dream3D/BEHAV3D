@@ -31,6 +31,7 @@ class StepType(Enum):
     TRAIN = "train"
     SEGMENT = "segment"
     CELLPOSE_SEGMENT = "cellpose_segment"
+    CELLPOSE_SAM_SEGMENT = "cellpose_sam_segment"
     DEAD_MASK = "dead_mask"
     APOC_SEGMENT = "apoc_segment"
     CONVPAINT_SEGMENT = "convpaint_segment"
@@ -54,6 +55,7 @@ class StepType(Enum):
             StepType.TRAIN: "🧠 Train Classifier",
             StepType.SEGMENT: "🦠 Segmentation",
             StepType.CELLPOSE_SEGMENT: "🦠 Segmentation",
+            StepType.CELLPOSE_SAM_SEGMENT: "🦠 Segmentation",
             StepType.DEAD_MASK: "☠ Dead Mask (Otsu)",
             StepType.APOC_SEGMENT: "🦠 Segmentation",
             StepType.CONVPAINT_SEGMENT: "🦠 Segmentation",
@@ -78,6 +80,7 @@ class StepType(Enum):
             StepType.TRAIN: 0,
             StepType.SEGMENT: 1,
             StepType.CELLPOSE_SEGMENT: 1.5,
+            StepType.CELLPOSE_SAM_SEGMENT: 1.5,
             StepType.DEAD_MASK: 1.6,
             StepType.APOC_SEGMENT: 1.5,
             StepType.CONVPAINT_SEGMENT: 1.5,
@@ -95,6 +98,14 @@ class StepType(Enum):
             StepType.SC_APPLY_STATE: 8,
             StepType.SC_TRACK_CLUSTER: 8.5,
         }[self]
+
+
+#: Segmentation methods that run for one cell type per step. APOC and ConvPaint
+#: instead segment every cell type in a single step, so they are excluded.
+_PER_CELL_TYPE_SEGMENT_STEPS = frozenset({
+    StepType.CELLPOSE_SEGMENT,
+    StepType.CELLPOSE_SAM_SEGMENT,
+})
 
 
 class StepStatus(Enum):
@@ -128,6 +139,11 @@ class QueueStep:
             return f"{base} — {strat}" if strat else base
         if self.step_type == StepType.CELLPOSE_SEGMENT:
             base = "🦠 Segmentation — Cellpose"
+            return f"{base} — {cell_type}" if cell_type else base
+        if self.step_type == StepType.CELLPOSE_SAM_SEGMENT:
+            base = "🦠 Segmentation — Cellpose-SAM"
+            if self.params.get("all_cell_types"):
+                return f"{base} — all cell types"
             return f"{base} — {cell_type}" if cell_type else base
         if self.step_type == StepType.ACTIVE_KILLING:
             immune = self.params.get("immune_type", "")
@@ -482,20 +498,25 @@ class ProcessingQueuePanel(QWidget):
         For CELLPOSE_SEGMENT steps, *params* must contain at least
         ``{"cell_type": ..., "model_path": ...}``.  Multiple cellpose steps
         with different cell types are allowed; duplicates (same cell type)
-        are silently ignored.
+        are silently ignored. CELLPOSE_SAM_SEGMENT behaves the same way, except
+        that an "all cell types" step covers every type in one go.
         """
         if params is None:
             params = {}
 
-        # Dedup: for cellpose, dedup by (step_type, cell_type); others by step_type
-        if step_type == StepType.CELLPOSE_SEGMENT:
+        # Dedup: per-cell-type methods dedup by (step_type, cell_type); others by step_type
+        if step_type in _PER_CELL_TYPE_SEGMENT_STEPS:
             ct = params.get("cell_type", "")
-            if any(
-                s.step_type == StepType.CELLPOSE_SEGMENT
-                and s.params.get("cell_type") == ct
-                for s in self._steps
-            ):
-                return  # same cell type already queued
+            all_cts = bool(params.get("all_cell_types"))
+            for s in self._steps:
+                if s.step_type != step_type:
+                    continue
+                # An all-cell-types step subsumes any single-cell-type step, and
+                # vice versa, so either combination is a duplicate.
+                if s.params.get("all_cell_types") or all_cts:
+                    return
+                if s.params.get("cell_type") == ct:
+                    return  # same cell type already queued
         else:
             if any(s.step_type == step_type for s in self._steps):
                 return
@@ -598,7 +619,9 @@ class ProcessingQueuePanel(QWidget):
         * a non-per-cell-type segmentation step (``APOC_SEGMENT`` or
           ``CONVPAINT_SEGMENT``) is already queued — those run for every
           cell type at once, so a single step covers all of them, or
-        * a ``CELLPOSE_SEGMENT`` step with that ``cell_type`` is queued, or
+        * a ``CELLPOSE_SEGMENT`` / ``CELLPOSE_SAM_SEGMENT`` step with that
+          ``cell_type`` is queued (or a Cellpose-SAM step set to all cell
+          types), or
         * the ``*_segments.zarr`` already exists on disk for every sample.
         """
         md = self.metadata_loader.metadata
@@ -612,9 +635,11 @@ class ProcessingQueuePanel(QWidget):
         if not all_cts:
             return False
 
-        # APOC / ConvPaint segment every cell type in a single batch run.
+        # APOC / ConvPaint segment every cell type in a single batch run, and a
+        # Cellpose-SAM step in all-cell-types mode does the same.
         if any(
             s.step_type in (StepType.APOC_SEGMENT, StepType.CONVPAINT_SEGMENT)
+            or (s.step_type == StepType.CELLPOSE_SAM_SEGMENT and s.params.get("all_cell_types"))
             for s in self._steps
         ):
             return True
@@ -622,7 +647,7 @@ class ProcessingQueuePanel(QWidget):
         queued_cellpose_cts = {
             s.params.get("cell_type")
             for s in self._steps
-            if s.step_type == StepType.CELLPOSE_SEGMENT
+            if s.step_type in _PER_CELL_TYPE_SEGMENT_STEPS
         }
 
         for ct in all_cts:
@@ -636,7 +661,7 @@ class ProcessingQueuePanel(QWidget):
                     break
             if all_exist:
                 continue  # this cell type is covered by existing data
-            # Not on disk — check if a cellpose step covers it
+            # Not on disk — check if a per-cell-type segmentation step covers it
             if ct not in queued_cellpose_cts:
                 return False
         return True
@@ -730,13 +755,16 @@ class ProcessingQueuePanel(QWidget):
 
     # ── Segmentation method resolution ─────────────────────────────────────
 
-    # Maps method_combo index → (StepType, page_attr_name)
+    # Maps method_combo index → (StepType, page_attr_name).
+    # Positionally coupled to the `methods` list in _segmentation.py — keep both
+    # in the same order. _assert_seg_method_alignment() checks this at runtime.
     _SEG_METHOD_MAP = [
-        (StepType.APOC_SEGMENT,      "apoc_page"),
-        (StepType.CONVPAINT_SEGMENT, "convpaint_page"),
-        (StepType.SEGMENT,           "pixel_classifier_page"),
-        (StepType.CELLPOSE_SEGMENT,  "cellpose_page"),
-        (None,                       None),   # Import — not queueable
+        (StepType.APOC_SEGMENT,         "apoc_page"),
+        (StepType.CONVPAINT_SEGMENT,    "convpaint_page"),
+        (StepType.SEGMENT,              "pixel_classifier_page"),
+        (StepType.CELLPOSE_SEGMENT,     "cellpose_page"),
+        (StepType.CELLPOSE_SAM_SEGMENT, "cellpose_sam_page"),
+        (None,                          None),   # Import — not queueable
     ]
 
     _SEG_METHOD_LABELS = [
@@ -744,8 +772,26 @@ class ProcessingQueuePanel(QWidget):
         "ConvPaint",
         "Pixel Classifier (CPU)",
         "Cellpose",
+        "Cellpose-SAM",
         "Import (not queueable)",
     ]
+
+    def _assert_seg_method_alignment(self):
+        """Warn if the method combo and _SEG_METHOD_MAP have drifted apart.
+
+        These two lists live in different files and are coupled only by index, so
+        a method added to one and not the other silently queues the wrong step.
+        """
+        try:
+            n_combo = self.segmentation_tab.method_combo.count()
+        except Exception:
+            return
+        if n_combo != len(self._SEG_METHOD_MAP):
+            print(
+                f"⚠️ Segmentation method lists are out of sync: method_combo has "
+                f"{n_combo} entries, _SEG_METHOD_MAP has {len(self._SEG_METHOD_MAP)}. "
+                "Queued segmentation steps may map to the wrong method."
+            )
 
     def _active_segment_step(self) -> "tuple[StepType | None, dict]":
         """Return (StepType, params) for the currently selected segmentation method."""
@@ -918,14 +964,23 @@ class ProcessingQueuePanel(QWidget):
                             warnings.append(f"Segmentation data for {sn}")
                             break
 
-            elif step.step_type == StepType.CELLPOSE_SEGMENT:
-                ct = step.params.get("cell_type", "")
-                if ct:
+            elif step.step_type in _PER_CELL_TYPE_SEGMENT_STEPS:
+                is_sam = step.step_type == StepType.CELLPOSE_SAM_SEGMENT
+                method_label = "Cellpose-SAM" if is_sam else "Cellpose"
+                if is_sam and step.params.get("all_cell_types"):
+                    cts = [
+                        ct for ct in (
+                            list(self.tracking_tab.panels.keys()) if self.tracking_tab else []
+                        )
+                    ]
+                else:
+                    cts = [step.params.get("cell_type", "")]
+                for ct in [c for c in cts if c]:
                     for _, sample in md.iterrows():
                         sn = sample.get("sample_name", "unknown")
                         seg_zarr = out_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
                         if seg_zarr.exists():
-                            warnings.append(f"Cellpose segmentation for {ct} ({sn})")
+                            warnings.append(f"{method_label} segmentation for {ct} ({sn})")
                             break
 
             elif step.step_type == StepType.DEAD_MASK:
@@ -1345,6 +1400,8 @@ class ProcessingQueuePanel(QWidget):
             return self._run_segment(skip_existing, cbs)
         if step.step_type == StepType.CELLPOSE_SEGMENT:
             return self._run_cellpose_segment(step, skip_existing, cbs)
+        if step.step_type == StepType.CELLPOSE_SAM_SEGMENT:
+            return self._run_cellpose_sam_segment(step, skip_existing, cbs)
         if step.step_type == StepType.DEAD_MASK:
             return self._run_dead_mask(skip_existing, cbs)
         if step.step_type == StepType.TRACK:
@@ -1554,6 +1611,48 @@ class ProcessingQueuePanel(QWidget):
             interactive=False, skip_existing=skip_existing, block=False,
             cell_type_override=step.params.get("cell_type"),
             model_path_override=step.params.get("model_path"),
+            extra_callbacks=extra_callbacks,
+        )
+        return cp
+
+    def _run_cellpose_sam_segment(self, step: QueueStep, skip_existing, extra_callbacks):
+        """Run Cellpose-SAM segmentation from a queued params snapshot.
+
+        ``step.params`` is the dict produced by
+        :meth:`CellposeSAMWidget.get_queue_params`. As with APOC, the values are
+        restored into the widget so the normal run path executes unchanged and
+        the queue does not depend on whatever the user has since clicked.
+        """
+        cp = self.segmentation_tab.cellpose_sam_page
+        p = step.params or {}
+
+        model_name = p.get("model_name")
+        if model_name and hasattr(cp, "combo_model"):
+            idx = cp.combo_model.findText(str(model_name))
+            if idx >= 0:
+                cp.combo_model.setCurrentIndex(idx)
+
+        # Torch device combo stores the device string as item data ("cuda:0"),
+        # not as the display text ("GPU 0: NVIDIA ..."), so match on data.
+        device = p.get("device")
+        if device and hasattr(cp, "combo_gpu_device"):
+            idx = cp.combo_gpu_device.findData(str(device))
+            if idx >= 0:
+                cp.combo_gpu_device.setCurrentIndex(idx)
+
+        if hasattr(cp, "btn_force_cpu"):
+            cp.btn_force_cpu.setChecked(bool(p.get("force_cpu", False)))
+
+        all_cell_types = bool(p.get("all_cell_types", False))
+        if hasattr(cp, "check_all_cell_types"):
+            cp.check_all_cell_types.setChecked(all_cell_types)
+
+        # With all_cell_types restored above, leaving the override unset lets the
+        # page expand to every detected cell type at run time.
+        cell_type = None if all_cell_types else p.get("cell_type")
+        cp.run_batch_cellpose_sam(
+            interactive=False, skip_existing=skip_existing, block=False,
+            cell_type_override=cell_type,
             extra_callbacks=extra_callbacks,
         )
         return cp
