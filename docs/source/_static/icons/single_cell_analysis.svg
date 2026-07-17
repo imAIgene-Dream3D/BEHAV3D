@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 222" width="300" height="222">
+  <text x="150.0" y="30" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="700" fill="#111111">Single cell analysis</text>
+  <rect x="6" y="42" width="288" height="174" rx="18" ry="18" fill="#ffffff" stroke="#9AAE9A" stroke-width="3"/>
+  
+  <path d="M 35,78 C 50,60 55,90 70,72 C 78,64 80,80 85,68" fill="none" stroke="#111111" stroke-width="1.4" stroke-dasharray="3,3"/>
+  <path d="M 100,72 C 112,60 118,84 133,74" fill="none" stroke="#111111" stroke-width="1.4" stroke-dasharray="3,3"/>
+  <path d="M 162,78 C 175,68 185,88 200,78" fill="none" stroke="#111111" stroke-width="1.4" stroke-dasharray="3,3"/>
+  <path d="M 42.7,74.3 Q 44.4,78.0 42.4,81.4 Q 40.4,84.8 36.7,85.7 Q 33.0,86.7 29.8,84.4 Q 26.5,82.1 27.5,78.5 Q 28.6,74.9 30.8,72.3 Q 33.1,69.7 37.0,70.2 Q 40.9,70.6 42.7,74.3 Z" fill="#7CD836" stroke="#111111" stroke-width="1.5"/>
+  <path d="M 92.8,63.6 Q 93.5,68.0 92.6,72.2 Q 91.8,76.5 87.2,77.4 Q 82.6,78.3 79.4,75.3 Q 76.1,72.3 76.6,68.3 Q 77.1,64.2 79.8,60.6 Q 82.5,57.0 87.3,58.1 Q 92.1,59.1 92.8,63.6 Z" fill="#7CD836" stroke="#111111" stroke-width="1.5"/>
+  <path d="M 160.9,72.2 Q 165.6,78.0 160.6,83.6 Q 155.5,89.3 150.6,92.3 Q 145.6,95.3 138.8,99.0 Q 132.0,102.7 128.1,96.1 Q 124.2,89.5 122.6,83.7 Q 121.0,78.0 121.1,71.2 Q 121.2,64.4 127.4,61.3 Q 133.6,58.2 140.7,56.2 Q 147.8,54.1 151.9,60.2 Q 156.1,66.3 160.9,72.2 Z" fill="#F5F27A" stroke="#111111" stroke-width="2"/>
+  <path d="M 140.3,70.8 Q 142.5,74.0 140.7,77.7 Q 139.0,81.5 134.9,82.3 Q 130.9,83.1 129.0,80.0 Q 127.1,76.8 126.3,73.6 Q 125.5,70.4 128.4,68.4 Q 131.3,66.5 134.7,67.1 Q 138.1,67.7 140.3,70.8 Z" fill="#7CD836" stroke="#111111" stroke-width="1.5"/>
+  <path d="M 250.3,69.8 Q 253.0,78.0 250.8,86.6 Q 248.6,95.2 240.4,97.5 Q 232.1,99.9 223.8,103.5 Q 215.5,107.2 210.9,99.4 Q 206.3,91.6 201.8,84.8 Q 197.4,78.0 202.2,71.5 Q 207.1,65.0 211.6,58.0 Q 216.2,51.0 224.1,53.7 Q 232.0,56.4 239.8,59.0 Q 247.6,61.6 250.3,69.8 Z" fill="#F5F27A" stroke="#111111" stroke-width="2"/>
+  <path d="M 219.5,75.2 Q 221.5,78.0 220.6,82.2 Q 219.7,86.4 215.2,87.2 Q 210.7,88.1 208.3,84.8 Q 205.9,81.4 204.7,77.4 Q 203.6,73.5 207.2,71.1 Q 210.9,68.7 214.2,70.5 Q 217.5,72.4 219.5,75.2 Z" fill="#7CD836" stroke="#111111" stroke-width="1.5"/>
+  <path d="M 247.2,54.5 Q 248.9,58.0 246.6,60.7 Q 244.3,63.4 241.4,64.1 Q 238.5,64.8 235.5,63.2 Q 232.5,61.6 233.3,58.4 Q 234.2,55.2 236.1,52.2 Q 238.0,49.3 241.8,50.1 Q 245.6,51.0 247.2,54.5 Z" fill="#EA3323" stroke="#111111" stroke-width="1.2"/>
+  <path d="M 256.9,65.8 Q 258.4,68.0 257.2,70.6 Q 256.1,73.1 253.2,74.1 Q 250.4,75.0 248.9,72.6 Q 247.3,70.3 247.5,68.1 Q 247.6,65.9 249.1,63.6 Q 250.5,61.3 253.0,62.5 Q 255.5,63.7 256.9,65.8 Z" fill="#EA3323" stroke="#111111" stroke-width="1.2"/>
+
+  <text x="150" y="112" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700" fill="#111111">State trajectory</text>
+  <rect x="30" y="118" width="55" height="14" fill="#8f9a8f"/>
+  <rect x="85" y="118" width="90" height="14" fill="#4FA6E0"/>
+  <rect x="175" y="118" width="45" height="14" fill="#F0A63C"/>
+  <path d="M 220,111 L 260,125 L 220,139 Z" fill="#EA3323"/>
+
+  <path d="M 90,132 L 70,150" fill="none" stroke="#9AAE9A" stroke-width="1.3" stroke-dasharray="2,2"/>
+  <path d="M 170,132 L 205,150" fill="none" stroke="#9AAE9A" stroke-width="1.3" stroke-dasharray="2,2"/>
+  <text x="137" y="158" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#666666">State window</text>
+  <rect x="55" y="163" width="165" height="16" fill="#4FA6E0"/>
+  <text x="137" y="175" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#111111">e.g. 20 mins</text>
+  <text x="150" y="198" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700" fill="#111111">Behavioral state</text>
+
+</svg>
