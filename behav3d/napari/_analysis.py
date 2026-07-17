@@ -344,13 +344,45 @@ class DeathDynamicsTab(QWidget):
 
     # ── UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
+        from behav3d.napari._guided import (
+            ModeSwitch, GuidedPanel, load_guided_mode,
+        )
+        from behav3d.napari.analysis_guided_copy import (
+            DEATH_DYNAMICS_ANALYSES, GUIDED_INTRO,
+        )
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        # Guided / Advanced switch + stacked pages (Guided = 0, form = 1).
+        guided_default = load_guided_mode()
+        self._mode_switch = ModeSwitch(guided=guided_default)
+        self._mode_switch.modeChanged.connect(self._on_mode_changed)
+        outer.addWidget(self._mode_switch)
+
+        self._stack = QStackedWidget()
+        outer.addWidget(self._stack)
+
+        # Page 0 — Guided explainers.
+        self._guided_panel = GuidedPanel(
+            DEATH_DYNAMICS_ANALYSES,
+            start_cb=self._on_guided_start,
+            intro=GUIDED_INTRO,
+        )
+        self._stack.addWidget(self._guided_panel)
+
+        # Page 1 — the existing settings form, wrapped verbatim.
+        form_page = QWidget()
+        form_outer = QVBoxLayout(form_page)
+        form_outer.setContentsMargins(0, 0, 0, 0)
+        form_outer.setSpacing(0)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        outer.addWidget(scroll)
+        form_outer.addWidget(scroll)
+        self._form_scroll = scroll
+        self._stack.addWidget(form_page)
 
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -894,6 +926,31 @@ class DeathDynamicsTab(QWidget):
 
         # Try a first build (in case metadata is already loaded)
         self._rebuild()
+
+        # Reveal the page matching the persisted mode.
+        self._stack.setCurrentIndex(0 if self._mode_switch.is_guided() else 1)
+
+    # ── Guided / Advanced mode ─────────────────────────────────────────────
+    def _on_mode_changed(self, guided: bool):
+        from behav3d.napari._guided import save_guided_mode
+
+        self._stack.setCurrentIndex(0 if guided else 1)
+        save_guided_mode(guided)
+
+    def _on_guided_start(self, analysis_id: str):
+        """Start from a Guided card: reveal the form and scroll to its step."""
+        from qtpy.QtCore import QTimer
+
+        self._mode_switch.set_guided(False)  # → _on_mode_changed flips the page
+        group = {
+            "death_dynamics": getattr(self, "dd_group", None),
+            "interaction": getattr(self, "ia_group", None),
+            "invasiveness": getattr(self, "inv_group", None),
+        }.get(analysis_id)
+        if group is not None:
+            QTimer.singleShot(
+                0, lambda: self._form_scroll.ensureWidgetVisible(group)
+            )
 
     def _style_primary(self, btn: QPushButton):
         btn.setStyleSheet(
