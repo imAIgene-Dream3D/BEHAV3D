@@ -348,8 +348,8 @@ class CellTypeFilterPanel(QWidget):
             "Requires the 'dead' column to have been created during\n"
             "Feature Extraction with a dead threshold."
         )
-        self.check_filter_dead_t0.setVisible(self._has_dead)
         layout.addWidget(self.check_filter_dead_t0)
+        self.check_filter_dead_t0.setVisible(self._has_dead)
 
 
 
@@ -850,13 +850,15 @@ class FilteringTab(QWidget):
         """User-triggered batch run — asynchronous."""
         self.run_batch_filtering(interactive=True, block=False)
 
-    def run_batch_filtering(self, interactive=True, skip_existing=False, block=True,
+    def run_batch_filtering(self, interactive=True, skip_existing=False, block=False,
                             extra_callbacks=None):
         """Run filtering for all cell types sequentially.
 
-        ``block=True`` (default, queue path) runs synchronously on the
-        caller's thread.  ``block=False`` (GUI button) runs in a background
-        worker with a determinate progress bar at cell-type granularity.
+        ``block=False`` (default) runs in a background worker thread with a
+        determinate progress bar at cell-type granularity, so plotting code
+        in ``filter_tracks`` never touches the Qt GUI backend from the main
+        thread. Pass ``block=True`` only if a caller genuinely needs the
+        call to complete synchronously before returning.
 
         ``extra_callbacks`` is the queue's chaining hook
         (``{"on_done": cb, "on_failed": cb}``).

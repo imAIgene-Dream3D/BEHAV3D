@@ -153,6 +153,40 @@ def detect_immune_cell_types_from_metadata(metadata):
     
     return sorted(list(immune_types))
 
+
+def resolve_immune_track_paths_for_sample(sample_row, exclude_multicolor=True):
+    """Return ``{immune_type: tracks_image_path}`` for a single sample row.
+
+    Scans ``im_<type>_tracks_image_path`` columns with a non-null value on
+    ``sample_row``. This is the single source of truth for "which cell types
+    count as immune, for dead-mask cleaning purposes" on a given sample —
+    used identically by feature extraction (``run_feature_extraction``) and
+    the death-threshold preview (``_on_preview_dead_clicked``) so the two
+    can never disagree about which loaded segments get cleaned under.
+
+    Deliberately does not exclude ``sample_row``'s own cell type: if the
+    type currently being processed is itself immune, it will appear as a key
+    in the returned dict pointing at its own path. Callers should check for
+    that (mirroring ``exclude_immune_from_dead`` in
+    ``timepoint_features.py``) to avoid cleaning a type's dead mask under
+    itself.
+    """
+    paths = {}
+    for col in sample_row.index:
+        if not (col.startswith('im_') and col.endswith('_tracks_image_path')):
+            continue
+        parts = col.split('_')
+        if len(parts) < 4:
+            continue
+        immune_type = '_'.join(parts[1:-3])
+        if exclude_multicolor and is_multicolor_celltype(immune_type):
+            continue
+        val = sample_row.get(col)
+        if pd.notna(val):
+            paths[immune_type] = val
+    return paths
+
+
 def detect_other_cell_types_from_metadata(metadata):
     """
     Detect 'other' cell types from metadata column names.

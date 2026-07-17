@@ -4,8 +4,6 @@ import time
 import numpy as np
 import pandas as pd
 
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from matplotlib.backends.backend_agg import FigureCanvasAgg

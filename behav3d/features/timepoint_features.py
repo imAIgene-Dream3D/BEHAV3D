@@ -186,7 +186,7 @@ import time
 import traceback
 from behav3d.analysis import smooth_value_over_time
 from behav3d.core.utils import get_current_time, format_time, convert_time, convert_distance
-from behav3d.core.metadata import is_multicolor_celltype
+from behav3d.core.metadata import is_multicolor_celltype, resolve_immune_track_paths_for_sample
 from behav3d.io.images import load_image, load_image_timepoint, convert_raw_file_to_zarr
 from tqdm import tqdm
 from datetime import datetime
@@ -556,17 +556,16 @@ def run_feature_extraction(
                         if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
                             organoid_segments_paths[organoid_type] = sample_metadata[col]
             
-            # Dynamically collect ALL immune cell types' paths (for contact calculation)
-            immune_segments_paths = {}
-            for col in sample_metadata.index:
-                if col.startswith('im_') and col.endswith('_tracks_image_path'):
-                    parts = col.split('_')
-                    if len(parts) >= 4:
-                        immune_type = '_'.join(parts[1:-3])
-                        if is_multicolor_celltype(immune_type):
-                            continue
-                        if pd.notna(sample_metadata[col]) and Path(sample_metadata[col]).exists():
-                            immune_segments_paths[immune_type] = sample_metadata[col]
+            # Dynamically collect ALL immune cell types' paths (for contact
+            # calculation and dead-mask cleaning). Shares its detection logic
+            # with the death-threshold preview via
+            # resolve_immune_track_paths_for_sample so the two can never
+            # disagree about which types count as immune.
+            immune_segments_paths = {
+                immune_type: path_val
+                for immune_type, path_val in resolve_immune_track_paths_for_sample(sample_metadata).items()
+                if Path(path_val).exists()
+            }
             
             # Dynamically collect ALL other cell types' paths (for contact calculation)
             other_segments_paths = {}

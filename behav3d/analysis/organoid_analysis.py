@@ -39,6 +39,7 @@ def run_organoid_analysis(
     df_tracks_path=None,
     org_type="organoid",
     group_cols=None,
+    show_in_notebook=True,
     # df_tracks_summarized_path=None,
     ):
     print(f"--------------- Performing {org_type} Death Dynamics analysis ---------------")
@@ -243,6 +244,7 @@ def run_organoid_analysis(
             group_cols=group_cols if has_condition_groups else None,
             color_map=condition_color_map,
             group_sample_counts=group_sample_counts,
+            show_in_notebook=show_in_notebook,
             )
     
     ## TODO PLOT A STACKED BARPLOT OVER TIME WHERE THE TOTAL BAR IS 
@@ -936,6 +938,12 @@ def _draw_end_state_barplot_panel(ax, df_general):
     if "percentage_dead" not in df_end.columns:
         df_end["percentage_dead"] = 1.0 - df_end["percentage_alive"]
 
+    if df_end.empty:
+        ax.text(0.5, 0.5, "No organoids detected at experiment end",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.axis("off")
+        return
+
     plot_cols = ["percentage_alive", "percentage_dead", "percentage_disappeared"]
 
     df_end.set_index("sample_name")[plot_cols].plot(
@@ -981,6 +989,7 @@ def plot_general_organoid_analysis(
     group_cols=None,
     color_map=None,
     group_sample_counts=None,
+    show_in_notebook=True,
     ):
 
     has_grouped_dead = df_dead_at_t_grouped is not None and len(df_dead_at_t_grouped) > 0
@@ -1008,7 +1017,8 @@ def plot_general_organoid_analysis(
             ax_top.set_ylim(0, 1.05)
             ax_top.set_xlim(0)
             fig1.subplots_adjust(left=0.10, right=0.55, top=0.90, bottom=0.08)
-            plt.show()
+            if show_in_notebook:
+                plt.show()
             pdf.savefig(fig1, bbox_inches="tight")
             plt.close(fig1)
 
@@ -1018,7 +1028,8 @@ def plot_general_organoid_analysis(
             _draw_persample_percentage_dead_panel(fig2.add_subplot(gs2[0]), df_general)
             _draw_end_state_barplot_panel(fig2.add_subplot(gs2[1]), df_general)
             fig2.subplots_adjust(left=0.10, right=0.78, top=0.90, bottom=0.10)
-            plt.show()
+            if show_in_notebook:
+                plt.show()
             pdf.savefig(fig2, bbox_inches="tight")
             plt.close(fig2)
         else:
@@ -1044,7 +1055,8 @@ def plot_general_organoid_analysis(
                 right_margin = 0.78
 
             fig.subplots_adjust(left=0.10, right=right_margin, top=0.91, bottom=0.06)
-            plt.show()
+            if show_in_notebook:
+                plt.show()
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
@@ -1589,6 +1601,7 @@ def plot_multi_organoid_death_dynamics(
     organoid_types,
     figsize=(12, 10),
     dead_perc_threshold_map=None,
+    show_in_notebook=True,
     ):
     """
     Generate comparison plots for death dynamics across multiple organoid types.
@@ -1834,7 +1847,8 @@ def plot_multi_organoid_death_dynamics(
         )
         
         plt.tight_layout()
-        plt.show()
+        if show_in_notebook:
+            plt.show()
         pdf.savefig(fig1, bbox_inches='tight')
         plt.close(fig1)
         
@@ -1889,7 +1903,8 @@ def plot_multi_organoid_death_dynamics(
         )
         
         plt.tight_layout()
-        plt.show()
+        if show_in_notebook:
+            plt.show()
         pdf.savefig(fig2, bbox_inches='tight')
         plt.close(fig2)
 
@@ -2485,7 +2500,8 @@ def plot_multi_organoid_death_dynamics(
             orig_dpi = fig_combo.get_dpi()
             if screen_show_scale != 1.0:
                 fig_combo.set_dpi(orig_dpi * screen_show_scale)
-            plt.show()
+            if show_in_notebook:
+                plt.show()
             if screen_show_scale != 1.0:
                 fig_combo.set_dpi(orig_dpi)
 
@@ -2533,6 +2549,7 @@ def run_organoid_morphology_dead_analysis(
     distance_metric = "euclidean",
     leiden_resolution=1.0,
     metadata=None,
+    show_in_notebook=True,
 ):
     """
     Initial Morphology Related to Death: PCA + Leiden + UMAP
@@ -3069,7 +3086,8 @@ def run_organoid_morphology_dead_analysis(
             ax.text(0.5, 0.5, "No features for heatmap", ha="center", va="center")
             ax.axis("off")
         pdf.savefig(fig, dpi=600)
-        plt.show()
+        if show_in_notebook:
+            plt.show()
         plt.close(fig)
 
         # Other pages: violin plots
@@ -3598,7 +3616,8 @@ def run_organoid_morphology_dead_analysis(
                 ax.grid(True, axis="y", linestyle=":", linewidth=0.5, alpha=0.5)
                 plt.tight_layout()
                 pdf.savefig(fig, bbox_inches="tight")
-                plt.show()
+                if show_in_notebook:
+                    plt.show()
                 plt.close(fig)
 
     print(f"  Composition PDF saved to: {comp_pdf_path}")

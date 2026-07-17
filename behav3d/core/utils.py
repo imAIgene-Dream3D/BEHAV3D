@@ -137,6 +137,33 @@ def hours_per_frame_from_metadata(metadata):
         return 1.0, False
 
 
+_TIME_UNIT_DISPLAY_NAMES = {"s": "seconds", "m": "minutes", "h": "hours"}
+
+
+def format_timepoints_as_time(n_timepoints, metadata):
+    """Return ``"= <value> <unit>"`` for ``n_timepoints`` converted to real time.
+
+    Uses the first sample row's ``time_interval``/``time_unit`` metadata
+    columns (mirroring :func:`hours_per_frame_from_metadata`), without
+    forcing a conversion to hours: the value stays in whatever unit the
+    metadata specifies (e.g. 3 timepoints at time_interval=2, time_unit="m"
+    -> "= 6 minutes"). Returns "" when metadata is missing/unusable.
+    """
+    try:
+        if metadata is None or len(metadata) == 0:
+            return ""
+        if "time_interval" not in metadata.columns or "time_unit" not in metadata.columns:
+            return ""
+        interval = float(metadata["time_interval"].iloc[0])
+        unit = str(metadata["time_unit"].iloc[0])
+        if not np.isfinite(interval) or interval <= 0 or unit not in _TIME_UNIT_DISPLAY_NAMES:
+            return ""
+        total = float(n_timepoints) * interval
+        return f"= {total:g} {_TIME_UNIT_DISPLAY_NAMES[unit]}"
+    except Exception:
+        return ""
+
+
 def element_to_dict(element):
     """
     Convert an ElementTree Element object to a dictionary.

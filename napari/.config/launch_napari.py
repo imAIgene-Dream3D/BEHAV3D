@@ -39,7 +39,7 @@ def run_napari_payload():
         sys.exit(1)
 
     # Create the viewer
-    window_title = "BEHAV3D"
+    window_title = "BEHAV3D Explorer"
     if os.environ.get("BEHAV3D_DEV_MODE") == "1":
         window_title += " [DEV MODE]"
     viewer = napari.Viewer(title=window_title)
