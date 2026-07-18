@@ -440,6 +440,87 @@ spinning_loader = (
 )
 
 # ===============================
+# ROW REORDER BUTTONS
+# ===============================
+def build_row_move_buttons(on_move_up, on_move_down):
+    """Small stacked up/down buttons for reordering a row within a list of rows."""
+    up = widgets.Button(
+        icon="chevron-up", tooltip="Move up",
+        layout=widgets.Layout(width="26px", height="17px", padding="0px"),
+    )
+    down = widgets.Button(
+        icon="chevron-down", tooltip="Move down",
+        layout=widgets.Layout(width="26px", height="17px", padding="0px"),
+    )
+    up.on_click(lambda _btn: on_move_up())
+    down.on_click(lambda _btn: on_move_down())
+    return widgets.VBox([up, down], layout=widgets.Layout(gap="0px"))
+
+
+# ===============================
+# PLOT ACTION BOX
+# ===============================
+def build_plot_box(title, description, run_row, settings=None, extra=None, output=None):
+    """Build a collapsible plot box in the same visual style as the workflow-step accordions.
+
+    Parameters
+    ----------
+    title : str
+        Plot name, shown as the accordion header.
+    description : str
+        Plain-text "what does this plot?" explanation, shown once the box is expanded.
+    run_row : widgets.Widget
+        The always-visible run control (typically ``HBox([button, spinner])``).
+    settings : list[widgets.Widget] or None
+        Parameter widgets for this plot. Hidden behind a "Settings" toggle until clicked,
+        rather than always shown inline.
+    extra : list[widgets.Widget] or None
+        Additional always-visible widgets (e.g. status/warning text) shown between the
+        description and the run row.
+    output : widgets.Output or None
+        Output area appended at the end of the box.
+
+    Returns
+    -------
+    widgets.Accordion
+        A single-section, initially-collapsed accordion titled ``title``.
+    """
+    children = [widgets.HTML(f"<span style='color:#555;'>{description}</span>")]
+    children.extend(extra or [])
+
+    if settings:
+        settings_toggle = widgets.ToggleButton(
+            value=False,
+            description="Settings",
+            icon="cog",
+            layout=widgets.Layout(width="110px"),
+        )
+        settings_panel = widgets.VBox(
+            list(settings),
+            layout=widgets.Layout(display="none", margin="6px 0 0 0"),
+        )
+
+        def _on_settings_toggle(change, panel=settings_panel):
+            panel.layout.display = "" if change["new"] else "none"
+
+        settings_toggle.observe(_on_settings_toggle, names="value")
+        children.append(
+            widgets.HBox([run_row, settings_toggle], layout=widgets.Layout(align_items="center", gap="8px"))
+        )
+        children.append(settings_panel)
+    else:
+        children.append(run_row)
+
+    if output is not None:
+        children.append(output)
+
+    box = widgets.VBox(children)
+    acc = widgets.Accordion(children=[box], selected_index=None)
+    acc.set_title(0, title)
+    return acc
+
+
+# ===============================
 # HELPER FUNCTIONS
 # ===============================
 def build_feature_distribution_figure(csv_path, feats, title=None, max_plots=36):

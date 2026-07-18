@@ -29,8 +29,8 @@ def _resolve_dtaidistance_paths(output_dir, cell_type, output_subdir_name="behav
     outfolder = analysis_outdir / str(output_subdir_name)
     clustering_outfolder = outfolder / "clustering"
     quality_control_outfolder = outfolder / "quality_control"
+    behavior_proportions_outfolder = outfolder / "behavior_proportions"
     outfolder.mkdir(parents=True, exist_ok=True)
-    clustering_outfolder.mkdir(parents=True, exist_ok=True)
     quality_control_outfolder.mkdir(parents=True, exist_ok=True)
     return {
         "root": root,
@@ -39,6 +39,7 @@ def _resolve_dtaidistance_paths(output_dir, cell_type, output_subdir_name="behav
         "outfolder": outfolder,
         "clustering_outfolder": clustering_outfolder,
         "quality_control_outfolder": quality_control_outfolder,
+        "behavior_proportions_outfolder": behavior_proportions_outfolder,
     }
 
 

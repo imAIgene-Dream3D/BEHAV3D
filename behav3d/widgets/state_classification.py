@@ -23,13 +23,16 @@ from behav3d.analysis.behavior.state.classification import (
     run_hmm_state_clustering,
 )
 from behav3d.analysis.behavior.state.utils import (
+    _apply_state_order,
     _coerce_hex_color,
     _get_classification_state_colors,
+    _get_classification_state_order,
     _mixed_label_sort_key,
     _normalize_label_color_map,
     _rebuild_full_behavioral_cluster_from_intrinsic,
     _resolve_state_paths,
     _set_classification_state_colors,
+    _set_classification_state_order,
 )
 
 from behav3d.analysis.behavior.state.visualization.backprojection import (
@@ -44,7 +47,9 @@ from behav3d.core.metadata import (
 )
 from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
     save_state_composition_report,
+    save_state_condition_comparison_report,
 )
+from behav3d.analysis.behavior.utils import _sanitize_filename_token
 from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
     save_state_transition_report,
 )
@@ -69,7 +74,7 @@ from behav3d.analysis.behavior.state.visualization.backprojection import (
     _resolve_tracked_image_path,
 )
 from behav3d.io.images import load_image
-from behav3d.widgets.utils import spinning_loader
+from behav3d.widgets.utils import build_plot_box, build_row_move_buttons, spinning_loader
 
 
 _TIME_UNIT_DISPLAY_NAMES = {"s": "seconds", "m": "minutes", "h": "hours"}
@@ -1416,35 +1421,89 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         self.btn_create_state_transition_plots.on_click(self._on_create_state_transition_plots_clicked)
         self.state_transition_spinner = widgets.HTML(value=spinning_loader)
         self.state_transition_spinner.layout.display = "none"
+        self.comparison_condition_col_dd = widgets.Dropdown(
+            options=[], description="Comparison condition:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.comparison_level_a_dd = widgets.Dropdown(
+            options=[], description="", layout=widgets.Layout(width="160px"), disabled=True,
+        )
+        self.comparison_level_b_dd = widgets.Dropdown(
+            options=[], description="", layout=widgets.Layout(width="160px"), disabled=True,
+        )
+        self.comparison_facet_col_dd = widgets.Dropdown(
+            options=["(none)"], value="(none)", description="Group by condition:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.comparison_condition_col_dd.observe(self._on_comparison_condition_col_changed, names="value")
+        self.btn_create_condition_comparison = widgets.Button(
+            description="Create condition comparison plot",
+            button_style="info",
+            layout=widgets.Layout(width="260px"),
+            disabled=True,
+        )
+        self.btn_create_condition_comparison.on_click(self._on_create_condition_comparison_clicked)
+        self.condition_comparison_spinner = widgets.HTML(value=spinning_loader)
+        self.condition_comparison_spinner.layout.display = "none"
         self.out_analysis_plots = widgets.Output()
-        self.analysis_plots_section = widgets.VBox(
-            [
-                self.analysis_plots_status,
+
+        state_composition_box = build_plot_box(
+            title="State composition plots",
+            description=(
+                "Summarizes how full behavioral clusters are distributed per sample "
+                "and in pooled overviews across time."
+            ),
+            run_row=widgets.HBox(
+                [self.btn_create_state_composition_plots, self.state_composition_spinner],
+                layout=widgets.Layout(align_items="center", gap="8px"),
+            ),
+            settings=[
                 widgets.HTML(
-                    "<b>State composition plots</b><br>"
-                    "<span style='color:#555;'>Summarizes how full behavioral clusters are distributed per sample "
-                    "and in pooled overviews across time.</span>"
-                ),
-                widgets.HBox(
-                    [self.btn_create_state_composition_plots, self.state_composition_spinner],
-                    layout=widgets.Layout(align_items="center", gap="8px"),
-                ),
-                widgets.HTML(
-                    "<b>Group composition plots by:</b><br>"
-                    "<span style='color:#555;'>Select metadata columns to pool samples into groups for an "
-                    "additional grouped-composition page in the PDF. "
+                    "<b>Group by condition:</b><br>"
+                    "<span style='color:#555;font-size:11px;'>Select metadata columns to pool samples into "
+                    "groups for an additional grouped-composition page in the PDF. "
                     "Hold Ctrl/Cmd to select multiple.</span>"
                 ),
                 self.composition_group_cols_select,
-                widgets.HTML(
-                    "<b>State transition plots</b><br>"
-                    "<span style='color:#555;'>Builds transition matrices and transition summaries between full "
-                    "behavioral clusters along tracks.</span>"
-                ),
+            ],
+        )
+        state_transition_box = build_plot_box(
+            title="State transition plots",
+            description=(
+                "Builds transition matrices and transition summaries between full "
+                "behavioral clusters along tracks."
+            ),
+            run_row=widgets.HBox(
+                [self.btn_create_state_transition_plots, self.state_transition_spinner],
+                layout=widgets.Layout(align_items="center", gap="8px"),
+            ),
+        )
+        condition_comparison_box = build_plot_box(
+            title="Condition comparison plot",
+            description=(
+                "Per-cluster overall proportion difference between two levels of a condition "
+                "(Welch's t-test), optionally split into separate plots by another condition's values."
+            ),
+            run_row=widgets.HBox(
+                [self.btn_create_condition_comparison, self.condition_comparison_spinner],
+                layout=widgets.Layout(align_items="center", gap="8px"),
+            ),
+            settings=[
+                self.comparison_condition_col_dd,
                 widgets.HBox(
-                    [self.btn_create_state_transition_plots, self.state_transition_spinner],
-                    layout=widgets.Layout(align_items="center", gap="8px"),
+                    [self.comparison_level_a_dd, widgets.HTML("<b>&nbsp;vs&nbsp;</b>"), self.comparison_level_b_dd],
+                    layout=widgets.Layout(align_items="center", gap="4px"),
                 ),
+                self.comparison_facet_col_dd,
+            ],
+        )
+
+        self.analysis_plots_section = widgets.VBox(
+            [
+                self.analysis_plots_status,
+                state_composition_box,
+                state_transition_box,
+                condition_comparison_box,
                 self.out_analysis_plots,
             ]
         )
@@ -2056,6 +2115,8 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
     def _rebuild_intrinsic_rename_rows(self):
         self._intrinsic_name_boxes = {}
         self._intrinsic_select_boxes = {}
+        self._intrinsic_row_widgets = {}
+        self._intrinsic_row_order = []
         self.intrinsic_combine_name.value = ""
         if self.model_adata is None or INTRINSIC_STATE_COL not in self.model_adata.obs.columns:
             self.rename_intrinsic_rows.children = []
@@ -2088,33 +2149,56 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             self.model_adata,
             cluster_col=INTRINSIC_STATE_COL,
         )
-        rows = []
-        for old_name in mapping.keys():
+        saved_order = _get_classification_state_order(self.model_adata, INTRINSIC_STATE_COL)
+        self._intrinsic_row_order = _apply_state_order(list(mapping.keys()), saved_order)
+        for old_name in self._intrinsic_row_order:
+            old_name = str(old_name)
             sel = widgets.Checkbox(
                 value=False,
                 description="",
                 indent=False,
                 layout=widgets.Layout(width="26px"),
             )
-            txt = widgets.Text(value=str(old_name), layout=widgets.Layout(width="280px"))
-            self._intrinsic_select_boxes[str(old_name)] = sel
-            self._intrinsic_name_boxes[str(old_name)] = txt
-            rows.append(
-                widgets.HBox(
-                    [sel, widgets.Label(str(old_name), layout=widgets.Layout(width="200px")), txt],
-                    layout=widgets.Layout(align_items="center", gap="8px"),
-                )
+            txt = widgets.Text(value=old_name, layout=widgets.Layout(width="280px"))
+            self._intrinsic_select_boxes[old_name] = sel
+            self._intrinsic_name_boxes[old_name] = txt
+            move_btns = build_row_move_buttons(
+                on_move_up=lambda n=old_name: self._move_intrinsic_row(n, -1),
+                on_move_down=lambda n=old_name: self._move_intrinsic_row(n, 1),
             )
-        self.rename_intrinsic_rows.children = rows
-        self.rename_intrinsic_status.value = f"<b>Intrinsic HMM states:</b> {len(rows)}"
+            self._intrinsic_row_widgets[old_name] = widgets.HBox(
+                [move_btns, sel, widgets.Label(old_name, layout=widgets.Layout(width="190px")), txt],
+                layout=widgets.Layout(align_items="center", gap="8px"),
+            )
+        self._refresh_intrinsic_row_children()
+        self.rename_intrinsic_status.value = f"<b>Intrinsic HMM states:</b> {len(self._intrinsic_row_order)}"
         self.btn_rename_intrinsic.disabled = False
         self.btn_combine_intrinsic.disabled = False
         self.intrinsic_combine_name.disabled = False
+
+    def _refresh_intrinsic_row_children(self):
+        self.rename_intrinsic_rows.children = [
+            self._intrinsic_row_widgets[n] for n in self._intrinsic_row_order if n in self._intrinsic_row_widgets
+        ]
+
+    def _move_intrinsic_row(self, old_name, delta):
+        order = self._intrinsic_row_order
+        old_name = str(old_name)
+        if old_name not in order:
+            return
+        idx = order.index(old_name)
+        new_idx = idx + delta
+        if not (0 <= new_idx < len(order)):
+            return
+        order[idx], order[new_idx] = order[new_idx], order[idx]
+        self._refresh_intrinsic_row_children()
 
     def _rebuild_full_rename_rows(self):
         self._full_select_boxes = {}
         self._full_name_boxes = {}
         self._full_color_pickers = {}
+        self._full_row_widgets = {}
+        self._full_row_order = []
         self.rename_full_rows.layout = widgets.Layout(width="660px")
         self.full_combine_name.value = ""
         if self.model_adata is None or FULL_STATE_COL not in self.model_adata.obs.columns:
@@ -2130,42 +2214,58 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             cluster_col=FULL_STATE_COL,
         )
         state_colors = self._ensure_full_state_colors(labels=list(mapping.keys()), write=True)
-        rows = []
-        for old_name in mapping.keys():
+        saved_order = _get_classification_state_order(self.model_adata, FULL_STATE_COL)
+        self._full_row_order = _apply_state_order(list(mapping.keys()), saved_order)
+        for old_name in self._full_row_order:
+            old_name = str(old_name)
             sel = widgets.Checkbox(
                 value=False,
                 description="",
                 indent=False,
                 layout=widgets.Layout(width="26px"),
             )
-            txt = widgets.Text(value=str(old_name), layout=widgets.Layout(width="280px"))
+            txt = widgets.Text(value=old_name, layout=widgets.Layout(width="280px"))
             color = widgets.ColorPicker(
-                value=str(state_colors.get(str(old_name), "#808080")),
+                value=str(state_colors.get(old_name, "#808080")),
                 concise=True,
                 layout=widgets.Layout(width="70px"),
             )
-            self._full_select_boxes[str(old_name)] = sel
-            self._full_name_boxes[str(old_name)] = txt
-            self._full_color_pickers[str(old_name)] = color
-            rows.append(
-                widgets.HBox(
-                    [
-                        sel,
-                        widgets.Label(str(old_name), layout=widgets.Layout(width="200px")),
-                        txt,
-                        color,
-                    ],
-                    layout=widgets.Layout(align_items="center", gap="8px"),
-                )
+            self._full_select_boxes[old_name] = sel
+            self._full_name_boxes[old_name] = txt
+            self._full_color_pickers[old_name] = color
+            move_btns = build_row_move_buttons(
+                on_move_up=lambda n=old_name: self._move_full_row(n, -1),
+                on_move_down=lambda n=old_name: self._move_full_row(n, 1),
             )
-        self.rename_full_rows.children = rows
+            self._full_row_widgets[old_name] = widgets.HBox(
+                [move_btns, sel, widgets.Label(old_name, layout=widgets.Layout(width="190px")), txt, color],
+                layout=widgets.Layout(align_items="center", gap="8px"),
+            )
+        self._refresh_full_row_children()
         self.rename_full_status.value = (
-            f"<b>HMM states assigned to binary groups:</b> {len(rows)} "
+            f"<b>HMM states assigned to binary groups:</b> {len(self._full_row_order)} "
             "(observed combinations from training data)"
         )
         self.btn_rename_full.disabled = False
         self.btn_combine_full.disabled = False
         self.full_combine_name.disabled = False
+
+    def _refresh_full_row_children(self):
+        self.rename_full_rows.children = [
+            self._full_row_widgets[n] for n in self._full_row_order if n in self._full_row_widgets
+        ]
+
+    def _move_full_row(self, old_name, delta):
+        order = self._full_row_order
+        old_name = str(old_name)
+        if old_name not in order:
+            return
+        idx = order.index(old_name)
+        new_idx = idx + delta
+        if not (0 <= new_idx < len(order)):
+            return
+        order[idx], order[new_idx] = order[new_idx], order[idx]
+        self._refresh_full_row_children()
 
     def _apply_intrinsic_rename_mapping(self, mapping, save_compression="lzf"):
         if self.model_adata is None:
@@ -2196,6 +2296,10 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             keep_unmapped=True,
             overwrite_original=True,
         )
+        new_intrinsic_order = list(dict.fromkeys(
+            normalized_mapping.get(n, n) for n in getattr(self, "_intrinsic_row_order", [])
+        ))
+        _set_classification_state_order(self.model_adata, INTRINSIC_STATE_COL, new_intrinsic_order)
         clustering_meta = self.model_adata.uns.get("clustering", {})
         binary_group_constraints = None
         enforce_binary_group_constraints = False
@@ -2208,6 +2312,11 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         binary_cols_to_merge = self._selected_binary_columns()
         if len(binary_cols_to_merge) == 0 and isinstance(clustering_meta, dict):
             binary_cols_to_merge = [str(c) for c in list(clustering_meta.get("binary_cols_to_merge", []) or [])]
+        old_full_labels = (
+            self.model_adata.obs[FULL_STATE_COL].astype(str).copy()
+            if FULL_STATE_COL in self.model_adata.obs.columns
+            else None
+        )
         _rebuild_full_behavioral_cluster_from_intrinsic(
             adata=self.model_adata,
             binary_cols_to_merge=binary_cols_to_merge,
@@ -2222,7 +2331,37 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                 dtype="string",
             )
         )
+        adata_full = getattr(self, "adata_full", None)
+        if adata_full is not None and INTRINSIC_STATE_COL in getattr(adata_full, "obs", {}).columns:
+            relabel_cluster_ids(
+                adata=adata_full,
+                mapping=normalized_mapping,
+                cluster_key=INTRINSIC_STATE_COL,
+                new_key=INTRINSIC_STATE_COL,
+                keep_unmapped=True,
+                overwrite_original=True,
+            )
+        if (
+            adata_full is not None
+            and old_full_labels is not None
+            and FULL_STATE_COL in getattr(adata_full, "obs", {}).columns
+        ):
+            new_full_labels = self.model_adata.obs[FULL_STATE_COL].astype(str)
+            derived_full_mapping = dict(zip(old_full_labels.tolist(), new_full_labels.tolist()))
+            relabel_cluster_ids(
+                adata=adata_full,
+                mapping=derived_full_mapping,
+                cluster_key=FULL_STATE_COL,
+                overwrite_original=True,
+                keep_unmapped=True,
+            )
         self._ensure_full_state_colors(write=True)
+        if adata_full is not None and FULL_STATE_COL in getattr(adata_full, "obs", {}).columns:
+            _set_classification_state_colors(
+                adata_full,
+                FULL_STATE_COL,
+                _get_classification_state_colors(self.model_adata, FULL_STATE_COL),
+            )
         self._invalidate_curated_state_reports(
             reason="State reports were cleared after curated HMM renaming. Recreate them from 'Create analysis plots'."
         )
@@ -2274,14 +2413,25 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             prefer_pickers=False,
         )
         remapped_colors = self._remap_full_state_colors(normalized_mapping, existing_labels)
+        new_full_order = list(dict.fromkeys(
+            normalized_mapping.get(n, n) for n in getattr(self, "_full_row_order", [])
+        ))
         has_changes = any(
             str(normalized_mapping.get(label, label)) != str(label)
             for label in existing_labels
         )
         color_changes = dict(saved_colors) != dict(remapped_colors)
+        adata_full = getattr(self, "adata_full", None)
+        adata_full_has_full_state = (
+            adata_full is not None and FULL_STATE_COL in getattr(adata_full, "obs", {}).columns
+        )
         if not has_changes:
             if color_changes:
                 _set_classification_state_colors(self.model_adata, FULL_STATE_COL, remapped_colors)
+                _set_classification_state_order(self.model_adata, FULL_STATE_COL, new_full_order)
+                if adata_full_has_full_state:
+                    _set_classification_state_colors(adata_full, FULL_STATE_COL, remapped_colors)
+                    _set_classification_state_order(adata_full, FULL_STATE_COL, new_full_order)
                 yaml_path = self._write_cluster_name_mappings_yaml(latest_full_mapping=normalized_mapping)
                 self._rebuild_full_rename_rows()
                 result = {"changed": True, "colors_changed": True, "mapping_yaml_path": str(yaml_path)}
@@ -2295,7 +2445,18 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                 overwrite_original=True,
                 keep_unmapped=True,
             )
+            if adata_full_has_full_state:
+                relabel_cluster_ids(
+                    adata=adata_full,
+                    mapping=normalized_mapping,
+                    cluster_key=FULL_STATE_COL,
+                    overwrite_original=True,
+                    keep_unmapped=True,
+                )
+                _set_classification_state_colors(adata_full, FULL_STATE_COL, remapped_colors)
+                _set_classification_state_order(adata_full, FULL_STATE_COL, new_full_order)
             _set_classification_state_colors(self.model_adata, FULL_STATE_COL, remapped_colors)
+            _set_classification_state_order(self.model_adata, FULL_STATE_COL, new_full_order)
             yaml_path = self._write_cluster_name_mappings_yaml(latest_full_mapping=normalized_mapping)
             self._rebuild_full_rename_rows()
             result = {"changed": True, "colors_changed": bool(color_changes), "mapping_yaml_path": str(yaml_path)}
@@ -2379,6 +2540,31 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         ]
         return cols
 
+    def _metadata_column_unique_values(self, col):
+        md = getattr(self.metadata_loader, "metadata", None)
+        if md is None or col not in getattr(md, "columns", []):
+            return []
+        return sorted(md[col].dropna().astype(str).unique().tolist())
+
+    def _refresh_comparison_level_options(self):
+        col = self.comparison_condition_col_dd.value
+        values = self._metadata_column_unique_values(col) if col else []
+        for dd in (self.comparison_level_a_dd, self.comparison_level_b_dd):
+            prev = dd.value
+            dd.options = values
+            if prev in values:
+                dd.value = prev
+            elif values:
+                dd.value = values[0]
+            dd.disabled = len(values) < 2
+        if len(values) >= 2:
+            self.comparison_level_a_dd.value = values[0]
+            self.comparison_level_b_dd.value = values[1]
+
+    def _on_comparison_condition_col_changed(self, change):
+        if change.get("name") == "value":
+            self._refresh_comparison_level_options()
+
     def _refresh_analysis_plots_status(self):
         if not hasattr(self, "analysis_plots_status"):
             return
@@ -2425,6 +2611,26 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                 self.composition_group_cols_select.value = [c for c in candidate_cols if c in prev]
             self.composition_group_cols_select.disabled = len(candidate_cols) == 0
 
+        if hasattr(self, "comparison_condition_col_dd"):
+            candidate_cols = self._metadata_grouping_columns()
+            if candidate_cols != list(self.comparison_condition_col_dd.options):
+                prev_cond = self.comparison_condition_col_dd.value
+                self.comparison_condition_col_dd.options = candidate_cols
+                if prev_cond in candidate_cols:
+                    self.comparison_condition_col_dd.value = prev_cond
+                elif candidate_cols:
+                    self.comparison_condition_col_dd.value = candidate_cols[0]
+            self.comparison_condition_col_dd.disabled = len(candidate_cols) == 0
+
+            facet_options = ["(none)"] + candidate_cols
+            if facet_options != list(self.comparison_facet_col_dd.options):
+                prev_facet = self.comparison_facet_col_dd.value
+                self.comparison_facet_col_dd.options = facet_options
+                self.comparison_facet_col_dd.value = prev_facet if prev_facet in facet_options else "(none)"
+            self.comparison_facet_col_dd.disabled = len(candidate_cols) == 0
+            self._refresh_comparison_level_options()
+            self.btn_create_condition_comparison.disabled = len(candidate_cols) == 0
+
     def _regenerate_curated_state_reports(
         self,
         verbose=False,
@@ -2454,6 +2660,17 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         if not isinstance(clustering_meta, dict):
             clustering_meta = {}
         full_state_colors = self._current_full_state_color_mapping(write=True)
+        if adata_for_plots is not self.model_adata and FULL_STATE_COL in getattr(adata_for_plots, "obs", {}).columns:
+            observed_labels = set(
+                pd.Series(adata_for_plots.obs[FULL_STATE_COL]).dropna().astype(str).unique().tolist()
+            )
+            missing_colors = sorted(observed_labels - set(full_state_colors.keys()))
+            if missing_colors:
+                print(
+                    f"  Warning: {len(missing_colors)} state label(s) in adata_full have no matching saved "
+                    f"color (falling back to defaults): {missing_colors[:10]}"
+                    f"{'...' if len(missing_colors) > 10 else ''}"
+                )
 
         composition_pdf = clustering_meta.get("state_composition_report_pdf", None)
         composition_auc_csv = clustering_meta.get("state_composition_report_auc_csv", None)
@@ -2594,6 +2811,64 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             finally:
                 self._set_busy(self.btn_create_state_transition_plots, self.state_transition_spinner, busy=False)
                 self._refresh_enablement()
+
+    def _on_create_condition_comparison_clicked(self, _):
+        self._set_busy(self.btn_create_condition_comparison, self.condition_comparison_spinner, busy=True)
+        self.out_analysis_plots.clear_output()
+        with self.out_analysis_plots:
+            try:
+                condition_col = self.comparison_condition_col_dd.value
+                level_a = self.comparison_level_a_dd.value
+                level_b = self.comparison_level_b_dd.value
+                facet_col = self.comparison_facet_col_dd.value
+                facet_col = None if facet_col in (None, "(none)") else facet_col
+                if not condition_col or level_a is None or level_b is None:
+                    raise ValueError("Select a condition column and two levels to compare.")
+                if str(level_a) == str(level_b):
+                    raise ValueError("Level A and Level B must be different.")
+
+                adata_for_plots = (
+                    self.adata_full
+                    if (
+                        getattr(self, "adata_full", None) is not None
+                        and FULL_STATE_COL in getattr(self.adata_full, "obs", {}).columns
+                    )
+                    else self.model_adata
+                )
+                if adata_for_plots is None or FULL_STATE_COL not in getattr(adata_for_plots, "obs", {}).columns:
+                    raise ValueError("No model adata loaded.")
+
+                full_state_colors = self._current_full_state_color_mapping(write=True)
+                state_paths = _resolve_state_paths(self.output_dir, self._current_cell_type())
+                out_dir = Path(state_paths.state_composition_outdir) / "behavior_proportions"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                cond_token = _sanitize_filename_token(condition_col, fallback="condition")
+                a_token = _sanitize_filename_token(str(level_a), fallback="a")
+                b_token = _sanitize_filename_token(str(level_b), fallback="b")
+                out_pdf = out_dir / f"condition_comparison_{cond_token}_{a_token}_vs_{b_token}.pdf"
+                out_csv = out_pdf.with_suffix(".csv")
+
+                result = save_state_condition_comparison_report(
+                    adata=adata_for_plots,
+                    output_pdf_path=out_pdf,
+                    output_csv_path=out_csv,
+                    state_col=FULL_STATE_COL,
+                    sample_col="sample_name",
+                    condition_col=condition_col,
+                    level_a=level_a,
+                    level_b=level_b,
+                    facet_col=facet_col,
+                    state_colors=full_state_colors,
+                    verbose=True,
+                )
+                _winfo(
+                    "state-hmm-widget",
+                    f"Created condition comparison plot: {result.get('pdf_path', out_pdf)}",
+                )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_create_condition_comparison, self.condition_comparison_spinner, busy=False)
 
     def _on_cluster_clicked(self, _):
         self._set_busy(self.btn_cluster, self.cluster_spinner, busy=True)

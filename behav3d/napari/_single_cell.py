@@ -812,6 +812,34 @@ class StateClassificationSubTab(QWidget):
         self.btn_view_transition = _make_view_btn()
         trans_row.addWidget(self.btn_view_transition)
         g3.addLayout(trans_row)
+
+        g3.addWidget(QLabel("Condition comparison (overall proportions, Welch's t-test):"))
+        comparison_form = QFormLayout()
+        comparison_form.setSpacing(3)
+        self.combo_comparison_condition_col = QComboBox()
+        self.combo_comparison_condition_col.setMinimumWidth(200)
+        self.combo_comparison_condition_col.currentTextChanged.connect(
+            self._on_comparison_condition_col_changed
+        )
+        comparison_form.addRow("Condition:", self.combo_comparison_condition_col)
+        self.combo_comparison_level_a = QComboBox()
+        self.combo_comparison_level_a.setMinimumWidth(200)
+        comparison_form.addRow("Level A:", self.combo_comparison_level_a)
+        self.combo_comparison_level_b = QComboBox()
+        self.combo_comparison_level_b.setMinimumWidth(200)
+        comparison_form.addRow("Level B:", self.combo_comparison_level_b)
+        self.combo_comparison_facet_col = QComboBox()
+        self.combo_comparison_facet_col.setMinimumWidth(200)
+        comparison_form.addRow("Facet by:", self.combo_comparison_facet_col)
+        g3.addLayout(comparison_form)
+        comparison_row = QHBoxLayout()
+        self.btn_condition_comparison = QPushButton("▶ Condition Comparison Report")
+        _style_secondary(self.btn_condition_comparison)
+        comparison_row.addWidget(self.btn_condition_comparison, stretch=1)
+        self.btn_view_condition_comparison = _make_view_btn()
+        comparison_row.addWidget(self.btn_view_condition_comparison)
+        g3.addLayout(comparison_row)
+
         lay.addWidget(self.grp3)
 
         # ── Step 4: Backprojection ───────────────────────────────────────
@@ -911,6 +939,8 @@ class StateClassificationSubTab(QWidget):
         self.btn_view_composition.clicked.connect(lambda: self._on_view("state_composition"))
         self.btn_state_transition.clicked.connect(self._on_state_transition)
         self.btn_view_transition.clicked.connect(lambda: self._on_view("state_transition"))
+        self.btn_condition_comparison.clicked.connect(self._on_condition_comparison)
+        self.btn_view_condition_comparison.clicked.connect(lambda: self._on_view("state_condition_comparison"))
         self.btn_browse_hmm.clicked.connect(self._browse_hmm_artifact)
         self.btn_apply_hmm.clicked.connect(self._on_apply_hmm)
         self.btn_show_state_bp.clicked.connect(self._on_show_state_bp)
@@ -1468,8 +1498,8 @@ class StateClassificationSubTab(QWidget):
 
         self._refresh_composition_group_cols()
 
-    def _refresh_composition_group_cols(self):
-        self.list_composition_group_cols.clear()
+    def _composition_candidate_columns(self):
+        cols = []
         added = set()
 
         # Prefer columns from the metadata CSV, but only surface the known
@@ -1478,7 +1508,7 @@ class StateClassificationSubTab(QWidget):
         if md is not None and hasattr(md, "columns"):
             for col in md.columns:
                 if col in ("exp_nr", "well") or col.endswith("_line_condition"):
-                    self.list_composition_group_cols.addItem(col)
+                    cols.append(col)
                     added.add(col)
 
         # Metadata CSV never carries per-cell columns like `origin_cell_type`
@@ -1490,24 +1520,75 @@ class StateClassificationSubTab(QWidget):
             ct = self._cell_type()
             full_path = self._full_adata_path(ct) if ct else None
             if not full_path or not full_path.exists():
-                return
+                return cols
             try:
                 import h5py
                 with h5py.File(str(full_path), "r") as f:
                     obs_cols = list(f.get("obs", {}).keys())
             except Exception:
-                return
+                return cols
         for col in obs_cols:
             if col in added or col.startswith("_") or col in _TECHNICAL_OBS_COLS:
                 continue
             if col in ("exp_nr", "well", "origin_cell_type") or col.endswith("_line_condition"):
-                self.list_composition_group_cols.addItem(col)
+                cols.append(col)
                 added.add(col)
+        return cols
+
+    def _metadata_column_unique_values(self, col):
+        md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+        if md is not None and col in getattr(md, "columns", []):
+            return sorted(md[col].dropna().astype(str).unique().tolist())
+        if self._model_adata is not None and col in self._model_adata.obs.columns:
+            return sorted(self._model_adata.obs[col].dropna().astype(str).unique().tolist())
+        return []
+
+    def _refresh_composition_group_cols(self):
+        candidate_cols = self._composition_candidate_columns()
+        self.list_composition_group_cols.clear()
+        for col in candidate_cols:
+            self.list_composition_group_cols.addItem(col)
+
+        prev_cond = self.combo_comparison_condition_col.currentText()
+        self.combo_comparison_condition_col.blockSignals(True)
+        self.combo_comparison_condition_col.clear()
+        self.combo_comparison_condition_col.addItems(candidate_cols)
+        if prev_cond in candidate_cols:
+            self.combo_comparison_condition_col.setCurrentText(prev_cond)
+        self.combo_comparison_condition_col.blockSignals(False)
+
+        prev_facet = self.combo_comparison_facet_col.currentText()
+        self.combo_comparison_facet_col.clear()
+        self.combo_comparison_facet_col.addItem("(none)")
+        self.combo_comparison_facet_col.addItems(candidate_cols)
+        self.combo_comparison_facet_col.setCurrentText(
+            prev_facet if prev_facet in (["(none)"] + candidate_cols) else "(none)"
+        )
+        self._refresh_comparison_level_options()
+
+    def _refresh_comparison_level_options(self):
+        col = self.combo_comparison_condition_col.currentText()
+        values = self._metadata_column_unique_values(col) if col else []
+        for combo in (self.combo_comparison_level_a, self.combo_comparison_level_b):
+            prev = combo.currentText()
+            combo.clear()
+            combo.addItems(values)
+            if prev in values:
+                combo.setCurrentText(prev)
+        if len(values) >= 2:
+            self.combo_comparison_level_a.setCurrentText(values[0])
+            self.combo_comparison_level_b.setCurrentText(values[1])
+
+    def _on_comparison_condition_col_changed(self, _text):
+        self._refresh_comparison_level_options()
 
     def _update_view_buttons(self):
         ct = self._cell_type()
         if not ct:
-            for btn in (self.btn_view_state, self.btn_view_composition, self.btn_view_transition):
+            for btn in (
+                self.btn_view_state, self.btn_view_composition, self.btn_view_transition,
+                self.btn_view_condition_comparison,
+            ):
                 btn.setEnabled(False)
             return
         model_path = self._model_adata_path(ct)
@@ -1516,6 +1597,9 @@ class StateClassificationSubTab(QWidget):
         self.btn_view_composition.setEnabled(bool(comp and comp.exists()))
         trans = self._report_path(ct, "state_transition_report")
         self.btn_view_transition.setEnabled(bool(trans and trans.exists()))
+        self.btn_view_condition_comparison.setEnabled(
+            len(self._get_view_candidates("state_condition_comparison", ct)) > 0
+        )
 
     def _update_bp_buttons(self):
         ct = self._cell_type()
@@ -1879,6 +1963,7 @@ class StateClassificationSubTab(QWidget):
                             .fillna("(unknown)")
                         )
 
+            from behav3d.analysis.behavior.state.utils import _get_classification_state_colors
             composition_dir = _resolve_state_paths(out, ct).state_composition_outdir
             composition_dir.mkdir(parents=True, exist_ok=True)
             return save_state_composition_report(
@@ -1890,6 +1975,7 @@ class StateClassificationSubTab(QWidget):
                 sample_col="sample_name",
                 include_pooled_summary=True,
                 group_cols=selected_cols,
+                state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
                 verbose=True,
             )
 
@@ -1929,6 +2015,7 @@ class StateClassificationSubTab(QWidget):
             from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
                 save_state_transition_report,
             )
+            from behav3d.analysis.behavior.state.utils import _get_classification_state_colors
             adata = ad.read_h5ad(str(full_path))
             transition_dir = _resolve_state_paths(out, ct).state_transitions_outdir
             transition_dir.mkdir(parents=True, exist_ok=True)
@@ -1937,6 +2024,7 @@ class StateClassificationSubTab(QWidget):
                 output_dir=transition_dir,
                 state_col=FULL_STATE_COL,
                 time_col="position_t",
+                state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
                 verbose=True,
             )
 
@@ -1953,6 +2041,79 @@ class StateClassificationSubTab(QWidget):
                 self._notify_results(),
             ),
             on_failed=lambda e: self._log(f"❌ Transition report failed: {e}"),
+        )
+
+    def _on_condition_comparison(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        full_path = self._full_adata_path(ct)
+        if not full_path or not full_path.exists():
+            QMessageBox.warning(self, "No data", "Run state classification first.")
+            return
+        condition_col = self.combo_comparison_condition_col.currentText()
+        level_a = self.combo_comparison_level_a.currentText()
+        level_b = self.combo_comparison_level_b.currentText()
+        facet_col = self.combo_comparison_facet_col.currentText()
+        facet_col = None if facet_col in ("", "(none)") else facet_col
+        if not condition_col or not level_a or not level_b:
+            QMessageBox.warning(self, "Missing selection", "Select a condition column and two levels to compare.")
+            return
+        if level_a == level_b:
+            QMessageBox.warning(self, "Invalid selection", "Level A and Level B must be different.")
+            return
+        out = self._out_dir()
+        self._log(f"▶ Generating condition comparison report for '{ct}'…")
+
+        def _run(**kw):
+            import anndata as ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.analysis.behavior.state.utils import (
+                _resolve_state_paths,
+                _get_classification_state_colors,
+            )
+            from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
+                save_state_condition_comparison_report,
+            )
+            from behav3d.analysis.behavior.utils import _sanitize_filename_token
+            adata = ad.read_h5ad(str(full_path))
+            state_paths = _resolve_state_paths(out, ct)
+            comp_dir = state_paths.state_composition_outdir / "behavior_proportions"
+            comp_dir.mkdir(parents=True, exist_ok=True)
+            cond_token = _sanitize_filename_token(condition_col, fallback="condition")
+            a_token = _sanitize_filename_token(str(level_a), fallback="a")
+            b_token = _sanitize_filename_token(str(level_b), fallback="b")
+            out_pdf = comp_dir / f"condition_comparison_{cond_token}_{a_token}_vs_{b_token}.pdf"
+            return save_state_condition_comparison_report(
+                adata=adata,
+                output_pdf_path=out_pdf,
+                output_csv_path=out_pdf.with_suffix(".csv"),
+                state_col=FULL_STATE_COL,
+                sample_col="sample_name",
+                condition_col=condition_col,
+                level_a=level_a,
+                level_b=level_b,
+                facet_col=facet_col,
+                state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Condition comparison report ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_condition_comparison],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Condition comparison report done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Condition comparison report failed: {e}"),
         )
 
     # ── Backprojection ───────────────────────────────────────────────────
@@ -2167,6 +2328,14 @@ class StateClassificationSubTab(QWidget):
         if kind == "state_transition":
             p = self._report_path(ct, "state_transition_report")
             return [(f"Transition report ({ct})", p)] if p else []
+        if kind == "state_condition_comparison":
+            comp_dir = out / "analysis" / ct / "behavioral_states" / "state_composition" / "behavior_proportions"
+            if not comp_dir.exists():
+                return []
+            return [
+                (p.stem.replace("condition_comparison_", ""), p)
+                for p in sorted(comp_dir.glob("condition_comparison_*.pdf"))
+            ]
         return []
 
     def _open_pdf(self, path: Path):
@@ -2635,6 +2804,54 @@ class TrackClassificationSubTab(QWidget):
         g_diag.addLayout(diag_row)
         g4.addWidget(grp_diag)
 
+        # Track Proportions sub-section
+        grp_proportions = QGroupBox("Track Proportions")
+        g_prop = QVBoxLayout(grp_proportions)
+        g_prop.setSpacing(4)
+
+        g_prop.addWidget(QLabel("Group proportion plots by (Ctrl/Cmd click for multiple):"))
+        self.list_track_proportion_group_cols = QListWidget()
+        self.list_track_proportion_group_cols.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_track_proportion_group_cols.setMaximumHeight(80)
+        g_prop.addWidget(self.list_track_proportion_group_cols)
+
+        prop_row = QHBoxLayout()
+        self.btn_track_proportions = QPushButton("▶ Create Track Proportion Plots")
+        _style_secondary(self.btn_track_proportions)
+        prop_row.addWidget(self.btn_track_proportions, stretch=1)
+        self.btn_view_track_proportions = _make_view_btn()
+        prop_row.addWidget(self.btn_view_track_proportions)
+        g_prop.addLayout(prop_row)
+
+        g_prop.addWidget(QLabel("Condition comparison (overall proportions, Welch's t-test):"))
+        track_comparison_form = QFormLayout()
+        track_comparison_form.setSpacing(3)
+        self.combo_track_comparison_condition_col = QComboBox()
+        self.combo_track_comparison_condition_col.setMinimumWidth(200)
+        self.combo_track_comparison_condition_col.currentTextChanged.connect(
+            self._on_track_comparison_condition_col_changed
+        )
+        track_comparison_form.addRow("Condition:", self.combo_track_comparison_condition_col)
+        self.combo_track_comparison_level_a = QComboBox()
+        self.combo_track_comparison_level_a.setMinimumWidth(200)
+        track_comparison_form.addRow("Level A:", self.combo_track_comparison_level_a)
+        self.combo_track_comparison_level_b = QComboBox()
+        self.combo_track_comparison_level_b.setMinimumWidth(200)
+        track_comparison_form.addRow("Level B:", self.combo_track_comparison_level_b)
+        self.combo_track_comparison_facet_col = QComboBox()
+        self.combo_track_comparison_facet_col.setMinimumWidth(200)
+        track_comparison_form.addRow("Facet by:", self.combo_track_comparison_facet_col)
+        g_prop.addLayout(track_comparison_form)
+        track_comparison_row = QHBoxLayout()
+        self.btn_track_condition_comparison = QPushButton("▶ Condition Comparison Report")
+        _style_secondary(self.btn_track_condition_comparison)
+        track_comparison_row.addWidget(self.btn_track_condition_comparison, stretch=1)
+        self.btn_view_track_condition_comparison = _make_view_btn()
+        track_comparison_row.addWidget(self.btn_view_track_condition_comparison)
+        g_prop.addLayout(track_comparison_row)
+
+        g4.addWidget(grp_proportions)
+
         # Exemplar Tracks sub-section
         grp_exemplar = QGroupBox("Exemplar Tracks")
         g_exemplar = QVBoxLayout(grp_exemplar)
@@ -2778,6 +2995,12 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_exemplars.clicked.connect(lambda: self._on_view("track_exemplars"))
         self.btn_diagnostics.clicked.connect(self._on_diagnostics)
         self.btn_view_diagnostics.clicked.connect(lambda: self._on_view("track_diagnostics"))
+        self.btn_track_proportions.clicked.connect(self._on_track_proportions)
+        self.btn_view_track_proportions.clicked.connect(lambda: self._on_view("track_proportions"))
+        self.btn_track_condition_comparison.clicked.connect(self._on_track_condition_comparison)
+        self.btn_view_track_condition_comparison.clicked.connect(
+            lambda: self._on_view("track_condition_comparison")
+        )
         self.btn_browse_pretrained_clf.clicked.connect(self._browse_pretrained_clf)
         self.btn_browse_pretrained_states.clicked.connect(self._browse_pretrained_states)
         self.btn_run_apply_pretrained.clicked.connect(self._on_apply_pretrained)
@@ -3004,9 +3227,10 @@ class TrackClassificationSubTab(QWidget):
             self.spin_track_n_jobs.setValue(int(cfg["rf_n_jobs"]))
         if "use_original" in cfg:
             val = bool(cfg["use_original"])
-            self.chk_use_original.blockSignals(True)
-            self.chk_use_original.setChecked(val)
-            self.chk_use_original.blockSignals(False)
+            for chk in (self.chk_use_original, self.chk_use_original_top):
+                chk.blockSignals(True)
+                chk.setChecked(val)
+                chk.blockSignals(False)
             self._apply_original_mode(val)
 
     # ── Metadata / reload ────────────────────────────────────────────────
@@ -3199,6 +3423,7 @@ class TrackClassificationSubTab(QWidget):
         self.btn_rename_track.setEnabled(has_adata)
         self.btn_train_track.setEnabled(has_adata)
         self.btn_apply_track.setEnabled(has_adata)
+        self.btn_track_proportions.setEnabled(has_adata)
         if has_adata:
             self.rename_track_status.setText(
                 f"✅ Track adata loaded: {self._track_adata.n_obs} rows."
@@ -3209,6 +3434,72 @@ class TrackClassificationSubTab(QWidget):
             )
         else:
             self.rename_track_status.setText("ℹ Run clustering first to enable renaming.")
+        self._refresh_track_proportion_group_cols()
+
+    def _track_proportion_candidate_columns(self):
+        cols = []
+        added = set()
+        md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+        if md is not None and hasattr(md, "columns"):
+            for col in md.columns:
+                if col in ("exp_nr", "well") or col.endswith("_line_condition"):
+                    cols.append(col)
+                    added.add(col)
+        if self._track_adata is not None:
+            for col in self._track_adata.obs.columns:
+                if col in added or col.startswith("_") or col in _TECHNICAL_OBS_COLS:
+                    continue
+                if col in ("exp_nr", "well", "origin_cell_type") or col.endswith("_line_condition"):
+                    cols.append(col)
+                    added.add(col)
+        return cols
+
+    def _track_metadata_column_unique_values(self, col):
+        md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+        if md is not None and col in getattr(md, "columns", []):
+            return sorted(md[col].dropna().astype(str).unique().tolist())
+        if self._track_adata is not None and col in self._track_adata.obs.columns:
+            return sorted(self._track_adata.obs[col].dropna().astype(str).unique().tolist())
+        return []
+
+    def _refresh_track_proportion_group_cols(self):
+        candidate_cols = self._track_proportion_candidate_columns()
+        self.list_track_proportion_group_cols.clear()
+        for col in candidate_cols:
+            self.list_track_proportion_group_cols.addItem(col)
+
+        prev_cond = self.combo_track_comparison_condition_col.currentText()
+        self.combo_track_comparison_condition_col.blockSignals(True)
+        self.combo_track_comparison_condition_col.clear()
+        self.combo_track_comparison_condition_col.addItems(candidate_cols)
+        if prev_cond in candidate_cols:
+            self.combo_track_comparison_condition_col.setCurrentText(prev_cond)
+        self.combo_track_comparison_condition_col.blockSignals(False)
+
+        prev_facet = self.combo_track_comparison_facet_col.currentText()
+        self.combo_track_comparison_facet_col.clear()
+        self.combo_track_comparison_facet_col.addItem("(none)")
+        self.combo_track_comparison_facet_col.addItems(candidate_cols)
+        self.combo_track_comparison_facet_col.setCurrentText(
+            prev_facet if prev_facet in (["(none)"] + candidate_cols) else "(none)"
+        )
+        self._refresh_track_comparison_level_options()
+
+    def _refresh_track_comparison_level_options(self):
+        col = self.combo_track_comparison_condition_col.currentText()
+        values = self._track_metadata_column_unique_values(col) if col else []
+        for combo in (self.combo_track_comparison_level_a, self.combo_track_comparison_level_b):
+            prev = combo.currentText()
+            combo.clear()
+            combo.addItems(values)
+            if prev in values:
+                combo.setCurrentText(prev)
+        if len(values) >= 2:
+            self.combo_track_comparison_level_a.setCurrentText(values[0])
+            self.combo_track_comparison_level_b.setCurrentText(values[1])
+
+    def _on_track_comparison_condition_col_changed(self, _text):
+        self._refresh_track_comparison_level_options()
 
     def _update_view_buttons(self):
         ct = self._cell_type()
@@ -3216,7 +3507,8 @@ class TrackClassificationSubTab(QWidget):
             for btn in (
                 self.btn_view_track, self.btn_view_train_track,
                 self.btn_view_apply_track, self.btn_view_exemplars,
-                self.btn_view_diagnostics,
+                self.btn_view_diagnostics, self.btn_view_track_proportions,
+                self.btn_view_track_condition_comparison,
             ):
                 btn.setEnabled(False)
             return
@@ -3234,6 +3526,21 @@ class TrackClassificationSubTab(QWidget):
         qc_dirs = self._track_diagnostics_qc_dirs(traj_dir)
         self.btn_view_diagnostics.setEnabled(
             any(any(qc_dir.glob("*.pdf")) for qc_dir in qc_dirs)
+        )
+        proportions_dir = traj_dir / "behavior_proportions" if traj_dir else None
+        self.btn_view_track_proportions.setEnabled(
+            bool(
+                proportions_dir
+                and proportions_dir.exists()
+                and any(proportions_dir.glob("*.pdf"))
+            )
+        )
+        self.btn_view_track_condition_comparison.setEnabled(
+            bool(
+                proportions_dir
+                and proportions_dir.exists()
+                and any(proportions_dir.glob("condition_comparison_*.pdf"))
+            )
         )
 
     def _update_bp_buttons(self):
@@ -3294,7 +3601,11 @@ class TrackClassificationSubTab(QWidget):
             return run_categorical_dtaidistance_trajectory_clustering(**params, verbose=True)
 
         def _done(r):
-            self._log(f"✅ Track clustering done for '{ct}'.")
+            umap_error = (r.uns.get("visualization", {}) or {}).get("umap_error")
+            if umap_error:
+                self._log(f"⚠ Track clustering done for '{ct}', but UMAP was skipped: {umap_error}")
+            else:
+                self._log(f"✅ Track clustering done for '{ct}'.")
             self._persist_track_cfg(ct)
             self._reload()
             self._notify_results()
@@ -3443,6 +3754,57 @@ class TrackClassificationSubTab(QWidget):
             self._update_view_buttons()
             if self._track_adata is not None:
                 self._sync_track_cluster_combo(self._track_adata)
+                self._regenerate_track_reports_after_rename(ct)
+
+    def _regenerate_track_reports_after_rename(self, ct: str):
+        """Re-run diagnostics + proportion plots so plots reflect the just-renamed labels/colors."""
+        if self._track_adata is None or self._bg.is_running():
+            return
+        out = self._out_dir()
+        track_adata = self._track_adata
+        method = (track_adata.uns.get("dtai_trajectory_clustering", {}) or {}).get("method")
+        if method == "original_behav3d_feature_dtw":
+            # The old (feature-DTW) method has its own regenerate-after-rename path,
+            # driven by its dedicated rename UI (not this generic adata-based one).
+            return
+
+        def _run(**kw):
+            from behav3d.analysis.behavior.track.state_dtw import save_dtaidistance_diagnostics
+            from behav3d.analysis.behavior.track.visualization.plots.reports import (
+                save_track_class_proportions_by_sample_plot,
+            )
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.napari._rename_dialog import _track_cluster_col
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+            diag = save_dtaidistance_diagnostics(
+                adata_tracks=track_adata,
+                output_dir=str(out) if out else "",
+                cell_type=ct,
+                verbose=True,
+            )
+            paths = _resolve_dtaidistance_paths(str(out) if out else "", ct)
+            prop = save_track_class_proportions_by_sample_plot(
+                track_adata,
+                paths["behavior_proportions_outfolder"],
+                sample_col="sample_name",
+                class_col=cluster_col,
+                verbose=True,
+            )
+            return {"diagnostics": diag, "proportions": prop}
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Refreshing track reports after rename ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_rename_track],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log("✅ Track reports refreshed after rename."),
+                self._update_view_buttons(),
+            ),
+            on_failed=lambda e: self._log(f"⚠ Could not refresh track reports after rename: {e}"),
+        )
 
     def _on_train_track(self):
         ct = self._cell_type()
@@ -3901,9 +4263,13 @@ class TrackClassificationSubTab(QWidget):
                 from behav3d.analysis.behavior.track.feature_dtw import (
                     _save_feature_dtw_quality_control,
                 )
+                from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
                 result = _save_feature_dtw_quality_control(
                     output_dir=str(out) if out else "",
                     cell_type=ct,
+                    proportions_outfolder=_resolve_dtaidistance_paths(
+                        str(out) if out else "", ct
+                    )["behavior_proportions_outfolder"],
                 )
             else:
                 result = save_dtaidistance_diagnostics(
@@ -3930,12 +4296,124 @@ class TrackClassificationSubTab(QWidget):
             buttons=[self.btn_diagnostics],
             viewer=self.viewer,
             inject_progress=False,
+            on_done=lambda r: self._on_diagnostics_done(r, ct),
+            on_failed=lambda e: self._log(f"❌ Diagnostics failed: {e}"),
+        )
+
+    def _on_diagnostics_done(self, result, ct):
+        umap_error = (result or {}).get("umap_error")
+        if umap_error:
+            self._log(f"⚠ Diagnostics done for '{ct}', but UMAP was skipped: {umap_error}")
+        else:
+            self._log(f"✅ Diagnostics done for '{ct}'.")
+        self._update_view_buttons()
+        self._notify_results()
+
+    def _on_track_proportions(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        out = self._out_dir()
+        self._log(f"▶ Creating track proportion plots for '{ct}'…")
+        track_adata = self._track_adata
+        selected_cols = [item.text() for item in self.list_track_proportion_group_cols.selectedItems()]
+
+        def _run(**kw):
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.analysis.behavior.track.visualization.plots.reports import (
+                save_track_class_proportions_by_sample_plot,
+            )
+            from behav3d.napari._rename_dialog import _track_cluster_col
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+            prop_dir = _resolve_dtaidistance_paths(str(out) if out else "", ct)["behavior_proportions_outfolder"]
+            return save_track_class_proportions_by_sample_plot(
+                track_adata,
+                prop_dir,
+                sample_col="sample_name",
+                class_col=cluster_col,
+                group_cols=selected_cols or None,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Track proportion plots ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_track_proportions],
+            viewer=self.viewer,
+            inject_progress=False,
             on_done=lambda r: (
-                self._log(f"✅ Diagnostics done for '{ct}'."),
+                self._log(f"✅ Track proportion plots done for '{ct}'."),
                 self._update_view_buttons(),
                 self._notify_results(),
             ),
-            on_failed=lambda e: self._log(f"❌ Diagnostics failed: {e}"),
+            on_failed=lambda e: self._log(f"❌ Track proportion plots failed: {e}"),
+        )
+
+    def _on_track_condition_comparison(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        condition_col = self.combo_track_comparison_condition_col.currentText()
+        level_a = self.combo_track_comparison_level_a.currentText()
+        level_b = self.combo_track_comparison_level_b.currentText()
+        facet_col = self.combo_track_comparison_facet_col.currentText()
+        facet_col = None if facet_col in ("", "(none)") else facet_col
+        if not condition_col or not level_a or not level_b:
+            QMessageBox.warning(self, "Missing selection", "Select a condition column and two levels to compare.")
+            return
+        if level_a == level_b:
+            QMessageBox.warning(self, "Invalid selection", "Level A and Level B must be different.")
+            return
+        out = self._out_dir()
+        self._log(f"▶ Creating track condition comparison plot for '{ct}'…")
+        track_adata = self._track_adata
+
+        def _run(**kw):
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.analysis.behavior.track.visualization.plots.reports import (
+                save_track_condition_comparison_report,
+            )
+            from behav3d.napari._rename_dialog import _track_cluster_col
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+            prop_dir = _resolve_dtaidistance_paths(str(out) if out else "", ct)["behavior_proportions_outfolder"]
+            return save_track_condition_comparison_report(
+                track_adata,
+                prop_dir,
+                sample_col="sample_name",
+                class_col=cluster_col,
+                condition_col=condition_col,
+                level_a=level_a,
+                level_b=level_b,
+                facet_col=facet_col,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Track condition comparison ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_track_condition_comparison],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Track condition comparison plot done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Track condition comparison failed: {e}"),
         )
 
     # ── Backprojection ───────────────────────────────────────────────────
@@ -4160,6 +4638,19 @@ class TrackClassificationSubTab(QWidget):
                 (f.stem, f)
                 for qc_dir in self._track_diagnostics_qc_dirs(traj_dir)
                 for f in sorted(qc_dir.glob("*.pdf"))
+            ]
+        elif kind == "track_proportions" and traj_dir:
+            proportions_dir = traj_dir / "behavior_proportions"
+            candidates = [
+                (f.stem, f)
+                for f in sorted(proportions_dir.glob("*.pdf"))
+                if not f.stem.startswith("condition_comparison_")
+            ]
+        elif kind == "track_condition_comparison" and traj_dir:
+            proportions_dir = traj_dir / "behavior_proportions"
+            candidates = [
+                (f.stem.replace("condition_comparison_", ""), f)
+                for f in sorted(proportions_dir.glob("condition_comparison_*.pdf"))
             ]
 
         existing = [(lbl, p) for lbl, p in candidates if p and p.exists()]

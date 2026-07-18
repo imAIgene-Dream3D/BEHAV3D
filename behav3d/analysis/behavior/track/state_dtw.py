@@ -12,6 +12,10 @@ from sklearn.metrics import silhouette_score
 from scipy.stats import chi2_contingency, ttest_rel, wilcoxon
 
 from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+from behav3d.analysis.behavior.state.utils import (
+    _get_classification_state_colors,
+    _normalize_label_color_map,
+)
 from behav3d.analysis.behavior.track.dtw import (
     _add_cluster_medoids,
     _cluster_precomputed_distances,
@@ -296,8 +300,9 @@ def _save_diagnostics(
         if umap_embedding is not None:
             fig, ax = plt.subplots(figsize=(7, 6))
             cluster_order = sorted(labels.unique().tolist(), key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x)))
-            cmap = plt.get_cmap("tab20")
-            color_map = {cluster: cmap(i % cmap.N) for i, cluster in enumerate(cluster_order)}
+            color_map = _normalize_label_color_map(
+                cluster_order, colors=_get_classification_state_colors(adata_tracks, cluster_key),
+            )
             for cluster in cluster_order:
                 mask = labels.to_numpy() == str(cluster)
                 ax.scatter(
@@ -412,8 +417,9 @@ def _save_diagnostics(
             if replicate_group_counts is not None:
                 replicate_order = sorted(replicate_group_counts[resolved_replicate_col].unique().tolist())
                 group_order_rep = sorted(replicate_group_counts[resolved_group_col].unique().tolist())
-                cluster_cmap = plt.get_cmap("tab20")
-                cluster_color_map = {c: cluster_cmap(i % cluster_cmap.N) for i, c in enumerate(cluster_order)}
+                cluster_color_map = _normalize_label_color_map(
+                    cluster_order, colors=_get_classification_state_colors(adata_tracks, cluster_key),
+                )
 
                 fig, axes = plt.subplots(
                     1, len(replicate_order), figsize=(3.2 * len(replicate_order) + 1, 5), sharey=True
@@ -1149,6 +1155,7 @@ def run_categorical_dtaidistance_trajectory_clustering(
                 _winfo("trajectory-dtai", f"skipping exemplar PDFs due to error: {exc}")
 
     if bool(save_distance_matrix):
+        paths["clustering_outfolder"].mkdir(parents=True, exist_ok=True)
         distance_csv = paths["clustering_outfolder"] / "categorical_dtai_distance_matrix.csv"
         pd.DataFrame(distances, index=adata_tracks.obs.index, columns=adata_tracks.obs.index).to_csv(distance_csv)
         adata_tracks.uns.setdefault("dtai_trajectory_clustering", {})

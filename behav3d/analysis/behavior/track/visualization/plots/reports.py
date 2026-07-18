@@ -79,6 +79,20 @@ from behav3d.analysis.behavior.track.visualization.plots.exemplar_coordinate_uti
     resolve_exemplar_positions_csv_path as _shared_resolve_exemplar_positions_csv_path,
 )
 from behav3d.analysis.behavior.general.visualization.plots import plot_top_ranking_features
+from behav3d.analysis.behavior.general.visualization.plots.proportion_bars import (
+    draw_thin_stacked_proportion_barh,
+    compute_condition_diff_stats,
+    plot_condition_diff_composite,
+    plot_page_stacked_proportion_barh_grid,
+    stacked_proportion_barh_rows_per_page,
+    _chunk_list,
+)
+from behav3d.analysis.behavior.state.utils import (
+    _apply_state_order,
+    _get_classification_state_colors,
+    _get_classification_state_order,
+    _normalize_label_color_map,
+)
 from behav3d.analysis.behavior.utils import (
     _mixed_label_sort_key,
     _resolve_output_dir,
@@ -194,19 +208,6 @@ def _plot_cluster_rankings(adata_tracks, cluster_key):
     return fig
 
 
-def _build_label_color_map(labels, cmap_name="tab20"):
-    """Create deterministic label->color mapping for stacked plots."""
-    labels = [str(x) for x in list(labels)]
-    if len(labels) == 0:
-        return {}
-    cmap = plt.get_cmap(cmap_name)
-    if len(labels) <= getattr(cmap, "N", 256):
-        denom = max(len(labels) - 1, 1)
-        color_values = [cmap(i / denom) for i in range(len(labels))]
-    else:
-        hsv = plt.get_cmap("hsv")
-        color_values = [hsv(i / max(len(labels), 1)) for i in range(len(labels))]
-    return {lab: color_values[i] for i, lab in enumerate(labels)}
 
 
 def _make_group_label(df, group_cols):
@@ -250,33 +251,6 @@ def _compute_grouped_class_proportions(df, *, group_cols, class_col, class_order
     return proportions_by_group, counts_by_group, n_by_group
 
 
-def _draw_stacked_class_barh(ax, values, class_order, colors, *, xmax=1.0, count=None, count_fontsize=6):
-    """Draw one horizontal stacked bar of class proportions/counts on `ax`."""
-    left = 0.0
-    for class_name in class_order:
-        val = float(values.get(class_name, 0.0))
-        if val <= 0.0:
-            continue
-        ax.barh(
-            [0.0], [val], left=left, color=colors[class_name],
-            height=0.92, edgecolor="none", linewidth=0.0,
-        )
-        left += val
-    ax.set_xlim(0.0, xmax if xmax and xmax > 0 else 1.0)
-    ax.set_ylim(-0.7, 0.7)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.grid(False)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    if count is not None:
-        ax.text(
-            0.5, -0.28, f"n={int(count)}",
-            ha="center", va="top", fontsize=count_fontsize,
-            transform=ax.transAxes, clip_on=False,
-        )
-
-
 def _class_legend_handles(class_order, colors):
     return (
         [
@@ -295,15 +269,12 @@ def _plot_page_grouped_class_proportions_2d_grid(
     class_order,
     class_colors,
     group_label_title,
-    mode="relative",
-    n_by_group=None,
-    global_xmax=None,
     row_slice=None,
     page_size=A4_PORTRAIT,
     group_title_fontsize=9,
 ):
     """
-    One page: grouped track-class proportions/counts arranged in a 2D grid.
+    One page: grouped track-class proportions arranged in a 2D grid.
 
     For 1 group_col: single column of panels, one row per unique value.
     For 2 group_cols: the column with more unique values goes to rows (Y),
@@ -311,9 +282,6 @@ def _plot_page_grouped_class_proportions_2d_grid(
     labels on each axis. row_slice=(start, end) selects a subset of Y rows
     for pagination.
     """
-    xmax = 1.0 if mode == "relative" else (global_xmax if global_xmax else 1.0)
-    mode_label = "Proportions" if mode == "relative" else "Counts"
-
     if len(group_cols) == 2:
         col_y, col_x = sorted(group_cols, key=lambda c: -len(unique_vals_per_col[c]))
         col_x_vals = unique_vals_per_col[col_x]
@@ -368,10 +336,9 @@ def _plot_page_grouped_class_proportions_2d_grid(
                     ax.axis("off")
                     continue
 
-                count = n_by_group.get(key) if n_by_group is not None else None
-                _draw_stacked_class_barh(ax, data_by_group[key], class_order, class_colors, xmax=xmax, count=count)
+                draw_thin_stacked_proportion_barh(ax, data_by_group[key], class_order, class_colors, xmax=1.0)
 
-        title_str = f"Grouped Track-Class {mode_label} — {col_x} (columns) × {col_y} (rows)"
+        title_str = f"Grouped Track-Class Proportions — {col_x} (columns) × {col_y} (rows)"
         if row_slice is not None and row_slice[0] > 0:
             title_str += f"\n(rows {row_slice[0] + 1}–{row_slice[1]} of {len(col_y_vals_all)})"
 
@@ -382,7 +349,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
 
         nrows_data = max(1, len(page_col_y_vals))
         fig = plt.figure(figsize=page_size)
-        outer = GridSpec(nrows=nrows_data, ncols=1, figure=fig, hspace=0.65)
+        outer = GridSpec(nrows=nrows_data, ncols=1, figure=fig, hspace=0.35)
 
         for r, col_y_val in enumerate(page_col_y_vals):
             key = str(col_y_val)
@@ -393,11 +360,10 @@ def _plot_page_grouped_class_proportions_2d_grid(
                 ax.axis("off")
                 continue
 
-            count = n_by_group.get(key) if n_by_group is not None else None
-            _draw_stacked_class_barh(ax, data_by_group[key], class_order, class_colors, xmax=xmax, count=count)
-            ax.set_title(f"{col_y}: {col_y_val}", fontsize=group_title_fontsize, fontweight="bold", pad=2)
+            draw_thin_stacked_proportion_barh(ax, data_by_group[key], class_order, class_colors, xmax=1.0)
+            ax.set_title(f"{col_y}: {col_y_val}", fontsize=group_title_fontsize, fontweight="bold", pad=1)
 
-        title_str = f"Grouped Track-Class {mode_label} — {group_label_title}"
+        title_str = f"Grouped Track-Class Proportions — {group_label_title}"
         if row_slice is not None and row_slice[0] > 0:
             title_str += f"\n(rows {row_slice[0] + 1}–{row_slice[1]} of {len(col_y_vals_all)})"
 
@@ -418,26 +384,20 @@ def _plot_page_grouped_class_proportions_flat_grid(
     class_colors,
     group_label_title,
     grid_ncols,
-    mode="relative",
-    n_by_group=None,
-    global_xmax=None,
     group_title_fontsize=8,
 ):
     """One flat wrapped grid page (for 3+ group_cols): one panel per group-label combo."""
     groups = list(data_by_group.keys())
     ncols = max(1, int(grid_ncols))
     nrows = max(1, int(np.ceil(float(len(groups)) / float(ncols))))
-    xmax = 1.0 if mode == "relative" else (global_xmax if global_xmax else 1.0)
-    mode_label = "Proportions" if mode == "relative" else "Counts"
 
     fig = plt.figure(figsize=A4_PORTRAIT)
-    outer = GridSpec(nrows=nrows, ncols=ncols, figure=fig, hspace=0.65, wspace=0.3)
+    outer = GridSpec(nrows=nrows, ncols=ncols, figure=fig, hspace=0.35, wspace=0.3)
 
     for i, grp in enumerate(groups):
         ax = fig.add_subplot(outer[i])
-        count = n_by_group.get(grp) if n_by_group is not None else None
-        _draw_stacked_class_barh(ax, data_by_group[grp], class_order, class_colors, xmax=xmax, count=count)
-        ax.set_title(grp, fontsize=group_title_fontsize, fontweight="bold", pad=2)
+        draw_thin_stacked_proportion_barh(ax, data_by_group[grp], class_order, class_colors, xmax=1.0)
+        ax.set_title(grp, fontsize=group_title_fontsize, fontweight="bold", pad=1)
 
     for i in range(len(groups), nrows * ncols):
         fig.add_subplot(outer[i]).axis("off")
@@ -448,7 +408,7 @@ def _plot_page_grouped_class_proportions_flat_grid(
         loc="lower center", ncol=min(len(legend_labels), 8), frameon=False, fontsize=7,
     )
     fig.suptitle(
-        f"Grouped Track-Class {mode_label} — {group_label_title}",
+        f"Grouped Track-Class Proportions — {group_label_title}",
         y=0.97, fontsize=10, fontweight="bold", wrap=True,
     )
     fig.tight_layout(rect=(0.02, 0.07, 0.98, 0.93))
@@ -466,6 +426,7 @@ def save_track_class_proportions_by_sample_plot(
     dpi=300,
     cmap_name="tab20",
     verbose=False,
+    class_colors=None,
 ):
     """
     Save one horizontal stacked bar per sample showing track-class proportions,
@@ -523,6 +484,7 @@ def save_track_class_proportions_by_sample_plot(
         .tolist(),
         key=_mixed_label_sort_key,
     )
+    class_order = _apply_state_order(class_order, _get_classification_state_order(adata_tracks, class_col))
     if len(sample_order) == 0:
         raise ValueError("No samples available to plot track class proportions.")
     if len(class_order) == 0:
@@ -542,39 +504,27 @@ def save_track_class_proportions_by_sample_plot(
     csv_path = pdf_path.with_suffix(".csv")
     proportion_table.to_csv(csv_path)
 
-    colors = _build_label_color_map(class_order, cmap_name=cmap_name)
+    resolved_colors = dict(class_colors) if class_colors else _get_classification_state_colors(adata_tracks, class_col)
+    colors = _normalize_label_color_map(class_order, colors=resolved_colors, cmap_name=cmap_name)
     grouped_csv_path = None
     n_grouped_pages = 0
 
     with PdfPages(pdf_path) as pdf:
-        fig_h = max(2.0, 1.2 * len(sample_order))
-        fig, axes = plt.subplots(
-            nrows=len(sample_order),
-            ncols=1,
-            figsize=(10.0, fig_h),
-            squeeze=False,
-        )
-        axes = axes.flatten()
-        for i, sample_name in enumerate(sample_order):
-            _draw_stacked_class_barh(axes[i], proportion_table.loc[sample_name], class_order, colors, xmax=1.0)
-            axes[i].set_title(str(sample_name), loc="left", fontsize=10, pad=2.0)
-
-        legend_handles, legend_labels = _class_legend_handles(class_order, colors)
-        fig.legend(
-            handles=legend_handles,
-            labels=legend_labels,
-            title=str(class_col),
-            loc="center left",
-            bbox_to_anchor=(1.01, 0.5),
-            borderaxespad=0.0,
-            frameon=False,
-        )
-        fig.tight_layout(rect=[0, 0, 0.82, 1.0])
-        pdf.savefig(fig, dpi=int(dpi), bbox_inches="tight")
-        plt.close(fig)
+        rows_per_page = stacked_proportion_barh_rows_per_page()
+        data_by_sample = {s: proportion_table.loc[s] for s in sample_order}
+        for page_samples in _chunk_list(sample_order, rows_per_page):
+            fig = plot_page_stacked_proportion_barh_grid(
+                data_by_sample,
+                row_order=page_samples,
+                class_order=class_order,
+                colors=colors,
+                title=f"Track-Class Proportions by Sample — {class_col}",
+            )
+            pdf.savefig(fig, dpi=int(dpi))
+            plt.close(fig)
 
         if valid_group_cols:
-            proportions_by_group, counts_by_group, n_by_group = _compute_grouped_class_proportions(
+            proportions_by_group, counts_by_group, _n_by_group = _compute_grouped_class_proportions(
                 plot_df, group_cols=valid_group_cols, class_col=class_col, class_order=class_order,
             )
             group_label_title = ", ".join(valid_group_cols)
@@ -583,9 +533,6 @@ def save_track_class_proportions_by_sample_plot(
                 for col in valid_group_cols:
                     unique_vals_per_col[col] = sorted(plot_df[col].astype(str).dropna().unique().tolist())
 
-            global_count_xmax = (
-                max((int(c.sum()) for c in counts_by_group.values()), default=1) * 1.1
-            )
             _, ncols_eff, max_rows = _panels_per_a4_page(grid_ncols)
 
             if len(valid_group_cols) in (1, 2):
@@ -605,28 +552,10 @@ def save_track_class_proportions_by_sample_plot(
                         class_order=class_order,
                         class_colors=colors,
                         group_label_title=group_label_title,
-                        mode="relative",
-                        n_by_group=n_by_group,
                         row_slice=_rs,
                     )
                     pdf.savefig(fig_rel, dpi=dpi)
                     plt.close(fig_rel)
-                    n_grouped_pages += 1
-
-                    fig_cnt = _plot_page_grouped_class_proportions_2d_grid(
-                        counts_by_group,
-                        group_cols=valid_group_cols,
-                        unique_vals_per_col=unique_vals_per_col,
-                        class_order=class_order,
-                        class_colors=colors,
-                        group_label_title=group_label_title,
-                        mode="count",
-                        n_by_group=n_by_group,
-                        global_xmax=global_count_xmax,
-                        row_slice=_rs,
-                    )
-                    pdf.savefig(fig_cnt, dpi=dpi)
-                    plt.close(fig_cnt)
                     n_grouped_pages += 1
             else:
                 if verbose:
@@ -640,25 +569,9 @@ def save_track_class_proportions_by_sample_plot(
                     class_colors=colors,
                     group_label_title=group_label_title,
                     grid_ncols=ncols_eff,
-                    mode="relative",
-                    n_by_group=n_by_group,
                 )
                 pdf.savefig(fig_rel, dpi=dpi)
                 plt.close(fig_rel)
-                n_grouped_pages += 1
-
-                fig_cnt = _plot_page_grouped_class_proportions_flat_grid(
-                    counts_by_group,
-                    class_order=class_order,
-                    class_colors=colors,
-                    group_label_title=group_label_title,
-                    grid_ncols=ncols_eff,
-                    mode="count",
-                    n_by_group=n_by_group,
-                    global_xmax=global_count_xmax,
-                )
-                pdf.savefig(fig_cnt, dpi=dpi)
-                plt.close(fig_cnt)
                 n_grouped_pages += 1
 
             grouped_long_rows = []
@@ -685,6 +598,94 @@ def save_track_class_proportions_by_sample_plot(
         "grouped_csv_path": str(grouped_csv_path) if grouped_csv_path is not None else None,
         "n_grouped_pages": n_grouped_pages,
     }
+
+
+def save_track_condition_comparison_report(
+    adata_tracks,
+    out_dir,
+    *,
+    sample_col="sample_name",
+    class_col="ClusterID",
+    condition_col,
+    level_a,
+    level_b,
+    facet_col=None,
+    class_order=None,
+    class_colors=None,
+    verbose=False,
+):
+    """Per-cluster overall (pooled) track-class proportion difference between two condition
+    levels, with Welch's two-sided unpaired t-test significance stars — optionally faceted
+    into side-by-side panels by the unique values of `facet_col`.
+
+    diff = mean(level_b) - mean(level_a), computed across per-sample proportions.
+    """
+    obs = adata_tracks.obs
+    required = [sample_col, class_col, condition_col] + ([facet_col] if facet_col else [])
+    missing = [c for c in required if c not in obs.columns]
+    if len(missing) > 0:
+        raise KeyError(f"Missing required columns in adata_tracks.obs: {missing}")
+
+    df = obs[required].dropna(subset=[sample_col, class_col, condition_col]).copy()
+    df[sample_col] = df[sample_col].astype(str)
+    df[class_col] = df[class_col].astype(str)
+    df[condition_col] = df[condition_col].astype(str)
+    if facet_col is not None:
+        df[facet_col] = df[facet_col].astype(str)
+    if len(df) == 0:
+        raise ValueError("No valid rows remain after filtering NaNs in required columns.")
+
+    if class_order is not None:
+        resolved_class_order = [str(c) for c in class_order]
+    else:
+        resolved_class_order = sorted(df[class_col].dropna().unique().tolist(), key=_mixed_label_sort_key)
+        resolved_class_order = _apply_state_order(
+            resolved_class_order, _get_classification_state_order(adata_tracks, class_col)
+        )
+
+    proportions_by_sample, _, _ = _compute_grouped_class_proportions(
+        df, group_cols=[sample_col], class_col=class_col, class_order=resolved_class_order,
+    )
+    per_sample_df = pd.DataFrame(proportions_by_sample).T.reindex(columns=resolved_class_order, fill_value=0.0)
+
+    metadata_cols = [sample_col, condition_col] + ([facet_col] if facet_col is not None else [])
+    sample_metadata = df[metadata_cols].drop_duplicates(subset=[sample_col]).set_index(sample_col)
+
+    resolved_colors = dict(class_colors) if class_colors else _get_classification_state_colors(adata_tracks, class_col)
+    resolved_colors = _normalize_label_color_map(resolved_class_order, colors=resolved_colors, cmap_name="tab20")
+
+    diff_stats_by_facet = compute_condition_diff_stats(
+        per_sample_df,
+        sample_metadata,
+        class_order=resolved_class_order,
+        condition_col=condition_col,
+        level_a=level_a,
+        level_b=level_b,
+        facet_col=facet_col,
+    )
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    condition_token = _sanitize_filename_token(condition_col, fallback="condition")
+    level_a_token = _sanitize_filename_token(str(level_a), fallback="a")
+    level_b_token = _sanitize_filename_token(str(level_b), fallback="b")
+    out_pdf = out_dir / f"condition_comparison_{condition_token}_{level_a_token}_vs_{level_b_token}.pdf"
+    out_csv = out_pdf.with_suffix(".csv")
+
+    title = f"{class_col}: {level_b} vs {level_a} ({condition_col})"
+    result = plot_condition_diff_composite(
+        diff_stats_by_facet,
+        class_order=resolved_class_order,
+        colors=resolved_colors,
+        level_a_label=str(level_a),
+        level_b_label=str(level_b),
+        title=title,
+        out_pdf=out_pdf,
+        out_csv=out_csv,
+    )
+    if bool(verbose):
+        print(f"Saved track condition comparison report: {result['pdf_path']}")
+    return result
 
 
 def generate_track_clustering_report_pdfs(

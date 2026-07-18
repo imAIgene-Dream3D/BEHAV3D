@@ -678,6 +678,37 @@ def _load_feature_dtw_name_mapping(output_dir, cell_type):
         return {}
 
 
+def _load_feature_dtw_cluster_colors(output_dir, cell_type):
+    mapping_path = _feature_dtw_rename_mapping_path(output_dir, cell_type)
+    if not mapping_path.exists():
+        return {}
+    try:
+        with mapping_path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        colors = data.get("cluster_colors", {})
+        if not isinstance(colors, dict):
+            return {}
+        return {str(k): str(v) for k, v in colors.items()}
+    except Exception:
+        return {}
+
+
+def _load_feature_dtw_cluster_order(output_dir, cell_type):
+    """User-defined display order for original-BEHAV3D cluster names, or [] if none saved."""
+    mapping_path = _feature_dtw_rename_mapping_path(output_dir, cell_type)
+    if not mapping_path.exists():
+        return []
+    try:
+        with mapping_path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        order = data.get("cluster_order", [])
+        if not isinstance(order, (list, tuple)):
+            return []
+        return [str(x) for x in order]
+    except Exception:
+        return []
+
+
 def _feature_dtw_plot_info_cols(df, cell_type=None):
     """Real behavioral feature columns to display on the UMAP/heatmap QC pages.
 
@@ -754,17 +785,22 @@ def _compute_feature_dtw_cluster_percentages(df_umap, cell_type, cluster_percent
 
 
 def _save_feature_dtw_quality_control(
-    output_dir, cell_type, *, outfolder=None, cluster_percentage_group_by=None,
+    output_dir, cell_type, *, outfolder=None, cluster_percentage_group_by=None, proportions_outfolder=None,
 ):
     """Regenerate the original-BEHAV3D QC plots ("Create diagnostics").
 
     Reads the raw clustered UMAP CSV (behavorial_trajectories/original_behav3d/raw/)
     and writes the refreshed plots — reflecting any cluster renaming — directly
     into behavorial_trajectories/original_behav3d/ (unless `outfolder` overrides it).
+    The cluster-percentage (proportion) plot is written into `proportions_outfolder`
+    when given (e.g. the shared behavorial_trajectories/behavior_proportions folder),
+    falling back to `qc_outdir` otherwise.
     """
     outdir = _feature_dtw_outdir(output_dir, cell_type)
     qc_outdir = outdir if outfolder is None else Path(outfolder)
     qc_outdir.mkdir(parents=True, exist_ok=True)
+    prop_outdir = qc_outdir if proportions_outfolder is None else Path(proportions_outfolder)
+    prop_outdir.mkdir(parents=True, exist_ok=True)
     umap_csv = _feature_dtw_umap_csv_path(output_dir, cell_type)
     if not umap_csv.exists():
         raise FileNotFoundError(f"Original BEHAV3D UMAP CSV not found: {umap_csv}")
@@ -782,7 +818,9 @@ def _save_feature_dtw_quality_control(
     info_cols = _feature_dtw_plot_info_cols(df_plot, cell_type=cell_type)
     cluster_umap_path = qc_outdir / f"BEHAV3D_{cell_type}_UMAP_clusters.pdf"
     heatmap_path = qc_outdir / f"BEHAV3D_{cell_type}_UMAP_cluster_feature_heatmap.pdf"
-    perc_prefix = qc_outdir / f"BEHAV3D_{cell_type}_UMAP_cluster_percentages"
+    perc_prefix = prop_outdir / f"BEHAV3D_{cell_type}_UMAP_cluster_percentages"
+    cluster_colors = _load_feature_dtw_cluster_colors(output_dir, cell_type)
+    cluster_order = _load_feature_dtw_cluster_order(output_dir, cell_type)
 
     plot_feature_umap(
         df_umap=df_plot,
@@ -794,6 +832,7 @@ def _save_feature_dtw_quality_control(
         rows_first_img=2,
         figsize=(8.27, 11.69),
         plot_results=False,
+        cluster_colors=cluster_colors,
     )
     plot_clustering_feature_heatmap(
         df_plot,
@@ -811,6 +850,7 @@ def _save_feature_dtw_quality_control(
     df_clust_perc.to_csv(perc_prefix.with_suffix(".csv"), index=False)
     plot_cluster_percentage_bars(
         df_clust_perc, perc_prefix, group_cols=cluster_percentage_group_by, plot_results=False,
+        cluster_colors=cluster_colors, saved_cluster_order=cluster_order,
     )
 
     return {
