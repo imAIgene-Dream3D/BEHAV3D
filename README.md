@@ -5,10 +5,10 @@ BEHAV3D Explorer is a tool for analyzing how cells behave in 3D microscopy image
 It works with pretty much any 3D microscopy data, for example 3D live co-cultures or intravital microscopy, and turns your raw movies into quantitative, cell-by-cell readouts. Here's the kind of analysis you can get out of it:
 
 <p align="center">
-  <img src="docs/source/_static/icons/death_dynamics.svg" width="200" alt="Death dynamics"/>
-  <img src="docs/source/_static/icons/invasion.svg" width="200" alt="Invasion"/>
-  <img src="docs/source/_static/icons/active_killing.svg" width="200" alt="Active killing"/>
-  <img src="docs/source/_static/icons/single_cell_analysis.svg" width="200" alt="Single cell analysis"/>
+  <img src="docs/source/_static/icons/death_dynamics.jpg" width="200" alt="Death dynamics"/>
+  <img src="docs/source/_static/icons/invasion.jpg" width="200" alt="Invasion"/>
+  <img src="docs/source/_static/icons/active_killing.jpg" width="200" alt="Active killing"/>
+  <img src="docs/source/_static/icons/single_cell_analysis.jpg" width="200" alt="Single cell analysis"/>
 </p>
 
 There's no one-size-fits-all solution, so BEHAV3D-Explorer is built as a set of flexible, modular tools: you pick and combine the segmentation, tracking and analysis methods that fit your experiment, or your computational power, instead of being locked into one fixed pipeline. Navigating a complex software with so many options is difficult, but you don't have to figure it out alone: **a built-in Co-pilot assistant** (QueenB) sits next to the panel, explains what each parameter does, and can fill in the forms for you.
