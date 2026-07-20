@@ -12,6 +12,7 @@ import json
 import re
 import time
 import shutil
+import contextlib
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +24,9 @@ from qtpy.QtWidgets import (
     QSizePolicy, QTabWidget, QFrame, QMessageBox,
     QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
 )
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import Qt, Signal, QTimer
+
+from behav3d.napari._background_runner import BackgroundOperation, ThreadSafeLogger
 from qtpy.QtGui import QColor
 
 import dask.array as da
@@ -32,6 +35,7 @@ import pyclesperanto_prototype as cle
 from behav3d.io.images import load_image, load_zarr, save_as_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.core.utils import rmtree_ignore_missing
 
 # ---------------------------------------------------------------------------
 # Feature grid constants (matching the official napari-apoc widget)
@@ -412,6 +416,22 @@ def _classifier_path(pixel_class_outdir, cell_type):
     return Path(pixel_class_outdir) / fname
 
 
+def _set_dead_mask_layer_color(layer, color=(0.9, 0.0, 0.0, 1.0)):
+    """Render the death pixel-classification layer as a solid color (red by
+    default) instead of napari's default per-label random colors — it is a
+    binary mask (dead vs. not), not a multi-class label map. Any nonzero
+    label (whichever convention is used for "dead") is painted ``color``;
+    background (0) stays transparent."""
+    try:
+        from napari.utils.colormaps import DirectLabelColormap
+        layer.colormap = DirectLabelColormap(color_dict={None: list(color), 0: [0, 0, 0, 0]})
+    except Exception:
+        try:
+            layer.color = {1: color, 2: color}
+        except Exception:
+            pass
+
+
 def _predicted_labels_path(pixel_class_outdir, cell_type):
     """Return the expected predicted-label zarr path for a cell type."""
     if not pixel_class_outdir:
@@ -727,6 +747,244 @@ def _load_training_images(
 
 
 # ---------------------------------------------------------------------------
+# Training data persistence helpers
+# ---------------------------------------------------------------------------
+# Training data is stored as a single zip bundle: PixelClassifier_TrainingData.zip
+# containing training_metadata.yml and per-cell-type {Stem}_X.npy / {Stem}_y.npy.
+# The bundle is written with a read-modify-write pattern so each save call
+# (per cell type, then metadata) updates only its own members.
+# Old-style TrainingData/ folders are still readable for backward compat.
+# ---------------------------------------------------------------------------
+
+def _training_bundle_path(pixel_class_outdir):
+    """Return the path to the single-file training bundle (.zip), or None."""
+    if not pixel_class_outdir:
+        return None
+    return Path(pixel_class_outdir) / "PixelClassifier_TrainingData.zip"
+
+
+def _training_data_dir(pixel_class_outdir):
+    """Return the legacy TrainingData/ subdirectory path (backward compat)."""
+    if not pixel_class_outdir:
+        return None
+    return Path(pixel_class_outdir) / "TrainingData"
+
+
+def _celltype_file_stem(cell_type):
+    """Return the file stem used for saving a cell type's data ('Death' / capitalized)."""
+    return "Death" if cell_type == "dead" else cell_type.capitalize()
+
+
+def _zip_read_all_members(zip_path):
+    """Return a dict {member_name: bytes} for an existing zip, or {} if absent."""
+    import zipfile
+    if not zip_path.exists():
+        return {}
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        return {name: zf.read(name) for name in zf.namelist()}
+
+
+def _zip_write_members(zip_path, members):
+    """Write *members* dict {name: bytes} to *zip_path*, replacing the file."""
+    import zipfile
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+
+
+def _save_training_data(pixel_class_outdir, cell_type, X, y):
+    """Save flattened feature matrix X and label vector y for one cell type."""
+    import io
+    bundle = _training_bundle_path(pixel_class_outdir)
+    if bundle is None:
+        return
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    stem = _celltype_file_stem(cell_type)
+
+    members = _zip_read_all_members(bundle)
+
+    buf_X = io.BytesIO()
+    np.save(buf_X, X.astype(np.float32))
+    members[f"{stem}_X.npy"] = buf_X.getvalue()
+
+    buf_y = io.BytesIO()
+    np.save(buf_y, y.astype(np.uint8))
+    members[f"{stem}_y.npy"] = buf_y.getvalue()
+
+    _zip_write_members(bundle, members)
+
+
+def _load_training_data_for_celltype(path_or_dir, cell_type):
+    """Load (X, y) arrays for one cell type; returns (None, None) if not found.
+
+    Accepts either a .zip bundle path or a legacy TrainingData/ directory.
+    """
+    import io, zipfile
+    stem = _celltype_file_stem(cell_type)
+    p = Path(path_or_dir)
+
+    if p.suffix == ".zip":
+        if not p.exists():
+            return None, None
+        with zipfile.ZipFile(p, "r") as zf:
+            names = zf.namelist()
+            x_name, y_name = f"{stem}_X.npy", f"{stem}_y.npy"
+            if x_name not in names or y_name not in names:
+                return None, None
+            X = np.load(io.BytesIO(zf.read(x_name)))
+            y = np.load(io.BytesIO(zf.read(y_name)))
+        return X, y
+
+    # Backward compat: old TrainingData/ folder
+    x_path = p / f"{stem}_X.npz"
+    y_path = p / f"{stem}_y.npy"
+    if not x_path.exists() or not y_path.exists():
+        return None, None
+    X = np.load(str(x_path))["X"]
+    y = np.load(str(y_path))
+    return X, y
+
+
+def _save_training_metadata(pixel_class_outdir, metadata_dict):
+    """Write training_metadata.yml into the training bundle zip."""
+    import yaml
+    bundle = _training_bundle_path(pixel_class_outdir)
+    if bundle is None:
+        return
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+
+    members = _zip_read_all_members(bundle)
+    members["training_metadata.yml"] = yaml.safe_dump(
+        metadata_dict, default_flow_style=False, sort_keys=False
+    ).encode("utf-8")
+    _zip_write_members(bundle, members)
+
+
+def _load_training_metadata(path_to_zip_yml_or_dir):
+    """Load training metadata; accepts a .zip bundle, a .yml path, or a directory.
+
+    Returns the parsed dict, or None if the file does not exist or fails to parse.
+    """
+    import yaml, zipfile
+    if path_to_zip_yml_or_dir is None:
+        return None
+    p = Path(path_to_zip_yml_or_dir)
+
+    if p.suffix == ".zip":
+        if not p.exists():
+            return None
+        try:
+            with zipfile.ZipFile(p, "r") as zf:
+                return yaml.safe_load(zf.read("training_metadata.yml"))
+        except Exception:
+            return None
+
+    # Backward compat: .yml path or directory
+    if p.is_dir():
+        p = p / "training_metadata.yml"
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r") as fh:
+            return yaml.safe_load(fh)
+    except Exception:
+        return None
+
+
+def _load_training_bundle(zip_path):
+    """Load a training bundle zip; returns (metadata_dict, {cell_type: (X, y)}).
+
+    Raises on unreadable files so callers can show a meaningful error dialog.
+    """
+    import io, yaml, zipfile
+    p = Path(zip_path)
+    with zipfile.ZipFile(p, "r") as zf:
+        meta = yaml.safe_load(zf.read("training_metadata.yml"))
+        cell_types = list(meta.get("cell_types", []))
+        if meta.get("has_death"):
+            cell_types.append("dead")
+        names = zf.namelist()
+        result = {}
+        for ct in cell_types:
+            stem = _celltype_file_stem(ct)
+            x_name, y_name = f"{stem}_X.npy", f"{stem}_y.npy"
+            if x_name in names and y_name in names:
+                X = np.load(io.BytesIO(zf.read(x_name)))
+                y = np.load(io.BytesIO(zf.read(y_name)))
+                result[ct] = (X, y)
+    return meta, result
+
+
+def _build_training_metadata(
+    cell_types,
+    has_death,
+    params_per_ct,
+    n_input_channels,
+    channel_names,
+    pixel_size_xy_um,
+    pixel_size_z_um,
+    pixel_counts_by_ct,
+    imported_from=None,
+    imported_counts=None,
+    new_counts=None,
+):
+    """Build the metadata dict that is written to training_metadata.yml."""
+    import datetime
+
+    all_cts = list(cell_types) + (["dead"] if has_death else [])
+    features_section = {}
+    for ct in all_cts:
+        cfg = params_per_ct.get(ct, {})
+        raw_sigmas = cfg.get("grid_sigmas", "") or ""
+        sigma_list = []
+        for tok in raw_sigmas.replace(",", " ").split():
+            try:
+                sigma_list.append(float(tok))
+            except ValueError:
+                pass
+        features_section[ct] = {
+            "feature_string":    cfg.get("feature_string", ""),
+            "sigmas":            sigma_list,
+            "consider_original": bool(cfg.get("consider_original", False)),
+            "channels_used":     list(cfg.get("channels", [])),
+            "max_depth":         int(cfg.get("max_depth", 5)),
+            "num_ensembles":     int(cfg.get("num_ensembles", 100)),
+        }
+
+    training_data_section = {}
+    for ct, counts in (pixel_counts_by_ct or {}).items():
+        training_data_section[ct] = {
+            "n_pixels":   int(counts.get("total", 0)),
+            "n_positive": int(counts.get("positive", 0)),
+            "n_negative": int(counts.get("negative", 0)),
+        }
+
+    return {
+        "version":    1,
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "cell_types": [str(ct) for ct in cell_types],
+        "has_death":  bool(has_death),
+        "image_metadata": {
+            "n_input_channels": int(n_input_channels) if n_input_channels is not None else None,
+            "channel_names":    list(channel_names),
+            "pixel_size_xy_um": float(pixel_size_xy_um) if pixel_size_xy_um is not None else None,
+            "pixel_size_z_um":  float(pixel_size_z_um)  if pixel_size_z_um  is not None else None,
+        },
+        "features":      features_section,
+        "training_data": training_data_section,
+        "provenance": {
+            "imported_from":         str(imported_from) if imported_from else None,
+            "imported_pixel_counts": {
+                str(k): int(v) for k, v in (imported_counts or {}).items()
+            },
+            "new_pixel_counts": {
+                str(k): int(v) for k, v in (new_counts or {}).items()
+            },
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Per-cell-type tab panel
 # ---------------------------------------------------------------------------
 
@@ -756,11 +1014,21 @@ class CellTypeTab(QWidget):
         show_strategy_combo=False,
         per_tab_strategies=None,
         on_per_tab_strategy_changed=None,
+        pixel_sizes=None,
     ):
         super().__init__(parent)
         self.cell_type = cell_type
         self.viewer = viewer
         self._pixel_class_outdir = pixel_class_outdir
+        # Optional resolved pixel sizes ({"xy_um":..., "z_um":...}) for the
+        # physical(µm)/pixel unit toggle on EDT/min-size/peak-distance
+        # controls (see behav3d.napari._units.UnitGroupManager).
+        self._pixel_sizes = dict(pixel_sizes) if pixel_sizes else {}
+        self._unit_mgr = None  # created lazily in _build_instance_controls
+        # Persists the user's px/µm display choice across strategy-change
+        # rebuilds (a fresh UnitGroupManager is created each rebuild since
+        # the spinbox instances themselves are discarded and recreated).
+        self._units_physical = True
         self._on_params_changed = on_params_changed
         self._run_instance_callback = run_instance_callback
         self._apoc_strategy = str(apoc_strategy)
@@ -790,17 +1058,18 @@ class CellTypeTab(QWidget):
         layout.setSpacing(6)
 
         # ── Channel selection ────────────────────────────────────────────────
-        chan_group = QGroupBox("Image Channel Inputs")
+        self.chan_group = QGroupBox("Image Channel Inputs")
         chan_layout = QVBoxLayout()
         chan_layout.setSpacing(2)
         self.channel_checkboxes = []
+        self._rebuilding_channel_checkboxes = False
         self.chan_checkbox_container = QWidget()
         self.chan_checkbox_layout = QVBoxLayout()
         self.chan_checkbox_layout.setContentsMargins(0, 0, 0, 0)
         self.chan_checkbox_container.setLayout(self.chan_checkbox_layout)
         chan_layout.addWidget(self.chan_checkbox_container)
-        chan_group.setLayout(chan_layout)
-        layout.addWidget(chan_group)
+        self.chan_group.setLayout(chan_layout)
+        layout.addWidget(self.chan_group)
 
         # ── Optional per-tab strategy combo ──────────────────────────────────
         # Only shown in the napari GUI plugin (per_cell_type_strategy=True). The
@@ -826,12 +1095,14 @@ class CellTypeTab(QWidget):
             layout.addWidget(self._per_tab_strategy_widget)
 
         # Labeling hint
-        hint = QLabel("Labels: <b>1</b> = background&nbsp;&nbsp; <b>2</b> = foreground")
-        hint.setStyleSheet("color: #666; font-style: italic;")
-        layout.addWidget(hint)
+        self._hint_label = QLabel("Labels: <b>1</b> = background&nbsp;&nbsp; <b>2</b> = foreground")
+        self._hint_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self._hint_label)
 
         # ── Preset dropdown ──────────────────────────────────────────────────
-        feat_row = QHBoxLayout()
+        self._feat_row_widget = QWidget()
+        feat_row = QHBoxLayout(self._feat_row_widget)
+        feat_row.setContentsMargins(0, 0, 0, 0)
         feat_row.addWidget(QLabel("Preset:"))
         self.feature_combo = QComboBox()
         self.feature_combo.addItems(list(FEATURE_PRESETS.keys()))
@@ -850,7 +1121,7 @@ class CellTypeTab(QWidget):
             "Open 'Tune Features' below to customise the grid."
         ))
         feat_row.addStretch()
-        layout.addLayout(feat_row)
+        layout.addWidget(self._feat_row_widget)
 
         # ── Tune Features collapsible group ─────────────────────────────────
         self.tune_group = QGroupBox("Tune Features")
@@ -886,7 +1157,9 @@ class CellTypeTab(QWidget):
         layout.addWidget(self.tune_group)
 
         # ── Consider original image checkbox ─────────────────────────────────
-        orig_row = QHBoxLayout()
+        self._orig_row_widget = QWidget()
+        orig_row = QHBoxLayout(self._orig_row_widget)
+        orig_row.setContentsMargins(0, 0, 0, 0)
         self.consider_original_cb = QCheckBox("Consider original image as well")
         preset_orig_default = FEATURE_PRESETS.get(saved_preset, {}).get("original", False)
         saved_orig = bool(ip.get(f"apoc_{cell_type}_consider_original", preset_orig_default))
@@ -900,7 +1173,7 @@ class CellTypeTab(QWidget):
             "Useful when intensity alone is a strong cue (e.g. very bright nuclei)."
         ))
         orig_row.addStretch()
-        layout.addLayout(orig_row)
+        layout.addWidget(self._orig_row_widget)
 
         # ── Feature string preview ───────────────────────────────────────────
         self.preview_label = QLabel("")
@@ -920,7 +1193,9 @@ class CellTypeTab(QWidget):
         layout.addWidget(self.stats_btn)
 
         # ── RF parameters ────────────────────────────────────────────────────
-        rf_row = QHBoxLayout()
+        self._rf_row_widget = QWidget()
+        rf_row = QHBoxLayout(self._rf_row_widget)
+        rf_row.setContentsMargins(0, 0, 0, 0)
         rf_row.addWidget(QLabel("Max depth:"))
         self.max_depth_spin = QSpinBox()
         self.max_depth_spin.setRange(1, 20)
@@ -945,7 +1220,7 @@ class CellTypeTab(QWidget):
             "Default (100) is a good starting point."
         ))
         rf_row.addStretch()
-        layout.addLayout(rf_row)
+        layout.addWidget(self._rf_row_widget)
 
         self.run_instance_btn = None
         self.instance_group = None
@@ -963,7 +1238,10 @@ class CellTypeTab(QWidget):
         # Placeholder where the instance group is inserted in inline mode.
         # In docked mode this placeholder is unused; the group is reparented
         # into the parent training widget's shared dock area.
-        self._instance_group_anchor = QWidget()
+        # Parented to `self` directly (not just added to `layout`, which has
+        # no widget parent until setLayout() runs below) so this widget is
+        # never briefly a real top-level window when setVisible(True) fires.
+        self._instance_group_anchor = QWidget(self)
         self._instance_group_anchor.setVisible(False)
         self._instance_group_anchor_layout = QVBoxLayout(self._instance_group_anchor)
         self._instance_group_anchor_layout.setContentsMargins(0, 0, 0, 0)
@@ -1002,7 +1280,19 @@ class CellTypeTab(QWidget):
             # Apply preset defaults
             self._apply_preset_defaults(saved_preset)
 
+        self._locked_feature_string = None
         self._update_preview()
+
+    def set_classifier_params_visible(self, visible):
+        """Toggle the visibility of all classifier-specific parameters."""
+        self.chan_group.setVisible(visible)
+        self._hint_label.setVisible(visible)
+        self._feat_row_widget.setVisible(visible)
+        self.tune_group.setVisible(visible)
+        self._orig_row_widget.setVisible(visible)
+        self.preview_label.setVisible(visible)
+        self.stats_btn.setVisible(visible)
+        self._rf_row_widget.setVisible(visible)
 
     # ────────────────────────────────────────────────────────────────────────
     # Internal helpers
@@ -1023,6 +1313,35 @@ class CellTypeTab(QWidget):
         """Return the set of (feat_key, sigma_str) currently checked in the grid."""
         return {key for key, cb in self._feat_sigma_checks.items() if cb.isChecked()}
 
+    def get_native(self, widget):
+        """Return the canonical native (px/voxel) value for a spinbox
+        registered with this tab's unit manager, or its raw ``.value()``
+        when no manager applies (dimensionless params, or no resolution
+        available). Safe to call with ``widget=None``."""
+        if widget is None:
+            return None
+        if self._unit_mgr is not None and widget in getattr(self._unit_mgr, "_entries", ()):
+            return self._unit_mgr.get_native(widget)
+        return widget.value()
+
+    def set_native(self, widget, native_value):
+        """Set a spinbox to a native value, converting to the currently
+        displayed unit via this tab's unit manager when registered."""
+        if widget is None or native_value is None:
+            return
+        if self._unit_mgr is not None and widget in getattr(self._unit_mgr, "_entries", ()):
+            self._unit_mgr.set_native(widget, native_value)
+        else:
+            widget.setValue(native_value)
+
+    def _on_units_toggled(self, checked):
+        """Remember the px/µm display choice across strategy rebuilds.
+
+        Native values are unaffected by this toggle — it only changes what
+        the spinboxes *display* — so this does not need to trigger a param
+        re-persist."""
+        self._units_physical = bool(checked)
+
     def _build_instance_controls(self, initial_params, strategy=None):
         """Create per-tab instance-segmentation preview controls.
 
@@ -1042,6 +1361,10 @@ class CellTypeTab(QWidget):
         self.fill_holes_cb = None
         self.peak_min_distance_spin = None
         self.peak_min_ratio_spin = None
+        # A fresh manager is created below (if any distance/volume controls
+        # end up being built for this strategy) rather than reused, since
+        # the spinbox instances themselves are rebuilt from scratch here.
+        self._unit_mgr = None
 
         effective_strategy = str(strategy or self._apoc_strategy)
 
@@ -1052,6 +1375,19 @@ class CellTypeTab(QWidget):
         group_layout = QVBoxLayout()
         group_layout.setContentsMargins(4, 4, 4, 4)
         group_layout.setSpacing(4)
+
+        # Per-tab physical(µm)/pixel unit toggle for the distance/volume
+        # controls below (EDT threshold, min size, peak distance). Mask/seed
+        # thresholds and peak ratio are dimensionless (0-1) and excluded, as
+        # is opening (fixed in pixels by definition).
+        from behav3d.napari._units import UnitGroupManager
+        self._unit_mgr = UnitGroupManager(
+            xy_um=self._pixel_sizes.get("xy_um"),
+            z_um=self._pixel_sizes.get("z_um"),
+            default_physical=self._units_physical,
+        )
+        self._unit_mgr.switch.toggled.connect(self._on_units_toggled)
+        group_layout.addWidget(self._unit_mgr.header_row("Units:"))
 
         if effective_strategy == "APOC Probability Map + Watershed":
             row1 = QHBoxLayout()
@@ -1078,7 +1414,13 @@ class CellTypeTab(QWidget):
                 "Seed threshold",
                 "Higher cutoff used to place watershed seeds.\n"
                 "Should be ≥ Mask threshold (typical: 0.8).\n"
-                "Lower values produce more seeds (split more touching objects)."
+                "Higher values keep only each object's confident core as a "
+                "separate seed, splitting more touching objects. Lower values "
+                "(closer to Mask threshold) merge neighboring cores together, "
+                "splitting fewer objects.\n\n"
+                "Note: this is the opposite direction from the 'EDT threshold' "
+                "used by the EDT/Watershed strategy (there, lower values split "
+                "more) — same identical behaviour in APOC and ConvPaint."
             ))
             group_layout.addLayout(row1)
 
@@ -1094,9 +1436,13 @@ class CellTypeTab(QWidget):
             ))
 
             self.segment_size_min_spin = QSpinBox()
-            self.segment_size_min_spin.setRange(0, 100000)
+            self.segment_size_min_spin.setRange(0, 1000000000)
             self.segment_size_min_spin.setSingleStep(10)
             self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 0)))
+            self._unit_mgr.register(
+                self.segment_size_min_spin, "volume",
+                initial_params.get(f"{self.cell_type}_segment_size_min", 0),
+            )
             row2.addWidget(QLabel("Min size:"))
             row2.addWidget(self.segment_size_min_spin)
             row2.addWidget(HelpButton(
@@ -1113,16 +1459,24 @@ class CellTypeTab(QWidget):
             row1 = QHBoxLayout()
             row2 = QHBoxLayout()
             self.edt_threshold_spin = QDoubleSpinBox()
-            self.edt_threshold_spin.setRange(0.0, 50.0)
+            self.edt_threshold_spin.setRange(0.0, 1000.0)
             self.edt_threshold_spin.setSingleStep(0.5)
             self.edt_threshold_spin.setValue(float(initial_params.get(f"{self.cell_type}_edt_threshold", 1.0)))
+            self._unit_mgr.register(
+                self.edt_threshold_spin, "distance",
+                initial_params.get(f"{self.cell_type}_edt_threshold", 1.0),
+            )
             row1.addWidget(QLabel("EDT threshold:"))
             row1.addWidget(self.edt_threshold_spin)
             row1.addWidget(HelpButton(
                 "EDT threshold",
                 "Euclidean-distance-transform threshold used to derive seeds inside "
                 "the binary mask.\n"
-                "Lower values give more aggressive splitting of touching objects."
+                "Lower values give more aggressive splitting of touching objects.\n\n"
+                "Note: this is the opposite direction from the 'Seed threshold' used "
+                "by the Probability Map + Watershed strategy (there, higher values "
+                "split more) — the two strategies use different mechanisms "
+                "(distance-from-edge vs. classifier confidence)."
             ))
 
             self.opening_nr_pixels_spin = QSpinBox()
@@ -1138,9 +1492,13 @@ class CellTypeTab(QWidget):
             group_layout.addLayout(row1)
 
             self.segment_size_min_spin = QSpinBox()
-            self.segment_size_min_spin.setRange(0, 100000)
+            self.segment_size_min_spin.setRange(0, 1000000000)
             self.segment_size_min_spin.setSingleStep(10)
             self.segment_size_min_spin.setValue(int(initial_params.get(f"{self.cell_type}_segment_size_min", 0)))
+            self._unit_mgr.register(
+                self.segment_size_min_spin, "volume",
+                initial_params.get(f"{self.cell_type}_segment_size_min", 0),
+            )
             row2.addWidget(QLabel("Min size:"))
             row2.addWidget(self.segment_size_min_spin)
             row2.addWidget(HelpButton(
@@ -1162,10 +1520,14 @@ class CellTypeTab(QWidget):
             if effective_strategy == "APOC Mask + Peak EDT/Watershed Resegmentation":
                 row3 = QHBoxLayout()
                 self.peak_min_distance_spin = QDoubleSpinBox()
-                self.peak_min_distance_spin.setRange(0.0, 50.0)
+                self.peak_min_distance_spin.setRange(0.0, 1000.0)
                 self.peak_min_distance_spin.setSingleStep(0.5)
                 self.peak_min_distance_spin.setValue(float(initial_params.get(f"{self.cell_type}_peak_min_distance", 0.0)))
-                self.peak_min_distance_spin.setToolTip("Minimum distance (µm) between local EDT peaks used as watershed seeds")
+                self._unit_mgr.register(
+                    self.peak_min_distance_spin, "distance",
+                    initial_params.get(f"{self.cell_type}_peak_min_distance", 0.0),
+                )
+                self.peak_min_distance_spin.setToolTip("Minimum distance between local EDT peaks used as watershed seeds")
                 row3.addWidget(QLabel("Peak min dist:"))
                 row3.addWidget(self.peak_min_distance_spin)
                 row3.addWidget(HelpButton(
@@ -1411,7 +1773,14 @@ class CellTypeTab(QWidget):
     # ────────────────────────────────────────────────────────────────────────
 
     def get_feature_string(self):
-        """Return the full APOC feature string based on current grid state."""
+        """Return the full APOC feature string based on current grid state.
+
+        When features are locked (imported mode) the locked string is returned
+        unchanged so the training loop always uses the imported classifier's
+        feature specification.
+        """
+        if getattr(self, "_locked_feature_string", None):
+            return self._locked_feature_string
         checked = self._get_current_checked_set()
         consider_orig = self.consider_original_cb.isChecked()
         return _build_feature_string_from_checked(checked, consider_original=consider_orig, current_sigmas=self.current_sigmas)
@@ -1428,29 +1797,61 @@ class CellTypeTab(QWidget):
             cb.deleteLater()
         self.channel_checkboxes = []
 
-        for layer in self.viewer.layers:
-            if (
-                isinstance(layer, napari.layers.Image)
-                and not layer.name.startswith("Pixel Classification")
-                and not layer.name.startswith("Probability Map")
-                and not layer.name.startswith("Instance Segmentation")
-            ):
-                cb = QCheckBox(layer.name)
-                if use_defaults and default_names:
-                    checked = layer.name in default_names
-                elif layer.name in existing_names:
-                    checked = layer.name in checked_names
-                elif default_names:
-                    checked = layer.name in default_names
-                else:
-                    checked = True
-                cb.setChecked(checked)
-                self.chan_checkbox_layout.addWidget(cb)
-                self.channel_checkboxes.append(cb)
-        if self.channel_checkboxes:
-            self._default_channel_names = [
-                cb.text() for cb in self.channel_checkboxes if cb.isChecked()
-            ]
+        # Image layers can arrive one at a time (e.g. one `add_image` call per
+        # channel while a session loads), so this rebuild can run repeatedly
+        # against a still-partial set of layers. Only a real user click
+        # (``_on_channel_checkbox_toggled``) is allowed to update
+        # ``_default_channel_names`` — otherwise an in-progress load would
+        # permanently forget a saved channel selection that hasn't appeared
+        # as a layer yet.
+        self._rebuilding_channel_checkboxes = True
+        try:
+            for layer in self.viewer.layers:
+                if (
+                    isinstance(layer, napari.layers.Image)
+                    and not layer.name.startswith("Pixel Classification")
+                    and not layer.name.startswith("Probability Map")
+                    and not layer.name.startswith("Instance Segmentation")
+                ):
+                    cb = QCheckBox(layer.name)
+                    if use_defaults and default_names:
+                        checked = layer.name in default_names
+                    elif layer.name in existing_names:
+                        checked = layer.name in checked_names
+                    elif default_names:
+                        checked = layer.name in default_names
+                    else:
+                        checked = True
+                    cb.setChecked(checked)
+                    cb.toggled.connect(self._on_channel_checkbox_toggled)
+                    self.chan_checkbox_layout.addWidget(cb)
+                    self.channel_checkboxes.append(cb)
+        finally:
+            self._rebuilding_channel_checkboxes = False
+
+    def _on_channel_checkbox_toggled(self, _checked=None):
+        """Update the remembered default only in response to a real user click."""
+        if getattr(self, "_rebuilding_channel_checkboxes", False):
+            return
+        self._default_channel_names = [
+            cb.text() for cb in self.channel_checkboxes if cb.isChecked()
+        ]
+
+    def channel_selection_is_complete(self):
+        """Whether ``channel_checkboxes`` covers every eligible image layer.
+
+        False while a session is still loading channels one at a time, which
+        callers use to avoid persisting a partial channel selection.
+        """
+        expected = {
+            layer.name for layer in self.viewer.layers
+            if isinstance(layer, napari.layers.Image)
+            and not layer.name.startswith("Pixel Classification")
+            and not layer.name.startswith("Probability Map")
+            and not layer.name.startswith("Instance Segmentation")
+        }
+        current = {cb.text() for cb in self.channel_checkboxes}
+        return current == expected
 
     def get_config(self):
         """Return a dict with all current widget values."""
@@ -1480,10 +1881,10 @@ class CellTypeTab(QWidget):
                 float(self.prob_seed_threshold_spin.value()) if self.prob_seed_threshold_spin is not None else None
             ),
             "edt_threshold": (
-                float(self.edt_threshold_spin.value()) if self.edt_threshold_spin is not None else None
+                float(self.get_native(self.edt_threshold_spin)) if self.edt_threshold_spin is not None else None
             ),
             "segment_size_min": (
-                int(self.segment_size_min_spin.value()) if self.segment_size_min_spin is not None else None
+                int(round(self.get_native(self.segment_size_min_spin))) if self.segment_size_min_spin is not None else None
             ),
             "opening_nr_pixels": (
                 int(self.opening_nr_pixels_spin.value()) if self.opening_nr_pixels_spin is not None else None
@@ -1492,7 +1893,7 @@ class CellTypeTab(QWidget):
                 bool(self.fill_holes_cb.isChecked()) if self.fill_holes_cb is not None else None
             ),
             "peak_min_distance": (
-                float(self.peak_min_distance_spin.value()) if self.peak_min_distance_spin is not None else None
+                float(self.get_native(self.peak_min_distance_spin)) if self.peak_min_distance_spin is not None else None
             ),
             "peak_min_ratio": (
                 float(self.peak_min_ratio_spin.value()) if self.peak_min_ratio_spin is not None else None
@@ -1529,17 +1930,108 @@ class CellTypeTab(QWidget):
         if "prob_seed_threshold" in cfg and self.prob_seed_threshold_spin is not None and cfg["prob_seed_threshold"] is not None:
             self.prob_seed_threshold_spin.setValue(float(cfg["prob_seed_threshold"]))
         if "edt_threshold" in cfg and self.edt_threshold_spin is not None and cfg["edt_threshold"] is not None:
-            self.edt_threshold_spin.setValue(float(cfg["edt_threshold"]))
+            self.set_native(self.edt_threshold_spin, float(cfg["edt_threshold"]))
         if "segment_size_min" in cfg and self.segment_size_min_spin is not None and cfg["segment_size_min"] is not None:
-            self.segment_size_min_spin.setValue(int(cfg["segment_size_min"]))
+            self.set_native(self.segment_size_min_spin, int(cfg["segment_size_min"]))
         if "opening_nr_pixels" in cfg and self.opening_nr_pixels_spin is not None and cfg["opening_nr_pixels"] is not None:
             self.opening_nr_pixels_spin.setValue(int(cfg["opening_nr_pixels"]))
         if "fill_holes" in cfg and self.fill_holes_cb is not None and cfg["fill_holes"] is not None:
             self.fill_holes_cb.setChecked(bool(cfg["fill_holes"]))
         if "peak_min_distance" in cfg and self.peak_min_distance_spin is not None and cfg["peak_min_distance"] is not None:
-            self.peak_min_distance_spin.setValue(float(cfg["peak_min_distance"]))
+            self.set_native(self.peak_min_distance_spin, float(cfg["peak_min_distance"]))
         if "peak_min_ratio" in cfg and self.peak_min_ratio_spin is not None and cfg["peak_min_ratio"] is not None:
             self.peak_min_ratio_spin.setValue(float(cfg["peak_min_ratio"]))
+        self._update_preview()
+
+    # ── Import / feature-locking API ──────────────────────────────────────────
+
+    def lock_features(self, feature_string, sigmas=None, consider_original=None, channels_used=None):
+        """Disable all feature controls and fix the feature string (imported mode).
+
+        Applies the imported settings visually before locking so greyed-out
+        controls show the imported values rather than the last user-edited state.
+        """
+        self._locked_feature_string = feature_string
+
+        # --- Apply imported values visually before disabling ---
+        parsed = _parse_feature_string(feature_string)
+
+        # Sigmas: explicit list from metadata takes priority over parsed
+        if sigmas:
+            sigma_str = ", ".join(_fmt_sigma(s) for s in sigmas)
+        else:
+            sigma_str = parsed.get("grid_sigmas", "")
+        if sigma_str:
+            self.sigma_input.setText(sigma_str)
+            try:
+                parts = sigma_str.replace(",", " ").split()
+                new_sigmas = [float(p) for p in parts if p.strip()]
+                if new_sigmas:
+                    self.current_sigmas = new_sigmas
+                    self._build_grid()
+            except ValueError:
+                pass
+
+        # Feature grid checkboxes
+        checked_set = {tuple(pair) for pair in parsed.get("checked_features", [])}
+        self._apply_checked_set(checked_set)
+
+        # Consider-original: explicit value takes priority over parsed
+        co_value = parsed.get("consider_original", False) if consider_original is None else consider_original
+        self.consider_original_cb.blockSignals(True)
+        self.consider_original_cb.setChecked(co_value)
+        self.consider_original_cb.blockSignals(False)
+
+        # Channel checkboxes
+        if channels_used is not None:
+            self._default_channel_names = list(channels_used)
+            channels_used_set = set(channels_used)
+            for cb in self.channel_checkboxes:
+                cb.setChecked(cb.text() in channels_used_set)
+
+        # --- Disable all controls ---
+        self.feature_combo.setEnabled(False)
+        self.sigma_input.setEnabled(False)
+        self.update_grid_btn.setEnabled(False)
+        self.consider_original_cb.setEnabled(False)
+        for cb in self._feat_sigma_checks.values():
+            cb.setEnabled(False)
+        for ch_cb in self.channel_checkboxes:
+            ch_cb.setEnabled(False)
+        self.chan_group.setEnabled(False)
+        self.tune_group.setEnabled(False)
+
+        short = feature_string if len(feature_string) <= 110 else feature_string[:107] + "…"
+        self.preview_label.setText(
+            f"<b>🔒 Features locked (imported):</b><br/>"
+            f"<span style='font-family:monospace;'>{short}</span>"
+        )
+        self.preview_label.setToolTip(feature_string)
+        self.preview_label.setStyleSheet(
+            "color: #c06000; font-size: 10px; padding: 4px 6px; "
+            "background: rgba(220,120,0,0.08); border-radius: 3px; "
+            "border: 1px solid #c06000;"
+        )
+
+    def unlock_features(self):
+        """Re-enable all feature controls and clear the import lock."""
+        self._locked_feature_string = None
+
+        self.feature_combo.setEnabled(True)
+        self.sigma_input.setEnabled(True)
+        self.update_grid_btn.setEnabled(True)
+        self.consider_original_cb.setEnabled(True)
+        for cb in self._feat_sigma_checks.values():
+            cb.setEnabled(True)
+        for ch_cb in self.channel_checkboxes:
+            ch_cb.setEnabled(True)
+        self.chan_group.setEnabled(True)
+        self.tune_group.setEnabled(True)
+
+        self.preview_label.setStyleSheet(
+            "color: #888; font-size: 10px; padding: 2px 4px; "
+            "background: rgba(0,0,0,0.05); border-radius: 3px;"
+        )
         self._update_preview()
 
 
@@ -1583,6 +2075,9 @@ class APOCTrainingWidget(QWidget):
     instance_preview_finished = Signal(str)
     # Emitted when the global strategy combo value changes (plugin mode).
     strategy_changed = Signal(str)
+    # Emitted when imported training data is applied or cleared.
+    import_applied = Signal()
+    import_cleared = Signal()
 
     STRATEGIES = [
         "APOC (Direct Instance Segmentation)",
@@ -1590,6 +2085,9 @@ class APOCTrainingWidget(QWidget):
         "APOC Mask + Peak EDT/Watershed Resegmentation",
         "APOC Probability Map + Watershed",
     ]
+    import os
+    if os.environ.get("BEHAV3D_DEV_MODE") != "1":
+        STRATEGIES.remove("APOC Mask + Peak EDT/Watershed Resegmentation")
     ADVANCED_STRATEGY = "Advanced (per cell type)"
 
     def __init__(
@@ -1605,8 +2103,10 @@ class APOCTrainingWidget(QWidget):
         per_cell_type_strategy=False,
         strategy_resolver=None,
         extra_toolbar_widgets=None,
+        pixel_sizes=None,
     ):
         super().__init__(parent)
+        self._bg = BackgroundOperation(self)
         self.viewer = viewer
         self.pixel_class_outdir = pixel_class_outdir
         self.all_cell_types = all_cell_types
@@ -1615,6 +2115,13 @@ class APOCTrainingWidget(QWidget):
         self._on_params_changed = on_params_changed
         self._apoc_strategy = str(self._initial_params.get("apoc_strategy", "APOC Probability Map + Watershed"))
         self._log_fn = print
+        # Optional pixel sizes dict: {"xy_um": float, "z_um": float}
+        self._pixel_sizes = dict(pixel_sizes) if pixel_sizes else {}
+        # Imported training data state
+        self._imported_training_data: dict = {}
+        self._imported_metadata: dict = {}
+        self._cell_type_mapping: dict = {}
+        self._imported_metadata_path: str = ""
 
         if instance_controls_mode not in ("docked", "inline"):
             raise ValueError(
@@ -1672,6 +2179,90 @@ class APOCTrainingWidget(QWidget):
         print(text)
         if callable(self._log_fn) and self._log_fn is not print:
             self._log_fn(text)
+
+    # ── Imported training data API ────────────────────────────────────────────
+
+    def apply_import(self, imported_metadata, data_by_celltype, cell_type_mapping, source_path=""):
+        """Apply imported training data: store X/y pairs and lock per-tab features.
+
+        Parameters
+        ----------
+        imported_metadata : dict
+            Parsed training_metadata.yml from the source experiment.
+        data_by_celltype : dict
+            {imported_cell_type: (X, y)} numpy arrays.
+        cell_type_mapping : dict
+            {imported_cell_type: local_cell_type | None}.  None means skip.
+        source_path : str
+            Path to the source training_metadata.yml (stored for provenance).
+        """
+        self._imported_metadata = dict(imported_metadata)
+        self._cell_type_mapping = dict(cell_type_mapping)
+        self._imported_training_data = {}
+        self._imported_metadata_path = str(source_path)
+
+        features_info = imported_metadata.get("features", {})
+        for imp_ct, local_ct in cell_type_mapping.items():
+            if local_ct is None:
+                continue
+            if imp_ct in data_by_celltype:
+                imp_X, imp_y = data_by_celltype[imp_ct]
+                self._imported_training_data[local_ct] = (
+                    imp_X.astype(np.float32),
+                    imp_y.astype(np.int32),
+                )
+            if local_ct in self.tabs:
+                ct_features = features_info.get(imp_ct, {})
+                feature_string = ct_features.get("feature_string", "")
+                if feature_string:
+                    self.tabs[local_ct].lock_features(
+                        feature_string,
+                        sigmas=ct_features.get("sigmas"),
+                        consider_original=ct_features.get("consider_original"),
+                        channels_used=ct_features.get("channels_used"),
+                    )
+
+        try:
+            self.import_applied.emit()
+        except Exception:
+            pass
+
+    def clear_import(self):
+        """Remove imported training data and unlock all feature controls."""
+        self._imported_training_data = {}
+        self._imported_metadata = {}
+        self._cell_type_mapping = {}
+        self._imported_metadata_path = ""
+        for tab in self.tabs.values():
+            tab.unlock_features()
+        try:
+            self.import_cleared.emit()
+        except Exception:
+            pass
+
+    def get_import_summary(self):
+        """Return a human-readable summary of the active import (or empty string)."""
+        if not self._imported_metadata:
+            return ""
+        lines = []
+        img_meta = self._imported_metadata.get("image_metadata", {})
+        xy = img_meta.get("pixel_size_xy_um")
+        z  = img_meta.get("pixel_size_z_um")
+        if xy is not None:
+            lines.append(f"Pixel size: xy={xy} µm, z={z} µm")
+        ch_names = img_meta.get("channel_names", [])
+        if ch_names:
+            lines.append(f"Channels: {', '.join(ch_names)}")
+        td_info = self._imported_metadata.get("training_data", {})
+        for imp_ct, local_ct in self._cell_type_mapping.items():
+            if local_ct is None:
+                continue
+            counts = td_info.get(imp_ct, {})
+            n = counts.get("n_pixels", 0)
+            pos = counts.get("n_positive", 0)
+            neg = counts.get("n_negative", 0)
+            lines.append(f"  {imp_ct} → {local_ct}: {n} px ({pos} fg / {neg} bg)")
+        return "\n".join(lines)
 
     def _build_ui(self):
         # Content widget (scrollable)
@@ -1738,6 +2329,7 @@ class APOCTrainingWidget(QWidget):
                 show_strategy_combo=self._per_cell_type_strategy,
                 per_tab_strategies=per_tab_strategies,
                 on_per_tab_strategy_changed=self._on_per_tab_strategy_changed,
+                pixel_sizes=self._pixel_sizes,
             )
             self.tabs[ct] = tab
             self.tab_widget.addTab(tab, ct.capitalize())
@@ -1822,12 +2414,28 @@ class APOCTrainingWidget(QWidget):
         self.apply_all_btn.clicked.connect(self._on_apply_to_all)
         self.train_current_btn.clicked.connect(self._on_train_current)
         self.train_all_btn.clicked.connect(self._on_train_all)
+        # Forward background progress label to the status_label for live updates.
+        self._bg.progress.connect(
+            lambda cur, tot, lbl: self.status_label.setText(lbl),
+            Qt.QueuedConnection,
+        )
         # In docked mode, switching tabs reparents the instance group; in
         # inline mode the group already lives in the tab so we do nothing.
         if self._instance_controls_mode == "docked":
             self.tab_widget.currentChanged.connect(lambda _idx: self._refresh_instance_controls())
+        self.tab_widget.currentChanged.connect(self._update_train_current_btn_text)
         if self.strategy_combo is not None:
             self.strategy_combo.currentTextChanged.connect(self._on_global_strategy_changed)
+        self._update_train_current_btn_text()
+
+    def _update_train_current_btn_text(self, *_args):
+        if hasattr(self, "train_current_btn") and hasattr(self, "tab_widget") and self._tab_cell_types:
+            try:
+                current_ct = self._tab_cell_types[self.tab_widget.currentIndex()]
+                self.train_current_btn.setText(f"▶ Train {current_ct.capitalize()} classifier")
+            except IndexError:
+                pass
+
 
     def _refresh_instance_controls(self):
         """Show the current tab's instance-segmentation controls in the main dock.
@@ -2005,6 +2613,16 @@ class APOCTrainingWidget(QWidget):
             if btn is not None:
                 btn.setEnabled(enabled)
 
+    def set_classifier_params_visible(self, visible):
+        """Show or hide the classifier-specific parameters while keeping segmentation parameters active."""
+        self.apply_all_btn.setVisible(visible)
+        self.train_current_btn.setVisible(visible)
+        self.train_all_btn.setVisible(visible)
+        self.save_labels_btn.setVisible(visible)
+        for tab in self.tabs.values():
+            if hasattr(tab, "set_classifier_params_visible"):
+                tab.set_classifier_params_visible(visible)
+
     def cleanup(self):
         """Disconnect viewer-layer callbacks before the widget is destroyed.
 
@@ -2019,6 +2637,20 @@ class APOCTrainingWidget(QWidget):
             except Exception:
                 pass
         self._layer_event_handles = []
+
+    @contextlib.contextmanager
+    def pause_channel_refresh(self):
+        """Temporarily block this widget's own layer-inserted/removed callbacks.
+
+        Blocking the whole event (``emitter.blocker()``) would also block
+        napari's internal layer-controls-widget registration, which listens
+        on the same event and desyncs the viewer UI. Blocking only this
+        widget's own callback leaves other listeners free to run.
+        """
+        with contextlib.ExitStack() as stack:
+            for emitter, callback in self._layer_event_handles:
+                stack.enter_context(emitter.blocker(callback))
+            yield
 
     # ------------------------------------------------------------------
     # Button handlers
@@ -2037,11 +2669,11 @@ class APOCTrainingWidget(QWidget):
     def _on_train_current(self):
         """Train only the classifier for the currently visible tab."""
         current_ct = self._tab_cell_types[self.tab_widget.currentIndex()]
-        self._run_training([current_ct])
+        self._run_training_bg([current_ct])
 
     def _on_train_all(self):
         """Train classifiers for ALL cell types using each tab's individual config."""
-        self._run_training(self._tab_cell_types)
+        self._run_training_bg(self._tab_cell_types)
 
     # ------------------------------------------------------------------
     # Core training logic
@@ -2196,6 +2828,8 @@ class APOCTrainingWidget(QWidget):
         """Push classifier preview outputs into Napari layers."""
         seg_layer_name = "Pixel Classification (Dead)" if ct == "dead" else f"{ct.capitalize()} Segments"
         self._set_labels_layer(seg_layer_name, segments_result, visible=True, opacity=0.8)
+        if ct == "dead":
+            _set_dead_mask_layer_color(self.viewer.layers[seg_layer_name])
 
         prob_layer_name = "Probability Map (Dead)" if ct == "dead" else f"Probability Map ({ct.capitalize()})"
         self._set_image_layer(prob_layer_name, prob_result, visible=False, opacity=0.6)
@@ -2214,7 +2848,7 @@ class APOCTrainingWidget(QWidget):
                 mask_thr=float(tab.prob_mask_threshold_spin.value()),
                 seed_thr=float(tab.prob_seed_threshold_spin.value()),
                 opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
-                segment_size_min=int(tab.segment_size_min_spin.value()),
+                segment_size_min=int(round(tab.get_native(tab.segment_size_min_spin))),
             )
 
         marker_strategy = (
@@ -2224,12 +2858,12 @@ class APOCTrainingWidget(QWidget):
         )
         return _mask_array_to_segments(
             raw_prediction > 0,
-            edt_thr=float(tab.edt_threshold_spin.value()),
+            edt_thr=float(tab.get_native(tab.edt_threshold_spin)),
             opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
-            segment_size_min=int(tab.segment_size_min_spin.value()),
+            segment_size_min=int(round(tab.get_native(tab.segment_size_min_spin))),
             fill_holes=bool(tab.fill_holes_cb.isChecked()),
             marker_strategy=marker_strategy,
-            peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
+            peak_min_distance=float(tab.get_native(tab.peak_min_distance_spin)) if tab.peak_min_distance_spin is not None else None,
             peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
         )
 
@@ -2263,12 +2897,17 @@ class APOCTrainingWidget(QWidget):
             if strategy == "APOC Probability Map + Watershed":
                 if prob_prediction is None or prob_path is None or not Path(prob_path).exists():
                     _raw_prediction, prob_prediction = self._predict_classifier_outputs(ct)
+                mask_thr = float(tab.prob_mask_threshold_spin.value())
+                seed_thr = float(tab.prob_seed_threshold_spin.value())
+                opening_nr_pixels = int(tab.opening_nr_pixels_spin.value())
+                segment_size_min = int(round(tab.get_native(tab.segment_size_min_spin)))
+                print(f"  ⚙ {ct} preview params: mask_thr={mask_thr}, seed_thr={seed_thr}, min_size={segment_size_min}, opening_px={opening_nr_pixels}")
                 instance_preview = _probability_array_to_segments(
                     prob_prediction,
-                    mask_thr=float(tab.prob_mask_threshold_spin.value()),
-                    seed_thr=float(tab.prob_seed_threshold_spin.value()),
-                    opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
-                    segment_size_min=int(tab.segment_size_min_spin.value()),
+                    mask_thr=mask_thr,
+                    seed_thr=seed_thr,
+                    opening_nr_pixels=opening_nr_pixels,
+                    segment_size_min=segment_size_min,
                 )
             else:
                 raw_prediction, prob_prediction = self._predict_classifier_outputs(ct)
@@ -2277,15 +2916,22 @@ class APOCTrainingWidget(QWidget):
                     if strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
                     else "threshold"
                 )
+                edt_thr = float(tab.get_native(tab.edt_threshold_spin))
+                opening_nr_pixels = int(tab.opening_nr_pixels_spin.value())
+                segment_size_min = int(round(tab.get_native(tab.segment_size_min_spin)))
+                fill_holes = bool(tab.fill_holes_cb.isChecked())
+                peak_min_distance = float(tab.get_native(tab.peak_min_distance_spin)) if tab.peak_min_distance_spin is not None else None
+                peak_min_ratio = float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35
+                print(f"  ⚙ {ct} preview params: edt_thr={edt_thr}, min_size={segment_size_min}, fill_holes={fill_holes}, opening_px={opening_nr_pixels}, peak_min_distance={peak_min_distance}, peak_min_ratio={peak_min_ratio}")
                 instance_preview = _mask_array_to_segments(
                     raw_prediction > 0,
-                    edt_thr=float(tab.edt_threshold_spin.value()),
-                    opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
-                    segment_size_min=int(tab.segment_size_min_spin.value()),
-                    fill_holes=bool(tab.fill_holes_cb.isChecked()),
+                    edt_thr=edt_thr,
+                    opening_nr_pixels=opening_nr_pixels,
+                    segment_size_min=segment_size_min,
+                    fill_holes=fill_holes,
                     marker_strategy=marker_strategy,
-                    peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
-                    peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
+                    peak_min_distance=peak_min_distance,
+                    peak_min_ratio=peak_min_ratio,
                 )
 
             self._update_prediction_layers(ct, instance_preview, prob_prediction)
@@ -2315,7 +2961,7 @@ class APOCTrainingWidget(QWidget):
             label_data = np.asarray(label_layer.data)
             outpath = Path(self.pixel_class_outdir, f"PixelClassifier_User{cell_type.capitalize()}Labels.zarr")
             if outpath.exists():
-                shutil.rmtree(outpath)
+                rmtree_ignore_missing(outpath)
             save_as_zarr(label_data, outpath)
             log(f"Saved {cell_type} labels → {outpath}")
 
@@ -2324,11 +2970,367 @@ class APOCTrainingWidget(QWidget):
             dead_label_data = np.asarray(dead_layer.data)
             dead_outpath = Path(self.pixel_class_outdir, "PixelClassifier_UserDeadLabels.zarr")
             if dead_outpath.exists():
-                shutil.rmtree(dead_outpath)
+                rmtree_ignore_missing(dead_outpath)
             save_as_zarr(dead_label_data, dead_outpath)
             log(f"Saved Death labels → {dead_outpath}")
 
         log("✅ All user labels saved!")
+
+    def _run_training_bg(self, cell_types_to_train):
+        """Background-threaded version of :meth:`_run_training`.
+
+        Phase 1 (Qt thread): read viewer layers & widget values into plain
+        NumPy arrays and APOC config dicts.
+        Phase 2 (worker thread): fit classifiers, run predictions.
+        Phase 3 (Qt thread, via on_done): write result arrays to viewer layers,
+        persist params, update status label.
+        """
+        import apoc
+
+        if self._bg.is_running():
+            self._log("⚠️ Training is already in progress.")
+            return
+
+        cell_types_to_train = list(cell_types_to_train)
+
+        # ── Phase 1 (Qt thread): emit signal + gather all data ────────────
+        try:
+            self.training_started.emit(cell_types_to_train)
+        except Exception:
+            pass
+
+        self._log("Auto-saving user labels before training…")
+        self.save_user_labels(log=self._log)
+
+        # Collect per-cell-type config, images, and annotation arrays.
+        ct_inputs = {}
+        for ct in cell_types_to_train:
+            tab = self.tabs[ct]
+            cfg = tab.get_config()
+            feature_string = cfg["feature_string"]
+
+            # Images: convert to numpy so the worker never touches viewer layers.
+            images_np = [
+                np.asarray(img) for img in self._get_images_for_tab(ct)
+            ]
+            if not images_np:
+                self._log(f"  ⚠️ No image layers selected for '{ct}' — skipping.")
+                continue
+
+            # Annotation layer data.
+            if ct == "dead":
+                layer_name = "User Provided Labels (Dead)"
+            else:
+                layer_name = f"User Provided Labels ({ct.capitalize()})"
+            try:
+                annotation = np.asarray(self.viewer.layers[layer_name].data)
+            except KeyError:
+                self._log(f"  ⚠️ Annotation layer '{layer_name}' not found — skipping.")
+                continue
+            if not np.any(annotation):
+                self._log(f"  ⚠️ No labels drawn for '{ct}' — skipping.")
+                continue
+
+            # Snapshot per-tab segmentation params (must happen on Qt thread).
+            strategy = self._resolve_strategy(ct)
+            tab_params = {}
+            if hasattr(tab, "edt_threshold_spin") and tab.edt_threshold_spin is not None:
+                tab_params["edt_thr"] = float(tab.get_native(tab.edt_threshold_spin))
+            if hasattr(tab, "opening_nr_pixels_spin") and tab.opening_nr_pixels_spin is not None:
+                tab_params["opening"] = int(tab.opening_nr_pixels_spin.value())
+            if hasattr(tab, "segment_size_min_spin") and tab.segment_size_min_spin is not None:
+                tab_params["min_size"] = int(round(tab.get_native(tab.segment_size_min_spin)))
+            if hasattr(tab, "fill_holes_cb") and tab.fill_holes_cb is not None:
+                tab_params["fill_holes"] = bool(tab.fill_holes_cb.isChecked())
+            if hasattr(tab, "prob_mask_threshold_spin") and tab.prob_mask_threshold_spin is not None:
+                tab_params["prob_mask_thr"] = float(tab.prob_mask_threshold_spin.value())
+            if hasattr(tab, "prob_seed_threshold_spin") and tab.prob_seed_threshold_spin is not None:
+                tab_params["prob_seed_thr"] = float(tab.prob_seed_threshold_spin.value())
+            if hasattr(tab, "peak_min_distance_spin") and tab.peak_min_distance_spin is not None:
+                tab_params["peak_min_dist"] = float(tab.get_native(tab.peak_min_distance_spin))
+            if hasattr(tab, "peak_min_ratio_spin") and tab.peak_min_ratio_spin is not None:
+                tab_params["peak_min_ratio"] = float(tab.peak_min_ratio_spin.value())
+
+            if ct == "dead":
+                clf_name = "PixelClassifier_Death.cl"
+            else:
+                clf_name = f"PixelClassifier_{ct.capitalize()}.cl"
+            clf_path = str(Path(self.pixel_class_outdir, clf_name))
+
+            ct_inputs[ct] = {
+                "cfg": cfg,
+                "feature_string": feature_string,
+                "images_np": images_np,
+                "annotation": annotation,
+                "clf_path": clf_path,
+                "strategy": strategy,
+                "tab_params": tab_params,
+            }
+
+        if not ct_inputs:
+            self._log("⚠️ No cell types with valid data to train.")
+            try:
+                self.training_finished.emit(cell_types_to_train, [])
+            except Exception:
+                pass
+            return
+
+        pixel_class_outdir = Path(self.pixel_class_outdir)
+        safe_log = ThreadSafeLogger(self._log)
+        training_start = time.time()
+        new_pixel_counts: dict = {}     # {ct: n_new_pixels} populated in _do_train
+        pixel_counts_by_ct: dict = {}   # {ct: {"total", "positive", "negative"}}
+
+        # ── Phase 2 (worker thread) ───────────────────────────────────────
+        def _do_train(progress_cb=None):
+            import apoc as _apoc
+            from sklearn.ensemble import RandomForestClassifier
+
+            cts = list(ct_inputs.keys())
+            n = len(cts)
+            results = {}  # ct -> {"display_segments", "prob_result"}
+
+            for i, ct in enumerate(cts):
+                if progress_cb:
+                    progress_cb(i, n, f"Training {ct}…")
+                safe_log(f"  Training {ct}…")
+
+                inp = ct_inputs[ct]
+                cfg            = inp["cfg"]
+                feature_string = inp["feature_string"]
+                images_np      = inp["images_np"]
+                annotation     = inp["annotation"]
+                clf_path       = inp["clf_path"]
+                strategy       = inp["strategy"]
+                tab_params     = inp["tab_params"]
+                max_depth      = cfg["max_depth"]
+                num_ensembles  = cfg["num_ensembles"]
+
+                # Erase existing classifier
+                if Path(clf_path).exists():
+                    _apoc.erase_classifier(clf_path)
+
+                clf = _apoc.ObjectSegmenter(
+                    opencl_filename=clf_path,
+                    max_depth=max_depth,
+                    num_ensembles=num_ensembles,
+                    positive_class_identifier=2,
+                )
+
+                # Build X/y arrays
+                X_parts, y_parts = [], []
+                gt_ndim = None
+                n_timepoints = annotation.shape[0] if annotation.ndim == 4 else 1
+
+                if annotation.ndim == 4:
+                    for t in range(n_timepoints):
+                        ann_t = annotation[t]
+                        if not np.any(ann_t):
+                            continue
+                        feats_t = self._generate_feature_list_for_timepoint(
+                            images_np, feature_string, t
+                        )
+                        X_t, y_t = clf._to_np(feats_t, ann_t)
+                        if X_t.size == 0 or y_t.size == 0:
+                            continue
+                        X_parts.append(X_t)
+                        y_parts.append(y_t)
+                        gt_ndim = ann_t.ndim
+                else:
+                    feats_np = self._generate_feature_list_for_timepoint(
+                        images_np, feature_string, 0
+                    )
+                    X_t, y_t = clf._to_np(feats_np, annotation)
+                    if X_t.size > 0 and y_t.size > 0:
+                        X_parts.append(X_t)
+                        y_parts.append(y_t)
+                        gt_ndim = annotation.ndim
+
+                if not X_parts:
+                    safe_log(f"  ⚠️ No labeled pixels for '{ct}' — skipping.")
+                    continue
+
+                X = np.concatenate(X_parts, axis=0)
+                y = np.concatenate(y_parts, axis=0)
+
+                # Track new-label pixel counts before import prepend
+                new_pixel_counts[ct] = int(len(y))
+
+                # Prepend imported training data when available for this type
+                imp_pair = self._imported_training_data.get(ct)
+                if imp_pair is not None:
+                    imp_X, imp_y = imp_pair
+                    safe_log(
+                        f"  {ct}: combining {len(imp_y)} imported + "
+                        f"{len(y)} new = {len(imp_y) + len(y)} total pixels"
+                    )
+                    X = np.concatenate([imp_X, X], axis=0)
+                    y = np.concatenate([imp_y, y], axis=0)
+
+                fitted_rf = RandomForestClassifier(
+                    max_depth=max_depth, n_estimators=num_ensembles, random_state=0
+                )
+                fitted_rf.fit(X, y)
+                clf.classifier              = fitted_rf
+                clf._feature_importances   = fitted_rf.feature_importances_
+                clf._X                     = X
+                clf._y                     = y
+                clf.num_features           = X.shape[1]
+                clf.num_ground_truth_dimensions = gt_ndim
+                clf.feature_specification  = feature_string
+                clf.to_opencl_file(clf_path)
+                _write_classifier_channel_metadata(clf_path, cfg["channels"])
+                safe_log(f"  Saved classifier: {Path(clf_path).name}")
+
+                # Save flattened training data (combined) for future import
+                try:
+                    _save_training_data(pixel_class_outdir, ct, X, y)
+                    n_pos = int(np.sum(y == 2))
+                    n_neg = int(np.sum(y == 1))
+                    pixel_counts_by_ct[ct] = {
+                        "total":    len(y),
+                        "positive": n_pos,
+                        "negative": n_neg,
+                    }
+                except Exception as _exc:
+                    safe_log(f"  ⚠️ Could not save training data for '{ct}': {_exc}")
+
+                # Predict (for visual confirmation in viewer).
+                if progress_cb:
+                    progress_cb(i, n, f"Predicting {ct}…")
+                raw_prediction, prob_result = self._predict_classifier_outputs(
+                    ct, clf=clf
+                )
+
+                # Build display segments using snapshotted tab params
+                # (mirrors _build_display_segments but without touching Qt widgets).
+                if ct == "dead" or strategy == "APOC (Direct Instance Segmentation)":
+                    display_segments = np.asarray(raw_prediction).astype(np.int16)
+                elif strategy == "APOC Probability Map + Watershed":
+                    display_segments = _probability_array_to_segments(
+                        prob_result,
+                        mask_thr=tab_params.get("prob_mask_thr", 0.5),
+                        seed_thr=tab_params.get("prob_seed_thr", 0.5),
+                        opening_nr_pixels=tab_params.get("opening", 0),
+                        segment_size_min=tab_params.get("min_size", 10),
+                    )
+                else:
+                    marker_strategy = (
+                        "peak"
+                        if strategy == "APOC Mask + Peak EDT/Watershed Resegmentation"
+                        else "threshold"
+                    )
+                    display_segments = _mask_array_to_segments(
+                        raw_prediction > 0,
+                        edt_thr=tab_params.get("edt_thr", 1.0),
+                        opening_nr_pixels=tab_params.get("opening", 0),
+                        segment_size_min=tab_params.get("min_size", 10),
+                        fill_holes=tab_params.get("fill_holes", True),
+                        marker_strategy=marker_strategy,
+                        peak_min_distance=tab_params.get("peak_min_dist"),
+                        peak_min_ratio=tab_params.get("peak_min_ratio", 0.35),
+                    )
+
+                # Save preview arrays to disk (file I/O is fine in the worker).
+                pred_path = _predicted_labels_path(pixel_class_outdir, ct)
+                if pred_path is not None:
+                    self._save_preview_array(pred_path, display_segments)
+                prob_path = _probability_map_path(pixel_class_outdir, ct)
+                if prob_path is not None:
+                    self._save_preview_array(prob_path, prob_result)
+
+                results[ct] = {
+                    "display_segments": display_segments,
+                    "prob_result": prob_result,
+                }
+
+            return results
+
+        # ── Phase 3 (Qt thread, on_done): write results to viewer ─────────
+        def _on_done(results):
+            successes = list(results.keys())
+            for ct, r in results.items():
+                self._update_prediction_layers(ct, r["display_segments"], r["prob_result"])
+                # Auto-show statistics
+                if ct in self.tabs:
+                    self.tabs[ct]._on_show_statistics()
+
+            elapsed_s   = time.time() - training_start
+            elapsed_txt = f"{elapsed_s:.1f}s"
+            if successes:
+                self.status_label.setText(
+                    f"✅ Trained: {', '.join(successes)} ({elapsed_txt})"
+                )
+                self._log(f"✅ Training finished in {elapsed_txt}")
+            else:
+                self.status_label.setText(
+                    f"⚠️ No cell types were trained (check labels). ({elapsed_txt})"
+                )
+                self._log(f"⚠️ No cell types were trained. Elapsed: {elapsed_txt}")
+
+            self._persist_params()
+
+            # Save training metadata YAML when at least one cell type was trained
+            if successes:
+                try:
+                    params_per_ct = {}
+                    for ct in list(self.all_cell_types) + (["dead"] if self.has_death else []):
+                        if ct in self.tabs:
+                            params_per_ct[ct] = self.tabs[ct].get_config()
+                    image_layers = [
+                        la for la in self.viewer.layers
+                        if hasattr(la, "data") and la.name.startswith("Channel ")
+                    ]
+                    n_channels = len(image_layers) if image_layers else None
+                    ch_names = [la.name for la in image_layers]
+                    imported_counts = {}
+                    for imp_ct, local_ct in self._cell_type_mapping.items():
+                        if local_ct is None:
+                            continue
+                        imp_pair = self._imported_training_data.get(local_ct)
+                        if imp_pair is not None:
+                            imported_counts[imp_ct] = int(len(imp_pair[1]))
+                    meta = _build_training_metadata(
+                        cell_types=self.all_cell_types,
+                        has_death=self.has_death,
+                        params_per_ct=params_per_ct,
+                        n_input_channels=n_channels,
+                        channel_names=ch_names,
+                        pixel_size_xy_um=self._pixel_sizes.get("xy_um"),
+                        pixel_size_z_um=self._pixel_sizes.get("z_um"),
+                        pixel_counts_by_ct=pixel_counts_by_ct,
+                        imported_from=self._imported_metadata_path or None,
+                        imported_counts=imported_counts if imported_counts else None,
+                        new_counts=new_pixel_counts if new_pixel_counts else None,
+                    )
+                    _save_training_metadata(self.pixel_class_outdir, meta)
+                    self._log("📄 Training data bundle saved to PixelClassifier_TrainingData.zip")
+                except Exception as _exc:
+                    self._log(f"  ⚠️ Could not save training metadata: {_exc}")
+
+            try:
+                self.training_finished.emit(cell_types_to_train, successes)
+            except Exception:
+                pass
+
+        def _on_failed(err):
+            self.status_label.setText(f"❌ Error: {err}")
+            self._log(f"❌ Training error: {err}")
+            try:
+                self.training_finished.emit(cell_types_to_train, [])
+            except Exception:
+                pass
+
+        self._bg.run(
+            fn=_do_train,
+            desc="APOC training…",
+            buttons=[self.train_current_btn, self.train_all_btn],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+            inject_progress=True,
+            indeterminate=False,
+        )
 
     def _run_training(self, cell_types_to_train):
         """Train (and apply) APOC classifiers for the given list of cell types."""
@@ -2345,6 +3347,8 @@ class APOCTrainingWidget(QWidget):
         self.save_user_labels(log=self._log)
 
         successes = []
+        pixel_counts_by_ct: dict = {}
+        new_pixel_counts: dict = {}
         try:
             for ct in cell_types_to_train:
                 tab = self.tabs[ct]
@@ -2372,11 +3376,11 @@ class APOCTrainingWidget(QWidget):
                 try:
                     annotation = self.viewer.layers[layer_name].data
                 except KeyError:
-                    print(f"Skipping '{ct}': annotation layer not found")
+                    self._log(f"Skipping '{ct}': annotation layer not found")
                     continue
 
                 if not np.any(annotation):
-                    print(f"Skipping '{ct}': no labels drawn")
+                    self._log(f"Skipping '{ct}': no labels drawn")
                     continue
 
                 if ct == "dead":
@@ -2390,7 +3394,6 @@ class APOCTrainingWidget(QWidget):
                 if Path(clf_path).exists():
                     apoc.erase_classifier(clf_path)
 
-                # Train with ObjectSegmenter
                 clf = apoc.ObjectSegmenter(
                     opencl_filename=clf_path,
                     max_depth=max_depth,
@@ -2400,27 +3403,6 @@ class APOCTrainingWidget(QWidget):
 
                 has_trained = False
                 n_timepoints = annotation.shape[0] if annotation.ndim == 4 else 1
-
-                # Old APOC incremental-style training path kept for reference:
-                # if annotation.ndim == 4:
-                #     for t in range(n_timepoints):
-                #         # Load only the current timepoint slice into memory
-                #         ann_t = np.asarray(annotation[t])
-                #         if not np.any(ann_t):
-                #             continue
-                #         feats_t = self._generate_feature_list_for_timepoint(images, feature_string, t)
-                #         clf.feature_specification = expanded_feature_spec
-                #         clf.train(feats_t, ann_t, continue_training=has_trained)
-                #         clf.feature_specification = expanded_feature_spec
-                #         has_trained = True
-                # else:
-                #     # Single timepoint
-                #     ann_np = np.asarray(annotation)
-                #     feats_np = self._generate_feature_list_for_timepoint(images, feature_string, 0)
-                #     clf.feature_specification = expanded_feature_spec
-                #     clf.train(feats_np, ann_np)
-                #     clf.feature_specification = expanded_feature_spec
-                #     has_trained = True
 
                 from sklearn.ensemble import RandomForestClassifier
 
@@ -2450,8 +3432,25 @@ class APOCTrainingWidget(QWidget):
                         gt_ndim = ann_np.ndim
 
                 if X_parts:
-                    X = np.concatenate(X_parts, axis=0)
-                    y = np.concatenate(y_parts, axis=0)
+                    X_new = np.concatenate(X_parts, axis=0)
+                    y_new = np.concatenate(y_parts, axis=0)
+
+                    # Track new-label pixel counts before adding imported data
+                    new_pixel_counts[ct] = int(len(y_new))
+
+                    # Prepend imported training data when available for this type
+                    imp_pair = self._imported_training_data.get(ct)
+                    if imp_pair is not None:
+                        imp_X, imp_y = imp_pair
+                        X = np.concatenate([imp_X, X_new], axis=0)
+                        y = np.concatenate([imp_y, y_new], axis=0)
+                        self._log(
+                            f"  {ct}: combined {len(imp_y)} imported + "
+                            f"{len(y_new)} new = {len(y)} total pixels"
+                        )
+                    else:
+                        X, y = X_new, y_new
+
                     fitted_rf = RandomForestClassifier(
                         max_depth=max_depth,
                         n_estimators=num_ensembles,
@@ -2466,6 +3465,19 @@ class APOCTrainingWidget(QWidget):
                     clf.num_ground_truth_dimensions = gt_ndim
                     clf.feature_specification = feature_string
                     has_trained = True
+
+                    # Save flattened training data (combined) for future import
+                    try:
+                        _save_training_data(self.pixel_class_outdir, ct, X, y)
+                        n_pos = int(np.sum(y == 2))
+                        n_neg = int(np.sum(y == 1))
+                        pixel_counts_by_ct[ct] = {
+                            "total":    len(y),
+                            "positive": n_pos,
+                            "negative": n_neg,
+                        }
+                    except Exception as _exc:
+                        self._log(f"  ⚠️ Could not save training data for '{ct}': {_exc}")
 
                 if not has_trained:
                     continue
@@ -2493,7 +3505,6 @@ class APOCTrainingWidget(QWidget):
                 elapsed_txt = f"{elapsed_s:.1f}s"
                 self.status_label.setText(f"✅ Trained: {', '.join(successes)} ({elapsed_txt})")
                 self._log(f"✅ Training finished in {elapsed_txt}")
-                # Auto-show statistics for each successfully trained classifier
                 for ct in successes:
                     if ct in self.tabs:
                         self.tabs[ct]._on_show_statistics()
@@ -2503,8 +3514,46 @@ class APOCTrainingWidget(QWidget):
                 self.status_label.setText(f"⚠️ No cell types were trained (check labels). ({elapsed_txt})")
                 self._log(f"⚠️ No cell types were trained. Elapsed time: {elapsed_txt}")
 
-            # Persist all params back to caller
             self._persist_params()
+
+            # Save training metadata YAML when at least one cell type was trained
+            if successes:
+                try:
+                    params_per_ct = {}
+                    for ct in list(self.all_cell_types) + (["dead"] if self.has_death else []):
+                        if ct in self.tabs:
+                            cfg = self.tabs[ct].get_config()
+                            params_per_ct[ct] = cfg
+                    image_layers = [
+                        la for la in self.viewer.layers
+                        if hasattr(la, "data") and la.name.startswith("Channel ")
+                    ]
+                    n_channels = len(image_layers) if image_layers else None
+                    ch_names = [la.name for la in image_layers]
+                    imported_counts = {}
+                    for imp_ct, local_ct in self._cell_type_mapping.items():
+                        if local_ct is None:
+                            continue
+                        imp_pair = self._imported_training_data.get(local_ct)
+                        if imp_pair is not None:
+                            imported_counts[imp_ct] = int(len(imp_pair[1]))
+                    meta = _build_training_metadata(
+                        cell_types=self.all_cell_types,
+                        has_death=self.has_death,
+                        params_per_ct=params_per_ct,
+                        n_input_channels=n_channels,
+                        channel_names=ch_names,
+                        pixel_size_xy_um=self._pixel_sizes.get("xy_um"),
+                        pixel_size_z_um=self._pixel_sizes.get("z_um"),
+                        pixel_counts_by_ct=pixel_counts_by_ct,
+                        imported_from=self._imported_metadata_path or None,
+                        imported_counts=imported_counts if imported_counts else None,
+                        new_counts=new_pixel_counts if new_pixel_counts else None,
+                    )
+                    _save_training_metadata(self.pixel_class_outdir, meta)
+                    self._log("📄 Training data bundle saved to PixelClassifier_TrainingData.zip")
+                except Exception as _exc:
+                    self._log(f"  ⚠️ Could not save training metadata: {_exc}")
 
         except Exception as e:
             self.status_label.setText(f"❌ Error: {e}")
@@ -2535,7 +3584,10 @@ class APOCTrainingWidget(QWidget):
             params[f"apoc_{ct}_checked_features"]      = cfg["checked_features"]
             params[f"apoc_{ct}_max_depth"]             = cfg["max_depth"]
             params[f"apoc_{ct}_num_ensembles"]         = cfg["num_ensembles"]
-            params[f"apoc_{ct}_channels"]              = cfg["channels"]
+            # Channel layers can still be loading in one at a time; don't
+            # overwrite the saved selection with a partial checkbox state.
+            if tab.channel_selection_is_complete():
+                params[f"apoc_{ct}_channels"] = cfg["channels"]
             if cfg["prob_mask_threshold"] is not None:
                 params[f"{ct}_prob_mask_threshold"] = cfg["prob_mask_threshold"]
             if cfg["prob_seed_threshold"] is not None:
@@ -2587,6 +3639,22 @@ def train_pixel_classifier_apoc(
     if gpu_device:
         print(f"APOC Training: Selecting device {gpu_device}")
         cle.select_device(gpu_device)
+
+    # Resolve pixel sizes (µm) from metadata so the per-tab µm/pixel unit
+    # toggle (EDT threshold / min size / peak distance) is available here
+    # too, matching the napari plugin's own APOCWidget.
+    from behav3d.core.utils import convert_distance
+    if metadata is not None and "pixel_distance_xy" in metadata.columns and "distance_unit" in metadata.columns:
+        _unit = str(metadata["distance_unit"].iloc[0])
+        _xy_from_md = convert_distance(float(metadata["pixel_distance_xy"].iloc[0]), _unit)
+        _z_from_md = convert_distance(float(metadata["pixel_distance_z"].iloc[0]), _unit)
+    else:
+        _xy_from_md = None
+        _z_from_md = None
+    pixel_sizes = {
+        "xy_um": ip.get("pixel_size_xy") or ip.get("pixel_size_xy_um") or _xy_from_md,
+        "z_um": ip.get("pixel_size_z") or ip.get("pixel_size_z_um") or _z_from_md,
+    }
 
     organoid_types = organoid_types or []
     immune_types   = immune_types   or []
@@ -2696,7 +3764,8 @@ def train_pixel_classifier_apoc(
                 pred_death = np.zeros(label_shape, dtype=np.int16)
         else:
             pred_death = np.zeros(label_shape, dtype=np.int16)
-        viewer.add_labels(pred_death, name="Pixel Classification (Dead)", opacity=0.8, visible=False)
+        dead_pred_layer = viewer.add_labels(pred_death, name="Pixel Classification (Dead)", opacity=0.8, visible=False)
+        _set_dead_mask_layer_color(dead_pred_layer)
 
         prob_death_path = _probability_map_path(pixel_class_outdir, "dead")
         if prob_death_path.exists():
@@ -2760,6 +3829,7 @@ def train_pixel_classifier_apoc(
         has_death=has_death,
         initial_params=ip,
         on_params_changed=on_params_changed,
+        pixel_sizes=pixel_sizes,
     )
     viewer.window.add_dock_widget(apoc_widget, area="right", name="APOC Pixel Classification")
 

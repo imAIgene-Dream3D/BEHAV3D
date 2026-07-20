@@ -1,13 +1,21 @@
 
 import napari
-from behav3d.napari._widgets import HelpButton, make_help_row
+from behav3d.napari._widgets import (
+    HelpButton,
+    make_help_row,
+    browse_file_or_zarr,
+    prompt_axis_order,
+    resolve_external_path,
+)
 import yaml
 from magicgui.widgets import create_widget
 from qtpy.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
-    QStackedWidget, QPushButton, QGroupBox, QFormLayout, 
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+    QStackedWidget, QPushButton, QGroupBox, QFormLayout,
     QSpinBox, QDoubleSpinBox, QCheckBox, QFileDialog, QScrollArea,
-    QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox, QFrame, QGridLayout
+    QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox, QFrame, QGridLayout,
+    QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QHeaderView,
+    QSizePolicy,
 )
 from qtpy.QtCore import Qt
 import pandas as pd
@@ -26,7 +34,9 @@ from sklearn.ensemble import RandomForestClassifier
 import joblib
 
 
-from behav3d.io.images import load_image, get_image_shape, save_as_zarr, append_to_zarr, load_zarr
+from behav3d.core.utils import convert_distance
+from behav3d.napari._units import UnitGroupManager
+from behav3d.io.images import load_image, get_image_shape, save_as_zarr, append_to_zarr, load_zarr, convert_label_file_to_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
     train_pixel_classifier,
@@ -34,6 +44,7 @@ from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
     segment_mask,
     postprocess_mask,
     make_features,
+    _set_dead_mask_layer_color,
 )
 from behav3d.napari._background_runner import (
     BackgroundOperation,
@@ -87,13 +98,15 @@ class SegmentationTab(QWidget):
         method_group = QGroupBox("Segmentation Method")
         method_layout = QHBoxLayout()
         self.method_combo = QComboBox()
-        self.method_combo.addItems([
+
+        methods = [
             "APOC (GPU)",
             "ConvPaint (DL pixel classifier)",
             "Pixel Classifier (Random Forest)",
             "Cellpose (Deep Learning)",
             "Import segmentation",
-        ])
+        ]
+        self.method_combo.addItems(methods)
         self.method_combo.currentIndexChanged.connect(self._on_method_changed)
         method_layout.addWidget(QLabel("Method:"))
         method_layout.addWidget(self.method_combo)
@@ -123,22 +136,31 @@ class SegmentationTab(QWidget):
         )
         self.param_stack.addWidget(self.convpaint_page)
 
-        # 2. Pixel Classifier Page  ← matches combo index 2
+        # 2. Pixel Classifier Page
         self.pixel_classifier_page = PixelClassifierWidget(
-            self.viewer, self.metadata_loader, log_callback=self._log,
+            self.viewer,
+            self.metadata_loader,
+            log_callback=self._log,
             tab_progress_row=self.progress_row,
         )
         self.param_stack.addWidget(self.pixel_classifier_page)
 
-        # 3. Cellpose Page  ← matches combo index 3
+        # 2. Cellpose Page  ← matches combo index 2
         self.cellpose_page = CellposeWidget(
-            self.viewer, self.metadata_loader, log_callback=self._log,
+            self.viewer,
+            self.metadata_loader,
+            log_callback=self._log,
             tab_progress_row=self.progress_row,
         )
         self.param_stack.addWidget(self.cellpose_page)
-
-        # 4. Import Page  ← matches combo index 4
-        self.import_page = ImportWidget(self.viewer, self.metadata_loader, log_callback=self._log)
+        
+        # 3. Import Page ← matches combo index 3
+        self.import_page = ImportWidget(
+            self.viewer,
+            self.metadata_loader,
+            log_callback=self._log,
+            switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
+        )
         self.param_stack.addWidget(self.import_page)
 
 
@@ -194,6 +216,22 @@ class SegmentationTab(QWidget):
         self.log.verticalScrollBar().setValue(
             self.log.verticalScrollBar().maximum()
         )
+
+    def _switch_to_data_prep_edit(self):
+        """Switch the main window to the Data Preparation tab with the
+        Metadata Builder already open in edit mode.
+
+        Used by ``ImportWidget`` (the "Add a new sample or cell type"
+        shortcut) so users don't need to duplicate the sample/cell-type
+        editing UI here — they jump straight to it instead.
+        """
+        parent = self.parent()
+        while parent and not hasattr(parent, 'tabs'):
+            parent = parent.parent()
+        if parent and hasattr(parent, 'tabs'):
+            parent.tabs.setCurrentIndex(0)
+            if hasattr(parent, 'data_prep_tab'):
+                parent.data_prep_tab.enter_metadata_edit_mode()
 
     def _switch_to_visualization(self):
         """Switch the main window to the Visualization tab and load the first sample.
@@ -491,6 +529,66 @@ class PerClassLegendWidget(QWidget):
                 pass
 
 
+def _run_multicolor_cleanup_if_needed(metadata_loader, log_fn, skip_unified=False):
+    """Run multicolor redundancy cleanup after segmentation."""
+    if skip_unified:
+        log_fn(
+            "Skipping multicolor cleanup: unified ConvPaint already "
+            "produces mutually-exclusive per-cell-type masks."
+        )
+        return metadata_loader.metadata
+
+    metadata = metadata_loader.metadata
+    if metadata is None or metadata.empty:
+        return metadata
+
+    from behav3d.core.metadata import (
+        is_multicolor_celltype, 
+        multicolor_base_name,
+        detect_organoid_types_from_metadata,
+        detect_immune_cell_types_from_metadata,
+        detect_other_cell_types_from_metadata
+    )
+    all_cell_types = (
+        detect_organoid_types_from_metadata(metadata) +
+        detect_immune_cell_types_from_metadata(metadata) +
+        detect_other_cell_types_from_metadata(metadata)
+    )
+
+    families = {}
+    for cell_type in all_cell_types:
+        if not is_multicolor_celltype(cell_type):
+            continue
+        base_name = multicolor_base_name(cell_type)
+        families.setdefault(base_name, []).append(cell_type)
+
+    if not families:
+        return metadata
+
+    from behav3d.preprocessing.segmentation.multicolor_segment_processing import (
+        apply_multicolor_segment_correction_for_base,
+    )
+
+    cleaned_metadata = metadata
+    for base_name, family_cell_types in sorted(families.items()):
+        if len(family_cell_types) < 2:
+            continue
+        log_fn(
+            f"Running multicolor cleanup for '{base_name}' after batch segmentation: "
+            f"{sorted(family_cell_types)}"
+        )
+        cleaned_metadata = apply_multicolor_segment_correction_for_base(
+            metadata=cleaned_metadata,
+            output_dir=str(metadata_loader.output_dir),
+            base_cell_type=base_name,
+            n_channels=len(family_cell_types),
+            overwrite=True,
+            n_workers=1,
+        )
+
+    return cleaned_metadata
+
+
 class PixelClassifierWidget(QWidget):
     def __init__(self, viewer, metadata_loader, log_callback=None,
                  tab_progress_row=None):
@@ -533,14 +631,10 @@ class PixelClassifierWidget(QWidget):
         self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
 
     def _init_ui(self):
-        # Connect to metadata updates
-        if hasattr(self.metadata_loader, 'metadata_loaded'):
-            self.metadata_loader.metadata_loaded.connect(self._on_metadata_updated)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
-        
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -569,9 +663,12 @@ class PixelClassifierWidget(QWidget):
         train_form.addRow("Examples/sample:", make_help_row(
             self.spin_examples,
             "Examples per Sample",
-            "Number of timepoints randomly sampled from each dataset "
-            "for training the pixel classifier.\n\n"
-            "More examples → better generalization but slower training."
+            "Number of timepoints selected from each dataset for labeling and "
+            "training the pixel classifier.\n\n"
+            "Timepoints are chosen evenly spaced across the time series "
+            "(including the first and last), not at random.\n\n"
+            "More examples → better generalization but more labeling work "
+            "and slower training."
         ))
         
 
@@ -798,6 +895,12 @@ class PixelClassifierWidget(QWidget):
             ct_form.setSpacing(3)
             ct_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
+            # Per-group physical(µm)/pixel unit toggle. EDT & min-size are
+            # entered in the chosen unit and converted to native px/voxels
+            # before running/persisting; opening stays fixed in pixels.
+            unit_mgr = UnitGroupManager(self.metadata_loader.metadata, default_physical=True)
+            ct_form.addRow("Units:", unit_mgr.header_row(label=""))
+
             # Determine defaults based on category
             if cell_type in self.organoid_types:
                 def_edt, def_size, def_open, def_fill = 12.0, 1000, 3, True
@@ -813,34 +916,37 @@ class PixelClassifierWidget(QWidget):
             saved_fill = pc.get(f"{cell_type}_fill_holes", def_fill)
 
             w_edt = QDoubleSpinBox()
-            w_edt.setRange(0.0, 50.0)
+            # Range widened so physical-unit display never clamps.
+            w_edt.setRange(0.0, 1000.0)
             w_edt.setSingleStep(0.5)
             w_edt.setValue(float(saved_edt))
-            w_edt.setMaximumWidth(70)
+            w_edt.setMaximumWidth(90)
             ct_form.addRow("EDT:", make_help_row(
                 w_edt,
                 "EDT (Distance Transform Threshold)",
                 "Controls sensitivity for separating touching objects.\n\n"
                 "Lower values → more sensitive, splits objects more aggressively.\n"
                 "Higher values → less splitting, objects stay merged.\n\n"
-                "Typical values:\n"
-                "  • Organoids: 8–15\n"
-                "  • Immune cells: 1.5–4.0"
+                "Shown in the unit selected above (µm by default; converted "
+                "using the image's pixel size). Typical values in pixels:\n"
+                "  • Organoids: 8–15 px\n"
+                "  • Immune cells: 1.5–4.0 px\n"
                 "  • Disable: 0.0 (not recommended, leads to under-segmentation)"
             ))
 
             w_size = QSpinBox()
-            w_size.setRange(1, 100000)
+            w_size.setRange(1, 1000000000)
             w_size.setValue(int(saved_size))
-            w_size.setMaximumWidth(80)
+            w_size.setMaximumWidth(90)
             ct_form.addRow("Min size:", make_help_row(
                 w_size,
-                "Minimum Object Size (pixels)",
-                "Minimum volume (in pixels) for a segmented object to be kept.\n\n"
+                "Minimum Object Size",
+                "Minimum volume for a segmented object to be kept.\n\n"
                 "Objects smaller than this are removed as noise.\n\n"
-                "Typical values:\n"
-                "  • Organoids: 500–2000\n"
-                "  • Immune cells: 5–50"
+                "Shown in the unit selected above (µm³ by default; converted "
+                "using the image's pixel size). Typical values in voxels:\n"
+                "  • Organoids: 500–2000 voxels\n"
+                "  • Immune cells: 5–50 voxels"
             ))
 
             w_open = QSpinBox()
@@ -858,13 +964,21 @@ class PixelClassifierWidget(QWidget):
 
             w_fill = QCheckBox("Fill holes")
             w_fill.setChecked(bool(saved_fill))
-            ct_form.addRow(make_help_row(
-                w_fill,
+            fill_row = QHBoxLayout()
+            fill_row.addWidget(w_fill)
+            fill_row.addWidget(HelpButton(
                 "Fill Holes",
                 "When checked, internal gaps or holes within segmented "
                 "objects are automatically filled.\n\n"
                 "Recommended ON for most use cases."
             ))
+            fill_row.addStretch()
+            ct_form.addRow("", fill_row)
+
+            # Register distance/volume spinboxes with the unit toggle so they
+            # display in the chosen unit; opening/fill-holes stay native.
+            unit_mgr.register(w_edt, "distance", float(saved_edt))
+            unit_mgr.register(w_size, "volume", int(saved_size))
 
             ct_group.setLayout(ct_form)
             self.param_layout.addWidget(ct_group)
@@ -873,7 +987,8 @@ class PixelClassifierWidget(QWidget):
                 'edt': w_edt,
                 'min_size': w_size,
                 'opening': w_open,
-                'fill_holes': w_fill
+                'fill_holes': w_fill,
+                'unit_mgr': unit_mgr,
             }
         
         # Add Test Button at the end of params list
@@ -893,8 +1008,17 @@ class PixelClassifierWidget(QWidget):
         for cell_type in self.all_cell_types:
             if cell_type in self.param_widgets:
                 w = self.param_widgets[cell_type]
-                pc[f"{cell_type}_edt_threshold"] = float(w['edt'].value())
-                pc[f"{cell_type}_segment_size_min"] = int(w['min_size'].value())
+                mgr = w.get('unit_mgr')
+                if mgr is not None:
+                    # Persist canonical native (pixel/voxel) values regardless
+                    # of the current display unit.
+                    edt_native = mgr.get_native(w['edt'])
+                    size_native = mgr.get_native(w['min_size'])
+                else:
+                    edt_native = float(w['edt'].value())
+                    size_native = int(w['min_size'].value())
+                pc[f"{cell_type}_edt_threshold"] = float(edt_native)
+                pc[f"{cell_type}_segment_size_min"] = int(round(size_native))
                 pc[f"{cell_type}_opening_nr_pixels"] = int(w['opening'].value())
                 pc[f"{cell_type}_fill_holes"] = bool(w['fill_holes'].isChecked())
 
@@ -1119,8 +1243,9 @@ class PixelClassifierWidget(QWidget):
             ct_key = cell_type.lower()
             if ct_key in self.param_widgets:
                 w = self.param_widgets[ct_key]
-                edt = float(w['edt'].value())
-                sz  = int(w['min_size'].value())
+                mgr = w.get('unit_mgr')
+                edt = float(mgr.get_native(w['edt'])) if mgr is not None else float(w['edt'].value())
+                sz  = int(round(mgr.get_native(w['min_size']))) if mgr is not None else int(w['min_size'].value())
                 opn = int(w['opening'].value())
                 fh  = bool(w['fill_holes'].isChecked())
             else:
@@ -1196,6 +1321,10 @@ class PixelClassifierWidget(QWidget):
             return updated_metadata
 
         def _apply_result(updated_metadata):
+            if updated_metadata is not None:
+                self.metadata_loader.metadata = updated_metadata
+                updated_metadata = _run_multicolor_cleanup_if_needed(self.metadata_loader, self.log, skip_unified=False)
+                self.metadata_loader.metadata = updated_metadata
             self.metadata_loader.metadata = updated_metadata
             csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
             if csv_path:
@@ -1589,7 +1718,8 @@ class PixelClassifierWidget(QWidget):
                          pred_dead = np.zeros(label_dims, dtype=np.uint16)
                 else:
                     pred_dead = np.zeros(label_dims, dtype=np.uint16)
-                self.viewer.add_labels(pred_dead, name='Pixel Classification (Dead)', opacity=0.3, visible=False)
+                dead_pred_layer = self.viewer.add_labels(pred_dead, name='Pixel Classification (Dead)', opacity=0.3, visible=False)
+                _set_dead_mask_layer_color(dead_pred_layer)
 
             for cell_type in self.all_cell_types:
                 pred_label_path = pixel_class_outdir / f'PixelClassifier_{cell_type.capitalize()}_PredictedLabels.zarr'
@@ -1664,252 +1794,337 @@ class PixelClassifierWidget(QWidget):
             self.log("Error: Failed to load training data for classifier.")
             fire_extra_callback(extra_callbacks, "on_failed", "no training data")
             if not interactive:
-                 raise RuntimeError("Training data not loaded. Please load training data manually first.")
+                raise RuntimeError("Training data not loaded. Please load training data manually first.")
 
     def _on_train_clicked(self):
-        """Train classifiers, predict pixels, and segment — mirrors original segment_and_update().
+        """Train classifiers, predict pixels, and segment — runs on a background thread.
 
-        Training is deeply interleaved with napari viewer reads/writes
-        (label layers, prediction layers, segment layers), so this call
-        stays on the Qt thread and napari may briefly appear unresponsive
-        while sklearn fits / predicts.  The in-tab progress row is set
-        to indeterminate-busy mode so the user gets visual feedback.
+        The work is split into three phases:
+          1. Qt thread  — read viewer layers & widget values into plain NumPy arrays
+                          via :meth:`_gather_train_inputs`.
+          2. Worker     — RandomForestClassifier fit, batch predict, instance segment.
+          3. Qt thread  — write result arrays back to viewer layers via
+                          :meth:`_apply_train_results` (the ``on_done`` callback).
+
+        The in-tab progress bar shows live per-target labels, e.g.
+        ``"Training Dead… — 1/3 — ETA 0:22"``.
         """
-        if self.tab_progress_row is not None:
-            self.tab_progress_row.set_busy(
-                "Training pixel classifier (may take a while)\u2026"
-            )
+        if self._bg.is_running():
+            self.log("⚠️ Training is already in progress.")
+            return
 
-        self.log("Training classifier & segmenting...")
-        self._persist_params()
-        self._save_user_labels()  # Always persist labels before training
+        # ── Phase 1 (Qt thread): gather all data we need ────────────────
+        ctx = self._gather_train_inputs()
+        if ctx is None:
+            return  # validation failed; error already logged
 
-        # ── Load features ───────────────────────────────────────────
-        if self.all_features is None:
-            output_dir = Path(self.metadata_loader.output_dir)
-            pixel_class_outdir = output_dir / "images" / "PixelClassification"
-            features_outpath = pixel_class_outdir / 'PixelClassifier_Features.zarr'
-            if features_outpath.exists():
-                self.log("Loading features from disk...")
-                self.all_features = np.asarray(load_zarr(features_outpath))
-            else:
-                self.log("Error: No features found. Please load training data first.")
-                if self.tab_progress_row is not None:
-                    self.tab_progress_row.finish()
-                return
+        all_features       = ctx["all_features"]
+        targets            = ctx["targets"]
+        label_data         = ctx["label_data"]
+        params_by_target   = ctx["params_by_target"]
+        seg_params         = ctx["seg_params"]
+        all_cell_types     = ctx["all_cell_types"]
+        pixel_class_outdir = ctx["pixel_class_outdir"]
 
-        output_dir = Path(self.metadata_loader.output_dir)
-        pixel_class_outdir = output_dir / "images" / "PixelClassification"
-        pixel_class_outdir.mkdir(parents=True, exist_ok=True)
-        n_workers = self.spin_workers.value()
+        from behav3d.napari._background_runner import ThreadSafeLogger
+        safe_log = ThreadSafeLogger(self.log)
 
-        # all_features shape: (T, Z, Y, X, C_feat) — channel LAST
-        all_features = np.asarray(self.all_features)
-        self.log(f"Features shape: {all_features.shape}")
-
-        # ── Collect targets ─────────────────────────────────────────
-        targets = []
-        if self.has_death:
-            targets.append('Dead')
-        targets.extend([t.capitalize() for t in self.all_cell_types])
-
-        try:
-            # ── 1. Save & postprocess user labels, then train ───────
+        # ── Phase 2 (worker thread) ──────────────────────────────────────
+        def _do_train(progress_cb=None):
             classifiers = {}
-            cell_type_labels = {}
+            valid_targets = [t for t in targets if t in label_data]
+            n_valid = len(valid_targets)
 
-            for target in targets:
-                label_layer_name = f'User Provided Labels ({target})'
-                if label_layer_name not in self.viewer.layers:
-                    self.log(f"  Layer {label_layer_name} not found. Skipping.")
-                    continue
-                
-                labels = self.viewer.layers[label_layer_name].data.copy()
+            # 1. Train one RF per target ─────────────────────────────────
+            for i, target in enumerate(valid_targets):
+                if progress_cb:
+                    progress_cb(i, n_valid * 2, f"Training {target}…")
+                safe_log(f"  Training {target}…")
 
-                if labels.max() == 0:
-                    self.log(f"  No labels for {target}. Skipping.")
-                    continue
+                labels  = label_data[target]
+                opening = params_by_target[target]["opening"]
+                fill    = params_by_target[target]["fill"]
 
-                # Get postprocessing params for this target
-                cell_type_key = target.lower()
-                if cell_type_key in self.param_widgets:
-                    w = self.param_widgets[cell_type_key]
-                    opening = int(w['opening'].value())
-                    fill = bool(w['fill_holes'].isChecked())
-                elif cell_type_key == 'dead':
-                    opening, fill = 0, True
-                else:
-                    opening, fill = 0, True
-
-                # Postprocess user labels before training (match original lines 594-618)
+                # Postprocess user labels
                 fg_mask = (labels == 2).astype(bool)
                 if np.any(fg_mask):
-                    processed_fg = postprocess_mask(fg_mask, fill_holes=fill, opening_nr_pixels=opening)
-                    labels = np.where(processed_fg, 2,
-                                      np.where(labels == 1, 1, 0)).astype(labels.dtype)
+                    processed_fg = postprocess_mask(
+                        fg_mask, fill_holes=fill, opening_nr_pixels=opening
+                    )
+                    labels = np.where(
+                        processed_fg, 2, np.where(labels == 1, 1, 0)
+                    ).astype(labels.dtype)
 
-                # Save user labels to zarr
-                labels_outpath = pixel_class_outdir / f'PixelClassifier_User{target}Labels.zarr'
+                # Save postprocessed labels to zarr
+                labels_outpath = (
+                    pixel_class_outdir / f"PixelClassifier_User{target}Labels.zarr"
+                )
                 if labels_outpath.exists():
                     shutil.rmtree(labels_outpath)
                 save_as_zarr(labels, labels_outpath)
-                cell_type_labels[target] = labels
-                self.log(f"  Saved {target} user labels (postprocessed)")
+                safe_log(f"  Saved {target} user labels (postprocessed)")
 
-                # Train classifier (match original train_classifier)
-                self.log(f"  Training {target}...")
-                flat_labels = labels.ravel()
+                flat_labels   = labels.ravel()
                 flat_features = all_features.reshape(-1, all_features.shape[-1])
-
                 label_indices = np.flatnonzero(flat_labels > 0)
+                if label_indices.size == 0:
+                    safe_log(f"  No labeled pixels for {target}. Skipping.")
+                    continue
                 selected_features = flat_features[label_indices]
-                selected_labels = flat_labels[label_indices]
+                selected_labels   = flat_labels[label_indices]
 
                 nr_bg = int(np.sum(selected_labels == 1))
                 nr_fg = int(np.sum(selected_labels == 2))
                 total = nr_bg + nr_fg
-                self.log(f"    BG pixels: {nr_bg}, FG pixels: {nr_fg}")
-
+                safe_log(f"    BG pixels: {nr_bg}, FG pixels: {nr_fg}")
                 if total == 0:
-                    self.log(f"  No labeled pixels for {target}. Skipping.")
+                    safe_log(f"  No labeled pixels for {target}. Skipping.")
                     continue
 
                 class_weights = {1: nr_bg / total, 2: nr_fg / total}
-
                 clf = RandomForestClassifier(
-                    n_estimators=50,
-                    n_jobs=-1,
-                    max_depth=20,
-                    class_weight=class_weights
+                    n_estimators=50, n_jobs=-1, max_depth=20,
+                    class_weight=class_weights,
                 )
                 from skimage import future
                 clf = future.fit_segmenter(selected_labels, selected_features, clf)
 
-                clf_path = pixel_class_outdir / f'PixelClassifier_{target}.joblib'
+                clf_path = pixel_class_outdir / f"PixelClassifier_{target}.joblib"
                 joblib.dump(clf, clf_path)
-                self.log(f"  Saved classifier: {clf_path.name}")
+                safe_log(f"  Saved classifier: {clf_path.name}")
                 classifiers[target] = clf
 
-            # ── 2. Predict all pixels ───────────────────────────────
-            pred_masks = {}
+            # 2. Predict all pixels ──────────────────────────────────────
+            pred_masks   = {}
             n_timepoints = all_features.shape[0]
 
-            for target, clf in classifiers.items():
-                self.log(f"  Predicting {target} pixels...")
+            for j, (target, clf) in enumerate(classifiers.items()):
+                if progress_cb:
+                    progress_cb(
+                        n_valid + j, n_valid * 2,
+                        f"Predicting {target} pixels…",
+                    )
+                safe_log(f"  Predicting {target} pixels…")
                 prediction_stack = []
-
                 for t in range(n_timepoints):
-                    # all_features[t] shape: (Z, Y, X, C_feat) — already channel-last
-                    feat_t = all_features[t]
-                    spatial_shape = feat_t.shape[:-1]  # (Z, Y, X)
-                    X_t = feat_t.reshape(-1, feat_t.shape[-1])
+                    feat_t        = all_features[t]
+                    spatial_shape = feat_t.shape[:-1]
+                    X_t           = feat_t.reshape(-1, feat_t.shape[-1])
+                    batch_size    = 100_000
+                    y_pred_t      = np.zeros(X_t.shape[0], dtype=np.uint8)
+                    for start in range(0, X_t.shape[0], batch_size):
+                        y_pred_t[start : start + batch_size] = clf.predict(
+                            X_t[start : start + batch_size]
+                        )
+                    prediction_stack.append(y_pred_t.reshape(spatial_shape))
+                full_prediction = np.stack(prediction_stack)
 
-                    # Predict in batches
-                    batch_size = 100_000
-                    y_pred_t = np.zeros(X_t.shape[0], dtype=np.uint8)
-                    for i in range(0, X_t.shape[0], batch_size):
-                        y_pred_t[i:i+batch_size] = clf.predict(X_t[i:i+batch_size])
-
-                    y_pred_t = y_pred_t.reshape(spatial_shape)
-                    prediction_stack.append(y_pred_t)
-
-                full_prediction = np.stack(prediction_stack)  # (T, Z, Y, X)
-
-                # Postprocess predictions (match original lines 728-738)
-                cell_type_key = target.lower()
-                if cell_type_key in self.param_widgets:
-                    w = self.param_widgets[cell_type_key]
-                    opening = int(w['opening'].value())
-                    fill = bool(w['fill_holes'].isChecked())
-                elif cell_type_key == 'dead':
-                    opening, fill = 0, True
-                else:
-                    opening, fill = 0, True
-
+                opening = params_by_target.get(target, {}).get("opening", 0)
+                fill    = params_by_target.get(target, {}).get("fill", True)
                 fg_mask = (full_prediction == 2).astype(bool)
-                processed_fg = postprocess_mask(fg_mask, fill_holes=fill, opening_nr_pixels=opening)
-                full_prediction = np.where(processed_fg, 2,
-                                           np.where(full_prediction == 1, 1, 0)).astype(np.uint8)
-
+                processed_fg = postprocess_mask(
+                    fg_mask, fill_holes=fill, opening_nr_pixels=opening
+                )
+                full_prediction = np.where(
+                    processed_fg, 2, np.where(full_prediction == 1, 1, 0)
+                ).astype(np.uint8)
                 pred_masks[target] = full_prediction
 
-                # Save predictions to zarr
-                pred_outpath = pixel_class_outdir / f'PixelClassifier_{target}_PredictedLabels.zarr'
+                pred_outpath = (
+                    pixel_class_outdir
+                    / f"PixelClassifier_{target}_PredictedLabels.zarr"
+                )
                 if pred_outpath.exists():
                     shutil.rmtree(pred_outpath)
                 save_as_zarr(full_prediction, pred_outpath)
 
-                # Update viewer layer
-                pred_layer_name = f'Pixel Classification ({target})'
-                if pred_layer_name in self.viewer.layers:
-                    self.viewer.layers[pred_layer_name].data = full_prediction
-                    # self.viewer.layers[pred_layer_name].visible = True
-                    self.viewer.layers[pred_layer_name].refresh()
-                else:
-                    self.viewer.add_labels(full_prediction, name=pred_layer_name, opacity=0.3)
-                self.log(f"  {target} prediction updated.")
-
-            # ── 3. Segment instances (match original lines 757-819) ──
-            self.log("Segmenting cell instances...")
-            for cell_type in self.all_cell_types:
+            # 3. Segment instances ───────────────────────────────────────
+            seg_results = {}
+            safe_log("Segmenting cell instances…")
+            for cell_type in all_cell_types:
                 target = cell_type.capitalize()
                 if target not in pred_masks:
                     continue
-
-                cell_type_key = cell_type.lower()
-                if cell_type_key in self.param_widgets:
-                    w = self.param_widgets[cell_type_key]
-                    edt_threshold = float(w['edt'].value())
-                    segment_size_min = int(w['min_size'].value())
-                else:
-                    if cell_type in self.organoid_types:
-                        edt_threshold, segment_size_min = 12.0, 1000
-                    elif cell_type in self.immune_types:
-                        edt_threshold, segment_size_min = 2.5, 10
-                    else:
-                        edt_threshold, segment_size_min = 1.0, 10
-
-                self.log(f"  Segmenting {target} (EDT={edt_threshold}, min_size={segment_size_min})...")
+                sp               = seg_params.get(cell_type, {})
+                edt_threshold    = sp.get("edt_threshold", 1.0)
+                segment_size_min = sp.get("segment_size_min", 10)
+                safe_log(
+                    f"  Segmenting {target} (EDT={edt_threshold}, "
+                    f"min_size={segment_size_min})…"
+                )
                 pred_mask = pred_masks[target]
-
                 segmented_timepoints = []
                 for t_idx in range(pred_mask.shape[0]):
                     mask_t = (pred_mask[t_idx] == 2)
-                    fg_pixels = int(mask_t.sum())
-
-                    if fg_pixels == 0:
-                        segmented = np.zeros_like(mask_t, dtype=np.uint16)
+                    if int(mask_t.sum()) == 0:
+                        segmented_timepoints.append(
+                            np.zeros_like(mask_t, dtype=np.uint16)
+                        )
                     else:
-                        segmented = segment_mask(
-                            mask=mask_t,
-                            edt_thr=edt_threshold,
-                            edt_thr_refined=None,
-                            segment_size_min=segment_size_min,
-                            use_dims=2,
-                            n_workers=1,
-                        ).astype(np.uint16, copy=False)
-
-                    segmented_timepoints.append(segmented)
-
+                        segmented_timepoints.append(
+                            segment_mask(
+                                mask=mask_t,
+                                edt_thr=edt_threshold,
+                                edt_thr_refined=None,
+                                segment_size_min=segment_size_min,
+                                use_dims=2,
+                                n_workers=1,
+                            ).astype(np.uint16, copy=False)
+                        )
                 full_seg = np.stack(segmented_timepoints, axis=0)
-                self.log(f"  {target}: max label = {int(full_seg.max())}")
+                safe_log(f"  {target}: max label = {int(full_seg.max())}")
+                seg_results[cell_type] = full_seg
 
-                seg_layer_name = f'{target} Segments'
-                if seg_layer_name in self.viewer.layers:
-                    self.viewer.layers[seg_layer_name].data = full_seg
-                    self.viewer.layers[seg_layer_name].visible = True
-                    self.viewer.layers[seg_layer_name].refresh()
+            return {"predictions": pred_masks, "segments": seg_results}
+
+        # ── Phase 3 (Qt thread): apply results to viewer ─────────────────
+        def _on_done(results):
+            self._apply_train_results(results)
+
+        def _on_failed(err):
+            self.log(f"❌ Error during training/segmentation: {err}")
+
+        self._bg.run(
+            fn=_do_train,
+            desc="Training pixel classifier…",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_train_update],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+            inject_progress=True,
+            indeterminate=False,
+        )
+
+    # ── Training helpers ─────────────────────────────────────────────────
+
+    def _gather_train_inputs(self):
+        """Phase 1 (Qt thread): read viewer layers & widget values.
+
+        Persists params and labels, loads features, reads label layer data
+        and all widget values into plain Python/NumPy objects so the worker
+        thread never touches Qt widgets or napari layers directly.
+
+        Returns a context dict on success, or ``None`` when validation fails.
+        """
+        self._persist_params()
+        self._save_user_labels()
+
+        # Load features
+        if self.all_features is None:
+            output_dir = Path(self.metadata_loader.output_dir)
+            pixel_class_outdir = output_dir / "images" / "PixelClassification"
+            features_outpath = pixel_class_outdir / "PixelClassifier_Features.zarr"
+            if features_outpath.exists():
+                self.log("Loading features from disk…")
+                self.all_features = np.asarray(load_zarr(features_outpath))
+            else:
+                self.log("Error: No features found. Please load training data first.")
+                return None
+
+        output_dir = Path(self.metadata_loader.output_dir)
+        pixel_class_outdir = output_dir / "images" / "PixelClassification"
+        pixel_class_outdir.mkdir(parents=True, exist_ok=True)
+
+        all_features = np.asarray(self.all_features)
+        self.log(f"Features shape: {all_features.shape}")
+
+        targets = []
+        if self.has_death:
+            targets.append("Dead")
+        targets.extend([t.capitalize() for t in self.all_cell_types])
+
+        # Read label layers — must be on the Qt thread
+        label_data = {}
+        for target in targets:
+            layer_name = f"User Provided Labels ({target})"
+            if layer_name not in self.viewer.layers:
+                self.log(f"  Layer {layer_name} not found. Skipping.")
+                continue
+            labels = self.viewer.layers[layer_name].data.copy()
+            if labels.max() == 0:
+                self.log(f"  No labels for {target}. Skipping.")
+                continue
+            label_data[target] = labels
+
+        # Read postprocessing params from widgets — must be on the Qt thread
+        params_by_target = {}
+        for target in targets:
+            cell_type_key = target.lower()
+            if cell_type_key in self.param_widgets:
+                w       = self.param_widgets[cell_type_key]
+                opening = int(w["opening"].value())
+                fill    = bool(w["fill_holes"].isChecked())
+            elif cell_type_key == "dead":
+                opening, fill = 0, True
+            else:
+                opening, fill = 0, True
+            params_by_target[target] = {"opening": opening, "fill": fill}
+
+        # Read segmentation params from widgets — must be on the Qt thread
+        seg_params = {}
+        for cell_type in self.all_cell_types:
+            cell_type_key = cell_type.lower()
+            if cell_type_key in self.param_widgets:
+                w                = self.param_widgets[cell_type_key]
+                mgr              = w.get('unit_mgr')
+                edt_threshold    = float(mgr.get_native(w["edt"])) if mgr is not None else float(w["edt"].value())
+                segment_size_min = int(round(mgr.get_native(w["min_size"]))) if mgr is not None else int(w["min_size"].value())
+            else:
+                if cell_type in self.organoid_types:
+                    edt_threshold, segment_size_min = 12.0, 1000
+                elif cell_type in self.immune_types:
+                    edt_threshold, segment_size_min = 2.5, 10
                 else:
-                    self.viewer.add_labels(full_seg, name=seg_layer_name, opacity=0.7)
+                    edt_threshold, segment_size_min = 1.0, 10
+            seg_params[cell_type] = {
+                "edt_threshold": edt_threshold,
+                "segment_size_min": segment_size_min,
+            }
 
-            self.log("Training, prediction, and segmentation complete!")
+        return {
+            "all_features": all_features,
+            "targets": targets,
+            "label_data": label_data,
+            "params_by_target": params_by_target,
+            "seg_params": seg_params,
+            "all_cell_types": list(self.all_cell_types),
+            "pixel_class_outdir": pixel_class_outdir,
+        }
 
-        except Exception as e:
-            traceback.print_exc()
-            self.log(f"Error during training/segmentation: {e}")
-        finally:
-            if self.tab_progress_row is not None:
-                self.tab_progress_row.finish()
+    def _apply_train_results(self, results):
+        """Phase 3 (Qt thread): write training results back to viewer layers."""
+        if results is None:
+            return
+        pred_masks  = results.get("predictions", {})
+        seg_results = results.get("segments", {})
+
+        for target, full_prediction in pred_masks.items():
+            pred_layer_name = f"Pixel Classification ({target})"
+            if pred_layer_name in self.viewer.layers:
+                pred_layer = self.viewer.layers[pred_layer_name]
+                pred_layer.data = full_prediction
+                pred_layer.refresh()
+            else:
+                pred_layer = self.viewer.add_labels(
+                    full_prediction, name=pred_layer_name, opacity=0.3
+                )
+            if target == "Dead":
+                _set_dead_mask_layer_color(pred_layer)
+            self.log(f"  {target} prediction updated.")
+
+        for cell_type, full_seg in seg_results.items():
+            target         = cell_type.capitalize()
+            seg_layer_name = f"{target} Segments"
+            if seg_layer_name in self.viewer.layers:
+                self.viewer.layers[seg_layer_name].data    = full_seg
+                self.viewer.layers[seg_layer_name].visible = True
+                self.viewer.layers[seg_layer_name].refresh()
+            else:
+                self.viewer.add_labels(full_seg, name=seg_layer_name, opacity=0.7)
+
+        self.log("Training, prediction, and segmentation complete!")
+
 
     def _on_resegment_clicked(self):
         self.log("Testing segmentation parameters on current view...")
@@ -1963,8 +2178,9 @@ class PixelClassifierWidget(QWidget):
                 else:
                     if cell_type_key in self.param_widgets:
                         widgets = self.param_widgets[cell_type_key]
-                        edt = widgets['edt'].value()
-                        size = widgets['min_size'].value()
+                        mgr = widgets.get('unit_mgr')
+                        edt = float(mgr.get_native(widgets['edt'])) if mgr is not None else widgets['edt'].value()
+                        size = int(round(mgr.get_native(widgets['min_size']))) if mgr is not None else widgets['min_size'].value()
                         opening = widgets['opening'].value()
                         fill = widgets['fill_holes'].isChecked()
                     else:
@@ -2126,9 +2342,6 @@ class CellposeWidget(QWidget):
 
     # ── UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
-        if hasattr(self.metadata_loader, "metadata_loaded"):
-            self.metadata_loader.metadata_loaded.connect(self._on_metadata_updated)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
@@ -2829,20 +3042,32 @@ class CellposeWidget(QWidget):
 
 
 class ImportWidget(QWidget):
-    """Widget to validate and import pre-existing segmentation files.
-    
-    Shows a per-sample, per-cell-type status table with conversion actions.
+    """Widget to browse-in, convert, and validate pre-existing segmentation
+    (and dead-mask) files.
+
+    Shows a per-sample, per-cell-type list of editable path rows (prefilled
+    from metadata when a path is already set) with live status/conversion
+    actions. Newly browsed/typed paths are staged in the row's own widget —
+    metadata.csv is only updated once the corresponding Convert/Save action
+    actually runs (or a batch Convert/Save-All).
     """
 
-    def __init__(self, viewer, metadata_loader, log_callback=None):
+    def __init__(self, viewer, metadata_loader, log_callback=None,
+                 switch_to_data_prep_edit_callback=None):
         super().__init__()
         self.viewer = viewer
         self.metadata_loader = metadata_loader
         self.log = log_callback or print
+        self._switch_to_data_prep_edit = switch_to_data_prep_edit_callback
         self.organoid_types = []
         self.immune_types = []
         self.other_types = []
         self.all_cell_types = []
+        # (sample_name, cell_type) -> {"path_edit", "browse_btn",
+        #  "status_container", "status_layout", "last_value", "row_idx"}
+        self._rows = {}
+        # sample_name -> same widget dict, for the dead-mask row
+        self._dead_rows = {}
         self._init_ui()
 
     # ── helpers ──────────────────────────────────────────────────────────
@@ -2863,27 +3088,34 @@ class ImportWidget(QWidget):
         out_dir = Path(self.metadata_loader.output_dir)
         return out_dir / "images" / sample_name / f"{sample_name}_{cell_type}_segments.zarr"
 
+    def _expected_dead_mask_outpath(self, sample_name):
+        """Where a converted dead-mask zarr would be saved."""
+        out_dir = Path(self.metadata_loader.output_dir)
+        return out_dir / "images" / sample_name / f"{sample_name}_dead_mask.zarr"
+
+    def _metadata_csv_path(self):
+        path = getattr(self.metadata_loader, "_loaded_csv_path", None)
+        if path:
+            return path
+        return self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv")
+
     def _resolve_path(self, path_str):
         """Resolve a path string, trying the metadata CSV directory if not absolute/found."""
-        if not path_str:
-            return None
-        p = Path(path_str)
-        if p.exists():
-            return p
-        
-        # Try relative to metadata CSV
-        md_path = getattr(self.metadata_loader, "_loaded_csv_path", None)
-        if md_path:
-            p_rel = Path(md_path).parent / path_str
-            if p_rel.exists():
-                return p_rel
-        return p # Return original if still not found (will trigger 'File not found' UI)
+        return resolve_external_path(path_str, self._metadata_csv_path())
+
+    @staticmethod
+    def _clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
 
     # ── zarr validation ─────────────────────────────────────────────────
     @staticmethod
     def _check_zarr_structure(path):
         """Check that a .zarr file matches the expected save_as_zarr structure.
-        
+
         Expected: single root array (no sub-groups), chunks starting with (1, ...).
         Returns (ok: bool, reason: str).
         """
@@ -2907,12 +3139,27 @@ class ImportWidget(QWidget):
 
     # ── UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
-        if hasattr(self.metadata_loader, "metadata_loaded"):
-            self.metadata_loader.metadata_loaded.connect(self._on_metadata_updated)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
+
+        if self._switch_to_data_prep_edit is not None:
+            add_row = QHBoxLayout()
+            btn_add = QPushButton("➕  Add a new sample or cell type…")
+            btn_add.setToolTip(
+                "Jumps to the Data Preparation tab's Metadata Builder "
+                "(already in edit mode) to add samples/cell types that "
+                "don't exist in metadata yet."
+            )
+            btn_add.setStyleSheet(
+                "QPushButton{background:#455A64;color:white;padding:6px 12px;"
+                "border-radius:3px}"
+                "QPushButton:hover{background:#546E7A}"
+            )
+            btn_add.clicked.connect(self._switch_to_data_prep_edit)
+            add_row.addWidget(btn_add)
+            add_row.addStretch()
+            layout.addLayout(add_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -2947,7 +3194,10 @@ class ImportWidget(QWidget):
 
     # ── table builder ───────────────────────────────────────────────────
     def _rebuild_table(self):
-        """Clear and rebuild the entire status table."""
+        """Clear and rebuild the entire status table from metadata."""
+        self._rows = {}
+        self._dead_rows = {}
+
         # clear old widgets
         while self.scroll_layout.count():
             item = self.scroll_layout.takeAt(0)
@@ -2970,19 +3220,13 @@ class ImportWidget(QWidget):
         any_fixes_needed = False
         for i in range(self.scroll_layout.count()):
             w = self.scroll_layout.itemAt(i).widget()
-            if isinstance(w, QWidget):
-                # Look for buttons with specific text/tooltips
-                btns = w.findChildren(QPushButton)
-                for b in btns:
-                    if "Convert" in b.text() or "Fix" in b.text():
-                        any_fixes_needed = True
-                        break
-            if any_fixes_needed:
+            if isinstance(w, QWidget) and w.findChildren(QPushButton):
+                any_fixes_needed = True
                 break
 
         if any_fixes_needed:
             # ── global Convert All button ──
-            btn_all = QPushButton("⚡  Convert / Fix All Samples")
+            btn_all = QPushButton("⚡  Convert / Save All Samples")
             btn_all.setStyleSheet(
                 "QPushButton{background:#1565C0;color:white;padding:8px 16px;"
                 "border-radius:4px;font-weight:bold;font-size:13px}"
@@ -2998,10 +3242,10 @@ class ImportWidget(QWidget):
             success_msg.setStyleSheet("color:#2E7D32; background:#E8F5E9; padding:12px; border-radius:8px; margin:5px; border:1px solid #C8E6C9; font-weight:bold;")
             self.scroll_layout.addWidget(success_msg)
 
-        # ── General Instruction (ALWAYS visible at the bottom) ──
+        # ── Save-timing note (ALWAYS visible at the bottom) ──
         instr = QLabel(
-            "To add or change segmentation paths, go to the <b>Data Preparation</b> tab "
-            "and check the <b>Metadata Builder</b>."
+            "Paths typed or browsed above are only written to metadata.csv "
+            "once you click Convert/Save for that row (or Convert/Save All)."
         )
         instr.setWordWrap(True)
         instr.setAlignment(Qt.AlignCenter)
@@ -3011,173 +3255,50 @@ class ImportWidget(QWidget):
         self.scroll_layout.addStretch()
 
     def _add_sample_section(self, sample_name, row_idx, row):
-        """Add a grouped section for one sample."""
-        from functools import partial
+        """Add a grouped section for one sample: one editable row per cell
+        type, plus a dead-mask row when applicable."""
+        from behav3d.core.metadata import has_dead_channel
 
-        # Sample header
         header = QLabel(f"📁  {sample_name}")
         header.setStyleSheet("font-weight:bold; font-size:13px; padding:6px 0 2px 0;")
         self.scroll_layout.addWidget(header)
 
-        # Track whether ALL cell types have empty paths
-        all_empty = True
-
         for ct in self.all_cell_types:
-            col = self._seg_col(ct)
-            raw_val = row.get(col) if col in row.index else None
-            has_value = raw_val is not None and pd.notna(raw_val) and str(raw_val).strip() not in ("", "nan")
+            self._add_cell_type_row(sample_name, row_idx, row, ct)
 
-            if has_value:
-                all_empty = False
+        md = self.metadata_loader.metadata
+        if has_dead_channel(md):
+            self._add_dead_mask_row(sample_name, row_idx, row)
 
-            row_widget = QWidget()
-            row_lay = QHBoxLayout(row_widget)
-            row_lay.setContentsMargins(16, 2, 4, 2)
-            lbl = QLabel(f"{ct}:")
-            lbl.setFixedWidth(120)
-            row_lay.addWidget(lbl)
-
-            if not has_value:
-                status = QLabel("No segmentation available")
-                status.setStyleSheet("color:#999; font-style:italic;")
-                row_lay.addWidget(status)
-            else:
-                path_str = str(raw_val).strip().strip('"').strip("'")
-                file_path = self._resolve_path(path_str)
-
-                if not file_path.exists():
-                    status = QLabel(f"⚠️  File not found")
-                    status.setToolTip(str(file_path))
-                    status.setStyleSheet("color:#E65100;")
-                    row_lay.addWidget(status)
-
-                elif file_path.suffix == ".zarr":
-                    ok, reason = self._check_zarr_structure(file_path)
-                    if ok:
-                        # --- Dimension check ---
-                        dims_match = True
-                        try:
-                            raw_path = Path(row.get("raw_image_path", ""))
-                            if raw_path.exists():
-                                import zarr
-                                raw_store = zarr.open(str(raw_path), mode='r')
-                                seg_store = zarr.open(str(file_path), mode='r')
-                                raw_shape = raw_store.shape
-                                seg_shape = seg_store.shape
-                                
-                                if len(seg_shape) < 3 or raw_shape[-3:] != seg_shape[-3:]:
-                                    dims_match = False
-                                    reason = f"Spatial mismatch: Raw {raw_shape[-3:]} vs Seg {seg_shape[-3:]}"
-                                elif raw_shape[0] != seg_shape[0]:
-                                    dims_match = False
-                                    reason = f"Time mismatch: Raw {raw_shape[0]}T vs Seg {seg_shape[0]}T"
-                        except:
-                            pass
-
-                        if dims_match:
-                            status = QLabel("✅  Ready for tracking")
-                            status.setStyleSheet("color:#2E7D32; font-weight:bold;")
-                            row_lay.addWidget(status)
-                        else:
-                            status = QLabel(f"⚠️  Dimension mismatch")
-                            status.setToolTip(reason)
-                            status.setStyleSheet("color:#E65100; font-weight:bold;")
-                            row_lay.addWidget(status)
-                    else:
-                        btn = QPushButton("🔄  Fix zarr format")
-                        btn.setToolTip(f"Issue: {reason}")
-                        btn.setStyleSheet(
-                            "QPushButton{background:#F57C00;color:white;padding:4px 10px;"
-                            "border-radius:3px}"
-                            "QPushButton:hover{background:#FB8C00}"
-                        )
-                        btn.clicked.connect(partial(self._convert_single, path_str, ct, sample_name, row_idx))
-                        row_lay.addWidget(btn)
-
-                elif file_path.suffix.lower() in (".tif", ".tiff"):
-                    # Check TIFF dims if possible
-                    warning = ""
-                    try:
-                        raw_path = Path(row.get("raw_image_path", ""))
-                        if raw_path.exists():
-                            import zarr
-                            from behav3d.io.images import load_image
-                            raw_store = zarr.open(str(raw_path), mode='r')
-                            # For TIFF we'd have to load it to check shape, which is slow for many files.
-                            # Let's just do it and log if mismatch.
-                            # Actually, maybe just keep it simple and check AFTER conversion? 
-                            # No, user wants check during import.
-                    except:
-                        pass
-
-                    btn = QPushButton("🔄  Convert TIFF → zarr")
-                    btn.setStyleSheet(
-                        "QPushButton{background:#1565C0;color:white;padding:4px 10px;"
-                        "border-radius:3px}"
-                        "QPushButton:hover{background:#1976D2}"
-                    )
-                    btn.clicked.connect(partial(self._convert_single, path_str, ct, sample_name, row_idx))
-                    row_lay.addWidget(btn)
-                else:
-                    status = QLabel(f"⚠️  Format not supported ({file_path.suffix})")
-                    status.setStyleSheet("color:#E65100;")
-                    row_lay.addWidget(status)
-
-            row_lay.addStretch()
-            self.scroll_layout.addWidget(row_widget)
-
-        # If ALL cell types empty → show combined message instead
-        if all_empty:
-            # remove the per-cell-type rows we just added (they all say "No segmentation")
-            # keep the header, remove the rest
-            items_to_remove = []
-            for i in range(self.scroll_layout.count() - 1, -1, -1):
-                item = self.scroll_layout.itemAt(i)
-                w = item.widget()
+        # Check if any "action" buttons were added for this sample
+        fixes_needed = False
+        found_header = False
+        for i in range(self.scroll_layout.count()):
+            w = self.scroll_layout.itemAt(i).widget()
+            if not found_header:
                 if w is header:
-                    break
-                items_to_remove.append(i)
-            for i in items_to_remove:
-                item = self.scroll_layout.takeAt(i)
-                if item.widget():
-                    item.widget().deleteLater()
+                    found_header = True
+                continue
+            if isinstance(w, QWidget) and w.findChildren(QPushButton):
+                fixes_needed = True
+                break
 
-            msg = QLabel("  No segmentation data found for this sample.<br>  (Check the <b>Metadata Builder</b> in Data Prep if you have files to import)")
-            msg.setStyleSheet("color:#888; font-style:italic; padding:4px 16px;")
-            msg.setWordWrap(True)
-            self.scroll_layout.addWidget(msg)
-        else:
-            # Check if any "action" buttons were added for this sample
-            fixes_needed = False
-            # We look at the widgets added after the header
-            found_header = False
-            for i in range(self.scroll_layout.count()):
-                w = self.scroll_layout.itemAt(i).widget()
-                if not found_header:
-                    if w is header:
-                        found_header = True
-                    continue
-                # Now we are past the header
-                if isinstance(w, QWidget):
-                    if w.findChildren(QPushButton):
-                        fixes_needed = True
-                        break
-            
-            if fixes_needed:
-                # Per-sample Convert All button
-                btn = QPushButton(f"⚡  Convert / Fix all for {sample_name}")
-                btn.setStyleSheet(
-                    "QPushButton{background:#2E7D32;color:white;padding:5px 12px;"
-                    "border-radius:3px;font-size:12px}"
-                    "QPushButton:hover{background:#388E3C}"
-                )
-                btn.clicked.connect(partial(self._convert_sample, sample_name, row_idx))
-                wrap = QWidget()
-                wrap_lay = QHBoxLayout(wrap)
-                wrap_lay.setContentsMargins(16, 2, 4, 6)
-                wrap_lay.addWidget(btn)
-                wrap_lay.addStretch()
-                self.scroll_layout.addWidget(wrap)
+        if fixes_needed:
+            btn = QPushButton(f"⚡  Convert / Save all for {sample_name}")
+            btn.setStyleSheet(
+                "QPushButton{background:#2E7D32;color:white;padding:5px 12px;"
+                "border-radius:3px;font-size:12px}"
+                "QPushButton:hover{background:#388E3C}"
+            )
+            btn.clicked.connect(
+                lambda _checked=False, s=sample_name, r=row_idx: self._convert_sample(s, r)
+            )
+            wrap = QWidget()
+            wrap_lay = QHBoxLayout(wrap)
+            wrap_lay.setContentsMargins(16, 2, 4, 6)
+            wrap_lay.addWidget(btn)
+            wrap_lay.addStretch()
+            self.scroll_layout.addWidget(wrap)
 
         # separator
         sep = QWidget()
@@ -3185,113 +3306,484 @@ class ImportWidget(QWidget):
         sep.setStyleSheet("background:#ddd;")
         self.scroll_layout.addWidget(sep)
 
-    # ── conversion logic ────────────────────────────────────────────────
-    def _convert_single(self, src_path_str, cell_type, sample_name, row_idx, 
-                        save_metadata=True, refresh_ui=True):
-        """Convert a single file (TIFF or bad zarr) and update metadata."""
-        from qtpy.QtWidgets import QMessageBox
-        src = Path(src_path_str)
-        dest = self._expected_outpath(sample_name, cell_type)
+    def _add_cell_type_row(self, sample_name, row_idx, row, cell_type):
+        """Build+register one editable segmentation-path row for one
+        (sample, cell_type) pair."""
+        col = self._seg_col(cell_type)
+        raw_val = row.get(col) if col in row.index else None
+        has_value = raw_val is not None and pd.notna(raw_val) and str(raw_val).strip() not in ("", "nan")
+        initial_value = str(raw_val).strip().strip('"').strip("'") if has_value else ""
 
-        # Overwrite check
-        if dest.exists():
-            # If we are in a batch operation (save_metadata=False), we might want to skip prompt
-            # but for safety let's prompt or assume user already confirmed global action?
-            # Actually, per-file confirmation is safer unless we add "Apply to all".
+        row_widget, path_edit, browse_btn, status_layout = self._build_path_row(f"{cell_type}:", initial_value)
+
+        key = (sample_name, cell_type)
+        self._rows[key] = {
+            "path_edit": path_edit,
+            "browse_btn": browse_btn,
+            "status_layout": status_layout,
+            "last_value": initial_value,
+            "row_idx": row_idx,
+        }
+        path_edit.editingFinished.connect(partial(self._on_row_path_edited, sample_name, cell_type))
+        browse_btn.clicked.connect(partial(self._on_browse_clicked, sample_name, cell_type))
+
+        self.scroll_layout.addWidget(row_widget)
+        self._refresh_row_status(sample_name, cell_type)
+
+    def _add_dead_mask_row(self, sample_name, row_idx, row):
+        """Build+register one editable dead-mask-path row for one sample."""
+        col = "dead_mask_path"
+        raw_val = row.get(col) if col in row.index else None
+        has_value = raw_val is not None and pd.notna(raw_val) and str(raw_val).strip() not in ("", "nan")
+        initial_value = str(raw_val).strip().strip('"').strip("'") if has_value else ""
+
+        row_widget, path_edit, browse_btn, status_layout = self._build_path_row("dead mask:", initial_value)
+
+        self._dead_rows[sample_name] = {
+            "path_edit": path_edit,
+            "browse_btn": browse_btn,
+            "status_layout": status_layout,
+            "last_value": initial_value,
+            "row_idx": row_idx,
+        }
+        path_edit.editingFinished.connect(partial(self._on_dead_mask_path_edited, sample_name))
+        browse_btn.clicked.connect(partial(self._on_dead_mask_browse_clicked, sample_name))
+
+        self.scroll_layout.addWidget(row_widget)
+        self._refresh_dead_mask_status(sample_name)
+
+    @staticmethod
+    def _build_path_row(label_text, initial_value):
+        """Build the shared visual shape of an editable path row (label,
+        path field, Browse button, status container) without wiring any
+        signals or registering it anywhere — callers do that."""
+        row_widget = QWidget()
+        row_lay = QHBoxLayout(row_widget)
+        row_lay.setContentsMargins(16, 2, 4, 2)
+
+        lbl = QLabel(label_text)
+        lbl.setFixedWidth(120)
+        row_lay.addWidget(lbl)
+
+        path_edit = QLineEdit(initial_value)
+        path_edit.setPlaceholderText("Path to .tif/.tiff file or .zarr directory")
+        path_edit.setMinimumWidth(220)
+        row_lay.addWidget(path_edit, stretch=1)
+
+        browse_btn = QPushButton("Browse…")
+        row_lay.addWidget(browse_btn)
+
+        status_container = QWidget()
+        status_layout = QHBoxLayout(status_container)
+        status_layout.setContentsMargins(8, 0, 0, 0)
+        row_lay.addWidget(status_container)
+        row_lay.addStretch()
+
+        return row_widget, path_edit, browse_btn, status_layout
+
+    # ── live status refresh (reads from the widget, not metadata) ───────
+    def _refresh_row_status(self, sample_name, cell_type):
+        info = self._rows.get((sample_name, cell_type))
+        if info is None:
+            return
+        self._clear_layout(info["status_layout"])
+
+        path_str = info["path_edit"].text().strip().strip('"').strip("'")
+        row_idx = info["row_idx"]
+
+        if not path_str:
+            status = QLabel("No segmentation available")
+            status.setStyleSheet("color:#999; font-style:italic;")
+            info["status_layout"].addWidget(status)
+            return
+
+        file_path = self._resolve_path(path_str)
+        if file_path is None or not file_path.exists():
+            status = QLabel("⚠️  File not found")
+            status.setToolTip(str(file_path))
+            status.setStyleSheet("color:#E65100;")
+            info["status_layout"].addWidget(status)
+            return
+
+        if file_path.suffix == ".zarr" or file_path.is_dir():
+            ok, reason = self._check_zarr_structure(file_path)
+            if not ok:
+                btn = QPushButton("🔄  Fix zarr format")
+                btn.setToolTip(f"Issue: {reason}")
+                btn.setStyleSheet(
+                    "QPushButton{background:#F57C00;color:white;padding:4px 10px;"
+                    "border-radius:3px}"
+                    "QPushButton:hover{background:#FB8C00}"
+                )
+                btn.clicked.connect(
+                    lambda _checked=False, s=sample_name, c=cell_type, r=row_idx: self._convert_single(s, c, r)
+                )
+                info["status_layout"].addWidget(btn)
+                return
+
+            # --- Dimension check against the sample's raw image ---
+            dims_match = True
+            try:
+                md = self.metadata_loader.metadata
+                raw_path_str = md.at[row_idx, "raw_image_path"] if "raw_image_path" in md.columns else ""
+                raw_path = Path(str(raw_path_str)) if raw_path_str else None
+                if raw_path is not None and raw_path.exists():
+                    import zarr
+                    raw_store = zarr.open(str(raw_path), mode='r')
+                    seg_store = zarr.open(str(file_path), mode='r')
+                    raw_shape = raw_store.shape
+                    seg_shape = seg_store.shape
+                    if len(seg_shape) < 3 or raw_shape[-3:] != seg_shape[-3:]:
+                        dims_match = False
+                        reason = f"Spatial mismatch: Raw {raw_shape[-3:]} vs Seg {seg_shape[-3:]}"
+                    elif raw_shape[0] != seg_shape[0]:
+                        dims_match = False
+                        reason = f"Time mismatch: Raw {raw_shape[0]}T vs Seg {seg_shape[0]}T"
+            except Exception:
+                pass
+
+            if not dims_match:
+                status = QLabel("⚠️  Dimension mismatch")
+                status.setToolTip(reason)
+                status.setStyleSheet("color:#E65100; font-weight:bold;")
+                info["status_layout"].addWidget(status)
+            elif str(file_path) == info["last_value"]:
+                status = QLabel("✅  Ready for tracking")
+                status.setStyleSheet("color:#2E7D32; font-weight:bold;")
+                info["status_layout"].addWidget(status)
+            else:
+                # Already a valid zarr, just not yet persisted to metadata.
+                btn = QPushButton("💾  Save path to metadata")
+                btn.setStyleSheet(
+                    "QPushButton{background:#2E7D32;color:white;padding:4px 10px;"
+                    "border-radius:3px}"
+                    "QPushButton:hover{background:#388E3C}"
+                )
+                btn.clicked.connect(
+                    lambda _checked=False, s=sample_name, c=cell_type, r=row_idx: self._convert_single(s, c, r)
+                )
+                info["status_layout"].addWidget(btn)
+
+        elif file_path.suffix.lower() in (".tif", ".tiff"):
+            btn = QPushButton("🔄  Convert TIFF → zarr")
+            btn.setStyleSheet(
+                "QPushButton{background:#1565C0;color:white;padding:4px 10px;"
+                "border-radius:3px}"
+                "QPushButton:hover{background:#1976D2}"
+            )
+            btn.clicked.connect(
+                lambda _checked=False, s=sample_name, c=cell_type, r=row_idx: self._convert_single(s, c, r)
+            )
+            info["status_layout"].addWidget(btn)
+        else:
+            status = QLabel(f"⚠️  Format not supported ({file_path.suffix})")
+            status.setStyleSheet("color:#E65100;")
+            info["status_layout"].addWidget(status)
+
+    def _refresh_dead_mask_status(self, sample_name):
+        info = self._dead_rows.get(sample_name)
+        if info is None:
+            return
+        self._clear_layout(info["status_layout"])
+
+        path_str = info["path_edit"].text().strip().strip('"').strip("'")
+        row_idx = info["row_idx"]
+
+        if not path_str:
+            status = QLabel("No dead mask available")
+            status.setStyleSheet("color:#999; font-style:italic;")
+            info["status_layout"].addWidget(status)
+            return
+
+        file_path = self._resolve_path(path_str)
+        if file_path is None or not file_path.exists():
+            status = QLabel("⚠️  File not found")
+            status.setToolTip(str(file_path))
+            status.setStyleSheet("color:#E65100;")
+            info["status_layout"].addWidget(status)
+            return
+
+        if file_path.suffix == ".zarr" or file_path.is_dir():
+            ok, reason = self._check_zarr_structure(file_path)
+            if not ok:
+                btn = QPushButton("🔄  Fix zarr format")
+                btn.setToolTip(f"Issue: {reason}")
+                btn.setStyleSheet(
+                    "QPushButton{background:#F57C00;color:white;padding:4px 10px;"
+                    "border-radius:3px}"
+                    "QPushButton:hover{background:#FB8C00}"
+                )
+                btn.clicked.connect(
+                    lambda _checked=False, s=sample_name, r=row_idx: self._convert_dead_mask(s, r)
+                )
+                info["status_layout"].addWidget(btn)
+            elif str(file_path) == info["last_value"]:
+                status = QLabel("✅  Ready")
+                status.setStyleSheet("color:#2E7D32; font-weight:bold;")
+                info["status_layout"].addWidget(status)
+            else:
+                btn = QPushButton("💾  Save path to metadata")
+                btn.setStyleSheet(
+                    "QPushButton{background:#2E7D32;color:white;padding:4px 10px;"
+                    "border-radius:3px}"
+                    "QPushButton:hover{background:#388E3C}"
+                )
+                btn.clicked.connect(
+                    lambda _checked=False, s=sample_name, r=row_idx: self._convert_dead_mask(s, r)
+                )
+                info["status_layout"].addWidget(btn)
+        elif file_path.suffix.lower() in (".tif", ".tiff"):
+            btn = QPushButton("🔄  Convert TIFF → zarr")
+            btn.setStyleSheet(
+                "QPushButton{background:#1565C0;color:white;padding:4px 10px;"
+                "border-radius:3px}"
+                "QPushButton:hover{background:#1976D2}"
+            )
+            btn.clicked.connect(
+                lambda _checked=False, s=sample_name, r=row_idx: self._convert_dead_mask(s, r)
+            )
+            info["status_layout"].addWidget(btn)
+        else:
+            status = QLabel(f"⚠️  Format not supported ({file_path.suffix})")
+            status.setStyleSheet("color:#E65100;")
+            info["status_layout"].addWidget(status)
+
+    # ── path-field change handlers ───────────────────────────────────────
+    def _on_browse_clicked(self, sample_name, cell_type):
+        info = self._rows.get((sample_name, cell_type))
+        if info is None:
+            return
+        new_path = browse_file_or_zarr(
+            self, f"Select {cell_type} segmentation for {sample_name}",
+            "Image files (*.tif *.tiff *.zarr);; All Files (*)",
+            allow_zarr=True,
+        )
+        if not new_path:
+            return
+        self._maybe_accept_new_value(
+            info, new_path,
+            label=f"{cell_type} / {sample_name}",
+            on_accept=lambda: self._refresh_row_status(sample_name, cell_type),
+        )
+
+    def _on_row_path_edited(self, sample_name, cell_type):
+        info = self._rows.get((sample_name, cell_type))
+        if info is None:
+            return
+        new_value = info["path_edit"].text().strip()
+        self._maybe_accept_new_value(
+            info, new_value,
+            label=f"{cell_type} / {sample_name}",
+            on_accept=lambda: self._refresh_row_status(sample_name, cell_type),
+            already_in_field=True,
+        )
+
+    def _on_dead_mask_browse_clicked(self, sample_name):
+        info = self._dead_rows.get(sample_name)
+        if info is None:
+            return
+        new_path = browse_file_or_zarr(
+            self, f"Select dead mask for {sample_name}",
+            "Image files (*.tif *.tiff *.zarr);; All Files (*)",
+            allow_zarr=True,
+        )
+        if not new_path:
+            return
+        self._maybe_accept_new_value(
+            info, new_path,
+            label=f"dead mask / {sample_name}",
+            on_accept=lambda: self._refresh_dead_mask_status(sample_name),
+        )
+
+    def _on_dead_mask_path_edited(self, sample_name):
+        info = self._dead_rows.get(sample_name)
+        if info is None:
+            return
+        new_value = info["path_edit"].text().strip()
+        self._maybe_accept_new_value(
+            info, new_value,
+            label=f"dead mask / {sample_name}",
+            on_accept=lambda: self._refresh_dead_mask_status(sample_name),
+            already_in_field=True,
+        )
+
+    def _maybe_accept_new_value(self, info, new_value, *, label, on_accept, already_in_field=False):
+        """Shared change-acceptance logic for both cell-type and dead-mask
+        rows: confirms overwriting an already-set metadata value, then
+        (re)writes the field and refreshes that row's status."""
+        new_value = str(new_value).strip()
+        old_value = info["last_value"]
+
+        if new_value != old_value and old_value:
             res = QMessageBox.question(
-                self, "Overwrite?",
-                f"There is a pre-existing segmentation file:\n{dest}\n\nDo you want to overwrite it?",
+                self, "Replace existing path?",
+                f"This will replace the existing path for {label}:\n{old_value}\n→\n{new_value}\n\nContinue?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if res != QMessageBox.Yes:
-                self.log(f"Skipped {cell_type} for {sample_name} (user declined overwrite)")
-                return False
+                info["path_edit"].blockSignals(True)
+                info["path_edit"].setText(old_value)
+                info["path_edit"].blockSignals(False)
+                return
 
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            self.log(f"Converting {src.name} → {dest.name} ...")
-            img = load_image(src)
-            if dest.exists():
-                import shutil
-                shutil.rmtree(dest)
-            save_as_zarr(img, dest)
-            self.log(f"✅  Saved: {dest}")
+        if not already_in_field:
+            info["path_edit"].blockSignals(True)
+            info["path_edit"].setText(new_value)
+            info["path_edit"].blockSignals(False)
 
-            # Update metadata
-            md = self.metadata_loader.metadata
-            col = self._seg_col(cell_type)
-            if col not in md.columns:
-                md[col] = pd.NA
-            md[col] = md[col].astype("object")
-            md.at[row_idx, col] = str(dest)
-            
-            if save_metadata:
-                self._save_metadata(refresh_ui=refresh_ui)
-            return True
+        on_accept()
 
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.log(f"❌  Error converting {cell_type} for {sample_name}: {e}")
-            if refresh_ui: # Only show error dialog if not in background bulk operation
-                QMessageBox.warning(self, "Conversion Error", str(e))
+    # ── conversion logic ────────────────────────────────────────────────
+    def _row_action(self, info, col, dest_path, row_idx, *, save_metadata, refresh_ui, label):
+        """Shared conversion engine for one row (cell-type or dead-mask):
+        saves an already-valid zarr path as-is, repairs a malformed zarr, or
+        converts a TIFF (with axis-order confirmation) — then writes the
+        result into metadata. Returns True if metadata changed."""
+        path_str = info["path_edit"].text().strip().strip('"').strip("'")
+        if not path_str:
+            return False
+        src = self._resolve_path(path_str)
+        if src is None or not src.exists():
             return False
 
-    def _convert_sample(self, sample_name, row_idx, save_metadata=True, refresh_ui=True):
-        """Convert all actionable files for one sample."""
         md = self.metadata_loader.metadata
-        row = md.iloc[row_idx]
+
+        if src.suffix == ".zarr" or src.is_dir():
+            ok, _ = self._check_zarr_structure(src)
+            if ok:
+                if str(src) == info["last_value"]:
+                    return False  # already saved, nothing to do
+                if col not in md.columns:
+                    md[col] = pd.NA
+                md[col] = md[col].astype("object")
+                md.at[row_idx, col] = str(src)
+                info["last_value"] = str(src)
+                self.log(f"  {col} for {label} -> {src}")
+                if save_metadata:
+                    self._save_metadata(refresh_ui=refresh_ui)
+                return True
+
+            # bad zarr structure -> repair via raw save_as_zarr (unchanged behavior)
+            if dest_path.exists():
+                res = QMessageBox.question(
+                    self, "Overwrite?",
+                    f"There is a pre-existing file:\n{dest_path}\n\nDo you want to overwrite it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if res != QMessageBox.Yes:
+                    self.log(f"Skipped {label} (user declined overwrite)")
+                    return False
+            try:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                self.log(f"Repairing zarr format: {src.name} → {dest_path.name} ...")
+                img = load_image(src)
+                if dest_path.exists():
+                    shutil.rmtree(dest_path)
+                save_as_zarr(img, dest_path)
+            except Exception as e:
+                traceback.print_exc()
+                self.log(f"❌  Error repairing {label}: {e}")
+                if refresh_ui:
+                    QMessageBox.warning(self, "Conversion Error", str(e))
+                return False
+
+        elif src.suffix.lower() in (".tif", ".tiff"):
+            if dest_path.exists():
+                res = QMessageBox.question(
+                    self, "Overwrite?",
+                    f"There is a pre-existing file:\n{dest_path}\n\nDo you want to overwrite it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if res != QMessageBox.Yes:
+                    self.log(f"Skipped {label} (user declined overwrite)")
+                    return False
+            axis_order = prompt_axis_order(self, src, log=self.log)
+            if axis_order is None:
+                self.log(f"Cancelled: no axis order selected for {label}")
+                return False
+            try:
+                self.log(f"Converting {src.name} → {dest_path.name} ...")
+                convert_label_file_to_zarr(path=src, outpath=dest_path, axis_order=axis_order, overwrite=True)
+            except Exception as e:
+                traceback.print_exc()
+                self.log(f"❌  Error converting {label}: {e}")
+                if refresh_ui:
+                    QMessageBox.warning(self, "Conversion Error", str(e))
+                return False
+        else:
+            self.log(f"⚠️  Unsupported format for {label}: {src.suffix}")
+            return False
+
+        self.log(f"✅  Saved: {dest_path}")
+        if col not in md.columns:
+            md[col] = pd.NA
+        md[col] = md[col].astype("object")
+        md.at[row_idx, col] = str(dest_path)
+        info["last_value"] = str(dest_path)
+        if save_metadata:
+            self._save_metadata(refresh_ui=refresh_ui)
+        return True
+
+    def _convert_single(self, sample_name, cell_type, row_idx, *, save_metadata=True, refresh_ui=True):
+        """Convert/save one cell type's segmentation row for one sample."""
+        info = self._rows.get((sample_name, cell_type))
+        if info is None:
+            return False
+        dest = self._expected_outpath(sample_name, cell_type)
+        col = self._seg_col(cell_type)
+        return self._row_action(
+            info, col, dest, row_idx,
+            save_metadata=save_metadata, refresh_ui=refresh_ui,
+            label=f"{cell_type} / {sample_name}",
+        )
+
+    def _convert_dead_mask(self, sample_name, row_idx, *, save_metadata=True, refresh_ui=True):
+        """Convert/save the dead-mask row for one sample."""
+        info = self._dead_rows.get(sample_name)
+        if info is None:
+            return False
+        dest = self._expected_dead_mask_outpath(sample_name)
+        return self._row_action(
+            info, "dead_mask_path", dest, row_idx,
+            save_metadata=save_metadata, refresh_ui=refresh_ui,
+            label=f"dead mask / {sample_name}",
+        )
+
+    def _convert_sample(self, sample_name, row_idx, *, save_metadata=True, refresh_ui=True):
+        """Convert/save all actionable rows (cell types + dead mask) for one sample."""
         converted_any = False
 
         for ct in self.all_cell_types:
-            col = self._seg_col(ct)
-            raw_val = row.get(col) if col in row.index else None
-            has_value = raw_val is not None and pd.notna(raw_val) and str(raw_val).strip() not in ("", "nan")
-            if not has_value:
-                continue
-
-            path_str = str(raw_val).strip().strip('"').strip("'")
-            file_path = self._resolve_path(path_str)
-
-            if not file_path.exists():
-                continue
-
-            needs_convert = False
-            if file_path.suffix.lower() in (".tif", ".tiff"):
-                needs_convert = True
-            elif file_path.suffix == ".zarr":
-                ok, _ = self._check_zarr_structure(file_path)
-                if not ok:
-                    needs_convert = True
-
-            if needs_convert:
-                # We pass refresh_ui=False here to prevent the table from being rebuilt 
-                # inside the loop, which causes the crash!
-                if self._convert_single(path_str, ct, sample_name, row_idx, 
-                                        save_metadata=False, refresh_ui=False):
+            if (sample_name, ct) in self._rows:
+                # refresh_ui=False to avoid rebuilding the table mid-loop, which crashes.
+                if self._convert_single(sample_name, ct, row_idx, save_metadata=False, refresh_ui=False):
                     converted_any = True
+
+        if sample_name in self._dead_rows:
+            if self._convert_dead_mask(sample_name, row_idx, save_metadata=False, refresh_ui=False):
+                converted_any = True
 
         if converted_any:
             if save_metadata:
                 self._save_metadata(refresh_ui=refresh_ui)
         elif refresh_ui:
             self.log(f"No conversions needed for {sample_name}")
-        
+
         return converted_any
 
     def _convert_all(self):
-        """Convert all actionable files across all samples."""
+        """Convert/save all actionable rows across all samples."""
         md = self.metadata_loader.metadata
         if md is None:
             return
-        
+
         converted_any = False
         for idx, row in md.iterrows():
             sample_name = str(row.get("sample_name", f"Row {idx+1}"))
             # refresh_ui=False to avoid crash
             if self._convert_sample(sample_name, idx, save_metadata=False, refresh_ui=False):
                 converted_any = True
-        
+
         if converted_any:
             self._save_metadata(refresh_ui=True)
         else:
@@ -3299,7 +3791,6 @@ class ImportWidget(QWidget):
 
     def _save_metadata(self, show_popup=True, refresh_ui=True):
         """Save metadata CSV to disk and show info popup."""
-        from qtpy.QtWidgets import QMessageBox
         md = self.metadata_loader.metadata
         csv_path = self.metadata_loader.behav3d_parameters.get("paths", {}).get("metadata_csv", "")
         if not csv_path:
@@ -3408,6 +3899,29 @@ class APOCWidget(QWidget):
         gpu_row.addStretch()
         layout.addLayout(gpu_row)
 
+        force_cpu_row = QHBoxLayout()
+        self.btn_force_cpu = QCheckBox("Force CPU-only processing")
+        self.btn_force_cpu.setToolTip("Override GPU selection and run pyclesperanto on the CPU")
+        is_force_cpu = bool(pc.get("force_cpu", False))
+        self.btn_force_cpu.setChecked(is_force_cpu)
+        if is_force_cpu:
+            self.combo_gpu_device.setEnabled(False)
+        force_cpu_row.addWidget(self.btn_force_cpu)
+        force_cpu_row.addWidget(HelpButton(
+            "Force CPU-only Processing",
+            "Overrides the GPU Device selection above and asks pyclesperanto "
+            "to run APOC (pixel classification + EDT/watershed) on the CPU "
+            "instead of the GPU.\n\n"
+            "Requires an OpenCL CPU runtime to be installed (e.g. the Intel "
+            "CPU Runtime for OpenCL). If none is found, pyclesperanto silently "
+            "falls back to whatever OpenCL device it can find and a warning "
+            "is logged.\n\n"
+            "Use this if you don't have a compatible GPU, or if GPU "
+            "processing is unstable/unavailable on this machine."
+        ))
+        force_cpu_row.addStretch()
+        layout.addLayout(force_cpu_row)
+
         # ── Training section (embedded APOCTrainingWidget) ──────
         self.training_group = QGroupBox("🎯 APOC Classifier Training")
         self.training_layout = QVBoxLayout(self.training_group)
@@ -3431,6 +3945,79 @@ class APOCWidget(QWidget):
         train_ctrl_lay.addStretch()
         
         self.training_layout.addLayout(train_ctrl_lay)
+
+        # ── Import Training Data row ──────────────────────────────────
+        import_ctrl_lay = QHBoxLayout()
+        self.btn_import_training = QPushButton("Import Training Data")
+        self.btn_import_training.setToolTip(
+            "Select a training_metadata.yml file from a previous BEHAV3D experiment.\n"
+            "Features and sigma values will be locked to match the imported classifier."
+        )
+        self.btn_import_training.setStyleSheet(
+            "background-color: #6f42c1; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px;"
+        )
+        self.btn_import_training.clicked.connect(self._on_import_training_data_clicked)
+        self.btn_import_training.setEnabled(False)   # enabled once metadata is loaded
+        self.btn_import_training.setVisible(False)   # hidden until training data is generated
+        import_ctrl_lay.addWidget(self.btn_import_training)
+        self._btn_import_help = HelpButton(
+            "Import Training Data",
+            "Select a training_metadata.yml file from a previous BEHAV3D experiment to reuse its "
+            "labeled training data (pixel features + labels).\n\n"
+            "⚠️ Features and sigma values will be locked to match the imported classifier. "
+            "This is required because the classifier was trained on a specific set of features "
+            "computed at specific scales (sigma values) — changing them would make the classifier "
+            "incompatible with the imported labels.\n\n"
+            "⚠️ Even when importing, you must first click 'Generate Training Data' to load this "
+            "experiment's images into the viewer. Importing replaces the need to manually label "
+            "pixels — but the viewer session must be active first."
+        )
+        self._btn_import_help.setToolTip(
+            "Requires: training_metadata.yml from a previous BEHAV3D experiment.\n"
+            "Locks features and sigma values to match the imported classifier — because the "
+            "classifier was trained on those exact features and cannot be used with different ones.\n"
+            "Note: click 'Generate Training Data' first — importing replaces labeling, not image loading."
+        )
+        self._btn_import_help.setVisible(False)
+        import_ctrl_lay.addWidget(self._btn_import_help)
+        import_ctrl_lay.addStretch()
+        self.training_layout.addLayout(import_ctrl_lay)
+
+        # ── Imported data info panel (hidden until import is applied) ─
+        self.import_info_group = QGroupBox("📦 Imported Training Data")
+        self.import_info_group.setVisible(False)
+        import_info_lay = QVBoxLayout(self.import_info_group)
+        import_info_lay.setContentsMargins(6, 6, 6, 6)
+        import_info_lay.setSpacing(4)
+
+        self.import_source_label = QLabel("")
+        self.import_source_label.setWordWrap(True)
+        self.import_source_label.setStyleSheet("color: #666; font-size: 10px;")
+        import_info_lay.addWidget(self.import_source_label)
+
+        self.import_details_label = QLabel("")
+        self.import_details_label.setWordWrap(True)
+        self.import_details_label.setStyleSheet(
+            "color: #444; font-size: 10px; font-family: monospace;"
+        )
+        import_info_lay.addWidget(self.import_details_label)
+
+        btn_clear_import = QPushButton("Clear Import")
+        btn_clear_import.setToolTip("Remove the imported training data and unlock feature controls.")
+        btn_clear_import.clicked.connect(self._on_clear_import_clicked)
+        import_info_lay.addWidget(btn_clear_import)
+
+        self.training_layout.addWidget(self.import_info_group)
+
+        # ── Export Training Bundle button ─────────────────────────────
+        self.btn_export_bundle = QPushButton("Export Training Bundle…")
+        self.btn_export_bundle.setToolTip(
+            "Copy PixelClassifier_TrainingData.zip + .cl classifier files into a shareable archive."
+        )
+        self.btn_export_bundle.setEnabled(False)
+        self.btn_export_bundle.clicked.connect(self._on_export_training_bundle)
+        self.training_layout.addWidget(self.btn_export_bundle)
 
         # Legend container for APOC
         self.legend_container = QWidget()
@@ -3536,6 +4123,7 @@ class APOCWidget(QWidget):
         self.spin_examples.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
         self.spin_workers.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
         self.combo_gpu_device.currentTextChanged.connect(self._on_gpu_device_changed)
+        self.btn_force_cpu.toggled.connect(self._on_force_cpu_toggled)
         self.check_process_all.stateChanged.connect(lambda _: self._save_apoc_params_to_yaml())
         self.spin_t_start.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
         self.spin_t_end.valueChanged.connect(lambda _: self._save_apoc_params_to_yaml())
@@ -3565,6 +4153,11 @@ class APOCWidget(QWidget):
         self._save_apoc_params_to_yaml()
         self._apply_apoc_gpu_selection(log_message=True)
 
+    def _on_force_cpu_toggled(self, checked):
+        self.combo_gpu_device.setEnabled(not checked)
+        self._save_apoc_params_to_yaml()
+        self._apply_apoc_gpu_selection(log_message=True)
+
     def _selected_gpu_device_name(self):
         if not hasattr(self, 'combo_gpu_device'):
             return ""
@@ -3573,6 +4166,29 @@ class APOCWidget(QWidget):
         return str(self.combo_gpu_device.currentText() or "").strip()
 
     def _apply_apoc_gpu_selection(self, log_message=True):
+        if hasattr(self, 'btn_force_cpu') and self.btn_force_cpu.isChecked():
+            try:
+                import pyclesperanto_prototype as cle
+                import warnings
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    device = cle.select_device("CPU")
+                    
+                    device_name = device.name if hasattr(device, 'name') else str(device)
+                    warning_msg = str(w[-1].message) if len(w) > 0 else ""
+                    
+                    if log_message:
+                        if "CPU" not in device_name and "No OpenCL device found" in warning_msg:
+                            self.log(f"⚠️ OpenCL CPU driver missing. Fell back to: {device_name}")
+                            self.log("To run APOC on the CPU, install an OpenCL CPU runtime (e.g. Intel CPU Runtime for OpenCL).")
+                        else:
+                            self.log(f"APOC: Forced OpenCL device '{device_name}'")
+                return True
+            except Exception as e:
+                if log_message:
+                    self.log(f"⚠️ Could not force CPU device: {e}")
+                return False
+
         gpu_device = self._selected_gpu_device_name()
         if not gpu_device:
             return False
@@ -3617,6 +4233,23 @@ class APOCWidget(QWidget):
                 w = getattr(tab, name, None)
                 if w is not None:
                     w.setEnabled(can_train)
+
+        # Re-apply import lock for tabs whose features were locked by a previous import.
+        # The enable loop above would otherwise undo locks set by apply_import().
+        if can_train:
+            for tab in getattr(tw, "tabs", {}).values():
+                fs = getattr(tab, "_locked_feature_string", None)
+                if fs:
+                    tab.lock_features(fs)
+
+        # Show/hide training parameters and import button based on session state
+        if hasattr(tw, "set_classifier_params_visible"):
+            tw.set_classifier_params_visible(can_train)
+        else:
+            tw.setVisible(can_train)
+        self.btn_import_training.setVisible(can_train)
+        if hasattr(self, '_btn_import_help'):
+            self._btn_import_help.setVisible(can_train)
 
         if can_train:
             self.log("APOC training controls unlocked (training data loaded).")
@@ -3704,10 +4337,12 @@ class APOCWidget(QWidget):
 
         for ct, tab in tw.tabs.items():
             cfg = tab.get_config()
+            if not tab.channel_selection_is_complete():
+                # Channel layers are still loading in — don't overwrite the
+                # saved selection with this partial checkbox state.
+                cfg.pop("channels", None)
             for k, v in cfg.items():
                 apoc_config[f"apoc_{ct}_{k}"] = v
-            if cfg.get("segment_size_min") is not None:
-                apoc_config[f"{ct}_segment_size_min"] = cfg["segment_size_min"]
         return apoc_config
 
     def _on_organoid_tab_input_changed(self, source_ct, *_args):
@@ -3893,7 +4528,9 @@ class APOCWidget(QWidget):
             other_types = [ct for ct in detect_other_cell_types_from_metadata(md) if not is_combined_multicolor_celltype(ct)]
             
             # Use apoc_train helper to fetch and process images
-            from behav3d.preprocessing.segmentation.apoc_train import _load_training_images
+            from behav3d.preprocessing.segmentation.apoc_train import (
+                _load_training_images, _predicted_labels_path, _probability_map_path,
+            )
             from behav3d.preprocessing import zeropad_image_to_match_shape
             
             # Determine the cached data path and whether it already exists
@@ -4003,20 +4640,38 @@ class APOCWidget(QWidget):
                 "gray", "turbo", "viridis", "plasma", "inferno", "twilight",
             ]
 
-            # Add Image layers
-            for ch in range(n_channels):
-                channel_data = stacked[:, ch, :, :, :]
-                nonzero = channel_data[channel_data > 0]
-                clim = (0, float(np.percentile(nonzero, 99.8))) if nonzero.size > 0 else (0, 1e-3)
-                img_layer = self.viewer.add_image(
-                    channel_data,
-                    name=f"Channel {ch}",
-                    contrast_limits=clim,
-                    colormap=channel_colors[ch % len(channel_colors)],
-                    blending="additive",
-                    opacity=0.8,
-                )
-                img_layer.contrast_limits_range = (0, float(channel_data.max()))
+            # Add Image layers. Channels are added one at a time, and each
+            # `add_image` call fires its own `layers.events.inserted` event —
+            # pause the training widget's own listener for the duration of
+            # the loop and refresh the training tabs' channel checkboxes
+            # once afterwards, so per-tab channel selections aren't rebuilt
+            # against a still-partial set of channel layers (which would
+            # look like no channels matching a tab's saved selection).
+            # Note: this must only block the training widget's own callback
+            # (via `pause_channel_refresh`), not the whole event — napari's
+            # internal layer-controls widget registration listens on the
+            # same event, and blocking it desyncs the viewer UI.
+            def _add_channel_layers():
+                for ch in range(n_channels):
+                    channel_data = stacked[:, ch, :, :, :]
+                    nonzero = channel_data[channel_data > 0]
+                    clim = (0, float(np.percentile(nonzero, 99.8))) if nonzero.size > 0 else (0, 1e-3)
+                    img_layer = self.viewer.add_image(
+                        channel_data,
+                        name=f"Channel {ch}",
+                        contrast_limits=clim,
+                        colormap=channel_colors[ch % len(channel_colors)],
+                        blending="additive",
+                        opacity=0.8,
+                    )
+                    img_layer.contrast_limits_range = (0, max(float(channel_data.max()), 1e-3))
+
+            if self._training_widget is not None:
+                with self._training_widget.pause_channel_refresh():
+                    _add_channel_layers()
+                self._training_widget._refresh_all_channels()
+            else:
+                _add_channel_layers()
 
             # Add Label layers
             label_shape = (T_total,) + stacked.shape[2:] 
@@ -4055,6 +4710,64 @@ class APOCWidget(QWidget):
                     
                 dead_layer = self.viewer.add_labels(dead_labels, name="User Provided Labels (Dead)", opacity=0.5)
                 self._configure_user_label_layer(dead_layer)
+
+            # Restore previously generated probability maps and segmentations
+            for cell_type in all_cell_types:
+                seg_p = _predicted_labels_path(pixel_class_outdir, cell_type)
+                if seg_p and seg_p.exists():
+                    try:
+                        pred = np.asarray(load_zarr(seg_p))
+                        if pred.shape == label_shape:
+                            self.viewer.add_labels(
+                                pred,
+                                name=f"{cell_type.capitalize()} Segments",
+                                opacity=0.8, visible=False,
+                            )
+                            self.log(f"  ↩ Restored predicted labels for '{cell_type}'")
+                    except Exception:
+                        pass
+                prob_p = _probability_map_path(pixel_class_outdir, cell_type)
+                if prob_p and prob_p.exists():
+                    try:
+                        prob = np.asarray(load_zarr(prob_p))
+                        if prob.shape == label_shape:
+                            self.viewer.add_image(
+                                prob,
+                                name=f"Probability Map ({cell_type.capitalize()})",
+                                opacity=0.6, blending="additive", colormap="magma",
+                                contrast_limits=(0.0, 1.0), visible=False,
+                            )
+                            self.log(f"  ↩ Restored probability map for '{cell_type}'")
+                    except Exception:
+                        pass
+
+            if has_death:
+                seg_p = _predicted_labels_path(pixel_class_outdir, "dead")
+                if seg_p and seg_p.exists():
+                    try:
+                        pred = np.asarray(load_zarr(seg_p))
+                        if pred.shape == label_shape:
+                            dead_pred_layer = self.viewer.add_labels(
+                                pred, name="Pixel Classification (Dead)",
+                                opacity=0.8, visible=False,
+                            )
+                            _set_dead_mask_layer_color(dead_pred_layer)
+                            self.log("  ↩ Restored predicted labels for 'dead'")
+                    except Exception:
+                        pass
+                prob_p = _probability_map_path(pixel_class_outdir, "dead")
+                if prob_p and prob_p.exists():
+                    try:
+                        prob = np.asarray(load_zarr(prob_p))
+                        if prob.shape == label_shape:
+                            self.viewer.add_image(
+                                prob, name="Probability Map (Dead)",
+                                opacity=0.6, blending="additive", colormap="magma",
+                                contrast_limits=(0.0, 1.0), visible=False,
+                            )
+                            self.log("  ↩ Restored probability map for 'dead'")
+                    except Exception:
+                        pass
 
             self._reorder_apoc_training_layers()
 
@@ -4264,6 +4977,7 @@ class APOCWidget(QWidget):
         toolbar_widgets = []
         self._check_unify_organoids = None
         if len(org) >= 2:
+            unify_row = QHBoxLayout()
             self._check_unify_organoids = QCheckBox(
                 "\u26d3 Apply same settings to all organoids"
             )
@@ -4274,7 +4988,36 @@ class APOCWidget(QWidget):
                 "Toggle again to re-sync after making further changes."
             )
             self._check_unify_organoids.stateChanged.connect(self._on_unify_organoids_changed)
-            toolbar_widgets.append(self._check_unify_organoids)
+            unify_row.addWidget(self._check_unify_organoids)
+            unify_row.addWidget(HelpButton(
+                "Apply Same Settings to All Organoids",
+                "When there are multiple organoid cell types, checking this box "
+                "immediately copies the first organoid tab's configuration "
+                "(selected channels/features, strategy, and EDT/opening/min "
+                "size/fill-holes parameters) to all other organoid tabs.\n\n"
+                "It only syncs once at the moment you check it \u2014 further edits "
+                "to any organoid tab are NOT automatically propagated. Toggle "
+                "the checkbox off and back on to re-sync after making more "
+                "changes.\n\n"
+                "Immune and other non-organoid cell types are not affected."
+            ))
+            unify_widget = QWidget()
+            unify_widget.setLayout(unify_row)
+            toolbar_widgets.append(unify_widget)
+
+        _pc_params = params.get("pixel_classifier", {}) or {}
+        _md = self.metadata_loader.metadata
+        if _md is not None and "pixel_distance_xy" in _md.columns and "distance_unit" in _md.columns:
+            _unit = str(_md["distance_unit"].iloc[0])
+            _xy_from_md = convert_distance(float(_md["pixel_distance_xy"].iloc[0]), _unit)
+            _z_from_md  = convert_distance(float(_md["pixel_distance_z"].iloc[0]),  _unit)
+        else:
+            _xy_from_md = None
+            _z_from_md  = None
+        _pixel_sizes = {
+            "xy_um": _pc_params.get("pixel_size_xy") or _pc_params.get("pixel_size_xy_um") or _xy_from_md,
+            "z_um":  _pc_params.get("pixel_size_z")  or _pc_params.get("pixel_size_z_um")  or _z_from_md,
+        }
 
         self._training_widget = APOCTrainingWidget(
             viewer=self.viewer,
@@ -4286,6 +5029,7 @@ class APOCWidget(QWidget):
             instance_controls_mode="inline",
             per_cell_type_strategy=True,
             extra_toolbar_widgets=toolbar_widgets,
+            pixel_sizes=_pixel_sizes,
         )
         # Pre-select the saved global strategy via the widget's combo (this
         # also propagates per-tab visibility for ``Advanced`` mode).
@@ -4306,9 +5050,50 @@ class APOCWidget(QWidget):
         tw.instance_preview_started.connect(self._on_instance_preview_started)
         tw.instance_preview_finished.connect(self._on_instance_preview_finished)
         tw.strategy_changed.connect(self._on_training_widget_strategy_changed)
+        tw.training_finished.connect(self._on_training_finished_update_export_btn)
+        tw.import_applied.connect(self._on_import_applied)
+        tw.import_cleared.connect(self._on_import_cleared)
 
         # Add global "▶ Run [CellType] Segmentation" button below the
         # train buttons. Lives in the same APOC layout as the Train buttons.
+        # Per-cell type time range limits for the global Run button
+        ct_tp_row = QHBoxLayout()
+        self.check_limit_timerange_ct = QCheckBox("Process all timepoints")
+        self.check_limit_timerange_ct.setChecked(True)
+        ct_tp_row.addWidget(self.check_limit_timerange_ct)
+        
+        self.spin_t_start_ct = QSpinBox()
+        self.spin_t_start_ct.setRange(0, 9999)
+        self.spin_t_start_ct.setValue(0)
+        self.spin_t_start_ct.setMaximumWidth(70)
+        self.spin_t_end_ct = QSpinBox()
+        self.spin_t_end_ct.setRange(0, 9999)
+        self.spin_t_end_ct.setValue(0)
+        self.spin_t_end_ct.setMaximumWidth(70)
+
+        ct_tp_range_row = QHBoxLayout()
+        ct_tp_range_row.addWidget(QLabel("  From t:"))
+        ct_tp_range_row.addWidget(self.spin_t_start_ct)
+        ct_tp_range_row.addWidget(QLabel("to t:"))
+        ct_tp_range_row.addWidget(self.spin_t_end_ct)
+        ct_tp_range_row.addStretch()
+
+        self.spin_t_start_ct.setVisible(False)
+        self.spin_t_end_ct.setVisible(False)
+        ct_tp_range_row_widget = QWidget()
+        ct_tp_range_row_widget.setLayout(ct_tp_range_row)
+        ct_tp_range_row_widget.setVisible(False)
+
+        def _toggle_ct_tp(_state):
+            ct_tp_range_row_widget.setVisible(not self.check_limit_timerange_ct.isChecked())
+            self.spin_t_start_ct.setVisible(not self.check_limit_timerange_ct.isChecked())
+            self.spin_t_end_ct.setVisible(not self.check_limit_timerange_ct.isChecked())
+
+        self.check_limit_timerange_ct.stateChanged.connect(_toggle_ct_tp)
+
+        tw._main_layout.addLayout(ct_tp_row)
+        tw._main_layout.addWidget(ct_tp_range_row_widget)
+
         first_ct = tw._tab_cell_types[0] if tw._tab_cell_types else "?"
         self._global_run_instance_btn = QPushButton(f"▶ Run {first_ct.capitalize()} Segmentation")
         self._global_run_instance_btn.setStyleSheet(
@@ -4328,7 +5113,400 @@ class APOCWidget(QWidget):
             self._wire_non_organoid_tab_channel_signals(ct, tab)
 
         self.training_layout.addWidget(self._training_widget)
+        self._training_widget.setVisible(True)
         self._update_training_controls_state()
+
+        # Enable import button now that cell types are known
+        self.btn_import_training.setEnabled(True)
+
+        # Re-apply persisted import if available
+        self._restore_import_on_session_load()
+
+        # Enable export bundle if training bundle already exists
+        self._refresh_export_btn_state()
+
+    # ── Import training data ────────────────────────────────────
+
+    def _on_import_training_data_clicked(self):
+        """Open file dialog, validate and apply imported training data."""
+        from behav3d.preprocessing.segmentation.apoc_train import (
+            _load_training_metadata,
+            _load_training_data_for_celltype,
+            _load_training_bundle,
+        )
+
+        if self._training_widget is None:
+            QMessageBox.warning(self, "No Metadata", "Load metadata first before importing training data.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select training data bundle or metadata from source experiment",
+            "",
+            "BEHAV3D Training Bundle (*.zip);;YAML files (training_metadata.yml);;All files (*)",
+        )
+        if not path:
+            return
+
+        if path.endswith(".zip"):
+            try:
+                meta, data_by_celltype = _load_training_bundle(path)
+            except Exception as exc:
+                QMessageBox.critical(self, "Import Error", f"Could not read training bundle from:\n{path}\n\n{exc}")
+                return
+            if meta is None:
+                QMessageBox.critical(self, "Import Error", f"Could not read training metadata from:\n{path}")
+                return
+            imported_cts = list(meta.get("cell_types", []))
+            if meta.get("has_death"):
+                imported_cts.append("dead")
+            missing = [ct for ct in imported_cts if ct not in data_by_celltype]
+        else:
+            meta = _load_training_metadata(path)
+            if meta is None:
+                QMessageBox.critical(self, "Import Error", f"Could not read training metadata from:\n{path}")
+                return
+            source_td = Path(path).parent
+            imported_cts = list(meta.get("cell_types", []))
+            if meta.get("has_death"):
+                imported_cts.append("dead")
+            data_by_celltype = {}
+            missing = []
+            for ct in imported_cts:
+                X, y = _load_training_data_for_celltype(source_td, ct)
+                if X is None:
+                    missing.append(ct)
+                else:
+                    data_by_celltype[ct] = (X, y)
+
+        if not data_by_celltype:
+            QMessageBox.critical(
+                self, "Import Error",
+                "No training data arrays found in the selected file.\n"
+                "Ensure the training bundle is complete."
+            )
+            return
+
+        if missing:
+            QMessageBox.warning(
+                self, "Partial Import",
+                f"Training data not found for: {', '.join(missing)}\n"
+                "The remaining cell types will still be imported."
+            )
+
+        local_cts = list(self.all_cell_types)
+        if self._training_widget.has_death:
+            local_cts.append("dead")
+
+        # Build cell type mapping (imported → local)
+        cell_type_mapping = self._build_celltype_mapping(imported_cts, local_cts, meta)
+        if cell_type_mapping is None:
+            return  # user cancelled the remap dialog
+
+        # Check pixel size compatibility
+        if not self._check_pixel_size_compatibility(meta):
+            return  # user cancelled
+
+        # Show validation preview (pixel counts) before committing
+        cell_type_mapping = self._show_import_validation_dialog(meta, data_by_celltype, cell_type_mapping)
+        if cell_type_mapping is None:
+            return  # user cancelled
+
+        # Apply import
+        self._training_widget.apply_import(meta, data_by_celltype, cell_type_mapping, source_path=path)
+
+        # Persist import path to YAML
+        pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        pc["apoc_imported_training_path"] = str(path)
+        self._flush_params_to_yaml()
+
+    def _build_celltype_mapping(self, imported_cts, local_cts, meta):
+        """Return {imported_ct: local_ct | None} mapping, or None if cancelled.
+
+        When all names match exactly, returns the identity mapping immediately.
+        Otherwise shows the remap dialog.
+        """
+        exact = {ct: ct for ct in imported_cts if ct in local_cts}
+        unmatched = [ct for ct in imported_cts if ct not in local_cts]
+        if not unmatched:
+            return exact
+
+        remap = self._show_celltype_remap_dialog(imported_cts, local_cts, exact)
+        return remap
+
+    def _show_celltype_remap_dialog(self, imported_cts, local_cts, initial_mapping):
+        """Show a dialog letting the user map imported cell types to local ones.
+
+        Returns the mapping dict {imported_ct: local_ct | None}, or None if cancelled.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Cell Type Mapping")
+        dlg.setMinimumWidth(420)
+        lay = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "Some cell type names in the imported data do not match the current experiment.\n"
+            "Please map each imported type to a local type (or '(skip)' to exclude it)."
+        )
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        combos = {}
+        for imp_ct in imported_cts:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"<b>{imp_ct}</b>  →"))
+            combo = QComboBox()
+            options = ["(skip)"] + local_cts
+            combo.addItems(options)
+            default = initial_mapping.get(imp_ct, None)
+            if default and default in local_cts:
+                combo.setCurrentText(default)
+            elif imp_ct in local_cts:
+                combo.setCurrentText(imp_ct)
+            row.addWidget(combo, stretch=1)
+            lay.addLayout(row)
+            combos[imp_ct] = combo
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+
+        result = {}
+        for imp_ct, combo in combos.items():
+            sel = combo.currentText()
+            result[imp_ct] = None if sel == "(skip)" else sel
+        return result
+
+    def _check_pixel_size_compatibility(self, imported_meta):
+        """Warn if pixel sizes differ significantly. Returns True to proceed, False to cancel."""
+        img_meta = imported_meta.get("image_metadata", {})
+        imp_xy = img_meta.get("pixel_size_xy_um")
+        imp_z  = img_meta.get("pixel_size_z_um")
+        if imp_xy is None and imp_z is None:
+            return True   # no pixel size info in imported data — skip check
+
+        pc = self.metadata_loader.behav3d_parameters.get("pixel_classifier", {}) or {}
+        cur_xy = pc.get("pixel_size_xy") or pc.get("pixel_size_xy_um")
+        cur_z  = pc.get("pixel_size_z")  or pc.get("pixel_size_z_um")
+
+        mismatches = []
+        if imp_xy is not None and cur_xy is not None:
+            if abs(float(imp_xy) - float(cur_xy)) / max(float(imp_xy), 1e-9) > 0.10:
+                mismatches.append(f"XY: imported {imp_xy} µm/px vs current {cur_xy} µm/px")
+        if imp_z is not None and cur_z is not None:
+            if abs(float(imp_z) - float(cur_z)) / max(float(imp_z), 1e-9) > 0.10:
+                mismatches.append(f"Z: imported {imp_z} µm/px vs current {cur_z} µm/px")
+
+        if not mismatches:
+            return True
+
+        msg = (
+            "Pixel sizes differ between the imported and current experiment:\n\n"
+            + "\n".join(f"  • {m}" for m in mismatches)
+            + "\n\nFeatures are computed in pixel space, so the same sigma value covers "
+            "a different physical scale. This may reduce classifier performance.\n\n"
+            "Proceed anyway?"
+        )
+        reply = QMessageBox.warning(
+            self, "Pixel Size Mismatch", msg,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def _show_import_validation_dialog(self, imported_meta, data_by_celltype, cell_type_mapping):
+        """Show a summary of imported pixel counts before committing, with a per-row checkbox
+        to opt out of importing specific cell types.
+
+        Returns the (possibly filtered) cell_type_mapping dict to proceed, with unchecked
+        rows set to None, or None if the user cancelled.
+        """
+        td_info = imported_meta.get("training_data", {})
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Imported Training Data — Summary")
+        dlg.setMinimumWidth(480)
+        lay = QVBoxLayout(dlg)
+
+        img_meta = imported_meta.get("image_metadata", {})
+        header_lines = []
+        xy = img_meta.get("pixel_size_xy_um")
+        z  = img_meta.get("pixel_size_z_um")
+        if xy:
+            header_lines.append(f"Pixel size: xy={xy} µm, z={z} µm")
+        ch_names = img_meta.get("channel_names", [])
+        if ch_names:
+            header_lines.append(f"Channels: {', '.join(ch_names)}")
+        if header_lines:
+            lbl = QLabel("\n".join(header_lines))
+            lbl.setStyleSheet("color:#555; font-size:10px;")
+            lay.addWidget(lbl)
+
+        active_rows = [
+            (imp_ct, local_ct)
+            for imp_ct, local_ct in cell_type_mapping.items()
+            if local_ct is not None and imp_ct in data_by_celltype
+        ]
+
+        table = QTableWidget(len(active_rows), 5)
+        table.setHorizontalHeaderLabels(["Import", "Imported type", "→ Local type", "Total px", "Fg / Bg"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        row_checkboxes = {}
+        for row_idx, (imp_ct, local_ct) in enumerate(active_rows):
+            counts = td_info.get(imp_ct, {})
+            n = counts.get("n_pixels", len(data_by_celltype[imp_ct][1]))
+            pos = counts.get("n_positive", int(np.sum(data_by_celltype[imp_ct][1] == 2)))
+            neg = counts.get("n_negative", int(np.sum(data_by_celltype[imp_ct][1] == 1)))
+
+            checkbox = QCheckBox()
+            checkbox.setChecked(True)
+            cb_container = QWidget()
+            cb_layout = QHBoxLayout(cb_container)
+            cb_layout.addWidget(checkbox)
+            cb_layout.setAlignment(Qt.AlignCenter)
+            cb_layout.setContentsMargins(0, 0, 0, 0)
+            table.setCellWidget(row_idx, 0, cb_container)
+            row_checkboxes[imp_ct] = checkbox
+
+            table.setItem(row_idx, 1, QTableWidgetItem(str(imp_ct)))
+            table.setItem(row_idx, 2, QTableWidgetItem(str(local_ct)))
+            table.setItem(row_idx, 3, QTableWidgetItem(str(n)))
+            table.setItem(row_idx, 4, QTableWidgetItem(f"{pos} / {neg}"))
+        lay.addWidget(table)
+
+        note = QLabel(
+            "Uncheck a row to exclude that cell type from the import.\n"
+            "Checked pixels will be prepended to your new labels when you click Train.\n"
+            "The combined dataset is saved so this experiment can itself be imported later."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555; font-style: italic; font-size: 10px; padding-top: 4px;")
+        lay.addWidget(note)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Proceed with Import")
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+
+        filtered_mapping = dict(cell_type_mapping)
+        for imp_ct, checkbox in row_checkboxes.items():
+            if not checkbox.isChecked():
+                filtered_mapping[imp_ct] = None
+        return filtered_mapping
+
+    def _update_import_panel(self):
+        """Refresh the import info panel from the training widget's active import."""
+        if self._training_widget is None:
+            return
+        summary = self._training_widget.get_import_summary()
+        if not summary:
+            self.import_info_group.setVisible(False)
+            return
+
+        meta_path = self._training_widget._imported_metadata_path
+        short_path = str(meta_path)
+        if len(short_path) > 60:
+            short_path = "…" + short_path[-57:]
+        self.import_source_label.setText(f"Source: {short_path}")
+        self.import_source_label.setToolTip(str(meta_path))
+        self.import_details_label.setText(summary)
+        self.import_info_group.setVisible(True)
+
+    def _on_import_applied(self):
+        """Slot: update panel after import is applied."""
+        self._update_import_panel()
+
+    def _on_import_cleared(self):
+        """Slot: hide panel after import is cleared."""
+        self.import_info_group.setVisible(False)
+
+    def _on_clear_import_clicked(self):
+        """Clear imported training data and remove it from YAML."""
+        if self._training_widget is not None:
+            self._training_widget.clear_import()
+        pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
+        pc.pop("apoc_imported_training_path", None)
+        self._flush_params_to_yaml()
+
+    def _restore_import_on_session_load(self):
+        """Re-apply a persisted import if the YAML holds an import path."""
+        from behav3d.preprocessing.segmentation.apoc_train import (
+            _load_training_metadata,
+            _load_training_data_for_celltype,
+            _load_training_bundle,
+        )
+        if self._training_widget is None:
+            return
+        pc = self.metadata_loader.behav3d_parameters.get("pixel_classifier", {}) or {}
+        saved_path = pc.get("apoc_imported_training_path", "")
+        if not saved_path or not Path(saved_path).exists():
+            return
+
+        try:
+            if saved_path.endswith(".zip"):
+                meta, data_by_celltype = _load_training_bundle(saved_path)
+                if meta is None or not data_by_celltype:
+                    return
+                imported_cts = list(meta.get("cell_types", []))
+                if meta.get("has_death"):
+                    imported_cts.append("dead")
+            else:
+                meta = _load_training_metadata(saved_path)
+                if meta is None:
+                    return
+                source_td = Path(saved_path).parent
+                imported_cts = list(meta.get("cell_types", []))
+                if meta.get("has_death"):
+                    imported_cts.append("dead")
+                data_by_celltype = {}
+                for ct in imported_cts:
+                    X, y = _load_training_data_for_celltype(source_td, ct)
+                    if X is not None:
+                        data_by_celltype[ct] = (X, y)
+            if not data_by_celltype:
+                return
+
+            local_cts = list(self.all_cell_types)
+            if self._training_widget.has_death:
+                local_cts.append("dead")
+            cell_type_mapping = {ct: ct for ct in imported_cts if ct in local_cts}
+
+            # Run pixel size check silently on restore (just warn, no cancel)
+            self._check_pixel_size_compatibility(meta)
+
+            self._training_widget.apply_import(
+                meta, data_by_celltype, cell_type_mapping, source_path=saved_path
+            )
+            self._update_import_panel()
+            self.log(f"↩ Restored import from {saved_path}")
+        except Exception as exc:
+            self.log(f"⚠️ Could not restore import from {saved_path}: {exc}")
+
+    def _on_training_finished_update_export_btn(self, *_):
+        """Enable the export button once training data has been saved."""
+        self._refresh_export_btn_state()
+
+    def _refresh_export_btn_state(self):
+        """Enable the export button if the training bundle exists for this experiment."""
+        try:
+            pixel_class_outdir = (
+                Path(self.metadata_loader.output_dir) / "images" / "PixelClassification"
+            )
+            bundle = pixel_class_outdir / "PixelClassifier_TrainingData.zip"
+            self.btn_export_bundle.setEnabled(
+                bool(self.metadata_loader.output_dir) and bundle.is_file()
+            )
+        except Exception:
+            pass
 
     # ── Queue param snapshot ────────────────────────────────────
     def _current_global_strategy(self):
@@ -4395,6 +5573,7 @@ class APOCWidget(QWidget):
             "strategy_index": all_strats.index(strategy) if strategy in all_strats else 0,
             "strategy_name": strategy,
             "gpu_device_name": self._selected_gpu_device_name(),
+            "force_cpu": self.btn_force_cpu.isChecked() if hasattr(self, 'btn_force_cpu') else False,
             "overwrite": self.check_overwrite.isChecked(),
             "workers": self.spin_workers.value(),
             "process_all": self.check_process_all.isChecked(),
@@ -4441,6 +5620,8 @@ class APOCWidget(QWidget):
             pc["examples_per_sample"] = self.spin_examples.value()
         if hasattr(self, 'combo_gpu_device') and self.combo_gpu_device is not None:
             pc["gpu_device_name"] = self._selected_gpu_device_name()
+        if hasattr(self, 'btn_force_cpu') and self.btn_force_cpu is not None:
+            pc["force_cpu"] = self.btn_force_cpu.isChecked()
             
         if hasattr(self, 'spin_workers') and hasattr(self, 'check_process_all'):
             pc["workers"] = self.spin_workers.value()
@@ -4462,6 +5643,55 @@ class APOCWidget(QWidget):
                 self._maybe_sync_organoid_tabs(source_ct=sync_source_ct)
             else:
                 self._maybe_sync_organoid_tabs()
+
+    def _flush_params_to_yaml(self):
+        """Persist current behav3d_parameters to the YAML file on disk."""
+        self._save_apoc_params_to_yaml(skip_sync=True)
+
+    # ── Export training bundle ──────────────────────────────────
+
+    def _on_export_training_bundle(self):
+        """Copy PixelClassifier_TrainingData.zip + .cl classifiers into a shareable archive."""
+        import zipfile
+
+        if not self.metadata_loader.output_dir:
+            QMessageBox.warning(self, "No Output Directory", "No output directory is set.")
+            return
+
+        pixel_class_outdir = (
+            Path(self.metadata_loader.output_dir) / "images" / "PixelClassification"
+        )
+        bundle = pixel_class_outdir / "PixelClassifier_TrainingData.zip"
+        if not bundle.is_file():
+            QMessageBox.warning(
+                self, "No Training Data",
+                "PixelClassifier_TrainingData.zip not found. Train at least one classifier first."
+            )
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Training Bundle As",
+            str(Path(self.metadata_loader.output_dir) / "behav3d_training_bundle.zip"),
+            "ZIP archives (*.zip)",
+        )
+        if not save_path:
+            return
+
+        try:
+            with zipfile.ZipFile(save_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(bundle, arcname=bundle.name)
+                for cl_file in sorted(pixel_class_outdir.glob("*.cl")):
+                    zf.write(cl_file, arcname=cl_file.name)
+
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Training bundle saved to:\n{save_path}"
+            )
+            self.log(f"📦 Training bundle exported to {save_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Error", f"Could not create bundle:\n{exc}")
+            self.log(f"❌ Training bundle export failed: {exc}")
 
     # ── APOC GUI compatibility helpers (frontend-only) ──────────
     def _apoc_normalize_feature_spec(self, feature_spec):
@@ -4820,11 +6050,18 @@ class APOCWidget(QWidget):
                     self.check_overwrite.setChecked(choice == "overwrite")
 
             # Timepoint range
-            if self.check_process_all.isChecked():
-                timepoint_range = None
+            if only_cell_types is not None and hasattr(self, 'check_limit_timerange_ct'):
+                use_all = self.check_limit_timerange_ct.isChecked()
+                t_start = self.spin_t_start_ct.value()
+                t_end = self.spin_t_end_ct.value()
             else:
+                use_all = self.check_process_all.isChecked()
                 t_start = self.spin_t_start.value()
                 t_end = self.spin_t_end.value()
+
+            if use_all:
+                timepoint_range = None
+            else:
                 if t_start > t_end:
                     self.log("Error: Start timepoint must be <= End timepoint.")
                     fire_extra_callback(extra_callbacks, "on_failed", "bad timepoint range")
@@ -4838,8 +6075,6 @@ class APOCWidget(QWidget):
                     cfg = tab.get_config()
                     for k, v in cfg.items():
                         apoc_config[f"apoc_{ct}_{k}"] = v
-                    if cfg.get("segment_size_min") is not None:
-                        apoc_config[f"{ct}_segment_size_min"] = cfg["segment_size_min"]
 
             # Save all parameters safely
             self._save_apoc_params_to_yaml(updated_apoc_params=apoc_config)
@@ -4910,6 +6145,8 @@ class APOCWidget(QWidget):
 
             def _apply_apoc_result(updated_metadata):
                 if updated_metadata is not None:
+                    self.metadata_loader.metadata = updated_metadata
+                    updated_metadata = _run_multicolor_cleanup_if_needed(self.metadata_loader, self.log, skip_unified=False)
                     self.metadata_loader.metadata = updated_metadata
                     if metadata_csv:
                         try:
@@ -5002,6 +6239,7 @@ class ConvPaintWidget(QWidget):
         self._training_widget = None
         self._is_session_active = False
         self._all_images_cache = None
+        self.all_cell_types = []           # set when metadata loaded
         # Background-execution infrastructure (shared progress row).
         self.tab_progress_row = tab_progress_row
         self._bg = BackgroundOperation(self)
@@ -5268,6 +6506,7 @@ class ConvPaintWidget(QWidget):
 
         md = self.metadata_loader.metadata
         if md is None:
+            self.all_cell_types = []
             if self.training_placeholder.parent() is None:
                 self.training_layout.addWidget(self.training_placeholder)
             self.training_placeholder.show()
@@ -5291,6 +6530,7 @@ class ConvPaintWidget(QWidget):
         other_types    = _filter_merge_types(detect_other_cell_types_from_metadata(md))
         all_cell_types = organoid_types + immune_types + other_types
         has_death      = has_dead_channel(md)
+        self.all_cell_types = list(all_cell_types)
 
         if not all_cell_types:
             if self.training_placeholder.parent() is None:
@@ -5312,6 +6552,18 @@ class ConvPaintWidget(QWidget):
         ip["convpaint_device"] = self._selected_device()
         cp_strategy = _normalize_strategy(ip.get("convpaint_strategy", DEFAULT_STRATEGY))
 
+        if "pixel_distance_xy" in md.columns and "distance_unit" in md.columns:
+            _unit = str(md["distance_unit"].iloc[0])
+            _xy_from_md = convert_distance(float(md["pixel_distance_xy"].iloc[0]), _unit)
+            _z_from_md  = convert_distance(float(md["pixel_distance_z"].iloc[0]),  _unit)
+        else:
+            _xy_from_md = None
+            _z_from_md  = None
+        _pixel_sizes = {
+            "xy_um": ip.get("pixel_size_xy") or ip.get("pixel_size_xy_um") or _xy_from_md,
+            "z_um":  ip.get("pixel_size_z")  or ip.get("pixel_size_z_um")  or _z_from_md,
+        }
+
         self._training_widget = ConvPaintTrainingWidget(
             viewer=self.viewer,
             all_images=[],          # no training data yet — parameter-only mode
@@ -5323,6 +6575,7 @@ class ConvPaintWidget(QWidget):
             convpaint_strategy=cp_strategy,
             unified_input_channels=[],
             death_input_channels=[],
+            pixel_sizes=_pixel_sizes,
             per_cell_type_strategy=True,
             show_device=False,
             external_log=self.log,
@@ -5473,6 +6726,7 @@ class ConvPaintWidget(QWidget):
                 overwrite_images=overwrite_images,
             )
             all_cell_types = _filter_merge_types(all_cell_types)
+            self.all_cell_types = list(all_cell_types)
 
             if not all_images:
                 self.log("⚠️ No training images loaded.")
@@ -5609,10 +6863,11 @@ class ConvPaintWidget(QWidget):
                     try:
                         pred = np.asarray(load_zarr(seg_p))
                         if pred.shape == label_shape:
-                            self.viewer.add_labels(
+                            dead_pred_layer = self.viewer.add_labels(
                                 pred, name=DEAD_PREDICTED_LAYER_NAME,
                                 opacity=0.8, visible=False,
                             )
+                            _set_dead_mask_layer_color(dead_pred_layer)
                     except Exception:
                         pass
 
@@ -5640,6 +6895,18 @@ class ConvPaintWidget(QWidget):
                 ip.get("convpaint_strategy", DEFAULT_STRATEGY)
             )
 
+            if md is not None and "pixel_distance_xy" in md.columns and "distance_unit" in md.columns:
+                _unit = str(md["distance_unit"].iloc[0])
+                _xy_from_md = convert_distance(float(md["pixel_distance_xy"].iloc[0]), _unit)
+                _z_from_md  = convert_distance(float(md["pixel_distance_z"].iloc[0]),  _unit)
+            else:
+                _xy_from_md = None
+                _z_from_md  = None
+            _pixel_sizes = {
+                "xy_um": ip.get("pixel_size_xy") or ip.get("pixel_size_xy_um") or _xy_from_md,
+                "z_um":  ip.get("pixel_size_z")  or ip.get("pixel_size_z_um")  or _z_from_md,
+            }
+
             self._training_widget = ConvPaintTrainingWidget(
                 viewer=self.viewer,
                 all_images=all_images,
@@ -5651,6 +6918,7 @@ class ConvPaintWidget(QWidget):
                 convpaint_strategy=cp_strategy,
                 unified_input_channels=unified_input_channels,
                 death_input_channels=death_input_channels,
+                pixel_sizes=_pixel_sizes,
                 per_cell_type_strategy=True,
                 show_device=False,
                 external_log=self.log,
@@ -5960,6 +7228,8 @@ class ConvPaintWidget(QWidget):
 
             def _apply_result(updated_metadata):
                 if updated_metadata is not None:
+                    self.metadata_loader.metadata = updated_metadata
+                    updated_metadata = _run_multicolor_cleanup_if_needed(self.metadata_loader, self.log, skip_unified=True)
                     self.metadata_loader.metadata = updated_metadata
                     if metadata_csv:
                         try:

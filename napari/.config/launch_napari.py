@@ -16,6 +16,11 @@ import argparse
 import platform
 from pathlib import Path
 
+# Check for developer mode file in BEHAV3D_GUI root
+_ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+if (_ROOT_DIR / ".behav3d_dev").exists():
+    os.environ["BEHAV3D_DEV_MODE"] = "1"
+
 # =============================================================================
 # PAYLOAD MODE (Runs inside the environment)
 # =============================================================================
@@ -34,7 +39,10 @@ def run_napari_payload():
         sys.exit(1)
 
     # Create the viewer
-    viewer = napari.Viewer(title="BEHAV3D")
+    window_title = "BEHAV3D Explorer"
+    if os.environ.get("BEHAV3D_DEV_MODE") == "1":
+        window_title += " [DEV MODE]"
+    viewer = napari.Viewer(title=window_title)
     
     # Add our dock widget
     widget = BEHAV3DWidget(viewer)

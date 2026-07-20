@@ -621,6 +621,49 @@ def convert_raw_file_to_zarr(
     )
 
 
+def clip_zarr_timepoints(path, t_start=None, t_end=None):
+    """
+    Clip an existing TCZYX .zarr in place to the inclusive timepoint range
+    [t_start, t_end], clamped to the array's own T extent.
+
+    Writes the clipped data to a temporary sibling path first, then replaces
+    the original, so a failed/interrupted clip never leaves a partially
+    written zarr behind at the final path.
+    """
+    path = Path(path)
+    img = load_zarr(path)
+    n_t_total = img.shape[0]
+
+    t_s = max(0, t_start) if t_start is not None else 0
+    t_e = min(n_t_total - 1, t_end) if t_end is not None else n_t_total - 1
+    if t_s > t_e:
+        print(f"  Warning: invalid time range [{t_s}, {t_e}] for {path.name}, using full range.")
+        t_s, t_e = 0, n_t_total - 1
+
+    if t_s == 0 and t_e == n_t_total - 1:
+        print(f"  Skipping clip for {path.name}: already within range [0, {n_t_total - 1}]")
+        return
+
+    clipped = img[t_s:t_e + 1]
+
+    tmp_path = path.with_name(path.stem + "_clip_tmp" + path.suffix)
+    if tmp_path.exists():
+        if tmp_path.is_dir():
+            shutil.rmtree(tmp_path)
+        else:
+            tmp_path.unlink()
+
+    save_as_zarr(clipped, tmp_path)
+
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+    tmp_path.rename(path)
+
+    print(f"  Clipped {path.name} to timepoints [{t_s}, {t_e}] ({t_e - t_s + 1} of {n_t_total})")
+
+
 def load_elsizes(path):
     path = Path(path)
     if path.suffix==".czi":
@@ -709,3 +752,24 @@ def get_image_dimension_order(path):
 
     except Exception:
         return None
+
+
+def get_czi_shape_and_dimension_order(path, take_dims="TCZYX"):
+    """
+    Like calling get_image_shape() and get_image_dimension_order() on a
+    .czi path, but opens the CziFile only once instead of twice.
+    """
+    from aicspylibczi import CziFile
+
+    path = Path(path)
+    czifile = CziFile(path)
+    raw_dims = czifile.dims
+
+    dim_size = {ax: int(sz[1]) for ax, sz in czifile.get_dims_shape()[0].items()}
+    shape = tuple(dim_size.get(ax, 1) for ax in raw_dims if ax in take_dims)
+
+    dim_order = "".join(ax for ax in raw_dims if ax in "TCZYX")
+    if not (dim_order and len(dim_order) == len(set(dim_order))):
+        dim_order = None
+
+    return shape, dim_order

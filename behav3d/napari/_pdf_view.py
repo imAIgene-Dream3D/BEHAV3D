@@ -30,10 +30,58 @@ import numpy as np
 from qtpy.QtCore import QUrl
 from qtpy.QtGui import QDesktopServices
 from qtpy.QtWidgets import (
+    QDialog,
     QHBoxLayout,
     QPushButton,
+    QVBoxLayout,
     QWidget,
 )
+
+
+# ---------------------------------------------------------------------------
+# Embedded matplotlib figure dialog (in-app, no external image viewer)
+# ---------------------------------------------------------------------------
+def show_matplotlib_figure(fig, title="BEHAV3D", parent=None):
+    """Show a matplotlib ``Figure`` in a modeless Qt dialog with a toolbar.
+
+    Renders the figure in-app instead of writing a temp PNG and handing it
+    to the OS default image viewer (which silently no-ops on machines with
+    no PNG handler). Returns the created ``QDialog`` (kept referenced on the
+    parent so it isn't garbage-collected).
+    """
+    from matplotlib.backends.backend_qtagg import (
+        FigureCanvasQTAgg,
+        NavigationToolbar2QT,
+    )
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.resize(900, 640)
+    lay = QVBoxLayout(dlg)
+    lay.setContentsMargins(4, 4, 4, 4)
+    canvas = FigureCanvasQTAgg(fig)
+    toolbar = NavigationToolbar2QT(canvas, dlg)
+    lay.addWidget(toolbar)
+    lay.addWidget(canvas)
+    canvas.draw_idle()
+
+    # Keep a reference so the dialog (and its canvas) survive after this
+    # function returns; modeless dialogs are otherwise collected.
+    if parent is not None:
+        refs = getattr(parent, "_behav3d_open_figure_dialogs", None)
+        if refs is None:
+            refs = []
+            try:
+                parent._behav3d_open_figure_dialogs = refs
+            except Exception:
+                pass
+        refs.append(dlg)
+        dlg.finished.connect(lambda _=None, d=dlg: refs.remove(d) if d in refs else None)
+
+    dlg.show()
+    dlg.raise_()
+    dlg.activateWindow()
+    return dlg
 
 
 # ---------------------------------------------------------------------------
@@ -321,4 +369,5 @@ __all__ = [
     "open_image_in_napari",
     "open_externally",
     "reveal_in_folder",
+    "show_matplotlib_figure",
 ]

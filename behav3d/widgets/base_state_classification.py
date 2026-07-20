@@ -27,6 +27,81 @@ from behav3d.core.utils import expand_column_patterns
 from behav3d.widgets.utils import PathPicker, behav3d_calculated_features, spinning_loader
 
 
+def normalize_binary_value(value, tol=1e-9):
+    """Return 0/1 if ``value`` normalizes to a boolean, else ``None``.
+
+    Accepts native bools, the strings true/false/t/f, and numeric 0/1.
+    Shared by the notebook and napari binary-column detectors so both use
+    identical semantics.
+    """
+    if isinstance(value, (bool, pd.BooleanDtype)):
+        return 1 if bool(value) else 0
+    if isinstance(value, str):
+        sval = value.strip().lower()
+        if sval in {"true", "t"}:
+            return 1
+        if sval in {"false", "f"}:
+            return 0
+        try:
+            value = float(sval)
+        except Exception:
+            return None
+    try:
+        fval = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(fval):
+        return None
+    if abs(fval - 0.0) <= tol:
+        return 0
+    if abs(fval - 1.0) <= tol:
+        return 1
+    return None
+
+
+def detect_binary_columns_from_csv(csv_path, cols, chunksize=50000):
+    """Value-based binary-column detection over the *full* CSV.
+
+    A column is binary only if every non-NA value normalizes (via
+    :func:`normalize_binary_value`) to ``{0, 1}``. This replaces fragile
+    dtype sniffing over a small row sample, which mis-classifies numeric
+    columns as binary whenever the sampled rows happen to be NaN/blank.
+    """
+    if csv_path is None or len(cols) == 0:
+        return []
+
+    states = {str(c): {"seen": set(), "invalid": False} for c in cols}
+    try:
+        for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=chunksize, low_memory=False):
+            for col in cols:
+                st = states[str(col)]
+                if st["invalid"]:
+                    continue
+                series = chunk[col].dropna()
+                if len(series) == 0:
+                    continue
+                unique_vals = pd.unique(series)
+                for raw in unique_vals:
+                    norm = normalize_binary_value(raw)
+                    if norm is None:
+                        st["invalid"] = True
+                        break
+                    st["seen"].add(int(norm))
+                    if len(st["seen"]) > 2:
+                        st["invalid"] = True
+                        break
+    except Exception:
+        return []
+
+    return sorted(
+        [
+            c
+            for c in cols
+            if (not states[str(c)]["invalid"]) and (len(states[str(c)]["seen"]) > 0)
+        ]
+    )
+
+
 def _winfo(prefix, message):
     print(f"[{prefix}] INFO {message}")
 
@@ -660,29 +735,7 @@ class BaseStateClassificationPanel:
         return float(value)
 
     def _normalize_binary_value(self, value, tol=1e-9):
-        if isinstance(value, (bool, pd.BooleanDtype)):
-            return 1 if bool(value) else 0
-        if isinstance(value, str):
-            sval = value.strip().lower()
-            if sval in {"true", "t"}:
-                return 1
-            if sval in {"false", "f"}:
-                return 0
-            try:
-                value = float(sval)
-            except Exception:
-                return None
-        try:
-            fval = float(value)
-        except Exception:
-            return None
-        if not math.isfinite(fval):
-            return None
-        if abs(fval - 0.0) <= tol:
-            return 0
-        if abs(fval - 1.0) <= tol:
-            return 1
-        return None
+        return normalize_binary_value(value, tol=tol)
 
     def _detect_binary_columns_from_csv(self, csv_path, cols, chunksize=50000):
         if csv_path is None or len(cols) == 0:
@@ -697,36 +750,7 @@ class BaseStateClassificationPanel:
             if self._binary_detection_cache.get("key", None) == cache_key:
                 return list(self._binary_detection_cache.get("binary_cols", []))
 
-        states = {str(c): {"seen": set(), "invalid": False} for c in cols}
-        try:
-            for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=chunksize, low_memory=False):
-                for col in cols:
-                    st = states[str(col)]
-                    if st["invalid"]:
-                        continue
-                    series = chunk[col].dropna()
-                    if len(series) == 0:
-                        continue
-                    unique_vals = pd.unique(series)
-                    for raw in unique_vals:
-                        norm = self._normalize_binary_value(raw)
-                        if norm is None:
-                            st["invalid"] = True
-                            break
-                        st["seen"].add(int(norm))
-                        if len(st["seen"]) > 2:
-                            st["invalid"] = True
-                            break
-        except Exception:
-            return []
-
-        binary_cols = sorted(
-            [
-                c
-                for c in cols
-                if (not states[str(c)]["invalid"]) and (len(states[str(c)]["seen"]) > 0)
-            ]
-        )
+        binary_cols = detect_binary_columns_from_csv(csv_path, cols, chunksize=chunksize)
         self._binary_detection_cache = {
             "key": cache_key,
             "binary_cols": list(binary_cols),
@@ -750,6 +774,8 @@ class BaseStateClassificationPanel:
             "interpolated",
             "exp_nr",
             "well",
+            "origin_cell_type",
+            "origin_TrackID",
         }
 
         md = getattr(self.metadata_loader, "metadata", None)

@@ -6,6 +6,7 @@ import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 from behav3d.analysis.behavior.state.legacy_clustering import *
+from behav3d.core.utils import rmtree_ignore_missing
 
 def rename_intrinsic_behavioral_clusters(
     adata,
@@ -172,15 +173,7 @@ def _rmtree_ignore_missing(path):
     if not path.exists():
         return
 
-    def _ignore_missing(func, target, excinfo):
-        # Python 3.12's shutil.rmtree(onexc=...) passes the exception object,
-        # while older error callbacks use an exc_info-style tuple.
-        err = excinfo[1] if isinstance(excinfo, tuple) else excinfo
-        if isinstance(err, FileNotFoundError):
-            return
-        raise err
-
-    shutil.rmtree(path, onexc=_ignore_missing)
+    rmtree_ignore_missing(path)
 
 
 def _select_exemplar_windows_by_cluster(

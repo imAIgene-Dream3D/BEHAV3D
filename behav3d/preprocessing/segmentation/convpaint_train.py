@@ -50,6 +50,8 @@ from qtpy.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from qtpy.QtCore import Qt, Signal
+
+from behav3d.napari._background_runner import BackgroundOperation, ThreadSafeLogger
 from qtpy.QtGui import QColor
 
 from behav3d.io.images import load_image, load_zarr, save_as_zarr
@@ -299,6 +301,22 @@ def _save_preview_array(path, data):
     if path.exists():
         shutil.rmtree(path)
     save_as_zarr(np.asarray(data), path)
+
+
+def _set_dead_mask_layer_color(layer, color=(0.9, 0.0, 0.0, 1.0)):
+    """Render the death pixel-classification layer as a solid color (red by
+    default) instead of napari's default per-label random colors — it is a
+    binary mask (dead vs. not), not a multi-class label map. Any nonzero
+    label (whichever convention is used for "dead") is painted ``color``;
+    background (0) stays transparent."""
+    try:
+        from napari.utils.colormaps import DirectLabelColormap
+        layer.colormap = DirectLabelColormap(color_dict={None: list(color), 0: [0, 0, 0, 0]})
+    except Exception:
+        try:
+            layer.color = {1: color, 2: color}
+        except Exception:
+            pass
 
 
 def _reorder_convpaint_layers(viewer, all_cell_types, has_death=False):
@@ -644,7 +662,8 @@ class CellTypeConvPaintTab(QWidget):
                  parent=None,
                  show_strategy_combo=False,
                  per_tab_strategies=None,
-                 on_per_tab_strategy_changed=None):
+                 on_per_tab_strategy_changed=None,
+                 pixel_sizes=None):
         super().__init__(parent)
         self.cell_type = cell_type
         self.strategy = _normalize_strategy(strategy)
@@ -656,6 +675,15 @@ class CellTypeConvPaintTab(QWidget):
         self._on_per_tab_strategy_changed = on_per_tab_strategy_changed
         self._per_tab_strategy_combo = None
         self._per_tab_strategy_widget = None
+        # Optional resolved pixel sizes ({"xy_um":..., "z_um":...}) for the
+        # physical(µm)/pixel unit toggle on EDT/min-size/peak-distance
+        # controls (see behav3d.napari._units.UnitGroupManager).
+        self._pixel_sizes = dict(pixel_sizes) if pixel_sizes else {}
+        self._unit_mgr = None  # created lazily in _build_controls
+        # Persists the user's px/µm display choice across strategy-change
+        # rebuilds (a fresh UnitGroupManager is created each rebuild since
+        # the spinbox instances themselves are discarded and recreated).
+        self._units_physical = True
 
         # Cached so future strategy switches reuse persisted values.
         self._initial_params_cache = dict(initial_params or {})
@@ -801,6 +829,35 @@ class CellTypeConvPaintTab(QWidget):
         row.addStretch()
         return row
 
+    def get_native(self, widget):
+        """Return the canonical native (px/voxel) value for a spinbox
+        registered with this tab's unit manager, or its raw ``.value()``
+        when no manager applies (dimensionless params, or no resolution
+        available). Safe to call with ``widget=None``."""
+        if widget is None:
+            return None
+        if self._unit_mgr is not None and widget in getattr(self._unit_mgr, "_entries", ()):
+            return self._unit_mgr.get_native(widget)
+        return widget.value()
+
+    def set_native(self, widget, native_value):
+        """Set a spinbox to a native value, converting to the currently
+        displayed unit via this tab's unit manager when registered."""
+        if widget is None or native_value is None:
+            return
+        if self._unit_mgr is not None and widget in getattr(self._unit_mgr, "_entries", ()):
+            self._unit_mgr.set_native(widget, native_value)
+        else:
+            widget.setValue(native_value)
+
+    def _on_units_toggled(self, checked):
+        """Remember the px/µm display choice across strategy rebuilds.
+
+        Native values are unaffected by this toggle — it only changes what
+        the spinboxes *display* — so this does not need to trigger a param
+        re-persist."""
+        self._units_physical = bool(checked)
+
     def _build_controls(self, strategy):
         """(Re)create the strategy-dependent spinners + preview button."""
         self._clear_controls_layout()
@@ -820,12 +877,28 @@ class CellTypeConvPaintTab(QWidget):
 
         strategy = _normalize_strategy(strategy)
         self.strategy = strategy
+        # A fresh manager is created below (rather than reused) since the
+        # spinbox instances themselves are rebuilt from scratch here.
+        self._unit_mgr = None
 
         layout = self._controls_layout
 
         strategy_lbl = QLabel(f"<i>Strategy:</i> <b>{strategy}</b>")
         strategy_lbl.setWordWrap(True)
         layout.addWidget(strategy_lbl)
+
+        # Per-tab physical(µm)/pixel unit toggle for the distance/volume
+        # controls below (EDT threshold, min size, peak distance). Mask/seed
+        # thresholds and peak ratio are dimensionless (0-1) and excluded, as
+        # is opening (fixed in pixels by definition).
+        from behav3d.napari._units import UnitGroupManager
+        self._unit_mgr = UnitGroupManager(
+            xy_um=self._pixel_sizes.get("xy_um"),
+            z_um=self._pixel_sizes.get("z_um"),
+            default_physical=self._units_physical,
+        )
+        self._unit_mgr.switch.toggled.connect(self._on_units_toggled)
+        layout.addWidget(self._unit_mgr.header_row("Units:"))
 
         if strategy == STRATEGY_PROB:
             self.prob_mask_threshold_spin = QDoubleSpinBox()
@@ -851,7 +924,13 @@ class CellTypeConvPaintTab(QWidget):
                 QLabel("Seed threshold:"), self.prob_seed_threshold_spin,
                 HelpButton("Seed threshold",
                     "Higher cutoff used to place watershed seeds (≥ Mask threshold).\n"
-                    "Lower values produce more seeds and split more touching objects."),
+                    "Higher values keep only each object's confident core as a "
+                    "separate seed, splitting more touching objects. Lower values "
+                    "(closer to Mask threshold) merge neighboring cores together, "
+                    "splitting fewer objects.\n\n"
+                    "Note: this is the opposite direction from the 'EDT threshold' "
+                    "used by the EDT/Watershed strategy (there, lower values split "
+                    "more) — same identical behaviour in APOC and ConvPaint."),
             ))
 
             self.opening_nr_pixels_spin = QSpinBox()
@@ -861,10 +940,14 @@ class CellTypeConvPaintTab(QWidget):
             )
 
             self.segment_size_min_spin = QSpinBox()
-            self.segment_size_min_spin.setRange(0, 100000)
+            self.segment_size_min_spin.setRange(0, 1000000000)
             self.segment_size_min_spin.setSingleStep(10)
             self.segment_size_min_spin.setValue(
                 int(ip.get(f"{cell_type}_segment_size_min", 10))
+            )
+            self._unit_mgr.register(
+                self.segment_size_min_spin, "volume",
+                ip.get(f"{cell_type}_segment_size_min", 10),
             )
             layout.addLayout(self._pair_row(
                 QLabel("Opening px:"), self.opening_nr_pixels_spin,
@@ -878,11 +961,15 @@ class CellTypeConvPaintTab(QWidget):
             ))
         else:
             self.edt_threshold_spin = QDoubleSpinBox()
-            self.edt_threshold_spin.setRange(0.0, 50.0)
+            self.edt_threshold_spin.setRange(0.0, 1000.0)
             self.edt_threshold_spin.setSingleStep(0.5)
             self.edt_threshold_spin.setDecimals(2)
             self.edt_threshold_spin.setValue(
                 float(ip.get(f"{cell_type}_edt_threshold", 1.0))
+            )
+            self._unit_mgr.register(
+                self.edt_threshold_spin, "distance",
+                ip.get(f"{cell_type}_edt_threshold", 1.0),
             )
 
             self.opening_nr_pixels_spin = QSpinBox()
@@ -895,7 +982,11 @@ class CellTypeConvPaintTab(QWidget):
                 HelpButton("EDT threshold",
                     "Euclidean-distance-transform threshold used to derive seeds inside "
                     "the binary mask.\n"
-                    "Lower values give more aggressive splitting of touching objects."),
+                    "Lower values give more aggressive splitting of touching objects.\n\n"
+                    "Note: this is the opposite direction from the 'Seed threshold' used "
+                    "by the Probability Map + Watershed strategy (there, higher values "
+                    "split more) — the two strategies use different mechanisms "
+                    "(distance-from-edge vs. classifier confidence)."),
                 QLabel("Opening px:"), self.opening_nr_pixels_spin,
                 HelpButton("Morphological opening",
                     "Number of erosion-then-dilation iterations applied to the mask.\n"
@@ -903,10 +994,14 @@ class CellTypeConvPaintTab(QWidget):
             ))
 
             self.segment_size_min_spin = QSpinBox()
-            self.segment_size_min_spin.setRange(0, 100000)
+            self.segment_size_min_spin.setRange(0, 1000000000)
             self.segment_size_min_spin.setSingleStep(10)
             self.segment_size_min_spin.setValue(
                 int(ip.get(f"{cell_type}_segment_size_min", 10))
+            )
+            self._unit_mgr.register(
+                self.segment_size_min_spin, "volume",
+                ip.get(f"{cell_type}_segment_size_min", 10),
             )
             self.fill_holes_cb = QCheckBox("Fill holes")
             self.fill_holes_cb.setChecked(
@@ -925,14 +1020,18 @@ class CellTypeConvPaintTab(QWidget):
 
             if strategy == STRATEGY_PEAK_EDT:
                 self.peak_min_distance_spin = QDoubleSpinBox()
-                self.peak_min_distance_spin.setRange(0.0, 50.0)
+                self.peak_min_distance_spin.setRange(0.0, 1000.0)
                 self.peak_min_distance_spin.setSingleStep(0.5)
                 self.peak_min_distance_spin.setDecimals(2)
                 self.peak_min_distance_spin.setValue(
                     float(ip.get(f"{cell_type}_peak_min_distance", 0.0))
                 )
+                self._unit_mgr.register(
+                    self.peak_min_distance_spin, "distance",
+                    ip.get(f"{cell_type}_peak_min_distance", 0.0),
+                )
                 self.peak_min_distance_spin.setToolTip(
-                    "Minimum distance (µm) between local EDT peaks used as watershed seeds"
+                    "Minimum distance between local EDT peaks used as watershed seeds"
                 )
 
                 self.peak_min_ratio_spin = QDoubleSpinBox()
@@ -1013,11 +1112,11 @@ class CellTypeConvPaintTab(QWidget):
         ct = self.cell_type
         params = {}
         if self.edt_threshold_spin is not None:
-            params[f"{ct}_edt_threshold"] = float(self.edt_threshold_spin.value())
+            params[f"{ct}_edt_threshold"] = float(self.get_native(self.edt_threshold_spin))
         if self.opening_nr_pixels_spin is not None:
             params[f"{ct}_opening_nr_pixels"] = int(self.opening_nr_pixels_spin.value())
         if self.segment_size_min_spin is not None:
-            params[f"{ct}_segment_size_min"] = int(self.segment_size_min_spin.value())
+            params[f"{ct}_segment_size_min"] = int(round(self.get_native(self.segment_size_min_spin)))
         if self.fill_holes_cb is not None:
             params[f"{ct}_fill_holes"] = bool(self.fill_holes_cb.isChecked())
         if self.prob_mask_threshold_spin is not None:
@@ -1030,7 +1129,7 @@ class CellTypeConvPaintTab(QWidget):
             )
         if self.peak_min_distance_spin is not None:
             params[f"{ct}_peak_min_distance"] = float(
-                self.peak_min_distance_spin.value()
+                self.get_native(self.peak_min_distance_spin)
             )
         if self.peak_min_ratio_spin is not None:
             params[f"{ct}_peak_min_ratio"] = float(
@@ -1075,6 +1174,9 @@ class ConvPaintTrainingWidget(QWidget):
     strategy_changed = Signal(str)
 
     STRATEGIES = [STRATEGY_EDT, STRATEGY_PEAK_EDT, STRATEGY_PROB]
+    import os
+    if os.environ.get("BEHAV3D_DEV_MODE") != "1":
+        STRATEGIES.remove(STRATEGY_PEAK_EDT)
     ADVANCED_STRATEGY = "Advanced (per cell type)"
 
     def __init__(self, viewer, all_images, pixel_class_outdir,
@@ -1086,13 +1188,19 @@ class ConvPaintTrainingWidget(QWidget):
                  strategy_resolver=None,
                  extra_toolbar_widgets=None,
                  show_device=True,
-                 external_log=None):
+                 external_log=None,
+                 show_legend=False,
+                 pixel_sizes=None):
         super().__init__(parent)
         self.viewer = viewer
         self.all_images = all_images
         self.pixel_class_outdir = Path(pixel_class_outdir)
         self.all_cell_types = list(all_cell_types)
         self.has_death = has_death
+        # Optional resolved pixel sizes ({"xy_um":..., "z_um":...}) threaded
+        # down to each per-cell-type tab for the µm/pixel unit toggle on
+        # EDT threshold / min size / peak distance.
+        self._pixel_sizes = dict(pixel_sizes) if pixel_sizes else {}
         self.unified_input_channels = list(unified_input_channels or [])
         self.death_input_channels = list(death_input_channels or [])
         self._on_params_changed = on_params_changed
@@ -1104,6 +1212,7 @@ class ConvPaintTrainingWidget(QWidget):
         self._strategy_resolver = strategy_resolver
         self._extra_toolbar_widgets = list(extra_toolbar_widgets or [])
         self._show_device = bool(show_device)
+        self._show_legend = bool(show_legend)
         # When provided, log messages are forwarded here instead of the
         # internal log_box (which is then hidden to reclaim vertical space).
         self._external_log = external_log if callable(external_log) else None
@@ -1120,6 +1229,7 @@ class ConvPaintTrainingWidget(QWidget):
         self.legend_tab = None
         self.strategy_combo = None
         self.strategy_help_button = None
+        self._bg = BackgroundOperation(self)
         self._build_ui()
         if self._external_log is not None and hasattr(self, "log_box"):
             self.log_box.hide()
@@ -1131,7 +1241,8 @@ class ConvPaintTrainingWidget(QWidget):
     # ── UI construction ─────────────────────────────────────────────
 
     def _build_ui(self):
-        root = QVBoxLayout()
+        self.content_widget = QWidget()
+        root = QVBoxLayout(self.content_widget)
         root.setContentsMargins(4, 4, 4, 4)
         self._main_layout = root
         root.addWidget(QLabel("<h3>ConvPaint Training (unified)</h3>"))
@@ -1180,6 +1291,11 @@ class ConvPaintTrainingWidget(QWidget):
             root.addLayout(help_row)
 
             self.strategy_combo.currentTextChanged.connect(self._on_global_strategy_changed)
+
+        self.legend_tab = None
+        if self._show_legend:
+            self.legend_tab = AnnotationLegendTab(self.viewer, self.label_map, has_death=self.has_death)
+            root.addWidget(self.legend_tab)
 
         # Feature Extractor (global)
         fe_group = QGroupBox("Feature Extractor")
@@ -1401,8 +1517,6 @@ class ConvPaintTrainingWidget(QWidget):
         self.tab_widget.tabBar().setExpanding(False)
         self.tab_widget.tabBar().setUsesScrollButtons(True)
 
-        self.legend_tab = None
-
         per_tab_strategies = list(self.STRATEGIES) if self._per_cell_type_strategy else None
         for ct in self._tab_cell_types:
             tab = CellTypeConvPaintTab(
@@ -1414,6 +1528,7 @@ class ConvPaintTrainingWidget(QWidget):
                 show_strategy_combo=self._per_cell_type_strategy,
                 per_tab_strategies=per_tab_strategies,
                 on_per_tab_strategy_changed=self._on_per_tab_strategy_changed,
+                pixel_sizes=self._pixel_sizes,
             )
             self.tabs[ct] = tab
             self.tab_widget.addTab(tab, ct.capitalize())
@@ -1472,7 +1587,15 @@ class ConvPaintTrainingWidget(QWidget):
         root.addWidget(self.log_box)
         root.addStretch()
 
-        self.setLayout(root)
+        scroll = QScrollArea()
+        scroll.setWidget(self.content_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.addWidget(scroll)
 
     # ── Callbacks ───────────────────────────────────────────────────
 
@@ -1706,25 +1829,425 @@ class ConvPaintTrainingWidget(QWidget):
     # ── Training ────────────────────────────────────────────────────
 
     def _on_train_clicked(self):
+        """Train unified (+ death) ConvPaint classifiers on a background thread.
+
+        Phase 1 (Qt thread) — read viewer layers into NumPy arrays, build the
+        ConvpaintModel object (which reads Qt widget values), save labels.
+        Phase 2 (worker thread) — model.train, segment_per_z, predict_probas.
+        Phase 3 (Qt thread, on_done) — write result arrays to viewer layers,
+        persist params, refresh legend.
+        """
+        if self._bg.is_running():
+            self._log("⚠️ Training is already in progress.")
+            return
+
         cell_types = list(self._tab_cell_types)
+
+        # ── Phase 1 (Qt thread): emit signal + gather all data ────────────
         try:
             self.training_started.emit(cell_types)
         except Exception:
             pass
-        try:
-            self._log("Auto-saving user labels before training...")
-            self.save_user_labels()
-            self._train_unified_classifier()
-            if self.has_death:
-                self._train_death_classifier()
-            self._persist_all_params()
-            if self.legend_tab is not None:
-                self.legend_tab.refresh()
-        finally:
+
+        self._log("Auto-saving user labels before training…")
+        self.save_user_labels()
+
+        # Read unified annotation layer on the Qt thread.
+        unified_annotations = None
+        for lyr in self.viewer.layers:
+            if lyr.name == UNIFIED_LABELS_LAYER_NAME:
+                unified_annotations = np.asarray(lyr.data)
+                break
+        if unified_annotations is None:
+            self._log(f"❌ Label layer '{UNIFIED_LABELS_LAYER_NAME}' not found!")
             try:
                 self.training_finished.emit(cell_types, None)
             except Exception:
                 pass
+            return
+
+        # Read death annotation layer if needed (Qt thread).
+        death_annotations = None
+        if self.has_death:
+            for lyr in self.viewer.layers:
+                if lyr.name == DEAD_LABELS_LAYER_NAME:
+                    death_annotations = np.asarray(lyr.data)
+                    break
+
+        # Build model NOW on Qt thread (reads widget values: fe_combo, etc.).
+        try:
+            model, fe_device = self._build_model()
+        except Exception as e:
+            self._log(f"❌ Failed to build model: {e}")
+            try:
+                self.training_finished.emit(cell_types, None)
+            except Exception:
+                pass
+            return
+
+        # Snapshot all other state needed by the worker.
+        unified_input_channels = list(self.unified_input_channels)
+        death_input_channels   = list(self.death_input_channels)
+        label_map              = dict(self.label_map)
+        all_cell_types         = list(self.all_cell_types)
+        has_death              = self.has_death
+        pixel_class_outdir     = Path(self.pixel_class_outdir)
+        all_images             = list(self.all_images)  # references; data is lazy
+        convpaint_strategy     = self.convpaint_strategy
+        fe_alias               = self.fe_combo.currentData()  # for death model
+
+        # Snapshot per-tab params (Qt thread only). Distance/volume spinboxes
+        # (edt_threshold_spin, segment_size_min_spin, peak_min_distance_spin)
+        # go through get_native() so the training run always uses the
+        # canonical native (px/voxel) value regardless of the tab's current
+        # px/µm display setting.
+        _native_attrs = {"edt_threshold_spin", "segment_size_min_spin", "peak_min_distance_spin"}
+        tabs_params = {}
+        for ct, tab in self.tabs.items():
+            p = {}
+            for attr in (
+                "edt_threshold_spin", "opening_nr_pixels_spin",
+                "segment_size_min_spin", "peak_min_distance_spin",
+                "peak_min_ratio_spin", "prob_mask_threshold_spin",
+                "prob_seed_threshold_spin",
+            ):
+                w = getattr(tab, attr, None)
+                if w is not None:
+                    p[attr] = tab.get_native(w) if attr in _native_attrs else w.value()
+            w2 = getattr(tab, "fill_holes_cb", None)
+            if w2 is not None:
+                p["fill_holes"] = bool(w2.isChecked())
+            tabs_params[ct] = p
+
+        safe_log = ThreadSafeLogger(self._log)
+
+        # ── Phase 2 (worker thread) ───────────────────────────────────────
+        def _do_train(progress_cb=None):
+            n_steps = 2 if has_death else 1
+            result = {}
+
+            # ── Unified classifier ──────────────────────────────────────
+            if progress_cb:
+                progress_cb(0, n_steps, "Training unified classifier…")
+
+            # Determine active cell types from annotations.
+            unique_vals = set(
+                int(v) for v in np.unique(unified_annotations) if int(v) > 0
+            )
+            active_cell_types = [
+                ct for ct in all_cell_types
+                if int(label_map["celltype_to_label"][ct]) in unique_vals
+            ]
+            skipped = [ct for ct in all_cell_types if ct not in active_cell_types]
+            if skipped:
+                safe_log(
+                    f"⚠️ No annotations for: {', '.join(skipped)}. "
+                    "Those cell types will not be predicted."
+                )
+            if not active_cell_types:
+                safe_log("❌ No annotated cell types — aborting training.")
+                result["error"] = "no_active_cell_types"
+                return result
+
+            # Remap annotations to dense indices.
+            active_label_map = build_label_map(active_cell_types)
+            remap = {0: 0, BACKGROUND_LABEL: BACKGROUND_LABEL}
+            for ct in active_cell_types:
+                old_idx = int(label_map["celltype_to_label"][ct])
+                new_idx = int(active_label_map["celltype_to_label"][ct])
+                remap[old_idx] = new_idx
+            remapped = np.zeros_like(unified_annotations)
+            for old_v, new_v in remap.items():
+                if old_v != 0:
+                    remapped[unified_annotations == old_v] = new_v
+
+            train_images, train_annots = [], []
+            for i, img in enumerate(all_images):
+                fa = remapped[i]
+                if np.any(fa > 0):
+                    train_images.append(
+                        _slice_image_channels(img, unified_input_channels)
+                    )
+                    train_annots.append(fa)
+
+            if not train_images:
+                safe_log("⚠️ No annotated frames — aborting training.")
+                result["error"] = "no_annotated_frames"
+                return result
+
+            safe_log(
+                f"Training unified classifier on {len(train_images)} frames "
+                f"({len(active_cell_types)} cell types: {active_cell_types})…"
+            )
+            model.train(
+                train_images, train_annots,
+                fe_use_device=fe_device, clf_use_device=fe_device,
+            )
+
+            # Save model + label-map sidecar.
+            model_path = unified_model_path(pixel_class_outdir)
+            map_path   = unified_label_map_path(pixel_class_outdir)
+            model.save(str(model_path))
+            save_label_map(map_path, active_label_map)
+            save_input_channels(
+                unified_input_channels_path(pixel_class_outdir),
+                unified_input_channels,
+                model_name="unified",
+            )
+            safe_log(f"✅ Saved model: {model_path.name}")
+
+            # Run inference on the training stack (pure compute).
+            safe_log("Running unified inference on the training stack…")
+            seg_stack = np.stack(
+                [
+                    segment_per_z(
+                        model,
+                        _slice_image_channels(img, unified_input_channels),
+                        fe_use_device=fe_device,
+                    )
+                    for img in all_images
+                ],
+                axis=0,
+            ).astype(np.int16)
+            _save_preview_array(
+                unified_predicted_labels_path(pixel_class_outdir), seg_stack
+            )
+
+            # Per-cell-type probability maps (when needed by strategy).
+            needs_prob = convpaint_strategy == STRATEGY_PROB or any(
+                tabs_params.get(ct, {}).get("prob_mask_threshold_spin") is not None
+                for ct in active_cell_types
+            )
+            per_ct_prob_stacks = {}
+            if needs_prob:
+                per_ct_stacks = {ct: [] for ct in active_cell_types}
+                for img in all_images:
+                    probas = np.asarray(predict_probas_per_z(
+                        model,
+                        _slice_image_channels(img, unified_input_channels),
+                        fe_use_device=fe_device,
+                    ))
+                    for ct in active_cell_types:
+                        k = int(active_label_map["celltype_to_label"][ct])
+                        if 0 <= (k - 1) < probas.shape[0]:
+                            per_ct_stacks[ct].append(
+                                probas[k - 1].astype(np.float32)
+                            )
+                        else:
+                            per_ct_stacks[ct].append(
+                                np.zeros(probas.shape[1:], dtype=np.float32)
+                            )
+                for ct, slices in per_ct_stacks.items():
+                    stack = np.stack(slices, axis=0)
+                    _save_preview_array(
+                        _probability_map_path(pixel_class_outdir, ct), stack
+                    )
+                    per_ct_prob_stacks[ct] = stack
+            else:
+                # EDT mode: remove stale probability files.
+                for ct in active_cell_types:
+                    p = _probability_map_path(pixel_class_outdir, ct)
+                    if p is not None and p.exists():
+                        shutil.rmtree(p)
+
+            # Instance segmentation previews (pure compute, use snapshotted params).
+            instance_previews = {}  # ct -> array
+            for ct in active_cell_types:
+                tp = tabs_params.get(ct, {})
+                effective = _normalize_strategy(
+                    self._resolve_strategy(ct)  # reads strategy_combo; OK if readonly
+                ) if False else convpaint_strategy  # use global strategy as fallback
+
+                k = int(active_label_map["celltype_to_label"][ct])
+                mask_stack = (seg_stack == k).astype(np.uint8)
+
+                if effective == STRATEGY_PROB and ct in per_ct_prob_stacks:
+                    instances = probability_to_instances(
+                        per_ct_prob_stacks[ct],
+                        mask_thr=tp.get("prob_mask_threshold_spin", 0.5),
+                        seed_thr=tp.get("prob_seed_threshold_spin", 0.5),
+                        opening_nr_pixels=int(tp.get("opening_nr_pixels_spin", 0)),
+                        segment_size_min=int(tp.get("segment_size_min_spin", 10)),
+                    )
+                else:
+                    instances = mask_to_instances(
+                        mask_stack,
+                        edt_thr=float(tp.get("edt_threshold_spin", 1.0)),
+                        opening_nr_pixels=int(tp.get("opening_nr_pixels_spin", 0)),
+                        fill_holes=bool(tp.get("fill_holes", True)),
+                        segment_size_min=int(tp.get("segment_size_min_spin", 10)),
+                        marker_strategy=(
+                            "peak" if effective == STRATEGY_PEAK_EDT else "threshold"
+                        ),
+                        peak_min_distance=float(tp.get("peak_min_distance_spin", 2.0))
+                        if "peak_min_distance_spin" in tp else None,
+                        peak_min_ratio=float(tp.get("peak_min_ratio_spin", 0.35))
+                        if "peak_min_ratio_spin" in tp else 0.35,
+                    )
+                # Save to disk (I/O fine in worker).
+                pred_path = _predicted_labels_path(pixel_class_outdir, ct)
+                if pred_path is not None:
+                    _save_preview_array(pred_path, instances)
+                instance_previews[ct] = instances
+
+            result["unified"] = {
+                "active_label_map": active_label_map,
+                "seg_stack": seg_stack,
+                "per_ct_prob_stacks": per_ct_prob_stacks,
+                "instance_previews": instance_previews,
+                "active_cell_types": active_cell_types,
+            }
+
+            # ── Death classifier (optional) ─────────────────────────────
+            if has_death and death_annotations is not None and np.any(death_annotations):
+                if progress_cb:
+                    progress_cb(1, n_steps, "Training death classifier…")
+                safe_log("Training death classifier…")
+
+                train_d_images, train_d_annots = [], []
+                for i, img in enumerate(all_images):
+                    if np.any(death_annotations[i] > 0):
+                        train_d_images.append(
+                            _slice_image_channels(img, death_input_channels)
+                        )
+                        train_d_annots.append(death_annotations[i])
+
+                if train_d_images:
+                    try:
+                        # Build a second model with the same params (already
+                        # saved the unified model above so model.save is safe).
+                        from napari_convpaint import ConvpaintModel
+                        d_model = ConvpaintModel(fe_alias)
+                        try:
+                            d_model.set_params(**model.params)
+                        except Exception:
+                            pass  # older ConvpaintModel may not support all params
+                        d_model.train(
+                            train_d_images, train_d_annots,
+                            fe_use_device=fe_device, clf_use_device=fe_device,
+                        )
+                        mp = _death_model_path(pixel_class_outdir)
+                        d_model.save(str(mp))
+                        save_input_channels(
+                            death_input_channels_path(pixel_class_outdir),
+                            death_input_channels,
+                            model_name="death",
+                        )
+                        safe_log(f"✅ Saved death model: {mp.name}")
+
+                        # Death preview
+                        d_seg_stack = np.stack(
+                            [
+                                segment_per_z(
+                                    d_model,
+                                    _slice_image_channels(img, death_input_channels),
+                                    fe_use_device=fe_device,
+                                )
+                                for img in all_images
+                            ],
+                            axis=0,
+                        ).astype(np.int16)
+                        death_mask = (d_seg_stack >= 2).astype(np.uint16)
+                        pred_path_d = _predicted_labels_path(pixel_class_outdir, "dead")
+                        if pred_path_d is not None:
+                            _save_preview_array(pred_path_d, death_mask)
+                        result["death"] = death_mask
+                    except Exception as e:
+                        safe_log(f"❌ Death training failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    safe_log("⚠️ No annotations for death — skipping.")
+            elif has_death:
+                safe_log("⚠️ Death layer missing or empty — skipping death training.")
+
+            return result
+
+        # ── Phase 3 (Qt thread, on_done): write results to viewer ─────────
+        def _on_done(result):
+            if not result or "error" in result:
+                self._log("❌ Training produced no results.")
+                try:
+                    self.training_finished.emit(cell_types, None)
+                except Exception:
+                    pass
+                return
+
+            # Apply unified results.
+            u = result.get("unified", {})
+            active_label_map = u.get("active_label_map", {})
+            seg_stack        = u.get("seg_stack")
+            per_ct_prob      = u.get("per_ct_prob_stacks", {})
+            instance_prev    = u.get("instance_previews", {})
+            active_cts       = u.get("active_cell_types", [])
+
+            # Update the live label map so downstream tabs decode correctly.
+            if active_label_map:
+                self.label_map = active_label_map
+
+            if seg_stack is not None:
+                self._set_labels_layer(
+                    UNIFIED_PREDICTED_LAYER_NAME, seg_stack, visible=False
+                )
+
+            for ct, prob_stack in per_ct_prob.items():
+                self._set_image_layer(
+                    _probability_layer_name(ct), prob_stack, visible=False
+                )
+
+            for ct, instances in instance_prev.items():
+                self._set_labels_layer(
+                    _segments_layer_name(ct), instances
+                )
+                prob_stack = per_ct_prob.get(ct)
+                if prob_stack is not None:
+                    self._set_image_layer(
+                        _probability_layer_name(ct), prob_stack, visible=False
+                    )
+
+            # Hide probability layers for non-active cell types.
+            for ct in self.all_cell_types:
+                if ct not in active_cts:
+                    lname = _probability_layer_name(ct)
+                    if lname in self.viewer.layers:
+                        self.viewer.layers[lname].visible = False
+
+            # Apply death result.
+            death_mask = result.get("death")
+            if death_mask is not None:
+                self._set_labels_layer(DEAD_PREDICTED_LAYER_NAME, death_mask)
+                _set_dead_mask_layer_color(self.viewer.layers[DEAD_PREDICTED_LAYER_NAME])
+
+            _reorder_convpaint_layers(
+                self.viewer, self.all_cell_types, has_death=self.has_death
+            )
+            self._log("✅ Unified inference + previews complete.")
+
+            self._persist_all_params()
+            if self.legend_tab is not None:
+                self.legend_tab.refresh()
+            try:
+                self.training_finished.emit(cell_types, None)
+            except Exception:
+                pass
+
+        def _on_failed(err):
+            self._log(f"❌ Training failed: {err}")
+            try:
+                self.training_finished.emit(cell_types, None)
+            except Exception:
+                pass
+
+        self._bg.run(
+            fn=_do_train,
+            desc="ConvPaint training…",
+            buttons=[self.btn_train],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+            inject_progress=True,
+            indeterminate=False,
+        )
 
     def _train_unified_classifier(self):
         """Train the single multi-class ConvPaint model."""
@@ -2060,16 +2583,16 @@ class ConvPaintTrainingWidget(QWidget):
         effective_strategy = _normalize_strategy(strategy or self.convpaint_strategy)
         instances = mask_to_instances(
             mask_stack,
-            edt_thr=float(tab.edt_threshold_spin.value()),
+            edt_thr=float(tab.get_native(tab.edt_threshold_spin)),
             opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
             fill_holes=bool(tab.fill_holes_cb.isChecked())
             if tab.fill_holes_cb is not None else True,
-            segment_size_min=int(tab.segment_size_min_spin.value()),
+            segment_size_min=int(round(tab.get_native(tab.segment_size_min_spin))),
             marker_strategy=(
                 "peak" if effective_strategy == STRATEGY_PEAK_EDT
                 else "threshold"
             ),
-            peak_min_distance=float(tab.peak_min_distance_spin.value()) if tab.peak_min_distance_spin is not None else None,
+            peak_min_distance=float(tab.get_native(tab.peak_min_distance_spin)) if tab.peak_min_distance_spin is not None else None,
             peak_min_ratio=float(tab.peak_min_ratio_spin.value()) if tab.peak_min_ratio_spin is not None else 0.35,
         )
         self._set_labels_layer(_segments_layer_name(cell_type), instances)
@@ -2096,7 +2619,7 @@ class ConvPaintTrainingWidget(QWidget):
             mask_thr=float(tab.prob_mask_threshold_spin.value()),
             seed_thr=float(tab.prob_seed_threshold_spin.value()),
             opening_nr_pixels=int(tab.opening_nr_pixels_spin.value()),
-            segment_size_min=int(tab.segment_size_min_spin.value()),
+            segment_size_min=int(round(tab.get_native(tab.segment_size_min_spin))),
         )
         self._set_labels_layer(_segments_layer_name(cell_type), instances)
         self._set_image_layer(
@@ -2137,6 +2660,7 @@ class ConvPaintTrainingWidget(QWidget):
         ).astype(np.int16)
         mask_stack = (seg_stack >= 2).astype(np.uint16)
         self._set_labels_layer(DEAD_PREDICTED_LAYER_NAME, mask_stack)
+        _set_dead_mask_layer_color(self.viewer.layers[DEAD_PREDICTED_LAYER_NAME])
         pred_path = _predicted_labels_path(self.pixel_class_outdir, "dead")
         if pred_path is not None:
             _save_preview_array(pred_path, mask_stack)
@@ -2276,6 +2800,22 @@ def train_pixel_classifier_convpaint(
     label_shape = (T_total,) + stacked.shape[2:]
     ip = initial_params or {}
 
+    # Resolve pixel sizes (µm) from metadata so the per-tab µm/pixel unit
+    # toggle (EDT threshold / min size / peak distance) is available here
+    # too, matching the napari plugin's own ConvPaintWidget.
+    from behav3d.core.utils import convert_distance
+    if metadata is not None and "pixel_distance_xy" in metadata.columns and "distance_unit" in metadata.columns:
+        _unit = str(metadata["distance_unit"].iloc[0])
+        _xy_from_md = convert_distance(float(metadata["pixel_distance_xy"].iloc[0]), _unit)
+        _z_from_md = convert_distance(float(metadata["pixel_distance_z"].iloc[0]), _unit)
+    else:
+        _xy_from_md = None
+        _z_from_md = None
+    pixel_sizes = {
+        "xy_um": ip.get("pixel_size_xy") or ip.get("pixel_size_xy_um") or _xy_from_md,
+        "z_um": ip.get("pixel_size_z") or ip.get("pixel_size_z_um") or _z_from_md,
+    }
+
     # Build (or rebuild) the label map for the active cell-type set.
     label_map = build_label_map(all_cell_types)
 
@@ -2382,10 +2922,11 @@ def train_pixel_classifier_convpaint(
             try:
                 pred = np.asarray(load_zarr(seg_path))
                 if pred.shape == label_shape:
-                    viewer.add_labels(
+                    dead_pred_layer = viewer.add_labels(
                         pred, name=DEAD_PREDICTED_LAYER_NAME, opacity=0.8,
                         visible=False,
                     )
+                    _set_dead_mask_layer_color(dead_pred_layer)
             except Exception as exc:
                 print(f"  \u26a0\ufe0f Could not restore death mask: {exc}")
 
@@ -2404,6 +2945,8 @@ def train_pixel_classifier_convpaint(
         convpaint_strategy=cp_strategy,
         unified_input_channels=unified_input_channels,
         death_input_channels=death_input_channels,
+        show_legend=True,
+        pixel_sizes=pixel_sizes,
     )
     viewer.window.add_dock_widget(widget, name="ConvPaint", area="right")
     _reorder_convpaint_layers(viewer, all_cell_types, has_death=has_death)

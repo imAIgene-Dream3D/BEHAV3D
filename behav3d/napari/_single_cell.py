@@ -27,6 +27,7 @@ from qtpy.QtGui import QDesktopServices
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QDialog,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -44,6 +45,7 @@ from qtpy.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QTabWidget,
     QTextEdit,
     QToolButton,
@@ -60,6 +62,7 @@ from behav3d.napari._background_runner import (
 from behav3d.napari._pdf_view import open_pdf_in_napari
 from behav3d.napari._rename_dialog import RenameClusterDialog
 from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.core.utils import rmtree_ignore_missing, format_timepoints_as_time
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -67,7 +70,9 @@ from behav3d.core.qt_help import HelpButton, make_help_row
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _detect_sc_cell_types(metadata_loader) -> list[str]:
-    """Return immune + other cell types (non-multicolor)."""
+    """Return immune + other cell types (non-multicolor), plus any
+    ``cell_type_groups`` (yml-based, post-filtering) groups categorized as
+    immune/other."""
     if metadata_loader is None or getattr(metadata_loader, "metadata", None) is None:
         return []
     try:
@@ -78,6 +83,7 @@ def _detect_sc_cell_types(metadata_loader) -> list[str]:
             filter_multicolor_inputs,
         )
         from behav3d.widgets.utils import detect_cell_type_category
+        from behav3d.analysis.grouping import list_cell_type_groups, group_category
 
         md = metadata_loader.metadata
         imm = list(filter_multicolor_inputs(detect_immune_cell_types_from_metadata(md)))
@@ -93,10 +99,114 @@ def _detect_sc_cell_types(metadata_loader) -> list[str]:
             elif cat == "other" and ct not in oth:
                 oth.append(ct)
 
+        # Every group is offered here regardless of its best-effort display
+        # category — groups exist specifically for Death Dynamics/Single
+        # Cell use (see behav3d/analysis/grouping.py), so an "organoid"
+        # category (picked from the group's first member, for icon/bucket
+        # purposes only) must never cause a group to be silently dropped.
+        params = getattr(metadata_loader, "behav3d_parameters", {}) or {}
+        for group_id in list_cell_type_groups(params):
+            cat = group_category(params, md, group_id)
+            if cat == "other":
+                if group_id not in oth:
+                    oth.append(group_id)
+            elif group_id not in imm:
+                imm.append(group_id)
+
         return imm + oth
     except Exception:
         traceback.print_exc()
         return []
+
+
+def _group_tracked_status_for(metadata_loader, cell_type):
+    """Return ``{"built", "total"}`` tracked-segment status if ``cell_type``
+    is a group, else ``None`` (not a group, or status can't be determined).
+
+    Training (HMM/DTW) only needs the group's merged track-features CSV
+    (already produced at group-creation time), so this is only relevant for
+    gating backprojection/exemplar features, which need per-sample tracked
+    zarrs built via ``create_group_tracked_segments``.
+    """
+    if metadata_loader is None or not cell_type:
+        return None
+    try:
+        from behav3d.analysis.grouping import (
+            group_tracked_segments_status,
+            list_cell_type_groups,
+        )
+
+        params = getattr(metadata_loader, "behav3d_parameters", {}) or {}
+        if cell_type not in list_cell_type_groups(params):
+            return None
+        output_dir = getattr(metadata_loader, "output_dir", None)
+        metadata = getattr(metadata_loader, "metadata", None)
+        if not output_dir or metadata is None:
+            return None
+        return group_tracked_segments_status(output_dir, cell_type, metadata)
+    except Exception:
+        return None
+
+
+def _apply_group_tracked_gate(warning_label, grp_bp, metadata_loader, cell_type):
+    """Disable ``grp_bp`` (Backprojection) and warn if ``cell_type`` is a
+    group with no tracked segments built yet.
+
+    Only touches the backprojection group box — training group boxes are
+    left alone since training doesn't need tracked segments.
+    """
+    status = _group_tracked_status_for(metadata_loader, cell_type)
+    if status is None or status["built"] > 0:
+        return
+    grp_bp.setEnabled(False)
+    extra = (
+        f"⚠ Tracked segments not built for group '{cell_type}' — "
+        "Backprojection/Exemplar export unavailable.\n"
+        "Build them from the Group Builder dialog (Analysis tab) → "
+        "'Build Tracked Segments'."
+    )
+    # Only stack onto an already-visible warning set earlier in this same
+    # prerequisite check; a hidden label may hold stale text from a
+    # previous cell-type selection.
+    if warning_label.isVisible() and warning_label.text():
+        warning_label.setText(f"{warning_label.text()}\n\n{extra}")
+    else:
+        warning_label.setText(extra)
+    warning_label.show()
+
+
+def _log_backprojection_manifest(log_fn, manifest):
+    """Log a backprojection export manifest's success/skip/error counts.
+
+    ``manifest`` is the dict returned by
+    ``export_behavioral_state_backprojection_zarrs`` (and, transitively,
+    ``export_track_cluster_backprojection``): keys ``output_paths``,
+    ``skipped_samples``, ``errors``. Per-sample skip/error reasons
+    previously only reached ``warnings.warn`` (invisible in the GUI) — this
+    surfaces them in the log instead, which matters most for a group whose
+    tracked segments haven't been built for every sample yet.
+    """
+    if not isinstance(manifest, dict):
+        log_fn("✅ Backprojection export done.")
+        return
+    n_ok = len(manifest.get("output_paths", {}) or {})
+    skipped = manifest.get("skipped_samples", []) or []
+    errors = manifest.get("errors", []) or []
+    log_fn(f"✅ Backprojection export done: {n_ok} sample(s) written.")
+    if skipped:
+        preview = "; ".join(
+            f"{s.get('sample_name', '?')} ({s.get('reason', 'unknown')})"
+            for s in skipped[:5]
+        )
+        more = f" (+{len(skipped) - 5} more)" if len(skipped) > 5 else ""
+        log_fn(f"⚠ {len(skipped)} sample(s) skipped: {preview}{more}")
+    if errors:
+        preview = "; ".join(
+            f"{e.get('sample_name', '?')} ({e.get('error', 'unknown')})"
+            for e in errors[:5]
+        )
+        more = f" (+{len(errors) - 5} more)" if len(errors) > 5 else ""
+        log_fn(f"❌ {len(errors)} sample(s) errored: {preview}{more}")
 
 
 def _style_primary(btn: QPushButton):
@@ -155,6 +265,13 @@ def _make_view_btn() -> QPushButton:
     return btn
 
 
+def _make_timepoint_time_label() -> QLabel:
+    """Return a small muted QLabel for showing a timepoint-window's real-time equivalent."""
+    lbl = QLabel("")
+    lbl.setStyleSheet("color: #999; font-style: italic; font-size: 10px;")
+    return lbl
+
+
 def _make_info_label(text: str) -> QLabel:
     lbl = QLabel(text)
     lbl.setWordWrap(True)
@@ -189,6 +306,84 @@ def _make_chk_help_row(chk: QCheckBox, title: str, desc: str) -> QHBoxLayout:
     return row
 
 
+# ── Default selections (used when no prior config exists) ───────────────────
+_DEFAULT_TIMEPOINT_FEATURES = {"speed", "sphericity", "elongation", "extent", "solidity"}
+_DEFAULT_WINDOW_FEATURES    = {"net_displacement", "straightness"}
+_DEFAULT_LOG_SCALE_FEATURES = {"speed"}
+
+_TECHNICAL_OBS_COLS = {
+    "position_t", "sample_name", "TrackID",
+    "intrinsic_behavioral_cluster", "full_behavioral_cluster",
+    "hmm_intrinsic_behavioral_state", "behavioral_state",
+}
+
+_CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
+
+
+def _bp_add_raw_channels(viewer, raw_img, sample_name, saved_channels, dim_order="TCZYX"):
+    """Add raw_img to viewer as one Image layer per channel. Returns list of layer names."""
+    import dask.array as da
+    if not isinstance(raw_img, da.Array):
+        raw_img = da.from_array(raw_img)
+    if dim_order != "TCZYX" and len(dim_order) == 5:
+        try:
+            axes = [dim_order.index(d) for d in "TCZYX"]
+            raw_img = da.transpose(raw_img, axes)
+        except ValueError:
+            pass
+    n_channels = raw_img.shape[1] if raw_img.ndim >= 5 else 1
+    added = []
+    for c in range(n_channels):
+        ch_data = raw_img[:, c, :, :, :] if raw_img.ndim >= 5 else raw_img
+        saved = saved_channels.get(c) or saved_channels.get(str(c))
+        color = saved["colormap"] if saved and "colormap" in saved else _CHANNEL_COLORS[c % len(_CHANNEL_COLORS)]
+        layer_name = f"{sample_name} – Ch{c}"
+        add_kwargs = dict(name=layer_name, colormap=color, blending="additive", visible=True)
+        if saved and "contrast_limits" in saved:
+            add_kwargs["contrast_limits"] = tuple(saved["contrast_limits"])
+        viewer.add_image(ch_data, **add_kwargs)
+        added.append(layer_name)
+    return added
+
+
+def _bp_save_channel_display(viewer, metadata_loader, out_dir_fn):
+    """Snapshot current channel display settings and persist to YAML."""
+    params = getattr(metadata_loader, "behav3d_parameters", None)
+    if not isinstance(params, dict):
+        return
+    channels_cfg = params.setdefault("viewer_display", {}).setdefault("channels", {})
+    for layer in viewer.layers:
+        if " – Ch" not in layer.name:
+            continue
+        try:
+            ch_idx = int(layer.name.rsplit("Ch", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if hasattr(layer, "contrast_limits") and hasattr(layer, "colormap"):
+            channels_cfg[ch_idx] = {
+                "colormap": str(layer.colormap.name),
+                "contrast_limits": [float(layer.contrast_limits[0]), float(layer.contrast_limits[1])],
+            }
+    _save_behav3d_params(metadata_loader, out_dir_fn)
+
+
+def _save_behav3d_params(metadata_loader, out_dir_fn):
+    params = getattr(metadata_loader, "behav3d_parameters", None)
+    if not isinstance(params, dict):
+        return
+    cfg_path = getattr(metadata_loader, "behav3d_parameters_path", None)
+    if cfg_path is None:
+        out = out_dir_fn()
+        if out:
+            cfg_path = out / "behav3d_parameters.yml"
+    if cfg_path is not None:
+        try:
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(params, f, sort_keys=False)
+        except Exception:
+            pass
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # State Classification sub-tab
 # ═══════════════════════════════════════════════════════════════════════════
@@ -204,6 +399,17 @@ class StateClassificationSubTab(QWidget):
         self._get_cell_type = cell_type_getter
         self._model_adata = None
         self._bg = BackgroundOperation(self)
+        self._preload_bg = BackgroundOperation(self)
+        self._last_features_key: tuple = ()
+        # Populated by _populate_dynamic_features; reused by the log-scaling
+        # "Preview feature distributions" histogram button.
+        self._logscale_candidate_cols: list = []
+        self._logscale_csv_path: Optional[Path] = None
+
+        self._display_save_timer = QTimer(self)
+        self._display_save_timer.setSingleShot(True)
+        self._display_save_timer.setInterval(1000)
+        self._display_save_timer.timeout.connect(self._persist_bp_viewer_display)
 
         # Queue buttons (wired by _widget.py)
         self.btn_queue_state_cluster = _make_queue_btn()
@@ -283,31 +489,33 @@ class StateClassificationSubTab(QWidget):
         self.feat_sel_lay = QVBoxLayout(feat_sel_content)
         self.feat_sel_lay.setSpacing(2)
 
-        self.feat_sel_lay.addWidget(QLabel("<b>Timepoint features</b>"))
-        self.timepoint_features_lay = QVBoxLayout()
-        self.feat_sel_lay.addLayout(self.timepoint_features_lay)
-
         self.feat_sel_lay.addWidget(QLabel("<b>Window features</b>"))
         win_feat_form = QFormLayout()
         self.spin_window_size = QSpinBox()
         self.spin_window_size.setRange(1, 500)
         self.spin_window_size.setValue(5)
-        win_feat_form.addRow("Window size:", make_help_row(
+        win_feat_form.addRow("Window size (timepoints):", make_help_row(
             self.spin_window_size, "Window size",
-            "Number of timepoints used for computing rolling window features "
-            "(e.g. net displacement, straightness over a sliding window)."
+            "Size of the rolling window (in timepoints/frames) used to compute window "
+            "features (net_displacement, straightness, mean_square_displacement). The line "
+            "below shows the equivalent real time, computed from this sample's "
+            "time_interval/time_unit metadata."
         ))
+        self.lbl_window_size_time = _make_timepoint_time_label()
+        win_feat_form.addRow("", self.lbl_window_size_time)
+        self.spin_window_size.valueChanged.connect(self._update_timepoint_time_labels)
         self.feat_sel_lay.addLayout(win_feat_form)
 
         self.chk_net_disp = QCheckBox("net_displacement")
         self.chk_straight = QCheckBox("straightness")
         self.chk_msd = QCheckBox("mean_square_displacement")
-        self.feat_sel_lay.addLayout(_make_chk_help_row(self.chk_net_disp,
-            "net_displacement", "Include net displacement window feature."))
-        self.feat_sel_lay.addLayout(_make_chk_help_row(self.chk_straight,
-            "straightness", "Include straightness window feature."))
-        self.feat_sel_lay.addLayout(_make_chk_help_row(self.chk_msd,
-            "mean_square_displacement", "Include mean square displacement window feature."))
+        self.feat_sel_lay.addWidget(self.chk_net_disp)
+        self.feat_sel_lay.addWidget(self.chk_straight)
+        self.feat_sel_lay.addWidget(self.chk_msd)
+
+        self.feat_sel_lay.addWidget(QLabel("<b>Timepoint features</b>"))
+        self.timepoint_features_lay = QVBoxLayout()
+        self.feat_sel_lay.addLayout(self.timepoint_features_lay)
 
         self.feat_sel_scroll.setWidget(feat_sel_content)
         feat_sel_sec.addWidget(self.feat_sel_scroll)
@@ -321,19 +529,37 @@ class StateClassificationSubTab(QWidget):
         feat_proc_content = QWidget()
         self.feat_proc_lay = QVBoxLayout(feat_proc_content)
 
-        self.feat_proc_lay.addWidget(QLabel("<b>Log scaling</b>"))
+        # Log Scaling inside Feature Processing
+        log_scale_sec = CollapsibleSection("Log scaling", expanded=False)
+        # Distribution preview: sits just below the "Log scaling" header and
+        # above the per-feature checkboxes, so the user can inspect which
+        # features are skewed (and would benefit from log scaling) first.
+        self.btn_preview_distributions = QPushButton("\U0001F4CA  Preview feature distributions")
+        self.btn_preview_distributions.setToolTip(
+            "Show histograms of the continuous features for the selected cell "
+            "type, to judge which ones benefit from log scaling before applying it."
+        )
+        self.btn_preview_distributions.clicked.connect(self._on_preview_feature_distributions)
+        log_scale_sec.addWidget(self.btn_preview_distributions)
         self.log_scale_lay = QVBoxLayout()
-        self.feat_proc_lay.addLayout(self.log_scale_lay)
+        log_scale_container = QWidget()
+        log_scale_container.setLayout(self.log_scale_lay)
+        log_scale_sec.addWidget(log_scale_container)
+        self.feat_proc_lay.addWidget(log_scale_sec)
 
         proc_form = QFormLayout()
         self.spin_hmm_feature_smoothing_window = QSpinBox()
         self.spin_hmm_feature_smoothing_window.setRange(1, 100)
-        self.spin_hmm_feature_smoothing_window.setValue(1)
-        proc_form.addRow("Smooth window:", make_help_row(
+        self.spin_hmm_feature_smoothing_window.setValue(5)
+        proc_form.addRow("Smooth window (timepoints):", make_help_row(
             self.spin_hmm_feature_smoothing_window, "Feature smoothing window",
-            "Size of the rolling smoothing window applied to features before HMM fitting. "
-            "1 = no smoothing."
+            "Size of the rolling smoothing window (in timepoints/frames) applied to features "
+            "before HMM fitting. 1 = no smoothing. The line below shows the equivalent real "
+            "time, computed from this sample's time_interval/time_unit metadata."
         ))
+        self.lbl_hmm_smoothing_time = _make_timepoint_time_label()
+        proc_form.addRow("", self.lbl_hmm_smoothing_time)
+        self.spin_hmm_feature_smoothing_window.valueChanged.connect(self._update_timepoint_time_labels)
 
         self.spin_quant_lo = QDoubleSpinBox()
         self.spin_quant_lo.setRange(0.0, 0.5)
@@ -347,7 +573,7 @@ class StateClassificationSubTab(QWidget):
         self.spin_quant_hi = QDoubleSpinBox()
         self.spin_quant_hi.setRange(0.5, 1.0)
         self.spin_quant_hi.setSingleStep(0.01)
-        self.spin_quant_hi.setValue(0.99)
+        self.spin_quant_hi.setValue(1.0)
         proc_form.addRow("High percentile cap:", make_help_row(
             self.spin_quant_hi, "High percentile cap",
             "Quantile at which to clip the upper end of feature values (0.99 = clip top 1%)."
@@ -369,18 +595,6 @@ class StateClassificationSubTab(QWidget):
         bin_grp_sec.addWidget(self.bin_grp_scroll)
         train_lay.addWidget(bin_grp_sec)
 
-        # n_states
-        nstates_form = QFormLayout()
-        self.spin_hmm_n_states = QSpinBox()
-        self.spin_hmm_n_states.setRange(2, 50)
-        self.spin_hmm_n_states.setValue(4)
-        nstates_form.addRow("n_states:", make_help_row(
-            self.spin_hmm_n_states, "Number of states",
-            "Number of HMM behavioral states. Ignored in 'auto' mode (use k_min/k_max). "
-            "Typical values: 3–8."
-        ))
-        train_lay.addLayout(nstates_form)
-
         # Advanced Settings
         adv_sec = CollapsibleSection("⚙ Advanced Configuration", expanded=False)
         adv_form = QFormLayout()
@@ -389,31 +603,36 @@ class StateClassificationSubTab(QWidget):
         self.combo_hmm_n_states_mode.addItems(["fixed", "auto"])
         adv_form.addRow("State selection mode:", make_help_row(
             self.combo_hmm_n_states_mode, "State selection mode",
-            "'fixed' uses n_states directly. 'auto' searches between k_min and k_max "
-            "and selects the best number by BIC/AIC."
+            "'fixed' uses n_states directly. 'auto' fits a separate HMM for every k "
+            "between k_min and k_max and selects the model with the lowest BIC "
+            "(Bayesian Information Criterion)."
         ))
 
         self.spin_hmm_k_min = QSpinBox()
         self.spin_hmm_k_min.setRange(2, 50)
         self.spin_hmm_k_min.setValue(2)
         self.row_k_min = QLabel("k_min (Auto mode):")
-        adv_form.addRow(self.row_k_min, make_help_row(
+        k_min_row = make_help_row(
             self.spin_hmm_k_min, "k_min",
             "Minimum number of states to test in auto mode."
-        ))
+        )
+        self.help_k_min = k_min_row.itemAt(1).widget()
+        adv_form.addRow(self.row_k_min, k_min_row)
 
         self.spin_hmm_k_max = QSpinBox()
         self.spin_hmm_k_max.setRange(2, 50)
         self.spin_hmm_k_max.setValue(8)
         self.row_k_max = QLabel("k_max (Auto mode):")
-        adv_form.addRow(self.row_k_max, make_help_row(
+        k_max_row = make_help_row(
             self.spin_hmm_k_max, "k_max",
             "Maximum number of states to test in auto mode."
-        ))
+        )
+        self.help_k_max = k_max_row.itemAt(1).widget()
+        adv_form.addRow(self.row_k_max, k_max_row)
 
         self.spin_hmm_start_offset = QSpinBox()
         self.spin_hmm_start_offset.setRange(0, 100000)
-        self.spin_hmm_start_offset.setValue(0)
+        self.spin_hmm_start_offset.setValue(1)
         adv_form.addRow("Start offset:", make_help_row(
             self.spin_hmm_start_offset, "Start offset",
             "Number of initial timepoints to skip per track (e.g. dead frames). "
@@ -465,7 +684,7 @@ class StateClassificationSubTab(QWidget):
         ))
 
         self.chk_hmm_sticky = QCheckBox("Sticky HMM")
-        adv_form.addRow("", make_help_row(
+        adv_form.addRow("", _make_chk_help_row(
             self.chk_hmm_sticky, "Sticky HMM",
             "Adds a self-transition bias (kappa) to make the model prefer staying "
             "in the same state, producing longer, more stable behavioral bouts."
@@ -475,19 +694,23 @@ class StateClassificationSubTab(QWidget):
         self.spin_hmm_stickiness_kappa.setRange(0.0, 100.0)
         self.spin_hmm_stickiness_kappa.setValue(8.0)
         self.row_kappa = QLabel("kappa (Sticky):")
-        adv_form.addRow(self.row_kappa, make_help_row(
+        kappa_row = make_help_row(
             self.spin_hmm_stickiness_kappa, "Stickiness kappa",
             "Self-transition bias strength. Higher = longer bouts before switching states."
-        ))
+        )
+        self.help_kappa = kappa_row.itemAt(1).widget()
+        adv_form.addRow(self.row_kappa, kappa_row)
 
         self.spin_hmm_transmat_alpha = QDoubleSpinBox()
         self.spin_hmm_transmat_alpha.setRange(0.0, 100.0)
         self.spin_hmm_transmat_alpha.setValue(1.0)
         self.row_alpha = QLabel("alpha (Sticky):")
-        adv_form.addRow(self.row_alpha, make_help_row(
+        alpha_row = make_help_row(
             self.spin_hmm_transmat_alpha, "Transition matrix alpha",
             "Dirichlet prior concentration for the transition matrix in sticky HMM mode."
-        ))
+        )
+        self.help_alpha = alpha_row.itemAt(1).widget()
+        adv_form.addRow(self.row_alpha, alpha_row)
 
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(0, 99999)
@@ -500,6 +723,28 @@ class StateClassificationSubTab(QWidget):
 
         adv_sec.addLayout(adv_form)
         train_lay.addWidget(adv_sec)
+
+        # n_states
+        nstates_form = QFormLayout()
+        self.spin_hmm_n_states = QSpinBox()
+        self.spin_hmm_n_states.setRange(2, 50)
+        self.spin_hmm_n_states.setValue(4)
+        nstates_form.addRow("n_states:", make_help_row(
+            self.spin_hmm_n_states, "Number of states",
+            "Number of HMM behavioral states. Ignored in 'auto' mode (use k_min/k_max). "
+            "Typical values: 3–8."
+        ))
+        train_lay.addLayout(nstates_form)
+
+        # Configuration summary
+        self.config_summary_label = QLabel("")
+        self.config_summary_label.setWordWrap(True)
+        self.config_summary_label.setStyleSheet(
+            "QLabel { background: #1a2e2e; color: #66ddcc; border-radius: 4px; "
+            "padding: 8px 10px; font-size: 11px; font-family: monospace; }"
+        )
+        self.config_summary_label.hide()
+        train_lay.addWidget(self.config_summary_label)
 
         # Run button
         row_run = QHBoxLayout()
@@ -546,6 +791,12 @@ class StateClassificationSubTab(QWidget):
         g3 = QVBoxLayout(self.grp3)
         g3.setSpacing(4)
 
+        g3.addWidget(QLabel("Group composition plots by (Ctrl/Cmd click for multiple):"))
+        self.list_composition_group_cols = QListWidget()
+        self.list_composition_group_cols.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_composition_group_cols.setMaximumHeight(80)
+        g3.addWidget(self.list_composition_group_cols)
+
         comp_row = QHBoxLayout()
         self.btn_state_composition = QPushButton("▶ State Composition Report")
         _style_secondary(self.btn_state_composition)
@@ -553,12 +804,6 @@ class StateClassificationSubTab(QWidget):
         self.btn_view_composition = _make_view_btn()
         comp_row.addWidget(self.btn_view_composition)
         g3.addLayout(comp_row)
-
-        g3.addWidget(QLabel("Group composition plots by (Ctrl/Cmd click for multiple):"))
-        self.list_composition_group_cols = QListWidget()
-        self.list_composition_group_cols.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.list_composition_group_cols.setMaximumHeight(80)
-        g3.addWidget(self.list_composition_group_cols)
 
         trans_row = QHBoxLayout()
         self.btn_state_transition = QPushButton("▶ State Transition Report")
@@ -601,14 +846,15 @@ class StateClassificationSubTab(QWidget):
 
         self.combo_state_color_by = QComboBox()
         self.combo_state_color_by.addItems(
-            ["full_behavioral_cluster", "intrinsic_behavioral_cluster"]
+            ["full_behavioral_cluster", "intrinsic_behavioral_cluster", "raw_hmm_state"]
         )
         self.combo_state_color_by.setMinimumWidth(220)
         bp_form.addRow("Color by:", make_help_row(
             self.combo_state_color_by, "Color by",
             "Which clustering label to use for coloring the backprojection overlay. "
             "'full_behavioral_cluster' includes binary grouping; "
-            "'intrinsic_behavioral_cluster' shows only the HMM states."
+            "'intrinsic_behavioral_cluster' shows only the HMM states; "
+            "'raw_hmm_state' shows the HMM output of Step 1 before any renaming."
         ))
 
         self.spin_state_opacity = QSpinBox()
@@ -627,38 +873,13 @@ class StateClassificationSubTab(QWidget):
         _style_primary(self.btn_show_state_bp)
         view_row.addWidget(self.btn_show_state_bp, stretch=1)
         g_view.addLayout(view_row)
-        g_bp.addWidget(grp_view)
 
-        # Export options (collapsed)
-        export_sec = CollapsibleSection("⚙ Export Options", expanded=False)
-        export_form = QFormLayout()
-        self.spin_state_export_dpi = QSpinBox()
-        self.spin_state_export_dpi.setRange(50, 600)
-        self.spin_state_export_dpi.setValue(150)
-        self.spin_state_export_dpi.setSuffix(" dpi")
-        self.spin_state_export_dpi.setMaximumWidth(110)
-        export_form.addRow("DPI (PDF):", make_help_row(
-            self.spin_state_export_dpi, "Export DPI",
-            "Resolution for exported PDF images."
-        ))
-        export_sec.addLayout(export_form)
-
-        export_opts = QHBoxLayout()
-        self.chk_state_export_pdf = QCheckBox("PDF")
-        self.chk_state_export_pdf.setChecked(True)
-        export_opts.addWidget(self.chk_state_export_pdf)
-        self.chk_state_export_mp4 = QCheckBox("MP4")
-        self.chk_state_export_mp4.setChecked(False)
-        export_opts.addWidget(self.chk_state_export_mp4)
-        export_opts.addStretch()
-        export_sec.addLayout(export_opts)
-
-        export_row = QHBoxLayout()
+        export_run_row = QHBoxLayout()
         self.btn_export_state_bp = QPushButton("▶ Export State Backprojection")
         _style_secondary(self.btn_export_state_bp)
-        export_row.addWidget(self.btn_export_state_bp, stretch=1)
-        export_sec.addLayout(export_row)
-        g_bp.addWidget(export_sec)
+        export_run_row.addWidget(self.btn_export_state_bp, stretch=1)
+        g_view.addLayout(export_run_row)
+        g_bp.addWidget(grp_view)
 
         lay.addWidget(self.grp_bp)
 
@@ -695,6 +916,14 @@ class StateClassificationSubTab(QWidget):
         self.btn_show_state_bp.clicked.connect(self._on_show_state_bp)
         self.btn_export_state_bp.clicked.connect(self._on_export_state_bp)
 
+        self.spin_window_size.valueChanged.connect(self._update_config_summary)
+        self.chk_net_disp.toggled.connect(self._update_config_summary)
+        self.chk_straight.toggled.connect(self._update_config_summary)
+        self.chk_msd.toggled.connect(self._update_config_summary)
+        self.spin_hmm_feature_smoothing_window.valueChanged.connect(self._update_config_summary)
+        self.spin_quant_lo.valueChanged.connect(self._update_config_summary)
+        self.spin_quant_hi.valueChanged.connect(self._update_config_summary)
+
         self._toggle_n_states_mode(self.combo_hmm_n_states_mode.currentText())
         self._toggle_sticky_hmm(self.chk_hmm_sticky.isChecked())
 
@@ -708,22 +937,35 @@ class StateClassificationSubTab(QWidget):
             self.warning_label.hide()
             return True
 
-        csv_path = out / "analysis" / ct / "track_features" / f"{ct}_track_features.csv"
-        if not csv_path.exists():
+        csv_filtered = out / "analysis" / ct / "track_features" / f"BEHAV3D_{ct}_combined_track_features_filtered.csv"
+        csv_unfiltered = out / "analysis" / ct / "track_features" / f"BEHAV3D_{ct}_combined_track_features.csv"
+
+        if csv_filtered.exists():
+            self.warning_label.hide()
+            for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
+                grp.setEnabled(True)
+            _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
+            return True
+        elif csv_unfiltered.exists():
+            self.warning_label.setText(
+                f"⚠ Filtered data not found for cell type '{ct}'.\n"
+                "Run Filtering first for full functionality.\n"
+                "Using unfiltered data as a fallback."
+            )
+            self.warning_label.show()
+            for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
+                grp.setEnabled(True)
+            _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
+            return True
+        else:
             self.warning_label.setText(
                 f"⚠ Feature data not found for cell type '{ct}'.\n"
-                "Run Feature Extraction first, then return here.\n"
-                # f"Expected: {csv_path}" ## Removed: Too long for display
+                "Run Filtering first, then return here."
             )
             self.warning_label.show()
             for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
                 grp.setEnabled(False)
             return False
-        else:
-            self.warning_label.hide()
-            for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
-                grp.setEnabled(True)
-            return True
 
     # ── Toggle helpers ───────────────────────────────────────────────────
 
@@ -738,14 +980,52 @@ class StateClassificationSubTab(QWidget):
         self.spin_hmm_n_states.setEnabled(not auto)
         self.spin_hmm_k_min.setVisible(auto)
         self.row_k_min.setVisible(auto)
+        self.help_k_min.setVisible(auto)
         self.spin_hmm_k_max.setVisible(auto)
         self.row_k_max.setVisible(auto)
+        self.help_k_max.setVisible(auto)
 
     def _toggle_sticky_hmm(self, checked):
         self.spin_hmm_stickiness_kappa.setVisible(checked)
         self.row_kappa.setVisible(checked)
+        self.help_kappa.setVisible(checked)
         self.spin_hmm_transmat_alpha.setVisible(checked)
         self.row_alpha.setVisible(checked)
+        self.help_alpha.setVisible(checked)
+
+    def _update_config_summary(self):
+        tp_feats = sorted(
+            f for f, cb in getattr(self, "_timepoint_checkboxes", {}).items()
+            if cb.isChecked()
+        )
+        log_feats = sorted(
+            f for f, cb in getattr(self, "_logscale_checkboxes", {}).items()
+            if cb.isChecked()
+        )
+        bin_groups = sorted(
+            f for f, cb in getattr(self, "_bingrp_checkboxes", {}).items()
+            if cb.isChecked()
+        )
+        win_feats = [
+            n for n, chk in [
+                ("net_displacement", self.chk_net_disp),
+                ("straightness", self.chk_straight),
+                ("mean_square_displacement", self.chk_msd),
+            ] if chk.isChecked()
+        ]
+        lo = self.spin_quant_lo.value()
+        hi = self.spin_quant_hi.value()
+        capping = f"lower={lo:.2f}, upper={hi:.2f}" if (lo > 0 or hi < 1.0) else "none"
+        lines = [
+            f"Timepoint features ({len(tp_feats)}): {', '.join(tp_feats) or '—'}",
+            f"Smoothing window: {self.spin_hmm_feature_smoothing_window.value()}",
+            f"Window features: {', '.join(win_feats) or '—'}  |  Window size: {self.spin_window_size.value()}",
+            f"Log-scaled: {', '.join(log_feats) or '—'}",
+            f"Binary groups: {', '.join(bin_groups) or '—'}",
+            f"Quantile capping: {capping}",
+        ]
+        self.config_summary_label.setText("\n".join(lines))
+        self.config_summary_label.show()
 
     def _browse_hmm_artifact(self):
         fpath, _ = QFileDialog.getOpenFileName(
@@ -772,12 +1052,11 @@ class StateClassificationSubTab(QWidget):
 
         def _run(**kw):
             from behav3d.analysis.behavior.state.classification import apply_hmm_deployment_artifact_to_full_dataset
-            from behav3d.analysis.behavior.state.utils import _resolve_state_paths
-            paths = _resolve_state_paths(out, ct)
             apply_hmm_deployment_artifact_to_full_dataset(
-                deployment_artifact_path=Path(pkl_path),
-                input_adata_path=paths.prepared_input_adata_path,
-                output_adata_path=paths.full_output_adata_path,
+                output_dir=str(out),
+                cell_type=ct,
+                hmm_deployment_artifact=Path(pkl_path),
+                verbose=True,
             )
 
         self._bg.run(
@@ -799,8 +1078,18 @@ class StateClassificationSubTab(QWidget):
     def on_metadata_updated(self):
         self._reload()
 
+    def _update_timepoint_time_labels(self, *_):
+        metadata = getattr(self.metadata_loader, "metadata", None)
+        self.lbl_window_size_time.setText(
+            format_timepoints_as_time(self.spin_window_size.value(), metadata)
+        )
+        self.lbl_hmm_smoothing_time.setText(
+            format_timepoints_as_time(self.spin_hmm_feature_smoothing_window.value(), metadata)
+        )
+
     def _reload(self):
         try:
+            self._update_timepoint_time_labels()
             ct = self._cell_type()
             if not ct:
                 self._model_adata = None
@@ -808,18 +1097,111 @@ class StateClassificationSubTab(QWidget):
                 return
 
             self._populate_dynamic_features(ct)
-            path = self._model_adata_path(ct)
-            if path and path.exists():
-                self._load_model_adata(path)
-            else:
-                self._model_adata = None
 
             self._check_prerequisites()
-            self._refresh_buttons()
             self._update_view_buttons()
             self._update_bp_buttons()
+
+            path = self._model_adata_path(ct)
+            if not path or not path.exists():
+                self._model_adata = None
+                self._refresh_buttons()
+                return
+
+            if self._preload_bg.is_running():
+                return
+
+            self._model_adata = None
+            self._refresh_buttons()
+
+            def _load():
+                import anndata as ad
+                return ad.read_h5ad(str(path))
+
+            def _on_done(result):
+                self._model_adata = result
+                self._refresh_buttons()
+
+            def _on_failed(err):
+                print(f"[BEHAV3D] State model adata failed to load: {err}")
+                self._model_adata = None
+                self._refresh_buttons()
+
+            self._preload_bg.run(
+                fn=_load,
+                inject_progress=False,
+                on_done=_on_done,
+                on_failed=_on_failed,
+            )
         except Exception:
             traceback.print_exc()
+
+    def _rebuild_log_scale_features(self, state=None):
+        while self.log_scale_lay.count():
+            child = self.log_scale_lay.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+                
+        selected_feats = [f for f, cb in getattr(self, "_timepoint_checkboxes", {}).items() if cb.isChecked()]
+        ct = self._cell_type()
+        cfg = getattr(self.metadata_loader, "behav3d_parameters", {}).get("state_classification", {}).get(ct, {}) if ct else {}
+        saved_log_raw = cfg.get("log_scale_features", None)
+        saved_log = set(saved_log_raw) if saved_log_raw is not None else (
+            _DEFAULT_LOG_SCALE_FEATURES & set(selected_feats)
+        )
+        prev_checked = {f for f, cb in getattr(self, "_logscale_checkboxes", {}).items() if cb.isChecked()}
+        
+        self._logscale_checkboxes = {}
+        if not selected_feats:
+            self.log_scale_lay.addWidget(QLabel("<i>No features selected.</i>"))
+            self._update_config_summary()
+            return
+
+        grid_log = QGridLayout()
+        for i, f in enumerate(selected_feats):
+            cb = QCheckBox(f)
+            if f in prev_checked or f in saved_log:
+                cb.setChecked(True)
+            cb.stateChanged.connect(self._update_config_summary)
+            self._logscale_checkboxes[f] = cb
+            grid_log.addWidget(cb, i // 3, i % 3)
+        self.log_scale_lay.addLayout(grid_log)
+        self._update_config_summary()
+
+    def _on_preview_feature_distributions(self, *_):
+        """Show histograms of the continuous features for the selected cell
+        type so the user can judge which benefit from log scaling."""
+        from behav3d.napari._pdf_view import show_matplotlib_figure
+        from behav3d.widgets.utils import build_feature_distribution_figure
+
+        ct = self._cell_type()
+        csv_path = getattr(self, "_logscale_csv_path", None)
+        candidates = list(getattr(self, "_logscale_candidate_cols", []) or [])
+        if not csv_path or not Path(csv_path).exists() or not candidates:
+            QMessageBox.information(
+                self,
+                "Feature distributions",
+                "No feature table is loaded yet for this cell type. "
+                "Select a cell type with extracted track features first.",
+            )
+            return
+
+        # Prefer the features the user has actually selected (those shown in the
+        # log-scaling list); fall back to all continuous candidates.
+        selected = [f for f, cb in getattr(self, "_timepoint_checkboxes", {}).items()
+                    if cb.isChecked() and f in candidates]
+        feats = selected or candidates
+        title = f"Feature distributions — {ct}"
+        fig, truncated = build_feature_distribution_figure(csv_path, feats, title=title)
+        if fig is None:
+            QMessageBox.warning(
+                self, "Feature distributions",
+                f"Could not read features from:\n{csv_path}",
+            )
+            return
+        if truncated:
+            title += "  (showing first 36)"
+        show_matplotlib_figure(fig, title=title, parent=self)
 
     def _populate_dynamic_features(self, ct):
         from behav3d.widgets.utils import behav3d_calculated_features
@@ -829,91 +1211,185 @@ class StateClassificationSubTab(QWidget):
         if not out:
             return
 
-        csv_path = out / "analysis" / ct / "track_features" / f"{ct}_track_features.csv"
+        base = out / "analysis" / ct / "track_features"
+        csv_path = base / f"BEHAV3D_{ct}_combined_track_features_filtered.csv"
+        if not csv_path.exists():
+            csv_path = base / f"BEHAV3D_{ct}_combined_track_features.csv"
+
+        try:
+            mtime = csv_path.stat().st_mtime if csv_path.exists() else None
+        except OSError:
+            mtime = None
+        features_key = (ct, str(csv_path), mtime)
+        if features_key == self._last_features_key:
+            return
+
         self._timepoint_checkboxes = {}
         self._logscale_checkboxes = {}
         self._bingrp_checkboxes = {}
 
-        for lay in [self.timepoint_features_lay, self.log_scale_lay, self.bin_grp_lay]:
-            while lay.count():
-                child = lay.takeAt(0)
-                if child.widget():
-                    child.widget().deleteLater()
+        self.setUpdatesEnabled(False)
+        try:
+            for lay in [self.timepoint_features_lay, self.log_scale_lay, self.bin_grp_lay]:
+                while lay.count():
+                    child = lay.takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
 
-        if not csv_path.exists():
-            self.timepoint_features_lay.addWidget(_make_info_label(
-                "<i>No track-features CSV found for this cell type.\n Run feature extraction first.</i>"
-            ))
-            self.log_scale_lay.addWidget(_make_info_label(
-                "<i>No track-features CSV found.</i>"
-            ))
-            self.bin_grp_lay.addWidget(_make_info_label(
-                "<i>No binary columns detected yet.</i>"
-            ))
+            if not csv_path.exists():
+                self.timepoint_features_lay.addWidget(_make_info_label(
+                    "<i>No track-features CSV found for this cell type.\n Run feature extraction first.</i>"
+                ))
+                self.log_scale_lay.addWidget(_make_info_label(
+                    "<i>No track-features CSV found.</i>"
+                ))
+                self.bin_grp_lay.addWidget(_make_info_label(
+                    "<i>No binary columns detected yet.</i>"
+                ))
+                for w in [self.spin_window_size, self.chk_net_disp, self.chk_straight, self.chk_msd,
+                          self.spin_hmm_feature_smoothing_window, self.spin_quant_lo, self.spin_quant_hi]:
+                    w.setEnabled(False)
+                self._last_features_key = features_key
+                return
+
+            # Read at least 5 rows so pandas can infer column dtypes properly.
+            # If nrows=0, many columns default to dtype 'object'.
             for w in [self.spin_window_size, self.chk_net_disp, self.chk_straight, self.chk_msd,
                       self.spin_hmm_feature_smoothing_window, self.spin_quant_lo, self.spin_quant_hi]:
-                w.setEnabled(False)
-            return
+                w.setEnabled(True)
 
-        df = pd.read_csv(csv_path, nrows=0)
-        cols = list(df.columns)
-        excluded = [
-            "TrackID", "position_t", "position_x", "position_y", "position_z",
-            "frame", "file", "index", "id", "sample_name", "Condition", "Timepoint"
-        ]
-        usable_cols = [c for c in cols if c not in excluded]
-        bin_cols, feat_cols = [], []
-        for c in usable_cols:
-            dtype = df.dtypes.get(c)
-            if (dtype == 'object' or dtype == 'bool'
-                    or pd.api.types.is_string_dtype(dtype)
-                    or pd.api.types.is_bool_dtype(dtype)):
-                bin_cols.append(c)
-            else:
-                feat_cols.append(c)
+            ct = self._cell_type()
+            cfg = getattr(self.metadata_loader, "behav3d_parameters", {}).get("state_classification", {}).get(ct, {})
 
-        from copy import deepcopy
-        base_groups = deepcopy(behav3d_calculated_features)
-        matched = set()
-        for gname, patterns in base_groups.items():
-            vals = []
-            for pat in patterns:
-                vals.extend(expand_column_patterns(pat, feat_cols))
-            clean_vals = sorted({x for x in vals if x in feat_cols})
-            if clean_vals:
-                self.timepoint_features_lay.addWidget(QLabel(f"<b>{gname}</b>"))
-                grid = QGridLayout()
-                for i, f in enumerate(clean_vals):
+            # ── Features ────────────────────────────────────────────────────────
+            saved_features_raw = cfg.get("selected_features", cfg.get("features", None))
+            saved_features = set(saved_features_raw) if saved_features_raw is not None else _DEFAULT_TIMEPOINT_FEATURES
+            saved_bin = set(cfg.get("binary_features_to_group", []))
+
+            # ── Window features ──────────────────────────────────────────────────
+            saved_window_raw = cfg.get("additional_window_features", None)
+            saved_window = set(saved_window_raw) if saved_window_raw is not None else _DEFAULT_WINDOW_FEATURES
+            self.chk_net_disp.setChecked("net_displacement" in saved_window)
+            self.chk_straight.setChecked("straightness" in saved_window)
+            self.chk_msd.setChecked("mean_square_displacement" in saved_window)
+
+            # ── Feature Processing ───────────────────────────────────────────────
+            self.spin_window_size.setValue(int(cfg.get("window_features_window", self.spin_window_size.value())))
+            self.spin_hmm_feature_smoothing_window.setValue(int(cfg.get("feature_smoothing_window", self.spin_hmm_feature_smoothing_window.value())))
+            lo = cfg.get("lower_quantile_cap", None)
+            self.spin_quant_lo.setValue(float(lo) if lo is not None else 0.0)
+            hi = cfg.get("upper_quantile_cap", None)
+            self.spin_quant_hi.setValue(float(hi) if hi is not None else 1.0)
+
+            # ── HMM Parameters ───────────────────────────────────────────────────
+            n_states_cfg = cfg.get("n_states", None)
+            if isinstance(n_states_cfg, int):
+                self.combo_hmm_n_states_mode.setCurrentText("fixed")
+                self.spin_hmm_n_states.setValue(n_states_cfg)
+            elif n_states_cfg == "auto":
+                self.combo_hmm_n_states_mode.setCurrentText("auto")
+            if "k_min" in cfg:
+                self.spin_hmm_k_min.setValue(int(cfg["k_min"]))
+            if "k_max" in cfg:
+                self.spin_hmm_k_max.setValue(int(cfg["k_max"]))
+            if "start_offset" in cfg:
+                self.spin_hmm_start_offset.setValue(int(cfg["start_offset"]))
+            if "start_offset_fill_mode" in cfg:
+                self.combo_hmm_start_offset_fill_mode.setCurrentText(cfg["start_offset_fill_mode"])
+            if "covariance_type" in cfg:
+                self.combo_hmm_covariance_type.setCurrentText(cfg["covariance_type"])
+            if "n_iter" in cfg:
+                self.spin_hmm_n_iter.setValue(int(cfg["n_iter"]))
+            if "tol" in cfg:
+                self.spin_hmm_tol.setValue(float(cfg["tol"]))
+            if "min_covar" in cfg:
+                self.spin_hmm_min_covar.setValue(float(cfg["min_covar"]))
+            if "sticky" in cfg:
+                self.chk_hmm_sticky.setChecked(bool(cfg["sticky"]))
+            if "stickiness_kappa" in cfg:
+                self.spin_hmm_stickiness_kappa.setValue(float(cfg["stickiness_kappa"]))
+            if "transmat_alpha" in cfg:
+                self.spin_hmm_transmat_alpha.setValue(float(cfg["transmat_alpha"]))
+            if "random_state" in cfg:
+                self.spin_seed.setValue(int(cfg["random_state"]))
+
+            cols = list(pd.read_csv(csv_path, nrows=0).columns)
+            excluded = [
+                "TrackID", "position_t", "position_x", "position_y", "position_z",
+                "frame", "file", "index", "id", "sample_name", "Condition", "Timepoint"
+            ]
+            usable_cols = [c for c in cols if c not in excluded]
+            # Value-based binary detection over the full CSV (see
+            # behav3d.widgets.base_state_classification.detect_binary_columns_from_csv).
+            # The previous 5-row dtype heuristic mis-classified numeric feature
+            # columns as "binary" whenever the sampled rows were NaN/blank, so
+            # switching cell types could dump every feature into the binary list.
+            from behav3d.widgets.base_state_classification import (
+                detect_binary_columns_from_csv,
+            )
+            bin_cols = detect_binary_columns_from_csv(Path(csv_path), usable_cols)
+            bin_set = set(bin_cols)
+            feat_cols = [c for c in usable_cols if c not in bin_set]
+            # Continuous features eligible for log scaling; reused by the
+            # "Preview feature distributions" histogram button.
+            self._logscale_candidate_cols = list(feat_cols)
+            self._logscale_csv_path = Path(csv_path)
+
+            from copy import deepcopy
+            base_groups = deepcopy(behav3d_calculated_features)
+            matched = set()
+            for gname, patterns in base_groups.items():
+                vals = []
+                for pat in patterns:
+                    vals.extend(expand_column_patterns(pat, feat_cols))
+                clean_vals = sorted({x for x in vals if x in feat_cols})
+                if clean_vals:
+                    group_sec = CollapsibleSection(gname, expanded=False)
+                    group_content = QWidget()
+                    grid = QGridLayout(group_content)
+                    for i, f in enumerate(clean_vals):
+                        cb = QCheckBox(f)
+                        if f in saved_features:
+                            cb.setChecked(True)
+                        cb.stateChanged.connect(self._rebuild_log_scale_features)
+                        self._timepoint_checkboxes[f] = cb
+                        grid.addWidget(cb, i // 3, i % 3)
+                    group_sec.addWidget(group_content)
+                    self.timepoint_features_lay.addWidget(group_sec)
+                    matched.update(clean_vals)
+
+            other = sorted([c for c in feat_cols if c not in matched])
+            if other:
+                group_sec = CollapsibleSection("other", expanded=False)
+                group_content = QWidget()
+                grid = QGridLayout(group_content)
+                for i, f in enumerate(other):
                     cb = QCheckBox(f)
+                    if f in saved_features:
+                        cb.setChecked(True)
+                    cb.stateChanged.connect(self._rebuild_log_scale_features)
                     self._timepoint_checkboxes[f] = cb
                     grid.addWidget(cb, i // 3, i % 3)
-                self.timepoint_features_lay.addLayout(grid)
-                matched.update(clean_vals)
+                group_sec.addWidget(group_content)
+                self.timepoint_features_lay.addWidget(group_sec)
 
-        other = sorted([c for c in feat_cols if c not in matched])
-        if other:
-            self.timepoint_features_lay.addWidget(QLabel("<b>other</b>"))
-            grid = QGridLayout()
-            for i, f in enumerate(other):
-                cb = QCheckBox(f)
-                self._timepoint_checkboxes[f] = cb
-                grid.addWidget(cb, i // 3, i % 3)
-            self.timepoint_features_lay.addLayout(grid)
+            self._rebuild_log_scale_features()
 
-        grid_log = QGridLayout()
-        for i, f in enumerate(feat_cols):
-            cb = QCheckBox(f)
-            self._logscale_checkboxes[f] = cb
-            grid_log.addWidget(cb, i // 3, i % 3)
-        self.log_scale_lay.addLayout(grid_log)
+            if not bin_cols:
+                self.bin_grp_lay.addWidget(QLabel("<i>No binary columns detected yet.</i>"))
+            else:
+                for b in bin_cols:
+                    cb = QCheckBox(b)
+                    if b in saved_bin:
+                        cb.setChecked(True)
+                    cb.stateChanged.connect(self._update_config_summary)
+                    self._bingrp_checkboxes[b] = cb
+                    self.bin_grp_lay.addWidget(cb)
+                self._update_config_summary()
 
-        if not bin_cols:
-            self.bin_grp_lay.addWidget(QLabel("<i>No binary columns detected yet.</i>"))
-        else:
-            for b in bin_cols:
-                cb = QCheckBox(b)
-                self._bingrp_checkboxes[b] = cb
-                self.bin_grp_lay.addWidget(cb)
+            self._last_features_key = features_key
+        finally:
+            self.setUpdatesEnabled(True)
 
     def _model_adata_path(self, cell_type: str) -> Optional[Path]:
         out = self._out_dir()
@@ -948,10 +1424,12 @@ class StateClassificationSubTab(QWidget):
         out = self._out_dir()
         if not out:
             return None
-        return (
-            out / "analysis" / cell_type / "behavioral_states" / "results"
-            / f"{report}_{cell_type}.pdf"
-        )
+        state_base = out / "analysis" / cell_type / "behavioral_states"
+        _REPORT_PATHS = {
+            "state_composition_report": state_base / "state_composition" / "state_composition_report.pdf",
+            "state_transition_report": state_base / "state_transitions" / "transition_matrix" / "transition_matrix_heatmap.pdf",
+        }
+        return _REPORT_PATHS.get(report)
 
     def _out_dir(self) -> Optional[Path]:
         od = getattr(self.metadata_loader, "output_dir", None) if self.metadata_loader else None
@@ -988,6 +1466,44 @@ class StateClassificationSubTab(QWidget):
         else:
             self.rename_status_lbl.setText("ℹ Run state classification first to enable renaming.")
 
+        self._refresh_composition_group_cols()
+
+    def _refresh_composition_group_cols(self):
+        self.list_composition_group_cols.clear()
+        added = set()
+
+        # Prefer columns from the metadata CSV, but only surface the known
+        # experimental-design grouping columns (exp_nr, well, *_line_condition).
+        md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+        if md is not None and hasattr(md, "columns"):
+            for col in md.columns:
+                if col in ("exp_nr", "well") or col.endswith("_line_condition"):
+                    self.list_composition_group_cols.addItem(col)
+                    added.add(col)
+
+        # Metadata CSV never carries per-cell columns like `origin_cell_type`
+        # (stamped during multi-population track merging), so also check the
+        # adata/h5ad obs columns for those, whether or not metadata was loaded.
+        if self._model_adata is not None:
+            obs_cols = list(self._model_adata.obs.columns)
+        else:
+            ct = self._cell_type()
+            full_path = self._full_adata_path(ct) if ct else None
+            if not full_path or not full_path.exists():
+                return
+            try:
+                import h5py
+                with h5py.File(str(full_path), "r") as f:
+                    obs_cols = list(f.get("obs", {}).keys())
+            except Exception:
+                return
+        for col in obs_cols:
+            if col in added or col.startswith("_") or col in _TECHNICAL_OBS_COLS:
+                continue
+            if col in ("exp_nr", "well", "origin_cell_type") or col.endswith("_line_condition"):
+                self.list_composition_group_cols.addItem(col)
+                added.add(col)
+
     def _update_view_buttons(self):
         ct = self._cell_type()
         if not ct:
@@ -1003,10 +1519,12 @@ class StateClassificationSubTab(QWidget):
 
     def _update_bp_buttons(self):
         ct = self._cell_type()
-        state_path = self._full_adata_path(ct) if ct else None
-        has_state = bool(state_path and state_path.exists())
-        self.btn_show_state_bp.setEnabled(has_state)
-        self.btn_export_state_bp.setEnabled(has_state)
+        full_path = self._full_adata_path(ct) if ct else None
+        model_path = self._model_adata_path(ct) if ct else None
+        has_full = bool(full_path and full_path.exists())
+        has_model = bool(model_path and model_path.exists())
+        self.btn_show_state_bp.setEnabled(has_full or has_model)
+        self.btn_export_state_bp.setEnabled(has_full)
 
     # ── Click handlers ───────────────────────────────────────────────────
 
@@ -1036,7 +1554,7 @@ class StateClassificationSubTab(QWidget):
 
         def _run(**kw):
             from behav3d.analysis.behavior.state.classification import run_hmm_state_clustering
-            res = run_hmm_state_clustering(**params, verbose=True)
+            res = run_hmm_state_clustering(**params, verbose=True, return_details=True)
             self._hmm_model = res["hmm_model"]
             return res["model_adata"]
 
@@ -1098,16 +1616,44 @@ class StateClassificationSubTab(QWidget):
             "random_state": self.spin_seed.value(),
         }
 
+    def _persist_state_cfg(self, ct: str):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if not isinstance(params, dict):
+            return
+        collected = self._collect_state_params(ct)
+        collected["selected_features"] = collected.pop("features", collected.get("selected_features", []))
+        params.setdefault("state_classification", {})[ct] = collected
+        _save_behav3d_params(self.metadata_loader, self._out_dir)
+
     def _on_state_done(self, result):
         ct = self._cell_type()
+        self._persist_state_cfg(ct)
         self._log(f"✅ State classification complete for '{ct}'.")
         path = self._model_adata_path(ct)
         if path and path.exists():
             self._load_model_adata(path)
+        if self._hmm_model is not None and ct:
+            out = self._out_dir()
+            if out:
+                from behav3d.analysis.behavior.state.classification import (
+                    save_hmm_deployment_artifact,
+                    _resolve_hmm_deployment_artifact_path,
+                )
+                _art_path = _resolve_hmm_deployment_artifact_path(output_dir=str(out), cell_type=ct)
+                try:
+                    save_hmm_deployment_artifact(
+                        output_path=_art_path,
+                        model_adata=self._model_adata,
+                        hmm_model=self._hmm_model,
+                        verbose=False,
+                    )
+                except Exception:
+                    pass
         self._refresh_buttons()
         self._update_view_buttons()
         self._update_bp_buttons()
         self._notify_results()
+        QTimer.singleShot(0, lambda _ct=ct: self._apply_to_full_dataset_after_rename(_ct))
 
     def run_state_classification(self, interactive=True, extra_callbacks=None):
         """Called from queue runner (_queue.py)."""
@@ -1129,7 +1675,7 @@ class StateClassificationSubTab(QWidget):
 
         def _run(**kw):
             from behav3d.analysis.behavior.state.classification import run_hmm_state_clustering
-            res = run_hmm_state_clustering(**params, verbose=True)
+            res = run_hmm_state_clustering(**params, verbose=True, return_details=True)
             self._hmm_model = res["hmm_model"]
             return res["model_adata"]
 
@@ -1168,9 +1714,10 @@ class StateClassificationSubTab(QWidget):
         dlg.clusters_renamed.connect(
             lambda mapping: self._log(f"✅ Intrinsic clusters renamed: {mapping}")
         )
-        dlg.exec_()
-        self._refresh_buttons()
-        self._update_view_buttons()
+        if dlg.exec_() == QDialog.Accepted:
+            self._refresh_buttons()
+            self._update_view_buttons()
+            self._apply_to_full_dataset_after_rename(ct)
 
     def _on_rename_full(self):
         ct = self._cell_type()
@@ -1193,9 +1740,94 @@ class StateClassificationSubTab(QWidget):
         dlg.clusters_renamed.connect(
             lambda mapping: self._log(f"✅ Full behavioral clusters renamed: {mapping}")
         )
-        dlg.exec_()
-        self._refresh_buttons()
-        self._update_view_buttons()
+        if dlg.exec_() == QDialog.Accepted:
+            self._refresh_buttons()
+            self._update_view_buttons()
+            self._apply_to_full_dataset_after_rename(ct)
+
+    def _apply_to_full_dataset_after_rename(self, ct: str):
+        """Rebuild the pkl artifact with renamed labels and apply it to the full dataset."""
+        out = self._out_dir()
+        if not out or self._model_adata is None or not ct:
+            return
+        if self._bg.is_running():
+            self._log("⚠ Background job running — skipping auto-apply to full dataset.")
+            return
+
+        from behav3d.analysis.behavior.state.classification import (
+            INTRINSIC_STATE_COL,
+            FULL_STATE_COL,
+            save_hmm_deployment_artifact,
+            load_hmm_deployment_artifact,
+            apply_hmm_deployment_artifact_to_full_dataset,
+            _resolve_hmm_deployment_artifact_path,
+        )
+
+        artifact_path = _resolve_hmm_deployment_artifact_path(output_dir=str(out), cell_type=ct)
+
+        hmm_model = self._hmm_model
+        if hmm_model is None and artifact_path.exists():
+            try:
+                _stored = load_hmm_deployment_artifact(str(artifact_path))
+                hmm_model = _stored.get("model")
+            except Exception:
+                pass
+
+        if hmm_model is None:
+            self._log(
+                "⚠ Cannot apply states to full dataset: HMM model not in memory and no saved artifact found. "
+                "Re-run Step 1 to regenerate."
+            )
+            return
+
+        # Sync columns so the artifact builder uses the renamed labels.
+        if "intrinsic_behavioral_cluster" in self._model_adata.obs.columns:
+            self._model_adata.obs[INTRINSIC_STATE_COL] = (
+                self._model_adata.obs["intrinsic_behavioral_cluster"].copy()
+            )
+        if "full_behavioral_cluster" in self._model_adata.obs.columns:
+            self._model_adata.obs[FULL_STATE_COL] = (
+                self._model_adata.obs["full_behavioral_cluster"].copy()
+            )
+
+        try:
+            save_hmm_deployment_artifact(
+                output_path=artifact_path,
+                model_adata=self._model_adata,
+                hmm_model=hmm_model,
+                cell_type=ct,
+                output_dir=str(out),
+                verbose=False,
+            )
+        except Exception as exc:
+            self._log(f"⚠ Could not save updated HMM artifact: {exc}")
+            return
+
+        self._log(f"▶ Applying state labels to full dataset for '{ct}'…")
+        _artifact_path = artifact_path
+        _out = out
+
+        def _run(**kw):
+            apply_hmm_deployment_artifact_to_full_dataset(
+                output_dir=str(_out),
+                cell_type=ct,
+                hmm_deployment_artifact=_artifact_path,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Apply states to full dataset ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ State labels applied to full dataset for '{ct}'."),
+                self._update_bp_buttons(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Apply to full dataset failed: {e}"),
+        )
 
     def _on_state_composition(self):
         ct = self._cell_type()
@@ -1204,25 +1836,57 @@ class StateClassificationSubTab(QWidget):
         if self._bg.is_running():
             QMessageBox.warning(self, "Busy", "Another operation is running.")
             return
-        if getattr(self, "_model_adata", None) is None:
+        full_path = self._full_adata_path(ct)
+        if not full_path or not full_path.exists():
             QMessageBox.warning(self, "No data", "Run state classification first.")
             return
         out = self._out_dir()
         self._log(f"▶ Generating state composition report for '{ct}'…")
         selected_cols = [item.text() for item in self.list_composition_group_cols.selectedItems()]
+        _raw_md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+        md_snapshot = _raw_md.copy() if _raw_md is not None else None
 
         def _run(**kw):
+            import anndata as ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.analysis.behavior.state.utils import _resolve_state_paths
             from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
                 save_state_composition_report,
             )
-            composition_dir = out / "state_composition"
+            adata = ad.read_h5ad(str(full_path))
+
+            # Inject known metadata grouping columns from metadata CSV into obs (for
+            # existing h5ad files that predate Fix 1 in classification.py).
+            if md_snapshot is not None and "sample_name" in md_snapshot.columns:
+                _known_meta = ["exp_nr", "well"] + [
+                    c for c in md_snapshot.columns if c.endswith("_line_condition")
+                ]
+                cols_to_inject = [
+                    c for c in _known_meta
+                    if c in md_snapshot.columns and c not in adata.obs.columns
+                ]
+                if cols_to_inject:
+                    meta_map = (
+                        md_snapshot[["sample_name"] + cols_to_inject]
+                        .drop_duplicates("sample_name")
+                        .set_index("sample_name")
+                    )
+                    for col in cols_to_inject:
+                        adata.obs[col] = (
+                            adata.obs["sample_name"]
+                            .map(meta_map[col])
+                            .astype(str)
+                            .fillna("(unknown)")
+                        )
+
+            composition_dir = _resolve_state_paths(out, ct).state_composition_outdir
             composition_dir.mkdir(parents=True, exist_ok=True)
             return save_state_composition_report(
-                adata=self._model_adata,
+                adata=adata,
                 output_pdf_path=composition_dir / "state_composition_report.pdf",
                 output_csv_path=composition_dir / "state_composition_report.csv",
                 time_col="position_t",
-                state_col="ClusterID",
+                state_col=FULL_STATE_COL,
                 sample_col="sample_name",
                 include_pooled_summary=True,
                 group_cols=selected_cols,
@@ -1251,22 +1915,27 @@ class StateClassificationSubTab(QWidget):
         if self._bg.is_running():
             QMessageBox.warning(self, "Busy", "Another operation is running.")
             return
-        if getattr(self, "_model_adata", None) is None:
+        full_path = self._full_adata_path(ct)
+        if not full_path or not full_path.exists():
             QMessageBox.warning(self, "No data", "Run state classification first.")
             return
         out = self._out_dir()
         self._log(f"▶ Generating state transition report for '{ct}'…")
 
         def _run(**kw):
+            import anndata as ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.analysis.behavior.state.utils import _resolve_state_paths
             from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
                 save_state_transition_report,
             )
-            transition_dir = out / "state_transitions"
+            adata = ad.read_h5ad(str(full_path))
+            transition_dir = _resolve_state_paths(out, ct).state_transitions_outdir
             transition_dir.mkdir(parents=True, exist_ok=True)
             return save_state_transition_report(
-                adata=self._model_adata,
+                adata=adata,
                 output_dir=transition_dir,
-                state_col="ClusterID",
+                state_col=FULL_STATE_COL,
                 time_col="position_t",
                 verbose=True,
             )
@@ -1288,33 +1957,126 @@ class StateClassificationSubTab(QWidget):
 
     # ── Backprojection ───────────────────────────────────────────────────
 
+    def _on_bp_layer_display_changed(self, event=None):
+        self._display_save_timer.start()
+
+    def _persist_bp_viewer_display(self):
+        _bp_save_channel_display(self.viewer, self.metadata_loader, self._out_dir)
+
     def _on_show_state_bp(self):
         ct = self._cell_type()
         sample = self._sample()
         if not ct:
             QMessageBox.warning(self, "No cell type", "Select a cell type first.")
             return
-        state_path = self._full_adata_path(ct)
-        if not state_path or not state_path.exists():
-            QMessageBox.warning(
-                self, "No state adata",
-                f"State adata not found:\n{state_path}\n\nRun State Classification first."
-            )
-            return
         color_by = self.combo_state_color_by.currentText()
+        if color_by == "raw_hmm_state":
+            state_path = self._model_adata_path(ct)
+            err_hint = "Model adata not found. Run State Classification (Step 1) first."
+        else:
+            state_path = self._full_adata_path(ct)
+            err_hint = f"State adata not found:\n{state_path}\n\nRun State Classification first."
+        if not state_path or not state_path.exists():
+            QMessageBox.warning(self, "No state adata", err_hint)
+            return
         opacity = self.spin_state_opacity.value() / 100.0
         self._log(f"▶ Loading state backprojection for '{ct}' / sample '{sample}'…")
         try:
-            from behav3d.napari.backprojection import show_behavioral_state_backprojection
-            show_behavioral_state_backprojection(
-                viewer=self.viewer,
-                adata_path=str(state_path),
+            import scanpy as sc
+            from behav3d.analysis.behavior.state.visualization.backprojection import (
+                export_behavioral_state_backprojection_zarrs,
+                _behavioral_state_backprojection_path,
+                _resolve_raw_image_path,
+                _resolve_tracked_image_path,
+                _extract_state_label_map,
+                _extract_state_code_color_map,
+                _apply_state_code_colors_to_layer,
+                _add_mapping_dock_widget,
+                _build_state_mapping_text,
+                _align_labels_to_raw_shape_for_view,
+            )
+            from behav3d.io.images import load_image
+            out_dir = self._out_dir()
+            if not out_dir:
+                raise ValueError("No output directory set.")
+            adata = sc.read_h5ad(str(state_path))
+            resolved_col = "hmm_intrinsic_behavioral_state_raw" if color_by == "raw_hmm_state" else color_by
+            state_col = resolved_col if (resolved_col and resolved_col in adata.obs.columns) else "full_behavioral_cluster"
+            obs_samples = adata.obs["sample_name"].astype(str)
+            sample_name = sample if sample else obs_samples.iloc[0]
+            sample_adata = adata[obs_samples == str(sample_name)]
+            export_behavioral_state_backprojection_zarrs(
+                adata=sample_adata,
+                output_dir=out_dir,
                 cell_type=ct,
-                sample=sample if sample else None,
-                color_by=color_by,
-                opacity=opacity,
-                metadata=getattr(self.metadata_loader, "metadata", None),
-                output_dir=str(self._out_dir()) if self._out_dir() else "",
+                state_col=state_col,
+                enforce_time_coverage=True,
+                n_workers=1,
+                verbose=False,
+            )
+            state_img_path = _behavioral_state_backprojection_path(out_dir, sample_name, ct)
+            raw_path = _resolve_raw_image_path(out_dir, sample_name, verbose=False)
+            if raw_path is None or not Path(raw_path).exists():
+                raise FileNotFoundError(f"Raw image not found for sample '{sample_name}'.")
+            tracked_path = _resolve_tracked_image_path(out_dir, sample_name, ct, verbose=False)
+            if tracked_path is None or not Path(tracked_path).exists():
+                raise FileNotFoundError(
+                    f"Tracked image not found for sample '{sample_name}', cell_type '{ct}'."
+                )
+            raw_img = load_image(raw_path)
+            tracked_img = load_image(tracked_path)
+            state_img = load_image(state_img_path)
+            tracked_view = _align_labels_to_raw_shape_for_view(tracked_img, raw_img, "TrackID", verbose=False)
+            state_view = _align_labels_to_raw_shape_for_view(
+                state_img, raw_img, color_by, verbose=False
+            )
+            _state_layer_names = {
+                "full_behavioral_cluster", "intrinsic_behavioral_cluster",
+                "raw_hmm_state", "behavioral_state_class",
+            }
+            for layer in list(self.viewer.layers):
+                if layer.name in {"TrackID"} | _state_layer_names or " – Ch" in layer.name:
+                    try:
+                        self.viewer.layers.remove(layer)
+                    except Exception:
+                        pass
+            saved_channels = (
+                getattr(self.metadata_loader, "behav3d_parameters", {})
+                .get("viewer_display", {})
+                .get("channels", {})
+            )
+            try:
+                md = self.metadata_loader.metadata
+                row = md[md["sample_name"] == sample_name].iloc[0]
+                dim_order = str(row.get("dimension_order", "TCZYX")).strip() or "TCZYX"
+            except Exception:
+                dim_order = "TCZYX"
+            ch_names = _bp_add_raw_channels(self.viewer, raw_img, sample_name, saved_channels, dim_order)
+            for lname in ch_names:
+                try:
+                    layer = self.viewer.layers[lname]
+                    layer.events.contrast_limits.connect(self._on_bp_layer_display_changed)
+                    layer.events.colormap.connect(self._on_bp_layer_display_changed)
+                except (KeyError, IndexError):
+                    pass
+            self.viewer.add_labels(tracked_view, name="TrackID", visible=False, opacity=opacity)
+            state_layer = self.viewer.add_labels(state_view, name=color_by, opacity=opacity)
+            code_colors = _extract_state_code_color_map(state_img_path)
+            _apply_state_code_colors_to_layer(state_layer, code_colors)
+            label_map = _extract_state_label_map(state_img_path)
+            mapping_text = _build_state_mapping_text(label_map, code_colors)
+            _existing_dock = getattr(self, "_state_mapping_dock", None)
+            if _existing_dock is not None:
+                try:
+                    self.viewer.window.remove_dock_widget(_existing_dock)
+                except Exception:
+                    pass
+            self._state_mapping_dock = _add_mapping_dock_widget(
+                self.viewer,
+                mapping_text=mapping_text,
+                label_map=label_map,
+                code_colors=code_colors,
+                title="State Class Mapping",
             )
             self._log("✅ State backprojection loaded.")
         except Exception as e:
@@ -1335,26 +2097,30 @@ class StateClassificationSubTab(QWidget):
             QMessageBox.warning(self, "Busy", "Another operation is running.")
             return
         color_by = self.combo_state_color_by.currentText()
-        dpi = int(self.spin_state_export_dpi.value())
-        make_pdf = self.chk_state_export_pdf.isChecked()
-        make_mp4 = self.chk_state_export_mp4.isChecked()
         out = self._out_dir()
         logger = ThreadSafeLogger(self._log)
         self._log(f"▶ Exporting state backprojection for '{ct}'…")
 
         def _run(**kw):
-            from behav3d.napari.backprojection import export_behavioral_state_backprojection
-            return export_behavioral_state_backprojection(
-                adata_path=str(state_path),
+            import scanpy as sc
+            from behav3d.analysis.behavior.state.visualization.backprojection import (
+                export_behavioral_state_backprojection_zarrs,
+            )
+            adata = sc.read_h5ad(str(state_path))
+            state_col = color_by if color_by else "full_behavioral_cluster"
+            sample_name = sample if sample else None
+            export_adata = (
+                adata[adata.obs["sample_name"].astype(str) == str(sample_name)]
+                if sample_name is not None else adata
+            )
+            logger("▶ Writing state backprojection zarrs…")
+            return export_behavioral_state_backprojection_zarrs(
+                adata=export_adata,
+                output_dir=out,
                 cell_type=ct,
-                sample=sample if sample else None,
-                color_by=color_by,
-                output_dir=str(out) if out else "",
-                metadata=getattr(self.metadata_loader, "metadata", None),
-                dpi=dpi,
-                make_pdf=make_pdf,
-                make_mp4=make_mp4,
-                log_callback=logger,
+                state_col=state_col,
+                enforce_time_coverage=True,
+                n_workers=1,
                 verbose=True,
             )
 
@@ -1365,7 +2131,7 @@ class StateClassificationSubTab(QWidget):
             buttons=[self.btn_export_state_bp, self.btn_show_state_bp],
             viewer=self.viewer,
             inject_progress=False,
-            on_done=lambda r: self._log("✅ State backprojection export done."),
+            on_done=lambda r: _log_backprojection_manifest(self._log, r),
             on_failed=lambda e: self._log(f"❌ Export failed: {e}"),
         )
 
@@ -1443,7 +2209,14 @@ class TrackClassificationSubTab(QWidget):
         self.metadata_loader = metadata_loader
         self._get_cell_type = cell_type_getter
         self._track_adata = None
+        self._track_adata_load_error: Optional[str] = None
         self._bg = BackgroundOperation(self)
+        self._preload_bg = BackgroundOperation(self)
+
+        self._display_save_timer = QTimer(self)
+        self._display_save_timer.setSingleShot(True)
+        self._display_save_timer.setInterval(1000)
+        self._display_save_timer.timeout.connect(self._persist_bp_viewer_display)
 
         # Queue buttons (wired by _widget.py)
         self.btn_queue_track_cluster = _make_queue_btn()
@@ -1538,11 +2311,17 @@ class TrackClassificationSubTab(QWidget):
         self.spin_traj_size.setRange(1, 9999)
         self.spin_traj_size.setValue(100)
         self.spin_traj_size.setMaximumWidth(120)
-        basic_form.addRow("Trajectory size:", make_help_row(
+        basic_form.addRow("Trajectory size (timepoints):", make_help_row(
             self.spin_traj_size, "Trajectory size",
-            "Number of timepoints to include per track (trims from the end by default). "
-            "Shorter trajectories are discarded. Match the value used in your notebook."
+            "Number of timepoints to include per track. With the default 'last' trim mode "
+            "this keeps each track's final N timepoints (dropping its earlier ones); "
+            "tracks shorter than this are discarded. Match the value used in your notebook. "
+            "The line below shows the equivalent real time, computed from this sample's "
+            "time_interval/time_unit metadata."
         ))
+        self.lbl_traj_size_time = _make_timepoint_time_label()
+        basic_form.addRow("", self.lbl_traj_size_time)
+        self.spin_traj_size.valueChanged.connect(self._update_timepoint_time_labels)
         self.spin_n_clusters = QSpinBox()
         self.spin_n_clusters.setRange(2, 200)
         self.spin_n_clusters.setValue(6)
@@ -1600,8 +2379,9 @@ class TrackClassificationSubTab(QWidget):
         self.combo_trim.setMaximumWidth(130)
         dtw_form.addRow("Trim mode:", make_help_row(
             self.combo_trim, "Trim mode",
-            "How to trim trajectories to behavioral_trajectory_size: "
-            "'last' removes trailing timepoints; 'first' removes leading ones."
+            "How to trim each track to Trajectory size: "
+            "'last' keeps each track's final N timepoints (removes leading/early ones); "
+            "'first' keeps each track's first N timepoints (removes trailing/late ones)."
         ))
         self.adv1.addLayout(dtw_form)
 
@@ -1684,9 +2464,21 @@ class TrackClassificationSubTab(QWidget):
         g2.addLayout(rename_row)
         lay.addWidget(self.grp2)
 
-        # ── Step 3: Classify Tracks ──────────────────────────────────────
-        self.grp3 = QGroupBox("Step 3 — Classify Tracks")
-        g3 = QVBoxLayout(self.grp3)
+        # ── Train Track Classifier (last step) ───────────────────────────
+        self.grp3 = CollapsibleSection("Train track classifier", expanded=False)
+        self.grp3._toggle.setStyleSheet(
+            "QToolButton { border: 2px solid #28a745; border-radius: 5px; font-weight: bold; "
+            "color: #28a745; font-size: 12px; background-color: rgba(40, 167, 69, 0.06); "
+            "padding: 4px 8px; text-align: left; }"
+            "QToolButton:hover { background-color: rgba(40, 167, 69, 0.12); }"
+            "QToolButton:checked { border-bottom-left-radius: 0px; border-bottom-right-radius: 0px; }"
+        )
+        self.grp3._content.setStyleSheet(
+            "QFrame { border: 2px solid #28a745; border-top: none; "
+            "border-bottom-left-radius: 5px; border-bottom-right-radius: 5px; "
+            "background-color: rgba(40, 167, 69, 0.06); padding: 4px; }"
+        )
+        g3 = self.grp3.contentLayout()
         g3.setSpacing(6)
 
         # Sub-section A: Train RF Classifier
@@ -1757,12 +2549,12 @@ class TrackClassificationSubTab(QWidget):
         ))
 
         self.combo_track_max_features = QComboBox()
-        self.combo_track_max_features.addItems(["sqrt", "log2", "auto"])
+        self.combo_track_max_features.addItems(["sqrt", "log2"])
         self.combo_track_max_features.setMaximumWidth(100)
         adv3_form.addRow("Max features:", make_help_row(
             self.combo_track_max_features, "Max features",
-            "Number of features to consider at each split: 'sqrt' (recommended), "
-            "'log2', or 'auto' (same as sqrt)."
+            "Number of features considered when looking for the best split: "
+            "'sqrt' (recommended) or 'log2'."
         ))
 
         self.spin_track_n_jobs = QSpinBox()
@@ -1824,10 +2616,8 @@ class TrackClassificationSubTab(QWidget):
         g_apply_clf.addLayout(apply_clf_run_row)
         g3.addWidget(grp_apply_clf)
 
-        lay.addWidget(self.grp3)
-
-        # ── Step 4: Create Plots ─────────────────────────────────────────
-        self.grp4 = QGroupBox("Step 4 — Create Plots")
+        # ── Step 3: Create Plots ─────────────────────────────────────────
+        self.grp4 = QGroupBox("Step 3 — Create Plots")
         g4 = QVBoxLayout(self.grp4)
         g4.setSpacing(6)
 
@@ -1894,7 +2684,7 @@ class TrackClassificationSubTab(QWidget):
         lay.addWidget(self.grp4)
 
         # ── Step 5: Backprojection ───────────────────────────────────────
-        self.grp_bp = QGroupBox("Step 5 — Backprojection")
+        self.grp_bp = QGroupBox("Step 4 — Backprojection")
         g_bp5 = QVBoxLayout(self.grp_bp)
         g_bp5.setSpacing(6)
 
@@ -1924,9 +2714,7 @@ class TrackClassificationSubTab(QWidget):
         tbp_form.addRow("Sample:", self.sample_combo)
 
         self.combo_track_color_by = QComboBox()
-        self.combo_track_color_by.addItems(
-            ["behavioral_trajectory_cluster", "dtaidistance_cluster", "track_cluster"]
-        )
+        # populated dynamically from actual obs columns when track adata is loaded
         self.combo_track_color_by.setMinimumWidth(220)
         tbp_form.addRow("Color by:", make_help_row(
             self.combo_track_color_by, "Color by",
@@ -1949,39 +2737,15 @@ class TrackClassificationSubTab(QWidget):
         _style_primary(self.btn_show_track_bp)
         track_view_row.addWidget(self.btn_show_track_bp, stretch=1)
         g_track_view.addLayout(track_view_row)
-        g_bp5.addWidget(grp_track_view)
-
-        # Export options (collapsed)
-        track_export_sec = CollapsibleSection("⚙ Export Options", expanded=False)
-        track_export_form = QFormLayout()
-        self.spin_track_export_dpi = QSpinBox()
-        self.spin_track_export_dpi.setRange(50, 600)
-        self.spin_track_export_dpi.setValue(150)
-        self.spin_track_export_dpi.setSuffix(" dpi")
-        self.spin_track_export_dpi.setMaximumWidth(110)
-        track_export_form.addRow("DPI (PDF):", make_help_row(
-            self.spin_track_export_dpi, "Export DPI",
-            "Resolution for exported PDF images."
-        ))
-        track_export_sec.addLayout(track_export_form)
-
-        track_export_opts = QHBoxLayout()
-        self.chk_track_pdf = QCheckBox("PDF")
-        self.chk_track_pdf.setChecked(True)
-        track_export_opts.addWidget(self.chk_track_pdf)
-        self.chk_track_mp4 = QCheckBox("MP4")
-        self.chk_track_mp4.setChecked(False)
-        track_export_opts.addWidget(self.chk_track_mp4)
-        track_export_opts.addStretch()
-        track_export_sec.addLayout(track_export_opts)
 
         track_export_run_row = QHBoxLayout()
         self.btn_export_track_bp = QPushButton("▶ Export Track Backprojection")
         _style_secondary(self.btn_export_track_bp)
         track_export_run_row.addWidget(self.btn_export_track_bp, stretch=1)
-        track_export_sec.addLayout(track_export_run_row)
-        g_bp5.addWidget(track_export_sec)
+        g_track_view.addLayout(track_export_run_row)
+        g_bp5.addWidget(grp_track_view)
         lay.addWidget(self.grp_bp)
+        lay.addWidget(self.grp3)
 
         # ── Progress + Log ───────────────────────────────────────────────
         self.progress_row = ProgressBarRow()
@@ -2075,12 +2839,13 @@ class TrackClassificationSubTab(QWidget):
                 chk.blockSignals(False)
             self._apply_original_mode(False)
 
+            _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
             return True
 
     # ── Toggle helpers ───────────────────────────────────────────────────
 
     def _toggle_pretrained_mode(self, checked: bool):
-        """Hide Steps 1–3 when apply-pretrained mode is active."""
+        """Hide Steps 1–2 and the train classifier box when apply-pretrained mode is active."""
         self.grp1.setVisible(not checked)
         self.grp2.setVisible(not checked)
         self.grp3.setVisible(not checked)
@@ -2092,6 +2857,8 @@ class TrackClassificationSubTab(QWidget):
         self.chk_use_original_top.setChecked(checked)
         self.chk_use_original_top.blockSignals(False)
         self._apply_original_mode(checked)
+        if checked:
+            self._show_original_dtw_disclaimer()
 
     def _on_original_toggled_from_top(self, checked: bool):
         """Top checkbox toggled (user unchecks from top) → sync adv checkbox + apply mode."""
@@ -2099,6 +2866,8 @@ class TrackClassificationSubTab(QWidget):
         self.chk_use_original.setChecked(checked)
         self.chk_use_original.blockSignals(False)
         self._apply_original_mode(checked)
+        if checked:
+            self._show_original_dtw_disclaimer()
 
     def _apply_original_mode(self, checked: bool):
         """Update visibility of UI sections for original vs dtaidistance mode."""
@@ -2109,6 +2878,29 @@ class TrackClassificationSubTab(QWidget):
             self.btn_run_track.setText("▶ Run Original BEHAV3D DTW")
         else:
             self.btn_run_track.setText("▶ Run Track Clustering")
+
+    def _show_original_dtw_disclaimer(self):
+        """Warn the user that the original BEHAV3D DTW pipeline requires equal-length tracks."""
+        if getattr(self, '_hide_original_dtw_disclaimer', False):
+            return
+
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Warning)
+        msg_box.setWindowTitle("Track length requirement")
+        msg_box.setText(
+            "The original feature-based BEHAV3D DTW pipeline requires that all tracks "
+            "be of the same length for a reliable result.\n\n"
+            "If your tracks are not all the same length, please go back to the "
+            "Filtering tab and filter/trim them to a uniform length before running "
+            "this analysis."
+        )
+        
+        cb = QCheckBox("Don't show again")
+        msg_box.setCheckBox(cb)
+        msg_box.exec_()
+        
+        if cb.isChecked():
+            self._hide_original_dtw_disclaimer = True
 
     # ── Browse helpers ───────────────────────────────────────────────────
 
@@ -2140,27 +2932,101 @@ class TrackClassificationSubTab(QWidget):
         if fpath:
             self.le_apply_states_path.setText(fpath)
 
+    # ── Config persistence / restoration ────────────────────────────────────
+
+    def _collect_track_params(self, ct: str) -> dict:
+        return {
+            "behavioral_trajectory_size": int(self.spin_traj_size.value()),
+            "n_clusters":                 int(self.spin_n_clusters.value()),
+            "linkage":                    self.combo_linkage.currentText(),
+            "trajectory_trim_mode":       self.combo_trim.currentText(),
+            "parallel":                   self.chk_parallel.isChecked(),
+            "save_distance_matrix":       self.chk_save_dist.isChecked(),
+            "random_state":               int(self.spin_seed.value()),
+            "use_original":               self.chk_use_original.isChecked(),
+            "umap_n_neighbors":           int(self.spin_umap_neighbors.value()),
+            "umap_min_dist":              float(self.spin_umap_min_dist.value()),
+            "rf_n_estimators":            int(self.spin_track_n_est.value()),
+            "rf_max_depth":               int(self.spin_track_max_depth.value()),
+            "rf_test_size_pct":           float(self.spin_track_test_pct.value()),
+            "rf_min_samples_leaf":        int(self.spin_track_min_leaf.value()),
+            "rf_min_samples_split":       int(self.spin_track_min_split.value()),
+            "rf_max_features":            self.combo_track_max_features.currentText(),
+            "rf_n_jobs":                  int(self.spin_track_n_jobs.value()),
+        }
+
+    def _persist_track_cfg(self, ct: str):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if not isinstance(params, dict):
+            return
+        params.setdefault("track_classification", {})[ct] = self._collect_track_params(ct)
+        _save_behav3d_params(self.metadata_loader, self._out_dir)
+
+    def _populate_track_settings(self, ct: str):
+        cfg = getattr(self.metadata_loader, "behav3d_parameters", {}).get("track_classification", {}).get(ct, {})
+        if not cfg:
+            return
+        if "behavioral_trajectory_size" in cfg:
+            self.spin_traj_size.setValue(int(cfg["behavioral_trajectory_size"]))
+        if "n_clusters" in cfg:
+            self.spin_n_clusters.setValue(int(cfg["n_clusters"]))
+        if "linkage" in cfg:
+            self.combo_linkage.setCurrentText(cfg["linkage"])
+        if "trajectory_trim_mode" in cfg:
+            self.combo_trim.setCurrentText(cfg["trajectory_trim_mode"])
+        if "parallel" in cfg:
+            self.chk_parallel.setChecked(bool(cfg["parallel"]))
+        if "save_distance_matrix" in cfg:
+            self.chk_save_dist.setChecked(bool(cfg["save_distance_matrix"]))
+        if "random_state" in cfg:
+            self.spin_seed.setValue(int(cfg["random_state"]))
+        if "umap_n_neighbors" in cfg:
+            self.spin_umap_neighbors.setValue(int(cfg["umap_n_neighbors"]))
+        if "umap_min_dist" in cfg:
+            self.spin_umap_min_dist.setValue(float(cfg["umap_min_dist"]))
+        if "rf_n_estimators" in cfg:
+            self.spin_track_n_est.setValue(int(cfg["rf_n_estimators"]))
+        if "rf_max_depth" in cfg:
+            self.spin_track_max_depth.setValue(int(cfg["rf_max_depth"]))
+        if "rf_test_size_pct" in cfg:
+            self.spin_track_test_pct.setValue(float(cfg["rf_test_size_pct"]))
+        if "rf_min_samples_leaf" in cfg:
+            self.spin_track_min_leaf.setValue(int(cfg["rf_min_samples_leaf"]))
+        if "rf_min_samples_split" in cfg:
+            self.spin_track_min_split.setValue(int(cfg["rf_min_samples_split"]))
+        if "rf_max_features" in cfg:
+            self.combo_track_max_features.setCurrentText(cfg["rf_max_features"])
+        if "rf_n_jobs" in cfg:
+            self.spin_track_n_jobs.setValue(int(cfg["rf_n_jobs"]))
+        if "use_original" in cfg:
+            val = bool(cfg["use_original"])
+            self.chk_use_original.blockSignals(True)
+            self.chk_use_original.setChecked(val)
+            self.chk_use_original.blockSignals(False)
+            self._apply_original_mode(val)
+
     # ── Metadata / reload ────────────────────────────────────────────────
 
     def on_metadata_updated(self):
         self._reload()
 
+    def _update_timepoint_time_labels(self, *_):
+        metadata = getattr(self.metadata_loader, "metadata", None)
+        self.lbl_traj_size_time.setText(
+            format_timepoints_as_time(self.spin_traj_size.value(), metadata)
+        )
+
     def _reload(self):
+        self._update_timepoint_time_labels()
         ct = self._cell_type()
         if not ct:
             self._track_adata = None
+            self._track_adata_load_error = None
             self._refresh_buttons()
             return
+
+        # ── Fast synchronous phase (main thread) ──────────────────────────
         path = self._track_adata_path(ct)
-        if path and path.exists():
-            try:
-                import anndata as ad
-                self._track_adata = ad.read_h5ad(str(path))
-            except Exception:
-                traceback.print_exc()
-                self._track_adata = None
-        else:
-            self._track_adata = None
 
         # Auto-fill classifier path if .pkl exists
         clf_path = self._track_classifier_path(ct)
@@ -2174,10 +3040,66 @@ class TrackClassificationSubTab(QWidget):
             self.le_apply_states_path.setText(str(states_path))
             self.le_pretrained_states_path.setText(str(states_path))
 
+        self._populate_track_settings(ct)
         self._check_prerequisites()
-        self._refresh_buttons()
         self._update_view_buttons()
         self._update_bp_buttons()
+
+        # Reset adata so buttons reflect "not yet loaded" state immediately.
+        self._track_adata = None
+        self._track_adata_load_error = None
+        self._refresh_buttons()
+
+        if not path or not path.exists():
+            return
+
+        # ── Slow async phase (background thread) ──────────────────────────
+        # Skip if a previous preload is still in flight (e.g. rapid tab switches).
+        if self._preload_bg.is_running():
+            return
+
+        def _load():
+            import h5py
+            import anndata as ad
+            if not h5py.is_hdf5(str(path)):
+                raise ValueError(f"Not a valid HDF5 file: {path.name}")
+            return ad.read_h5ad(str(path))
+
+        def _on_done(result):
+            self._track_adata = result
+            self._refresh_buttons()
+            self._sync_track_cluster_combo(result)
+
+        def _on_failed(err):
+            print(f"[BEHAV3D] Track adata failed to load: {err}")
+            self._track_adata_load_error = err
+            self._refresh_buttons()
+
+        self._preload_bg.run(
+            fn=_load,
+            inject_progress=False,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )
+
+    def _autofill_paths(self, ct: str):
+        """Lightweight path auto-fill called on tab switch.
+
+        Only checks whether the states h5ad and classifier pkl exist and fills
+        the corresponding line-edit fields.  Avoids the full _reload() cost
+        (widget rebuild, prerequisite check, async h5ad load) that is
+        unnecessary when switching tabs after a previous _reload already ran.
+        """
+        if not ct:
+            return
+        clf_path = self._track_classifier_path(ct)
+        if clf_path and clf_path.exists():
+            self.le_apply_clf_path.setText(str(clf_path))
+            self.le_pretrained_clf_path.setText(str(clf_path))
+        states_path = self._state_adata_path(ct)
+        if states_path and states_path.exists():
+            self.le_apply_states_path.setText(str(states_path))
+            self.le_pretrained_states_path.setText(str(states_path))
 
     # ── Path helpers ─────────────────────────────────────────────────────
 
@@ -2186,14 +3108,36 @@ class TrackClassificationSubTab(QWidget):
         return Path(str(od)).expanduser() if od else None
 
     def _track_adata_path(self, ct: str) -> Optional[Path]:
+        from behav3d.analysis.behavior.track.utils import get_dtaidistance_track_trajectories_filename
         out = self._out_dir()
         if not out:
             return None
         d = out / "analysis" / ct / "behavorial_trajectories"
+        canonical = d / get_dtaidistance_track_trajectories_filename(ct)
+        if canonical.exists():
+            return canonical
         if d.exists():
             for f in sorted(d.glob("*.h5ad")):
                 return f
-        return d / f"BEHAV3D_{ct}_track_trajectories.h5ad"
+        return None
+
+    def _sync_track_cluster_combo(self, adata_tracks) -> None:
+        """Repopulate the 'Color by' combo from actual obs columns in adata_tracks."""
+        from behav3d.napari._rename_dialog import _track_cluster_col
+        primary = _track_cluster_col(adata_tracks)
+        if primary is None:
+            return
+        options = [primary]
+        original_col = f"{primary}_original"
+        if original_col in adata_tracks.obs.columns:
+            options.append(original_col)
+        current = self.combo_track_color_by.currentText()
+        self.combo_track_color_by.blockSignals(True)
+        self.combo_track_color_by.clear()
+        self.combo_track_color_by.addItems(options)
+        if current in options:
+            self.combo_track_color_by.setCurrentText(current)
+        self.combo_track_color_by.blockSignals(False)
 
     def _track_classifier_path(self, ct: str) -> Optional[Path]:
         out = self._out_dir()
@@ -2244,6 +3188,10 @@ class TrackClassificationSubTab(QWidget):
             self.rename_track_status.setText(
                 f"✅ Track adata loaded: {self._track_adata.n_obs} rows."
             )
+        elif self._track_adata_load_error:
+            self.rename_track_status.setText(
+                f"⚠ Track adata failed to load — re-run clustering. ({self._track_adata_load_error})"
+            )
         else:
             self.rename_track_status.setText("ℹ Run clustering first to enable renaming.")
 
@@ -2268,16 +3216,19 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_exemplars.setEnabled(
             bool(traj_dir and any(traj_dir.glob("exemplar_tracks*.pdf")))
         )
+        qc_dir = traj_dir / "quality_control" if traj_dir else None
         self.btn_view_diagnostics.setEnabled(
-            bool(traj_dir and any(traj_dir.glob("diagnostics*.pdf")))
+            bool(qc_dir and any(qc_dir.glob("*diagnostics*.pdf")))
         )
 
     def _update_bp_buttons(self):
         ct = self._cell_type()
         track_path = self._track_adata_path(ct) if ct else None
+        state_path = self._state_adata_path(ct) if ct else None
         has_track = bool(track_path and track_path.exists())
-        self.btn_show_track_bp.setEnabled(has_track)
-        self.btn_export_track_bp.setEnabled(has_track)
+        has_state = bool(state_path and state_path.exists())
+        self.btn_show_track_bp.setEnabled(has_track and has_state)
+        self.btn_export_track_bp.setEnabled(has_track and has_state)
 
     # ── Click handlers ───────────────────────────────────────────────────
 
@@ -2311,12 +3262,17 @@ class TrackClassificationSubTab(QWidget):
             "trajectory_trim_mode": self.combo_trim.currentText(),
             "parallel": self.chk_parallel.isChecked(),
             "save_distance_matrix": self.chk_save_dist.isChecked(),
+            "plot_results": True,
         }
 
         on_done_ext = extra_callbacks.get("on_done") if extra_callbacks else None
         on_fail_ext = extra_callbacks.get("on_failed") if extra_callbacks else None
 
         def _run(**kw):
+            import shutil
+            _traj_dir = out / "analysis" / ct / "behavorial_trajectories"
+            if _traj_dir.exists():
+                rmtree_ignore_missing(_traj_dir)
             from behav3d.analysis.behavior.track.state_dtw import (
                 run_categorical_dtaidistance_trajectory_clustering,
             )
@@ -2324,8 +3280,45 @@ class TrackClassificationSubTab(QWidget):
 
         def _done(r):
             self._log(f"✅ Track clustering done for '{ct}'.")
+            self._persist_track_cfg(ct)
             self._reload()
             self._notify_results()
+            _track_adata = r
+            _n_per = int(self.spin_n_per_cluster.value())
+            _seed = int(self.spin_seed.value())
+            _log = self._log
+
+            def _run_overview(**kw):
+                from behav3d.analysis.behavior.track.state_dtw import save_dtaidistance_exemplar_overview
+                from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+                _raw_dir = _resolve_dtaidistance_paths(str(out), ct)["quality_control_outfolder"] / "raw"
+                _raw_dir.mkdir(parents=True, exist_ok=True)
+                return save_dtaidistance_exemplar_overview(
+                    _track_adata,
+                    output_dir=str(out),
+                    cell_type=ct,
+                    n_per_cluster=_n_per,
+                    random_state=_seed,
+                    outfolder=_raw_dir,
+                    verbose=True,
+                )
+
+            def _overview_done(_):
+                _log("✅ Exemplar overview done.")
+                QTimer.singleShot(0, self._update_view_buttons)
+
+            def _start_overview():
+                self._bg.run(
+                    fn=_run_overview,
+                    desc=f"Exemplar overview ({ct})…",
+                    progress_row=self.progress_row,
+                    buttons=[],
+                    viewer=self.viewer,
+                    inject_progress=False,
+                    on_done=_overview_done,
+                    on_failed=lambda e: self._log(f"⚠ Exemplar overview failed: {e}"),
+                )
+            QTimer.singleShot(0, _start_overview)
             if on_done_ext:
                 on_done_ext(r)
 
@@ -2376,6 +3369,10 @@ class TrackClassificationSubTab(QWidget):
         min_dist = float(self.spin_umap_min_dist.value())
 
         def _run(**kw):
+            import shutil
+            _traj_dir = out / "analysis" / ct / "behavorial_trajectories"
+            if _traj_dir.exists():
+                rmtree_ignore_missing(_traj_dir)
             from behav3d.analysis.behavior.track.feature_dtw import run_tcell_analysis
             return run_tcell_analysis(
                 output_dir=str(out) if out else "",
@@ -2386,7 +3383,19 @@ class TrackClassificationSubTab(QWidget):
                 umap_n_neighbors=n_neigh,
                 umap_minimal_distance=min_dist,
                 feature_scaling_preset="original_behav3d",
+                output_subdir_name="behavorial_trajectories/original_behav3d",
             )
+
+        def _done(_):
+            from behav3d.analysis.behavior.track.feature_dtw import _create_original_behav3d_adata
+            try:
+                _create_original_behav3d_adata(str(out), ct)
+            except Exception as e:
+                self._log(f"⚠ Could not create h5ad from original BEHAV3D results: {e}")
+            self._log(f"✅ Original BEHAV3D clustering done for '{ct}'.")
+            self._persist_track_cfg(ct)
+            self._reload()
+            self._notify_results()
 
         self._bg.run(
             fn=_run,
@@ -2395,11 +3404,7 @@ class TrackClassificationSubTab(QWidget):
             buttons=[self.btn_run_track],
             viewer=self.viewer,
             inject_progress=False,
-            on_done=lambda r: (
-                self._log(f"✅ Original BEHAV3D clustering done for '{ct}'."),
-                self._reload(),
-                self._notify_results(),
-            ),
+            on_done=_done,
             on_failed=lambda e: self._log(f"❌ Original BEHAV3D failed: {e}"),
         )
 
@@ -2418,9 +3423,11 @@ class TrackClassificationSubTab(QWidget):
         dlg.clusters_renamed.connect(
             lambda mapping: self._log(f"✅ Track clusters renamed: {mapping}")
         )
-        dlg.exec_()
-        self._refresh_buttons()
-        self._update_view_buttons()
+        if dlg.exec_() == QDialog.Accepted:
+            self._refresh_buttons()
+            self._update_view_buttons()
+            if self._track_adata is not None:
+                self._sync_track_cluster_combo(self._track_adata)
 
     def _on_train_track(self):
         ct = self._cell_type()
@@ -2466,6 +3473,7 @@ class TrackClassificationSubTab(QWidget):
 
         def _done(r):
             self._log(f"✅ Track classifier trained for '{ct}'.")
+            self._persist_track_cfg(ct)
             # Auto-fill classifier path
             clf_path = None
             if isinstance(r, dict):
@@ -2538,6 +3546,7 @@ class TrackClassificationSubTab(QWidget):
 
         def _done(r):
             self._log(f"✅ Track classifier trained for '{ct}'.")
+            self._persist_track_cfg(ct)
             self._update_view_buttons()
             self._notify_results()
             if on_done_cb:
@@ -2729,30 +3738,112 @@ class TrackClassificationSubTab(QWidget):
             QMessageBox.warning(self, "Busy", "Another operation is running.")
             return
         out = self._out_dir()
-        logger = ThreadSafeLogger(self._log)
         n_per = int(self.spin_n_per_cluster.value())
         make_overview = self.chk_overview_statebars.isChecked()
         make_bp_pdf = self.chk_backproj_pdf.isChecked()
         make_bp_mp4 = self.chk_backproj_mp4.isChecked()
         self._log(f"▶ Creating exemplar PDFs for '{ct}'…")
         track_adata = self._track_adata
+        state_adata_path = self._state_adata_path(ct)
 
         def _run(**kw):
+            from pathlib import Path as _Path
             from behav3d.analysis.behavior.track.visualization.plots.exemplar_track_per_cluster import (
+                plot_exemplar_tracks_by_cluster,
+                save_exemplar_statebar_track_pdf_per_cluster,
                 save_exemplar_statebar_backprojection_pdf,
+                save_exemplar_statebar_backprojection_video_per_cluster,
             )
-            return save_exemplar_statebar_backprojection_pdf(
-                adata=track_adata,
-                output_dir=str(out) if out else "",
-                cell_type=ct,
-                metadata=getattr(self.metadata_loader, "metadata", None),
-                n_per_cluster=n_per,
-                make_overview_statebars=make_overview,
-                make_backprojection_pdf=make_bp_pdf,
-                make_backprojection_mp4=make_bp_mp4,
-                log_callback=logger,
-                verbose=True,
-            )
+            from matplotlib.backends.backend_pdf import PdfPages
+            import matplotlib.pyplot as plt
+            import anndata as _ad
+
+            if state_adata_path is None or not state_adata_path.exists():
+                raise FileNotFoundError(
+                    f"Behavioral states h5ad not found at {state_adata_path}. "
+                    "Run State Classification first."
+                )
+            full_adata = _ad.read_h5ad(str(state_adata_path))
+
+            out_path = _Path(out) if out else _Path(".")
+            exemplar_root = out_path / "example_tracks"
+            exemplar_root.mkdir(parents=True, exist_ok=True)
+            results = {}
+
+            if make_overview:
+                fig, _, _ = plot_exemplar_tracks_by_cluster(
+                    full_adata,
+                    track_adata,
+                    n_per_cluster=n_per,
+                    sample_key="sample_name",
+                    track_key="TrackID",
+                    time_key="position_t",
+                    state_key="ClusterID",
+                    cluster_key="ClusterID",
+                    tmin_key="position_t_min",
+                    tmax_key="position_t_max",
+                )
+                overview_pdf = exemplar_root / "example_tracks_overview.pdf"
+                with PdfPages(overview_pdf) as pdf:
+                    pdf.savefig(fig, bbox_inches="tight", dpi=300)
+                plt.close(fig)
+                results["overview_pdf"] = str(overview_pdf)
+
+                statebar_out = save_exemplar_statebar_track_pdf_per_cluster(
+                    adata_full=full_adata,
+                    out_dir=exemplar_root,
+                    adata_tracks=track_adata,
+                    n_per_cluster=n_per,
+                    sample_key="sample_name",
+                    track_key="TrackID",
+                    time_key="position_t",
+                    state_key="ClusterID",
+                    cluster_key="ClusterID",
+                    tmin_key="position_t_min",
+                    tmax_key="position_t_max",
+                    verbose=True,
+                )
+                results["statebar_pdfs"] = statebar_out
+
+            if make_bp_pdf:
+                bp_pdf_out = save_exemplar_statebar_backprojection_pdf(
+                    full_adata,
+                    output_dir=str(out_path),
+                    cell_type=ct,
+                    out_dir=exemplar_root / "backprojection",
+                    adata_tracks=track_adata,
+                    n_per_cluster=n_per,
+                    sample_key="sample_name",
+                    track_key="TrackID",
+                    time_key="position_t",
+                    state_key="ClusterID",
+                    cluster_key="ClusterID",
+                    tmin_key="position_t_min",
+                    tmax_key="position_t_max",
+                    verbose=True,
+                )
+                results["backprojection_pdf"] = bp_pdf_out
+
+            if make_bp_mp4:
+                bp_mp4_out = save_exemplar_statebar_backprojection_video_per_cluster(
+                    full_adata,
+                    output_dir=str(out_path),
+                    cell_type=ct,
+                    out_dir=exemplar_root / "backprojection",
+                    adata_tracks=track_adata,
+                    n_per_cluster=n_per,
+                    sample_key="sample_name",
+                    track_key="TrackID",
+                    time_key="position_t",
+                    state_key="ClusterID",
+                    cluster_key="ClusterID",
+                    tmin_key="position_t_min",
+                    tmax_key="position_t_max",
+                    verbose=True,
+                )
+                results["backprojection_mp4"] = bp_mp4_out
+
+            return results
 
         self._bg.run(
             fn=_run,
@@ -2780,19 +3871,30 @@ class TrackClassificationSubTab(QWidget):
             QMessageBox.warning(self, "Busy", "Another operation is running.")
             return
         out = self._out_dir()
-        logger = ThreadSafeLogger(self._log)
         self._log(f"▶ Creating diagnostics for '{ct}'…")
         track_adata = self._track_adata
 
         def _run(**kw):
-            from behav3d.analysis.behavior.track.state_dtw import save_dtaidistance_diagnostics
-            return save_dtaidistance_diagnostics(
-                adata=track_adata,
+            from behav3d.analysis.behavior.track.state_dtw import (
+                save_dtaidistance_diagnostics,
+                save_dtaidistance_exemplar_overview,
+            )
+            result = save_dtaidistance_diagnostics(
+                adata_tracks=track_adata,
                 output_dir=str(out) if out else "",
                 cell_type=ct,
-                log_callback=logger,
                 verbose=True,
             )
+            try:
+                save_dtaidistance_exemplar_overview(
+                    track_adata,
+                    output_dir=str(out) if out else "",
+                    cell_type=ct,
+                    verbose=True,
+                )
+            except Exception as _exc:
+                print(f"[BEHAV3D] Could not generate exemplar overview: {_exc}")
+            return result
 
         self._bg.run(
             fn=_run,
@@ -2811,6 +3913,12 @@ class TrackClassificationSubTab(QWidget):
 
     # ── Backprojection ───────────────────────────────────────────────────
 
+    def _on_bp_layer_display_changed(self, event=None):
+        self._display_save_timer.start()
+
+    def _persist_bp_viewer_display(self):
+        _bp_save_channel_display(self.viewer, self.metadata_loader, self._out_dir)
+
     def _on_show_track_bp(self):
         ct = self._cell_type()
         sample = self._sample()
@@ -2821,20 +3929,115 @@ class TrackClassificationSubTab(QWidget):
         if not track_path or not track_path.exists():
             QMessageBox.warning(self, "No track adata", "Run Track Clustering first.")
             return
-        color_by = self.combo_track_color_by.currentText()
         opacity = self.spin_track_opacity.value() / 100.0
+        state_adata_path = self._state_adata_path(ct)
+        if not state_adata_path or not state_adata_path.exists():
+            QMessageBox.warning(
+                self, "State Classification Required",
+                f"Full state adata not found at:\n{state_adata_path}\n\n"
+                "Run State Classification first."
+            )
+            return
         self._log(f"▶ Loading track backprojection for '{ct}' / sample '{sample}'…")
         try:
-            from behav3d.napari.backprojection import show_track_cluster_backprojection
-            show_track_cluster_backprojection(
-                viewer=self.viewer,
-                adata_path=str(track_path),
+            import scanpy as sc
+            from behav3d.analysis.behavior.state.visualization.backprojection import (
+                _behavioral_state_backprojection_path,
+                _resolve_raw_image_path,
+                _resolve_tracked_image_path,
+                _extract_state_label_map,
+                _extract_state_code_color_map,
+                _apply_state_code_colors_to_layer,
+                _add_mapping_dock_widget,
+                _build_state_mapping_text,
+                _align_labels_to_raw_shape_for_view,
+            )
+            from behav3d.analysis.behavior.track.visualization.backprojection import (
+                export_track_cluster_backprojection as _track_bp_export,
+                _add_track_statebar_click_dock,
+            )
+            from behav3d.io.images import load_image
+            out_dir = self._out_dir()
+            if not out_dir:
+                raise ValueError("No output directory set.")
+            adata_tracks = sc.read_h5ad(str(track_path))
+            self._sync_track_cluster_combo(adata_tracks)
+            color_by = self.combo_track_color_by.currentText()
+            adata_full = sc.read_h5ad(str(state_adata_path))
+            cluster_col = color_by if color_by else "ClusterID"
+            obs_samples = adata_tracks.obs["sample_name"].astype(str)
+            sample_name = sample if sample else obs_samples.iloc[0]
+            _track_bp_export(
+                adata_full=adata_full,
+                adata_tracks=adata_tracks,
+                output_dir=out_dir,
                 cell_type=ct,
-                sample=sample if sample else None,
-                color_by=color_by,
-                opacity=opacity,
-                metadata=getattr(self.metadata_loader, "metadata", None),
-                output_dir=str(self._out_dir()) if self._out_dir() else "",
+                cluster_col=cluster_col,
+                sample_name=sample_name,
+                n_workers=1,
+                verbose=False,
+            )
+            state_img_path = _behavioral_state_backprojection_path(out_dir, sample_name, ct)
+            raw_path = _resolve_raw_image_path(out_dir, sample_name, verbose=False)
+            if raw_path is None or not Path(raw_path).exists():
+                raise FileNotFoundError(f"Raw image not found for sample '{sample_name}'.")
+            tracked_path = _resolve_tracked_image_path(out_dir, sample_name, ct, verbose=False)
+            if tracked_path is None or not Path(tracked_path).exists():
+                raise FileNotFoundError(
+                    f"Tracked image not found for sample '{sample_name}', cell_type '{ct}'."
+                )
+            raw_img = load_image(raw_path)
+            tracked_img = load_image(tracked_path)
+            state_img = load_image(state_img_path)
+            tracked_view = _align_labels_to_raw_shape_for_view(tracked_img, raw_img, "TrackID", verbose=False)
+            state_view = _align_labels_to_raw_shape_for_view(
+                state_img, raw_img, "behavioral_state_class", verbose=False
+            )
+            for layer in list(self.viewer.layers):
+                if layer.name in ("TrackID", "behavioral_state_class") or " – Ch" in layer.name:
+                    try:
+                        self.viewer.layers.remove(layer)
+                    except Exception:
+                        pass
+            saved_channels = (
+                getattr(self.metadata_loader, "behav3d_parameters", {})
+                .get("viewer_display", {})
+                .get("channels", {})
+            )
+            try:
+                md = self.metadata_loader.metadata
+                row = md[md["sample_name"] == sample_name].iloc[0]
+                dim_order = str(row.get("dimension_order", "TCZYX")).strip() or "TCZYX"
+            except Exception:
+                dim_order = "TCZYX"
+            ch_names = _bp_add_raw_channels(self.viewer, raw_img, sample_name, saved_channels, dim_order)
+            for lname in ch_names:
+                try:
+                    layer = self.viewer.layers[lname]
+                    layer.events.contrast_limits.connect(self._on_bp_layer_display_changed)
+                    layer.events.colormap.connect(self._on_bp_layer_display_changed)
+                except (KeyError, IndexError):
+                    pass
+            self.viewer.add_labels(tracked_view, name="TrackID", visible=False, opacity=opacity)
+            state_layer = self.viewer.add_labels(state_view, name="behavioral_state_class", opacity=opacity)
+            code_colors = _extract_state_code_color_map(state_img_path)
+            _apply_state_code_colors_to_layer(state_layer, code_colors)
+            label_map = _extract_state_label_map(state_img_path)
+            mapping_text = _build_state_mapping_text(label_map, code_colors)
+            _add_mapping_dock_widget(
+                self.viewer,
+                mapping_text=mapping_text,
+                label_map=label_map,
+                code_colors=code_colors,
+                title="Track Cluster Mapping",
+            )
+            _add_track_statebar_click_dock(
+                self.viewer,
+                sample_name=sample_name,
+                adata_full=adata_full,
+                adata_tracks=adata_tracks,
+                cluster_col=cluster_col,
+                title="Track State Bar",
             )
             self._log("✅ Track backprojection loaded.")
         except Exception as e:
@@ -2854,27 +4057,36 @@ class TrackClassificationSubTab(QWidget):
         if self._bg.is_running():
             QMessageBox.warning(self, "Busy", "Another operation is running.")
             return
+        import scanpy as sc
+        adata_tracks = sc.read_h5ad(str(track_path))
+        self._sync_track_cluster_combo(adata_tracks)
         color_by = self.combo_track_color_by.currentText()
-        dpi = int(self.spin_track_export_dpi.value())
-        make_pdf = self.chk_track_pdf.isChecked()
-        make_mp4 = self.chk_track_mp4.isChecked()
         out = self._out_dir()
         logger = ThreadSafeLogger(self._log)
         self._log(f"▶ Exporting track backprojection for '{ct}'…")
 
         def _run(**kw):
-            from behav3d.napari.backprojection import export_track_cluster_backprojection
-            return export_track_cluster_backprojection(
-                adata_path=str(track_path),
+            from behav3d.analysis.behavior.track.visualization.backprojection import (
+                export_track_cluster_backprojection as _track_bp_export,
+            )
+            state_adata_path = self._state_adata_path(ct)
+            if not state_adata_path or not state_adata_path.exists():
+                raise FileNotFoundError(
+                    f"Full state adata not found at '{state_adata_path}'. "
+                    "Run State Classification first."
+                )
+            adata_full = sc.read_h5ad(str(state_adata_path))
+            cluster_col = color_by if color_by else "ClusterID"
+            sample_name = sample if sample else None
+            logger("▶ Writing track backprojection zarrs…")
+            return _track_bp_export(
+                adata_full=adata_full,
+                adata_tracks=adata_tracks,
+                output_dir=out,
                 cell_type=ct,
-                sample=sample if sample else None,
-                color_by=color_by,
-                output_dir=str(out) if out else "",
-                metadata=getattr(self.metadata_loader, "metadata", None),
-                dpi=dpi,
-                make_pdf=make_pdf,
-                make_mp4=make_mp4,
-                log_callback=logger,
+                cluster_col=cluster_col,
+                sample_name=sample_name,
+                n_workers=1,
                 verbose=True,
             )
 
@@ -2885,7 +4097,7 @@ class TrackClassificationSubTab(QWidget):
             buttons=[self.btn_export_track_bp, self.btn_show_track_bp],
             viewer=self.viewer,
             inject_progress=False,
-            on_done=lambda r: self._log("✅ Track backprojection export done."),
+            on_done=lambda r: _log_backprojection_manifest(self._log, r),
             on_failed=lambda e: self._log(f"❌ Export failed: {e}"),
         )
 
@@ -2913,7 +4125,8 @@ class TrackClassificationSubTab(QWidget):
         elif kind == "track_exemplars" and traj_dir:
             candidates = [(f.stem, f) for f in sorted(traj_dir.glob("exemplar_tracks*.pdf"))]
         elif kind == "track_diagnostics" and traj_dir:
-            candidates = [(f.stem, f) for f in sorted(traj_dir.glob("diagnostics*.pdf"))]
+            qc_dir = traj_dir / "quality_control"
+            candidates = [(f.stem, f) for f in sorted(qc_dir.glob("*diagnostics*.pdf"))]
 
         existing = [(lbl, p) for lbl, p in candidates if p and p.exists()]
         if not existing:
@@ -3007,9 +4220,33 @@ class SingleCellTab(QWidget):
         hdr_lay.addWidget(self.status_lbl)
         outer.addLayout(hdr_lay)
 
-        # ── Inner sub-tabs ───────────────────────────────────────────────
+        # ── Guided / Advanced switch + stacked pages ─────────────────────
+        from behav3d.napari._guided import (
+            ModeSwitch, GuidedPanel, load_guided_mode,
+        )
+        from behav3d.napari.analysis_guided_copy import (
+            SINGLE_CELL_ANALYSES, GUIDED_INTRO,
+        )
+
+        guided_default = load_guided_mode()
+        self._mode_switch = ModeSwitch(guided=guided_default)
+        self._mode_switch.modeChanged.connect(self._on_mode_changed)
+        outer.addWidget(self._mode_switch)
+
+        self._stack = QStackedWidget()
+        outer.addWidget(self._stack, stretch=1)
+
+        # Page 0 — Guided explainers.
+        self._guided_panel = GuidedPanel(
+            SINGLE_CELL_ANALYSES,
+            start_cb=self._on_guided_start,
+            intro=GUIDED_INTRO,
+        )
+        self._stack.addWidget(self._guided_panel)
+
+        # Page 1 — the existing inner sub-tabs (settings forms).
         self.inner_tabs = QTabWidget()
-        outer.addWidget(self.inner_tabs, stretch=1)
+        self._stack.addWidget(self.inner_tabs)
 
         self.state_tab = StateClassificationSubTab(
             viewer=self.viewer,
@@ -3017,7 +4254,9 @@ class SingleCellTab(QWidget):
             cell_type_getter=self._current_cell_type,
             parent=self,
         )
-        self.inner_tabs.addTab(self.state_tab, "🔬 State Classification")
+        # Display name only — internal SC_STATE_CLUSTER StepType / methods /
+        # outputs are unchanged.
+        self.inner_tabs.addTab(self.state_tab, "🔬 Behavioral State")
 
         self.track_tab = TrackClassificationSubTab(
             viewer=self.viewer,
@@ -3025,16 +4264,41 @@ class SingleCellTab(QWidget):
             cell_type_getter=self._current_cell_type,
             parent=self,
         )
-        self.inner_tabs.addTab(self.track_tab, "🛤️ Track Classification")
+        # Display name only — internal SC_TRACK_CLUSTER StepType / methods /
+        # outputs are unchanged.
+        self.inner_tabs.addTab(self.track_tab, "🛤️ State Trajectory")
 
-        # When switching to Track Classification (index 1), trigger a reload
+        # When switching to State Trajectory (index 1), trigger a reload
         # so the behavioral-states path auto-fills from disk if it exists.
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
 
+        self._stack.setCurrentIndex(0 if guided_default else 1)
+
+    # ── Guided / Advanced mode ─────────────────────────────────────────────
+    def _on_mode_changed(self, guided: bool):
+        from behav3d.napari._guided import save_guided_mode
+
+        self._stack.setCurrentIndex(0 if guided else 1)
+        save_guided_mode(guided)
+
+    def _on_guided_start(self, analysis_id: str):
+        """Start from a Guided card: reveal the form and focus its sub-tab."""
+        self._mode_switch.set_guided(False)  # → _on_mode_changed flips the page
+        index = {"state": 0, "track": 1}.get(analysis_id)
+        if index is not None:
+            self.inner_tabs.setCurrentIndex(index)
+
     def _on_inner_tab_changed(self, index: int):
-        """Reload track tab when switched to, so states path auto-fills from disk."""
+        """Auto-fill path fields when switching to Track Classification tab."""
         if index == 1:  # Track Classification
-            self.track_tab.on_metadata_updated()
+            self.track_tab._autofill_paths(self._current_cell_type())
+            # Re-check prerequisites too: a behavioral-states h5ad may have been
+            # written (or rewritten) by the State Classification tab since the
+            # last time this tab was visited, and _autofill_paths alone doesn't
+            # refresh the "states not found" warning/lock state.
+            self.track_tab._check_prerequisites()
+            if self.track_tab.chk_use_original.isChecked():
+                self.track_tab._show_original_dtw_disclaimer()
 
     # ── Metadata update ──────────────────────────────────────────────────
 
@@ -3045,7 +4309,14 @@ class SingleCellTab(QWidget):
         self.cell_type_combo.clear()
         if cell_types:
             self.cell_type_combo.addItems(cell_types)
-            if current in cell_types:
+            saved_ct = (
+                getattr(self.metadata_loader, "behav3d_parameters", {})
+                .get("single_cell", {})
+                .get("selected_cell_type")
+            )
+            if saved_ct and saved_ct in cell_types:
+                self.cell_type_combo.setCurrentText(saved_ct)
+            elif current in cell_types:
                 self.cell_type_combo.setCurrentText(current)
             self.status_lbl.setText(f"Ready — {len(cell_types)} cell type(s) available.")
         else:
@@ -3073,7 +4344,15 @@ class SingleCellTab(QWidget):
         self.state_tab.on_metadata_updated()
         self.track_tab.on_metadata_updated()
 
-    def _on_cell_type_changed(self, _text: str):
+    def _out_dir(self) -> Optional[Path]:
+        od = getattr(self.metadata_loader, "output_dir", None) if self.metadata_loader else None
+        return Path(str(od)).expanduser() if od else None
+
+    def _on_cell_type_changed(self, text: str):
+        params = getattr(self.metadata_loader, "behav3d_parameters", None)
+        if isinstance(params, dict) and text:
+            params.setdefault("single_cell", {})["selected_cell_type"] = text
+            _save_behav3d_params(self.metadata_loader, self._out_dir)
         self._propagate_metadata_update()
 
     def _current_cell_type(self) -> str:

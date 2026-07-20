@@ -1,5 +1,5 @@
 import ipywidgets as widgets
-from IPython.display import display
+from IPython.display import display, HTML
 from pathlib import Path
 import os
 import pandas as pd
@@ -98,6 +98,59 @@ def _normalize_segmentation_labels_for_view(label_arr, raw_img_shape, layer_name
     )
 
 
+def _build_notebook_annotation_legend(label_map, has_death=False):
+    """Generate an HTML table displaying the ConvPaint annotation legend."""
+    if not label_map or "celltype_to_label" not in label_map:
+        return
+        
+    BACKGROUND_LABEL = 0
+    UNKNOWN_LABEL = 1
+    CELL_TYPE_COLORS = {
+        "tcells": "#00FFFF",  # Cyan
+        "nkcells": "#FF00FF", # Magenta
+        "macrophages": "#00FF00", # Green
+        "tumor": "#FF0000", # Red
+        "organoid": "#FF0000", # Red
+    }
+    
+    html = [
+        "<div style='margin-top: 10px; margin-bottom: 10px; font-family: sans-serif;'>",
+        "<h4>ConvPaint Annotation Legend</h4>",
+        "<table style='border-collapse: collapse; width: 300px; text-align: left;'>",
+        "<tr style='border-bottom: 1px solid #ddd;'><th>Index</th><th>Color</th><th>Cell Type</th></tr>"
+    ]
+    
+    bg_label = int(label_map.get("background_label", BACKGROUND_LABEL))
+    html.append(
+        f"<tr><td>{bg_label}</td>"
+        f"<td style='background-color: #000000; width: 20px;'></td>"
+        f"<td>Background</td></tr>"
+    )
+    
+    ordered_cts = sorted(list(label_map["celltype_to_label"].keys()))
+    for ct in ordered_cts:
+        idx = int(label_map["celltype_to_label"][ct])
+        # Find base name for coloring (e.g. organoid1 -> organoid)
+        base_ct = ''.join([i for i in ct if not i.isdigit()]).lower()
+        color = CELL_TYPE_COLORS.get(base_ct, "#888888")
+        html.append(
+            f"<tr><td>{idx}</td>"
+            f"<td style='background-color: {color}; width: 20px;'></td>"
+            f"<td>{ct}</td></tr>"
+        )
+        
+    if has_death:
+        death_label = int(label_map.get("death_label", UNKNOWN_LABEL))
+        html.append(
+            f"<tr><td>{death_label}</td>"
+            f"<td style='background-color: #FFFFFF; width: 20px; border: 1px solid #000;'></td>"
+            f"<td>Death</td></tr>"
+        )
+        
+    html.append("</table></div>")
+    display(HTML("".join(html)))
+
+
 class PixelClassifierPanel:
     def __init__(self, metadata_loader):
         self.metadata_loader = metadata_loader
@@ -149,9 +202,13 @@ class PixelClassifierPanel:
         if not CONVPAINT_AVAILABLE:
             self.classifier_engine.tooltip = (self.classifier_engine.tooltip or "") + " ConvPaint disabled: 'napari-convpaint' required."
 
+        _saved_gpu = pc.get("gpu_device_name", _gpu_devices[0] if _gpu_devices else "")
+        if _gpu_devices and _saved_gpu not in _gpu_devices:
+            _saved_gpu = _gpu_devices[0]
+
         self.gpu_device = widgets.Dropdown(
             options=_gpu_devices,
-            value=pc.get("gpu_device_name", _gpu_devices[0]) if _gpu_devices else "",
+            value=_saved_gpu,
             description="GPU Device:",
             layout=widgets.Layout(width="auto", display="none")  # Hidden by default
         )
@@ -163,6 +220,9 @@ class PixelClassifierPanel:
             "APOC Mask + Peak EDT/Watershed Resegmentation",
             "APOC Probability Map + Watershed",
         ]
+        import os
+        if os.environ.get("BEHAV3D_DEV_MODE") != "1":
+            _apoc_strategy_options.remove("APOC Mask + Peak EDT/Watershed Resegmentation")
         _saved_apoc_strategy = pc.get("apoc_strategy", "APOC (Direct Instance Segmentation)")
         if _saved_apoc_strategy not in _apoc_strategy_options:
             _saved_apoc_strategy = "APOC (Direct Instance Segmentation)"
@@ -181,6 +241,9 @@ class PixelClassifierPanel:
             "ConvPaint Mask + Peak EDT/Watershed",
             "ConvPaint Probability + Watershed",
         ]
+        import os
+        if os.environ.get("BEHAV3D_DEV_MODE") != "1":
+            _convpaint_strategy_options.remove("ConvPaint Mask + Peak EDT/Watershed")
         _saved_cp_strategy = pc.get(
             "convpaint_strategy", "ConvPaint Mask + EDT/Watershed"
         )
@@ -281,6 +344,15 @@ class PixelClassifierPanel:
                     if saved_path:
                         self.clf_paths[cell_type].value = str(saved_path)
 
+        # Per-group physical(µm)/pixel unit toggles. "Segmentation
+        # parameters" (EDT threshold, min size, peak distance) share one
+        # toggle; the separate "post-processing size filtering" section
+        # (apoc_min_size_inputs) gets its own, matching the napari plugin's
+        # per-group design (behav3d.napari._units.UnitGroupManager).
+        from .utils import UnitGroupManager
+        self._seg_unit_mgr = UnitGroupManager(self.metadata_loader.metadata, default_physical=True)
+        self._apoc_size_unit_mgr = UnitGroupManager(self.metadata_loader.metadata, default_physical=True)
+
         self.edt_thresholds = {}
         self._create_edt_threshold_inputs()
         self._create_postprocessing_inputs()
@@ -318,7 +390,7 @@ class PixelClassifierPanel:
         )
 
         self.btn_run = widgets.Button(
-            description="Run segmentation",
+            description="Run batch segmentation",
             button_style="success",
             layout=widgets.Layout(width="fit-content", flex="0 0 auto")
         )
@@ -330,10 +402,37 @@ class PixelClassifierPanel:
         
         self.spinner_apply = widgets.HTML(value=spinning_loader)
         self.spinner_apply.layout.display = "none"
+
+        ct_options = self.all_cell_types
+        if self.has_death:
+            ct_options = ct_options + ["death"]
+
+        self.segment_ct_dropdown = widgets.Dropdown(
+            options=ct_options,
+            description="Cell type:",
+            layout=widgets.Layout(width="250px")
+        )
+        self.btn_run_single = widgets.Button(
+            description="Run for selected cell type",
+            button_style="info",
+            layout=widgets.Layout(width="fit-content", flex="0 0 auto")
+        )
+
+        self.single_apply_row = widgets.HBox(
+            [self.segment_ct_dropdown, self.btn_run_single],
+            layout=widgets.Layout(align_items="center", gap="8px", margin="0 0 10px 0")
+        )
+
         self.apply_row = widgets.HBox(
             [self.btn_run, self.btn_resegment, self.spinner_apply],
             layout=widgets.Layout(align_items="center", gap="8px")
         )
+        
+        self.apply_container = widgets.VBox(
+            [self.single_apply_row, self.apply_row],
+            layout=widgets.Layout(margin="10px 0")
+        )
+
         self.only_resegment_warning = widgets.HTML(
             "<span style='color:#b26a00;'>"
             "Warning: Only resegment must use the same timepoint range as the masks/segmentation it comes from. "
@@ -343,8 +442,9 @@ class PixelClassifierPanel:
 
         self.btn_train.on_click(self._on_train_clicked)
         self.close_button.on_click(self._on_close_clicked)
-        self.btn_run.on_click(partial(self._on_apply_clicked, only_segment=False))
-        self.btn_resegment.on_click(partial(self._on_apply_clicked, only_segment=True))
+        self.btn_run.on_click(partial(self._on_apply_clicked, only_segment=False, target_cell_type=None))
+        self.btn_resegment.on_click(partial(self._on_apply_clicked, only_segment=True, target_cell_type=None))
+        self.btn_run_single.on_click(lambda _: self._on_apply_clicked(None, only_segment=False, target_cell_type=self.segment_ct_dropdown.value))
 
         # --- Post-processing: size filtering ---
         # We create a list of min size inputs, one per cell type
@@ -359,13 +459,19 @@ class PixelClassifierPanel:
                 description=f"{ct.capitalize()}:",
                 value=int(saved_size),
                 min=0,
-                max=1000000,
+                max=1000000000,
                 step=10,
                 style={'description_width': '100px'},
                 layout=widgets.Layout(width='200px'),
             )
+            self._apoc_size_unit_mgr.register(
+                self.apoc_min_size_inputs[ct], "volume", saved_size,
+            )
 
-        self.apoc_size_inputs_box = widgets.VBox(list(self.apoc_min_size_inputs.values()))
+        self.apoc_size_inputs_box = widgets.VBox(
+            [self._apoc_size_unit_mgr.header_row("Units:")]
+            + list(self.apoc_min_size_inputs.values())
+        )
 
         self.btn_size_filter = widgets.Button(
             description="Run size filtering",
@@ -410,7 +516,10 @@ class PixelClassifierPanel:
         self.clf_dir.text.observe(_dir_changed, names='value')
 
         # Build segmentation parameter widgets organized by cell type
-        segmentation_widgets = [widgets.HTML("<b>Segmentation parameters per cell type</b>")]
+        segmentation_widgets = [
+            widgets.HTML("<b>Segmentation parameters per cell type</b>"),
+            self._seg_unit_mgr.header_row("Units:"),
+        ]
 
         def _add_cell_type_rows(ct_list):
             for ct in ct_list:
@@ -477,7 +586,7 @@ class PixelClassifierPanel:
                 self.overwrite_existing,
                 widgets.HBox([self.use_all_timepoints, self.tp_start, self.tp_end]),
                 self.only_resegment_warning,
-                self.apply_row,
+                self.apply_container,
             ]),
             widgets.HTML("<hr>"),
             self.post_processing_box,
@@ -616,9 +725,12 @@ class PixelClassifierPanel:
                 description=f"{cell_type.capitalize()} EDT:",
                 value=float(saved_threshold),
                 min=0,
-                max=50.0,
+                max=1000.0,
                 step=0.5,
                 style={'description_width': '160px'},
+            )
+            self._seg_unit_mgr.register(
+                self.edt_thresholds[cell_type], "distance", saved_threshold,
             )
     
     def _create_postprocessing_inputs(self):
@@ -650,9 +762,12 @@ class PixelClassifierPanel:
                 description=f"{cell_type.capitalize()} min size:",
                 value=int(saved_size),
                 min=0,
-                max=100000,
+                max=1000000000,
                 step=10,
                 style={'description_width': '160px'},
+            )
+            self._seg_unit_mgr.register(
+                self.segment_size_mins[cell_type], "volume", saved_size,
             )
             
             # Opening nr pixels
@@ -687,9 +802,12 @@ class PixelClassifierPanel:
                 description=f"{cell_type.capitalize()} peak dist:",
                 value=float(saved_dist),
                 min=0.0,
-                max=50.0,
+                max=1000.0,
                 step=0.5,
                 style={'description_width': '160px'},
+            )
+            self._seg_unit_mgr.register(
+                self.peak_min_distances[cell_type], "distance", saved_dist,
             )
             self.peak_min_distances[cell_type].layout.width = 'auto'
 
@@ -749,14 +867,14 @@ class PixelClassifierPanel:
         pc["convpaint_strategy"] = str(self.convpaint_strategy.value)
         
         for ct, w in self.apoc_min_size_inputs.items():
-            pc[f"apoc_{ct}_min_size_voxels"] = int(w.value)
+            pc[f"apoc_{ct}_min_size_voxels"] = int(round(self._apoc_size_unit_mgr.get_native(w)))
 
         for cell_type, threshold_widget in self.edt_thresholds.items():
-            pc[f"{cell_type}_edt_threshold"] = float(threshold_widget.value)
-        
+            pc[f"{cell_type}_edt_threshold"] = float(self._seg_unit_mgr.get_native(threshold_widget))
+
         for cell_type in self.all_cell_types:
             if cell_type in self.segment_size_mins:
-                pc[f"{cell_type}_segment_size_min"] = int(self.segment_size_mins[cell_type].value)
+                pc[f"{cell_type}_segment_size_min"] = int(round(self._seg_unit_mgr.get_native(self.segment_size_mins[cell_type])))
             if cell_type in self.opening_nr_pixels:
                 pc[f"{cell_type}_opening_nr_pixels"] = int(self.opening_nr_pixels[cell_type].value)
             if cell_type in self.fill_holes:
@@ -766,7 +884,7 @@ class PixelClassifierPanel:
             if cell_type in self.prob_seed_thresholds:
                 pc[f"{cell_type}_prob_seed_threshold"] = float(self.prob_seed_thresholds[cell_type].value)
             if cell_type in self.peak_min_distances:
-                pc[f"{cell_type}_peak_min_distance"] = float(self.peak_min_distances[cell_type].value)
+                pc[f"{cell_type}_peak_min_distance"] = float(self._seg_unit_mgr.get_native(self.peak_min_distances[cell_type]))
             if cell_type in self.peak_min_ratios:
                 pc[f"{cell_type}_peak_min_ratio"] = float(self.peak_min_ratios[cell_type].value)
         
@@ -953,8 +1071,7 @@ class PixelClassifierPanel:
 
     def _lock(self, state: bool):
         to_lock = [
-            self.btn_train, self.btn_run, self.btn_resegment,
-            self.classifier_engine,
+            self.btn_train, self.apply_container,
             #self.examples_per_sample, self.sample_specific_classifier, self.n_workers,
             self.examples_per_sample, self.n_workers,
             self.use_all_timepoints, self.tp_start, self.tp_end,
@@ -996,13 +1113,13 @@ class PixelClassifierPanel:
         for cell_type in self.all_cell_types:
             if cell_type in self.edt_thresholds:
                 w = self.edt_thresholds[cell_type]
-                params[f"{cell_type}_edt_threshold"] = float(w.value)
+                params[f"{cell_type}_edt_threshold"] = float(self._seg_unit_mgr.get_native(w))
                 params[f"{cell_type}_edt_min"] = float(w.min)
                 params[f"{cell_type}_edt_max"] = float(w.max)
                 params[f"{cell_type}_edt_step"] = float(w.step)
             if cell_type in self.segment_size_mins:
                 w = self.segment_size_mins[cell_type]
-                params[f"{cell_type}_segment_size_min"] = int(w.value)
+                params[f"{cell_type}_segment_size_min"] = int(round(self._seg_unit_mgr.get_native(w)))
                 params[f"{cell_type}_segment_size_min_limit"] = int(w.min)
                 params[f"{cell_type}_segment_size_max_limit"] = int(w.max)
                 params[f"{cell_type}_segment_size_step"] = int(w.step)
@@ -1026,7 +1143,7 @@ class PixelClassifierPanel:
 
         for cell_type in self.all_cell_types:
             if cell_type in self.peak_min_distances:
-                params[f"{cell_type}_peak_min_distance"] = float(self.peak_min_distances[cell_type].value)
+                params[f"{cell_type}_peak_min_distance"] = float(self._seg_unit_mgr.get_native(self.peak_min_distances[cell_type]))
             if cell_type in self.peak_min_ratios:
                 params[f"{cell_type}_peak_min_ratio"] = float(self.peak_min_ratios[cell_type].value)
 
@@ -1059,9 +1176,9 @@ class PixelClassifierPanel:
         """
         for cell_type in self.all_cell_types:
             if f"{cell_type}_edt_threshold" in params and cell_type in self.edt_thresholds:
-                self.edt_thresholds[cell_type].value = float(params[f"{cell_type}_edt_threshold"])
+                self._seg_unit_mgr.set_native(self.edt_thresholds[cell_type], float(params[f"{cell_type}_edt_threshold"]))
             if f"{cell_type}_segment_size_min" in params and cell_type in self.segment_size_mins:
-                self.segment_size_mins[cell_type].value = int(params[f"{cell_type}_segment_size_min"])
+                self._seg_unit_mgr.set_native(self.segment_size_mins[cell_type], int(params[f"{cell_type}_segment_size_min"]))
             if f"{cell_type}_opening_nr_pixels" in params and cell_type in self.opening_nr_pixels:
                 self.opening_nr_pixels[cell_type].value = int(params[f"{cell_type}_opening_nr_pixels"])
             if f"{cell_type}_fill_holes" in params and cell_type in self.fill_holes:
@@ -1080,7 +1197,7 @@ class PixelClassifierPanel:
                 self.convpaint_strategy.value = cp_val
         for cell_type in self.all_cell_types:
             if f"{cell_type}_peak_min_distance" in params and cell_type in self.peak_min_distances:
-                self.peak_min_distances[cell_type].value = float(params[f"{cell_type}_peak_min_distance"])
+                self._seg_unit_mgr.set_native(self.peak_min_distances[cell_type], float(params[f"{cell_type}_peak_min_distance"]))
             if f"{cell_type}_peak_min_ratio" in params and cell_type in self.peak_min_ratios:
                 self.peak_min_ratios[cell_type].value = float(params[f"{cell_type}_peak_min_ratio"])
 
@@ -1187,7 +1304,7 @@ class PixelClassifierPanel:
                 self.out.clear_output()
                 print("Training finished.")
 
-    def _on_apply_clicked(self, _, only_segment=False):
+    def _on_apply_clicked(self, _, only_segment=False, target_cell_type=None):
         self._lock(True)
         with self.out:
             self.out.clear_output()
@@ -1195,7 +1312,10 @@ class PixelClassifierPanel:
             try:
                 odir = Path(self.metadata_loader.output_dir).expanduser()
                 tpr = _mk_timepoint_range(bool(self.use_all_timepoints.value), int(self.tp_start.value), int(self.tp_end.value))
-                
+
+                # Build only_cell_types filter: None means run all
+                only_cell_types = None if target_cell_type is None else [target_cell_type]
+
                 clf_organoid_paths = {ct: str(self.clf_paths[ct].value) for ct in self.organoid_types if ct in self.clf_paths and self.clf_paths[ct].value} if self.manual_clf_paths.value else None
                 clf_immune_paths = {ct: str(self.clf_paths[ct].value) for ct in self.immune_types if ct in self.clf_paths and self.clf_paths[ct].value} if self.manual_clf_paths.value else None
                 clf_other_paths = {ct: str(self.clf_paths[ct].value) for ct in self.other_types if ct in self.clf_paths and self.clf_paths[ct].value} if self.manual_clf_paths.value else None
@@ -1211,9 +1331,6 @@ class PixelClassifierPanel:
                         metadata=self.metadata_loader.metadata,
                         metadata_csv_path=str(self.metadata_loader.metadata_csv_path),
                         apoc_config=pc,
-                        organoid_types=self.organoid_types,
-                        immune_types=self.immune_types,
-                        other_types=self.other_types,
                         timepoint_range=tpr,
                         clf_organoid_paths=clf_organoid_paths,
                         clf_immune_paths=clf_immune_paths,
@@ -1224,6 +1341,7 @@ class PixelClassifierPanel:
                         n_workers=int(self.n_workers.value),
                         gpu_device=str(self.gpu_device.value),
                         apoc_strategy=str(self.apoc_strategy.value),
+                        only_cell_types=only_cell_types,
                     )
                 elif str(self.classifier_engine.value) == "ConvPaint":
                     from behav3d.preprocessing.segmentation.convpaint_segment import run_convpaint_segmentation
@@ -1247,9 +1365,6 @@ class PixelClassifierPanel:
                         metadata=self.metadata_loader.metadata,
                         metadata_csv_path=str(self.metadata_loader.metadata_csv_path),
                         convpaint_config=pc,
-                        organoid_types=self.organoid_types,
-                        immune_types=self.immune_types,
-                        other_types=self.other_types,
                         timepoint_range=tpr,
                         clf_unified_path=clf_unified_path,
                         clf_death_path=clf_death_convpaint_path,
@@ -1257,6 +1372,7 @@ class PixelClassifierPanel:
                         overwrite_existing=bool(self.overwrite_existing.value),
                         n_workers=int(self.n_workers.value),
                         convpaint_strategy=str(self.convpaint_strategy.value),
+                        only_cell_types=only_cell_types,
                     )
                 else:
                     # Original scikit-learn pixel classifier
@@ -1272,12 +1388,12 @@ class PixelClassifierPanel:
                         output_dir=str(odir),
                         metadata=self.metadata_loader.metadata,
                         metadata_csv_path=str(self.metadata_loader.metadata_csv_path),
-                        organoid_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.organoid_types if ct in self.edt_thresholds},
-                        immune_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.immune_types if ct in self.edt_thresholds},
-                        other_edt_thresholds={ct: float(self.edt_thresholds[ct].value) for ct in self.other_types if ct in self.edt_thresholds},
-                        organoid_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.organoid_types if ct in self.segment_size_mins},
-                        immune_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.immune_types if ct in self.segment_size_mins},
-                        other_segment_size_mins={ct: int(self.segment_size_mins[ct].value) for ct in self.other_types if ct in self.segment_size_mins},
+                        organoid_edt_thresholds={ct: float(self._seg_unit_mgr.get_native(self.edt_thresholds[ct])) for ct in self.organoid_types if ct in self.edt_thresholds},
+                        immune_edt_thresholds={ct: float(self._seg_unit_mgr.get_native(self.edt_thresholds[ct])) for ct in self.immune_types if ct in self.edt_thresholds},
+                        other_edt_thresholds={ct: float(self._seg_unit_mgr.get_native(self.edt_thresholds[ct])) for ct in self.other_types if ct in self.edt_thresholds},
+                        organoid_segment_size_mins={ct: int(round(self._seg_unit_mgr.get_native(self.segment_size_mins[ct]))) for ct in self.organoid_types if ct in self.segment_size_mins},
+                        immune_segment_size_mins={ct: int(round(self._seg_unit_mgr.get_native(self.segment_size_mins[ct]))) for ct in self.immune_types if ct in self.segment_size_mins},
+                        other_segment_size_mins={ct: int(round(self._seg_unit_mgr.get_native(self.segment_size_mins[ct]))) for ct in self.other_types if ct in self.segment_size_mins},
                         organoid_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.organoid_types if ct in self.opening_nr_pixels},
                         immune_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.immune_types if ct in self.opening_nr_pixels},
                         other_opening_nr_pixels={ct: int(self.opening_nr_pixels[ct].value) for ct in self.other_types if ct in self.opening_nr_pixels},
@@ -1292,6 +1408,7 @@ class PixelClassifierPanel:
                         only_segment=bool(only_segment),
                         overwrite_existing=bool(self.overwrite_existing.value),
                         n_workers=int(self.n_workers.value),
+                        only_cell_types=only_cell_types,
                     )
                 if new_md is not None:
                     new_md = self._apply_multicolor_segment_cleanup(new_md, odir)
@@ -1323,7 +1440,7 @@ class PixelClassifierPanel:
                 # Persist the setting
                 pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
                 for ct, w in self.apoc_min_size_inputs.items():
-                    pc[f"apoc_{ct}_min_size_voxels"] = int(w.value)
+                    pc[f"apoc_{ct}_min_size_voxels"] = int(round(self._apoc_size_unit_mgr.get_native(w)))
 
                 if hasattr(self.metadata_loader, "behav3d_parameters_path"):
                     yaml.safe_dump(
@@ -1343,7 +1460,7 @@ class PixelClassifierPanel:
                         if not seg_path.exists():
                             continue
 
-                        min_size = int(self.apoc_min_size_inputs[ct].value)
+                        min_size = int(round(self._apoc_size_unit_mgr.get_native(self.apoc_min_size_inputs[ct])))
                         if min_size <= 0:
                             continue
 
@@ -2170,6 +2287,18 @@ class SegmentationVisualizationPanel:
                     print("No segments/mask layers found.")
                 elif added_label_layers == 0:
                     print("No segments/mask layers added after shape normalization.")
+
+                # Try to load and display the ConvPaint label legend if present
+                try:
+                    from behav3d.preprocessing.segmentation.convpaint_label_map import load_label_map, unified_label_map_path
+                    pixel_class_outdir = output_dir / "images" / "PixelClassification"
+                    map_path = unified_label_map_path(pixel_class_outdir)
+                    if map_path.exists():
+                        label_map = load_label_map(map_path)
+                        has_death = has_dead_channel(metadata)
+                        _build_notebook_annotation_legend(label_map, has_death=has_death)
+                except Exception as e:
+                    print(f"Could not load ConvPaint legend: {e}")
 
                 napari.run()
                 self._viewer = viewer

@@ -38,6 +38,7 @@ def run_organoid_analysis(
     metadata=None,
     df_tracks_path=None,
     org_type="organoid",
+    show_in_notebook=True,
     # df_tracks_summarized_path=None,
     ):
     print(f"--------------- Performing {org_type} Death Dynamics analysis ---------------")
@@ -199,7 +200,8 @@ def run_organoid_analysis(
             df_meansem=df_meansem,
             value_cols=meansem_value_cols,
             org_type=org_type,
-            figsize=(8.27, 11.69)
+            figsize=(8.27, 11.69),
+            show_in_notebook=show_in_notebook,
             )
     
     ## TODO PLOT A STACKED BARPLOT OVER TIME WHERE THE TOTAL BAR IS 
@@ -218,7 +220,11 @@ def run_organoid_analysis(
         df_tracks_sample = df_tracks[df_tracks["sample_name"] == sample_name]
         
         img_outdir = Path(output_dir, "images", sample_name)
-        
+
+        sample_metadata = pd.DataFrame()
+        if metadata is not None:
+            sample_metadata = metadata[metadata['sample_name'] == sample_name]
+
         df_tracks_sample_outpath = Path(analysis_sample_outdir, f"{sample_name}_{org_type}_track_analysis.csv")
         df_tracks_sample.to_csv(
             df_tracks_sample_outpath,
@@ -243,27 +249,27 @@ def run_organoid_analysis(
         
         sample_pdf_outpath = Path(analysis_sample_outdir, f"{sample_name}_{org_type}_analysis.pdf")
     
+        # raw_img_path: prefer metadata raw_image_path, fall back to constructed path
         raw_img_path = Path(img_outdir, f"{sample_name}.zarr")
+        if not sample_metadata.empty and 'raw_image_path' in sample_metadata.columns:
+            raw_path_val = sample_metadata['raw_image_path'].values[0]
+            if pd.notna(raw_path_val) and str(raw_path_val).strip():
+                raw_img_path = Path(raw_path_val)
+
         organoid_seg_path = Path(img_outdir, f"{sample_name}_{org_type}_tracked.zarr")
-        
-        # Get dead_mask_path from metadata
-        # only runs if has_dead_data=True, so dead_channel must exist
+
+        # dead_mask_path: prefer metadata, fall back to constructed path
         dead_mask_path = None
-        
-        if metadata is not None:
-            sample_metadata = metadata[metadata['sample_name'] == sample_name]
-            if not sample_metadata.empty:
-                # dead_mask_path directly from metadata
-                if 'dead_mask_path' in sample_metadata.columns:
-                    mask_path_val = sample_metadata['dead_mask_path'].values[0]
-                    if pd.notna(mask_path_val) and str(mask_path_val).strip():
-                        dead_mask_path = Path(mask_path_val)
-                        if dead_mask_path.exists():
-                            print(f"  Using dead_mask_path from metadata: {dead_mask_path}")
-                        else:
-                            print(f"  ⚠️  dead_mask_path in metadata does not exist: {dead_mask_path}")
-                            dead_mask_path = None
-        
+        if not sample_metadata.empty and 'dead_mask_path' in sample_metadata.columns:
+            mask_path_val = sample_metadata['dead_mask_path'].values[0]
+            if pd.notna(mask_path_val) and str(mask_path_val).strip():
+                dead_mask_path = Path(mask_path_val)
+                if dead_mask_path.exists():
+                    print(f"  Using dead_mask_path from metadata: {dead_mask_path}")
+                else:
+                    print(f"  ⚠️  dead_mask_path in metadata does not exist: {dead_mask_path}")
+                    dead_mask_path = None
+
         # Fallback: construct path if not found in metadata
         if dead_mask_path is None:
             fallback_path = Path(img_outdir, f"{sample_name}_mask_dead.zarr")
@@ -272,18 +278,16 @@ def run_organoid_analysis(
                 print(f"  Using fallback dead_mask_path: {dead_mask_path}")
             else:
                 print(f"  ⚠️  Fallback dead_mask_path does not exist: {fallback_path}")
-        
+
         # Skip PDF plotting if dead_mask_path is still None
         if dead_mask_path is None:
             has_dead_channel = (
-                metadata is not None
-                and "sample_metadata" in locals()
-                and not sample_metadata.empty
+                not sample_metadata.empty
                 and "dead_channel" in sample_metadata.columns
                 and sample_metadata["dead_channel"].notna().any()
             )
             print(f"  ⚠️  Skipping PDF generation for {sample_name} - no dead_mask_path available")
-            print(f"      (has_dead_channel={has_dead_channel}, metadata columns: {list(sample_metadata.columns) if metadata is not None and not sample_metadata.empty else 'N/A'})")
+            print(f"      (has_dead_channel={has_dead_channel}, metadata columns: {list(sample_metadata.columns) if not sample_metadata.empty else 'N/A'})")
             continue
 
         ### Plot analysis results per sample
@@ -668,7 +672,8 @@ def plot_general_organoid_analysis(
     df_meansem=None,
     value_cols=None,
     org_type=None,
-    figsize=(8.27, 11.69)
+    figsize=(8.27, 11.69),
+    show_in_notebook=True,
     ):
     
     with PdfPages(outpath) as pdf:
@@ -744,39 +749,45 @@ def plot_general_organoid_analysis(
         # Keep the plotting columns in the intended order: dead (red) then alive (blue)
         plot_cols = ["percentage_alive", "percentage_dead", "percentage_disappeared"]
 
-        df_end.set_index("sample_name")[plot_cols].plot(
-            kind="bar",
-            stacked=True,
-            ax=ax,
-            color=["#6699CC", "#CC6666", "#898989"],  # Red for Dead, Blue for Alive, Grey for Disappeared
-            alpha=1.0,
-            width=0.25,
-            zorder=2,
-        )
+        if df_end.empty:
+            ax.text(0.5, 0.5, "No organoids detected at experiment end",
+                    ha="center", va="center", transform=ax.transAxes)
+            ax.axis("off")
+        else:
+            df_end.set_index("sample_name")[plot_cols].plot(
+                kind="bar",
+                stacked=True,
+                ax=ax,
+                color=["#6699CC", "#CC6666", "#898989"],  # Red for Dead, Blue for Alive, Grey for Disappeared
+                alpha=1.0,
+                width=0.25,
+                zorder=2,
+            )
 
-        ax.grid(True, linestyle=":", linewidth=1, alpha=0.5, zorder=1)
-        ax.set_ylim(0, 1.1)
-        ax.set_xlabel("")
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", size=6)
-        ax.set_ylabel("")
-        ax.set_title("Percentage Alive Organoids at end of experiment")
+            ax.grid(True, linestyle=":", linewidth=1, alpha=0.5, zorder=1)
+            ax.set_ylim(0, 1.1)
+            ax.set_xlabel("")
+            ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", size=6)
+            ax.set_ylabel("")
+            ax.set_title("Percentage Alive Organoids at end of experiment")
 
-        # Legend: Dead first, then Alive (matches bar order/colors)
-        handles, labels = ax.get_legend_handles_labels()
-        order = [2, 0, 1]  # 0=Dead (red), 1=Alive (blue), 2=Disappeared (grey)
-        ax.legend(
-            [handles[i] for i in order],
-            [labels[i] for i in order],
-            bbox_to_anchor=(1.05, 1),
-            loc="upper left",
-            borderaxespad=0,
-            prop={"size": 5},
-            title="",
-        )
+            # Legend: Dead first, then Alive (matches bar order/colors)
+            handles, labels = ax.get_legend_handles_labels()
+            order = [2, 0, 1]  # 0=Dead (red), 1=Alive (blue), 2=Disappeared (grey)
+            ax.legend(
+                [handles[i] for i in order],
+                [labels[i] for i in order],
+                bbox_to_anchor=(1.05, 1),
+                loc="upper left",
+                borderaxespad=0,
+                prop={"size": 5},
+                title="",
+            )
 
         fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
 
-        plt.show()
+        if show_in_notebook:
+            plt.show()
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
@@ -1314,6 +1325,7 @@ def plot_multi_organoid_death_dynamics(
     organoid_types,
     figsize=(12, 10),
     dead_perc_threshold_map=None,
+    show_in_notebook=True,
     ):
     """
     Generate comparison plots for death dynamics across multiple organoid types.
@@ -1559,7 +1571,8 @@ def plot_multi_organoid_death_dynamics(
         )
         
         plt.tight_layout()
-        plt.show()
+        if show_in_notebook:
+            plt.show()
         pdf.savefig(fig1, bbox_inches='tight')
         plt.close(fig1)
         
@@ -1614,7 +1627,8 @@ def plot_multi_organoid_death_dynamics(
         )
         
         plt.tight_layout()
-        plt.show()
+        if show_in_notebook:
+            plt.show()
         pdf.savefig(fig2, bbox_inches='tight')
         plt.close(fig2)
 
@@ -2210,7 +2224,8 @@ def plot_multi_organoid_death_dynamics(
             orig_dpi = fig_combo.get_dpi()
             if screen_show_scale != 1.0:
                 fig_combo.set_dpi(orig_dpi * screen_show_scale)
-            plt.show()
+            if show_in_notebook:
+                plt.show()
             if screen_show_scale != 1.0:
                 fig_combo.set_dpi(orig_dpi)
 
@@ -2258,6 +2273,7 @@ def run_organoid_morphology_dead_analysis(
     distance_metric = "euclidean",
     leiden_resolution=1.0,
     metadata=None,
+    show_in_notebook=True,
 ):
     """
     Initial Morphology Related to Death: PCA + Leiden + UMAP
@@ -2794,7 +2810,8 @@ def run_organoid_morphology_dead_analysis(
             ax.text(0.5, 0.5, "No features for heatmap", ha="center", va="center")
             ax.axis("off")
         pdf.savefig(fig, dpi=600)
-        plt.show()
+        if show_in_notebook:
+            plt.show()
         plt.close(fig)
 
         # Other pages: violin plots
@@ -3323,7 +3340,8 @@ def run_organoid_morphology_dead_analysis(
                 ax.grid(True, axis="y", linestyle=":", linewidth=0.5, alpha=0.5)
                 plt.tight_layout()
                 pdf.savefig(fig, bbox_inches="tight")
-                plt.show()
+                if show_in_notebook:
+                    plt.show()
                 plt.close(fig)
 
     print(f"  Composition PDF saved to: {comp_pdf_path}")

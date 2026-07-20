@@ -27,7 +27,7 @@ import yaml
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QCheckBox, QGroupBox,
-    QScrollArea, QSpinBox, QComboBox, QFrame, QSizePolicy,
+    QScrollArea, QSpinBox, QDoubleSpinBox, QComboBox, QFrame, QSizePolicy,
     QToolButton, QMessageBox, QSplitter, QStackedWidget,
     QTreeWidget, QTreeWidgetItem, QMenu, QHeaderView,
 )
@@ -36,17 +36,49 @@ from qtpy.QtGui import QDesktopServices
 
 from behav3d.napari._pdf_view import open_pdf_in_napari
 from behav3d.napari._results_panel import ResultsPanel
-from behav3d.core.qt_help import make_help_row
+from behav3d.core.qt_help import make_help_row, HelpButton
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
+def _period_from_spins(start_spin, end_spin):
+    """Build ``analysis_period_min`` from optional start/end minute spinboxes.
+
+    Spin value ``-1`` means an open bound (from start / to end). Both open
+    returns ``None`` (whole movie).
+    """
+    start = None if start_spin.value() < 0 else float(start_spin.value())
+    end = None if end_spin.value() < 0 else float(end_spin.value())
+    if start is None and end is None:
+        return None
+    return (start, end)
+
+
+def _period_from_t_radios(radio_group, start_spin, end_spin):
+    """Build ``analysis_period_t`` from a radio group + integer spinboxes.
+
+    Returns ``None`` when "All timepoints" is selected, otherwise
+    ``(start_t, end_t)`` from the spin values.
+    """
+    # Qt radio: checked text; ipywidgets: value string
+    if hasattr(radio_group, 'checkedButton'):
+        # Qt path
+        btn = radio_group.checkedButton()
+        if btn is None or btn.text() == "All timepoints":
+            return None
+    else:
+        if getattr(radio_group, 'value', 'All timepoints') == 'All timepoints':
+            return None
+    return (int(start_spin.value()), int(end_spin.value()))
+
+
 def _detect_cell_types(metadata_loader):
     """Return (organoid_types, immune_types, other_types) lists.
 
-    Includes merged/grouped outputs routed to their detected category.
-    Returns three empty lists when metadata is missing.
+    Includes both legacy metadata-registered merged types and the current
+    ``cell_type_groups`` (yml-based, post-filtering) groups, routed to their
+    detected category. Returns three empty lists when metadata is missing.
     """
     if metadata_loader is None or metadata_loader.metadata is None:
         return [], [], []
@@ -58,6 +90,7 @@ def _detect_cell_types(metadata_loader):
         filter_multicolor_inputs,
     )
     from behav3d.widgets.utils import detect_cell_type_category
+    from behav3d.analysis.grouping import list_cell_type_groups, group_category
 
     md = metadata_loader.metadata
     org = filter_multicolor_inputs(detect_organoid_types_from_metadata(md))
@@ -75,6 +108,16 @@ def _detect_cell_types(metadata_loader):
             oth.append(ct)
         elif category == "immune" and ct not in imm:
             imm.append(ct)
+
+    params = getattr(metadata_loader, "behav3d_parameters", {}) or {}
+    for group_id in list_cell_type_groups(params):
+        category = group_category(params, md, group_id)
+        if category == "organoid" and group_id not in org:
+            org.append(group_id)
+        elif category == "other" and group_id not in oth:
+            oth.append(group_id)
+        elif group_id not in imm:
+            imm.append(group_id)
     return org, imm, oth
 
 
@@ -106,6 +149,28 @@ def _contact_cols_in_csv(csv_path: Path) -> set[str]:
         return {c[:-len("_contact")] for c in cols if c.endswith("_contact")}
     except Exception:
         return set()
+
+
+# Summary statistics offered by the invasiveness per-movie plot. Kept as a
+# local constant to avoid importing the (matplotlib-heavy) invasiveness module
+# at plugin import time; the actual analysis is imported lazily when run.
+_INV_SUMMARY_STATS = ("mean", "median", "max", "auc")
+
+
+def _invasiveness_targets_in_csv(csv_path: Path) -> list:
+    """Return available invasiveness targets in the filtered CSV at *csv_path*."""
+    if not csv_path.exists():
+        return []
+    try:
+        import pandas as pd
+        from behav3d.analysis.invasiveness_analysis import (
+            detect_invasiveness_targets,
+        )
+
+        cols = pd.read_csv(csv_path, nrows=0)
+        return detect_invasiveness_targets(cols)
+    except Exception:
+        return []
 
 
 def _csv_has_column(csv_path: Path, col: str) -> bool:
@@ -158,8 +223,8 @@ class CollapsibleSection(QWidget):
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(12, 2, 4, 4)
         self._content_layout.setSpacing(4)
-        self._content.setVisible(expanded)
         outer.addWidget(self._content)
+        self._content.setVisible(expanded)
 
         self._update_arrow()
 
@@ -279,13 +344,45 @@ class DeathDynamicsTab(QWidget):
 
     # ── UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
+        from behav3d.napari._guided import (
+            ModeSwitch, GuidedPanel, load_guided_mode,
+        )
+        from behav3d.napari.analysis_guided_copy import (
+            DEATH_DYNAMICS_ANALYSES, GUIDED_INTRO,
+        )
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        # Guided / Advanced switch + stacked pages (Guided = 0, form = 1).
+        guided_default = load_guided_mode()
+        self._mode_switch = ModeSwitch(guided=guided_default)
+        self._mode_switch.modeChanged.connect(self._on_mode_changed)
+        outer.addWidget(self._mode_switch)
+
+        self._stack = QStackedWidget()
+        outer.addWidget(self._stack)
+
+        # Page 0 — Guided explainers.
+        self._guided_panel = GuidedPanel(
+            DEATH_DYNAMICS_ANALYSES,
+            start_cb=self._on_guided_start,
+            intro=GUIDED_INTRO,
+        )
+        self._stack.addWidget(self._guided_panel)
+
+        # Page 1 — the existing settings form, wrapped verbatim.
+        form_page = QWidget()
+        form_outer = QVBoxLayout(form_page)
+        form_outer.setContentsMargins(0, 0, 0, 0)
+        form_outer.setSpacing(0)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        outer.addWidget(scroll)
+        form_outer.addWidget(scroll)
+        self._form_scroll = scroll
+        self._stack.addWidget(form_page)
 
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -403,8 +500,8 @@ class DeathDynamicsTab(QWidget):
             "  • Alive vs Dead overall / per-sample comparison plots\n"
             "  • Fate-based statistics (n_survives / n_dies, "
             "mean_contacts_survives / mean_contacts_dies)\n"
-            "  • Cumulative-to-death curves (Combined run)\n"
-            "  • Active Killing dashboard (Combined run)"
+            "  • Cumulative-to-death curves (Interaction Overview)\n"
+            "  • Active Killing dashboard (Interaction Overview)"
         )
         self.ia_warning_label.setWordWrap(True)
         self.ia_warning_label.setStyleSheet(
@@ -441,6 +538,15 @@ class DeathDynamicsTab(QWidget):
         self.interaction_lay.addWidget(self._interaction_placeholder)
         ia_lay.addWidget(self.interaction_group)
 
+        # ── 2a Per-target Interaction Analysis ───────────────────
+        ia_single_info = QLabel(
+            "2a — Per-target analysis: cumulative contact over time and "
+            "alive vs dead bar plots (one PDF per target × immune type)."
+        )
+        ia_single_info.setWordWrap(True)
+        ia_single_info.setStyleSheet("color: #aaa; font-size: 11px;")
+        ia_lay.addWidget(ia_single_info)
+
         ia_btn_row = QHBoxLayout()
         self.btn_run_ia_single = QPushButton("▶ Run Interaction Analysis (per target)")
         self._style_primary(self.btn_run_ia_single)
@@ -450,9 +556,45 @@ class DeathDynamicsTab(QWidget):
         ia_btn_row.addWidget(self.btn_view_ia_single)
         ia_lay.addLayout(ia_btn_row)
 
+        self.ia_single_adv = CollapsibleSection(
+            "Per-target settings", expanded=False
+        )
+        ia_single_form = QFormLayout()
+        ia_single_form.setContentsMargins(0, 0, 0, 0)
+        ia_single_form.setSpacing(4)
+        self.check_group_by_lc = QCheckBox(
+            "Group overall plots by immune line condition"
+        )
+        gbl_row = QHBoxLayout()
+        gbl_row.addWidget(self.check_group_by_lc)
+        gbl_row.addWidget(HelpButton(
+            "Group overall plots by immune line condition",
+            "Splits the two per-target overall plots by the interacting "
+            "immune cell's line condition (im_{type}_line_condition): the "
+            "cumulative-contact curve draws one line per condition, and the "
+            "alive-vs-dead bar plot colours bars by condition. Only affects "
+            "the 2a per-target overall plots.",
+        ))
+        gbl_row.addStretch()
+        ia_single_form.addRow("", gbl_row)
+        ia_single_adv_host = QWidget()
+        ia_single_adv_host.setLayout(ia_single_form)
+        self.ia_single_adv.contentLayout().addWidget(ia_single_adv_host)
+        ia_lay.addWidget(self.ia_single_adv)
+
+        # ── 2b Interaction Overview ──────────────────────────────
+        ia_overview_info = QLabel(
+            "2b — Interaction Overview: violin (cumulative contacts per "
+            "organoid), cumulative-to-death curves, and active-killing "
+            "dashboard. Works with one or more targets."
+        )
+        ia_overview_info.setWordWrap(True)
+        ia_overview_info.setStyleSheet("color: #aaa; font-size: 11px;")
+        ia_lay.addWidget(ia_overview_info)
+
         ia_combined_row = QHBoxLayout()
         self.btn_run_ia_combined = QPushButton(
-            "▶ Run Combined Interaction Comparison (≥2 targets)"
+            "▶ Run Interaction Overview"
         )
         self._style_primary(self.btn_run_ia_combined)
         self.btn_run_ia_combined.clicked.connect(self._on_run_ia_combined)
@@ -461,36 +603,305 @@ class DeathDynamicsTab(QWidget):
         ia_combined_row.addWidget(self.btn_view_ia_combined)
         ia_lay.addLayout(ia_combined_row)
 
-        # ── Advanced settings (Interaction Analysis) ─────────────
-        # Genuinely collapsible (arrow toggle, no checkbox).
-        self.ia_adv = CollapsibleSection(
-            "Advanced settings (Interaction Analysis)", expanded=False
+        self.ia_overview_settings = CollapsibleSection(
+            "Interaction Overview settings", expanded=False
         )
-        ia_adv_form = QFormLayout()
-        ia_adv_form.setContentsMargins(0, 0, 0, 0)
-        ia_adv_form.setSpacing(4)
+        ia_overview_form = QFormLayout()
+        ia_overview_form.setContentsMargins(0, 0, 0, 0)
+        ia_overview_form.setSpacing(4)
 
         self.spin_time_window = QSpinBox()
         self.spin_time_window.setRange(1, 99999)
         self.spin_time_window.setValue(60)
         self.spin_time_window.setSuffix(" min")
         self.spin_time_window.setMaximumWidth(100)
-        ia_adv_form.addRow("Time window before TOD:", make_help_row(
-            self.spin_time_window, "Time window before TOD", "Lookback time window before Time of Death to consider an interaction."
+        ia_overview_form.addRow("Before-death window:", make_help_row(
+            self.spin_time_window, "Before-death window",
+            "Lookback window (minutes before Time of Death) for the "
+            "cumulative-to-death curve only. Requires death classification.",
         ))
+
+        # Temporal Range: radio buttons + Start T / End T spinboxes
+        from qtpy.QtWidgets import QRadioButton, QButtonGroup
+        self.radio_period_all = QRadioButton("All timepoints")
+        self.radio_period_custom = QRadioButton("Custom time range")
+        self.radio_period_all.setChecked(True)
+        self.period_radio_group = QButtonGroup()
+        self.period_radio_group.addButton(self.radio_period_all)
+        self.period_radio_group.addButton(self.radio_period_custom)
+
+        self.spin_period_start_t = QSpinBox()
+        self.spin_period_start_t.setRange(0, 999999)
+        self.spin_period_start_t.setValue(0)
+        self.spin_period_start_t.setPrefix("Start T: ")
+        self.spin_period_start_t.setMaximumWidth(130)
+        self.spin_period_start_t.setEnabled(False)
+        self.spin_period_end_t = QSpinBox()
+        self.spin_period_end_t.setRange(0, 999999)
+        self.spin_period_end_t.setValue(100)
+        self.spin_period_end_t.setPrefix("End T: ")
+        self.spin_period_end_t.setMaximumWidth(130)
+        self.spin_period_end_t.setEnabled(False)
+
+        def _on_period_radio_toggled(checked):
+            custom = self.radio_period_custom.isChecked()
+            self.spin_period_start_t.setEnabled(custom)
+            self.spin_period_end_t.setEnabled(custom)
+        self.radio_period_custom.toggled.connect(_on_period_radio_toggled)
+
+        period_radio_row = QHBoxLayout()
+        period_radio_row.addWidget(self.radio_period_all)
+        period_radio_row.addWidget(self.radio_period_custom)
+        period_radio_row.addStretch()
+        period_t_row = QHBoxLayout()
+        period_t_row.addWidget(self.spin_period_start_t)
+        period_t_row.addWidget(QLabel("to"))
+        period_t_row.addWidget(self.spin_period_end_t)
+        period_t_row.addStretch()
+
+        temporal_info = QLabel(
+            "Temporal Range — applies to: cumulative interactions "
+            "per organoid and active killing plots"
+        )
+        temporal_info.setWordWrap(True)
+        temporal_info.setStyleSheet("color: #aaa; font-size: 10px;")
+        ia_overview_form.addRow(temporal_info)
+        ia_overview_form.addRow("", period_radio_row)
+        ia_overview_form.addRow("", period_t_row)
+
+        self.check_annotate_lc = QCheckBox(
+            "Annotate by immune line condition"
+        )
+        annotate_lc_row = QHBoxLayout()
+        annotate_lc_row.addWidget(self.check_annotate_lc)
+        annotate_lc_row.addWidget(HelpButton(
+            "Annotate by immune line condition",
+            "When enabled, the violin (cumulative contacts per organoid) and "
+            "the active-killing dashboard add the immune line condition as a "
+            "hue / line-style annotation within the selected 'Group by' "
+            "grouping, instead of pooling all line conditions together. Does "
+            "not affect the cumulative-to-death curve.",
+        ))
+        annotate_lc_row.addStretch()
+        ia_overview_form.addRow("", annotate_lc_row)
 
         self.combo_group_by = QComboBox()
         self.combo_group_by.addItem("By target (organoid) type", userData="organoid_type")
         self.combo_group_by.addItem("By treatment (immune cell)", userData="treatment")
         self.combo_group_by.setMaximumWidth(280)
-        ia_adv_form.addRow("Combined group by:", make_help_row(
-            self.combo_group_by, "Combined group by", "Metadata attribute to group results by in combined analysis."
+        ia_overview_form.addRow("Group by:", make_help_row(
+            self.combo_group_by, "Group by",
+            "How results are grouped on the x-axis in Interaction Overview "
+            "(violin, cumulative-to-death curve, active-killing dashboard). "
+            "'By target (organoid) type' keeps each organoid type as its own "
+            "x-axis group. 'By treatment (immune cell)' pools all organoid "
+            "types together and groups by the interacting immune cell type "
+            "instead.",
         ))
 
-        self.ia_adv.addLayout(ia_adv_form)
-        ia_lay.addWidget(self.ia_adv)
+        ia_overview_host = QWidget()
+        ia_overview_host.setLayout(ia_overview_form)
+        self.ia_overview_settings.contentLayout().addWidget(ia_overview_host)
+        ia_lay.addWidget(self.ia_overview_settings)
+
+        # Overview widgets whose enabled state is managed in
+        # ``_refresh_button_states``.
+        self._ia_overview_setting_widgets = [
+            self.spin_time_window,
+            self.radio_period_all,
+            self.radio_period_custom,
+            self.spin_period_start_t,
+            self.spin_period_end_t,
+            self.check_annotate_lc,
+            self.combo_group_by,
+        ]
 
         layout.addWidget(self.ia_group)
+
+        # ── Step 3: Invasiveness Analysis (immune-cell perspective) ──
+        # Self-contained: has its own immune-cell picker + target checkboxes,
+        # independent of the Death Dynamics / Interaction selectors above.
+        self.inv_group = QGroupBox("Step 3 — Invasiveness Analysis")
+        inv_lay = QVBoxLayout(self.inv_group)
+        inv_lay.setSpacing(4)
+
+        inv_info_row = QHBoxLayout()
+        inv_info_row.addStretch()
+        inv_info_row.addWidget(HelpButton(
+            "Invasiveness Analysis",
+            "Measures invasiveness of the selected immune cell type(s) against "
+            "one or more targets, over time and summarized per movie. Enable "
+            "'invasiveness' during feature extraction to compute the underlying "
+            "values.\n\n"
+            "Feature extraction records, for every immune cell at every "
+            "timepoint, the % of its surface touching a chosen organoid "
+            "target (a '{target}_invasiveness_perc' value, 0-100) and a "
+            "boolean invasive flag that is True once that contact reaches "
+            "≥50%. This step turns those per-cell, per-timepoint values "
+            "into three views:\n\n"
+            "• Fraction over time: % of cells flagged invasive (≥50% "
+            "contact) at each timepoint.\n"
+            "• Mean / median % over time: average / typical contact % "
+            "across ALL cells (including non-invasive 0% ones) at each "
+            "timepoint.\n"
+            "• Per-movie summary: the chosen over-time curve collapsed to "
+            "one dot per movie (see the 'Per-movie summary stat' help).\n\n"
+            "If organoid types are selected for fate cross-referencing, "
+            "fate violins (one point per organoid, requires organoid filtered "
+            "CSVs with death data) additionally show contact %/invasive-cell "
+            "counts per organoid, split by whether that organoid died.",
+        ))
+        inv_lay.addLayout(inv_info_row)
+
+        self.inv_immune_group = QGroupBox("Immune cell type(s)")
+        self.inv_immune_lay = QVBoxLayout(self.inv_immune_group)
+        self.inv_immune_lay.setSpacing(2)
+        self._inv_immune_checks: dict[str, QCheckBox] = {}
+        self._inv_immune_placeholder = QLabel("No immune cell types detected yet.")
+        self._inv_immune_placeholder.setStyleSheet("color: #888; font-style: italic;")
+        self.inv_immune_lay.addWidget(self._inv_immune_placeholder)
+        inv_lay.addWidget(self.inv_immune_group)
+
+        self.inv_targets_group = QGroupBox("🎯 Targets to compare")
+        self.inv_targets_lay = QVBoxLayout(self.inv_targets_group)
+        self.inv_targets_lay.setSpacing(2)
+        self._inv_target_checks: dict[str, QCheckBox] = {}
+        self._inv_targets_placeholder = QLabel(
+            "No invasiveness targets detected yet."
+        )
+        self._inv_targets_placeholder.setStyleSheet(
+            "color: #888; font-style: italic;"
+        )
+        self.inv_targets_lay.addWidget(self._inv_targets_placeholder)
+        inv_lay.addWidget(self.inv_targets_group)
+
+        inv_stat_row = QHBoxLayout()
+        inv_stat_row.addWidget(QLabel("Per-movie summary stat:"))
+        self.inv_summary_combo = QComboBox()
+        for _s in _INV_SUMMARY_STATS:
+            self.inv_summary_combo.addItem(_s, userData=_s)
+        self.inv_summary_combo.setMaximumWidth(160)
+        inv_stat_row.addWidget(self.inv_summary_combo)
+        inv_stat_row.addWidget(HelpButton(
+            "Per-movie summary stat",
+            "Collapses each movie's time series to one value (mean/median/max/AUC). "
+            "Does not affect the separate mean/median-over-time curves.\n\n"
+            "Defines the single number plotted as one dot per movie in the "
+            "'Per-movie' plots (for both the boolean fraction and the "
+            "percentage). For each movie (per immune type / target / line "
+            "condition), the per-timepoint curve is first built by averaging "
+            "across that movie's cells at each timepoint (mean %, or the "
+            "per-timepoint median % when 'median' is selected), then "
+            "collapsed over time using the selected statistic:\n\n"
+            "• mean — average of the per-timepoint values.\n"
+            "• median — median of the per-timepoint values.\n"
+            "• max — highest per-timepoint value reached.\n"
+            "• AUC — area under the per-timepoint curve, normalized by the "
+            "time span (trapezoidal integral / duration), so it stays on "
+            "the same 0-1 / 0-100 scale as the other statistics.\n\n"
+            "This choice only affects the per-movie summary plots/CSV, not "
+            "the separate fraction/mean/median over-time curves.",
+        ))
+        inv_stat_row.addStretch()
+        inv_lay.addLayout(inv_stat_row)
+
+        self.check_inv_group_by_lc = QCheckBox(
+            "Separate by immune line condition"
+        )
+        inv_lc_row = QHBoxLayout()
+        inv_lc_row.addWidget(self.check_inv_group_by_lc)
+        inv_lc_row.addWidget(HelpButton(
+            "Separate by immune line condition",
+            "When enabled, results are additionally split by the immune "
+            "cell's line condition (im_{type}_line_condition): a distinct "
+            "box/line per line condition in the per-movie summary and "
+            "over-time plots, instead of pooling all conditions together.",
+        ))
+        inv_lc_row.addStretch()
+        inv_lay.addLayout(inv_lc_row)
+
+        # Invasiveness temporal range: radio + Start T / End T
+        from qtpy.QtWidgets import QRadioButton, QButtonGroup
+        self.inv_radio_period_all = QRadioButton("All timepoints")
+        self.inv_radio_period_custom = QRadioButton("Custom time range")
+        self.inv_radio_period_all.setChecked(True)
+        self.inv_period_radio_group = QButtonGroup()
+        self.inv_period_radio_group.addButton(self.inv_radio_period_all)
+        self.inv_period_radio_group.addButton(self.inv_radio_period_custom)
+
+        self.spin_inv_start_t = QSpinBox()
+        self.spin_inv_start_t.setRange(0, 999999)
+        self.spin_inv_start_t.setValue(0)
+        self.spin_inv_start_t.setPrefix("Start T: ")
+        self.spin_inv_start_t.setMaximumWidth(130)
+        self.spin_inv_start_t.setEnabled(False)
+        self.spin_inv_end_t = QSpinBox()
+        self.spin_inv_end_t.setRange(0, 999999)
+        self.spin_inv_end_t.setValue(100)
+        self.spin_inv_end_t.setPrefix("End T: ")
+        self.spin_inv_end_t.setMaximumWidth(130)
+        self.spin_inv_end_t.setEnabled(False)
+
+        def _on_inv_period_radio_toggled(checked):
+            custom = self.inv_radio_period_custom.isChecked()
+            self.spin_inv_start_t.setEnabled(custom)
+            self.spin_inv_end_t.setEnabled(custom)
+        self.inv_radio_period_custom.toggled.connect(_on_inv_period_radio_toggled)
+
+        inv_period_radio_row = QHBoxLayout()
+        inv_period_radio_row.addWidget(self.inv_radio_period_all)
+        inv_period_radio_row.addWidget(self.inv_radio_period_custom)
+        inv_period_radio_row.addStretch()
+        inv_period_t_row = QHBoxLayout()
+        inv_period_t_row.addWidget(self.spin_inv_start_t)
+        inv_period_t_row.addWidget(QLabel("to"))
+        inv_period_t_row.addWidget(self.spin_inv_end_t)
+        inv_period_t_row.addStretch()
+
+        inv_temporal_label = QLabel("Temporal Range (in timepoints):")
+        inv_temporal_label.setStyleSheet("color: #aaa; font-size: 10px;")
+        inv_lay.addWidget(inv_temporal_label)
+        inv_lay.addLayout(inv_period_radio_row)
+        inv_lay.addLayout(inv_period_t_row)
+
+        # Queue + view buttons for the invasiveness step.
+        self.btn_queue_inv = QPushButton("+🛒")
+        self.btn_queue_inv.setFixedSize(36, 28)
+        self.btn_queue_inv.setToolTip("Add to Processing Queue")
+        self.btn_queue_inv.setStyleSheet(
+            "QPushButton { background: #1a1a2e; color: #ffc107; "
+            "border: 1px solid #ffc107; border-radius: 4px; "
+            "font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
+        )
+        self.btn_view_inv = QPushButton("👁")
+        self.btn_view_inv.setFixedSize(36, 28)
+        self.btn_view_inv.setToolTip(
+            "View the invasiveness result PDF in napari"
+        )
+        self.btn_view_inv.setStyleSheet(
+            "QPushButton { background: #1a2e1a; color: #6dd56d; "
+            "border: 1px solid #6dd56d; border-radius: 4px; "
+            "font-size: 12px; font-weight: bold; }"
+            "QPushButton:hover { background: #6dd56d; color: #1a2e1a; }"
+            "QPushButton:disabled { background: #1a1a1a; color: #555; "
+            "border: 1px solid #333; }"
+        )
+        self.btn_view_inv.setEnabled(False)
+        self.btn_view_inv.clicked.connect(
+            lambda: self._on_view_clicked("invasiveness")
+        )
+
+        inv_btn_row = QHBoxLayout()
+        self.btn_run_inv = QPushButton("▶ Run Invasiveness Analysis")
+        self._style_primary(self.btn_run_inv)
+        self.btn_run_inv.clicked.connect(self._on_run_invasiveness)
+        inv_btn_row.addWidget(self.btn_run_inv, stretch=1)
+        inv_btn_row.addWidget(self.btn_queue_inv)
+        inv_btn_row.addWidget(self.btn_view_inv)
+        inv_lay.addLayout(inv_btn_row)
+
+        layout.addWidget(self.inv_group)
 
         # ── Run All Available + Log ───────────────────────────────
         run_all_row = QHBoxLayout()
@@ -515,6 +926,31 @@ class DeathDynamicsTab(QWidget):
 
         # Try a first build (in case metadata is already loaded)
         self._rebuild()
+
+        # Reveal the page matching the persisted mode.
+        self._stack.setCurrentIndex(0 if self._mode_switch.is_guided() else 1)
+
+    # ── Guided / Advanced mode ─────────────────────────────────────────────
+    def _on_mode_changed(self, guided: bool):
+        from behav3d.napari._guided import save_guided_mode
+
+        self._stack.setCurrentIndex(0 if guided else 1)
+        save_guided_mode(guided)
+
+    def _on_guided_start(self, analysis_id: str):
+        """Start from a Guided card: reveal the form and scroll to its step."""
+        from qtpy.QtCore import QTimer
+
+        self._mode_switch.set_guided(False)  # → _on_mode_changed flips the page
+        group = {
+            "death_dynamics": getattr(self, "dd_group", None),
+            "interaction": getattr(self, "ia_group", None),
+            "invasiveness": getattr(self, "inv_group", None),
+        }.get(analysis_id)
+        if group is not None:
+            QTimer.singleShot(
+                0, lambda: self._form_scroll.ensureWidgetVisible(group)
+            )
 
     def _style_primary(self, btn: QPushButton):
         btn.setStyleSheet(
@@ -683,6 +1119,7 @@ class DeathDynamicsTab(QWidget):
 
         self._refresh_interaction_availability()
         self._refresh_button_states()
+        self._rebuild_invasiveness()
 
     # ── State helpers ──────────────────────────────────────────────────
     def _selected_targets(self) -> list[str]:
@@ -803,21 +1240,50 @@ class DeathDynamicsTab(QWidget):
         ia_ready_single = bool(targets) and bool(interactions)
         self.btn_run_ia_single.setEnabled(ia_ready_single)
         self.btn_queue_ia_single.setEnabled(ia_ready_single)
-        ia_ready_combined = ia_ready_single and (len(targets) >= 2)
-        self.btn_run_ia_combined.setEnabled(ia_ready_combined)
-        self.btn_queue_ia_combined.setEnabled(ia_ready_combined)
-        tip_combined = ""
-        if len(targets) < 2:
-            tip_combined = "Select at least 2 targets to compare."
+        self.check_group_by_lc.setEnabled(ia_ready_single)
+        ia_ready_overview = ia_ready_single
+        self.btn_run_ia_combined.setEnabled(ia_ready_overview)
+        self.btn_queue_ia_combined.setEnabled(ia_ready_overview)
+        for w in self._ia_overview_setting_widgets:
+            w.setEnabled(ia_ready_overview)
+        # Before-death window only meaningful when death data exists.
+        overview_has_dead = bool(targets_with_dead) and has_dead
+        self.spin_time_window.setEnabled(ia_ready_overview and overview_has_dead)
+        # Temporal T spinboxes: respect custom-range toggle when overview runs.
+        if ia_ready_overview:
+            custom_period = self.radio_period_custom.isChecked()
+            self.spin_period_start_t.setEnabled(custom_period)
+            self.spin_period_end_t.setEnabled(custom_period)
+        tip_overview = ""
+        if not targets:
+            tip_overview = "Select at least one target above."
         elif not interactions:
-            tip_combined = "Select at least one interaction cell type."
+            tip_overview = "Select at least one interaction cell type."
         elif not has_dead:
-            tip_combined = (
-                "Will run without dead data — alive/dead comparison panels "
-                "and cumulative-to-death curves will be skipped."
+            tip_overview = (
+                "Will run without dead data — fate split, cumulative-to-death "
+                "curves and active-killing dashboard will be skipped."
             )
-        self.btn_run_ia_combined.setToolTip(tip_combined)
-        self.btn_queue_ia_combined.setToolTip(tip_combined)
+        elif len(targets) == 1:
+            tip_overview = (
+                "Summary plots for the selected target: violin, "
+                "before-death curves, active-killing dashboard."
+            )
+        else:
+            tip_overview = (
+                "Summary plots across selected targets on the same figure."
+            )
+        self.btn_run_ia_combined.setToolTip(tip_overview)
+        self.btn_queue_ia_combined.setToolTip(tip_overview)
+        if ia_ready_overview and not overview_has_dead:
+            self.spin_time_window.setToolTip(
+                "Requires death classification in the filtered CSV."
+            )
+        else:
+            self.spin_time_window.setToolTip(
+                "Lookback window (minutes before Time of Death) for the "
+                "cumulative-to-death curve only."
+            )
 
         # IA disclaimer — shown when targets are selected but their filtered
         # CSV(s) lack a ``dead`` column (Feature Extraction not yet run with
@@ -938,13 +1404,49 @@ class DeathDynamicsTab(QWidget):
                 for it in interactions
             ]
         if kind == "ia_combined":
+            comp_dir = out_dir / "analysis" / "multi_organoid_comparison"
+            pdfs = sorted(comp_dir.glob("multi_organoid_interaction_comparison*.pdf"))
+            if not pdfs:
+                return [
+                    (
+                        "Interaction Overview",
+                        comp_dir / "multi_organoid_interaction_comparison.pdf",
+                    )
+                ]
             return [
-                (
-                    "Combined Interaction Comparison",
-                    out_dir / "analysis" / "multi_organoid_comparison"
-                    / "multi_organoid_interaction_comparison.pdf",
-                )
+                (p.stem.replace("multi_organoid_interaction_comparison", "Overview").strip("_") or "Overview", p)
+                for p in pdfs
             ]
+        if kind == "invasiveness":
+            immune_list = self._selected_invasiveness_immune()
+            if not immune_list:
+                return []
+            # Look in each selected immune type's folder plus the combined
+            # multi-immune folder, matching all suffixed output PDFs.
+            search_dirs = [
+                out_dir / "analysis" / im / "invasiveness_analysis"
+                for im in immune_list
+            ]
+            search_dirs.append(out_dir / "analysis" / "invasiveness_analysis")
+            pdfs = []
+            for d in search_dirs:
+                if d.exists():
+                    pdfs.extend(sorted(d.glob("invasiveness_analysis_*.pdf")))
+            # De-duplicate while preserving order.
+            seen = set()
+            uniq = []
+            for p in pdfs:
+                if p not in seen:
+                    seen.add(p)
+                    uniq.append(p)
+            if not uniq:
+                im0 = immune_list[0]
+                return [(
+                    f"Invasiveness — {im0}",
+                    out_dir / "analysis" / im0 / "invasiveness_analysis"
+                    / f"invasiveness_analysis_{im0}.pdf",
+                )]
+            return [(p.stem, p) for p in uniq]
         return []
 
     def _update_view_buttons(self):
@@ -993,6 +1495,13 @@ class DeathDynamicsTab(QWidget):
             ),
         )
         _set(self.btn_view_ia_combined, "ia_combined")
+        _set(
+            self.btn_view_inv, "invasiveness",
+            empty_tip=(
+                "Select an immune cell type and target(s) to view its "
+                "invasiveness-analysis PDF."
+            ),
+        )
 
     def _open_pdf_in_napari(self, path: Path):
         """Open *path* in napari using the shared Results panel's settings.
@@ -1026,6 +1535,7 @@ class DeathDynamicsTab(QWidget):
             "dd_combined": self.btn_view_dd_combined,
             "ia_single": self.btn_view_ia_single,
             "ia_combined": self.btn_view_ia_combined,
+            "invasiveness": self.btn_view_inv,
         }.get(kind)
         menu = QMenu(self)
         for lbl, path in existing:
@@ -1066,6 +1576,16 @@ class DeathDynamicsTab(QWidget):
         cfg = params.setdefault("analysis_tab", {}).setdefault("interaction", {})
         cfg["time_window_min"] = int(self.spin_time_window.value())
         cfg["group_by"] = self.combo_group_by.currentData() or "organoid_type"
+        cfg["annotate_line_condition"] = bool(self.check_annotate_lc.isChecked())
+        cfg["group_by_line_condition"] = bool(self.check_group_by_lc.isChecked())
+        cfg["analysis_period_t"] = _period_from_t_radios(
+            self.period_radio_group, self.spin_period_start_t, self.spin_period_end_t,
+        )
+        inv_cfg = params.setdefault("analysis_tab", {}).setdefault("invasiveness", {})
+        inv_cfg["group_by_line_condition"] = bool(self.check_inv_group_by_lc.isChecked())
+        inv_cfg["analysis_period_t"] = _period_from_t_radios(
+            self.inv_period_radio_group, self.spin_inv_start_t, self.spin_inv_end_t,
+        )
         params_path = getattr(self.metadata_loader, "behav3d_parameters_path", None)
         if params_path is not None:
             try:
@@ -1149,15 +1669,21 @@ class DeathDynamicsTab(QWidget):
         interactions = self._selected_interactions()
         if not targets or not interactions:
             return
+        self._persist_advanced()
         try:
-            self.run_interaction_for(targets, interactions, interactive=True)
+            self.run_interaction_for(
+                targets,
+                interactions,
+                group_by_line_condition=self.check_group_by_lc.isChecked(),
+                interactive=True,
+            )
         finally:
             self._notify_results_changed()
 
     def _on_run_ia_combined(self):
         targets = self._selected_targets()
         interactions = self._selected_interactions()
-        if len(targets) < 2 or not interactions:
+        if not targets or not interactions:
             return
         self._persist_advanced()
         try:
@@ -1166,6 +1692,10 @@ class DeathDynamicsTab(QWidget):
                 interactions,
                 time_window_min=int(self.spin_time_window.value()),
                 group_by=self.combo_group_by.currentData() or "organoid_type",
+                annotate_line_condition=self.check_annotate_lc.isChecked(),
+                analysis_period_t=_period_from_t_radios(
+                    self.period_radio_group, self.spin_period_start_t, self.spin_period_end_t,
+                ),
                 interactive=True,
             )
         finally:
@@ -1186,16 +1716,24 @@ class DeathDynamicsTab(QWidget):
                     self.run_multi_organoid_death_for(targets, interactive=True)
                 )
         if interactions:
-            self.run_interaction_for(targets, interactions, interactive=True)
-            if len(targets) >= 2:
-                self._persist_advanced()
-                self.run_multi_organoid_interaction_for(
-                    targets,
-                    interactions,
-                    time_window_min=int(self.spin_time_window.value()),
-                    group_by=self.combo_group_by.currentData() or "organoid_type",
-                    interactive=True,
-                )
+            self._persist_advanced()
+            self.run_interaction_for(
+                targets,
+                interactions,
+                group_by_line_condition=self.check_group_by_lc.isChecked(),
+                interactive=True,
+            )
+            self.run_multi_organoid_interaction_for(
+                targets,
+                interactions,
+                time_window_min=int(self.spin_time_window.value()),
+                group_by=self.combo_group_by.currentData() or "organoid_type",
+                annotate_line_condition=self.check_annotate_lc.isChecked(),
+                analysis_period_t=_period_from_t_radios(
+                    self.period_radio_group, self.spin_period_start_t, self.spin_period_end_t,
+                ),
+                interactive=True,
+            )
         if dd_any_ok:
             folder = Path(self.metadata_loader.output_dir).expanduser() / "analysis"
             self._offer_open_results_folder(folder, what="Death Dynamics")
@@ -1252,6 +1790,7 @@ class DeathDynamicsTab(QWidget):
                     df_tracks_path=None,
                     org_type=ct,
                     metadata=self.metadata_loader.metadata,
+                    show_in_notebook=False,
                 )
                 self._log(f"✅ Death Dynamics complete for {ct}.")
                 any_ok = True
@@ -1333,6 +1872,7 @@ class DeathDynamicsTab(QWidget):
                 output_dir=out_dir,
                 organoid_types=usable,
                 dead_perc_threshold_map=thr_map,
+                show_in_notebook=False,
             )
             self._log("✅ Combined Death Dynamics complete.")
             return True
@@ -1348,6 +1888,7 @@ class DeathDynamicsTab(QWidget):
         cell_types: Iterable[str],
         interaction_cell_types: Iterable[str],
         *,
+        group_by_line_condition: bool = False,
         interactive: bool = True,
     ):
         from behav3d.analysis.interaction_analysis import run_interaction_analysis
@@ -1380,6 +1921,7 @@ class DeathDynamicsTab(QWidget):
                     interacting_cell_types=selected,
                     df_tracks_path=str(csv),
                     show_plots=interactive,
+                    group_by_line_condition=group_by_line_condition,
                 )
                 self._log(f"✅ Interaction Analysis complete for {ct}.")
             except Exception as e:
@@ -1395,16 +1937,17 @@ class DeathDynamicsTab(QWidget):
         *,
         time_window_min: float = 60.0,
         group_by: str = "organoid_type",
+        annotate_line_condition: bool = False,
+        analysis_period_t: tuple = None,
         interactive: bool = True,
     ):
-        """Run Combined Interaction Comparison.
+        """Run Interaction Overview.
 
         Pre-filters *cell_types* to those whose filtered CSV exists and
         carries a contact column for at least one of the selected
-        interaction cell types. If fewer than 2 usable targets remain we
-        log a skip message and return without raising, so the queue can
-        continue when an earlier Filter step has not yet produced the
-        expected outputs.
+        interaction cell types. If no usable targets remain we log a skip
+        message and return without raising, so the queue can continue when
+        an earlier Filter step has not yet produced the expected outputs.
         """
         from behav3d.analysis.interaction_analysis import (
             run_multi_organoid_interaction_comparison,
@@ -1412,11 +1955,11 @@ class DeathDynamicsTab(QWidget):
 
         cts = list(cell_types)
         ints = list(interaction_cell_types)
-        if len(cts) < 2 or not ints:
+        if not cts or not ints:
             return
         if not _has_dead_channel(self.metadata_loader.metadata):
             self._log(
-                "ⓘ Running Combined Interaction Comparison without dead "
+                "ⓘ Running Interaction Overview without dead "
                 "data — alive/dead split, cumulative-to-death curves and "
                 "active-killing dashboard will be skipped."
             )
@@ -1440,20 +1983,19 @@ class DeathDynamicsTab(QWidget):
             usable.append(ct)
         if skipped:
             self._log(
-                "⏭ Combined Interaction Comparison: skipping "
+                "⏭ Interaction Overview: skipping "
                 f"{', '.join(skipped)}."
             )
-        if len(usable) < 2:
+        if len(usable) < 1:
             self._log(
-                f"⏭ Skipping Combined Interaction Comparison: only "
-                f"{len(usable)} target(s) with usable data — need at "
-                f"least 2."
+                f"⏭ Skipping Interaction Overview: no targets with "
+                f"usable data."
             )
             return
 
         try:
             self._log(
-                f"Combined Interaction Comparison: {', '.join(usable)} "
+                f"Interaction Overview: {', '.join(usable)} "
                 f"× {', '.join(ints)}…"
             )
             run_multi_organoid_interaction_comparison(
@@ -1463,14 +2005,204 @@ class DeathDynamicsTab(QWidget):
                 metadata=self.metadata_loader.metadata,
                 group_by=group_by,
                 time_window_min=float(time_window_min),
+                analysis_period_t=analysis_period_t,
+                annotate_line_condition=annotate_line_condition,
                 show_plots=interactive,
             )
-            self._log("✅ Combined Interaction Comparison complete.")
+            self._log("✅ Interaction Overview complete.")
         except Exception as e:
             traceback.print_exc()
-            self._log(f"❌ Combined Interaction Comparison failed: {e}")
+            self._log(f"❌ Interaction Overview failed: {e}")
             if not interactive:
                 raise
+
+    # ── Invasiveness Analysis (Step 3, immune-cell perspective) ─────────
+    def _selected_invasiveness_immune(self) -> list[str]:
+        return [
+            im for im, cb in getattr(self, "_inv_immune_checks", {}).items()
+            if cb.isChecked()
+        ]
+
+    def _selected_invasiveness_targets(self) -> list[str]:
+        return [
+            t for t, cb in getattr(self, "_inv_target_checks", {}).items()
+            if cb.isChecked()
+        ]
+
+    def _rebuild_invasiveness(self):
+        """(Re)populate the immune-cell checkboxes, then rebuild target
+        checkboxes. Additive: called whenever metadata changes."""
+        self._inv_immune_checks = {}
+        self._clear_layout(self.inv_immune_lay)
+        _, immune_types, other_types = _detect_cell_types(self.metadata_loader)
+        candidates = list(immune_types) + list(other_types)
+        if not candidates:
+            self.inv_immune_lay.addWidget(self._inv_immune_placeholder)
+        else:
+            for i, ct in enumerate(candidates):
+                cb = QCheckBox(ct)
+                cb.setChecked(i == 0)
+                cb.toggled.connect(
+                    lambda _checked=False: self._rebuild_invasiveness_targets()
+                )
+                self.inv_immune_lay.addWidget(cb)
+                self._inv_immune_checks[ct] = cb
+        self._rebuild_invasiveness_targets()
+
+    def _rebuild_invasiveness_targets(self):
+        self._inv_target_checks = {}
+        self._clear_layout(self.inv_targets_lay)
+
+        immune_list = self._selected_invasiveness_immune()
+        if (
+            self.metadata_loader is None
+            or self.metadata_loader.metadata is None
+            or not self.metadata_loader.output_dir
+            or not immune_list
+        ):
+            self.inv_targets_lay.addWidget(self._inv_targets_placeholder)
+            self.btn_run_inv.setEnabled(False)
+            self.btn_queue_inv.setEnabled(False)
+            self._update_view_buttons()
+            return
+
+        # Union of targets across all selected immune types; note any whose
+        # filtered CSV is missing.
+        out_dir = Path(self.metadata_loader.output_dir)
+        targets: list[str] = []
+        missing: list[str] = []
+        for im in immune_list:
+            csv = _filtered_csv(out_dir, im)
+            tg = _invasiveness_targets_in_csv(csv)
+            if not tg:
+                missing.append(im)
+            for t in tg:
+                if t not in targets:
+                    targets.append(t)
+        if not targets:
+            msg = QLabel(
+                f"⚠ No invasiveness columns for: {', '.join(missing or immune_list)}. "
+                "Run Feature Extraction with 'invasiveness' enabled, then Filtering."
+            )
+            msg.setWordWrap(True)
+            msg.setStyleSheet("color: #888; font-style: italic;")
+            self.inv_targets_lay.addWidget(msg)
+            self.btn_run_inv.setEnabled(False)
+            self.btn_queue_inv.setEnabled(False)
+            self._update_view_buttons()
+            return
+
+        for t in sorted(targets):
+            cb = QCheckBox(t)
+            cb.setChecked(True)
+            cb.toggled.connect(
+                lambda _checked=False: self._refresh_invasiveness_buttons()
+            )
+            self.inv_targets_lay.addWidget(cb)
+            self._inv_target_checks[t] = cb
+        self._refresh_invasiveness_buttons()
+
+    def _refresh_invasiveness_buttons(self):
+        immune_list = self._selected_invasiveness_immune()
+        ready = bool(immune_list) and bool(self._selected_invasiveness_targets())
+        self.btn_run_inv.setEnabled(ready)
+        self.btn_queue_inv.setEnabled(ready)
+        if not immune_list:
+            tip = "Select at least one immune cell type."
+        elif not self._selected_invasiveness_targets():
+            tip = "Select at least one target to compare."
+        else:
+            tip = ""
+        self.btn_run_inv.setToolTip(tip)
+        self.btn_queue_inv.setToolTip(tip)
+        self._update_view_buttons()
+
+    def _on_run_invasiveness(self):
+        immune_list = self._selected_invasiveness_immune()
+        targets = self._selected_invasiveness_targets()
+        if not immune_list or not targets:
+            return
+        try:
+            ok = self.run_invasiveness_for(
+                immune_list,
+                targets,
+                summary_stat=self.inv_summary_combo.currentData() or "mean",
+                group_by_line_condition=self.check_inv_group_by_lc.isChecked(),
+                analysis_period_t=_period_from_t_radios(
+                    self.inv_period_radio_group, self.spin_inv_start_t, self.spin_inv_end_t,
+                ),
+                interactive=True,
+            )
+            if ok:
+                base = Path(self.metadata_loader.output_dir).expanduser() / "analysis"
+                folder = (
+                    base / "invasiveness_analysis" if len(immune_list) > 1
+                    else base / immune_list[0] / "invasiveness_analysis"
+                )
+                self._offer_open_results_folder(
+                    folder, what="Invasiveness Analysis"
+                )
+        finally:
+            self._notify_results_changed()
+
+    def run_invasiveness_for(
+        self,
+        immune_cell_types,
+        targets: Iterable[str],
+        *,
+        summary_stat: str = "mean",
+        group_by_line_condition: bool = False,
+        analysis_period_t: tuple = None,
+        interactive: bool = True,
+    ) -> bool:
+        """Run invasiveness analysis for one or more immune cell types vs
+        targets. ``immune_cell_types`` may be a single string or a list.
+
+        Returns True on success. Skips gracefully (logs) when none of the
+        immune cell types' filtered CSVs exist, so the queue can continue.
+        """
+        from behav3d.analysis.invasiveness_analysis import (
+            run_invasiveness_analysis,
+        )
+
+        if isinstance(immune_cell_types, str):
+            immune_list = [immune_cell_types]
+        else:
+            immune_list = [str(c) for c in immune_cell_types if c]
+        tgts = list(targets)
+        if not immune_list or not tgts:
+            return False
+        out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+        present = [im for im in immune_list if _filtered_csv(Path(out_dir), im).exists()]
+        if not present:
+            self._log(
+                f"⚠ Skipping invasiveness: no filtered CSV found for "
+                f"{', '.join(immune_list)}."
+            )
+            return False
+        try:
+            self._log(
+                f"Invasiveness Analysis: {', '.join(present)} → {', '.join(tgts)}…"
+            )
+            organoid_types, _, _ = _detect_cell_types(self.metadata_loader)
+            run_invasiveness_analysis(
+                output_dir=out_dir,
+                immune_cell_types=present,
+                targets=tgts,
+                summary_stat=summary_stat,
+                show_plots=interactive,
+                group_by_line_condition=group_by_line_condition,
+                analysis_period_t=analysis_period_t,
+                organoid_types=list(organoid_types),
+            )
+            self._log(f"✅ Invasiveness Analysis complete for {', '.join(present)}.")
+            return True
+        except Exception as e:
+            traceback.print_exc()
+            self._log(f"❌ Invasiveness Analysis failed for {', '.join(present)}: {e}")
+            if not interactive:
+                raise
+            return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1533,6 +2265,33 @@ class AnalysisTab(QWidget):
         main_lay.setContentsMargins(0, 0, 0, 0)
         main_lay.setSpacing(0)
 
+        # ── Cell type grouping ──────────────────────────────────────────
+        # Sits above both subtabs: grouping merges already-*filtered*
+        # populations (see behav3d.analysis.grouping), so it belongs after
+        # Filtering and before Death Dynamics / Single Cell, not before
+        # Feature Extraction — that would duplicate feature
+        # extraction/filtering work for every group.
+        grouping_row = QHBoxLayout()
+        grouping_row.setContentsMargins(6, 6, 6, 4)
+        self.btn_open_grouping = QPushButton("🧬  Cell type grouping…")
+        self.btn_open_grouping.setToolTip(
+            "Merge several already-filtered cell types into a single "
+            "'{name}_merged' population for Death Dynamics / Single Cell.\n"
+            "Metadata is not modified — only behav3d_parameters.yml and a "
+            "merged filtered CSV are written."
+        )
+        self.btn_open_grouping.setStyleSheet(
+            "QPushButton { background:#1f3a5f; color:#bbdefb; font-weight:bold; "
+            "border:1px solid #64b5f6; border-radius:4px; padding:6px 12px; } "
+            "QPushButton:hover { background:#2c4f7f; }"
+            "QPushButton:disabled { color:#666; border-color:#444; }"
+        )
+        self.btn_open_grouping.clicked.connect(self._on_open_grouping_dialog)
+        self.btn_open_grouping.setEnabled(False)
+        grouping_row.addWidget(self.btn_open_grouping)
+        grouping_row.addStretch()
+        main_lay.addLayout(grouping_row)
+
         self.splitter = QSplitter(Qt.Vertical, self.main_content)
         self.splitter.setChildrenCollapsible(True)
         main_lay.addWidget(self.splitter)
@@ -1580,12 +2339,17 @@ class AnalysisTab(QWidget):
             and getattr(metadata_loader, "metadata", None) is not None
         ):
             self.stack.setCurrentIndex(1)
+            self.btn_open_grouping.setEnabled(True)
         else:
             self.stack.setCurrentIndex(0)
 
     def _on_metadata_loaded(self, *_):
         """Reveal the analysis GUI once metadata is available."""
         self.stack.setCurrentIndex(1)
+        self.btn_open_grouping.setEnabled(
+            self.metadata_loader is not None
+            and getattr(self.metadata_loader, "metadata", None) is not None
+        )
 
     def _on_metadata_updated(self, *_):
         """Cascade metadata updates to inner tabs and results panel."""
@@ -1595,3 +2359,22 @@ class AnalysisTab(QWidget):
             self.single_cell_tab._on_metadata_updated()
         if hasattr(self, "results_panel"):
             self.results_panel.refresh()
+
+    # ── Cell type grouping ────────────────────────────────────────────────
+    def _on_open_grouping_dialog(self):
+        """Open the cell-type grouping dialog and refresh cell-type
+        dropdowns (Death Dynamics / Single Cell) on success."""
+        from behav3d.napari._grouping_dialog import GroupBuilderDialog
+
+        if self.metadata_loader is None or self.metadata_loader.metadata is None:
+            return
+
+        dlg = GroupBuilderDialog(self.metadata_loader, parent=self)
+        dlg.group_created.connect(self._on_group_changed)
+        dlg.group_removed.connect(self._on_group_changed)
+        dlg.exec_()
+
+    def _on_group_changed(self, group_id: str):
+        """Slot: refresh Death Dynamics / Single Cell dropdowns after a
+        group is created or removed."""
+        self._on_metadata_updated()

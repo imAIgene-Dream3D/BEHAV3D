@@ -263,6 +263,21 @@ def _load_classifier(pixelclass_dir, cell_type, provided_path=None):
     return None
 
 
+def _cfg_val(cfg, ct, key, default):
+    """Look up a per-cell-type instance-segmentation postprocessing param.
+
+    Two callers feed ``apoc_config`` here with different key conventions: the
+    napari GUI (``behav3d/napari/_segmentation.py``) writes ``apoc_{ct}_{key}``,
+    while the notebook widget (``behav3d/widgets/segmentation.py``) writes the
+    unprefixed ``{ct}_{key}`` into its own ``pixel_classifier`` config. Prefer
+    the prefixed key and fall back to the unprefixed one so both stay correct.
+    """
+    prefixed = f"apoc_{ct}_{key}"
+    if prefixed in cfg:
+        return cfg[prefixed]
+    return cfg.get(f"{ct}_{key}", default)
+
+
 def _open_zarr_output(path, dtype, shape, overwrite):
     """Open a zarr array for output, creating/recreating as needed."""
     path = Path(path)
@@ -321,7 +336,7 @@ def run_apoc_segmentation(
     output_dir = Path(output_dir)
     pixelclass_dir = output_dir / "images" / "PixelClassification"
 
-    # --- Discover cell types from metadata (same logic as the rest of BEHAV3D) ---
+    # --- Discover cell types from metadata ---
     organoid_types = detect_organoid_types_from_metadata(metadata)
     immune_types = detect_immune_cell_types_from_metadata(metadata)
     other_types = detect_other_cell_types_from_metadata(metadata)
@@ -392,22 +407,8 @@ def run_apoc_segmentation(
  
         # Output directory
         img_outdir = output_dir / "images" / sample_name
- 
-        # SKIP LOGIC: If all active outputs already exist and overwrite=False, skip
-        if not overwrite_existing:
-            all_done = True
-            for ct in active_cell_types:
-                if not (img_outdir / f"{sample_name}_{ct}_segments.zarr").exists():
-                    all_done = False
-                    break
-            if all_done and has_death and clf_death:
-                if not (img_outdir / f"{sample_name}_mask_dead.zarr").exists():
-                    all_done = False
-
-            if all_done and active_cell_types:  # guard: don't skip if nothing was checked
-                print(f"  ⏭️ Skipping {sample_name} (all outputs already exist)")
-                continue
-
+        done_dir = img_outdir / ".done_markers"
+        
         # Use raw_image_path from metadata (source of truth)
         sample_row = metadata[metadata['sample_name'] == sample_name].iloc[0]
         raw_image_path = sample_row.get('raw_image_path')
@@ -419,8 +420,6 @@ def run_apoc_segmentation(
             print(f"  ⚠️ Raw image not found for {sample_name}: {raw_image_path}")
             continue
 
-        _ensure_zarr(raw_image_path, label=f"Raw image for '{sample_name}'")
-
         # Get dimension order from metadata for this sample
         axis_order = sample_row.get('dimension_order', "TCZYX")
         if not isinstance(axis_order, str) or not axis_order:
@@ -429,8 +428,50 @@ def run_apoc_segmentation(
         img = load_image(raw_image_path, axis_order=axis_order)             # lazy load via metadata path
         n_timepoints = img.shape[0]
 
-        # Ensure output directory exists
+        # Timepoint progress via tqdm (per-sample)
+        if timepoint_range is not None:
+            if isinstance(timepoint_range, (range, list)):
+                t_range = list(timepoint_range)
+            else:
+                # Handle old tuple (start, end)
+                s, e = timepoint_range
+                t_range = list(range(s, e + 1))
+        else:
+            t_range = list(range(n_timepoints))
+
+        # Check existing segmentations for skip logic (cell-type level)
+        active_cts_for_sample = list(active_cell_types)
+        has_death_for_sample = has_death
+
+        if not overwrite_existing:
+            # Check cell types
+            remaining_cts = []
+            for ct in active_cts_for_sample:
+                seg_path = img_outdir / f"{sample_name}_{ct}_segments.zarr"
+                if seg_path.exists():
+                    all_done = all((done_dir / f"{ct}_t{t:04d}.done").exists() for t in t_range)
+                    if all_done:
+                        continue  # Skip this cell type for this sample
+                remaining_cts.append(ct)
+            active_cts_for_sample = remaining_cts
+
+            # Check death mask
+            if has_death_for_sample and clf_death:
+                death_path = img_outdir / f"{sample_name}_mask_dead.zarr"
+                if death_path.exists():
+                    all_done = all((done_dir / f"dead_t{t:04d}.done").exists() for t in t_range)
+                    if all_done:
+                        has_death_for_sample = False
+
+            if not active_cts_for_sample and (not has_death_for_sample or not clf_death):
+                print(f"  ⏭️ Skipping {sample_name} (all selected outputs already exist)")
+                continue
+
+        _ensure_zarr(raw_image_path, label=f"Raw image for '{sample_name}'")
+
+        # Ensure output directories exist
         img_outdir.mkdir(parents=True, exist_ok=True)
+        done_dir.mkdir(parents=True, exist_ok=True)
 
         # Spatial shape for output arrays
         spatial_shape = img.shape[2:]           # (Z, Y, X)  — img is (T, C, Z, Y, X)
@@ -439,7 +480,7 @@ def run_apoc_segmentation(
         # Create output zarr arrays
         zarr_segs = {}
         zarr_masks = {}
-        for ct in active_cell_types:
+        for ct in active_cts_for_sample:
             zarr_segs[ct] = _open_zarr_output(
                 img_outdir / f"{sample_name}_{ct}_segments.zarr",
                 "uint16", out_shape, overwrite_existing if not only_segment else True,
@@ -457,22 +498,11 @@ def run_apoc_segmentation(
                 )
 
         zarr_death = None
-        if has_death and clf_death and not only_segment:
+        if has_death_for_sample and clf_death and not only_segment:
             zarr_death = _open_zarr_output(
                 img_outdir / f"{sample_name}_mask_dead.zarr",
                 "uint16", out_shape, overwrite_existing,
             )
-
-        # Timepoint progress via tqdm (per-sample)
-        if timepoint_range is not None:
-            if isinstance(timepoint_range, (range, list)):
-                t_range = list(timepoint_range)
-            else:
-                # Handle old tuple (start, end)
-                s, e = timepoint_range
-                t_range = list(range(s, e + 1))
-        else:
-            t_range = list(range(n_timepoints))
 
         def _load_tp(img_obj, t_idx):
             return np.asarray(img_obj[t_idx])
@@ -494,9 +524,26 @@ def run_apoc_segmentation(
                     future = executor.submit(_load_tp, img, t_range[i + 1])
 
                 # 3. Process current timepoint (GPU-bound or CPU-bound if only_segment)
-                for ct in active_cell_types:
+                for ct in active_cts_for_sample:
+                    if not overwrite_existing and (done_dir / f"{ct}_t{t:04d}.done").exists():
+                        continue  # Skip timepoint for this cell type if already computed
+
                     cfg = apoc_config or {}
-                    indices = [i_ch for i_ch in clf_channels[ct] if 0 <= i_ch < t_img.shape[0]] or [0]
+                    opencl_path = getattr(classifiers[ct], "opencl_file", None)
+                    n_clf_ch_raw = _read_classifier_header_value(opencl_path, "n_image_channels")
+                    if n_clf_ch_raw is not None:
+                        try:
+                            n_clf_ch = int(n_clf_ch_raw)
+                            if n_clf_ch != t_img.shape[0]:
+                                raise ValueError(
+                                    f"Classifier for '{ct}' was trained on an image with {n_clf_ch} channel(s), "
+                                    f"but the current image has {t_img.shape[0]} channel(s). "
+                                    f"Retrain the classifier on an image with the same number of channels."
+                                )
+                        except (TypeError, ValueError) as _e:
+                            if "channel" in str(_e).lower():
+                                raise
+                    indices = clf_channels[ct] or [0]
                     imgs = [t_img[i_ch] for i_ch in indices]
                     imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
 
@@ -511,7 +558,7 @@ def run_apoc_segmentation(
                         from behav3d.preprocessing.segmentation.segmentation_utils import postprocess_mask, segment_mask
                         _diag = (i == 0)  # print timings on first timepoint only
 
-                        opening_nr_pixels = int(cfg.get(f"{ct}_opening_nr_pixels", 0))
+                        opening_nr_pixels = int(_cfg_val(cfg, ct, "opening_nr_pixels", 0))
                         if not only_segment:
                             _t0 = time.time()
                             prob_clf = _get_probability_classifier(classifiers[ct])
@@ -521,7 +568,7 @@ def run_apoc_segmentation(
                             if _diag: print(f"    ⏱ {ct} predict (prob): {time.time()-_t0:.2f}s  range=[{prob_map.min():.3f}, {prob_map.max():.3f}]")
 
                             _t0 = time.time()
-                            mask_thr = float(cfg.get(f"{ct}_prob_mask_threshold", 0.5))
+                            mask_thr = float(_cfg_val(cfg, ct, "prob_mask_threshold", 0.5))
                             mask_out = postprocess_mask(
                                 prob_map > mask_thr,
                                 fill_holes=False,
@@ -533,8 +580,9 @@ def run_apoc_segmentation(
                             mask_out = np.asarray(zarr_masks[ct][t])
                             prob_map = None
 
-                        seed_thr = float(cfg.get(f"{ct}_prob_seed_threshold", 0.8))
-                        segment_size_min = int(cfg.get(f"{ct}_segment_size_min", 10))
+                        seed_thr = float(_cfg_val(cfg, ct, "prob_seed_threshold", 0.8))
+                        segment_size_min = int(_cfg_val(cfg, ct, "segment_size_min", 10))
+                        if _diag: print(f"    ⚙ {ct} params: mask_thr={mask_thr if not only_segment else 'n/a'}, seed_thr={seed_thr}, min_size={segment_size_min}, opening_px={opening_nr_pixels}")
 
                         if prob_map is not None:
                             _t0 = time.time()
@@ -586,6 +634,7 @@ def run_apoc_segmentation(
                         from behav3d.preprocessing.segmentation.segmentation_utils import (
                             postprocess_mask, segment_mask
                         )
+                        _diag = (i == 0)  # print timings/params on first timepoint only
                         if not only_segment:
                             seg_out = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
                             mask_out = (seg_out > 0).astype(np.uint16)
@@ -593,15 +642,16 @@ def run_apoc_segmentation(
                         else:
                             mask_out = np.asarray(zarr_masks[ct][t])
 
-                        fill_holes = cfg.get(f"{ct}_fill_holes", True)
-                        opening_nr_pixels = cfg.get(f"{ct}_opening_nr_pixels", 0)
+                        fill_holes = _cfg_val(cfg, ct, "fill_holes", True)
+                        opening_nr_pixels = _cfg_val(cfg, ct, "opening_nr_pixels", 0)
                         proc_mask = postprocess_mask(mask_out, fill_holes=fill_holes, opening_nr_pixels=opening_nr_pixels)
 
-                        edt_thr = cfg.get(f"{ct}_edt_threshold", 1.0)
-                        segment_size_min = cfg.get(f"{ct}_segment_size_min", 10)
-                        _raw_peak_dist = cfg.get(f"{ct}_peak_min_distance", 0)
+                        edt_thr = _cfg_val(cfg, ct, "edt_threshold", 1.0)
+                        segment_size_min = _cfg_val(cfg, ct, "segment_size_min", 10)
+                        _raw_peak_dist = _cfg_val(cfg, ct, "peak_min_distance", 0)
                         peak_min_distance = None if (not _raw_peak_dist or float(_raw_peak_dist) <= 0) else float(_raw_peak_dist)
-                        peak_min_ratio = float(cfg.get(f"{ct}_peak_min_ratio", 0.35))
+                        peak_min_ratio = float(_cfg_val(cfg, ct, "peak_min_ratio", 0.35))
+                        if _diag: print(f"    ⚙ {ct} params: edt_thr={edt_thr}, min_size={segment_size_min}, fill_holes={fill_holes}, opening_px={opening_nr_pixels}, peak_min_distance={peak_min_distance}, peak_min_ratio={peak_min_ratio}")
                         seg_refined = segment_mask(
                             proc_mask,
                             edt_thr=edt_thr,
@@ -621,6 +671,8 @@ def run_apoc_segmentation(
 
                     else:
                         # ── Default: Direct APOC (or unknown strategy) ────
+                        if i == 0:
+                            print(f"    ⚙ {ct}: Direct APOC strategy — no postprocessing parameters applied")
                         if not only_segment:
                             seg_out = np.asarray(classifiers[ct].predict(image=imgs_to_pass)).astype(np.uint16)
                             mask_out = (seg_out > 0).astype(np.uint16)
@@ -632,16 +684,36 @@ def run_apoc_segmentation(
                                 print(f"⚠️ Warning: 'Only resegment' selected but strategy is Direct APOC. Cannot tweak instance rules without EDT method. Resaving {ct} instances.")
                         zarr_segs[ct][t] = seg_out
 
+                    # Mark timepoint as done for this cell type
+                    (done_dir / f"{ct}_t{t:04d}.done").touch()
+
                 if zarr_death is not None:
-                    indices = [i_ch for i_ch in death_channels if 0 <= i_ch < t_img.shape[0]] or [0]
-                    imgs = [t_img[i_ch] for i_ch in indices]
-                    imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
-                    death_mask = (np.asarray(clf_death.predict(image=imgs_to_pass)) > 0).astype(np.uint16)
-                    zarr_death[t] = death_mask
+                    if not overwrite_existing and (done_dir / f"dead_t{t:04d}.done").exists():
+                        pass  # Skip timepoint for death mask if already computed
+                    else:
+                        n_death_ch_raw = _read_classifier_header_value(clf_death.opencl_file, "n_image_channels")
+                        if n_death_ch_raw is not None:
+                            try:
+                                n_death_ch = int(n_death_ch_raw)
+                                if n_death_ch != t_img.shape[0]:
+                                    raise ValueError(
+                                        f"Death classifier was trained on an image with {n_death_ch} channel(s), "
+                                        f"but the current image has {t_img.shape[0]} channel(s). "
+                                        f"Retrain the classifier on an image with the same number of channels."
+                                    )
+                            except (TypeError, ValueError) as _e:
+                                if "channel" in str(_e).lower():
+                                    raise
+                        indices = death_channels or [0]
+                        imgs = [t_img[i_ch] for i_ch in indices]
+                        imgs_to_pass = imgs[0] if len(imgs) == 1 else imgs
+                        death_mask = (np.asarray(clf_death.predict(image=imgs_to_pass)) > 0).astype(np.uint16)
+                        zarr_death[t] = death_mask
+                        (done_dir / f"dead_t{t:04d}.done").touch()
 
         # Update metadata with output paths
         row_idx = metadata.index[metadata['sample_name'] == sample_name].tolist()[0]
-        for ct in active_cell_types:
+        for ct in active_cts_for_sample:
             if ct in organoid_types: prefix = 'or'
             elif ct in immune_types: prefix = 'im'
             elif ct in other_types: prefix = 'ot'

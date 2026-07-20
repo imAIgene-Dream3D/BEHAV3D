@@ -42,7 +42,6 @@ from behav3d.core.metadata import (
     detect_merged_cell_types_from_metadata,
     filter_multicolor_inputs,
 )
-
 from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
     save_state_composition_report,
 )
@@ -71,6 +70,33 @@ from behav3d.analysis.behavior.state.visualization.backprojection import (
 )
 from behav3d.io.images import load_image
 from behav3d.widgets.utils import spinning_loader
+
+
+_TIME_UNIT_DISPLAY_NAMES = {"s": "seconds", "m": "minutes", "h": "hours"}
+
+
+def _format_timepoint_window_as_time(n_timepoints, metadata):
+    """Return an HTML snippet showing ``n_timepoints`` converted to real time.
+
+    Uses the first sample row's ``time_interval``/``time_unit`` metadata
+    columns (mirroring :func:`behav3d.core.utils.hours_per_frame_from_metadata`).
+    Returns an empty string when metadata is missing/unusable.
+    """
+    try:
+        if metadata is None or len(metadata) == 0:
+            return ""
+        if "time_interval" not in metadata.columns or "time_unit" not in metadata.columns:
+            return ""
+        interval = float(metadata["time_interval"].iloc[0])
+        unit = str(metadata["time_unit"].iloc[0])
+        if not np.isfinite(interval) or interval <= 0 or unit not in _TIME_UNIT_DISPLAY_NAMES:
+            return ""
+        total = float(n_timepoints) * interval
+        unit_name = _TIME_UNIT_DISPLAY_NAMES[unit]
+        total_str = f"{total:g}"
+        return f"<i>= {total_str} {unit_name}</i>"
+    except Exception:
+        return ""
 
 
 def _intrinsic_hmm_backprojection_path(output_dir, sample_name, cell_type):
@@ -893,6 +919,15 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         self.hmm_log_scale_status = widgets.HTML("<i>Select features to choose optional log1p scaling.</i>")
         self.hmm_log_scale_box = widgets.VBox([])
         self._hmm_log_scale_checkboxes = {}
+        # Distribution preview: sits just below the "Log scaling" header and
+        # above the per-feature checkboxes, so the user can inspect which
+        # features are skewed before applying log scaling.
+        self.hmm_log_scale_dist_btn = widgets.Button(
+            description="📊 Preview feature distributions",
+            layout=widgets.Layout(width="260px"),
+        )
+        self.hmm_log_scale_dist_btn.on_click(self._on_preview_log_scale_distributions)
+        self.hmm_log_scale_dist_out = widgets.Output()
         self.binary_group_status = widgets.HTML("<i>No binary columns detected yet.</i>")
         self.binary_group_checks_box = widgets.VBox([])
         self._binary_group_checkboxes = {}
@@ -922,11 +957,24 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         for cb in self.additional_window_feature_cbs.values():
             cb.observe(self._on_feature_checkbox_changed, names="value")
         self.hmm_window_features_window = widgets.IntText(
-            description="Window size",
+            description="Window size (timepoints)",
             value=5,
             style={"description_width": "initial"},
-            layout=widgets.Layout(width="190px"),
+            layout=widgets.Layout(width="230px"),
         )
+        self.hmm_window_features_window.observe(
+            self._on_time_conversion_widget_changed, names="value"
+        )
+        self.hmm_window_features_help = widgets.Button(
+            description="?",
+            tooltip=(
+                "Window size is in timepoints (frames). The line below shows "
+                "the equivalent real time, computed from this sample's "
+                "time_interval/time_unit metadata."
+            ),
+            layout=widgets.Layout(width="24px"),
+        )
+        self.hmm_window_features_time_html = widgets.HTML(value="")
 
         self.hmm_n_states_mode = widgets.Dropdown(
             description="State selection",
@@ -1003,11 +1051,24 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             layout=widgets.Layout(width="170px"),
         )
         self.hmm_feature_smoothing_window = widgets.IntText(
-            description="Smooth window",
+            description="Smooth window (timepoints)",
             value=1,
             style={"description_width": "initial"},
-            layout=widgets.Layout(width="190px"),
+            layout=widgets.Layout(width="250px"),
         )
+        self.hmm_feature_smoothing_window.observe(
+            self._on_time_conversion_widget_changed, names="value"
+        )
+        self.hmm_feature_smoothing_help = widgets.Button(
+            description="?",
+            tooltip=(
+                "Smoothing window is in timepoints (frames). The line below "
+                "shows the equivalent real time, computed from this sample's "
+                "time_interval/time_unit metadata."
+            ),
+            layout=widgets.Layout(width="24px"),
+        )
+        self.hmm_feature_smoothing_time_html = widgets.HTML(value="")
         self.hmm_smoothing_min_periods = widgets.IntText(
             description="Min periods",
             value=1,
@@ -1071,7 +1132,11 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         window_features_block = widgets.VBox(
             [
                 widgets.HTML("<b>window features</b>"),
-                self.hmm_window_features_window,
+                widgets.HBox(
+                    [self.hmm_window_features_window, self.hmm_window_features_help],
+                    layout=widgets.Layout(align_items="center", gap="4px"),
+                ),
+                self.hmm_window_features_time_html,
                 widgets.VBox(list(self.additional_window_feature_cbs.values())),
             ]
         )
@@ -1093,6 +1158,8 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             children=[
                 widgets.VBox(
                     [
+                        self.hmm_log_scale_dist_btn,
+                        self.hmm_log_scale_dist_out,
                         self.hmm_log_scale_status,
                         self.hmm_log_scale_box,
                     ],
@@ -1111,9 +1178,10 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                 self.hmm_log_scale_accordion,
                 widgets.HTML("<b>feature processing</b>"),
                 widgets.HBox(
-                    [self.hmm_feature_smoothing_window],
-                    layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
+                    [self.hmm_feature_smoothing_window, self.hmm_feature_smoothing_help],
+                    layout=widgets.Layout(align_items="center", gap="4px"),
                 ),
+                self.hmm_feature_smoothing_time_html,
                 self.hmm_quantile_row,
             ]
         )
@@ -1450,6 +1518,34 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             if bool(cb.value)
         ]
 
+    def _on_preview_log_scale_distributions(self, *_):
+        """Plot histograms of the currently selected features so the user can
+        judge which benefit from log scaling before applying it."""
+        from behav3d.widgets.utils import build_feature_distribution_figure
+        from IPython.display import display
+
+        out = self.hmm_log_scale_dist_out
+        out.clear_output(wait=True)
+        ct = self._current_cell_type()
+        csv_path = self._resolve_track_features_csv()
+        feats = self._selected_hmm_feature_columns()
+        with out:
+            if csv_path is None:
+                print(f"No track-features CSV found for '{ct}'. Run feature extraction/filtering first.")
+                return
+            if not feats:
+                print("Select at least one feature above to preview its distribution.")
+                return
+            fig, truncated = build_feature_distribution_figure(
+                csv_path, feats, title=f"Feature distributions — {ct}"
+            )
+            if fig is None:
+                print(f"Could not read features from: {csv_path}")
+                return
+            if truncated:
+                print("Showing the first 36 selected features.")
+            display(fig)
+
     def _rebuild_log_scale_feature_controls(self):
         selected_features = self._selected_hmm_feature_columns()
         cfg = self._effective_panel_cfg()
@@ -1669,6 +1765,19 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         if hasattr(self.apply_hmm_artifact_picker, "_start_dir"):
             self.apply_hmm_artifact_picker._start_dir = self.output_dir or "."
         self._load_existing_hmm_deployment_artifact_if_available()
+        self._update_time_conversion_labels()
+
+    def _on_time_conversion_widget_changed(self, change):
+        self._update_time_conversion_labels()
+
+    def _update_time_conversion_labels(self):
+        metadata = getattr(self.metadata_loader, "metadata", None)
+        self.hmm_window_features_time_html.value = _format_timepoint_window_as_time(
+            self.hmm_window_features_window.value, metadata
+        )
+        self.hmm_feature_smoothing_time_html.value = _format_timepoint_window_as_time(
+            self.hmm_feature_smoothing_window.value, metadata
+        )
 
     def _refresh_enablement(self):
         super()._refresh_enablement()

@@ -61,6 +61,11 @@ from behav3d.analysis.interaction_analysis import (
     run_interaction_analysis,
     run_multi_organoid_interaction_comparison,
 )
+from behav3d.analysis.invasiveness_analysis import (
+    run_invasiveness_analysis,
+    detect_invasiveness_targets,
+    SUMMARY_STATS,
+)
 
 # Fallback for default features: behav3d_calculated_features is now imported from .utils
 '''try:
@@ -113,6 +118,28 @@ def _csv_has_columns(csv_path, required_columns):
     except Exception:
         return False
     return set(required_columns).issubset(columns)
+
+
+def _parse_analysis_period_min(start_widget, end_widget):
+    """Return ``analysis_period_min`` from optional minute fields; blank = whole movie."""
+
+    def _val(w):
+        v = w.value
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            return float(s)
+        if v == "":
+            return None
+        return float(v)
+
+    start, end = _val(start_widget), _val(end_widget)
+    if start is None and end is None:
+        return None
+    return (start, end)
 
 
 def _detect_downstream_cell_types(metadata):
@@ -569,7 +596,8 @@ class _CellTypeFeatureExtractionPanel:
             try:
                 self._persist_params()
                 self.output_dir.mkdir(parents=True, exist_ok=True)
-                self._reset_required_intermediates()
+                if bool(self.overwrite.value):
+                    self._reset_required_intermediates()
                 run_feature_extraction(
                     dead_mask_percentage_threshold=(self._current_dead_threshold() if self.has_dead else None),
                     contact_threshold=float(self.contact_threshold.value),
@@ -860,7 +888,12 @@ class TrackFilterPanel:
 
         self.max_track_length = widgets.IntText(description=f"Maximal length ({cfg.get('time_type','frames')})", value=int(cfg.get("max_track_length", 30)), style={'description_width': '180px'})
         self.en_max_length = widgets.Checkbox(description="Trim down tracks to supplied length", value=bool(cfg.get("max_length_enabled", True)), indent=False)
-        self.row_max = widgets.HBox([self.max_track_length], layout=widgets.Layout(display=(None if self.en_max_length.value else "none")))
+        self.split_long_tracks = widgets.Checkbox(
+            description="Split long tracks into chunks (new TrackIDs)",
+            value=bool(cfg.get("split_long_tracks", True)),
+            indent=False,
+        )
+        self.row_max = widgets.HBox([self.max_track_length, self.split_long_tracks], layout=widgets.Layout(display=(None if self.en_max_length.value else "none")))
         self.en_max_length.observe(lambda c: setattr(self.row_max.layout, 'display', None if c['new'] else 'none'), names="value")
 
         self.has_dead = has_dead_channel(self.metadata_loader.metadata)
@@ -959,6 +992,7 @@ class TrackFilterPanel:
                     "min_track_length": int(self.min_track_length.value),
                     "max_length_enabled": self.en_max_length.value,
                     "max_track_length": int(self.max_track_length.value),
+                    "split_long_tracks": bool(self.split_long_tracks.value),
                     "filter_min_size": self.en_min_size.value,
                     "min_size": int(self.min_size_val.value),
                     "filter_t0_dead": bool(self.filter_t0_dead.value),
@@ -973,6 +1007,7 @@ class TrackFilterPanel:
                     exp_duration=(int(self.exp_duration.value) if self.en_exp_duration.value else None),
                     min_track_length=(int(self.min_track_length.value) if self.en_min_length.value else None),
                     max_track_length=(int(self.max_track_length.value) if self.en_max_length.value else None),
+                    split_long_tracks=bool(self.split_long_tracks.value),
                     filter_t0_dead=(bool(self.filter_t0_dead.value) if self.has_dead else False),
                     min_size=(int(self.min_size_val.value) if self.en_min_size.value else None),
                     cell_type=self.cell_type,
@@ -1186,7 +1221,13 @@ class ActiveKillingPanel:
                 
                 with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
                     yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
-                
+
+                abs_thresh = (
+                    float(self.absolute_threshold.value)
+                    if self.use_absolute_threshold.value
+                    else None
+                )
+
                 # Run analysis
                 def run_for_targets(targets, subfolder):
                     return run_active_killing_analysis(
@@ -2089,7 +2130,14 @@ class DeathDynamicsPanel:
         self.has_dead_channel_in_metadata = has_dead_channel(self.metadata_loader.metadata)
 
         feature_outdir = Path(self.output_dir, "analysis", self.cell_type, "track_features")
-        p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features.csv")
+        # Check the *filtered* CSV first — this is what run_organoid_analysis
+        # actually reads (df_tracks_path=None resolves to it), and it's the
+        # only file that exists for a cell-type *group* (see
+        # behav3d.analysis.grouping.create_cell_type_group), which merges
+        # already-filtered populations and never produces an unfiltered CSV.
+        filtered_p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features_filtered.csv")
+        unfiltered_p = Path(feature_outdir, f"BEHAV3D_{self.cell_type}_combined_track_features.csv")
+        p = filtered_p if filtered_p.exists() else unfiltered_p
         self.has_death_features = False
         if p.exists():
             try:
@@ -2148,9 +2196,8 @@ class DeathDynamicsPanel:
 
 class MultiOrganoidDeathDynamicsPanel:
     """
-    Combined death dynamics comparison panel for multiple organoid types.
+    Combined death dynamics comparison panel for one or more organoid types.
     Shows all organoid types together on the same plot for easy comparison.
-    Only appears when 2+ organoid types are detected.
     """
     def __init__(self, metadata_loader, organoid_types):
         self.metadata_loader = metadata_loader
@@ -2176,12 +2223,20 @@ class MultiOrganoidDeathDynamicsPanel:
         self._refresh_status()
         
         self.ui = widgets.VBox([
-            widgets.HTML('<b>Multi-Organoid Death Dynamics Comparison</b>'),
-            widgets.HTML('<div style="font-size:12px;color:#666;">Compare death dynamics across all organoid types.</div>'),
-            widgets.HBox([self.status_html, self.btn_refresh], layout=widgets.Layout(align_items="center", gap="10px")),
+            widgets.HTML('<b>Death Dynamics Comparison</b>'),
+            widgets.HTML(
+                '<div style="font-size:12px;color:#666;">'
+                'Compare death curves across organoid types on the same plot. '
+                'Works with one or more organoid types.'
+                '</div>'
+            ),
+            widgets.HBox(
+                [self.status_html, self.btn_refresh],
+                layout=widgets.Layout(align_items="center", gap="10px"),
+            ),
             widgets.HTML("<hr>"),
             widgets.HBox([self.btn_run, self.spinner_html]),
-            self.out
+            self.out,
         ])
     
     def _refresh_status(self):
@@ -2241,8 +2296,8 @@ class MultiOrganoidDeathDynamicsPanel:
 
 class MultiOrganoidInteractionComparisonPanel:
     """
-    Compare interactions across organoid types / treatments.
-    Produces a violin plot (dying vs live) and TOD-aligned cumulative curves.
+    Interaction Overview: violin, before-death curves, and active-killing
+    dashboard across one or more organoid types.
     """
     def __init__(self, metadata_loader, organoid_types):
         self.metadata_loader = metadata_loader
@@ -2266,11 +2321,42 @@ class MultiOrganoidInteractionComparisonPanel:
             layout=widgets.Layout(width="300px"),
         )
 
+        self.annotate_lc = widgets.Checkbox(
+            value=False,
+            description="Annotate by immune line condition",
+            indent=False,
+        )
+
         self.time_window = widgets.IntText(
             value=60,
-            description="Time window (min):",
-            style={"description_width": "140px"},
-            layout=widgets.Layout(width="240px"),
+            description="Before-death window (min):",
+            style={"description_width": "160px"},
+            layout=widgets.Layout(width="260px"),
+        )
+
+        # Temporal Range: radio + Start T / End T
+        self.temporal_radio = widgets.RadioButtons(
+            options=["All timepoints", "Custom time range"],
+            value="All timepoints",
+            layout=widgets.Layout(width="200px"),
+        )
+        self.temporal_radio.observe(self._on_temporal_radio_changed, names="value")
+
+        self.start_t = widgets.IntText(
+            value=0,
+            description="Start T:",
+            style={"description_width": "60px"},
+            layout=widgets.Layout(width="160px"),
+        )
+        self.end_t = widgets.IntText(
+            value=100,
+            description="End T:",
+            style={"description_width": "60px"},
+            layout=widgets.Layout(width="160px"),
+        )
+        self.custom_t_box = widgets.HBox(
+            [self.start_t, self.end_t],
+            layout=widgets.Layout(display="none"),
         )
 
         self.immune_checkboxes = {}
@@ -2286,7 +2372,7 @@ class MultiOrganoidInteractionComparisonPanel:
         )
         self.btn_refresh.on_click(self._on_refresh_clicked)
         self.btn_run = widgets.Button(
-            description="Run Interaction Comparison", button_style="warning",
+            description="Run Interaction Overview", button_style="warning",
             layout=widgets.Layout(width="280px"),
         )
         self.btn_run.on_click(self._on_run_clicked)
@@ -2298,26 +2384,47 @@ class MultiOrganoidInteractionComparisonPanel:
         self._refresh_status()
 
         self.ui = widgets.VBox([
-            widgets.HTML(
-                '<b>Multi-Organoid Interaction Comparison</b>'
-            ),
+            widgets.HTML('<b>Interaction Overview</b>'),
             widgets.HTML(
                 '<div style="font-size:12px;color:#666;">'
-                'Compare cumulative interactions across organoid types or treatments. '
-                'Violin plot shows dying vs live distributions; '
-                'cumulative curve shows mean interactions before death.</div>'
+                'Produces: violin (cumulative contacts per organoid), '
+                'cumulative-to-death curves, and active-killing dashboard. '
+                'Works with one or more organoid types.'
+                '</div>'
             ),
             widgets.HBox(
                 [self.status_html, self.btn_refresh],
                 layout=widgets.Layout(align_items="center", gap="10px"),
             ),
-            widgets.HBox([self.group_by, self.time_window]),
+            widgets.HBox([self.group_by, self.annotate_lc]),
+            widgets.HTML(
+                '<div style="font-size:11px;color:#888;margin:4px 0;">'
+                '<b>Temporal Range</b> — applies to: '
+                '<i>cumulative interactions per organoid</i> and '
+                '<i>active killing plots</i>'
+                '</div>'
+            ),
+            self.temporal_radio,
+            self.custom_t_box,
+            widgets.HTML(
+                '<div style="font-size:11px;color:#888;margin:4px 0;">'
+                '<b>Before-death window</b> — applies to: '
+                '<i>cumulative interactions before death plot</i> only'
+                '</div>'
+            ),
+            self.time_window,
             widgets.HTML("<b>Immune / interacting cell types:</b>"),
             self.immune_box,
             widgets.HTML("<hr>"),
             widgets.HBox([self.btn_run, self.spinner_html]),
             self.out,
         ])
+
+    def _on_temporal_radio_changed(self, change):
+        if change["new"] == "Custom time range":
+            self.custom_t_box.layout.display = None
+        else:
+            self.custom_t_box.layout.display = "none"
 
     # ---- status ----
     def _refresh_status(self):
@@ -2347,6 +2454,12 @@ class MultiOrganoidInteractionComparisonPanel:
     def _on_refresh_clicked(self, *_):
         self._refresh_status()
 
+    def _parse_period(self):
+        """Return ``analysis_period_t`` as ``(start_t, end_t)`` or ``None``."""
+        if self.temporal_radio.value == "All timepoints":
+            return None
+        return (int(self.start_t.value), int(self.end_t.value))
+
     # ---- run ----
     def _on_run_clicked(self, *_):
         selected_im = [
@@ -2367,9 +2480,11 @@ class MultiOrganoidInteractionComparisonPanel:
                     metadata=self.metadata_loader.metadata,
                     group_by=self.group_by.value,
                     time_window_min=float(self.time_window.value),
+                    analysis_period_t=self._parse_period(),
+                    annotate_line_condition=bool(self.annotate_lc.value),
                     show_plots=True,
                 )
-                print("✅ Multi-organoid interaction comparison complete!")
+                print("✅ Interaction Overview complete!")
             except Exception:
                 traceback.print_exc()
             finally:
@@ -2379,9 +2494,9 @@ class MultiOrganoidInteractionComparisonPanel:
 
 class MultiOrganoidAnalysisPanel:
     """
-    Wrapper that groups all cross-organoid comparison panels:
-      1. Death Dynamics Comparison  (existing)
-      2. Interaction Comparison     (new)
+    Wrapper that groups cross-target comparison panels:
+      1. Death Dynamics Comparison  (works with ≥1 organoid type)
+      2. Interaction Overview       (works with ≥1 organoid type)
     """
     def __init__(self, metadata_loader, organoid_types):
         self.metadata_loader = metadata_loader
@@ -2400,12 +2515,10 @@ class MultiOrganoidAnalysisPanel:
         )
 
         self.ui = widgets.VBox([
-            widgets.HTML(
-                '<h3>Multi-Organoid Analysis</h3>'
-            ),
+            widgets.HTML('<h3>Cross-Target Analysis</h3>'),
             widgets.HTML('<h4>1. Death Dynamics Comparison</h4>'),
             self.death_panel.ui,
-            widgets.HTML('<h4>2. Interaction Comparison</h4>'),
+            widgets.HTML('<h4>2. Interaction Overview</h4>'),
             self.interaction_panel.ui,
         ])
 
@@ -2600,6 +2713,11 @@ class InteractionAnalysisPanel:
         self.status_html = widgets.HTML("")
         self.cell_type_box = widgets.VBox([])
         self.cell_type_checkboxes = {}
+        self.group_by_line_condition = widgets.Checkbox(
+            value=False,
+            description="Group overall plots by immune line condition",
+            indent=False,
+        )
         self.btn_refresh = widgets.Button(description="🔄 Refresh", button_style="info", layout=widgets.Layout(width="100px"))
         self.btn_refresh.on_click(self._on_refresh_clicked)
         self.btn_run = widgets.Button(description="Run Interaction Analysis", button_style="warning", layout=widgets.Layout(width="250px"))
@@ -2608,7 +2726,25 @@ class InteractionAnalysisPanel:
         self.spinner_html.layout.display = "none"
         self.out = widgets.Output()
         
-        self.ui = widgets.VBox([widgets.HTML(f'<b>{self.cell_type} Interaction Analysis</b>'), widgets.HBox([self.status_html, self.btn_refresh], layout=widgets.Layout(align_items="center", gap="10px")), widgets.HTML('<b>Select cell types:</b>'), self.cell_type_box, widgets.HTML("<hr>"), widgets.HBox([self.btn_run, self.spinner_html]), self.out])
+        self.ui = widgets.VBox([
+            widgets.HTML(f'<b>{self.cell_type} Interaction Analysis</b>'),
+            widgets.HTML(
+                '<div style="font-size:12px;color:#666;">'
+                'Produces: cumulative contact over time and alive vs dead bar '
+                'plots (overall + per-sample). One PDF per immune type.'
+                '</div>'
+            ),
+            widgets.HBox(
+                [self.status_html, self.btn_refresh],
+                layout=widgets.Layout(align_items="center", gap="10px"),
+            ),
+            widgets.HTML('<b>Select cell types:</b>'),
+            self.cell_type_box,
+            self.group_by_line_condition,
+            widgets.HTML("<hr>"),
+            widgets.HBox([self.btn_run, self.spinner_html]),
+            self.out,
+        ])
         self._refresh_data_status()
 
     def _refresh_data_status(self):
@@ -2635,10 +2771,250 @@ class InteractionAnalysisPanel:
         self.btn_run.disabled = True; self.spinner_html.layout.display = None; self.out.clear_output()
         with self.out:
             try:
-                run_interaction_analysis(output_dir=self.output_dir, cell_type=self.cell_type, interacting_cell_types=sel, df_tracks_path=str(self.df_tracks_path), show_plots=True)
+                run_interaction_analysis(
+                    output_dir=self.output_dir,
+                    cell_type=self.cell_type,
+                    interacting_cell_types=sel,
+                    df_tracks_path=str(self.df_tracks_path),
+                    show_plots=True,
+                    group_by_line_condition=bool(self.group_by_line_condition.value),
+                )
                 print("✅ Interaction Analysis complete!")
             except Exception: traceback.print_exc()
             finally: self.spinner_html.layout.display = "none"; self.btn_run.disabled = False
+
+class InvasivenessAnalysisPanel:
+    """
+    Invasiveness analysis panel (immune-cell perspective).
+
+    Measures how invasive a selected immune cell type is against one or more
+    organoid targets (e.g. "27T" vs "MDO"), over time and summarized per movie.
+    Reads the immune cell type's filtered track features CSV, which must contain
+    ``{target}_invasiveness`` / ``{target}_invasiveness_perc`` columns produced
+    during feature extraction (invasiveness feature enabled for immune cells).
+    """
+    def __init__(self, metadata_loader):
+        self.metadata_loader = metadata_loader
+        self.output_dir = str(Path(self.metadata_loader.output_dir).expanduser())
+
+        md = self.metadata_loader.metadata
+        if md is None:
+            raise RuntimeError("Metadata not loaded.")
+
+        organoid_types, immune_types, other_types = _detect_downstream_cell_types(md)
+        self.potential_immune = immune_types + other_types
+        self.organoid_types = organoid_types  # Needed for violin-by-fate plots
+
+        # Multi-select immune cell types (one checkbox each). Targets shown are
+        # the union across all selected immune types.
+        self.immune_checkboxes = {
+            im: widgets.Checkbox(
+                value=(i == 0), description=im, indent=False,
+                layout=widgets.Layout(width="150px"),
+            )
+            for i, im in enumerate(self.potential_immune)
+        }
+        for cb in self.immune_checkboxes.values():
+            cb.observe(lambda _c: self._refresh_data_status(), names="value")
+        self.immune_box = widgets.HBox(
+            list(self.immune_checkboxes.values()) or [widgets.HTML("(none detected)")]
+        )
+        self.target_box = widgets.VBox([])
+        self.target_checkboxes = {}
+        self.summary_stat_dd = widgets.Dropdown(
+            options=list(SUMMARY_STATS),
+            value="mean",
+            description="Per-movie stat:",
+            style={"description_width": "120px"},
+            layout=widgets.Layout(width="260px"),
+        )
+        self.group_by_line_condition = widgets.Checkbox(
+            value=False,
+            description="Separate by immune line condition",
+            indent=False,
+        )
+
+        # Temporal Range: radio + Start T / End T
+        self.temporal_radio = widgets.RadioButtons(
+            options=["All timepoints", "Custom time range"],
+            value="All timepoints",
+            layout=widgets.Layout(width="200px"),
+        )
+        self.temporal_radio.observe(self._on_temporal_radio_changed, names="value")
+
+        self.start_t = widgets.IntText(
+            value=0,
+            description="Start T:",
+            style={"description_width": "60px"},
+            layout=widgets.Layout(width="160px"),
+        )
+        self.end_t = widgets.IntText(
+            value=100,
+            description="End T:",
+            style={"description_width": "60px"},
+            layout=widgets.Layout(width="160px"),
+        )
+        self.custom_t_box = widgets.HBox(
+            [self.start_t, self.end_t],
+            layout=widgets.Layout(display="none"),
+        )
+
+        self.status_html = widgets.HTML("")
+        self.btn_refresh = widgets.Button(description="🔄 Refresh", button_style="info", layout=widgets.Layout(width="100px"))
+        self.btn_refresh.on_click(self._on_refresh_clicked)
+        self.btn_run = widgets.Button(description="Run Invasiveness Analysis", button_style="warning", layout=widgets.Layout(width="260px"))
+        self.btn_run.on_click(self._on_run_clicked)
+        self.spinner_html = widgets.HTML(value=spinning_loader)
+        self.spinner_html.layout.display = "none"
+        self.out = widgets.Output()
+
+        self.ui = widgets.VBox([
+            widgets.HTML("<b>Invasiveness Analysis</b>"),
+            widgets.HTML(
+                '<div style="color:#555;font-size:12px;">'
+                'Immune-cell perspective: compare invasion against one or more '
+                'organoid targets over time and per movie.<br>'
+                '<b>Over-time plots:</b> fraction (% cells invasive), mean % '
+                '(average contact across all cells), median % (typical cell).<br>'
+                '<b>Per-movie stat</b> collapses the temporal window into one dot '
+                'per movie (does not change the median-over-time curve).<br>'
+                'Fate violins: one point per organoid. Enable '
+                '<i>invasiveness</i> during feature extraction.'
+                '</div>'
+            ),
+            widgets.HTML("<b>Select immune cell type(s):</b>"),
+            self.immune_box,
+            widgets.HBox([self.status_html, self.btn_refresh], layout=widgets.Layout(align_items="center", gap="10px")),
+            widgets.HTML("<b>Select target(s) to compare:</b>"),
+            self.target_box,
+            self.summary_stat_dd,
+            self.group_by_line_condition,
+            widgets.HTML(
+                '<div style="font-size:11px;color:#888;margin:4px 0;">'
+                '<b>Temporal Range</b> (in timepoints)'
+                '</div>'
+            ),
+            self.temporal_radio,
+            self.custom_t_box,
+            widgets.HTML("<hr>"),
+            widgets.HBox([self.btn_run, self.spinner_html]),
+            self.out,
+        ])
+
+        self._refresh_data_status()
+
+    def _on_temporal_radio_changed(self, change):
+        if change["new"] == "Custom time range":
+            self.custom_t_box.layout.display = None
+        else:
+            self.custom_t_box.layout.display = "none"
+
+    def _filtered_csv(self, immune):
+        return Path(
+            self.output_dir, "analysis", immune, "track_features",
+            f"BEHAV3D_{immune}_combined_track_features_filtered.csv",
+        )
+
+    def _selected_immune(self):
+        return [im for im, cb in self.immune_checkboxes.items() if cb.value]
+
+    def _refresh_data_status(self):
+        selected = self._selected_immune()
+        # Preserve which targets were checked across refreshes.
+        prev_checked = {t for t, cb in getattr(self, "target_checkboxes", {}).items() if cb.value}
+        self.target_checkboxes = {}
+        self.target_box.children = []
+        if not selected:
+            self.status_html.value = '<div style="color:#b00;">⚠️ Select at least one immune cell type.</div>'
+            self.btn_run.disabled = True
+            return
+
+        # Union of targets across all selected immune types; note any immune
+        # types whose filtered CSV is missing.
+        targets = set()
+        missing = []
+        for im in selected:
+            csv_path = self._filtered_csv(im)
+            if not csv_path.exists():
+                missing.append(im)
+                continue
+            try:
+                cols_df = pd.read_csv(csv_path, nrows=0)
+            except Exception:
+                missing.append(im)
+                continue
+            targets.update(detect_invasiveness_targets(cols_df))
+
+        if missing:
+            self.status_html.value = (
+                f'<div style="color:#b00;">⚠️ Filtered tracks not found for: '
+                f'{", ".join(missing)}. Run feature extraction (with invasiveness) '
+                "+ filtering first.</div>"
+            )
+            self.btn_run.disabled = True
+            return
+        if not targets:
+            self.status_html.value = (
+                '<div style="color:#b00;">⚠️ No invasiveness columns found. '
+                "Enable 'invasiveness' during feature extraction for these immune cells.</div>"
+            )
+            self.btn_run.disabled = True
+            return
+
+        targets = sorted(targets)
+        self.status_html.value = f'<div style="color:#080;">✅ Ready: {", ".join(targets)}</div>'
+        self.btn_run.disabled = False
+        # No any_org — only real organoid targets. Default all checked (or keep
+        # the user's prior selection when refreshing).
+        default_all = not prev_checked
+        self.target_checkboxes = {
+            t: widgets.Checkbox(
+                value=(default_all or t in prev_checked),
+                description=t, indent=False,
+            )
+            for t in targets
+        }
+        self.target_box.children = list(self.target_checkboxes.values())
+
+    def _on_refresh_clicked(self, *_):
+        self._refresh_data_status()
+
+    def _parse_period(self):
+        """Return ``analysis_period_t`` as ``(start_t, end_t)`` or ``None``."""
+        if self.temporal_radio.value == "All timepoints":
+            return None
+        return (int(self.start_t.value), int(self.end_t.value))
+
+    def _on_run_clicked(self, *_):
+        immune_list = self._selected_immune()
+        selected = [t for t, cb in self.target_checkboxes.items() if cb.value]
+        if not immune_list or not selected:
+            with self.out:
+                self.out.clear_output()
+                print("Please select at least one immune cell type and one target.")
+            return
+        self.btn_run.disabled = True
+        self.spinner_html.layout.display = None
+        self.out.clear_output()
+        with self.out:
+            try:
+                run_invasiveness_analysis(
+                    output_dir=self.output_dir,
+                    immune_cell_types=immune_list,
+                    targets=selected,
+                    summary_stat=self.summary_stat_dd.value,
+                    show_plots=True,
+                    group_by_line_condition=bool(self.group_by_line_condition.value),
+                    analysis_period_t=self._parse_period(),
+                    organoid_types=self.organoid_types,
+                )
+                print("✅ Invasiveness Analysis complete!")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner_html.layout.display = "none"
+                self.btn_run.disabled = False
+
 
 class MotileCellAnalysisPanel:
     """

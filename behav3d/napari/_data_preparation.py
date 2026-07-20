@@ -56,6 +56,7 @@ from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
 )
+from behav3d.core.qt_help import HelpButton
 
 # These are imported lazily by the conversion worker to keep startup fast.
 # from behav3d.preprocessing import convert_input_files_to_zarr
@@ -98,6 +99,94 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+def _compute_dim_order_data(metadata: pd.DataFrame, progress_callback=None):
+    """Per-sample ``(sample_name, shape_str, detected_dim_order)``.
+
+    This is the I/O-heavy part of populating the Dimension Order table —
+    it opens each sample's raw image container to read its shape/axes.
+    Kept as a plain function (no Qt widget access) so it can run on a
+    background thread; the caller is responsible for feeding the result
+    into the table widget on the GUI thread.
+    """
+    from behav3d.io.images import get_image_shape, get_image_dimension_order, get_czi_shape_and_dimension_order
+
+    samples = metadata["sample_name"].tolist()
+    data = []
+    for idx, sample in enumerate(samples):
+        if progress_callback is not None:
+            progress_callback(f"Reading image info {idx + 1}/{len(samples)}: {sample}")
+
+        raw_path = metadata.loc[metadata["sample_name"] == sample, "raw_image_path"]
+        shape_str = ""
+        detected_order = "TCZYX"
+        if not raw_path.empty:
+            p = Path(str(raw_path.iloc[0]).strip())
+            if p.exists():
+                if p.suffix == ".czi":
+                    # Single open covers both shape and dim order (avoids opening the file twice).
+                    try:
+                        raw_shape, detected_order = get_czi_shape_and_dimension_order(p)
+                        shape_str = str(raw_shape)
+                    except Exception:
+                        shape_str = "?"
+                else:
+                    try:
+                        raw_shape = get_image_shape(p)
+                        shape_str = str(raw_shape)
+                    except Exception:
+                        shape_str = "?"
+                    try:
+                        detected_order = get_image_dimension_order(p)
+                    except Exception:
+                        pass
+        data.append((sample, shape_str, detected_order))
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Background worker for metadata load (CSV read + validation + per-sample
+# image-header reads can be slow, especially over network storage)
+# ═══════════════════════════════════════════════════════════════════════════
+class _MetadataLoadWorker(QThread):
+    progress = Signal(str)
+    finished = Signal(object)  # dict — see run()
+
+    def __init__(self, csv_path: str, out_dir: str, parent=None):
+        super().__init__(parent)
+        self.csv_path = csv_path
+        self.out_dir = out_dir
+
+    def run(self):
+        try:
+            metadata = load_behav3d_metadata(self.csv_path)
+            check_behav3d_metadata(metadata, func=False)
+
+            behav3d_parameters = None
+            params_path = Path(self.out_dir) / "behav3d_parameters.yml" if self.out_dir else None
+            if params_path:
+                if params_path.exists():
+                    behav3d_parameters = _deep_merge(deepcopy(_DEFAULT_CONFIG), _load_config(params_path))
+                else:
+                    behav3d_parameters = deepcopy(_DEFAULT_CONFIG)
+                behav3d_parameters["paths"]["metadata_csv"] = self.csv_path
+                behav3d_parameters["paths"]["output_dir"] = self.out_dir
+                with open(params_path, "w") as f:
+                    yaml.safe_dump(behav3d_parameters, f, sort_keys=False)
+
+            dim_order_data = _compute_dim_order_data(metadata, progress_callback=self.progress.emit)
+
+            self.finished.emit({
+                "ok": True,
+                "metadata": metadata,
+                "behav3d_parameters": behav3d_parameters,
+                "dim_order_data": dim_order_data,
+                "csv_path": self.csv_path,
+                "out_dir": self.out_dir,
+            })
+        except Exception as e:
+            self.finished.emit({"ok": False, "error": str(e)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -166,6 +255,34 @@ class _ZarrWorker(QThread):
             )
 
 
+class _ZarrClipWorker(QThread):
+    """Clips already-converted .zarr files in place to a timepoint range."""
+    progress = Signal(str)
+    # (success, message)
+    finished = Signal(bool, str)
+
+    def __init__(self, samples: list, t_start: int, t_end: int, parent=None):
+        super().__init__(parent)
+        # samples: list of {"sample_name": str, "zarr_path": str}
+        self.samples = samples
+        self.t_start = t_start
+        self.t_end = t_end
+
+    def run(self):
+        try:
+            from behav3d.io.images import clip_zarr_timepoints
+
+            for entry in self.samples:
+                sample_name = entry["sample_name"]
+                zarr_path = entry["zarr_path"]
+                self.progress.emit(f"Clipping '{sample_name}' to timepoints [{self.t_start}, {self.t_end}]…")
+                clip_zarr_timepoints(zarr_path, t_start=self.t_start, t_end=self.t_end)
+
+            self.finished.emit(True, f"✅ Clipped {len(self.samples)} existing zarr file(s)!")
+        except Exception:
+            self.finished.emit(False, f"❌ Clipping existing zarr failed:\n{traceback.format_exc()}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # DataPreparationTab
 # ═══════════════════════════════════════════════════════════════════════════
@@ -183,6 +300,8 @@ class DataPreparationTab(QWidget):
         self.output_dir: str = ""
         self.behav3d_parameters: dict = deepcopy(_DEFAULT_CONFIG)
         self._zarr_worker: _ZarrWorker | None = None
+        self._zarr_clip_worker: _ZarrClipWorker | None = None
+        self._sample_t_counts: dict = {}       # sample_name -> T count (Section 5)
         self._edit_mode: bool = False          # True when editing loaded metadata
         self._loaded_csv_path: str = ""        # CSV path of last loaded metadata
 
@@ -279,8 +398,22 @@ class DataPreparationTab(QWidget):
         pop_form.addRow("Organoid types:", self.n_organoid_spin)
         pop_form.addRow("Immune types:", self.n_immune_spin)
         pop_form.addRow("Other types:", self.n_other_spin)
+        dead_row = QHBoxLayout()
         self.include_dead_cb = QCheckBox("Include dead channel")
-        pop_form.addRow(self.include_dead_cb)
+        dead_row.addWidget(self.include_dead_cb)
+        dead_row.addWidget(HelpButton(
+            "Include Dead Channel",
+            "Tick this when the acquisition has a dedicated viability/death "
+            "marker channel (e.g. a live/dead dye), separate from the "
+            "organoid/immune/other cell-type channels above.\n\n"
+            "Enabling it adds a 'Dead ch #' field and an optional 'Dead "
+            "mask' path to each sample form, writing 'dead_channel' and "
+            "'dead_mask_path' columns to metadata.csv. If a dead channel "
+            "number is set but no mask path is given, the mask must be "
+            "produced later via Segmentation."
+        ))
+        dead_row.addStretch()
+        pop_form.addRow(dead_row)
         lay.addLayout(pop_form)
 
         # --- Cell type naming inputs (dynamically rebuilt) ---
@@ -288,7 +421,7 @@ class DataPreparationTab(QWidget):
         lay.addLayout(self.cell_type_naming_container)
 
         btn_configure = QPushButton("Configure Cell Types")
-        btn_configure.clicked.connect(self._on_configure_cell_types)
+        btn_configure.clicked.connect(lambda: self._on_configure_cell_types(force=True))
         lay.addWidget(btn_configure)
 
         # --- Sample form area (dynamically rebuilt) ---
@@ -320,7 +453,18 @@ class DataPreparationTab(QWidget):
         self._sample_forms: list[dict] = []
 
     # --- configure cell-type naming fields --------------------------------
-    def _on_configure_cell_types(self):
+    def _on_configure_cell_types(self, force: bool = False):
+        # Idempotent: when the existing naming fields already match the configured
+        # counts, skip the destructive rebuild so entered names survive. The
+        # assistant may re-trigger this structurally; user button clicks pass
+        # force=True to always rebuild.
+        if (not force
+                and (self._organoid_name_edits or self._immune_name_edits
+                     or self._other_name_edits)
+                and len(self._organoid_name_edits) == self.n_organoid_spin.value()
+                and len(self._immune_name_edits) == self.n_immune_spin.value()
+                and len(self._other_name_edits) == self.n_other_spin.value()):
+            return
         # Clear old
         self._clear_layout(self.cell_type_naming_container)
 
@@ -383,10 +527,34 @@ class DataPreparationTab(QWidget):
 
         # After naming is set, build sample forms
         btn = QPushButton("Create Sample Forms")
-        btn.clicked.connect(self._build_sample_forms)
+        btn.clicked.connect(lambda: self._build_sample_forms(force=True))
         self.cell_type_naming_container.addWidget(btn)
 
-    def _build_sample_forms(self):
+    def _sample_forms_match_current(self) -> bool:
+        """True if the existing sample forms already match the configured sample
+        count, cell-type names and dead-channel flag — so a rebuild would only
+        destroy values the user (or assistant) already entered."""
+        forms = getattr(self, "_sample_forms", [])
+        if not forms or len(forms) != self.n_samples_spin.value():
+            return False
+        org = [e.text().strip() for e in self._organoid_name_edits]
+        imm = self._expanded_immune_names()
+        oth = [e.text().strip() for e in self._other_name_edits]
+        include_dead = self.include_dead_cb.isChecked()
+        for form in forms:
+            if (form.get("org_names") != org or form.get("imm_names") != imm
+                    or form.get("oth_names") != oth):
+                return False
+            if include_dead != bool(form.get("dead_channel")):
+                return False
+        return True
+
+    def _build_sample_forms(self, force: bool = False):
+        # Idempotent: skip the destructive rebuild when the forms already match the
+        # configured structure, so entered values survive structural re-triggers
+        # from the assistant. User button clicks pass force=True to always rebuild.
+        if not force and self._sample_forms_match_current():
+            return
         self._clear_layout(self.sample_form_container)
         self._sample_forms = []
 
@@ -577,7 +745,11 @@ class DataPreparationTab(QWidget):
                 
         for base, ct_names in multi_groups.items():
             if len(ct_names) > 1:
-                fields_to_sync = ["line", "condition", "segments_image_path", "tracks_image_path", "tracks_csv_path"]
+                # Path fields (segments/tracks) are intentionally excluded: each
+                # multicolor channel is a distinct external segmentation/tracking
+                # result and must keep its own path, unlike line/condition which
+                # describe the same underlying population.
+                fields_to_sync = ["line", "condition"]
                 for field_name in fields_to_sync:
                     for ct_name in ct_names:
                         w = cell_type_fields[ct_name][field_name]
@@ -774,6 +946,26 @@ class DataPreparationTab(QWidget):
             "background-color: #4CAF50; color: white; font-weight: bold;"
         )
 
+    def enter_metadata_edit_mode(self):
+        """Open the Metadata Builder already in edit mode for the currently
+        loaded metadata.
+
+        Bypasses the "Edit Current / Generate New / Cancel" prompt normally
+        shown by ``_on_builder_toggled`` — intent is unambiguous when this is
+        called from an external shortcut (e.g. the Segmentation/Tracking
+        import tabs' "Add a new sample or cell type" button).
+        """
+        if self.metadata is None:
+            QMessageBox.information(
+                self, "No Metadata Loaded",
+                "Load or build a metadata CSV first before adding samples or cell types.",
+            )
+            return
+        self.builder_grp.blockSignals(True)
+        self.builder_grp.setChecked(True)
+        self.builder_grp.blockSignals(False)
+        self._enter_edit_mode()
+
     def _populate_builder_from_metadata(self):
         """Fill the metadata builder forms from self.metadata."""
         md = self.metadata
@@ -797,8 +989,8 @@ class DataPreparationTab(QWidget):
         self.n_other_spin.setValue(len(oth_types))
         self.include_dead_cb.setChecked(include_dead)
 
-        # Build cell type naming fields
-        self._on_configure_cell_types()
+        # Build cell type naming fields (force: loading replaces any prior structure)
+        self._on_configure_cell_types(force=True)
 
         # Fill naming edits with detected names
         for i, name in enumerate(org_types):
@@ -816,8 +1008,8 @@ class DataPreparationTab(QWidget):
             if i < len(self._other_name_edits):
                 self._other_name_edits[i].setText(name)
 
-        # Build sample forms
-        self._build_sample_forms()
+        # Build sample forms (force: loading replaces any prior structure)
+        self._build_sample_forms(force=True)
 
         # Populate each sample form from the DataFrame row
         for row_idx, (_, row) in enumerate(md.iterrows()):
@@ -1071,10 +1263,10 @@ class DataPreparationTab(QWidget):
         row.addWidget(btn_browse)
         lay.addLayout(row)
 
-        btn_load = QPushButton("Load Metadata")
-        btn_load.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
-        btn_load.clicked.connect(self._on_load_metadata)
-        lay.addWidget(btn_load)
+        self.btn_load_metadata = QPushButton("Load Metadata")
+        self.btn_load_metadata.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        self.btn_load_metadata.clicked.connect(self._on_load_metadata)
+        lay.addWidget(self.btn_load_metadata)
 
         self.metadata_info_label = QLabel("")
         self.metadata_info_label.setWordWrap(True)
@@ -1098,55 +1290,62 @@ class DataPreparationTab(QWidget):
             QMessageBox.warning(self, "Error", f"File not found: {csv_path}")
             return
 
-        try:
-            self.metadata = load_behav3d_metadata(csv_path)
-            self.output_dir = out_dir
-            check_behav3d_metadata(self.metadata, func=False)
+        if getattr(self, "_metadata_load_worker", None) is not None and self._metadata_load_worker.isRunning():
+            return
 
-            # Persist parameters
-            params_path = Path(out_dir) / "behav3d_parameters.yml" if out_dir else None
-            if params_path:
-                if params_path.exists():
-                    self.behav3d_parameters = _deep_merge(deepcopy(_DEFAULT_CONFIG), _load_config(params_path))
-                else:
-                    self.behav3d_parameters = deepcopy(_DEFAULT_CONFIG)
-                self.behav3d_parameters["paths"]["metadata_csv"] = csv_path
-                self.behav3d_parameters["paths"]["output_dir"] = out_dir
-                with open(params_path, "w") as f:
-                    yaml.safe_dump(self.behav3d_parameters, f, sort_keys=False)
+        self.btn_load_metadata.setEnabled(False)
+        self.btn_load_metadata.setText("Loading…")
+        self.metadata_info_label.setText("⏳ Loading metadata…")
 
-            n = len(self.metadata)
-            cols = len(self.metadata.columns)
-            org = detect_organoid_types_from_metadata(self.metadata)
-            imm = detect_immune_cell_types_from_metadata(self.metadata)
-            oth = detect_other_cell_types_from_metadata(self.metadata)
-            info_parts = [f"✅ Loaded {n} samples, {cols} columns."]
-            if org:
-                info_parts.append(f"Organoid: {', '.join(org)}")
-            if imm:
-                info_parts.append(f"Immune: {', '.join(imm)}")
-            if oth:
-                info_parts.append(f"Other: {', '.join(oth)}")
-            self.metadata_info_label.setText("  |  ".join(info_parts))
-            self._log(f"✅ Metadata loaded from {csv_path}")
-            self._loaded_csv_path = csv_path
+        self._metadata_load_worker = _MetadataLoadWorker(csv_path, out_dir, parent=self)
+        self._metadata_load_worker.progress.connect(lambda msg: self._log(msg))
+        self._metadata_load_worker.finished.connect(self._on_metadata_load_finished)
+        self._metadata_load_worker.start()
 
-            # Switch save button to "Edit Metadata CSV" (yellow)
-            self.btn_save_metadata.setText("Edit Metadata CSV")
-            self.btn_save_metadata.setStyleSheet(
-                "background-color: #FFA726; color: white; font-weight: bold;"
-            )
+    def _on_metadata_load_finished(self, result: dict):
+        self.btn_load_metadata.setEnabled(True)
+        self.btn_load_metadata.setText("Load Metadata")
 
-            # Populate overview and dim-order table
-            self._populate_metadata_overview()
-            self._populate_dim_order_table()
+        if not result["ok"]:
+            self.metadata_info_label.setText(f"❌ {result['error']}")
+            self._log(f"❌ Error loading metadata: {result['error']}")
+            return
 
-            # Emit signal for other tabs
-            self.metadata_loaded.emit(self.metadata)
+        csv_path = result["csv_path"]
+        self.metadata = result["metadata"]
+        self.output_dir = result["out_dir"]
+        if result["behav3d_parameters"] is not None:
+            self.behav3d_parameters = result["behav3d_parameters"]
 
-        except Exception as e:
-            self.metadata_info_label.setText(f"❌ {e}")
-            self._log(f"❌ Error loading metadata: {e}")
+        n = len(self.metadata)
+        cols = len(self.metadata.columns)
+        org = detect_organoid_types_from_metadata(self.metadata)
+        imm = detect_immune_cell_types_from_metadata(self.metadata)
+        oth = detect_other_cell_types_from_metadata(self.metadata)
+        info_parts = [f"✅ Loaded {n} samples, {cols} columns."]
+        if org:
+            info_parts.append(f"Organoid: {', '.join(org)}")
+        if imm:
+            info_parts.append(f"Immune: {', '.join(imm)}")
+        if oth:
+            info_parts.append(f"Other: {', '.join(oth)}")
+        self.metadata_info_label.setText("  |  ".join(info_parts))
+        self._log(f"✅ Metadata loaded from {csv_path}")
+        self._loaded_csv_path = csv_path
+
+        # Switch save button to "Edit Metadata CSV" (yellow)
+        self.btn_save_metadata.setText("Edit Metadata CSV")
+        self.btn_save_metadata.setStyleSheet(
+            "background-color: #FFA726; color: white; font-weight: bold;"
+        )
+
+        # Populate overview and dim-order table (dim-order data was already
+        # computed on the background thread — no extra image I/O here).
+        self._populate_metadata_overview()
+        self._populate_dim_order_table(result["dim_order_data"])
+
+        # Emit signal for other tabs
+        self.metadata_loaded.emit(self.metadata)
 
     def _on_tracking_completed(self):
         """Reload metadata after tracking completes to reflect new tracking outputs."""
@@ -1206,7 +1405,7 @@ class DataPreparationTab(QWidget):
     # Section 5 – Dimension Order Table
     # ══════════════════════════════════════════════════════════════════════
     def _build_dim_order_section(self):
-        grp = QGroupBox("5 · Dimension Order")
+        grp = QGroupBox("5 · Dimension Order (Optional)")
         lay = QVBoxLayout(grp)
 
         self.dim_table = QTableWidget(0, 3)
@@ -1232,36 +1431,24 @@ class DataPreparationTab(QWidget):
 
         self._layout.addWidget(grp)
 
-    def _populate_dim_order_table(self):
+    def _populate_dim_order_table(self, dim_order_data=None):
         if self.metadata is None:
             return
 
-        from behav3d.io.images import get_image_shape, get_image_dimension_order
+        # dim_order_data lets callers (e.g. the background metadata-load
+        # worker) hand in already-computed (sample, shape_str, detected_order)
+        # tuples so this method only ever touches Qt widgets, never the disk.
+        if dim_order_data is None:
+            dim_order_data = _compute_dim_order_data(self.metadata)
 
-        samples = self.metadata["sample_name"].tolist()
-        self.dim_table.setRowCount(len(samples))
+        self.dim_table.setRowCount(len(dim_order_data))
+        self._sample_t_counts = {}
 
-        for i, sample in enumerate(samples):
+        for i, (sample, shape_str, detected_order) in enumerate(dim_order_data):
             # Sample name (read-only)
             item = QTableWidgetItem(str(sample))
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             self.dim_table.setItem(i, 0, item)
-
-            # Shape
-            raw_path = self.metadata.loc[self.metadata["sample_name"] == sample, "raw_image_path"]
-            shape_str = ""
-            detected_order = "TCZYX"
-            if not raw_path.empty:
-                p = Path(str(raw_path.iloc[0]).strip())
-                if p.exists():
-                    try:
-                        shape_str = str(get_image_shape(p))
-                    except Exception:
-                        shape_str = "?"
-                    try:
-                        detected_order = get_image_dimension_order(p)
-                    except Exception:
-                        pass
 
             shape_item = QTableWidgetItem(shape_str)
             shape_item.setFlags(shape_item.flags() & ~Qt.ItemIsEditable)
@@ -1282,7 +1469,54 @@ class DataPreparationTab(QWidget):
                     combo.setCurrentText(detected_order if detected_order in DIM_ORDER_OPTIONS else "TCZYX")
             else:
                 combo.setCurrentText(detected_order if detected_order in DIM_ORDER_OPTIONS else "TCZYX")
+            combo.currentTextChanged.connect(self._recompute_sample_t_counts_from_table)
             self.dim_table.setCellWidget(i, 2, combo)
+
+        self._recompute_sample_t_counts_from_table()
+
+    def _recompute_sample_t_counts_from_table(self, *_args):
+        """Re-derive each sample's T count from the dim_table's Shape/Dim Order
+        columns (no disk access) and refresh the T-mismatch warning."""
+        import ast
+
+        counts: dict = {}
+        for i in range(self.dim_table.rowCount()):
+            sample_item = self.dim_table.item(i, 0)
+            shape_item = self.dim_table.item(i, 1)
+            combo = self.dim_table.cellWidget(i, 2)
+            if sample_item is None:
+                continue
+            t_count = None
+            if shape_item is not None and combo is not None and shape_item.text():
+                order = combo.currentText()
+                try:
+                    raw_shape = ast.literal_eval(shape_item.text())
+                    if "T" in order and len(order) == len(raw_shape):
+                        t_count = int(raw_shape[order.index("T")])
+                except Exception:
+                    t_count = None
+            counts[sample_item.text()] = t_count
+        self._sample_t_counts = counts
+        self._update_t_mismatch_warning()
+
+    def _update_t_mismatch_warning(self):
+        """Show/hide the Section 6 warning when samples have differing T counts."""
+        if not hasattr(self, "t_mismatch_warning"):
+            return
+        counts = {s: t for s, t in self._sample_t_counts.items() if t is not None}
+        distinct = sorted(set(counts.values()))
+        if len(distinct) <= 1:
+            self.t_mismatch_warning.setVisible(False)
+            return
+        lo, hi = distinct[0], distinct[-1]
+        self.t_mismatch_warning.setText(
+            f"⚠ Images do not have the same number of timepoints ({lo}–{hi} T). "
+            f"Clipping timepoints is recommended before conversion."
+        )
+        self.t_mismatch_warning.setToolTip(
+            "\n".join(f"{s}: T={t}" for s, t in sorted(counts.items()))
+        )
+        self.t_mismatch_warning.setVisible(True)
 
     def _apply_dim_order_all(self):
         order = self.dim_apply_all_combo.currentText()
@@ -1290,6 +1524,7 @@ class DataPreparationTab(QWidget):
             combo = self.dim_table.cellWidget(i, 2)
             if combo:
                 combo.setCurrentText(order)
+        self._recompute_sample_t_counts_from_table()
 
     def _save_dim_order(self):
         if self.metadata is None:
@@ -1323,10 +1558,34 @@ class DataPreparationTab(QWidget):
         grp = QGroupBox("6 · Convert to Zarr")
         lay = QVBoxLayout(grp)
 
+        # T-mismatch warning (hidden until _update_t_mismatch_warning finds a mismatch)
+        self.t_mismatch_warning = QLabel("")
+        self.t_mismatch_warning.setWordWrap(True)
+        self.t_mismatch_warning.setStyleSheet(
+            "QLabel { background: #4a2222; color: #ffdada; border-radius: 4px; "
+            "padding: 6px 8px; font-size: 11px; }"
+        )
+        self.t_mismatch_warning.setVisible(False)
+        lay.addWidget(self.t_mismatch_warning)
+
         # Timepoint clipping
+        clip_check_row = QHBoxLayout()
         self.zarr_clip_check = QCheckBox("Clip timepoints (select range)")
         self.zarr_clip_check.setChecked(False)
-        lay.addWidget(self.zarr_clip_check)
+        clip_check_row.addWidget(self.zarr_clip_check)
+        clip_check_row.addWidget(HelpButton(
+            "Clip Timepoints",
+            "Restrict every image to an inclusive [Start, End] timepoint "
+            "range during zarr conversion, instead of keeping all "
+            "timepoints. Useful when samples have differing timepoint "
+            "counts (see the warning above) — trimming them to a common "
+            "range avoids mismatches in downstream tracking/feature steps.\n\n"
+            "If some samples were already converted to .zarr in a previous "
+            "run, you will additionally be offered the option to clip those "
+            "existing .zarr files in place to the same range."
+        ))
+        clip_check_row.addStretch()
+        lay.addLayout(clip_check_row)
 
         clip_row = QHBoxLayout()
         clip_row.setContentsMargins(20, 0, 0, 0)
@@ -1382,7 +1641,21 @@ class DataPreparationTab(QWidget):
 
         self._layout.addWidget(grp)
 
+    def _find_already_converted_samples(self, out_dir: str) -> list:
+        """Return the samples whose output .zarr (from a previous conversion
+        run) already exists at the path convert_input_files_to_zarr writes to."""
+        found = []
+        for _, row in self.metadata.iterrows():
+            sample_name = str(row.get("sample_name", ""))
+            zarr_path = Path(out_dir, "images", sample_name, f"{sample_name}.zarr")
+            if zarr_path.exists():
+                found.append({"sample_name": sample_name, "zarr_path": str(zarr_path)})
+        return found
+
     def _on_convert_zarr(self):
+        if self._zarr_worker is not None:
+            self._log("⚠️ Zarr conversion already running. Please wait.")
+            return
         out_dir = self.output_dir_edit.text().strip()
         if self.metadata is None:
             QMessageBox.warning(self, "Error", "Please load metadata first.")
@@ -1405,6 +1678,66 @@ class DataPreparationTab(QWidget):
                     f"End timepoint ({t_end}) must be greater than start ({t_start}).")
                 return
 
+            already_converted = self._find_already_converted_samples(out_dir)
+            if already_converted:
+                names = ", ".join(e["sample_name"] for e in already_converted)
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Question)
+                box.setWindowTitle("Clip already-converted images?")
+                box.setTextFormat(Qt.RichText)
+                box.setText(
+                    f"<b>{len(already_converted)}</b> sample(s) already have a converted "
+                    f".zarr and will be skipped by a normal conversion run."
+                )
+                box.setInformativeText(
+                    f"Clip their existing .zarr in place to timepoints "
+                    f"[{t_start}, {t_end}] now?\n\n"
+                    "Clip existing zarr: truncate the already-converted files to the "
+                    "selected range (fast, no re-read of raw files)\n"
+                    "Leave as-is: keep them untouched and only convert samples that "
+                    "haven't been converted yet"
+                )
+                box.setDetailedText("Already converted:\n" + "\n".join(
+                    f"  • {n}" for n in names.split(", ")
+                ))
+                btn_clip = box.addButton("Clip Existing Zarr", QMessageBox.AcceptRole)
+                btn_leave = box.addButton("Leave As-Is", QMessageBox.YesRole)
+                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+                box.exec_()
+                clicked = box.clickedButton()
+                if clicked == btn_cancel:
+                    self._log("Action cancelled.")
+                    return
+                if clicked == btn_clip:
+                    self.zarr_btn.setEnabled(False)
+                    self.zarr_status.setText("⏳ Clipping already-converted zarr files…")
+                    self._log(f"Clipping {len(already_converted)} already-converted sample(s)…")
+                    self._zarr_clip_worker = _ZarrClipWorker(
+                        already_converted, t_start, t_end, parent=self
+                    )
+                    self._zarr_clip_worker.progress.connect(lambda msg: self._log(msg))
+                    self._zarr_clip_worker.finished.connect(
+                        lambda success, message: self._on_zarr_clip_done(
+                            success, message, out_dir, t_start, t_end
+                        )
+                    )
+                    self._zarr_clip_worker.start()
+                    return
+                # else: "Leave As-Is" clicked — fall through to normal conversion
+
+        self._start_zarr_conversion(out_dir, t_start, t_end)
+
+    def _on_zarr_clip_done(self, success: bool, message: str,
+                            out_dir: str, t_start, t_end):
+        self._log(message)
+        if not success:
+            self.zarr_btn.setEnabled(True)
+            self.zarr_status.setText(message.split("\n")[0])
+            return
+        # Continue with the normal conversion for any not-yet-converted samples.
+        self._start_zarr_conversion(out_dir, t_start, t_end)
+
+    def _start_zarr_conversion(self, out_dir: str, t_start, t_end):
         self.zarr_btn.setEnabled(False)
         self.zarr_status.setText("⏳ Converting…")
         self._log("Starting zarr conversion…")
@@ -1667,6 +2000,14 @@ class DataPreparationTab(QWidget):
             )
         summary.setStandardButtons(QMessageBox.Ok)
         summary.exec_()
+
+        # Re-emit metadata_loaded so all other tabs (segmentation, tracking, etc.)
+        # automatically pick up the updated zarr paths without a manual reload.
+        try:
+            self.metadata_loaded.emit(self.metadata)
+            self._log("✅ Metadata reloaded in all tabs automatically.")
+        except Exception as e:
+            self._log(f"⚠ Could not auto-reload metadata: {e}")
 
     # ══════════════════════════════════════════════════════════════════════
     # Utility

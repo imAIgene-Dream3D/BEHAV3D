@@ -23,6 +23,362 @@ from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers: line-condition grouping and absolute analysis-time window.
+#
+# All of these are additive and OFF by default: callers that do not pass a
+# line-condition flag / analysis period get exactly the previous behaviour.
+# They are defined here (and imported by invasiveness_analysis) so the two
+# analyses share one implementation instead of repeating the logic.
+# ---------------------------------------------------------------------------
+
+def resolve_line_condition_map(df: pd.DataFrame, immune_types: list):
+    """
+    Map each ``sample_name`` to its immune *line condition* value.
+
+    Uses the metadata convention ``im_{immune_type}_line_condition``. These
+    per-sample columns are carried into the filtered track-feature CSVs, so a
+    lookup on the loaded DataFrame is enough (no separate metadata read). The
+    first immune type in ``immune_types`` with a usable column wins; a couple
+    of fallbacks keep it robust to naming drift.
+
+    Returns
+    -------
+    (mapping, column_name) : (dict, str | None)
+        ``mapping`` is ``{sample_name: condition_value}`` (values as str).
+        ``column_name`` is the resolved source column (``None`` if none found).
+    """
+    candidates = [f"im_{ct}_line_condition" for ct in (immune_types or [])]
+    # Fallbacks: any immune line_condition column, then any *_line_condition.
+    candidates += [
+        c for c in df.columns
+        if c.startswith("im_") and c.endswith("_line_condition")
+    ]
+    candidates += [c for c in df.columns if c.endswith("_line_condition")]
+
+    seen = set()
+    for col in candidates:
+        if col in seen or col not in df.columns:
+            continue
+        seen.add(col)
+        sub = df.dropna(subset=[col])
+        if sub.empty:
+            continue
+        mapping = (
+            sub.drop_duplicates("sample_name")
+            .set_index("sample_name")[col]
+            .astype(str)
+            .to_dict()
+        )
+        if mapping:
+            return mapping, col
+    return {}, None
+
+
+def add_line_condition_column(
+    df: pd.DataFrame, immune_types: list, target_col: str = "line_condition",
+):
+    """
+    Attach a per-sample ``line_condition`` column to ``df`` in place.
+
+    Missing values (samples with no condition) become ``"(no line condition)"``
+    so grouping never drops rows silently. Returns ``(df, source_column)``.
+    """
+    mapping, col = resolve_line_condition_map(df, immune_types)
+    if mapping:
+        df[target_col] = (
+            df["sample_name"].map(mapping).fillna("(no line condition)")
+        )
+    else:
+        df[target_col] = "(no line condition)"
+    return df, col
+
+
+def add_minutes_from_start(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add ``analysis_time_min`` = minutes elapsed from the start of each movie.
+
+    Per sample, ``t0`` is that movie's minimum ``time``; the offset is converted
+    to minutes with :func:`_time_unit_to_minutes_factor` so movies with
+    different frame intervals are directly comparable. Falls back to
+    ``position_t`` (treated as minutes) when no ``time`` column exists so the
+    filter still works on legacy CSVs. Operates in place and returns ``df``.
+    """
+    if "time" in df.columns:
+        to_min = _time_unit_to_minutes_factor(df)
+        t0 = df.groupby("sample_name")["time"].transform("min")
+        df["analysis_time_min"] = (df["time"] - t0) * to_min
+    else:
+        t0 = df.groupby("sample_name")["position_t"].transform("min")
+        df["analysis_time_min"] = (df["position_t"] - t0).astype(float)
+    return df
+
+
+def _normalize_period(analysis_period_min):
+    """Coerce a period spec to ``(start, end)`` floats/None; tolerant of junk."""
+    if analysis_period_min is None:
+        return None, None
+    try:
+        start, end = analysis_period_min
+    except (TypeError, ValueError):
+        return None, None
+    start = None if start is None or start == "" else float(start)
+    end = None if end is None or end == "" else float(end)
+    return start, end
+
+
+def apply_analysis_period(df: pd.DataFrame, analysis_period_min) -> pd.DataFrame:
+    """
+    Keep only rows inside the absolute analysis window (minutes from movie
+    start). ``analysis_period_min`` is ``(start, end)`` in minutes; either bound
+    may be ``None`` (open-ended). Returns a filtered copy; a no-op (returns the
+    same object) when the period is ``None`` / fully open.
+    """
+    start, end = _normalize_period(analysis_period_min)
+    if start is None and end is None:
+        return df
+    if "analysis_time_min" not in df.columns:
+        df = add_minutes_from_start(df.copy())
+    mask = pd.Series(True, index=df.index)
+    if start is not None:
+        mask &= df["analysis_time_min"] >= start
+    if end is not None:
+        mask &= df["analysis_time_min"] <= end
+    return df[mask].copy()
+
+
+def period_bounds_by_sample(df: pd.DataFrame, analysis_period_min):
+    """
+    Translate the absolute minutes window into per-sample ``position_t`` bounds.
+
+    Needed to filter the active-killing event CSVs, which only carry
+    ``position_t`` (no real ``time``). Returns ``{sample_name: (t_start, t_end)}``
+    inclusive, omitting samples with no timepoints in the window. Returns
+    ``None`` when the period is open (i.e. no filtering required).
+    """
+    start, end = _normalize_period(analysis_period_min)
+    if start is None and end is None:
+        return None
+    if "analysis_time_min" not in df.columns:
+        df = add_minutes_from_start(df.copy())
+    bounds = {}
+    for sample, grp in df.groupby("sample_name"):
+        sub = grp
+        if start is not None:
+            sub = sub[sub["analysis_time_min"] >= start]
+        if end is not None:
+            sub = sub[sub["analysis_time_min"] <= end]
+        if sub.empty:
+            continue
+        bounds[str(sample)] = (
+            int(sub["position_t"].min()), int(sub["position_t"].max()),
+        )
+    return bounds
+
+
+def _in_bounds(period_bounds: dict, sample_name, position_t) -> bool:
+    """True if ``position_t`` falls within ``period_bounds`` for that sample.
+
+    Samples absent from ``period_bounds`` have no timepoints in the window and
+    return False. Non-finite timepoints return False.
+    """
+    b = period_bounds.get(str(sample_name))
+    if b is None:
+        return False
+    try:
+        t = float(position_t)
+    except (TypeError, ValueError):
+        return False
+    if np.isnan(t):
+        return False
+    return b[0] <= t <= b[1]
+
+
+def _sample_period_bounds(period_bounds: dict, sample_name):
+    """Return inclusive ``(lo, hi)`` for *sample_name*, or ``None``."""
+    if period_bounds is None:
+        return None
+    return period_bounds.get(str(sample_name))
+
+
+def _event_end_t(row) -> float:
+    """Best-effort inclusive end timepoint for a contact-event row."""
+    if "contact_end_t" in row.index and pd.notna(row["contact_end_t"]):
+        return float(row["contact_end_t"])
+    if "contact_duration" in row.index and pd.notna(row["contact_duration"]):
+        try:
+            dur = int(row["contact_duration"])
+        except (TypeError, ValueError):
+            dur = 0
+        if dur > 0 and pd.notna(row.get("contact_start_t")):
+            return float(row["contact_start_t"]) + dur - 1
+    if pd.notna(row.get("contact_start_t")):
+        return float(row["contact_start_t"])
+    return float("nan")
+
+
+def _interval_overlaps_window(start_t, end_t, lo, hi) -> bool:
+    """True when inclusive ``[start_t, end_t]`` overlaps ``[lo, hi]``."""
+    try:
+        s, e = float(start_t), float(end_t)
+    except (TypeError, ValueError):
+        return False
+    if np.isnan(s) or np.isnan(e):
+        return False
+    if s > e:
+        s, e = e, s
+    return s <= hi and e >= lo
+
+
+def _overlap_duration(start_t, end_t, lo, hi) -> int:
+    """Inclusive timepoint count in the overlap of event and window."""
+    try:
+        s, e = float(start_t), float(end_t)
+    except (TypeError, ValueError):
+        return 0
+    if np.isnan(s) or np.isnan(e):
+        return 0
+    if s > e:
+        s, e = e, s
+    overlap_lo = max(s, lo)
+    overlap_hi = min(e, hi)
+    if overlap_lo > overlap_hi:
+        return 0
+    return int(overlap_hi - overlap_lo + 1)
+
+
+def _clip_contact_events_to_period(df_ev: pd.DataFrame, period_bounds: dict) -> pd.DataFrame:
+    """Keep events overlapping the per-sample window; clip ``contact_duration``.
+
+    Events that start before the window but extend into it are included (with
+  duration counted only inside the window). Events with zero overlap are dropped.
+    """
+    if period_bounds is None or df_ev.empty or "contact_start_t" not in df_ev.columns:
+        return df_ev
+
+    rows = []
+    for _, row in df_ev.iterrows():
+        bounds = _sample_period_bounds(period_bounds, row["sample_name"])
+        if bounds is None:
+            continue
+        lo, hi = bounds
+        start_t = row["contact_start_t"]
+        end_t = _event_end_t(row)
+        if not _interval_overlaps_window(start_t, end_t, lo, hi):
+            continue
+        dur = _overlap_duration(start_t, end_t, lo, hi)
+        if dur <= 0:
+            continue
+        r = row.copy()
+        r["contact_duration"] = dur
+        rows.append(r)
+    if not rows:
+        return df_ev.iloc[0:0].copy()
+    return pd.DataFrame(rows)
+
+
+def format_period_label(analysis_period_min) -> str:
+    """Human-readable label for the analysis window, e.g. '10-60 min'."""
+    start, end = _normalize_period(analysis_period_min)
+    if start is None and end is None:
+        return "full movie"
+    lo = "start" if start is None else f"{start:g}"
+    hi = "end" if end is None else f"{end:g}"
+    return f"{lo}-{hi} min"
+
+
+# ---------------------------------------------------------------------------
+# Timepoint-based temporal range (position_t) — new API
+# ---------------------------------------------------------------------------
+
+def _normalize_period_t(analysis_period_t):
+    """Coerce a timepoint period spec to ``(start, end)`` ints/None."""
+    if analysis_period_t is None:
+        return None, None
+    try:
+        start, end = analysis_period_t
+    except (TypeError, ValueError):
+        return None, None
+    start = None if start is None or start == "" else int(start)
+    end = None if end is None or end == "" else int(end)
+    return start, end
+
+
+def apply_analysis_period_timepoints(
+    df: pd.DataFrame, analysis_period_t,
+) -> pd.DataFrame:
+    """Keep only rows where ``position_t`` is inside ``[start_t, end_t]``.
+
+    ``analysis_period_t`` is ``(start_t, end_t)`` in raw timepoints; either
+    bound may be ``None`` (open-ended).  Returns a filtered copy; a no-op
+    when the period is ``None`` / fully open.
+    """
+    start, end = _normalize_period_t(analysis_period_t)
+    if start is None and end is None:
+        return df
+    mask = pd.Series(True, index=df.index)
+    if start is not None:
+        mask &= df["position_t"] >= start
+    if end is not None:
+        mask &= df["position_t"] <= end
+    return df[mask].copy()
+
+
+def format_period_label_timepoints(analysis_period_t) -> str:
+    """Human-readable label for a timepoint window, e.g. 'T 10–50'."""
+    start, end = _normalize_period_t(analysis_period_t)
+    if start is None and end is None:
+        return "all timepoints"
+    lo = "start" if start is None else str(start)
+    hi = "end" if end is None else str(end)
+    return f"T {lo}–{hi}"
+
+
+def period_bounds_by_sample_t(df: pd.DataFrame, analysis_period_t):
+    """Per-sample ``position_t`` bounds from a timepoint-based window.
+
+    Returns ``{sample_name: (t_start, t_end)}`` inclusive, or ``None``
+    when no filtering is required.
+    """
+    start, end = _normalize_period_t(analysis_period_t)
+    if start is None and end is None:
+        return None
+    bounds = {}
+    for sample, grp in df.groupby("sample_name"):
+        sub = grp
+        if start is not None:
+            sub = sub[sub["position_t"] >= start]
+        if end is not None:
+            sub = sub[sub["position_t"] <= end]
+        if sub.empty:
+            continue
+        bounds[str(sample)] = (
+            int(sub["position_t"].min()), int(sub["position_t"].max()),
+        )
+    return bounds
+
+
+def _build_output_suffix(
+    group_by: str,
+    analysis_period_t,
+    annotate_line_condition: bool = False,
+) -> str:
+    """Build a filename suffix encoding key settings so runs don't overwrite."""
+    parts = []
+    gb_short = {"organoid_type": "orgtype", "treatment": "treatment"}
+    parts.append(gb_short.get(group_by, group_by))
+    start, end = _normalize_period_t(analysis_period_t)
+    if start is None and end is None:
+        parts.append("Tall")
+    else:
+        lo = "s" if start is None else str(start)
+        hi = "e" if end is None else str(end)
+        parts.append(f"T{lo}-{hi}")
+    if annotate_line_condition:
+        parts.append("annoLC")
+    return "_" + "_".join(parts)
+
+
 def run_interaction_analysis(
     output_dir: str,
     cell_type: str,
@@ -30,6 +386,7 @@ def run_interaction_analysis(
     dead_threshold: float = 0.02,
     df_tracks_path: str = None,
     show_plots: bool = True,
+    group_by_line_condition: bool = False,
 ):
     """
     Run interaction analysis for an organoid cell type.
@@ -49,7 +406,13 @@ def run_interaction_analysis(
         Path to filtered track features CSV. If None, uses default location.
     show_plots : bool
         Whether to display plots inline (default: True)
-        
+    group_by_line_condition : bool
+        When True, the two *overall* plots are split by the interacting immune
+        cell's line condition (``im_{type}_line_condition``): the cumulative
+        curve draws one line per condition, and the alive-vs-dead plot colours
+        by condition (solid = survives, dashed = dies). Default False keeps the
+        original single-curve behaviour. Per-sample plots are unaffected.
+
     Returns
     -------
     dict
@@ -130,7 +493,21 @@ def run_interaction_analysis(
         stats_csv_path = results_dir / f"interaction_stats_{cell_type}_vs_{ct}.csv"
         stats_df.to_csv(stats_csv_path, index=False)
         print(f"   📊 Statistics saved: {stats_csv_path.name}")
-        
+
+        # Optional per-immune-type line-condition split column for the overall
+        # plots. Attached per-ct so each interacting type uses its own
+        # im_{ct}_line_condition values.
+        split_col = None
+        if group_by_line_condition:
+            df, _lc_used = add_line_condition_column(
+                df, [ct], target_col=f"__lc_{ct}",
+            )
+            split_col = f"__lc_{ct}"
+            if _lc_used is None:
+                print(f"   ⚠️ No line_condition column found for {ct}; "
+                      "falling back to combined curves.")
+                split_col = None
+
         # Generate plots and PDF
         figs = generate_interaction_plots(
             df=df,
@@ -140,6 +517,7 @@ def run_interaction_analysis(
             has_dead_column=has_dead_column,
             n_organoids=n_organoids,
             n_samples=n_samples,
+            split_col=split_col,
         )
         
         # Save PDF
@@ -304,10 +682,17 @@ def generate_interaction_plots(
     has_dead_column: bool,
     n_organoids: int,
     n_samples: int,
+    split_col: str = None,
 ) -> dict:
     """
     Generate all interaction plots.
-    
+
+    Parameters
+    ----------
+    split_col : str, optional
+        Column name to split the overall plots by (used for line-condition
+        grouping). When None, the overall plots are single combined curves.
+
     Returns
     -------
     dict
@@ -321,13 +706,15 @@ def generate_interaction_plots(
     
     # Plot 1: Cumulative overall
     figs["cumulative_overall"] = plot_cumulative_overall(
-        df, cell_type, interacting_type, cumulative_col, n_organoids, n_samples
+        df, cell_type, interacting_type, cumulative_col, n_organoids, n_samples,
+        split_col=split_col,
     )
     
     # Plot 2: Alive vs Dead overall
     if has_dead_column and "survives" in df.columns:
         fig = plot_alive_vs_dead_overall(
-            df, cell_type, interacting_type, cumulative_col, n_organoids
+            df, cell_type, interacting_type, cumulative_col, n_organoids,
+            split_col=split_col,
         )
         if fig is not None:
             figs["alive_vs_dead_overall"] = fig
@@ -365,22 +752,50 @@ def plot_cumulative_overall(
     cumulative_col: str,
     n_organoids: int,
     n_samples: int,
+    split_col: str = None,
 ) -> plt.Figure:
-    """Plot cumulative interactions over time (all samples combined)."""
+    """Plot cumulative interactions over time (all samples combined).
+
+    When ``split_col`` is given (line-condition grouping), one mean +/- SEM
+    curve is drawn per value of that column instead of a single combined curve.
+    """
     fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # Calculate mean and SEM per timepoint
-    stats = df.groupby("position_t")[cumulative_col].agg(["mean", "std", "count"]).reset_index()
-    stats["sem"] = stats["std"] / np.sqrt(stats["count"])
-    
-    ax.plot(stats["position_t"], stats["mean"], linewidth=2, color="steelblue")
-    ax.fill_between(
-        stats["position_t"],
-        stats["mean"] - stats["sem"],
-        stats["mean"] + stats["sem"],
-        alpha=0.3,
-        color="steelblue"
-    )
+
+    if split_col and split_col in df.columns and df[split_col].notna().any():
+        groups = sorted(df[split_col].dropna().unique())
+        palette = sns.color_palette("tab10", max(len(groups), 1))
+        for gi, gval in enumerate(groups):
+            sub = df[df[split_col] == gval]
+            stats = (
+                sub.groupby("position_t")[cumulative_col]
+                .agg(["mean", "std", "count"]).reset_index()
+            )
+            stats["sem"] = stats["std"] / np.sqrt(stats["count"])
+            n_g = sub.groupby(["sample_name", "TrackID"]).ngroups
+            ax.plot(
+                stats["position_t"], stats["mean"],
+                linewidth=2, color=palette[gi], label=f"{gval} (n={n_g})",
+            )
+            ax.fill_between(
+                stats["position_t"],
+                stats["mean"] - stats["sem"],
+                stats["mean"] + stats["sem"],
+                alpha=0.25, color=palette[gi],
+            )
+        ax.legend(title="Line condition", fontsize=9)
+    else:
+        # Calculate mean and SEM per timepoint
+        stats = df.groupby("position_t")[cumulative_col].agg(["mean", "std", "count"]).reset_index()
+        stats["sem"] = stats["std"] / np.sqrt(stats["count"])
+
+        ax.plot(stats["position_t"], stats["mean"], linewidth=2, color="steelblue")
+        ax.fill_between(
+            stats["position_t"],
+            stats["mean"] - stats["sem"],
+            stats["mean"] + stats["sem"],
+            alpha=0.3,
+            color="steelblue"
+        )
     
     ax.set_xlabel("Time (frames)", fontsize=12)
     ax.set_ylabel(f"Cumulative {interacting_type} contacts", fontsize=12)
@@ -453,11 +868,58 @@ def plot_alive_vs_dead_overall(
     interacting_type: str,
     cumulative_col: str,
     n_organoids: int,
+    split_col: str = None,
 ) -> plt.Figure:
-    """Plot alive vs dead comparison (all samples combined)."""
+    """Plot alive vs dead comparison (all samples combined).
+
+    When ``split_col`` is given (line-condition grouping), curves are coloured
+    by that column's value with survival encoded as line style
+    (solid = survives, dashed = dies).
+    """
     if "survives" not in df.columns:
         return None
-    
+
+    if split_col and split_col in df.columns and df[split_col].notna().any():
+        fig, ax = plt.subplots(figsize=(10, 6))
+        groups = sorted(df[split_col].dropna().unique())
+        palette = sns.color_palette("tab10", max(len(groups), 1))
+        color_map = dict(zip(groups, palette))
+        for gval in groups:
+            for survives, style, fate_lbl in [
+                (True, "-", "Survives"), (False, "--", "Dies"),
+            ]:
+                sub = df[(df[split_col] == gval) & (df["survives"] == survives)]
+                n_sub = sub.groupby(["sample_name", "TrackID"]).ngroups
+                if n_sub == 0:
+                    continue
+                stats = (
+                    sub.groupby("position_t")[cumulative_col]
+                    .agg(["mean", "std", "count"]).reset_index()
+                )
+                stats["sem"] = stats["std"] / np.sqrt(stats["count"])
+                ax.plot(
+                    stats["position_t"], stats["mean"],
+                    linewidth=2, color=color_map[gval], linestyle=style,
+                    label=f"{gval} — {fate_lbl} (n={n_sub})",
+                )
+                ax.fill_between(
+                    stats["position_t"],
+                    stats["mean"] - stats["sem"],
+                    stats["mean"] + stats["sem"],
+                    alpha=0.15, color=color_map[gval],
+                )
+        ax.set_xlabel("Time (frames)", fontsize=12)
+        ax.set_ylabel(f"Cumulative {interacting_type} contacts", fontsize=12)
+        ax.set_title(
+            f"Cumulative {interacting_type} Interactions by line condition: "
+            f"Surviving vs Dying {cell_type}s\n(Total n = {n_organoids})",
+            fontsize=14,
+        )
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
     fig, ax = plt.subplots(figsize=(10, 6))
     
     for survives, label, color in [(True, "Survives", "forestgreen"), (False, "Dies", "crimson")]:
@@ -564,7 +1026,7 @@ def plot_alive_vs_dead_per_sample(
 
 
 # ---------------------------------------------------------------------------
-# Multi-Organoid Interaction Comparison
+# Interaction Overview (multi-organoid / cross-target)
 # ---------------------------------------------------------------------------
 
 def run_multi_organoid_interaction_comparison(
@@ -575,6 +1037,11 @@ def run_multi_organoid_interaction_comparison(
     group_by: str = "organoid_type",
     time_window_min: float = 60,
     show_plots: bool = True,
+    analysis_period_t: tuple = None,
+    annotate_line_condition: bool = False,
+    # Backward compat: old callers may pass analysis_period_min (minutes).
+    # When set AND analysis_period_t is None, it is used instead.
+    analysis_period_min: tuple = None,
 ):
     """
     Compare interactions across multiple organoid types.
@@ -592,20 +1059,49 @@ def run_multi_organoid_interaction_comparison(
     group_by : str
         "organoid_type" or "treatment".
     time_window_min : float
-        Time window in minutes before TOD for the cumulative curve.
+        Time window in minutes before TOD for the *cumulative-to-death* curve
+        only. This is independent of ``analysis_period_t``.
     show_plots : bool
         Whether to display figures inline.
+    analysis_period_t : tuple, optional
+        Temporal range ``(start_t, end_t)`` in raw timepoints (``position_t``).
+        Restricts data for the violin ("cumulative interactions per organoid")
+        and the active-killing dashboard. Either bound may be ``None`` for
+        open-ended. The cumulative-to-death curve keeps its own
+        ``time_window_min`` and is NOT affected. Default ``None`` (all
+        timepoints).
+    annotate_line_condition : bool
+        When True, the violin and dashboard add the immune line condition as
+        an annotation (hue / line style) within the selected ``group_by``
+        grouping. Default False.
+    analysis_period_min : tuple, optional
+        **Deprecated** — kept for backward compatibility. When
+        ``analysis_period_t`` is None and this is set, the old minutes-based
+        window is used instead.
 
     Returns
     -------
     dict  with keys "violin_fig", "curve_fig", "pdf_path", "summary_csv_path".
     """
-    print("--------------- Multi-Organoid Interaction Comparison ---------------")
+    print("--------------- Interaction Overview ---------------")
     start = time.time()
+
+    # Resolve analysis_period_t vs legacy analysis_period_min.
+    if analysis_period_t is None and analysis_period_min is not None:
+        # Backward compat — convert old minutes-based to same variable
+        analysis_period_t = analysis_period_min
+        _use_minutes_fallback = True
+    else:
+        _use_minutes_fallback = False
 
     output_dir = Path(output_dir)
     results_dir = output_dir / "analysis" / "multi_organoid_comparison"
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build output suffix for non-overwriting filenames.
+    out_suffix = _build_output_suffix(
+        group_by, analysis_period_t, annotate_line_condition,
+    )
 
     # ------------------------------------------------------------------
     # 1. Load filtered tracks for every organoid type
@@ -675,6 +1171,54 @@ def run_multi_organoid_interaction_comparison(
         return None
 
     # ------------------------------------------------------------------
+    # 1b. Line-condition annotation + temporal range (both optional)
+    # ------------------------------------------------------------------
+    # Resolve line condition for annotation (NOT as primary grouping).
+    lc_map = {}
+    lc_col = None
+    lc_maps = {}  # per-immune-type: {immune_type: {sample_name: line_condition}}
+    if annotate_line_condition:
+        lc_map, lc_col = resolve_line_condition_map(df_all, active_immune)
+        if lc_map:
+            df_all["line_condition"] = (
+                df_all["sample_name"].map(lc_map).fillna("(no line condition)")
+            )
+            print(f"   Annotating by line condition (from '{lc_col}')")
+        else:
+            print("   ⚠️ No line_condition column found — "
+                  "skipping line condition annotation.")
+        # Per-immune-type line condition maps so each immune type's own
+        # ``im_{type}_line_condition`` column drives its own violins/lines.
+        for ct in active_immune:
+            col = f"im_{ct}_line_condition"
+            if col in df_all.columns:
+                m = (
+                    df_all.dropna(subset=[col])
+                    .drop_duplicates("sample_name")
+                    .set_index("sample_name")[col]
+                    .astype(str)
+                    .to_dict()
+                )
+                if m:
+                    lc_maps[ct] = m
+
+    # Determine the temporal range (timepoint-based or legacy minutes).
+    if _use_minutes_fallback:
+        # Legacy path: convert minutes to internal filtering
+        start_min, end_min = _normalize_period(analysis_period_min)
+        has_period = not (start_min is None and end_min is None)
+        if has_period:
+            df_all = add_minutes_from_start(df_all)
+            print(f"   Analysis window applied to violin + dashboard: "
+                  f"{format_period_label(analysis_period_min)}")
+    else:
+        start_t, end_t = _normalize_period_t(analysis_period_t)
+        has_period = not (start_t is None and end_t is None)
+        if has_period:
+            print(f"   Temporal range applied to violin + dashboard: "
+                  f"{format_period_label_timepoints(analysis_period_t)}")
+
+    # ------------------------------------------------------------------
     # 2. Build per-track summary for violin
     # ------------------------------------------------------------------
     track_keys = ["organoid_type", "sample_name", "TrackID"]
@@ -694,15 +1238,57 @@ def run_multi_organoid_interaction_comparison(
         )
         track_summary = track_summary.merge(max_vals, on=track_keys, how="left")
 
+    # Attach line condition (per sample) to the track summary for annotation.
+    if annotate_line_condition and lc_map:
+        track_summary["line_condition"] = (
+            track_summary["sample_name"].map(lc_map).fillna("(no line condition)")
+        )
+
     # Total contacts across all selected immune types (for "by organoid_type" grouping)
     im_max_cols = [f"max_{ct}_contact" for ct in active_immune]
     track_summary["total_contacts"] = track_summary[im_max_cols].sum(axis=1)
     track_summary["fate"] = track_summary["survives"].map({True: "Live", False: "Dying"})
 
     # Save summary
-    summary_csv = results_dir / "multi_organoid_interaction_summary.csv"
+    summary_csv = results_dir / f"multi_organoid_interaction_summary{out_suffix}.csv"
     track_summary.to_csv(summary_csv, index=False)
     print(f"   Summary saved: {summary_csv.name}")
+
+    # ------------------------------------------------------------------
+    # 2a. Period-restricted per-track summary for the violin (optional)
+    # ------------------------------------------------------------------
+    track_summary_violin = track_summary
+    if has_period:
+        if _use_minutes_fallback:
+            df_period = apply_analysis_period(df_all, analysis_period_min)
+        else:
+            df_period = apply_analysis_period_timepoints(df_all, analysis_period_t)
+        ts_v = track_summary.copy()
+        for ct in active_immune:
+            contact_col = f"{ct}_contact"
+            mcol = f"max_{ct}_contact"
+            if contact_col in df_period.columns:
+                windowed = (
+                    df_period.groupby(track_keys)[contact_col]
+                    .sum()
+                    .rename(mcol)
+                    .reset_index()
+                )
+                ts_v = ts_v.drop(columns=[mcol], errors="ignore").merge(
+                    windowed, on=track_keys, how="left",
+                )
+                ts_v[mcol] = ts_v[mcol].fillna(0)
+        ts_v["total_contacts"] = ts_v[im_max_cols].sum(axis=1)
+        track_summary_violin = ts_v
+
+    # Per-sample bounds for filtering event CSVs to the window.
+    if has_period:
+        if _use_minutes_fallback:
+            dash_period_bounds = period_bounds_by_sample(df_all, analysis_period_min)
+        else:
+            dash_period_bounds = period_bounds_by_sample_t(df_all, analysis_period_t)
+    else:
+        dash_period_bounds = None
 
     # ------------------------------------------------------------------
     # 2b. Load active killing data (if available)
@@ -710,6 +1296,8 @@ def run_multi_organoid_interaction_comparison(
     df_contact_events = _load_active_killing_data(
         output_dir, active_immune, organoid_types,
         track_summary=track_summary,
+        period_bounds=dash_period_bounds,
+        line_condition_map=(lc_map if annotate_line_condition and lc_map else None),
     )
     has_killing_data = not df_contact_events.empty
     if has_killing_data:
@@ -735,8 +1323,20 @@ def run_multi_organoid_interaction_comparison(
 
     has_dead_data = "survives" in track_summary.columns and not track_summary["survives"].all()
 
+    # Build period label for plot annotation.
+    if has_period:
+        if _use_minutes_fallback:
+            period_label = format_period_label(analysis_period_min)
+        else:
+            period_label = format_period_label_timepoints(analysis_period_t)
+    else:
+        period_label = None
+
     fig_violin = plot_interaction_violin_comparison(
-        track_summary, group_by, active_immune, has_dead_data,
+        track_summary_violin, group_by, active_immune, has_dead_data,
+        period_label=period_label,
+        annotate_line_condition=annotate_line_condition and bool(lc_map),
+        lc_maps=lc_maps,
     )
     figs["violin"] = fig_violin
 
@@ -748,26 +1348,30 @@ def run_multi_organoid_interaction_comparison(
         time_window_min,
         track_summary,
         curve_data_out=curve_data_container,
+        annotate_line_condition=annotate_line_condition and bool(lc_map),
+        lc_maps=lc_maps,
     )
     if fig_curve is not None:
         figs["cumulative_to_death"] = fig_curve
 
     if curve_data_container:
-        curve_csv = results_dir / "multi_organoid_cumulative_to_death_curves_min.csv"
+        curve_csv = results_dir / f"multi_organoid_cumulative_to_death_curves_min{out_suffix}.csv"
         curve_df = curve_data_container[0]
         curve_df.to_csv(curve_csv, index=False)
         print(f"   Curve data saved (time in minutes): {curve_csv.name}")
 
-    # Active killing dashboard (only generated when killing data exists)
     fig_dashboard = plot_interaction_overview_dashboard(
         track_summary, df_contact_events, active_immune, has_dead_data,
+        group_by=group_by,
+        period_label=period_label,
+        annotate_line_condition=annotate_line_condition and bool(lc_map),
+        lc_maps=lc_maps,
     )
     if fig_dashboard is not None:
         figs["dashboard"] = fig_dashboard
 
-    # Save PDF. Order matches the notebook display order (violin and
-    # cumulative-to-death first, active-killing dashboard last).
-    pdf_path = results_dir / "multi_organoid_interaction_comparison.pdf"
+    # Save PDF with non-overwriting filename.
+    pdf_path = results_dir / f"multi_organoid_interaction_comparison{out_suffix}.pdf"
     with PdfPages(pdf_path) as pdf:
         for key in ["violin", "cumulative_to_death", "dashboard"]:
             if key in figs:
@@ -787,7 +1391,7 @@ def run_multi_organoid_interaction_comparison(
         plt.close(fig)
 
     elapsed = time.time() - start
-    print(f"\n   Multi-Organoid Interaction Comparison complete! ({elapsed:.1f}s)")
+    print(f"\n   Interaction Overview complete! ({elapsed:.1f}s)")
     return {
         "summary_csv_path": summary_csv,
         "pdf_path": pdf_path,
@@ -799,8 +1403,66 @@ def plot_interaction_violin_comparison(
     group_by: str,
     immune_types: list,
     has_dead_data: bool,
+    period_label: str = None,
+    annotate_line_condition: bool = False,
+    lc_maps: dict = None,
 ) -> plt.Figure:
-    if group_by == "treatment":
+    # ``lc_maps`` = {immune_type: {sample_name: line_condition}}. When
+    # annotation is requested we DISAGGREGATE: instead of pooling immune types
+    # / line conditions into one violin (and marking them with symbols), we
+    # draw a SEPARATE violin for each organoid_type x immune_type x
+    # line_condition combination, side by side in the same figure.
+    lc_maps = lc_maps or {}
+
+    def _lc_for(ct):
+        m = {str(k): str(v) for k, v in lc_maps.get(ct, {}).items()}
+        return m
+
+    # Decide whether disaggregation is meaningful: more than one immune type,
+    # or at least one immune type spanning more than one line condition.
+    disaggregate = False
+    if annotate_line_condition:
+        if len([c for c in immune_types if f"max_{c}_contact" in track_summary.columns]) > 1:
+            disaggregate = True
+        else:
+            for ct in immune_types:
+                if len(set(_lc_for(ct).values())) > 1:
+                    disaggregate = True
+                    break
+
+    per_immune = False
+    if disaggregate:
+        # One point per (organoid, immune_type); condition label carries the
+        # immune type and line condition so seaborn renders distinct violins.
+        per_immune = True
+        rows = []
+        for ct in immune_types:
+            col = f"max_{ct}_contact"
+            if col not in track_summary.columns:
+                continue
+            sub = track_summary[["organoid_type", "sample_name", "TrackID", "fate", col]].copy()
+            sub = sub.rename(columns={col: "cumulative_interactions"})
+            lc_map = _lc_for(ct)
+            sub["line_condition"] = (
+                sub["sample_name"].astype(str).map(lc_map).fillna("(no LC)")
+            )
+            sub["immune_type"] = ct
+            if group_by == "treatment":
+                sub["condition"] = ct + "\n" + sub["line_condition"].astype(str)
+            else:
+                sub["condition"] = (
+                    sub["organoid_type"].astype(str)
+                    + "\n" + ct
+                    + "\n" + sub["line_condition"].astype(str)
+                )
+            rows.append(sub)
+        df_plot = pd.concat(rows, ignore_index=True)
+        x_label = (
+            "Immune type / line condition" if group_by == "treatment"
+            else "Organoid type / immune / line condition"
+        )
+    elif group_by == "treatment":
+        per_immune = True
         rows = []
         for ct in immune_types:
             col = f"max_{ct}_contact"
@@ -899,31 +1561,30 @@ def plot_interaction_violin_comparison(
         edgecolor="white", linewidth=0.3,
     )
 
-    # Legend -- framed, semi-transparent. Use full-strength fate colours
-    # for the swatches (rather than the lighter violin fill) so dead = red /
-    # live = green reads at a glance. Re-label "Dying" -> "Dead" at display
-    # time so internal track_summary values stay unchanged.
+    # Legend: organoid fate (colour). Immune type / line condition are now
+    # disaggregated onto the x-axis (separate violins), so no marker legend.
+    legend_handles = []
     if hue_order:
-        legend_handles = [
+        legend_handles.extend([
             mpatches.Patch(
                 facecolor=_FATE_COLORS[f],
                 edgecolor="white",
                 label=_FATE_DISPLAY.get(f, f),
             )
             for f in hue_order
-        ]
+        ])
+    if legend_handles:
         existing = ax.get_legend()
         if existing is not None:
             existing.remove()
-        leg = ax.legend(
+        ax.legend(
             handles=legend_handles,
-            fontsize=10, loc="best",
+            fontsize=9, loc="best",
             frameon=True, framealpha=0.85, edgecolor="#cccccc",
             fancybox=True, shadow=False,
             title="Organoid fate",
             title_fontsize=9,
         )
-        leg.get_frame().set_linewidth(0.6)
 
     # Annotate organoids with zero contacts with a subtle badge.
     if has_dead_data:
@@ -979,18 +1640,24 @@ def plot_interaction_violin_comparison(
     # label so the unit is unambiguous.
     ax.set_ylabel(
         "Cumulative contact timepoints per organoid\n"
-        "(sum over selected immune types)",
+        + ("(per immune type shown separately)" if per_immune
+           else "(sum over selected immune types)"),
         fontsize=12, labelpad=8,
     )
-    title_detail = (
-        " + ".join(immune_types) if group_by == "organoid_type"
-        else "all organoid types"
-    )
-    # Title makes the unit of observation explicit: one point = one
-    # organoid, not one immune cell.
+    if group_by == "organoid_type":
+        title_detail = " + ".join(immune_types)
+        title = (
+            f"Cumulative interactions per organoid — contacts with {title_detail}"
+        )
+    else:
+        title = (
+            f"Cumulative interactions per organoid — by immune type "
+            f"({' + '.join(immune_types)}; all organoid types pooled)"
+        )
+    if period_label:
+        title += f"\n(analysis window: {period_label})"
     ax.set_title(
-        f"Cumulative interactions per organoid -- contacts with "
-        f"{title_detail}",
+        title,
         fontsize=14, fontweight="semibold", pad=12,
     )
 
@@ -1045,6 +1712,8 @@ def plot_cumulative_to_death_curves(
     time_window_min: float,
     track_summary: pd.DataFrame = None,
     curve_data_out: list = None,
+    annotate_line_condition: bool = False,
+    lc_maps: dict = None,
 ) -> plt.Figure:
     """
     Mean +/- SEM cumulative interaction curves aligned to time of death.
@@ -1125,8 +1794,46 @@ def plot_cumulative_to_death_curves(
             .cumsum()
         )
 
+    # Per-immune line-condition maps for disaggregation.
+    lc_maps = lc_maps or {}
+
+    def _lc_series(ct):
+        m = {str(k): str(v) for k, v in lc_maps.get(ct, {}).items()}
+        return df_dying["sample_name"].astype(str).map(m).fillna("(no LC)")
+
+    # Decide whether to disaggregate lines by immune type x line condition.
+    avail_immune = [ct for ct in immune_types if f"window_cum_{ct}" in df_dying.columns]
+    disaggregate = False
+    if annotate_line_condition:
+        if len(avail_immune) > 1:
+            disaggregate = True
+        else:
+            for ct in avail_immune:
+                if len(set(str(v) for v in lc_maps.get(ct, {}).values())) > 1:
+                    disaggregate = True
+                    break
+
     # Build long-form data for plotting
-    if group_by == "treatment":
+    if disaggregate:
+        # Separate line per (organoid_type ×) immune_type × line_condition.
+        curve_frames = []
+        for ct in avail_immune:
+            cum_col = f"window_cum_{ct}"
+            sub = df_dying[track_keys + ["relative_time_min", cum_col]].copy()
+            sub = sub.rename(columns={cum_col: "cumulative_interactions"})
+            lc = _lc_series(ct).values
+            if group_by == "treatment":
+                sub["condition"] = [f"{ct} | {v}" for v in lc]
+            else:
+                sub["condition"] = [
+                    f"{ot} | {ct} | {v}"
+                    for ot, v in zip(sub["organoid_type"].astype(str), lc)
+                ]
+            curve_frames.append(sub)
+        if not curve_frames:
+            return None
+        df_curve = pd.concat(curve_frames, ignore_index=True)
+    elif group_by == "treatment":
         curve_frames = []
         for ct in immune_types:
             cum_col = f"window_cum_{ct}"
@@ -1143,9 +1850,13 @@ def plot_cumulative_to_death_curves(
         cum_cols = [f"window_cum_{ct}" for ct in immune_types if f"window_cum_{ct}" in df_dying.columns]
         if not cum_cols:
             return None
+        cond_col = "organoid_type"
         df_dying["cumulative_interactions"] = df_dying[cum_cols].sum(axis=1)
-        df_curve = df_dying[track_keys + ["relative_time_min", "cumulative_interactions"]].copy()
-        df_curve["condition"] = df_curve["organoid_type"]
+        keep_cols = track_keys + ["relative_time_min", "cumulative_interactions"]
+        if cond_col not in keep_cols:
+            keep_cols = keep_cols + [cond_col]
+        df_curve = df_dying[keep_cols].copy()
+        df_curve["condition"] = df_curve[cond_col]
 
     # ---- Interpolate per-track curves onto a common time grid ----
     n_grid = max(int(time_window_min), 30)
@@ -1182,17 +1893,50 @@ def plot_cumulative_to_death_curves(
     # ---- Compute totals for legend ----
     total_per_cond = {}
     dying_per_cond = {}
-    if track_summary is not None:
-        dying_mask = track_summary["fate"] == "Dying" if "fate" in track_summary.columns else ~track_summary["survives"].fillna(True)
-        if group_by == "treatment":
+    if track_summary is not None and not track_summary.empty:
+        ts = track_summary.copy()
+        if "fate" in ts.columns:
+            dying_mask = ts["fate"] == "Dying"
+        else:
+            dying_mask = ~ts["survives"].fillna(True)
+
+        conditions_for_legend = sorted(df_interp["condition"].unique())
+
+        if disaggregate:
+            # Keys match composite labels like "13T | blue | teg_cd4".
+            for cond in conditions_for_legend:
+                parts = [p.strip() for p in str(cond).split(" | ")]
+                if group_by == "treatment" and len(parts) >= 2:
+                    ct, lc = parts[0], parts[-1]
+                    lc_map = {str(k): str(v) for k, v in lc_maps.get(ct, {}).items()}
+                    samples = {s for s, v in lc_map.items() if v == lc}
+                    mask = ts["sample_name"].astype(str).isin(samples)
+                elif len(parts) >= 3:
+                    ot, ct, lc = parts[0], parts[1], parts[-1]
+                    lc_map = {str(k): str(v) for k, v in lc_maps.get(ct, {}).items()}
+                    samples = {s for s, v in lc_map.items() if v == lc}
+                    mask = (
+                        (ts["organoid_type"].astype(str) == ot)
+                        & ts["sample_name"].astype(str).isin(samples)
+                    )
+                else:
+                    mask = pd.Series(False, index=ts.index)
+                total_per_cond[cond] = int(mask.sum())
+                dying_per_cond[cond] = int((mask & dying_mask).sum())
+        elif group_by == "treatment":
             for ct in immune_types:
-                total_per_cond[ct] = len(track_summary)
+                total_per_cond[ct] = len(ts)
                 dying_per_cond[ct] = int(dying_mask.sum())
         else:
-            for org in track_summary["organoid_type"].unique():
-                org_mask = track_summary["organoid_type"] == org
-                total_per_cond[org] = int(org_mask.sum())
-                dying_per_cond[org] = int((org_mask & dying_mask).sum())
+            legend_col = (
+                "line_condition"
+                if group_by == "line_condition" and "line_condition" in ts.columns
+                else "organoid_type"
+            )
+            for cond_val in ts[legend_col].unique():
+                cond_mask = ts[legend_col] == cond_val
+                total_per_cond[cond_val] = int(cond_mask.sum())
+                dying_per_cond[cond_val] = int((cond_mask & dying_mask).sum())
 
     # ---- Plot ----
     conditions = sorted(df_interp["condition"].unique())
@@ -1264,11 +2008,65 @@ def plot_cumulative_to_death_curves(
 # Interaction Overview Dashboard
 # ---------------------------------------------------------------------------
 
+def _resolve_active_killing_csv_paths(
+    ak_dir: Path,
+    im_type: str,
+    organoid_types: list = None,
+) -> tuple:
+    """
+    Locate active-killing CSVs under ``active_killing/`` or a target subfolder.
+
+    Active killing writes to ``active_killing/<target>/`` (or ``combined/`` when
+    multiple targets are selected). Legacy runs used a flat ``active_killing/``
+    layout. Returns ``(events_path, killing_path)``; either may be ``None``.
+    """
+    events_name = f"contact_events_{im_type}.csv"
+    killing_name = f"active_killing_per_timepoint_{im_type}.csv"
+
+    flat_events = ak_dir / events_name
+    if flat_events.exists():
+        flat_killing = ak_dir / killing_name
+        return flat_events, flat_killing if flat_killing.exists() else None
+
+    combined_events = ak_dir / "combined" / events_name
+    if combined_events.exists():
+        combined_killing = ak_dir / "combined" / killing_name
+        return combined_events, (
+            combined_killing if combined_killing.exists() else None
+        )
+
+    for org_type in organoid_types or []:
+        cand_events = ak_dir / org_type / events_name
+        if cand_events.exists():
+            cand_killing = ak_dir / org_type / killing_name
+            return cand_events, (
+                cand_killing if cand_killing.exists() else None
+            )
+
+    event_candidates = sorted(
+        ak_dir.glob(f"*/{events_name}"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if len(event_candidates) == 1:
+        ev = event_candidates[0]
+        k = ev.parent / killing_name
+        return ev, k if k.exists() else None
+    if len(event_candidates) > 1:
+        ev = event_candidates[0]
+        k = ev.parent / killing_name
+        return ev, k if k.exists() else None
+
+    return None, None
+
+
 def _load_active_killing_data(
     output_dir: Path,
     immune_types: list,
     organoid_types: list,
     track_summary: pd.DataFrame = None,
+    period_bounds: dict = None,
+    line_condition_map: dict = None,
 ) -> pd.DataFrame:
     """
     Load contact events from active-killing CSVs and link each event to
@@ -1288,6 +2086,18 @@ def _load_active_killing_data(
         DataFrame gains a ``fate`` column per (event, target-organoid) row
         used by the dashboard panels to split by fate. When missing, ``fate``
         defaults to ``"Live"`` so downstream plotting still works.
+    period_bounds : dict, optional
+        ``{sample_name: (t_start, t_end)}`` inclusive ``position_t`` bounds for
+        the absolute analysis window. When given, contact events that *overlap*
+        their sample's bounds are kept and ``contact_duration`` is recomputed as
+        the number of timepoints inside the window only (not the full event
+        length). Per-timepoint killing is counted only within those bounds.
+        Samples not present in the dict have no timepoints in the window and
+        are dropped. ``None`` (default) means no window restriction.
+    line_condition_map : dict, optional
+        ``{sample_name: line_condition}``. When given, the returned DataFrame
+        gains a ``line_condition`` column (per sample) so the dashboard can
+        group by line condition instead of organoid type.
 
     Returns
     -------
@@ -1317,16 +2127,24 @@ def _load_active_killing_data(
 
     for im_type in immune_types:
         ak_dir = output_dir / "analysis" / im_type / "active_killing"
-        events_path = ak_dir / f"contact_events_{im_type}.csv"
-        killing_path = ak_dir / f"active_killing_per_timepoint_{im_type}.csv"
+        events_path, killing_path = _resolve_active_killing_csv_paths(
+            ak_dir, im_type, organoid_types=organoid_types,
+        )
 
-        if not events_path.exists():
+        if events_path is None or not events_path.exists():
             continue
 
         df_ev = pd.read_csv(events_path)
         if df_ev.empty:
             continue
         df_ev["immune_type"] = im_type
+
+        # Absolute analysis window: keep overlapping events and clip duration
+        # to timepoints inside the per-sample bounds.
+        if period_bounds is not None:
+            df_ev = _clip_contact_events_to_period(df_ev, period_bounds)
+            if df_ev.empty:
+                continue
 
         # Per-target active-killing attribution from the per-timepoint CSV.
         #
@@ -1337,13 +2155,24 @@ def _load_active_killing_data(
         # behav3d/features/advanced_timepoint_features.py line 437). So
         # each killing event is attributable to exactly one target.
         per_target_kill = None
-        if killing_path.exists():
+        if killing_path is not None and killing_path.exists():
             df_tp = pd.read_csv(killing_path)
             required_cols = {
                 "is_active_killing", "contact_event_id", "sample_name",
                 "targeted_track_id",
             }
             if not df_tp.empty and required_cols.issubset(df_tp.columns):
+                # Restrict killing timepoints to the analysis window so the
+                # killing-efficiency numerator only counts kills inside it.
+                if period_bounds is not None and "position_t" in df_tp.columns:
+                    df_tp = df_tp[
+                        df_tp.apply(
+                            lambda r: _in_bounds(
+                                period_bounds, r["sample_name"], r["position_t"],
+                            ),
+                            axis=1,
+                        )
+                    ].copy()
                 kill_mask = df_tp["is_active_killing"].astype(bool)
                 df_tp_kill = df_tp.loc[
                     kill_mask
@@ -1433,10 +2262,19 @@ def _load_active_killing_data(
     else:
         df_all["fate"] = "Live"
 
+    # Attach immune line condition (per sample) when requested, so the
+    # dashboard can group by line_condition instead of organoid type.
+    if line_condition_map:
+        df_all["line_condition"] = (
+            df_all["sample_name"].astype(str)
+            .map({str(k): v for k, v in line_condition_map.items()})
+            .fillna("(no line condition)")
+        )
+
     keep = [
         "contact_event_id", "sample_name", "immune_track_id", "immune_type",
-        "target_track_id", "organoid_type", "fate", "contact_duration",
-        "has_active_killing", "n_killing_tp",
+        "target_track_id", "organoid_type", "line_condition", "fate",
+        "contact_duration", "has_active_killing", "n_killing_tp",
     ]
     return df_all[[c for c in keep if c in df_all.columns]]
 
@@ -1536,6 +2374,10 @@ def plot_interaction_overview_dashboard(
     df_contact_events: pd.DataFrame,
     immune_types: list,
     has_dead_data: bool,
+    group_by: str = "organoid_type",
+    period_label: str = None,
+    annotate_line_condition: bool = False,
+    lc_maps: dict = None,
 ):
     """
     Active-killing dashboard: two panels derived from the per-event / per-
@@ -1544,13 +2386,18 @@ def plot_interaction_overview_dashboard(
 
     Panels
     ------
-    Left  -- Contact Event Duration per (organoid_type x fate); one point
+    Left  -- Contact Event Duration per (primary x fate); one point
              per immune-cell <-> organoid contact event, colored by whether
              that event actively killed the targeted organoid.
-    Right -- Active Killing Efficiency per (organoid_type x fate); for each
-             (organoid_type, fate) group, the % of its contact events that
-             actively killed the targeted organoid, aggregated across all
-             selected immune types.
+    Right -- Active Killing Efficiency per (primary x fate); for each
+             (primary, fate) group, the % of its contact events that
+             actively killed the targeted organoid.
+
+    ``group_by`` mirrors the violin / before-death curve:
+    ``"organoid_type"`` keeps organoid types separate on the x-axis;
+    ``"treatment"`` pools organoid types and groups by immune type (and,
+    when annotating, by line condition). ``period_label`` (when set) is
+    added to the figure title to note the absolute analysis window.
 
     Returns ``None`` when no active-killing data is available -- the
     dashboard has nothing to show without it.
@@ -1558,7 +2405,50 @@ def plot_interaction_overview_dashboard(
     if df_contact_events.empty:
         return None
 
-    org_types = sorted(df_contact_events["organoid_type"].unique())
+    lc_maps = lc_maps or {}
+    df = df_contact_events.copy()
+
+    # Per-row line condition from the event's own immune type (multi-immune safe).
+    if annotate_line_condition and "immune_type" in df.columns and lc_maps:
+        def _row_lc(row):
+            m = {str(k): str(v) for k, v in lc_maps.get(row["immune_type"], {}).items()}
+            return m.get(str(row["sample_name"]), None)
+        mapped = df.apply(_row_lc, axis=1)
+        if "line_condition" in df.columns:
+            df["line_condition"] = mapped.fillna(df["line_condition"])
+        else:
+            df["line_condition"] = mapped.fillna("(no LC)")
+
+    # Same disaggregation trigger as the violin plot.
+    disaggregate = False
+    if annotate_line_condition:
+        n_immune = df["immune_type"].nunique() if "immune_type" in df.columns else 1
+        n_lc = df["line_condition"].nunique() if "line_condition" in df.columns else 1
+        if n_immune > 1 or n_lc > 1:
+            disaggregate = True
+
+    # Fold the x-axis grouping into ``organoid_type`` (the column the panels read).
+    if disaggregate:
+        if group_by == "treatment":
+            parts = df["immune_type"].astype(str)
+            if "line_condition" in df.columns:
+                parts = parts + "\n" + df["line_condition"].astype(str)
+            primary_label = "Immune / line condition"
+        else:
+            parts = df["organoid_type"].astype(str)
+            if "immune_type" in df.columns and df["immune_type"].nunique() > 1:
+                parts = parts + "\n" + df["immune_type"].astype(str)
+            if "line_condition" in df.columns:
+                parts = parts + "\n" + df["line_condition"].astype(str)
+            primary_label = "Organoid / immune / line condition"
+        df["organoid_type"] = parts
+    elif group_by == "treatment":
+        df["organoid_type"] = df["immune_type"].astype(str)
+        primary_label = "Immune type"
+    else:
+        primary_label = "Organoid"
+
+    org_types = sorted(df["organoid_type"].unique())
     if not org_types:
         return None
 
@@ -1576,13 +2466,23 @@ def plot_interaction_overview_dashboard(
     axC = fig.add_subplot(gs[0, 0])
     axD = fig.add_subplot(gs[1, 0])
 
-    _panel_contact_duration(axC, df_contact_events, org_types)
+    _panel_contact_duration(
+        axC, df, org_types, primary_label=primary_label,
+        # Disaggregation already places immune x line condition on the x-axis,
+        # so no marker-based annotation is needed here.
+        annotate_line_condition=annotate_line_condition and not disaggregate,
+        period_label=period_label,
+    )
     _panel_killing_proportion(
-        axD, df_contact_events, org_types, immune_types,
+        axD, df, org_types, immune_types,
+        primary_label=primary_label,
     )
 
+    suptitle = "Interaction -- Active Killing"
+    if period_label:
+        suptitle += f"  (analysis window: {period_label})"
     fig.suptitle(
-        "Interaction -- Active Killing",
+        suptitle,
         fontsize=15, fontweight="bold",
         y=0.995,
     )
@@ -1596,20 +2496,23 @@ def _panel_contact_duration(
     ax: plt.Axes,
     df_contact_events: pd.DataFrame,
     org_types: list,
+    primary_label: str = "organoid",
+    annotate_line_condition: bool = False,
+    period_label: str = None,
 ):
     """
     Contact Event Duration panel.
 
     Each point = one immune-cell <-> organoid contact event (as written to
     ``contact_events_{im}.csv`` by the active-killing feature step). Points
-    are grouped on the x-axis by (organoid_type, fate of the contacted
+    are grouped on the x-axis by (primary, fate of the contacted
     organoid) and colored by whether that event actively killed the
     targeted organoid. x-axis scales dynamically to ``2 * len(org_types)``
-    slots; fate order is Dead then Live per organoid type.
+    slots; fate order is Dead then Live per group.
     """
     _style_dashboard_ax(ax)
 
-    panel_title = "Contact event duration per organoid fate"
+    panel_title = f"Contact event duration per {primary_label} fate"
 
     if (
         df_contact_events.empty
@@ -1698,6 +2601,17 @@ def _panel_contact_duration(
     # centre for the box without overlapping it.
     kill_color = _KILLING_COLORS
     rng = np.random.default_rng(1)
+    use_lc_markers = (
+        annotate_line_condition
+        and "line_condition" in df.columns
+        and df["line_condition"].nunique() > 1
+    )
+    lc_marker_map = {}
+    if use_lc_markers:
+        marker_cycle = ["o", "s", "^", "D", "v", "P", "*", "X"]
+        for i, lc in enumerate(sorted(df["line_condition"].dropna().unique())):
+            lc_marker_map[lc] = marker_cycle[i % len(marker_cycle)]
+
     for g_label, sub in df.groupby("group"):
         if g_label not in group_to_idx or len(sub) == 0:
             continue
@@ -1707,18 +2621,42 @@ def _panel_contact_duration(
         non_active = sub[~active_mask]
         if len(active) > 0:
             x_left = xi + rng.uniform(-0.22, -0.03, size=len(active))
-            ax.scatter(
-                x_left, active["contact_duration"],
-                s=10, c=kill_color["Active killing event"],
-                alpha=0.55, edgecolors="white", linewidths=0.25, zorder=3,
-            )
+            if use_lc_markers:
+                active_plot = active.copy()
+                active_plot["_x"] = x_left
+                for lc, chunk in active_plot.groupby("line_condition"):
+                    mk = lc_marker_map.get(lc, "o")
+                    ax.scatter(
+                        chunk["_x"], chunk["contact_duration"],
+                        s=10, c=kill_color["Active killing event"],
+                        marker=mk,
+                        alpha=0.55, edgecolors="white", linewidths=0.25, zorder=3,
+                    )
+            else:
+                ax.scatter(
+                    x_left, active["contact_duration"],
+                    s=10, c=kill_color["Active killing event"],
+                    alpha=0.55, edgecolors="white", linewidths=0.25, zorder=3,
+                )
         if len(non_active) > 0:
             x_right = xi + rng.uniform(0.03, 0.22, size=len(non_active))
-            ax.scatter(
-                x_right, non_active["contact_duration"],
-                s=10, c=kill_color["Non-killing event"],
-                alpha=0.55, edgecolors="white", linewidths=0.25, zorder=3,
-            )
+            if use_lc_markers:
+                non_plot = non_active.copy()
+                non_plot["_x"] = x_right
+                for lc, chunk in non_plot.groupby("line_condition"):
+                    mk = lc_marker_map.get(lc, "o")
+                    ax.scatter(
+                        chunk["_x"], chunk["contact_duration"],
+                        s=10, c=kill_color["Non-killing event"],
+                        marker=mk,
+                        alpha=0.55, edgecolors="white", linewidths=0.25, zorder=3,
+                    )
+            else:
+                ax.scatter(
+                    x_right, non_active["contact_duration"],
+                    s=10, c=kill_color["Non-killing event"],
+                    alpha=0.55, edgecolors="white", linewidths=0.25, zorder=3,
+                )
 
     handles = [
         plt.Line2D(
@@ -1734,6 +2672,15 @@ def _panel_contact_duration(
             label="Non-killing event (right)",
         ),
     ]
+    if use_lc_markers:
+        for lc, mk in lc_marker_map.items():
+            handles.append(
+                plt.Line2D(
+                    [0], [0], marker=mk, linestyle="", markersize=6,
+                    markerfacecolor="#666666", markeredgecolor="white",
+                    markeredgewidth=0.5, label=str(lc),
+                )
+            )
     ax.legend(
         handles=handles, fontsize=9,
         frameon=True, framealpha=0.85, edgecolor="#cccccc",
@@ -1743,9 +2690,13 @@ def _panel_contact_duration(
 
     _apply_org_fate_xticks(ax, group_pairs)
     ax.set_ylim(bottom=0)
-    ax.set_xlabel("Organoid type / fate", fontsize=11, labelpad=8)
+    ax.set_xlabel(
+        f"{primary_label.capitalize()} / fate", fontsize=11, labelpad=8,
+    )
     ax.set_ylabel(
-        "Contact duration (timepoints)",
+        "Contact duration in window (timepoints)"
+        if period_label
+        else "Contact duration (timepoints)",
         fontsize=11, labelpad=8,
     )
     ax.set_title(panel_title, fontsize=13, fontweight="semibold", pad=10)
@@ -1756,6 +2707,7 @@ def _panel_killing_proportion(
     df_contact_events: pd.DataFrame,
     org_types: list,
     immune_types: list,
+    primary_label: str = "organoid",
 ):
     """
     Active Killing Efficiency panel.
@@ -1770,7 +2722,7 @@ def _panel_killing_proportion(
     """
     _style_dashboard_ax(ax)
 
-    panel_title = "Active killing efficiency per organoid fate"
+    panel_title = f"Active killing efficiency per {primary_label} fate"
 
     if df_contact_events.empty:
         ax.text(
@@ -1869,7 +2821,9 @@ def _panel_killing_proportion(
     _apply_org_fate_xticks(ax, group_pairs)
     top = max(max(vals) * 1.25 if vals else 10, 10)
     ax.set_ylim(bottom=0, top=min(top, 105))
-    ax.set_xlabel("Organoid type / fate", fontsize=11, labelpad=8)
+    ax.set_xlabel(
+        f"{primary_label.capitalize()} / fate", fontsize=11, labelpad=8,
+    )
     ax.set_ylabel(
         "Contact events that actively killed (%)",
         fontsize=11, labelpad=8,

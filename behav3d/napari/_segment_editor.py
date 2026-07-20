@@ -2,16 +2,16 @@
 
 Embedded both in the BEHAV3D plugin's Visualization tab and in the
 notebook-launched napari window.  Uses :class:`behav3d.editing.EditBuffer`
-under the hood, so undo / redo / save / discard semantics are identical
-across both surfaces.
+under the hood.
 
 Design notes
 ------------
 * The editor binds to **one** Labels layer at a time and refuses any
   layer whose name does not end in ``" tracked segments"``.
-* All operations stage in memory; the napari layer's ``.data`` array is
-  rewritten in place after each commit so the user sees the result
-  immediately.
+* All operations stage in memory (dirty frames); the napari layer's ``.data``
+  array is rebuilt after each commit so the user sees the result immediately.
+* **Undo/redo has been removed** to minimise RAM usage.  Use *Discard* to
+  revert all unsaved changes to the on-disk state.
 * Save persists to the original ``*_tracked.zarr`` (only dirty frames)
   and regenerates the matching ``*_tracks.csv``.
 * Tab-switch / window-close prompts are handled by ``request_exit()``,
@@ -51,22 +51,67 @@ from behav3d.editing import (
     EditBuffer,
     create_label,
     delete_label,
+    delete_labels,
     dilate_label,
     erode_label,
+    fill_label,
     lifetime_of,
     merge_labels,
     split_label,
 )
 from behav3d.napari._loaders import tracked_segments_paths_for
+from behav3d.napari._tutorial_dialog import TutorialButton, TutorialStep
 
 try:
     from napari.utils import progress as _NapariProgress
 except Exception:
     _NapariProgress = None
 
+try:
+    from napari.utils.colormaps import DirectLabelColormap
+except Exception:
+    DirectLabelColormap = None
+
 
 _SPLIT_SEEDS_LAYER = "__split_seeds__"
+_HIGHLIGHT_LAYER = "__selected_label_highlight__"
+_HIGHLIGHT_COLOR = "yellow"
 _TRACKED_SUFFIX = " tracked segments"
+
+_SEED_TUTORIAL_STEPS = [
+    TutorialStep(
+        "1. Select the label to edit",
+        "seed_step1_select_label.png",
+        "Click the cell you want to split/create from in the viewer "
+        "(or type its ID above). It becomes the active label.",
+    ),
+    TutorialStep(
+        "2. Click “Add seed points”",
+        "seed_step2_add_seed_points.png",
+        "This creates a temporary points layer and switches the view to "
+        "2D so seed clicks land precisely.",
+    ),
+    TutorialStep(
+        "3. Place seeds, one per sub-region",
+        "seed_step3_place_seeds.png",
+        "Click inside the label for each seed. Move the Z slider between "
+        "clicks if you want seeds on different planes — seeds don't "
+        "need to share a Z-slice, they just need to land inside the label.",
+    ),
+    TutorialStep(
+        "4. Preview",
+        "seed_step4_preview.png",
+        "Once the seed counter shows enough seeds, click Preview to run "
+        "the split/create on the current frame only, so you can check the "
+        "result before committing to the full time range.",
+    ),
+    TutorialStep(
+        "5. Apply",
+        "seed_step5_apply.png",
+        "Happy with the preview? Click Apply to commit it and propagate "
+        "the result forward and backward across the track's lifetime.",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -104,15 +149,44 @@ class _MaterialiseWorker(QObject):
 # ---------------------------------------------------------------------------
 # Background edit operation worker
 # ---------------------------------------------------------------------------
+class _IndexWorker(QObject):
+    """Builds the lifetime index for an :class:`~behav3d.editing.EditBuffer`
+    in a background thread.
+
+    Emits ``done()`` when finished (or silently absorbs errors), followed by
+    ``finished()`` so the owning QThread can be told to quit.
+    """
+    done = Signal()
+    finished = Signal()
+
+    def __init__(self, buf) -> None:
+        super().__init__()
+        self._buf = buf
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
+
+    def run(self) -> None:
+        try:
+            self._buf.build_lifetime_index(is_interrupted=lambda: self._is_cancelled)
+        except Exception:
+            pass
+        finally:
+            self.done.emit()
+            self.finished.emit()
+
+
+# ---------------------------------------------------------------------------
+# Background edit operation worker
+# ---------------------------------------------------------------------------
 class _EditWorker(QObject):
     """Runs a single editing primitive in a background QThread.
 
     The callable ``fn`` receives ``*args, **kwargs`` and must return either an
-    :class:`~behav3d.editing.OpResult` or a ``list[OpResult]`` (delete uses
-    a list when multiple labels are removed in one shot).  All reads from the
-    :class:`~behav3d.editing.EditBuffer` happen inside the thread; the caller
-    is responsible for calling ``buf.apply()`` back on the Qt thread via the
-    ``done`` signal so the buffer is never written from a background thread.
+    :class:`~behav3d.editing.OpResult` or a ``list[OpResult]``.  All reads from
+    the :class:`~behav3d.editing.EditBuffer` happen inside the thread; the
+    caller commits results back on the Qt thread via the ``done`` signal.
     """
 
     done = Signal(object)    # OpResult or list[OpResult]
@@ -125,6 +199,10 @@ class _EditWorker(QObject):
         self._fn = fn
         self._args = args
         self._kwargs = kwargs
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
 
     def run(self) -> None:
         try:
@@ -237,6 +315,9 @@ class TrackedSegmentEditor(QWidget):
         self._preview_tool: Optional[str] = None
         # napari activity-dock progress bar (None when no operation is running).
         self._activity_progress = None
+        # ndisplay saved while seed placement forces the view to 2D (None
+        # when not currently overridden).
+        self._ndisplay_before_seeds: Optional[int] = None
 
         self._build_ui()
         self._bind_to_layer()
@@ -291,45 +372,64 @@ class TrackedSegmentEditor(QWidget):
         layout.addWidget(sel_hint)
 
         # ---- Tool toolbar (drives the QStackedWidget) ----------------
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(2)
+        # Uses a wrapping QWidget so buttons reflow to a second row when the
+        # dock panel is narrow (FlowLayout handles the geometry).
+        from behav3d.napari._flow_layout import FlowLayout
+        toolbar_widget = QWidget()
+        toolbar_layout = FlowLayout(toolbar_widget, margin=0, h_spacing=2, v_spacing=2)
         self._tool_group = QButtonGroup(self)
         self._tool_group.setExclusive(True)
         self._tool_buttons: List[QToolButton] = []
+        _btn_style = (
+            "QToolButton{padding:4px 8px;border:1px solid palette(mid);border-radius:3px;}"
+            "QToolButton:checked{background:#1976D2;color:white;border-color:#0D47A1;}"
+        )
         for i, (label, tip) in enumerate([
-            ("Split", "Split a label into two using two or more seed points"),
-            ("Merge", "Merge two or more labels into one"),
-            ("Erode", "Erode the selected label by N pixels (3D)"),
-            ("Dilate", "Expand the selected label by N pixels without crossing into other labels"),
-            ("Delete", "Erase the selected label across the chosen time range"),
-            ("Create", "Create new label(s) from seed points placed in unlabelled background pixels"),
+            ("Split",   "Split a label into two using two or more seed points"),
+            ("Merge",   "Merge two or more labels into one"),
+            ("Erode",   "Erode the selected label by N pixels (3D)"),
+            ("Dilate",  "Expand the selected label by N pixels without crossing into other labels"),
+            ("Delete",  "Erase the selected label across the chosen time range"),
+            ("Create",  "Create new label(s) from seed points placed in unlabelled background pixels"),
+            ("Fill",    "Fill internal holes/cavities in a hollow (shell-like) label"),
         ]):
             btn = QToolButton()
             btn.setText(label)
             btn.setToolTip(tip)
             btn.setCheckable(True)
-            btn.setStyleSheet(
-                "QToolButton{padding:4px 8px;border:1px solid palette(mid);border-radius:3px;}"
-                "QToolButton:checked{background:#1976D2;color:white;border-color:#0D47A1;}"
-            )
+            btn.setStyleSheet(_btn_style)
             self._tool_group.addButton(btn, i)
             self._tool_buttons.append(btn)
-            toolbar.addWidget(btn)
-        toolbar.addStretch(1)
-        layout.addLayout(toolbar)
+            toolbar_layout.addWidget(btn)
+        layout.addWidget(toolbar_widget)
         self._tool_group.idClicked.connect(self._on_tool_changed)
 
         # ---- Tool stack ---------------------------------------------
         self.tool_stack = QStackedWidget()
         layout.addWidget(self.tool_stack)
-        self.tool_stack.addWidget(self._build_split_page())
-        self.tool_stack.addWidget(self._build_merge_page())
-        self.tool_stack.addWidget(self._build_erode_page())
-        self.tool_stack.addWidget(self._build_dilate_page())
-        self.tool_stack.addWidget(self._build_delete_page())
-        self.tool_stack.addWidget(self._build_create_page())
+        self.tool_stack.addWidget(self._build_split_page())   # 0
+        self.tool_stack.addWidget(self._build_merge_page())   # 1
+        self.tool_stack.addWidget(self._build_erode_page())   # 2
+        self.tool_stack.addWidget(self._build_dilate_page())  # 3
+        self.tool_stack.addWidget(self._build_delete_page())  # 4
+        self.tool_stack.addWidget(self._build_create_page())  # 5
+        self.tool_stack.addWidget(self._build_fill_page())    # 6
         self._tool_buttons[0].setChecked(True)
         self.tool_stack.setCurrentIndex(0)
+
+        # ---- Progress bar (hidden until an operation is running) -----
+        prog_row = QHBoxLayout()
+        self.lbl_progress = QLabel("Running…")
+        self.lbl_progress.setStyleSheet("color:#555; font-size:11px; min-width:120px;")
+        self.lbl_progress.setVisible(False)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)   # indeterminate by default
+        self.progress_bar.setMaximumHeight(14)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setVisible(False)
+        prog_row.addWidget(self.lbl_progress)
+        prog_row.addWidget(self.progress_bar, stretch=1)
+        layout.addLayout(prog_row)
 
         # ---- Time range ---------------------------------------------
         rng_group = QGroupBox("Time range")
@@ -361,19 +461,31 @@ class TrackedSegmentEditor(QWidget):
         )
         layout.addWidget(rng_group)
 
-        # ---- History row ---------------------------------------------
-        hist_row = QHBoxLayout()
-        self.btn_undo = QPushButton("↶ Undo")
-        self.btn_undo.setToolTip("Revert the latest layer change (in memory)")
-        self.btn_undo.clicked.connect(self._on_undo)
-        self.btn_redo = QPushButton("↷ Redo")
-        self.btn_redo.clicked.connect(self._on_redo)
-        hist_row.addWidget(self.btn_undo)
-        hist_row.addWidget(self.btn_redo)
-        self.lbl_history = QLabel("0 pending changes")
-        self.lbl_history.setStyleSheet("color:#666; font-style:italic;")
-        hist_row.addWidget(self.lbl_history, stretch=1)
-        layout.addLayout(hist_row)
+        # ---- Workers row --------------------------------------------
+        import multiprocessing as _mp
+        _n_cores = max(1, _mp.cpu_count())
+        _default_w = max(1, _n_cores // 2)
+        workers_row = QHBoxLayout()
+        workers_row.addWidget(QLabel("Workers:"))
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(1, max(1, _n_cores - 1))
+        self.spin_workers.setValue(_default_w)
+        self.spin_workers.setMaximumWidth(70)
+        self.spin_workers.setToolTip(
+            "Number of CPU cores used for parallel per-timepoint processing.\n"
+            "This value is shared across all pipeline tabs — changing it here\n"
+            f"updates every other Workers field (and vice-versa). [{_n_cores} cores detected]"
+        )
+        workers_row.addWidget(self.spin_workers)
+        workers_row.addStretch(1)
+        layout.addLayout(workers_row)
+
+        # ---- Pending changes status row ------------------------------
+        pending_row = QHBoxLayout()
+        self.lbl_pending = QLabel("No unsaved changes")
+        self.lbl_pending.setStyleSheet("color:#666; font-style:italic; font-size:10px;")
+        pending_row.addWidget(self.lbl_pending, stretch=1)
+        layout.addLayout(pending_row)
 
         # ---- Log -----------------------------------------------------
         self.log = QTextEdit()
@@ -382,20 +494,6 @@ class TrackedSegmentEditor(QWidget):
         self.log.setStyleSheet("font-family: monospace; font-size: 11px;")
         layout.addWidget(self.log)
 
-        # ---- Progress bar (hidden until an operation is running) -----
-        prog_row = QHBoxLayout()
-        self.lbl_progress = QLabel("Running…")
-        self.lbl_progress.setStyleSheet("color:#555; font-size:11px; min-width:120px;")
-        self.lbl_progress.setVisible(False)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)   # indeterminate by default
-        self.progress_bar.setMaximumHeight(14)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setVisible(False)
-        prog_row.addWidget(self.lbl_progress)
-        prog_row.addWidget(self.progress_bar, stretch=1)
-        layout.addLayout(prog_row)
-
         # ---- Footer --------------------------------------------------
         foot = QHBoxLayout()
         self.btn_save = QPushButton("💾 Save tracked segments")
@@ -403,9 +501,13 @@ class TrackedSegmentEditor(QWidget):
             "background-color:#28a745; color:white; font-weight:bold; padding:6px;"
         )
         self.btn_save.clicked.connect(self._on_save)
-        self.btn_discard = QPushButton("✗ Discard changes")
+        self.btn_discard = QPushButton("✗ Discard all changes")
         self.btn_discard.setStyleSheet(
             "background-color:#FB8C00; color:white; font-weight:bold; padding:6px;"
+        )
+        self.btn_discard.setToolTip(
+            "Revert ALL unsaved edits back to the on-disk state.\n"
+            "This is permanent — there is no undo after discarding."
         )
         self.btn_discard.clicked.connect(self._on_discard)
         self.btn_stop = QPushButton("Stop editing")
@@ -442,6 +544,12 @@ class TrackedSegmentEditor(QWidget):
         self.lbl_seed_count.setStyleSheet("color:#1976D2;")
         seed_row.addWidget(self.lbl_seed_count, stretch=1)
         lay.addLayout(seed_row)
+        seed_tutorial_row = QHBoxLayout()
+        seed_tutorial_row.addWidget(
+            TutorialButton("? How to place seeds", "Placing seed points", _SEED_TUTORIAL_STEPS)
+        )
+        seed_tutorial_row.addStretch(1)
+        lay.addLayout(seed_tutorial_row)
         keep_row = QHBoxLayout()
         self.cb_keep_first = QCheckBox("First seed keeps the original TrackID")
         self.cb_keep_first.setChecked(True)
@@ -599,22 +707,106 @@ class TrackedSegmentEditor(QWidget):
         lay.addWidget(info)
         self.cb_delete_confirm = QCheckBox("Yes, erase the selected label(s)")
         lay.addWidget(self.cb_delete_confirm)
-        self.btn_delete_preview = QPushButton("👁 Preview delete (single timepoint)")
-        self.btn_delete_preview.setToolTip(
-            "Preview the deletion on the current frame only (confirmation checkbox\n"
-            "not required) so you can verify before erasing the full time range."
-        )
-        self.btn_delete_preview.setStyleSheet(
+        _prev_style = (
             "QPushButton{color:#1565C0;border:1px solid #90CAF9;"
             "border-radius:3px;padding:4px;}"
             "QPushButton:hover{background:#E3F2FD;}"
             "QPushButton:disabled{color:#aaa;border-color:#ddd;}"
         )
+        self.btn_delete_preview = QPushButton("👁 Preview delete (single timepoint)")
+        self.btn_delete_preview.setToolTip(
+            "Preview the deletion on the current frame only (confirmation checkbox\n"
+            "not required) so you can verify before erasing the full time range."
+        )
+        self.btn_delete_preview.setStyleSheet(_prev_style)
         self.btn_delete_preview.clicked.connect(self._preview_delete)
         lay.addWidget(self.btn_delete_preview)
         self.btn_delete_apply = QPushButton("Apply delete")
         self.btn_delete_apply.clicked.connect(self._apply_delete)
         lay.addWidget(self.btn_delete_apply)
+
+        # ── Delete short tracks ──────────────────────────────────────────
+        from qtpy.QtWidgets import QFrame
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#ccc; margin-top:4px; margin-bottom:4px;")
+        lay.addWidget(sep)
+        self.cb_delete_short = QCheckBox("Delete all labels shorter than")
+        self.cb_delete_short.setToolTip(
+            "Scan the entire volume and delete every track whose total lifetime\n"
+            "(number of timepoints present) is shorter than the threshold below.\n"
+            "The current time range selection is ignored — full lifetime is always used."
+        )
+        short_row = QHBoxLayout()
+        short_row.addWidget(self.cb_delete_short)
+        self.spin_short_min_tp = QSpinBox()
+        self.spin_short_min_tp.setRange(1, 9999)
+        self.spin_short_min_tp.setValue(5)
+        self.spin_short_min_tp.setMaximumWidth(70)
+        self.spin_short_min_tp.setEnabled(False)
+        short_row.addWidget(self.spin_short_min_tp)
+        short_row.addWidget(QLabel("timepoints"))
+        short_row.addStretch(1)
+        lay.addLayout(short_row)
+        self.btn_preview_short = QPushButton("👁 Preview short-track labels")
+        self.btn_preview_short.setToolTip(
+            "List all labels that would be deleted in the log box."
+        )
+        self.btn_preview_short.setStyleSheet(_prev_style)
+        self.btn_preview_short.setEnabled(False)
+        self.btn_preview_short.clicked.connect(self._preview_delete_short_tracks)
+        lay.addWidget(self.btn_preview_short)
+        self.btn_delete_short = QPushButton("Delete short-track labels")
+        self.btn_delete_short.setEnabled(False)
+        self.btn_delete_short.clicked.connect(self._apply_delete_short_tracks)
+        lay.addWidget(self.btn_delete_short)
+
+        def _on_short_toggled(checked: bool):
+            self.spin_short_min_tp.setEnabled(checked)
+            self.btn_preview_short.setEnabled(checked)
+            self.btn_delete_short.setEnabled(checked)
+            # Force full-lifetime when scanning short tracks
+            if checked:
+                self.rb_full.setChecked(True)
+                self.rb_full.setEnabled(False)
+                self.rb_custom.setEnabled(False)
+            else:
+                self.rb_full.setEnabled(True)
+                self.rb_custom.setEnabled(True)
+
+        self.cb_delete_short.toggled.connect(_on_short_toggled)
+        lay.addStretch(1)
+        return page
+
+    def _build_fill_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(2, 2, 2, 2)
+        info = QLabel(
+            "Fill internal holes / cavities inside the selected label.\n"
+            "Useful for hollow sphere-like organoids segmented only on the outer shell.\n"
+            "Only background (value = 0) pixels inside the filled region are assigned\n"
+            "to the label — other labels are never overwritten."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#555; font-style:italic;")
+        lay.addWidget(info)
+        self.btn_fill_preview = QPushButton("👁 Preview fill (single timepoint)")
+        self.btn_fill_preview.setToolTip(
+            "Preview the fill on the current frame only so you can verify\n"
+            "how many voxels will be added before committing to the full lifetime."
+        )
+        self.btn_fill_preview.setStyleSheet(
+            "QPushButton{color:#1565C0;border:1px solid #90CAF9;"
+            "border-radius:3px;padding:4px;}"
+            "QPushButton:hover{background:#E3F2FD;}"
+            "QPushButton:disabled{color:#aaa;border-color:#ddd;}"
+        )
+        self.btn_fill_preview.clicked.connect(self._preview_fill)
+        lay.addWidget(self.btn_fill_preview)
+        self.btn_fill_apply = QPushButton("Apply fill")
+        self.btn_fill_apply.clicked.connect(self._apply_fill)
+        lay.addWidget(self.btn_fill_apply)
         lay.addStretch(1)
         return page
 
@@ -661,6 +853,12 @@ class TrackedSegmentEditor(QWidget):
         self.lbl_create_seed_count.setStyleSheet("color:#1976D2;")
         seed_row.addWidget(self.lbl_create_seed_count, stretch=1)
         lay.addLayout(seed_row)
+        create_tutorial_row = QHBoxLayout()
+        create_tutorial_row.addWidget(
+            TutorialButton("? How to place seeds", "Placing seed points", _SEED_TUTORIAL_STEPS)
+        )
+        create_tutorial_row.addStretch(1)
+        lay.addLayout(create_tutorial_row)
         self.btn_create_preview = QPushButton("👁 Preview create (single timepoint)")
         self.btn_create_preview.setToolTip(
             "Run the watershed on the current frame only so you can verify\n"
@@ -870,8 +1068,8 @@ class TrackedSegmentEditor(QWidget):
             getattr(self, "btn_delete_apply", None),
             getattr(self, "btn_create_preview", None),
             getattr(self, "btn_create_apply", None),
-            getattr(self, "btn_undo", None),
-            getattr(self, "btn_redo", None),
+            getattr(self, "btn_fill_preview", None),
+            getattr(self, "btn_fill_apply", None),
             getattr(self, "btn_save", None),
             getattr(self, "btn_seeds_layer", None),
             getattr(self, "btn_create_seeds_layer", None),
@@ -918,16 +1116,21 @@ class TrackedSegmentEditor(QWidget):
         Parameters
         ----------
         fn:
-            Callable that performs the editing primitive.  Must not call
-            ``buf.apply()`` itself — that is done by ``_on_edit_done``.
-        args, kwargs:
-            Positional and keyword arguments forwarded to ``fn``.
+            Callable executed in the worker thread.
+        args:
+            Arguments passed to ``fn``.
+        kwargs:
+            Keyword arguments passed to ``fn``.  A ``progress_cb`` kwarg is
+            automatically injected if the signature accepts it.
         on_success:
-            Optional callable invoked with the result after every
-            :meth:`_commit_op` succeeds (e.g. clear split seeds).
+            Callback invoked on the Qt thread after the results have been
+            successfully applied to the buffer.
         desc:
-            Short description shown in the napari activity-dock progress bar.
+            Short description displayed in the progress UI.
         """
+        if self._edit_thread is not None:
+            self._log_msg("  ⚠️ An operation is already running. Please wait.")
+            return
         if kwargs is None:
             kwargs = {}
         self._pending_on_success = on_success
@@ -937,7 +1140,11 @@ class TrackedSegmentEditor(QWidget):
         # Inject progress callback — primitives expose it as an optional kwarg.
         # We add it to the *same* dict that the worker already holds so the
         # worker will see it when it calls fn(**kwargs) on the thread.
-        kwargs['progress_cb'] = worker.progress.emit
+        def _cb(c, tot):
+            if worker._is_cancelled:
+                raise InterruptedError("Operation cancelled")
+            worker.progress.emit(c, tot)
+        kwargs['progress_cb'] = _cb
         thread = QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1021,6 +1228,9 @@ class TrackedSegmentEditor(QWidget):
         undo stack.  Buttons are disabled during execution (same as the real
         operations) to avoid race conditions.
         """
+        if self._edit_thread is not None:
+            self._log_msg("  ⚠️ An operation is already running. Please wait.")
+            return
         if kwargs is None:
             kwargs = {}
         self._pending_preview_tool = tool_name
@@ -1028,7 +1238,11 @@ class TrackedSegmentEditor(QWidget):
             f"Preview {tool_name}…" if tool_name else "Previewing…"
         )
         worker = _EditWorker(fn, args, kwargs)
-        kwargs['progress_cb'] = worker.progress.emit
+        def _cb(c, tot):
+            if worker._is_cancelled:
+                raise InterruptedError("Operation cancelled")
+            worker.progress.emit(c, tot)
+        kwargs['progress_cb'] = _cb
         thread = QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1095,22 +1309,102 @@ class TrackedSegmentEditor(QWidget):
             pass
         layer.editable = True
         layer.mouse_drag_callbacks.append(self._on_layer_clicked)
-        # The caller (visualization tab / notebook panel) is responsible
-        # for loading the layer's data as a writable numpy array — we
-        # deliberately do NOT replace ``layer.data`` here, because that
-        # blanks the layer in some napari versions.  If the caller passed
-        # a dask-backed layer we promote it on first edit (see
-        # ``_refresh_layer_data``).
         try:
             self.viewer.dims.events.current_step.connect(
                 lambda *_: self._refresh_seed_counter()
             )
+            self.viewer.dims.events.current_step.connect(
+                lambda *_: self._refresh_highlight_layer()
+            )
+        except Exception:
+            pass
+        try:
+            self.viewer.layers.events.removed.connect(self._on_layer_removed)
         except Exception:
             pass
         try:
             self.viewer.layers.selection.active = self.viewer.layers[self.layer_name]
         except Exception:
             pass
+
+        # ── Eager lifetime index + frame pre-warm (background) ───────────
+        self._start_lifetime_index_build()
+
+    def _start_lifetime_index_build(self) -> None:
+        """Launch a background thread to build the lifetime index for all labels.
+
+        Shows "Building label index…" in the progress bar until the scan
+        completes.  All label-click operations remain available during the
+        scan — slow cache misses just fall back to the lazy per-label scan.
+        """
+        # Show indicator
+        self._log_msg("  🔎 Building label index in background (speeds up label selection)…")
+        pb = getattr(self, "progress_bar", None)
+        lbl = getattr(self, "lbl_progress", None)
+        if pb is not None:
+            pb.setRange(0, 0)
+            pb.setVisible(True)
+        if lbl is not None:
+            lbl.setText("Building label index…")
+            lbl.setVisible(True)
+
+        worker = _IndexWorker(self.buffer)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        worker.done.connect(self._on_index_build_done)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_index_thread_finished)
+        # Keep reference so GC doesn't collect
+        self._index_thread = thread
+        self._index_worker = worker
+        thread.start()
+
+    def _on_index_build_done(self) -> None:
+        """Called on Qt thread when lifetime index build finishes."""
+        pb = getattr(self, "progress_bar", None)
+        lbl = getattr(self, "lbl_progress", None)
+        if pb is not None:
+            pb.setVisible(False)
+        if lbl is not None:
+            lbl.setVisible(False)
+        self._log_msg("  ✅ Label index ready — label clicks will be fast.")
+
+    def _on_index_thread_finished(self) -> None:
+        """Called on the Qt thread when the index worker OS thread has fully stopped."""
+        self._index_thread = None
+        self._index_worker = None
+    def _on_layer_removed(self, event) -> None:
+        """Keep the tracked-segments layer active when the seed-points
+        layer is removed.
+
+        This covers deletion via the Apply/Cancel flow *and* manual
+        deletion from napari's own layer list (e.g. the trash icon or
+        the Delete key), which otherwise leaves napari to fall back to
+        whatever layer happens to be first in the list.
+        """
+        removed = getattr(event, "value", None)
+        if getattr(removed, "name", None) != _SPLIT_SEEDS_LAYER:
+            return
+        # The layer is already gone at this point, so the counter must be
+        # refreshed explicitly — it won't get another data/current_step
+        # event to react to.
+        self._refresh_seed_counter()
+        # Defer: napari's LayerList does its own "pick a new active layer"
+        # bookkeeping in response to the same ``removed`` event, and
+        # depending on connection order that can run *after* us — which
+        # would leave both the tracked-segments layer and napari's default
+        # pick selected. Running on the next event-loop tick guarantees we
+        # go last and end up with exactly one layer selected.
+        QTimer.singleShot(0, self._reselect_tracked_layer)
+
+    def _reselect_tracked_layer(self) -> None:
+        if self.layer_name in self.viewer.layers:
+            layer = self.viewer.layers[self.layer_name]
+            self.viewer.layers.selection.clear()
+            self.viewer.layers.selection.add(layer)
+            self.viewer.layers.selection.active = layer
 
     def _build_dask_with_dirty_frames(self) -> da.Array:
         """Return a dask array where dirty frames are served from memory.
@@ -1216,7 +1510,7 @@ class TrackedSegmentEditor(QWidget):
             except Exception:
                 pass
         else:
-            self.lbl_selected.setText("(click on the tracked-segments layer)")
+            self.lbl_selected.setText("(no labels selected)")
         # Refresh time-range defaults from the lifetime of the first label.
         if self._selected_labels:
             f, l = lifetime_of(self.buffer, self._selected_labels[0])
@@ -1229,6 +1523,7 @@ class TrackedSegmentEditor(QWidget):
             self.combo_merge_target.addItem(str(lid), userData=int(lid))
         self._refresh_buttons()
         self._refresh_seed_counter()
+        self._refresh_highlight_layer()
 
     # ------------------------------------------------------------------
     # Tool dispatch
@@ -1240,11 +1535,18 @@ class TrackedSegmentEditor(QWidget):
         is_seed_tool = idx in (0, 5)
         if not is_seed_tool and _SPLIT_SEEDS_LAYER in self.viewer.layers:
             self.viewer.layers[_SPLIT_SEEDS_LAYER].visible = False
+        if not is_seed_tool:
+            self._restore_ndisplay()
         if is_seed_tool and _SPLIT_SEEDS_LAYER in self.viewer.layers:
             self.viewer.layers[_SPLIT_SEEDS_LAYER].visible = True
         # Refresh channel list whenever the user switches to Create.
         if idx == 5:
             self._refresh_create_channels()
+
+    @property
+    def _n_workers(self) -> int:
+        """Current worker count from the Workers spinbox."""
+        return int(getattr(self, "spin_workers", type("_", (), {"value": lambda self: 1})()).value())
 
     def _selected_t_range(self, label_id: Optional[int] = None) -> Optional[Tuple[int, int]]:
         if self.rb_full.isChecked():
@@ -1258,6 +1560,22 @@ class TrackedSegmentEditor(QWidget):
 
     # ---- Split -------------------------------------------------------
     def _ensure_seeds_layer(self) -> None:
+        # Split needs an existing label to seed the watershed from; Create
+        # (index 5) deliberately has no such requirement.
+        if self.tool_stack.currentIndex() == 0 and not self._selected_labels:
+            QMessageBox.warning(
+                self,
+                "No label selected",
+                "Select a label in the viewer (or type its ID) before adding seed points.",
+            )
+            return
+        if self.viewer.dims.ndisplay == 3 and self._ndisplay_before_seeds is None:
+            self._ndisplay_before_seeds = 3
+            self.viewer.dims.ndisplay = 2
+            self._log_msg(
+                "  Switched to 2D view for precise seed placement — move "
+                "the Z slider between clicks to place seeds at different depths."
+            )
         if _SPLIT_SEEDS_LAYER not in self.viewer.layers:
             layer = self.viewer.add_points(
                 np.empty((0, 4)),
@@ -1275,10 +1593,19 @@ class TrackedSegmentEditor(QWidget):
                 self.viewer.window._qt_viewer.layer_to_visual[layer].node.text.visible = False
             except Exception:
                 pass
+            layer.events.data.connect(lambda *_: self._refresh_seed_counter())
         layer = self.viewer.layers[_SPLIT_SEEDS_LAYER]
         layer.mode = "add"
         self.viewer.layers.selection.active = layer
         self._refresh_seed_counter()
+
+    def _restore_ndisplay(self) -> None:
+        if self._ndisplay_before_seeds is not None:
+            try:
+                self.viewer.dims.ndisplay = self._ndisplay_before_seeds
+            except Exception:
+                pass
+            self._ndisplay_before_seeds = None
 
     def _refresh_seed_counter(self) -> None:
         n = 0
@@ -1296,6 +1623,46 @@ class TrackedSegmentEditor(QWidget):
             self.lbl_seed_count.setText(text)
         if hasattr(self, "lbl_create_seed_count"):
             self.lbl_create_seed_count.setText(text)
+
+    def _refresh_highlight_layer(self) -> None:
+        """Show the selected label(s) as a bright contour-only overlay.
+
+        Uses a dedicated Labels layer rather than recoloring
+        ``self.layer_name`` in place, so the rest of the tracked-segments
+        layer keeps its normal per-object colors.  Whatever layer was
+        active before this call (e.g. the seeds layer mid-placement, or
+        the tracked-segments layer during label picking) is restored
+        afterward so this never steals mouse interaction away from it.
+        """
+        try:
+            prev_active = self.viewer.layers.selection.active
+            if not self._selected_labels:
+                if _HIGHLIGHT_LAYER in self.viewer.layers:
+                    self.viewer.layers.remove(_HIGHLIGHT_LAYER)
+                    if (
+                        prev_active is not None
+                        and getattr(prev_active, "name", None) != _HIGHLIGHT_LAYER
+                    ):
+                        self.viewer.layers.selection.active = prev_active
+                return
+            t_now = int(self.viewer.dims.current_step[0])
+            mask = np.isin(self.buffer.peek(t_now), self._selected_labels).astype(np.uint8)
+            if _HIGHLIGHT_LAYER in self.viewer.layers:
+                layer = self.viewer.layers[_HIGHLIGHT_LAYER]
+                layer.data = mask
+                layer.visible = True
+            else:
+                layer = self.viewer.add_labels(mask, name=_HIGHLIGHT_LAYER, opacity=1.0)
+                layer.editable = False
+                layer.contour = 1
+                if DirectLabelColormap is not None:
+                    layer.colormap = DirectLabelColormap(
+                        color_dict={1: _HIGHLIGHT_COLOR, None: "transparent"}
+                    )
+            if prev_active is not None and getattr(prev_active, "name", None) != _HIGHLIGHT_LAYER:
+                self.viewer.layers.selection.active = prev_active
+        except Exception:
+            pass
 
     def _apply_split(self) -> None:
         self._clear_preview()
@@ -1337,6 +1704,7 @@ class TrackedSegmentEditor(QWidget):
                     )
             except Exception:
                 pass
+            self._restore_ndisplay()
 
         self._run_operation_async(
             split_label,
@@ -1414,6 +1782,7 @@ class TrackedSegmentEditor(QWidget):
                 label_ids=list(self._selected_labels),
                 target_id=int(target),
                 t_range=rng,
+                n_workers=self._n_workers,
             ),
             desc=f"Merging labels → {target}…",
         )
@@ -1478,6 +1847,7 @@ class TrackedSegmentEditor(QWidget):
                 r_xy=r_xy,
                 r_z=r_z,
                 t_range=rng,
+                n_workers=self._n_workers,
             ),
             desc=f"Eroding label {label_id}…",
         )
@@ -1516,6 +1886,7 @@ class TrackedSegmentEditor(QWidget):
                 r_xy=r_xy,
                 r_z=r_z,
                 t_range=rng,
+                n_workers=self._n_workers,
             ),
             desc=f"Dilating label {label_id}…",
         )
@@ -1548,24 +1919,17 @@ class TrackedSegmentEditor(QWidget):
         label_ids = list(self._selected_labels)
         # Resolve time ranges on the Qt thread (accesses Qt widgets).
         ranges = {lid: self._selected_t_range(lid) for lid in label_ids}
-        self._log_msg(f"  Running delete of label(s) {label_ids}…")
+        n_workers = self._n_workers
+        self._log_msg(f"  Running delete of label(s) {label_ids} ({n_workers} worker(s))…")
 
         def _do_delete_all(_buf, progress_cb=None):
-            n = len(label_ids)
-            results = []
-            for i, lid in enumerate(label_ids):
-                # For a single label forward progress_cb directly so the bar
-                # tracks per-frame; for multiple labels track per-label.
-                if n == 1:
-                    results.append(delete_label(_buf, label_id=lid, t_range=ranges[lid],
-                                                progress_cb=progress_cb))
-                else:
-                    if progress_cb:
-                        progress_cb(i, n)
-                    results.append(delete_label(_buf, label_id=lid, t_range=ranges[lid]))
-                    if progress_cb:
-                        progress_cb(i + 1, n)
-            return results
+            return delete_labels(
+                _buf,
+                label_ids=label_ids,
+                t_ranges=ranges,
+                n_workers=n_workers,
+                progress_cb=progress_cb,
+            )
 
         def _uncheck(_result):
             self.cb_delete_confirm.setChecked(False)
@@ -1586,11 +1950,12 @@ class TrackedSegmentEditor(QWidget):
         self._log_msg(f"  Previewing delete of label(s) {label_ids} at t={t_now}…")
 
         def _do_delete_preview(_buf, progress_cb=None):
-            return [
-                delete_label(_buf, label_id=lid, t_range=(t_now, t_now),
-                             progress_cb=progress_cb)
-                for lid in label_ids
-            ]
+            return delete_labels(
+                _buf,
+                label_ids=label_ids,
+                t_ranges={lid: (t_now, t_now) for lid in label_ids},
+                progress_cb=progress_cb,
+            )
 
         self._run_preview_async(
             _do_delete_preview,
@@ -1677,6 +2042,7 @@ class TrackedSegmentEditor(QWidget):
                     )
             except Exception:
                 pass
+            self._restore_ndisplay()
 
         self._run_operation_async(
             create_label,
@@ -1756,34 +2122,15 @@ class TrackedSegmentEditor(QWidget):
             return darr
 
     # ------------------------------------------------------------------
-    # Commit / undo / redo / save / discard
+    # Commit / save / discard
     # ------------------------------------------------------------------
     def _commit_op(self, op) -> None:
         if not op.new_frames:
             self._log_msg(f"  ⚠️ {op.summary or op.name}: no frames changed.")
             self._refresh_buttons()
             return
-        large = len(op.new_frames) > self.buffer.max_undoable_frames
-        self.buffer.apply(op)
-        if large:
-            self._log_msg(
-                f"  ✅ {op.summary}  "
-                f"⚠️ Large operation ({len(op.new_frames)} frames) — undo not available."
-            )
-        else:
-            self._log_msg(f"  ✅ {op.summary}")
-        self._refresh_buttons()
-
-    def _on_undo(self) -> None:
-        self._clear_preview()
-        msg = self.buffer.undo()
-        self._log_msg(f"  ↶ {msg or 'nothing to undo'}")
-        self._refresh_buttons()
-
-    def _on_redo(self) -> None:
-        self._clear_preview()
-        msg = self.buffer.redo()
-        self._log_msg(f"  ↷ {msg or 'nothing to redo'}")
+        self.buffer.commit(op)
+        self._log_msg(f"  ✅ {op.summary}")
         self._refresh_buttons()
 
     def _on_save(self) -> None:
@@ -1848,16 +2195,17 @@ class TrackedSegmentEditor(QWidget):
         ret = QMessageBox.question(
             self,
             "Discard all edits?",
-            "All in-memory edits will be lost.  Continue?",
+            f"This will revert ALL {self.buffer.dirty_count()} unsaved frame edit(s) "
+            f"back to the on-disk state.\n\n"
+            "There is no undo after discarding.  Continue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if ret != QMessageBox.Yes:
             return
         self.buffer.discard()
-        # buffer.discard() calls _emit() which triggers _refresh_layer_data()
-        # and resets layer.data to buffer._darr — no extra refresh needed here.
-        self._log_msg("Discarded all in-memory edits.")
+        # buffer.discard() calls _emit() which triggers _refresh_layer_data().
+        self._log_msg("Discarded all in-memory edits — on-disk state restored.")
         self._refresh_buttons()
 
     def _on_stop_clicked(self) -> None:
@@ -1915,26 +2263,39 @@ class TrackedSegmentEditor(QWidget):
         return True
 
     def _cleanup(self) -> None:
+        if not hasattr(self, "_zombie_threads"):
+            self._zombie_threads = []
+        
+        # Stop any in-progress background index build.
+        if getattr(self, "_index_thread", None) is not None:
+            if getattr(self, "_index_worker", None) is not None:
+                self._index_worker.cancel()
+            try:
+                self._index_thread.quit()
+                if not self._index_thread.wait(500):
+                    self._zombie_threads.append((self._index_thread, self._index_worker))
+            except Exception:
+                pass
+            self._index_thread = None
+            self._index_worker = None
         # Stop any in-progress background edit operation.
-        if self._edit_thread is not None:
+        if getattr(self, "_edit_thread", None) is not None:
+            if getattr(self, "_edit_worker", None) is not None:
+                self._edit_worker.cancel()
             try:
                 self._edit_thread.quit()
-                # Allow up to 60 s for long operations (e.g. 500-frame split).
-                # If the thread is still alive after that, terminate it forcefully
-                # to avoid "QThread: Destroyed while thread is still running" and
-                # the resulting fatal crash (Windows 0xC0000409).
-                if not self._edit_thread.wait(60_000):
-                    self._edit_thread.terminate()
-                    self._edit_thread.wait(3_000)
+                if not self._edit_thread.wait(500):
+                    self._zombie_threads.append((self._edit_thread, self._edit_worker))
             except Exception:
                 pass
             self._edit_thread = None
             self._edit_worker = None
         # Stop any in-progress background materialisation (legacy path).
-        if self._materialise_thread is not None:
+        if getattr(self, "_materialise_thread", None) is not None:
             try:
                 self._materialise_thread.quit()
-                self._materialise_thread.wait(2000)  # ms
+                if not self._materialise_thread.wait(500):
+                    self._zombie_threads.append((self._materialise_thread, self._materialise_worker))
             except Exception:
                 pass
             self._materialise_thread = None
@@ -1943,6 +2304,12 @@ class TrackedSegmentEditor(QWidget):
         try:
             if _SPLIT_SEEDS_LAYER in self.viewer.layers:
                 self.viewer.layers.remove(_SPLIT_SEEDS_LAYER)
+        except Exception:
+            pass
+        # Remove the selection-highlight overlay if present.
+        try:
+            if _HIGHLIGHT_LAYER in self.viewer.layers:
+                self.viewer.layers.remove(_HIGHLIGHT_LAYER)
         except Exception:
             pass
         # Remove our mouse callback from the bound layer (best-effort).
@@ -1958,6 +2325,7 @@ class TrackedSegmentEditor(QWidget):
     # ------------------------------------------------------------------
     def _on_frames_changed(self, frames: List[int]) -> None:
         self._refresh_layer_data(frames)
+        self._refresh_highlight_layer()
 
     def _refresh_buttons(self) -> None:
         has_sel = bool(self._selected_labels)
@@ -1970,6 +2338,8 @@ class TrackedSegmentEditor(QWidget):
             getattr(self, "btn_dilate_apply", None),
             getattr(self, "btn_delete_preview", None),
             getattr(self, "btn_delete_apply", None),
+            getattr(self, "btn_fill_preview", None),
+            getattr(self, "btn_fill_apply", None),
         ):
             if btn is not None:
                 btn.setEnabled(has_sel)
@@ -1985,15 +2355,192 @@ class TrackedSegmentEditor(QWidget):
         ):
             if btn is not None:
                 btn.setEnabled(True)
-        if hasattr(self, "btn_undo"):
-            self.btn_undo.setEnabled(self.buffer.can_undo())
-        if hasattr(self, "btn_redo"):
-            self.btn_redo.setEnabled(self.buffer.can_redo())
+        # Pending-changes status label (replaces old undo/redo history display).
         n = self.buffer.dirty_count()
-        if hasattr(self, "lbl_history"):
-            self.lbl_history.setText(
-                f"{n} pending frame change(s); {len(self.buffer.history())} step(s) in history"
+        if hasattr(self, "lbl_pending"):
+            if n == 0:
+                self.lbl_pending.setText("No unsaved changes")
+                self.lbl_pending.setStyleSheet(
+                    "color:#666; font-style:italic; font-size:10px;"
+                )
+            else:
+                self.lbl_pending.setText(
+                    f"⚠️ {n} pending frame change(s) (unsaved) — use Discard to revert all"
+                )
+                self.lbl_pending.setStyleSheet(
+                    "color:#E65100; font-style:italic; font-size:10px;"
+                )
+
+    # ---- Fill --------------------------------------------------------
+    def _apply_fill(self) -> None:
+        self._clear_preview()
+        if not self._selected_labels:
+            self._log_msg("Pick a label first.")
+            return
+        label_id = self._selected_labels[0]
+        rng = self._selected_t_range(label_id)
+        n_workers = self._n_workers
+        self._log_msg(f"  Running fill of label {label_id} ({n_workers} worker(s))…")
+        self._run_operation_async(
+            fill_label,
+            (self.buffer,),
+            dict(label_id=label_id, t_range=rng, n_workers=n_workers),
+            desc=f"Filling label {label_id}…",
+        )
+
+    def _preview_fill(self) -> None:
+        if not self._selected_labels:
+            self._log_msg("Pick a label first.")
+            return
+        label_id = self._selected_labels[0]
+        t_now = int(self.viewer.dims.current_step[0])
+        self._log_msg(f"  Previewing fill of label {label_id} at t={t_now}…")
+        self._run_preview_async(
+            fill_label,
+            (self.buffer,),
+            dict(label_id=label_id, t_range=(t_now, t_now)),
+            tool_name="fill",
+        )
+
+    # ---- Delete short tracks -----------------------------------------
+    def _preview_delete_short_tracks(self) -> None:
+        """List all labels shorter than the threshold in the log box."""
+        min_tp = int(self.spin_short_min_tp.value())
+        self._log_msg(
+            f"  Scanning for labels shorter than {min_tp} timepoint(s)…"
+        )
+
+        def _scan(_buf, progress_cb=None):
+            """Return a synthetic OpResult that lists short tracks."""
+            from behav3d.editing.tracked_segments import OpResult as _OR
+            T = int(_buf.shape[0])
+            # Build lifetime for all labels in one pass.
+            first: dict = {}
+            last: dict = {}
+            import numpy as _np
+            for t in range(T):
+                frame = _buf.peek(t)
+                for lbl in _np.unique(frame):
+                    lbl = int(lbl)
+                    if lbl == 0:
+                        continue
+                    if lbl not in first:
+                        first[lbl] = t
+                    last[lbl] = t
+                if progress_cb:
+                    progress_cb(t + 1, T)
+            short = {
+                lbl: last[lbl] - first[lbl] + 1
+                for lbl in first
+                if last[lbl] - first[lbl] + 1 < min_tp
+            }
+            return _OR(
+                name="_short_preview",
+                new_frames={},
+                affected_labels=list(short.keys()),
+                new_labels=[],
+                summary=f"SHORT_PREVIEW:{min_tp}:{len(short)}:{short}",
             )
+
+        def _on_done(result):
+            # Parse the synthetic summary to extract the dict.
+            try:
+                parts = result.summary.split(":", 3)
+                n = int(parts[2])
+                import ast
+                short = ast.literal_eval(parts[3])
+            except Exception:
+                n = len(result.affected_labels)
+                short = {lbl: "?" for lbl in result.affected_labels}
+            if n == 0:
+                self._log_msg(
+                    f"  ✅ No labels shorter than {min_tp} timepoints found."
+                )
+            else:
+                self._log_msg(
+                    f"  Found {n} label(s) shorter than {min_tp} timepoints:"
+                )
+                lines = [
+                    f"    label {lbl}: {tp} timepoint(s)"
+                    for lbl, tp in sorted(short.items())
+                ]
+                for chunk in ["".join(lines[i:i+50]) for i in range(0, len(lines), 50)]:
+                    self._log_msg(chunk)
+                self._log_msg(
+                    f"  Click 'Delete short-track labels' to remove them."
+                )
+
+        self._run_operation_async(
+            _scan,
+            (self.buffer,),
+            on_success=_on_done,
+            desc=f"Scanning short tracks (<{min_tp} tp)…",
+        )
+
+    def _apply_delete_short_tracks(self) -> None:
+        """Delete all labels whose lifetime < threshold."""
+        min_tp = int(self.spin_short_min_tp.value())
+        self._log_msg(
+            f"  Deleting all labels shorter than {min_tp} timepoint(s)…"
+        )
+
+        def _delete_short(_buf, progress_cb=None):
+            from behav3d.editing.tracked_segments import (
+                delete_labels as _del_lbl, OpResult as _OR
+            )
+            import numpy as _np
+            T = int(_buf.shape[0])
+            first: dict = {}
+            last: dict = {}
+            # Phase 1: scan (50% progress)
+            for t in range(T):
+                frame = _buf.peek(t)
+                for lbl in _np.unique(frame):
+                    lbl = int(lbl)
+                    if lbl == 0:
+                        continue
+                    if lbl not in first:
+                        first[lbl] = t
+                    last[lbl] = t
+                if progress_cb:
+                    progress_cb(t + 1, T * 2)
+            short_ids = [
+                lbl for lbl in first
+                if last[lbl] - first[lbl] + 1 < min_tp
+            ]
+            if not short_ids:
+                return _OR(
+                    name="delete",
+                    new_frames={},
+                    affected_labels=[],
+                    new_labels=[],
+                    summary=f"No labels shorter than {min_tp} tp found.",
+                )
+            t_ranges = {lbl: (first[lbl], last[lbl]) for lbl in short_ids}
+            # Phase 2: delete (50–100% progress)
+            def _cb2(c, tot):
+                if progress_cb:
+                    progress_cb(T + c, T * 2)
+            return _del_lbl(
+                _buf,
+                label_ids=short_ids,
+                t_ranges=t_ranges,
+                progress_cb=_cb2,
+            )
+
+        def _on_done(result):
+            n = len(result.affected_labels)
+            if n == 0:
+                self._log_msg(f"  No labels shorter than {min_tp} tp found — nothing deleted.")
+            else:
+                self._log_msg(result.summary)
+
+        self._run_operation_async(
+            _delete_short,
+            (self.buffer,),
+            on_success=_on_done,
+            desc=f"Deleting short tracks (<{min_tp} tp)…",
+        )
 
     def _log_msg(self, msg: str) -> None:
         self.log.append(msg)

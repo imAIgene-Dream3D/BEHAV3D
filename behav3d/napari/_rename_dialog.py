@@ -27,8 +27,10 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from qtpy.QtCore import Qt, Signal
+from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -65,7 +67,11 @@ def _track_cluster_col(adata) -> Optional[str]:
     """Return the first recognised track-cluster obs column in *adata*, or None."""
     if adata is None:
         return None
+    uns_key = adata.uns.get("dtai_trajectory_clustering", {}).get("cluster_key")
+    if uns_key and uns_key in adata.obs.columns:
+        return uns_key
     for col in (
+        "ClusterID",
         "behavioral_trajectory_cluster",
         "dtaidistance_cluster",
         "track_cluster",
@@ -140,9 +146,10 @@ class RenameClusterDialog(QDialog):
 
         self._name_edits: Dict[str, QLineEdit] = {}
         self._select_checks: Dict[str, QCheckBox] = {}  # full mode only
+        self._color_buttons: Dict[str, QPushButton] = {}
 
         self.setWindowTitle(self._TITLES[mode])
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(580)
         self.setMinimumHeight(380)
         self.setSizeGripEnabled(True)
 
@@ -195,6 +202,10 @@ class RenameClusterDialog(QDialog):
         new_hdr = QLabel("New name")
         new_hdr.setStyleSheet("color:#888; font-size:10px; font-weight:bold;")
         hdr.addWidget(new_hdr, stretch=3)
+        color_hdr = QLabel("Color")
+        color_hdr.setFixedWidth(40)
+        color_hdr.setStyleSheet("color:#888; font-size:10px; font-weight:bold;")
+        hdr.addWidget(color_hdr)
         outer.addLayout(hdr)
 
         # Scrollable rows
@@ -287,7 +298,38 @@ class RenameClusterDialog(QDialog):
         )
         self._name_edits[old_name] = edit
         row.addWidget(edit, stretch=3)
+
+        color_btn = QPushButton()
+        color_btn.setFixedSize(36, 22)
+        color_btn.setToolTip("Click to pick a color for this cluster")
+        self._set_button_color(color_btn, "#808080")
+        color_btn.clicked.connect(lambda _checked, n=old_name: self._on_color_btn_clicked(n))
+        self._color_buttons[old_name] = color_btn
+        row.addWidget(color_btn)
+
         return row
+
+    # ── Color helpers ───────────────────────────────────────────────────
+
+    def _set_button_color(self, btn: QPushButton, hex_color: str):
+        btn.setStyleSheet(
+            f"QPushButton {{ background: {hex_color}; border: 1px solid #555; "
+            f"border-radius: 2px; }}"
+            f"QPushButton:hover {{ border: 1px solid #aaa; }}"
+        )
+        btn.setProperty("hex_color", hex_color)
+
+    def _get_button_color(self, btn: QPushButton) -> str:
+        return btn.property("hex_color") or "#808080"
+
+    def _on_color_btn_clicked(self, old_name: str):
+        btn = self._color_buttons.get(old_name)
+        if btn is None:
+            return
+        current = QColor(self._get_button_color(btn))
+        chosen = QColorDialog.getColor(current, self, f"Color for '{old_name}'")
+        if chosen.isValid():
+            self._set_button_color(btn, chosen.name())
 
     # ── Population ──────────────────────────────────────────────────────
 
@@ -295,6 +337,7 @@ class RenameClusterDialog(QDialog):
         """Read cluster names from the adata and build the rename rows."""
         self._name_edits.clear()
         self._select_checks.clear()
+        self._color_buttons.clear()
 
         # Clear existing rows (keep the trailing stretch)
         while self._rows_layout.count() > 1:
@@ -328,17 +371,34 @@ class RenameClusterDialog(QDialog):
             self._rows_layout.addWidget(container)
         self._rows_layout.addItem(stretch_item)
 
+        # Apply saved colors to buttons
+        self._apply_saved_colors_to_buttons(clusters)
+
+    def _state_col(self) -> Optional[str]:
+        if self._mode == "track":
+            return _track_cluster_col(self._adata)
+        return self._OBS_COLS.get(self._mode)
+
+    def _apply_saved_colors_to_buttons(self, clusters: list):
+        from behav3d.analysis.behavior.state.utils import (
+            _get_classification_state_colors,
+            _normalize_label_color_map,
+        )
+        if self._adata is None:
+            return
+        state_col = self._state_col()
+        if state_col is None:
+            return
+        saved = _get_classification_state_colors(self._adata, state_col)
+        colors = _normalize_label_color_map(clusters, colors=saved)
+        for name, btn in self._color_buttons.items():
+            if name in colors:
+                self._set_button_color(btn, colors[name])
+
     def _get_cluster_names(self) -> list:
         if self._adata is None:
             return []
-        if self._mode == "track":
-            col = _track_cluster_col(self._adata)
-            if col is None:
-                return []
-            return _unique_sorted(
-                self._adata.obs[col].dropna().astype(str).unique()
-            )
-        col = self._OBS_COLS.get(self._mode)
+        col = self._state_col()
         if col is None or col not in self._adata.obs.columns:
             return []
         return _unique_sorted(
@@ -363,9 +423,17 @@ class RenameClusterDialog(QDialog):
                 self, "Combine", "Select at least one cluster to combine."
             )
             return
+        # Use the color of the first selected cluster for all combined rows
+        first_color = None
+        for name in selected:
+            if name in self._color_buttons:
+                first_color = self._get_button_color(self._color_buttons[name])
+                break
         for name in selected:
             if name in self._name_edits:
                 self._name_edits[name].setText(target)
+            if first_color is not None and name in self._color_buttons:
+                self._set_button_color(self._color_buttons[name], first_color)
         self._combine_edit.clear()
 
     # ── Save ────────────────────────────────────────────────────────────
@@ -401,30 +469,53 @@ class RenameClusterDialog(QDialog):
 
     def _apply_mapping(self, mapping: dict):
         from behav3d.analysis.behavior.general import relabel_cluster_ids
+        from behav3d.analysis.behavior.state.utils import (
+            _coerce_hex_color,
+            _set_classification_state_colors,
+        )
 
-        if self._mode == "track":
-            col = _track_cluster_col(self._adata)
-        else:
-            col = self._OBS_COLS[self._mode]
-
+        col = self._state_col()
         if col is None or col not in self._adata.obs.columns:
             return  # nothing to do
 
-        # Only apply if there are actual changes
+        # Save colors first (remap: color follows the renamed label)
+        new_colors = {}
+        for old_name, btn in self._color_buttons.items():
+            new_label = mapping.get(old_name, old_name)
+            new_colors[new_label] = _coerce_hex_color(self._get_button_color(btn))
+        if new_colors:
+            _set_classification_state_colors(self._adata, col, new_colors)
+
+        # Only apply renaming if there are actual label changes
         existing = set(self._adata.obs[col].astype(str).unique())
         changed = any(
             str(mapping.get(lbl, lbl)) != str(lbl) for lbl in existing
         )
-        if not changed:
-            return
+        if changed:
+            relabel_cluster_ids(
+                adata=self._adata,
+                mapping=mapping,
+                cluster_key=col,
+                overwrite_original=True,
+                keep_unmapped=True,
+            )
 
-        relabel_cluster_ids(
-            adata=self._adata,
-            mapping=mapping,
-            cluster_key=col,
-            overwrite_original=True,
-            keep_unmapped=True,
-        )
+        # Rebuild full_behavioral_cluster so its prefix reflects the renamed intrinsic labels
+        if self._mode == "intrinsic" and "full_behavioral_cluster" in self._adata.obs.columns:
+            from behav3d.analysis.behavior.state.utils import (
+                _rebuild_full_behavioral_cluster_from_intrinsic,
+            )
+            import copy
+            clustering_meta = self._adata.uns.get("clustering", {})
+            binary_cols = clustering_meta.get("binary_cols_to_merge", [])
+            bgc = copy.deepcopy(clustering_meta.get("binary_group_constraints", None))
+            enforce = isinstance(bgc, dict) and "forbidden_binary_combinations" in bgc
+            _rebuild_full_behavioral_cluster_from_intrinsic(
+                self._adata,
+                binary_cols_to_merge=binary_cols,
+                binary_group_constraints=bgc,
+                enforce_binary_group_constraints=enforce,
+            )
 
         # Persist to disk
         if self._adata_path is not None:
