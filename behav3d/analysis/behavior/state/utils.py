@@ -9,6 +9,7 @@ from matplotlib import pyplot as plt
 from behav3d.analysis.behavior.utils import (
     _mixed_label_sort_key,
     _resolve_output_dir,
+    _save_adata_obs_csv,
     _sanitize_filename_token,
     _to_numpy_2d,
     _vdone,
@@ -102,6 +103,53 @@ def _set_classification_state_colors(adata, state_col, colors):
     classification_meta["state_colors"] = state_colors
     adata.uns["classification"] = classification_meta
     return normalized
+
+
+def _get_classification_state_order(adata, state_col):
+    """Return the user-defined display order for `state_col`'s labels, or [] if none is set."""
+    if adata is None or not hasattr(adata, "uns"):
+        return []
+    classification_meta = adata.uns.get("classification", {})
+    if not isinstance(classification_meta, dict):
+        return []
+    state_order = classification_meta.get("state_order", {})
+    if not isinstance(state_order, dict):
+        return []
+    order = state_order.get(str(state_col), None)
+    if isinstance(order, (list, tuple)):
+        return [str(x) for x in order]
+    return []
+
+
+def _set_classification_state_order(adata, state_col, order):
+    """Persist a user-defined display order for `state_col`'s labels."""
+    if adata is None or not hasattr(adata, "uns"):
+        return []
+    classification_meta = adata.uns.get("classification", {})
+    if not isinstance(classification_meta, dict):
+        classification_meta = {}
+    state_order_map = classification_meta.get("state_order", {})
+    if not isinstance(state_order_map, dict):
+        state_order_map = {}
+    normalized = [str(x) for x in list(order or []) if str(x).strip() != ""]
+    state_order_map[str(state_col)] = normalized
+    classification_meta["state_order"] = state_order_map
+    adata.uns["classification"] = classification_meta
+    return normalized
+
+
+def _apply_state_order(labels, order):
+    """Sort `labels` by a stored display `order`.
+
+    Labels found in `order` come first, in that order; any label not in `order` (e.g. added
+    after the order was last saved) is appended afterwards, in its original relative order.
+    """
+    labels = [str(x) for x in list(labels or [])]
+    order = [str(x) for x in list(order or [])]
+    ranked = {label: i for i, label in enumerate(order)}
+    known = sorted((label for label in labels if label in ranked), key=lambda label: ranked[label])
+    unknown = [label for label in labels if label not in ranked]
+    return known + unknown
 
 
 def _require_columns(df, required_cols, context):

@@ -444,6 +444,29 @@ def analyze_active_killing_per_timepoint(
     return pd.DataFrame(killing_results)
 
 
+def find_advanced_features_csv(output_dir: Union[str, Path], cell_type: str) -> Optional[Path]:
+    """
+    Locate the active-killing advanced-features CSV for a cell type.
+
+    run_active_killing_analysis() writes into a per-target subfolder (the
+    target cell type name, or "combined" for multi-target runs), so this
+    searches analysis/<cell_type>/active_killing/*/ rather than assuming a
+    flat layout. Falls back to the legacy flat path for older runs. Returns
+    the most recently modified match, or None if none exist.
+    """
+    active_killing_dir = Path(output_dir) / "analysis" / cell_type / "active_killing"
+    if not active_killing_dir.exists():
+        return None
+    filename = f"BEHAV3D_{cell_type}_advanced_track_features.csv"
+    candidates = list(active_killing_dir.glob(f"*/{filename}"))
+    legacy = active_killing_dir / filename
+    if legacy.exists():
+        candidates.append(legacy)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
 def run_active_killing_analysis(
     metadata: pd.DataFrame,
     output_dir: Union[str, Path],

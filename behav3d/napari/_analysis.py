@@ -30,6 +30,7 @@ from qtpy.QtWidgets import (
     QScrollArea, QSpinBox, QDoubleSpinBox, QComboBox, QFrame, QSizePolicy,
     QToolButton, QMessageBox, QSplitter, QStackedWidget,
     QTreeWidget, QTreeWidgetItem, QMenu, QHeaderView,
+    QListWidget, QAbstractItemView,
 )
 from qtpy.QtCore import Qt, QUrl
 from qtpy.QtGui import QDesktopServices
@@ -344,9 +345,7 @@ class DeathDynamicsTab(QWidget):
 
     # ── UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
-        from behav3d.napari._guided import (
-            ModeSwitch, GuidedPanel, load_guided_mode,
-        )
+        from behav3d.napari._guided import GuidedPanel, make_back_header
         from behav3d.napari.analysis_guided_copy import (
             DEATH_DYNAMICS_ANALYSES, GUIDED_INTRO,
         )
@@ -355,12 +354,7 @@ class DeathDynamicsTab(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Guided / Advanced switch + stacked pages (Guided = 0, form = 1).
-        guided_default = load_guided_mode()
-        self._mode_switch = ModeSwitch(guided=guided_default)
-        self._mode_switch.modeChanged.connect(self._on_mode_changed)
-        outer.addWidget(self._mode_switch)
-
+        # Stacked pages: Guided overview (0), isolated settings form (1).
         self._stack = QStackedWidget()
         outer.addWidget(self._stack)
 
@@ -372,11 +366,17 @@ class DeathDynamicsTab(QWidget):
         )
         self._stack.addWidget(self._guided_panel)
 
-        # Page 1 — the existing settings form, wrapped verbatim.
+        # Page 1 — the existing settings form, wrapped verbatim, with a Back
+        # header above it. `_focus_step` shows only the group(s) relevant to
+        # whichever analysis Start was pressed for.
         form_page = QWidget()
         form_outer = QVBoxLayout(form_page)
         form_outer.setContentsMargins(0, 0, 0, 0)
         form_outer.setSpacing(0)
+        back_bar, self._focus_title = make_back_header(
+            on_back=lambda: self._stack.setCurrentIndex(0)
+        )
+        form_outer.addWidget(back_bar)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -419,6 +419,16 @@ class DeathDynamicsTab(QWidget):
         )
         self.dd_warning_label.setVisible(False)
         dd_lay.addWidget(self.dd_warning_label)
+
+        # ── Condition-column grouping (per-target Death Dynamics only) ──
+        # Lets the user group/color the mean +/- SEM plots by one or more
+        # metadata condition columns (e.g. organoid_line + macrophage_line),
+        # mirroring the state-composition "group by" multi-select.
+        dd_lay.addWidget(QLabel("Group plots by condition column(s):"))
+        self.list_dd_group_cols = QListWidget()
+        self.list_dd_group_cols.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_dd_group_cols.setMaximumHeight(70)
+        dd_lay.addWidget(self.list_dd_group_cols)
 
         dd_btn_row = QHBoxLayout()
         self.btn_run_dd_single = QPushButton("▶ Run Death Dynamics (per target)")
@@ -904,6 +914,9 @@ class DeathDynamicsTab(QWidget):
         layout.addWidget(self.inv_group)
 
         # ── Run All Available + Log ───────────────────────────────
+        # Wrapped in a container widget so it can be hidden as a unit while
+        # a single step is focused (running "all" doesn't make sense when
+        # only one step's settings are on screen).
         run_all_row = QHBoxLayout()
         self.btn_run_all = QPushButton("▶▶  Run All Available")
         self.btn_run_all.setStyleSheet(
@@ -913,7 +926,9 @@ class DeathDynamicsTab(QWidget):
         self.btn_run_all.clicked.connect(self._on_run_all_clicked)
         run_all_row.addWidget(self.btn_run_all, stretch=1)
         run_all_row.addWidget(self.btn_queue_all)
-        layout.addLayout(run_all_row)
+        self.run_all_container = QWidget()
+        self.run_all_container.setLayout(run_all_row)
+        layout.addWidget(self.run_all_container)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -927,30 +942,38 @@ class DeathDynamicsTab(QWidget):
         # Try a first build (in case metadata is already loaded)
         self._rebuild()
 
-        # Reveal the page matching the persisted mode.
-        self._stack.setCurrentIndex(0 if self._mode_switch.is_guided() else 1)
+        # Always land on the Guided overview; a specific analysis's settings
+        # are only reached via that analysis's Start button.
+        self._stack.setCurrentIndex(0)
 
-    # ── Guided / Advanced mode ─────────────────────────────────────────────
-    def _on_mode_changed(self, guided: bool):
-        from behav3d.napari._guided import save_guided_mode
-
-        self._stack.setCurrentIndex(0 if guided else 1)
-        save_guided_mode(guided)
-
+    # ── Guided overview / focused settings ──────────────────────────────────
     def _on_guided_start(self, analysis_id: str):
-        """Start from a Guided card: reveal the form and scroll to its step."""
-        from qtpy.QtCore import QTimer
+        """Start from a Guided card: show only that analysis's settings."""
+        self._focus_step(analysis_id)
+        self._stack.setCurrentIndex(1)
+        self._form_scroll.verticalScrollBar().setValue(0)
 
-        self._mode_switch.set_guided(False)  # → _on_mode_changed flips the page
-        group = {
-            "death_dynamics": getattr(self, "dd_group", None),
-            "interaction": getattr(self, "ia_group", None),
-            "invasiveness": getattr(self, "inv_group", None),
-        }.get(analysis_id)
-        if group is not None:
-            QTimer.singleShot(
-                0, lambda: self._form_scroll.ensureWidgetVisible(group)
-            )
+    def _focus_step(self, analysis_id: str):
+        """Show only the group(s) relevant to ``analysis_id``, hide the rest."""
+        from behav3d.napari.analysis_guided_copy import (
+            DEATH_DYNAMICS, INTERACTION, INVASIVENESS,
+        )
+
+        visible = {
+            "death_dynamics": {self.targets_group, self.dd_group},
+            "interaction": {self.targets_group, self.ia_group},
+            "invasiveness": {self.inv_group},
+        }.get(analysis_id, set())
+        for group in (self.targets_group, self.dd_group, self.ia_group, self.inv_group):
+            group.setVisible(group in visible)
+        self.run_all_container.setVisible(False)
+
+        title = {
+            "death_dynamics": DEATH_DYNAMICS["title"],
+            "interaction": INTERACTION["title"],
+            "invasiveness": INVASIVENESS["title"],
+        }.get(analysis_id, "")
+        self._focus_title.setText(title)
 
     def _style_primary(self, btn: QPushButton):
         btn.setStyleSheet(
@@ -996,6 +1019,7 @@ class DeathDynamicsTab(QWidget):
         ):
             self.targets_lay.addWidget(self._targets_placeholder)
             self.interaction_lay.addWidget(self._interaction_placeholder)
+            self.list_dd_group_cols.clear()
             self._refresh_button_states()
             return
 
@@ -1005,6 +1029,18 @@ class DeathDynamicsTab(QWidget):
         out_dir = Path(self.metadata_loader.output_dir)
         md = self.metadata_loader.metadata
         has_dead = _has_dead_channel(md)
+
+        # ---- Condition-column grouping options -----------------------
+        prev_selected = {item.text() for item in self.list_dd_group_cols.selectedItems()}
+        self.list_dd_group_cols.clear()
+        group_col_options = [
+            c for c in md.columns
+            if c in ("exp_nr", "well") or c.endswith("_line_condition")
+        ]
+        for col in group_col_options:
+            self.list_dd_group_cols.addItem(col)
+            if col in prev_selected:
+                self.list_dd_group_cols.item(self.list_dd_group_cols.count() - 1).setSelected(True)
 
         # ---- Target cells (organoid + other) -----------------------
         target_types = list(organoid_types) + list(other_types)
@@ -1765,6 +1801,9 @@ class DeathDynamicsTab(QWidget):
             return False
         out_dir_path = Path(self.metadata_loader.output_dir).expanduser()
         out_dir = str(out_dir_path)
+        selected_group_cols = [
+            item.text() for item in self.list_dd_group_cols.selectedItems()
+        ] or None
         any_ok = False
         for ct in cts:
             csv = _filtered_csv(out_dir_path, ct)
@@ -1790,6 +1829,7 @@ class DeathDynamicsTab(QWidget):
                     df_tracks_path=None,
                     org_type=ct,
                     metadata=self.metadata_loader.metadata,
+                    group_cols=selected_group_cols,
                     show_in_notebook=False,
                 )
                 self._log(f"✅ Death Dynamics complete for {ct}.")
@@ -2273,7 +2313,7 @@ class AnalysisTab(QWidget):
         # extraction/filtering work for every group.
         grouping_row = QHBoxLayout()
         grouping_row.setContentsMargins(6, 6, 6, 4)
-        self.btn_open_grouping = QPushButton("🧬  Cell type grouping…")
+        self.btn_open_grouping = QPushButton("🧬  Group cells together for analysis…")
         self.btn_open_grouping.setToolTip(
             "Merge several already-filtered cell types into a single "
             "'{name}_merged' population for Death Dynamics / Single Cell.\n"
@@ -2282,13 +2322,24 @@ class AnalysisTab(QWidget):
         )
         self.btn_open_grouping.setStyleSheet(
             "QPushButton { background:#1f3a5f; color:#bbdefb; font-weight:bold; "
-            "border:1px solid #64b5f6; border-radius:4px; padding:6px 12px; } "
+            "border:1px solid #64b5f6; border-radius:4px; padding:8px 14px; } "
             "QPushButton:hover { background:#2c4f7f; }"
             "QPushButton:disabled { color:#666; border-color:#444; }"
         )
         self.btn_open_grouping.clicked.connect(self._on_open_grouping_dialog)
         self.btn_open_grouping.setEnabled(False)
         grouping_row.addWidget(self.btn_open_grouping)
+        grouping_row.addWidget(HelpButton(
+            "Group cells together for analysis",
+            "Combine several already-filtered cell types (e.g. CD4 T cells + "
+            "CD8 T cells) into one merged population you can run Death "
+            "Dynamics / Single Cell on as a single group.\n\n"
+            "Each cell keeps its original type too — a new 'origin_cell_type' "
+            "column records which type it came from, so you can still split "
+            "or colour results by the original identity afterwards.\n\n"
+            "Your metadata.csv is never modified; only a new merged results "
+            "file is created.",
+        ))
         grouping_row.addStretch()
         main_lay.addLayout(grouping_row)
 

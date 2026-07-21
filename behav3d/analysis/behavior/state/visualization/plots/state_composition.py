@@ -4,8 +4,22 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Patch
 
-from behav3d.analysis.behavior.state.utils import _normalize_label_color_map
+from behav3d.analysis.behavior.state.utils import (
+    _apply_state_order,
+    _get_classification_state_order,
+    _normalize_label_color_map,
+)
+from behav3d.analysis.behavior.general.visualization.plots.proportion_bars import (
+    draw_thin_stacked_proportion_barh,
+    compute_condition_diff_stats_pairwise,
+    plot_condition_diff_grid,
+    plot_page_stacked_proportion_barh_grid,
+    stacked_proportion_barh_rows_per_page,
+    _resolve_effective_group_cols,
+    _make_group_label,
+)
 
 
 A4_PORTRAIT = (8.27, 11.69)
@@ -332,211 +346,6 @@ def _compute_overall_relative_composition_by_sample(
     return overall_by_sample
 
 
-def _build_color_map(labels, cmap_name="tab20"):
-    """Create deterministic label->color mapping."""
-    labels = [str(x) for x in list(labels)]
-    if len(labels) == 0:
-        return {}
-    cmap = plt.get_cmap(cmap_name)
-    if len(labels) <= getattr(cmap, "N", 256):
-        color_values = [cmap(i / max(len(labels) - 1, 1)) for i in range(len(labels))]
-    else:
-        hsv = plt.get_cmap("hsv")
-        color_values = [hsv(i / len(labels)) for i in range(len(labels))]
-    return {lab: color_values[i] for i, lab in enumerate(labels)}
-
-
-def _make_panel_grid(n_panels, ncols, figsize_per_panel, page_size=None):
-    """Create a dynamic subplot grid and return flattened axes."""
-    ncols = max(1, int(ncols))
-    nrows = int(np.ceil(float(n_panels) / float(ncols)))
-    figsize = page_size if page_size is not None else (figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows)
-    fig, axes = plt.subplots(
-        nrows=nrows,
-        ncols=ncols,
-        sharex=False,
-        figsize=figsize,
-    )
-    axes = np.atleast_1d(axes).ravel()
-    for i in range(n_panels, len(axes)):
-        axes[i].axis("off")
-    return fig, axes
-
-
-def _compute_count_matrix(panel_df, *, time_col, state_col, state_order):
-    """Build raw count state-composition matrix (time x state) for a panel."""
-    mat = (
-        panel_df.groupby([time_col, state_col], observed=True)
-        .size()
-        .unstack(fill_value=0)
-        .sort_index()
-    )
-    for state in state_order:
-        if state not in mat.columns:
-            mat[state] = 0
-    mat = mat[state_order]
-    return mat
-
-
-def _compute_count_matrices_by_sample(
-    df,
-    *,
-    time_col,
-    state_col,
-    sample_col,
-    state_order,
-    sample_order,
-):
-    """Compute per-sample and pooled raw count matrices."""
-    count_by_sample = {}
-    for sample in sample_order:
-        panel = df[df[sample_col] == sample]
-        count_by_sample[str(sample)] = _compute_count_matrix(
-            panel,
-            time_col=time_col,
-            state_col=state_col,
-            state_order=state_order,
-        )
-    count_pooled = _compute_count_matrix(
-        df,
-        time_col=time_col,
-        state_col=state_col,
-        state_order=state_order,
-    )
-    return count_by_sample, count_pooled
-
-
-def _compute_overall_count_by_sample(
-    df,
-    *,
-    state_col,
-    sample_col,
-    state_order,
-    sample_order,
-):
-    """Compute raw count per state per sample (pooled across time)."""
-    overall_by_sample = {}
-    for sample in sample_order:
-        panel = df[df[sample_col] == sample]
-        counts = panel[state_col].value_counts().reindex(state_order, fill_value=0).astype(int)
-        overall_by_sample[str(sample)] = counts
-    return overall_by_sample
-
-
-def _plot_overall_count_bar(ax, overall_counts, *, state_order, state_colors):
-    """Draw a narrow vertical stacked bar showing raw cell counts."""
-    total = float(sum(int(overall_counts.get(s, 0)) for s in state_order))
-    ylim_top = max(total * 1.1, 1.0)
-    bottom = 0.0
-    for state in state_order:
-        value = float(int(overall_counts.get(state, 0)))
-        ax.bar(
-            [0.0],
-            [value],
-            bottom=bottom,
-            width=0.8,
-            color=state_colors[state],
-            linewidth=0,
-        )
-        bottom += value
-    ax.set_ylim(0.0, ylim_top)
-    ax.set_xlim(-0.6, 0.6)
-    ax.set_xticks([])
-    ax.set_yticklabels([])
-    ax.set_xlabel("Overall", fontsize=7)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.tick_params(length=0)
-
-
-def _plot_page_count_stacked_grid(
-    count_by_sample,
-    *,
-    overall_count_by_sample,
-    state_order,
-    time_col,
-    sample_col,
-    grid_ncols,
-    figsize_per_panel,
-    state_colors,
-    sample_title_fontsize=8,
-    sample_title_pad=2,
-):
-    """One A4 page: absolute cell count stacked composition per sample (grid)."""
-    samples = list(count_by_sample.keys())
-    ncols = max(1, int(grid_ncols))
-    nrows = max(1, int(np.ceil(float(len(samples)) / float(ncols))))
-
-    all_maxes = []
-    for mat in count_by_sample.values():
-        if mat is not None and len(mat) > 0:
-            row_totals = mat.sum(axis=1)
-            if len(row_totals) > 0:
-                all_maxes.append(float(row_totals.max()))
-    global_ymax = max(all_maxes) * 1.1 if all_maxes else 1.0
-
-    fig = plt.figure(figsize=A4_PORTRAIT)
-    outer = GridSpec(nrows=nrows, ncols=ncols, figure=fig)
-    first_handles = []
-    first_labels = []
-
-    for i, sample in enumerate(samples):
-        inner = outer[i].subgridspec(1, 2, width_ratios=[8, 1], wspace=0.10)
-        ax = fig.add_subplot(inner[0, 0])
-        ax_bar = fig.add_subplot(inner[0, 1])
-        mat = count_by_sample[sample]
-        x = mat.index.to_numpy(dtype=float)
-        if len(x) == 0:
-            ax.set_title(
-                _wrap_title(sample) + "\n(empty)",
-                fontsize=sample_title_fontsize,
-                fontweight="bold",
-                pad=sample_title_pad,
-            )
-            ax.axis("off")
-            ax_bar.axis("off")
-            continue
-        y_arrays = [mat[state].to_numpy(dtype=float) for state in state_order]
-        colors = [state_colors[state] for state in state_order]
-        ax.stackplot(x, *y_arrays, labels=[str(s) for s in state_order], colors=colors, alpha=0.85)
-        ax.set_ylim(0.0, global_ymax)
-        ax.set_title(
-            _wrap_title(sample),
-            fontsize=sample_title_fontsize,
-            fontweight="bold",
-            pad=sample_title_pad,
-        )
-        ax.set_xlabel(time_col, fontsize=8)
-        ax.set_ylabel("Cell count", fontsize=8)
-        _pub_style_ax(ax)
-        _plot_overall_count_bar(
-            ax_bar,
-            overall_count_by_sample[sample],
-            state_order=state_order,
-            state_colors=state_colors,
-        )
-        if len(first_labels) == 0:
-            first_handles, first_labels = ax.get_legend_handles_labels()
-
-    for i in range(len(samples), nrows * ncols):
-        ax_empty = fig.add_subplot(outer[i])
-        ax_empty.axis("off")
-
-    if len(first_labels) > 0:
-        fig.legend(
-            first_handles,
-            first_labels,
-            loc="lower center",
-            ncol=min(len(first_labels), 8),
-            frameon=False,
-            fontsize=7,
-        )
-        fig.tight_layout(rect=(0.03, 0.07, 1, 0.93))
-    else:
-        fig.tight_layout(rect=(0.03, 0, 1, 0.93))
-    fig.suptitle("Absolute Cell Count (Stacked) by Sample", y=0.97, fontsize=12, fontweight="bold")
-    return fig
-
 
 def _compute_relative_auc_table(
     relative_by_sample,
@@ -631,31 +440,6 @@ def _paginate_samples(sample_names, samples_per_page=4):
         sample_names[i : i + samples_per_page]
         for i in range(0, len(sample_names), samples_per_page)
     ]
-
-
-def _compute_state_panel_ylims(
-    relative_by_sample,
-    *,
-    state_order,
-    headroom=0.10,
-    min_positive_ylim=0.05,
-):
-    """Compute per-state y-limits from the largest observed relative proportion."""
-    ylims = {}
-    for state in state_order:
-        max_value = 0.0
-        for mat in relative_by_sample.values():
-            if mat is None or len(mat) == 0 or state not in mat.columns:
-                continue
-            state_max = float(np.nanmax(mat[state].to_numpy(dtype=float))) if len(mat.index) > 0 else 0.0
-            if np.isfinite(state_max):
-                max_value = max(max_value, state_max)
-        if max_value <= 0.0:
-            ylims[str(state)] = (0.0, 1.0)
-            continue
-        y_max = min(1.0, max(max_value * (1.0 + float(headroom)), float(min_positive_ylim)))
-        ylims[str(state)] = (0.0, float(y_max))
-    return ylims
 
 
 def _plot_overall_summary_bar(ax, overall, *, state_order, state_colors, show_ylabel=False):
@@ -765,218 +549,93 @@ def _plot_page_relative_stacked_grid(
     return fig
 
 
-def _plot_page_nonstacked_state_lines_grid(
-    relative_by_sample,
+def save_state_condition_comparison_report(
+    adata,
+    output_pdf_path,
+    output_csv_path=None,
     *,
-    state_order,
-    time_col,
-    sample_col,
-    grid_ncols,
-    figsize_per_panel,
-    state_colors,
-    sample_title_fontsize=8,
-    sample_title_pad=2,
+    state_col="ClusterID",
+    sample_col="sample_name",
+    condition_col,
+    group_cols=None,
+    group_x=None,
+    state_order=None,
+    state_colors=None,
+    verbose=True,
 ):
-    """Page 2: non-stacked line plots by sample (one line per state)."""
-    samples = list(relative_by_sample.keys())
-    fig, axes = _make_panel_grid(len(samples), grid_ncols, figsize_per_panel)
-    for i, sample in enumerate(samples):
-        ax = axes[i]
-        mat = relative_by_sample[sample]
-        x = mat.index.to_numpy(dtype=float)
-        if len(x) == 0:
-            ax.set_title(
-                f"{sample_col}: {sample} (empty)",
-                fontsize=sample_title_fontsize,
-                pad=sample_title_pad,
-            )
-            ax.axis("off")
-            continue
-        for state in state_order:
-            ax.plot(
-                x,
-                mat[state].to_numpy(dtype=float),
-                color=state_colors[state],
-                linewidth=1.4,
-                alpha=0.9,
-                label=str(state),
-            )
-        ax.set_ylim(0.0, 1.0)
-        ax.set_title(
-            f"{sample_col}: {sample}",
-            fontsize=sample_title_fontsize,
-            pad=sample_title_pad,
-        )
-        ax.set_xlabel(time_col)
-        ax.set_ylabel("Proportion")
+    """Per-cluster overall (pooled, non-per-timepoint) proportion difference between every
+    pairwise combination of `condition_col`'s levels, with Welch's two-sided unpaired t-test
+    significance stars — one row per pairwise comparison, one column per group, optionally
+    split into multiple groups (columns) via `group_x`/`group_cols`.
 
-    fig.subplots_adjust(hspace=0.35)
-    handles, labels = axes[0].get_legend_handles_labels() if len(samples) > 0 else ([], [])
-    if len(labels) > 0:
-        fig.legend(
-            handles,
-            labels,
-            loc="lower center",
-            ncol=min(len(labels), 8),
-            frameon=False,
+    diff = mean of the second level minus mean of the first level in each pair.
+    """
+    obs = adata.obs
+    effective_group_cols, _ = _resolve_effective_group_cols(group_cols, group_x, None)
+    valid_group_cols = [c for c in effective_group_cols if c in obs.columns]
+    required = [state_col, sample_col, condition_col] + valid_group_cols
+    missing = [c for c in required if c not in obs.columns]
+    if len(missing) > 0:
+        raise KeyError(f"Missing required columns in adata.obs: {missing}")
+
+    df = obs[required].dropna(subset=[state_col, sample_col, condition_col]).copy()
+    df[state_col] = df[state_col].astype(str)
+    df[sample_col] = df[sample_col].astype(str)
+    df[condition_col] = df[condition_col].astype(str)
+    for gc in valid_group_cols:
+        df[gc] = df[gc].astype(str)
+    if len(df) == 0:
+        raise ValueError("No valid rows remain after filtering NaNs in required columns.")
+
+    observed_states = df[state_col].value_counts().index.tolist()
+    if state_order is None:
+        resolved_state_order = _apply_state_order(
+            [str(s) for s in observed_states], _get_classification_state_order(adata, state_col)
         )
-        fig.tight_layout(rect=(0, 0.06, 1, 1))
     else:
-        fig.tight_layout()
-    fig.suptitle("Relative State Composition (Non-Stacked Lines) by Sample", y=0.998, fontsize=12)
-    return fig
+        resolved_state_order = [str(s) for s in list(state_order)]
+        extras = [s for s in observed_states if str(s) not in resolved_state_order]
+        resolved_state_order.extend(extras)
 
+    sample_order = df[sample_col].drop_duplicates().tolist()
 
-def _plot_nonstacked_state_lines_page(
-    relative_by_sample,
-    *,
-    overall_by_sample,
-    state_order,
-    time_col,
-    sample_col,
-    state_colors,
-    sample_title_fontsize=8,
-    sample_title_pad=2,
-    page_size=A4_PORTRAIT,
-):
-    """Render one A4 portrait page with one sample panel per row (non-stacked lines)."""
-    samples = list(relative_by_sample.keys())
-    nrows = max(len(samples), 1)
-    fig = plt.figure(figsize=page_size)
-    outer = GridSpec(nrows=nrows, ncols=1, figure=fig)
-    first_handles = []
-    first_labels = []
+    overall_by_sample = _compute_overall_relative_composition_by_sample(
+        df,
+        state_col=state_col,
+        sample_col=sample_col,
+        state_order=resolved_state_order,
+        sample_order=sample_order,
+    )
+    per_sample_df = pd.DataFrame(overall_by_sample).T.reindex(columns=resolved_state_order, fill_value=0.0)
 
-    for i, sample in enumerate(samples):
-        inner = outer[i].subgridspec(1, 2, width_ratios=[8, 1], wspace=0.10)
-        ax = fig.add_subplot(inner[0, 0])
-        ax_bar = fig.add_subplot(inner[0, 1], sharey=ax)
-        mat = relative_by_sample[sample]
-        x = mat.index.to_numpy(dtype=float)
-        if len(x) == 0:
-            ax.set_title(
-                _wrap_title(sample) + "\n(empty)",
-                fontsize=sample_title_fontsize,
-                fontweight="bold",
-                pad=sample_title_pad,
-            )
-            ax.axis("off")
-            ax_bar.axis("off")
-            continue
-        for state in state_order:
-            ax.plot(
-                x,
-                mat[state].to_numpy(dtype=float),
-                color=state_colors[state],
-                linewidth=1.5,
-                alpha=0.9,
-                label=str(state),
-            )
-        ax.set_ylim(0.0, 1.0)
-        ax.set_title(
-            _wrap_title(sample),
-            fontsize=sample_title_fontsize,
-            fontweight="bold",
-            pad=sample_title_pad,
-        )
-        ax.set_xlabel(time_col, fontsize=8)
-        ax.set_ylabel("Proportion", fontsize=8)
-        _pub_style_ax(ax)
-        _plot_overall_summary_bar(
-            ax_bar,
-            overall_by_sample[sample],
-            state_order=state_order,
-            state_colors=state_colors,
-        )
-        if len(first_labels) == 0:
-            first_handles, first_labels = ax.get_legend_handles_labels()
+    metadata_cols = [sample_col, condition_col] + valid_group_cols
+    sample_metadata = (
+        df[metadata_cols].drop_duplicates(subset=[sample_col]).set_index(sample_col)
+    )
 
-    if len(first_labels) > 0:
-        fig.legend(
-            first_handles,
-            first_labels,
-            loc="lower center",
-            ncol=min(len(first_labels), 8),
-            frameon=False,
-            fontsize=7,
-        )
-        fig.tight_layout(rect=(0.03, 0.07, 1, 0.93))
-    else:
-        fig.tight_layout(rect=(0.03, 0, 1, 0.93))
-    fig.suptitle("Relative State Composition (Non-Stacked Lines) by Sample", y=0.97, fontsize=12, fontweight="bold")
-    return fig
+    resolved_colors = _normalize_label_color_map(resolved_state_order, colors=state_colors, cmap_name="tab20")
 
+    diff_stats_by_group = compute_condition_diff_stats_pairwise(
+        per_sample_df,
+        sample_metadata,
+        class_order=resolved_state_order,
+        condition_col=condition_col,
+        group_cols=valid_group_cols,
+    )
 
-def _plot_page_per_state_sample_lines_grid(
-    relative_by_sample,
-    *,
-    state_order,
-    time_col,
-    sample_col,
-    grid_ncols,
-    figsize_per_panel,
-    sample_colors,
-    state_ylims=None,
-):
-    """One A4 page: one panel per state, with sample-colored lines."""
-    fig, axes = _make_panel_grid(len(state_order), grid_ncols, figsize_per_panel, page_size=A4_PORTRAIT)
-    samples = list(relative_by_sample.keys())
-    for i, state in enumerate(state_order):
-        ax = axes[i]
-        for sample in samples:
-            mat = relative_by_sample[sample]
-            x = mat.index.to_numpy(dtype=float)
-            if len(x) == 0:
-                continue
-            ax.plot(
-                x,
-                mat[state].to_numpy(dtype=float),
-                color=sample_colors[sample],
-                linewidth=1.5,
-                alpha=0.9,
-                label=str(sample),
-            )
-        if isinstance(state_ylims, dict) and str(state) in state_ylims:
-            ax.set_ylim(*state_ylims[str(state)])
-        else:
-            ax.set_ylim(0.0, 1.0)
-        ax.set_title(f"{state}", fontweight="bold")
-        ax.set_xlabel(time_col, fontsize=8)
-        ax.set_ylabel("Proportion", fontsize=8)
-        _pub_style_ax(ax)
-
-    handles, labels = axes[0].get_legend_handles_labels() if len(state_order) > 0 else ([], [])
-    if len(labels) > 0:
-        fig.legend(
-            handles,
-            labels,
-            loc="lower center",
-            ncol=min(len(labels), 8),
-            frameon=False,
-            title=sample_col,
-            fontsize=7,
-            title_fontsize=7,
-        )
-        fig.tight_layout(rect=(0.03, 0.07, 1, 0.93))
-    else:
-        fig.tight_layout(rect=(0.03, 0, 1, 0.93))
-    fig.suptitle("Per-State Relative Composition — Sample Lines", y=0.97, fontsize=12, fontweight="bold")
-    return fig
-
-
-def _make_group_label(df, group_cols):
-    """Return a Series of concatenated group-column values (index aligned with df)."""
-    parts = []
-    for col in group_cols:
-        if col in df.columns:
-            parts.append(df[col].fillna("(unknown)").astype(str))
-        else:
-            parts.append(pd.Series(["(unknown)"] * len(df), index=df.index))
-    if len(parts) == 0:
-        return pd.Series(["(all)"] * len(df), index=df.index)
-    result = parts[0]
-    for p in parts[1:]:
-        result = result + " | " + p
+    output_pdf_path = Path(output_pdf_path)
+    output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    title = f"{state_col} — {condition_col} pairwise comparison"
+    result = plot_condition_diff_grid(
+        diff_stats_by_group,
+        class_order=resolved_state_order,
+        colors=resolved_colors,
+        title=title,
+        out_pdf=output_pdf_path,
+        out_csv=output_csv_path,
+    )
+    if bool(verbose):
+        print(f"Saved condition comparison report: {result['pdf_path']}")
     return result
 
 
@@ -1012,35 +671,6 @@ def _compute_grouped_relative_matrices(
 
     return relative_by_group, overall_by_group
 
-
-def _compute_grouped_count_matrices(
-    df,
-    *,
-    group_cols,
-    time_col,
-    state_col,
-    state_order,
-):
-    """Compute raw count matrices per unique group label."""
-    group_labels = _make_group_label(df, group_cols)
-    tmp = df.copy()
-    tmp["_group_label"] = group_labels.values
-    unique_groups = tmp["_group_label"].dropna().unique().tolist()
-
-    count_by_group = {}
-    overall_count_by_group = {}
-    for grp in unique_groups:
-        panel = tmp[tmp["_group_label"] == grp]
-        count_by_group[str(grp)] = _compute_count_matrix(
-            panel,
-            time_col=time_col,
-            state_col=state_col,
-            state_order=state_order,
-        )
-        counts = panel[state_col].value_counts().reindex(state_order, fill_value=0).astype(int)
-        overall_count_by_group[str(grp)] = counts
-
-    return count_by_group, overall_count_by_group
 
 
 def _plot_page_grouped_stacked_grid(
@@ -1118,92 +748,6 @@ def _plot_page_grouped_stacked_grid(
     return fig
 
 
-def _plot_page_grouped_count_stacked_grid(
-    count_by_group,
-    *,
-    overall_count_by_group,
-    state_order,
-    time_col,
-    group_label_title,
-    grid_ncols,
-    figsize_per_panel,
-    state_colors,
-    global_ymax=None,
-    sample_title_fontsize=8,
-    sample_title_pad=2,
-):
-    """One A4 page: absolute cell count stacked composition per group (flat grid, for 3+ group_cols)."""
-    groups = list(count_by_group.keys())
-    ncols = max(1, int(grid_ncols))
-    nrows = max(1, int(np.ceil(float(len(groups)) / float(ncols))))
-
-    if global_ymax is None:
-        all_maxes = []
-        for mat in count_by_group.values():
-            if mat is not None and len(mat) > 0:
-                row_totals = mat.sum(axis=1)
-                if len(row_totals) > 0:
-                    all_maxes.append(float(row_totals.max()))
-        global_ymax = max(all_maxes) * 1.1 if all_maxes else 1.0
-
-    fig = plt.figure(figsize=A4_PORTRAIT)
-    outer = GridSpec(nrows=nrows, ncols=ncols, figure=fig)
-    first_handles = []
-    first_labels = []
-
-    for i, grp in enumerate(groups):
-        inner = outer[i].subgridspec(1, 2, width_ratios=[8, 1], wspace=0.10)
-        ax = fig.add_subplot(inner[0, 0])
-        ax_bar = fig.add_subplot(inner[0, 1])
-        mat = count_by_group[grp]
-        x = mat.index.to_numpy(dtype=float)
-        if len(x) == 0:
-            ax.set_title(f"{grp} (empty)", fontsize=sample_title_fontsize, fontweight="bold", pad=sample_title_pad)
-            ax.axis("off")
-            ax_bar.axis("off")
-            continue
-        y_arrays = [mat[state].to_numpy(dtype=float) for state in state_order]
-        colors = [state_colors[state] for state in state_order]
-        ax.stackplot(x, *y_arrays, labels=[str(s) for s in state_order], colors=colors, alpha=0.85)
-        ax.set_ylim(0.0, global_ymax)
-        ax.set_title(grp, fontsize=sample_title_fontsize, fontweight="bold", pad=sample_title_pad)
-        ax.set_xlabel(time_col, fontsize=8)
-        ax.set_ylabel("Cell count", fontsize=8)
-        _pub_style_ax(ax)
-        _plot_overall_count_bar(
-            ax_bar,
-            overall_count_by_group[grp],
-            state_order=state_order,
-            state_colors=state_colors,
-        )
-        if len(first_labels) == 0:
-            first_handles, first_labels = ax.get_legend_handles_labels()
-
-    for i in range(len(groups), nrows * ncols):
-        ax_empty = fig.add_subplot(outer[i])
-        ax_empty.axis("off")
-
-    if len(first_labels) > 0:
-        fig.legend(
-            first_handles,
-            first_labels,
-            loc="lower center",
-            ncol=min(len(first_labels), 8),
-            frameon=False,
-            fontsize=7,
-        )
-        fig.tight_layout(rect=(0.03, 0.07, 1, 0.93))
-    else:
-        fig.tight_layout(rect=(0.03, 0, 1, 0.93))
-    fig.suptitle(
-        f"Grouped Absolute Cell Count — {group_label_title}",
-        y=0.97,
-        fontsize=12,
-        fontweight="bold",
-    )
-    return fig
-
-
 def _plot_page_grouped_2d_grid(
     data_by_group,
     *,
@@ -1214,25 +758,28 @@ def _plot_page_grouped_2d_grid(
     time_col,
     group_label_title,
     state_colors,
-    mode="relative",
-    global_ymax=None,
     row_slice=None,
+    axis_cols=None,
     sample_title_fontsize=8,
     sample_title_pad=2,
     page_size=A4_PORTRAIT,
 ):
     """
-    One A4 page: grouped state composition arranged in a 2D grid.
+    One A4 page: grouped relative state composition arranged in a 2D grid.
 
     For 1 group_col: single column of panels, one row per unique value.
-    For 2 group_cols: the column with more unique values goes to rows (Y),
-    the column with fewer unique values goes to columns (X), with header
-    labels on each axis. row_slice=(start, end) selects a subset of Y rows
-    for pagination.
+    For 2 group_cols: by default the column with more unique values goes to
+    rows (Y) and the column with fewer unique values goes to columns (X);
+    pass ``axis_cols=(col_y, col_x)`` to pick the axes explicitly instead.
+    Header labels are drawn on each axis. row_slice=(start, end) selects a
+    subset of Y rows for pagination.
     """
     if len(group_cols) == 2:
-        # Assign high-cardinality column to rows for A4 portrait fit
-        col_y, col_x = sorted(group_cols, key=lambda c: -len(unique_vals_per_col[c]))
+        if axis_cols is not None:
+            col_y, col_x = axis_cols
+        else:
+            # Assign high-cardinality column to rows for A4 portrait fit
+            col_y, col_x = sorted(group_cols, key=lambda c: -len(unique_vals_per_col[c]))
         col_x_vals = unique_vals_per_col[col_x]
         col_y_vals_all = unique_vals_per_col[col_y]
         if row_slice is not None:
@@ -1313,36 +860,22 @@ def _plot_page_grouped_2d_grid(
                 colors = [state_colors[state] for state in state_order]
                 ax.stackplot(x, *y_arrays, labels=[str(s) for s in state_order], colors=colors, alpha=0.85)
 
-                if mode == "relative":
-                    ax.set_ylim(0.0, 1.0)
-                    ax.set_ylabel("Proportion", fontsize=7)
-                else:
-                    ymax = global_ymax if global_ymax is not None else 1.0
-                    ax.set_ylim(0.0, ymax)
-                    ax.set_ylabel("Cell count", fontsize=7)
+                ax.set_ylim(0.0, 1.0)
+                ax.set_ylabel("Proportion", fontsize=7)
 
                 ax.set_xlabel(time_col, fontsize=7)
                 _pub_style_ax(ax)
                 ax.tick_params(labelsize=6)
 
-                if mode == "relative":
-                    _plot_overall_summary_bar(
-                        ax_bar, overall_by_group[key],
-                        state_order=state_order, state_colors=state_colors,
-                    )
-                else:
-                    _plot_overall_count_bar(
-                        ax_bar, overall_by_group[key],
-                        state_order=state_order, state_colors=state_colors,
-                    )
+                _plot_overall_summary_bar(
+                    ax_bar, overall_by_group[key],
+                    state_order=state_order, state_colors=state_colors,
+                )
 
                 if len(first_labels) == 0:
                     first_handles, first_labels = ax.get_legend_handles_labels()
 
-        mode_label = "Relative State Composition" if mode == "relative" else "Absolute Cell Count"
-        title_str = (
-            f"Grouped {mode_label} — {col_x} (columns) × {col_y} (rows)"
-        )
+        title_str = f"Grouped Relative State Composition — {col_x} (columns) × {col_y} (rows)"
         if row_slice is not None and row_slice[0] > 0:
             total_rows = len(col_y_vals_all)
             title_str += f"\n(rows {row_slice[0]+1}–{row_slice[1]} of {total_rows})"
@@ -1386,34 +919,22 @@ def _plot_page_grouped_2d_grid(
             colors = [state_colors[state] for state in state_order]
             ax.stackplot(x, *y_arrays, labels=[str(s) for s in state_order], colors=colors, alpha=0.85)
 
-            if mode == "relative":
-                ax.set_ylim(0.0, 1.0)
-                ax.set_ylabel("Proportion", fontsize=8)
-            else:
-                ymax = global_ymax if global_ymax is not None else 1.0
-                ax.set_ylim(0.0, ymax)
-                ax.set_ylabel("Cell count", fontsize=8)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_ylabel("Proportion", fontsize=8)
 
             ax.set_title(f"{col_y}: {col_y_val}", fontsize=sample_title_fontsize, fontweight="bold", pad=sample_title_pad)
             ax.set_xlabel(time_col, fontsize=8)
             _pub_style_ax(ax)
 
-            if mode == "relative":
-                _plot_overall_summary_bar(
-                    ax_bar, overall_by_group[key],
-                    state_order=state_order, state_colors=state_colors,
-                )
-            else:
-                _plot_overall_count_bar(
-                    ax_bar, overall_by_group[key],
-                    state_order=state_order, state_colors=state_colors,
-                )
+            _plot_overall_summary_bar(
+                ax_bar, overall_by_group[key],
+                state_order=state_order, state_colors=state_colors,
+            )
 
             if len(first_labels) == 0:
                 first_handles, first_labels = ax.get_legend_handles_labels()
 
-        mode_label = "Relative State Composition" if mode == "relative" else "Absolute Cell Count"
-        title_str = f"Grouped {mode_label} — {group_label_title}"
+        title_str = f"Grouped Relative State Composition — {group_label_title}"
         if row_slice is not None and row_slice[0] > 0:
             total_rows = len(col_y_vals_all)
             title_str += f"\n(groups {row_slice[0]+1}–{row_slice[1]} of {total_rows})"
@@ -1452,9 +973,14 @@ def save_state_composition_report(
     sample_title_fontsize: float = 8,
     sample_title_pad: float = 2,
     group_cols=None,
+    group_x=None,
+    group_y=None,
 ):
     """
     Save a combined multi-page PDF report + merged plot-data CSV for relative state composition.
+
+    ``group_x``/``group_y`` explicitly pick the grouped-grid's axes; ``group_cols``
+    is the "group per page" column list (unaffected in meaning).
 
     Outputs:
       1) one combined PDF with all report pages
@@ -1477,6 +1003,7 @@ def save_state_composition_report(
     output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
     output_auc_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
+    _state_order_explicit = state_order is not None
     df, state_order, sample_order = _prepare_state_composition_df(
         adata,
         time_col=time_col,
@@ -1484,6 +1011,8 @@ def save_state_composition_report(
         sample_col=sample_col,
         state_order=state_order,
     )
+    if not _state_order_explicit:
+        state_order = _apply_state_order(state_order, _get_classification_state_order(adata, state_col))
 
     relative_by_sample, relative_pooled = _compute_relative_matrices_by_sample(
         df,
@@ -1501,32 +1030,28 @@ def save_state_composition_report(
         sample_order=sample_order,
     )
 
-    count_by_sample, _count_pooled = _compute_count_matrices_by_sample(
-        df,
-        time_col=time_col,
-        state_col=state_col,
-        sample_col=sample_col,
-        state_order=state_order,
-        sample_order=sample_order,
-    )
-    overall_count_by_sample = _compute_overall_count_by_sample(
-        df,
-        state_col=state_col,
-        sample_col=sample_col,
-        state_order=state_order,
-        sample_order=sample_order,
+    effective_group_cols, requested_axis_cols = _resolve_effective_group_cols(
+        group_cols, group_x, group_y,
     )
 
     valid_group_cols = []
-    if group_cols:
+    if effective_group_cols:
         obs_cols_available = list(adata.obs.columns)
-        for gc in group_cols:
+        for gc in effective_group_cols:
             if gc in obs_cols_available:
                 valid_group_cols.append(gc)
                 df[gc] = adata.obs.loc[df.index, gc].astype(str).fillna("(unknown)").values
             else:
                 if verbose:
                     print(f"  Warning: group_col '{gc}' not found in adata.obs — skipping.")
+
+    axis_cols = (
+        requested_axis_cols
+        if requested_axis_cols is not None
+        and requested_axis_cols[0] in valid_group_cols
+        and requested_axis_cols[1] in valid_group_cols
+        else None
+    )
 
     auc_table = _compute_relative_auc_table(
         relative_by_sample,
@@ -1541,29 +1066,16 @@ def save_state_composition_report(
         colors=state_colors,
         cmap_name="tab20",
     )
-    sample_colors = _build_color_map(sample_order, cmap_name="tab20")
-    per_state_ylim_headroom = 0.10
-
     # Pagination: compute how many panels fit on one A4 page
     panels_per_page, ncols_eff, max_rows = _panels_per_a4_page(grid_ncols)
-    nonstacked_samples_per_page = min(4, max_rows)
 
     relative_by_group = {}
     overall_by_group = {}
-    count_by_group = {}
-    overall_count_by_group = {}
     group_label_title = ""
     unique_vals_per_col = {}
     if len(valid_group_cols) > 0:
         group_label_title = ", ".join(valid_group_cols)
         relative_by_group, overall_by_group = _compute_grouped_relative_matrices(
-            df,
-            group_cols=valid_group_cols,
-            time_col=time_col,
-            state_col=state_col,
-            state_order=state_order,
-        )
-        count_by_group, overall_count_by_group = _compute_grouped_count_matrices(
             df,
             group_cols=valid_group_cols,
             time_col=time_col,
@@ -1576,22 +1088,18 @@ def save_state_composition_report(
                     df[col].astype(str).dropna().unique().tolist()
                 )
 
-    # Pre-compute global y-max for grouped count pages
-    _grp_count_maxes = [
-        float(mat.sum(axis=1).max())
-        for mat in count_by_group.values()
-        if mat is not None and len(mat) > 0 and len(mat.sum(axis=1)) > 0
-    ]
-    global_group_ymax = max(_grp_count_maxes) * 1.1 if _grp_count_maxes else 1.0
-
     with PdfPages(merged_pdf_path) as pdf:
         # --- Grouped pages (when group_cols provided) ---
         if len(valid_group_cols) > 0:
             if len(valid_group_cols) in (1, 2):
                 # 2D grid layout with pagination on the Y (row) axis
-                col_y_vals = unique_vals_per_col[
-                    max(valid_group_cols, key=lambda c: len(unique_vals_per_col[c]))
-                ] if len(valid_group_cols) == 2 else unique_vals_per_col[valid_group_cols[0]]
+                if len(valid_group_cols) == 2:
+                    row_col = axis_cols[0] if axis_cols is not None else max(
+                        valid_group_cols, key=lambda c: len(unique_vals_per_col[c])
+                    )
+                    col_y_vals = unique_vals_per_col[row_col]
+                else:
+                    col_y_vals = unique_vals_per_col[valid_group_cols[0]]
 
                 for row_start in range(0, max(1, len(col_y_vals)), max_rows):
                     row_end = min(row_start + max_rows, len(col_y_vals))
@@ -1606,31 +1114,13 @@ def save_state_composition_report(
                         time_col=time_col,
                         group_label_title=group_label_title,
                         state_colors=state_colors,
-                        mode="relative",
                         row_slice=_rs,
+                        axis_cols=axis_cols,
                         sample_title_fontsize=sample_title_fontsize,
                         sample_title_pad=sample_title_pad,
                     )
                     pdf.savefig(fig_g, dpi=dpi)
                     plt.close(fig_g)
-
-                    fig_g_cnt = _plot_page_grouped_2d_grid(
-                        count_by_group,
-                        overall_by_group=overall_count_by_group,
-                        group_cols=valid_group_cols,
-                        unique_vals_per_col=unique_vals_per_col,
-                        state_order=state_order,
-                        time_col=time_col,
-                        group_label_title=group_label_title,
-                        state_colors=state_colors,
-                        mode="count",
-                        global_ymax=global_group_ymax,
-                        row_slice=_rs,
-                        sample_title_fontsize=sample_title_fontsize,
-                        sample_title_pad=sample_title_pad,
-                    )
-                    pdf.savefig(fig_g_cnt, dpi=dpi)
-                    plt.close(fig_g_cnt)
 
             else:
                 # 3+ group_cols: flat grid, paginated
@@ -1653,24 +1143,21 @@ def save_state_composition_report(
                     pdf.savefig(fig_flat, dpi=dpi)
                     plt.close(fig_flat)
 
-                for page_groups in _chunk_list(group_keys, panels_per_page):
-                    page_cnt = {k: count_by_group[k] for k in page_groups}
-                    page_overall_cnt = {k: overall_count_by_group[k] for k in page_groups}
-                    fig_flat_cnt = _plot_page_grouped_count_stacked_grid(
-                        page_cnt,
-                        overall_count_by_group=page_overall_cnt,
-                        state_order=state_order,
-                        time_col=time_col,
-                        group_label_title=group_label_title,
-                        grid_ncols=ncols_eff,
-                        figsize_per_panel=figsize_per_panel,
-                        state_colors=state_colors,
-                        global_ymax=global_group_ymax,
-                        sample_title_fontsize=sample_title_fontsize,
-                        sample_title_pad=sample_title_pad,
-                    )
-                    pdf.savefig(fig_flat_cnt, dpi=dpi)
-                    plt.close(fig_flat_cnt)
+            # --- Grouped overall relative composition — horizontal bars ---
+            group_row_order = list(overall_by_group.keys())
+            rows_per_page = stacked_proportion_barh_rows_per_page()
+            for page_groups in _chunk_list(group_row_order, rows_per_page):
+                page_overall_g = {g: overall_by_group[g] for g in page_groups}
+                fig_group_overall_h = plot_page_stacked_proportion_barh_grid(
+                    page_overall_g,
+                    row_order=page_groups,
+                    class_order=state_order,
+                    colors=state_colors,
+                    title=f"Grouped Overall Relative State Composition — {group_label_title}",
+                    row_label_fontsize=sample_title_fontsize,
+                )
+                pdf.savefig(fig_group_overall_h, dpi=dpi)
+                plt.close(fig_group_overall_h)
 
         # --- Per-sample relative stacked grid (paginated) ---
         for page_samples in _paginate_samples(sample_order, samples_per_page=panels_per_page):
@@ -1691,61 +1178,20 @@ def save_state_composition_report(
             pdf.savefig(fig1, dpi=dpi)
             plt.close(fig1)
 
-        # --- Per-sample absolute count stacked grid (paginated) ---
-        for page_samples in _paginate_samples(sample_order, samples_per_page=panels_per_page):
-            page_cnt = {s: count_by_sample[s] for s in page_samples if s in count_by_sample}
-            page_overall_cnt = {s: overall_count_by_sample[s] for s in page_samples if s in overall_count_by_sample}
-            fig_counts = _plot_page_count_stacked_grid(
-                page_cnt,
-                overall_count_by_sample=page_overall_cnt,
-                state_order=state_order,
-                time_col=time_col,
-                sample_col=sample_col,
-                grid_ncols=ncols_eff,
-                figsize_per_panel=figsize_per_panel,
-                state_colors=state_colors,
-                sample_title_fontsize=sample_title_fontsize,
-                sample_title_pad=sample_title_pad,
-            )
-            pdf.savefig(fig_counts, dpi=dpi)
-            plt.close(fig_counts)
-
-        # --- Non-stacked per-sample line plots (paginated, max 4 per page) ---
-        for page_samples in _paginate_samples(sample_order, samples_per_page=nonstacked_samples_per_page):
-            page_relative = {s: relative_by_sample[s] for s in page_samples if s in relative_by_sample}
+        # --- Overall relative composition — horizontal bars, all samples (paginated) ---
+        rows_per_page = stacked_proportion_barh_rows_per_page()
+        for page_samples in _chunk_list(sample_order, rows_per_page):
             page_overall = {s: overall_by_sample[s] for s in page_samples if s in overall_by_sample}
-            fig2 = _plot_nonstacked_state_lines_page(
-                page_relative,
-                overall_by_sample=page_overall,
-                state_order=state_order,
-                time_col=time_col,
-                sample_col=sample_col,
-                state_colors=state_colors,
-                sample_title_fontsize=sample_title_fontsize,
-                sample_title_pad=sample_title_pad,
+            fig_overall_h = plot_page_stacked_proportion_barh_grid(
+                page_overall,
+                row_order=page_samples,
+                class_order=state_order,
+                colors=state_colors,
+                title="Overall Relative State Composition — All Samples",
+                row_label_fontsize=sample_title_fontsize,
             )
-            pdf.savefig(fig2, dpi=dpi)
-            plt.close(fig2)
-
-        # --- Per-state lines colored by sample (paginated) ---
-        state_ylims = _compute_state_panel_ylims(
-            relative_by_sample,
-            state_order=state_order,
-            headroom=per_state_ylim_headroom,
-        )
-        for page_states in _chunk_list(state_order, panels_per_page):
-            fig3 = _plot_page_per_state_sample_lines_grid(
-                relative_by_sample,
-                state_order=page_states,
-                time_col=time_col,
-                sample_col=sample_col,
-                grid_ncols=ncols_eff,
-                figsize_per_panel=figsize_per_panel,
-                sample_colors=sample_colors,
-                state_ylims=state_ylims,
-            )
-            pdf.savefig(fig3, dpi=dpi)
-            plt.close(fig3)
+            pdf.savefig(fig_overall_h, dpi=dpi)
+            plt.close(fig_overall_h)
 
     merged_plot_data = pd.concat(
         [
@@ -1754,15 +1200,6 @@ def save_state_composition_report(
             ),
             _build_overall_summary_plot_data_table(overall_by_sample, plot_view="stacked_by_sample").assign(
                 plot_component="overall_summary"
-            ),
-            _build_relative_plot_data_table(relative_by_sample, plot_view="nonstacked_by_sample").assign(
-                plot_component="timecourse"
-            ),
-            _build_overall_summary_plot_data_table(overall_by_sample, plot_view="nonstacked_by_sample").assign(
-                plot_component="overall_summary"
-            ),
-            _build_relative_plot_data_table(relative_by_sample, plot_view="per_state_by_sample").assign(
-                plot_component="timecourse"
             ),
         ],
         ignore_index=True,

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('behav3d/widgets/state_classification.py'\\).read\\(\\)\\)\")"
+    ]
+  }
+}

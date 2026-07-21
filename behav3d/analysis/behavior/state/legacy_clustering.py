@@ -55,6 +55,7 @@ from behav3d.analysis.behavior.state.utils import (
     _resolve_positions_csv_path,
     _resolve_state_paths,
     _resolve_state_stage_paths,
+    _save_adata_obs_csv,
     _save_pdf_page_a4,
     _sanitize_filename_token,
     _to_numpy_2d,
@@ -1937,8 +1938,10 @@ def apply_state_classifiers_to_full_dataset(
 
     write_started = _vstart(verbose, "state-apply", "write classified full adata")
     adata_full.write(state_paths.full_output_adata_path, compression="gzip")
+    full_output_csv_path = _save_adata_obs_csv(adata_full, state_paths.full_output_adata_path)
     _vdone(verbose, "state-apply", "write classified full adata", write_started)
     _vsave(verbose, "state-apply", "classified full adata", state_paths.full_output_adata_path)
+    _vsave(verbose, "state-apply", "classified full adata csv", full_output_csv_path)
     n_rows = int(adata_full.n_obs)
     n_intrinsic = int(
         adata_full.obs["intrinsic_behavioral_cluster"].astype(str).nunique()

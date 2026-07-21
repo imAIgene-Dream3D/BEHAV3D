@@ -376,16 +376,57 @@ def _build_track_cluster_lookup(adata_tracks, sample_col="sample_name", track_co
     if any(col not in adata_tracks.obs.columns for col in required_cols):
         return {}
 
-    obs = adata_tracks.obs[required_cols].copy()
+    window_cols = [c for c in ["position_t_min", "position_t_max"] if c in adata_tracks.obs.columns]
+    obs = adata_tracks.obs[required_cols + window_cols].copy()
     obs["__sample"] = obs[str(sample_col)].astype("string").str.strip()
     obs["__track"] = obs[str(track_col)].map(_normalize_track_id_key)
     obs["__cluster"] = obs[str(cluster_col)].astype("string").str.strip()
     obs = obs.dropna(subset=["__sample", "__track", "__cluster"]).copy()
     obs = obs[(obs["__sample"] != "") & (obs["__track"] != "")].copy()
-    return {
-        (str(row["__sample"]), str(row["__track"])): str(row["__cluster"])
-        for _, row in obs.drop_duplicates(["__sample", "__track"], keep="last").iterrows()
-    }
+    lookup = {}
+    for (sample, track), group in obs.groupby(["__sample", "__track"], observed=True, sort=False):
+        rows = []
+        for _, row in group.iterrows():
+            tmin = pd.to_numeric(pd.Series([row.get("position_t_min", np.nan)]), errors="coerce").iloc[0]
+            tmax = pd.to_numeric(pd.Series([row.get("position_t_max", np.nan)]), errors="coerce").iloc[0]
+            rows.append(
+                {
+                    "cluster": str(row["__cluster"]),
+                    "tmin": None if pd.isna(tmin) else float(tmin),
+                    "tmax": None if pd.isna(tmax) else float(tmax),
+                }
+            )
+        lookup[(str(sample), str(track))] = rows
+    return lookup
+
+
+def _resolve_track_cluster_label(cluster_lookup, sample_key, track_key_value, cursor_time=None):
+    rows = cluster_lookup.get((sample_key, track_key_value), [])
+    if len(rows) == 0:
+        return "unknown"
+    if cursor_time is not None:
+        matches = []
+        for row in rows:
+            tmin = row.get("tmin")
+            tmax = row.get("tmax")
+            if tmin is None or tmax is None:
+                matches.append(str(row.get("cluster", "unknown")))
+                continue
+            lo = min(float(tmin), float(tmax))
+            hi = max(float(tmin), float(tmax))
+            if lo <= float(cursor_time) <= hi:
+                matches.append(str(row.get("cluster", "unknown")))
+        matches = sorted({m for m in matches if m != ""})
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return "multiple"
+    labels = sorted({str(row.get("cluster", "unknown")) for row in rows if str(row.get("cluster", "")).strip() != ""})
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) > 1:
+        return "multiple"
+    return "unknown"
 
 
 def _normalize_track_id_key(value):
@@ -510,7 +551,12 @@ def _add_track_statebar_click_dock(
             if times.notna().any():
                 cursor_time = float(times.iloc[(times - cursor_time).abs().argmin()])
 
-        cluster_label = cluster_lookup.get((sample_key, track_key_value), "unknown")
+        cluster_label = _resolve_track_cluster_label(
+            cluster_lookup,
+            sample_key,
+            track_key_value,
+            cursor_time=cursor_time,
+        )
         title_text = f"TrackID {track_key_value} | {cluster_col}: {cluster_label}"
         rgb_img = render_track_statebar_image(
             track_df=track_df,

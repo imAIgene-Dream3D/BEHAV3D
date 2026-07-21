@@ -11,6 +11,17 @@ from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.pyplot as plt
 
 from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+from behav3d.analysis.behavior.state.utils import (
+    _apply_state_order,
+    _get_classification_state_colors,
+    _get_classification_state_order,
+    _set_classification_state_colors,
+    _set_classification_state_order,
+    _normalize_label_color_map,
+)
+from behav3d.analysis.behavior.general.visualization.plots.proportion_bars import (
+    hash_stable_label_color_map,
+)
 from behav3d.analysis.behavior.track.bouts import (
     apply_track_classifier_to_subtracks,
     rename_track_clusters,
@@ -33,6 +44,7 @@ from behav3d.analysis.behavior.track.feature_dtw import (
     _feature_dtw_output_csv_paths,
     _feature_dtw_rename_mapping_path,
     _feature_dtw_umap_csv_path,
+    _load_feature_dtw_cluster_order,
     _load_feature_dtw_name_mapping,
     _save_feature_dtw_quality_control,
     run_tcell_analysis,
@@ -43,6 +55,12 @@ from behav3d.analysis.behavior.track.state_dtw import (
     save_dtaidistance_exemplar_plots,
     train_dtaidistance_trajectory_classifier,
 )
+from behav3d.analysis.behavior.track.visualization.plots.reports import (
+    save_track_class_proportions_by_sample_plot,
+    save_track_condition_comparison_report,
+    save_track_contact_group_analysis,
+)
+from behav3d.analysis.behavior.track.contact_grouping import list_available_contact_columns
 from behav3d.analysis.behavior.track.utils import (
     _build_identity_cluster_mapping_from_obs,
     _default_behavioral_states_path,
@@ -59,9 +77,11 @@ from behav3d.core.metadata import (
     detect_other_cell_types_from_metadata,
     detect_merged_cell_types_from_metadata,
     filter_multicolor_inputs,
+    list_grouping_candidate_columns,
+    merge_condition_columns_into_obs,
 )
 from behav3d.core.utils import rmtree_ignore_missing
-from behav3d.widgets.utils import spinning_loader
+from behav3d.widgets.utils import build_plot_box, build_row_move_buttons, spinning_loader
 
 
 class TrackClassificationPanel:
@@ -194,6 +214,12 @@ class TrackClassificationPanel:
             layout=widgets.Layout(width="210px"),
             style={"description_width": "60px"},
         )
+        self.split_long_tracks = widgets.Checkbox(
+            description="Divide long tracks",
+            value=False,
+            indent=False,
+            layout=widgets.Layout(width="190px"),
+        )
 
         self.btn_run = widgets.Button(
             description="Run one-hot dtaidistance clustering",
@@ -211,6 +237,13 @@ class TrackClassificationPanel:
         )
         self.diagnostics_spinner = widgets.HTML(value=spinning_loader)
         self.diagnostics_spinner.layout.display = "none"
+        self.btn_track_proportions = widgets.Button(
+            description="Create track proportion plots",
+            button_style="info",
+            layout=widgets.Layout(width="260px"),
+        )
+        self.track_proportions_spinner = widgets.HTML(value=spinning_loader)
+        self.track_proportions_spinner.layout.display = "none"
         self.btn_exemplars = widgets.Button(
             description="Create exemplar PDFs",
             button_style="info",
@@ -298,6 +331,108 @@ class TrackClassificationPanel:
             "the DTW window is the main speed constraint."
         )
 
+        self.apply_group_x_dd = widgets.Dropdown(
+            options=["(none)"], value="(none)", description="Group in X:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.apply_group_y_dd = widgets.Dropdown(
+            options=["(none)"], value="(none)", description="Group in Y:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.apply_group_cols_select = widgets.SelectMultiple(
+            options=[],
+            value=[],
+            description="",
+            rows=2,
+            layout=widgets.Layout(width="360px"),
+            disabled=True,
+        )
+        self.apply_group_cols_html = widgets.HTML(
+            "<b>Group classification plots by:</b><br>"
+            "<span style='color:#555;'>Select metadata columns to group by. "
+            "Hold Ctrl/Cmd to select multiple.</span>"
+        )
+        self.track_proportions_group_html = widgets.HTML(
+            "<b>Group by condition:</b><br>"
+            "<span style='color:#555;'>\"Group in X\"/\"Group in Y\" pick a single condition each to "
+            "arrange the track-class proportion grid. \"Group per page\" pools additional metadata "
+            "columns into that grid instead — hold Ctrl/Cmd to select multiple.</span>"
+        )
+
+        self.track_comparison_condition_col_dd = widgets.Dropdown(
+            options=[], description="Compare condition:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.track_comparison_condition_col_dd.observe(
+            self._on_track_comparison_condition_col_changed, names="value",
+        )
+        self.track_comparison_group_x_dd = widgets.Dropdown(
+            options=["(none)"], value="(none)", description="Group in X:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.track_comparison_group_y_text = widgets.Text(
+            value="", description="Group in Y:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.track_comparison_group_cols_select = widgets.SelectMultiple(
+            options=[],
+            value=[],
+            description="",
+            rows=2,
+            layout=widgets.Layout(width="360px"),
+            disabled=True,
+        )
+        self.btn_track_condition_comparison = widgets.Button(
+            description="Create condition comparison plot",
+            button_style="info",
+            layout=widgets.Layout(width="260px"),
+            disabled=True,
+        )
+        self.track_condition_comparison_spinner = widgets.HTML(value=spinning_loader)
+        self.track_condition_comparison_spinner.layout.display = "none"
+        self.btn_track_condition_comparison.on_click(self._on_track_condition_comparison_clicked)
+
+        self.contact_col_dd = widgets.Dropdown(
+            options=[], description="Contact column:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.contact_min_bout_length = widgets.IntText(
+            description="Min. contiguous contact bout (timepoints):",
+            value=5,
+            style={"description_width": "260px"},
+            layout=widgets.Layout(width="360px"),
+        )
+        self.contact_group_x_dd = widgets.Dropdown(
+            options=["(none)"], value="(none)", description="Group in X:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.contact_group_y_dd = widgets.Dropdown(
+            options=["(none)"], value="(none)", description="Group in Y:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.contact_group_cols_select = widgets.SelectMultiple(
+            options=[],
+            value=[],
+            description="",
+            rows=2,
+            layout=widgets.Layout(width="360px"),
+            disabled=True,
+        )
+        self.contact_group_cols_html = widgets.HTML(
+            "<b>Also split by condition:</b><br>"
+            "<span style='color:#555;'>\"Group in X\"/\"Group in Y\" pick a single condition each to "
+            "arrange the grid. \"Group per page\" pools additional metadata columns into it instead — "
+            "hold Ctrl/Cmd to select multiple.</span>"
+        )
+        self.btn_contact_analysis = widgets.Button(
+            description="Run contact-vs-no-contact analysis",
+            button_style="info",
+            layout=widgets.Layout(width="280px"),
+            disabled=True,
+        )
+        self.contact_analysis_spinner = widgets.HTML(value=spinning_loader)
+        self.contact_analysis_spinner.layout.display = "none"
+
         self.run_section = widgets.VBox(
             [
                 self.state_col_html,
@@ -318,30 +453,103 @@ class TrackClassificationPanel:
             ],
             layout=widgets.Layout(gap="8px"),
         )
-        self.plot_section = widgets.VBox(
-            [
-                self.plot_status_html,
+        diagnostics_box = build_plot_box(
+            title="Diagnostics",
+            description="Writes cluster counts, medoids, and a distance-matrix heatmap.",
+            run_row=widgets.HBox([self.btn_diagnostics, self.diagnostics_spinner], layout=widgets.Layout(gap="8px")),
+        )
+        track_proportions_box = build_plot_box(
+            title="Track-class proportions",
+            description=(
+                "Writes a stacked bar of track-class proportions per sample, "
+                "plus optional condition-grouped grid pages."
+            ),
+            run_row=widgets.HBox(
+                [self.btn_track_proportions, self.track_proportions_spinner],
+                layout=widgets.Layout(gap="8px"),
+            ),
+            settings=[
+                self.track_proportions_group_html,
+                self.apply_group_x_dd,
+                self.apply_group_y_dd,
+                widgets.HTML("<span style='color:#555;font-size:11px;'>Group per page:</span>"),
+                self.apply_group_cols_select,
+            ],
+        )
+        track_condition_comparison_box = build_plot_box(
+            title="Condition comparison plot",
+            description=(
+                "Per-cluster overall track-class proportion difference between every pairwise "
+                "combination of a condition's levels (Welch's t-test), shown as one row per "
+                "pairwise comparison."
+            ),
+            run_row=widgets.HBox(
+                [self.btn_track_condition_comparison, self.track_condition_comparison_spinner],
+                layout=widgets.Layout(gap="8px"),
+            ),
+            settings=[
+                self.track_comparison_condition_col_dd,
                 widgets.HTML(
-                    "<b>Diagnostics</b><br>"
-                    "<span style='color:#555;'>Writes cluster counts, medoids, and a distance-matrix heatmap.</span>"
+                    "<b>Group by condition:</b><br>"
+                    "<span style='color:#555;'>Each row is one pairwise comparison of \"Compare "
+                    "condition\"'s levels (shown in \"Group in Y\"). \"Group in X\" splits the "
+                    "comparison into side-by-side columns from another condition. \"Group per page\" "
+                    "pools additional metadata columns into that same columns axis instead — hold "
+                    "Ctrl/Cmd to select multiple.</span>"
                 ),
-                widgets.HBox([self.btn_diagnostics, self.diagnostics_spinner], layout=widgets.Layout(gap="8px")),
-                widgets.HTML(
-                    "<b>Exemplar tracks</b><br>"
-                    "<span style='color:#555;'>Writes exemplar overview and per-cluster statebar PDFs.</span>"
-                ),
+                self.track_comparison_group_x_dd,
+                self.track_comparison_group_y_text,
+                widgets.HTML("<span style='color:#555;font-size:11px;'>Group per page:</span>"),
+                self.track_comparison_group_cols_select,
+            ],
+        )
+        contact_group_box = build_plot_box(
+            title="Contact-based grouping",
+            description=(
+                "Groups tracks by whether they had a sufficiently long contiguous bout of contact "
+                "with another cell type ('contact' vs 'no_contact'), then writes cluster proportions "
+                "for each group (and the reverse view), a condition-comparison report between the two "
+                "groups, and violin plots of mean contact fraction / max contact-bout length per cluster."
+            ),
+            run_row=widgets.HBox(
+                [self.btn_contact_analysis, self.contact_analysis_spinner],
+                layout=widgets.Layout(gap="8px"),
+            ),
+            settings=[
+                self.contact_col_dd,
+                self.contact_min_bout_length,
+                self.contact_group_cols_html,
+                self.contact_group_x_dd,
+                self.contact_group_y_dd,
+                widgets.HTML("<span style='color:#555;font-size:11px;'>Group per page:</span>"),
+                self.contact_group_cols_select,
+            ],
+        )
+        exemplar_box = build_plot_box(
+            title="Exemplar tracks",
+            description="Writes exemplar overview and per-cluster statebar PDFs.",
+            run_row=widgets.HBox([self.btn_exemplars, self.exemplar_spinner], layout=widgets.Layout(gap="8px")),
+            settings=[
                 widgets.HBox(
                     [
                         self.n_per_cluster,
                         self.make_overview_statebars,
                         self.make_backprojection_pdf,
                         self.make_backprojection_mp4,
-                        self.btn_exemplars,
-                        self.exemplar_spinner,
                     ],
                     layout=widgets.Layout(flex_flow="row wrap", gap="8px"),
                 ),
-                self.state_outputs_warning,
+            ],
+            extra=[self.state_outputs_warning],
+        )
+        self.plot_section = widgets.VBox(
+            [
+                self.plot_status_html,
+                diagnostics_box,
+                track_proportions_box,
+                track_condition_comparison_box,
+                contact_group_box,
+                exemplar_box,
                 self.out_plots,
             ],
             layout=widgets.Layout(gap="8px"),
@@ -474,6 +682,8 @@ class TrackClassificationPanel:
                 widgets.HTML("<b>Apply classifier to new data</b>"),
                 self.classifier_artifact_path,
                 self.classifier_apply_states_path,
+                self.apply_group_cols_html,
+                self.apply_group_cols_select,
                 widgets.HBox([self.btn_apply_classifier, self.apply_classifier_spinner], layout=widgets.Layout(gap="8px")),
                 self.out_apply_classifier,
             ],
@@ -485,6 +695,8 @@ class TrackClassificationPanel:
                 widgets.HTML("<b>Apply pretrained classifier</b>"),
                 self.classifier_artifact_path,
                 self.classifier_apply_states_path,
+                self.apply_group_cols_html,
+                self.apply_group_cols_select,
                 widgets.HBox([self.btn_apply_classifier, self.apply_classifier_spinner], layout=widgets.Layout(gap="8px")),
                 self.out_apply_classifier,
             ],
@@ -558,6 +770,8 @@ class TrackClassificationPanel:
             [
                 self.original_description_html,
                 self.original_controls_row,
+                self.apply_group_cols_html,
+                self.apply_group_cols_select,
                 self.original_run_row,
                 self.out_original,
             ],
@@ -587,6 +801,8 @@ class TrackClassificationPanel:
         self.btn_refresh_rename.on_click(self._on_refresh_rename_clicked)
         self.btn_rename.on_click(self._on_rename_clicked)
         self.btn_diagnostics.on_click(self._on_diagnostics_clicked)
+        self.btn_track_proportions.on_click(self._on_track_proportions_clicked)
+        self.btn_contact_analysis.on_click(self._on_contact_analysis_clicked)
         self.btn_exemplars.on_click(self._on_exemplars_clicked)
         self.make_overview_statebars.observe(self._on_exemplar_output_changed, names="value")
         self.make_backprojection_pdf.observe(self._on_exemplar_output_changed, names="value")
@@ -698,6 +914,7 @@ class TrackClassificationPanel:
         self.n_per_cluster.value = int(cfg.get("n_per_cluster", self.n_per_cluster.value))
         self.random_state.value = int(cfg.get("random_state", self.random_state.value))
         self.trajectory_trim_mode.value = str(cfg.get("trajectory_trim_mode", self.trajectory_trim_mode.value))
+        self.split_long_tracks.value = bool(cfg.get("split_long_tracks", self.split_long_tracks.value))
         self.linkage.value = str(cfg.get("linkage", self.linkage.value))
         self.missing_policy.value = str(cfg.get("missing_policy", self.missing_policy.value))
         self.parallel.value = bool(cfg.get("parallel", self.parallel.value))
@@ -733,6 +950,7 @@ class TrackClassificationPanel:
             "n_per_cluster": int(self.n_per_cluster.value),
             "random_state": int(self.random_state.value),
             "trajectory_trim_mode": str(self.trajectory_trim_mode.value),
+            "split_long_tracks": bool(self.split_long_tracks.value),
             "linkage": str(self.linkage.value),
             "missing_policy": str(self.missing_policy.value),
             "parallel": bool(self.parallel.value),
@@ -842,6 +1060,7 @@ class TrackClassificationPanel:
     def _sync_trim_mode_visibility(self):
         has_size = str(self.behavioral_trajectory_size.value).strip() != ""
         self.trajectory_trim_mode.layout.display = None if has_size else "none"
+        self.split_long_tracks.layout.display = None if has_size else "none"
 
     def _on_trajectory_size_changed(self, _):
         self._sync_trim_mode_visibility()
@@ -886,6 +1105,8 @@ class TrackClassificationPanel:
                 self.original_mode_switch_row,
                 self.original_description_html,
                 self.original_controls_row,
+                self.apply_group_cols_html,
+                self.apply_group_cols_select,
                 self.original_run_row,
                 self.out_original,
             ]
@@ -906,6 +1127,7 @@ class TrackClassificationPanel:
                 self.output_dir,
                 self._current_cell_type(),
             ).exists()
+            self.btn_track_proportions.disabled = self.btn_diagnostics.disabled
             self.btn_exemplars.disabled = True
             self.plot_status_html.value = "<i>Run original BEHAV3D clustering first, then create QC or rename clusters.</i>"
             self._rebuild_rename_rows()
@@ -913,6 +1135,7 @@ class TrackClassificationPanel:
         else:
             self.advanced_row_2.children = [
                 self.trajectory_trim_mode,
+                self.split_long_tracks,
                 self.linkage,
                 self.parallel,
                 self.save_distance_matrix,
@@ -921,6 +1144,8 @@ class TrackClassificationPanel:
             self.original_run_section.children = [
                 self.original_description_html,
                 self.original_controls_row,
+                self.apply_group_cols_html,
+                self.apply_group_cols_select,
                 self.original_run_row,
                 self.out_original,
             ]
@@ -963,6 +1188,7 @@ class TrackClassificationPanel:
                 self.status_html.value = "<b style='color:#080;'>Ready for plots:</b> an existing model is available."
             self.plot_status_html.value = "<b>Ready for plots:</b> an existing DTAI model is available."
             self.btn_diagnostics.disabled = False
+            self.btn_track_proportions.disabled = False
             self.btn_exemplars.disabled = False
         else:
             if not bool(self.use_original_behav3d.value):
@@ -972,14 +1198,81 @@ class TrackClassificationPanel:
                 )
             self.plot_status_html.value = "<i>Run clustering first, then create plots as needed.</i>"
             self.btn_diagnostics.disabled = True
+            self.btn_track_proportions.disabled = True
             self.btn_exemplars.disabled = True
         self._refresh_backprojection_samples()
         self._rebuild_rename_rows()
+        candidate_group_cols = list_grouping_candidate_columns(getattr(self.metadata_loader, "metadata", None))
+        if candidate_group_cols != list(self.apply_group_cols_select.options):
+            prev_selection = set(self.apply_group_cols_select.value)
+            self.apply_group_cols_select.options = candidate_group_cols
+            self.apply_group_cols_select.value = [c for c in candidate_group_cols if c in prev_selection]
+        self.apply_group_cols_select.rows = max(2, min(len(candidate_group_cols), 6))
+        self.apply_group_cols_select.disabled = len(candidate_group_cols) == 0
+
+        if candidate_group_cols != list(self.contact_group_cols_select.options):
+            prev_contact_group_selection = set(self.contact_group_cols_select.value)
+            self.contact_group_cols_select.options = candidate_group_cols
+            self.contact_group_cols_select.value = [
+                c for c in candidate_group_cols if c in prev_contact_group_selection
+            ]
+        self.contact_group_cols_select.rows = max(2, min(len(candidate_group_cols), 6))
+        self.contact_group_cols_select.disabled = len(candidate_group_cols) == 0
+
+        if candidate_group_cols != list(self.track_comparison_group_cols_select.options):
+            prev_comparison_group_selection = set(self.track_comparison_group_cols_select.value)
+            self.track_comparison_group_cols_select.options = candidate_group_cols
+            self.track_comparison_group_cols_select.value = [
+                c for c in candidate_group_cols if c in prev_comparison_group_selection
+            ]
+        self.track_comparison_group_cols_select.rows = max(2, min(len(candidate_group_cols), 6))
+        self.track_comparison_group_cols_select.disabled = len(candidate_group_cols) == 0
+
+        axis_options = ["(none)"] + candidate_group_cols
+        for dd in (
+            self.apply_group_x_dd, self.apply_group_y_dd,
+            self.contact_group_x_dd, self.contact_group_y_dd,
+            self.track_comparison_group_x_dd,
+        ):
+            if axis_options != list(dd.options):
+                prev_axis = dd.value
+                dd.options = axis_options
+                dd.value = prev_axis if prev_axis in axis_options else "(none)"
+            dd.disabled = len(candidate_group_cols) == 0
+
+        if candidate_group_cols != list(self.track_comparison_condition_col_dd.options):
+            prev_cond = self.track_comparison_condition_col_dd.value
+            self.track_comparison_condition_col_dd.options = candidate_group_cols
+            if prev_cond in candidate_group_cols:
+                self.track_comparison_condition_col_dd.value = prev_cond
+            elif candidate_group_cols:
+                self.track_comparison_condition_col_dd.value = candidate_group_cols[0]
+        self.track_comparison_condition_col_dd.disabled = len(candidate_group_cols) == 0
+        self._sync_track_comparison_group_y_text()
+        self.btn_track_condition_comparison.disabled = len(candidate_group_cols) == 0
+
+        contact_columns = []
+        features_path = self._original_track_features_path()
+        if features_path.exists():
+            try:
+                contact_columns = list_available_contact_columns(pd.read_csv(features_path, nrows=0))
+            except Exception:
+                contact_columns = []
+        if contact_columns != list(self.contact_col_dd.options):
+            prev_contact_col = self.contact_col_dd.value
+            self.contact_col_dd.options = contact_columns
+            if prev_contact_col in contact_columns:
+                self.contact_col_dd.value = prev_contact_col
+            elif contact_columns:
+                self.contact_col_dd.value = contact_columns[0]
+        self.contact_col_dd.disabled = len(contact_columns) == 0
+        self.btn_contact_analysis.disabled = len(contact_columns) == 0 or not model_path.exists()
         if bool(self.use_original_behav3d.value):
             self.btn_diagnostics.disabled = not _feature_dtw_umap_csv_path(
                 self.output_dir,
                 self._current_cell_type(),
             ).exists()
+            self.btn_track_proportions.disabled = self.btn_diagnostics.disabled
             self._sync_exemplar_state_controls()
         else:
             self._sync_exemplar_state_controls()
@@ -1041,6 +1334,8 @@ class TrackClassificationPanel:
 
     def _rebuild_rename_rows(self):
         self._name_boxes = {}
+        self._track_row_widgets = {}
+        self._track_row_order = []
         if bool(self.use_original_behav3d.value):
             clustered_path = _feature_dtw_clustered_csv_path(self.output_dir, self._current_cell_type())
             if not clustered_path.exists():
@@ -1059,6 +1354,7 @@ class TrackClassificationPanel:
             saved_mapping = _load_feature_dtw_name_mapping(self.output_dir, self._current_cell_type())
             for key in list(mapping.keys()):
                 mapping[key] = saved_mapping.get(key, key)
+            saved_order = _load_feature_dtw_cluster_order(self.output_dir, self._current_cell_type())
             label = "Original BEHAV3D clusters"
         else:
             try:
@@ -1073,21 +1369,51 @@ class TrackClassificationPanel:
                 self.btn_rename.disabled = True
                 return
             mapping = _build_identity_cluster_mapping_from_obs(adata_tracks.obs, cluster_col="ClusterID")
+            saved_order = _get_classification_state_order(adata_tracks, "ClusterID")
             label = "DTAI clusters"
 
-        rows = []
-        for old_name, current_name in mapping.items():
+        # `saved_order` lists display names (post-rename); `mapping` maps raw keys -> display
+        # names, and for the DTAI branch keys already equal display names. Reorder by display
+        # name, then translate back to the raw keys the rows/apply-mapping logic is keyed on.
+        raw_keys = list(mapping.keys())
+        name_to_key = {}
+        for k in raw_keys:
+            name_to_key.setdefault(str(mapping[k]), k)
+        ordered_names = _apply_state_order(list(name_to_key.keys()), saved_order)
+        self._track_row_order = [name_to_key[n] for n in ordered_names]
+        for old_name in self._track_row_order:
+            old_name = str(old_name)
+            current_name = mapping[old_name]
             txt = widgets.Text(value=str(current_name), layout=widgets.Layout(width="300px"))
-            self._name_boxes[str(old_name)] = txt
-            rows.append(
-                widgets.HBox(
-                    [widgets.Label(str(old_name), layout=widgets.Layout(width="120px")), txt],
-                    layout=widgets.Layout(align_items="center", gap="8px"),
-                )
+            self._name_boxes[old_name] = txt
+            move_btns = build_row_move_buttons(
+                on_move_up=lambda n=old_name: self._move_track_row(n, -1),
+                on_move_down=lambda n=old_name: self._move_track_row(n, 1),
             )
-        self.rename_rows.children = rows
-        self.rename_status.value = f"<b>{label}:</b> {len(rows)}"
-        self.btn_rename.disabled = len(rows) == 0
+            self._track_row_widgets[old_name] = widgets.HBox(
+                [move_btns, widgets.Label(old_name, layout=widgets.Layout(width="110px")), txt],
+                layout=widgets.Layout(align_items="center", gap="8px"),
+            )
+        self._refresh_track_row_children()
+        self.rename_status.value = f"<b>{label}:</b> {len(self._track_row_order)}"
+        self.btn_rename.disabled = len(self._track_row_order) == 0
+
+    def _refresh_track_row_children(self):
+        self.rename_rows.children = [
+            self._track_row_widgets[n] for n in self._track_row_order if n in self._track_row_widgets
+        ]
+
+    def _move_track_row(self, old_name, delta):
+        order = self._track_row_order
+        old_name = str(old_name)
+        if old_name not in order:
+            return
+        idx = order.index(old_name)
+        new_idx = idx + delta
+        if not (0 <= new_idx < len(order)):
+            return
+        order[idx], order[new_idx] = order[new_idx], order[idx]
+        self._refresh_track_row_children()
 
     def _on_refresh_rename_clicked(self, _):
         self._rebuild_rename_rows()
@@ -1115,12 +1441,22 @@ class TrackClassificationPanel:
 
     def _rename_dtaidistance_clusters(self, mapping):
         adata_tracks = self._load_model_adata()
+        old_colors = _get_classification_state_colors(adata_tracks, "ClusterID")
+        new_colors = {}
+        for old_label, new_label in mapping.items():
+            new_colors.setdefault(str(new_label), old_colors.get(str(old_label)))
+        new_colors = _normalize_label_color_map(list(new_colors.keys()), colors=new_colors)
         rename_track_clusters(
             adata=adata_tracks,
             mapping=mapping,
             cluster_col="ClusterID",
             keep_unmapped=True,
         )
+        _set_classification_state_colors(adata_tracks, "ClusterID", new_colors)
+        new_order = list(dict.fromkeys(
+            mapping.get(n, n) for n in getattr(self, "_track_row_order", [])
+        ))
+        _set_classification_state_order(adata_tracks, "ClusterID", new_order)
         adata_tracks.write(self._model_adata_path(), compression="lzf")
         qc_dir = _resolve_dtaidistance_paths(self.output_dir, self._current_cell_type())[
             "quality_control_outfolder"
@@ -1140,9 +1476,19 @@ class TrackClassificationPanel:
 
     def _rename_original_behav3d_clusters(self, mapping):
         ct = self._current_cell_type()
-        outdir = _feature_dtw_outdir(self.output_dir, ct)
         mapping_path = _feature_dtw_rename_mapping_path(self.output_dir, ct)
         mapping_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_colors = {}
+        if mapping_path.exists():
+            try:
+                existing_colors = (yaml.safe_load(mapping_path.read_text()) or {}).get("cluster_colors", {}) or {}
+            except Exception:
+                existing_colors = {}
+        new_names = sorted(set(str(v) for v in mapping.values()))
+        cluster_colors = hash_stable_label_color_map(new_names, colors=existing_colors)
+        new_order = list(dict.fromkeys(
+            mapping.get(n, n) for n in getattr(self, "_track_row_order", [])
+        ))
         with mapping_path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(
                 {
@@ -1150,6 +1496,8 @@ class TrackClassificationPanel:
                     "cluster_id_column": "ClusterID",
                     "cluster_name_column": "ClusterName",
                     "cluster_names": dict(mapping),
+                    "cluster_colors": cluster_colors,
+                    "cluster_order": new_order,
                 },
                 f,
                 sort_keys=False,
@@ -1169,7 +1517,8 @@ class TrackClassificationPanel:
         plot_paths = _save_feature_dtw_quality_control(
             self.output_dir,
             ct,
-            outfolder=outdir / "quality_control" / "after_renaming",
+            cluster_percentage_group_by=list(self.apply_group_cols_select.value) or None,
+            proportions_outfolder=_resolve_dtaidistance_paths(self.output_dir, ct)["behavior_proportions_outfolder"],
         )
         self.plot_status_html.value = "<b>Renamed QC ready:</b> original BEHAV3D diagnostics were written after renaming."
         _winfo("trajectory-dtai-widget", f"Saved original BEHAV3D cluster names: {mapping_path}")
@@ -1376,6 +1725,7 @@ class TrackClassificationPanel:
                     behavioral_trajectory_size=trajectory_size,
                     min_track_length=trajectory_size,
                     trajectory_trim_mode=str(self.trajectory_trim_mode.value),
+                    split_long_tracks=bool(self.split_long_tracks.value),
                     max_tracks=None,
                     n_clusters=int(self.n_clusters.value),
                     window=None,
@@ -1397,8 +1747,15 @@ class TrackClassificationPanel:
                     f"<b style='color:#080;'>Saved one-hot dtaidistance model:</b> {self._model_adata_path().name} "
                     f"({self.model_adata.n_obs} tracks)"
                 )
-                self.plot_status_html.value = "<b>Ready for plots:</b> clustering finished."
+                umap_error = (self.model_adata.uns.get("visualization", {}) or {}).get("umap_error")
+                if umap_error:
+                    self.plot_status_html.value = (
+                        f"<b style='color:#a60;'>⚠ UMAP was skipped in diagnostics:</b> {umap_error}"
+                    )
+                else:
+                    self.plot_status_html.value = "<b>Ready for plots:</b> clustering finished."
                 self.btn_diagnostics.disabled = False
+                self.btn_track_proportions.disabled = False
                 self.btn_exemplars.disabled = False
                 self._rebuild_rename_rows()
                 self._refresh_backprojection_samples()
@@ -1448,18 +1805,20 @@ class TrackClassificationPanel:
                     nr_of_clusters=int(self.original_n_clusters.value),
                     plot_results=False,
                     seed=int(self.random_state.value),
-                    output_subdir_name="behavorial_trajectories/original_behav3d",
+                    output_subdir_name="behavorial_trajectories/original_behav3d/raw",
                     feature_scaling_preset="original_behav3d",
                     min_track_length=int(self.original_trajectory_size.value),
                     max_track_length=int(self.original_trajectory_size.value),
+                    cluster_percentage_group_by=list(self.apply_group_cols_select.value) or None,
                 )
-                plot_paths = _save_feature_dtw_quality_control(self.output_dir, ct)
                 _create_original_behav3d_adata(self.output_dir, ct)
                 _winfo("trajectory-dtai-widget", "Original BEHAV3D feature-DTW analysis complete.")
-                for path in plot_paths.values():
-                    _winfo("trajectory-dtai-widget", f"Created original BEHAV3D QC: {path}")
                 self.btn_diagnostics.disabled = False
-                self.plot_status_html.value = "<b>Ready for renaming:</b> raw original BEHAV3D QC was written."
+                self.btn_track_proportions.disabled = False
+                self.plot_status_html.value = (
+                    "<b>Ready for renaming:</b> raw clusters written. Click 'Create diagnostics plots' "
+                    "to generate the original_behav3d QC (with any renamed cluster names)."
+                )
                 self._rebuild_rename_rows()
                 self._sync_exemplar_state_controls()
                 self.steps.selected_index = 1
@@ -1477,6 +1836,10 @@ class TrackClassificationPanel:
                     plot_paths = _save_feature_dtw_quality_control(
                         self.output_dir,
                         self._current_cell_type(),
+                        cluster_percentage_group_by=list(self.apply_group_cols_select.value) or None,
+                        proportions_outfolder=_resolve_dtaidistance_paths(
+                            self.output_dir, self._current_cell_type()
+                        )["behavior_proportions_outfolder"],
                     )
                     self.plot_status_html.value = "<b>Diagnostics ready:</b> original BEHAV3D QC was written."
                     for path in plot_paths.values():
@@ -1491,7 +1854,13 @@ class TrackClassificationPanel:
                         save_outputs=True,
                         verbose=True,
                     )
-                    self.plot_status_html.value = "<b>Diagnostics ready:</b> cluster diagnostics were written."
+                    umap_error = plot_paths.get("umap_error")
+                    if umap_error:
+                        self.plot_status_html.value = (
+                            f"<b style='color:#a60;'>⚠ UMAP was skipped in diagnostics:</b> {umap_error}"
+                        )
+                    else:
+                        self.plot_status_html.value = "<b>Diagnostics ready:</b> cluster diagnostics were written."
                     _winfo(
                         "trajectory-dtai-widget",
                         f"Created diagnostics plots: {plot_paths.get('diagnostics_pdf')}",
@@ -1500,6 +1869,166 @@ class TrackClassificationPanel:
                 traceback.print_exc()
             finally:
                 self._set_busy(self.btn_diagnostics, self.diagnostics_spinner, busy=False)
+
+    def _on_track_proportions_clicked(self, _):
+        self._set_busy(self.btn_track_proportions, self.track_proportions_spinner, busy=True)
+        self.out_plots.clear_output()
+        with self.out_plots:
+            try:
+                group_cols = list(self.apply_group_cols_select.value) or None
+                group_x = self.apply_group_x_dd.value
+                group_x = None if group_x in (None, "(none)") else group_x
+                group_y = self.apply_group_y_dd.value
+                group_y = None if group_y in (None, "(none)") else group_y
+                if bool(self.use_original_behav3d.value):
+                    plot_paths = _save_feature_dtw_quality_control(
+                        self.output_dir,
+                        self._current_cell_type(),
+                        cluster_percentage_group_by=group_cols,
+                        proportions_outfolder=_resolve_dtaidistance_paths(
+                            self.output_dir, self._current_cell_type()
+                        )["behavior_proportions_outfolder"],
+                    )
+                    self.plot_status_html.value = (
+                        "<b>Track proportions ready:</b> original BEHAV3D per-sample proportions were written."
+                    )
+                    for path in plot_paths.values():
+                        _winfo("trajectory-dtai-widget", f"Created original BEHAV3D proportions QC: {path}")
+                else:
+                    adata_tracks = self._load_model_adata()
+                    md = getattr(self.metadata_loader, "metadata", None)
+                    all_cols = (group_cols or []) + [c for c in (group_x, group_y) if c]
+                    cols_to_merge = [c for c in all_cols if c not in adata_tracks.obs.columns]
+                    if cols_to_merge and md is not None:
+                        merge_condition_columns_into_obs(adata_tracks, md, cols_to_merge)
+                    paths = _resolve_dtaidistance_paths(self.output_dir, self._current_cell_type())
+                    plot_paths = save_track_class_proportions_by_sample_plot(
+                        adata_tracks,
+                        paths["behavior_proportions_outfolder"],
+                        sample_col="sample_name",
+                        class_col="ClusterID",
+                        group_cols=group_cols,
+                        group_x=group_x,
+                        group_y=group_y,
+                        verbose=True,
+                    )
+                    self.plot_status_html.value = (
+                        "<b>Track proportions ready:</b> per-sample class proportions were written."
+                    )
+                    _winfo(
+                        "trajectory-dtai-widget",
+                        f"Created track-class proportions plot: {plot_paths.get('pdf_path')}",
+                    )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_track_proportions, self.track_proportions_spinner, busy=False)
+
+    def _sync_track_comparison_group_y_text(self):
+        if hasattr(self, "track_comparison_group_y_text"):
+            self.track_comparison_group_y_text.value = str(self.track_comparison_condition_col_dd.value or "")
+
+    def _on_track_comparison_condition_col_changed(self, change):
+        if change.get("name") == "value":
+            self._sync_track_comparison_group_y_text()
+
+    def _on_track_condition_comparison_clicked(self, _):
+        self._set_busy(self.btn_track_condition_comparison, self.track_condition_comparison_spinner, busy=True)
+        self.out_plots.clear_output()
+        with self.out_plots:
+            try:
+                if bool(self.use_original_behav3d.value):
+                    raise ValueError(
+                        "Condition comparison plots are only available for the one-hot dtaidistance method."
+                    )
+                condition_col = self.track_comparison_condition_col_dd.value
+                group_cols = list(self.track_comparison_group_cols_select.value) or None
+                group_x = self.track_comparison_group_x_dd.value
+                group_x = None if group_x in (None, "(none)") else group_x
+                if not condition_col:
+                    raise ValueError("Select a condition column to compare.")
+
+                adata_tracks = self._load_model_adata()
+                md = getattr(self.metadata_loader, "metadata", None)
+                all_cols = [condition_col] + (group_cols or []) + [c for c in (group_x,) if c]
+                cols_to_merge = [c for c in all_cols if c not in adata_tracks.obs.columns]
+                if cols_to_merge and md is not None:
+                    merge_condition_columns_into_obs(adata_tracks, md, cols_to_merge)
+                paths = _resolve_dtaidistance_paths(self.output_dir, self._current_cell_type())
+                result = save_track_condition_comparison_report(
+                    adata_tracks,
+                    paths["behavior_comparisons_outfolder"],
+                    sample_col="sample_name",
+                    class_col="ClusterID",
+                    condition_col=condition_col,
+                    group_cols=group_cols,
+                    group_x=group_x,
+                    verbose=True,
+                )
+                self.plot_status_html.value = "<b>Condition comparison ready:</b> plot was written."
+                _winfo(
+                    "trajectory-dtai-widget",
+                    f"Created track condition comparison plot: {result.get('pdf_path')}",
+                )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_track_condition_comparison, self.track_condition_comparison_spinner, busy=False)
+
+    def _on_contact_analysis_clicked(self, _):
+        self._set_busy(self.btn_contact_analysis, self.contact_analysis_spinner, busy=True)
+        self.out_plots.clear_output()
+        with self.out_plots:
+            try:
+                if bool(self.use_original_behav3d.value):
+                    raise ValueError(
+                        "Contact-based grouping is only available for the one-hot dtaidistance method."
+                    )
+                contact_col = self.contact_col_dd.value
+                if not contact_col:
+                    raise ValueError("Select a contact column to group tracks by.")
+                min_bout_length = int(self.contact_min_bout_length.value)
+                if min_bout_length < 1:
+                    raise ValueError("Min. contiguous contact bout must be at least 1 timepoint.")
+
+                adata_tracks = self._load_model_adata()
+                df_timepoints = pd.read_csv(self._original_track_features_path())
+                extra_group_cols = list(self.contact_group_cols_select.value) or None
+                group_x = self.contact_group_x_dd.value
+                group_x = None if group_x in (None, "(none)") else group_x
+                group_y = self.contact_group_y_dd.value
+                group_y = None if group_y in (None, "(none)") else group_y
+                md = getattr(self.metadata_loader, "metadata", None)
+                all_extra_cols = (extra_group_cols or []) + [c for c in (group_x, group_y) if c]
+                cols_to_merge = [c for c in all_extra_cols if c not in adata_tracks.obs.columns]
+                if cols_to_merge and md is not None:
+                    merge_condition_columns_into_obs(adata_tracks, md, cols_to_merge)
+                paths = _resolve_dtaidistance_paths(self.output_dir, self._current_cell_type())
+                result = save_track_contact_group_analysis(
+                    adata_tracks,
+                    df_timepoints,
+                    paths["outfolder"],
+                    contact_col=contact_col,
+                    min_bout_length=min_bout_length,
+                    sample_col="sample_name",
+                    class_col="ClusterID",
+                    extra_group_cols=extra_group_cols,
+                    group_x=group_x,
+                    group_y=group_y,
+                    verbose=True,
+                )
+                self.plot_status_html.value = (
+                    "<b>Contact-based grouping ready:</b> proportion, condition-comparison, "
+                    "and violin plots were written."
+                )
+                _winfo(
+                    "trajectory-dtai-widget",
+                    f"Created contact-group analysis bundle: {result.get('condition_comparison', {}).get('pdf_path')}",
+                )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_contact_analysis, self.contact_analysis_spinner, busy=False)
 
     def _on_exemplars_clicked(self, _):
         self._set_busy(self.btn_exemplars, self.exemplar_spinner, busy=True)
@@ -1680,6 +2209,8 @@ class TrackClassificationPanel:
                     classifier_artifact_or_path=clf_path,
                     adata_full_path=states_path,
                     output_subdir_name="behavorial_trajectories",
+                    group_cols=list(self.apply_group_cols_select.value) or None,
+                    metadata=getattr(self.metadata_loader, "metadata", None),
                     verbose=True,
                 )
                 out_path = apply_result.get("output_path", "")
