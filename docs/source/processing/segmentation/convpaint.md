@@ -21,7 +21,6 @@ ConvPaint's strategy combo controls how the predicted probability / mask becomes
 | Strategy | What it does |
 |---|---|
 | **ConvPaint Mask + EDT/Watershed** (default) | Threshold ConvPaint's predicted mask → Euclidean Distance Transform → watershed seeds above a threshold → watershed. |
-| **ConvPaint Mask + Peak EDT/Watershed** | Same idea, but watershed seeds are placed at *peaks* of the EDT. Better for densely-packed objects with clear central peaks. |
 | **ConvPaint Probability + Watershed** | Use the full probability map (not just the binary mask) for both seed placement and watershed. |
 | **Advanced (per cell type)** | One strategy per cell type. |
 
@@ -31,7 +30,7 @@ A full session usually goes like this:
 
 1. **Open the Segmentation tab** → pick **ConvPaint (DL pixel classifier)** from the method dropdown.
 2. **Pick a device** at the top (CUDA GPU strongly preferred).
-3. **Pick a strategy.** Start with **ConvPaint Mask + EDT/Watershed** (default). Only switch to Peak EDT or Probability + Watershed if the initial result has the specific failure mode each one is designed for (densely-packed cells with clear central peaks; noisy mask boundary, respectively).
+3. **Pick a strategy.** Start with **ConvPaint Mask + EDT/Watershed** (default). Only switch to Probability + Watershed if the initial result has its specific failure mode (a noisy/uncertain mask boundary).
 4. **Set `Examples / sample`** (default 3) and click **Generate Training Data**. The viewer clears and loads timepoints as Image layers plus **one** `User Provided Labels` layer (ConvPaint is multi-class — one Labels layer holds all classes).
 5. **Open the `Legend` tab** (the first tab in the *Annotation & Segmentation* tab strip, before the per-cell-type tabs) to see which label index maps to which cell type (`1 = background`, `2 = organoid`, `3 = tcell`, etc.).
 6. **Paint each class on the single Labels layer using its assigned index.** A few hundred pixels per class is usually enough; bias your strokes toward boundaries and confusing regions.
@@ -97,7 +96,7 @@ Below the classifier group are three global performance checkboxes (all **OFF** 
 
 ### 5 · Per cell-type tab — Instance-preview parameters
 
-Each cell-type tab includes an "Instance Segmentation Preview" group whose spinboxes (EDT threshold, mask / seed thresholds, opening, min size, fill holes, peak min-distance, peak min-ratio) depend on the chosen strategy. Their meaning and tuning are documented once in [Instance post-processing parameters](./index.md#instance-post-processing-parameters); the set shown per strategy and the defaults match APOC for the equivalent strategy.
+Each cell-type tab includes an "Instance Segmentation Preview" group whose spinboxes (EDT threshold, mask / seed thresholds, opening, min size, fill holes) depend on the chosen strategy. Their meaning and tuning are documented once in [Instance post-processing parameters](./index.md#instance-post-processing-parameters); the set shown per strategy and most defaults match APOC for the equivalent strategy.
 
 ### 6 · Train + Preview
 

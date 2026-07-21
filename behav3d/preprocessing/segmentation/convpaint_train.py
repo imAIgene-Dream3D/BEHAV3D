@@ -928,9 +928,12 @@ class CellTypeConvPaintTab(QWidget):
                     "separate seed, splitting more touching objects. Lower values "
                     "(closer to Mask threshold) merge neighboring cores together, "
                     "splitting fewer objects.\n\n"
-                    "Note: this is the opposite direction from the 'EDT threshold' "
-                    "used by the EDT/Watershed strategy (there, lower values split "
-                    "more) — same identical behaviour in APOC and ConvPaint."),
+                    "Note: this is the SAME direction as the 'EDT threshold' on the "
+                    "plain EDT/Watershed strategy (there, higher values also split "
+                    "more), but the OPPOSITE direction from that same field on the "
+                    "Peak EDT/Watershed strategy, where it acts as a peak-height "
+                    "noise filter instead — same identical behaviour in APOC and "
+                    "ConvPaint."),
             ))
 
             self.opening_nr_pixels_spin = QSpinBox()
@@ -977,16 +980,36 @@ class CellTypeConvPaintTab(QWidget):
             self.opening_nr_pixels_spin.setValue(
                 int(ip.get(f"{cell_type}_opening_nr_pixels", 0))
             )
+            _edt_help = (
+                HelpButton(
+                    "EDT threshold (peak height)",
+                    "Minimum EDT peak height required for a local maximum to count as "
+                    "a watershed seed — a noise filter, not an erosion cutoff.\n"
+                    "Higher values suppress weaker peaks (e.g. a boundary bump on one "
+                    "cell) → fewer seeds, less splitting. Lower values keep weak peaks "
+                    "→ more seeds, more splitting.\n\n"
+                    "Note: this is the OPPOSITE direction from this same field on the "
+                    "plain 'Mask + EDT/Watershed' strategy, where higher values "
+                    "increase splitting instead (there it's an erosion cutoff, not a "
+                    "peak-height filter)."
+                )
+                if strategy == STRATEGY_PEAK_EDT
+                else HelpButton(
+                    "EDT threshold",
+                    "Euclidean-distance-transform threshold used to derive seeds inside "
+                    "the binary mask (an erosion-style cutoff: seeds = mask voxels with "
+                    "EDT ≥ this value).\n"
+                    "Higher values erode further, breaking the thin neck between "
+                    "touching objects → more splitting. Lower values keep neighbouring "
+                    "cores connected → objects stay merged.\n\n"
+                    "Note: this is the SAME direction as 'Seed threshold' used by the "
+                    "Probability Map + Watershed strategy (there, higher values also "
+                    "split more)."
+                )
+            )
             layout.addLayout(self._pair_row(
                 QLabel("EDT threshold:"), self.edt_threshold_spin,
-                HelpButton("EDT threshold",
-                    "Euclidean-distance-transform threshold used to derive seeds inside "
-                    "the binary mask.\n"
-                    "Lower values give more aggressive splitting of touching objects.\n\n"
-                    "Note: this is the opposite direction from the 'Seed threshold' used "
-                    "by the Probability Map + Watershed strategy (there, higher values "
-                    "split more) — the two strategies use different mechanisms "
-                    "(distance-from-edge vs. classifier confidence)."),
+                _edt_help,
                 QLabel("Opening px:"), self.opening_nr_pixels_spin,
                 HelpButton("Morphological opening",
                     "Number of erosion-then-dilation iterations applied to the mask.\n"

@@ -17,11 +17,10 @@ The strategy combo at the top of the training area controls how a trained classi
 |---|---|---|
 | **APOC (Direct Instance Segmentation)** | Already-labelled instances. | None, the output is used as-is. |
 | **APOC Mask + EDT/Watershed Resegmentation** | Foreground vs. background mask. | Euclidean Distance Transform of the mask → threshold → watershed seeds → watershed → size filter. |
-| **APOC Mask + Peak EDT/Watershed Resegmentation** | Foreground vs. background mask. | Same idea, but watershed seeds are placed at *peaks* of the EDT, better for densely-packed objects with clear central peaks. |
 | **APOC Probability Map + Watershed** | Per-voxel foreground probability. | A mask threshold defines foreground; a higher seed threshold defines watershed seeds; watershed splits touching objects on the probability map. |
 
 ```{tip}
-The plugin opens on **APOC Probability Map + Watershed** by default, it splits touching objects well and copes with fuzzy boundaries. **Direct Instance Segmentation** is the simplest and fastest, but assumes your cells are already well-separated by the pixel classifier alone. The watershed variants exist because biological cells in 3D very often touch — pick the one whose post-processing matches your object morphology and tune its parameters in the per-cell-type tab. Preview with **Run instance segmentation** after each change; switch to APOC Mask + EDT/Watershed (use Peak EDT for very dense objects) if the probability-map split isn't clean.
+The plugin opens on **APOC Probability Map + Watershed** by default, it splits touching objects well and copes with fuzzy boundaries. **Direct Instance Segmentation** is the simplest and fastest, but assumes your cells are already well-separated by the pixel classifier alone. The watershed variants exist because biological cells in 3D very often touch — pick the one whose post-processing matches your object morphology and tune its parameters in the per-cell-type tab. Preview with **Run instance segmentation** after each change; switch to APOC Mask + EDT/Watershed if the probability-map split isn't clean.
 ```
 
 ## Step-by-step in the napari plugin
@@ -35,8 +34,8 @@ A full session usually goes like this:
 5. **Paint a few foreground and background pixels** on the Labels layer for each cell type — see [Labeling foreground and background](./index.md#labeling-foreground-and-background) for the painting convention and labeling tips.
 6. **Go to the per cell-type tab** (one tab per cell type at the top of the training area) and review the per-type controls: `Image Channel Inputs`, `Feature Preset` / `Tune Features`, and Random Forest parameters. Defaults are sensible; the most common manual change is unchecking irrelevant channels in `Image Channel Inputs`.
 7. **Click `▶ Train current tab`** to fit the classifier for the active cell type, or **`▶▶ Train ALL classifiers`** to train every cell type at once. Use **`⬇ Apply config to all tabs`** beforehand if you want one tab's feature/RF settings copied to the others, and **`Save User Labels`** to persist the labels you painted.
-8. For non-Direct strategies, instance-segmentation parameters (EDT / mask & seed thresholds / opening / min size / peak settings) are exposed in the per-tab **Instance Segmentation Preview** group before you train, adjust these to control how the classifier output is turned into instances. After training the per-tab preview will be updated (usually automatically); you can also click **Run instance segmentation** in a cell-type tab to re-run the classifier + post-processing preview on the current timepoint without retraining.
-9. **Inspect the result.** If touching cells are merged, single cells split, or noise appears, see [Tuning the parameters](#tuning-the-parameters) and adjust the per-tab segmentation parameters. Note: **APOC (Direct Instance Segmentation)** uses classifier-produced instance labels as-is, so if you need splitting or cleanup, switch to a Mask/Peak/Probability + Watershed strategy.
+8. For non-Direct strategies, instance-segmentation parameters (EDT / mask & seed thresholds / opening / min size) are exposed in the per-tab **Instance Segmentation Preview** group before you train, adjust these to control how the classifier output is turned into instances. After training the per-tab preview will be updated (usually automatically); you can also click **Run instance segmentation** in a cell-type tab to re-run the classifier + post-processing preview on the current timepoint without retraining.
+9. **Inspect the result.** If touching cells are merged, single cells split, or noise appears, see [Tuning the parameters](#tuning-the-parameters) and adjust the per-tab segmentation parameters. Note: **APOC (Direct Instance Segmentation)** uses classifier-produced instance labels as-is, so if you need splitting or cleanup, switch to a Mask/Probability + Watershed strategy.
 10. **Scroll to  Batch segmentation section** → pick timepoint range and workers → click **▶ Run APOC Batch Segmentation** for an immediate run, or **+🛒** to queue.
 
 ### 1 · GPU device
@@ -47,7 +46,7 @@ A full session usually goes like this:
 
 | Control | Default | Effect |
 |---|---|---|
-| **Strategy** | APOC Probability Map + Watershed | One of the four strategies listed above (plus **Advanced (per cell type)** to set a different strategy per cell type). Changing it rebuilds the per-cell-type instance-preview controls. |
+| **Strategy** | APOC Probability Map + Watershed | One of the three strategies listed above (plus **Advanced (per cell type)** to set a different strategy per cell type). Changing it rebuilds the per-cell-type instance-preview controls. |
 | **Examples / sample** | 3 | Number of timepoints randomly sampled from each metadata row as training data (range 1–10). |
 | **Generate Training Data** | — | Clears the viewer and loads those timepoints as Image layers + empty Labels layers per cell type. |
 
@@ -74,7 +73,6 @@ When the strategy includes a watershed post-processing, an **Instance Segmentati
 |---|---|
 | **APOC (Direct Instance Segmentation)** | none — instance labels come directly from the classifier output, no post-processing controls. |
 | **APOC Mask + EDT/Watershed Resegmentation** | EDT threshold `1.0`, Opening px `0`, Min size `0`, Fill holes `True`. |
-| **APOC Mask + Peak EDT/Watershed Resegmentation** | EDT threshold `1.0`, Peak min dist `0.0`, Peak min ratio `0.35`, Opening px `0`, Min size `0`, Fill holes `True`. |
 | **APOC Probability Map + Watershed** | Mask threshold `0.5`, Seed threshold `0.8`, Opening px `0`, Min size `0`. |
 
 The defaults in the table are the **same on every tab** the first time you open APOC — only a starting point. For tips on tuning **large vs small** objects (shared with ConvPaint and Pixel Classifier), see [Advice: large vs small objects](./index.md#advice-large-vs-small-objects) on the [segmentation overview](./index.md).
@@ -89,7 +87,7 @@ The defaults in the table are the **same on every tab** the first time you open 
 - `"<CellType> Segments"` — Labels layer containing the instance preview (for the special `dead` cell type this label layer is named `Pixel Classification (Dead)`).
 - `"Probability Map (<CellType>)"` — Image layer with per-voxel probabilities (for `dead` this is `Probability Map (Dead)`).
 
-- Behavior details: the plugin replaces or updates any existing viewer layers with the same name (i.e., reuses the layer name and sets its `.data`), and removes stale preview layers at preview start. The preview is primarily GUI-only and recreated on each run to let you iterate quickly on EDT / mask & seed thresholds, Opening, Min size and Peak settings.
+- Behavior details: the plugin replaces or updates any existing viewer layers with the same name (i.e., reuses the layer name and sets its `.data`), and removes stale preview layers at preview start. The preview is primarily GUI-only and recreated on each run to let you iterate quickly on EDT / mask & seed thresholds, Opening and Min size.
 
 - Optional persistence: when a PixelClassification output folder is configured the preview routine will also write preview arrays to the PixelClassification preview paths (e.g. `PixelClassifier_<CellType>_PredictedLabels.zarr` and `PixelClassifier_<CellType>_ProbabilityMap.zarr`). For full, per-sample segmentation outputs use `▶ Run APOC Batch Segmentation`, which writes `<output_dir>/images/<sample>/<sample>_<cell_type>_segments.zarr`.
 
@@ -177,10 +175,9 @@ Enable **Consider original image as well** only when raw intensity alone separat
 
 - Cells in your data **never touch** → use **Direct Instance Segmentation**. No watershed parameters to tune.
 - Cells touch and the binary mask is clean → use **APOC Mask + EDT/Watershed**.
-- Cells are very densely packed with clear central peaks → use **APOC Mask + Peak EDT/Watershed**.
-- The classifier output is **uncertain at boundaries** (see below) → use **APOC Probability Map + Watershed** and tune **Mask threshold** / **Seed threshold** instead of the Mask+EDT strategies.
+- The classifier output is **uncertain at boundaries** (see below) → use **APOC Probability Map + Watershed** and tune **Mask threshold** / **Seed threshold** instead of the Mask+EDT strategy.
 
-**Post-processing parameters (EDT / mask & seed thresholds / Opening / Min size / Peak settings)**
+**Post-processing parameters (EDT / mask & seed thresholds / Opening / Min size)**
 
 - If watershed results look wrong (merged cells, speckles, etc.), see [Tuning (failure mode → fix)](./index.md#instance-post-processing-tuning) on the [segmentation overview](./index.md) — the same tips apply to APOC, ConvPaint, and Pixel Classifier.
 

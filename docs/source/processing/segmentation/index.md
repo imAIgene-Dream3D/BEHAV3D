@@ -10,6 +10,10 @@ The zarr is a 4-D `(T, Z, Y, X)` `uint16` array; pixel value `0` is background; 
 
 ![Segmentation tab](../../_static/screenshots/segmentation_tab_overview.png)
 
+```{tip}
+In a hurry? [Troubleshooting](troubleshooting) is a one-page, symptom → fix quick reference for method choice, classifier issues, and instance-processing parameters.
+```
+
 ## The five methods
 
 A top dropdown lets you pick the segmentation method. The body of the tab swaps to show that method's parameters.
@@ -118,19 +122,17 @@ APOC, ConvPaint and the Pixel Classifier are *pixel* classifiers: their raw outp
 
 | Parameter | Meaning |
 |---|---|
-| **EDT threshold** | Threshold on the Euclidean Distance Transform of the mask. Voxels above it become watershed seeds. **Lower → more aggressive splitting** of touching objects; **higher → objects stay merged**. `0` disables splitting. |
+| **EDT threshold** | Erosion-style threshold on the Euclidean Distance Transform of the mask: voxels with EDT ≥ this value become watershed seeds. **Higher → seeds shrink toward each object's core, breaking the thin neck between touching objects → more splitting**; **lower → neighbouring cores stay connected → objects stay merged**. `0` disables splitting. |
 | **Opening px** | Morphological opening applied to the mask before watershed. Smooths boundaries and removes small protrusions / speckles. `0` disables. |
 | **Min size** | Segments smaller than this many voxels are discarded after watershed (noise / debris filter). |
 | **Fill holes** | Fill internal gaps inside objects before watershed (recommended for solid 3-D objects). |
 | **Mask threshold** *(probability strategies)* | Foreground cutoff applied to the probability map. |
-| **Seed threshold** *(probability strategies)* | Higher cutoff used to place watershed seeds; should be ≥ Mask threshold. Lower → more seeds (more splitting). |
-| **Peak min dist** *(peak-EDT strategies)* | Minimum distance (µm) between local EDT peaks used as seeds. Larger → fewer, more separated seeds. |
-| **Peak min ratio** *(peak-EDT strategies)* | Minimum EDT peak height as a fraction of the local maximum (0–1). Higher → fewer seeds. |
+| **Seed threshold** *(probability strategies)* | Higher cutoff used to place watershed seeds; should be ≥ Mask threshold. **Higher → keeps only each object's confident core as a seed, splitting more** touching objects; lower merges neighbouring cores together, splitting fewer. Same direction as EDT threshold above. |
 
 ### Instance post-processing tuning
 
-- Touching cells **merged** into one label → **lower EDT** (or, for probability strategies, **raise Seed threshold**).
-- One cell **split** into several labels → **raise EDT** (or **lower Seed threshold**).
+- Touching cells **merged** into one label → **raise EDT threshold** (Mask + EDT/Watershed strategy), or **raise Seed threshold** (Probability Map strategy).
+- One cell **split** into several labels → **lower EDT threshold**, or **lower Seed threshold**.
 - Background labelled as cells → **raise Mask threshold**, or add more background labels.
 - Cells lost at the edges → **lower Mask threshold**.
 - Small speckles appear as tiny labels → **raise Min size**; real small cells dropped → **lower Min size**.
@@ -142,8 +144,8 @@ APOC, ConvPaint and the Pixel Classifier are *pixel* classifiers: their raw outp
 For **APOC**, **ConvPaint**, and the **Pixel Classifier**: tune **each cell type on its own tab**. Settings for **big** objects (e.g. organoids) are usually wrong for **small, crowded** ones (e.g. immune cells / T cells).
 
 - Work **one cell type at a time**: train (or paint), run a **preview**, look at the labels, adjust sliders, repeat. Settings on one tab do not apply to another.
-- **Big** (e.g. organoids): **large** minimum size; EDT around **10–12** so one object is not cut in pieces. Stuck together → **lower** EDT. Fuzzy outline → try a **probability-map** strategy if your method has one.
-- **Small / crowded** (e.g. immune, T cells): **small** minimum size; **lower** EDT to start. One cell split into many → **raise** EDT. Very packed → **peak-EDT** strategies often help.
+- **Big** (e.g. organoids): **large** minimum size; EDT around **10–12** so one object is not cut in pieces. Stuck together → **raise** EDT. Fuzzy outline → try a **probability-map** strategy if your method has one.
+- **Small / crowded** (e.g. immune, T cells): **small** minimum size; **lower** EDT to start. One cell split into many → **lower** EDT further.
 - **Ballpark numbers:** see organoid vs immune defaults on the [Pixel Classifier](pixel_classifier) page (EDT **12** / min **1000** vs EDT **2.5** / min **10**); copy similar values in APOC or ConvPaint, then adjust by eye.
 - **Several cell types in one experiment?** In APOC or ConvPaint, **Advanced (per cell type)** lets each type use a different strategy; still tune post-processing separately on each tab.
 
@@ -190,4 +192,5 @@ convpaint
 pixel_classifier
 cellpose
 import
+troubleshooting
 ```

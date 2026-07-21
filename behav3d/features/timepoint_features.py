@@ -988,7 +988,17 @@ def calculate_image_based_track_features(
         # Determine if invasiveness should be calculated (immune cells + invasiveness feature requested)
         should_calculate_invasiveness = "invasiveness" in features_choice and cell_type in immune_segments_paths.keys()
         
-        if df_contacts_outpath.exists() and not overwrite:
+        cache_valid = df_contacts_outpath.exists() and not overwrite
+        if cache_valid and should_calculate_invasiveness:
+            cached_cols = pd.read_csv(df_contacts_outpath, nrows=0).columns
+            if not any(c.endswith("_invasiveness_perc") for c in cached_cols):
+                print(
+                    "Contact .csv already exists but predates invasiveness "
+                    "calculation. Recomputing contact information..."
+                )
+                cache_valid = False
+
+        if cache_valid:
             print("Contact .csv already exists. Loading in contact information...")
             df_contacts = pd.read_csv(df_contacts_outpath)
 
