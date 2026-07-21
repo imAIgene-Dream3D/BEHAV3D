@@ -59,7 +59,7 @@ This section appears once metadata is loaded. One group-box per cell type is gen
 
 | Parameter | What it does | Default for organoids | Default for immune cells | Default for "other" |
 |---|---|---|---|---|
-| **EDT** | Threshold on the Euclidean Distance Transform of the binary mask. Voxels with EDT above the threshold become *watershed seeds*. Lower → more aggressive splitting of touching objects; higher → keep objects merged. `0.0` disables splitting (not recommended). The in-widget help suggests typical values of 8–15 for organoids and 1.5–4.0 for immune cells. | 12.0 | 2.5 | 1.0 |
+| **EDT** | Erosion-style threshold on the Euclidean Distance Transform of the binary mask. Voxels with EDT above the threshold become *watershed seeds*. **Higher → more aggressive splitting** of touching objects (the threshold erodes further, breaking the thin neck between them); **lower → objects stay merged**. `0.0` disables splitting (not recommended). | 12.0 | 2.5 | 1.0 |
 | **Min size** | Minimum object volume in voxels. Anything smaller is discarded as noise. | 1000 | 10 | 10 |
 | **Opening** | Radius of morphological opening (in pixels) applied to the binary mask before watershed. Smooths boundaries and removes small protrusions. `0` disables. | 3 | 0 | 0 |
 | **Fill holes** | If checked, internal holes in the foreground mask are filled before watershed. | ON | ON | ON |
@@ -84,7 +84,7 @@ Use `Test Segmentation Parameters` between every change. The rules below are the
 
 **Post-processing parameters (EDT / Min size / Opening / Fill holes)**
 
-- For this method EDT is the most important parameter — lower it to split touching cells more aggressively, raise it to keep them merged. The full failure-mode → fix heuristics for all four parameters are shared and documented once in [Tuning (failure mode → fix)](./index.md#instance-post-processing-tuning) on the [segmentation overview](./index.md).
+- For this method EDT is the most important parameter — **raise it to split touching cells more aggressively, lower it to keep them merged**. The full failure-mode → fix heuristics for all four parameters are shared and documented once in [Tuning (failure mode → fix)](./index.md#instance-post-processing-tuning) on the [segmentation overview](./index.md).
 
 **Examples / sample**
 

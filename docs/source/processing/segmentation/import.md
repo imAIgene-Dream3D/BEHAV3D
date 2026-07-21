@@ -14,13 +14,14 @@ The widget reads the **`{prefix}_{ct}_segments_image_path`** columns from your m
 |---|---|---|
 | **No segmentation available** | The metadata column for this sample × cell type is empty. | Fill in the path in Data Preparation → Metadata Builder. |
 | **⚠️ File not found** | A path is set but the file does not exist. | Fix the path in the Metadata Builder. |
-| **✅ Ready for tracking** | A valid `.zarr` (single root array, first chunk dim `1`) whose spatial (`Z,Y,X`) and time (`T`) sizes match the raw image. | Nothing — already importable as-is. |
+| **✅ Ready for tracking** | A valid, already-imported `.zarr` (single root array, first chunk dim `1`) whose spatial (`Z,Y,X`) and time (`T`) sizes match the raw image, **and** whose path is already saved in the metadata. | Nothing — already importable as-is. |
+| **💾 Save path to metadata** *(button)* | A structurally valid, dimension-matching `.zarr` that the metadata CSV doesn't point at yet (e.g. you just typed/browsed to a new path). | Click to persist the path to the metadata CSV — no file conversion needed. |
 | **⚠️ Dimension mismatch** | A structurally valid `.zarr` whose spatial or time size does **not** match the raw image (hover the label for the exact reason). | Re-export with matching dimensions. |
 | **🔄 Fix zarr format** *(button)* | A `.zarr` whose first chunk dim is not `1`, or that is a `zarr.Group` instead of a root array. | Click to re-chunk. |
 | **🔄 Convert TIFF → zarr** *(button)* | A `.tif` / `.tiff` file (including `.ome.tif`). | Click to convert + re-chunk to zarr. |
 | **⚠️ Format not supported (…)** | Any other extension (e.g. `.h5`). | Re-export the segmentation as TIFF first. |
 
-When you click a per-row button, **⚡ Convert / Fix all for `<sample>`** (per sample), or **⚡ Convert / Fix All Samples** (global), the widget:
+When you click a per-row button, **⚡ Convert / Save all for `<sample>`** (per sample), or **⚡ Convert / Save All Samples** (global), the widget:
 
 1. Reads the source file (TIFF, or an existing zarr that only needs re-chunking).
 2. Writes a zarr at the canonical path `<output_dir>/images/<sample>/<sample>_<cell_type>_segments.zarr` chunked one timepoint per chunk, matching every other output in BEHAV3D EXPLORER, and updates the metadata column to point at it.

@@ -1517,7 +1517,7 @@ def build_external_seg_import_ui(metadata_loader):
             output_dir=str(out_dir),
             on_converted=make_metadata_callback(metadata_loader, "dead_mask_path"),
             sample_names=sample_names,
-            output_filename="{sample_name}_dead_mask.zarr",
+            output_filename="{sample_name}_mask_dead.zarr",
             is_label_image=True,
         ))
 
