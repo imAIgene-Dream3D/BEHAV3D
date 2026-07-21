@@ -3091,7 +3091,7 @@ class ImportWidget(QWidget):
     def _expected_dead_mask_outpath(self, sample_name):
         """Where a converted dead-mask zarr would be saved."""
         out_dir = Path(self.metadata_loader.output_dir)
-        return out_dir / "images" / sample_name / f"{sample_name}_dead_mask.zarr"
+        return out_dir / "images" / sample_name / f"{sample_name}_mask_dead.zarr"
 
     def _metadata_csv_path(self):
         path = getattr(self.metadata_loader, "_loaded_csv_path", None)

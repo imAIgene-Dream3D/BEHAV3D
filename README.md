@@ -1,6 +1,17 @@
-# BEHAV3D
+# BEHAV3D Explorer
 
-BEHAV3D analyzes cell behavior (movement, contacts, cell death) from 3D microscopy images — no coding required. Built for biologists.
+BEHAV3D Explorer is a tool for analyzing how cells behave in 3D microscopy images: no coding required, built for biologists.
+
+It works with pretty much any 3D microscopy data, for example 3D live co-cultures or intravital microscopy, and turns your raw movies into quantitative, cell-by-cell readouts. Here's the kind of analysis you can get out of it:
+
+<p align="center">
+  <img src="docs/source/_static/icons/death_dynamics.jpg" width="200" alt="Death dynamics"/>
+  <img src="docs/source/_static/icons/invasion.jpg" width="200" alt="Invasion"/>
+  <img src="docs/source/_static/icons/active_killing.jpg" width="200" alt="Active killing"/>
+  <img src="docs/source/_static/icons/single_cell_analysis.jpg" width="200" alt="Single cell analysis"/>
+</p>
+
+There's no one-size-fits-all solution, so BEHAV3D-Explorer is built as a set of flexible, modular tools: you pick and combine the segmentation, tracking and analysis methods that fit your experiment, or your computational power, instead of being locked into one fixed pipeline. Navigating a complex software with so many options is difficult, but you don't have to figure it out alone: **a built-in Co-pilot assistant** (QueenB) sits next to the panel, explains what each parameter does, and can fill in the forms for you.
 
 📖 [Full wiki](https://imaigene-dream3d.github.io/BEHAV3D/)
 
@@ -29,8 +40,8 @@ The BEHAV3D plugin opens automatically inside napari, covering the full pipeline
 ## Files you need before starting
 
 **Required:**
-- A [metadata.csv file](./configs/metadata.csv) listing the samples to analyze. On Windows we recommend editing it with https://www.moderncsv.com/, as it doesn't alter the format on save.
-- Per sample, a microscopy image (.czi, .tiff, .zarr).
+- Per sample, a microscopy image (.czi, .lif .tiff, .zarr).
+- A [metadata.csv file](./configs/metadata.csv) listing the samples to analyze. You can build this directly inside BEHAV3D-Explorer with the built-in metadata editor, no need to prepare it beforehand. If you prefer editing it outside the app, on Windows we recommend https://www.moderncsv.com/, as it doesn't alter the format on save.
 
 **Optional:**
 - Already segmented data per sample.
@@ -40,7 +51,7 @@ See the exact `metadata.csv` structure [below](#metadatacsv-structure).
 
 ## Co-pilot assistant
 
-The napari panel includes an AI assistant on the right that answers questions about parameters and methods, and can fill in the forms for you (with your confirmation). Works out of the box, no setup required.
+No setup needed: the Co-pilot dock on the right of the napari panel is ready to use as soon as you open BEHAV3D. Ask it about any parameter or method, and confirm with one click to let it fill in the form for you.
 
 ---
 
@@ -327,7 +338,7 @@ The co-pilot runs as a **CPU-only [Modal](https://modal.com) service** that prox
 - A [DeepSeek API](https://platform.deepseek.com) key
 - Authenticated: `python -m modal token new`
 
-### 1 — Store the DeepSeek API key as a Modal secret
+### 1. Store the DeepSeek API key as a Modal secret
 
 ```bash
 python -m modal secret create deepseek-api-key DEEPSEEK_API_KEY=<your-key>
@@ -335,7 +346,7 @@ python -m modal secret create deepseek-api-key DEEPSEEK_API_KEY=<your-key>
 
 > Set a **monthly spend limit** in the DeepSeek dashboard to cap costs.
 
-### 2 — Build the RAG index
+### 2. Build the RAG index
 
 The RAG index embeds all BEHAV3D documentation and parameter descriptions so the bot can retrieve relevant context for every question.
 
@@ -345,7 +356,7 @@ python -m modal run chatbot/app.py::ingest
 
 Re-run this whenever files in `chatbot/knowledge/` or `chatbot/schema_cards.json` change.
 
-### 3 — Deploy
+### 3. Deploy
 
 ```bash
 python -m modal deploy chatbot/app.py
@@ -357,9 +368,9 @@ The deploy output will print the endpoint URL. Update `napari/assistant_config.j
 { "endpoint": "https://<your-modal-url>.modal.run", "timeout": 60 }
 ```
 
-The service runs on CPU with `min_containers=1` (always warm, ~$6/month at default specs). No GPU or model weights are downloaded — cold start is a few seconds.
+The service runs on CPU with `min_containers=1` (always warm, ~$6/month at default specs). No GPU or model weights are downloaded, so cold start only takes a few seconds.
 
-### 4 — Development / hot-reload
+### 4. Development / hot-reload
 
 ```bash
 python -m modal serve chatbot/app.py
@@ -380,7 +391,7 @@ Available options: `deepseek-v4-flash` (fast, cheap), `deepseek-v4-pro` (stronge
 ### Monitoring costs
 
 - DeepSeek usage: [platform.deepseek.com](https://platform.deepseek.com) → Usage
-- Modal compute: [modal.com/apps](https://modal.com/apps) — the `behav3d-assistant` app
+- Modal compute: [modal.com/apps](https://modal.com/apps), under the `behav3d-assistant` app
 - Set a DeepSeek spend limit to prevent runaway costs from unexpected traffic
 
 </details>
@@ -424,7 +435,7 @@ del .behav3d_dev        # Windows CMD
 Remove-Item .behav3d_dev  # Windows PowerShell
 ```
 
-**For developers — checking dev mode in code:**
+**For developers, checking dev mode in code:**
 
 ```python
 import os
