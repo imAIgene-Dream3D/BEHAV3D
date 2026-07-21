@@ -8,6 +8,10 @@ Qt needed — only the dependency-free logic is exercised here.
 import os
 import sys
 
+import anndata as ad
+import numpy as np
+import pandas as pd
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "chatbot"))
 
 from behav3d.napari._assistant_schema import (
@@ -31,10 +35,91 @@ from behav3d.analysis.track_counts import (
     calculate_track_count_table, format_track_count_summary,
     generate_track_count_summary,
 )
+from behav3d.analysis.behavior.track.utils import _filter_tracks_for_dtaidistance
+from behav3d.analysis.behavior.track.visualization.backprojection import (
+    _build_track_cluster_lookup,
+    _resolve_track_cluster_label,
+)
 from behav3d.napari._results_catalog import scan_outputs
 
 
 # --------------------------------------------------------------------------
+def _make_dtaidistance_adata(track_lengths):
+    rows = []
+    for track_id, track_len in enumerate(track_lengths):
+        for t in range(int(track_len)):
+            rows.append(
+                {
+                    "sample_name": "sample_0",
+                    "TrackID": int(track_id),
+                    "position_t": int(t),
+                    "full_behavioral_cluster": "state_a" if t % 2 == 0 else "state_b",
+                }
+            )
+    obs = pd.DataFrame(rows)
+    return ad.AnnData(X=np.zeros((len(obs), 1)), obs=obs)
+
+
+def test_dtaidistance_split_long_tracks_first_mode_preserves_original_trackid():
+    adata = _make_dtaidistance_adata([350])
+    out = _filter_tracks_for_dtaidistance(
+        adata,
+        trajectory_size=100,
+        min_length=100,
+        trim_mode="first",
+        split_long_tracks=True,
+    )
+
+    obs = out.obs.sort_values(["trajectory_window_id", "position_t"])
+    assert obs["TrackID"].nunique() == 1
+    assert obs["TrackID"].iloc[0] == 0
+    assert obs.groupby("trajectory_window_id", observed=True).size().tolist() == [100, 100, 100]
+    assert obs["position_t"].min() == 0
+    assert obs["position_t"].max() == 299
+
+
+def test_dtaidistance_split_long_tracks_last_mode_drops_leading_leftover():
+    adata = _make_dtaidistance_adata([350, 100, 80])
+    out = _filter_tracks_for_dtaidistance(
+        adata,
+        trajectory_size=100,
+        min_length=100,
+        trim_mode="last",
+        split_long_tracks=True,
+    )
+
+    obs = out.obs.sort_values(["TrackID", "trajectory_window_id", "position_t"])
+    long_track = obs[obs["TrackID"] == 0]
+    exact_track = obs[obs["TrackID"] == 1]
+    short_track = obs[obs["TrackID"] == 2]
+    assert len(long_track) == 300
+    assert long_track["position_t"].min() == 50
+    assert long_track["position_t"].max() == 349
+    assert long_track.groupby("trajectory_window_id", observed=True).size().tolist() == [100, 100, 100]
+    assert len(exact_track) == 100
+    assert exact_track["trajectory_window_id"].nunique() == 1
+    assert len(short_track) == 0
+
+
+def test_dtaidistance_split_track_cluster_lookup_uses_clicked_window():
+    obs = pd.DataFrame(
+        {
+            "sample_name": ["sample_0", "sample_0"],
+            "TrackID": [7, 7],
+            "trajectory_window_id": [0, 1],
+            "position_t_min": [0, 100],
+            "position_t_max": [99, 199],
+            "ClusterID": ["early", "late"],
+        }
+    )
+    adata_tracks = ad.AnnData(X=np.zeros((2, 1)), obs=obs)
+    lookup = _build_track_cluster_lookup(adata_tracks)
+
+    assert _resolve_track_cluster_label(lookup, "sample_0", "7", cursor_time=25) == "early"
+    assert _resolve_track_cluster_label(lookup, "sample_0", "7", cursor_time=125) == "late"
+    assert _resolve_track_cluster_label(lookup, "sample_0", "7", cursor_time=None) == "multiple"
+
+
 def test_schema_flatten_synthetic():
     cfg = {"tracking": {"immune": {"method": "trackpy",
                                    "lap": {"track_cost_px": 60}}},

@@ -33,6 +33,7 @@ from behav3d.analysis.behavior.state.utils import (
     _resolve_log_scale_feature_cols,
     _resolve_positions_csv_path,
     _resolve_state_paths,
+    _save_adata_obs_csv,
     _save_pdf_page_a4,
     _sanitize_filename_token,
     _set_classification_state_colors,
@@ -866,8 +867,15 @@ def _prepare_hmm_apply_adata_from_df_positions(
             validate="one_to_one",
         )
 
-    df_base = _smooth_timepoint_features(
-        df_base,
+    # Mirrors the training-path fix in run_hmm_state_clustering: rows skipped via start_offset
+    # (e.g. the fabricated-zero first timepoint of each track) must not be blended into the
+    # smoothed values of the rows that will actually be scored.
+    _scored_candidate_mask = df_base["_start_offset_track_idx"] >= int(resolved_start_offset)
+    df_base_scored = df_base.loc[_scored_candidate_mask].copy()
+    df_base_skipped = df_base.loc[~_scored_candidate_mask].copy()
+
+    df_base_scored = _smooth_timepoint_features(
+        df_base_scored,
         raw_feature_cols,
         id_cols=("sample_name", "TrackID"),
         time_col="position_t",
@@ -875,11 +883,15 @@ def _prepare_hmm_apply_adata_from_df_positions(
         min_periods=int(windowing.get("smoothing_min_periods", 1)),
     )
 
+    df_smoothed = pd.concat([df_base_scored, df_base_skipped], axis=0).sort_values(
+        ["sample_name", "TrackID", "position_t"], kind="mergesort"
+    )
+
     cont_cols = [str(c) for c in list(feature_cols)]
-    numeric_frame = df_base[cont_cols].apply(pd.to_numeric, errors="coerce")
+    numeric_frame = df_smoothed[cont_cols].apply(pd.to_numeric, errors="coerce")
     valid_mask = numeric_frame.notna().all(axis=1)
     drop_summary = _summarize_hmm_apply_row_drops(
-        df_base,
+        df_smoothed,
         valid_mask,
         sample_col="sample_name",
         track_col="TrackID",
@@ -889,7 +901,7 @@ def _prepare_hmm_apply_adata_from_df_positions(
     if not bool(valid_mask.any()):
         raise ValueError("No valid timepoints remain after smoothing for HMM apply.")
 
-    df_valid = df_base.loc[valid_mask].copy()
+    df_valid = df_smoothed.loc[valid_mask].copy()
     df_valid.loc[:, cont_cols] = numeric_frame.loc[valid_mask, cont_cols].to_numpy(dtype=float)
     df_valid["_start_offset_scored"] = df_valid["_start_offset_track_idx"] >= int(resolved_start_offset)
     df_valid["_start_offset_skipped"] = ~df_valid["_start_offset_scored"]
@@ -1213,11 +1225,10 @@ def _plot_hmm_feature_distribution_pdf(
             "state-hmm",
             f"feature distribution feature pages | pages={page_count}, panels_per_page={1 + len(cluster_order)}",
         )
-        cluster_values = cluster_series.to_numpy()
         for idx, feature_name in enumerate(valid_features):
             page_specs = [("overall", np.ones(adata.n_obs, dtype=bool), "#C94C4C")]
             page_specs.extend(
-                (f"cluster {cluster_name}", cluster_values == str(cluster_name), "#4C7E9E")
+                (f"cluster {cluster_name}", (cluster_series == str(cluster_name)).fillna(False).to_numpy(), "#4C7E9E")
                 for cluster_name in cluster_order
             )
             page_data = []
@@ -1324,17 +1335,19 @@ def _plot_hmm_state_diagnostics_pdf(
                 f"diagnostics Scanpy heatmap | features={len(valid_features)}",
             )
             ad_heat = ad[:, valid_features].copy()
-            cluster_order = sorted(
-                pd.Series(ad_heat.obs[cluster_col], index=ad_heat.obs.index, dtype="string").dropna().unique().tolist(),
-                key=_mixed_label_sort_key,
-            )
+            cluster_series = pd.Series(ad_heat.obs[cluster_col], index=ad_heat.obs.index, dtype="string")
+            valid_mask = cluster_series.notna()
+            if not bool(valid_mask.all()):
+                ad_heat = ad_heat[valid_mask.to_numpy()].copy()
+                cluster_series = cluster_series[valid_mask]
+            cluster_order = sorted(cluster_series.unique().tolist(), key=_mixed_label_sort_key)
             ad_heat.obs[cluster_col] = pd.Categorical(
-                pd.Series(ad_heat.obs[cluster_col], index=ad_heat.obs.index, dtype="string"),
+                cluster_series,
                 categories=cluster_order,
                 ordered=True,
             )
             dendrogram_arg = False
-            if len(cluster_order) > 1:
+            if ad_heat.n_obs > 0 and len(cluster_order) > 1:
                 try:
                     dendrogram_key = f"dendrogram_{cluster_col}"
                     if dendrogram_key not in ad_heat.uns:
@@ -1344,26 +1357,27 @@ def _plot_hmm_state_diagnostics_pdf(
                 except Exception:
                     dendrogram_arg = False
 
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Starting a Matplotlib GUI outside of the main thread",
-                )
-                sc.pl.heatmap(
-                    ad_heat,
-                    var_names=valid_features,
-                    groupby=cluster_col,
-                    standard_scale="var",
-                    figsize=A4_LANDSCAPE,
-                    swap_axes=True,
-                    dendrogram=dendrogram_arg,
-                    show_gene_labels=True,
-                    show=False,
-                )
-                fig_sc = plt.gcf()
-            fig_sc.suptitle(f"{title} | Scanpy heatmap", y=0.995)
-            _save_pdf_page_a4(pdf, fig_sc, orientation="landscape")
-            plt.close(fig_sc)
+            if ad_heat.n_obs > 0 and len(cluster_order) > 0:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="Starting a Matplotlib GUI outside of the main thread",
+                    )
+                    sc.pl.heatmap(
+                        ad_heat,
+                        var_names=valid_features,
+                        groupby=cluster_col,
+                        standard_scale="var",
+                        figsize=A4_LANDSCAPE,
+                        swap_axes=True,
+                        dendrogram=dendrogram_arg,
+                        show_gene_labels=True,
+                        show=False,
+                    )
+                    fig_sc = plt.gcf()
+                fig_sc.suptitle(f"{title} | Scanpy heatmap", y=0.995)
+                _save_pdf_page_a4(pdf, fig_sc, orientation="landscape")
+                plt.close(fig_sc)
             _vdone(verbose, "state-hmm", "diagnostics Scanpy heatmap", heatmap_started)
 
         if not transition_df.empty:
@@ -1523,8 +1537,17 @@ def run_hmm_state_clustering(
             how="left",
             validate="one_to_one",
         )
-    df_base = _smooth_timepoint_features(
-        df_base,
+    # Timepoints skipped via start_offset (e.g. the first timepoint of each track, whose raw
+    # motion features are a fabricated 0.0 from the upstream np.diff(prepend=...) construction,
+    # not a real measurement) must have zero influence on smoothing, quantile-cap bounds, or
+    # scaler fitting below -- not just on the HMM fit itself. Split before any of those steps
+    # so the excluded rows are never blended into the scored rows' computed values.
+    _scored_candidate_mask = df_base["_start_offset_track_idx"] >= int(start_offset)
+    df_base_scored = df_base.loc[_scored_candidate_mask].copy()
+    df_base_skipped = df_base.loc[~_scored_candidate_mask].copy()
+
+    df_base_scored = _smooth_timepoint_features(
+        df_base_scored,
         raw_features,
         id_cols=("sample_name", "TrackID"),
         time_col="position_t",
@@ -1533,14 +1556,18 @@ def run_hmm_state_clustering(
     )
 
     cap_started = _vstart(verbose, "state-hmm", "cap observation features to quantiles")
-    df_capped, cap_limits = cap_values_to_quantile(
-        df_base,
+    df_base_scored, cap_limits = cap_values_to_quantile(
+        df_base_scored,
         kept_features,
         lower_quantile=lower_quantile_cap,
         upper_quantile=upper_quantile_cap,
         return_limits=True,
     )
     _vdone(verbose, "state-hmm", "cap observation features to quantiles", cap_started)
+
+    df_capped = pd.concat([df_base_scored, df_base_skipped], axis=0).sort_values(
+        sort_cols, kind="mergesort"
+    )
 
     numeric_frame = df_capped[kept_features].apply(pd.to_numeric, errors="coerce")
     valid_mask = numeric_frame.notna().all(axis=1)
@@ -1587,7 +1614,8 @@ def run_hmm_state_clustering(
 
     scale_started = _vstart(verbose, "state-hmm", "z-scale observation features")
     scaler = StandardScaler()
-    df_valid.loc[:, kept_features] = scaler.fit_transform(df_valid[kept_features].to_numpy(dtype=float))
+    scaler.fit(df_scored[kept_features].to_numpy(dtype=float))
+    df_valid.loc[:, kept_features] = scaler.transform(df_valid[kept_features].to_numpy(dtype=float))
     df_scored.loc[:, kept_features] = df_valid.loc[df_scored.index, kept_features].to_numpy(dtype=float)
     _vdone(verbose, "state-hmm", "z-scale observation features", scale_started)
 
@@ -2129,8 +2157,10 @@ def _finalize_hmm_apply_outputs(
 
     write_started = _vstart(verbose, "state-hmm-apply", "write full output adata")
     adata_full.write(state_paths.full_output_adata_path, compression="gzip")
+    full_output_csv_path = _save_adata_obs_csv(adata_full, state_paths.full_output_adata_path)
     _vdone(verbose, "state-hmm-apply", "write full output adata", write_started)
     _vsave(verbose, "state-hmm-apply", "full output adata", state_paths.full_output_adata_path)
+    _vsave(verbose, "state-hmm-apply", "full output csv", full_output_csv_path)
     return adata_full
 
 

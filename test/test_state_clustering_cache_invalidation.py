@@ -516,6 +516,58 @@ def test_run_hmm_state_clustering_fixed_k_outputs(tmp_path):
     assert (state_paths.state_clustering_outdir / "behavioral_clustering_hmm_state_counts.csv").exists()
 
 
+def test_run_hmm_state_clustering_leave_unassigned_start_offset_writes_diagnostics_pdf(tmp_path):
+    df_positions = _make_positions_df(n_tracks=6, track_len=15)
+    output_dir = Path(tmp_path) / "hmm_leave_unassigned"
+
+    cluster_out = run_hmm_state_clustering(
+        features=["speed", "elongation"],
+        binary_features_to_group=[],
+        output_dir=output_dir,
+        cell_type="tcell",
+        n_states=3,
+        random_state=19,
+        start_offset=3,
+        start_offset_fill_mode="leave_unassigned",
+        df_positions=df_positions,
+        return_details=True,
+        verbose=False,
+    )
+    model_adata = cluster_out["model_adata"]
+
+    assert (
+        pd.Series(model_adata.obs[state_classification.INTRINSIC_STATE_COL], dtype="string").isna().any()
+    ), "expected leave_unassigned + start_offset to leave some frames unassigned"
+
+    state_paths = _resolve_state_paths(output_dir, "tcell")
+    hmm_qc_outdir = state_classification._resolve_hmm_quality_control_outdir(state_paths=state_paths) / "raw"
+    assert (hmm_qc_outdir / "behavioral_clustering_diagnostics.pdf").exists()
+    assert (hmm_qc_outdir / "behavioral_clustering_feature_distributions.pdf").exists()
+
+
+def test_plot_hmm_state_diagnostics_pdf_skips_nan_labeled_rows(tmp_path):
+    n_valid = 12
+    rng = np.random.default_rng(7)
+    features = rng.normal(size=(n_valid + 2, 2))
+    labels = pd.array(["1"] * 6 + ["2"] * 6 + [pd.NA, pd.NA], dtype="string")
+    adata = sc.AnnData(
+        X=features.astype(float),
+        obs=pd.DataFrame({state_classification.INTRINSIC_STATE_COL: labels}),
+        var=pd.DataFrame(index=["speed", "elongation"]),
+    )
+
+    pdf_path = tmp_path / "diagnostics.pdf"
+    state_classification._plot_hmm_state_diagnostics_pdf(
+        adata,
+        cluster_col=state_classification.INTRINSIC_STATE_COL,
+        feature_cols=["speed", "elongation"],
+        pdf_path=pdf_path,
+        verbose=False,
+    )
+
+    assert pdf_path.exists()
+
+
 def test_run_hmm_state_clustering_writes_grouped_binary_constraints_and_enforces(tmp_path):
     df_positions = _with_multi_binary_flags(_make_positions_df(n_tracks=8, track_len=10))
     output_dir = Path(tmp_path) / "hmm_grouped_binary_constraints"

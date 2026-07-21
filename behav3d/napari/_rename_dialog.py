@@ -26,9 +26,10 @@ import traceback
 from pathlib import Path
 from typing import Dict, Optional
 
-from qtpy.QtCore import Qt, Signal
-from qtpy.QtGui import QColor
+from qtpy.QtCore import Qt, QMimeData, Signal
+from qtpy.QtGui import QColor, QDrag
 from qtpy.QtWidgets import (
+    QApplication,
     QCheckBox,
     QColorDialog,
     QDialog,
@@ -46,22 +47,17 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from behav3d.analysis.behavior.utils import _mixed_label_sort_key
+from behav3d.analysis.behavior.state.utils import (
+    _apply_state_order,
+    _get_classification_state_order,
+    _set_classification_state_order,
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
-
-def _unique_sorted(values) -> list:
-    """Return unique non-None string values in sorted order."""
-    seen = set()
-    out = []
-    for v in values:
-        s = str(v)
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return sorted(out)
-
 
 def _track_cluster_col(adata) -> Optional[str]:
     """Return the first recognised track-cluster obs column in *adata*, or None."""
@@ -80,6 +76,76 @@ def _track_cluster_col(adata) -> Optional[str]:
         if col in adata.obs.columns:
             return col
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Drag-and-drop row reordering
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _DragHandle(QLabel):
+    """Small grip control that starts a manual drag carrying its row's name.
+
+    A plain ``QListWidget`` drag (``InternalMove``) can't be used here because
+    each row is a rich composite widget (checkbox/edit/color button) attached
+    via ``setItemWidget``, which swallows the mouse press before the view's
+    own drag machinery ever sees it. Starting the drag from this dedicated
+    handle sidesteps that.
+    """
+
+    def __init__(self, row_name: str, get_row_widget, parent=None):
+        super().__init__("⣿", parent)
+        self._row_name = row_name
+        self._get_row_widget = get_row_widget
+        self._press_pos = None
+        self.setFixedWidth(18)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("color:#777; font-size:12px;")
+        self.setToolTip("Drag to reorder")
+        self.setCursor(Qt.OpenHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._press_pos is not None
+            and event.buttons() & Qt.LeftButton
+            and (event.pos() - self._press_pos).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            self._press_pos = None
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setText(self._row_name)
+            drag.setMimeData(mime)
+            row_widget = self._get_row_widget()
+            if row_widget is not None:
+                drag.setPixmap(row_widget.grab())
+            drag.exec_(Qt.MoveAction)
+        super().mouseMoveEvent(event)
+
+
+class _RowsContainer(QWidget):
+    """Hosts the rename rows and accepts drag-and-drop reordering via ``on_drop``."""
+
+    def __init__(self, on_drop, parent=None):
+        super().__init__(parent)
+        self._on_drop = on_drop
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        self._on_drop(event.mimeData().text(), event.pos().y())
+        event.acceptProposedAction()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -147,11 +213,14 @@ class RenameClusterDialog(QDialog):
         self._name_edits: Dict[str, QLineEdit] = {}
         self._select_checks: Dict[str, QCheckBox] = {}  # full mode only
         self._color_buttons: Dict[str, QPushButton] = {}
+        self._row_order: list = []
+        self._row_widgets: Dict[str, QWidget] = {}
 
         self.setWindowTitle(self._TITLES[mode])
         self.setMinimumWidth(580)
         self.setMinimumHeight(380)
         self.setSizeGripEnabled(True)
+        self.setAcceptDrops(True)
 
         self._init_ui()
         self._populate()
@@ -214,7 +283,7 @@ class RenameClusterDialog(QDialog):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet("QScrollArea { border: none; }")
 
-        self._rows_widget = QWidget()
+        self._rows_widget = _RowsContainer(self._handle_drop)
         self._rows_layout = QVBoxLayout(self._rows_widget)
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
         self._rows_layout.setSpacing(3)
@@ -280,6 +349,8 @@ class RenameClusterDialog(QDialog):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
 
+        row.addWidget(_DragHandle(old_name, lambda n=old_name: self._row_widgets.get(n)))
+
         if self._mode == "full":
             chk = QCheckBox()
             chk.setFixedWidth(30)
@@ -338,6 +409,7 @@ class RenameClusterDialog(QDialog):
         self._name_edits.clear()
         self._select_checks.clear()
         self._color_buttons.clear()
+        self._row_widgets.clear()
 
         # Clear existing rows (keep the trailing stretch)
         while self._rows_layout.count() > 1:
@@ -352,6 +424,7 @@ class RenameClusterDialog(QDialog):
                         sub.widget().deleteLater()
 
         clusters = self._get_cluster_names()
+        self._row_order = list(clusters)
         if not clusters:
             self._status_lbl.setText("No clusters detected (run analysis first).")
             self._btn_save.setEnabled(False)
@@ -368,11 +441,62 @@ class RenameClusterDialog(QDialog):
             container = QWidget()
             row_lay = self._make_row(name)
             container.setLayout(row_lay)
+            self._row_widgets[name] = container
             self._rows_layout.addWidget(container)
         self._rows_layout.addItem(stretch_item)
 
         # Apply saved colors to buttons
         self._apply_saved_colors_to_buttons(clusters)
+
+    def dragEnterEvent(self, event):
+        """Fallback catch-all so an overshot drag above the top row (e.g. over
+        the column header, which is a sibling of ``_RowsContainer`` rather than
+        an ancestor) still resolves to a reorder instead of being rejected."""
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        local_pos = self._rows_widget.mapFrom(self, event.pos())
+        self._handle_drop(event.mimeData().text(), local_pos.y())
+        event.acceptProposedAction()
+
+    def _row_index_at(self, y: int) -> int:
+        """Return the row_order index that drop position *y* corresponds to."""
+        for i, name in enumerate(self._row_order):
+            widget = self._row_widgets.get(name)
+            if widget is None:
+                continue
+            mid = widget.y() + widget.height() / 2
+            if y < mid:
+                return i
+        return len(self._row_order)
+
+    def _handle_drop(self, dragged_name: str, y: int):
+        order = self._row_order
+        if dragged_name not in order:
+            return
+        old_idx = order.index(dragged_name)
+        new_idx = self._row_index_at(y)
+        order.pop(old_idx)
+        if new_idx > old_idx:
+            new_idx -= 1
+        new_idx = max(0, min(new_idx, len(order)))
+        order.insert(new_idx, dragged_name)
+        self._refresh_row_order()
+
+    def _refresh_row_order(self):
+        stretch_item = self._rows_layout.takeAt(self._rows_layout.count() - 1)
+        for i in range(self._rows_layout.count() - 1, -1, -1):
+            self._rows_layout.takeAt(i)
+        for name in self._row_order:
+            widget = self._row_widgets.get(name)
+            if widget is not None:
+                self._rows_layout.addWidget(widget)
+        self._rows_layout.addItem(stretch_item)
 
     def _state_col(self) -> Optional[str]:
         if self._mode == "track":
@@ -401,9 +525,11 @@ class RenameClusterDialog(QDialog):
         col = self._state_col()
         if col is None or col not in self._adata.obs.columns:
             return []
-        return _unique_sorted(
-            self._adata.obs[col].dropna().astype(str).unique()
+        base_order = sorted(
+            {str(v) for v in self._adata.obs[col].dropna().astype(str).unique()},
+            key=_mixed_label_sort_key,
         )
+        return _apply_state_order(base_order, _get_classification_state_order(self._adata, col))
 
     # ── Combine (full mode) ─────────────────────────────────────────────
 
@@ -486,6 +612,10 @@ class RenameClusterDialog(QDialog):
         if new_colors:
             _set_classification_state_colors(self._adata, col, new_colors)
 
+        # Save the user-defined display order (remapped through the rename)
+        new_order = list(dict.fromkeys(mapping.get(n, n) for n in self._row_order))
+        _set_classification_state_order(self._adata, col, new_order)
+
         # Only apply renaming if there are actual label changes
         existing = set(self._adata.obs[col].astype(str).unique())
         changed = any(
@@ -519,5 +649,8 @@ class RenameClusterDialog(QDialog):
 
         # Persist to disk
         if self._adata_path is not None:
+            from behav3d.analysis.behavior.utils import _save_adata_obs_csv
+
             self._adata_path.parent.mkdir(parents=True, exist_ok=True)
             self._adata.write_h5ad(str(self._adata_path), compression="lzf")
+            _save_adata_obs_csv(self._adata, self._adata_path)

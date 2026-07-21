@@ -15,7 +15,7 @@ from behav3d.analysis.behavior.track.visualization.plots.feature_dtw import (
     plot_clustering_feature_heatmap,
     plot_feature_umap,
 )
-from behav3d.analysis.behavior.utils import _handle_nan_in_distance_matrix
+from behav3d.analysis.behavior.utils import _handle_nan_in_distance_matrix, _save_adata_obs_csv
 from behav3d.core.utils import expand_column_patterns, format_time
 
 
@@ -909,5 +909,6 @@ def _create_original_behav3d_adata(output_dir, cell_type):
 
     out_path = outdir.parent / get_dtaidistance_track_trajectories_filename(cell_type)
     adata.write(out_path, compression="gzip")
+    _save_adata_obs_csv(adata, out_path)
     print(f"- Saved original BEHAV3D AnnData ({len(adata)} tracks) to {out_path}")
     return adata

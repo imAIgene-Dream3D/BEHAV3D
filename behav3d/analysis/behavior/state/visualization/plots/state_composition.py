@@ -13,10 +13,12 @@ from behav3d.analysis.behavior.state.utils import (
 )
 from behav3d.analysis.behavior.general.visualization.plots.proportion_bars import (
     draw_thin_stacked_proportion_barh,
-    compute_condition_diff_stats,
-    plot_condition_diff_composite,
+    compute_condition_diff_stats_pairwise,
+    plot_condition_diff_grid,
     plot_page_stacked_proportion_barh_grid,
     stacked_proportion_barh_rows_per_page,
+    _resolve_effective_group_cols,
+    _make_group_label,
 )
 
 
@@ -555,21 +557,23 @@ def save_state_condition_comparison_report(
     state_col="ClusterID",
     sample_col="sample_name",
     condition_col,
-    level_a,
-    level_b,
-    facet_col=None,
+    group_cols=None,
+    group_x=None,
     state_order=None,
     state_colors=None,
     verbose=True,
 ):
-    """Per-cluster overall (pooled, non-per-timepoint) proportion difference between two
-    condition levels, with Welch's two-sided unpaired t-test significance stars — optionally
-    faceted into side-by-side panels by the unique values of `facet_col`.
+    """Per-cluster overall (pooled, non-per-timepoint) proportion difference between every
+    pairwise combination of `condition_col`'s levels, with Welch's two-sided unpaired t-test
+    significance stars — one row per pairwise comparison, one column per group, optionally
+    split into multiple groups (columns) via `group_x`/`group_cols`.
 
-    diff = mean(level_b) - mean(level_a), computed across per-sample proportions.
+    diff = mean of the second level minus mean of the first level in each pair.
     """
     obs = adata.obs
-    required = [state_col, sample_col, condition_col] + ([facet_col] if facet_col else [])
+    effective_group_cols, _ = _resolve_effective_group_cols(group_cols, group_x, None)
+    valid_group_cols = [c for c in effective_group_cols if c in obs.columns]
+    required = [state_col, sample_col, condition_col] + valid_group_cols
     missing = [c for c in required if c not in obs.columns]
     if len(missing) > 0:
         raise KeyError(f"Missing required columns in adata.obs: {missing}")
@@ -578,8 +582,8 @@ def save_state_condition_comparison_report(
     df[state_col] = df[state_col].astype(str)
     df[sample_col] = df[sample_col].astype(str)
     df[condition_col] = df[condition_col].astype(str)
-    if facet_col is not None:
-        df[facet_col] = df[facet_col].astype(str)
+    for gc in valid_group_cols:
+        df[gc] = df[gc].astype(str)
     if len(df) == 0:
         raise ValueError("No valid rows remain after filtering NaNs in required columns.")
 
@@ -604,54 +608,34 @@ def save_state_condition_comparison_report(
     )
     per_sample_df = pd.DataFrame(overall_by_sample).T.reindex(columns=resolved_state_order, fill_value=0.0)
 
-    metadata_cols = [sample_col, condition_col] + ([facet_col] if facet_col is not None else [])
+    metadata_cols = [sample_col, condition_col] + valid_group_cols
     sample_metadata = (
         df[metadata_cols].drop_duplicates(subset=[sample_col]).set_index(sample_col)
     )
 
     resolved_colors = _normalize_label_color_map(resolved_state_order, colors=state_colors, cmap_name="tab20")
 
-    diff_stats_by_facet = compute_condition_diff_stats(
+    diff_stats_by_group = compute_condition_diff_stats_pairwise(
         per_sample_df,
         sample_metadata,
         class_order=resolved_state_order,
         condition_col=condition_col,
-        level_a=level_a,
-        level_b=level_b,
-        facet_col=facet_col,
+        group_cols=valid_group_cols,
     )
 
     output_pdf_path = Path(output_pdf_path)
     output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    title = f"{state_col}: {level_b} vs {level_a} ({condition_col})"
-    result = plot_condition_diff_composite(
-        diff_stats_by_facet,
+    title = f"{state_col} — {condition_col} pairwise comparison"
+    result = plot_condition_diff_grid(
+        diff_stats_by_group,
         class_order=resolved_state_order,
         colors=resolved_colors,
-        level_a_label=str(level_a),
-        level_b_label=str(level_b),
         title=title,
         out_pdf=output_pdf_path,
         out_csv=output_csv_path,
     )
     if bool(verbose):
         print(f"Saved condition comparison report: {result['pdf_path']}")
-    return result
-
-
-def _make_group_label(df, group_cols):
-    """Return a Series of concatenated group-column values (index aligned with df)."""
-    parts = []
-    for col in group_cols:
-        if col in df.columns:
-            parts.append(df[col].fillna("(unknown)").astype(str))
-        else:
-            parts.append(pd.Series(["(unknown)"] * len(df), index=df.index))
-    if len(parts) == 0:
-        return pd.Series(["(all)"] * len(df), index=df.index)
-    result = parts[0]
-    for p in parts[1:]:
-        result = result + " | " + p
     return result
 
 
@@ -775,6 +759,7 @@ def _plot_page_grouped_2d_grid(
     group_label_title,
     state_colors,
     row_slice=None,
+    axis_cols=None,
     sample_title_fontsize=8,
     sample_title_pad=2,
     page_size=A4_PORTRAIT,
@@ -783,14 +768,18 @@ def _plot_page_grouped_2d_grid(
     One A4 page: grouped relative state composition arranged in a 2D grid.
 
     For 1 group_col: single column of panels, one row per unique value.
-    For 2 group_cols: the column with more unique values goes to rows (Y),
-    the column with fewer unique values goes to columns (X), with header
-    labels on each axis. row_slice=(start, end) selects a subset of Y rows
-    for pagination.
+    For 2 group_cols: by default the column with more unique values goes to
+    rows (Y) and the column with fewer unique values goes to columns (X);
+    pass ``axis_cols=(col_y, col_x)`` to pick the axes explicitly instead.
+    Header labels are drawn on each axis. row_slice=(start, end) selects a
+    subset of Y rows for pagination.
     """
     if len(group_cols) == 2:
-        # Assign high-cardinality column to rows for A4 portrait fit
-        col_y, col_x = sorted(group_cols, key=lambda c: -len(unique_vals_per_col[c]))
+        if axis_cols is not None:
+            col_y, col_x = axis_cols
+        else:
+            # Assign high-cardinality column to rows for A4 portrait fit
+            col_y, col_x = sorted(group_cols, key=lambda c: -len(unique_vals_per_col[c]))
         col_x_vals = unique_vals_per_col[col_x]
         col_y_vals_all = unique_vals_per_col[col_y]
         if row_slice is not None:
@@ -984,9 +973,14 @@ def save_state_composition_report(
     sample_title_fontsize: float = 8,
     sample_title_pad: float = 2,
     group_cols=None,
+    group_x=None,
+    group_y=None,
 ):
     """
     Save a combined multi-page PDF report + merged plot-data CSV for relative state composition.
+
+    ``group_x``/``group_y`` explicitly pick the grouped-grid's axes; ``group_cols``
+    is the "group per page" column list (unaffected in meaning).
 
     Outputs:
       1) one combined PDF with all report pages
@@ -1036,16 +1030,28 @@ def save_state_composition_report(
         sample_order=sample_order,
     )
 
+    effective_group_cols, requested_axis_cols = _resolve_effective_group_cols(
+        group_cols, group_x, group_y,
+    )
+
     valid_group_cols = []
-    if group_cols:
+    if effective_group_cols:
         obs_cols_available = list(adata.obs.columns)
-        for gc in group_cols:
+        for gc in effective_group_cols:
             if gc in obs_cols_available:
                 valid_group_cols.append(gc)
                 df[gc] = adata.obs.loc[df.index, gc].astype(str).fillna("(unknown)").values
             else:
                 if verbose:
                     print(f"  Warning: group_col '{gc}' not found in adata.obs — skipping.")
+
+    axis_cols = (
+        requested_axis_cols
+        if requested_axis_cols is not None
+        and requested_axis_cols[0] in valid_group_cols
+        and requested_axis_cols[1] in valid_group_cols
+        else None
+    )
 
     auc_table = _compute_relative_auc_table(
         relative_by_sample,
@@ -1087,9 +1093,13 @@ def save_state_composition_report(
         if len(valid_group_cols) > 0:
             if len(valid_group_cols) in (1, 2):
                 # 2D grid layout with pagination on the Y (row) axis
-                col_y_vals = unique_vals_per_col[
-                    max(valid_group_cols, key=lambda c: len(unique_vals_per_col[c]))
-                ] if len(valid_group_cols) == 2 else unique_vals_per_col[valid_group_cols[0]]
+                if len(valid_group_cols) == 2:
+                    row_col = axis_cols[0] if axis_cols is not None else max(
+                        valid_group_cols, key=lambda c: len(unique_vals_per_col[c])
+                    )
+                    col_y_vals = unique_vals_per_col[row_col]
+                else:
+                    col_y_vals = unique_vals_per_col[valid_group_cols[0]]
 
                 for row_start in range(0, max(1, len(col_y_vals)), max_rows):
                     row_end = min(row_start + max_rows, len(col_y_vals))
@@ -1105,6 +1115,7 @@ def save_state_composition_report(
                         group_label_title=group_label_title,
                         state_colors=state_colors,
                         row_slice=_rs,
+                        axis_cols=axis_cols,
                         sample_title_fontsize=sample_title_fontsize,
                         sample_title_pad=sample_title_pad,
                     )

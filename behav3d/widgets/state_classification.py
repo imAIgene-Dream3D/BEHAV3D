@@ -1406,11 +1406,20 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         self.btn_create_state_composition_plots.on_click(self._on_create_state_composition_plots_clicked)
         self.state_composition_spinner = widgets.HTML(value=spinning_loader)
         self.state_composition_spinner.layout.display = "none"
+        self.composition_group_x_dd = widgets.Dropdown(
+            options=["(none)"], value="(none)", description="Group in X:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.composition_group_y_dd = widgets.Dropdown(
+            options=["(none)"], value="(none)", description="Group in Y:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
         self.composition_group_cols_select = widgets.SelectMultiple(
             options=[],
             value=[],
             description="",
-            layout=widgets.Layout(width="360px", height="80px"),
+            rows=2,
+            layout=widgets.Layout(width="360px"),
             disabled=True,
         )
         self.btn_create_state_transition_plots = widgets.Button(
@@ -1422,20 +1431,26 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         self.state_transition_spinner = widgets.HTML(value=spinning_loader)
         self.state_transition_spinner.layout.display = "none"
         self.comparison_condition_col_dd = widgets.Dropdown(
-            options=[], description="Comparison condition:",
-            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
-        )
-        self.comparison_level_a_dd = widgets.Dropdown(
-            options=[], description="", layout=widgets.Layout(width="160px"), disabled=True,
-        )
-        self.comparison_level_b_dd = widgets.Dropdown(
-            options=[], description="", layout=widgets.Layout(width="160px"), disabled=True,
-        )
-        self.comparison_facet_col_dd = widgets.Dropdown(
-            options=["(none)"], value="(none)", description="Group by condition:",
+            options=[], description="Compare condition:",
             style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
         )
         self.comparison_condition_col_dd.observe(self._on_comparison_condition_col_changed, names="value")
+        self.comparison_group_x_dd = widgets.Dropdown(
+            options=["(none)"], value="(none)", description="Group in X:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.comparison_group_y_text = widgets.Text(
+            value="", description="Group in Y:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"), disabled=True,
+        )
+        self.comparison_group_cols_select = widgets.SelectMultiple(
+            options=[],
+            value=[],
+            description="",
+            rows=2,
+            layout=widgets.Layout(width="360px"),
+            disabled=True,
+        )
         self.btn_create_condition_comparison = widgets.Button(
             description="Create condition comparison plot",
             button_style="info",
@@ -1460,10 +1475,13 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             settings=[
                 widgets.HTML(
                     "<b>Group by condition:</b><br>"
-                    "<span style='color:#555;font-size:11px;'>Select metadata columns to pool samples into "
-                    "groups for an additional grouped-composition page in the PDF. "
-                    "Hold Ctrl/Cmd to select multiple.</span>"
+                    "<span style='color:#555;font-size:11px;'>\"Group in X\"/\"Group in Y\" pick a single "
+                    "condition each to arrange the grouped-composition grid. \"Group per page\" pools "
+                    "additional metadata columns into that grid instead — hold Ctrl/Cmd to select multiple.</span>"
                 ),
+                self.composition_group_x_dd,
+                self.composition_group_y_dd,
+                widgets.HTML("<span style='color:#555;font-size:11px;'>Group per page:</span>"),
                 self.composition_group_cols_select,
             ],
         )
@@ -1481,8 +1499,8 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         condition_comparison_box = build_plot_box(
             title="Condition comparison plot",
             description=(
-                "Per-cluster overall proportion difference between two levels of a condition "
-                "(Welch's t-test), optionally split into separate plots by another condition's values."
+                "Per-cluster overall proportion difference between every pairwise combination of a "
+                "condition's levels (Welch's t-test), shown as one row per pairwise comparison."
             ),
             run_row=widgets.HBox(
                 [self.btn_create_condition_comparison, self.condition_comparison_spinner],
@@ -1490,11 +1508,18 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             ),
             settings=[
                 self.comparison_condition_col_dd,
-                widgets.HBox(
-                    [self.comparison_level_a_dd, widgets.HTML("<b>&nbsp;vs&nbsp;</b>"), self.comparison_level_b_dd],
-                    layout=widgets.Layout(align_items="center", gap="4px"),
+                widgets.HTML(
+                    "<b>Group by condition:</b><br>"
+                    "<span style='color:#555;font-size:11px;'>Each row is one pairwise comparison of "
+                    "\"Compare condition\"'s levels (shown in \"Group in Y\"). \"Group in X\" splits the "
+                    "comparison into side-by-side columns from another condition. \"Group per page\" pools "
+                    "additional metadata columns into that same columns axis instead — hold Ctrl/Cmd to "
+                    "select multiple.</span>"
                 ),
-                self.comparison_facet_col_dd,
+                self.comparison_group_x_dd,
+                self.comparison_group_y_text,
+                widgets.HTML("<span style='color:#555;font-size:11px;'>Group per page:</span>"),
+                self.comparison_group_cols_select,
             ],
         )
 
@@ -2540,30 +2565,13 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         ]
         return cols
 
-    def _metadata_column_unique_values(self, col):
-        md = getattr(self.metadata_loader, "metadata", None)
-        if md is None or col not in getattr(md, "columns", []):
-            return []
-        return sorted(md[col].dropna().astype(str).unique().tolist())
-
-    def _refresh_comparison_level_options(self):
-        col = self.comparison_condition_col_dd.value
-        values = self._metadata_column_unique_values(col) if col else []
-        for dd in (self.comparison_level_a_dd, self.comparison_level_b_dd):
-            prev = dd.value
-            dd.options = values
-            if prev in values:
-                dd.value = prev
-            elif values:
-                dd.value = values[0]
-            dd.disabled = len(values) < 2
-        if len(values) >= 2:
-            self.comparison_level_a_dd.value = values[0]
-            self.comparison_level_b_dd.value = values[1]
+    def _sync_comparison_group_y_text(self):
+        if hasattr(self, "comparison_group_y_text"):
+            self.comparison_group_y_text.value = str(self.comparison_condition_col_dd.value or "")
 
     def _on_comparison_condition_col_changed(self, change):
         if change.get("name") == "value":
-            self._refresh_comparison_level_options()
+            self._sync_comparison_group_y_text()
 
     def _refresh_analysis_plots_status(self):
         if not hasattr(self, "analysis_plots_status"):
@@ -2609,7 +2617,16 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                 prev = set(self.composition_group_cols_select.value)
                 self.composition_group_cols_select.options = candidate_cols
                 self.composition_group_cols_select.value = [c for c in candidate_cols if c in prev]
+            self.composition_group_cols_select.rows = max(2, min(len(candidate_cols), 6))
             self.composition_group_cols_select.disabled = len(candidate_cols) == 0
+
+            axis_options = ["(none)"] + candidate_cols
+            for dd in (self.composition_group_x_dd, self.composition_group_y_dd):
+                if axis_options != list(dd.options):
+                    prev_axis = dd.value
+                    dd.options = axis_options
+                    dd.value = prev_axis if prev_axis in axis_options else "(none)"
+                dd.disabled = len(candidate_cols) == 0
 
         if hasattr(self, "comparison_condition_col_dd"):
             candidate_cols = self._metadata_grouping_columns()
@@ -2622,13 +2639,21 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                     self.comparison_condition_col_dd.value = candidate_cols[0]
             self.comparison_condition_col_dd.disabled = len(candidate_cols) == 0
 
-            facet_options = ["(none)"] + candidate_cols
-            if facet_options != list(self.comparison_facet_col_dd.options):
-                prev_facet = self.comparison_facet_col_dd.value
-                self.comparison_facet_col_dd.options = facet_options
-                self.comparison_facet_col_dd.value = prev_facet if prev_facet in facet_options else "(none)"
-            self.comparison_facet_col_dd.disabled = len(candidate_cols) == 0
-            self._refresh_comparison_level_options()
+            if candidate_cols != list(self.comparison_group_cols_select.options):
+                prev = set(self.comparison_group_cols_select.value)
+                self.comparison_group_cols_select.options = candidate_cols
+                self.comparison_group_cols_select.value = [c for c in candidate_cols if c in prev]
+            self.comparison_group_cols_select.rows = max(2, min(len(candidate_cols), 6))
+            self.comparison_group_cols_select.disabled = len(candidate_cols) == 0
+
+            axis_options = ["(none)"] + candidate_cols
+            if axis_options != list(self.comparison_group_x_dd.options):
+                prev_axis = self.comparison_group_x_dd.value
+                self.comparison_group_x_dd.options = axis_options
+                self.comparison_group_x_dd.value = prev_axis if prev_axis in axis_options else "(none)"
+            self.comparison_group_x_dd.disabled = len(candidate_cols) == 0
+            self._sync_comparison_group_y_text()
+
             self.btn_create_condition_comparison.disabled = len(candidate_cols) == 0
 
     def _regenerate_curated_state_reports(
@@ -2638,6 +2663,8 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         create_composition=True,
         create_transition=True,
         group_cols=None,
+        group_x=None,
+        group_y=None,
     ):
         if self.model_adata is None:
             raise ValueError("No model adata loaded.")
@@ -2697,6 +2724,8 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                     state_colors=full_state_colors,
                     verbose=verbose,
                     group_cols=group_cols if group_cols else None,
+                    group_x=group_x,
+                    group_y=group_y,
                 )
                 composition_pdf = str(composition_out.get("pdf_path", report_pdf_path))
                 composition_auc_csv = str(composition_out.get("csv_path", report_csv_path))
@@ -2762,11 +2791,17 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         with self.out_analysis_plots:
             try:
                 group_cols = list(self.composition_group_cols_select.value) or None
+                group_x = self.composition_group_x_dd.value
+                group_x = None if group_x in (None, "(none)") else group_x
+                group_y = self.composition_group_y_dd.value
+                group_y = None if group_y in (None, "(none)") else group_y
                 report_out = self._regenerate_curated_state_reports(
                     verbose=True,
                     create_composition=True,
                     create_transition=False,
                     group_cols=group_cols,
+                    group_x=group_x,
+                    group_y=group_y,
                 )
                 self._save_model_adata(compression="lzf")
                 _winfo(
@@ -2818,14 +2853,11 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         with self.out_analysis_plots:
             try:
                 condition_col = self.comparison_condition_col_dd.value
-                level_a = self.comparison_level_a_dd.value
-                level_b = self.comparison_level_b_dd.value
-                facet_col = self.comparison_facet_col_dd.value
-                facet_col = None if facet_col in (None, "(none)") else facet_col
-                if not condition_col or level_a is None or level_b is None:
-                    raise ValueError("Select a condition column and two levels to compare.")
-                if str(level_a) == str(level_b):
-                    raise ValueError("Level A and Level B must be different.")
+                group_cols = list(self.comparison_group_cols_select.value) or None
+                group_x = self.comparison_group_x_dd.value
+                group_x = None if group_x in (None, "(none)") else group_x
+                if not condition_col:
+                    raise ValueError("Select a condition column to compare.")
 
                 adata_for_plots = (
                     self.adata_full
@@ -2843,9 +2875,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                 out_dir = Path(state_paths.state_composition_outdir) / "behavior_proportions"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 cond_token = _sanitize_filename_token(condition_col, fallback="condition")
-                a_token = _sanitize_filename_token(str(level_a), fallback="a")
-                b_token = _sanitize_filename_token(str(level_b), fallback="b")
-                out_pdf = out_dir / f"condition_comparison_{cond_token}_{a_token}_vs_{b_token}.pdf"
+                out_pdf = out_dir / f"condition_comparison_{cond_token}.pdf"
                 out_csv = out_pdf.with_suffix(".csv")
 
                 result = save_state_condition_comparison_report(
@@ -2855,9 +2885,8 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                     state_col=FULL_STATE_COL,
                     sample_col="sample_name",
                     condition_col=condition_col,
-                    level_a=level_a,
-                    level_b=level_b,
-                    facet_col=facet_col,
+                    group_cols=group_cols,
+                    group_x=group_x,
                     state_colors=full_state_colors,
                     verbose=True,
                 )

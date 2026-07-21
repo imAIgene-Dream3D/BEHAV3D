@@ -9,6 +9,7 @@ from matplotlib import pyplot as plt
 from behav3d.analysis.behavior.utils import (
     _mixed_label_sort_key,
     _resolve_output_dir,
+    _save_adata_obs_csv,
     _sanitize_filename_token,
     _to_numpy_2d,
     _vdone,

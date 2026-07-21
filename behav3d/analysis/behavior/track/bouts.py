@@ -88,6 +88,7 @@ from behav3d.analysis.behavior.track.visualization.plots.reports import (
 from behav3d.analysis.behavior.utils import (
     _mixed_label_sort_key,
     _resolve_output_dir,
+    _save_adata_obs_csv,
     _sanitize_filename_token,
     _to_numpy_2d,
     _vdone,
@@ -1466,6 +1467,7 @@ def apply_track_classifier_to_subtracks(
     if bool(save_outputs) and output_path is not None:
         save_started = time.perf_counter()
         adata_tracks.write(output_path, compression="gzip")
+        _save_adata_obs_csv(adata_tracks, output_path)
         _vsave(verbose, "trajectory-apply", "classifier-applied trajectory model", output_path)
         _vdone(verbose, "trajectory-apply", "save classifier outputs", save_started)
     _vdone(verbose, "trajectory-apply", "apply classifier", apply_started)
@@ -2166,6 +2168,7 @@ def run_state_based_analysis(
     if save_outputs:
         save_started = time.perf_counter()
         adata_state_features.write(adata_feat_out, compression="gzip")
+        _save_adata_obs_csv(adata_state_features, adata_feat_out)
         _vsave(verbose, "trajectory-clustering", "clustered trajectory model", adata_feat_out)
         _vdone(verbose, "trajectory-clustering", "save clustered model", save_started)
 

@@ -137,6 +137,13 @@ def plot_tracks_bars_on_ax(
     key_cols = [sample_key, track_key]
 
     obs = adata_full.obs[[sample_key, track_key, time_key, state_key]].copy()
+    obs[sample_key] = obs[sample_key].astype("string")
+    obs[track_key] = obs[track_key].astype("string")
+
+    chosen_df = chosen_df.copy()
+    chosen_df[sample_key] = chosen_df[sample_key].astype("string")
+    chosen_df[track_key] = chosen_df[track_key].astype("string")
+
     chosen_keys = chosen_df[key_cols].drop_duplicates()
     obs = obs.merge(chosen_keys, on=key_cols, how="inner")
 
