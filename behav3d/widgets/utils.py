@@ -78,6 +78,54 @@ _DEFAULT_CONFIG = {
         "channel_labels": {},  # {0: "organoid1", 1: "tcell", ...}
         "per_sample_channel_labels": {},  # {sample_name: {0: "organoid1", ...}, ...}
     },
+    # Cellpose-SAM (cellpose v4, zero-shot). Channel selection is its own,
+    # per-cell-type config here (channel_selection below) - separate from
+    # classic Cellpose's per-channel "cellpose" block above, since Cellpose-SAM
+    # supports selecting several raw channels per cell type.
+    "cellpose_sam": {
+        "model_name": "cpsam",
+        "python_path": "",       # optional override for the sidecar interpreter
+        "device": "auto",        # "auto" | "cpu" | "cuda:<n>"
+        "force_cpu": False,
+        "all_cell_types": False,
+        "use_all_timepoints": True,
+        "tp_start": 0,
+        "tp_end": 0,
+        "preview_sample": "",
+        "preview_timepoint": 0,
+        # Mirrors the official Cellpose GUI's segmentation settings, except
+        # min_size/max_size_fraction - see DEFAULT_SAM_PARAMS in
+        # behav3d.preprocessing.segmentation.cellpose_sam_prediction for why
+        # those two deviate from cellpose's own defaults.
+        "diameter": 0.0,             # 0 => auto
+        "flow_threshold": 0.4,       # ignored by cellpose when do_3D is True
+        "cellprob_threshold": 0.0,
+        "niter": 0,
+        "do_3D": True,
+        "stitch_threshold": 0.0,
+        "flow3D_smooth": 0.0,
+        "batch_size": 8,
+        "min_size": 1,
+        "max_size_fraction": 1.0,
+        "norm_percentile_low": 1.0,
+        "norm_percentile_high": 99.0,
+        "norm3D": True,
+        "sharpen_radius": 0.0,
+        "smooth_radius": 0.0,
+        "tile_norm_blocksize": 0.0,
+        "tile_norm_smooth3D": 0.0,
+        "invert": False,
+        # BEHAV3D post-process: drop labels occupying a single Z/Y/X slice.
+        # Cellpose leaves flat fragments on the first/last Z slice, most often in
+        # 2D+stitch mode.
+        "drop_2d_segments": True,
+        # Interactive size filter, native voxels, per cell type:
+        # {"tcell": {"size_min": 10, "size_max": 0}}  (0 => bound disabled)
+        "size_filter": {},
+        # Which raw channels feed Cellpose-SAM for each cell type, uniform
+        # across samples: {"tcell": [0], "organoid1": [1], "organoid2": [2, 3]}
+        "channel_selection": {},
+    },
     "tracking": {
         "track_organoids_together": False,
         "all_organoids": {

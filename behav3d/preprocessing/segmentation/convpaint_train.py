@@ -1470,6 +1470,38 @@ class ConvPaintTrainingWidget(QWidget):
             "  • SqrtBalanced: square root of Balanced, milder adjustment."
         ))
         clf_layout.addLayout(r)
+
+        # Tile annotations lives here (not in the prediction-performance
+        # group below) because it only affects *training*: it crops feature
+        # extraction to bounding boxes around painted regions instead of the
+        # whole image. Being inside clf_group means it is correctly disabled
+        # together with the rest of the training controls when no training
+        # images are loaded (see disable_training_params()).
+        r = QHBoxLayout()
+        self.tile_annotations_cb = QCheckBox("Tile annotations")
+        self.tile_annotations_cb.setToolTip(
+            "Only extract features inside annotated regions during training "
+            "(faster on sparse annotations)."
+        )
+        self.tile_annotations_cb.setChecked(
+            bool(self.ip.get("convpaint_tile_annotations", False))
+        )
+        r.addWidget(self.tile_annotations_cb)
+        r.addWidget(HelpButton(
+            "Tile annotations (training only)",
+            "Applies only during 'Train Classifier'.\n\n"
+            "Instead of extracting features over the whole image, ConvPaint "
+            "crops a bounding box around each painted region and only "
+            "extracts features inside those boxes.\n\n"
+            "Speeds up training when your annotations are small/sparse "
+            "relative to the image size. Has no effect on prediction "
+            "(Run instance segmentation / Re-run preview), which is why it "
+            "lives with the other training-only controls and is disabled "
+            "when no training images are loaded."
+        ))
+        r.addStretch()
+        clf_layout.addLayout(r)
+
         clf_group.setLayout(clf_layout)
         self.clf_group = clf_group
         root.addWidget(clf_group)
@@ -1492,17 +1524,15 @@ class ConvPaintTrainingWidget(QWidget):
             r.addWidget(self.device_combo)
             root.addLayout(r)
 
-        # Tiling options (global)
-        tile_row = QHBoxLayout()
-        self.tile_annotations_cb = QCheckBox("Tile annotations")
-        self.tile_annotations_cb.setToolTip(
-            "Only extract features inside annotated regions during training "
-            "(faster on sparse annotations)."
-        )
-        self.tile_annotations_cb.setChecked(
-            bool(self.ip.get("convpaint_tile_annotations", False))
-        )
-        tile_row.addWidget(self.tile_annotations_cb)
+        # Prediction performance (large images) \u2014 deliberately its own group,
+        # separate from Feature Extractor / Classifier: these two controls
+        # only affect prediction (Run instance segmentation / Re-run preview
+        # / batch processing), so they must stay usable even when no training
+        # images are loaded (unlike Tile annotations above, which is
+        # training-only and lives in clf_group instead). Never disabled by
+        # disable_training_params().
+        perf_group = QGroupBox("Prediction Performance (large images)")
+        perf_layout = QHBoxLayout()
         self.tile_image_cb = QCheckBox("Tile image")
         self.tile_image_cb.setToolTip(
             "Extract features in tiles during prediction "
@@ -1511,18 +1541,53 @@ class ConvPaintTrainingWidget(QWidget):
         self.tile_image_cb.setChecked(
             bool(self.ip.get("convpaint_tile_image", False))
         )
-        tile_row.addWidget(self.tile_image_cb)
+        perf_layout.addWidget(self.tile_image_cb)
+        perf_layout.addWidget(HelpButton(
+            "Tile image",
+            "Applies to prediction (Run instance segmentation / Re-run "
+            "preview / batch processing) \u2014 available whether or not "
+            "training images are currently loaded.\n\n"
+            "Splits the image into ~1000\u00d71000 px blocks with a 50 px "
+            "overlap margin, extracts features and classifies each block "
+            "separately, then stitches the results back together.\n\n"
+            "Lower peak memory (only one block's features are held at a "
+            "time) at the cost of some recomputation in the overlap "
+            "margins \u2014 somewhat slower than processing the whole image "
+            "in one pass.\n\n"
+            "Turn on when a large image runs out of memory or crashes "
+            "during prediction. Leave off for images that comfortably fit "
+            "in memory \u2014 it will be faster."
+        ))
         self.use_dask_cb = QCheckBox("Use Dask")
         self.use_dask_cb.setToolTip(
-            "Parallelize prediction across tiles with Dask. Only takes effect "
-            "when 'Tile image' is also enabled (per the napari-convpaint API). "
-            "Beta feature \u2014 may not be fully optimized yet."
+            "Parallelize prediction across tiles with Dask. Automatically "
+            "enables 'Tile image' \u2014 Dask only takes effect when tiling "
+            "is on (per the napari-convpaint API). Beta feature \u2014 may "
+            "not be fully optimized yet."
         )
         self.use_dask_cb.setChecked(
             bool(self.ip.get("convpaint_use_dask", False))
         )
-        tile_row.addWidget(self.use_dask_cb)
-        root.addLayout(tile_row)
+        self.use_dask_cb.toggled.connect(self._on_use_dask_toggled)
+        perf_layout.addWidget(self.use_dask_cb)
+        perf_layout.addWidget(HelpButton(
+            "Use Dask (beta)",
+            "Only takes effect when 'Tile image' is also on \u2014 checking "
+            "this automatically checks 'Tile image' for you.\n\n"
+            "Runs the per-block predictions from Tile image in parallel "
+            "worker processes via Dask instead of one block at a time. Can "
+            "speed up tiled prediction on machines with several free CPU "
+            "cores, since blocks are computed concurrently.\n\n"
+            "It does not reduce memory further than Tile image alone \u2014 "
+            "several blocks are held in memory at once while they compute, "
+            "so peak memory can be higher, not lower.\n\n"
+            "Beta feature in napari-convpaint \u2014 "
+            "may not be fully optimized."
+        ))
+        perf_layout.addStretch()
+        perf_group.setLayout(perf_layout)
+        self.perf_group = perf_group
+        root.addWidget(perf_group)
 
         # Extra toolbar widgets (plugin can inject session-level controls
         # before the tabs).
@@ -1718,6 +1783,13 @@ class ConvPaintTrainingWidget(QWidget):
         self.ip[f"per_ct_convpaint_strategy_{cell_type}"] = new_strategy
         self._persist_all_params()
 
+    def _on_use_dask_toggled(self, checked):
+        # Dask only takes effect when tiling is on (napari-convpaint API),
+        # so enabling it here also enables 'Tile image' rather than leaving
+        # the user with a checked-but-inert setting.
+        if checked and not self.tile_image_cb.isChecked():
+            self.tile_image_cb.setChecked(True)
+
     # ── Enable/disable + teardown helpers ────────────────────────────
     def set_training_enabled(self, enabled):
         enabled = bool(enabled)
@@ -1735,9 +1807,16 @@ class ConvPaintTrainingWidget(QWidget):
 
         Leaves segmentation post-processing parameters (EDT threshold,
         probability thresholds, watershed settings, etc.) and their preview
-        buttons fully interactive.  Only the feature-extractor settings,
-        classifier hyper-parameters, tiling options, Train and Save-Labels
-        buttons are disabled.
+        buttons fully interactive. Only the feature-extractor settings and
+        classifier hyper-parameters (including 'Tile annotations', which
+        lives inside clf_group since it only affects training) are disabled,
+        along with the Train and Save-Labels buttons.
+
+        'Tile image' and 'Use Dask' (perf_group) are deliberately NOT
+        disabled here: they control prediction behavior (Run instance
+        segmentation / Re-run preview / batch processing), which stays
+        usable even when no training images are loaded — e.g. when working
+        with an already-trained/loaded classifier.
 
         Also hides the training log box (it would remain empty since no
         training runs here) to avoid a large blank area in the widget.
@@ -1746,10 +1825,6 @@ class ConvPaintTrainingWidget(QWidget):
             g = getattr(self, group_attr, None)
             if g is not None:
                 g.setEnabled(False)
-        for attr in ("tile_annotations_cb", "tile_image_cb", "use_dask_cb"):
-            w = getattr(self, attr, None)
-            if w is not None:
-                w.setEnabled(False)
         for attr in ("btn_train", "btn_save_labels"):
             w = getattr(self, attr, None)
             if w is not None:
