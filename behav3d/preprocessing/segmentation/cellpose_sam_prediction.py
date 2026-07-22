@@ -757,6 +757,8 @@ def preview_cellpose_sam(
         def _on_event(e):
             if e.get("event") == "ready":
                 log(f"  {_describe_device(e)} cellpose={e.get('cellpose_version')}")
+            elif e.get("event") == "log":
+                log(f"  {e.get('msg')}")
             elif e.get("event") == "progress":
                 vram = f", peak VRAM {e['peak_vram_mb']} MB" if e.get("peak_vram_mb") else ""
                 log(f"  t={e['t']}: {e['n_objects']} objects in {e['seconds']}s{vram}")

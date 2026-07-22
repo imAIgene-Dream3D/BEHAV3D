@@ -140,11 +140,28 @@ def main(argv=None) -> int:
 
     device, using_gpu, device_info = _resolve_device(force_cpu)
 
+    model_name = str(job.get("model_name", "cpsam"))
+    # Cellpose caches SAM weights at ~/.cellpose/models/<model_name>; only a
+    # missing cache entry means this call is about to download (~1.15 GB), so
+    # tell the user which case they're in before the long pause starts.
+    cached_weights = Path.home() / ".cellpose" / "models" / model_name
+    if cached_weights.exists():
+        _emit("log", msg=f"Loading Cellpose-SAM weights ('{model_name}') from local cache...")
+    else:
+        _emit(
+            "log",
+            msg=f"Downloading Cellpose-SAM weights ('{model_name}', ~1.15 GB) - first use only, "
+                "this can take several minutes depending on your connection...",
+        )
+    _model_load_started = time.time()
+
     model = models.CellposeModel(
         gpu=using_gpu,
-        pretrained_model=str(job.get("model_name", "cpsam")),
+        pretrained_model=model_name,
         device=device,
     )
+
+    _emit("log", msg=f"Cellpose-SAM model ready in {time.time() - _model_load_started:.1f}s.")
 
     # Read the placement back off the loaded weights rather than trusting the
     # requested device: cellpose silently falls back to CPU if it cannot use the
@@ -158,7 +175,7 @@ def main(argv=None) -> int:
         "ready",
         device=str(device),
         gpu=using_gpu,
-        model=str(job.get("model_name", "cpsam")),
+        model=model_name,
         cellpose_version=__import__("cellpose").version,
         **device_info,
     )
