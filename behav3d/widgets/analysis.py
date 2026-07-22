@@ -13,11 +13,12 @@ from io import BytesIO
 from PIL import Image as PILImage, ImageDraw, ImageFont
 from copy import deepcopy
 from .utils import (
-    _cfg_get, 
+    _cfg_get,
     spinning_loader,
     detect_cell_type_category,
     _DEFAULT_CONFIG,
-    behav3d_calculated_features
+    behav3d_calculated_features,
+    Debouncer,
 )
 from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
@@ -84,6 +85,11 @@ except ImportError:
         "death": ["mean_dead_dye", "percentage_dead_mask"],
         "active_killing": ["is_active_killing", "killing_efficiency"]
     }'''
+
+# Settle time for death-threshold widgets before recalculating/persisting, so
+# retyping a value (e.g. 0.035 -> 0.040) or holding the spinner arrows doesn't
+# trigger a recompute/YAML write on every intermediate value.
+THRESHOLD_DEBOUNCE_SECONDS = 1.2
 
 def _filter_track_image_to_ids(track_img, track_ids):
     track_ids = np.asarray(list(track_ids), dtype=np.int64)
@@ -310,7 +316,8 @@ class _CellTypeFeatureExtractionPanel:
                 layout=widgets.Layout(width="220px")
             )
             if self.has_dead:
-                self.dead_mask_threshold.observe(self._on_threshold_changed, names="value")
+                self._threshold_debouncer = Debouncer(self._on_threshold_changed, wait=THRESHOLD_DEBOUNCE_SECONDS)
+                self.dead_mask_threshold.observe(self._threshold_debouncer, names="value")
             else:
                 self.dead_mask_threshold.layout.display = "none"
         else:
@@ -656,7 +663,8 @@ class _SharedOrganoidThresholdPanel:
             style={'description_width': '160px'},
             layout=widgets.Layout(width="220px")
         )
-        self.dead_mask_threshold.observe(self._on_threshold_changed, names="value")
+        self._threshold_debouncer = Debouncer(self._on_threshold_changed, wait=THRESHOLD_DEBOUNCE_SECONDS)
+        self.dead_mask_threshold.observe(self._threshold_debouncer, names="value")
 
         self.btn_preview = widgets.ToggleButton(
             description="Preview Threshold",
@@ -1069,7 +1077,10 @@ class ActiveKillingPanel:
         self.use_absolute_threshold = widgets.Checkbox(description="Use absolute threshold", value=bool(self._cfg.get("use_absolute_threshold", False)), indent=False, layout=widgets.Layout(width="200px"))
         self.absolute_threshold = widgets.FloatText(description="Absolute threshold:", value=float(self._cfg.get("absolute_killing_threshold", 0.0) or 0.0), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"), disabled=not self._cfg.get("use_absolute_threshold", False))
         self.use_absolute_threshold.observe(self._on_absolute_threshold_toggle, names="value")
-        
+        self.absolute_hint_html = widgets.HTML("")
+        self.absolute_hint_html.layout.display = "none"
+        self.death_signal_dd.observe(lambda _: self._update_absolute_hint(), names="value")
+
         self.save_results = widgets.Checkbox(description="Save results to CSV", value=bool(self._cfg.get("save_results", True)), indent=False)
         self.gallery_item_count = widgets.IntText(description="Immune cells in gallery:", value=5, style={'description_width': '180px'}, layout=widgets.Layout(width="280px"))
         
@@ -1096,6 +1107,7 @@ class ActiveKillingPanel:
         self.insights_accordion.layout.display = "none"
         self.validation_html = widgets.HTML("")
         self._validate_inputs()
+        self._update_absolute_hint()
         self.immune_dd.observe(lambda _: self._validate_inputs(), names="value")
         self.target_dd.observe(lambda _: self._validate_inputs(), names="value")
         self.target_dd.observe(lambda _: self._check_existing_results(), names="value")
@@ -1105,9 +1117,10 @@ class ActiveKillingPanel:
             widgets.HTML('<div style="font-size:22px;font-weight:700;">Active Killing Analysis</div>'),
             widgets.HTML('<div style="color:#555;font-size:13px;margin-bottom:10px;">Detects functional killing events. <b>Targets:</b> Select the target cell types to analyze (organoids and/or other cell types).</div>'),
             self.immune_dd, self.target_dd, self.validation_html, widgets.HTML("<hr>"),
-            widgets.HBox([self.observation_window, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints after contact</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.killing_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">× background rate</span>')], layout=widgets.Layout(align_items="center")),
+            widgets.HBox([self.observation_window, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints after contact</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.killing_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">× organoid\'s own signal at contact start</span>')], layout=widgets.Layout(align_items="center")),
             widgets.HBox([self.min_contact_duration, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.death_signal_dd], layout=widgets.Layout(align_items="center")),
             widgets.HBox([self.use_absolute_threshold, self.absolute_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">death signal increase (bypasses multiplier)</span>')], layout=widgets.Layout(align_items="center")),
+            self.absolute_hint_html,
             widgets.HTML("<hr>"),
             widgets.HBox([self.btn_run, self.spinner_html, self.save_results, self.gallery_item_count, widgets.HTML('<span style="color:#666;font-size:12px;">x sample</span>')], layout=widgets.Layout(align_items="center", gap="15px")),
             self.btn_show_results,
@@ -1139,6 +1152,20 @@ class ActiveKillingPanel:
             self.killing_threshold.disabled = True
         else:
             self.killing_threshold.disabled = False
+        self._update_absolute_hint()
+
+    def _update_absolute_hint(self):
+        """Show a non-blocking recommendation to use nr_dead_mask_pixels with an absolute threshold."""
+        if self.use_absolute_threshold.value and self.death_signal_dd.value != "nr_dead_mask_pixels":
+            self.absolute_hint_html.value = (
+                '<div style="color:#8a6d00;font-size:12px;">'
+                '💡 Recommended: use <b>nr_dead_mask_pixels</b> as the death signal when using an '
+                'absolute threshold — a flat pixel-count cutoff is easier to reason about than one '
+                'expressed in a fraction or intensity scale.</div>'
+            )
+            self.absolute_hint_html.layout.display = None
+        else:
+            self.absolute_hint_html.layout.display = "none"
 
     def _check_existing_results(self):
         """Check if analysis results already exist to enable the display button."""
@@ -1766,10 +1793,12 @@ class DeathThresholdPreview:
         )
         self.out = widgets.Output(layout={'overflow': 'visible', 'height': 'auto'})
 
+        self._threshold_debouncer = Debouncer(self._update, wait=THRESHOLD_DEBOUNCE_SECONDS)
+
         if self.cell_type_dd is not None:
             self.cell_type_dd.observe(self._on_context_change, names='value')
         self.time_slider.observe(self._update, names='value')
-        self.threshold_widget.observe(self._update, names='value')
+        self.threshold_widget.observe(self._threshold_debouncer, names='value')
         self.org_ch_input.observe(self._update, names='value')
         self.dead_ch_input.observe(self._update, names='value')
 

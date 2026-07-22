@@ -15,10 +15,12 @@ and subsequently causes an increase in death signal (dead dye/dead mask) above b
 Key concepts:
 - Contact event: Continuous period where immune cell touches ANY target cell
 - Total contact duration: Full length of continuous contact (must exceed min_contact_duration)
-- Per-timepoint calculation: Active killing is evaluated at EACH timepoint during contact
-- Observation window: N timepoints after each contact timepoint to measure death signal change
-- Background death rate: Average death signal increase per sample (accounts for batch effects)
-- Active killing: Death signal increase exceeds background rate Ã— threshold multiplier
+- Per-organoid calculation: Each touched organoid is evaluated independently, anchored at
+  the contact's start timepoint (not recomputed at every contact timepoint)
+- Observation window: N timepoints after contact start to measure death signal change
+- Active killing: Death signal increase (contact start -> contact start + window) exceeds
+  either a multiplier of the organoid's own signal at contact start, or a fixed absolute
+  increase, depending on the selected mode
 
 -------------------------------------
 --------------- OUTPUT --------------
@@ -27,7 +29,7 @@ Key concepts:
 # Per-timepoint features (added to track features CSV)
 - is_active_killing: Boolean, True if this timepoint's contact caused killing
 - death_signal_increase_{N}tp: Death signal change over observation window
-- killing_efficiency: Ratio of actual vs expected background death increase
+- killing_efficiency: Ratio of actual death signal increase vs the organoid's own threshold
 
 # Where no contact occurs:
 - is_active_killing = False
@@ -51,88 +53,10 @@ from behav3d.core.utils import get_current_time, format_time
 from behav3d.io.images import load_image
 
 
-def calculate_background_death_rate(
-    df_target_tracks: pd.DataFrame,
-    death_signal_column: str = "mean_dead_dye",
-    groupby: List[str] = ["sample_name", "TrackID"]
-) -> Tuple[Dict[str, float], pd.DataFrame]:
-    """
-    Calculate the average background death rate PER SAMPLE.
-    
-    This represents the baseline increase in death signal per timepoint,
-    regardless of immune cell contact. Active killing should exceed this rate.
-    
-    Algorithm:
-    1. For each organoid track: calculate death_rate = (final - initial) / track_duration
-    2. Average these per-track rates across ALL organoid types in the sample (NOT T-cells)
-    
-    This gives the average death signal increase per timepoint for the sample,
-    serving as a baseline to determine when a killing event exceeds normal death.
-    
-    NOTE: The input df_target_tracks should already be filtered to exclude T-cells
-    (only contain target cells like organoids). This is handled by the caller.
-    
-    Parameters
-    ----------
-    df_target_tracks : pd.DataFrame
-        DataFrame containing target cell tracks with death signal information.
-        Should NOT include T-cell tracks - only organoid/target tracks.
-    death_signal_column : str
-        Column name containing the death signal (e.g., 'mean_dead_dye', 'percentage_dead_mask')
-    groupby : List[str]
-        Columns to group by for per-track calculations
-        
-    Returns
-    -------
-    background_rates : Dict[str, float]
-        Dictionary mapping sample_name -> background death rate for that sample
-    df_death_rates : pd.DataFrame
-        Per-track death rate statistics (includes sample_name)
-    """
-    df = df_target_tracks.copy()
-    df = df.sort_values(by=groupby + ["position_t"])
-    
-    # Calculate statistics per organoid track (all organoid types combined)
-    df_death_rates = df.groupby(groupby).agg(
-        initial_death_signal=(death_signal_column, "first"),
-        final_death_signal=(death_signal_column, "last"),
-        track_start_t=("position_t", "min"),
-        track_end_t=("position_t", "max"),
-    ).reset_index()
-    
-    # Calculate per-track death increase and duration
-    df_death_rates["death_increase"] = (
-        df_death_rates["final_death_signal"] - df_death_rates["initial_death_signal"]
-    )
-    df_death_rates["track_duration"] = (
-        df_death_rates["track_end_t"] - df_death_rates["track_start_t"] + 1
-    )
-    
-    # Calculate per-track death rate (death increase per timepoint)
-    df_death_rates["death_rate_per_timepoint"] = (
-        df_death_rates["death_increase"] / df_death_rates["track_duration"].clip(lower=1)
-    )
-    
-    # Calculate per-sample background rate:
-    # = average of per-track death rates across ALL organoid types (T-cells excluded from input)
-    df_sample_stats = df_death_rates.groupby("sample_name").agg(
-        background_rate=("death_rate_per_timepoint", "mean"),
-        n_tracks=("death_rate_per_timepoint", "count"),
-        std_death_rate=("death_rate_per_timepoint", "std"),
-    ).reset_index()
-    
-    # Convert to dictionary for easy lookup
-    background_rates = dict(zip(df_sample_stats["sample_name"], df_sample_stats["background_rate"]))
-    
-    # Add the sample-level rate back to per-track dataframe for reference
-    df_death_rates = df_death_rates.merge(
-        df_sample_stats[["sample_name", "background_rate"]], 
-        on="sample_name", 
-        how="left"
-    )
-    df_death_rates.rename(columns={"background_rate": "sample_background_rate"}, inplace=True)
-    
-    return background_rates, df_death_rates
+# If an organoid's death signal is exactly 0 at the moment contact starts, a multiplier
+# threshold would be trivially 0 (any nonzero signal would count as active killing).
+# Substitute this small epsilon as the effective starting signal in that case only.
+ZERO_BASELINE_EPSILON = 0.1
 
 
 def identify_contact_events_global(
@@ -276,17 +200,27 @@ def analyze_active_killing_per_timepoint(
     death_signal_column: str = "mean_dead_dye",
     killing_threshold_multiplier: float = 1.5,
     absolute_killing_threshold: Optional[float] = None,
-    background_rates: Optional[Dict[str, float]] = None,
 ) -> pd.DataFrame:
     """
-    Calculate active killing status for EACH timepoint during qualifying contacts.
-    
-    For each timepoint in a contact event:
-    1. Get death signal at that timepoint
-    2. Get death signal after observation_window timepoints
-    3. Calculate increase and compare to background threshold
-    4. If near end of timelapse, forward-fill the last calculable value
-    
+    Calculate active killing status for each qualifying contact event.
+
+    Each touched target organoid is evaluated independently, anchored at the
+    contact event's start timepoint (not recomputed at every contact timepoint):
+    1. Get the target's death signal at contact_start_t
+    2. Get the target's death signal at contact_start_t + observation_window
+       (or the last available timepoint, if the track ends before then)
+    3. Compare the increase to a threshold:
+       - multiplier mode: threshold = death_at_contact_start x (killing_threshold_multiplier - 1)
+         (i.e. active if death_after >= death_at_contact_start x killing_threshold_multiplier).
+         If death_at_contact_start is exactly 0, ZERO_BASELINE_EPSILON is substituted so the
+         threshold isn't trivially 0.
+       - absolute mode: threshold = absolute_killing_threshold (flat, in death_signal_column units)
+    4. Among all touched targets, the one with the highest efficiency (increase relative to
+       its own threshold) is reported as the event's representative target/values. This is
+       reported whether or not it is active; targeted_track_id is only set when active.
+    5. The single per-event result is broadcast across every timepoint in the contact event's
+       observed contact_timepoints (same row-per-timepoint output shape as before).
+
     Parameters
     ----------
     df_immune_tracks : pd.DataFrame
@@ -296,17 +230,16 @@ def analyze_active_killing_per_timepoint(
     df_contact_events : pd.DataFrame
         Contact events from identify_contact_events_global
     observation_window : int
-        Number of timepoints after each contact timepoint to measure death signal
+        Number of timepoints after contact start to measure death signal change
     death_signal_column : str
         Column in target tracks containing death signal
     killing_threshold_multiplier : float
-        Multiplier for background rate to determine killing threshold (used when absolute_killing_threshold is None)
+        Multiplier applied to a target's own signal at contact start (used when
+        absolute_killing_threshold is None)
     absolute_killing_threshold : float, optional
-        If provided, use this absolute value as the killing threshold instead of 
-        multiplier-based threshold. Useful when background death rate is near zero.
-    background_rates : Dict[str, float], optional
-        Pre-computed per-sample background rates
-        
+        If provided, use this flat value as the killing threshold instead of the
+        multiplier-based threshold. Useful when organoids start with near-zero signal.
+
     Returns
     -------
     df_killing_per_timepoint : pd.DataFrame
@@ -314,133 +247,110 @@ def analyze_active_killing_per_timepoint(
     """
     if df_contact_events.empty:
         return pd.DataFrame()
-    
-    # Calculate background rates if not provided
-    if background_rates is None:
-        background_rates, _ = calculate_background_death_rate(
-            df_target_tracks, death_signal_column=death_signal_column
-        )
-    
-    # Get max timepoint per sample (to know when we're near the end)
+
+    # Get max timepoint per sample (to know when the observation window runs past track end)
     max_timepoints = df_target_tracks.groupby("sample_name")["position_t"].max().to_dict()
-    
+
     killing_results = []
-    
+
     for _, event in df_contact_events.iterrows():
         sample_name = event["sample_name"]
         immune_track_id = event["immune_track_id"]
         target_ids = [t.strip() for t in str(event["target_track_ids"]).split(",")]
         contact_timepoints = event["contact_timepoints"]
-        
-        sample_bg_rate = background_rates.get(sample_name, 0.0)
+        contact_start_t = event["contact_start_t"]
+
         max_t = max_timepoints.get(sample_name, contact_timepoints[-1])
-        
+        observation_end_t = contact_start_t + observation_window
+        can_observe = observation_end_t <= max_t
+
         # Get target tracks for this sample
         target_mask = df_target_tracks["sample_name"] == sample_name
-        df_targets_sample = df_target_tracks[target_mask].copy()
-        
-        # Track the last known calculated values for forward-filling
-        last_death_increase = 0.0
-        last_is_active = False
-        last_efficiency = 0.0
-        last_killing_threshold = 0.0
-        last_target_id = None
-        
-        for i, t in enumerate(contact_timepoints):
-            observation_end_t = t + observation_window
-            can_observe = observation_end_t <= max_t
-            
-            if can_observe:
-                # Calculate death signal change for all touched targets
-                death_increases = []
-                
-                for target_id in target_ids:
-                    try:
-                        target_id_int = int(float(target_id))
-                    except (ValueError, TypeError):
-                        target_id_int = target_id
-                    
-                    target_rows = df_targets_sample[
-                        df_targets_sample["TrackID"].astype(str) == str(target_id_int)
-                    ].sort_values("position_t")
-                    
-                    if target_rows.empty:
-                        continue
-                    
-                    # Get death signal at contact timepoint
-                    at_t = target_rows[target_rows["position_t"] == t]
-                    if at_t.empty:
-                        # Find closest before or at t
-                        before_t = target_rows[target_rows["position_t"] <= t]
-                        if before_t.empty:
-                            continue
-                        at_t = before_t.iloc[[-1]]
-                    
-                    death_at_t = at_t[death_signal_column].values[0]
-                    
-                    # Get death signal after observation window
-                    after_window = target_rows[target_rows["position_t"] >= observation_end_t]
-                    if after_window.empty:
-                        # Use last available
-                        after_window = target_rows.iloc[[-1]]
-                    else:
-                        after_window = after_window.iloc[[0]]
-                    
-                    death_after = after_window[death_signal_column].values[0]
-                    death_increases.append((target_id_int, death_after - death_at_t))
-                
-                # Use max death increase across all touched targets
-                if death_increases:
-                    # Find which target had the max increase
-                    max_idx = np.argmax([d[1] for d in death_increases])
-                    target_id_max = death_increases[max_idx][0]
-                    death_increase = death_increases[max_idx][1]
-                else:
-                    target_id_max = None
-                    death_increase = 0.0
-                
-                # Calculate killing threshold
-                expected_increase = sample_bg_rate * observation_window
-                
-                # Use absolute threshold if provided, otherwise use multiplier-based threshold
-                if absolute_killing_threshold is not None:
-                    killing_threshold = absolute_killing_threshold
-                    threshold_type = "absolute"
-                else:
-                    killing_threshold = expected_increase * killing_threshold_multiplier
-                    threshold_type = "multiplier"
-                
-                is_active = death_increase > killing_threshold
-                efficiency = death_increase / (expected_increase + 1e-10) if expected_increase > 0 else 0.0
-                
-                # Update last known values
-                last_death_increase = death_increase
-                last_is_active = is_active
-                last_efficiency = efficiency
-                last_killing_threshold = killing_threshold
-                last_target_id = target_id_max
+        df_targets_sample = df_target_tracks[target_mask]
+
+        target_evals = []
+
+        for target_id in target_ids:
+            try:
+                target_id_int = int(float(target_id))
+            except (ValueError, TypeError):
+                target_id_int = target_id
+
+            target_rows = df_targets_sample[
+                df_targets_sample["TrackID"].astype(str) == str(target_id_int)
+            ].sort_values("position_t")
+
+            if target_rows.empty:
+                continue
+
+            # Death signal at contact start
+            at_start = target_rows[target_rows["position_t"] == contact_start_t]
+            if at_start.empty:
+                before_start = target_rows[target_rows["position_t"] <= contact_start_t]
+                if before_start.empty:
+                    continue
+                at_start = before_start.iloc[[-1]]
+            death_at_start = at_start[death_signal_column].values[0]
+
+            # Death signal at end of observation window (or last available frame)
+            after_window = target_rows[target_rows["position_t"] >= observation_end_t]
+            if after_window.empty:
+                after_window = target_rows.iloc[[-1]]
             else:
-                # Cannot observe full window - forward-fill last known values
-                death_increase = last_death_increase
-                is_active = last_is_active
-                efficiency = last_efficiency
-                killing_threshold = last_killing_threshold
-                target_id_max = last_target_id
-            
+                after_window = after_window.iloc[[0]]
+            death_at_end = after_window[death_signal_column].values[0]
+
+            death_increase = death_at_end - death_at_start
+
+            if absolute_killing_threshold is not None:
+                threshold_increase = absolute_killing_threshold
+            else:
+                effective_start = death_at_start if death_at_start != 0 else ZERO_BASELINE_EPSILON
+                threshold_increase = effective_start * (killing_threshold_multiplier - 1)
+
+            is_active = death_increase > threshold_increase
+            efficiency = death_increase / (threshold_increase + 1e-10) if threshold_increase > 0 else (
+                1.0 if death_increase > 0 else 0.0
+            )
+
+            target_evals.append({
+                "target_id": target_id_int,
+                "death_increase": death_increase,
+                "threshold_increase": threshold_increase,
+                "is_active": is_active,
+                "efficiency": efficiency,
+            })
+
+        # Representative target = highest efficiency among all evaluated targets
+        best = max(target_evals, key=lambda d: d["efficiency"]) if target_evals else None
+
+        if best is not None:
+            is_active_killing = best["is_active"]
+            targeted_track_id = best["target_id"] if is_active_killing else None
+            death_signal_increase = best["death_increase"]
+            killing_efficiency = best["efficiency"]
+            killing_threshold_used = best["threshold_increase"]
+        else:
+            is_active_killing = False
+            targeted_track_id = None
+            death_signal_increase = 0.0
+            killing_efficiency = 0.0
+            killing_threshold_used = 0.0
+
+        for t in contact_timepoints:
             killing_results.append({
                 "contact_event_id": event["contact_event_id"],
                 "sample_name": sample_name,
                 "immune_track_id": immune_track_id,
                 "position_t": t,
-                "death_signal_increase": death_increase,
-                "is_active_killing": is_active,
-                "killing_efficiency": efficiency,
-                "targeted_track_id": target_id_max if is_active else None,
-                "sample_background_rate": sample_bg_rate,
-                "killing_threshold_used": killing_threshold if can_observe else last_killing_threshold,
+                "death_signal_increase": death_signal_increase,
+                "is_active_killing": is_active_killing,
+                "killing_efficiency": killing_efficiency,
+                "targeted_track_id": targeted_track_id,
+                "killing_threshold_used": killing_threshold_used,
                 "observation_complete": can_observe,
             })
-    
+
     return pd.DataFrame(killing_results)
 
 
@@ -489,11 +399,16 @@ def run_active_killing_analysis(
     Algorithm:
     1. Identify continuous contact events with ANY target cell (across all target types)
     2. Filter contacts by total duration (must be >= min_contact_duration)
-    3. For each timepoint during qualifying contacts:
-       - Measure death signal increase over observation_window
-       - Compare to sample-specific background death rate
-       - Classify as active killing if exceeds threshold
-    4. Forward-fill values when observation window extends past end of timelapse
+    3. For each contact event, evaluate every touched target organoid independently,
+       anchored at the contact's start timepoint:
+       - Measure that organoid's own death signal increase from contact start to
+         contact start + observation_window
+       - Compare to either a multiplier of its own starting signal, or a flat
+         absolute increase
+       - Classify as active killing if exceeds threshold; the highest-efficiency
+         touched organoid is reported as the event's target
+    4. Broadcast the event's result across every timepoint of its observed contact
+       duration (used e.g. for backprojection and gallery display)
     
     Parameters
     ----------
@@ -513,10 +428,11 @@ def run_active_killing_analysis(
     min_contact_duration : int
         Minimum TOTAL contact duration (continuous) in timepoints
     killing_threshold_multiplier : float
-        Multiplier for background rate threshold. Used when absolute_killing_threshold is None.
+        Multiplier applied to a target organoid's own signal at contact start.
+        Used when absolute_killing_threshold is None.
     absolute_killing_threshold : float, optional
-        If provided, use this absolute value as the killing threshold instead of the
-        multiplier-based threshold. Useful when background death rate is close to 0.
+        If provided, use this flat value as the killing threshold instead of the
+        multiplier-based threshold. Useful when organoids start with near-zero signal.
         Default is None (uses killing_threshold_multiplier instead).
     save_results : bool
         Whether to save results to CSV files
@@ -532,7 +448,7 @@ def run_active_killing_analysis(
     """
     print(f"--------------- Running Active Killing Analysis ---------------")
     print(f"Immune cell type: {immune_cell_type}")
-    print(f"Algorithm: Global contacts (any target), per-timepoint calculation")
+    print(f"Algorithm: Global contacts (any target), per-organoid contact-start evaluation")
     start_time = time.time()
     
     output_dir = Path(output_dir)
@@ -549,7 +465,7 @@ def run_active_killing_analysis(
     if absolute_killing_threshold is not None:
         print(f"Killing threshold mode: ABSOLUTE ({absolute_killing_threshold})")
     else:
-        print(f"Killing threshold mode: MULTIPLIER ({killing_threshold_multiplier}x background rate)")
+        print(f"Killing threshold mode: MULTIPLIER ({killing_threshold_multiplier}x organoid's own signal at contact start)")
     
     # Load immune cell tracks
     immune_feature_dir = output_dir / "analysis" / immune_cell_type / "track_features"
@@ -589,18 +505,7 @@ def run_active_killing_analysis(
     # Combine all target tracks
     df_target_tracks = pd.concat(all_target_tracks, ignore_index=True)
     print(f"{get_current_time()} - Combined {len(df_target_tracks)} target cell track rows")
-    
-    # Calculate per-sample background death rates
-    print(f"{get_current_time()} - Calculating per-sample background death rates...")
-    background_rates, df_death_rates = calculate_background_death_rate(
-        df_target_tracks,
-        death_signal_column=death_signal_column
-    )
-    
-    print(f"{get_current_time()} - Background death rates per sample:")
-    for sample_name, rate in background_rates.items():
-        print(f"    {sample_name}: {rate:.6f} per timepoint")
-    
+
     # Identify GLOBAL contact events (contact with ANY target type)
     print(f"{get_current_time()} - Identifying global contact events...")
     df_contact_events = identify_contact_events_global(
@@ -644,7 +549,6 @@ def run_active_killing_analysis(
         death_signal_column=death_signal_column,
         killing_threshold_multiplier=killing_threshold_multiplier,
         absolute_killing_threshold=absolute_killing_threshold,
-        background_rates=background_rates,
     )
     
     # Calculate summary statistics
@@ -657,7 +561,6 @@ def run_active_killing_analysis(
             mean_death_signal_increase=("death_signal_increase", "mean"),
             median_death_signal_increase=("death_signal_increase", "median"),
             mean_killing_efficiency=("killing_efficiency", "mean"),
-            sample_background_rate=("sample_background_rate", "first"),
             n_contact_events=("contact_event_id", "nunique"),
         ).reset_index()
         
@@ -673,7 +576,6 @@ def run_active_killing_analysis(
         "total_contact_timepoints": len(df_killing_per_tp) if not df_killing_per_tp.empty else 0,
         "total_active_killing_timepoints": int(df_killing_per_tp["is_active_killing"].sum()) if not df_killing_per_tp.empty else 0,
         "overall_killing_rate": df_killing_per_tp["is_active_killing"].mean() if not df_killing_per_tp.empty else 0.0,
-        "background_death_rates": background_rates,
         "observation_window": observation_window,
         "min_contact_duration": min_contact_duration,
         "killing_threshold_multiplier": killing_threshold_multiplier,
@@ -742,7 +644,9 @@ def create_advanced_features_csv(
     This function adds killing information for each timepoint:
     - is_active_killing: Boolean (True if active killing at this timepoint)
     - death_signal_increase_{N}tp: Death signal change over observation window
-    - killing_efficiency: Ratio of actual vs expected background death
+    - killing_efficiency: Ratio of actual death signal increase vs the targeted
+      organoid's own threshold (its signal at contact start, scaled by the multiplier,
+      or the flat absolute threshold)
     
     NO NAs: Where no contact occurs, is_active_killing=False and numeric values=0.0
     
