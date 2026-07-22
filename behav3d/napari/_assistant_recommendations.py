@@ -120,8 +120,11 @@ def format_edt_recommendations(result: dict, cell_type: str) -> str:
     lines.extend([
         "",
         f"A practical global starting value is **{result['global_start_px']:g} pixels** "
-        "(the median middle candidate across samples). Lower EDT values split touching "
-        "objects more aggressively; higher values keep more objects merged.",
+        "(the median middle candidate across samples). On the plain Mask + EDT/Watershed "
+        "strategy, higher EDT values generally split touching objects more and lower values "
+        "keep neighbouring cores connected. On Peak EDT/Watershed, the direction is reversed "
+        "because EDT is used as a minimum peak-height filter. Probability Map + Watershed uses "
+        "Mask and Seed thresholds instead of EDT.",
         "",
         "These candidates are 20%, 25%, and 30% of the expected XY diameter. "
         "They are XY-based starting points, so preview segmentation around them before "

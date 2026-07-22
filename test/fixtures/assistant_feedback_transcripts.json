@@ -40,12 +40,30 @@
     "id": "metadata_based_edt",
     "step": "segmentation",
     "user": "Calcula el EDT segun la resolucion de mis imagenes.",
-    "required": ["10 um cell", "pixel_distance_xy", "20%, 25%, and 30%", "cell widths"]
+    "required": ["10 um cell", "XY pixel size", "20%, 25%, and 30%", "cell widths"]
   },
   {
     "id": "interactive_track_counts",
     "step": "filtering",
     "user": "Si filtro a 200 timepoints, cuantos tracks quedan en position_t 0?",
     "required": ["unique position_t", "requested position_t", "never estimate"]
+  },
+  {
+    "id": "merged_cells_threshold_direction",
+    "step": "segmentation",
+    "user": "The CMTMR T cells are touching and not split.",
+    "required": ["raise both mask and seed thresholds", "raise EDT for plain", "lower EDT for Peak"]
+  },
+  {
+    "id": "tracking_uses_motion_and_interval",
+    "step": "tracking",
+    "user": "Guide tracking for my T cells and collagen.",
+    "required": ["do not infer it from the cell-type label", "Use Propagation", "one-frame displacement", "15 seconds is 15 um/frame"]
+  },
+  {
+    "id": "equal_track_lengths_are_valid",
+    "step": "filtering",
+    "user": "Are minimum 30 and maximum 30 contradictory?",
+    "required": ["valid, not contradictory", "trims retained longer tracks", "same comparison window"]
   }
 ]
