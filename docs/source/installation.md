@@ -48,7 +48,11 @@ What the installer does automatically:
 - ✅ Detect your GPU (NVIDIA CUDA / Apple Silicon MPS / CPU-only)
 - ✅ Create the conda environment with all dependencies
 - ✅ Install PyTorch with the appropriate backend
-- ✅ Install Cellpose for cell segmentation
+- ✅ Install Cellpose (v3) for cell segmentation
+
+```{note}
+**Cellpose-SAM is set up inside the plugin, not by the installer.** The [Cellpose-SAM](processing/segmentation/cellpose_sam) method needs **cellpose v4**, which cannot share an environment with the pinned v3 used everywhere else. The first time you open the Cellpose-SAM segmentation method, click **Set up Cellpose-SAM environment** — it creates a small one-time **sidecar** environment that reuses your existing PyTorch install (only a few MB) and leaves your cellpose v3 install and trained models untouched. You only do this once per computer, and only if you intend to use Cellpose-SAM.
+```
 
 
 ## ⚙️ Installation Options

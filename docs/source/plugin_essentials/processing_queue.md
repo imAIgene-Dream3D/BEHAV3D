@@ -19,7 +19,7 @@ Running each step manually from its tab is fine for testing and checking. But on
 | Step | Source tab | What it does |
 |---|---|---|
 | 🧠 Train Classifier | Segmentation | Train segmentation classifiers on the labelled examples |
-| 🦠 Segmentation | Segmentation | Run segmentation using the trained classifiers (Cellpose / APOC / ConvPaint / Pixel Classifier) |
+| 🦠 Segmentation | Segmentation | Run segmentation (APOC / ConvPaint / Pixel Classifier / Cellpose / Cellpose-SAM) |
 | ☠ Dead Mask (Otsu) | Segmentation | Compute the Otsu dead-cell mask |
 | 📍 Batch Tracking | Tracking | Batch tracking across cell types |
 | 🧪 Feature Extraction | Feature Extraction | Compute per-track features |
@@ -69,7 +69,7 @@ Two one-click presets are exposed via the dropdown:
 | **Segment + Track** | Segmentation → Batch Tracking |
 | **Segment → Filter** | Segmentation → Batch Tracking → Feature Extraction → Filtering |
 
-The `Segmentation` placeholder in a preset is replaced at load-time with whichever segmentation method is currently selected in the Segmentation tab (APOC / ConvPaint / Cellpose / Pixel Classifier). Pick a preset and the steps populate. You can still edit individual steps' parameters afterwards (by going back to the tab that owns them) and reorder by removing + re-adding.
+The `Segmentation` placeholder in a preset is replaced at load-time with whichever segmentation method is currently selected in the Segmentation tab (APOC / ConvPaint / Pixel Classifier / Cellpose / Cellpose-SAM). Pick a preset and the steps populate. You can still edit individual steps' parameters afterwards (by going back to the tab that owns them) and reorder by removing + re-adding.
 
 ## Running the queue
 

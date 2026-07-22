@@ -10,7 +10,7 @@
 
 - Immune cells or other fast-moving cells.
 - Datasets with cell divisions (branching) or programmed cell death (`P_dead`).
-- Anything where LAP / TrackPy under- or over-link and you want finer control.
+- Any motile cell type where you want a motion model and finer control over linking, gap-closing, division and death.
 
 ## Two-step workflow
 
@@ -29,7 +29,7 @@ Tune Step 1 first and **validate visually** before turning on Step 2.
 | **Custom JSON path** | — | path | Only active when the preset is "Custom JSON…". See `models/README_btrack.md` in the repo for the expected format. |
 | **Max search radius (px)** | 100 | 1–9999 | Maximum isotropic search distance for linking objects between frames. Increase for fast cells; decrease to prevent long-range false links. |
 | **Update method** | EXACT | EXACT / APPROXIMATE | EXACT = full Bayesian belief matrix (accurate, slower). APPROXIMATE = local spatial search (faster, recommended once you exceed ~1000 cells/frame). |
-| **Step size (frames)** | 100 | 1–10000 | Frames per tracking iteration. Lower = less RAM, slightly slower. |
+| **Step size (frames)** | 100 | 1–10000 | Frames processed per tracking iteration — e.g. `100` processes 100 frames' worth of data at a time rather than loading a whole 1000-frame movie into memory at once. Only lower it (e.g. to 50 or 20) if you hit an **out-of-memory error** while tracking a long movie: each chunk then uses less RAM, at the cost of a little extra overhead stitching more chunks together. |
 | **Use visual features** | OFF | checkbox | When enabled, raw image intensity statistics (**mean and standard deviation per channel**) of each cell are computed alongside the centroids and fed to the Kalman filter as an extra cue. Requires `raw_image_path` in the metadata. |
 | **Workers** | 1 | 1 to (CPU cores − 1) | CPU cores for parallel feature extraction and zarr writing during btrack. The tracker itself is serial. |
 
@@ -39,8 +39,8 @@ Tune Step 1 first and **validate visually** before turning on Step 2.
 |---|---|---|
 | **Enable global track optimization** | OFF | Master switch for Step 2. |
 | **Hypotheses** | `P_FP, P_init, P_term, P_link` | Which hypotheses the optimizer considers. `P_FP` is always required (and the checkbox is disabled in the UI). Additional opt-in hypotheses: `P_branch` (track branching — cell division), `P_dead` (cell death), `P_merge` (track merging). |
-| **Distance threshold** | 60 | Maximum distance for generating link / branch hypotheses. |
-| **Time threshold** | 3 | Maximum frame gap for generating link hypotheses. |
+| **Distance threshold** (`dist_thresh`) | 60 | Maximum distance (in your data's spatial units) between the **end of one tracklet and the start of another** for the optimizer to even consider linking them. If two fragments of the same real cell drift further apart than this while segmentation missed a few frames, they will not be reconnected — no matter how good the rest of the evidence looks. |
+| **Time threshold** (`time_thresh`) | 3 | Maximum number of frames a track can be **"missing"** before the optimizer will still consider re-linking it to a later tracklet. If a cell disappears for longer than this (out of focus, signal drops), the two fragments are treated as unrelated tracks rather than one interrupted track. |
 
 ```{tip}
 **Recommended workflow**: tune Step 1 only → preview → fix segmentation issues that surface → tune Step 1 again → only *then* enable Step 2 for refinement. Step 2 makes Step 1's mistakes much harder to diagnose, so debug Step 1 first.
@@ -133,11 +133,10 @@ CSV columns: `TrackID, SegmentID, position_t, position_x/y/z, pixel_position_x/y
 
 ## Things this page does **not** claim
 
-- That btrack always beats LAP / TrackPy — it is more powerful but also more complex. For simple data, LAP at default settings often produces equivalent tracks faster.
 - Specific per-sample runtimes — depends on cells-per-frame, frames, and Step 2 hypothesis set.
 
 ## See also
 
 - [btrack documentation](https://btrack.readthedocs.io/) — upstream library, including precise definitions of every hypothesis and motion-model parameter.
 - `models/README_btrack.md` in the BEHAV3D repo — JSON config format and example files.
-- [LAP](lap) for simpler global assignment.
+- [Propagation](propagation) — the overlap-based method for slow, non-dividing organoids.

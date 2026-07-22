@@ -69,6 +69,16 @@ Per-sample fields:
 
 Recommended method: **APOC (GPU)** with a probability-map + watershed strategy.
 
+```{note}
+APOC is the practical first choice on a normal workstation, especially when you
+have many similar datasets (train once, reuse everywhere). If you have a **strong
+GPU / HPC**, clean high-resolution images, and accuracy is the priority — and you'd
+rather not paint labels — reach for **[Cellpose-SAM](processing/segmentation/cellpose_sam)**
+(zero-shot, no training). It is the most accurate but by far the slowest method,
+so it fits a modest number of movies. Set up its one-time sidecar environment
+first.
+```
+
 ### Generating training data
 
 - **Examples per sample** defaults to ~3 (first / middle / last time point). Add
@@ -118,10 +128,11 @@ training data without training first.
 ### Training parameters (per cell type)
 
 - **Organoids** — input channels: organoid + dead only (leave out the T-cell
-  channel; it adds little and slows things down). Feature preset: large objects
-  (a.k.a. `large_quick`), sigmas `1, 2, 5, 15`.
+  channel; it adds little and slows things down). Feature preset: `medium_preset`
+  (sigmas `1, 2, 5, 15`), or `large_preset` (sigmas `1, 2, 5, 10, 25`) for
+  multi-scale data.
 - **T cells** — pick the channels/features relevant to T cells. Feature preset:
-  small cells, sigmas `1, 2, 5`.
+  `small_preset` (sigmas `1, 2, 5`).
 
 Shared random-forest / instance settings:
 
